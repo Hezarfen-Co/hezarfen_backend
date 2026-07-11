@@ -217,6 +217,36 @@ impl User {
         }
     }
 
+    /// Idempotent startup seed: guarantee an admin account with this username.
+    /// Missing → created directly with [`Role::Admin`]. Already an admin →
+    /// nothing to do (the stored password stays whatever it is — the seed never
+    /// rewrites credentials). Taken by a non-admin → refuse to touch it and log
+    /// a warning: silently promoting an account someone else registered would
+    /// be a privilege escalation, so that conflict is resolved out-of-band.
+    pub async fn ensure_admin(
+        username: Username,
+        password: Password,
+        db: &Database,
+    ) -> Result<(), AppError> {
+        match Self::find_by_username(username.as_str(), db).await? {
+            Some(user) if user.role == Role::Admin => Ok(()),
+            Some(_) => {
+                tracing::warn!(
+                    username = username.as_str(),
+                    "ADMIN_USERNAME names an existing non-admin account; refusing to promote it. \
+                     Grant the role through an existing admin or the manual SurrealQL path."
+                );
+                Ok(())
+            }
+            None => {
+                let created = Self::create(username, password.hash()?, db).await?;
+                let admin = created.set_role(Role::Admin, db).await?;
+                tracing::info!(username = admin.username.as_str(), "seeded admin account");
+                Ok(())
+            }
+        }
+    }
+
     pub async fn read(id: &UserId, db: &Database) -> Result<Option<User>, AppError> {
         Ok(db.select(id.record()).await?)
     }

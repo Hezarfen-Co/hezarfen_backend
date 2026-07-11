@@ -1,4 +1,7 @@
+use anyhow::Context;
 use hezarfen_backend::config::Config;
+use hezarfen_backend::database::Database;
+use hezarfen_backend::domain::user::{Password, User, Username};
 use hezarfen_backend::state::AppState;
 use hezarfen_backend::{build_router, database};
 
@@ -14,6 +17,7 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = Config::from_env();
     let db = database::init(&cfg).await?;
+    seed_admin(&cfg, &db).await?;
     let app = build_router(AppState {
         db,
         cookie_secure: cfg.cookie_secure,
@@ -33,6 +37,24 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     tracing::info!("shutting down");
     Ok(())
+}
+
+/// Apply the `ADMIN_USERNAME` / `ADMIN_PASSWORD` bootstrap, if configured.
+/// Both-or-neither: half a credential pair is a deployment mistake, so it
+/// aborts startup rather than silently running without the seed.
+async fn seed_admin(cfg: &Config, db: &Database) -> anyhow::Result<()> {
+    match (&cfg.admin_username, &cfg.admin_password) {
+        (Some(username), Some(password)) => {
+            let username = Username::try_new(username).context("invalid ADMIN_USERNAME")?;
+            let password = Password::try_new(password).context("invalid ADMIN_PASSWORD")?;
+            User::ensure_admin(username, password, db)
+                .await
+                .context("failed to seed the admin account")?;
+            Ok(())
+        }
+        (None, None) => Ok(()),
+        _ => anyhow::bail!("ADMIN_USERNAME and ADMIN_PASSWORD must be set together"),
+    }
 }
 
 /// Resolve on SIGINT (Ctrl-C) or SIGTERM. As PID 1 in a container the process

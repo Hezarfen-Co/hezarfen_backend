@@ -14,6 +14,10 @@ services:
       DB_NAMESPACE: hezarfen
       DB_DATABASE: hezarfen
       RUST_LOG: info,hezarfen_backend=debug
+      # First-boot admin seed: created once if the username doesn't exist yet.
+      # Local-dev credentials — change or remove before exposing this anywhere.
+      ADMIN_USERNAME: admin
+      ADMIN_PASSWORD: admin123
       # Production knobs — uncomment as needed (see .env.example for docs):
       # COOKIE_SECURE: "true"
       # CORS_ALLOWED_ORIGINS: https://app.example.com

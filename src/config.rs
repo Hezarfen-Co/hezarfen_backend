@@ -21,6 +21,11 @@ pub struct Config {
     /// Per-IP request limits (`RATE_LIMIT_AUTH_PER_MINUTE`,
     /// `RATE_LIMIT_API_PER_MINUTE`, `TRUST_PROXY`). `0` disables a tier.
     pub rate_limit: RateLimitConfig,
+    /// Startup admin seed (`ADMIN_USERNAME` + `ADMIN_PASSWORD`). When both are
+    /// set, an admin account with these credentials is created at boot if the
+    /// username doesn't exist yet. Blank values count as unset.
+    pub admin_username: Option<String>,
+    pub admin_password: Option<String>,
 }
 
 impl Config {
@@ -43,8 +48,15 @@ impl Config {
                 ),
                 trust_proxy: parse_flag(env::var("TRUST_PROXY").ok()),
             },
+            admin_username: parse_optional(env::var("ADMIN_USERNAME").ok()),
+            admin_password: parse_optional(env::var("ADMIN_PASSWORD").ok()),
         }
     }
+}
+
+/// Treat an unset or blank variable as absent.
+fn parse_optional(value: Option<String>) -> Option<String> {
+    value.filter(|v| !v.trim().is_empty())
 }
 
 /// Parse a per-minute limit, falling back to `default` when unset or
