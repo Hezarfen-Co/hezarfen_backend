@@ -25,6 +25,7 @@ pub fn routes() -> OpenApiRouter<AppState> {
         .routes(routes!(grade, list_results))
         .routes(routes!(my_result))
         .routes(routes!(remove_result))
+        .routes(routes!(exam_statistics))
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -64,6 +65,17 @@ impl ExamResultResponse {
             graded_by: result.get_graded_by().key().to_string(),
         }
     }
+}
+
+#[derive(Serialize, ToSchema)]
+struct ExamStatisticsResponse {
+    exam: String,
+    /// Number of graded results.
+    graded: u64,
+    /// Plain mean of the graded marks; `null` while nothing is graded.
+    average: Option<f64>,
+    min: Option<i64>,
+    max: Option<i64>,
 }
 
 /// The course an exam belongs to. A dangling reference means the course-delete
@@ -371,4 +383,42 @@ async fn remove_result(
         return Err(AppError::NotFound);
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Summary statistics for an exam's graded results. Requires teacher+.
+#[utoipa::path(
+    get,
+    path = "/{id}/statistics",
+    tag = "exams",
+    security(("session_cookie" = [])),
+    params(("id" = String, Path, description = "Exam id")),
+    responses(
+        (status = 200, description = "The exam's mark statistics", body = ExamStatisticsResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
+        (status = 404, description = "Exam not found", body = ErrorResponse),
+    ),
+)]
+async fn exam_statistics(
+    State(st): State<AppState>,
+    _teacher: RequireTeacher,
+    Path(id): Path<String>,
+) -> Result<Json<ExamStatisticsResponse>, AppError> {
+    let exam_id = ExamId::from_key(&id);
+    // Exam must exist — a missing exam is a 404, not an empty statistic.
+    Exam::read(&exam_id, &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let results = ExamResult::list_for_exam(&exam_id, &st.db).await?;
+
+    let marks: Vec<i64> = results.iter().map(|r| r.get_mark().as_i64()).collect();
+    let average =
+        (!marks.is_empty()).then(|| marks.iter().sum::<i64>() as f64 / marks.len() as f64);
+    Ok(Json(ExamStatisticsResponse {
+        exam: exam_id.key().to_string(),
+        graded: marks.len() as u64,
+        average,
+        min: marks.iter().min().copied(),
+        max: marks.iter().max().copied(),
+    }))
 }
