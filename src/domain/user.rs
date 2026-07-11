@@ -6,6 +6,7 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use ulid::Ulid;
 
 use crate::database::{Database, USER_TABLE};
+use crate::domain::profile::{BirthDate, Email, PersonName, Phone};
 use crate::domain::role::Role;
 use crate::error::{AppError, ValidationError};
 use crate::validate::{validate_password, validate_username};
@@ -123,6 +124,14 @@ pub struct User {
     username: Username,
     password_hash: PasswordHash,
     role: Role,
+    // Personal info, identical for every role. All optional: accounts are
+    // created from bare credentials and filled in later, and rows from before
+    // these fields existed simply read back as `None`.
+    name: Option<PersonName>,
+    surname: Option<PersonName>,
+    email: Option<Email>,
+    phone: Option<Phone>,
+    birth_date: Option<BirthDate>,
 }
 
 impl User {
@@ -140,6 +149,26 @@ impl User {
 
     pub fn get_role(&self) -> Role {
         self.role
+    }
+
+    pub fn get_name(&self) -> Option<&PersonName> {
+        self.name.as_ref()
+    }
+
+    pub fn get_surname(&self) -> Option<&PersonName> {
+        self.surname.as_ref()
+    }
+
+    pub fn get_email(&self) -> Option<&Email> {
+        self.email.as_ref()
+    }
+
+    pub fn get_phone(&self) -> Option<&Phone> {
+        self.phone.as_ref()
+    }
+
+    pub fn get_birth_date(&self) -> Option<&BirthDate> {
+        self.birth_date.as_ref()
     }
 
     /// Register a new account. New users always start as [`Role::Student`];
@@ -160,6 +189,11 @@ impl User {
             username,
             password_hash,
             role: Role::Student,
+            name: None,
+            surname: None,
+            email: None,
+            phone: None,
+            birth_date: None,
         };
         let created: Result<Option<User>, surrealdb::Error> =
             db.create(user.id.record()).content(user.clone()).await;
@@ -198,6 +232,27 @@ impl User {
     /// Overwrite this user's role. The caller is responsible for authorizing it.
     pub async fn set_role(mut self, role: Role, db: &Database) -> Result<User, AppError> {
         self.role = role;
+        let updated: Option<User> = db.update(self.id.record()).content(self).await?;
+        updated.ok_or(AppError::NotFound)
+    }
+
+    /// Overwrite the personal-info fields wholesale. Each argument is the final
+    /// value (`None` clears); merging "keep what wasn't sent" against the
+    /// current row is the HTTP layer's job. The caller authorizes.
+    pub async fn set_profile(
+        mut self,
+        name: Option<PersonName>,
+        surname: Option<PersonName>,
+        email: Option<Email>,
+        phone: Option<Phone>,
+        birth_date: Option<BirthDate>,
+        db: &Database,
+    ) -> Result<User, AppError> {
+        self.name = name;
+        self.surname = surname;
+        self.email = email;
+        self.phone = phone;
+        self.birth_date = birth_date;
         let updated: Option<User> = db.update(self.id.record()).content(self).await?;
         updated.ok_or(AppError::NotFound)
     }

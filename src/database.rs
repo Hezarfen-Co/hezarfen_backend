@@ -23,6 +23,11 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS username ON user TYPE string;
     DEFINE FIELD IF NOT EXISTS password_hash ON user TYPE string;
     DEFINE FIELD IF NOT EXISTS role ON user TYPE string DEFAULT 'student';
+    DEFINE FIELD IF NOT EXISTS name ON user TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS surname ON user TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS email ON user TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS phone ON user TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS birth_date ON user TYPE option<string>;
     DEFINE INDEX IF NOT EXISTS user_username ON user FIELDS username UNIQUE;
     UPDATE user SET role = 'student' WHERE role = NONE;
 

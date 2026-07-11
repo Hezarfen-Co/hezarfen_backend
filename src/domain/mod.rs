@@ -7,6 +7,7 @@ pub mod event;
 pub mod exam;
 pub mod exam_result;
 pub mod note;
+pub mod profile;
 pub mod role;
 pub mod session;
 pub mod timestamp;

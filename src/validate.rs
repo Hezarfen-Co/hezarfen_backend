@@ -2,8 +2,8 @@
 //! the value, so an existing newtype is always valid (parse, don't validate).
 
 use crate::constant::{
-    ATTENDANCE_STATUSES, EXAM_KINDS, MAX_MARK, MAX_PASSWORD_LEN, MAX_USERNAME_LEN, MIN_MARK,
-    MIN_PASSWORD_LEN, MIN_USERNAME_LEN,
+    ATTENDANCE_STATUSES, EXAM_KINDS, MAX_EMAIL_LEN, MAX_MARK, MAX_PASSWORD_LEN, MAX_PHONE_DIGITS,
+    MAX_USERNAME_LEN, MIN_MARK, MIN_PASSWORD_LEN, MIN_PHONE_DIGITS, MIN_USERNAME_LEN,
 };
 use crate::error::ValidationError;
 
@@ -91,6 +91,71 @@ pub fn validate_optional(
     Ok(())
 }
 
+/// Pragmatic email shape check: one `@` with non-empty sides, a dot inside the
+/// domain, ASCII, no whitespace. Deliverability is not provable here — this only
+/// rejects values that cannot be an address.
+pub fn validate_email(value: &str) -> Result<(), ValidationError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(ValidationError::Empty("email"));
+    }
+    if !value.is_ascii() {
+        return Err(ValidationError::NotAscii("email"));
+    }
+    if value.chars().count() > MAX_EMAIL_LEN {
+        return Err(ValidationError::TooLong {
+            field: "email",
+            max: MAX_EMAIL_LEN,
+            got: value.chars().count(),
+        });
+    }
+    let invalid = ValidationError::Invalid {
+        field: "email",
+        reason: "must look like name@example.com",
+    };
+    if value.contains(char::is_whitespace) || value.matches('@').count() != 1 {
+        return Err(invalid);
+    }
+    match value.split_once('@') {
+        Some((local, domain))
+            if !local.is_empty()
+                && domain.contains('.')
+                && !domain.starts_with('.')
+                && !domain.ends_with('.') =>
+        {
+            Ok(())
+        }
+        _ => Err(invalid),
+    }
+}
+
+/// Phone numbers: an optional leading `+`, then digits with cosmetic spaces,
+/// dashes, or parentheses; 7–15 digits total (E.164's ceiling).
+pub fn validate_phone(value: &str) -> Result<(), ValidationError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(ValidationError::Empty("phone"));
+    }
+    let rest = value.strip_prefix('+').unwrap_or(value);
+    if rest
+        .chars()
+        .any(|c| !c.is_ascii_digit() && !matches!(c, ' ' | '-' | '(' | ')'))
+    {
+        return Err(ValidationError::Invalid {
+            field: "phone",
+            reason: "may contain digits, spaces, dashes, parentheses, and a leading +",
+        });
+    }
+    let digits = rest.chars().filter(char::is_ascii_digit).count();
+    if !(MIN_PHONE_DIGITS..=MAX_PHONE_DIGITS).contains(&digits) {
+        return Err(ValidationError::Invalid {
+            field: "phone",
+            reason: "must contain 7 to 15 digits",
+        });
+    }
+    Ok(())
+}
+
 pub fn validate_status(value: &str) -> Result<(), ValidationError> {
     if ATTENDANCE_STATUSES.contains(&value) {
         Ok(())
@@ -168,6 +233,35 @@ mod tests {
     async fn optional_rules() {
         assert!(validate_optional("content", "", 10).is_ok());
         assert!(validate_optional("content", "toolong", 3).is_err());
+    }
+
+    #[tokio::test]
+    async fn email_rules() {
+        assert!(validate_email("ada@example.com").is_ok());
+        assert!(validate_email("  ada@example.com  ").is_ok()); // trimmed before checking
+        assert!(validate_email("").is_err());
+        assert!(validate_email("ada").is_err()); // no @
+        assert!(validate_email("@example.com").is_err()); // empty local part
+        assert!(validate_email("ada@").is_err()); // empty domain
+        assert!(validate_email("ada@example").is_err()); // no dot in domain
+        assert!(validate_email("ada@.com").is_err()); // dot at domain edge
+        assert!(validate_email("ada@example.com.").is_err());
+        assert!(validate_email("a da@example.com").is_err()); // whitespace inside
+        assert!(validate_email("ada@ex@ample.com").is_err()); // two @
+        assert!(validate_email("adä@example.com").is_err()); // non-ascii
+        assert!(validate_email(&format!("{}@example.com", "x".repeat(250))).is_err());
+    }
+
+    #[tokio::test]
+    async fn phone_rules() {
+        assert!(validate_phone("+90 555 123 45 67").is_ok());
+        assert!(validate_phone("05551234567").is_ok());
+        assert!(validate_phone("(555) 123-4567").is_ok());
+        assert!(validate_phone("").is_err());
+        assert!(validate_phone("123456").is_err()); // 6 digits, too few
+        assert!(validate_phone("1234567890123456").is_err()); // 16 digits, too many
+        assert!(validate_phone("call-me-maybe").is_err()); // letters
+        assert!(validate_phone("55+5123456").is_err()); // + only allowed in front
     }
 
     #[tokio::test]

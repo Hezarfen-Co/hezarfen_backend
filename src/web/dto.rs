@@ -30,8 +30,9 @@ impl From<DomainRole> for Role {
     }
 }
 
-/// Public shape of a user: id, username, role. Never carries the password hash.
-/// Shared by `auth` (register/login/me) and `users` (admin listing/role changes).
+/// Public shape of a user: id, username, role, and the optional personal info
+/// (`null` until filled in). Never carries the password hash. Shared by `auth`
+/// (register/login/me) and `users` (listing, role and profile changes).
 #[derive(Serialize, ToSchema)]
 pub struct UserResponse {
     #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
@@ -39,6 +40,16 @@ pub struct UserResponse {
     #[schema(example = "ada")]
     pub username: String,
     pub role: Role,
+    #[schema(example = "Ada")]
+    pub name: Option<String>,
+    #[schema(example = "Lovelace")]
+    pub surname: Option<String>,
+    #[schema(example = "ada@example.com")]
+    pub email: Option<String>,
+    #[schema(example = "+90 555 123 45 67")]
+    pub phone: Option<String>,
+    #[schema(example = "1990-01-02")]
+    pub birth_date: Option<String>,
 }
 
 impl UserResponse {
@@ -47,6 +58,11 @@ impl UserResponse {
             id: user.get_id().key().to_string(),
             username: user.get_username().as_str().to_string(),
             role: user.get_role().into(),
+            name: user.get_name().map(|v| v.as_str().to_string()),
+            surname: user.get_surname().map(|v| v.as_str().to_string()),
+            email: user.get_email().map(|v| v.as_str().to_string()),
+            phone: user.get_phone().map(|v| v.as_str().to_string()),
+            birth_date: user.get_birth_date().map(|v| v.as_str().to_string()),
         }
     }
 }
