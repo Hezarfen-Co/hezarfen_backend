@@ -1,6 +1,7 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
 use crate::database::{Database, EXAM_RESULT_TABLE};
+use crate::domain::course::CourseId;
 use crate::domain::exam::ExamId;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
@@ -122,6 +123,26 @@ impl ExamResult {
         };
         let saved: Option<ExamResult> = db.upsert(result.id.record()).content(result).await?;
         saved.ok_or_else(|| AppError::Internal("failed to record exam result".into()))
+    }
+
+    /// The user's graded results restricted to one course's exams — the raw
+    /// rows behind the per-course block of the marks report.
+    pub async fn list_for_user_in_course(
+        course: &CourseId,
+        user: &UserId,
+        db: &Database,
+    ) -> Result<Vec<ExamResult>, AppError> {
+        let mut result = db
+            .query(
+                "SELECT * FROM exam_result WHERE user = $usr
+                 AND exam IN (SELECT VALUE id FROM exam WHERE course = $course)
+                 ORDER BY id DESC",
+            )
+            .bind(("usr", user.record()))
+            .bind(("course", course.record()))
+            .await?
+            .check()?;
+        Ok(result.take::<Vec<ExamResult>>(0)?)
     }
 
     pub async fn list_for_exam(exam: &ExamId, db: &Database) -> Result<Vec<ExamResult>, AppError> {

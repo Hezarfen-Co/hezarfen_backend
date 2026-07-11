@@ -32,7 +32,7 @@ use crate::state::AppState;
     info(
         title = "Hezarfen Backend API",
         version = env!("CARGO_PKG_VERSION"),
-        description = "Notes, events, attendance, and exams behind cookie-session auth.",
+        description = "Notes, events, attendance, courses, and weighted exam marks behind cookie-session auth.",
     ),
     modifiers(&SecurityAddon),
     tags(
@@ -43,6 +43,7 @@ use crate::state::AppState;
         (name = "events", description = "Events and attendance"),
         (name = "courses", description = "Courses, enrollment, and course exams"),
         (name = "exams", description = "Exams (per course, weighted) and student results"),
+        (name = "marks", description = "Weighted mark reports per course and overall"),
     ),
 )]
 struct ApiDoc;
@@ -76,6 +77,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/events", web::events::routes())
         .nest("/courses", web::courses::routes())
         .nest("/exams", web::exams::routes())
+        .nest("/marks", web::marks::routes())
         .split_for_parts();
 
     // Catch-all per-IP limit over every route (Swagger included). Kept inside

@@ -7,6 +7,7 @@ pub mod auth;
 pub mod courses;
 pub mod events;
 pub mod exams;
+pub mod marks;
 pub mod notes;
 pub mod users;
 
