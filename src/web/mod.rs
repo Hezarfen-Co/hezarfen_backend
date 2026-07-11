@@ -4,6 +4,7 @@
 //! `RequireTeacher` / `RequireAdmin` extractor instead of `CurrentUser`.
 
 pub mod auth;
+pub mod courses;
 pub mod events;
 pub mod exams;
 pub mod notes;
@@ -12,5 +13,5 @@ pub mod users;
 mod dto;
 mod extractor;
 
-pub use dto::UserResponse;
+pub use dto::{CourseResponse, ExamResponse, UserResponse};
 pub use extractor::{CurrentUser, RequireAdmin, RequireTeacher};

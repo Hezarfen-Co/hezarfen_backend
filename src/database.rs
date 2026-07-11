@@ -15,6 +15,8 @@ pub const EVENT_TABLE: &str = "event";
 pub const ATTENDANCE_TABLE: &str = "attendance";
 pub const EXAM_TABLE: &str = "exam";
 pub const EXAM_RESULT_TABLE: &str = "exam_result";
+pub const COURSE_TABLE: &str = "course";
+pub const ENROLLMENT_TABLE: &str = "enrollment";
 
 /// SCHEMAFULL schema: every column is typed, references use `record<..>`.
 /// Idempotent — safe to run on every boot.
@@ -58,11 +60,26 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS marked_by ON attendance TYPE record<user>;
     DEFINE INDEX IF NOT EXISTS attendance_event_user ON attendance FIELDS event, user UNIQUE;
 
+    DEFINE TABLE IF NOT EXISTS course SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS creator ON course TYPE record<user>;
+    DEFINE FIELD IF NOT EXISTS title ON course TYPE string;
+    DEFINE FIELD IF NOT EXISTS description ON course TYPE string;
+
+    DEFINE TABLE IF NOT EXISTS enrollment SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS course ON enrollment TYPE record<course>;
+    DEFINE FIELD IF NOT EXISTS user ON enrollment TYPE record<user>;
+    DEFINE FIELD IF NOT EXISTS enrolled_by ON enrollment TYPE record<user>;
+    DEFINE INDEX IF NOT EXISTS enrollment_course_user ON enrollment FIELDS course, user UNIQUE;
+    DEFINE INDEX IF NOT EXISTS enrollment_user ON enrollment FIELDS user;
+
     DEFINE TABLE IF NOT EXISTS exam SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS creator ON exam TYPE record<user>;
+    DEFINE FIELD IF NOT EXISTS course ON exam TYPE record<course>;
     DEFINE FIELD IF NOT EXISTS title ON exam TYPE string;
     DEFINE FIELD IF NOT EXISTS description ON exam TYPE string;
     DEFINE FIELD IF NOT EXISTS kind ON exam TYPE string;
+    DEFINE FIELD IF NOT EXISTS weight ON exam TYPE int;
+    DEFINE INDEX IF NOT EXISTS exam_course ON exam FIELDS course;
 
     DEFINE TABLE IF NOT EXISTS exam_result SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS exam ON exam_result TYPE record<exam>;

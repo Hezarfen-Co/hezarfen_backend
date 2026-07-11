@@ -3,6 +3,8 @@
 use serde::Serialize;
 use utoipa::ToSchema;
 
+use crate::domain::course::Course;
+use crate::domain::exam::Exam;
 use crate::domain::role::Role as DomainRole;
 use crate::domain::user::User;
 
@@ -63,6 +65,56 @@ impl UserResponse {
             email: user.get_email().map(|v| v.as_str().to_string()),
             phone: user.get_phone().map(|v| v.as_str().to_string()),
             birth_date: user.get_birth_date().map(|v| v.as_str().to_string()),
+        }
+    }
+}
+
+/// Public shape of a course. Shared by `courses` (CRUD) and `marks` (report
+/// blocks embed the course they average).
+#[derive(Serialize, ToSchema)]
+pub struct CourseResponse {
+    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    pub id: String,
+    pub creator: String,
+    #[schema(example = "Algebra")]
+    pub title: String,
+    pub description: String,
+}
+
+impl CourseResponse {
+    pub fn new(course: &Course) -> Self {
+        Self {
+            id: course.get_id().key().to_string(),
+            creator: course.get_creator().key().to_string(),
+            title: course.get_title().as_str().to_string(),
+            description: course.get_description().as_str().to_string(),
+        }
+    }
+}
+
+/// Public shape of an exam. Shared by `exams` (CRUD/results) and `courses`
+/// (in-course creation and listing).
+#[derive(Serialize, ToSchema)]
+pub struct ExamResponse {
+    pub id: String,
+    pub creator: String,
+    pub course: String,
+    pub title: String,
+    pub description: String,
+    pub kind: String,
+    pub weight: i64,
+}
+
+impl ExamResponse {
+    pub fn new(exam: &Exam) -> Self {
+        Self {
+            id: exam.get_id().key().to_string(),
+            creator: exam.get_creator().key().to_string(),
+            course: exam.get_course().key().to_string(),
+            title: exam.get_title().as_str().to_string(),
+            description: exam.get_description().as_str().to_string(),
+            kind: exam.get_kind().as_str().to_string(),
+            weight: exam.get_weight().as_i64(),
         }
     }
 }

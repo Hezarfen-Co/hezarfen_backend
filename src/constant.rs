@@ -24,14 +24,23 @@ pub const MAX_EVENT_DESCRIPTION_LEN: usize = 2_000;
 pub const MAX_EXAM_TITLE_LEN: usize = 200;
 pub const MAX_EXAM_DESCRIPTION_LEN: usize = 2_000;
 
+pub const MAX_COURSE_TITLE_LEN: usize = 200;
+pub const MAX_COURSE_DESCRIPTION_LEN: usize = 2_000;
+
 /// The only accepted attendance states.
 pub const ATTENDANCE_STATUSES: [&str; 4] = ["present", "absent", "late", "excused"];
 
-/// The only accepted exam kinds — an exam is a homework or a quiz, nothing else.
-pub const EXAM_KINDS: [&str; 2] = ["homework", "quiz"];
+/// The only accepted exam kinds. Informational metadata only — `weight` drives
+/// the course average.
+pub const EXAM_KINDS: [&str; 6] = ["homework", "quiz", "midterm", "final", "project", "oral"];
 
 /// Inclusive bounds for an exam mark.
 pub const MIN_MARK: i64 = 0;
 pub const MAX_MARK: i64 = 100;
+
+/// Inclusive bounds for an exam's weight in the course average. The minimum of
+/// 1 keeps every graded exam counted and the average's denominator non-zero.
+pub const MIN_EXAM_WEIGHT: i64 = 1;
+pub const MAX_EXAM_WEIGHT: i64 = 100;
 
 pub const SESSION_DURATION_DAYS: i64 = 7;

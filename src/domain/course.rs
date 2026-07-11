@@ -1,0 +1,183 @@
+use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
+use ulid::Ulid;
+
+use crate::constant::{MAX_COURSE_DESCRIPTION_LEN, MAX_COURSE_TITLE_LEN};
+use crate::database::{COURSE_TABLE, Database};
+use crate::domain::user::UserId;
+use crate::error::{AppError, ValidationError};
+use crate::validate::{validate_optional, validate_required};
+
+#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+pub struct CourseId(RecordId);
+
+impl CourseId {
+    pub fn generate() -> Self {
+        Self(RecordId::new(COURSE_TABLE, Ulid::new().to_string()))
+    }
+
+    pub fn from_key(key: &str) -> Self {
+        Self(RecordId::new(COURSE_TABLE, key))
+    }
+
+    pub fn record(&self) -> RecordId {
+        self.0.clone()
+    }
+
+    pub fn key(&self) -> &str {
+        match &self.0.key {
+            RecordIdKey::String(key) => key,
+            _ => "",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+pub struct CourseTitle(String);
+
+impl CourseTitle {
+    pub fn try_new(value: &str) -> Result<Self, ValidationError> {
+        validate_required("title", value, MAX_COURSE_TITLE_LEN)?;
+        Ok(Self(value.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+pub struct CourseDescription(String);
+
+impl CourseDescription {
+    pub fn try_new(value: &str) -> Result<Self, ValidationError> {
+        validate_optional("description", value, MAX_COURSE_DESCRIPTION_LEN)?;
+        Ok(Self(value.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A course: the unit exams and enrollments hang off. Marks are computed per
+/// course from its exams' weights.
+#[derive(Debug, Clone, SurrealValue)]
+pub struct Course {
+    id: CourseId,
+    creator: UserId,
+    title: CourseTitle,
+    description: CourseDescription,
+}
+
+impl Course {
+    pub fn get_id(&self) -> &CourseId {
+        &self.id
+    }
+
+    pub fn get_creator(&self) -> &UserId {
+        &self.creator
+    }
+
+    pub fn get_title(&self) -> &CourseTitle {
+        &self.title
+    }
+
+    pub fn get_description(&self) -> &CourseDescription {
+        &self.description
+    }
+
+    pub fn is_creator(&self, user: &UserId) -> bool {
+        &self.creator == user
+    }
+
+    pub async fn create(
+        creator: &UserId,
+        title: CourseTitle,
+        description: CourseDescription,
+        db: &Database,
+    ) -> Result<Course, AppError> {
+        let course = Course {
+            id: CourseId::generate(),
+            creator: creator.clone(),
+            title,
+            description,
+        };
+        let created: Option<Course> = db.create(course.id.record()).content(course).await?;
+        created.ok_or_else(|| AppError::Internal("failed to create course".into()))
+    }
+
+    pub async fn read(id: &CourseId, db: &Database) -> Result<Option<Course>, AppError> {
+        Ok(db.select(id.record()).await?)
+    }
+
+    pub async fn list_all(db: &Database) -> Result<Vec<Course>, AppError> {
+        let mut result = db
+            .query("SELECT * FROM course ORDER BY id DESC")
+            .await?
+            .check()?;
+        Ok(result.take::<Vec<Course>>(0)?)
+    }
+
+    /// The courses `user` is enrolled in — the spine of `/courses/me` and the
+    /// marks report.
+    pub async fn list_enrolled(user: &UserId, db: &Database) -> Result<Vec<Course>, AppError> {
+        let mut result = db
+            .query(
+                "SELECT * FROM course
+                 WHERE id IN (SELECT VALUE course FROM enrollment WHERE user = $usr)
+                 ORDER BY id DESC",
+            )
+            .bind(("usr", user.record()))
+            .await?
+            .check()?;
+        Ok(result.take::<Vec<Course>>(0)?)
+    }
+
+    pub async fn update(
+        mut self,
+        title: CourseTitle,
+        description: CourseDescription,
+        db: &Database,
+    ) -> Result<Course, AppError> {
+        self.title = title;
+        self.description = description;
+        let updated: Option<Course> = db.update(self.id.record()).content(self).await?;
+        updated.ok_or(AppError::NotFound)
+    }
+
+    /// Delete the course and cascade-remove everything inside it: results of
+    /// its exams, its enrollments, and the exams themselves. The children go in
+    /// one transaction so a crash can't leave an exam pointing at a deleted
+    /// course.
+    pub async fn delete(self, db: &Database) -> Result<Course, AppError> {
+        db.query(
+            "BEGIN TRANSACTION;
+             DELETE exam_result WHERE exam IN (SELECT VALUE id FROM exam WHERE course = $course);
+             DELETE enrollment WHERE course = $course;
+             DELETE exam WHERE course = $course;
+             COMMIT TRANSACTION;",
+        )
+        .bind(("course", self.id.record()))
+        .await?
+        .check()?;
+        let deleted: Option<Course> = db.delete(self.id.record()).await?;
+        deleted.ok_or(AppError::NotFound)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn title_is_required() {
+        assert!(CourseTitle::try_new("algebra").is_ok());
+        assert!(CourseTitle::try_new("").is_err());
+        assert!(CourseTitle::try_new("   ").is_err());
+    }
+
+    #[tokio::test]
+    async fn description_is_optional() {
+        assert!(CourseDescription::try_new("").is_ok());
+    }
+}

@@ -6,18 +6,21 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::domain::exam::{Exam, ExamDescription, ExamId, ExamKind, ExamTitle};
+use crate::database::Database;
+use crate::domain::course::Course;
+use crate::domain::enrollment::Enrollment;
+use crate::domain::exam::{Exam, ExamDescription, ExamId, ExamKind, ExamTitle, ExamWeight};
 use crate::domain::exam_result::{ExamResult, Mark};
-use crate::domain::role::Role;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
 
-use super::{CurrentUser, RequireTeacher};
+use super::courses::can_manage_course;
+use super::{CurrentUser, ExamResponse, RequireTeacher};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
-        .routes(routes!(create_exam, list_exams))
+        .routes(routes!(list_exams))
         .routes(routes!(get_exam, update_exam, delete_exam))
         .routes(routes!(grade, list_results))
         .routes(routes!(my_result))
@@ -25,20 +28,11 @@ pub fn routes() -> OpenApiRouter<AppState> {
 }
 
 #[derive(Deserialize, ToSchema)]
-struct CreateExam {
-    #[schema(example = "Chapter 3 quiz")]
-    title: String,
-    description: Option<String>,
-    /// The assessment form: `homework` or `quiz`.
-    #[schema(example = "quiz")]
-    kind: String,
-}
-
-#[derive(Deserialize, ToSchema)]
 struct UpdateExam {
     title: Option<String>,
     description: Option<String>,
     kind: Option<String>,
+    weight: Option<i64>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -49,27 +43,6 @@ struct GradeResult {
     /// The student being graded.
     #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
     user_id: String,
-}
-
-#[derive(Serialize, ToSchema)]
-struct ExamResponse {
-    id: String,
-    creator: String,
-    title: String,
-    description: String,
-    kind: String,
-}
-
-impl ExamResponse {
-    fn new(exam: &Exam) -> Self {
-        Self {
-            id: exam.get_id().key().to_string(),
-            creator: exam.get_creator().key().to_string(),
-            title: exam.get_title().as_str().to_string(),
-            description: exam.get_description().as_str().to_string(),
-            kind: exam.get_kind().as_str().to_string(),
-        }
-    }
 }
 
 #[derive(Serialize, ToSchema)]
@@ -93,39 +66,16 @@ impl ExamResultResponse {
     }
 }
 
-/// Who may edit/delete a specific exam: its creator, or anyone `manager` and
-/// above. Callers have already cleared the `teacher` bar via `RequireTeacher`.
-fn can_manage(exam: &Exam, user: &User) -> bool {
-    exam.is_creator(user.get_id()) || user.get_role().at_least(Role::Manager)
+/// The course an exam belongs to. A dangling reference means the course-delete
+/// cascade was violated — surface it loudly as a 500, not a user-facing 404.
+async fn course_of(exam: &Exam, db: &Database) -> Result<Course, AppError> {
+    Course::read(exam.get_course(), db)
+        .await?
+        .ok_or_else(|| AppError::Internal("exam references a missing course".into()))
 }
 
 // ---- exams --------------------------------------------------------------
-
-/// Create an exam owned by the current user. Requires the `teacher` role or higher.
-#[utoipa::path(
-    post,
-    path = "/",
-    tag = "exams",
-    security(("session_cookie" = [])),
-    request_body = CreateExam,
-    responses(
-        (status = 201, description = "Exam created", body = ExamResponse),
-        (status = 400, description = "Invalid fields or kind", body = ErrorResponse),
-        (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
-    ),
-)]
-async fn create_exam(
-    State(st): State<AppState>,
-    RequireTeacher(user): RequireTeacher,
-    Json(req): Json<CreateExam>,
-) -> Result<(StatusCode, Json<ExamResponse>), AppError> {
-    let title = ExamTitle::try_new(&req.title)?;
-    let description = ExamDescription::try_new(&req.description.unwrap_or_default())?;
-    let kind = ExamKind::try_new(&req.kind)?;
-    let exam = Exam::create(user.get_id(), title, description, kind, &st.db).await?;
-    Ok((StatusCode::CREATED, Json(ExamResponse::new(&exam))))
-}
+// Exams are created inside a course: `POST /courses/{id}/exams`.
 
 /// List all exams.
 #[utoipa::path(
@@ -170,8 +120,9 @@ async fn get_exam(
     Ok(Json(ExamResponse::new(&exam)))
 }
 
-/// Update an exam. Requires teacher+; the creator may edit their own exam and
-/// managers/admins may edit anyone's. Omitted fields keep their value.
+/// Update an exam. Requires teacher+ and management rights over the exam's
+/// course (its creator, or manager/admin). Omitted fields keep their value; the
+/// course itself is not updatable.
 #[utoipa::path(
     patch,
     path = "/{id}",
@@ -181,9 +132,9 @@ async fn get_exam(
     request_body = UpdateExam,
     responses(
         (status = 200, description = "Updated exam", body = ExamResponse),
-        (status = 400, description = "Invalid fields or kind", body = ErrorResponse),
+        (status = 400, description = "Invalid fields, kind, or weight", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
     ),
 )]
@@ -196,9 +147,10 @@ async fn update_exam(
     let exam = Exam::read(&ExamId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    if !can_manage(&exam, &user) {
+    let course = course_of(&exam, &st.db).await?;
+    if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the creator or a manager/admin can edit this exam",
+            "only the course creator or a manager/admin can edit this exam",
         ));
     }
 
@@ -214,13 +166,19 @@ async fn update_exam(
         Some(ref kind) => ExamKind::try_new(kind)?,
         None => exam.get_kind().clone(),
     };
+    let weight = match req.weight {
+        Some(weight) => ExamWeight::try_new(weight)?,
+        None => exam.get_weight(),
+    };
 
-    let updated = exam.update(title, description, kind, &st.db).await?;
+    let updated = exam
+        .update(title, description, kind, weight, &st.db)
+        .await?;
     Ok(Json(ExamResponse::new(&updated)))
 }
 
-/// Delete an exam. Requires teacher+; the creator may delete their own exam and
-/// managers/admins may delete anyone's. Cascades the exam's result rows.
+/// Delete an exam. Requires teacher+ and management rights over the exam's
+/// course (its creator, or manager/admin). Cascades the exam's result rows.
 #[utoipa::path(
     delete,
     path = "/{id}",
@@ -230,7 +188,7 @@ async fn update_exam(
     responses(
         (status = 204, description = "Deleted"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
     ),
 )]
@@ -242,9 +200,10 @@ async fn delete_exam(
     let exam = Exam::read(&ExamId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    if !can_manage(&exam, &user) {
+    let course = course_of(&exam, &st.db).await?;
+    if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the creator or a manager/admin can delete this exam",
+            "only the course creator or a manager/admin can delete this exam",
         ));
     }
     exam.delete(&st.db).await?;
@@ -253,8 +212,9 @@ async fn delete_exam(
 
 // ---- results ------------------------------------------------------------
 
-/// Record (or overwrite) a student's mark for an exam. Requires teacher+.
-/// Students never grade — including themselves.
+/// Record (or overwrite) a student's mark for an exam. Requires teacher+ and
+/// management rights over the exam's course; the target must be enrolled.
+/// Students never grade — and nobody grades themselves.
 #[utoipa::path(
     post,
     path = "/{id}/results",
@@ -264,9 +224,9 @@ async fn delete_exam(
     request_body = GradeResult,
     responses(
         (status = 200, description = "Result recorded", body = ExamResultResponse),
-        (status = 400, description = "Invalid mark or unknown user", body = ErrorResponse),
+        (status = 400, description = "Invalid mark, unknown user, or user not enrolled", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Requires teacher role or higher, or attempted to grade yourself", body = ErrorResponse),
+        (status = 403, description = "Not the course creator (and not a manager/admin), or attempted to grade yourself", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
     ),
 )]
@@ -278,9 +238,15 @@ async fn grade(
 ) -> Result<Json<ExamResultResponse>, AppError> {
     let exam_id = ExamId::from_key(&id);
     // Exam must exist.
-    Exam::read(&exam_id, &st.db)
+    let exam = Exam::read(&exam_id, &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
+    let course = course_of(&exam, &st.db).await?;
+    if !can_manage_course(&course, &teacher) {
+        return Err(AppError::Forbidden(
+            "only the course creator or a manager/admin can grade this exam",
+        ));
+    }
 
     let mark = Mark::try_new(req.mark)?;
     let target = UserId::from_key(&req.user_id);
@@ -296,6 +262,17 @@ async fn grade(
         return Err(AppError::Validation(ValidationError::Invalid {
             field: "user_id",
             reason: "target user does not exist",
+        }));
+    }
+
+    // ... and be enrolled in the exam's course.
+    if Enrollment::read_for_user(exam.get_course(), &target, &st.db)
+        .await?
+        .is_none()
+    {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "user_id",
+            reason: "target user is not enrolled in this course",
         }));
     }
 
@@ -357,7 +334,8 @@ async fn my_result(
     Ok(Json(ExamResultResponse::new(&result)))
 }
 
-/// Remove a student's result from an exam. Requires teacher+.
+/// Remove a student's result from an exam. Requires teacher+ and management
+/// rights over the exam's course.
 #[utoipa::path(
     delete,
     path = "/{id}/results/{user}",
@@ -370,17 +348,25 @@ async fn my_result(
     responses(
         (status = 204, description = "Removed"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
+        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
     ),
 )]
 async fn remove_result(
     State(st): State<AppState>,
-    _teacher: RequireTeacher,
+    RequireTeacher(user): RequireTeacher,
     Path((id, target)): Path<(String, String)>,
 ) -> Result<StatusCode, AppError> {
-    let removed =
-        ExamResult::remove(&ExamId::from_key(&id), &UserId::from_key(&target), &st.db).await?;
+    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let course = course_of(&exam, &st.db).await?;
+    if !can_manage_course(&course, &user) {
+        return Err(AppError::Forbidden(
+            "only the course creator or a manager/admin can remove results",
+        ));
+    }
+    let removed = ExamResult::remove(exam.get_id(), &UserId::from_key(&target), &st.db).await?;
     if removed.is_none() {
         return Err(AppError::NotFound);
     }

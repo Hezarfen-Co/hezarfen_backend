@@ -2,8 +2,9 @@
 //! the value, so an existing newtype is always valid (parse, don't validate).
 
 use crate::constant::{
-    ATTENDANCE_STATUSES, EXAM_KINDS, MAX_EMAIL_LEN, MAX_MARK, MAX_PASSWORD_LEN, MAX_PHONE_DIGITS,
-    MAX_USERNAME_LEN, MIN_MARK, MIN_PASSWORD_LEN, MIN_PHONE_DIGITS, MIN_USERNAME_LEN,
+    ATTENDANCE_STATUSES, EXAM_KINDS, MAX_EMAIL_LEN, MAX_EXAM_WEIGHT, MAX_MARK, MAX_PASSWORD_LEN,
+    MAX_PHONE_DIGITS, MAX_USERNAME_LEN, MIN_EXAM_WEIGHT, MIN_MARK, MIN_PASSWORD_LEN,
+    MIN_PHONE_DIGITS, MIN_USERNAME_LEN,
 };
 use crate::error::ValidationError;
 
@@ -173,7 +174,7 @@ pub fn validate_exam_kind(value: &str) -> Result<(), ValidationError> {
     } else {
         Err(ValidationError::Invalid {
             field: "kind",
-            reason: "must be one of: homework, quiz",
+            reason: "must be one of: homework, quiz, midterm, final, project, oral",
         })
     }
 }
@@ -185,6 +186,17 @@ pub fn validate_mark(value: i64) -> Result<(), ValidationError> {
         Err(ValidationError::Invalid {
             field: "mark",
             reason: "must be between 0 and 100",
+        })
+    }
+}
+
+pub fn validate_weight(value: i64) -> Result<(), ValidationError> {
+    if (MIN_EXAM_WEIGHT..=MAX_EXAM_WEIGHT).contains(&value) {
+        Ok(())
+    } else {
+        Err(ValidationError::Invalid {
+            field: "weight",
+            reason: "must be between 1 and 100",
         })
     }
 }
@@ -275,10 +287,10 @@ mod tests {
 
     #[tokio::test]
     async fn exam_kind_rules() {
-        for kind in ["homework", "quiz"] {
+        for kind in ["homework", "quiz", "midterm", "final", "project", "oral"] {
             assert!(validate_exam_kind(kind).is_ok());
         }
-        assert!(validate_exam_kind("final").is_err());
+        assert!(validate_exam_kind("essay").is_err());
         assert!(validate_exam_kind("").is_err());
     }
 
@@ -289,5 +301,15 @@ mod tests {
         }
         assert!(validate_mark(-1).is_err());
         assert!(validate_mark(101).is_err());
+    }
+
+    #[tokio::test]
+    async fn weight_rules() {
+        for weight in [1, 50, 100] {
+            assert!(validate_weight(weight).is_ok());
+        }
+        assert!(validate_weight(0).is_err());
+        assert!(validate_weight(-1).is_err());
+        assert!(validate_weight(101).is_err());
     }
 }

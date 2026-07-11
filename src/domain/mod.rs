@@ -3,6 +3,8 @@
 //! same typed value flows from HTTP input all the way into the database.
 
 pub mod attendance;
+pub mod course;
+pub mod enrollment;
 pub mod event;
 pub mod exam;
 pub mod exam_result;

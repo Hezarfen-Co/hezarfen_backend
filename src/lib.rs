@@ -41,7 +41,8 @@ use crate::state::AppState;
         (name = "users", description = "User info: self-service profile, plus listing, lookup, and role/profile administration (admin only)"),
         (name = "notes", description = "Per-user notes CRUD"),
         (name = "events", description = "Events and attendance"),
-        (name = "exams", description = "Exams (homework/quiz) and student results"),
+        (name = "courses", description = "Courses, enrollment, and course exams"),
+        (name = "exams", description = "Exams (per course, weighted) and student results"),
     ),
 )]
 struct ApiDoc;
@@ -73,6 +74,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/users", web::users::routes())
         .nest("/notes", web::notes::routes())
         .nest("/events", web::events::routes())
+        .nest("/courses", web::courses::routes())
         .nest("/exams", web::exams::routes())
         .split_for_parts();
 
