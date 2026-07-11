@@ -1,0 +1,10 @@
+# Read by both podman (falls back from .containerignore) and docker.
+target/
+data/
+tests/
+.env
+.git/
+.gitignore
+README.md
+compose.yaml
+Containerfile
