@@ -119,3 +119,58 @@ pub async fn login(app: &Router, username: &str) -> String {
 pub fn id_of(v: &Value) -> String {
     v["id"].as_str().expect("id field").to_string()
 }
+
+/// The caller's own user id via `GET /auth/me`.
+pub async fn me_id(app: &Router, cookie: &str) -> String {
+    let res = send(app, "GET", "/auth/me", Some(cookie), None).await;
+    assert_eq!(res.status, StatusCode::OK, "GET /auth/me");
+    id_of(&res.body)
+}
+
+/// Create a course as `cookie` (asserts 201); returns its id.
+pub async fn create_course(app: &Router, cookie: &str, title: &str) -> String {
+    let res = send(
+        app,
+        "POST",
+        "/courses",
+        Some(cookie),
+        Some(json!({ "title": title })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "create course {title}");
+    id_of(&res.body)
+}
+
+/// Create an exam inside `course` as `cookie` (asserts 201); returns its id.
+pub async fn create_exam(
+    app: &Router,
+    cookie: &str,
+    course: &str,
+    title: &str,
+    kind: &str,
+    weight: i64,
+) -> String {
+    let res = send(
+        app,
+        "POST",
+        &format!("/courses/{course}/exams"),
+        Some(cookie),
+        Some(json!({ "title": title, "kind": kind, "weight": weight })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "create exam {title}");
+    id_of(&res.body)
+}
+
+/// Enroll `user_id` into `course` as `cookie` (asserts 200).
+pub async fn enroll(app: &Router, cookie: &str, course: &str, user_id: &str) {
+    let res = send(
+        app,
+        "POST",
+        &format!("/courses/{course}/enrollments"),
+        Some(cookie),
+        Some(json!({ "user_id": user_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "enroll {user_id}");
+}

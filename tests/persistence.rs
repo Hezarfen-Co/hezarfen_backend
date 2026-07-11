@@ -7,7 +7,7 @@ mod common;
 use std::time::Duration;
 
 use axum::http::StatusCode;
-use common::send;
+use common::{create_course, create_exam, enroll, me_id, send, set_role};
 use hezarfen_backend::config::Config;
 use hezarfen_backend::database::Database;
 use hezarfen_backend::rate_limit::RateLimitConfig;
@@ -38,6 +38,8 @@ fn config_at(dir: &TempDir) -> Config {
         db_name: "hezarfen".into(),
         cookie_secure: false,
         rate_limit: RateLimitConfig::unlimited(),
+        admin_username: None,
+        admin_password: None,
     }
 }
 
@@ -143,5 +145,157 @@ async fn data_survives_reopen() {
         let rows = notes.body.as_array().unwrap();
         assert_eq!(rows.len(), 1, "note survived reopen");
         assert_eq!(rows[0]["title"], "persisted");
+    }
+}
+
+/// Personal info written through `PATCH /users/me` is still on the account
+/// after a close + reopen.
+#[tokio::test]
+async fn profile_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config_at(&dir);
+    let creds = json!({ "username": "ali", "password": "secret1" });
+
+    // First boot: register and fill in the profile.
+    {
+        let db = database::init(&cfg).await.expect("first open");
+        let app = build_router(state(db));
+        assert_eq!(
+            send(&app, "POST", "/auth/register", None, Some(creds.clone()))
+                .await
+                .status,
+            StatusCode::CREATED
+        );
+        let cookie = send(&app, "POST", "/auth/login", None, Some(creds.clone()))
+            .await
+            .cookie
+            .unwrap();
+        let res = send(
+            &app,
+            "PATCH",
+            "/users/me",
+            Some(&cookie),
+            Some(json!({
+                "name": "Ali",
+                "surname": "Gümüş",
+                "email": "ali@example.com",
+                "phone": "+90 555 123 45 67",
+                "birth_date": "1990-01-02",
+            })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK);
+    }
+
+    // Second boot: the info comes back from disk.
+    {
+        let db = reopen(&cfg).await;
+        let app = build_router(state(db));
+        let cookie = send(&app, "POST", "/auth/login", None, Some(creds))
+            .await
+            .cookie
+            .unwrap();
+        let me = send(&app, "GET", "/auth/me", Some(&cookie), None).await;
+        assert_eq!(me.status, StatusCode::OK);
+        assert_eq!(me.body["name"], "Ali");
+        assert_eq!(me.body["surname"], "Gümüş");
+        assert_eq!(me.body["email"], "ali@example.com");
+        assert_eq!(me.body["phone"], "+90 555 123 45 67");
+        assert_eq!(me.body["birth_date"], "1990-01-02");
+    }
+}
+
+/// A course with an enrollment, a weighted exam, and a graded mark survives a
+/// close + reopen — the weighted report is rebuilt from disk.
+#[tokio::test]
+async fn course_marks_survive_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config_at(&dir);
+    let teacher_creds = json!({ "username": "hoca", "password": "secret1" });
+    let student_creds = json!({ "username": "ali", "password": "secret1" });
+
+    // First boot: teacher sets up a course, enrolls the student, grades 80.
+    {
+        let db = database::init(&cfg).await.expect("first open");
+        let app = build_router(state(db.clone()));
+        for creds in [&teacher_creds, &student_creds] {
+            assert_eq!(
+                send(&app, "POST", "/auth/register", None, Some((*creds).clone()))
+                    .await
+                    .status,
+                StatusCode::CREATED
+            );
+        }
+        set_role(&db, "hoca", "teacher").await;
+        let teacher = send(
+            &app,
+            "POST",
+            "/auth/login",
+            None,
+            Some(teacher_creds.clone()),
+        )
+        .await
+        .cookie
+        .unwrap();
+        let student = send(
+            &app,
+            "POST",
+            "/auth/login",
+            None,
+            Some(student_creds.clone()),
+        )
+        .await
+        .cookie
+        .unwrap();
+        let student_id = me_id(&app, &student).await;
+
+        let course_id = create_course(&app, &teacher, "algebra").await;
+        enroll(&app, &teacher, &course_id, &student_id).await;
+        let exam_id = create_exam(&app, &teacher, &course_id, "midterm", "midterm", 2).await;
+        assert_eq!(
+            send(
+                &app,
+                "POST",
+                &format!("/exams/{exam_id}/results"),
+                Some(&teacher),
+                Some(json!({ "mark": 80, "user_id": student_id }))
+            )
+            .await
+            .status,
+            StatusCode::OK
+        );
+    }
+
+    // Second boot: the report, roster, and exam weight are all rebuilt from disk.
+    {
+        let db = reopen(&cfg).await;
+        let app = build_router(state(db));
+        let student = send(&app, "POST", "/auth/login", None, Some(student_creds))
+            .await
+            .cookie
+            .unwrap();
+        let report = send(&app, "GET", "/marks/me", Some(&student), None).await;
+        assert_eq!(report.status, StatusCode::OK);
+        let course = &report.body["courses"][0];
+        assert_eq!(course["course"]["title"], "algebra");
+        assert_eq!(course["average"], 80.0);
+        assert_eq!(course["results"][0]["weight"], 2);
+        assert_eq!(course["results"][0]["mark"], 80);
+        assert_eq!(report.body["overall_average"], 80.0);
+
+        let teacher = send(&app, "POST", "/auth/login", None, Some(teacher_creds))
+            .await
+            .cookie
+            .unwrap();
+        let course_id = course["course"]["id"].as_str().unwrap();
+        let roster = send(
+            &app,
+            "GET",
+            &format!("/courses/{course_id}/enrollments"),
+            Some(&teacher),
+            None,
+        )
+        .await;
+        assert_eq!(roster.body.as_array().unwrap().len(), 1, "roster intact");
     }
 }
