@@ -1,0 +1,199 @@
+//! Field validators. Each newtype's `try_new` calls one of these before wrapping
+//! the value, so an existing newtype is always valid (parse, don't validate).
+
+use crate::constant::{
+    ATTENDANCE_STATUSES, EXAM_KINDS, MAX_MARK, MAX_PASSWORD_LEN, MAX_USERNAME_LEN, MIN_MARK,
+    MIN_PASSWORD_LEN, MIN_USERNAME_LEN,
+};
+use crate::error::ValidationError;
+
+pub fn validate_username(value: &str) -> Result<(), ValidationError> {
+    // Length is measured on the trimmed value so padding can't defeat the
+    // minimum (e.g. "a  " is a one-character name, not a three-character one).
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(ValidationError::Empty("username"));
+    }
+    if !value.is_ascii() {
+        return Err(ValidationError::NotAscii("username"));
+    }
+    let len = value.chars().count();
+    if len < MIN_USERNAME_LEN {
+        return Err(ValidationError::TooShort {
+            field: "username",
+            min: MIN_USERNAME_LEN,
+            got: len,
+        });
+    }
+    if len > MAX_USERNAME_LEN {
+        return Err(ValidationError::TooLong {
+            field: "username",
+            max: MAX_USERNAME_LEN,
+            got: len,
+        });
+    }
+    Ok(())
+}
+
+pub fn validate_password(value: &str) -> Result<(), ValidationError> {
+    // A password may contain anything, including whitespace, so it is not
+    // trimmed — but length is still measured in characters, not UTF-8 bytes.
+    let len = value.chars().count();
+    if len < MIN_PASSWORD_LEN {
+        return Err(ValidationError::TooShort {
+            field: "password",
+            min: MIN_PASSWORD_LEN,
+            got: len,
+        });
+    }
+    if len > MAX_PASSWORD_LEN {
+        return Err(ValidationError::TooLong {
+            field: "password",
+            max: MAX_PASSWORD_LEN,
+            got: len,
+        });
+    }
+    Ok(())
+}
+
+/// A required free-text field: non-blank and within `max`.
+pub fn validate_required(
+    field: &'static str,
+    value: &str,
+    max: usize,
+) -> Result<(), ValidationError> {
+    if value.trim().is_empty() {
+        return Err(ValidationError::Empty(field));
+    }
+    if value.chars().count() > max {
+        return Err(ValidationError::TooLong {
+            field,
+            max,
+            got: value.chars().count(),
+        });
+    }
+    Ok(())
+}
+
+/// An optional free-text field: may be empty, but within `max`.
+pub fn validate_optional(
+    field: &'static str,
+    value: &str,
+    max: usize,
+) -> Result<(), ValidationError> {
+    if value.chars().count() > max {
+        return Err(ValidationError::TooLong {
+            field,
+            max,
+            got: value.chars().count(),
+        });
+    }
+    Ok(())
+}
+
+pub fn validate_status(value: &str) -> Result<(), ValidationError> {
+    if ATTENDANCE_STATUSES.contains(&value) {
+        Ok(())
+    } else {
+        Err(ValidationError::Invalid {
+            field: "status",
+            reason: "must be one of: present, absent, late, excused",
+        })
+    }
+}
+
+pub fn validate_exam_kind(value: &str) -> Result<(), ValidationError> {
+    if EXAM_KINDS.contains(&value) {
+        Ok(())
+    } else {
+        Err(ValidationError::Invalid {
+            field: "kind",
+            reason: "must be one of: homework, quiz",
+        })
+    }
+}
+
+pub fn validate_mark(value: i64) -> Result<(), ValidationError> {
+    if (MIN_MARK..=MAX_MARK).contains(&value) {
+        Ok(())
+    } else {
+        Err(ValidationError::Invalid {
+            field: "mark",
+            reason: "must be between 0 and 100",
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn username_rules() {
+        assert!(validate_username("ali").is_ok());
+        assert!(validate_username("ab").is_err()); // too short
+        assert!(validate_username("   ").is_err()); // blank
+        assert!(validate_username(&"x".repeat(33)).is_err()); // too long
+        assert!(validate_username("naïve").is_err()); // non-ascii
+        assert!(validate_username("a  ").is_err()); // padding can't defeat the minimum
+    }
+
+    #[tokio::test]
+    async fn length_is_measured_in_characters_not_bytes() {
+        // "é" is two UTF-8 bytes; a 4-char password of them is under the 6-char
+        // minimum and must be rejected as too short, not accepted on byte count.
+        assert!(validate_password("éééé").is_err());
+        // Exactly `max` multi-byte characters is allowed (bytes would overflow).
+        assert!(validate_required("title", &"é".repeat(5), 5).is_ok());
+        assert!(validate_required("title", &"é".repeat(6), 5).is_err());
+        assert!(validate_optional("content", &"é".repeat(5), 5).is_ok());
+        assert!(validate_optional("content", &"é".repeat(6), 5).is_err());
+    }
+
+    #[tokio::test]
+    async fn password_rules() {
+        assert!(validate_password("secret1").is_ok());
+        assert!(validate_password("12345").is_err());
+        assert!(validate_password(&"x".repeat(129)).is_err());
+    }
+
+    #[tokio::test]
+    async fn required_rules() {
+        assert!(validate_required("title", "hi", 10).is_ok());
+        assert!(validate_required("title", "  ", 10).is_err());
+        assert!(validate_required("title", "toolong", 3).is_err());
+    }
+
+    #[tokio::test]
+    async fn optional_rules() {
+        assert!(validate_optional("content", "", 10).is_ok());
+        assert!(validate_optional("content", "toolong", 3).is_err());
+    }
+
+    #[tokio::test]
+    async fn status_rules() {
+        for status in ["present", "absent", "late", "excused"] {
+            assert!(validate_status(status).is_ok());
+        }
+        assert!(validate_status("maybe").is_err());
+        assert!(validate_status("").is_err());
+    }
+
+    #[tokio::test]
+    async fn exam_kind_rules() {
+        for kind in ["homework", "quiz"] {
+            assert!(validate_exam_kind(kind).is_ok());
+        }
+        assert!(validate_exam_kind("final").is_err());
+        assert!(validate_exam_kind("").is_err());
+    }
+
+    #[tokio::test]
+    async fn mark_rules() {
+        for mark in [0, 1, 50, 99, 100] {
+            assert!(validate_mark(mark).is_ok());
+        }
+        assert!(validate_mark(-1).is_err());
+        assert!(validate_mark(101).is_err());
+    }
+}
