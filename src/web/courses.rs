@@ -23,7 +23,7 @@ use crate::state::AppState;
 use super::sessions::resolve_session_teacher;
 use super::{
     CourseResponse, CurrentUser, ExamResponse, PersonRef, RequireTeacher, SessionResponse,
-    check_time_range, person_map,
+    check_not_past, check_time_range, person_map,
 };
 
 pub fn routes() -> OpenApiRouter<AppState> {
@@ -74,10 +74,12 @@ struct CreateExamInCourse {
     /// offline-graded exam.
     #[schema(example = "sync")]
     mode: Option<String>,
-    /// Window open, UTC unix-milliseconds. Required with `mode`.
-    #[schema(example = 1_752_275_000_000_i64)]
+    /// Window open, UTC unix-milliseconds. Required with `mode`; must not be
+    /// in the past.
+    #[schema(example = 1_900_000_000_000_i64)]
     starts_at: Option<i64>,
-    /// Window close, UTC unix-milliseconds. Required with `mode`.
+    /// Window close, UTC unix-milliseconds. Required with `mode`; must not be
+    /// in the past.
     ends_at: Option<i64>,
     /// Per-student time budget, milliseconds — required for (and exclusive to)
     /// `async` exams.
@@ -420,7 +422,7 @@ async fn unenroll(
     request_body = CreateExamInCourse,
     responses(
         (status = 201, description = "Exam created", body = ExamResponse),
-        (status = 400, description = "Invalid fields, kind, or weight", body = ErrorResponse),
+        (status = 400, description = "Invalid fields, kind, weight, or schedule (malformed window, or times in the past)", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
@@ -445,10 +447,14 @@ async fn create_exam_in_course(
     let description = ExamDescription::try_new(&req.description.unwrap_or_default())?;
     let kind = ExamKind::try_new(&req.kind)?;
     let weight = ExamWeight::try_new(req.weight)?;
+    let starts_at = req.starts_at.map(Timestamp::from_millis);
+    let ends_at = req.ends_at.map(Timestamp::from_millis);
+    check_not_past("starts_at", starts_at)?;
+    check_not_past("ends_at", ends_at)?;
     let schedule = ExamSchedule::try_new(
         req.mode.as_deref().map(ExamMode::try_new).transpose()?,
-        req.starts_at.map(Timestamp::from_millis),
-        req.ends_at.map(Timestamp::from_millis),
+        starts_at,
+        ends_at,
         req.duration_ms.map(ExamDuration::try_new).transpose()?,
     )?;
     let exam = Exam::create(
@@ -502,10 +508,11 @@ struct CreateSessionInCourse {
     /// Who teaches the session. Defaults to the caller; must hold the
     /// `teacher` role or higher.
     teacher_id: Option<String>,
-    /// Lesson start, UTC unix-milliseconds.
-    #[schema(example = 1_752_275_000_000_i64)]
+    /// Lesson start, UTC unix-milliseconds. Must not be in the past.
+    #[schema(example = 1_900_000_000_000_i64)]
     starts_at: i64,
-    /// Lesson end, UTC unix-milliseconds. Optional (open-ended).
+    /// Lesson end, UTC unix-milliseconds. Optional (open-ended); must not be
+    /// in the past.
     ends_at: Option<i64>,
 }
 
@@ -520,7 +527,7 @@ struct CreateSessionInCourse {
     request_body = CreateSessionInCourse,
     responses(
         (status = 201, description = "Session created", body = SessionResponse),
-        (status = 400, description = "Invalid fields, time range, or teacher", body = ErrorResponse),
+        (status = 400, description = "Invalid fields, time range, times in the past, or teacher", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
@@ -545,6 +552,8 @@ async fn create_session_in_course(
     let teacher = resolve_session_teacher(req.teacher_id.as_deref(), &user, &st.db).await?;
     let starts_at = Timestamp::from_millis(req.starts_at);
     let ends_at = req.ends_at.map(Timestamp::from_millis);
+    check_not_past("starts_at", Some(starts_at))?;
+    check_not_past("ends_at", ends_at)?;
     check_time_range(Some(starts_at), ends_at)?;
 
     let session = CourseSession::create(

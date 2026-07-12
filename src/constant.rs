@@ -80,3 +80,10 @@ pub const MIN_EXAM_WEIGHT: i64 = 1;
 pub const MAX_EXAM_WEIGHT: i64 = 100;
 
 pub const SESSION_DURATION_DAYS: i64 = 7;
+
+/// How far in the past a request-supplied schedule instant (exam window,
+/// lesson, event time) may lie before it is rejected as backdated. The grace
+/// absorbs request latency and modest client-clock skew — a "starts now"
+/// submission must survive its own round trip — while still refusing
+/// genuinely past deadlines.
+pub const SCHEDULE_PAST_GRACE_MS: i64 = 60 * 1000;

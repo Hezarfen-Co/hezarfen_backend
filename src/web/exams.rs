@@ -32,7 +32,9 @@ use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
 
 use super::courses::can_manage_course;
-use super::{CurrentUser, ExamResponse, PersonRef, RequireTeacher, person_map, set_or_clear};
+use super::{
+    CurrentUser, ExamResponse, PersonRef, RequireTeacher, check_not_past, person_map, set_or_clear,
+};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -72,11 +74,13 @@ struct UpdateExam {
     #[schema(value_type = Option<String>)]
     mode: Option<Option<String>>,
     /// Window open, UTC unix-milliseconds. Omit to keep; `null` to clear.
+    /// A newly set value must not be in the past.
     #[serde(default, deserialize_with = "set_or_clear")]
     #[schema(value_type = Option<i64>)]
     starts_at: Option<Option<i64>>,
     /// Window close, UTC unix-milliseconds. Omit to keep; `null` to clear.
-    /// Moving it while a sync exam runs extends (or cuts) everyone's deadline.
+    /// Moving it while a sync exam runs extends (or cuts) everyone's deadline;
+    /// a newly set value must not be in the past.
     #[serde(default, deserialize_with = "set_or_clear")]
     #[schema(value_type = Option<i64>)]
     ends_at: Option<Option<i64>>,
@@ -200,7 +204,7 @@ async fn get_exam(
     request_body = UpdateExam,
     responses(
         (status = 200, description = "Updated exam", body = ExamResponse),
-        (status = 400, description = "Invalid fields, kind, weight, or schedule", body = ErrorResponse),
+        (status = 400, description = "Invalid fields, kind, weight, or schedule (malformed window, or newly set times in the past)", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
@@ -241,17 +245,28 @@ async fn update_exam(
     };
 
     // Merge the schedule (set / clear / keep per field), then re-validate it
-    // as a unit — a PATCH can't leave a half-schedule behind.
+    // as a unit — a PATCH can't leave a half-schedule behind. Only values this
+    // request sets are held to the no-past rule: kept ones may legitimately be
+    // past (a running exam's `starts_at`), and rechecking them would block
+    // unrelated edits.
     let mode = match req.mode {
         Some(update) => update.as_deref().map(ExamMode::try_new).transpose()?,
         None => exam.get_mode().cloned(),
     };
     let starts_at = match req.starts_at {
-        Some(update) => update.map(Timestamp::from_millis),
+        Some(update) => {
+            let starts_at = update.map(Timestamp::from_millis);
+            check_not_past("starts_at", starts_at)?;
+            starts_at
+        }
         None => exam.get_starts_at(),
     };
     let ends_at = match req.ends_at {
-        Some(update) => update.map(Timestamp::from_millis),
+        Some(update) => {
+            let ends_at = update.map(Timestamp::from_millis);
+            check_not_past("ends_at", ends_at)?;
+            ends_at
+        }
         None => exam.get_ends_at(),
     };
     let duration_ms = match req.duration_ms {

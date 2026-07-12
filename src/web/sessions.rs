@@ -22,8 +22,8 @@ use crate::state::AppState;
 
 use super::courses::can_manage_course;
 use super::{
-    CurrentUser, PersonRef, RequireTeacher, SessionResponse, check_time_range, person_map,
-    set_or_clear,
+    CurrentUser, PersonRef, RequireTeacher, SessionResponse, check_not_past, check_time_range,
+    person_map, set_or_clear,
 };
 
 pub fn routes() -> OpenApiRouter<AppState> {
@@ -38,10 +38,11 @@ struct UpdateSession {
     topic: Option<String>,
     /// Reassign the session's teacher. Omit to keep; must be teacher+.
     teacher_id: Option<String>,
-    /// Unix-millisecond timestamp. Omit to keep the current value.
+    /// Unix-millisecond timestamp. Omit to keep the current value. A newly
+    /// set value must not be in the past.
     starts_at: Option<i64>,
     /// Unix-millisecond timestamp. Omit to keep the current value; send `null`
-    /// to clear it.
+    /// to clear it. A newly set value must not be in the past.
     #[serde(default, deserialize_with = "set_or_clear")]
     #[schema(value_type = Option<i64>)]
     ends_at: Option<Option<i64>>,
@@ -166,7 +167,7 @@ async fn get_session(
     request_body = UpdateSession,
     responses(
         (status = 200, description = "Updated session", body = SessionResponse),
-        (status = 400, description = "Invalid fields, time range, or teacher", body = ErrorResponse),
+        (status = 400, description = "Invalid fields, time range, newly set times in the past, or teacher", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
@@ -196,14 +197,24 @@ async fn update_session(
             .clone(),
         None => session.get_teacher().clone(),
     };
+    // Only values this request sets are held to the no-past rule — a kept
+    // `starts_at` of a lesson already underway is legitimately past.
     let starts_at = match req.starts_at {
-        Some(millis) => Timestamp::from_millis(millis),
+        Some(millis) => {
+            let starts_at = Timestamp::from_millis(millis);
+            check_not_past("starts_at", Some(starts_at))?;
+            starts_at
+        }
         None => session.get_starts_at(),
     };
     // A provided value sets the field, an explicit `null` clears it, and an
     // omitted one keeps the current value.
     let ends_at = match req.ends_at {
-        Some(update) => update.map(Timestamp::from_millis),
+        Some(update) => {
+            let ends_at = update.map(Timestamp::from_millis);
+            check_not_past("ends_at", ends_at)?;
+            ends_at
+        }
         None => session.get_ends_at(),
     };
     check_time_range(Some(starts_at), ends_at)?;

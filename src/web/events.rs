@@ -16,7 +16,10 @@ use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
 
-use super::{CurrentUser, PersonRef, RequireTeacher, check_time_range, person_map, set_or_clear};
+use super::{
+    CurrentUser, PersonRef, RequireTeacher, check_not_past, check_time_range, person_map,
+    set_or_clear,
+};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -31,8 +34,8 @@ struct CreateEvent {
     #[schema(example = "Sprint demo")]
     title: String,
     description: Option<String>,
-    /// Unix-millisecond timestamps.
-    #[schema(example = 1_700_000_000_000_i64)]
+    /// Unix-millisecond timestamps. Must not be in the past.
+    #[schema(example = 1_900_000_000_000_i64)]
     starts_at: Option<i64>,
     ends_at: Option<i64>,
 }
@@ -42,12 +45,12 @@ struct UpdateEvent {
     title: Option<String>,
     description: Option<String>,
     /// Unix-millisecond timestamp. Omit to keep the current value; send `null`
-    /// to clear it.
+    /// to clear it. A newly set value must not be in the past.
     #[serde(default, deserialize_with = "set_or_clear")]
     #[schema(value_type = Option<i64>)]
     starts_at: Option<Option<i64>>,
     /// Unix-millisecond timestamp. Omit to keep the current value; send `null`
-    /// to clear it.
+    /// to clear it. A newly set value must not be in the past.
     #[serde(default, deserialize_with = "set_or_clear")]
     #[schema(value_type = Option<i64>)]
     ends_at: Option<Option<i64>>,
@@ -126,7 +129,7 @@ impl AttendanceResponse {
     request_body = CreateEvent,
     responses(
         (status = 201, description = "Event created", body = EventResponse),
-        (status = 400, description = "Invalid fields or time range", body = ErrorResponse),
+        (status = 400, description = "Invalid fields, time range, or times in the past", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
     ),
@@ -140,6 +143,8 @@ async fn create_event(
     let description = EventDescription::try_new(&req.description.unwrap_or_default())?;
     let starts_at = req.starts_at.map(Timestamp::from_millis);
     let ends_at = req.ends_at.map(Timestamp::from_millis);
+    check_not_past("starts_at", starts_at)?;
+    check_not_past("ends_at", ends_at)?;
     check_time_range(starts_at, ends_at)?;
     let event = Event::create(
         user.get_id(),
@@ -208,7 +213,7 @@ async fn get_event(
     request_body = UpdateEvent,
     responses(
         (status = 200, description = "Updated event", body = EventResponse),
-        (status = 400, description = "Invalid fields or time range", body = ErrorResponse),
+        (status = 400, description = "Invalid fields, time range, or times in the past", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
@@ -238,13 +243,22 @@ async fn update_event(
         None => event.get_description().clone(),
     };
     // A provided value sets the field, an explicit `null` clears it, and an
-    // omitted one keeps the current value.
+    // omitted one keeps the current value. Only set values are held to the
+    // no-past rule — a kept time of an event already underway may be past.
     let starts_at = match req.starts_at {
-        Some(update) => update.map(Timestamp::from_millis),
+        Some(update) => {
+            let starts_at = update.map(Timestamp::from_millis);
+            check_not_past("starts_at", starts_at)?;
+            starts_at
+        }
         None => event.get_starts_at(),
     };
     let ends_at = match req.ends_at {
-        Some(update) => update.map(Timestamp::from_millis),
+        Some(update) => {
+            let ends_at = update.map(Timestamp::from_millis);
+            check_not_past("ends_at", ends_at)?;
+            ends_at
+        }
         None => event.get_ends_at(),
     };
     check_time_range(starts_at, ends_at)?;
