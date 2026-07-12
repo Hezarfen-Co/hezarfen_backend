@@ -217,6 +217,7 @@ logged-in user.
 | POST   | `/auth/logout`                   | no      | Clear session (no-op if none)   |
 | GET    | `/auth/me`                       | student | Current user (incl. `role` and personal info) |
 | PATCH  | `/users/me`                      | student | Update own personal info (see below) |
+| GET    | `/users/search`                  | teacher | `?q=<fragment>&role=<role?>` — find users by username/name fragment (pickers); ≤10 refs, no contact info |
 | GET    | `/users`                         | admin   | List all users                  |
 | GET    | `/users/{id}`                    | admin   | Get one user                    |
 | PATCH  | `/users/{id}/role`               | admin   | `{role}` — set a user's role    |
@@ -537,7 +538,11 @@ curl -s -b $JAR $BASE/events/$EV/attendance -H 'content-type: application/json' 
   -d '{"status":"present"}'
 curl -s -b $JAR $BASE/events/$EV/attendance
 
-# courses + weighted marks (as a teacher; $SID is a student's user id)
+# courses + weighted marks (as a teacher)
+# find the student to enroll (here: a registered user "veli"): fragment
+# search over username/name, role-narrowed (teacher+)
+SID=$(curl -s -b $JAR "$BASE/users/search?q=vel&role=student" \
+  | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
 CO=$(curl -s -b $JAR $BASE/courses -H 'content-type: application/json' \
   -d '{"title":"algebra"}' | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
 curl -s -b $JAR $BASE/courses/$CO/enrollments -H 'content-type: application/json' \

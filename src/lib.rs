@@ -38,7 +38,7 @@ use crate::state::AppState;
     tags(
         (name = "meta", description = "Liveness and service metadata"),
         (name = "auth", description = "Registration, login, session lifecycle"),
-        (name = "users", description = "User info: self-service profile, plus listing, lookup, and role/profile administration (admin only)"),
+        (name = "users", description = "User info: self-service profile, name search for the pickers (teacher+, optionally role-filtered), plus listing, lookup, and role/profile administration (admin only)"),
         (name = "notes", description = "Per-user notes CRUD"),
         (name = "events", description = "Events and attendance"),
         (name = "courses", description = "Courses, enrollment, course exams, and course sessions"),
