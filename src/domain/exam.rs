@@ -4,9 +4,13 @@ use ulid::Ulid;
 use crate::constant::{MAX_EXAM_DESCRIPTION_LEN, MAX_EXAM_TITLE_LEN};
 use crate::database::{Database, EXAM_TABLE};
 use crate::domain::course::CourseId;
+use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
-use crate::validate::{validate_exam_kind, validate_optional, validate_required, validate_weight};
+use crate::validate::{
+    validate_exam_duration, validate_exam_kind, validate_exam_mode, validate_optional,
+    validate_required, validate_weight,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct ExamId(RecordId);
@@ -93,6 +97,107 @@ impl ExamWeight {
     }
 }
 
+/// A validated exam mode: `sync` (everyone sits inside one fixed window) or
+/// `async` (each student starts inside the window and gets `duration_ms`).
+#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+pub struct ExamMode(String);
+
+impl ExamMode {
+    pub fn try_new(value: &str) -> Result<Self, ValidationError> {
+        validate_exam_mode(value)?;
+        Ok(Self(value.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A validated per-student time budget for an `async` exam, milliseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, SurrealValue)]
+pub struct ExamDuration(i64);
+
+impl ExamDuration {
+    pub fn try_new(value: i64) -> Result<Self, ValidationError> {
+        validate_exam_duration(value)?;
+        Ok(Self(value))
+    }
+
+    pub fn as_millis(&self) -> i64 {
+        self.0
+    }
+}
+
+/// The scheduling fields of an exam, validated as a unit — they only make
+/// sense together. `try_new` is the sole constructor, so an `ExamSchedule` in
+/// hand always satisfies:
+///
+/// - no mode → no `starts_at`/`ends_at`/`duration_ms` (an unscheduled exam is
+///   graded offline; attempts are rejected),
+/// - `sync` → `starts_at` + `ends_at`, no duration (everyone's deadline is
+///   `ends_at`),
+/// - `async` → `starts_at` + `ends_at` + `duration_ms` (a student who starts
+///   at `t` gets until `min(t + duration_ms, ends_at)`),
+/// - `ends_at` strictly after `starts_at`.
+#[derive(Debug, Clone, Default)]
+pub struct ExamSchedule {
+    mode: Option<ExamMode>,
+    starts_at: Option<Timestamp>,
+    ends_at: Option<Timestamp>,
+    duration_ms: Option<ExamDuration>,
+}
+
+impl ExamSchedule {
+    pub fn try_new(
+        mode: Option<ExamMode>,
+        starts_at: Option<Timestamp>,
+        ends_at: Option<Timestamp>,
+        duration_ms: Option<ExamDuration>,
+    ) -> Result<Self, ValidationError> {
+        let invalid = |field, reason| ValidationError::Invalid { field, reason };
+        match &mode {
+            None => {
+                if starts_at.is_some() || ends_at.is_some() || duration_ms.is_some() {
+                    return Err(invalid(
+                        "mode",
+                        "starts_at, ends_at, and duration_ms require a mode (sync or async)",
+                    ));
+                }
+            }
+            Some(m) => {
+                if starts_at.is_none() {
+                    return Err(invalid("starts_at", "required for a scheduled exam"));
+                }
+                if ends_at.is_none() {
+                    return Err(invalid("ends_at", "required for a scheduled exam"));
+                }
+                if ends_at <= starts_at {
+                    return Err(invalid("ends_at", "must be after starts_at"));
+                }
+                match (m.as_str(), duration_ms.is_some()) {
+                    ("async", false) => {
+                        return Err(invalid("duration_ms", "required for an async exam"));
+                    }
+                    ("sync", true) => {
+                        return Err(invalid("duration_ms", "only async exams take a duration"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(Self {
+            mode,
+            starts_at,
+            ends_at,
+            duration_ms,
+        })
+    }
+
+    pub fn get_mode(&self) -> Option<&ExamMode> {
+        self.mode.as_ref()
+    }
+}
+
 #[derive(Debug, Clone, SurrealValue)]
 pub struct Exam {
     id: ExamId,
@@ -102,6 +207,13 @@ pub struct Exam {
     description: ExamDescription,
     kind: ExamKind,
     weight: ExamWeight,
+    // The schedule, flattened into columns (SCHEMAFULL keeps them typed).
+    // Always written through an `ExamSchedule`, so the invariants above hold
+    // for every stored row; pre-schedule rows read back as all-`None`.
+    mode: Option<ExamMode>,
+    starts_at: Option<Timestamp>,
+    ends_at: Option<Timestamp>,
+    duration_ms: Option<ExamDuration>,
 }
 
 impl Exam {
@@ -133,10 +245,42 @@ impl Exam {
         self.weight
     }
 
+    pub fn get_mode(&self) -> Option<&ExamMode> {
+        self.mode.as_ref()
+    }
+
+    pub fn get_starts_at(&self) -> Option<Timestamp> {
+        self.starts_at
+    }
+
+    pub fn get_ends_at(&self) -> Option<Timestamp> {
+        self.ends_at
+    }
+
+    pub fn get_duration_ms(&self) -> Option<ExamDuration> {
+        self.duration_ms
+    }
+
+    /// The stored schedule as the validated bundle (for merge-on-update).
+    /// Bypasses `try_new`: the fields were written through an `ExamSchedule`,
+    /// so the invariants already hold.
+    pub fn schedule(&self) -> ExamSchedule {
+        ExamSchedule {
+            mode: self.mode.clone(),
+            starts_at: self.starts_at,
+            ends_at: self.ends_at,
+            duration_ms: self.duration_ms,
+        }
+    }
+
     pub fn is_creator(&self, user: &UserId) -> bool {
         &self.creator == user
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the sibling entities' create(field, field, ..) shape"
+    )]
     pub async fn create(
         creator: &UserId,
         course: &CourseId,
@@ -144,6 +288,7 @@ impl Exam {
         description: ExamDescription,
         kind: ExamKind,
         weight: ExamWeight,
+        schedule: ExamSchedule,
         db: &Database,
     ) -> Result<Exam, AppError> {
         let exam = Exam {
@@ -154,6 +299,10 @@ impl Exam {
             description,
             kind,
             weight,
+            mode: schedule.mode,
+            starts_at: schedule.starts_at,
+            ends_at: schedule.ends_at,
+            duration_ms: schedule.duration_ms,
         };
         let created: Option<Exam> = db.create(exam.id.record()).content(exam).await?;
         created.ok_or_else(|| AppError::Internal("failed to create exam".into()))
@@ -188,22 +337,35 @@ impl Exam {
         description: ExamDescription,
         kind: ExamKind,
         weight: ExamWeight,
+        schedule: ExamSchedule,
         db: &Database,
     ) -> Result<Exam, AppError> {
         self.title = title;
         self.description = description;
         self.kind = kind;
         self.weight = weight;
+        self.mode = schedule.mode;
+        self.starts_at = schedule.starts_at;
+        self.ends_at = schedule.ends_at;
+        self.duration_ms = schedule.duration_ms;
         let updated: Option<Exam> = db.update(self.id.record()).content(self).await?;
         updated.ok_or(AppError::NotFound)
     }
 
-    /// Delete the exam and cascade-remove its result rows.
+    /// Delete the exam and cascade-remove its result, attempt, question, and
+    /// answer rows.
     pub async fn delete(self, db: &Database) -> Result<Exam, AppError> {
-        db.query("DELETE exam_result WHERE exam = $ex")
-            .bind(("ex", self.id.record()))
-            .await?
-            .check()?;
+        db.query(
+            "BEGIN TRANSACTION;
+             DELETE exam_result WHERE exam = $ex;
+             DELETE exam_attempt WHERE exam = $ex;
+             DELETE exam_answer WHERE exam = $ex;
+             DELETE exam_question WHERE exam = $ex;
+             COMMIT TRANSACTION;",
+        )
+        .bind(("ex", self.id.record()))
+        .await?
+        .check()?;
         let deleted: Option<Exam> = db.delete(self.id.record()).await?;
         deleted.ok_or(AppError::NotFound)
     }
@@ -240,5 +402,40 @@ mod tests {
         assert_eq!(ExamWeight::try_new(100).unwrap().as_i64(), 100);
         assert!(ExamWeight::try_new(0).is_err());
         assert!(ExamWeight::try_new(101).is_err());
+    }
+
+    #[tokio::test]
+    async fn mode_must_be_known() {
+        for mode in ["sync", "async"] {
+            assert_eq!(ExamMode::try_new(mode).unwrap().as_str(), mode);
+        }
+        assert!(ExamMode::try_new("live").is_err());
+    }
+
+    #[tokio::test]
+    async fn schedule_invariants_hold() {
+        let mode = |m| Some(ExamMode::try_new(m).unwrap());
+        let at = |ms| Some(Timestamp::from_millis(ms));
+        let dur = Some(ExamDuration::try_new(90 * 60 * 1000).unwrap());
+
+        // Unscheduled: nothing set is fine, any time/duration without a mode is not.
+        assert!(ExamSchedule::try_new(None, None, None, None).is_ok());
+        assert!(ExamSchedule::try_new(None, at(1), None, None).is_err());
+        assert!(ExamSchedule::try_new(None, None, at(2), None).is_err());
+        assert!(ExamSchedule::try_new(None, None, None, dur).is_err());
+
+        // Sync: fixed window, no duration.
+        assert!(ExamSchedule::try_new(mode("sync"), at(1), at(2), None).is_ok());
+        assert!(ExamSchedule::try_new(mode("sync"), None, at(2), None).is_err());
+        assert!(ExamSchedule::try_new(mode("sync"), at(1), None, None).is_err());
+        assert!(ExamSchedule::try_new(mode("sync"), at(1), at(2), dur).is_err());
+
+        // Async: window plus a per-student duration.
+        assert!(ExamSchedule::try_new(mode("async"), at(1), at(2), dur).is_ok());
+        assert!(ExamSchedule::try_new(mode("async"), at(1), at(2), None).is_err());
+
+        // The window must be a real interval, whatever the mode.
+        assert!(ExamSchedule::try_new(mode("sync"), at(2), at(2), None).is_err());
+        assert!(ExamSchedule::try_new(mode("async"), at(3), at(2), dur).is_err());
     }
 }

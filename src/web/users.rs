@@ -1,7 +1,7 @@
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use serde::Deserialize;
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -13,12 +13,13 @@ use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
 
 use super::dto::Role as RoleSchema;
-use super::{CurrentUser, RequireAdmin, UserResponse};
+use super::{CurrentUser, PersonRef, RequireAdmin, RequireTeacher, UserResponse};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(list_users))
         .routes(routes!(update_my_profile))
+        .routes(routes!(search_users))
         .routes(routes!(get_user))
         .routes(routes!(set_role))
         .routes(routes!(update_user_profile))
@@ -88,6 +89,43 @@ async fn apply_profile(
         .set_profile(name, surname, email, phone, birth_date, db)
         .await?;
     Ok(UserResponse::new(&updated))
+}
+
+#[derive(Deserialize, IntoParams)]
+struct SearchUsers {
+    /// Case-insensitive fragment of a username, name, or surname.
+    q: String,
+}
+
+/// Find users by username or name — backs the pickers (enroll, grade, mark
+/// attendance). Requires teacher+. Returns at most 10 matches, and only
+/// id/username/display name — no contact details.
+#[utoipa::path(
+    get,
+    path = "/search",
+    tag = "users",
+    security(("session_cookie" = [])),
+    params(SearchUsers),
+    responses(
+        (status = 200, description = "Matching users, at most 10", body = [PersonRef]),
+        (status = 400, description = "Empty query", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
+    ),
+)]
+async fn search_users(
+    State(st): State<AppState>,
+    _teacher: RequireTeacher,
+    Query(req): Query<SearchUsers>,
+) -> Result<Json<Vec<PersonRef>>, AppError> {
+    if req.q.trim().is_empty() {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "q",
+            reason: "must not be empty",
+        }));
+    }
+    let users = User::search(&req.q, &st.db).await?;
+    Ok(Json(users.iter().map(PersonRef::new).collect()))
 }
 
 /// List every user with their role. Admin only.

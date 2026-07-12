@@ -259,6 +259,40 @@ impl User {
         Ok(result.take::<Vec<User>>(0)?)
     }
 
+    /// Fetch the users behind `ids` in one query. Ids with no row are simply
+    /// absent from the result — the caller decides how to degrade.
+    pub async fn list_by_ids(ids: &[UserId], db: &Database) -> Result<Vec<User>, AppError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let records: Vec<RecordId> = ids.iter().map(UserId::record).collect();
+        let mut result = db
+            .query("SELECT * FROM user WHERE id IN $ids")
+            .bind(("ids", records))
+            .await?
+            .check()?;
+        Ok(result.take::<Vec<User>>(0)?)
+    }
+
+    /// Case-insensitive fragment search over username, name, and surname —
+    /// backs the user pickers. Capped at 10 rows: pickers show a short list,
+    /// and the cap keeps an over-broad fragment from hauling the whole table.
+    pub async fn search(query: &str, db: &Database) -> Result<Vec<User>, AppError> {
+        let needle = query.trim().to_lowercase();
+        let mut result = db
+            .query(
+                "SELECT * FROM user WHERE \
+                   string::lowercase(username) CONTAINS $q \
+                   OR string::lowercase(name ?? '') CONTAINS $q \
+                   OR string::lowercase(surname ?? '') CONTAINS $q \
+                 ORDER BY username LIMIT 10",
+            )
+            .bind(("q", needle))
+            .await?
+            .check()?;
+        Ok(result.take::<Vec<User>>(0)?)
+    }
+
     /// Overwrite this user's role. The caller is responsible for authorizing it.
     pub async fn set_role(mut self, role: Role, db: &Database) -> Result<User, AppError> {
         self.role = role;

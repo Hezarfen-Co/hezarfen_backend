@@ -34,6 +34,40 @@ pub const ATTENDANCE_STATUSES: [&str; 4] = ["present", "absent", "late", "excuse
 /// the course average.
 pub const EXAM_KINDS: [&str; 6] = ["homework", "quiz", "midterm", "final", "project", "oral"];
 
+/// The only accepted exam modes. `sync`: everyone sits the exam inside one
+/// fixed window. `async`: each student starts inside the window and gets their
+/// own `duration_ms` slice of it.
+pub const EXAM_MODES: [&str; 2] = ["sync", "async"];
+
+/// Inclusive bounds for an async exam's per-student duration, milliseconds
+/// (1 minute to 24 hours).
+pub const MIN_EXAM_DURATION_MS: i64 = 60 * 1000;
+pub const MAX_EXAM_DURATION_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// Cadence of the live exam-monitor SSE stream (`GET /exams/{id}/live/stream`).
+pub const EXAM_LIVE_STREAM_INTERVAL_SECS: u64 = 2;
+
+/// Cadence of the `state` ticks on the student exam-room WebSocket
+/// (`GET /exams/{id}/attempt/ws`).
+pub const EXAM_WS_TICK_SECS: u64 = 2;
+
+/// The only accepted question kinds. `choice`: pick one of the listed
+/// choices, auto-scorable. `text`: free text, judged by the grader.
+pub const QUESTION_KINDS: [&str; 2] = ["choice", "text"];
+
+pub const MAX_QUESTION_TEXT_LEN: usize = 2_000;
+
+/// Inclusive bounds for a question's points (its share of the auto-score).
+pub const MIN_QUESTION_POINTS: i64 = 1;
+pub const MAX_QUESTION_POINTS: i64 = 100;
+
+/// Bounds for a choice question's option list and each option's text.
+pub const MIN_QUESTION_CHOICES: usize = 2;
+pub const MAX_QUESTION_CHOICES: usize = 10;
+pub const MAX_CHOICE_TEXT_LEN: usize = 500;
+
+pub const MAX_ANSWER_TEXT_LEN: usize = 10_000;
+
 /// Inclusive bounds for an exam mark.
 pub const MIN_MARK: i64 = 0;
 pub const MAX_MARK: i64 = 100;

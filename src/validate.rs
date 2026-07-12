@@ -2,9 +2,10 @@
 //! the value, so an existing newtype is always valid (parse, don't validate).
 
 use crate::constant::{
-    ATTENDANCE_STATUSES, EXAM_KINDS, MAX_EMAIL_LEN, MAX_EXAM_WEIGHT, MAX_MARK, MAX_PASSWORD_LEN,
-    MAX_PHONE_DIGITS, MAX_USERNAME_LEN, MIN_EXAM_WEIGHT, MIN_MARK, MIN_PASSWORD_LEN,
-    MIN_PHONE_DIGITS, MIN_USERNAME_LEN,
+    ATTENDANCE_STATUSES, EXAM_KINDS, EXAM_MODES, MAX_EMAIL_LEN, MAX_EXAM_DURATION_MS,
+    MAX_EXAM_WEIGHT, MAX_MARK, MAX_PASSWORD_LEN, MAX_PHONE_DIGITS, MAX_QUESTION_POINTS,
+    MAX_USERNAME_LEN, MIN_EXAM_DURATION_MS, MIN_EXAM_WEIGHT, MIN_MARK, MIN_PASSWORD_LEN,
+    MIN_PHONE_DIGITS, MIN_QUESTION_POINTS, MIN_USERNAME_LEN, QUESTION_KINDS,
 };
 use crate::error::ValidationError;
 
@@ -179,6 +180,50 @@ pub fn validate_exam_kind(value: &str) -> Result<(), ValidationError> {
     }
 }
 
+pub fn validate_exam_mode(value: &str) -> Result<(), ValidationError> {
+    if EXAM_MODES.contains(&value) {
+        Ok(())
+    } else {
+        Err(ValidationError::Invalid {
+            field: "mode",
+            reason: "must be one of: sync, async",
+        })
+    }
+}
+
+pub fn validate_exam_duration(value: i64) -> Result<(), ValidationError> {
+    if (MIN_EXAM_DURATION_MS..=MAX_EXAM_DURATION_MS).contains(&value) {
+        Ok(())
+    } else {
+        Err(ValidationError::Invalid {
+            field: "duration_ms",
+            reason: "must be between 60000 (1 minute) and 86400000 (24 hours) milliseconds",
+        })
+    }
+}
+
+pub fn validate_question_kind(value: &str) -> Result<(), ValidationError> {
+    if QUESTION_KINDS.contains(&value) {
+        Ok(())
+    } else {
+        Err(ValidationError::Invalid {
+            field: "kind",
+            reason: "must be one of: choice, text",
+        })
+    }
+}
+
+pub fn validate_question_points(value: i64) -> Result<(), ValidationError> {
+    if (MIN_QUESTION_POINTS..=MAX_QUESTION_POINTS).contains(&value) {
+        Ok(())
+    } else {
+        Err(ValidationError::Invalid {
+            field: "points",
+            reason: "must be between 1 and 100",
+        })
+    }
+}
+
 pub fn validate_mark(value: i64) -> Result<(), ValidationError> {
     if (MIN_MARK..=MAX_MARK).contains(&value) {
         Ok(())
@@ -292,6 +337,45 @@ mod tests {
         }
         assert!(validate_exam_kind("essay").is_err());
         assert!(validate_exam_kind("").is_err());
+    }
+
+    #[tokio::test]
+    async fn exam_mode_rules() {
+        for mode in ["sync", "async"] {
+            assert!(validate_exam_mode(mode).is_ok());
+        }
+        assert!(validate_exam_mode("live").is_err());
+        assert!(validate_exam_mode("").is_err());
+    }
+
+    #[tokio::test]
+    async fn exam_duration_rules() {
+        assert!(validate_exam_duration(MIN_EXAM_DURATION_MS).is_ok());
+        assert!(validate_exam_duration(90 * 60 * 1000).is_ok());
+        assert!(validate_exam_duration(MAX_EXAM_DURATION_MS).is_ok());
+        assert!(validate_exam_duration(MIN_EXAM_DURATION_MS - 1).is_err());
+        assert!(validate_exam_duration(MAX_EXAM_DURATION_MS + 1).is_err());
+        assert!(validate_exam_duration(0).is_err());
+        assert!(validate_exam_duration(-1).is_err());
+    }
+
+    #[tokio::test]
+    async fn question_kind_rules() {
+        for kind in ["choice", "text"] {
+            assert!(validate_question_kind(kind).is_ok());
+        }
+        assert!(validate_question_kind("essay").is_err());
+        assert!(validate_question_kind("").is_err());
+    }
+
+    #[tokio::test]
+    async fn question_points_rules() {
+        for points in [1, 50, 100] {
+            assert!(validate_question_points(points).is_ok());
+        }
+        assert!(validate_question_points(0).is_err());
+        assert!(validate_question_points(-1).is_err());
+        assert!(validate_question_points(101).is_err());
     }
 
     #[tokio::test]

@@ -42,7 +42,7 @@ use crate::state::AppState;
         (name = "notes", description = "Per-user notes CRUD"),
         (name = "events", description = "Events and attendance"),
         (name = "courses", description = "Courses, enrollment, and course exams"),
-        (name = "exams", description = "Exams (per course, weighted) and student results"),
+        (name = "exams", description = "Exams (per course, weighted): results, sync/async scheduling, attempts, questions/answers, and live monitoring. Not in this spec (WebSocket): the student exam room at `GET /exams/{id}/attempt/ws` — JSON frames, see the README's \"Taking an exam\" section for the protocol"),
         (name = "marks", description = "Weighted mark reports per course and overall"),
     ),
 )]

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -8,13 +10,16 @@ use utoipa_axum::routes;
 
 use crate::domain::course::{Course, CourseDescription, CourseId, CourseTitle};
 use crate::domain::enrollment::Enrollment;
-use crate::domain::exam::{Exam, ExamDescription, ExamKind, ExamTitle, ExamWeight};
+use crate::domain::exam::{
+    Exam, ExamDescription, ExamDuration, ExamKind, ExamMode, ExamSchedule, ExamTitle, ExamWeight,
+};
 use crate::domain::role::Role;
+use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
 
-use super::{CourseResponse, CurrentUser, ExamResponse, RequireTeacher};
+use super::{CourseResponse, CurrentUser, ExamResponse, PersonRef, RequireTeacher, person_map};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -58,23 +63,39 @@ struct CreateExamInCourse {
     /// How many times this exam counts into the course average, `1`–`100`.
     #[schema(example = 3)]
     weight: i64,
+    /// `sync` (one fixed window for everyone) or `async` (each student starts
+    /// inside the window and gets `duration_ms`). Omit for an unscheduled,
+    /// offline-graded exam.
+    #[schema(example = "sync")]
+    mode: Option<String>,
+    /// Window open, UTC unix-milliseconds. Required with `mode`.
+    #[schema(example = 1_752_275_000_000_i64)]
+    starts_at: Option<i64>,
+    /// Window close, UTC unix-milliseconds. Required with `mode`.
+    ends_at: Option<i64>,
+    /// Per-student time budget, milliseconds — required for (and exclusive to)
+    /// `async` exams.
+    #[schema(example = 5_400_000_i64)]
+    duration_ms: Option<i64>,
 }
 
 #[derive(Serialize, ToSchema)]
 struct EnrollmentResponse {
     id: String,
     course: String,
-    user: String,
-    enrolled_by: String,
+    /// The enrolled student.
+    user: PersonRef,
+    /// Who enrolled them.
+    enrolled_by: PersonRef,
 }
 
 impl EnrollmentResponse {
-    fn new(enrollment: &Enrollment) -> Self {
+    fn new(enrollment: &Enrollment, people: &HashMap<String, PersonRef>) -> Self {
         Self {
             id: enrollment.get_id().key().to_string(),
             course: enrollment.get_course().key().to_string(),
-            user: enrollment.get_user().key().to_string(),
-            enrolled_by: enrollment.get_enrolled_by().key().to_string(),
+            user: PersonRef::resolve(people, enrollment.get_user()),
+            enrolled_by: PersonRef::resolve(people, enrollment.get_enrolled_by()),
         }
     }
 }
@@ -288,15 +309,16 @@ async fn enroll(
     }
 
     let target = UserId::from_key(&req.user_id);
-    if User::read(&target, &st.db).await?.is_none() {
+    let Some(target_user) = User::read(&target, &st.db).await? else {
         return Err(AppError::Validation(ValidationError::Invalid {
             field: "user_id",
             reason: "target user does not exist",
         }));
-    }
+    };
 
     let enrollment = Enrollment::enroll(course.get_id(), &target, user.get_id(), &st.db).await?;
-    Ok(Json(EnrollmentResponse::new(&enrollment)))
+    let people = PersonRef::map_of(&[&target_user, &user]);
+    Ok(Json(EnrollmentResponse::new(&enrollment, &people)))
 }
 
 /// List a course's roster. Requires teacher+ — students see their own courses
@@ -325,8 +347,18 @@ async fn list_roster(
         .await?
         .ok_or(AppError::NotFound)?;
     let enrollments = Enrollment::list_for_course(&course_id, &st.db).await?;
+    let people = person_map(
+        enrollments
+            .iter()
+            .flat_map(|e| [e.get_user().clone(), e.get_enrolled_by().clone()]),
+        &st.db,
+    )
+    .await?;
     Ok(Json(
-        enrollments.iter().map(EnrollmentResponse::new).collect(),
+        enrollments
+            .iter()
+            .map(|e| EnrollmentResponse::new(e, &people))
+            .collect(),
     ))
 }
 
@@ -407,6 +439,12 @@ async fn create_exam_in_course(
     let description = ExamDescription::try_new(&req.description.unwrap_or_default())?;
     let kind = ExamKind::try_new(&req.kind)?;
     let weight = ExamWeight::try_new(req.weight)?;
+    let schedule = ExamSchedule::try_new(
+        req.mode.as_deref().map(ExamMode::try_new).transpose()?,
+        req.starts_at.map(Timestamp::from_millis),
+        req.ends_at.map(Timestamp::from_millis),
+        req.duration_ms.map(ExamDuration::try_new).transpose()?,
+    )?;
     let exam = Exam::create(
         user.get_id(),
         course.get_id(),
@@ -414,6 +452,7 @@ async fn create_exam_in_course(
         description,
         kind,
         weight,
+        schedule,
         &st.db,
     )
     .await?;

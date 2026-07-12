@@ -1,7 +1,9 @@
+use std::collections::HashMap;
+
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
@@ -14,7 +16,7 @@ use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
 
-use super::{CurrentUser, RequireTeacher};
+use super::{CurrentUser, PersonRef, RequireTeacher, person_map, set_or_clear};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -33,16 +35,6 @@ struct CreateEvent {
     #[schema(example = 1_700_000_000_000_i64)]
     starts_at: Option<i64>,
     ends_at: Option<i64>,
-}
-
-/// Distinguishes an *absent* field from an explicit `null`: absent never
-/// reaches the deserializer and stays `None` via `#[serde(default)]` (keep the
-/// stored value); `null` or a number lands here as `Some(inner)` (clear or set).
-fn set_or_clear<'de, D>(de: D) -> Result<Option<Option<i64>>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Option::<i64>::deserialize(de).map(Some)
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -120,19 +112,21 @@ fn check_time_range(
 struct AttendanceResponse {
     id: String,
     event: String,
-    user: String,
+    /// Whose attendance this row records.
+    user: PersonRef,
     status: String,
-    marked_by: String,
+    /// Who recorded it.
+    marked_by: PersonRef,
 }
 
 impl AttendanceResponse {
-    fn new(attendance: &Attendance) -> Self {
+    fn new(attendance: &Attendance, people: &HashMap<String, PersonRef>) -> Self {
         Self {
             id: attendance.get_id().key().to_string(),
             event: attendance.get_event().key().to_string(),
-            user: attendance.get_user().key().to_string(),
+            user: PersonRef::resolve(people, attendance.get_user()),
             status: attendance.get_status().as_str().to_string(),
-            marked_by: attendance.get_marked_by().key().to_string(),
+            marked_by: PersonRef::resolve(people, attendance.get_marked_by()),
         }
     }
 }
@@ -355,15 +349,16 @@ async fn mark(
     }
 
     // Target user must exist.
-    if User::read(&target, &st.db).await?.is_none() {
+    let Some(target_user) = User::read(&target, &st.db).await? else {
         return Err(AppError::Validation(ValidationError::Invalid {
             field: "user_id",
             reason: "target user does not exist",
         }));
-    }
+    };
 
     let attendance = Attendance::mark(&event_id, &target, status, user.get_id(), &st.db).await?;
-    Ok(Json(AttendanceResponse::new(&attendance)))
+    let people = PersonRef::map_of(&[&target_user, &user]);
+    Ok(Json(AttendanceResponse::new(&attendance, &people)))
 }
 
 /// List the attendance roster for an event.
@@ -390,7 +385,19 @@ async fn list_attendance(
         .await?
         .ok_or(AppError::NotFound)?;
     let roster = Attendance::list_for_event(&event_id, &st.db).await?;
-    Ok(Json(roster.iter().map(AttendanceResponse::new).collect()))
+    let people = person_map(
+        roster
+            .iter()
+            .flat_map(|a| [a.get_user().clone(), a.get_marked_by().clone()]),
+        &st.db,
+    )
+    .await?;
+    Ok(Json(
+        roster
+            .iter()
+            .map(|a| AttendanceResponse::new(a, &people))
+            .collect(),
+    ))
 }
 
 /// Remove a user's attendance record from an event. Requires teacher+.

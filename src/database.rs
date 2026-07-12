@@ -15,6 +15,9 @@ pub const EVENT_TABLE: &str = "event";
 pub const ATTENDANCE_TABLE: &str = "attendance";
 pub const EXAM_TABLE: &str = "exam";
 pub const EXAM_RESULT_TABLE: &str = "exam_result";
+pub const EXAM_ATTEMPT_TABLE: &str = "exam_attempt";
+pub const EXAM_QUESTION_TABLE: &str = "exam_question";
+pub const EXAM_ANSWER_TABLE: &str = "exam_answer";
 pub const COURSE_TABLE: &str = "course";
 pub const ENROLLMENT_TABLE: &str = "enrollment";
 
@@ -79,7 +82,39 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS description ON exam TYPE string;
     DEFINE FIELD IF NOT EXISTS kind ON exam TYPE string;
     DEFINE FIELD IF NOT EXISTS weight ON exam TYPE int;
+    DEFINE FIELD IF NOT EXISTS mode ON exam TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS starts_at ON exam TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS ends_at ON exam TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS duration_ms ON exam TYPE option<int>;
     DEFINE INDEX IF NOT EXISTS exam_course ON exam FIELDS course;
+
+    DEFINE TABLE IF NOT EXISTS exam_attempt SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS exam ON exam_attempt TYPE record<exam>;
+    DEFINE FIELD IF NOT EXISTS user ON exam_attempt TYPE record<user>;
+    DEFINE FIELD IF NOT EXISTS started_at ON exam_attempt TYPE int;
+    DEFINE FIELD IF NOT EXISTS finished_at ON exam_attempt TYPE option<int>;
+    DEFINE INDEX IF NOT EXISTS exam_attempt_exam_user ON exam_attempt FIELDS exam, user UNIQUE;
+    DEFINE INDEX IF NOT EXISTS exam_attempt_exam ON exam_attempt FIELDS exam;
+
+    DEFINE TABLE IF NOT EXISTS exam_question SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS exam ON exam_question TYPE record<exam>;
+    DEFINE FIELD IF NOT EXISTS text ON exam_question TYPE string;
+    DEFINE FIELD IF NOT EXISTS kind ON exam_question TYPE string;
+    DEFINE FIELD IF NOT EXISTS points ON exam_question TYPE int;
+    DEFINE FIELD IF NOT EXISTS choices ON exam_question TYPE option<array<string>>;
+    DEFINE FIELD IF NOT EXISTS correct ON exam_question TYPE option<int>;
+    DEFINE INDEX IF NOT EXISTS exam_question_exam ON exam_question FIELDS exam;
+
+    DEFINE TABLE IF NOT EXISTS exam_answer SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS exam ON exam_answer TYPE record<exam>;
+    DEFINE FIELD IF NOT EXISTS question ON exam_answer TYPE record<exam_question>;
+    DEFINE FIELD IF NOT EXISTS user ON exam_answer TYPE record<user>;
+    DEFINE FIELD IF NOT EXISTS selected ON exam_answer TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS text ON exam_answer TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS updated_at ON exam_answer TYPE int;
+    DEFINE INDEX IF NOT EXISTS exam_answer_question_user ON exam_answer FIELDS question, user UNIQUE;
+    DEFINE INDEX IF NOT EXISTS exam_answer_exam_user ON exam_answer FIELDS exam, user;
+    DEFINE INDEX IF NOT EXISTS exam_answer_exam ON exam_answer FIELDS exam;
 
     DEFINE TABLE IF NOT EXISTS exam_result SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS exam ON exam_result TYPE record<exam>;
