@@ -58,6 +58,36 @@ the docs pages, `register` / `login` / `logout`) don't (`logout` is idempotent â
 it clears the session if one is present). Set `COOKIE_SECURE=true` when serving
 behind TLS to add the cookie's `Secure` attribute.
 
+## Time policy
+
+Timezones and clock differences cannot corrupt data, by construction:
+
+- **Every instant is a UTC unix-millisecond `i64`** (`domain::timestamp::Timestamp`),
+  stored as an `int`, sent as a plain number. Nothing stores or parses a
+  timezone, so the server's `TZ`, the container's clock config, and the
+  client's locale are all irrelevant â€” clients convert millis to local time
+  for display only.
+- **One clock choke point.** `Timestamp::now()` is the only wall-clock read.
+  `clippy.toml` bans every other source (`chrono::Local`/`Utc::now`,
+  `SystemTime::now`, `time::OffsetDateTime::now_*`, absolute cookie
+  `Expires`) and `[lints.clippy]` raises that to a hard `cargo clippy` error,
+  so local-time bugs can't be reintroduced.
+- **Expiry is server-authoritative.** Sessions expire by comparing the stored
+  millis against the server clock; the cookie carries a relative `Max-Age`
+  (never an absolute `Expires`), so a wrong client clock changes nothing.
+- **Pacing uses the monotonic clock.** The rate limiter runs on `Instant`,
+  immune to NTP steps and wall-clock jumps.
+- **Calendar dates get a timezone grace.** A birth date is a calendar date on
+  the writer's wall, not an instant: validation accepts up to UTC-tomorrow,
+  since a client ahead of UTC (up to UTC+14) legitimately writes a date the
+  server's UTC calendar hasn't reached yet.
+- **Frontends can sync to the server clock.** `GET /time` (no auth) returns
+  `{"now": <UTC unix-millis>}`. Fetch once, keep
+  `offset = now - Date.now()`, and use `Date.now() + offset` for countdowns
+  and past/future checks instead of trusting the device clock.
+
+Keep the single server's clock NTP-synced; that's the only clock that matters.
+
 ## Rate limiting
 
 Requests are limited per client IP over a fixed 60-second window, in two tiers:
@@ -150,6 +180,7 @@ logged-in user.
 |--------|----------------------------------|---------|---------------------------------|
 | GET    | `/health`                        | no      | Liveness check                  |
 | GET    | `/`                              | no      | Same as `/health`               |
+| GET    | `/time`                          | no      | Server clock: `{now}` UTC unix-millis (frontend sync) |
 | GET    | `/swagger`                       | no      | Interactive API docs (Swagger UI) |
 | GET    | `/api-docs/openapi.json`         | no      | Raw OpenAPI 3 spec              |
 | POST   | `/auth/register`                 | no      | `{username, password}` (new users are `student`) |
