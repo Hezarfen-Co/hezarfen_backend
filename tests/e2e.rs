@@ -168,8 +168,31 @@ async fn full_user_journey() {
         .await
         .unwrap();
     assert_eq!(roster.as_array().unwrap().len(), 1);
-    assert_eq!(roster[0]["user"], veli_id);
+    // People come back as refs — id plus something a human can read.
+    assert_eq!(roster[0]["user"]["id"], veli_id);
+    assert_eq!(roster[0]["user"]["username"], "veli");
+    assert_eq!(roster[0]["marked_by"]["username"], "ali");
     assert_eq!(roster[0]["status"], "present");
+
+    // --- user search (for the pickers) -----------------------------------
+    // Teacher+ finds people by fragment; the refs carry no contact details.
+    let found: Value = ali
+        .get(format!("{base}/users/search?q=vel"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(found[0]["username"], "veli");
+    assert!(found[0].get("email").is_none());
+
+    let res = veli
+        .get(format!("{base}/users/search?q=ali"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
 
     // veli is only a student, so she cannot create events.
     let res = veli
@@ -273,4 +296,629 @@ async fn attendance_rollup_across_users() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// The live exam monitor over a real TCP connection: an `EventSource`-style
+/// GET must yield a `snapshot` event carrying the roster within the first
+/// ticks (the first one fires immediately on connect).
+#[tokio::test]
+async fn live_exam_stream_pushes_snapshots_over_http() {
+    let (base, db) = spawn_server().await;
+    let teacher = client();
+    register(&teacher, &base, "hoca").await;
+    promote(&db, "hoca", "teacher").await;
+    login(&teacher, &base, "hoca").await;
+
+    let student = client();
+    register(&student, &base, "veli").await;
+    login(&student, &base, "veli").await;
+    let student_id: Value = student
+        .get(format!("{base}/auth/me"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let student_id = student_id["id"].as_str().unwrap().to_string();
+
+    // Course + enrolled student + a sync exam whose window is open now
+    // (window times judged by the server clock, fetched from `/time`).
+    let now: Value = teacher
+        .get(format!("{base}/time"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let now = now["now"].as_i64().unwrap();
+
+    let course: Value = teacher
+        .post(format!("{base}/courses"))
+        .json(&json!({ "title": "algebra" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let course_id = course["id"].as_str().unwrap();
+    let res = teacher
+        .post(format!("{base}/courses/{course_id}/enrollments"))
+        .json(&json!({ "user_id": student_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let exam: Value = teacher
+        .post(format!("{base}/courses/{course_id}/exams"))
+        .json(&json!({
+            "title": "final", "kind": "final", "weight": 2,
+            "mode": "sync", "starts_at": now - 1_000, "ends_at": now + 600_000,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let exam_id = exam["id"].as_str().unwrap();
+
+    // The student sits down — that's the live-attendance signal.
+    let res = student
+        .post(format!("{base}/exams/{exam_id}/attempt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+
+    // Open the stream and read until one full snapshot event has arrived.
+    let mut res = teacher
+        .get(format!("{base}/exams/{exam_id}/live/stream"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let content_type = res
+        .headers()
+        .get("content-type")
+        .expect("content-type")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "{content_type}"
+    );
+
+    let mut body = String::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !(body.contains("event: snapshot") && body.contains("\n\n")) {
+        let chunk = tokio::time::timeout_at(deadline, res.chunk())
+            .await
+            .expect("a snapshot event within 5s")
+            .expect("stream stays open")
+            .expect("stream yields data");
+        body.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    assert!(body.contains("\"in_progress\""), "{body}");
+    assert!(body.contains("veli"), "{body}");
+    assert!(body.contains("\"enrolled\":1"), "{body}");
+}
+
+/// Log in without a cookie jar and hand back the raw `session=<token>` pair —
+/// the exact header value the WebSocket handshake needs (tungstenite carries
+/// no jar of its own).
+async fn raw_session_cookie(base: &str, user: &str) -> String {
+    let res = Client::new()
+        .post(format!("{base}/auth/login"))
+        .json(&json!({ "username": user, "password": "secret1" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "login {user}");
+    res.headers()
+        .get("set-cookie")
+        .expect("session cookie set on login")
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+// ---- the exam room (WebSocket) ---------------------------------------------
+
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::Message;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+
+type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Open the exam room, optionally authenticated. `Ok` is the upgraded socket;
+/// `Err` is the HTTP status a pre-upgrade gate refused with.
+async fn ws_open(base: &str, exam_id: &str, cookie: Option<&str>) -> Result<WsStream, u16> {
+    let url = format!(
+        "{}/exams/{exam_id}/attempt/ws",
+        base.replace("http://", "ws://")
+    );
+    let mut request = url.into_client_request().unwrap();
+    if let Some(cookie) = cookie {
+        request
+            .headers_mut()
+            .insert("cookie", cookie.parse().unwrap());
+    }
+    match connect_async(request).await {
+        Ok((ws, _)) => Ok(ws),
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            Err(response.status().as_u16())
+        }
+        Err(other) => panic!("unexpected handshake failure: {other}"),
+    }
+}
+
+async fn ws_send(ws: &mut WsStream, frame: Value) {
+    ws.send(Message::Text(frame.to_string().into()))
+        .await
+        .unwrap();
+}
+
+/// The next JSON text frame, within a deadline; `None` once the server closes.
+/// 6 s covers the room's 2 s tick with room to spare on a loaded machine.
+async fn ws_next_frame(ws: &mut WsStream) -> Option<Value> {
+    loop {
+        let message = tokio::time::timeout(std::time::Duration::from_secs(6), ws.next())
+            .await
+            .expect("a frame within 6s")?
+            .expect("stream stays healthy");
+        match message {
+            Message::Text(text) => {
+                return Some(serde_json::from_str(text.as_str()).expect("JSON frame"));
+            }
+            Message::Close(_) => return None,
+            _ => continue,
+        }
+    }
+}
+
+/// Skip periodic `state` ticks until a frame of `kind` arrives.
+async fn ws_frame_of_type(ws: &mut WsStream, kind: &str) -> Value {
+    loop {
+        let frame = ws_next_frame(ws)
+            .await
+            .unwrap_or_else(|| panic!("room closed while waiting for a {kind:?} frame"));
+        if frame["type"] == kind {
+            return frame;
+        }
+        assert_eq!(frame["type"], "state", "unexpected frame: {frame}");
+    }
+}
+
+/// A booted server with teacher `hoca`, enrolled student `veli` (jar client +
+/// raw cookie for the handshake), and an open sync exam holding one choice
+/// question — the spine of every exam-room test. The window closes
+/// `window_ms` from now.
+struct ExamRoom {
+    base: String,
+    teacher: Client,
+    student: Client,
+    student_id: String,
+    cookie: String,
+    course_id: String,
+    exam_id: String,
+    question_id: String,
+}
+
+async fn exam_room_fixture(window_ms: i64) -> ExamRoom {
+    let (base, db) = spawn_server().await;
+    let teacher = client();
+    register(&teacher, &base, "hoca").await;
+    promote(&db, "hoca", "teacher").await;
+    login(&teacher, &base, "hoca").await;
+
+    let student = client();
+    register(&student, &base, "veli").await;
+    login(&student, &base, "veli").await;
+    let me: Value = student
+        .get(format!("{base}/auth/me"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let student_id = me["id"].as_str().unwrap().to_string();
+
+    let now: Value = teacher
+        .get(format!("{base}/time"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let now = now["now"].as_i64().unwrap();
+    let course: Value = teacher
+        .post(format!("{base}/courses"))
+        .json(&json!({ "title": "algebra" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let course_id = course["id"].as_str().unwrap().to_string();
+    let res = teacher
+        .post(format!("{base}/courses/{course_id}/enrollments"))
+        .json(&json!({ "user_id": student_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let exam: Value = teacher
+        .post(format!("{base}/courses/{course_id}/exams"))
+        .json(&json!({
+            "title": "final", "kind": "final", "weight": 2,
+            "mode": "sync", "starts_at": now - 1_000, "ends_at": now + window_ms,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let exam_id = exam["id"].as_str().unwrap().to_string();
+    let question: Value = teacher
+        .post(format!("{base}/exams/{exam_id}/questions"))
+        .json(&json!({ "text": "2 + 2?", "kind": "choice", "points": 10,
+                       "choices": ["3", "4"], "correct": 1 }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let question_id = question["id"].as_str().unwrap().to_string();
+    let cookie = raw_session_cookie(&base, "veli").await;
+    ExamRoom {
+        base,
+        teacher,
+        student,
+        student_id,
+        cookie,
+        course_id,
+        exam_id,
+        question_id,
+    }
+}
+
+/// The student exam room over a real TCP WebSocket: connect with the session
+/// cookie, get the state frame, autosave an answer, survive junk input,
+/// finish, and watch the server close the room — with the result visible to
+/// the teacher over REST.
+#[tokio::test]
+async fn exam_room_websocket_round_trip() {
+    let room = exam_room_fixture(600_000).await;
+    let ExamRoom {
+        base,
+        teacher,
+        student,
+        student_id,
+        cookie,
+        exam_id,
+        question_id,
+        ..
+    } = &room;
+    // A second question so progress counts have something to be partial over.
+    let res = teacher
+        .post(format!("{base}/exams/{exam_id}/questions"))
+        .json(&json!({ "text": "Explain.", "kind": "text", "points": 20 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+
+    // The room requires an attempt — the gate rejects at HTTP time (404),
+    // before any upgrade.
+    assert_eq!(
+        ws_open(base, exam_id, Some(cookie)).await.err(),
+        Some(404),
+        "start the attempt first"
+    );
+
+    let res = student
+        .post(format!("{base}/exams/{exam_id}/attempt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+
+    let mut ws = ws_open(base, exam_id, Some(cookie)).await.expect("upgrade");
+
+    // Connect-time state: in progress, nothing answered yet, server clock in.
+    let state = ws_next_frame(&mut ws).await.expect("connect state");
+    assert_eq!(state["type"], "state", "{state}");
+    assert_eq!(state["status"], "in_progress");
+    assert_eq!(state["answered"], 0);
+    assert_eq!(state["question_count"], 2);
+    assert!(state["remaining_ms"].as_i64().unwrap() > 0);
+    assert!(state["now"].as_i64().is_some());
+
+    // Ping/pong keeps the client's clock honest between ticks.
+    ws_send(&mut ws, json!({ "type": "ping" })).await;
+    ws_frame_of_type(&mut ws, "pong").await;
+
+    // Autosave: answer -> saved ack -> a state showing the progress.
+    ws_send(
+        &mut ws,
+        json!({ "type": "answer", "question_id": question_id, "selected": 1 }),
+    )
+    .await;
+    let saved = ws_frame_of_type(&mut ws, "saved").await;
+    assert_eq!(saved["question_id"], question_id.as_str());
+    assert!(saved["updated_at"].as_i64().is_some());
+    let state = ws_frame_of_type(&mut ws, "state").await;
+    assert_eq!(state["answered"], 1, "{state}");
+
+    // A payload that doesn't fit the question is an error frame, not a close.
+    ws_send(
+        &mut ws,
+        json!({ "type": "answer", "question_id": question_id, "text": "4" }),
+    )
+    .await;
+    let error = ws_frame_of_type(&mut ws, "error").await;
+    assert!(
+        error["message"].as_str().unwrap().contains("selected"),
+        "{error}"
+    );
+
+    // Junk and unknown message types too — the room shrugs and stays up.
+    ws.send(Message::Text("not json".into())).await.unwrap();
+    let error = ws_frame_of_type(&mut ws, "error").await;
+    assert!(
+        error["message"].as_str().unwrap().contains("unrecognized"),
+        "{error}"
+    );
+    ws_send(&mut ws, json!({ "type": "selfdestruct" })).await;
+    let error = ws_frame_of_type(&mut ws, "error").await;
+    assert!(
+        error["message"].as_str().unwrap().contains("unrecognized"),
+        "{error}"
+    );
+    ws_send(&mut ws, json!({ "type": "ping" })).await;
+    ws_frame_of_type(&mut ws, "pong").await;
+
+    // Finish: acknowledged, then the server closes the room.
+    ws_send(&mut ws, json!({ "type": "finish" })).await;
+    let finished = ws_frame_of_type(&mut ws, "finished").await;
+    assert!(finished["finished_at"].as_i64().is_some(), "{finished}");
+    loop {
+        match ws_next_frame(&mut ws).await {
+            None => break, // closed — as promised
+            Some(frame) => assert_eq!(frame["type"], "state", "{frame}"),
+        }
+    }
+
+    // The submission and the saved answer are visible over REST.
+    let attempt: Value = student
+        .get(format!("{base}/exams/{exam_id}/attempt"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(attempt["status"], "submitted");
+    assert_eq!(attempt["answered"], 1);
+
+    let sheet: Value = teacher
+        .get(format!(
+            "{base}/exams/{exam_id}/attempts/{student_id}/answers"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(sheet["answers"][0]["is_correct"], true);
+    assert_eq!(sheet["auto_score"]["earned"], 10);
+    assert_eq!(sheet["auto_score"]["possible"], 10);
+}
+
+/// Every pre-upgrade gate answers with a proper HTTP status, so a rejected
+/// client sees *why* instead of an instant close.
+#[tokio::test]
+async fn exam_room_rejects_bad_handshakes() {
+    let room = exam_room_fixture(600_000).await;
+
+    // No session cookie: 401 before anything else.
+    assert_eq!(
+        ws_open(&room.base, &room.exam_id, None).await.err(),
+        Some(401)
+    );
+
+    // Unknown exam: 404.
+    assert_eq!(
+        ws_open(&room.base, "does-not-exist", Some(&room.cookie))
+            .await
+            .err(),
+        Some(404)
+    );
+
+    // An unscheduled exam has no room to join: 409.
+    let unscheduled: Value = room
+        .teacher
+        .post(format!("{}/courses/{}/exams", room.base, room.course_id))
+        .json(&json!({ "title": "homework", "kind": "homework", "weight": 1 }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let unscheduled_id = unscheduled["id"].as_str().unwrap();
+    assert_eq!(
+        ws_open(&room.base, unscheduled_id, Some(&room.cookie))
+            .await
+            .err(),
+        Some(409)
+    );
+
+    // Not enrolled: 403, even on a scheduled, open exam.
+    let outsider = client();
+    register(&outsider, &room.base, "omer").await;
+    let outsider_cookie = raw_session_cookie(&room.base, "omer").await;
+    assert_eq!(
+        ws_open(&room.base, &room.exam_id, Some(&outsider_cookie))
+            .await
+            .err(),
+        Some(403)
+    );
+
+    // A submitted attempt has nothing left to write: 409.
+    let res = room
+        .student
+        .post(format!("{}/exams/{}/attempt", room.base, room.exam_id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let res = room
+        .student
+        .post(format!(
+            "{}/exams/{}/attempt/finish",
+            room.base, room.exam_id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        ws_open(&room.base, &room.exam_id, Some(&room.cookie))
+            .await
+            .err(),
+        Some(409)
+    );
+}
+
+/// A teacher extending `ends_at` mid-exam moves the open room's countdown on
+/// the next tick — the deadline is re-read, never cached in the socket.
+#[tokio::test]
+async fn exam_room_deadline_moves_with_a_live_extension() {
+    let room = exam_room_fixture(600_000).await;
+    let res = room
+        .student
+        .post(format!("{}/exams/{}/attempt", room.base, room.exam_id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+
+    let mut ws = ws_open(&room.base, &room.exam_id, Some(&room.cookie))
+        .await
+        .expect("upgrade");
+    let state = ws_next_frame(&mut ws).await.expect("connect state");
+    let deadline = state["deadline"].as_i64().expect("deadline");
+
+    let extended = deadline + 300_000;
+    let res = room
+        .teacher
+        .patch(format!("{}/exams/{}", room.base, room.exam_id))
+        .json(&json!({ "ends_at": extended }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Within a couple of ticks the room follows.
+    let mut moved = false;
+    for _ in 0..5 {
+        let state = ws_frame_of_type(&mut ws, "state").await;
+        if state["deadline"].as_i64() == Some(extended) {
+            assert!(state["remaining_ms"].as_i64().unwrap() > 300_000);
+            moved = true;
+            break;
+        }
+    }
+    assert!(moved, "the extension reaches the open room");
+}
+
+/// When the deadline passes mid-session, a tick notices: the room announces
+/// `expired`, closes, and everything saved in time survives for grading.
+#[tokio::test]
+async fn exam_room_expires_mid_session() {
+    // The window closes ~2.6 s in — enough to connect and save, gone by the
+    // second tick. Real time: expiry is judged by the server clock.
+    let room = exam_room_fixture(2_600).await;
+    let res = room
+        .student
+        .post(format!("{}/exams/{}/attempt", room.base, room.exam_id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+
+    let mut ws = ws_open(&room.base, &room.exam_id, Some(&room.cookie))
+        .await
+        .expect("upgrade");
+    let state = ws_next_frame(&mut ws).await.expect("connect state");
+    assert_eq!(state["status"], "in_progress", "{state}");
+
+    // One answer lands inside the window.
+    ws_send(
+        &mut ws,
+        json!({ "type": "answer", "question_id": room.question_id, "selected": 1 }),
+    )
+    .await;
+    ws_frame_of_type(&mut ws, "saved").await;
+
+    // A tick notices the deadline: `expired`, then the room closes.
+    ws_frame_of_type(&mut ws, "expired").await;
+    assert!(
+        ws_next_frame(&mut ws).await.is_none(),
+        "room closes after expiring"
+    );
+
+    // The server agrees over REST: no more writes, the attempt is expired,
+    // and the in-time answer is still there for the grader.
+    let res = room
+        .student
+        .post(format!(
+            "{}/exams/{}/attempt/answers",
+            room.base, room.exam_id
+        ))
+        .json(&json!({ "question_id": room.question_id, "selected": 0 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    let attempt: Value = room
+        .student
+        .get(format!("{}/exams/{}/attempt", room.base, room.exam_id))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(attempt["status"], "expired");
+    assert_eq!(attempt["answered"], 1);
+    let sheet: Value = room
+        .teacher
+        .get(format!(
+            "{}/exams/{}/attempts/{}/answers",
+            room.base, room.exam_id, room.student_id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(sheet["answers"][0]["selected"], 1);
+    assert_eq!(sheet["auto_score"]["earned"], 10);
 }

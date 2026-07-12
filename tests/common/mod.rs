@@ -162,6 +162,19 @@ pub async fn create_exam(
     id_of(&res.body)
 }
 
+/// Create an exam inside `course` from a full JSON body (no assertion) —
+/// for exercising the scheduling fields and their validation.
+pub async fn create_exam_with(app: &Router, cookie: &str, course: &str, body: Value) -> Res {
+    send(
+        app,
+        "POST",
+        &format!("/courses/{course}/exams"),
+        Some(cookie),
+        Some(body),
+    )
+    .await
+}
+
 /// Enroll `user_id` into `course` as `cookie` (asserts 200).
 pub async fn enroll(app: &Router, cookie: &str, course: &str, user_id: &str) {
     let res = send(
