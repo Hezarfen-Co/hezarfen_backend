@@ -32,7 +32,7 @@ use crate::state::AppState;
     info(
         title = "Hezarfen Backend API",
         version = env!("CARGO_PKG_VERSION"),
-        description = "Notes, events, attendance, courses, and weighted exam marks behind cookie-session auth.",
+        description = "Notes, events, attendance, courses, and weighted exam marks behind cookie-session auth. Courses carry lesson sessions with teacher-taken roll call; staff clock in/out on a server-stamped work log; attendance reports tally events and per-course roll call with rates.",
     ),
     modifiers(&SecurityAddon),
     tags(

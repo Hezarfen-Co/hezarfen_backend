@@ -534,8 +534,22 @@ EX=$(curl -s -b $JAR $BASE/courses/$CO/exams -H 'content-type: application/json'
 curl -s -b $JAR $BASE/exams/$EX/results -H 'content-type: application/json' \
   -d "{\"mark\":90,\"user_id\":\"$SID\"}"
 curl -s -b $JAR $BASE/exams/$EX/statistics
+
+# lesson sessions + roll call (course manager creates; the session's teacher
+# or a course manager marks enrolled students)
+SE=$(curl -s -b $JAR $BASE/courses/$CO/sessions -H 'content-type: application/json' \
+  -d '{"topic":"limits","starts_at":1752275000000}' | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+curl -s -b $JAR $BASE/sessions/$SE/attendance -H 'content-type: application/json' \
+  -d "{\"status\":\"present\",\"user_id\":\"$SID\"}"
+
+# staff work log (instants are server-stamped)
+curl -s -b $JAR -X POST $BASE/work/check-in
+curl -s -b $JAR -X POST $BASE/work/check-out
+curl -s -b $JAR $BASE/work/me
+
 # ...and as the student:
 curl -s -b $STUDENT_JAR $BASE/marks/me
+curl -s -b $STUDENT_JAR $BASE/attendance/me
 ```
 
 ## Layout
