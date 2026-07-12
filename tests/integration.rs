@@ -9,6 +9,7 @@ use common::{
     app_and_db, create_course, create_exam, enroll, id_of, login, login_as, me_id, mem_app, send,
 };
 use hezarfen_backend::domain::session::Session;
+use hezarfen_backend::domain::timestamp::Timestamp;
 use hezarfen_backend::domain::user::{Password, User, Username};
 use hezarfen_backend::state::AppState;
 use hezarfen_backend::{build_router, database};
@@ -23,6 +24,21 @@ async fn health_reports_ok() {
     let res = send(&app, "GET", "/health", None, None).await;
     assert_eq!(res.status, StatusCode::OK);
     assert_eq!(res.body["status"], "ok");
+}
+
+#[tokio::test]
+async fn time_serves_server_clock_without_auth() {
+    let app = mem_app().await;
+
+    let before = Timestamp::now().as_millis();
+    let res = send(&app, "GET", "/time", None, None).await;
+    let after = Timestamp::now().as_millis();
+
+    assert_eq!(res.status, StatusCode::OK);
+    // Bracketed by two local reads: proves it is the same clock in millis,
+    // not seconds/nanos or some other epoch.
+    let now = res.body["now"].as_i64().expect("now is an integer");
+    assert!(before <= now && now <= after);
 }
 
 #[tokio::test]
@@ -2532,6 +2548,41 @@ async fn login_purges_expired_sessions() {
     assert_eq!(
         send(&app, "GET", "/auth/me", Some(&ali), None).await.status,
         StatusCode::OK
+    );
+}
+
+/// An expired session row is rejected at auth even while it still exists —
+/// expiry must not depend on the purge sweep having run.
+#[tokio::test]
+async fn expired_session_is_unauthorized_before_any_purge() {
+    let (app, db) = app_and_db().await;
+    let ali = login(&app, "ali").await;
+
+    // Copy ali's live session into a second row that expired long ago
+    // (epoch millis 1), pointing at the same real user.
+    db.query(
+        "CREATE session SET \
+            user = (SELECT VALUE user FROM ONLY session WHERE token = $live LIMIT 1), \
+            token = 'stale-token', expires_at = 1",
+    )
+    .bind(("live", ali.trim_start_matches("session=").to_string()))
+    .await
+    .unwrap()
+    .check()
+    .unwrap();
+
+    // Row exists, but the clock says no.
+    assert!(
+        Session::find_by_token("stale-token", &db)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        send(&app, "GET", "/auth/me", Some("session=stale-token"), None)
+            .await
+            .status,
+        StatusCode::UNAUTHORIZED
     );
 }
 
