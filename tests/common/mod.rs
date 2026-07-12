@@ -175,6 +175,21 @@ pub async fn create_exam_with(app: &Router, cookie: &str, course: &str, body: Va
     .await
 }
 
+/// Create a lesson session inside `course` as `cookie` (asserts 201); returns
+/// its id. The session's teacher defaults to the caller.
+pub async fn create_session(app: &Router, cookie: &str, course: &str, starts_at: i64) -> String {
+    let res = send(
+        app,
+        "POST",
+        &format!("/courses/{course}/sessions"),
+        Some(cookie),
+        Some(json!({ "starts_at": starts_at })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "create session");
+    id_of(&res.body)
+}
+
 /// Enroll `user_id` into `course` as `cookie` (asserts 200).
 pub async fn enroll(app: &Router, cookie: &str, course: &str, user_id: &str) {
     let res = send(

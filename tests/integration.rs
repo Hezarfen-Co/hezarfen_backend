@@ -6,8 +6,8 @@ mod common;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use common::{
-    app_and_db, create_course, create_exam, create_exam_with, enroll, id_of, login, login_as,
-    me_id, mem_app, send,
+    app_and_db, create_course, create_exam, create_exam_with, create_session, enroll, id_of, login,
+    login_as, me_id, mem_app, send,
 };
 use hezarfen_backend::domain::exam::ExamId;
 use hezarfen_backend::domain::exam_attempt::ExamAttempt;
@@ -134,6 +134,22 @@ async fn protected_routes_require_session() {
         ("GET", "/exams/x/attempts/u/answers"),
         // The WebSocket room authenticates before it upgrades.
         ("GET", "/exams/x/attempt/ws"),
+        ("POST", "/courses/x/sessions"),
+        ("GET", "/courses/x/sessions"),
+        ("GET", "/sessions/x"),
+        ("PATCH", "/sessions/x"),
+        ("DELETE", "/sessions/x"),
+        ("POST", "/sessions/x/attendance"),
+        ("GET", "/sessions/x/attendance"),
+        ("DELETE", "/sessions/x/attendance/u"),
+        ("POST", "/work/check-in"),
+        ("POST", "/work/check-out"),
+        ("GET", "/work/me"),
+        ("GET", "/work/u"),
+        ("PATCH", "/work/entries/x"),
+        ("DELETE", "/work/entries/x"),
+        ("GET", "/attendance/me"),
+        ("GET", "/attendance/u"),
     ] {
         let res = send(&app, method, uri, None, None).await;
         assert_eq!(res.status, StatusCode::UNAUTHORIZED, "{method} {uri}");
@@ -5081,4 +5097,787 @@ async fn concurrent_answer_saves_never_collide() {
     )
     .await;
     assert_eq!(res.body["answered"], 1, "24 saves, one answer");
+}
+
+// --- course sessions + roll call ------------------------------------------
+
+#[tokio::test]
+async fn session_crud_follows_course_management() {
+    let (app, db) = app_and_db().await;
+    let owner = login_as(&app, &db, "owner", "teacher").await;
+    let rival = login_as(&app, &db, "rival", "teacher").await;
+    let boss = login_as(&app, &db, "boss", "manager").await;
+    let student = login(&app, "ali").await;
+    let course = create_course(&app, &owner, "algebra").await;
+
+    // Create: student 403, unrelated teacher 403, owner 201, manager+ 201.
+    let body = json!({ "topic": "limits", "starts_at": 1_700_000_000_000_i64 });
+    let res = send(
+        &app,
+        "POST",
+        &format!("/courses/{course}/sessions"),
+        Some(&student),
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/courses/{course}/sessions"),
+        Some(&rival),
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/courses/{course}/sessions"),
+        Some(&owner),
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED);
+    let session = id_of(&res.body);
+    // The teacher defaults to the caller, rendered as a PersonRef.
+    assert_eq!(res.body["teacher"]["username"], "owner");
+    assert_eq!(res.body["topic"], "limits");
+    assert_eq!(res.body["starts_at"], 1_700_000_000_000_i64);
+    assert!(res.body["ends_at"].is_null());
+    let res = send(
+        &app,
+        "POST",
+        &format!("/courses/{course}/sessions"),
+        Some(&boss),
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::CREATED,
+        "manager+ manages any course"
+    );
+
+    // Explicit teacher_id: must exist and be teacher+.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/courses/{course}/sessions"),
+        Some(&owner),
+        Some(json!({ "starts_at": 1, "teacher_id": "01UNKNOWN" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "unknown teacher");
+    let ali_id = me_id(&app, &student).await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/courses/{course}/sessions"),
+        Some(&owner),
+        Some(json!({ "starts_at": 1, "teacher_id": ali_id })),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::BAD_REQUEST,
+        "a student cannot teach"
+    );
+    let rival_id = me_id(&app, &rival).await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/courses/{course}/sessions"),
+        Some(&owner),
+        Some(json!({ "starts_at": 2, "teacher_id": rival_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED);
+    assert_eq!(res.body["teacher"]["username"], "rival");
+    let rival_session = id_of(&res.body);
+
+    // Time range validated on create and update.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/courses/{course}/sessions"),
+        Some(&owner),
+        Some(json!({ "starts_at": 10, "ends_at": 5 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+
+    // Reads are open to any logged-in user; parents must exist.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/courses/{course}/sessions"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    // owner's, the manager's, and the one taught by `rival` — newest starts_at
+    // first, so the two 1.7e12 lessons precede the starts_at=2 one.
+    assert_eq!(res.body.as_array().unwrap().len(), 3);
+    assert_eq!(res.body[2]["starts_at"], 2);
+    let res = send(&app, "GET", "/courses/nope/sessions", Some(&student), None).await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/sessions/{session}"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    let res = send(&app, "GET", "/sessions/nope", Some(&student), None).await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+
+    // PATCH: management rights; set/keep/clear semantics; range check.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/sessions/{session}"),
+        Some(&rival),
+        Some(json!({ "topic": "hijack" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/sessions/{session}"),
+        Some(&owner),
+        Some(json!({ "topic": "derivatives", "ends_at": 1_700_000_100_000_i64 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["topic"], "derivatives");
+    assert_eq!(res.body["ends_at"], 1_700_000_100_000_i64);
+    assert_eq!(
+        res.body["starts_at"], 1_700_000_000_000_i64,
+        "omitted keeps"
+    );
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/sessions/{session}"),
+        Some(&owner),
+        Some(json!({ "ends_at": null })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert!(res.body["ends_at"].is_null(), "explicit null clears");
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/sessions/{session}"),
+        Some(&owner),
+        Some(json!({ "ends_at": 999 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "ends before starts");
+    // Reassigning the teacher revalidates the target.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/sessions/{rival_session}"),
+        Some(&boss),
+        Some(json!({ "teacher_id": ali_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+
+    // DELETE: management rights.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/sessions/{session}"),
+        Some(&rival),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/sessions/{session}"),
+        Some(&owner),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/sessions/{session}"),
+        Some(&owner),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn roll_call_rbac_and_upsert() {
+    let (app, db) = app_and_db().await;
+    let owner = login_as(&app, &db, "owner", "teacher").await;
+    let hoca = login_as(&app, &db, "hoca", "teacher").await;
+    let rival = login_as(&app, &db, "rival", "teacher").await;
+    let boss = login_as(&app, &db, "boss", "manager").await;
+    let ali = login(&app, "ali").await;
+    let veli = login(&app, "veli").await;
+    let ali_id = me_id(&app, &ali).await;
+    let veli_id = me_id(&app, &veli).await;
+    let hoca_id = me_id(&app, &hoca).await;
+
+    let course = create_course(&app, &owner, "algebra").await;
+    enroll(&app, &owner, &course, &ali_id).await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/courses/{course}/sessions"),
+        Some(&owner),
+        Some(json!({ "starts_at": 1, "teacher_id": hoca_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED);
+    let session = id_of(&res.body);
+    let mark_uri = format!("/sessions/{session}/attendance");
+
+    // The session's teacher takes roll even without course-management rights.
+    let res = send(
+        &app,
+        "POST",
+        &mark_uri,
+        Some(&hoca),
+        Some(json!({ "status": "present", "user_id": ali_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["user"]["username"], "ali");
+    assert_eq!(res.body["marked_by"]["username"], "hoca");
+    assert_eq!(res.body["course"].as_str().unwrap(), course);
+
+    // Re-marking overwrites — one row per session+user (course manager may too).
+    let res = send(
+        &app,
+        "POST",
+        &mark_uri,
+        Some(&owner),
+        Some(json!({ "status": "absent", "user_id": ali_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    let res = send(&app, "GET", &mark_uri, Some(&ali), None).await;
+    assert_eq!(res.status, StatusCode::OK, "roster is readable by students");
+    let roster = res.body.as_array().unwrap();
+    assert_eq!(roster.len(), 1);
+    assert_eq!(roster[0]["status"], "absent");
+
+    // Neither an unrelated teacher nor the student themselves may mark.
+    let res = send(
+        &app,
+        "POST",
+        &mark_uri,
+        Some(&rival),
+        Some(json!({ "status": "present", "user_id": ali_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    let res = send(
+        &app,
+        "POST",
+        &mark_uri,
+        Some(&ali),
+        Some(json!({ "status": "present", "user_id": ali_id })),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::FORBIDDEN,
+        "students never self-mark"
+    );
+
+    // The roster comes from enrollment; targets must exist; statuses are closed.
+    let res = send(
+        &app,
+        "POST",
+        &mark_uri,
+        Some(&hoca),
+        Some(json!({ "status": "present", "user_id": veli_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "not enrolled");
+    let res = send(
+        &app,
+        "POST",
+        &mark_uri,
+        Some(&hoca),
+        Some(json!({ "status": "present", "user_id": "01UNKNOWN" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+    let res = send(
+        &app,
+        "POST",
+        &mark_uri,
+        Some(&hoca),
+        Some(json!({ "status": "sleeping", "user_id": ali_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+    let res = send(
+        &app,
+        "POST",
+        "/sessions/nope/attendance",
+        Some(&hoca),
+        Some(json!({ "status": "present", "user_id": ali_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+
+    // The session teacher's own row is management's call: even the course
+    // creator (teacher role) can't write it; a manager can.
+    let res = send(
+        &app,
+        "POST",
+        &mark_uri,
+        Some(&hoca),
+        Some(json!({ "status": "present", "user_id": hoca_id })),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::FORBIDDEN,
+        "no self-declared presence"
+    );
+    let res = send(
+        &app,
+        "POST",
+        &mark_uri,
+        Some(&owner),
+        Some(json!({ "status": "present", "user_id": hoca_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    let res = send(
+        &app,
+        "POST",
+        &mark_uri,
+        Some(&boss),
+        Some(json!({ "status": "late", "user_id": hoca_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+
+    // Removal mirrors marking rights.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("{mark_uri}/{ali_id}"),
+        Some(&rival),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("{mark_uri}/{hoca_id}"),
+        Some(&hoca),
+        None,
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::FORBIDDEN,
+        "teacher row needs manager+"
+    );
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("{mark_uri}/{hoca_id}"),
+        Some(&boss),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("{mark_uri}/{ali_id}"),
+        Some(&hoca),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("{mark_uri}/{ali_id}"),
+        Some(&hoca),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND, "row already gone");
+}
+
+#[tokio::test]
+async fn deleting_session_or_course_cascades_roll_call() {
+    let (app, db) = app_and_db().await;
+    let owner = login_as(&app, &db, "owner", "teacher").await;
+    let ali = login(&app, "ali").await;
+    let ali_id = me_id(&app, &ali).await;
+
+    let course = create_course(&app, &owner, "algebra").await;
+    enroll(&app, &owner, &course, &ali_id).await;
+    let s1 = create_session(&app, &owner, &course, 1).await;
+    let s2 = create_session(&app, &owner, &course, 2).await;
+    for s in [&s1, &s2] {
+        let res = send(
+            &app,
+            "POST",
+            &format!("/sessions/{s}/attendance"),
+            Some(&owner),
+            Some(json!({ "status": "present", "user_id": ali_id })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK);
+    }
+    let report = send(&app, "GET", "/attendance/me", Some(&ali), None).await;
+    assert_eq!(report.body["sessions"]["total"], 2);
+
+    // Deleting one session removes exactly its rows...
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/sessions/{s1}"),
+        Some(&owner),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    let report = send(&app, "GET", "/attendance/me", Some(&ali), None).await;
+    assert_eq!(report.body["sessions"]["total"], 1);
+
+    // ...and deleting the course removes the rest, sessions included.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/courses/{course}"),
+        Some(&owner),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    let res = send(&app, "GET", &format!("/sessions/{s2}"), Some(&ali), None).await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+    let report = send(&app, "GET", "/attendance/me", Some(&ali), None).await;
+    assert_eq!(report.body["sessions"]["total"], 0);
+    assert!(report.body["courses"].as_array().unwrap().is_empty());
+}
+
+// --- work log ---------------------------------------------------------------
+
+#[tokio::test]
+async fn work_log_lifecycle_is_server_stamped_and_exclusive() {
+    let (app, db) = app_and_db().await;
+    let hoca = login_as(&app, &db, "hoca", "teacher").await;
+    let ali = login(&app, "ali").await;
+
+    // Staff only.
+    let res = send(&app, "POST", "/work/check-in", Some(&ali), None).await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    let res = send(&app, "GET", "/work/me", Some(&ali), None).await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+
+    // Check out before check-in conflicts.
+    let res = send(&app, "POST", "/work/check-out", Some(&hoca), None).await;
+    assert_eq!(res.status, StatusCode::CONFLICT);
+
+    let res = send(&app, "POST", "/work/check-in", Some(&hoca), None).await;
+    assert_eq!(res.status, StatusCode::CREATED);
+    assert!(res.body["check_out"].is_null());
+    let first_in = res.body["check_in"].as_i64().unwrap();
+
+    // A second check-in neither opens a second stint nor resets the clock.
+    let res = send(&app, "POST", "/work/check-in", Some(&hoca), None).await;
+    assert_eq!(res.status, StatusCode::CONFLICT);
+    let res = send(&app, "GET", "/work/me", Some(&hoca), None).await;
+    let log = res.body.as_array().unwrap();
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0]["check_in"].as_i64().unwrap(), first_in);
+
+    let res = send(&app, "POST", "/work/check-out", Some(&hoca), None).await;
+    assert_eq!(res.status, StatusCode::OK);
+    let out = res.body["check_out"].as_i64().unwrap();
+    assert!(out >= first_in);
+    assert_eq!(res.body["duration_ms"].as_i64().unwrap(), out - first_in);
+    let res = send(&app, "POST", "/work/check-out", Some(&hoca), None).await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "already checked out");
+
+    // The open slot is free again; the log keeps both stints, newest first.
+    let res = send(&app, "POST", "/work/check-in", Some(&hoca), None).await;
+    assert_eq!(res.status, StatusCode::CREATED);
+    let res = send(&app, "GET", "/work/me", Some(&hoca), None).await;
+    let log = res.body.as_array().unwrap();
+    assert_eq!(log.len(), 2);
+    assert!(log[0]["check_out"].is_null(), "open stint sorts newest");
+    assert!(!log[1]["check_out"].is_null());
+}
+
+#[tokio::test]
+async fn work_log_manager_reads_and_corrections() {
+    let (app, db) = app_and_db().await;
+    let hoca = login_as(&app, &db, "hoca", "teacher").await;
+    let other = login_as(&app, &db, "other", "teacher").await;
+    let boss = login_as(&app, &db, "boss", "manager").await;
+    let hoca_id = me_id(&app, &hoca).await;
+
+    // One closed stint and one open stint for hoca.
+    send(&app, "POST", "/work/check-in", Some(&hoca), None).await;
+    let closed = send(&app, "POST", "/work/check-out", Some(&hoca), None).await;
+    let closed_id = id_of(&closed.body);
+    let open = send(&app, "POST", "/work/check-in", Some(&hoca), None).await;
+    let open_id = id_of(&open.body);
+
+    // Reading someone's log is manager+; unknown users are 404.
+    let res = send(&app, "GET", &format!("/work/{hoca_id}"), Some(&other), None).await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    let res = send(&app, "GET", &format!("/work/{hoca_id}"), Some(&boss), None).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body.as_array().unwrap().len(), 2);
+    let res = send(&app, "GET", "/work/01UNKNOWN", Some(&boss), None).await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+
+    // Corrections: manager+ only, closed entries only, ordered instants only.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/work/entries/{closed_id}"),
+        Some(&hoca),
+        Some(json!({ "check_in": 1000 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/work/entries/{closed_id}"),
+        Some(&boss),
+        Some(json!({ "check_in": 1000, "check_out": 2000 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["check_in"], 1000);
+    assert_eq!(res.body["check_out"], 2000);
+    assert_eq!(res.body["duration_ms"], 1000);
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/work/entries/{closed_id}"),
+        Some(&boss),
+        Some(json!({ "check_out": 500 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "out precedes in");
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/work/entries/{open_id}"),
+        Some(&boss),
+        Some(json!({ "check_in": 1 })),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::CONFLICT,
+        "open entries aren't correctable"
+    );
+    let res = send(
+        &app,
+        "PATCH",
+        "/work/entries/nope",
+        Some(&boss),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+
+    // Deletion: manager+, any entry (open ones included — the stray-row broom).
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/work/entries/{closed_id}"),
+        Some(&hoca),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/work/entries/{open_id}"),
+        Some(&boss),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/work/entries/{open_id}"),
+        Some(&boss),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+    // With the open row swept, hoca can check in again.
+    let res = send(&app, "POST", "/work/check-in", Some(&hoca), None).await;
+    assert_eq!(res.status, StatusCode::CREATED);
+}
+
+// --- attendance reports -------------------------------------------------------
+
+#[tokio::test]
+async fn attendance_report_tallies_events_and_sessions_per_course() {
+    let (app, db) = app_and_db().await;
+    let owner = login_as(&app, &db, "owner", "teacher").await;
+    let ali = login(&app, "ali").await;
+    let veli = login(&app, "veli").await;
+    let ali_id = me_id(&app, &ali).await;
+
+    // A fresh user's report is all zeros with null rates.
+    let res = send(&app, "GET", "/attendance/me", Some(&ali), None).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["events"]["total"], 0);
+    assert!(res.body["events"]["rate"].is_null());
+    assert!(res.body["courses"].as_array().unwrap().is_empty());
+
+    // Two event rows: one self-marked, one teacher-marked.
+    let ev1 = send(
+        &app,
+        "POST",
+        "/events",
+        Some(&owner),
+        Some(json!({ "title": "assembly" })),
+    )
+    .await;
+    let ev2 = send(
+        &app,
+        "POST",
+        "/events",
+        Some(&owner),
+        Some(json!({ "title": "trip" })),
+    )
+    .await;
+    let (ev1, ev2) = (id_of(&ev1.body), id_of(&ev2.body));
+    send(
+        &app,
+        "POST",
+        &format!("/events/{ev1}/attendance"),
+        Some(&ali),
+        Some(json!({ "status": "present" })),
+    )
+    .await;
+    send(
+        &app,
+        "POST",
+        &format!("/events/{ev2}/attendance"),
+        Some(&owner),
+        Some(json!({ "status": "absent", "user_id": ali_id })),
+    )
+    .await;
+
+    // Roll call across two courses: algebra present+late, physics absent+excused.
+    let algebra = create_course(&app, &owner, "algebra").await;
+    let physics = create_course(&app, &owner, "physics").await;
+    for (course, statuses) in [
+        (&algebra, ["present", "late"]),
+        (&physics, ["absent", "excused"]),
+    ] {
+        enroll(&app, &owner, course, &ali_id).await;
+        for (n, status) in statuses.iter().enumerate() {
+            let session = create_session(&app, &owner, course, n as i64 + 1).await;
+            let res = send(
+                &app,
+                "POST",
+                &format!("/sessions/{session}/attendance"),
+                Some(&owner),
+                Some(json!({ "status": status, "user_id": ali_id })),
+            )
+            .await;
+            assert_eq!(res.status, StatusCode::OK);
+        }
+    }
+
+    let res = send(&app, "GET", "/attendance/me", Some(&ali), None).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["user"].as_str().unwrap(), ali_id);
+    // Events: 1 present + 1 absent → rate 1/2.
+    assert_eq!(res.body["events"]["present"], 1);
+    assert_eq!(res.body["events"]["absent"], 1);
+    assert_eq!(res.body["events"]["total"], 2);
+    assert_eq!(res.body["events"]["rate"].as_f64().unwrap(), 0.5);
+    // Sessions overall: present+late+absent+excused → rate (1+1)/3.
+    assert_eq!(res.body["sessions"]["total"], 4);
+    assert_eq!(res.body["sessions"]["excused"], 1);
+    let rate = res.body["sessions"]["rate"].as_f64().unwrap();
+    assert!(
+        (rate - 2.0 / 3.0).abs() < 1e-12,
+        "excused stays out: {rate}"
+    );
+    // Per-course blocks: algebra 100% attended, physics 0% (excused uncounted).
+    let courses = res.body["courses"].as_array().unwrap();
+    assert_eq!(courses.len(), 2);
+    let block = |title: &str| {
+        courses
+            .iter()
+            .find(|b| b["course"]["title"] == title)
+            .unwrap_or_else(|| panic!("missing course block {title}"))
+            .clone()
+    };
+    assert_eq!(block("algebra")["counts"]["rate"].as_f64().unwrap(), 1.0);
+    assert_eq!(block("algebra")["counts"]["late"], 1);
+    assert_eq!(block("physics")["counts"]["rate"].as_f64().unwrap(), 0.0);
+    assert_eq!(block("physics")["counts"]["excused"], 1);
+
+    // Unenrolling hides marks, never absences: the physics block stays.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/courses/{physics}/enrollments/{ali_id}"),
+        Some(&owner),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    let res = send(&app, "GET", "/attendance/me", Some(&ali), None).await;
+    assert_eq!(res.body["courses"].as_array().unwrap().len(), 2);
+
+    // Someone else's report: teacher+ only; unknown users are 404.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/attendance/{ali_id}"),
+        Some(&veli),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/attendance/{ali_id}"),
+        Some(&owner),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["sessions"]["total"], 4);
+    let res = send(&app, "GET", "/attendance/01UNKNOWN", Some(&owner), None).await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
 }
