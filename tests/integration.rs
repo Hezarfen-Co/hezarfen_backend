@@ -705,6 +705,9 @@ async fn deleting_event_cascades_attendance() {
 async fn event_timestamps_echo_and_validate() {
     let (app, db) = app_and_db().await;
     let ali = login_as(&app, &db, "ali", "teacher").await;
+    let now = Timestamp::now().as_millis();
+    let starts = now + 3_600_000;
+    let ends = now + 7_200_000;
 
     // Create with unix-millis times.
     let res = send(
@@ -712,12 +715,12 @@ async fn event_timestamps_echo_and_validate() {
         "POST",
         "/events",
         Some(&ali),
-        Some(json!({ "title": "mtg", "starts_at": 1000, "ends_at": 2000 })),
+        Some(json!({ "title": "mtg", "starts_at": starts, "ends_at": ends })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED);
-    assert_eq!(res.body["starts_at"], 1000);
-    assert_eq!(res.body["ends_at"], 2000);
+    assert_eq!(res.body["starts_at"], starts);
+    assert_eq!(res.body["ends_at"], ends);
     let event_id = id_of(&res.body);
 
     // Omitted times serialize as null.
@@ -738,10 +741,19 @@ async fn event_timestamps_echo_and_validate() {
         "POST",
         "/events",
         Some(&ali),
-        Some(json!({ "title": "bad", "starts_at": 5000, "ends_at": 1000 })),
+        Some(json!({ "title": "bad", "starts_at": now + 5_000_000, "ends_at": now + 1_000_000 })),
     )
     .await;
     assert_eq!(bad.status, StatusCode::BAD_REQUEST);
+
+    // Past times -> 400, whichever end carries them.
+    for body in [
+        json!({ "title": "old", "starts_at": now - 3_600_000 }),
+        json!({ "title": "old", "ends_at": now - 3_600_000 }),
+    ] {
+        let res = send(&app, "POST", "/events", Some(&ali), Some(body)).await;
+        assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+    }
 
     // Updating only ends_at keeps starts_at.
     let updated = send(
@@ -749,12 +761,28 @@ async fn event_timestamps_echo_and_validate() {
         "PATCH",
         &format!("/events/{event_id}"),
         Some(&ali),
-        Some(json!({ "ends_at": 3000 })),
+        Some(json!({ "ends_at": now + 10_800_000 })),
     )
     .await;
     assert_eq!(updated.status, StatusCode::OK);
-    assert_eq!(updated.body["starts_at"], 1000);
-    assert_eq!(updated.body["ends_at"], 3000);
+    assert_eq!(updated.body["starts_at"], starts);
+    assert_eq!(updated.body["ends_at"], now + 10_800_000);
+
+    // A PATCH may not move a time into the past either — whichever end.
+    for body in [
+        json!({ "starts_at": now - 3_600_000 }),
+        json!({ "ends_at": now - 3_600_000 }),
+    ] {
+        let res = send(
+            &app,
+            "PATCH",
+            &format!("/events/{event_id}"),
+            Some(&ali),
+            Some(body),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+    }
 }
 
 // --- exams + results -----------------------------------------------------
@@ -2913,13 +2941,16 @@ async fn session_cookie_secure_attribute_follows_config() {
 async fn patch_null_clears_event_times() {
     let (app, db) = app_and_db().await;
     let ali = login_as(&app, &db, "ali", "teacher").await;
+    let now = Timestamp::now().as_millis();
+    let starts = now + 3_600_000;
+    let ends = now + 7_200_000;
     let event_id = id_of(
         &send(
             &app,
             "POST",
             "/events",
             Some(&ali),
-            Some(json!({"title":"mtg","starts_at":1000,"ends_at":2000})),
+            Some(json!({"title":"mtg","starts_at": starts,"ends_at": ends})),
         )
         .await
         .body,
@@ -2934,8 +2965,8 @@ async fn patch_null_clears_event_times() {
         Some(json!({"title":"mtg2"})),
     )
     .await;
-    assert_eq!(res.body["starts_at"], 1000);
-    assert_eq!(res.body["ends_at"], 2000);
+    assert_eq!(res.body["starts_at"], starts);
+    assert_eq!(res.body["ends_at"], ends);
 
     // An explicit null clears just that field.
     let res = send(
@@ -2947,7 +2978,7 @@ async fn patch_null_clears_event_times() {
     )
     .await;
     assert_eq!(res.status, StatusCode::OK);
-    assert_eq!(res.body["starts_at"], 1000);
+    assert_eq!(res.body["starts_at"], starts);
     assert!(res.body["ends_at"].is_null());
 
     // With ends_at cleared, moving starts_at past the old end is legal...
@@ -2957,7 +2988,7 @@ async fn patch_null_clears_event_times() {
             "PATCH",
             &format!("/events/{event_id}"),
             Some(&ali),
-            Some(json!({"starts_at": 5000}))
+            Some(json!({"starts_at": now + 9_000_000}))
         )
         .await
         .status,
@@ -2970,7 +3001,7 @@ async fn patch_null_clears_event_times() {
             "PATCH",
             &format!("/events/{event_id}"),
             Some(&ali),
-            Some(json!({"ends_at": 1}))
+            Some(json!({"ends_at": now + 1_000_000}))
         )
         .await
         .status,
@@ -3203,10 +3234,102 @@ async fn exam_scheduling_validates_and_echoes() {
             json!({ "title": "x", "kind": "quiz", "weight": 1, "mode": "async",
                     "starts_at": now, "ends_at": now + 90_000_000, "duration_ms": 86_400_001 }),
         ),
+        (
+            "past starts_at",
+            json!({ "title": "x", "kind": "quiz", "weight": 1, "mode": "sync",
+                    "starts_at": now - 3_600_000, "ends_at": now + 3_600_000 }),
+        ),
+        (
+            // starts_at is future so the rejection can only come from ends_at.
+            "past ends_at",
+            json!({ "title": "x", "kind": "quiz", "weight": 1, "mode": "sync",
+                    "starts_at": now + 3_600_000, "ends_at": now - 3_600_000 }),
+        ),
     ] {
         let res = create_exam_with(&app, &teacher, &course, body).await;
         assert_eq!(res.status, StatusCode::BAD_REQUEST, "{label}: {}", res.body);
     }
+}
+
+/// Nothing can be scheduled to start (or end) in the past — on create and on
+/// any PATCH that sets a time. Values a PATCH merely keeps are exempt, so a
+/// running exam (its `starts_at` naturally behind the clock) stays editable.
+#[tokio::test]
+async fn schedule_times_cannot_be_backdated() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "past_t", "teacher").await;
+    let course = create_course(&app, &teacher, "history").await;
+    let now = Timestamp::now().as_millis();
+
+    // A running exam: started seconds ago (inside the clock-skew grace).
+    let exam = scheduled_exam(
+        &app,
+        &teacher,
+        &course,
+        json!({ "title": "running", "kind": "quiz", "weight": 1,
+                "mode": "sync", "starts_at": now - 1_000, "ends_at": now + 600_000 }),
+    )
+    .await;
+
+    // Setting either time to the past is rejected...
+    for body in [
+        json!({ "starts_at": now - 3_600_000 }),
+        json!({ "ends_at": now - 3_600_000 }),
+    ] {
+        let res = send(
+            &app,
+            "PATCH",
+            &format!("/exams/{exam}"),
+            Some(&teacher),
+            Some(body),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+    }
+
+    // ...while edits that only keep the stored (already past) start work:
+    // a rename, and a deadline extension.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/exams/{exam}"),
+        Some(&teacher),
+        Some(json!({ "title": "renamed" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/exams/{exam}"),
+        Some(&teacher),
+        Some(json!({ "ends_at": now + 1_200_000 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["ends_at"].as_i64(), Some(now + 1_200_000));
+
+    // The grace is real: times well inside it (30s < 60s) are accepted, on
+    // create and on PATCH alike.
+    let res = create_exam_with(
+        &app,
+        &teacher,
+        &course,
+        json!({ "title": "graced", "kind": "quiz", "weight": 1,
+                "mode": "sync", "starts_at": now - 30_000, "ends_at": now + 600_000 }),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let graced = id_of(&res.body);
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/exams/{graced}"),
+        Some(&teacher),
+        Some(json!({ "starts_at": now - 20_000 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
 }
 
 #[tokio::test]
@@ -3457,8 +3580,9 @@ async fn attempts_gate_on_schedule_enrollment_and_window() {
         &app,
         &teacher,
         &course,
+        // Inside the backdating grace, yet already closed by the clock.
         json!({ "title": "gone", "kind": "quiz", "weight": 1,
-                "mode": "sync", "starts_at": now - 120_000, "ends_at": now - 60_000 }),
+                "mode": "sync", "starts_at": now - 50_000, "ends_at": now - 10_000 }),
     )
     .await;
     let res = send(
@@ -5109,9 +5233,11 @@ async fn session_crud_follows_course_management() {
     let boss = login_as(&app, &db, "boss", "manager").await;
     let student = login(&app, "ali").await;
     let course = create_course(&app, &owner, "algebra").await;
+    let now = Timestamp::now().as_millis();
+    let start = now + 3_600_000;
 
     // Create: student 403, unrelated teacher 403, owner 201, manager+ 201.
-    let body = json!({ "topic": "limits", "starts_at": 1_700_000_000_000_i64 });
+    let body = json!({ "topic": "limits", "starts_at": start });
     let res = send(
         &app,
         "POST",
@@ -5143,7 +5269,7 @@ async fn session_crud_follows_course_management() {
     // The teacher defaults to the caller, rendered as a PersonRef.
     assert_eq!(res.body["teacher"]["username"], "owner");
     assert_eq!(res.body["topic"], "limits");
-    assert_eq!(res.body["starts_at"], 1_700_000_000_000_i64);
+    assert_eq!(res.body["starts_at"], start);
     assert!(res.body["ends_at"].is_null());
     let res = send(
         &app,
@@ -5165,7 +5291,7 @@ async fn session_crud_follows_course_management() {
         "POST",
         &format!("/courses/{course}/sessions"),
         Some(&owner),
-        Some(json!({ "starts_at": 1, "teacher_id": "01UNKNOWN" })),
+        Some(json!({ "starts_at": now + 60_000, "teacher_id": "01UNKNOWN" })),
     )
     .await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST, "unknown teacher");
@@ -5175,7 +5301,7 @@ async fn session_crud_follows_course_management() {
         "POST",
         &format!("/courses/{course}/sessions"),
         Some(&owner),
-        Some(json!({ "starts_at": 1, "teacher_id": ali_id })),
+        Some(json!({ "starts_at": now + 60_000, "teacher_id": ali_id })),
     )
     .await;
     assert_eq!(
@@ -5189,7 +5315,7 @@ async fn session_crud_follows_course_management() {
         "POST",
         &format!("/courses/{course}/sessions"),
         Some(&owner),
-        Some(json!({ "starts_at": 2, "teacher_id": rival_id })),
+        Some(json!({ "starts_at": now + 120_000, "teacher_id": rival_id })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED);
@@ -5202,10 +5328,31 @@ async fn session_crud_follows_course_management() {
         "POST",
         &format!("/courses/{course}/sessions"),
         Some(&owner),
-        Some(json!({ "starts_at": 10, "ends_at": 5 })),
+        Some(json!({ "starts_at": now + 10_000, "ends_at": now + 5_000 })),
     )
     .await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST);
+
+    // Past lessons cannot be scheduled — on create or by a later PATCH,
+    // whichever end carries the past value.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/courses/{course}/sessions"),
+        Some(&owner),
+        Some(json!({ "starts_at": now - 3_600_000 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/courses/{course}/sessions"),
+        Some(&owner),
+        Some(json!({ "starts_at": now + 3_600_000, "ends_at": now - 3_600_000 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "past ends_at");
 
     // Reads are open to any logged-in user; parents must exist.
     let res = send(
@@ -5218,9 +5365,9 @@ async fn session_crud_follows_course_management() {
     .await;
     assert_eq!(res.status, StatusCode::OK);
     // owner's, the manager's, and the one taught by `rival` — newest starts_at
-    // first, so the two 1.7e12 lessons precede the starts_at=2 one.
+    // first, so the two `start` lessons precede the earlier `rival` one.
     assert_eq!(res.body.as_array().unwrap().len(), 3);
-    assert_eq!(res.body[2]["starts_at"], 2);
+    assert_eq!(res.body[2]["starts_at"], now + 120_000);
     let res = send(&app, "GET", "/courses/nope/sessions", Some(&student), None).await;
     assert_eq!(res.status, StatusCode::NOT_FOUND);
     let res = send(
@@ -5250,16 +5397,13 @@ async fn session_crud_follows_course_management() {
         "PATCH",
         &format!("/sessions/{session}"),
         Some(&owner),
-        Some(json!({ "topic": "derivatives", "ends_at": 1_700_000_100_000_i64 })),
+        Some(json!({ "topic": "derivatives", "ends_at": start + 100_000 })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK);
     assert_eq!(res.body["topic"], "derivatives");
-    assert_eq!(res.body["ends_at"], 1_700_000_100_000_i64);
-    assert_eq!(
-        res.body["starts_at"], 1_700_000_000_000_i64,
-        "omitted keeps"
-    );
+    assert_eq!(res.body["ends_at"], start + 100_000);
+    assert_eq!(res.body["starts_at"], start, "omitted keeps");
     let res = send(
         &app,
         "PATCH",
@@ -5275,10 +5419,49 @@ async fn session_crud_follows_course_management() {
         "PATCH",
         &format!("/sessions/{session}"),
         Some(&owner),
-        Some(json!({ "ends_at": 999 })),
+        Some(json!({ "ends_at": now + 1_800_000 })),
     )
     .await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST, "ends before starts");
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/sessions/{session}"),
+        Some(&owner),
+        Some(json!({ "starts_at": now - 3_600_000 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "backdated start");
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/sessions/{session}"),
+        Some(&owner),
+        Some(json!({ "ends_at": now - 3_600_000 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "backdated end");
+    // A lesson already underway (start inside the grace) stays editable as
+    // long as the past time is only kept, not re-sent.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/courses/{course}/sessions"),
+        Some(&owner),
+        Some(json!({ "topic": "underway", "starts_at": now - 1_000 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let underway = id_of(&res.body);
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/sessions/{underway}"),
+        Some(&owner),
+        Some(json!({ "topic": "still editable" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     // Reassigning the teacher revalidates the target.
     let res = send(
         &app,
@@ -5340,7 +5523,9 @@ async fn roll_call_rbac_and_upsert() {
         "POST",
         &format!("/courses/{course}/sessions"),
         Some(&owner),
-        Some(json!({ "starts_at": 1, "teacher_id": hoca_id })),
+        Some(
+            json!({ "starts_at": Timestamp::now().as_millis() + 3_600_000, "teacher_id": hoca_id }),
+        ),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED);
@@ -5534,8 +5719,9 @@ async fn deleting_session_or_course_cascades_roll_call() {
 
     let course = create_course(&app, &owner, "algebra").await;
     enroll(&app, &owner, &course, &ali_id).await;
-    let s1 = create_session(&app, &owner, &course, 1).await;
-    let s2 = create_session(&app, &owner, &course, 2).await;
+    let now = Timestamp::now().as_millis();
+    let s1 = create_session(&app, &owner, &course, now + 3_600_000).await;
+    let s2 = create_session(&app, &owner, &course, now + 7_200_000).await;
     for s in [&s1, &s2] {
         let res = send(
             &app,
@@ -5801,7 +5987,13 @@ async fn attendance_report_tallies_events_and_sessions_per_course() {
     ] {
         enroll(&app, &owner, course, &ali_id).await;
         for (n, status) in statuses.iter().enumerate() {
-            let session = create_session(&app, &owner, course, n as i64 + 1).await;
+            let session = create_session(
+                &app,
+                &owner,
+                course,
+                Timestamp::now().as_millis() + (n as i64 + 1) * 3_600_000,
+            )
+            .await;
             let res = send(
                 &app,
                 "POST",
