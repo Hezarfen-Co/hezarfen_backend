@@ -133,6 +133,21 @@ impl Course {
         Ok(result.take::<Vec<Course>>(0)?)
     }
 
+    /// Load every course behind `ids` (one query) — the join half of the
+    /// attendance report's per-course blocks.
+    pub async fn list_by_ids(ids: &[CourseId], db: &Database) -> Result<Vec<Course>, AppError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let records: Vec<RecordId> = ids.iter().map(CourseId::record).collect();
+        let mut result = db
+            .query("SELECT * FROM course WHERE id IN $ids")
+            .bind(("ids", records))
+            .await?
+            .check()?;
+        Ok(result.take::<Vec<Course>>(0)?)
+    }
+
     pub async fn update(
         mut self,
         title: CourseTitle,
@@ -146,9 +161,9 @@ impl Course {
     }
 
     /// Delete the course and cascade-remove everything inside it: results and
-    /// attempts of its exams, its enrollments, and the exams themselves. The
-    /// children go in one transaction so a crash can't leave an exam pointing
-    /// at a deleted course.
+    /// attempts of its exams, its enrollments, its sessions with their roll
+    /// call, and the exams themselves. The children go in one transaction so a
+    /// crash can't leave an exam pointing at a deleted course.
     pub async fn delete(self, db: &Database) -> Result<Course, AppError> {
         db.query(
             "BEGIN TRANSACTION;
@@ -156,6 +171,8 @@ impl Course {
              DELETE exam_attempt WHERE exam IN (SELECT VALUE id FROM exam WHERE course = $course);
              DELETE exam_answer WHERE exam IN (SELECT VALUE id FROM exam WHERE course = $course);
              DELETE exam_question WHERE exam IN (SELECT VALUE id FROM exam WHERE course = $course);
+             DELETE session_attendance WHERE course = $course;
+             DELETE course_session WHERE course = $course;
              DELETE enrollment WHERE course = $course;
              DELETE exam WHERE course = $course;
              COMMIT TRANSACTION;",

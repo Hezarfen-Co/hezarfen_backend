@@ -20,6 +20,9 @@ pub const EXAM_QUESTION_TABLE: &str = "exam_question";
 pub const EXAM_ANSWER_TABLE: &str = "exam_answer";
 pub const COURSE_TABLE: &str = "course";
 pub const ENROLLMENT_TABLE: &str = "enrollment";
+pub const COURSE_SESSION_TABLE: &str = "course_session";
+pub const SESSION_ATTENDANCE_TABLE: &str = "session_attendance";
+pub const WORK_ENTRY_TABLE: &str = "work_entry";
 
 /// SCHEMAFULL schema: every column is typed, references use `record<..>`.
 /// Idempotent — safe to run on every boot.
@@ -62,6 +65,7 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS status ON attendance TYPE string;
     DEFINE FIELD IF NOT EXISTS marked_by ON attendance TYPE record<user>;
     DEFINE INDEX IF NOT EXISTS attendance_event_user ON attendance FIELDS event, user UNIQUE;
+    DEFINE INDEX IF NOT EXISTS attendance_user ON attendance FIELDS user;
 
     DEFINE TABLE IF NOT EXISTS course SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS creator ON course TYPE record<user>;
@@ -74,6 +78,31 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS enrolled_by ON enrollment TYPE record<user>;
     DEFINE INDEX IF NOT EXISTS enrollment_course_user ON enrollment FIELDS course, user UNIQUE;
     DEFINE INDEX IF NOT EXISTS enrollment_user ON enrollment FIELDS user;
+
+    DEFINE TABLE IF NOT EXISTS course_session SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS course ON course_session TYPE record<course>;
+    DEFINE FIELD IF NOT EXISTS teacher ON course_session TYPE record<user>;
+    DEFINE FIELD IF NOT EXISTS topic ON course_session TYPE string;
+    DEFINE FIELD IF NOT EXISTS starts_at ON course_session TYPE int;
+    DEFINE FIELD IF NOT EXISTS ends_at ON course_session TYPE option<int>;
+    DEFINE INDEX IF NOT EXISTS course_session_course ON course_session FIELDS course;
+
+    DEFINE TABLE IF NOT EXISTS session_attendance SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS session ON session_attendance TYPE record<course_session>;
+    DEFINE FIELD IF NOT EXISTS course ON session_attendance TYPE record<course>;
+    DEFINE FIELD IF NOT EXISTS user ON session_attendance TYPE record<user>;
+    DEFINE FIELD IF NOT EXISTS status ON session_attendance TYPE string;
+    DEFINE FIELD IF NOT EXISTS marked_by ON session_attendance TYPE record<user>;
+    DEFINE INDEX IF NOT EXISTS session_attendance_session_user ON session_attendance FIELDS session, user UNIQUE;
+    DEFINE INDEX IF NOT EXISTS session_attendance_session ON session_attendance FIELDS session;
+    DEFINE INDEX IF NOT EXISTS session_attendance_user ON session_attendance FIELDS user;
+    DEFINE INDEX IF NOT EXISTS session_attendance_course ON session_attendance FIELDS course;
+
+    DEFINE TABLE IF NOT EXISTS work_entry SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS user ON work_entry TYPE record<user>;
+    DEFINE FIELD IF NOT EXISTS check_in ON work_entry TYPE int;
+    DEFINE FIELD IF NOT EXISTS check_out ON work_entry TYPE option<int>;
+    DEFINE INDEX IF NOT EXISTS work_entry_user ON work_entry FIELDS user;
 
     DEFINE TABLE IF NOT EXISTS exam SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS creator ON exam TYPE record<user>;

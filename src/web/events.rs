@@ -16,7 +16,7 @@ use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
 
-use super::{CurrentUser, PersonRef, RequireTeacher, person_map, set_or_clear};
+use super::{CurrentUser, PersonRef, RequireTeacher, check_time_range, person_map, set_or_clear};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -90,22 +90,6 @@ impl EventResponse {
 /// already cleared the `teacher` bar via the `RequireTeacher` extractor.
 fn can_manage(event: &Event, user: &User) -> bool {
     event.is_creator(user.get_id()) || user.get_role().at_least(Role::Manager)
-}
-
-/// If both ends are present, `ends_at` must not precede `starts_at`.
-fn check_time_range(
-    starts_at: Option<Timestamp>,
-    ends_at: Option<Timestamp>,
-) -> Result<(), AppError> {
-    if let (Some(starts), Some(ends)) = (starts_at, ends_at)
-        && ends < starts
-    {
-        return Err(AppError::Validation(ValidationError::Invalid {
-            field: "ends_at",
-            reason: "must be at or after starts_at",
-        }));
-    }
-    Ok(())
 }
 
 #[derive(Serialize, ToSchema)]

@@ -115,6 +115,17 @@ impl Attendance {
         Ok(result.take::<Vec<Attendance>>(0)?)
     }
 
+    /// Every event-attendance row recorded for `user` — the events half of the
+    /// attendance report.
+    pub async fn list_for_user(user: &UserId, db: &Database) -> Result<Vec<Attendance>, AppError> {
+        let mut result = db
+            .query("SELECT * FROM attendance WHERE user = $usr ORDER BY id DESC")
+            .bind(("usr", user.record()))
+            .await?
+            .check()?;
+        Ok(result.take::<Vec<Attendance>>(0)?)
+    }
+
     pub async fn remove(
         event: &EventId,
         user: &UserId,

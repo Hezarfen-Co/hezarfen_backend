@@ -4,6 +4,7 @@
 
 pub mod attendance;
 pub mod course;
+pub mod course_session;
 pub mod enrollment;
 pub mod event;
 pub mod exam;
@@ -15,5 +16,7 @@ pub mod note;
 pub mod profile;
 pub mod role;
 pub mod session;
+pub mod session_attendance;
 pub mod timestamp;
 pub mod user;
+pub mod work_entry;

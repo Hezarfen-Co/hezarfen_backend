@@ -74,6 +74,26 @@ where
     }
 }
 
+/// Like [`CurrentUser`], but also requires at least the `manager` role.
+/// Authenticated-but-under-privileged callers get `403`.
+pub struct RequireManager(pub User);
+
+impl<S> FromRequestParts<S> for RequireManager
+where
+    S: Send + Sync,
+    AppState: FromRef<S>,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let user = authed_user(parts, state).await?;
+        if !user.get_role().at_least(Role::Manager) {
+            return Err(AppError::Forbidden("requires manager role or higher"));
+        }
+        Ok(RequireManager(user))
+    }
+}
+
 /// Like [`CurrentUser`], but also requires the `admin` role. Anyone below admin
 /// gets `403`.
 pub struct RequireAdmin(pub User);

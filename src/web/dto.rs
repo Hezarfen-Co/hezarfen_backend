@@ -7,6 +7,7 @@ use utoipa::ToSchema;
 
 use crate::database::Database;
 use crate::domain::course::Course;
+use crate::domain::course_session::CourseSession;
 use crate::domain::exam::Exam;
 use crate::domain::role::Role as DomainRole;
 use crate::domain::user::{User, UserId};
@@ -158,6 +159,35 @@ impl CourseResponse {
             creator: course.get_creator().key().to_string(),
             title: course.get_title().as_str().to_string(),
             description: course.get_description().as_str().to_string(),
+        }
+    }
+}
+
+/// Public shape of a course session (one lesson). Shared by `courses`
+/// (in-course creation and listing) and `sessions` (CRUD + roll call).
+#[derive(Serialize, ToSchema)]
+pub struct SessionResponse {
+    pub id: String,
+    /// The course this lesson belongs to.
+    pub course: String,
+    /// Who teaches this session.
+    pub teacher: PersonRef,
+    pub topic: String,
+    /// Lesson start, UTC unix-milliseconds.
+    pub starts_at: i64,
+    /// Lesson end, UTC unix-milliseconds; `null` when open-ended.
+    pub ends_at: Option<i64>,
+}
+
+impl SessionResponse {
+    pub fn new(session: &CourseSession, people: &HashMap<String, PersonRef>) -> Self {
+        Self {
+            id: session.get_id().key().to_string(),
+            course: session.get_course().key().to_string(),
+            teacher: PersonRef::resolve(people, session.get_teacher()),
+            topic: session.get_topic().as_str().to_string(),
+            starts_at: session.get_starts_at().as_millis(),
+            ends_at: session.get_ends_at().map(|t| t.as_millis()),
         }
     }
 }

@@ -9,6 +9,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::domain::course::{Course, CourseDescription, CourseId, CourseTitle};
+use crate::domain::course_session::{CourseSession, SessionTopic};
 use crate::domain::enrollment::Enrollment;
 use crate::domain::exam::{
     Exam, ExamDescription, ExamDuration, ExamKind, ExamMode, ExamSchedule, ExamTitle, ExamWeight,
@@ -19,7 +20,11 @@ use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
 
-use super::{CourseResponse, CurrentUser, ExamResponse, PersonRef, RequireTeacher, person_map};
+use super::sessions::resolve_session_teacher;
+use super::{
+    CourseResponse, CurrentUser, ExamResponse, PersonRef, RequireTeacher, SessionResponse,
+    check_time_range, person_map,
+};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -29,6 +34,7 @@ pub fn routes() -> OpenApiRouter<AppState> {
         .routes(routes!(enroll, list_roster))
         .routes(routes!(unenroll))
         .routes(routes!(create_exam_in_course, list_course_exams))
+        .routes(routes!(create_session_in_course, list_course_sessions))
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -484,4 +490,108 @@ async fn list_course_exams(
         .ok_or(AppError::NotFound)?;
     let exams = Exam::list_for_course(&course_id, &st.db).await?;
     Ok(Json(exams.iter().map(ExamResponse::new).collect()))
+}
+
+// ---- sessions in a course --------------------------------------------------
+
+#[derive(Deserialize, ToSchema)]
+struct CreateSessionInCourse {
+    /// What the lesson covers. Optional.
+    #[schema(example = "Limits and continuity")]
+    topic: Option<String>,
+    /// Who teaches the session. Defaults to the caller; must hold the
+    /// `teacher` role or higher.
+    teacher_id: Option<String>,
+    /// Lesson start, UTC unix-milliseconds.
+    #[schema(example = 1_752_275_000_000_i64)]
+    starts_at: i64,
+    /// Lesson end, UTC unix-milliseconds. Optional (open-ended).
+    ends_at: Option<i64>,
+}
+
+/// Create a lesson session inside a course. Requires teacher+ and course
+/// management rights. The session's teacher defaults to the caller.
+#[utoipa::path(
+    post,
+    path = "/{id}/sessions",
+    tag = "courses",
+    security(("session_cookie" = [])),
+    params(("id" = String, Path, description = "Course id")),
+    request_body = CreateSessionInCourse,
+    responses(
+        (status = 201, description = "Session created", body = SessionResponse),
+        (status = 400, description = "Invalid fields, time range, or teacher", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 404, description = "Course not found", body = ErrorResponse),
+    ),
+)]
+async fn create_session_in_course(
+    State(st): State<AppState>,
+    RequireTeacher(user): RequireTeacher,
+    Path(id): Path<String>,
+    Json(req): Json<CreateSessionInCourse>,
+) -> Result<(StatusCode, Json<SessionResponse>), AppError> {
+    let course = Course::read(&CourseId::from_key(&id), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if !can_manage_course(&course, &user) {
+        return Err(AppError::Forbidden(
+            "only the course creator or a manager/admin can add sessions to this course",
+        ));
+    }
+
+    let topic = SessionTopic::try_new(&req.topic.unwrap_or_default())?;
+    let teacher = resolve_session_teacher(req.teacher_id.as_deref(), &user, &st.db).await?;
+    let starts_at = Timestamp::from_millis(req.starts_at);
+    let ends_at = req.ends_at.map(Timestamp::from_millis);
+    check_time_range(Some(starts_at), ends_at)?;
+
+    let session = CourseSession::create(
+        course.get_id(),
+        teacher.get_id(),
+        topic,
+        starts_at,
+        ends_at,
+        &st.db,
+    )
+    .await?;
+    let people = PersonRef::map_of(&[&teacher]);
+    Ok((
+        StatusCode::CREATED,
+        Json(SessionResponse::new(&session, &people)),
+    ))
+}
+
+/// List a course's lesson sessions, most recent first.
+#[utoipa::path(
+    get,
+    path = "/{id}/sessions",
+    tag = "courses",
+    security(("session_cookie" = [])),
+    params(("id" = String, Path, description = "Course id")),
+    responses(
+        (status = 200, description = "The course's sessions", body = [SessionResponse]),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 404, description = "Course not found", body = ErrorResponse),
+    ),
+)]
+async fn list_course_sessions(
+    State(st): State<AppState>,
+    _user: CurrentUser,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<SessionResponse>>, AppError> {
+    let course_id = CourseId::from_key(&id);
+    // Course must exist — a missing course is a 404, not an empty list.
+    Course::read(&course_id, &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let sessions = CourseSession::list_for_course(&course_id, &st.db).await?;
+    let people = person_map(sessions.iter().map(|s| s.get_teacher().clone()), &st.db).await?;
+    Ok(Json(
+        sessions
+            .iter()
+            .map(|s| SessionResponse::new(s, &people))
+            .collect(),
+    ))
 }

@@ -41,7 +41,10 @@ use crate::state::AppState;
         (name = "users", description = "User info: self-service profile, plus listing, lookup, and role/profile administration (admin only)"),
         (name = "notes", description = "Per-user notes CRUD"),
         (name = "events", description = "Events and attendance"),
-        (name = "courses", description = "Courses, enrollment, and course exams"),
+        (name = "courses", description = "Courses, enrollment, course exams, and course sessions"),
+        (name = "sessions", description = "Lesson sessions and their roll call (session teacher or course manager marks enrolled students; manager+ marks the teacher)"),
+        (name = "work", description = "Staff work log: check-in/check-out stamped by the server clock, manager corrections"),
+        (name = "attendance", description = "Attendance summary reports: event tallies + per-course lesson roll call with rates"),
         (name = "exams", description = "Exams (per course, weighted): results, sync/async scheduling, attempts, questions/answers, and live monitoring. Not in this spec (WebSocket): the student exam room at `GET /exams/{id}/attempt/ws` — JSON frames, see the README's \"Taking an exam\" section for the protocol"),
         (name = "marks", description = "Weighted mark reports per course and overall"),
     ),
@@ -77,8 +80,11 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/notes", web::notes::routes())
         .nest("/events", web::events::routes())
         .nest("/courses", web::courses::routes())
+        .nest("/sessions", web::sessions::routes())
         .nest("/exams", web::exams::routes())
         .nest("/marks", web::marks::routes())
+        .nest("/work", web::work::routes())
+        .nest("/attendance", web::attendance::routes())
         .split_for_parts();
 
     // Catch-all per-IP limit over every route (Swagger included). Kept inside
