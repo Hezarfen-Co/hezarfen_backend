@@ -187,6 +187,36 @@ async fn full_user_journey() {
     assert_eq!(found[0]["username"], "veli");
     assert!(found[0].get("email").is_none());
 
+    // Role filter narrows: veli is a student, so she matches `role=student`
+    // but vanishes under `role=teacher`. An unknown role is a 400.
+    let found: Value = ali
+        .get(format!("{base}/users/search?q=vel&role=student"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(found.as_array().unwrap().len(), 1);
+    assert_eq!(found[0]["username"], "veli");
+
+    let found: Value = ali
+        .get(format!("{base}/users/search?q=vel&role=teacher"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(found.as_array().unwrap().is_empty());
+
+    let res = ali
+        .get(format!("{base}/users/search?q=vel&role=wizard"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
     let res = veli
         .get(format!("{base}/users/search?q=ali"))
         .send()
