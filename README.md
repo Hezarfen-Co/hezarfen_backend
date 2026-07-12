@@ -7,7 +7,11 @@ Session-cookie auth with four hierarchical roles (`student < teacher < manager
 then mark users present / absent / late / excused. Marks are course-shaped
 (Google Classroom style): a teacher creates a course, enrolls students, adds
 weighted exams inside it, and grades; students read a per-course weighted
-average and an overall average from their mark report.
+average and an overall average from their mark report. Exams can be scheduled
+**sync** (one fixed window) or **async** (start anytime inside the window, with
+a personal time budget); students *sit* them via attempts, and teachers watch
+attendance, per-student remaining time, submissions, and marks land live on a
+monitor endpoint (snapshot or SSE stream).
 
 Every field is a validated newtype (`Username(String)`, `NoteTitle(String)`, …)
 constructed only after its restrictions pass — invalid input can't be
@@ -134,6 +138,11 @@ effect on the user's very next call (no re-login).
 | Create events; remove attendance rows    | teacher      |                                               |
 | Edit / delete an event                   | teacher      | Only the **creator**, or a `manager`+ for any event |
 | View courses/exams; read **own** result, courses, mark report | student |                            |
+| Sit a scheduled exam: start / read / submit **own** attempt | student | Must be enrolled; window enforced by the server clock |
+| Answer questions inside **own** attempt (REST autosave or the exam-room WebSocket) | student | Attempt must be `in_progress`; deadline judged by the server clock |
+| Author an exam's questions (add/edit/delete)  | teacher | Course-management rights; frozen once anyone has an attempt |
+| Read a question list (with `correct`) or a student's answer sheet | teacher | Staff-wide read, like result lists |
+| Watch an exam's live monitor (snapshot or SSE stream) | teacher | Staff-wide read, like result lists |
 | Create courses                           | teacher      | The creator manages the course                 |
 | Manage inside a course: edit/delete it, enroll/unenroll, add/edit/delete its exams, grade, remove results | teacher | Only the **course creator**, or a `manager`+ for any course |
 | View rosters, full result lists, exam statistics, any user's mark report | teacher | Staff-wide reads |
@@ -214,17 +223,30 @@ logged-in user.
 | POST   | `/courses/{id}/enrollments`      | teacher | `{user_id}` — enroll a user (idempotent upsert; course manager) |
 | GET    | `/courses/{id}/enrollments`      | teacher | List the course roster          |
 | DELETE | `/courses/{id}/enrollments/{user}` | teacher | Unenroll (keeps recorded results; course manager) |
-| POST   | `/courses/{id}/exams`            | teacher | `{title, description?, kind, weight}` — add an exam (course manager) |
+| POST   | `/courses/{id}/exams`            | teacher | `{title, description?, kind, weight, mode?, starts_at?, ends_at?, duration_ms?}` — add an exam (course manager) |
 | GET    | `/courses/{id}/exams`            | student | List the course's exams         |
 | GET    | `/exams`                         | student | List all exams                  |
 | GET    | `/exams/{id}`                    | student | Get exam                        |
-| PATCH  | `/exams/{id}`                    | teacher | Edit exam incl. `weight` (course manager; `course` immutable) |
-| DELETE | `/exams/{id}`                    | teacher | Delete exam + its results (course manager) |
+| PATCH  | `/exams/{id}`                    | teacher | Edit exam incl. `weight` and schedule (course manager; `course` immutable, `mode` frozen once attempted) |
+| DELETE | `/exams/{id}`                    | teacher | Delete exam + its results, attempts, questions, and answers (course manager) |
 | POST   | `/exams/{id}/results`            | teacher | `{mark, user_id}` — grade an **enrolled** student (upsert; course manager) |
 | GET    | `/exams/{id}/results`            | teacher | List every result for the exam  |
 | GET    | `/exams/{id}/result`             | student | The caller's **own** result (`404` until graded) |
 | DELETE | `/exams/{id}/results/{user}`     | teacher | Remove a student's result (course manager) |
 | GET    | `/exams/{id}/statistics`         | teacher | `{graded, average, min, max}` over the exam's results |
+| POST   | `/exams/{id}/attempt`            | student | Start (`201`) or resume (`200`) the caller's attempt — enrolled, window open |
+| GET    | `/exams/{id}/attempt`            | student | Own attempt: status, deadline, `remaining_ms`, mark, progress (`answered`/`question_count`), server `now` |
+| POST   | `/exams/{id}/attempt/finish`     | student | Submit the attempt (`409` once the deadline passed)   |
+| POST   | `/exams/{id}/questions`          | teacher | `{text, kind, points, choices?, correct?}` — add a question (course manager; frozen once attempted) |
+| GET    | `/exams/{id}/questions`          | teacher | The full question list, `correct` included            |
+| PATCH  | `/exams/{id}/questions/{qid}`    | teacher | Edit a question — the kind bundle revalidates as a unit (course manager; frozen once attempted) |
+| DELETE | `/exams/{id}/questions/{qid}`    | teacher | Delete a question + its answers (course manager; frozen once attempted) |
+| GET    | `/exams/{id}/attempt/questions`  | student | The sitting view: no `correct`, own answers embedded (requires an attempt) |
+| POST   | `/exams/{id}/attempt/answers`    | student | `{question_id, selected? \| text?}` — autosave one answer while `in_progress` |
+| GET    | `/exams/{id}/attempts/{user}/answers` | teacher | A student's answer sheet: `is_correct` flags + suggested `auto_score` |
+| GET    | `/exams/{id}/attempt/ws`         | student | **WebSocket** exam room: state ticks, autosave, finish (see "Taking an exam") |
+| GET    | `/exams/{id}/live`               | teacher | Live monitor snapshot: roster × attempts × marks + per-student progress + counts |
+| GET    | `/exams/{id}/live/stream`        | teacher | The same snapshot as SSE `snapshot` events every ~2s  |
 | GET    | `/marks/me`                      | student | The caller's mark report (per-course + overall averages) |
 | GET    | `/marks/{user}`                  | teacher | Any user's mark report          |
 
@@ -257,12 +279,146 @@ is independent: omitted (or `null`) keeps the current value, an empty string
 separators, `birth_date` is a real `YYYY-MM-DD` calendar date not in the
 future. Names allow unicode; usernames stay ASCII.
 
+## Sync/async exams, attempts & live monitoring
+
+An exam is **unscheduled** by default (all schedule fields `null`) — graded
+offline, exactly as before; attempts on it are a `409`. Scheduling means
+setting, as one consistent unit (validated together on create and after every
+`PATCH` merge):
+
+- `mode: "sync"` + `starts_at` + `ends_at` — everyone sits inside one window;
+  every attempt's deadline is `ends_at`.
+- `mode: "async"` + `starts_at` + `ends_at` + `duration_ms` — each student
+  starts anywhere inside the window and gets
+  `min(started_at + duration_ms, ends_at)` as their personal deadline.
+  `duration_ms` is 1 minute to 24 hours.
+- `ends_at` must be strictly after `starts_at`. All instants are the usual UTC
+  unix-milliseconds, judged only by the server clock (`GET /time` for sync).
+
+A student **sits** a scheduled exam through their attempt (one per exam+user,
+by construction — the row id is the composite key):
+
+- `POST /exams/{id}/attempt` starts it (enrolled + window open). Re-posting
+  returns the existing attempt unchanged (`200`, not `201`): reconnecting
+  never resets the clock. Starting is the live-attendance signal.
+- `GET /exams/{id}/attempt` is the student's exam screen: `status`
+  (`in_progress` | `submitted` | `expired`), `deadline`, `remaining_ms`, own
+  `mark` once graded, and the server `now`.
+- `POST /exams/{id}/attempt/finish` submits. After the deadline the attempt is
+  `expired` — a valid terminal state (the student used their full time), and
+  finishing answers `409`.
+
+Deadlines are **recomputed from the exam's current schedule on every read**,
+never stored: a teacher who `PATCH`es `ends_at` (or an async `duration_ms`)
+while the exam runs moves every running deadline instantly. What's frozen once
+anyone has started is only `mode` (including unscheduling) — swapping the
+deadline rules mid-sitting would be a different exam (`409`).
+
+Teachers watch it all live: `GET /exams/{id}/live` returns one snapshot —
+the enrolled roster joined with attempts and marks (`not_started` |
+`in_progress` | `submitted` | `expired`, per-student `deadline` /
+`remaining_ms` / `mark`) plus summary counts, all judged at a single `now`.
+`GET /exams/{id}/live/stream` is the same JSON as Server-Sent Events: a
+`snapshot` event immediately on connect, then every ~2 s — attendance, ticking
+clocks, submissions, and marks land without polling:
+
+```js
+const es = new EventSource(`${BASE}/exams/${id}/live/stream`, { withCredentials: true });
+es.addEventListener("snapshot", (e) => render(JSON.parse(e.data)));
+```
+
+Deleting an exam (or its course) cascades attempts, questions, and answers
+along with results; unenrolling mid-exam hides the student from the monitor
+roster but keeps the attempt and mark rows, mirroring the marks report.
+
 > **Upgrading a pre-course database**: `exam` rows created before courses
 > existed lack the now-required `course` and `weight` fields and will fail to
 > deserialize. For a dev database, delete `./data/hezarfen.db` and reboot; to
 > keep data, backfill manually with the SurrealDB CLI (server stopped), e.g.
 > `UPDATE exam SET course = course:<id>, weight = 1 WHERE course = NONE;`
 > after creating a course to attach them to.
+
+## Taking an exam: questions, answers & the exam room
+
+Teachers author a question list per exam; students answer inside their
+attempt, autosaved as they go; choice questions are machine-checked as a
+**suggestion** — the final mark stays a human call through the existing
+`POST /exams/{id}/results`.
+
+**Questions** (`POST/GET/PATCH/DELETE /exams/{id}/questions[/{qid}]`,
+course-management rights): each has `text` (≤ 2000 chars), `points` `1`–`100`
+(its share of the auto-score), and a `kind`:
+
+- `kind: "choice"` — carries `choices` (2–10 options, each ≤ 500 chars) and
+  `correct`, the zero-based index of the right option. Auto-scorable.
+- `kind: "text"` — free text, judged by the grader; carries neither.
+
+The kind bundle is validated as a unit (create and after every `PATCH` merge):
+switching a question to `text` needs explicit `"choices": null, "correct":
+null`, switching to `choice` must bring both along. Presentation order is
+creation order. The whole list **freezes once anyone has started an attempt**
+(`409` on create/edit/delete) — editing questions under a sitting student
+would fork what "the exam" means. Deleting a question cascades its answers.
+
+**Answering** (student, attempt `in_progress`, deadline judged by the server
+clock on every save):
+
+- `GET /exams/{id}/attempt/questions` — the sitting view. Requires an attempt
+  (`404` before `POST /exams/{id}/attempt`; also the anti-peek gate), never
+  contains `correct`, and embeds the caller's own saved answer per question
+  (`{selected, text, updated_at}` or `null`). Still readable after
+  submitting/expiry, for review.
+- `POST /exams/{id}/attempt/answers` `{question_id, selected? | text?}` — an
+  upsert: one row per question+user, re-answering overwrites. The payload must
+  match the question's kind (`selected` indexing a choice, or `text`
+  ≤ 10 000 chars — empty clears the draft); mismatches are `400`s. Once the
+  attempt is submitted or past its deadline every save is a `409`; answers
+  saved in time survive untouched for grading.
+
+**Grading view** (teacher+): `GET /exams/{id}/attempts/{user}/answers` returns
+the student's sheet — every saved answer with `is_correct` (`true`/`false` for
+choice, `null` for text: that's the grader's call) plus
+`auto_score: {earned, possible}` summing the choice questions' points. It is a
+suggestion to read while grading, never written anywhere.
+
+**The exam room (WebSocket)** — `GET /exams/{id}/attempt/ws`, cookie-authed
+like everything else; REST above remains the full fallback. Gates run before
+the upgrade: unknown exam `404`, unscheduled `409`, not enrolled `403`, no
+attempt yet `404` (start it first), submitted/expired `409`. Then JSON text
+frames:
+
+| direction | frame |
+|-----------|-------|
+| server →  | `{"type":"state", status, deadline, remaining_ms, now, answered, question_count}` on connect, every ~2 s, and after each save |
+| client →  | `{"type":"answer", "question_id":"…", "selected":1}` or `{"type":"answer", "question_id":"…", "text":"…"}` |
+| server →  | `{"type":"saved", question_id, updated_at}` — the autosave ack |
+| client →  | `{"type":"finish"}` — submit the attempt |
+| server →  | `{"type":"finished", finished_at}`, then Close |
+| server →  | `{"type":"expired"}`, then Close — a tick noticed the deadline |
+| client →  | `{"type":"ping"}` → server `{"type":"pong"}` |
+| server →  | `{"type":"error", message}` — bad JSON, wrong kind, deadline, … |
+
+Every tick and every save re-read the exam, so a mid-exam `ends_at` extension
+moves the room's countdown on the next tick, and no stale socket can write
+past its real deadline — the socket shares the exact REST write path.
+Example client:
+
+```js
+const ws = new WebSocket(`${BASE.replace("http", "ws")}/exams/${id}/attempt/ws`);
+ws.onmessage = (e) => {
+  const m = JSON.parse(e.data);
+  if (m.type === "state") renderCountdown(m.remaining_ms, m.answered, m.question_count);
+  if (m.type === "saved") markSaved(m.question_id);
+};
+const save = (question_id, selected) =>
+  ws.send(JSON.stringify({ type: "answer", question_id, selected }));
+```
+
+The live monitor rides along: each roster row now carries `answered` and
+`last_activity` (latest save instant), and the snapshot a top-level
+`question_count`, so "stuck at 3/10 for five minutes" is visible at a glance.
+The student's own `GET /exams/{id}/attempt` echoes the same
+`answered`/`question_count` pair.
 
 ## Quick tour (curl)
 
@@ -328,12 +484,19 @@ src/
     attendance.rs  AttendanceId · AttendanceStatus · Attendance
     course.rs      CourseId · CourseTitle · CourseDescription · Course
     enrollment.rs  EnrollmentId · Enrollment (one row per course+user)
-    exam.rs        ExamId · ExamTitle · ExamDescription · ExamKind · ExamWeight · Exam (belongs to a course)
+    exam.rs        ExamId · ExamTitle · ExamDescription · ExamKind · ExamWeight ·
+                   ExamMode · ExamDuration · ExamSchedule · Exam (belongs to a course)
+    exam_attempt.rs ExamAttemptId · AttemptStatus · ExamAttempt (one sitting per exam+user)
+    exam_question.rs ExamQuestionId · QuestionText · QuestionKind · QuestionPoints ·
+                   ChoiceText · QuestionSpec · ExamQuestion (choice|text, per exam)
+    exam_answer.rs ExamAnswerId · AnswerText · ExamAnswer (one row per question+user) ·
+                   auto_score (choice-question suggestion)
     exam_result.rs ExamResultId · Mark · ExamResult (one row per exam+user)
   web/             axum layer: DTOs (serde + OpenAPI schemas) + handlers +
                    auth extractors
     extractor.rs   CurrentUser · RequireTeacher · RequireAdmin
     dto.rs         shared UserResponse · CourseResponse · ExamResponse schemas
+    exam_ws.rs     the student exam-room WebSocket (state ticks, autosave, finish)
     auth.rs  users.rs  notes.rs  events.rs  courses.rs  exams.rs  marks.rs
 ```
 
