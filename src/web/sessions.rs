@@ -20,7 +20,7 @@ use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
 
-use super::courses::can_manage_course;
+use super::courses::{can_manage_course, can_view_course};
 use super::{
     CurrentUser, PersonRef, RequireTeacher, SessionResponse, check_not_past, check_time_range,
     person_map, set_or_clear,
@@ -131,7 +131,8 @@ fn can_roll_call(session: &CourseSession, course: &Course, user: &User) -> bool 
 
 // ---- sessions -------------------------------------------------------------
 
-/// Fetch a single session by id.
+/// Fetch a single session by id. Visible to its course's enrolled users, the
+/// session's teacher, the course creator, and managers/admins.
 #[utoipa::path(
     get,
     path = "/{id}",
@@ -141,17 +142,21 @@ fn can_roll_call(session: &CourseSession, course: &Course, user: &User) -> bool 
     responses(
         (status = 200, description = "The session", body = SessionResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not enrolled, not the session teacher, and without course rights", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
     ),
 )]
 async fn get_session(
     State(st): State<AppState>,
-    _user: CurrentUser,
+    CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<SessionResponse>, AppError> {
-    let session = CourseSession::read(&CourseSessionId::from_key(&id), &st.db)
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let (session, course) = session_with_course(&id, &st.db).await?;
+    if !session.is_teacher(user.get_id()) && !can_view_course(&course, &user, &st.db).await? {
+        return Err(AppError::Forbidden(
+            "only enrolled users, the session teacher, the course creator, or a manager/admin can view this session",
+        ));
+    }
     let people = person_map([session.get_teacher().clone()], &st.db).await?;
     Ok(Json(SessionResponse::new(&session, &people)))
 }
@@ -325,7 +330,9 @@ async fn mark_roll_call(
     Ok(Json(SessionAttendanceResponse::new(&attendance, &people)))
 }
 
-/// List a session's roll call.
+/// List a session's roll call. Same rights as taking it: the session's
+/// teacher or a course manager — students see their own tallies via
+/// `GET /attendance/me`.
 #[utoipa::path(
     get,
     path = "/{id}/attendance",
@@ -335,17 +342,21 @@ async fn mark_roll_call(
     responses(
         (status = 200, description = "Roll-call roster", body = [SessionAttendanceResponse]),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not the session teacher or a course manager", body = ErrorResponse),
         (status = 404, description = "Session not found", body = ErrorResponse),
     ),
 )]
 async fn list_roll_call(
     State(st): State<AppState>,
-    _user: CurrentUser,
+    RequireTeacher(user): RequireTeacher,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<SessionAttendanceResponse>>, AppError> {
-    let session = CourseSession::read(&CourseSessionId::from_key(&id), &st.db)
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let (session, course) = session_with_course(&id, &st.db).await?;
+    if !can_roll_call(&session, &course, &user) {
+        return Err(AppError::Forbidden(
+            "only the session's teacher or a course manager can list the roll call",
+        ));
+    }
     let roster = SessionAttendance::list_for_session(session.get_id(), &st.db).await?;
     let people = person_map(
         roster

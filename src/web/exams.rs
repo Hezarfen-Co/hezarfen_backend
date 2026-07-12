@@ -26,12 +26,13 @@ use crate::domain::exam_question::{
     ExamQuestion, ExamQuestionId, QuestionKind, QuestionPoints, QuestionSpec, QuestionText,
 };
 use crate::domain::exam_result::{ExamResult, Mark};
+use crate::domain::role::Role;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
 
-use super::courses::can_manage_course;
+use super::courses::{can_manage_course, can_view_course, visible_courses};
 use super::{
     CurrentUser, ExamResponse, PersonRef, RequireTeacher, check_not_past, person_map, set_or_clear,
 };
@@ -146,26 +147,34 @@ async fn course_of(exam: &Exam, db: &Database) -> Result<Course, AppError> {
 // ---- exams --------------------------------------------------------------
 // Exams are created inside a course: `POST /courses/{id}/exams`.
 
-/// List all exams.
+/// List the exams visible to the caller: every exam for manager+, otherwise
+/// the exams of the courses they created or are enrolled in.
 #[utoipa::path(
     get,
     path = "/",
     tag = "exams",
     security(("session_cookie" = [])),
     responses(
-        (status = 200, description = "All exams", body = [ExamResponse]),
+        (status = 200, description = "The caller's visible exams", body = [ExamResponse]),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
     ),
 )]
 async fn list_exams(
     State(st): State<AppState>,
-    _user: CurrentUser,
+    CurrentUser(user): CurrentUser,
 ) -> Result<Json<Vec<ExamResponse>>, AppError> {
-    let exams = Exam::list_all(&st.db).await?;
+    let exams = if user.get_role().at_least(Role::Manager) {
+        Exam::list_all(&st.db).await?
+    } else {
+        let courses = visible_courses(&user, &st.db).await?;
+        let ids: Vec<_> = courses.iter().map(|c| c.get_id().clone()).collect();
+        Exam::list_for_courses(&ids, &st.db).await?
+    };
     Ok(Json(exams.iter().map(ExamResponse::new).collect()))
 }
 
-/// Fetch a single exam by id.
+/// Fetch a single exam by id. Visible to its course's enrolled users, the
+/// course creator, and managers/admins.
 #[utoipa::path(
     get,
     path = "/{id}",
@@ -175,17 +184,24 @@ async fn list_exams(
     responses(
         (status = 200, description = "The exam", body = ExamResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not enrolled in the exam's course, not its creator, and not a manager/admin", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
     ),
 )]
 async fn get_exam(
     State(st): State<AppState>,
-    _user: CurrentUser,
+    CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<ExamResponse>, AppError> {
     let exam = Exam::read(&ExamId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
+    let course = course_of(&exam, &st.db).await?;
+    if !can_view_course(&course, &user, &st.db).await? {
+        return Err(AppError::Forbidden(
+            "only enrolled users, the course creator, or a manager/admin can view this exam",
+        ));
+    }
     Ok(Json(ExamResponse::new(&exam)))
 }
 
@@ -397,8 +413,9 @@ async fn grade(
     Ok(Json(ExamResultResponse::new(&result, &people)))
 }
 
-/// List every result for an exam. Requires teacher+ — students read only their
-/// own via `GET /exams/{id}/result`.
+/// List every result for an exam. Requires teacher+ and management rights
+/// over the exam's course — students read only their own via
+/// `GET /exams/{id}/result`.
 #[utoipa::path(
     get,
     path = "/{id}/results",
@@ -408,21 +425,26 @@ async fn grade(
     responses(
         (status = 200, description = "All results", body = [ExamResultResponse]),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
+        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
     ),
 )]
 async fn list_results(
     State(st): State<AppState>,
-    _teacher: RequireTeacher,
+    RequireTeacher(user): RequireTeacher,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<ExamResultResponse>>, AppError> {
-    let exam_id = ExamId::from_key(&id);
     // Exam must exist — a missing exam is a 404, not an empty result list.
-    Exam::read(&exam_id, &st.db)
+    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    let results = ExamResult::list_for_exam(&exam_id, &st.db).await?;
+    let course = course_of(&exam, &st.db).await?;
+    if !can_manage_course(&course, &user) {
+        return Err(AppError::Forbidden(
+            "only the course creator or a manager/admin can list results",
+        ));
+    }
+    let results = ExamResult::list_for_exam(exam.get_id(), &st.db).await?;
     let people = person_map(
         results
             .iter()
@@ -507,7 +529,8 @@ async fn remove_result(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Summary statistics for an exam's graded results. Requires teacher+.
+/// Summary statistics for an exam's graded results. Requires teacher+ and
+/// management rights over the exam's course.
 #[utoipa::path(
     get,
     path = "/{id}/statistics",
@@ -517,27 +540,32 @@ async fn remove_result(
     responses(
         (status = 200, description = "The exam's mark statistics", body = ExamStatisticsResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
+        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
     ),
 )]
 async fn exam_statistics(
     State(st): State<AppState>,
-    _teacher: RequireTeacher,
+    RequireTeacher(user): RequireTeacher,
     Path(id): Path<String>,
 ) -> Result<Json<ExamStatisticsResponse>, AppError> {
-    let exam_id = ExamId::from_key(&id);
     // Exam must exist — a missing exam is a 404, not an empty statistic.
-    Exam::read(&exam_id, &st.db)
+    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    let results = ExamResult::list_for_exam(&exam_id, &st.db).await?;
+    let course = course_of(&exam, &st.db).await?;
+    if !can_manage_course(&course, &user) {
+        return Err(AppError::Forbidden(
+            "only the course creator or a manager/admin can view statistics",
+        ));
+    }
+    let results = ExamResult::list_for_exam(exam.get_id(), &st.db).await?;
 
     let marks: Vec<i64> = results.iter().map(|r| r.get_mark().as_i64()).collect();
     let average =
         (!marks.is_empty()).then(|| marks.iter().sum::<i64>() as f64 / marks.len() as f64);
     Ok(Json(ExamStatisticsResponse {
-        exam: exam_id.key().to_string(),
+        exam: exam.get_id().key().to_string(),
         graded: marks.len() as u64,
         average,
         min: marks.iter().min().copied(),
@@ -929,8 +957,9 @@ async fn live_snapshot(exam: &Exam, db: &Database) -> Result<ExamLiveResponse, A
 }
 
 /// A one-shot live snapshot of the exam: who's in, who's still writing, time
-/// each student has left, and marks as they land. Requires teacher+. For a
-/// self-updating feed of the same shape, see `GET /exams/{id}/live/stream`.
+/// each student has left, and marks as they land. Requires teacher+ and
+/// management rights over the exam's course. For a self-updating feed of the
+/// same shape, see `GET /exams/{id}/live/stream`.
 #[utoipa::path(
     get,
     path = "/{id}/live",
@@ -940,27 +969,34 @@ async fn live_snapshot(exam: &Exam, db: &Database) -> Result<ExamLiveResponse, A
     responses(
         (status = 200, description = "Live snapshot", body = ExamLiveResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
+        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
     ),
 )]
 async fn exam_live(
     State(st): State<AppState>,
-    _teacher: RequireTeacher,
+    RequireTeacher(user): RequireTeacher,
     Path(id): Path<String>,
 ) -> Result<Json<ExamLiveResponse>, AppError> {
     let exam = Exam::read(&ExamId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
+    let course = course_of(&exam, &st.db).await?;
+    if !can_manage_course(&course, &user) {
+        return Err(AppError::Forbidden(
+            "only the course creator or a manager/admin can monitor this exam",
+        ));
+    }
     Ok(Json(live_snapshot(&exam, &st.db).await?))
 }
 
 /// The live snapshot as a Server-Sent-Events stream: one `snapshot` event
 /// (the `ExamLiveResponse` JSON) immediately on connect and then every couple
 /// of seconds, so attendance, remaining time, submissions, and marks update
-/// without polling. Requires teacher+. Consume with `EventSource` (cookies
-/// ride along on same-site / credentialed requests). If the exam disappears
-/// mid-stream an `error` event is sent instead.
+/// without polling. Requires teacher+ and management rights over the exam's
+/// course. Consume with `EventSource` (cookies ride along on same-site /
+/// credentialed requests). If the exam disappears mid-stream an `error` event
+/// is sent instead.
 #[utoipa::path(
     get,
     path = "/{id}/live/stream",
@@ -970,20 +1006,26 @@ async fn exam_live(
     responses(
         (status = 200, description = "SSE feed of `snapshot` events (`ExamLiveResponse` as JSON)", content_type = "text/event-stream"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
+        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
     ),
 )]
 async fn exam_live_stream(
     State(st): State<AppState>,
-    _teacher: RequireTeacher,
+    RequireTeacher(user): RequireTeacher,
     Path(id): Path<String>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, axum::Error>>>, AppError> {
     let exam_id = ExamId::from_key(&id);
     // A missing exam is a 404 up front; after this the response is a stream.
-    Exam::read(&exam_id, &st.db)
+    let exam = Exam::read(&exam_id, &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
+    let course = course_of(&exam, &st.db).await?;
+    if !can_manage_course(&course, &user) {
+        return Err(AppError::Forbidden(
+            "only the course creator or a manager/admin can monitor this exam",
+        ));
+    }
 
     // First tick fires immediately, so the monitor paints on connect. The
     // exam is re-read every tick: schedule edits (deadline extensions) show
@@ -1159,8 +1201,9 @@ async fn create_question(
     Ok((StatusCode::CREATED, Json(QuestionResponse::new(&question))))
 }
 
-/// The exam's full question list, `correct` indexes included. Requires
-/// teacher+. Students read questions through `GET /exams/{id}/attempt/questions`.
+/// The exam's full question list, `correct` indexes included — the answer
+/// key. Requires teacher+ and management rights over the exam's course.
+/// Students read questions through `GET /exams/{id}/attempt/questions`.
 #[utoipa::path(
     get,
     path = "/{id}/questions",
@@ -1170,20 +1213,25 @@ async fn create_question(
     responses(
         (status = 200, description = "The exam's questions", body = [QuestionResponse]),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
+        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
     ),
 )]
 async fn list_questions(
     State(st): State<AppState>,
-    _teacher: RequireTeacher,
+    RequireTeacher(user): RequireTeacher,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<QuestionResponse>>, AppError> {
-    let exam_id = ExamId::from_key(&id);
-    Exam::read(&exam_id, &st.db)
+    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    let questions = ExamQuestion::list_for_exam(&exam_id, &st.db).await?;
+    let course = course_of(&exam, &st.db).await?;
+    if !can_manage_course(&course, &user) {
+        return Err(AppError::Forbidden(
+            "only the course creator or a manager/admin can read the question list",
+        ));
+    }
+    let questions = ExamQuestion::list_for_exam(exam.get_id(), &st.db).await?;
     Ok(Json(questions.iter().map(QuestionResponse::new).collect()))
 }
 
@@ -1496,7 +1544,8 @@ async fn save_answer(
 /// saved answer plus `is_correct` (`null` for text questions — those are the
 /// grader's call), and the machine's `auto_score` over the choice questions is
 /// attached as a *suggestion*: the final mark stays human, via
-/// `POST /exams/{id}/results`. Requires teacher+.
+/// `POST /exams/{id}/results`. Requires teacher+ and management rights over
+/// the exam's course.
 #[utoipa::path(
     get,
     path = "/{id}/attempts/{user}/answers",
@@ -1509,18 +1558,24 @@ async fn save_answer(
     responses(
         (status = 200, description = "The student's answers, judged", body = AttemptAnswersResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
+        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "No such exam, or the student has no attempt", body = ErrorResponse),
     ),
 )]
 async fn attempt_answers(
     State(st): State<AppState>,
-    _teacher: RequireTeacher,
+    RequireTeacher(user): RequireTeacher,
     Path((id, target)): Path<(String, String)>,
 ) -> Result<Json<AttemptAnswersResponse>, AppError> {
     let exam = Exam::read(&ExamId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
+    let course = course_of(&exam, &st.db).await?;
+    if !can_manage_course(&course, &user) {
+        return Err(AppError::Forbidden(
+            "only the course creator or a manager/admin can read answer sheets",
+        ));
+    }
     let target = UserId::from_key(&target);
     // No attempt means no answer sheet — a 404, not an empty one.
     ExamAttempt::read_for_user(exam.get_id(), &target, &st.db)

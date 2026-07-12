@@ -788,7 +788,7 @@ async fn event_timestamps_echo_and_validate() {
 // --- exams + results -----------------------------------------------------
 
 #[tokio::test]
-async fn exams_are_shared_but_course_guarded() {
+async fn exams_are_course_scoped_and_course_guarded() {
     let (app, db) = app_and_db().await;
     let ali = login_as(&app, &db, "ali", "teacher").await;
     let veli = login_as(&app, &db, "veli", "teacher").await;
@@ -808,15 +808,45 @@ async fn exams_are_shared_but_course_guarded() {
     assert_eq!(ex.body["weight"], 2);
     let exam_id = id_of(&ex.body);
 
-    // Any authenticated user can read the exam and the lists.
+    // A teacher outside the course sees none of it: not the exam, not the
+    // course's exam list, and an empty catalog.
     assert_eq!(
         send(&app, "GET", &format!("/exams/{exam_id}"), Some(&veli), None)
+            .await
+            .status,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        send(&app, "GET", "/exams", Some(&veli), None)
+            .await
+            .body
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(
+        send(
+            &app,
+            "GET",
+            &format!("/courses/{course_id}/exams"),
+            Some(&veli),
+            None
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
+
+    // The course creator reads all three views.
+    assert_eq!(
+        send(&app, "GET", &format!("/exams/{exam_id}"), Some(&ali), None)
             .await
             .status,
         StatusCode::OK
     );
     assert_eq!(
-        send(&app, "GET", "/exams", Some(&veli), None)
+        send(&app, "GET", "/exams", Some(&ali), None)
             .await
             .body
             .as_array()
@@ -829,7 +859,7 @@ async fn exams_are_shared_but_course_guarded() {
             &app,
             "GET",
             &format!("/courses/{course_id}/exams"),
-            Some(&veli),
+            Some(&ali),
             None
         )
         .await
@@ -1273,7 +1303,7 @@ async fn deleting_exam_cascades_results() {
 // --- courses + enrollments + marks ----------------------------------------
 
 #[tokio::test]
-async fn courses_are_shared_but_creator_guarded() {
+async fn courses_are_owner_scoped_and_creator_guarded() {
     let (app, db) = app_and_db().await;
     let ali = login_as(&app, &db, "ali", "teacher").await;
     let veli = login_as(&app, &db, "veli", "teacher").await;
@@ -1291,7 +1321,8 @@ async fn courses_are_shared_but_creator_guarded() {
     assert_eq!(res.body["title"], "algebra");
     let course_id = id_of(&res.body);
 
-    // Any authenticated user can read the course and the list.
+    // Another teacher is not enrolled and doesn't manage it: no read, and the
+    // catalog shows them nothing.
     assert_eq!(
         send(
             &app,
@@ -1302,7 +1333,7 @@ async fn courses_are_shared_but_creator_guarded() {
         )
         .await
         .status,
-        StatusCode::OK
+        StatusCode::FORBIDDEN
     );
     assert_eq!(
         send(&app, "GET", "/courses", Some(&veli), None)
@@ -1311,8 +1342,33 @@ async fn courses_are_shared_but_creator_guarded() {
             .as_array()
             .unwrap()
             .len(),
-        1
+        0
     );
+
+    // The creator and a manager see it — in the catalog too.
+    for caller in [&ali, &boss] {
+        assert_eq!(
+            send(
+                &app,
+                "GET",
+                &format!("/courses/{course_id}"),
+                Some(caller),
+                None
+            )
+            .await
+            .status,
+            StatusCode::OK
+        );
+        assert_eq!(
+            send(&app, "GET", "/courses", Some(caller), None)
+                .await
+                .body
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
 
     // Non-creator teacher cannot edit or delete.
     assert_eq!(
@@ -1606,7 +1662,34 @@ async fn exam_creation_lives_under_courses() {
         StatusCode::FORBIDDEN
     );
 
-    // Any authenticated user (a student) can list the course's exams.
+    // An unenrolled student cannot list the course's exams …
+    assert_eq!(
+        send(
+            &app,
+            "GET",
+            &format!("/courses/{course_id}/exams"),
+            Some(&alice),
+            None
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
+
+    // … but an enrolled one can.
+    let alice_id = me_id(&app, &alice).await;
+    assert_eq!(
+        send(
+            &app,
+            "POST",
+            &format!("/courses/{course_id}/enrollments"),
+            Some(&teacher),
+            Some(json!({ "user_id": alice_id }))
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
     assert_eq!(
         send(
             &app,
@@ -1902,6 +1985,114 @@ async fn marks_reports_are_self_or_teacher_scoped() {
         .status,
         StatusCode::OK
     );
+}
+
+/// One teacher's course is a wall: another teacher can't read its roster,
+/// results, statistics, live monitor, answer key, or answer sheets, and the
+/// per-user reports narrow to the courses the caller manages. Managers see
+/// through the wall; an enrolled student sees the course itself.
+#[tokio::test]
+async fn course_data_is_walled_off_from_other_teachers() {
+    let (app, db) = app_and_db().await;
+    let owner = login_as(&app, &db, "owner", "teacher").await;
+    let rival = login_as(&app, &db, "rival", "teacher").await;
+    let boss = login_as(&app, &db, "boss", "manager").await;
+    let alice = login(&app, "alice").await;
+    let alice_id = me_id(&app, &alice).await;
+
+    let course_id = create_course(&app, &owner, "algebra").await;
+    enroll(&app, &owner, &course_id, &alice_id).await;
+    let exam_id = create_exam(&app, &owner, &course_id, "mt", "quiz", 2).await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam_id}/results"),
+        Some(&owner),
+        Some(json!({ "mark": 70, "user_id": alice_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+
+    // Every course-scoped teacher read is refused for the rival …
+    for uri in [
+        format!("/courses/{course_id}/enrollments"),
+        format!("/exams/{exam_id}/results"),
+        format!("/exams/{exam_id}/statistics"),
+        format!("/exams/{exam_id}/live"),
+        format!("/exams/{exam_id}/live/stream"),
+        format!("/exams/{exam_id}/questions"),
+        format!("/exams/{exam_id}/attempts/{alice_id}/answers"),
+    ] {
+        let res = send(&app, "GET", &uri, Some(&rival), None).await;
+        assert_eq!(res.status, StatusCode::FORBIDDEN, "{uri}");
+    }
+
+    // … and open to the owner and a manager. (The answer sheet turns into a
+    // 404 once authorization clears: alice never sat the exam.)
+    for caller in [&owner, &boss] {
+        for uri in [
+            format!("/courses/{course_id}/enrollments"),
+            format!("/exams/{exam_id}/results"),
+            format!("/exams/{exam_id}/statistics"),
+            format!("/exams/{exam_id}/live"),
+            format!("/exams/{exam_id}/questions"),
+        ] {
+            let res = send(&app, "GET", &uri, Some(caller), None).await;
+            assert_eq!(res.status, StatusCode::OK, "{uri}");
+        }
+        let res = send(
+            &app,
+            "GET",
+            &format!("/exams/{exam_id}/attempts/{alice_id}/answers"),
+            Some(caller),
+            None,
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::NOT_FOUND);
+    }
+
+    // The marks report narrows to the caller's courses: the rival gets an
+    // empty shell, the owner and the manager get the graded course.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/marks/{alice_id}"),
+        Some(&rival),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert!(res.body["courses"].as_array().unwrap().is_empty());
+    assert!(res.body["overall_average"].is_null());
+    for caller in [&owner, &boss] {
+        let res = send(
+            &app,
+            "GET",
+            &format!("/marks/{alice_id}"),
+            Some(caller),
+            None,
+        )
+        .await;
+        assert_eq!(res.body["courses"].as_array().unwrap().len(), 1);
+        assert_eq!(res.body["overall_average"], 70.0);
+    }
+
+    // The enrolled student reads the course and its exam, and both catalogs
+    // include them; the rival's catalogs stay empty; a manager sees all.
+    for uri in [format!("/courses/{course_id}"), format!("/exams/{exam_id}")] {
+        let res = send(&app, "GET", &uri, Some(&alice), None).await;
+        assert_eq!(res.status, StatusCode::OK, "{uri}");
+    }
+    for (caller, visible) in [(&alice, 1), (&rival, 0), (&boss, 1)] {
+        for uri in ["/courses", "/exams"] {
+            let res = send(&app, "GET", uri, Some(caller), None).await;
+            assert_eq!(
+                res.body.as_array().unwrap().len(),
+                visible,
+                "{uri} as seen by caller"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -5354,7 +5545,27 @@ async fn session_crud_follows_course_management() {
     .await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST, "past ends_at");
 
-    // Reads are open to any logged-in user; parents must exist.
+    // Reads follow course visibility: an unenrolled student is refused …
+    let res = send(
+        &app,
+        "GET",
+        &format!("/courses/{course}/sessions"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+
+    // … an enrolled one reads; parents must exist.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/courses/{course}/enrollments"),
+        Some(&owner),
+        Some(json!({ "user_id": ali_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
     let res = send(
         &app,
         "GET",
@@ -5379,6 +5590,26 @@ async fn session_crud_follows_course_management() {
     )
     .await;
     assert_eq!(res.status, StatusCode::OK);
+    // The session's own teacher reads it without course rights; a session of
+    // someone else's course stays out of reach.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/sessions/{rival_session}"),
+        Some(&rival),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/sessions/{session}"),
+        Some(&rival),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
     let res = send(&app, "GET", "/sessions/nope", Some(&student), None).await;
     assert_eq!(res.status, StatusCode::NOT_FOUND);
 
@@ -5556,11 +5787,18 @@ async fn roll_call_rbac_and_upsert() {
     )
     .await;
     assert_eq!(res.status, StatusCode::OK);
-    let res = send(&app, "GET", &mark_uri, Some(&ali), None).await;
-    assert_eq!(res.status, StatusCode::OK, "roster is readable by students");
+    // The roster follows roll-call rights: the session teacher reads it, a
+    // student (even a listed one) and an unrelated teacher do not — students
+    // get their own tallies via `/attendance/me`.
+    let res = send(&app, "GET", &mark_uri, Some(&hoca), None).await;
+    assert_eq!(res.status, StatusCode::OK);
     let roster = res.body.as_array().unwrap();
     assert_eq!(roster.len(), 1);
     assert_eq!(roster[0]["status"], "absent");
+    let res = send(&app, "GET", &mark_uri, Some(&ali), None).await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    let res = send(&app, "GET", &mark_uri, Some(&rival), None).await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
 
     // Neither an unrelated teacher nor the student themselves may mark.
     let res = send(
@@ -6070,6 +6308,62 @@ async fn attendance_report_tallies_events_and_sessions_per_course() {
     .await;
     assert_eq!(res.status, StatusCode::OK);
     assert_eq!(res.body["sessions"]["total"], 4);
+
+    // A teacher's view narrows to the courses they manage: rival runs only
+    // chemistry, so ali's report shows that block alone — the overall session
+    // tally follows, while event tallies stay school-wide.
+    let rival = login_as(&app, &db, "rival", "teacher").await;
+    let chemistry = create_course(&app, &rival, "chemistry").await;
+    enroll(&app, &rival, &chemistry, &ali_id).await;
+    let session = create_session(
+        &app,
+        &rival,
+        &chemistry,
+        Timestamp::now().as_millis() + 10 * 3_600_000,
+    )
+    .await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/sessions/{session}/attendance"),
+        Some(&rival),
+        Some(json!({ "status": "present", "user_id": ali_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+
+    let res = send(
+        &app,
+        "GET",
+        &format!("/attendance/{ali_id}"),
+        Some(&rival),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["events"]["total"], 2, "events stay school-wide");
+    assert_eq!(res.body["sessions"]["total"], 1);
+    let blocks = res.body["courses"].as_array().unwrap();
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0]["course"]["title"], "chemistry");
+
+    // The owner's view still carries only their own two courses …
+    let res = send(
+        &app,
+        "GET",
+        &format!("/attendance/{ali_id}"),
+        Some(&owner),
+        None,
+    )
+    .await;
+    assert_eq!(res.body["courses"].as_array().unwrap().len(), 2);
+    assert_eq!(res.body["sessions"]["total"], 4);
+
+    // … and the self view stays complete: all three courses, every row.
+    let res = send(&app, "GET", "/attendance/me", Some(&ali), None).await;
+    assert_eq!(res.body["courses"].as_array().unwrap().len(), 3);
+    assert_eq!(res.body["sessions"]["total"], 5);
+
     let res = send(&app, "GET", "/attendance/01UNKNOWN", Some(&owner), None).await;
     assert_eq!(res.status, StatusCode::NOT_FOUND);
 }

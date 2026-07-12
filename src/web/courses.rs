@@ -8,6 +8,7 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use crate::database::Database;
 use crate::domain::course::{Course, CourseDescription, CourseId, CourseTitle};
 use crate::domain::course_session::{CourseSession, SessionTopic};
 use crate::domain::enrollment::Enrollment;
@@ -115,6 +116,44 @@ pub(crate) fn can_manage_course(course: &Course, user: &User) -> bool {
     course.is_creator(user.get_id()) || user.get_role().at_least(Role::Manager)
 }
 
+/// Who may read inside a specific course (its details, exams, sessions):
+/// anyone who can manage it, plus its enrolled users. Other teachers and
+/// unenrolled students see nothing.
+pub(crate) async fn can_view_course(
+    course: &Course,
+    user: &User,
+    db: &Database,
+) -> Result<bool, AppError> {
+    if can_manage_course(course, user) {
+        return Ok(true);
+    }
+    Ok(
+        Enrollment::read_for_user(course.get_id(), user.get_id(), db)
+            .await?
+            .is_some(),
+    )
+}
+
+/// The catalog as one user sees it: every course for manager+, otherwise the
+/// courses they created plus the ones they're enrolled in, newest first.
+pub(crate) async fn visible_courses(user: &User, db: &Database) -> Result<Vec<Course>, AppError> {
+    if user.get_role().at_least(Role::Manager) {
+        return Course::list_all(db).await;
+    }
+    let mut courses = Course::list_created(user.get_id(), db).await?;
+    for course in Course::list_enrolled(user.get_id(), db).await? {
+        if !courses
+            .iter()
+            .any(|known| known.get_id() == course.get_id())
+        {
+            courses.push(course);
+        }
+    }
+    // Both sources come newest-first; re-sort so the merged list is too.
+    courses.sort_by(|a, b| b.get_id().key().cmp(a.get_id().key()));
+    Ok(courses)
+}
+
 // ---- courses ------------------------------------------------------------
 
 /// Create a course owned by the current user. Requires the `teacher` role or higher.
@@ -142,22 +181,23 @@ async fn create_course(
     Ok((StatusCode::CREATED, Json(CourseResponse::new(&course))))
 }
 
-/// List all courses.
+/// List the courses visible to the caller: every course for manager+,
+/// otherwise the courses they created plus the ones they're enrolled in.
 #[utoipa::path(
     get,
     path = "/",
     tag = "courses",
     security(("session_cookie" = [])),
     responses(
-        (status = 200, description = "All courses", body = [CourseResponse]),
+        (status = 200, description = "The caller's visible courses", body = [CourseResponse]),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
     ),
 )]
 async fn list_courses(
     State(st): State<AppState>,
-    _user: CurrentUser,
+    CurrentUser(user): CurrentUser,
 ) -> Result<Json<Vec<CourseResponse>>, AppError> {
-    let courses = Course::list_all(&st.db).await?;
+    let courses = visible_courses(&user, &st.db).await?;
     Ok(Json(courses.iter().map(CourseResponse::new).collect()))
 }
 
@@ -180,7 +220,8 @@ async fn my_courses(
     Ok(Json(courses.iter().map(CourseResponse::new).collect()))
 }
 
-/// Fetch a single course by id.
+/// Fetch a single course by id. Visible to its enrolled users, its creator,
+/// and managers/admins.
 #[utoipa::path(
     get,
     path = "/{id}",
@@ -190,17 +231,23 @@ async fn my_courses(
     responses(
         (status = 200, description = "The course", body = CourseResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not enrolled, not the creator, and not a manager/admin", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
     ),
 )]
 async fn get_course(
     State(st): State<AppState>,
-    _user: CurrentUser,
+    CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<CourseResponse>, AppError> {
     let course = Course::read(&CourseId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
+    if !can_view_course(&course, &user, &st.db).await? {
+        return Err(AppError::Forbidden(
+            "only enrolled users, the course creator, or a manager/admin can view this course",
+        ));
+    }
     Ok(Json(CourseResponse::new(&course)))
 }
 
@@ -329,8 +376,8 @@ async fn enroll(
     Ok(Json(EnrollmentResponse::new(&enrollment, &people)))
 }
 
-/// List a course's roster. Requires teacher+ — students see their own courses
-/// via `GET /courses/me`.
+/// List a course's roster. Requires teacher+ and course management rights —
+/// students see their own courses via `GET /courses/me`.
 #[utoipa::path(
     get,
     path = "/{id}/enrollments",
@@ -340,21 +387,25 @@ async fn enroll(
     responses(
         (status = 200, description = "All enrollments", body = [EnrollmentResponse]),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
+        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
     ),
 )]
 async fn list_roster(
     State(st): State<AppState>,
-    _teacher: RequireTeacher,
+    RequireTeacher(user): RequireTeacher,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<EnrollmentResponse>>, AppError> {
-    let course_id = CourseId::from_key(&id);
     // Course must exist — a missing course is a 404, not an empty roster.
-    Course::read(&course_id, &st.db)
+    let course = Course::read(&CourseId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    let enrollments = Enrollment::list_for_course(&course_id, &st.db).await?;
+    if !can_manage_course(&course, &user) {
+        return Err(AppError::Forbidden(
+            "only the course creator or a manager/admin can list the roster",
+        ));
+    }
+    let enrollments = Enrollment::list_for_course(course.get_id(), &st.db).await?;
     let people = person_map(
         enrollments
             .iter()
@@ -471,7 +522,8 @@ async fn create_exam_in_course(
     Ok((StatusCode::CREATED, Json(ExamResponse::new(&exam))))
 }
 
-/// List a course's exams.
+/// List a course's exams. Visible to the course's enrolled users, its
+/// creator, and managers/admins.
 #[utoipa::path(
     get,
     path = "/{id}/exams",
@@ -481,20 +533,25 @@ async fn create_exam_in_course(
     responses(
         (status = 200, description = "The course's exams", body = [ExamResponse]),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not enrolled, not the creator, and not a manager/admin", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
     ),
 )]
 async fn list_course_exams(
     State(st): State<AppState>,
-    _user: CurrentUser,
+    CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<ExamResponse>>, AppError> {
-    let course_id = CourseId::from_key(&id);
     // Course must exist — a missing course is a 404, not an empty exam list.
-    Course::read(&course_id, &st.db)
+    let course = Course::read(&CourseId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    let exams = Exam::list_for_course(&course_id, &st.db).await?;
+    if !can_view_course(&course, &user, &st.db).await? {
+        return Err(AppError::Forbidden(
+            "only enrolled users, the course creator, or a manager/admin can view this course",
+        ));
+    }
+    let exams = Exam::list_for_course(course.get_id(), &st.db).await?;
     Ok(Json(exams.iter().map(ExamResponse::new).collect()))
 }
 
@@ -572,7 +629,8 @@ async fn create_session_in_course(
     ))
 }
 
-/// List a course's lesson sessions, most recent first.
+/// List a course's lesson sessions, most recent first. Visible to the
+/// course's enrolled users, its creator, and managers/admins.
 #[utoipa::path(
     get,
     path = "/{id}/sessions",
@@ -582,20 +640,25 @@ async fn create_session_in_course(
     responses(
         (status = 200, description = "The course's sessions", body = [SessionResponse]),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not enrolled, not the creator, and not a manager/admin", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
     ),
 )]
 async fn list_course_sessions(
     State(st): State<AppState>,
-    _user: CurrentUser,
+    CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<SessionResponse>>, AppError> {
-    let course_id = CourseId::from_key(&id);
     // Course must exist — a missing course is a 404, not an empty list.
-    Course::read(&course_id, &st.db)
+    let course = Course::read(&CourseId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    let sessions = CourseSession::list_for_course(&course_id, &st.db).await?;
+    if !can_view_course(&course, &user, &st.db).await? {
+        return Err(AppError::Forbidden(
+            "only enrolled users, the course creator, or a manager/admin can view this course",
+        ));
+    }
+    let sessions = CourseSession::list_for_course(course.get_id(), &st.db).await?;
     let people = person_map(sessions.iter().map(|s| s.get_teacher().clone()), &st.db).await?;
     Ok(Json(
         sessions

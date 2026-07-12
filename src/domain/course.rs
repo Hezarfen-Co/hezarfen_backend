@@ -133,6 +133,16 @@ impl Course {
         Ok(result.take::<Vec<Course>>(0)?)
     }
 
+    /// The courses `user` created — a teacher's slice of the catalog.
+    pub async fn list_created(user: &UserId, db: &Database) -> Result<Vec<Course>, AppError> {
+        let mut result = db
+            .query("SELECT * FROM course WHERE creator = $usr ORDER BY id DESC")
+            .bind(("usr", user.record()))
+            .await?
+            .check()?;
+        Ok(result.take::<Vec<Course>>(0)?)
+    }
+
     /// Load every course behind `ids` (one query) — the join half of the
     /// attendance report's per-course blocks.
     pub async fn list_by_ids(ids: &[CourseId], db: &Database) -> Result<Vec<Course>, AppError> {

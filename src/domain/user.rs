@@ -285,7 +285,11 @@ impl User {
         db: &Database,
     ) -> Result<Vec<User>, AppError> {
         let needle = query.trim().to_lowercase();
-        let role_clause = if role.is_some() { "AND role = $role" } else { "" };
+        let role_clause = if role.is_some() {
+            "AND role = $role"
+        } else {
+            ""
+        };
         let mut query = db
             .query(format!(
                 "SELECT * FROM user WHERE \

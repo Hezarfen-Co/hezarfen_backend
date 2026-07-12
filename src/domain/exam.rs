@@ -329,6 +329,24 @@ impl Exam {
         Ok(result.take::<Vec<Exam>>(0)?)
     }
 
+    /// Every exam of every course in `courses` (one query) — the catalog as one
+    /// user sees it.
+    pub async fn list_for_courses(
+        courses: &[CourseId],
+        db: &Database,
+    ) -> Result<Vec<Exam>, AppError> {
+        if courses.is_empty() {
+            return Ok(Vec::new());
+        }
+        let records: Vec<RecordId> = courses.iter().map(CourseId::record).collect();
+        let mut result = db
+            .query("SELECT * FROM exam WHERE course IN $courses ORDER BY id DESC")
+            .bind(("courses", records))
+            .await?
+            .check()?;
+        Ok(result.take::<Vec<Exam>>(0)?)
+    }
+
     // `course` is deliberately not updatable — moving an exam between courses
     // would strand results of students not enrolled in the target course.
     pub async fn update(

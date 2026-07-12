@@ -159,7 +159,16 @@ async fn full_user_journey() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
-    let roster: Value = veli
+    // The roster is a teacher+ view — veli (a student) is refused …
+    let res = veli
+        .get(format!("{base}/events/{event_id}/attendance"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+    // … while ali (the teacher) reads it in full.
+    let roster: Value = ali
         .get(format!("{base}/events/{event_id}/attendance"))
         .send()
         .await
@@ -353,8 +362,17 @@ async fn attendance_rollup_across_users() {
         .await
         .unwrap();
 
-    // Any attendee can read the full roster (3 people).
-    let roster: Value = b
+    // The roster is a teacher+ view: an attendee sees only their own tallies
+    // (`/attendance/me`), so ben is refused …
+    let res = b
+        .get(format!("{base}/events/{event_id}/attendance"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+    // … while the host reads the full roster (3 people).
+    let roster: Value = host
         .get(format!("{base}/events/{event_id}/attendance"))
         .send()
         .await

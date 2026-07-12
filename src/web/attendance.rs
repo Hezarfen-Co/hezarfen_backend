@@ -10,11 +10,13 @@ use utoipa_axum::routes;
 use crate::database::Database;
 use crate::domain::attendance::{Attendance, AttendanceStatus};
 use crate::domain::course::{Course, CourseId};
+use crate::domain::role::Role;
 use crate::domain::session_attendance::SessionAttendance;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse};
 use crate::state::AppState;
 
+use super::courses::can_manage_course;
 use super::{CourseResponse, CurrentUser, RequireTeacher};
 
 pub fn routes() -> OpenApiRouter<AppState> {
@@ -87,8 +89,15 @@ struct AttendanceReport {
 }
 
 /// Assemble the report: tally the user's event rows, then their session rows
-/// grouped by the (denormalized) course reference.
-async fn build_report(user: &UserId, db: &Database) -> Result<AttendanceReport, AppError> {
+/// grouped by the (denormalized) course reference. A `viewer` narrows the
+/// per-course blocks — and the overall session tally — to the courses that
+/// viewer manages (self-reports and manager+ reports pass `None`). Event
+/// tallies are school-wide, not course data, so they stay in either case.
+async fn build_report(
+    user: &UserId,
+    viewer: Option<&User>,
+    db: &Database,
+) -> Result<AttendanceReport, AppError> {
     let events = Attendance::list_for_user(user, db).await?;
     let sessions = SessionAttendance::list_for_user(user, db).await?;
 
@@ -108,23 +117,35 @@ async fn build_report(user: &UserId, db: &Database) -> Result<AttendanceReport, 
         courses.iter().map(|c| (c.get_id().key(), c)).collect();
 
     let mut blocks = Vec::with_capacity(course_ids.len());
+    let mut visible_rows: Vec<&SessionAttendance> = Vec::with_capacity(sessions.len());
     for course_id in &course_ids {
         // A row whose course is gone cannot happen given the delete cascade —
         // skip defensively rather than fabricate a course block.
         let Some(course) = course_by_key.get(course_id.key()) else {
             continue;
         };
+        if viewer.is_some_and(|viewer| !can_manage_course(course, viewer)) {
+            continue;
+        }
         let rows = &by_course[course_id.key()];
+        visible_rows.extend(rows.iter().copied());
         blocks.push(CourseAttendance {
             course: CourseResponse::new(course),
             counts: StatusCounts::tally(rows.iter().map(|r| r.get_status())),
         });
     }
 
+    // A narrowed viewer's overall tally follows the visible blocks; a full
+    // report keeps the historical every-row tally.
+    let session_counts = match viewer {
+        Some(_) => StatusCounts::tally(visible_rows.iter().map(|r| r.get_status())),
+        None => StatusCounts::tally(sessions.iter().map(|a| a.get_status())),
+    };
+
     Ok(AttendanceReport {
         user: user.key().to_string(),
         events: StatusCounts::tally(events.iter().map(|a| a.get_status())),
-        sessions: StatusCounts::tally(sessions.iter().map(|a| a.get_status())),
+        sessions: session_counts,
         courses: blocks,
     })
 }
@@ -145,10 +166,12 @@ async fn my_report(
     State(st): State<AppState>,
     CurrentUser(user): CurrentUser,
 ) -> Result<Json<AttendanceReport>, AppError> {
-    Ok(Json(build_report(user.get_id(), &st.db).await?))
+    Ok(Json(build_report(user.get_id(), None, &st.db).await?))
 }
 
-/// Any user's attendance report. Requires teacher+.
+/// Any user's attendance report. Requires teacher+. Managers and admins see
+/// every course; a teacher sees the event tallies plus only the roll-call
+/// blocks of the target's courses they manage.
 #[utoipa::path(
     get,
     path = "/{user}",
@@ -156,7 +179,7 @@ async fn my_report(
     security(("session_cookie" = [])),
     params(("user" = String, Path, description = "User id")),
     responses(
-        (status = 200, description = "The user's attendance report", body = AttendanceReport),
+        (status = 200, description = "The user's attendance report, narrowed to the caller's courses", body = AttendanceReport),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
         (status = 404, description = "User not found", body = ErrorResponse),
@@ -164,7 +187,7 @@ async fn my_report(
 )]
 async fn user_report(
     State(st): State<AppState>,
-    _teacher: RequireTeacher,
+    RequireTeacher(teacher): RequireTeacher,
     Path(user): Path<String>,
 ) -> Result<Json<AttendanceReport>, AppError> {
     let target = UserId::from_key(&user);
@@ -172,7 +195,8 @@ async fn user_report(
     User::read(&target, &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    Ok(Json(build_report(&target, &st.db).await?))
+    let viewer = (!teacher.get_role().at_least(Role::Manager)).then_some(&teacher);
+    Ok(Json(build_report(&target, viewer, &st.db).await?))
 }
 
 #[cfg(test)]

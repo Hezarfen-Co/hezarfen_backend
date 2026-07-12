@@ -359,7 +359,8 @@ async fn mark(
     Ok(Json(AttendanceResponse::new(&attendance, &people)))
 }
 
-/// List the attendance roster for an event.
+/// List the attendance roster for an event. Requires teacher+ — students see
+/// their own tallies via `GET /attendance/me`.
 #[utoipa::path(
     get,
     path = "/{id}/attendance",
@@ -369,12 +370,13 @@ async fn mark(
     responses(
         (status = 200, description = "Attendance roster", body = [AttendanceResponse]),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
         (status = 404, description = "Event not found", body = ErrorResponse),
     ),
 )]
 async fn list_attendance(
     State(st): State<AppState>,
-    _user: CurrentUser,
+    _teacher: RequireTeacher,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<AttendanceResponse>>, AppError> {
     let event_id = EventId::from_key(&id);

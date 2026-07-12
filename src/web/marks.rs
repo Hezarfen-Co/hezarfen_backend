@@ -11,10 +11,12 @@ use crate::database::Database;
 use crate::domain::course::Course;
 use crate::domain::exam::Exam;
 use crate::domain::exam_result::ExamResult;
+use crate::domain::role::Role;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse};
 use crate::state::AppState;
 
+use super::courses::can_manage_course;
 use super::{CourseResponse, CurrentUser, RequireTeacher};
 
 pub fn routes() -> OpenApiRouter<AppState> {
@@ -69,9 +71,19 @@ fn weighted_average(pairs: &[(i64, i64)]) -> Option<f64> {
 }
 
 /// Assemble the report: for each enrolled course, join the course's exams
-/// (weights) with the user's graded results, then average.
-async fn build_report(user: &UserId, db: &Database) -> Result<MarksReport, AppError> {
-    let courses = Course::list_enrolled(user, db).await?;
+/// (weights) with the user's graded results, then average. A `viewer` narrows
+/// the report to the courses that viewer manages (self-reports and manager+
+/// reports pass `None` and see everything); the overall average follows the
+/// narrowed set.
+async fn build_report(
+    user: &UserId,
+    viewer: Option<&User>,
+    db: &Database,
+) -> Result<MarksReport, AppError> {
+    let mut courses = Course::list_enrolled(user, db).await?;
+    if let Some(viewer) = viewer {
+        courses.retain(|course| can_manage_course(course, viewer));
+    }
 
     let mut blocks = Vec::with_capacity(courses.len());
     for course in &courses {
@@ -132,10 +144,12 @@ async fn my_marks(
     State(st): State<AppState>,
     CurrentUser(user): CurrentUser,
 ) -> Result<Json<MarksReport>, AppError> {
-    Ok(Json(build_report(user.get_id(), &st.db).await?))
+    Ok(Json(build_report(user.get_id(), None, &st.db).await?))
 }
 
-/// Any user's mark report. Requires teacher+.
+/// Any user's mark report. Requires teacher+. Managers and admins see every
+/// course; a teacher sees only the target's courses they manage — the rest of
+/// the report (other teachers' courses) stays out of reach.
 #[utoipa::path(
     get,
     path = "/{user}",
@@ -143,7 +157,7 @@ async fn my_marks(
     security(("session_cookie" = [])),
     params(("user" = String, Path, description = "User id")),
     responses(
-        (status = 200, description = "The user's mark report", body = MarksReport),
+        (status = 200, description = "The user's mark report, narrowed to the caller's courses", body = MarksReport),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
         (status = 404, description = "User not found", body = ErrorResponse),
@@ -151,7 +165,7 @@ async fn my_marks(
 )]
 async fn user_marks(
     State(st): State<AppState>,
-    _teacher: RequireTeacher,
+    RequireTeacher(teacher): RequireTeacher,
     Path(user): Path<String>,
 ) -> Result<Json<MarksReport>, AppError> {
     let target = UserId::from_key(&user);
@@ -159,7 +173,8 @@ async fn user_marks(
     User::read(&target, &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    Ok(Json(build_report(&target, &st.db).await?))
+    let viewer = (!teacher.get_role().at_least(Role::Manager)).then_some(&teacher);
+    Ok(Json(build_report(&target, viewer, &st.db).await?))
 }
 
 #[cfg(test)]
