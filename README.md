@@ -88,6 +88,15 @@ Timezones and clock differences cannot corrupt data, by construction:
   the writer's wall, not an instant: validation accepts up to UTC-tomorrow,
   since a client ahead of UTC (up to UTC+14) legitimately writes a date the
   server's UTC calendar hasn't reached yet.
+- **Nothing schedules in the past.** A request-supplied schedule instant — an
+  exam window, a lesson's `starts_at`/`ends_at`, an event time — must not lie
+  before the server's now, on create and on every `PATCH` that sets it: a
+  deadline that starts in the past is dead on arrival, so it's a `400`. A
+  60-second grace absorbs request latency and client-clock skew ("starts now"
+  survives its own round trip). Values a `PATCH` merely keeps are exempt — a
+  running exam's `starts_at` is legitimately past, and a rename or deadline
+  extension must not trip over it. (Work-log corrections are records of past
+  work, not schedules, and stay free.)
 - **Frontends can sync to the server clock.** `GET /time` (no auth) returns
   `{"now": <UTC unix-millis>}`. Fetch once, keep
   `offset = now - Date.now()`, and use `Date.now() + offset` for countdowns
@@ -292,8 +301,9 @@ course averages. Unenrolling keeps result rows: the marks drop out of the
 report until re-enrollment, but stay visible on the exam itself. Deleting a
 course cascades its exams, their results, and all enrollments.
 Event `starts_at`/`ends_at` are optional **unix-millisecond** integers; if both
-are given, `ends_at` must not precede `starts_at` (else `400`). On `PATCH`, an
-omitted time keeps its value and an explicit `null` clears it.
+are given, `ends_at` must not precede `starts_at`, and neither may be set in
+the past (else `400`). On `PATCH`, an omitted time keeps its value and an
+explicit `null` clears it.
 Reading a child collection of a missing parent (`/events/{id}/attendance`,
 `/exams/{id}/results`, `/courses/{id}/enrollments`, `/courses/{id}/exams`,
 `/courses/{id}/sessions`, `/sessions/{id}/attendance`) is a `404`, not an
@@ -320,8 +330,10 @@ setting, as one consistent unit (validated together on create and after every
   starts anywhere inside the window and gets
   `min(started_at + duration_ms, ends_at)` as their personal deadline.
   `duration_ms` is 1 minute to 24 hours.
-- `ends_at` must be strictly after `starts_at`. All instants are the usual UTC
-  unix-milliseconds, judged only by the server clock (`GET /time` for sync).
+- `ends_at` must be strictly after `starts_at`, and neither may be *set* in
+  the past — on create or `PATCH` (kept values are exempt, so a running exam
+  stays editable). All instants are the usual UTC unix-milliseconds, judged
+  only by the server clock (`GET /time` for sync).
 
 A student **sits** a scheduled exam through their attempt (one per exam+user,
 by construction — the row id is the composite key):
@@ -454,7 +466,8 @@ Events cover ad-hoc gatherings; **sessions** are a course's lessons. A session
 belongs to a course and carries a `teacher` (defaults to whoever creates it;
 any explicit `teacher_id` must hold teacher+ — a student cannot teach), an
 optional `topic`, a required `starts_at`, and an optional `ends_at` (when both
-are set, `ends_at` must not precede `starts_at`). Sessions are created, edited,
+are set, `ends_at` must not precede `starts_at`; neither may be set in the
+past). Sessions are created, edited,
 and deleted under course-management rights, exactly like exams; session lists
 are ordered by `starts_at` (a timetable, not a creation log).
 
@@ -538,7 +551,7 @@ curl -s -b $JAR $BASE/exams/$EX/statistics
 # lesson sessions + roll call (course manager creates; the session's teacher
 # or a course manager marks enrolled students)
 SE=$(curl -s -b $JAR $BASE/courses/$CO/sessions -H 'content-type: application/json' \
-  -d '{"topic":"limits","starts_at":1752275000000}' | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+  -d '{"topic":"limits","starts_at":1900000000000}' | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
 curl -s -b $JAR $BASE/sessions/$SE/attendance -H 'content-type: application/json' \
   -d "{\"status\":\"present\",\"user_id\":\"$SID\"}"
 
