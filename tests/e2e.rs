@@ -217,6 +217,51 @@ async fn full_user_journey() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 
+    // The filter also *includes* on non-student roles: ali is the teacher.
+    let found: Value = ali
+        .get(format!("{base}/users/search?q=al&role=teacher"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(found.as_array().unwrap().len(), 1);
+    assert_eq!(found[0]["username"], "ali");
+
+    // Search matches profile names too, and the role filter applies to those
+    // hits as well: "lic" only exists in ali's freshly set name, not in any
+    // username, so it appears under `role=teacher` and not `role=student`.
+    let res = ali
+        .patch(format!("{base}/users/me"))
+        .json(&json!({ "name": "Alice" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let found: Value = ali
+        .get(format!("{base}/users/search?q=lic&role=teacher"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(found.as_array().unwrap().len(), 1);
+    assert_eq!(found[0]["username"], "ali");
+    assert_eq!(found[0]["display_name"], "Alice");
+
+    let found: Value = ali
+        .get(format!("{base}/users/search?q=lic&role=student"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(found.as_array().unwrap().is_empty());
+
     let res = veli
         .get(format!("{base}/users/search?q=ali"))
         .send()
