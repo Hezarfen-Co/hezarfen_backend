@@ -11,7 +11,10 @@ average and an overall average from their mark report. Exams can be scheduled
 **sync** (one fixed window) or **async** (start anytime inside the window, with
 a personal time budget); students *sit* them via attempts, and teachers watch
 attendance, per-student remaining time, submissions, and marks land live on a
-monitor endpoint (snapshot or SSE stream).
+monitor endpoint (snapshot or SSE stream). Courses also carry **lesson
+sessions** with teacher-taken roll call (students never self-mark a lesson),
+staff clock in/out on a server-stamped **work log**, and every user has an
+**attendance report** (event + per-course lesson tallies with rates).
 
 Every field is a validated newtype (`Username(String)`, `NoteTitle(String)`, …)
 constructed only after its restrictions pass — invalid input can't be
@@ -137,6 +140,14 @@ effect on the user's very next call (no re-login).
 | Mark **another user's** attendance       | teacher      |                                               |
 | Create events; remove attendance rows    | teacher      |                                               |
 | Edit / delete an event                   | teacher      | Only the **creator**, or a `manager`+ for any event |
+| View course sessions and their roll call | student      |                                               |
+| Create / edit / delete a course session  | teacher      | Course-management rights (course creator, or `manager`+) |
+| Take a session's roll call (mark/remove **enrolled students**) | teacher | The **session's teacher**, or anyone with course-management rights |
+| Mark / remove the **session teacher's** presence row | manager | Staff presence is management's call — the teacher can't self-mark |
+| Work check-in / check-out; view **own** work log | teacher | Instants are server-stamped, never client-supplied |
+| View / correct / delete **any** staff work log entry | manager | Corrections only on closed entries |
+| Read **own** attendance report           | student      |                                               |
+| Read **any** user's attendance report    | teacher      |                                               |
 | View courses/exams; read **own** result, courses, mark report | student |                            |
 | Sit a scheduled exam: start / read / submit **own** attempt | student | Must be enrolled; window enforced by the server clock |
 | Answer questions inside **own** attempt (REST autosave or the exam-room WebSocket) | student | Attempt must be `in_progress`; deadline judged by the server clock |
@@ -223,6 +234,14 @@ logged-in user.
 | POST   | `/courses/{id}/enrollments`      | teacher | `{user_id}` — enroll a user (idempotent upsert; course manager) |
 | GET    | `/courses/{id}/enrollments`      | teacher | List the course roster          |
 | DELETE | `/courses/{id}/enrollments/{user}` | teacher | Unenroll (keeps recorded results; course manager) |
+| POST   | `/courses/{id}/sessions`         | teacher | `{topic?, teacher_id?, starts_at, ends_at?}` — add a lesson (course manager; teacher defaults to the caller) |
+| GET    | `/courses/{id}/sessions`         | student | List the course's sessions (most recent lesson first) |
+| GET    | `/sessions/{id}`                 | student | Get session                     |
+| PATCH  | `/sessions/{id}`                 | teacher | Edit session (course manager; `null` clears `ends_at`) |
+| DELETE | `/sessions/{id}`                 | teacher | Delete session + its roll call (course manager) |
+| POST   | `/sessions/{id}/attendance`      | teacher | `{status, user_id}` — roll call: session teacher/course manager mark **enrolled** students; the teacher's own row needs manager+ |
+| GET    | `/sessions/{id}/attendance`      | student | List the session's roll call    |
+| DELETE | `/sessions/{id}/attendance/{user}` | teacher | Remove a roll-call row (same rights as marking) |
 | POST   | `/courses/{id}/exams`            | teacher | `{title, description?, kind, weight, mode?, starts_at?, ends_at?, duration_ms?}` — add an exam (course manager) |
 | GET    | `/courses/{id}/exams`            | student | List the course's exams         |
 | GET    | `/exams`                         | student | List all exams                  |
@@ -249,6 +268,14 @@ logged-in user.
 | GET    | `/exams/{id}/live/stream`        | teacher | The same snapshot as SSE `snapshot` events every ~2s  |
 | GET    | `/marks/me`                      | student | The caller's mark report (per-course + overall averages) |
 | GET    | `/marks/{user}`                  | teacher | Any user's mark report          |
+| POST   | `/work/check-in`                 | teacher | Open a work stint (server-stamped; `409` if already open) |
+| POST   | `/work/check-out`                | teacher | Close the open stint (`409` if none open) |
+| GET    | `/work/me`                       | teacher | Own work log, newest first (open stint has `check_out: null`) |
+| GET    | `/work/{user}`                   | manager | A staff member's work log       |
+| PATCH  | `/work/entries/{id}`             | manager | `{check_in?, check_out?}` — correct a **closed** stint (`409` on open) |
+| DELETE | `/work/entries/{id}`             | manager | Delete a work entry (open or closed) |
+| GET    | `/attendance/me`                 | student | Own attendance report: events + sessions + per-course tallies |
+| GET    | `/attendance/{user}`             | teacher | Any user's attendance report    |
 
 `status` ∈ `present | absent | late | excused`.
 `kind` ∈ `homework | quiz | midterm | final | project | oral` — informational
@@ -268,8 +295,9 @@ Event `starts_at`/`ends_at` are optional **unix-millisecond** integers; if both
 are given, `ends_at` must not precede `starts_at` (else `400`). On `PATCH`, an
 omitted time keeps its value and an explicit `null` clears it.
 Reading a child collection of a missing parent (`/events/{id}/attendance`,
-`/exams/{id}/results`, `/courses/{id}/enrollments`, `/courses/{id}/exams`) is
-a `404`, not an empty list.
+`/exams/{id}/results`, `/courses/{id}/enrollments`, `/courses/{id}/exams`,
+`/courses/{id}/sessions`, `/sessions/{id}/attendance`) is a `404`, not an
+empty list.
 Personal info (`name`, `surname`, `email`, `phone`, `birth_date`) is the same
 optional set on every account, whatever the role, and is `null` until filled
 in. On `PATCH /users/me` (or the admin `PATCH /users/{id}/profile`) each field
@@ -420,6 +448,56 @@ The live monitor rides along: each roster row now carries `answered` and
 The student's own `GET /exams/{id}/attempt` echoes the same
 `answered`/`question_count` pair.
 
+## Lesson sessions, roll call, the work log & attendance reports
+
+Events cover ad-hoc gatherings; **sessions** are a course's lessons. A session
+belongs to a course and carries a `teacher` (defaults to whoever creates it;
+any explicit `teacher_id` must hold teacher+ — a student cannot teach), an
+optional `topic`, a required `starts_at`, and an optional `ends_at` (when both
+are set, `ends_at` must not precede `starts_at`). Sessions are created, edited,
+and deleted under course-management rights, exactly like exams; session lists
+are ordered by `starts_at` (a timetable, not a creation log).
+
+**Roll call** (`/sessions/{id}/attendance`) deliberately differs from event
+attendance: students never mark themselves. The session's teacher or a course
+manager marks **enrolled** students (an unenrolled target is a `400`), and the
+**session teacher's own** presence row can only be written or removed by
+manager+ — staff presence is management's call, so a teacher can't declare
+themselves present. Re-marking overwrites: one row per session+user, by
+construction. Deleting a session (or its course) cascades its roll-call rows.
+
+The **work log** (`/work`) is the staff timesheet, for teachers and above.
+`POST /work/check-in` opens a stint and `POST /work/check-out` closes it, both
+stamped by the **server clock** — a request never carries an instant, so a
+wrong device clock (or a crafted request) can't forge presence. At most one
+open stint per user holds atomically: double check-ins and check-outs without
+an open stint answer `409`, and a reconnecting double-click can't reset a
+running clock. `GET /work/me` lists your stints newest-first (the open one has
+`check_out: null`, closed ones a convenience `duration_ms`); manager+ reads
+anyone's log (`GET /work/{user}`), corrects a **closed** stint's instants
+(`PATCH /work/entries/{id}`, `409` while open — check out or delete instead),
+and deletes entries.
+
+**Attendance reports** mirror the marks report: `GET /attendance/me` for any
+logged-in user, `GET /attendance/{user}` for teacher+. The report tallies
+event attendance and lesson roll call separately, plus a per-course breakdown:
+
+```json
+{
+  "user": "01J…",
+  "events":   { "present": 4, "absent": 1, "late": 0, "excused": 1, "total": 6, "rate": 0.8 },
+  "sessions": { "present": 9, "absent": 2, "late": 1, "excused": 0, "total": 12, "rate": 0.8333 },
+  "courses": [ { "course": { "id": "01J…", "title": "algebra", … }, "counts": { … } } ]
+}
+```
+
+`rate = (present + late) / (present + absent + late)`: arriving late still
+counts as attending, and an excused absence counts against no one (`rate` is
+`null` when every row is excused, or there are none). Per-course blocks appear
+for every course the user has roll-call rows in — attendance is a historical
+record, so unenrolling hides marks from the marks report but never hides an
+absence.
+
 ## Quick tour (curl)
 
 ```sh
@@ -483,6 +561,9 @@ src/
     event.rs       EventId · EventTitle · EventDescription · Event
     attendance.rs  AttendanceId · AttendanceStatus · Attendance
     course.rs      CourseId · CourseTitle · CourseDescription · Course
+    course_session.rs CourseSessionId · SessionTopic · CourseSession (a course's lesson)
+    session_attendance.rs SessionAttendanceId · SessionAttendance (roll call; one row per session+user)
+    work_entry.rs  WorkEntryId · WorkEntry (staff stint; one open per user by construction)
     enrollment.rs  EnrollmentId · Enrollment (one row per course+user)
     exam.rs        ExamId · ExamTitle · ExamDescription · ExamKind · ExamWeight ·
                    ExamMode · ExamDuration · ExamSchedule · Exam (belongs to a course)
@@ -494,10 +575,11 @@ src/
     exam_result.rs ExamResultId · Mark · ExamResult (one row per exam+user)
   web/             axum layer: DTOs (serde + OpenAPI schemas) + handlers +
                    auth extractors
-    extractor.rs   CurrentUser · RequireTeacher · RequireAdmin
-    dto.rs         shared UserResponse · CourseResponse · ExamResponse schemas
+    extractor.rs   CurrentUser · RequireTeacher · RequireManager · RequireAdmin
+    dto.rs         shared UserResponse · CourseResponse · ExamResponse · SessionResponse schemas
     exam_ws.rs     the student exam-room WebSocket (state ticks, autosave, finish)
-    auth.rs  users.rs  notes.rs  events.rs  courses.rs  exams.rs  marks.rs
+    auth.rs  users.rs  notes.rs  events.rs  courses.rs  sessions.rs  exams.rs
+    marks.rs  work.rs  attendance.rs
 ```
 
 Tests: `cargo test` — unit (in-source), integration (`tower::oneshot` + in-memory
