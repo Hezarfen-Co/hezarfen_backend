@@ -71,6 +71,7 @@ pub fn build_router(state: AppState) -> Router {
     let (router, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
         .route("/", get(health))
         .routes(routes!(health))
+        .routes(routes!(server_time))
         .nest("/auth", web::auth::routes(&state.rate_limit))
         .nest("/users", web::users::routes())
         .nest("/notes", web::notes::routes())
@@ -140,4 +141,28 @@ fn cors_layer() -> CorsLayer {
 )]
 async fn health() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok" }))
+}
+
+/// The server's current time. All API timestamps are UTC unix-milliseconds
+/// judged by this clock (session expiry included), so a frontend that renders
+/// countdowns or "is this in the past?" logic should not trust the device
+/// clock — fetch this once, keep `offset = now - Date.now()`, and add the
+/// offset to `Date.now()` whenever it needs the authoritative time.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+struct TimeResponse {
+    /// Current server time, UTC unix-milliseconds.
+    #[schema(example = 1_752_275_000_000_i64)]
+    now: i64,
+}
+
+#[utoipa::path(
+    get,
+    path = "/time",
+    tag = "meta",
+    responses((status = 200, description = "Current server time (UTC unix-milliseconds)", body = TimeResponse)),
+)]
+async fn server_time() -> Json<TimeResponse> {
+    Json(TimeResponse {
+        now: domain::timestamp::Timestamp::now().as_millis(),
+    })
 }
