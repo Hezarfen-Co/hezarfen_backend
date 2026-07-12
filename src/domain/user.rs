@@ -275,21 +275,31 @@ impl User {
     }
 
     /// Case-insensitive fragment search over username, name, and surname —
-    /// backs the user pickers. Capped at 10 rows: pickers show a short list,
-    /// and the cap keeps an over-broad fragment from hauling the whole table.
-    pub async fn search(query: &str, db: &Database) -> Result<Vec<User>, AppError> {
+    /// backs the user pickers. `role` narrows to one role (e.g. only students
+    /// for an enroll picker); `None` searches everyone. Capped at 10 rows:
+    /// pickers show a short list, and the cap keeps an over-broad fragment
+    /// from hauling the whole table.
+    pub async fn search(
+        query: &str,
+        role: Option<Role>,
+        db: &Database,
+    ) -> Result<Vec<User>, AppError> {
         let needle = query.trim().to_lowercase();
-        let mut result = db
-            .query(
+        let role_clause = if role.is_some() { "AND role = $role" } else { "" };
+        let mut query = db
+            .query(format!(
                 "SELECT * FROM user WHERE \
-                   string::lowercase(username) CONTAINS $q \
-                   OR string::lowercase(name ?? '') CONTAINS $q \
-                   OR string::lowercase(surname ?? '') CONTAINS $q \
-                 ORDER BY username LIMIT 10",
-            )
-            .bind(("q", needle))
-            .await?
-            .check()?;
+                   (string::lowercase(username) CONTAINS $q \
+                    OR string::lowercase(name ?? '') CONTAINS $q \
+                    OR string::lowercase(surname ?? '') CONTAINS $q) \
+                   {role_clause} \
+                 ORDER BY username LIMIT 10"
+            ))
+            .bind(("q", needle));
+        if let Some(role) = role {
+            query = query.bind(("role", role));
+        }
+        let mut result = query.await?.check()?;
         Ok(result.take::<Vec<User>>(0)?)
     }
 

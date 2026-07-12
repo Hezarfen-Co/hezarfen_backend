@@ -95,10 +95,14 @@ async fn apply_profile(
 struct SearchUsers {
     /// Case-insensitive fragment of a username, name, or surname.
     q: String,
+    /// Restrict matches to one role: `student`, `teacher`, `manager`, or
+    /// `admin`. Omit to search every role.
+    role: Option<String>,
 }
 
 /// Find users by username or name — backs the pickers (enroll, grade, mark
-/// attendance). Requires teacher+. Returns at most 10 matches, and only
+/// attendance). Requires teacher+. `role` narrows to one role (e.g.
+/// `role=student` for an enroll picker). Returns at most 10 matches, and only
 /// id/username/display name — no contact details.
 #[utoipa::path(
     get,
@@ -108,7 +112,7 @@ struct SearchUsers {
     params(SearchUsers),
     responses(
         (status = 200, description = "Matching users, at most 10", body = [PersonRef]),
-        (status = 400, description = "Empty query", body = ErrorResponse),
+        (status = 400, description = "Empty query or unknown role", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
     ),
@@ -124,7 +128,8 @@ async fn search_users(
             reason: "must not be empty",
         }));
     }
-    let users = User::search(&req.q, &st.db).await?;
+    let role = req.role.as_deref().map(Role::try_from_str).transpose()?;
+    let users = User::search(&req.q, role, &st.db).await?;
     Ok(Json(users.iter().map(PersonRef::new).collect()))
 }
 
