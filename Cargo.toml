@@ -3,6 +3,12 @@ name = "hezarfen_backend"
 version = "0.1.0"
 edition = "2024"
 
+# Time-policy guard: clippy.toml lists the banned clock calls (local time,
+# raw now() sources); deny makes `cargo clippy` fail on any reintroduction.
+[lints.clippy]
+disallowed_methods = "deny"
+disallowed_types = "deny"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"

@@ -4,6 +4,7 @@
 use surrealdb::types::SurrealValue;
 
 use crate::constant::MAX_NAME_LEN;
+use crate::domain::timestamp::Timestamp;
 use crate::error::ValidationError;
 use crate::validate::{validate_email, validate_phone, validate_required};
 
@@ -57,6 +58,12 @@ impl Phone {
 
 /// A birth date, canonicalized to `YYYY-MM-DD`. Construction parses the input
 /// as a real calendar date (no 2026-02-30) and refuses future dates.
+///
+/// "Future" is judged against UTC **plus one day of grace**: a birth date is a
+/// calendar date on the writer's wall, and a client ahead of UTC (up to
+/// UTC+14) legitimately submits a date the server's UTC calendar hasn't
+/// reached yet. Without the grace, "born today" entered from Istanbul or
+/// Auckland shortly after local midnight is wrongly rejected.
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct BirthDate(String);
 
@@ -68,7 +75,10 @@ impl BirthDate {
                 reason: "must be a calendar date in YYYY-MM-DD form",
             }
         })?;
-        if date > chrono::Utc::now().date_naive() {
+        let latest_allowed = Timestamp::today_utc()
+            .succ_opt()
+            .unwrap_or(chrono::NaiveDate::MAX);
+        if date > latest_allowed {
             return Err(ValidationError::Invalid {
                 field: "birth_date",
                 reason: "must not be in the future",
@@ -130,5 +140,20 @@ mod tests {
         assert!(BirthDate::try_new("02/01/1990").is_err()); // wrong format
         assert!(BirthDate::try_new("9999-01-01").is_err()); // future
         assert!(BirthDate::try_new("").is_err());
+    }
+
+    #[tokio::test]
+    async fn birth_date_tolerates_clients_ahead_of_utc() {
+        let fmt = |d: chrono::NaiveDate| d.format("%Y-%m-%d").to_string();
+        let today = Timestamp::today_utc();
+
+        // "Today" for a client in UTC+14 can be the server's UTC tomorrow —
+        // that must pass, or "born today" fails near midnight east of UTC.
+        assert!(BirthDate::try_new(&fmt(today)).is_ok());
+        assert!(BirthDate::try_new(&fmt(today.succ_opt().unwrap())).is_ok());
+
+        // Two days out is beyond any real timezone: still rejected.
+        let two_days_out = today.succ_opt().unwrap().succ_opt().unwrap();
+        assert!(BirthDate::try_new(&fmt(two_days_out)).is_err());
     }
 }

@@ -1,0 +1,23 @@
+# Time policy enforcement (see src/domain/timestamp.rs).
+#
+# All wall-clock reads must go through `Timestamp::now()` — one UTC
+# unix-millisecond source. Local time and absolute non-UTC types are banned so
+# timezone/clock bugs cannot be reintroduced. `Instant` (monotonic) stays
+# allowed: it is the correct tool for pacing (rate limiter) and immune to
+# clock adjustments. `[lints.clippy]` in Cargo.toml raises these to `deny`.
+
+disallowed-methods = [
+    { path = "chrono::Utc::now", reason = "use domain::timestamp::Timestamp::now() / today_utc() — the single clock choke point" },
+    { path = "chrono::Local::now", reason = "local time is banned; use domain::timestamp::Timestamp (UTC unix-millis)" },
+    { path = "std::time::SystemTime::now", reason = "use domain::timestamp::Timestamp::now() — the single clock choke point" },
+    { path = "time::OffsetDateTime::now_utc", reason = "use domain::timestamp::Timestamp::now() — the single clock choke point" },
+    # Unreachable today (time's `local-offset` feature is off) — allow-invalid
+    # keeps the ban armed in case a future feature flag exposes it.
+    { path = "time::OffsetDateTime::now_local", reason = "local time is banned; use domain::timestamp::Timestamp (UTC unix-millis)", allow-invalid = true },
+    { path = "cookie::Cookie::set_expires", reason = "absolute Expires compares against the client's clock; use max_age (relative) instead" },
+]
+
+disallowed-types = [
+    { path = "chrono::Local", reason = "local timezone is banned; all instants are UTC unix-millis (domain::timestamp::Timestamp)" },
+    { path = "chrono::NaiveDateTime", reason = "timezone-ambiguous; use Timestamp (UTC instant) or NaiveDate (pure calendar date)" },
+]
