@@ -3188,6 +3188,7 @@ async fn session_cookie_secure_attribute_follows_config() {
         db,
         cookie_secure: true,
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
+        exam_presence: Default::default(),
     });
     let secure = login_set_cookie(&app).await;
     assert!(

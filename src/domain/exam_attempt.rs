@@ -3,7 +3,6 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use crate::database::{Database, EXAM_ATTEMPT_TABLE};
 use crate::domain::exam::Exam;
 use crate::domain::exam::ExamId;
-use crate::domain::exam_answer::ExamAnswer;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
@@ -153,9 +152,10 @@ impl ExamAttempt {
     /// - A terminal latest attempt (submitted or expired) starts sitting
     ///   `seq + 1` if the exam's `max_attempts` allows another, and is a
     ///   conflict otherwise. A retake begins from a blank sheet: the student's
-    ///   previous answers are wiped first. Wiping *before* creating keeps the
-    ///   race benign — until the new row exists, saves still hit the terminal
-    ///   attempt and are rejected, so no fresh answer can be lost to the wipe.
+    ///   previous answers are wiped in the same transaction that creates the
+    ///   new row ([`Self::wipe_and_create`]), so a lost race (or a failed
+    ///   create) rolls the wipe back — no answer sheet is ever destroyed
+    ///   without its retake existing.
     ///
     /// The composite id makes each create atomic; a concurrent double-start
     /// races on the same seq, loses to the unique id, and reads the winner's
@@ -180,9 +180,6 @@ impl ExamAttempt {
                 latest.seq + 1
             }
         };
-        if next_seq > 1 {
-            ExamAnswer::delete_for_exam_user(exam.get_id(), user, db).await?;
-        }
         let attempt = ExamAttempt {
             id: ExamAttemptId::composite(exam.get_id(), user, next_seq),
             exam: exam.get_id().clone(),
@@ -192,8 +189,11 @@ impl ExamAttempt {
             finished_at: None,
             left_at: None,
         };
-        let created: Result<Option<ExamAttempt>, surrealdb::Error> =
-            db.create(attempt.id.record()).content(attempt).await;
+        let created: Result<Option<ExamAttempt>, surrealdb::Error> = if next_seq == 1 {
+            db.create(attempt.id.record()).content(attempt).await
+        } else {
+            Self::wipe_and_create(attempt, db).await
+        };
         match created {
             Ok(Some(created)) => Ok((created, true)),
             Ok(None) => Err(AppError::Internal("failed to start exam attempt".into())),
@@ -202,6 +202,33 @@ impl ExamAttempt {
                 None => Err(err.into()),
             },
         }
+    }
+
+    /// Wipe the student's previous answers and create the retake row in one
+    /// transaction. Atomicity is the point: a create that fails (a concurrent
+    /// double-start lost the race on the composite id, or the database
+    /// hiccuped) cancels the whole transaction, wipe included — otherwise a
+    /// stale loser could delete answers freshly saved into the winner's
+    /// sitting, or destroy a graded sheet without a retake ever existing.
+    async fn wipe_and_create(
+        attempt: ExamAttempt,
+        db: &Database,
+    ) -> Result<Option<ExamAttempt>, surrealdb::Error> {
+        let mut result = db
+            .query(
+                "BEGIN TRANSACTION;
+                 DELETE exam_answer WHERE exam = $ex AND user = $usr;
+                 CREATE $id CONTENT $attempt;
+                 COMMIT TRANSACTION;",
+            )
+            .bind(("ex", attempt.exam.record()))
+            .bind(("usr", attempt.user.record()))
+            .bind(("id", attempt.id.record()))
+            .bind(("attempt", attempt))
+            .await?
+            .check()?;
+        // Statement slots count BEGIN and COMMIT too: the CREATE is slot 2.
+        Ok(result.take::<Vec<ExamAttempt>>(2)?.into_iter().next())
     }
 
     /// Stamp the submission time. The caller has already checked the deadline
@@ -222,6 +249,12 @@ impl ExamAttempt {
         self.left_at = left_at;
         let updated: Option<ExamAttempt> = db.update(self.id.record()).content(self).await?;
         updated.ok_or(AppError::NotFound)
+    }
+
+    /// One sitting by id — the exam room re-reads its own attempt this way,
+    /// so a retake started elsewhere can never be mistaken for it.
+    pub async fn read(id: &ExamAttemptId, db: &Database) -> Result<Option<ExamAttempt>, AppError> {
+        Ok(db.select(id.record()).await?)
     }
 
     /// The student's current sitting — the highest `seq` for the pair. All
@@ -279,5 +312,131 @@ impl ExamAttempt {
             .await?
             .check()?;
         Ok(!result.take::<Vec<RecordId>>(0)?.is_empty())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::init_mem;
+    use crate::domain::course::CourseId;
+    use crate::domain::exam::{
+        ExamAttemptLimit, ExamDescription, ExamKind, ExamMode, ExamSchedule, ExamTitle, ExamWeight,
+    };
+    use crate::domain::exam_answer::ExamAnswer;
+    use crate::domain::exam_question::{ExamQuestion, QuestionKind, QuestionPoints, QuestionSpec};
+    use crate::domain::settings::Settings;
+
+    /// An open exam with retakes allowed, plus one choice question — enough
+    /// rows to exercise the attempt lifecycle without the HTTP layer.
+    async fn open_exam_with_question(db: &Database, max_attempts: i64) -> (Exam, ExamQuestion) {
+        let creator = UserId::from_key("01TESTTEACHERAAAAAAAAAAAAA");
+        let course = CourseId::from_key("01TESTCOURSEAAAAAAAAAAAAAA");
+        let kinds = Settings::defaults().get_exam_kinds().to_vec();
+        let exam = Exam::create(
+            &creator,
+            &course,
+            ExamTitle::try_new("practice").unwrap(),
+            ExamDescription::try_new("").unwrap(),
+            ExamKind::try_new("quiz", &kinds).unwrap(),
+            ExamWeight::try_new(1).unwrap(),
+            ExamSchedule::try_new(Some(ExamMode::try_new("open").unwrap()), None, None, None)
+                .unwrap(),
+            ExamAttemptLimit::try_new(max_attempts).unwrap(),
+            true,
+            db,
+        )
+        .await
+        .unwrap();
+        let spec = QuestionSpec::try_new(
+            QuestionKind::try_new("choice").unwrap(),
+            Some(vec!["5".into(), "6".into()]),
+            Some(1),
+        )
+        .unwrap();
+        let question = ExamQuestion::create(
+            exam.get_id(),
+            crate::domain::exam_question::QuestionText::try_new("3 + 3?").unwrap(),
+            QuestionPoints::try_new(5).unwrap(),
+            spec,
+            db,
+        )
+        .await
+        .unwrap();
+        (exam, question)
+    }
+
+    fn student() -> UserId {
+        UserId::from_key("01TESTSTUDENTAAAAAAAAAAAAA")
+    }
+
+    #[tokio::test]
+    async fn a_retake_starts_from_a_blank_sheet() {
+        let db = init_mem().await.unwrap();
+        let (exam, question) = open_exam_with_question(&db, 2).await;
+        let user = student();
+
+        let (first, created) = ExamAttempt::start(&exam, &user, &db).await.unwrap();
+        assert!(created);
+        assert_eq!(first.get_seq(), 1);
+        ExamAnswer::save(&question, &user, Some(1), None, &db)
+            .await
+            .unwrap();
+        first.finish(&db).await.unwrap();
+
+        // The retake lands as sitting #2 with the sheet wiped in the same
+        // transaction that created it.
+        let (second, created) = ExamAttempt::start(&exam, &user, &db).await.unwrap();
+        assert!(created);
+        assert_eq!(second.get_seq(), 2);
+        let answers = ExamAnswer::list_for_exam_user(exam.get_id(), &user, &db)
+            .await
+            .unwrap();
+        assert!(answers.is_empty(), "a retake starts blank");
+    }
+
+    #[tokio::test]
+    async fn a_lost_retake_race_cannot_wipe_the_winners_sheet() {
+        let db = init_mem().await.unwrap();
+        let (exam, question) = open_exam_with_question(&db, 3).await;
+        let user = student();
+
+        // Sitting #1 ends; the winner starts sitting #2 and saves an answer.
+        let (first, _) = ExamAttempt::start(&exam, &user, &db).await.unwrap();
+        first.finish(&db).await.unwrap();
+        let (winner, created) = ExamAttempt::start(&exam, &user, &db).await.unwrap();
+        assert!(created);
+        assert_eq!(winner.get_seq(), 2);
+        ExamAnswer::save(&question, &user, Some(1), None, &db)
+            .await
+            .unwrap();
+
+        // A stale double-start races on the same seq and loses to the
+        // composite id — and the aborted transaction must roll its wipe back,
+        // leaving the winner's fresh answer untouched.
+        let loser = ExamAttempt {
+            id: ExamAttemptId::composite(exam.get_id(), &user, 2),
+            exam: exam.get_id().clone(),
+            user: user.clone(),
+            seq: 2,
+            started_at: Timestamp::now(),
+            finished_at: None,
+            left_at: None,
+        };
+        let lost = ExamAttempt::wipe_and_create(loser, &db).await;
+        assert!(lost.is_err(), "the duplicate create must fail");
+        let answers = ExamAnswer::list_for_exam_user(exam.get_id(), &user, &db)
+            .await
+            .unwrap();
+        assert_eq!(
+            answers.len(),
+            1,
+            "the lost race must not wipe the winner's saved answer"
+        );
+
+        // The public path shrugs the race off: a re-start resumes the winner.
+        let (resumed, created) = ExamAttempt::start(&exam, &user, &db).await.unwrap();
+        assert!(!created);
+        assert_eq!(resumed.get_seq(), 2);
     }
 }

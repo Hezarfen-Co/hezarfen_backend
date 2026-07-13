@@ -48,6 +48,7 @@ fn state(db: Database) -> AppState {
         db,
         cookie_secure: false,
         rate_limit: RateLimitConfig::unlimited(),
+        exam_presence: Default::default(),
     }
 }
 

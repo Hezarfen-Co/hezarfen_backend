@@ -19,6 +19,7 @@ async fn spawn_server() -> (String, Database) {
         // Every request here comes from 127.0.0.1, so per-IP limits would
         // meter the whole suite as one client. Off; `rate_limit.rs` covers it.
         rate_limit: RateLimitConfig::unlimited(),
+        exam_presence: Default::default(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1159,6 +1160,185 @@ async fn exam_room_rejoin_door_is_the_teachers_call() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK, "finish is exempt from rejoin");
+}
+
+/// A walk-out stamp belongs to the sitting the room was opened for — never to
+/// a retake started while the old socket lingered. Closing the stale room of a
+/// finished sitting must not mark the *new* sitting as left (with the door
+/// closed, that stamp would lock the student out of an exam room they never
+/// entered).
+#[tokio::test]
+async fn exam_room_close_after_a_retake_leaves_the_new_sitting_alone() {
+    let room = exam_room_fixture(600_000).await;
+
+    // An open exam with two sittings and the rejoin door closed.
+    let exam: Value = room
+        .teacher
+        .post(format!("{}/courses/{}/exams", room.base, room.course_id))
+        .json(&json!({
+            "title": "practice", "kind": "quiz", "weight": 1,
+            "mode": "open", "max_attempts": 2, "allow_rejoin": false,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let exam_id = exam["id"].as_str().unwrap().to_string();
+    let question: Value = room
+        .teacher
+        .post(format!("{}/exams/{exam_id}/questions", room.base))
+        .json(&json!({ "text": "3 + 3?", "kind": "choice", "points": 5,
+                       "choices": ["5", "6"], "correct": 1 }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let question_id = question["id"].as_str().unwrap().to_string();
+
+    // Sit sitting #1 and open its room.
+    let res = room
+        .student
+        .post(format!("{}/exams/{exam_id}/attempt", room.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let mut ws = ws_open(&room.base, &exam_id, Some(&room.cookie))
+        .await
+        .expect("room for sitting #1");
+    let state = ws_next_frame(&mut ws).await.expect("connect state");
+    assert_eq!(state["attempt"], 1, "{state}");
+
+    // Finish sitting #1 and start sitting #2 over REST — the old socket is
+    // still open while the retake begins.
+    let res = room
+        .student
+        .post(format!("{}/exams/{exam_id}/attempt/finish", room.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let res = room
+        .student
+        .post(format!("{}/exams/{exam_id}/attempt", room.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["attempt"], 2);
+
+    // Now walk out of the stale sitting-#1 room and give the teardown time.
+    ws.close(None).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Sitting #2 was never entered, so it was never left: no stamp, and
+    // answering it works despite the closed door.
+    let attempt: Value = room
+        .student
+        .get(format!("{}/exams/{exam_id}/attempt", room.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(attempt["attempt"], 2, "{attempt}");
+    assert!(
+        attempt["left_at"].is_null(),
+        "closing the old sitting's room must not stamp the new sitting: {attempt}"
+    );
+    let res = room
+        .student
+        .post(format!("{}/exams/{exam_id}/attempt/answers", room.base))
+        .json(&json!({ "question_id": question_id, "selected": 1 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "sitting #2 is writable — the student never left it"
+    );
+}
+
+/// Two sockets on the same sitting (a second tab): closing one must not count
+/// as leaving the exam room while the other is still connected — only the last
+/// socket out stamps `left_at` and (with the door closed) locks answering.
+#[tokio::test]
+async fn exam_room_second_tab_keeps_the_student_present() {
+    let room = exam_room_fixture(600_000).await;
+
+    // Close the door before anyone sits, so a false stamp locks immediately.
+    let res = room
+        .teacher
+        .patch(format!("{}/exams/{}", room.base, room.exam_id))
+        .json(&json!({ "allow_rejoin": false }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let res = room
+        .student
+        .post(format!("{}/exams/{}/attempt", room.base, room.exam_id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+
+    // Two tabs in the same room.
+    let mut ws1 = ws_open(&room.base, &room.exam_id, Some(&room.cookie))
+        .await
+        .expect("first tab");
+    ws_next_frame(&mut ws1).await.expect("state on tab one");
+    let mut ws2 = ws_open(&room.base, &room.exam_id, Some(&room.cookie))
+        .await
+        .expect("second tab");
+    ws_next_frame(&mut ws2).await.expect("state on tab two");
+
+    // Closing one tab is not leaving: the student is still in the room.
+    ws1.close(None).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let attempt = my_attempt(&room).await;
+    assert!(
+        attempt["left_at"].is_null(),
+        "one closed tab of two must not stamp a walk-out: {attempt}"
+    );
+    let res = room
+        .student
+        .post(format!(
+            "{}/exams/{}/attempt/answers",
+            room.base, room.exam_id
+        ))
+        .json(&json!({ "question_id": room.question_id, "selected": 1 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "still present via the second tab, so saves land"
+    );
+
+    // The last tab closing is the real walk-out: stamped, and the closed door
+    // now locks further saves.
+    ws2.close(None).await.unwrap();
+    wait_for_left_at(&room).await;
+    let res = room
+        .student
+        .post(format!(
+            "{}/exams/{}/attempt/answers",
+            room.base, room.exam_id
+        ))
+        .json(&json!({ "question_id": room.question_id, "selected": 0 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CONFLICT);
 }
 
 /// An `open`-mode exam room: no deadline in the state frames, and a retake

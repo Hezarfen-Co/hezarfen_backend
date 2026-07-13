@@ -554,9 +554,11 @@ moves the room's countdown on the next tick, and no stale socket can write
 past its real deadline — the socket shares the exact REST write path.
 
 The room is also the presence signal behind the **rejoin door**: connecting
-clears the attempt's `left_at`, and a socket that closes while the sitting is
-still running stamps it (visible on the live monitor — "left the room three
-minutes ago" at a glance). With the exam's `allow_rejoin` off, a stamped
+clears the attempt's `left_at`, and the *last* socket of the sitting to close
+while it is still running stamps it (visible on the live monitor — "left the
+room three minutes ago" at a glance). Closing one of two tabs is not leaving,
+and a lingering socket from an already-finished sitting never marks a later
+retake as left — each room is bound to the sitting it was opened for. With the exam's `allow_rejoin` off, a stamped
 `left_at` refuses re-entry *and* any further saves, over the socket or REST,
 until the teacher flips the door back open (`PATCH /exams/{id}
 {"allow_rejoin": true}` — live, like the times). Finishing stays allowed: a

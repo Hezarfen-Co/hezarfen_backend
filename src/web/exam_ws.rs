@@ -27,10 +27,17 @@
 //! never write past its real deadline.
 //!
 //! The room is also the presence signal behind the rejoin policy: connecting
-//! clears the attempt's `left_at`, and a socket that closes while the attempt
-//! is still running stamps it. With the exam's `allow_rejoin` off, a stamped
-//! `left_at` refuses re-entry (and any further saves, here or over REST) until
-//! the teacher flips the door back open; finishing stays allowed.
+//! clears the attempt's `left_at`, and the *last* socket of the sitting to
+//! close while the attempt is still running stamps it — a student closing one
+//! of two tabs hasn't left, and a lingering socket from an already-finished
+//! sitting can never mark a later retake as left. With the exam's
+//! `allow_rejoin` off, a stamped `left_at` refuses re-entry (and any further
+//! saves, here or over REST) until the teacher flips the door back open;
+//! finishing stays allowed.
+//!
+//! Each room is bound to the sitting it was opened for: state frames track
+//! that attempt (not whatever is latest), so a room whose sitting ends —
+//! submitted or expired anywhere — announces it and closes.
 
 use std::time::Duration;
 
@@ -45,7 +52,7 @@ use crate::database::Database;
 use crate::domain::enrollment::Enrollment;
 use crate::domain::exam::{Exam, ExamId};
 use crate::domain::exam_answer::ExamAnswer;
-use crate::domain::exam_attempt::{AttemptStatus, ExamAttempt};
+use crate::domain::exam_attempt::{AttemptStatus, ExamAttempt, ExamAttemptId};
 use crate::domain::exam_question::ExamQuestion;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
@@ -99,24 +106,30 @@ pub async fn attempt_ws(
     }
     let attempt = writable_attempt(&exam, user.get_id(), &st.db).await?;
     check_rejoin(&exam, &attempt)?;
-    if attempt.get_left_at().is_some() {
-        attempt.set_left(None, &st.db).await?;
-    }
+    let attempt = if attempt.get_left_at().is_some() {
+        attempt.set_left(None, &st.db).await?
+    } else {
+        attempt
+    };
 
     let user_id = user.get_id().clone();
-    Ok(ws.on_upgrade(move |socket| room(socket, st, exam, user_id)))
+    Ok(ws.on_upgrade(move |socket| room(socket, st, exam, attempt, user_id)))
 }
 
 /// The room loop: state ticks out, answer/finish/ping in, until the socket
-/// closes or the attempt reaches a terminal state.
-async fn room(mut socket: WebSocket, st: AppState, exam: Exam, user: UserId) {
+/// closes or the room's sitting reaches a terminal state. The room is bound
+/// to the attempt it was opened for — `attempt` — and to no later sitting.
+async fn room(mut socket: WebSocket, st: AppState, exam: Exam, attempt: ExamAttempt, user: UserId) {
     let exam_id = exam.get_id().clone();
+    let attempt_id = attempt.get_id().clone();
+    // This socket counts as presence in the sitting's room until it closes.
+    st.exam_presence.enter(attempt_id.key());
     let mut tick = tokio::time::interval(Duration::from_secs(EXAM_WS_TICK_SECS));
     loop {
         tokio::select! {
             // First tick fires immediately — the connect-time state frame.
             _ = tick.tick() => {
-                if push_state(&mut socket, &exam_id, &user, &st.db).await.is_err() {
+                if push_state(&mut socket, &exam_id, &attempt_id, &st.db).await.is_err() {
                     break;
                 }
             }
@@ -128,7 +141,7 @@ async fn room(mut socket: WebSocket, st: AppState, exam: Exam, user: UserId) {
                     Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
                     Some(Ok(_)) => continue,
                 };
-                if handle_message(&mut socket, text.as_str(), &exam_id, &user, &st.db)
+                if handle_message(&mut socket, text.as_str(), &exam_id, &attempt_id, &user, &st.db)
                     .await
                     .is_err()
                 {
@@ -140,19 +153,23 @@ async fn room(mut socket: WebSocket, st: AppState, exam: Exam, user: UserId) {
     // Best-effort closing handshake — a bare TCP teardown reads as an error
     // on the client; a Close frame reads as "the room is over".
     let _ = socket.send(Message::Close(None)).await;
-    // The student is out of the room. If their attempt is still running,
-    // stamp the walk-out — with `allow_rejoin` off this is what locks further
-    // answering. Terminal exits (finished/expired) need no stamp. Best-effort:
-    // a failed stamp only means the walk-out goes unrecorded.
-    stamp_left(&exam_id, &user, &st.db).await;
+    // Only the last socket out means the student actually left the room. If
+    // this sitting is still running, stamp the walk-out — with `allow_rejoin`
+    // off this is what locks further answering. Terminal exits (finished or
+    // expired, and any sitting superseded by a retake is terminal) need no
+    // stamp. Best-effort: a failed stamp only means it goes unrecorded.
+    if st.exam_presence.leave(attempt_id.key()) {
+        stamp_left(&exam_id, &attempt_id, &st.db).await;
+    }
 }
 
-/// Stamp `left_at` on the student's latest attempt if it is still in
-/// progress — re-reading both rows so a finish or expiry that raced the
-/// socket close wins.
-async fn stamp_left(exam_id: &ExamId, user: &UserId, db: &Database) {
+/// Stamp `left_at` on the room's own sitting if it is still in progress —
+/// re-reading both rows so a finish or expiry that raced the socket close
+/// wins. Targeting the sitting by id (never "the latest") means a retake
+/// started elsewhere can't be marked as left by an old room's teardown.
+async fn stamp_left(exam_id: &ExamId, attempt_id: &ExamAttemptId, db: &Database) {
     let attempt = match Exam::read(exam_id, db).await {
-        Ok(Some(exam)) => match ExamAttempt::read_latest_for_user(exam.get_id(), user, db).await {
+        Ok(Some(exam)) => match ExamAttempt::read(attempt_id, db).await {
             Ok(Some(attempt))
                 if attempt.status(&exam, Timestamp::now()) == AttemptStatus::InProgress =>
             {
@@ -189,14 +206,15 @@ async fn send(socket: &mut WebSocket, frame: Value) -> Result<(), RoomClosed> {
 }
 
 /// Re-read everything, push a `state` frame, and close the room (after a
-/// `finished`/`expired` notice) once the attempt is no longer in progress.
+/// `finished`/`expired` notice) once the room's sitting is no longer in
+/// progress.
 async fn push_state(
     socket: &mut WebSocket,
     exam: &ExamId,
-    user: &UserId,
+    attempt: &ExamAttemptId,
     db: &Database,
 ) -> Result<(), RoomClosed> {
-    let (frame, status, finished_at) = match state_frame(exam, user, db).await {
+    let (frame, status, finished_at) = match state_frame(exam, attempt, db).await {
         Ok(state) => state,
         // The exam vanished mid-room (deleted) or the db hiccuped: nothing
         // sensible left to serve.
@@ -228,15 +246,15 @@ async fn push_state(
     }
 }
 
-/// One server-judged snapshot of the attempt, shaped like the REST
+/// One server-judged snapshot of the room's own sitting, shaped like the REST
 /// `AttemptResponse`'s live fields.
 async fn state_frame(
     exam: &ExamId,
-    user: &UserId,
+    attempt: &ExamAttemptId,
     db: &Database,
 ) -> Result<(Value, AttemptStatus, Option<i64>), AppError> {
     let exam = Exam::read(exam, db).await?.ok_or(AppError::NotFound)?;
-    let attempt = ExamAttempt::read_latest_for_user(exam.get_id(), user, db)
+    let attempt = ExamAttempt::read(attempt, db)
         .await?
         .ok_or(AppError::NotFound)?;
     let now = Timestamp::now();
@@ -245,7 +263,7 @@ async fn state_frame(
     let remaining_ms = (status == AttemptStatus::InProgress)
         .then(|| deadline.map(|d| (d.as_millis() - now.as_millis()).max(0)))
         .flatten();
-    let answered = ExamAnswer::list_for_exam_user(exam.get_id(), user, db)
+    let answered = ExamAnswer::list_for_exam_user(exam.get_id(), attempt.get_user(), db)
         .await?
         .len();
     let question_count = ExamQuestion::list_for_exam(exam.get_id(), db).await?.len();
@@ -270,6 +288,7 @@ async fn handle_message(
     socket: &mut WebSocket,
     text: &str,
     exam_id: &ExamId,
+    attempt_id: &ExamAttemptId,
     user: &UserId,
     db: &Database,
 ) -> Result<(), RoomClosed> {
@@ -312,7 +331,7 @@ async fn handle_message(
                     .await?;
                     // Progress changed — refresh the countdown/answered state
                     // right away rather than waiting out the tick.
-                    push_state(socket, exam_id, user, db).await
+                    push_state(socket, exam_id, attempt_id, db).await
                 }
                 Err(err) => send(socket, error_frame(&err)).await,
             }

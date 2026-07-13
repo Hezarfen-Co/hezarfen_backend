@@ -22,6 +22,7 @@ async fn main() -> anyhow::Result<()> {
         db,
         cookie_secure: cfg.cookie_secure,
         rate_limit: cfg.rate_limit.clone(),
+        exam_presence: Default::default(),
     });
 
     let addr = format!("{}:{}", cfg.host, cfg.port);
