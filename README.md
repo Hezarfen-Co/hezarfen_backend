@@ -328,7 +328,14 @@ is independent: omitted (or `null`) keeps the current value, an empty string
 `""` clears it, anything else is validated — email must look like
 `name@example.com`, phone is 7–15 digits with an optional `+` and cosmetic
 separators, `birth_date` is a real `YYYY-MM-DD` calendar date not in the
-future. Names allow unicode; usernames stay ASCII.
+future. Names allow unicode; usernames are strict: lowercase letters and
+digits plus non-consecutive interior `.`, `_`, `-` separators, starting and
+ending with a letter or digit (3–32 chars). Staff-looking names (`admin`,
+`administrator`, `root`, `support`, `system`, `moderator`, `staff`) are
+rejected at `/auth/register` only — the `ADMIN_USERNAME` bootstrap may still
+seed them. A duplicate username on register is a `409`; that this reveals the
+name is taken is a deliberate tradeoff (usernames are public handles here,
+unlike emails).
 
 ## Sync/async exams, attempts & live monitoring
 
