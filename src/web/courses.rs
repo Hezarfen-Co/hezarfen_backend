@@ -488,6 +488,11 @@ async fn unenroll(
 
 /// Create an exam inside a course. Requires teacher+ and course management
 /// rights; the exam's marks count `weight` times into the course average.
+/// Omit `mode` for an offline-graded draft nobody can sit; `sync`/`async`
+/// take a window (async also `duration_ms`), `open` is sittable anytime with
+/// an optional per-attempt `duration_ms`. `max_attempts` (default 1, `0` =
+/// unlimited) meters retakes and `allow_rejoin` (default `true`) is the
+/// exam-room door — both stay editable while the exam runs.
 #[utoipa::path(
     post,
     path = "/{id}/exams",
@@ -497,7 +502,7 @@ async fn unenroll(
     request_body = CreateExamInCourse,
     responses(
         (status = 201, description = "Exam created", body = ExamResponse),
-        (status = 400, description = "Invalid fields, kind, weight, or schedule (malformed window, or times in the past)", body = ErrorResponse),
+        (status = 400, description = "Invalid fields, kind, weight, attempt limit, or schedule (malformed window, or times in the past)", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),

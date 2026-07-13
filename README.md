@@ -7,11 +7,14 @@ Session-cookie auth with four hierarchical roles (`student < teacher < manager
 then mark users present / absent / late / excused. Marks are course-shaped
 (Google Classroom style): a teacher creates a course, enrolls students, adds
 weighted exams inside it, and grades; students read a per-course weighted
-average and an overall average from their mark report. Exams can be scheduled
-**sync** (one fixed window) or **async** (start anytime inside the window, with
-a personal time budget); students *sit* them via attempts, and teachers watch
-attendance, per-student remaining time, submissions, and marks land live on a
-monitor endpoint (snapshot or SSE stream). Courses also carry **lesson
+average and an overall average from their mark report. Exams run **sync** (one
+fixed window), **async** (start anytime inside the window, with a personal
+time budget), or **open** (sit anytime, optionally timed per attempt);
+students *sit* them via attempts — retakes metered by a per-exam limit
+(`0` = unlimited), leaving the exam room governed by a teacher-controlled
+rejoin door — and teachers watch attendance, per-student remaining time,
+sittings, walk-outs, submissions, and marks land live on a monitor endpoint
+(snapshot or SSE stream). Courses also carry **lesson
 sessions** with teacher-taken roll call (students never self-mark a lesson),
 staff clock in/out on a server-stamped **work log**, and every user has an
 **attendance report** (event + per-course lesson tallies with rates).
@@ -477,6 +480,12 @@ roster but keeps the attempt and mark rows, mirroring the marks report.
 > keep data, backfill manually with the SurrealDB CLI (server stopped), e.g.
 > `UPDATE exam SET course = course:<id>, weight = 1 WHERE course = NONE;`
 > after creating a course to attach them to.
+>
+> **Upgrading to the attempts/rejoin build needs nothing manual**: the boot
+> migration backfills `max_attempts = 1`, `allow_rejoin = true`, and attempt
+> `seq = 1` on existing rows, and swaps the single-attempt unique index for
+> the per-sitting one. Pre-upgrade attempts keep their record ids and count
+> as sitting #1.
 
 ## Taking an exam: questions, answers & the exam room
 

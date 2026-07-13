@@ -32,7 +32,7 @@ use crate::state::AppState;
     info(
         title = "Hezarfen Backend API",
         version = env!("CARGO_PKG_VERSION"),
-        description = "Notes, events, attendance, courses, and weighted exam marks behind cookie-session auth. Courses carry lesson sessions with teacher-taken roll call; staff clock in/out on a server-stamped work log; attendance reports tally events and per-course roll call with rates. School-varying policy (exam kinds, attendance statuses, grade-display bands) lives in an editable settings singleton, and courses may link to academic terms.",
+        description = "Notes, events, attendance, courses, and weighted exam marks behind cookie-session auth. Exams run sync (one window), async (window + per-attempt duration), or open (sit anytime), with per-exam attempt limits (retakes) and a teacher-controlled rejoin door on the live exam room. Courses carry lesson sessions with teacher-taken roll call; staff clock in/out on a server-stamped work log; attendance reports tally events and per-course roll call with rates. School-varying policy (exam kinds, attendance statuses, grade-display bands) lives in an editable settings singleton, and courses may link to academic terms.",
     ),
     modifiers(&SecurityAddon),
     tags(
@@ -45,7 +45,7 @@ use crate::state::AppState;
         (name = "sessions", description = "Lesson sessions and their roll call (session teacher or course manager marks enrolled students; manager+ marks the teacher)"),
         (name = "work", description = "Staff work log: check-in/check-out stamped by the server clock, manager corrections"),
         (name = "attendance", description = "Attendance summary reports: event tallies + per-course lesson roll call with rates"),
-        (name = "exams", description = "Exams (per course, weighted): results, sync/async scheduling, attempts, questions/answers, and live monitoring. Not in this spec (WebSocket): the student exam room at `GET /exams/{id}/attempt/ws` — JSON frames, see the README's \"Taking an exam\" section for the protocol"),
+        (name = "exams", description = "Exams (per course, weighted): results, sync/async/open scheduling, attempts with retakes (`max_attempts`, 0 = unlimited) and a live rejoin door (`allow_rejoin`), questions/answers, and live monitoring. A modeless exam is an offline-graded draft — attempts on it are a 409. Not in this spec (WebSocket): the student exam room at `GET /exams/{id}/attempt/ws` — JSON frames; entering clears the attempt's `left_at`, leaving mid-attempt stamps it. See the README's \"Taking an exam\" section for the protocol"),
         (name = "marks", description = "Weighted mark reports per course and overall, labeled by the school's grade bands when configured"),
         (name = "settings", description = "School policy, one singleton: exam kinds, attendance statuses, grade-display bands. Read: any authenticated user; edit: manager+"),
         (name = "terms", description = "Academic terms (semester/trimester/quarter — whatever the school runs); courses may link to one. Read: any authenticated user; edit: manager+"),

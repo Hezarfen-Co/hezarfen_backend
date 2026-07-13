@@ -232,7 +232,7 @@ async fn get_exam(
     request_body = UpdateExam,
     responses(
         (status = 200, description = "Updated exam", body = ExamResponse),
-        (status = 400, description = "Invalid fields, kind, weight, or schedule (malformed window, or newly set times in the past)", body = ErrorResponse),
+        (status = 400, description = "Invalid fields, kind, weight, attempt limit, or schedule (malformed window, or newly set times in the past)", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
@@ -1056,8 +1056,9 @@ async fn live_snapshot(exam: &Exam, db: &Database) -> Result<ExamLiveResponse, A
     })
 }
 
-/// A one-shot live snapshot of the exam: who's in, who's still writing, time
-/// each student has left, and marks as they land. Requires teacher+ and
+/// A one-shot live snapshot of the exam: who's in, who's still writing (and
+/// on which sitting), who walked out of the room (`left_at`), time each
+/// student has left, and marks as they land. Requires teacher+ and
 /// management rights over the exam's course. For a self-updating feed of the
 /// same shape, see `GET /exams/{id}/live/stream`.
 #[utoipa::path(
@@ -1556,7 +1557,8 @@ pub(crate) async fn save_answer_checked(
 }
 
 /// The exam's questions as the sitting student sees them: `correct` stripped,
-/// their own saved answers embedded. Requires an attempt — start one with
+/// their own saved answers embedded — the latest sitting's, since a retake
+/// starts from a blank sheet. Requires an attempt — start one with
 /// `POST /exams/{id}/attempt` first (404 until then). Readable in every
 /// attempt state, so a submitted student can still review what they wrote.
 #[utoipa::path(
@@ -1657,10 +1659,11 @@ async fn save_answer(
     }))
 }
 
-/// One student's answer sheet with correctness flags. Every row carries the
-/// saved answer plus `is_correct` (`null` for text questions — those are the
-/// grader's call), and the machine's `auto_score` over the choice questions is
-/// attached as a *suggestion*: the final mark stays human, via
+/// One student's answer sheet with correctness flags — always the *latest*
+/// sitting's answers (a retake starts from a blank sheet). Every row carries
+/// the saved answer plus `is_correct` (`null` for text questions — those are
+/// the grader's call), and the machine's `auto_score` over the choice
+/// questions is attached as a *suggestion*: the final mark stays human, via
 /// `POST /exams/{id}/results`. Requires teacher+ and management rights over
 /// the exam's course.
 #[utoipa::path(
