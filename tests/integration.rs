@@ -73,7 +73,15 @@ async fn register_validates_input() {
     }
 
     // Interior characters are an allowlist: lowercase, digits, . _ - only.
-    for bad in ["a b", "a\nb", "a\u{1b}[31mb", "a<b>c", "a@b.c", "a/b", "a\"b"] {
+    for bad in [
+        "a b",
+        "a\nb",
+        "a\u{1b}[31mb",
+        "a<b>c",
+        "a@b.c",
+        "a/b",
+        "a\"b",
+    ] {
         let ugly = json!({ "username": bad, "password": "secret1" });
         let res = send(&app, "POST", "/auth/register", None, Some(ugly)).await;
         assert_eq!(res.status, StatusCode::BAD_REQUEST, "{bad:?} accepted");
@@ -123,7 +131,10 @@ async fn register_rejects_reserved_usernames() {
         let res = send(&app, "POST", "/auth/register", None, Some(creds)).await;
         assert_eq!(res.status, StatusCode::BAD_REQUEST, "{name} accepted");
         let msg = res.body["error"].as_str().unwrap_or_default();
-        assert!(msg.contains("reserved"), "unexpected error for {name}: {msg}");
+        assert!(
+            msg.contains("reserved"),
+            "unexpected error for {name}: {msg}"
+        );
     }
 
     // The reservation is registration-only policy: the seeded bootstrap admin
@@ -3425,7 +3436,8 @@ async fn exam_scheduling_validates_and_echoes() {
     assert_eq!(res.body["mode"], "async");
     assert_eq!(res.body["duration_ms"].as_i64(), Some(5_400_000));
 
-    // Unscheduled: every schedule field stays null (pre-schedule behavior).
+    // Unscheduled: every schedule field stays null (pre-schedule behavior),
+    // and the attempt policy shows its defaults.
     let res = create_exam_with(
         &app,
         &teacher,
@@ -3438,6 +3450,28 @@ async fn exam_scheduling_validates_and_echoes() {
     assert!(res.body["starts_at"].is_null());
     assert!(res.body["ends_at"].is_null());
     assert!(res.body["duration_ms"].is_null());
+    assert_eq!(res.body["max_attempts"], 1);
+    assert_eq!(res.body["allow_rejoin"], true);
+
+    // Open: no window at all; an optional per-attempt duration is fine, and
+    // the attempt policy echoes what was asked for.
+    let res = create_exam_with(
+        &app,
+        &teacher,
+        &course,
+        json!({
+            "title": "practice", "kind": "quiz", "weight": 1, "mode": "open",
+            "duration_ms": 5_400_000, "max_attempts": 0, "allow_rejoin": false,
+        }),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    assert_eq!(res.body["mode"], "open");
+    assert!(res.body["starts_at"].is_null());
+    assert!(res.body["ends_at"].is_null());
+    assert_eq!(res.body["duration_ms"].as_i64(), Some(5_400_000));
+    assert_eq!(res.body["max_attempts"], 0);
+    assert_eq!(res.body["allow_rejoin"], false);
 
     // Inconsistent schedules are rejected as a unit.
     for (label, body) in [
@@ -3499,6 +3533,24 @@ async fn exam_scheduling_validates_and_echoes() {
             "past ends_at",
             json!({ "title": "x", "kind": "quiz", "weight": 1, "mode": "sync",
                     "starts_at": now + 3_600_000, "ends_at": now - 3_600_000 }),
+        ),
+        (
+            "open with a window",
+            json!({ "title": "x", "kind": "quiz", "weight": 1, "mode": "open",
+                    "starts_at": now + 60_000, "ends_at": now + 120_000 }),
+        ),
+        (
+            "open with only an ends_at",
+            json!({ "title": "x", "kind": "quiz", "weight": 1, "mode": "open",
+                    "ends_at": now + 120_000 }),
+        ),
+        (
+            "negative attempt limit",
+            json!({ "title": "x", "kind": "quiz", "weight": 1, "max_attempts": -1 }),
+        ),
+        (
+            "attempt limit over the cap",
+            json!({ "title": "x", "kind": "quiz", "weight": 1, "max_attempts": 101 }),
         ),
     ] {
         let res = create_exam_with(&app, &teacher, &course, body).await;
@@ -4179,6 +4231,316 @@ async fn attempts_cascade_with_exam_and_course_deletion() {
             .await
             .unwrap()
     );
+}
+
+/// An `open` exam is sittable anytime — no window, no deadline — and
+/// `max_attempts` meters the retakes: every terminal attempt can be followed
+/// by a fresh sitting (blank answer sheet) until the limit is spent, and the
+/// limit is live-editable, `0` meaning unlimited.
+#[tokio::test]
+async fn open_exams_sit_anytime_and_retakes_respect_the_limit() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "open_t", "teacher").await;
+    let student = login(&app, "omer").await;
+    let student_id = me_id(&app, &student).await;
+    let course = create_course(&app, &teacher, "practice").await;
+    enroll(&app, &teacher, &course, &student_id).await;
+    let exam = scheduled_exam(
+        &app,
+        &teacher,
+        &course,
+        json!({ "title": "drill", "kind": "quiz", "weight": 1,
+                "mode": "open", "max_attempts": 2 }),
+    )
+    .await;
+    let question = create_question(
+        &app,
+        &teacher,
+        &exam,
+        json!({ "text": "2 + 2?", "kind": "choice", "points": 10,
+                "choices": ["3", "4"], "correct": 1 }),
+    )
+    .await;
+
+    // First sitting starts right away — no window to wait for — and runs
+    // without a deadline: it can only end by submission.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    assert_eq!(res.body["attempt"], 1);
+    assert_eq!(res.body["attempts_used"], 1);
+    assert_eq!(res.body["max_attempts"], 2);
+    assert_eq!(res.body["status"], "in_progress");
+    assert!(res.body["deadline"].is_null());
+    assert!(res.body["remaining_ms"].is_null());
+
+    // Answer, then re-"start": the running attempt resumes (200), same clock.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt/answers"),
+        Some(&student),
+        Some(json!({ "question_id": question, "selected": 1 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["attempt"], 1);
+    assert_eq!(res.body["answered"], 1);
+
+    // Submit, then start again: sitting #2, and the retake wiped the sheet.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt/finish"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    assert_eq!(res.body["attempt"], 2);
+    assert_eq!(res.body["attempts_used"], 2);
+    assert_eq!(res.body["answered"], 0, "retake starts from a blank sheet");
+    let res = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/attempt/questions"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert!(
+        res.body[0]["answer"].is_null(),
+        "wiped answer resurfaced: {}",
+        res.body
+    );
+
+    // The limit is spent after sitting #2 ends: no third start.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt/finish"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+
+    // …until the teacher raises it live. `0` = unlimited: sitting #3 opens.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/exams/{exam}"),
+        Some(&teacher),
+        Some(json!({ "max_attempts": 0 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["max_attempts"], 0);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    assert_eq!(res.body["attempt"], 3);
+    assert_eq!(res.body["max_attempts"], 0);
+
+    // Lowering the limit below what's used never kills the running attempt —
+    // it only blocks the next start once this one is over.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/exams/{exam}"),
+        Some(&teacher),
+        Some(json!({ "max_attempts": 1 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/attempt"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["status"], "in_progress");
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt/finish"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+}
+
+/// An `open` exam with a `duration_ms` gives each sitting its own countdown
+/// (`started_at + duration`), and retakes inside a sync window restart the
+/// sheet while the monitor tracks the latest sitting.
+#[tokio::test]
+async fn open_duration_and_sync_retakes_shape_the_deadline_and_monitor() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "dur_t", "teacher").await;
+    let student = login(&app, "duru").await;
+    let student_id = me_id(&app, &student).await;
+    let course = create_course(&app, &teacher, "timing").await;
+    enroll(&app, &teacher, &course, &student_id).await;
+
+    // Open + duration: the deadline is exactly start + budget.
+    let timed = scheduled_exam(
+        &app,
+        &teacher,
+        &course,
+        json!({ "title": "sprint", "kind": "quiz", "weight": 1,
+                "mode": "open", "duration_ms": 60_000 }),
+    )
+    .await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{timed}/attempt"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let started_at = res.body["started_at"].as_i64().expect("started_at");
+    assert_eq!(res.body["deadline"].as_i64(), Some(started_at + 60_000));
+    let remaining = res.body["remaining_ms"].as_i64().expect("remaining_ms");
+    assert!(
+        remaining > 0 && remaining <= 60_000,
+        "remaining {remaining}"
+    );
+
+    // Sync exam with retakes: sitting #2 opens inside the window and the
+    // monitor shows the latest sitting plus the usage count.
+    let now = Timestamp::now().as_millis();
+    let ends = now + 600_000;
+    let exam = scheduled_exam(
+        &app,
+        &teacher,
+        &course,
+        json!({ "title": "final", "kind": "final", "weight": 1,
+                "mode": "sync", "starts_at": now - 1_000, "ends_at": ends,
+                "max_attempts": 3 }),
+    )
+    .await;
+    for _ in 0..2 {
+        let res = send(
+            &app,
+            "POST",
+            &format!("/exams/{exam}/attempt"),
+            Some(&student),
+            None,
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+        assert_eq!(res.body["deadline"].as_i64(), Some(ends));
+        let res = send(
+            &app,
+            "POST",
+            &format!("/exams/{exam}/attempt/finish"),
+            Some(&student),
+            None,
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    }
+    let res = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/live"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["counts"]["submitted"], 1);
+    let row = &res.body["students"][0];
+    assert_eq!(row["user"]["username"], "duru");
+    assert_eq!(row["attempt"], 2);
+    assert_eq!(row["attempts_used"], 2);
+    assert!(row["left_at"].is_null());
+
+    // The third sitting is the last: the window still gates retakes, so once
+    // it shuts (or the limit is spent) starting conflicts.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED);
+    assert_eq!(res.body["attempt"], 3);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt/finish"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
 }
 
 #[tokio::test]
@@ -6495,14 +6857,7 @@ async fn search_rejects_a_blank_query() {
     login(&app, "alice").await;
 
     // Whitespace-only (url-encoded spaces) -> 400, not the full user list.
-    let res = send(
-        &app,
-        "GET",
-        "/users/search?q=%20%20",
-        Some(&teacher),
-        None,
-    )
-    .await;
+    let res = send(&app, "GET", "/users/search?q=%20%20", Some(&teacher), None).await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST);
 
     // Missing `q` entirely is a deserialization failure, not a wildcard.
@@ -6604,8 +6959,8 @@ async fn settings_validation_rejects_bad_lists_and_bands() {
     let manager = login_as(&app, &db, "val.manager", "manager").await;
 
     let bad = [
-        json!({ "exam_kinds": [] }),             // a school needs at least one kind
-        json!({ "exam_kinds": ["   "] }),        // blank entry
+        json!({ "exam_kinds": [] }),      // a school needs at least one kind
+        json!({ "exam_kinds": ["   "] }), // blank entry
         json!({ "exam_kinds": ["Lab", "lab"] }), // case-insensitive duplicate
         json!({ "attendance_statuses": ["present", "absent", "late"] }), // core dropped
         json!({ "grade_bands": [{ "min": 50, "label": "CC" }] }), // no band starts at 0
@@ -6615,7 +6970,14 @@ async fn settings_validation_rejects_bad_lists_and_bands() {
         json!({ "grade_bands": [{ "min": 0, "label": "  " }] }),
     ];
     for body in bad {
-        let res = send(&app, "PATCH", "/settings", Some(&manager), Some(body.clone())).await;
+        let res = send(
+            &app,
+            "PATCH",
+            "/settings",
+            Some(&manager),
+            Some(body.clone()),
+        )
+        .await;
         assert_eq!(res.status, StatusCode::BAD_REQUEST, "should reject {body}");
     }
 
@@ -6860,7 +7222,14 @@ async fn terms_crud_gates_and_links_to_courses() {
         "starts_at": 1_600_000_000_000_i64,
         "ends_at": 1_610_000_000_000_i64,
     });
-    let res = send(&app, "POST", "/terms", Some(&teacher), Some(past_term.clone())).await;
+    let res = send(
+        &app,
+        "POST",
+        "/terms",
+        Some(&teacher),
+        Some(past_term.clone()),
+    )
+    .await;
     assert_eq!(res.status, StatusCode::FORBIDDEN);
     let res = send(&app, "POST", "/terms", Some(&manager), Some(past_term)).await;
     assert_eq!(res.status, StatusCode::CREATED);
@@ -6954,11 +7323,25 @@ async fn terms_crud_gates_and_links_to_courses() {
     assert_eq!(res.body["term"].as_str(), Some(term.as_str()));
 
     // Deleting the term unlinks its courses but never deletes them.
-    let res = send(&app, "DELETE", &format!("/terms/{term}"), Some(&manager), None).await;
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/terms/{term}"),
+        Some(&manager),
+        None,
+    )
+    .await;
     assert_eq!(res.status, StatusCode::NO_CONTENT);
     let res = send(&app, "GET", &format!("/terms/{term}"), Some(&student), None).await;
     assert_eq!(res.status, StatusCode::NOT_FOUND);
-    let res = send(&app, "GET", &format!("/courses/{course}"), Some(&teacher), None).await;
+    let res = send(
+        &app,
+        "GET",
+        &format!("/courses/{course}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
     assert_eq!(res.status, StatusCode::OK);
     assert_eq!(res.body["title"], "History II");
     assert_eq!(res.body["term"], serde_json::Value::Null);
@@ -7088,14 +7471,39 @@ async fn terms_list_newest_first_require_auth_and_unlink_in_bulk() {
     .await;
     let unrelated = id_of(&res.body);
 
-    let res = send(&app, "DELETE", &format!("/terms/{newer}"), Some(&manager), None).await;
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/terms/{newer}"),
+        Some(&manager),
+        None,
+    )
+    .await;
     assert_eq!(res.status, StatusCode::NO_CONTENT);
 
     for course in &linked {
-        let res = send(&app, "GET", &format!("/courses/{course}"), Some(&teacher), None).await;
-        assert_eq!(res.body["term"], serde_json::Value::Null, "unlinked {course}");
+        let res = send(
+            &app,
+            "GET",
+            &format!("/courses/{course}"),
+            Some(&teacher),
+            None,
+        )
+        .await;
+        assert_eq!(
+            res.body["term"],
+            serde_json::Value::Null,
+            "unlinked {course}"
+        );
     }
-    let res = send(&app, "GET", &format!("/courses/{unrelated}"), Some(&teacher), None).await;
+    let res = send(
+        &app,
+        "GET",
+        &format!("/courses/{unrelated}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
     assert_eq!(res.body["term"].as_str(), Some(older.as_str()));
 }
 

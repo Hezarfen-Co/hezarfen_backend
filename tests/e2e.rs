@@ -1015,3 +1015,231 @@ async fn exam_room_expires_mid_session() {
     assert_eq!(sheet["answers"][0]["selected"], 1);
     assert_eq!(sheet["auto_score"]["earned"], 10);
 }
+
+/// The student's latest attempt as their own REST view sees it.
+async fn my_attempt(room: &ExamRoom) -> Value {
+    room.student
+        .get(format!("{}/exams/{}/attempt", room.base, room.exam_id))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+/// Wait (bounded) for the room teardown to stamp `left_at` — the socket close
+/// and the server's stamp race, so poll the REST view briefly.
+async fn wait_for_left_at(room: &ExamRoom) -> i64 {
+    for _ in 0..50 {
+        let attempt = my_attempt(room).await;
+        if let Some(left_at) = attempt["left_at"].as_i64() {
+            return left_at;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("left_at was never stamped after the socket closed");
+}
+
+/// The rejoin door: with `allow_rejoin` off, walking out of the room stamps
+/// `left_at` and locks re-entry and further saves (REST included) — finish
+/// stays possible — until the teacher flips the door back open, which lets
+/// the student reconnect (clearing `left_at`) and keep answering.
+#[tokio::test]
+async fn exam_room_rejoin_door_is_the_teachers_call() {
+    let room = exam_room_fixture(600_000).await;
+
+    // Close the door before anyone sits.
+    let res = room
+        .teacher
+        .patch(format!("{}/exams/{}", room.base, room.exam_id))
+        .json(&json!({ "allow_rejoin": false }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let res = room
+        .student
+        .post(format!("{}/exams/{}/attempt", room.base, room.exam_id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+
+    // First entry is fine — the door only matters after a walk-out.
+    let mut ws = ws_open(&room.base, &room.exam_id, Some(&room.cookie))
+        .await
+        .expect("first entry");
+    let state = ws_next_frame(&mut ws).await.expect("connect state");
+    assert_eq!(state["status"], "in_progress", "{state}");
+    assert_eq!(state["attempt"], 1, "{state}");
+    ws.close(None).await.unwrap();
+    let left_at = wait_for_left_at(&room).await;
+    assert!(left_at > 0);
+
+    // Locked out: no REST saves, no re-entry.
+    let res = room
+        .student
+        .post(format!(
+            "{}/exams/{}/attempt/answers",
+            room.base, room.exam_id
+        ))
+        .json(&json!({ "question_id": room.question_id, "selected": 1 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        ws_open(&room.base, &room.exam_id, Some(&room.cookie))
+            .await
+            .expect_err("rejoin is closed"),
+        409
+    );
+
+    // The teacher reopens the door live; the student walks back in, which
+    // clears the stamp, and answering works again.
+    let res = room
+        .teacher
+        .patch(format!("{}/exams/{}", room.base, room.exam_id))
+        .json(&json!({ "allow_rejoin": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let mut ws = ws_open(&room.base, &room.exam_id, Some(&room.cookie))
+        .await
+        .expect("rejoin after the teacher reopened");
+    ws_next_frame(&mut ws).await.expect("state after rejoin");
+    let attempt = my_attempt(&room).await;
+    assert!(
+        attempt["left_at"].is_null(),
+        "re-entry clears left_at: {attempt}"
+    );
+    ws_send(
+        &mut ws,
+        json!({ "type": "answer", "question_id": room.question_id, "selected": 1 }),
+    )
+    .await;
+    ws_frame_of_type(&mut ws, "saved").await;
+
+    // Walking out again with the door open: stamped, but REST saves still
+    // land — rejoin is allowed, the stamp is just presence.
+    ws.close(None).await.unwrap();
+    wait_for_left_at(&room).await;
+    let res = room
+        .student
+        .post(format!(
+            "{}/exams/{}/attempt/answers",
+            room.base, room.exam_id
+        ))
+        .json(&json!({ "question_id": room.question_id, "selected": 0 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // A locked-out student can still submit what they saved: close the door
+    // once more and finish over REST.
+    let res = room
+        .teacher
+        .patch(format!("{}/exams/{}", room.base, room.exam_id))
+        .json(&json!({ "allow_rejoin": false }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let res = room
+        .student
+        .post(format!(
+            "{}/exams/{}/attempt/finish",
+            room.base, room.exam_id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "finish is exempt from rejoin");
+}
+
+/// An `open`-mode exam room: no deadline in the state frames, and a retake
+/// (attempt #2) enters the room with a blank sheet after the first sitting is
+/// submitted.
+#[tokio::test]
+async fn exam_room_open_mode_runs_untimed_and_retakes() {
+    let room = exam_room_fixture(600_000).await;
+
+    // A second, open exam in the same course: two sittings, no window.
+    let exam: Value = room
+        .teacher
+        .post(format!("{}/courses/{}/exams", room.base, room.course_id))
+        .json(&json!({
+            "title": "practice", "kind": "quiz", "weight": 1,
+            "mode": "open", "max_attempts": 2,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let exam_id = exam["id"].as_str().unwrap().to_string();
+    let question: Value = room
+        .teacher
+        .post(format!("{}/exams/{exam_id}/questions", room.base))
+        .json(&json!({ "text": "3 + 3?", "kind": "choice", "points": 5,
+                       "choices": ["5", "6"], "correct": 1 }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let question_id = question["id"].as_str().unwrap().to_string();
+
+    let res = room
+        .student
+        .post(format!("{}/exams/{exam_id}/attempt", room.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+
+    let mut ws = ws_open(&room.base, &exam_id, Some(&room.cookie))
+        .await
+        .expect("open-mode room");
+    let state = ws_next_frame(&mut ws).await.expect("connect state");
+    assert_eq!(state["status"], "in_progress", "{state}");
+    assert_eq!(state["attempt"], 1, "{state}");
+    assert!(state["deadline"].is_null(), "{state}");
+    assert!(state["remaining_ms"].is_null(), "{state}");
+
+    ws_send(
+        &mut ws,
+        json!({ "type": "answer", "question_id": question_id, "selected": 1 }),
+    )
+    .await;
+    ws_frame_of_type(&mut ws, "saved").await;
+    ws_send(&mut ws, json!({ "type": "finish" })).await;
+    ws_frame_of_type(&mut ws, "finished").await;
+    assert!(ws_next_frame(&mut ws).await.is_none(), "room closes");
+
+    // Retake: sitting #2, blank sheet, fresh room.
+    let res = room
+        .student
+        .post(format!("{}/exams/{exam_id}/attempt", room.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["attempt"], 2);
+    assert_eq!(body["answered"], 0);
+
+    let mut ws = ws_open(&room.base, &exam_id, Some(&room.cookie))
+        .await
+        .expect("room for the retake");
+    let state = ws_next_frame(&mut ws).await.expect("state");
+    assert_eq!(state["attempt"], 2, "{state}");
+    assert_eq!(state["answered"], 0, "{state}");
+    ws.close(None).await.unwrap();
+}
