@@ -2,10 +2,11 @@
 //! the value, so an existing newtype is always valid (parse, don't validate).
 
 use crate::constant::{
-    EXAM_MODES, MAX_EMAIL_LEN, MAX_EXAM_DURATION_MS, MAX_EXAM_WEIGHT, MAX_MARK, MAX_PASSWORD_LEN,
-    MAX_PHONE_DIGITS, MAX_QUESTION_POINTS, MAX_USERNAME_LEN, MIN_EXAM_DURATION_MS,
-    MIN_EXAM_WEIGHT, MIN_MARK, MIN_PASSWORD_LEN, MIN_PHONE_DIGITS, MIN_QUESTION_POINTS,
-    MIN_USERNAME_LEN, QUESTION_KINDS, USERNAME_SEPARATORS,
+    EXAM_MODES, MAX_EMAIL_LEN, MAX_EXAM_ATTEMPTS, MAX_EXAM_DURATION_MS, MAX_EXAM_WEIGHT, MAX_MARK,
+    MAX_PASSWORD_LEN, MAX_PHONE_DIGITS, MAX_QUESTION_POINTS, MAX_USERNAME_LEN,
+    MIN_EXAM_DURATION_MS, MIN_EXAM_WEIGHT, MIN_MARK, MIN_PASSWORD_LEN, MIN_PHONE_DIGITS,
+    MIN_QUESTION_POINTS, MIN_USERNAME_LEN, QUESTION_KINDS, UNLIMITED_EXAM_ATTEMPTS,
+    USERNAME_SEPARATORS,
 };
 use crate::error::ValidationError;
 
@@ -63,7 +64,9 @@ pub fn validate_username(value: &str) -> Result<(), ValidationError> {
     let mut chars = value.chars().peekable();
     while let Some(c) = chars.next() {
         if USERNAME_SEPARATORS.contains(&c)
-            && chars.peek().is_some_and(|n| USERNAME_SEPARATORS.contains(n))
+            && chars
+                .peek()
+                .is_some_and(|n| USERNAME_SEPARATORS.contains(n))
         {
             return Err(ValidationError::Invalid {
                 field: "username",
@@ -201,7 +204,18 @@ pub fn validate_exam_mode(value: &str) -> Result<(), ValidationError> {
     } else {
         Err(ValidationError::Invalid {
             field: "mode",
-            reason: "must be one of: sync, async",
+            reason: "must be one of: sync, async, open",
+        })
+    }
+}
+
+pub fn validate_attempt_limit(value: i64) -> Result<(), ValidationError> {
+    if value == UNLIMITED_EXAM_ATTEMPTS || (1..=MAX_EXAM_ATTEMPTS).contains(&value) {
+        Ok(())
+    } else {
+        Err(ValidationError::Invalid {
+            field: "max_attempts",
+            reason: "must be between 1 and 100, or 0 for unlimited",
         })
     }
 }
@@ -374,11 +388,21 @@ mod tests {
 
     #[tokio::test]
     async fn exam_mode_rules() {
-        for mode in ["sync", "async"] {
+        for mode in ["sync", "async", "open"] {
             assert!(validate_exam_mode(mode).is_ok());
         }
         assert!(validate_exam_mode("live").is_err());
         assert!(validate_exam_mode("").is_err());
+    }
+
+    #[tokio::test]
+    async fn attempt_limit_rules() {
+        assert!(validate_attempt_limit(UNLIMITED_EXAM_ATTEMPTS).is_ok());
+        for limit in [1, 2, 50, MAX_EXAM_ATTEMPTS] {
+            assert!(validate_attempt_limit(limit).is_ok());
+        }
+        assert!(validate_attempt_limit(-1).is_err());
+        assert!(validate_attempt_limit(MAX_EXAM_ATTEMPTS + 1).is_err());
     }
 
     #[tokio::test]

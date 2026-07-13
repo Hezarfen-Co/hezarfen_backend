@@ -13,7 +13,8 @@ use crate::domain::course::{Course, CourseDescription, CourseId, CourseTitle};
 use crate::domain::course_session::{CourseSession, SessionTopic};
 use crate::domain::enrollment::Enrollment;
 use crate::domain::exam::{
-    Exam, ExamDescription, ExamDuration, ExamKind, ExamMode, ExamSchedule, ExamTitle, ExamWeight,
+    Exam, ExamAttemptLimit, ExamDescription, ExamDuration, ExamKind, ExamMode, ExamSchedule,
+    ExamTitle, ExamWeight,
 };
 use crate::domain::role::Role;
 use crate::domain::settings::Settings;
@@ -80,22 +81,29 @@ struct CreateExamInCourse {
     /// How many times this exam counts into the course average, `1`–`100`.
     #[schema(example = 3)]
     weight: i64,
-    /// `sync` (one fixed window for everyone) or `async` (each student starts
-    /// inside the window and gets `duration_ms`). Omit for an unscheduled,
-    /// offline-graded exam.
+    /// `sync` (one fixed window for everyone), `async` (each student starts
+    /// inside the window and gets `duration_ms`), or `open` (no window — sit
+    /// anytime). Omit for an offline-graded draft that cannot be sat.
     #[schema(example = "sync")]
     mode: Option<String>,
-    /// Window open, UTC unix-milliseconds. Required with `mode`; must not be
-    /// in the past.
+    /// Window open, UTC unix-milliseconds. Required for `sync`/`async`,
+    /// forbidden for `open`; must not be in the past.
     #[schema(example = 1_900_000_000_000_i64)]
     starts_at: Option<i64>,
-    /// Window close, UTC unix-milliseconds. Required with `mode`; must not be
-    /// in the past.
+    /// Window close, UTC unix-milliseconds. Required for `sync`/`async`,
+    /// forbidden for `open`; must not be in the past.
     ends_at: Option<i64>,
-    /// Per-student time budget, milliseconds — required for (and exclusive to)
-    /// `async` exams.
+    /// Per-attempt time budget, milliseconds — required for `async`, optional
+    /// for `open` (omit for unlimited time), forbidden for `sync`.
     #[schema(example = 5_400_000_i64)]
     duration_ms: Option<i64>,
+    /// How many attempts each student gets, `1`–`100`, or `0` for unlimited.
+    /// Defaults to `1` — the classic single sitting.
+    #[schema(example = 1)]
+    max_attempts: Option<i64>,
+    /// Whether a student who left the exam room may come back in and keep
+    /// answering. Defaults to `true`; editable live while the exam runs.
+    allow_rejoin: Option<bool>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -525,6 +533,10 @@ async fn create_exam_in_course(
         ends_at,
         req.duration_ms.map(ExamDuration::try_new).transpose()?,
     )?;
+    let max_attempts = match req.max_attempts {
+        Some(limit) => ExamAttemptLimit::try_new(limit)?,
+        None => ExamAttemptLimit::single(),
+    };
     let exam = Exam::create(
         user.get_id(),
         course.get_id(),
@@ -533,6 +545,8 @@ async fn create_exam_in_course(
         kind,
         weight,
         schedule,
+        max_attempts,
+        req.allow_rejoin.unwrap_or(true),
         &st.db,
     )
     .await?;

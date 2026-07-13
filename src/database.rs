@@ -27,7 +27,10 @@ pub const SETTINGS_TABLE: &str = "settings";
 pub const TERM_TABLE: &str = "term";
 
 /// SCHEMAFULL schema: every column is typed, references use `record<..>`.
-/// Idempotent — safe to run on every boot.
+/// Idempotent — safe to run on every boot: `IF NOT EXISTS` guards the
+/// definitions, the backfill `UPDATE ... WHERE <field> = NONE` lines only
+/// touch rows written before their column existed, and `REMOVE ... IF EXISTS`
+/// retires schema (like the single-attempt unique index) exactly once.
 const MIGRATION: &str = "
     DEFINE TABLE IF NOT EXISTS user SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS username ON user TYPE string;
@@ -123,14 +126,22 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS starts_at ON exam TYPE option<int>;
     DEFINE FIELD IF NOT EXISTS ends_at ON exam TYPE option<int>;
     DEFINE FIELD IF NOT EXISTS duration_ms ON exam TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS max_attempts ON exam TYPE int DEFAULT 1;
+    DEFINE FIELD IF NOT EXISTS allow_rejoin ON exam TYPE bool DEFAULT true;
     DEFINE INDEX IF NOT EXISTS exam_course ON exam FIELDS course;
+    UPDATE exam SET max_attempts = 1 WHERE max_attempts = NONE;
+    UPDATE exam SET allow_rejoin = true WHERE allow_rejoin = NONE;
 
     DEFINE TABLE IF NOT EXISTS exam_attempt SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS exam ON exam_attempt TYPE record<exam>;
     DEFINE FIELD IF NOT EXISTS user ON exam_attempt TYPE record<user>;
+    DEFINE FIELD IF NOT EXISTS seq ON exam_attempt TYPE int DEFAULT 1;
     DEFINE FIELD IF NOT EXISTS started_at ON exam_attempt TYPE int;
     DEFINE FIELD IF NOT EXISTS finished_at ON exam_attempt TYPE option<int>;
-    DEFINE INDEX IF NOT EXISTS exam_attempt_exam_user ON exam_attempt FIELDS exam, user UNIQUE;
+    DEFINE FIELD IF NOT EXISTS left_at ON exam_attempt TYPE option<int>;
+    UPDATE exam_attempt SET seq = 1 WHERE seq = NONE;
+    REMOVE INDEX IF EXISTS exam_attempt_exam_user ON TABLE exam_attempt;
+    DEFINE INDEX IF NOT EXISTS exam_attempt_exam_user_seq ON exam_attempt FIELDS exam, user, seq UNIQUE;
     DEFINE INDEX IF NOT EXISTS exam_attempt_exam ON exam_attempt FIELDS exam;
 
     DEFINE TABLE IF NOT EXISTS exam_question SCHEMAFULL;

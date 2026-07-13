@@ -189,6 +189,21 @@ impl ExamAnswer {
             .check()?;
         Ok(result.take::<Vec<ExamAnswer>>(0)?)
     }
+
+    /// Drop one student's answers across an exam — a retake starts from a
+    /// blank sheet.
+    pub async fn delete_for_exam_user(
+        exam: &ExamId,
+        user: &UserId,
+        db: &Database,
+    ) -> Result<(), AppError> {
+        db.query("DELETE exam_answer WHERE exam = $ex AND user = $usr")
+            .bind(("ex", exam.record()))
+            .bind(("usr", user.record()))
+            .await?
+            .check()?;
+        Ok(())
+    }
 }
 
 /// The choice-question score suggested by the machine: `earned` points from

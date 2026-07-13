@@ -8,7 +8,7 @@
 //! Wire protocol (JSON text frames):
 //!
 //! server → client
-//! - `{"type":"state", status, deadline, remaining_ms, now, answered, question_count}`
+//! - `{"type":"state", status, attempt, deadline, remaining_ms, now, answered, question_count}`
 //!   on connect, every [`EXAM_WS_TICK_SECS`], and after each save
 //! - `{"type":"saved", question_id, updated_at}` — an answer landed
 //! - `{"type":"pong"}`
@@ -25,6 +25,12 @@
 //! stays server-authoritative: a teacher extending `ends_at` (or `duration_ms`)
 //! mid-exam moves this room's clock on the next tick, and a stale client can
 //! never write past its real deadline.
+//!
+//! The room is also the presence signal behind the rejoin policy: connecting
+//! clears the attempt's `left_at`, and a socket that closes while the attempt
+//! is still running stamps it. With the exam's `allow_rejoin` off, a stamped
+//! `left_at` refuses re-entry (and any further saves, here or over REST) until
+//! the teacher flips the door back open; finishing stays allowed.
 
 use std::time::Duration;
 
@@ -46,7 +52,7 @@ use crate::domain::user::UserId;
 use crate::error::AppError;
 use crate::state::AppState;
 use crate::web::CurrentUser;
-use crate::web::exams::{save_answer_checked, writable_attempt};
+use crate::web::exams::{check_rejoin, save_answer_checked, writable_attempt};
 
 /// What the client asked for, tagged by `type`.
 #[derive(Deserialize)]
@@ -65,8 +71,10 @@ enum ClientMessage {
 
 /// Upgrade into the caller's exam room. All gates run *before* the upgrade so
 /// a rejected client gets a proper HTTP status instead of an instant close:
-/// unknown exam (404), unscheduled (409), not enrolled (403), no attempt yet
-/// (404 — `POST /exams/{id}/attempt` first), submitted or expired (409).
+/// unknown exam (404), draft with no mode (409), not enrolled (403), no
+/// attempt yet (404 — `POST /exams/{id}/attempt` first), submitted or expired
+/// (409), left the room while rejoin is closed (409). Entering the room
+/// clears the attempt's `left_at` — the student is back inside.
 pub async fn attempt_ws(
     State(st): State<AppState>,
     CurrentUser(user): CurrentUser,
@@ -76,9 +84,9 @@ pub async fn attempt_ws(
     let exam = Exam::read(&ExamId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    if exam.get_starts_at().is_none() {
+    if exam.get_mode().is_none() {
         return Err(AppError::Conflict(
-            "this exam is not scheduled — there is nothing to sit",
+            "this exam is not scheduled — there is nothing to sit (give it a mode: sync, async, or open)",
         ));
     }
     if Enrollment::read_for_user(exam.get_course(), user.get_id(), &st.db)
@@ -89,7 +97,11 @@ pub async fn attempt_ws(
             "you are not enrolled in this exam's course",
         ));
     }
-    writable_attempt(&exam, user.get_id(), &st.db).await?;
+    let attempt = writable_attempt(&exam, user.get_id(), &st.db).await?;
+    check_rejoin(&exam, &attempt)?;
+    if attempt.get_left_at().is_some() {
+        attempt.set_left(None, &st.db).await?;
+    }
 
     let user_id = user.get_id().clone();
     Ok(ws.on_upgrade(move |socket| room(socket, st, exam, user_id)))
@@ -128,6 +140,41 @@ async fn room(mut socket: WebSocket, st: AppState, exam: Exam, user: UserId) {
     // Best-effort closing handshake — a bare TCP teardown reads as an error
     // on the client; a Close frame reads as "the room is over".
     let _ = socket.send(Message::Close(None)).await;
+    // The student is out of the room. If their attempt is still running,
+    // stamp the walk-out — with `allow_rejoin` off this is what locks further
+    // answering. Terminal exits (finished/expired) need no stamp. Best-effort:
+    // a failed stamp only means the walk-out goes unrecorded.
+    stamp_left(&exam_id, &user, &st.db).await;
+}
+
+/// Stamp `left_at` on the student's latest attempt if it is still in
+/// progress — re-reading both rows so a finish or expiry that raced the
+/// socket close wins.
+async fn stamp_left(exam_id: &ExamId, user: &UserId, db: &Database) {
+    let attempt = match Exam::read(exam_id, db).await {
+        Ok(Some(exam)) => match ExamAttempt::read_latest_for_user(exam.get_id(), user, db).await {
+            Ok(Some(attempt))
+                if attempt.status(&exam, Timestamp::now()) == AttemptStatus::InProgress =>
+            {
+                Some(attempt)
+            }
+            Ok(_) => None,
+            Err(err) => {
+                tracing::warn!("exam room could not read the attempt to stamp left_at: {err}");
+                None
+            }
+        },
+        Ok(None) => None,
+        Err(err) => {
+            tracing::warn!("exam room could not read the exam to stamp left_at: {err}");
+            None
+        }
+    };
+    if let Some(attempt) = attempt
+        && let Err(err) = attempt.set_left(Some(Timestamp::now()), db).await
+    {
+        tracing::warn!("exam room could not stamp left_at: {err}");
+    }
 }
 
 /// Errors that end the room: the peer went away, or the attempt reached a
@@ -189,7 +236,7 @@ async fn state_frame(
     db: &Database,
 ) -> Result<(Value, AttemptStatus, Option<i64>), AppError> {
     let exam = Exam::read(exam, db).await?.ok_or(AppError::NotFound)?;
-    let attempt = ExamAttempt::read_for_user(exam.get_id(), user, db)
+    let attempt = ExamAttempt::read_latest_for_user(exam.get_id(), user, db)
         .await?
         .ok_or(AppError::NotFound)?;
     let now = Timestamp::now();
@@ -205,6 +252,7 @@ async fn state_frame(
     let frame = json!({
         "type": "state",
         "status": status.as_str(),
+        "attempt": attempt.get_seq(),
         "deadline": deadline.map(|t| t.as_millis()),
         "remaining_ms": remaining_ms,
         "now": now.as_millis(),

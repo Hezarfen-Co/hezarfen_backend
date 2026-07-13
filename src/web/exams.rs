@@ -17,8 +17,8 @@ use crate::database::Database;
 use crate::domain::course::Course;
 use crate::domain::enrollment::Enrollment;
 use crate::domain::exam::{
-    Exam, ExamDescription, ExamDuration, ExamId, ExamKind, ExamMode, ExamSchedule, ExamTitle,
-    ExamWeight,
+    Exam, ExamAttemptLimit, ExamDescription, ExamDuration, ExamId, ExamKind, ExamMode,
+    ExamSchedule, ExamTitle, ExamWeight,
 };
 use crate::domain::exam_answer::{ExamAnswer, auto_score};
 use crate::domain::exam_attempt::{AttemptStatus, ExamAttempt};
@@ -70,8 +70,10 @@ struct UpdateExam {
     description: Option<String>,
     kind: Option<String>,
     weight: Option<i64>,
-    /// `sync` or `async`. Omit to keep the current mode; send `null` to
-    /// unschedule the exam. Frozen once anyone has started an attempt.
+    /// `sync`, `async`, or `open`. Omit to keep the current mode; send `null`
+    /// to turn the exam back into an offline draft. Frozen once anyone has
+    /// started an attempt. Switching to `open` requires clearing
+    /// `starts_at`/`ends_at` in the same request.
     #[serde(default, deserialize_with = "set_or_clear")]
     #[schema(value_type = Option<String>)]
     mode: Option<Option<String>>,
@@ -86,11 +88,19 @@ struct UpdateExam {
     #[serde(default, deserialize_with = "set_or_clear")]
     #[schema(value_type = Option<i64>)]
     ends_at: Option<Option<i64>>,
-    /// Per-student budget, milliseconds (async only). Omit to keep; `null` to
-    /// clear. Changing it mid-exam moves every running attempt's deadline.
+    /// Per-attempt budget, milliseconds (`async`, or optionally `open`). Omit
+    /// to keep; `null` to clear. Changing it mid-exam moves every running
+    /// attempt's deadline.
     #[serde(default, deserialize_with = "set_or_clear")]
     #[schema(value_type = Option<i64>)]
     duration_ms: Option<Option<i64>>,
+    /// Attempt limit: `1`–`100`, or `0` for unlimited. Omit to keep. Editable
+    /// live — raising it grants retakes on the spot; lowering it only blocks
+    /// future starts.
+    max_attempts: Option<i64>,
+    /// Whether students who left the exam room may come back in. Omit to
+    /// keep. Editable live — the teacher's door handle for the running room.
+    allow_rejoin: Option<bool>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -210,8 +220,9 @@ async fn get_exam(
 /// course (its creator, or manager/admin). Omitted fields keep their value; an
 /// explicit `null` clears a schedule field; the course itself is not updatable.
 /// The schedule must stay consistent as a whole (see the create endpoint), and
-/// `mode` is frozen once anyone has started an attempt — times and duration
-/// stay editable so a running exam can be extended live.
+/// `mode` is frozen once anyone has started an attempt — times, duration,
+/// `max_attempts`, and `allow_rejoin` stay editable so a running exam can be
+/// extended, granted retakes, or have its rejoin door opened live.
 #[utoipa::path(
     patch,
     path = "/{id}",
@@ -297,10 +308,16 @@ async fn update_exam(
         None => exam.get_duration_ms(),
     };
     let schedule = ExamSchedule::try_new(mode, starts_at, ends_at, duration_ms)?;
+    let max_attempts = match req.max_attempts {
+        Some(limit) => ExamAttemptLimit::try_new(limit)?,
+        None => exam.get_max_attempts(),
+    };
+    let allow_rejoin = req.allow_rejoin.unwrap_or_else(|| exam.get_allow_rejoin());
 
-    // Switching sync <-> async (or unscheduling) would silently rewrite the
-    // deadline rules under students who already sat down; extending times is
-    // the supported live adjustment instead.
+    // Switching sync <-> async <-> open (or back to a draft) would silently
+    // rewrite the deadline rules under students who already sat down;
+    // extending times, the attempt limit, and the rejoin door are the
+    // supported live adjustments instead.
     let mode_changed =
         schedule.get_mode().map(ExamMode::as_str) != exam.get_mode().map(ExamMode::as_str);
     if mode_changed && ExamAttempt::any_for_exam(exam.get_id(), &st.db).await? {
@@ -310,7 +327,16 @@ async fn update_exam(
     }
 
     let updated = exam
-        .update(title, description, kind, weight, schedule, &st.db)
+        .update(
+            title,
+            description,
+            kind,
+            weight,
+            schedule,
+            max_attempts,
+            allow_rejoin,
+            &st.db,
+        )
         .await?;
     Ok(Json(ExamResponse::new(&updated)))
 }
@@ -581,29 +607,44 @@ async fn exam_statistics(
 }
 
 // ---- attempts -------------------------------------------------------------
-// A scheduled exam is *sat*: starting an attempt is the live-attendance
-// signal, finishing is the submission. Deadlines are judged only by the
-// server clock — clients sync via `GET /time`.
+// A sittable exam (sync, async, or open mode) is *sat*: starting an attempt
+// is the live-attendance signal, finishing is the submission. The exam's
+// `max_attempts` (0 = unlimited) says how many sittings each student gets;
+// re-posting resumes a running attempt and mints the next sitting once the
+// last one is over. Deadlines are judged only by the server clock — clients
+// sync via `GET /time`.
 
-/// A student's view of their attempt. `now` is echoed so clients can render
-/// countdowns without trusting the device clock.
+/// A student's view of their (latest) attempt. `now` is echoed so clients can
+/// render countdowns without trusting the device clock.
 #[derive(Serialize, ToSchema)]
 struct AttemptResponse {
     id: String,
     exam: String,
     user: PersonRef,
+    /// Which sitting this is — 1 for the first attempt, counting up.
+    attempt: i64,
+    /// How many sittings the caller has used, this one included.
+    attempts_used: u64,
+    /// The exam's attempt limit; `0` means unlimited.
+    max_attempts: i64,
     /// When the attempt started, UTC unix-milliseconds.
     started_at: i64,
     /// Submission instant; `null` while running (or expired unsubmitted).
     finished_at: Option<i64>,
+    /// When the student left the exam room mid-attempt; `null` while inside
+    /// (or if they never used the room). With `allow_rejoin` off, a set
+    /// `left_at` locks further answering until the teacher reopens the door.
+    left_at: Option<i64>,
     /// `in_progress` | `submitted` | `expired`.
     #[schema(example = "in_progress")]
     status: String,
-    /// When the attempt closes: `ends_at` for sync, `min(started_at +
-    /// duration_ms, ends_at)` for async. Recomputed live from the exam's
-    /// current schedule.
+    /// When the attempt closes: the earlier of the window's `ends_at` and
+    /// `started_at + duration_ms` (whichever exists). Recomputed live from
+    /// the exam's current schedule; `null` for an open exam without a
+    /// duration — such an attempt only ends by submission.
     deadline: Option<i64>,
-    /// `deadline - now`, floored at 0; `null` unless in progress.
+    /// `deadline - now`, floored at 0; `null` unless in progress with a
+    /// deadline.
     remaining_ms: Option<i64>,
     /// The caller's mark, once graded.
     mark: Option<i64>,
@@ -616,6 +657,10 @@ struct AttemptResponse {
 }
 
 impl AttemptResponse {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a flat view over attempt + exam + progress; a builder would obscure it"
+    )]
     fn new(
         attempt: &ExamAttempt,
         exam: &Exam,
@@ -623,6 +668,7 @@ impl AttemptResponse {
         people: &HashMap<String, PersonRef>,
         answered: u64,
         question_count: u64,
+        attempts_used: u64,
         now: Timestamp,
     ) -> Self {
         let status = attempt.status(exam, now);
@@ -634,8 +680,12 @@ impl AttemptResponse {
             id: attempt.get_id().key().to_string(),
             exam: attempt.get_exam().key().to_string(),
             user: PersonRef::resolve(people, attempt.get_user()),
+            attempt: attempt.get_seq(),
+            attempts_used,
+            max_attempts: exam.get_max_attempts().as_i64(),
             started_at: attempt.get_started_at().as_millis(),
             finished_at: attempt.get_finished_at().map(|t| t.as_millis()),
+            left_at: attempt.get_left_at().map(|t| t.as_millis()),
             status: status.as_str().to_string(),
             deadline: deadline.map(|t| t.as_millis()),
             remaining_ms,
@@ -659,23 +709,31 @@ async fn attempt_progress(
     Ok((answered, question_count))
 }
 
-/// The exam's window, or a 409 when it isn't scheduled at all. Enrollment and
+/// A 409 unless the exam can be sat at all: it needs a mode (`sync`, `async`,
+/// or `open`) — a modeless exam is an offline-graded draft. Enrollment and
 /// window checks for the caller are the caller's own state — hence `Conflict`
 /// (a state problem), not validation.
-fn window_of(exam: &Exam) -> Result<(Timestamp, Timestamp), AppError> {
-    match (exam.get_starts_at(), exam.get_ends_at()) {
-        (Some(starts), Some(ends)) => Ok((starts, ends)),
-        _ => Err(AppError::Conflict(
-            "this exam is not scheduled — there is nothing to sit",
-        )),
+fn ensure_sittable(exam: &Exam) -> Result<(), AppError> {
+    if exam.get_mode().is_none() {
+        return Err(AppError::Conflict(
+            "this exam is not scheduled — there is nothing to sit (give it a mode: sync, async, or open)",
+        ));
     }
+    Ok(())
 }
 
-/// Start (or resume) the caller's attempt at a scheduled exam. Requires
-/// enrollment in the exam's course and the window to be open. Idempotent in
-/// the useful direction: if an attempt already exists it is returned as-is
-/// (`200` instead of `201`), so a reconnecting client gets its original clock
-/// back — re-starting never resets the time.
+/// How many sittings the caller has used at this exam.
+async fn attempts_used(exam: &ExamId, user: &UserId, db: &Database) -> Result<u64, AppError> {
+    Ok(ExamAttempt::list_for_user(exam, user, db).await?.len() as u64)
+}
+
+/// Start, resume, or retake the caller's attempt. Requires enrollment in the
+/// exam's course, a sittable exam (`sync`/`async`/`open` mode), and — when a
+/// window exists — the window to be open. A still-running attempt is returned
+/// as-is (`200` instead of `201`), so a reconnecting client gets its original
+/// clock back — re-starting never resets the time. Once the latest attempt is
+/// submitted or expired, re-posting starts the next sitting (`201`, blank
+/// answer sheet) while the exam's `max_attempts` (0 = unlimited) allows it.
 #[utoipa::path(
     post,
     path = "/{id}/attempt",
@@ -683,12 +741,12 @@ fn window_of(exam: &Exam) -> Result<(Timestamp, Timestamp), AppError> {
     security(("session_cookie" = [])),
     params(("id" = String, Path, description = "Exam id")),
     responses(
-        (status = 201, description = "Attempt started", body = AttemptResponse),
-        (status = 200, description = "Attempt already existed (unchanged)", body = AttemptResponse),
+        (status = 201, description = "Attempt started (first sitting or a retake)", body = AttemptResponse),
+        (status = 200, description = "Running attempt resumed (unchanged)", body = AttemptResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not enrolled in the exam's course", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
-        (status = 409, description = "Unscheduled exam, or outside the window", body = ErrorResponse),
+        (status = 409, description = "Draft exam, outside the window, or no attempts remaining", body = ErrorResponse),
     ),
 )]
 async fn start_attempt(
@@ -699,7 +757,7 @@ async fn start_attempt(
     let exam = Exam::read(&ExamId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    let (starts_at, ends_at) = window_of(&exam)?;
+    ensure_sittable(&exam)?;
     if Enrollment::read_for_user(exam.get_course(), user.get_id(), &st.db)
         .await?
         .is_none()
@@ -709,18 +767,23 @@ async fn start_attempt(
         ));
     }
     let now = Timestamp::now();
-    if now < starts_at {
+    if let Some(starts_at) = exam.get_starts_at()
+        && now < starts_at
+    {
         return Err(AppError::Conflict("the exam has not started yet"));
     }
-    if now >= ends_at {
+    if let Some(ends_at) = exam.get_ends_at()
+        && now >= ends_at
+    {
         return Err(AppError::Conflict("the exam has already ended"));
     }
 
-    let (attempt, created) = ExamAttempt::start(exam.get_id(), user.get_id(), &st.db).await?;
+    let (attempt, created) = ExamAttempt::start(&exam, user.get_id(), &st.db).await?;
     let mark = ExamResult::read_for_user(exam.get_id(), user.get_id(), &st.db)
         .await?
         .map(|r| r.get_mark());
     let (answered, question_count) = attempt_progress(exam.get_id(), user.get_id(), &st.db).await?;
+    let used = attempts_used(exam.get_id(), user.get_id(), &st.db).await?;
     let people = PersonRef::map_of(&[&user]);
     let status = if created {
         StatusCode::CREATED
@@ -736,14 +799,15 @@ async fn start_attempt(
             &people,
             answered,
             question_count,
+            used,
             Timestamp::now(),
         )),
     ))
 }
 
-/// The caller's own attempt: status, deadline, remaining time, and mark once
-/// graded — everything a student's live exam screen needs, judged by the
-/// server clock. `404` until the attempt is started.
+/// The caller's own (latest) attempt: status, deadline, remaining time, and
+/// mark once graded — everything a student's live exam screen needs, judged
+/// by the server clock. `404` until an attempt is started.
 #[utoipa::path(
     get,
     path = "/{id}/attempt",
@@ -751,7 +815,7 @@ async fn start_attempt(
     security(("session_cookie" = [])),
     params(("id" = String, Path, description = "Exam id")),
     responses(
-        (status = 200, description = "The caller's attempt", body = AttemptResponse),
+        (status = 200, description = "The caller's latest attempt", body = AttemptResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 404, description = "No such exam, or no attempt yet", body = ErrorResponse),
     ),
@@ -764,13 +828,14 @@ async fn my_attempt(
     let exam = Exam::read(&ExamId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    let attempt = ExamAttempt::read_for_user(exam.get_id(), user.get_id(), &st.db)
+    let attempt = ExamAttempt::read_latest_for_user(exam.get_id(), user.get_id(), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
     let mark = ExamResult::read_for_user(exam.get_id(), user.get_id(), &st.db)
         .await?
         .map(|r| r.get_mark());
     let (answered, question_count) = attempt_progress(exam.get_id(), user.get_id(), &st.db).await?;
+    let used = attempts_used(exam.get_id(), user.get_id(), &st.db).await?;
     let people = PersonRef::map_of(&[&user]);
     Ok(Json(AttemptResponse::new(
         &attempt,
@@ -779,6 +844,7 @@ async fn my_attempt(
         &people,
         answered,
         question_count,
+        used,
         Timestamp::now(),
     )))
 }
@@ -807,7 +873,7 @@ async fn finish_attempt(
     let exam = Exam::read(&ExamId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    let attempt = ExamAttempt::read_for_user(exam.get_id(), user.get_id(), &st.db)
+    let attempt = ExamAttempt::read_latest_for_user(exam.get_id(), user.get_id(), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
     if attempt.get_finished_at().is_some() {
@@ -820,11 +886,14 @@ async fn finish_attempt(
         return Err(AppError::Conflict("time is up — the attempt has expired"));
     }
 
+    // Deliberately no rejoin check: a student locked out of the room may
+    // still submit what they saved — finishing answers nothing new.
     let finished = attempt.finish(&st.db).await?;
     let mark = ExamResult::read_for_user(exam.get_id(), user.get_id(), &st.db)
         .await?
         .map(|r| r.get_mark());
     let (answered, question_count) = attempt_progress(exam.get_id(), user.get_id(), &st.db).await?;
+    let used = attempts_used(exam.get_id(), user.get_id(), &st.db).await?;
     let people = PersonRef::map_of(&[&user]);
     Ok(Json(AttemptResponse::new(
         &finished,
@@ -833,21 +902,29 @@ async fn finish_attempt(
         &people,
         answered,
         question_count,
+        used,
         Timestamp::now(),
     )))
 }
 
 // ---- live monitor ---------------------------------------------------------
 
-/// One roster row of the live exam monitor.
+/// One roster row of the live exam monitor. The attempt fields describe the
+/// student's *latest* sitting.
 #[derive(Serialize, ToSchema)]
 struct LiveStudentResponse {
     user: PersonRef,
     /// `not_started` | `in_progress` | `submitted` | `expired`.
     #[schema(example = "in_progress")]
     status: String,
+    /// Which sitting the shown attempt is (1, 2, …); `null` before the first.
+    attempt: Option<i64>,
+    /// How many sittings this student has used.
+    attempts_used: u64,
     started_at: Option<i64>,
     finished_at: Option<i64>,
+    /// When this student left the exam room mid-attempt; `null` while inside.
+    left_at: Option<i64>,
     /// When this student's attempt closes (server-authoritative).
     deadline: Option<i64>,
     /// Time this student has left, floored at 0; `null` unless in progress.
@@ -890,11 +967,24 @@ struct ExamLiveResponse {
 async fn live_snapshot(exam: &Exam, db: &Database) -> Result<ExamLiveResponse, AppError> {
     let now = Timestamp::now();
     let roster = Enrollment::list_for_course(exam.get_course(), db).await?;
-    let attempts: HashMap<String, ExamAttempt> = ExamAttempt::list_for_exam(exam.get_id(), db)
-        .await?
-        .into_iter()
-        .map(|attempt| (attempt.get_user().key().to_string(), attempt))
-        .collect();
+    // Per student: their latest sitting (the one the monitor shows) plus how
+    // many they've used.
+    let mut attempts: HashMap<String, ExamAttempt> = HashMap::new();
+    let mut used: HashMap<String, u64> = HashMap::new();
+    for attempt in ExamAttempt::list_for_exam(exam.get_id(), db).await? {
+        let key = attempt.get_user().key().to_string();
+        *used.entry(key.clone()).or_insert(0) += 1;
+        match attempts.entry(key) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(attempt);
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                if attempt.get_seq() > slot.get().get_seq() {
+                    slot.insert(attempt);
+                }
+            }
+        }
+    }
     let marks: HashMap<String, i64> = ExamResult::list_for_exam(exam.get_id(), db)
         .await?
         .iter()
@@ -929,10 +1019,13 @@ async fn live_snapshot(exam: &Exam, db: &Database) -> Result<ExamLiveResponse, A
                 status: status
                     .map_or("not_started", AttemptStatus::as_str)
                     .to_string(),
+                attempt: attempt.map(ExamAttempt::get_seq),
+                attempts_used: used.get(key).copied().unwrap_or(0),
                 started_at: attempt.map(|a| a.get_started_at().as_millis()),
                 finished_at: attempt
                     .and_then(|a| a.get_finished_at())
                     .map(|t| t.as_millis()),
+                left_at: attempt.and_then(|a| a.get_left_at()).map(|t| t.as_millis()),
                 deadline: deadline.map(|t| t.as_millis()),
                 remaining_ms: (status == Some(AttemptStatus::InProgress))
                     .then(|| deadline.map(|d| (d.as_millis() - now.as_millis()).max(0)))
@@ -1412,15 +1505,16 @@ struct AnswerSavedResponse {
     updated_at: i64,
 }
 
-/// The caller's attempt provided it is still writable, or the error that says
-/// why not: no attempt yet (404 — start it first), already submitted (409),
-/// deadline passed (409). One gate shared by REST saves and the WebSocket room.
+/// The caller's latest attempt provided it is still writable, or the error
+/// that says why not: no attempt yet (404 — start it first), already
+/// submitted (409), deadline passed (409). One gate shared by REST saves and
+/// the WebSocket room.
 pub(crate) async fn writable_attempt(
     exam: &Exam,
     user: &UserId,
     db: &Database,
 ) -> Result<ExamAttempt, AppError> {
-    let attempt = ExamAttempt::read_for_user(exam.get_id(), user, db)
+    let attempt = ExamAttempt::read_latest_for_user(exam.get_id(), user, db)
         .await?
         .ok_or(AppError::NotFound)?;
     match attempt.status(exam, Timestamp::now()) {
@@ -1430,9 +1524,23 @@ pub(crate) async fn writable_attempt(
     }
 }
 
+/// A 409 when the student has walked out of the exam room and the exam's
+/// rejoin door is closed: no more answering (from anywhere) until the teacher
+/// flips `allow_rejoin` back on. Finishing is deliberately exempt — see
+/// `finish_attempt`.
+pub(crate) fn check_rejoin(exam: &Exam, attempt: &ExamAttempt) -> Result<(), AppError> {
+    if attempt.get_left_at().is_some() && !exam.get_allow_rejoin() {
+        return Err(AppError::Conflict(
+            "you left the exam and rejoin is closed — ask your teacher to reopen it",
+        ));
+    }
+    Ok(())
+}
+
 /// Save one answer inside the caller's in-progress attempt — the whole write
-/// path (attempt gate, question lookup, kind check, upsert), shared verbatim
-/// by the REST handler and the WebSocket room so the two can never drift.
+/// path (attempt gate, rejoin gate, question lookup, kind check, upsert),
+/// shared verbatim by the REST handler and the WebSocket room so the two can
+/// never drift.
 pub(crate) async fn save_answer_checked(
     exam: &Exam,
     user: &UserId,
@@ -1441,7 +1549,8 @@ pub(crate) async fn save_answer_checked(
     text: Option<String>,
     db: &Database,
 ) -> Result<ExamAnswer, AppError> {
-    writable_attempt(exam, user, db).await?;
+    let attempt = writable_attempt(exam, user, db).await?;
+    check_rejoin(exam, &attempt)?;
     let question = question_of_exam(exam.get_id(), question_id, db).await?;
     ExamAnswer::save(&question, user, selected, text, db).await
 }
@@ -1472,7 +1581,7 @@ async fn attempt_questions(
         .ok_or(AppError::NotFound)?;
     // The question list is for sitting students; without an attempt there is
     // nothing to sit behind — and no early peek at the questions.
-    ExamAttempt::read_for_user(exam.get_id(), user.get_id(), &st.db)
+    ExamAttempt::read_latest_for_user(exam.get_id(), user.get_id(), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
 
@@ -1505,7 +1614,8 @@ async fn attempt_questions(
 /// Save (or overwrite) one answer in the caller's in-progress attempt.
 /// `choice` questions take `selected`; `text` questions take `text`. Rejected
 /// once the attempt is submitted or its deadline has passed — the server
-/// clock, not the client's, is the judge.
+/// clock, not the client's, is the judge — and rejected while the student has
+/// left the exam room with the exam's rejoin door closed.
 #[utoipa::path(
     post,
     path = "/{id}/attempt/answers",
@@ -1518,7 +1628,7 @@ async fn attempt_questions(
         (status = 400, description = "Payload doesn't match the question's kind", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 404, description = "No such exam, question, or attempt", body = ErrorResponse),
-        (status = 409, description = "Attempt already submitted, or time is up", body = ErrorResponse),
+        (status = 409, description = "Attempt already submitted, time is up, or rejoin is closed", body = ErrorResponse),
     ),
 )]
 async fn save_answer(
@@ -1584,8 +1694,9 @@ async fn attempt_answers(
         ));
     }
     let target = UserId::from_key(&target);
-    // No attempt means no answer sheet — a 404, not an empty one.
-    ExamAttempt::read_for_user(exam.get_id(), &target, &st.db)
+    // No attempt means no answer sheet — a 404, not an empty one. Answers are
+    // always the latest sitting's: a retake starts from a blank sheet.
+    ExamAttempt::read_latest_for_user(exam.get_id(), &target, &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
 

@@ -1,15 +1,15 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use ulid::Ulid;
 
-use crate::constant::{MAX_EXAM_DESCRIPTION_LEN, MAX_EXAM_TITLE_LEN};
+use crate::constant::{MAX_EXAM_DESCRIPTION_LEN, MAX_EXAM_TITLE_LEN, UNLIMITED_EXAM_ATTEMPTS};
 use crate::database::{Database, EXAM_TABLE};
 use crate::domain::course::CourseId;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 use crate::validate::{
-    validate_exam_duration, validate_exam_mode, validate_optional, validate_required,
-    validate_weight,
+    validate_attempt_limit, validate_exam_duration, validate_exam_mode, validate_optional,
+    validate_required, validate_weight,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
@@ -104,8 +104,9 @@ impl ExamWeight {
     }
 }
 
-/// A validated exam mode: `sync` (everyone sits inside one fixed window) or
-/// `async` (each student starts inside the window and gets `duration_ms`).
+/// A validated exam mode: `sync` (everyone sits inside one fixed window),
+/// `async` (each student starts inside the window and gets `duration_ms`), or
+/// `open` (no window — sit anytime, with an optional per-attempt duration).
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct ExamMode(String);
 
@@ -120,7 +121,8 @@ impl ExamMode {
     }
 }
 
-/// A validated per-student time budget for an `async` exam, milliseconds.
+/// A validated per-attempt time budget, milliseconds. Required for an `async`
+/// exam, optional for an `open` one (absent = unlimited time).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, SurrealValue)]
 pub struct ExamDuration(i64);
 
@@ -135,17 +137,51 @@ impl ExamDuration {
     }
 }
 
+/// How many attempts a student gets at an exam. `0` means unlimited — the
+/// same spelling on the wire and in storage; `1` (the default) is the classic
+/// single sitting. Editable live: raising it mid-exam grants retakes, and
+/// lowering it only blocks *future* starts (existing attempts stand).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, SurrealValue)]
+pub struct ExamAttemptLimit(i64);
+
+impl ExamAttemptLimit {
+    pub fn try_new(value: i64) -> Result<Self, ValidationError> {
+        validate_attempt_limit(value)?;
+        Ok(Self(value))
+    }
+
+    /// The single-sitting default for exams created without a limit.
+    pub fn single() -> Self {
+        Self(1)
+    }
+
+    pub fn as_i64(&self) -> i64 {
+        self.0
+    }
+
+    pub fn is_unlimited(&self) -> bool {
+        self.0 == UNLIMITED_EXAM_ATTEMPTS
+    }
+
+    /// Whether a student who already used `used` attempts may start another.
+    pub fn allows_another(&self, used: usize) -> bool {
+        self.is_unlimited() || (used as i64) < self.0
+    }
+}
+
 /// The scheduling fields of an exam, validated as a unit — they only make
 /// sense together. `try_new` is the sole constructor, so an `ExamSchedule` in
 /// hand always satisfies:
 ///
-/// - no mode → no `starts_at`/`ends_at`/`duration_ms` (an unscheduled exam is
-///   graded offline; attempts are rejected),
+/// - no mode → no `starts_at`/`ends_at`/`duration_ms` (an offline-graded
+///   draft; attempts are rejected),
 /// - `sync` → `starts_at` + `ends_at`, no duration (everyone's deadline is
 ///   `ends_at`),
 /// - `async` → `starts_at` + `ends_at` + `duration_ms` (a student who starts
 ///   at `t` gets until `min(t + duration_ms, ends_at)`),
-/// - `ends_at` strictly after `starts_at`.
+/// - `open` → no window; `duration_ms` optional (a student who starts at `t`
+///   gets until `t + duration_ms`, or forever when absent),
+/// - `ends_at` strictly after `starts_at` whenever the window exists.
 #[derive(Debug, Clone, Default)]
 pub struct ExamSchedule {
     mode: Option<ExamMode>,
@@ -167,9 +203,19 @@ impl ExamSchedule {
                 if starts_at.is_some() || ends_at.is_some() || duration_ms.is_some() {
                     return Err(invalid(
                         "mode",
-                        "starts_at, ends_at, and duration_ms require a mode (sync or async)",
+                        "starts_at, ends_at, and duration_ms require a mode (sync, async, or open)",
                     ));
                 }
+            }
+            Some(m) if m.as_str() == "open" => {
+                if starts_at.is_some() || ends_at.is_some() {
+                    return Err(invalid(
+                        "starts_at",
+                        "an open exam has no window — drop starts_at/ends_at or pick sync/async",
+                    ));
+                }
+                // `duration_ms` stays optional: limited time per attempt when
+                // set, unlimited when absent.
             }
             Some(m) => {
                 if starts_at.is_none() {
@@ -186,7 +232,10 @@ impl ExamSchedule {
                         return Err(invalid("duration_ms", "required for an async exam"));
                     }
                     ("sync", true) => {
-                        return Err(invalid("duration_ms", "only async exams take a duration"));
+                        return Err(invalid(
+                            "duration_ms",
+                            "only async and open exams take a duration",
+                        ));
                     }
                     _ => {}
                 }
@@ -221,6 +270,10 @@ pub struct Exam {
     starts_at: Option<Timestamp>,
     ends_at: Option<Timestamp>,
     duration_ms: Option<ExamDuration>,
+    // Attempt policy. Rows predating these columns are backfilled by the boot
+    // migration (limit 1, rejoin open), so reads never see them missing.
+    max_attempts: ExamAttemptLimit,
+    allow_rejoin: bool,
 }
 
 impl Exam {
@@ -268,6 +321,16 @@ impl Exam {
         self.duration_ms
     }
 
+    pub fn get_max_attempts(&self) -> ExamAttemptLimit {
+        self.max_attempts
+    }
+
+    /// Whether a student who left the exam room may come back into it (and
+    /// keep saving answers). The teacher can flip this live.
+    pub fn get_allow_rejoin(&self) -> bool {
+        self.allow_rejoin
+    }
+
     /// The stored schedule as the validated bundle (for merge-on-update).
     /// Bypasses `try_new`: the fields were written through an `ExamSchedule`,
     /// so the invariants already hold.
@@ -296,6 +359,8 @@ impl Exam {
         kind: ExamKind,
         weight: ExamWeight,
         schedule: ExamSchedule,
+        max_attempts: ExamAttemptLimit,
+        allow_rejoin: bool,
         db: &Database,
     ) -> Result<Exam, AppError> {
         let exam = Exam {
@@ -310,6 +375,8 @@ impl Exam {
             starts_at: schedule.starts_at,
             ends_at: schedule.ends_at,
             duration_ms: schedule.duration_ms,
+            max_attempts,
+            allow_rejoin,
         };
         let created: Option<Exam> = db.create(exam.id.record()).content(exam).await?;
         created.ok_or_else(|| AppError::Internal("failed to create exam".into()))
@@ -356,6 +423,10 @@ impl Exam {
 
     // `course` is deliberately not updatable — moving an exam between courses
     // would strand results of students not enrolled in the target course.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the sibling entities' update(field, field, ..) shape"
+    )]
     pub async fn update(
         mut self,
         title: ExamTitle,
@@ -363,6 +434,8 @@ impl Exam {
         kind: ExamKind,
         weight: ExamWeight,
         schedule: ExamSchedule,
+        max_attempts: ExamAttemptLimit,
+        allow_rejoin: bool,
         db: &Database,
     ) -> Result<Exam, AppError> {
         self.title = title;
@@ -373,6 +446,8 @@ impl Exam {
         self.starts_at = schedule.starts_at;
         self.ends_at = schedule.ends_at;
         self.duration_ms = schedule.duration_ms;
+        self.max_attempts = max_attempts;
+        self.allow_rejoin = allow_rejoin;
         let updated: Option<Exam> = db.update(self.id.record()).content(self).await?;
         updated.ok_or(AppError::NotFound)
     }
@@ -441,10 +516,32 @@ mod tests {
 
     #[tokio::test]
     async fn mode_must_be_known() {
-        for mode in ["sync", "async"] {
+        for mode in ["sync", "async", "open"] {
             assert_eq!(ExamMode::try_new(mode).unwrap().as_str(), mode);
         }
         assert!(ExamMode::try_new("live").is_err());
+    }
+
+    #[tokio::test]
+    async fn attempt_limit_counts_or_never_runs_out() {
+        let single = ExamAttemptLimit::single();
+        assert_eq!(single.as_i64(), 1);
+        assert!(!single.is_unlimited());
+        assert!(single.allows_another(0));
+        assert!(!single.allows_another(1));
+
+        let three = ExamAttemptLimit::try_new(3).unwrap();
+        assert!(three.allows_another(2));
+        assert!(!three.allows_another(3));
+        assert!(!three.allows_another(4));
+
+        let unlimited = ExamAttemptLimit::try_new(0).unwrap();
+        assert!(unlimited.is_unlimited());
+        assert!(unlimited.allows_another(0));
+        assert!(unlimited.allows_another(10_000));
+
+        assert!(ExamAttemptLimit::try_new(-1).is_err());
+        assert!(ExamAttemptLimit::try_new(101).is_err());
     }
 
     #[tokio::test]
@@ -468,6 +565,13 @@ mod tests {
         // Async: window plus a per-student duration.
         assert!(ExamSchedule::try_new(mode("async"), at(1), at(2), dur).is_ok());
         assert!(ExamSchedule::try_new(mode("async"), at(1), at(2), None).is_err());
+
+        // Open: no window, duration optional (limited or unlimited time).
+        assert!(ExamSchedule::try_new(mode("open"), None, None, None).is_ok());
+        assert!(ExamSchedule::try_new(mode("open"), None, None, dur).is_ok());
+        assert!(ExamSchedule::try_new(mode("open"), at(1), None, None).is_err());
+        assert!(ExamSchedule::try_new(mode("open"), None, at(2), None).is_err());
+        assert!(ExamSchedule::try_new(mode("open"), at(1), at(2), dur).is_err());
 
         // The window must be a real interval, whatever the mode.
         assert!(ExamSchedule::try_new(mode("sync"), at(2), at(2), None).is_err());

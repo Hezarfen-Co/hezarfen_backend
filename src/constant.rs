@@ -69,13 +69,21 @@ pub const MAX_TERM_NAME_LEN: usize = 100;
 
 /// The only accepted exam modes. `sync`: everyone sits the exam inside one
 /// fixed window. `async`: each student starts inside the window and gets their
-/// own `duration_ms` slice of it.
-pub const EXAM_MODES: [&str; 2] = ["sync", "async"];
+/// own `duration_ms` slice of it. `open`: no window — students sit anytime,
+/// with an optional per-attempt `duration_ms` (absent = unlimited time). An
+/// exam with no mode at all is an offline-graded draft and cannot be sat.
+pub const EXAM_MODES: [&str; 3] = ["sync", "async", "open"];
 
-/// Inclusive bounds for an async exam's per-student duration, milliseconds
-/// (1 minute to 24 hours).
+/// Inclusive bounds for an exam's per-attempt duration, milliseconds
+/// (1 minute to 24 hours). Required for `async`, optional for `open`.
 pub const MIN_EXAM_DURATION_MS: i64 = 60 * 1000;
 pub const MAX_EXAM_DURATION_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// Upper bound for an exam's attempt limit; `UNLIMITED_EXAM_ATTEMPTS` (zero)
+/// is the wire-and-storage spelling of "no limit". A limit of 1 — the
+/// default — is the classic single sitting.
+pub const MAX_EXAM_ATTEMPTS: i64 = 100;
+pub const UNLIMITED_EXAM_ATTEMPTS: i64 = 0;
 
 /// Cadence of the live exam-monitor SSE stream (`GET /exams/{id}/live/stream`).
 pub const EXAM_LIVE_STREAM_INTERVAL_SECS: u64 = 2;

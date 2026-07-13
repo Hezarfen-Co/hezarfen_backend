@@ -198,7 +198,7 @@ impl SessionResponse {
 
 /// Public shape of an exam. Shared by `exams` (CRUD/results) and `courses`
 /// (in-course creation and listing). The schedule fields are all `null` for an
-/// unscheduled (offline-graded) exam; see the create/update endpoints for the
+/// offline-graded draft (no mode); see the create/update endpoints for the
 /// rules tying them together.
 #[derive(Serialize, ToSchema)]
 pub struct ExamResponse {
@@ -209,15 +209,23 @@ pub struct ExamResponse {
     pub description: String,
     pub kind: String,
     pub weight: i64,
-    /// `sync` or `async`; `null` for an unscheduled exam.
+    /// `sync`, `async`, or `open`; `null` for an offline-graded draft
+    /// (not sittable).
     #[schema(example = "sync")]
     pub mode: Option<String>,
-    /// Window open, UTC unix-milliseconds.
+    /// Window open, UTC unix-milliseconds (`sync`/`async`).
     pub starts_at: Option<i64>,
-    /// Window close, UTC unix-milliseconds.
+    /// Window close, UTC unix-milliseconds (`sync`/`async`).
     pub ends_at: Option<i64>,
-    /// Per-student time budget in milliseconds (async exams only).
+    /// Per-attempt time budget in milliseconds — required for `async`,
+    /// optional for `open` (`null` = unlimited time).
     pub duration_ms: Option<i64>,
+    /// How many attempts each student gets; `0` means unlimited.
+    #[schema(example = 1)]
+    pub max_attempts: i64,
+    /// Whether a student who left the exam room may come back in and keep
+    /// answering. Teachers can flip this live.
+    pub allow_rejoin: bool,
 }
 
 impl ExamResponse {
@@ -234,6 +242,8 @@ impl ExamResponse {
             starts_at: exam.get_starts_at().map(|t| t.as_millis()),
             ends_at: exam.get_ends_at().map(|t| t.as_millis()),
             duration_ms: exam.get_duration_ms().map(|d| d.as_millis()),
+            max_attempts: exam.get_max_attempts().as_i64(),
+            allow_rejoin: exam.get_allow_rejoin(),
         }
     }
 }
