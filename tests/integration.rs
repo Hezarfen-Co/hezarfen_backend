@@ -6367,3 +6367,109 @@ async fn attendance_report_tallies_events_and_sessions_per_course() {
     let res = send(&app, "GET", "/attendance/01UNKNOWN", Some(&owner), None).await;
     assert_eq!(res.status, StatusCode::NOT_FOUND);
 }
+
+// --- users: search matching semantics --------------------------------------
+
+/// The search fragment is matched with literal `CONTAINS` semantics — never
+/// SQL-`LIKE`. A regression to a `LIKE '%{q}%'` pattern would turn `%` and `_`
+/// in the query into wildcards: `q=%` would dump every named user and `q=_`
+/// every username, defeating the "real substring only" intent of the picker.
+/// `%` and `_` must match only users who literally carry those characters.
+#[tokio::test]
+async fn search_matches_are_literal_not_like_wildcards() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "teacher", "teacher").await;
+
+    // Three students: one plainly named, one with a literal `%` in their name,
+    // one with a literal `_` in their username.
+    let alice = login(&app, "alice").await;
+    let res = send(
+        &app,
+        "PATCH",
+        "/users/me",
+        Some(&alice),
+        Some(json!({ "name": "Plain", "surname": "Jane" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+
+    let percy = login(&app, "percy").await;
+    let res = send(
+        &app,
+        "PATCH",
+        "/users/me",
+        Some(&percy),
+        Some(json!({ "name": "100% legend" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+
+    login(&app, "under_score").await;
+
+    // `q=%` (url-encoded %25) is a literal percent sign: only percy matches.
+    // Under LIKE semantics it would match every user with a name.
+    let res = send(&app, "GET", "/users/search?q=%25", Some(&teacher), None).await;
+    assert_eq!(res.status, StatusCode::OK);
+    let hits = res.body.as_array().unwrap();
+    assert_eq!(hits.len(), 1, "`%` must match literally: {hits:?}");
+    assert_eq!(hits[0]["username"], "percy");
+
+    // `q=_` is a literal underscore: only under_score matches. Under LIKE
+    // semantics `_` is any-single-character and would match everyone.
+    let res = send(&app, "GET", "/users/search?q=_", Some(&teacher), None).await;
+    assert_eq!(res.status, StatusCode::OK);
+    let hits = res.body.as_array().unwrap();
+    assert_eq!(hits.len(), 1, "`_` must match literally: {hits:?}");
+    assert_eq!(hits[0]["username"], "under_score");
+}
+
+/// A blank search fragment is refused, not treated as match-everything.
+#[tokio::test]
+async fn search_rejects_a_blank_query() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "teacher", "teacher").await;
+    login(&app, "alice").await;
+
+    // Whitespace-only (url-encoded spaces) -> 400, not the full user list.
+    let res = send(
+        &app,
+        "GET",
+        "/users/search?q=%20%20",
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+
+    // Missing `q` entirely is a deserialization failure, not a wildcard.
+    let res = send(&app, "GET", "/users/search", Some(&teacher), None).await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+}
+
+// --- courses: catalog dedup -------------------------------------------------
+
+/// A teacher who is also enrolled in their own course sees it once in the
+/// catalog, not twice — the created and enrolled sources are deduplicated.
+#[tokio::test]
+async fn course_catalog_lists_a_creator_enrolled_course_once() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "teacher", "teacher").await;
+    let teacher_id = me_id(&app, &teacher).await;
+
+    let course = create_course(&app, &teacher, "algebra").await;
+    enroll(&app, &teacher, &course, &teacher_id).await;
+
+    let res = send(&app, "GET", "/courses", Some(&teacher), None).await;
+    assert_eq!(res.status, StatusCode::OK);
+    let courses = res.body.as_array().unwrap();
+    assert_eq!(courses.len(), 1, "created+enrolled must dedup: {courses:?}");
+    assert_eq!(courses[0]["id"], json!(course));
+
+    // The exam catalog derives from the same visible set and must not double
+    // the course's exams either.
+    let exam = create_exam(&app, &teacher, &course, "mt", "quiz", 1).await;
+    let res = send(&app, "GET", "/exams", Some(&teacher), None).await;
+    let exams = res.body.as_array().unwrap();
+    assert_eq!(exams.len(), 1, "one exam listed once: {exams:?}");
+    assert_eq!(exams[0]["id"], json!(exam));
+}
