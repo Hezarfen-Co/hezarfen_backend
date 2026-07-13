@@ -159,7 +159,9 @@ mod tests {
             .to_vec();
         for status in ["present", "absent", "late", "excused"] {
             assert_eq!(
-                AttendanceStatus::try_new(status, &allowed).unwrap().as_str(),
+                AttendanceStatus::try_new(status, &allowed)
+                    .unwrap()
+                    .as_str(),
                 status
             );
         }

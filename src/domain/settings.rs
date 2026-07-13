@@ -176,10 +176,7 @@ impl Settings {
 
 /// Shared rules for the editable string lists: 1–20 trimmed, non-empty,
 /// ≤50-char entries with no case-insensitive duplicates.
-fn validate_list(
-    field: &'static str,
-    values: Vec<String>,
-) -> Result<Vec<String>, ValidationError> {
+fn validate_list(field: &'static str, values: Vec<String>) -> Result<Vec<String>, ValidationError> {
     if values.is_empty() {
         return Err(ValidationError::Empty(field));
     }
@@ -315,11 +312,15 @@ mod tests {
         // Save a custom policy and read it back — bands (nested objects under
         // a FLEXIBLE field) must survive the trip.
         let statuses = Settings::defaults().get_attendance_statuses().to_vec();
-        Settings::try_new(kinds(&["lab"]), statuses.clone(), bands(&[(0, "F"), (50, "P")]))
-            .unwrap()
-            .save(&db)
-            .await
-            .unwrap();
+        Settings::try_new(
+            kinds(&["lab"]),
+            statuses.clone(),
+            bands(&[(0, "F"), (50, "P")]),
+        )
+        .unwrap()
+        .save(&db)
+        .await
+        .unwrap();
         let loaded = Settings::load(&db).await.unwrap();
         assert_eq!(loaded.get_exam_kinds(), ["lab"]);
         assert_eq!(loaded.get_grade_bands().len(), 2);
