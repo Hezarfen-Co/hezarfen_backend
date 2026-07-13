@@ -15,6 +15,9 @@ monitor endpoint (snapshot or SSE stream). Courses also carry **lesson
 sessions** with teacher-taken roll call (students never self-mark a lesson),
 staff clock in/out on a server-stamped **work log**, and every user has an
 **attendance report** (event + per-course lesson tallies with rates).
+School-varying policy is data, not code: exam kinds, attendance statuses, and
+grade-display bands live in an editable **settings** singleton, and academic
+**terms** are plain rows courses can link to (see "Per-school policy").
 
 Every field is a validated newtype (`Username(String)`, `NoteTitle(String)`, …)
 constructed only after its restrictions pass — invalid input can't be
@@ -171,6 +174,8 @@ effect on the user's very next call (no re-login).
 | Read another user's mark report          | teacher      | Narrowed to the caller's managed courses; `manager`+ sees all |
 | Grade students                           | teacher      | Target must be **enrolled**; grading never targets oneself |
 | Edit **own** personal info (name, surname, email, phone, birth date) | student | Every account carries the same optional info fields |
+| Read the school settings and the term list | student | Clients need them to render kind/status pickers, grades, and the calendar |
+| Edit school settings; create / edit / delete terms | manager | School policy (exam kinds, attendance statuses, grade bands) and the academic calendar are management's call |
 | List users; look up one user; change a user's role; edit **any** user's personal info | admin | An admin cannot change **their own** role |
 
 ### Bootstrapping the first admin
@@ -298,10 +303,23 @@ marks/attendance reports narrow to the courses the caller manages.
 | DELETE | `/work/entries/{id}`             | manager | Delete a work entry (open or closed) |
 | GET    | `/attendance/me`                 | student | Own attendance report: events + sessions + per-course tallies |
 | GET    | `/attendance/{user}`             | teacher | A user's attendance report, narrowed to the caller's courses (manager+: full) |
+| GET    | `/settings`                      | student | The school's policy: `exam_kinds`, `attendance_statuses`, `grade_bands` |
+| PATCH  | `/settings`                      | manager | Replace any subset of the three lists, each wholesale (see "Per-school policy") |
+| POST   | `/terms`                         | manager | `{name, starts_at, ends_at}` — past dates allowed (calendar backfill) |
+| GET    | `/terms`                         | student | List terms, newest first        |
+| GET    | `/terms/{id}`                    | student | Get one term                    |
+| PATCH  | `/terms/{id}`                    | manager | Edit a term (the merged range must stay ordered) |
+| DELETE | `/terms/{id}`                    | manager | Delete a term — linked courses are unlinked, never deleted |
 
-`status` ∈ `present | absent | late | excused`.
-`kind` ∈ `homework | quiz | midterm | final | project | oral` — informational
+`status` must be one of the school's attendance statuses (`GET /settings`);
+the core four `present | absent | late | excused` always exist, plus whatever
+the school added.
+`kind` must be one of the school's exam kinds (`GET /settings`; defaults:
+`homework | quiz | midterm | final | project | oral`) — informational
 metadata; the average is driven by `weight`, an integer `1`–`100` set per exam.
+A course may carry a `term_id` (`null` = unassigned); on `PATCH
+/courses/{id}`, an omitted `term_id` keeps the link and an explicit `null`
+clears it.
 `role` ∈ `student | teacher | manager | admin`. Ids in responses are ULIDs.
 An exam `mark` is an integer `0`–`100`; it lives in its own `exam_result` row,
 never in a `note`. Students never grade anyone — grading is teacher+ with
@@ -336,6 +354,47 @@ rejected at `/auth/register` only — the `ADMIN_USERNAME` bootstrap may still
 seed them. A duplicate username on register is a `409`; that this reveals the
 name is taken is a deliberate tradeoff (usernames are public handles here,
 unlike emails).
+
+## Per-school policy (settings & terms)
+
+Every school runs differently; the parts that vary are data, not code. One
+editable `settings` singleton (`GET /settings` for any signed-in user,
+`PATCH /settings` for manager+) carries three knobs:
+
+- **`exam_kinds`** — the accepted `kind` values for new exams. Defaults to
+  `homework, quiz, midterm, final, project, oral`; replace the list with
+  whatever the school grades (`lab`, `presentation`, …). Kinds stay
+  informational — `weight` drives every average.
+- **`attendance_statuses`** — what attendance marking accepts. The core four
+  (`present`, `absent`, `late`, `excused`) are mandatory because the
+  attendance rate is defined over them (`(present+late) /
+  (present+absent+late)`); school extras (say `online`) are **rate-neutral**
+  and tally under `custom` in the attendance reports.
+- **`grade_bands`** — how numeric marks display: a list of `{min, label}`
+  bands (`85 → "AA"`, `50 → "CC"`, …). One band must start at `0` so every
+  mark maps; an empty list (the default) means numeric-only. Storage and
+  averaging stay `0`–`100` forever — bands only add `grade`,
+  `average_grade`, and `overall_grade` labels to the mark report, so a school
+  can switch display scales without touching a single stored mark.
+
+A `PATCH` replaces only the fields it carries, each wholesale, and validation
+is all-or-nothing. Editing a list never rewrites history: an exam keeps its
+retired kind, a roll-call row keeps its retired status — only **new writes**
+are held to the current lists.
+
+Academic structure is data too. **Terms** (`/terms`) model whatever calendar
+the school runs — semester, trimester, quarter systems are just rows with a
+name and a date range. Courses may link to one via `term_id` (nullable), and
+deleting a term only unlinks its courses. Term dates may lie in the past,
+deliberately: a school adopting the app mid-year backfills its calendar —
+unlike exam/lesson/event times, which reject backdating.
+
+What stays fixed is deliberate too: the four roles, the `0`–`100` mark scale,
+validation bounds, and the UTC time policy are invariants, not preferences
+(rename role labels in the frontend if a school says "principal" instead of
+"manager"). Deployment knobs (ports, rate limits, admin seed, CORS) remain
+environment variables — the model is **one school per deployment**, which
+keeps every school's data physically isolated.
 
 ## Sync/async exams, attempts & live monitoring
 
