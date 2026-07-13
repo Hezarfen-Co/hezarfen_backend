@@ -6537,3 +6537,641 @@ async fn course_catalog_lists_a_creator_enrolled_course_once() {
     assert_eq!(exams.len(), 1, "one exam listed once: {exams:?}");
     assert_eq!(exams[0]["id"], json!(exam));
 }
+
+// --- school settings + terms ----------------------------------------------
+
+#[tokio::test]
+async fn settings_serve_defaults_and_gate_edits_to_manager() {
+    let (app, db) = app_and_db().await;
+    let student = login(&app, "set.student").await;
+    let teacher = login_as(&app, &db, "set.teacher", "teacher").await;
+    let manager = login_as(&app, &db, "set.manager", "manager").await;
+
+    // Reading requires a session; the policy is not public.
+    let res = send(&app, "GET", "/settings", None, None).await;
+    assert_eq!(res.status, StatusCode::UNAUTHORIZED);
+
+    // Any authenticated user reads; the defaults mirror the old constants.
+    let res = send(&app, "GET", "/settings", Some(&student), None).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(
+        res.body["exam_kinds"],
+        json!(["homework", "quiz", "midterm", "final", "project", "oral"])
+    );
+    assert_eq!(
+        res.body["attendance_statuses"],
+        json!(["present", "absent", "late", "excused"])
+    );
+    assert_eq!(res.body["grade_bands"], json!([]));
+
+    // Students and teachers cannot edit school policy.
+    for cookie in [&student, &teacher] {
+        let res = send(
+            &app,
+            "PATCH",
+            "/settings",
+            Some(cookie),
+            Some(json!({ "exam_kinds": ["lab"] })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::FORBIDDEN);
+    }
+
+    // A manager edits one field; omitted fields keep their value.
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&manager),
+        Some(json!({ "exam_kinds": ["lab", "Quiz"] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["exam_kinds"], json!(["lab", "Quiz"]));
+    assert_eq!(
+        res.body["attendance_statuses"],
+        json!(["present", "absent", "late", "excused"])
+    );
+
+    // Every reader sees the new policy at once.
+    let res = send(&app, "GET", "/settings", Some(&student), None).await;
+    assert_eq!(res.body["exam_kinds"], json!(["lab", "Quiz"]));
+}
+
+#[tokio::test]
+async fn settings_validation_rejects_bad_lists_and_bands() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "val.manager", "manager").await;
+
+    let bad = [
+        json!({ "exam_kinds": [] }),             // a school needs at least one kind
+        json!({ "exam_kinds": ["   "] }),        // blank entry
+        json!({ "exam_kinds": ["Lab", "lab"] }), // case-insensitive duplicate
+        json!({ "attendance_statuses": ["present", "absent", "late"] }), // core dropped
+        json!({ "grade_bands": [{ "min": 50, "label": "CC" }] }), // no band starts at 0
+        json!({ "grade_bands": [{ "min": 0, "label": "F" }, { "min": 0, "label": "E" }] }),
+        json!({ "grade_bands": [{ "min": -1, "label": "F" }] }),
+        json!({ "grade_bands": [{ "min": 101, "label": "A" }] }),
+        json!({ "grade_bands": [{ "min": 0, "label": "  " }] }),
+    ];
+    for body in bad {
+        let res = send(&app, "PATCH", "/settings", Some(&manager), Some(body.clone())).await;
+        assert_eq!(res.status, StatusCode::BAD_REQUEST, "should reject {body}");
+    }
+
+    // No failed PATCH half-applied anything.
+    let res = send(&app, "GET", "/settings", Some(&manager), None).await;
+    assert_eq!(res.body["exam_kinds"].as_array().unwrap().len(), 6);
+    assert_eq!(res.body["grade_bands"], json!([]));
+}
+
+#[tokio::test]
+async fn exam_kinds_follow_settings_for_new_writes_only() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "kind.teacher", "teacher").await;
+    let manager = login_as(&app, &db, "kind.manager", "manager").await;
+
+    let course = create_course(&app, &teacher, "Chemistry").await;
+    let exam = create_exam(&app, &teacher, &course, "Midterm", "midterm", 1).await;
+
+    // The school swaps its kind list wholesale.
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&manager),
+        Some(json!({ "exam_kinds": ["lab"] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+
+    // New exams are held to the new list.
+    let res = create_exam_with(
+        &app,
+        &teacher,
+        &course,
+        json!({ "title": "Retired kind", "kind": "midterm", "weight": 1 }),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+    let res = create_exam_with(
+        &app,
+        &teacher,
+        &course,
+        json!({ "title": "Lab 1", "kind": "lab", "weight": 1 }),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED);
+
+    // The stored exam keeps its retired kind: a title-only PATCH passes…
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/exams/{exam}"),
+        Some(&teacher),
+        Some(json!({ "title": "Midterm A" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["kind"], "midterm");
+    // …but a kind this request sets is validated against the current list.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/exams/{exam}"),
+        Some(&teacher),
+        Some(json!({ "kind": "midterm" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/exams/{exam}"),
+        Some(&teacher),
+        Some(json!({ "kind": "lab" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["kind"], "lab");
+}
+
+#[tokio::test]
+async fn attendance_statuses_follow_settings_and_bucket_in_reports() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "att.manager", "manager").await;
+    let student = login(&app, "att.student").await;
+
+    // Add a school-specific status on top of the mandatory core.
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&manager),
+        Some(json!({
+            "attendance_statuses": ["present", "absent", "late", "excused", "online"]
+        })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+
+    let res = send(
+        &app,
+        "POST",
+        "/events",
+        Some(&manager),
+        Some(json!({ "title": "Assembly" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED);
+    let event = id_of(&res.body);
+
+    // The custom status is markable; garbage still is not.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/events/{event}/attendance"),
+        Some(&student),
+        Some(json!({ "status": "online" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/events/{event}/attendance"),
+        Some(&student),
+        Some(json!({ "status": "maybe" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+
+    // The report buckets it under `custom` and keeps it out of the rate.
+    let res = send(&app, "GET", "/attendance/me", Some(&student), None).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["events"]["custom"]["online"], 1);
+    assert_eq!(res.body["events"]["total"], 1);
+    assert_eq!(res.body["events"]["rate"], serde_json::Value::Null);
+
+    // Retiring the status blocks new marks; the stored row keeps reporting.
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&manager),
+        Some(json!({
+            "attendance_statuses": ["present", "absent", "late", "excused"]
+        })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/events/{event}/attendance"),
+        Some(&student),
+        Some(json!({ "status": "online" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+    let res = send(&app, "GET", "/attendance/me", Some(&student), None).await;
+    assert_eq!(res.body["events"]["custom"]["online"], 1);
+}
+
+#[tokio::test]
+async fn grade_bands_label_the_marks_report() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "band.teacher", "teacher").await;
+    let manager = login_as(&app, &db, "band.manager", "manager").await;
+    let student = login(&app, "band.student").await;
+    let student_id = me_id(&app, &student).await;
+
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&manager),
+        Some(json!({
+            "grade_bands": [
+                { "min": 0, "label": "FF" },
+                { "min": 50, "label": "CC" },
+                { "min": 85, "label": "AA" },
+            ]
+        })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    // Bands echo highest-first — the canonical order.
+    assert_eq!(res.body["grade_bands"][0]["label"], "AA");
+
+    let course = create_course(&app, &teacher, "Physics").await;
+    enroll(&app, &teacher, &course, &student_id).await;
+    let exam = create_exam(&app, &teacher, &course, "Final", "final", 2).await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/results"),
+        Some(&teacher),
+        Some(json!({ "user_id": student_id, "mark": 90 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+
+    let res = send(&app, "GET", "/marks/me", Some(&student), None).await;
+    assert_eq!(res.status, StatusCode::OK);
+    let block = &res.body["courses"][0];
+    assert_eq!(block["results"][0]["mark"], 90);
+    assert_eq!(block["results"][0]["grade"], "AA");
+    assert_eq!(block["average"], 90.0);
+    assert_eq!(block["average_grade"], "AA");
+    assert_eq!(res.body["overall_grade"], "AA");
+
+    // Clearing the bands turns labels off without touching the numbers.
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&manager),
+        Some(json!({ "grade_bands": [] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    let res = send(&app, "GET", "/marks/me", Some(&student), None).await;
+    assert_eq!(res.body["courses"][0]["results"][0]["mark"], 90);
+    assert_eq!(
+        res.body["courses"][0]["results"][0]["grade"],
+        serde_json::Value::Null
+    );
+    assert_eq!(res.body["overall_grade"], serde_json::Value::Null);
+}
+
+#[tokio::test]
+async fn terms_crud_gates_and_links_to_courses() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "term.manager", "manager").await;
+    let teacher = login_as(&app, &db, "term.teacher", "teacher").await;
+    let student = login(&app, "term.student").await;
+
+    // Writes are manager+; and a term may lie fully in the past — a school
+    // adopting the app mid-year backfills its calendar, unlike the no-past
+    // rule on exams/lessons/events.
+    let past_term = json!({
+        "name": "2025 Fall",
+        "starts_at": 1_600_000_000_000_i64,
+        "ends_at": 1_610_000_000_000_i64,
+    });
+    let res = send(&app, "POST", "/terms", Some(&teacher), Some(past_term.clone())).await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    let res = send(&app, "POST", "/terms", Some(&manager), Some(past_term)).await;
+    assert_eq!(res.status, StatusCode::CREATED);
+    let term = id_of(&res.body);
+
+    // The range stays ordered, merged PATCHes included.
+    let res = send(
+        &app,
+        "POST",
+        "/terms",
+        Some(&manager),
+        Some(json!({ "name": "Broken", "starts_at": 2, "ends_at": 1 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/terms/{term}"),
+        Some(&manager),
+        Some(json!({ "ends_at": 1_500_000_000_000_i64 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/terms/{term}"),
+        Some(&manager),
+        Some(json!({ "name": "2025/26 Fall" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["name"], "2025/26 Fall");
+
+    // Any authenticated user reads the calendar.
+    let res = send(&app, "GET", "/terms", Some(&student), None).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body.as_array().unwrap().len(), 1);
+
+    // Courses link to a term at creation; a bogus id is a 400, not a silent null.
+    let res = send(
+        &app,
+        "POST",
+        "/courses",
+        Some(&teacher),
+        Some(json!({ "title": "History", "term_id": term })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED);
+    let course = id_of(&res.body);
+    assert_eq!(res.body["term"].as_str(), Some(term.as_str()));
+    let res = send(
+        &app,
+        "POST",
+        "/courses",
+        Some(&teacher),
+        Some(json!({ "title": "Broken", "term_id": "nope" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+
+    // PATCH: null unlinks, a value re-links, omitting keeps.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/courses/{course}"),
+        Some(&teacher),
+        Some(json!({ "term_id": null })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["term"], serde_json::Value::Null);
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/courses/{course}"),
+        Some(&teacher),
+        Some(json!({ "term_id": term })),
+    )
+    .await;
+    assert_eq!(res.body["term"].as_str(), Some(term.as_str()));
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/courses/{course}"),
+        Some(&teacher),
+        Some(json!({ "title": "History II" })),
+    )
+    .await;
+    assert_eq!(res.body["term"].as_str(), Some(term.as_str()));
+
+    // Deleting the term unlinks its courses but never deletes them.
+    let res = send(&app, "DELETE", &format!("/terms/{term}"), Some(&manager), None).await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    let res = send(&app, "GET", &format!("/terms/{term}"), Some(&student), None).await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+    let res = send(&app, "GET", &format!("/courses/{course}"), Some(&teacher), None).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["title"], "History II");
+    assert_eq!(res.body["term"], serde_json::Value::Null);
+}
+
+#[tokio::test]
+async fn roll_call_accepts_school_statuses_and_buckets_session_reports() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "roll.manager", "manager").await;
+    let teacher = login_as(&app, &db, "roll.teacher", "teacher").await;
+    let student = login(&app, "roll.student").await;
+    let student_id = me_id(&app, &student).await;
+
+    // The event path is already covered; this proves the second marking
+    // path — lesson roll call — reads the same settings list.
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&manager),
+        Some(json!({
+            "attendance_statuses": ["present", "absent", "late", "excused", "online"]
+        })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+
+    let course = create_course(&app, &teacher, "Biology").await;
+    enroll(&app, &teacher, &course, &student_id).await;
+    let future = Timestamp::now().as_millis() + 3_600_000;
+    let session = create_session(&app, &teacher, &course, future).await;
+
+    // Custom status marks; garbage still dies.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/sessions/{session}/attendance"),
+        Some(&teacher),
+        Some(json!({ "status": "online", "user_id": student_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["status"], "online");
+    let res = send(
+        &app,
+        "POST",
+        &format!("/sessions/{session}/attendance"),
+        Some(&teacher),
+        Some(json!({ "status": "onsite", "user_id": student_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+
+    // Both the overall session tally and the per-course block bucket it
+    // under `custom`, rate-neutral.
+    let res = send(&app, "GET", "/attendance/me", Some(&student), None).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["sessions"]["custom"]["online"], 1);
+    assert_eq!(res.body["sessions"]["total"], 1);
+    assert_eq!(res.body["sessions"]["rate"], serde_json::Value::Null);
+    let block = &res.body["courses"][0];
+    assert_eq!(block["counts"]["custom"]["online"], 1);
+    assert_eq!(block["counts"]["rate"], serde_json::Value::Null);
+}
+
+#[tokio::test]
+async fn terms_list_newest_first_require_auth_and_unlink_in_bulk() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "bulk.manager", "manager").await;
+    let teacher = login_as(&app, &db, "bulk.teacher", "teacher").await;
+
+    // The calendar is not public.
+    let res = send(&app, "GET", "/terms", None, None).await;
+    assert_eq!(res.status, StatusCode::UNAUTHORIZED);
+
+    let older = send(
+        &app,
+        "POST",
+        "/terms",
+        Some(&manager),
+        Some(json!({ "name": "2025 Fall", "starts_at": 1_000, "ends_at": 2_000 })),
+    )
+    .await;
+    let newer = send(
+        &app,
+        "POST",
+        "/terms",
+        Some(&manager),
+        Some(json!({ "name": "2026 Spring", "starts_at": 5_000, "ends_at": 6_000 })),
+    )
+    .await;
+    let (older, newer) = (id_of(&older.body), id_of(&newer.body));
+
+    // Newest (by starts_at) first.
+    let res = send(&app, "GET", "/terms", Some(&teacher), None).await;
+    let names: Vec<&str> = res
+        .body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["2026 Spring", "2025 Fall"]);
+
+    // Deleting a term unlinks EVERY linked course in one stroke, and leaves
+    // courses on other terms alone.
+    let mut linked = Vec::new();
+    for title in ["Algebra", "Geometry"] {
+        let res = send(
+            &app,
+            "POST",
+            "/courses",
+            Some(&teacher),
+            Some(json!({ "title": title, "term_id": newer })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED);
+        linked.push(id_of(&res.body));
+    }
+    let res = send(
+        &app,
+        "POST",
+        "/courses",
+        Some(&teacher),
+        Some(json!({ "title": "History", "term_id": older })),
+    )
+    .await;
+    let unrelated = id_of(&res.body);
+
+    let res = send(&app, "DELETE", &format!("/terms/{newer}"), Some(&manager), None).await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+
+    for course in &linked {
+        let res = send(&app, "GET", &format!("/courses/{course}"), Some(&teacher), None).await;
+        assert_eq!(res.body["term"], serde_json::Value::Null, "unlinked {course}");
+    }
+    let res = send(&app, "GET", &format!("/courses/{unrelated}"), Some(&teacher), None).await;
+    assert_eq!(res.body["term"].as_str(), Some(older.as_str()));
+}
+
+#[tokio::test]
+async fn grade_band_boundary_applies_to_the_weighted_average() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "edge.teacher", "teacher").await;
+    let manager = login_as(&app, &db, "edge.manager", "manager").await;
+    let student = login(&app, "edge.student").await;
+    let student_id = me_id(&app, &student).await;
+
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&manager),
+        Some(json!({
+            "grade_bands": [{ "min": 0, "label": "FF" }, { "min": 85, "label": "AA" }]
+        })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+
+    // Two equal-weight marks straddling the band edge: 80 and 90 → average
+    // exactly 85.0, which is INSIDE the AA band (min is inclusive), while
+    // the 80 itself still reads FF.
+    let course = create_course(&app, &teacher, "Calculus").await;
+    enroll(&app, &teacher, &course, &student_id).await;
+    for (title, mark) in [("Quiz A", 80), ("Quiz B", 90)] {
+        let exam = create_exam(&app, &teacher, &course, title, "quiz", 1).await;
+        let res = send(
+            &app,
+            "POST",
+            &format!("/exams/{exam}/results"),
+            Some(&teacher),
+            Some(json!({ "user_id": student_id, "mark": mark })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK);
+    }
+
+    let res = send(&app, "GET", "/marks/me", Some(&student), None).await;
+    let block = &res.body["courses"][0];
+    assert_eq!(block["average"], 85.0);
+    assert_eq!(block["average_grade"], "AA");
+    let grades: Vec<(&str, &str)> = block["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["title"].as_str().unwrap(), r["grade"].as_str().unwrap()))
+        .collect();
+    assert!(grades.contains(&("Quiz A", "FF")));
+    assert!(grades.contains(&("Quiz B", "AA")));
+    assert_eq!(res.body["overall_grade"], "AA");
+}
+
+#[tokio::test]
+async fn settings_accept_admin_edits_trim_entries_and_noop_on_empty_patch() {
+    let (app, db) = app_and_db().await;
+    let admin = login_as(&app, &db, "adm.admin", "admin").await;
+
+    // An empty PATCH is a valid no-op: current policy back, nothing changed.
+    let res = send(&app, "PATCH", "/settings", Some(&admin), Some(json!({}))).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["exam_kinds"].as_array().unwrap().len(), 6);
+
+    // Admin clears the manager bar (hierarchy, not equality), and entries
+    // arrive trimmed on the wire.
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&admin),
+        Some(json!({ "exam_kinds": ["  lab  ", "quiz"] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["exam_kinds"], json!(["lab", "quiz"]));
+}

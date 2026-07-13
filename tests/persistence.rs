@@ -299,3 +299,83 @@ async fn course_marks_survive_reopen() {
         assert_eq!(roster.body.as_array().unwrap().len(), 1, "roster intact");
     }
 }
+
+/// School policy and terms survive a close + reopen — the settings singleton
+/// (nested band objects included) and the course→term link both come back,
+/// and the second boot's idempotent migration doesn't disturb them.
+#[tokio::test]
+async fn settings_and_terms_survive_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config_at(&dir);
+
+    let term;
+    {
+        let db = database::init(&cfg).await.expect("open file db");
+        let app = build_router(state(db.clone()));
+
+        let creds = json!({ "username": "boss", "password": "secret1" });
+        send(&app, "POST", "/auth/register", None, Some(creds.clone())).await;
+        set_role(&db, "boss", "manager").await;
+        let cookie = send(&app, "POST", "/auth/login", None, Some(creds))
+            .await
+            .cookie
+            .unwrap();
+
+        let res = send(
+            &app,
+            "PATCH",
+            "/settings",
+            Some(&cookie),
+            Some(json!({
+                "exam_kinds": ["lab", "quiz"],
+                "grade_bands": [{ "min": 0, "label": "F" }, { "min": 50, "label": "P" }],
+            })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK);
+
+        let res = send(
+            &app,
+            "POST",
+            "/terms",
+            Some(&cookie),
+            Some(json!({ "name": "2026 Fall", "starts_at": 1, "ends_at": 2 })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED);
+        term = res.body["id"].as_str().unwrap().to_string();
+
+        let res = send(
+            &app,
+            "POST",
+            "/courses",
+            Some(&cookie),
+            Some(json!({ "title": "History", "term_id": term })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED);
+    }
+
+    // New handle at the same path — a fresh boot, migration re-applied.
+    let db = reopen(&cfg).await;
+    let app = build_router(state(db));
+    let creds = json!({ "username": "boss", "password": "secret1" });
+    let cookie = send(&app, "POST", "/auth/login", None, Some(creds))
+        .await
+        .cookie
+        .unwrap();
+
+    let res = send(&app, "GET", "/settings", Some(&cookie), None).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["exam_kinds"], json!(["lab", "quiz"]));
+    assert_eq!(res.body["grade_bands"][0]["label"], "P");
+
+    let res = send(&app, "GET", &format!("/terms/{term}"), Some(&cookie), None).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["name"], "2026 Fall");
+
+    let res = send(&app, "GET", "/courses", Some(&cookie), None).await;
+    let courses = res.body.as_array().unwrap();
+    assert_eq!(courses.len(), 1);
+    assert_eq!(courses[0]["term"].as_str(), Some(term.as_str()));
+}
