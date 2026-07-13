@@ -9,10 +9,10 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::constant::SESSION_DURATION_DAYS;
+use crate::constant::{RESERVED_USERNAMES, SESSION_DURATION_DAYS};
 use crate::domain::session::Session;
 use crate::domain::user::{Password, PasswordHash, User, Username};
-use crate::error::{AppError, ErrorResponse};
+use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::state::AppState;
 
@@ -62,6 +62,16 @@ async fn register(
     Json(req): Json<Credentials>,
 ) -> Result<(StatusCode, Json<UserResponse>), AppError> {
     let username = Username::try_new(&req.username)?;
+    // Registration-level policy, not a `Username` invariant: these names read
+    // as staff and invite impersonation, but the `ADMIN_USERNAME` bootstrap
+    // must still be able to seed e.g. `admin` through the same newtype.
+    if RESERVED_USERNAMES.contains(&username.as_str()) {
+        return Err(ValidationError::Invalid {
+            field: "username",
+            reason: "this username is reserved",
+        }
+        .into());
+    }
     let password_hash = Password::try_new(&req.password)?.hash()?;
     let user = User::create(username, password_hash, &st.db).await?;
     Ok((StatusCode::CREATED, Json(UserResponse::new(&user))))

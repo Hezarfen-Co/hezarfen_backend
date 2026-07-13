@@ -3,6 +3,23 @@
 pub const MIN_USERNAME_LEN: usize = 3;
 pub const MAX_USERNAME_LEN: usize = 32;
 
+/// Separators allowed inside a username (never at the edges, never doubled).
+pub const USERNAME_SEPARATORS: [char; 3] = ['.', '_', '-'];
+
+/// Names nobody may claim through `/auth/register`: they read as staff and
+/// invite impersonation. Enforced at the registration endpoint, not in
+/// `Username` itself, so the `ADMIN_USERNAME` bootstrap can still seed
+/// accounts like `admin`.
+pub const RESERVED_USERNAMES: [&str; 7] = [
+    "admin",
+    "administrator",
+    "root",
+    "support",
+    "system",
+    "moderator",
+    "staff",
+];
+
 pub const MIN_PASSWORD_LEN: usize = 6;
 pub const MAX_PASSWORD_LEN: usize = 128;
 

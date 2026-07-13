@@ -58,6 +58,40 @@ async fn register_validates_input() {
     let res = send(&app, "POST", "/auth/register", None, Some(blank)).await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST);
 
+    // Uppercase anywhere in the username -> 400.
+    for bad in ["Bob", "bOb", "BOB"] {
+        let upper = json!({ "username": bad, "password": "secret1" });
+        let res = send(&app, "POST", "/auth/register", None, Some(upper)).await;
+        assert_eq!(res.status, StatusCode::BAD_REQUEST, "{bad} accepted");
+    }
+
+    // Username must start and end with a letter or digit -> 400.
+    for bad in ["-bob", "bob-", "_bob", "bob_", ".bob"] {
+        let edge = json!({ "username": bad, "password": "secret1" });
+        let res = send(&app, "POST", "/auth/register", None, Some(edge)).await;
+        assert_eq!(res.status, StatusCode::BAD_REQUEST, "{bad} accepted");
+    }
+
+    // Interior characters are an allowlist: lowercase, digits, . _ - only.
+    for bad in ["a b", "a\nb", "a\u{1b}[31mb", "a<b>c", "a@b.c", "a/b", "a\"b"] {
+        let ugly = json!({ "username": bad, "password": "secret1" });
+        let res = send(&app, "POST", "/auth/register", None, Some(ugly)).await;
+        assert_eq!(res.status, StatusCode::BAD_REQUEST, "{bad:?} accepted");
+    }
+
+    // Consecutive separators -> 400.
+    for bad in ["a--b", "a..b", "a__b", "a.-b"] {
+        let doubled = json!({ "username": bad, "password": "secret1" });
+        let res = send(&app, "POST", "/auth/register", None, Some(doubled)).await;
+        assert_eq!(res.status, StatusCode::BAD_REQUEST, "{bad} accepted");
+    }
+
+    // Single separators between alphanumerics are fine -> 201.
+    let dotted = json!({ "username": "ali.k_1-b", "password": "secret1" });
+    let res = send(&app, "POST", "/auth/register", None, Some(dotted)).await;
+    assert_eq!(res.status, StatusCode::CREATED);
+    assert_eq!(res.body["username"], "ali.k_1-b");
+
     // Valid -> 201, no password echoed back, defaults to the student role.
     let ok = json!({ "username": "bob", "password": "secret1" });
     let res = send(&app, "POST", "/auth/register", None, Some(ok.clone())).await;
@@ -69,6 +103,36 @@ async fn register_validates_input() {
     // Duplicate username -> 409.
     let res = send(&app, "POST", "/auth/register", None, Some(ok)).await;
     assert_eq!(res.status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn register_rejects_reserved_usernames() {
+    let app = mem_app().await;
+
+    // Staff-looking names can't be claimed through public registration.
+    for name in [
+        "admin",
+        "administrator",
+        "root",
+        "support",
+        "system",
+        "moderator",
+        "staff",
+    ] {
+        let creds = json!({ "username": name, "password": "secret1" });
+        let res = send(&app, "POST", "/auth/register", None, Some(creds)).await;
+        assert_eq!(res.status, StatusCode::BAD_REQUEST, "{name} accepted");
+        let msg = res.body["error"].as_str().unwrap_or_default();
+        assert!(msg.contains("reserved"), "unexpected error for {name}: {msg}");
+    }
+
+    // The reservation is registration-only policy: the seeded bootstrap admin
+    // (created through `ensure_admin`, not `/auth/register`) still logs in.
+    // Covered by the admin bootstrap tests; here just prove a reserved name
+    // is not permanently poisoned for login by the register-level check.
+    let creds = json!({ "username": "admin", "password": "wrong" });
+    let res = send(&app, "POST", "/auth/login", None, Some(creds)).await;
+    assert_eq!(res.status, StatusCode::UNAUTHORIZED); // bad credentials, not "reserved"
 }
 
 #[tokio::test]
@@ -2362,7 +2426,7 @@ async fn event_management_follows_hierarchy() {
 #[tokio::test]
 async fn admin_manages_roles_with_guards() {
     let (app, db) = app_and_db().await;
-    let admin = login_as(&app, &db, "admin", "admin").await;
+    let admin = login_as(&app, &db, "boss", "admin").await;
     let alice = login(&app, "alice").await; // student
     let alice_id = id_of(&send(&app, "GET", "/auth/me", Some(&alice), None).await.body);
 
@@ -2567,7 +2631,7 @@ async fn profile_rejects_invalid_fields() {
 #[tokio::test]
 async fn admin_reads_and_edits_any_profile_with_guards() {
     let (app, db) = app_and_db().await;
-    let admin = login_as(&app, &db, "admin", "admin").await;
+    let admin = login_as(&app, &db, "boss", "admin").await;
     let alice = login(&app, "alice").await;
     let alice_id = id_of(&send(&app, "GET", "/auth/me", Some(&alice), None).await.body);
     let admin_id = id_of(&send(&app, "GET", "/auth/me", Some(&admin), None).await.body);

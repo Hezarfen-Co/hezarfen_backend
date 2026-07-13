@@ -5,7 +5,7 @@ use crate::constant::{
     ATTENDANCE_STATUSES, EXAM_KINDS, EXAM_MODES, MAX_EMAIL_LEN, MAX_EXAM_DURATION_MS,
     MAX_EXAM_WEIGHT, MAX_MARK, MAX_PASSWORD_LEN, MAX_PHONE_DIGITS, MAX_QUESTION_POINTS,
     MAX_USERNAME_LEN, MIN_EXAM_DURATION_MS, MIN_EXAM_WEIGHT, MIN_MARK, MIN_PASSWORD_LEN,
-    MIN_PHONE_DIGITS, MIN_QUESTION_POINTS, MIN_USERNAME_LEN, QUESTION_KINDS,
+    MIN_PHONE_DIGITS, MIN_QUESTION_POINTS, MIN_USERNAME_LEN, QUESTION_KINDS, USERNAME_SEPARATORS,
 };
 use crate::error::ValidationError;
 
@@ -33,6 +33,43 @@ pub fn validate_username(value: &str) -> Result<(), ValidationError> {
             max: MAX_USERNAME_LEN,
             got: len,
         });
+    }
+    if value.chars().any(|c| c.is_ascii_uppercase()) {
+        return Err(ValidationError::Invalid {
+            field: "username",
+            reason: "must be all lowercase",
+        });
+    }
+    // Allowlist, not "any ASCII": control characters, spaces, quotes, and HTML
+    // metacharacters inside a username enable log injection, impersonation
+    // ("admin support"), and stored XSS in sloppy frontends.
+    if !value
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || USERNAME_SEPARATORS.contains(&c))
+    {
+        return Err(ValidationError::Invalid {
+            field: "username",
+            reason: "may contain only lowercase letters, digits, '.', '_' and '-'",
+        });
+    }
+    if !value.starts_with(|c: char| c.is_ascii_alphanumeric())
+        || !value.ends_with(|c: char| c.is_ascii_alphanumeric())
+    {
+        return Err(ValidationError::Invalid {
+            field: "username",
+            reason: "must start and end with a letter or digit",
+        });
+    }
+    let mut chars = value.chars().peekable();
+    while let Some(c) = chars.next() {
+        if USERNAME_SEPARATORS.contains(&c)
+            && chars.peek().is_some_and(|n| USERNAME_SEPARATORS.contains(n))
+        {
+            return Err(ValidationError::Invalid {
+                field: "username",
+                reason: "must not contain consecutive '.', '_' or '-'",
+            });
+        }
     }
     Ok(())
 }
@@ -258,6 +295,42 @@ mod tests {
         assert!(validate_username(&"x".repeat(33)).is_err()); // too long
         assert!(validate_username("naïve").is_err()); // non-ascii
         assert!(validate_username("a  ").is_err()); // padding can't defeat the minimum
+        assert!(validate_username("Ali").is_err()); // uppercase
+        assert!(validate_username("aLi").is_err()); // uppercase inside
+        assert!(validate_username("ali9").is_ok()); // digits fine, no case
+        assert!(validate_username("a-li").is_ok()); // separator inside is fine
+        assert!(validate_username("a.li").is_ok());
+        assert!(validate_username("a_li").is_ok());
+        assert!(validate_username("a.b-c_d").is_ok()); // mixed single separators
+        assert!(validate_username("-ali").is_err()); // must start alphanumeric
+        assert!(validate_username("ali-").is_err()); // must end alphanumeric
+        assert!(validate_username("_ali_").is_err());
+        assert!(validate_username("9ali").is_ok()); // digit edges count as alphanumeric
+        assert!(validate_username(" ali ").is_ok()); // trimmed before edge check
+    }
+
+    #[tokio::test]
+    async fn username_interior_is_an_allowlist_not_any_ascii() {
+        // ASCII control characters and metacharacters between valid edges must
+        // die here: they enable log injection, spoofing, and stored XSS.
+        assert!(validate_username("a b").is_err()); // interior space
+        assert!(validate_username("a\nb").is_err()); // newline survives trim mid-string
+        assert!(validate_username("a\x1bb").is_err()); // terminal escape
+        assert!(validate_username("a\x00b").is_err()); // null byte
+        assert!(validate_username("a<b>c").is_err()); // html metacharacters
+        assert!(validate_username("a\"b").is_err()); // quote
+        assert!(validate_username("a@b.c").is_err()); // looks like an email
+        assert!(validate_username("a/b").is_err());
+    }
+
+    #[tokio::test]
+    async fn username_separators_must_not_repeat() {
+        assert!(validate_username("a--b").is_err());
+        assert!(validate_username("a..b").is_err());
+        assert!(validate_username("a__b").is_err());
+        assert!(validate_username("a.-b").is_err()); // mixed pairs count too
+        assert!(validate_username("a_-b").is_err());
+        assert!(validate_username("a-b-c").is_ok()); // separated singles are fine
     }
 
     #[tokio::test]

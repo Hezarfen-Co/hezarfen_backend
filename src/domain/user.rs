@@ -354,6 +354,9 @@ mod tests {
         assert_eq!(Username::try_new("ali").unwrap().as_str(), "ali");
         assert!(Username::try_new("").is_err());
         assert!(Username::try_new("ab").is_err());
+        assert!(Username::try_new("Ali").is_err());
+        assert!(Username::try_new("-ali").is_err());
+        assert!(Username::try_new("ali-").is_err());
     }
 
     #[tokio::test]
