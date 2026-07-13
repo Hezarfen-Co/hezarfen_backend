@@ -11,6 +11,7 @@ use utoipa_axum::routes;
 use crate::domain::attendance::{Attendance, AttendanceStatus};
 use crate::domain::event::{Event, EventDescription, EventId, EventTitle};
 use crate::domain::role::Role;
+use crate::domain::settings::Settings;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
@@ -58,7 +59,8 @@ struct UpdateEvent {
 
 #[derive(Deserialize, ToSchema)]
 struct MarkAttendance {
-    /// One of the accepted attendance statuses (e.g. `present`, `absent`).
+    /// One of the school's attendance statuses (`GET /settings`; the core
+    /// four are `present`, `absent`, `late`, `excused`).
     #[schema(example = "present")]
     status: String,
     /// Target user id. Defaults to the caller when omitted.
@@ -333,7 +335,8 @@ async fn mark(
         .await?
         .ok_or(AppError::NotFound)?;
 
-    let status = AttendanceStatus::try_new(&req.status)?;
+    let school = Settings::load(&st.db).await?;
+    let status = AttendanceStatus::try_new(&req.status, school.get_attendance_statuses())?;
     let target = match req.user_id {
         Some(ref key) => UserId::from_key(key),
         None => user.get_id().clone(),

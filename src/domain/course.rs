@@ -3,6 +3,7 @@ use ulid::Ulid;
 
 use crate::constant::{MAX_COURSE_DESCRIPTION_LEN, MAX_COURSE_TITLE_LEN};
 use crate::database::{COURSE_TABLE, Database};
+use crate::domain::term::TermId;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 use crate::validate::{validate_optional, validate_required};
@@ -60,13 +61,14 @@ impl CourseDescription {
 }
 
 /// A course: the unit exams and enrollments hang off. Marks are computed per
-/// course from its exams' weights.
+/// course from its exams' weights. May belong to an academic term.
 #[derive(Debug, Clone, SurrealValue)]
 pub struct Course {
     id: CourseId,
     creator: UserId,
     title: CourseTitle,
     description: CourseDescription,
+    term: Option<TermId>,
 }
 
 impl Course {
@@ -86,6 +88,10 @@ impl Course {
         &self.description
     }
 
+    pub fn get_term(&self) -> Option<&TermId> {
+        self.term.as_ref()
+    }
+
     pub fn is_creator(&self, user: &UserId) -> bool {
         &self.creator == user
     }
@@ -94,6 +100,7 @@ impl Course {
         creator: &UserId,
         title: CourseTitle,
         description: CourseDescription,
+        term: Option<TermId>,
         db: &Database,
     ) -> Result<Course, AppError> {
         let course = Course {
@@ -101,6 +108,7 @@ impl Course {
             creator: creator.clone(),
             title,
             description,
+            term,
         };
         let created: Option<Course> = db.create(course.id.record()).content(course).await?;
         created.ok_or_else(|| AppError::Internal("failed to create course".into()))
@@ -162,10 +170,12 @@ impl Course {
         mut self,
         title: CourseTitle,
         description: CourseDescription,
+        term: Option<TermId>,
         db: &Database,
     ) -> Result<Course, AppError> {
         self.title = title;
         self.description = description;
+        self.term = term;
         let updated: Option<Course> = db.update(self.id.record()).content(self).await?;
         updated.ok_or(AppError::NotFound)
     }

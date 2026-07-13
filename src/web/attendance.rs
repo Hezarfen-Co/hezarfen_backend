@@ -32,11 +32,15 @@ struct StatusCounts {
     absent: u64,
     late: u64,
     excused: u64,
-    /// All rows, `excused` included.
+    /// Tallies of the school-added statuses (`GET /settings`), keyed by
+    /// status. Rate-neutral like `excused`: their semantics are the school's,
+    /// so they count into `total` only.
+    custom: HashMap<String, u64>,
+    /// All rows, `excused` and custom statuses included.
     total: u64,
     /// `(present + late) / (present + absent + late)` — being late is still
     /// attending, and an excused absence counts against no one. `null` when
-    /// every row is excused (or there are none).
+    /// every row is excused/custom (or there are none).
     rate: Option<f64>,
 }
 
@@ -49,8 +53,8 @@ impl StatusCounts {
                 "present" => counts.present += 1,
                 "absent" => counts.absent += 1,
                 "late" => counts.late += 1,
-                // `AttendanceStatus` admits exactly four values.
-                _ => counts.excused += 1,
+                "excused" => counts.excused += 1,
+                custom => *counts.custom.entry(custom.to_string()).or_default() += 1,
             }
         }
         counts.rate = attendance_rate(counts.present, counts.absent, counts.late);
@@ -215,17 +219,24 @@ mod tests {
 
     #[tokio::test]
     async fn tally_buckets_every_status() {
-        let statuses: Vec<AttendanceStatus> = ["present", "present", "late", "absent", "excused"]
+        let allowed: Vec<String> = ["present", "absent", "late", "excused", "online"]
             .iter()
-            .map(|s| AttendanceStatus::try_new(s).unwrap())
+            .map(|s| s.to_string())
             .collect();
+        let statuses: Vec<AttendanceStatus> =
+            ["present", "present", "late", "absent", "excused", "online"]
+                .iter()
+                .map(|s| AttendanceStatus::try_new(s, &allowed).unwrap())
+                .collect();
         let counts = StatusCounts::tally(statuses.iter());
         assert_eq!(counts.present, 2);
         assert_eq!(counts.late, 1);
         assert_eq!(counts.absent, 1);
         assert_eq!(counts.excused, 1);
-        assert_eq!(counts.total, 5);
-        // (2 + 1) / (2 + 1 + 1)
+        // A school-added status lands in its own bucket — never in `excused`.
+        assert_eq!(counts.custom.get("online"), Some(&1));
+        assert_eq!(counts.total, 6);
+        // Rate ignores excused and custom rows: (2 + 1) / (2 + 1 + 1).
         assert_eq!(counts.rate, Some(0.75));
     }
 }

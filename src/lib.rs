@@ -32,7 +32,7 @@ use crate::state::AppState;
     info(
         title = "Hezarfen Backend API",
         version = env!("CARGO_PKG_VERSION"),
-        description = "Notes, events, attendance, courses, and weighted exam marks behind cookie-session auth. Courses carry lesson sessions with teacher-taken roll call; staff clock in/out on a server-stamped work log; attendance reports tally events and per-course roll call with rates.",
+        description = "Notes, events, attendance, courses, and weighted exam marks behind cookie-session auth. Courses carry lesson sessions with teacher-taken roll call; staff clock in/out on a server-stamped work log; attendance reports tally events and per-course roll call with rates. School-varying policy (exam kinds, attendance statuses, grade-display bands) lives in an editable settings singleton, and courses may link to academic terms.",
     ),
     modifiers(&SecurityAddon),
     tags(
@@ -46,7 +46,9 @@ use crate::state::AppState;
         (name = "work", description = "Staff work log: check-in/check-out stamped by the server clock, manager corrections"),
         (name = "attendance", description = "Attendance summary reports: event tallies + per-course lesson roll call with rates"),
         (name = "exams", description = "Exams (per course, weighted): results, sync/async scheduling, attempts, questions/answers, and live monitoring. Not in this spec (WebSocket): the student exam room at `GET /exams/{id}/attempt/ws` — JSON frames, see the README's \"Taking an exam\" section for the protocol"),
-        (name = "marks", description = "Weighted mark reports per course and overall"),
+        (name = "marks", description = "Weighted mark reports per course and overall, labeled by the school's grade bands when configured"),
+        (name = "settings", description = "School policy, one singleton: exam kinds, attendance statuses, grade-display bands. Read: any authenticated user; edit: manager+"),
+        (name = "terms", description = "Academic terms (semester/trimester/quarter — whatever the school runs); courses may link to one. Read: any authenticated user; edit: manager+"),
     ),
 )]
 struct ApiDoc;
@@ -85,6 +87,8 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/marks", web::marks::routes())
         .nest("/work", web::work::routes())
         .nest("/attendance", web::attendance::routes())
+        .nest("/settings", web::settings::routes())
+        .nest("/terms", web::terms::routes())
         .split_for_parts();
 
     // Catch-all per-IP limit over every route (Swagger included). Kept inside

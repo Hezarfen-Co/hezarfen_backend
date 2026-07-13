@@ -16,15 +16,17 @@ use crate::domain::exam::{
     Exam, ExamDescription, ExamDuration, ExamKind, ExamMode, ExamSchedule, ExamTitle, ExamWeight,
 };
 use crate::domain::role::Role;
+use crate::domain::settings::Settings;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
 
 use super::sessions::resolve_session_teacher;
+use super::terms::resolve_term;
 use super::{
     CourseResponse, CurrentUser, ExamResponse, PersonRef, RequireTeacher, SessionResponse,
-    check_not_past, check_time_range, person_map,
+    check_not_past, check_time_range, person_map, set_or_clear,
 };
 
 pub fn routes() -> OpenApiRouter<AppState> {
@@ -43,12 +45,19 @@ struct CreateCourse {
     #[schema(example = "Algebra")]
     title: String,
     description: Option<String>,
+    /// The academic term this course belongs to (`GET /terms`). Optional.
+    term_id: Option<String>,
 }
 
 #[derive(Deserialize, ToSchema)]
 struct UpdateCourse {
     title: Option<String>,
     description: Option<String>,
+    /// Omit to keep the current term, send `null` to unlink, or send a term
+    /// id to (re)assign.
+    #[serde(default, deserialize_with = "set_or_clear")]
+    #[schema(value_type = Option<String>)]
+    term_id: Option<Option<String>>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -63,8 +72,9 @@ struct CreateExamInCourse {
     #[schema(example = "Midterm")]
     title: String,
     description: Option<String>,
-    /// The assessment form: `homework`, `quiz`, `midterm`, `final`, `project`,
-    /// or `oral`. Informational — `weight` drives the course average.
+    /// The assessment form — one of the school's exam kinds (`GET /settings`;
+    /// defaults: `homework`, `quiz`, `midterm`, `final`, `project`, `oral`).
+    /// Informational — `weight` drives the course average.
     #[schema(example = "midterm")]
     kind: String,
     /// How many times this exam counts into the course average, `1`–`100`.
@@ -177,7 +187,8 @@ async fn create_course(
 ) -> Result<(StatusCode, Json<CourseResponse>), AppError> {
     let title = CourseTitle::try_new(&req.title)?;
     let description = CourseDescription::try_new(&req.description.unwrap_or_default())?;
-    let course = Course::create(user.get_id(), title, description, &st.db).await?;
+    let term = resolve_term(req.term_id.as_deref(), &st.db).await?;
+    let course = Course::create(user.get_id(), title, description, term, &st.db).await?;
     Ok((StatusCode::CREATED, Json(CourseResponse::new(&course))))
 }
 
@@ -291,8 +302,13 @@ async fn update_course(
         Some(ref description) => CourseDescription::try_new(description)?,
         None => course.get_description().clone(),
     };
+    let term = match req.term_id {
+        // Explicit `null` clears the link; a value must name a real term.
+        Some(update) => resolve_term(update.as_deref(), &st.db).await?,
+        None => course.get_term().cloned(),
+    };
 
-    let updated = course.update(title, description, &st.db).await?;
+    let updated = course.update(title, description, term, &st.db).await?;
     Ok(Json(CourseResponse::new(&updated)))
 }
 
@@ -496,7 +512,8 @@ async fn create_exam_in_course(
 
     let title = ExamTitle::try_new(&req.title)?;
     let description = ExamDescription::try_new(&req.description.unwrap_or_default())?;
-    let kind = ExamKind::try_new(&req.kind)?;
+    let school = Settings::load(&st.db).await?;
+    let kind = ExamKind::try_new(&req.kind, school.get_exam_kinds())?;
     let weight = ExamWeight::try_new(req.weight)?;
     let starts_at = req.starts_at.map(Timestamp::from_millis);
     let ends_at = req.ends_at.map(Timestamp::from_millis);

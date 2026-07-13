@@ -23,6 +23,8 @@ pub const ENROLLMENT_TABLE: &str = "enrollment";
 pub const COURSE_SESSION_TABLE: &str = "course_session";
 pub const SESSION_ATTENDANCE_TABLE: &str = "session_attendance";
 pub const WORK_ENTRY_TABLE: &str = "work_entry";
+pub const SETTINGS_TABLE: &str = "settings";
+pub const TERM_TABLE: &str = "term";
 
 /// SCHEMAFULL schema: every column is typed, references use `record<..>`.
 /// Idempotent — safe to run on every boot.
@@ -67,10 +69,16 @@ const MIGRATION: &str = "
     DEFINE INDEX IF NOT EXISTS attendance_event_user ON attendance FIELDS event, user UNIQUE;
     DEFINE INDEX IF NOT EXISTS attendance_user ON attendance FIELDS user;
 
+    DEFINE TABLE IF NOT EXISTS term SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS name ON term TYPE string;
+    DEFINE FIELD IF NOT EXISTS starts_at ON term TYPE int;
+    DEFINE FIELD IF NOT EXISTS ends_at ON term TYPE int;
+
     DEFINE TABLE IF NOT EXISTS course SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS creator ON course TYPE record<user>;
     DEFINE FIELD IF NOT EXISTS title ON course TYPE string;
     DEFINE FIELD IF NOT EXISTS description ON course TYPE string;
+    DEFINE FIELD IF NOT EXISTS term ON course TYPE option<record<term>>;
 
     DEFINE TABLE IF NOT EXISTS enrollment SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS course ON enrollment TYPE record<course>;
@@ -151,6 +159,13 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS mark ON exam_result TYPE int;
     DEFINE FIELD IF NOT EXISTS graded_by ON exam_result TYPE record<user>;
     DEFINE INDEX IF NOT EXISTS exam_result_exam_user ON exam_result FIELDS exam, user UNIQUE;
+
+    DEFINE TABLE IF NOT EXISTS settings SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS exam_kinds ON settings TYPE array<string>;
+    DEFINE FIELD IF NOT EXISTS attendance_statuses ON settings TYPE array<string>;
+    DEFINE FIELD IF NOT EXISTS grade_bands ON settings TYPE array<object>;
+    DEFINE FIELD IF NOT EXISTS grade_bands.*.min ON settings TYPE int;
+    DEFINE FIELD IF NOT EXISTS grade_bands.*.label ON settings TYPE string;
 ";
 
 /// Open the file-backed database and apply the schema.

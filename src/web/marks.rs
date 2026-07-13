@@ -12,6 +12,7 @@ use crate::domain::course::Course;
 use crate::domain::exam::Exam;
 use crate::domain::exam_result::ExamResult;
 use crate::domain::role::Role;
+use crate::domain::settings::Settings;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse};
 use crate::state::AppState;
@@ -34,6 +35,10 @@ struct MarkEntry {
     kind: String,
     weight: i64,
     mark: i64,
+    /// The mark's label from the school's grade bands (`GET /settings`);
+    /// `null` when no bands are configured.
+    #[schema(example = "AA")]
+    grade: Option<String>,
     graded_by: String,
 }
 
@@ -46,6 +51,9 @@ struct CourseMarks {
     /// `Σ(mark×weight) / Σ(weight)` over the graded exams; `null` while
     /// nothing is graded.
     average: Option<f64>,
+    /// The average's label from the school's grade bands; `null` when there
+    /// is no average or no bands are configured.
+    average_grade: Option<String>,
 }
 
 /// A student's full mark report across their enrolled courses.
@@ -57,6 +65,9 @@ struct MarksReport {
     /// Plain mean of the non-null course averages; `null` while no course has
     /// a graded exam.
     overall_average: Option<f64>,
+    /// The overall average's label from the school's grade bands; `null` when
+    /// there is no average or no bands are configured.
+    overall_grade: Option<String>,
 }
 
 /// `Σ(mark×weight) / Σ(weight)`; `None` when there is nothing to average. The
@@ -85,6 +96,9 @@ async fn build_report(
         courses.retain(|course| can_manage_course(course, viewer));
     }
 
+    // One settings read labels the whole report.
+    let school = Settings::load(db).await?;
+
     let mut blocks = Vec::with_capacity(courses.len());
     for course in &courses {
         let exams = Exam::list_for_course(course.get_id(), db).await?;
@@ -105,14 +119,19 @@ async fn build_report(
                 kind: exam.get_kind().as_str().to_string(),
                 weight: exam.get_weight().as_i64(),
                 mark: result.get_mark().as_i64(),
+                grade: school
+                    .grade_label(result.get_mark().as_i64() as f64)
+                    .map(str::to_string),
                 graded_by: result.get_graded_by().key().to_string(),
             });
             pairs.push((result.get_mark().as_i64(), exam.get_weight().as_i64()));
         }
 
+        let average = weighted_average(&pairs);
         blocks.push(CourseMarks {
             course: CourseResponse::new(course),
-            average: weighted_average(&pairs),
+            average,
+            average_grade: average.and_then(|a| school.grade_label(a).map(str::to_string)),
             results: entries,
         });
     }
@@ -125,6 +144,7 @@ async fn build_report(
         user: user.key().to_string(),
         courses: blocks,
         overall_average,
+        overall_grade: overall_average.and_then(|a| school.grade_label(a).map(str::to_string)),
     })
 }
 

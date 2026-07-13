@@ -8,8 +8,8 @@ use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 use crate::validate::{
-    validate_exam_duration, validate_exam_kind, validate_exam_mode, validate_optional,
-    validate_required, validate_weight,
+    validate_exam_duration, validate_exam_mode, validate_optional, validate_required,
+    validate_weight,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
@@ -64,15 +64,22 @@ impl ExamDescription {
     }
 }
 
-/// A validated exam kind: `homework` | `quiz` | `midterm` | `final` |
-/// `project` | `oral`. Informational metadata only — `weight` drives the
-/// course average.
+/// A validated exam kind — one of the school's configured kinds
+/// ([`crate::domain::settings::Settings::get_exam_kinds`]). Informational
+/// metadata only — `weight` drives the course average. Stored exams keep
+/// their kind even if the school later edits the list; only new writes are
+/// held to the current one.
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct ExamKind(String);
 
 impl ExamKind {
-    pub fn try_new(value: &str) -> Result<Self, ValidationError> {
-        validate_exam_kind(value)?;
+    pub fn try_new(value: &str, allowed: &[String]) -> Result<Self, ValidationError> {
+        if !allowed.iter().any(|kind| kind == value) {
+            return Err(ValidationError::Invalid {
+                field: "kind",
+                reason: "is not one of this school's exam kinds (see GET /settings)",
+            });
+        }
         Ok(Self(value.to_string()))
     }
 
@@ -406,12 +413,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kind_must_be_known() {
+    async fn kind_must_be_in_the_allowed_list() {
+        let allowed: Vec<String> = crate::domain::settings::Settings::defaults()
+            .get_exam_kinds()
+            .to_vec();
         for kind in ["homework", "quiz", "midterm", "final", "project", "oral"] {
-            assert_eq!(ExamKind::try_new(kind).unwrap().as_str(), kind);
+            assert_eq!(ExamKind::try_new(kind, &allowed).unwrap().as_str(), kind);
         }
-        assert!(ExamKind::try_new("essay").is_err());
-        assert!(ExamKind::try_new("").is_err());
+        assert!(ExamKind::try_new("essay", &allowed).is_err());
+        assert!(ExamKind::try_new("", &allowed).is_err());
+        // A school-defined list swaps the acceptance set wholesale.
+        let custom = vec!["lab".to_string()];
+        assert!(ExamKind::try_new("lab", &custom).is_ok());
+        assert!(ExamKind::try_new("midterm", &custom).is_err());
+        // Matching is exact, case included — the settings list is the wire
+        // truth, not a case-folded suggestion.
+        assert!(ExamKind::try_new("Lab", &custom).is_err());
     }
 
     #[tokio::test]

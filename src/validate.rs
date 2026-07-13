@@ -2,10 +2,10 @@
 //! the value, so an existing newtype is always valid (parse, don't validate).
 
 use crate::constant::{
-    ATTENDANCE_STATUSES, EXAM_KINDS, EXAM_MODES, MAX_EMAIL_LEN, MAX_EXAM_DURATION_MS,
-    MAX_EXAM_WEIGHT, MAX_MARK, MAX_PASSWORD_LEN, MAX_PHONE_DIGITS, MAX_QUESTION_POINTS,
-    MAX_USERNAME_LEN, MIN_EXAM_DURATION_MS, MIN_EXAM_WEIGHT, MIN_MARK, MIN_PASSWORD_LEN,
-    MIN_PHONE_DIGITS, MIN_QUESTION_POINTS, MIN_USERNAME_LEN, QUESTION_KINDS, USERNAME_SEPARATORS,
+    EXAM_MODES, MAX_EMAIL_LEN, MAX_EXAM_DURATION_MS, MAX_EXAM_WEIGHT, MAX_MARK, MAX_PASSWORD_LEN,
+    MAX_PHONE_DIGITS, MAX_QUESTION_POINTS, MAX_USERNAME_LEN, MIN_EXAM_DURATION_MS,
+    MIN_EXAM_WEIGHT, MIN_MARK, MIN_PASSWORD_LEN, MIN_PHONE_DIGITS, MIN_QUESTION_POINTS,
+    MIN_USERNAME_LEN, QUESTION_KINDS, USERNAME_SEPARATORS,
 };
 use crate::error::ValidationError;
 
@@ -195,28 +195,6 @@ pub fn validate_phone(value: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
-pub fn validate_status(value: &str) -> Result<(), ValidationError> {
-    if ATTENDANCE_STATUSES.contains(&value) {
-        Ok(())
-    } else {
-        Err(ValidationError::Invalid {
-            field: "status",
-            reason: "must be one of: present, absent, late, excused",
-        })
-    }
-}
-
-pub fn validate_exam_kind(value: &str) -> Result<(), ValidationError> {
-    if EXAM_KINDS.contains(&value) {
-        Ok(())
-    } else {
-        Err(ValidationError::Invalid {
-            field: "kind",
-            reason: "must be one of: homework, quiz, midterm, final, project, oral",
-        })
-    }
-}
-
 pub fn validate_exam_mode(value: &str) -> Result<(), ValidationError> {
     if EXAM_MODES.contains(&value) {
         Ok(())
@@ -392,24 +370,6 @@ mod tests {
         assert!(validate_phone("1234567890123456").is_err()); // 16 digits, too many
         assert!(validate_phone("call-me-maybe").is_err()); // letters
         assert!(validate_phone("55+5123456").is_err()); // + only allowed in front
-    }
-
-    #[tokio::test]
-    async fn status_rules() {
-        for status in ["present", "absent", "late", "excused"] {
-            assert!(validate_status(status).is_ok());
-        }
-        assert!(validate_status("maybe").is_err());
-        assert!(validate_status("").is_err());
-    }
-
-    #[tokio::test]
-    async fn exam_kind_rules() {
-        for kind in ["homework", "quiz", "midterm", "final", "project", "oral"] {
-            assert!(validate_exam_kind(kind).is_ok());
-        }
-        assert!(validate_exam_kind("essay").is_err());
-        assert!(validate_exam_kind("").is_err());
     }
 
     #[tokio::test]

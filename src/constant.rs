@@ -44,14 +44,28 @@ pub const MAX_EXAM_DESCRIPTION_LEN: usize = 2_000;
 pub const MAX_COURSE_TITLE_LEN: usize = 200;
 pub const MAX_COURSE_DESCRIPTION_LEN: usize = 2_000;
 
-/// The only accepted attendance states.
-pub const ATTENDANCE_STATUSES: [&str; 4] = ["present", "absent", "late", "excused"];
+/// The default attendance states, and also the mandatory core: a school may
+/// add its own statuses via `PATCH /settings`, but these four can never be
+/// removed — the attendance rate's semantics are defined over them.
+pub const DEFAULT_ATTENDANCE_STATUSES: [&str; 4] = ["present", "absent", "late", "excused"];
 
 pub const MAX_SESSION_TOPIC_LEN: usize = 200;
 
-/// The only accepted exam kinds. Informational metadata only — `weight` drives
-/// the course average.
-pub const EXAM_KINDS: [&str; 6] = ["homework", "quiz", "midterm", "final", "project", "oral"];
+/// The default exam kinds; schools replace the list via `PATCH /settings`.
+/// Informational metadata only — `weight` drives the course average.
+pub const DEFAULT_EXAM_KINDS: [&str; 6] =
+    ["homework", "quiz", "midterm", "final", "project", "oral"];
+
+/// Bounds for the school-editable lists in settings (exam kinds, attendance
+/// statuses): entry count and per-entry character length.
+pub const MAX_SETTINGS_LIST_LEN: usize = 20;
+pub const MAX_SETTINGS_ITEM_LEN: usize = 50;
+
+/// Bounds for the grade-display bands in settings.
+pub const MAX_GRADE_BANDS: usize = 20;
+pub const MAX_GRADE_LABEL_LEN: usize = 20;
+
+pub const MAX_TERM_NAME_LEN: usize = 100;
 
 /// The only accepted exam modes. `sync`: everyone sits the exam inside one
 /// fixed window. `async`: each student starts inside the window and gets their

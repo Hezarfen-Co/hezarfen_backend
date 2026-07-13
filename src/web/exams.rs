@@ -27,6 +27,7 @@ use crate::domain::exam_question::{
 };
 use crate::domain::exam_result::{ExamResult, Mark};
 use crate::domain::role::Role;
+use crate::domain::settings::Settings;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
@@ -252,7 +253,13 @@ async fn update_exam(
         None => exam.get_description().clone(),
     };
     let kind = match req.kind {
-        Some(ref kind) => ExamKind::try_new(kind)?,
+        // Only a kind this request sets is held to the current settings list —
+        // a stored kind survives later list edits, like past times survive
+        // the no-past rule.
+        Some(ref kind) => {
+            let school = Settings::load(&st.db).await?;
+            ExamKind::try_new(kind, school.get_exam_kinds())?
+        }
         None => exam.get_kind().clone(),
     };
     let weight = match req.weight {

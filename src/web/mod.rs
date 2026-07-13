@@ -12,6 +12,8 @@ pub mod exams;
 pub mod marks;
 pub mod notes;
 pub mod sessions;
+pub mod settings;
+pub mod terms;
 pub mod users;
 pub mod work;
 

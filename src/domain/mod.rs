@@ -17,6 +17,8 @@ pub mod profile;
 pub mod role;
 pub mod session;
 pub mod session_attendance;
+pub mod settings;
+pub mod term;
 pub mod timestamp;
 pub mod user;
 pub mod work_entry;

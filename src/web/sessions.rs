@@ -15,6 +15,7 @@ use crate::domain::course_session::{CourseSession, CourseSessionId, SessionTopic
 use crate::domain::enrollment::Enrollment;
 use crate::domain::role::Role;
 use crate::domain::session_attendance::SessionAttendance;
+use crate::domain::settings::Settings;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
@@ -50,7 +51,8 @@ struct UpdateSession {
 
 #[derive(Deserialize, ToSchema)]
 struct MarkRollCall {
-    /// One of the accepted attendance statuses (e.g. `present`, `absent`).
+    /// One of the school's attendance statuses (`GET /settings`; the core
+    /// four are `present`, `absent`, `late`, `excused`).
     #[schema(example = "present")]
     status: String,
     /// Whose roll-call state to record: an enrolled student, or the session's
@@ -295,7 +297,8 @@ async fn mark_roll_call(
         ));
     }
 
-    let status = AttendanceStatus::try_new(&req.status)?;
+    let school = Settings::load(&st.db).await?;
+    let status = AttendanceStatus::try_new(&req.status, school.get_attendance_statuses())?;
     let target = UserId::from_key(&req.user_id);
 
     // Target user must exist.

@@ -4,7 +4,6 @@ use crate::database::{ATTENDANCE_TABLE, Database};
 use crate::domain::event::EventId;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
-use crate::validate::validate_status;
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct AttendanceId(RecordId);
@@ -33,13 +32,21 @@ impl AttendanceId {
     }
 }
 
-/// A validated attendance state: present | absent | late | excused.
+/// A validated attendance state — one of the school's configured statuses
+/// ([`crate::domain::settings::Settings::get_attendance_statuses`]): the core
+/// `present | absent | late | excused` plus any the school added. Stored rows
+/// keep their status even if the school later edits the list.
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct AttendanceStatus(String);
 
 impl AttendanceStatus {
-    pub fn try_new(value: &str) -> Result<Self, ValidationError> {
-        validate_status(value)?;
+    pub fn try_new(value: &str, allowed: &[String]) -> Result<Self, ValidationError> {
+        if !allowed.iter().any(|status| status == value) {
+            return Err(ValidationError::Invalid {
+                field: "status",
+                reason: "is not one of this school's attendance statuses (see GET /settings)",
+            });
+        }
         Ok(Self(value.to_string()))
     }
 
@@ -146,11 +153,24 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn status_must_be_known() {
+    async fn status_must_be_in_the_allowed_list() {
+        let allowed: Vec<String> = crate::domain::settings::Settings::defaults()
+            .get_attendance_statuses()
+            .to_vec();
         for status in ["present", "absent", "late", "excused"] {
-            assert_eq!(AttendanceStatus::try_new(status).unwrap().as_str(), status);
+            assert_eq!(
+                AttendanceStatus::try_new(status, &allowed).unwrap().as_str(),
+                status
+            );
         }
-        assert!(AttendanceStatus::try_new("maybe").is_err());
-        assert!(AttendanceStatus::try_new("").is_err());
+        assert!(AttendanceStatus::try_new("maybe", &allowed).is_err());
+        assert!(AttendanceStatus::try_new("", &allowed).is_err());
+        // A school-added status is accepted once it's in the list.
+        let extended: Vec<String> = allowed
+            .iter()
+            .cloned()
+            .chain(["online".to_string()])
+            .collect();
+        assert!(AttendanceStatus::try_new("online", &extended).is_ok());
     }
 }
