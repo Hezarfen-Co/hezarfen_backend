@@ -53,7 +53,9 @@ impl WorkEntryResponse {
             user: entry.get_user().key().to_string(),
             check_in,
             check_out,
-            duration_ms: check_out.map(|out| out - check_in),
+            // Saturating: manager-corrected instants are arbitrary i64s, and
+            // an absurdly wide pair must cap the duration, not overflow it.
+            duration_ms: check_out.map(|out| out.saturating_sub(check_in)),
         }
     }
 }

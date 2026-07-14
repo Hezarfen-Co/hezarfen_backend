@@ -65,6 +65,10 @@ pub const MAX_SETTINGS_ITEM_LEN: usize = 50;
 pub const MAX_GRADE_BANDS: usize = 20;
 pub const MAX_GRADE_LABEL_LEN: usize = 20;
 
+/// How many times `PATCH /settings` re-merges and retries when a concurrent
+/// edit lands between its snapshot and its compare-and-set save.
+pub const SETTINGS_UPDATE_RETRIES: usize = 3;
+
 pub const MAX_TERM_NAME_LEN: usize = 100;
 
 /// The only accepted exam modes. `sync`: everyone sits the exam inside one

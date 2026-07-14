@@ -1266,6 +1266,118 @@ async fn exam_room_close_after_a_retake_leaves_the_new_sitting_alone() {
     );
 }
 
+/// Messages through a stale room act on that room's own sitting — never on a
+/// retake started while the old socket lingered. An `answer` or `finish` sent
+/// through the old room after sitting #1 ended must be refused, not silently
+/// applied to sitting #2 (which would scribble on — or instantly submit — a
+/// fresh attempt the student opened elsewhere, burning a limited sitting).
+#[tokio::test]
+async fn exam_room_messages_bind_to_their_own_sitting() {
+    let room = exam_room_fixture(600_000).await;
+
+    // An open exam with two sittings and one choice question.
+    let exam: Value = room
+        .teacher
+        .post(format!("{}/courses/{}/exams", room.base, room.course_id))
+        .json(&json!({
+            "title": "practice", "kind": "quiz", "weight": 1,
+            "mode": "open", "max_attempts": 2,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let exam_id = exam["id"].as_str().unwrap().to_string();
+    let question: Value = room
+        .teacher
+        .post(format!("{}/exams/{exam_id}/questions", room.base))
+        .json(&json!({ "text": "3 + 3?", "kind": "choice", "points": 5,
+                       "choices": ["5", "6"], "correct": 1 }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let question_id = question["id"].as_str().unwrap().to_string();
+
+    // Sit sitting #1 and open its room.
+    let res = room
+        .student
+        .post(format!("{}/exams/{exam_id}/attempt", room.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let mut ws = ws_open(&room.base, &exam_id, Some(&room.cookie))
+        .await
+        .expect("room for sitting #1");
+    let state = ws_next_frame(&mut ws).await.expect("connect state");
+    assert_eq!(state["attempt"], 1, "{state}");
+
+    // Finish sitting #1 and start sitting #2 over REST — the old socket is
+    // still open while the retake begins.
+    let res = room
+        .student
+        .post(format!("{}/exams/{exam_id}/attempt/finish", room.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let res = room
+        .student
+        .post(format!("{}/exams/{exam_id}/attempt", room.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["attempt"], 2);
+
+    // An answer through the stale room must be refused — not saved into the
+    // blank sheet of sitting #2.
+    ws_send(
+        &mut ws,
+        json!({ "type": "answer", "question_id": question_id, "selected": 1 }),
+    )
+    .await;
+    let error = ws_frame_of_type(&mut ws, "error").await;
+    assert!(
+        error["message"].as_str().unwrap().contains("sitting"),
+        "{error}"
+    );
+
+    // A finish through the stale room must be refused — not submit sitting #2.
+    ws_send(&mut ws, json!({ "type": "finish" })).await;
+    let error = ws_frame_of_type(&mut ws, "error").await;
+    assert!(
+        error["message"].as_str().unwrap().contains("sitting"),
+        "{error}"
+    );
+
+    // Sitting #2 is untouched: still running, sheet still blank.
+    let attempt: Value = room
+        .student
+        .get(format!("{}/exams/{exam_id}/attempt", room.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(attempt["attempt"], 2, "{attempt}");
+    assert_eq!(
+        attempt["status"], "in_progress",
+        "a stale room must not submit the new sitting: {attempt}"
+    );
+    assert_eq!(
+        attempt["answered"], 0,
+        "a stale room must not write into the new sitting's sheet: {attempt}"
+    );
+}
+
 /// Two sockets on the same sitting (a second tab): closing one must not count
 /// as leaving the exam room while the other is still connected — only the last
 /// socket out stamps `left_at` and (with the door closed) locks answering.

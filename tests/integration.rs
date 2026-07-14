@@ -5248,6 +5248,122 @@ async fn answer_saves_gate_on_attempt_state_and_kind() {
 }
 
 #[tokio::test]
+async fn unenrollment_cuts_the_sittings_reads_and_writes() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "cut_t", "teacher").await;
+    let student = login(&app, "cansu").await;
+    let student_id = me_id(&app, &student).await;
+    let (course, exam) = open_exam_with_student(&app, &teacher, &student_id, "chem").await;
+    let question = create_question(
+        &app,
+        &teacher,
+        &exam,
+        json!({ "text": "2 + 2?", "kind": "choice", "points": 10,
+                "choices": ["3", "4"], "correct": 1 }),
+    )
+    .await;
+
+    // Enrolled: start the attempt, read the questions, save an answer.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/attempt/questions"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt/answers"),
+        Some(&student),
+        Some(json!({ "question_id": question, "selected": 1 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    // Unenrolled mid-exam: the course wall closes over the sitting too. The
+    // question list is course content (`GET /exams/{id}` is already walled),
+    // and answering from outside the course would dodge the same wall the
+    // exam room enforces on entry.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/courses/{course}/enrollments/{student_id}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/attempt/questions"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::FORBIDDEN,
+        "question list after unenrollment: {}",
+        res.body
+    );
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt/answers"),
+        Some(&student),
+        Some(json!({ "question_id": question, "selected": 0 })),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::FORBIDDEN,
+        "answer save after unenrollment: {}",
+        res.body
+    );
+
+    // Their own status and submission stay theirs: like the rejoin lock,
+    // finishing submits what's already saved and writes nothing new.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/attempt"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt/finish"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::OK,
+        "finish stays open: {}",
+        res.body
+    );
+    assert_eq!(res.body["status"], "submitted");
+    assert_eq!(res.body["answered"], 1, "the enrolled-time answer survives");
+}
+
+#[tokio::test]
 async fn answer_saves_stop_at_the_deadline() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "dl_t", "teacher").await;
@@ -6589,6 +6705,38 @@ async fn work_log_manager_reads_and_corrections() {
     // With the open row swept, hoca can check in again.
     let res = send(&app, "POST", "/work/check-in", Some(&hoca), None).await;
     assert_eq!(res.status, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn work_duration_survives_absurd_corrected_instants() {
+    let (app, db) = app_and_db().await;
+    let hoca = login_as(&app, &db, "wid_t", "teacher").await;
+    let boss = login_as(&app, &db, "wid_m", "manager").await;
+    send(&app, "POST", "/work/check-in", Some(&hoca), None).await;
+    let closed = send(&app, "POST", "/work/check-out", Some(&hoca), None).await;
+    let closed_id = id_of(&closed.body);
+
+    // Corrected instants are arbitrary i64 millis; the widest legal pair must
+    // not overflow the `check_out - check_in` duration (a wrapped negative in
+    // release, a panicking 500 in debug) — it saturates instead.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/work/entries/{closed_id}"),
+        Some(&boss),
+        Some(json!({ "check_in": i64::MIN, "check_out": i64::MAX })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(
+        res.body["duration_ms"].as_i64(),
+        Some(i64::MAX),
+        "the over-wide stint saturates: {}",
+        res.body
+    );
+    // The stored row must stay readable, not a permanent 500.
+    let res = send(&app, "GET", "/work/me", Some(&hoca), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
 }
 
 // --- attendance reports -------------------------------------------------------

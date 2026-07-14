@@ -36,8 +36,10 @@
 //! finishing stays allowed.
 //!
 //! Each room is bound to the sitting it was opened for: state frames track
-//! that attempt (not whatever is latest), so a room whose sitting ends —
-//! submitted or expired anywhere — announces it and closes.
+//! that attempt (not whatever is latest), a room whose sitting ends —
+//! submitted or expired anywhere — announces it and closes, and `answer` /
+//! `finish` refuse to touch any other sitting, so a lingering socket can
+//! never write into (or submit) a retake it never hosted.
 
 use std::time::Duration;
 
@@ -49,7 +51,6 @@ use serde_json::{Value, json};
 
 use crate::constant::EXAM_WS_TICK_SECS;
 use crate::database::Database;
-use crate::domain::enrollment::Enrollment;
 use crate::domain::exam::{Exam, ExamId};
 use crate::domain::exam_answer::ExamAnswer;
 use crate::domain::exam_attempt::{AttemptStatus, ExamAttempt, ExamAttemptId};
@@ -59,7 +60,7 @@ use crate::domain::user::UserId;
 use crate::error::AppError;
 use crate::state::AppState;
 use crate::web::CurrentUser;
-use crate::web::exams::{check_rejoin, save_answer_checked, writable_attempt};
+use crate::web::exams::{check_rejoin, ensure_enrolled, save_answer_in, writable_attempt};
 
 /// What the client asked for, tagged by `type`.
 #[derive(Deserialize)]
@@ -96,14 +97,7 @@ pub async fn attempt_ws(
             "this exam is not scheduled — there is nothing to sit (give it a mode: sync, async, or open)",
         ));
     }
-    if Enrollment::read_for_user(exam.get_course(), user.get_id(), &st.db)
-        .await?
-        .is_none()
-    {
-        return Err(AppError::Forbidden(
-            "you are not enrolled in this exam's course",
-        ));
-    }
+    ensure_enrolled(&exam, user.get_id(), &st.db).await?;
     let attempt = writable_attempt(&exam, user.get_id(), &st.db).await?;
     check_rejoin(&exam, &attempt)?;
     let attempt = if attempt.get_left_at().is_some() {
@@ -197,6 +191,27 @@ async fn stamp_left(exam_id: &ExamId, attempt_id: &ExamAttemptId, db: &Database)
 /// Errors that end the room: the peer went away, or the attempt reached a
 /// terminal state and the close frame was sent.
 struct RoomClosed;
+
+/// The room's own sitting, provided it is still the student's current one and
+/// writable. Messages act on the sitting the room was opened for — never on a
+/// retake started elsewhere while this socket lingered, which a stale tab
+/// could otherwise scribble on or instantly submit (burning a limited
+/// sitting). The latest-attempt read also keeps the deadline gates on the
+/// exam's current schedule, exactly like the REST path.
+async fn writable_room_attempt(
+    exam: &Exam,
+    attempt_id: &ExamAttemptId,
+    user: &UserId,
+    db: &Database,
+) -> Result<ExamAttempt, AppError> {
+    let attempt = writable_attempt(exam, user, db).await?;
+    if attempt.get_id() != attempt_id {
+        return Err(AppError::Conflict(
+            "this room's sitting is over — reconnect to continue in the new attempt",
+        ));
+    }
+    Ok(attempt)
+}
 
 async fn send(socket: &mut WebSocket, frame: Value) -> Result<(), RoomClosed> {
     socket
@@ -310,11 +325,15 @@ async fn handle_message(
             text,
         } => {
             // Re-read the exam so the save is judged against the *current*
-            // schedule, exactly like the REST path it shares.
+            // schedule, exactly like the REST path it shares — but write into
+            // the room's own sitting, never whatever is latest.
             let saved = match Exam::read(exam_id, db).await {
-                Ok(Some(exam)) => {
-                    save_answer_checked(&exam, user, &question_id, selected, text, db).await
-                }
+                Ok(Some(exam)) => match writable_room_attempt(&exam, attempt_id, user, db).await {
+                    Ok(attempt) => {
+                        save_answer_in(&exam, &attempt, &question_id, selected, text, db).await
+                    }
+                    Err(err) => Err(err),
+                },
                 Ok(None) => Err(AppError::NotFound),
                 Err(err) => Err(err),
             };
@@ -337,8 +356,10 @@ async fn handle_message(
             }
         }
         ClientMessage::Finish => {
+            // Submit the room's own sitting — a stale room must not submit a
+            // retake it never hosted.
             let finished = match Exam::read(exam_id, db).await {
-                Ok(Some(exam)) => match writable_attempt(&exam, user, db).await {
+                Ok(Some(exam)) => match writable_room_attempt(&exam, attempt_id, user, db).await {
                     Ok(attempt) => attempt.finish(db).await,
                     Err(err) => Err(err),
                 },

@@ -290,8 +290,8 @@ marks/attendance reports narrow to the courses the caller manages.
 | GET    | `/exams/{id}/questions`          | teacher | The full question list, `correct` included (course manager) |
 | PATCH  | `/exams/{id}/questions/{qid}`    | teacher | Edit a question — the kind bundle revalidates as a unit (course manager; frozen once attempted) |
 | DELETE | `/exams/{id}/questions/{qid}`    | teacher | Delete a question + its answers (course manager; frozen once attempted) |
-| GET    | `/exams/{id}/attempt/questions`  | student | The sitting view: no `correct`, own answers embedded (requires an attempt) |
-| POST   | `/exams/{id}/attempt/answers`    | student | `{question_id, selected? \| text?}` — autosave one answer while `in_progress` (and not locked out by a closed rejoin door) |
+| GET    | `/exams/{id}/attempt/questions`  | student | The sitting view: no `correct`, own answers embedded (requires enrollment + an attempt) |
+| POST   | `/exams/{id}/attempt/answers`    | student | `{question_id, selected? \| text?}` — autosave one answer while enrolled and `in_progress` (and not locked out by a closed rejoin door) |
 | GET    | `/exams/{id}/attempts/{user}/answers` | teacher | A student's answer sheet: `is_correct` flags + suggested `auto_score` (course manager) |
 | GET    | `/exams/{id}/attempt/ws`         | student | **WebSocket** exam room: state ticks, autosave, finish; entering clears `left_at`, leaving stamps it (see "Taking an exam") |
 | GET    | `/exams/{id}/live`               | teacher | Live monitor snapshot: roster × latest attempts × marks + per-student progress/`left_at`/`attempts_used` + counts (course manager) |
@@ -307,7 +307,7 @@ marks/attendance reports narrow to the courses the caller manages.
 | GET    | `/attendance/me`                 | student | Own attendance report: events + sessions + per-course tallies |
 | GET    | `/attendance/{user}`             | teacher | A user's attendance report, narrowed to the caller's courses (manager+: full) |
 | GET    | `/settings`                      | student | The school's policy: `exam_kinds`, `attendance_statuses`, `grade_bands` |
-| PATCH  | `/settings`                      | manager | Replace any subset of the three lists, each wholesale (see "Per-school policy") |
+| PATCH  | `/settings`                      | manager | Replace any subset of the three lists, each wholesale; concurrent edits merge, never silently revert each other (see "Per-school policy") |
 | POST   | `/terms`                         | manager | `{name, starts_at, ends_at}` — past dates allowed (calendar backfill) |
 | GET    | `/terms`                         | student | List terms, newest first        |
 | GET    | `/terms/{id}`                    | student | Get one term                    |
@@ -381,9 +381,12 @@ editable `settings` singleton (`GET /settings` for any signed-in user,
   can switch display scales without touching a single stored mark.
 
 A `PATCH` replaces only the fields it carries, each wholesale, and validation
-is all-or-nothing. Editing a list never rewrites history: an exam keeps its
-retired kind, a roll-call row keeps its retired status — only **new writes**
-are held to the current lists.
+is all-or-nothing. Concurrent edits are safe: each save applies only if the
+policy still matches the snapshot it merged from (retrying over the fresh row
+otherwise), so two managers patching different fields both land instead of
+the later write silently reverting the earlier one. Editing a list never
+rewrites history: an exam keeps its retired kind, a roll-call row keeps its
+retired status — only **new writes** are held to the current lists.
 
 Academic structure is data too. **Terms** (`/terms`) model whatever calendar
 the school runs — semester, trimester, quarter systems are just rows with a
@@ -512,15 +515,18 @@ would fork what "the exam" means. Deleting a question cascades its answers.
 **Answering** (student, attempt `in_progress`, deadline judged by the server
 clock on every save):
 
-- `GET /exams/{id}/attempt/questions` — the sitting view. Requires an attempt
-  (`404` before `POST /exams/{id}/attempt`; also the anti-peek gate), never
-  contains `correct`, and embeds the caller's own saved answer per question
-  (`{selected, text, updated_at}` or `null`). Still readable after
-  submitting/expiry, for review.
+- `GET /exams/{id}/attempt/questions` — the sitting view. Requires
+  enrollment (`403` — the questions are course content, so leaving the course
+  closes them) and an attempt (`404` before `POST /exams/{id}/attempt`; also
+  the anti-peek gate), never contains `correct`, and embeds the caller's own
+  saved answer per question (`{selected, text, updated_at}` or `null`). Still
+  readable after submitting/expiry, for review.
 - `POST /exams/{id}/attempt/answers` `{question_id, selected? | text?}` — an
   upsert: one row per question+user, re-answering overwrites. The payload must
   match the question's kind (`selected` indexing a choice, or `text`
-  ≤ 10 000 chars — empty clears the draft); mismatches are `400`s. Once the
+  ≤ 10 000 chars — empty clears the draft); mismatches are `400`s. Requires
+  enrollment (`403`): an unenrollment mid-exam closes the sheet (the exam
+  room's door check, applied to every save — finishing stays open). Once the
   attempt is submitted or past its deadline every save is a `409` — likewise
   while the student has left the exam room with `allow_rejoin` off; answers
   saved in time survive untouched for grading (until a retake wipes the sheet
@@ -551,7 +557,10 @@ rejoin is closed `409`. Then JSON text frames:
 
 Every tick and every save re-read the exam, so a mid-exam `ends_at` extension
 moves the room's countdown on the next tick, and no stale socket can write
-past its real deadline — the socket shares the exact REST write path.
+past its real deadline — the socket shares the exact REST write path. Each
+room acts only on the sitting it was opened for: once that sitting is over,
+its `answer`/`finish` are `error` frames, so a lingering socket can never
+scribble on (or instantly submit) a retake started elsewhere.
 
 The room is also the presence signal behind the **rejoin door**: connecting
 clears the attempt's `left_at`, and the *last* socket of the sitting to close

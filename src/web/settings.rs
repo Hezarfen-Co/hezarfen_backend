@@ -5,6 +5,7 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use crate::constant::SETTINGS_UPDATE_RETRIES;
 use crate::domain::settings::{GradeBand, Settings};
 use crate::error::{AppError, ErrorResponse};
 use crate::state::AppState;
@@ -108,6 +109,7 @@ async fn get_settings(
         (status = 400, description = "Invalid lists or bands", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
+        (status = 409, description = "Concurrent edits kept changing the settings mid-save", body = ErrorResponse),
     ),
 )]
 async fn update_settings(
@@ -115,23 +117,35 @@ async fn update_settings(
     RequireManager(_user): RequireManager,
     Json(req): Json<UpdateSettings>,
 ) -> Result<Json<SettingsResponse>, AppError> {
-    let current = Settings::load(&st.db).await?;
+    // Merge over a snapshot, then save only while the row still matches it —
+    // otherwise a concurrent PATCH of a *different* field would be silently
+    // reverted by whichever whole-row write lands second. A refused save
+    // reloads and re-merges, so both edits land.
+    for _ in 0..SETTINGS_UPDATE_RETRIES {
+        let current = Settings::load(&st.db).await?;
 
-    let exam_kinds = req
-        .exam_kinds
-        .unwrap_or_else(|| current.get_exam_kinds().to_vec());
-    let attendance_statuses = req
-        .attendance_statuses
-        .unwrap_or_else(|| current.get_attendance_statuses().to_vec());
-    let grade_bands = match req.grade_bands {
-        Some(bands) => bands
-            .into_iter()
-            .map(|band| GradeBand::try_new(band.min, &band.label))
-            .collect::<Result<Vec<_>, _>>()?,
-        None => current.get_grade_bands().to_vec(),
-    };
+        let exam_kinds = req
+            .exam_kinds
+            .clone()
+            .unwrap_or_else(|| current.get_exam_kinds().to_vec());
+        let attendance_statuses = req
+            .attendance_statuses
+            .clone()
+            .unwrap_or_else(|| current.get_attendance_statuses().to_vec());
+        let grade_bands = match &req.grade_bands {
+            Some(bands) => bands
+                .iter()
+                .map(|band| GradeBand::try_new(band.min, &band.label))
+                .collect::<Result<Vec<_>, _>>()?,
+            None => current.get_grade_bands().to_vec(),
+        };
 
-    let settings = Settings::try_new(exam_kinds, attendance_statuses, grade_bands)?;
-    let saved = settings.save(&st.db).await?;
-    Ok(Json(SettingsResponse::new(&saved)))
+        let settings = Settings::try_new(exam_kinds, attendance_statuses, grade_bands)?;
+        if let Some(saved) = settings.save_if_unchanged(&current, &st.db).await? {
+            return Ok(Json(SettingsResponse::new(&saved)));
+        }
+    }
+    Err(AppError::Conflict(
+        "the settings kept changing underneath this update — try again",
+    ))
 }

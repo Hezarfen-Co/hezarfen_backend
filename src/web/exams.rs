@@ -758,14 +758,7 @@ async fn start_attempt(
         .await?
         .ok_or(AppError::NotFound)?;
     ensure_sittable(&exam)?;
-    if Enrollment::read_for_user(exam.get_course(), user.get_id(), &st.db)
-        .await?
-        .is_none()
-    {
-        return Err(AppError::Forbidden(
-            "you are not enrolled in this exam's course",
-        ));
-    }
+    ensure_enrolled(&exam, user.get_id(), &st.db).await?;
     let now = Timestamp::now();
     if let Some(starts_at) = exam.get_starts_at()
         && now < starts_at
@@ -1539,9 +1532,10 @@ pub(crate) fn check_rejoin(exam: &Exam, attempt: &ExamAttempt) -> Result<(), App
 }
 
 /// Save one answer inside the caller's in-progress attempt — the whole write
-/// path (attempt gate, rejoin gate, question lookup, kind check, upsert),
-/// shared verbatim by the REST handler and the WebSocket room so the two can
-/// never drift.
+/// path (attempt gate, rejoin gate, question lookup, kind check, upsert). The
+/// REST handler saves into the latest sitting via this; the WebSocket room
+/// resolves its own sitting first and shares [`save_answer_in`], so the two
+/// can never drift.
 pub(crate) async fn save_answer_checked(
     exam: &Exam,
     user: &UserId,
@@ -1551,16 +1545,53 @@ pub(crate) async fn save_answer_checked(
     db: &Database,
 ) -> Result<ExamAnswer, AppError> {
     let attempt = writable_attempt(exam, user, db).await?;
-    check_rejoin(exam, &attempt)?;
+    save_answer_in(exam, &attempt, question_id, selected, text, db).await
+}
+
+/// The tail of the answer write path, given the sitting to write in: the
+/// enrollment wall (leaving the course closes the sheet, mid-exam included),
+/// the rejoin gate, the question lookup, and the upsert.
+pub(crate) async fn save_answer_in(
+    exam: &Exam,
+    attempt: &ExamAttempt,
+    question_id: &str,
+    selected: Option<i64>,
+    text: Option<String>,
+    db: &Database,
+) -> Result<ExamAnswer, AppError> {
+    ensure_enrolled(exam, attempt.get_user(), db).await?;
+    check_rejoin(exam, attempt)?;
     let question = question_of_exam(exam.get_id(), question_id, db).await?;
-    ExamAnswer::save(&question, user, selected, text, db).await
+    ExamAnswer::save(&question, attempt.get_user(), selected, text, db).await
+}
+
+/// A 403 unless `user` is enrolled in the exam's course — the same wall the
+/// exam room checks at its door, re-applied to the sitting's content paths so
+/// an unenrollment mid-exam cuts them too. Finishing stays exempt: like the
+/// rejoin lock, submitting what's already saved writes nothing new.
+pub(crate) async fn ensure_enrolled(
+    exam: &Exam,
+    user: &UserId,
+    db: &Database,
+) -> Result<(), AppError> {
+    if Enrollment::read_for_user(exam.get_course(), user, db)
+        .await?
+        .is_none()
+    {
+        return Err(AppError::Forbidden(
+            "you are not enrolled in this exam's course",
+        ));
+    }
+    Ok(())
 }
 
 /// The exam's questions as the sitting student sees them: `correct` stripped,
 /// their own saved answers embedded — the latest sitting's, since a retake
-/// starts from a blank sheet. Requires an attempt — start one with
-/// `POST /exams/{id}/attempt` first (404 until then). Readable in every
-/// attempt state, so a submitted student can still review what they wrote.
+/// starts from a blank sheet. Requires enrollment in the exam's course (the
+/// questions are course content — leaving the course closes them) and an
+/// attempt — start one with `POST /exams/{id}/attempt` first (404 until
+/// then). Readable in every attempt state, so a submitted student can still
+/// review what they wrote.
 #[utoipa::path(
     get,
     path = "/{id}/attempt/questions",
@@ -1570,6 +1601,7 @@ pub(crate) async fn save_answer_checked(
     responses(
         (status = 200, description = "Questions with the caller's answers embedded", body = [AttemptQuestionResponse]),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not enrolled in the exam's course", body = ErrorResponse),
         (status = 404, description = "No such exam, or no attempt yet — start the attempt first", body = ErrorResponse),
     ),
 )]
@@ -1581,6 +1613,7 @@ async fn attempt_questions(
     let exam = Exam::read(&ExamId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
+    ensure_enrolled(&exam, user.get_id(), &st.db).await?;
     // The question list is for sitting students; without an attempt there is
     // nothing to sit behind — and no early peek at the questions.
     ExamAttempt::read_latest_for_user(exam.get_id(), user.get_id(), &st.db)
@@ -1614,10 +1647,11 @@ async fn attempt_questions(
 }
 
 /// Save (or overwrite) one answer in the caller's in-progress attempt.
-/// `choice` questions take `selected`; `text` questions take `text`. Rejected
-/// once the attempt is submitted or its deadline has passed — the server
-/// clock, not the client's, is the judge — and rejected while the student has
-/// left the exam room with the exam's rejoin door closed.
+/// `choice` questions take `selected`; `text` questions take `text`. Requires
+/// enrollment in the exam's course — an unenrollment mid-exam closes the
+/// sheet. Rejected once the attempt is submitted or its deadline has passed —
+/// the server clock, not the client's, is the judge — and rejected while the
+/// student has left the exam room with the exam's rejoin door closed.
 #[utoipa::path(
     post,
     path = "/{id}/attempt/answers",
@@ -1629,6 +1663,7 @@ async fn attempt_questions(
         (status = 200, description = "Answer saved", body = AnswerSavedResponse),
         (status = 400, description = "Payload doesn't match the question's kind", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not enrolled in the exam's course", body = ErrorResponse),
         (status = 404, description = "No such exam, question, or attempt", body = ErrorResponse),
         (status = 409, description = "Attempt already submitted, time is up, or rejoin is closed", body = ErrorResponse),
     ),

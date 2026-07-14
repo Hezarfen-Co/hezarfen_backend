@@ -167,10 +167,52 @@ impl Settings {
         Ok(found.unwrap_or_else(Self::defaults))
     }
 
-    /// Persist the policy (single UPSERT on the fixed singleton id).
+    /// Persist the policy (single UPSERT on the fixed singleton id),
+    /// unconditionally — last write wins. Prefer [`Self::save_if_unchanged`]
+    /// wherever the new policy was merged from a loaded snapshot.
     pub async fn save(self, db: &Database) -> Result<Settings, AppError> {
         let saved: Option<Settings> = db.upsert(Self::record_id()).content(self).await?;
         saved.ok_or_else(|| AppError::Internal("failed to save settings".into()))
+    }
+
+    /// Persist the policy only while the stored row still matches `expected`
+    /// — the snapshot the caller merged omitted fields from. `None` means a
+    /// concurrent edit landed in between and nothing was written: reload,
+    /// re-merge, retry. Without this compare-and-set, two managers patching
+    /// *different* fields silently revert each other (both merge from the
+    /// same snapshot; the later whole-row write restores its stale copy of
+    /// the other's field).
+    ///
+    /// One transaction: the seed insert materializes the defaults-as-loaded
+    /// state when no row exists yet (`load` reported the defaults, so the
+    /// defaults are what the caller merged over), then the guarded update
+    /// applies `self` only if the row (still) equals `expected`.
+    pub async fn save_if_unchanged(
+        self,
+        expected: &Settings,
+        db: &Database,
+    ) -> Result<Option<Settings>, AppError> {
+        let mut result = db
+            .query(
+                "BEGIN TRANSACTION;
+                 INSERT IGNORE INTO settings $expected;
+                 UPDATE $id CONTENT $new
+                     WHERE exam_kinds = $ek
+                       AND attendance_statuses = $st
+                       AND grade_bands = $gb;
+                 COMMIT TRANSACTION;",
+            )
+            .bind(("expected", expected.clone()))
+            .bind(("id", Self::record_id()))
+            .bind(("new", self))
+            .bind(("ek", expected.exam_kinds.clone()))
+            .bind(("st", expected.attendance_statuses.clone()))
+            .bind(("gb", expected.grade_bands.clone()))
+            .await?
+            .check()?;
+        // Statement slots count BEGIN too: the guarded UPDATE is slot 2. An
+        // empty slot means the row no longer matched `expected`.
+        Ok(result.take::<Vec<Settings>>(2)?.into_iter().next())
     }
 }
 
@@ -335,6 +377,81 @@ mod tests {
         let rows: Vec<Settings> = result.take(0).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get_exam_kinds(), ["quiz"]);
+    }
+
+    #[tokio::test]
+    async fn a_stale_snapshot_cannot_revert_a_newer_policy() {
+        let db = crate::database::init_mem().await.unwrap();
+        let statuses = Settings::defaults().get_attendance_statuses().to_vec();
+
+        // Editor A snapshots the policy (the defaults — no row yet)...
+        let stale = Settings::load(&db).await.unwrap();
+        // ...then editor B lands a new exam-kind list first.
+        Settings::try_new(kinds(&["lab"]), statuses.clone(), vec![])
+            .unwrap()
+            .save(&db)
+            .await
+            .unwrap();
+
+        // A's merge over the stale snapshot (kinds kept "as loaded", bands
+        // changed) — exactly what a concurrent PATCH /settings computes —
+        // must be refused, not applied.
+        let refused = Settings::try_new(
+            stale.get_exam_kinds().to_vec(),
+            stale.get_attendance_statuses().to_vec(),
+            bands(&[(0, "F"), (50, "P")]),
+        )
+        .unwrap()
+        .save_if_unchanged(&stale, &db)
+        .await
+        .unwrap();
+        assert!(refused.is_none(), "a stale snapshot's save must not apply");
+
+        // B's edit must survive A's stale write attempt.
+        let after = Settings::load(&db).await.unwrap();
+        assert_eq!(
+            after.get_exam_kinds(),
+            ["lab"],
+            "a concurrent editor's exam kinds must not be silently reverted"
+        );
+        assert!(after.get_grade_bands().is_empty());
+
+        // A's retry — reload, re-merge, save again — lands both edits.
+        let fresh = Settings::load(&db).await.unwrap();
+        let saved = Settings::try_new(
+            fresh.get_exam_kinds().to_vec(),
+            fresh.get_attendance_statuses().to_vec(),
+            bands(&[(0, "F"), (50, "P")]),
+        )
+        .unwrap()
+        .save_if_unchanged(&fresh, &db)
+        .await
+        .unwrap()
+        .expect("a merge over the current row applies");
+        assert_eq!(saved.get_exam_kinds(), ["lab"]);
+        assert_eq!(saved.get_grade_bands().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn save_if_unchanged_seeds_the_first_row() {
+        let db = crate::database::init_mem().await.unwrap();
+        // No row yet: `load` reports the defaults, and a save conditioned on
+        // that snapshot must apply (seeding the singleton on the way).
+        let current = Settings::load(&db).await.unwrap();
+        let saved = Settings::try_new(
+            kinds(&["lab"]),
+            current.get_attendance_statuses().to_vec(),
+            vec![],
+        )
+        .unwrap()
+        .save_if_unchanged(&current, &db)
+        .await
+        .unwrap()
+        .expect("the first save applies");
+        assert_eq!(saved.get_exam_kinds(), ["lab"]);
+        let mut result = db.query("SELECT * FROM settings").await.unwrap();
+        let rows: Vec<Settings> = result.take(0).unwrap();
+        assert_eq!(rows.len(), 1, "still one singleton row");
     }
 
     #[tokio::test]
