@@ -907,7 +907,10 @@ async fn finish_attempt(
 #[derive(Serialize, ToSchema)]
 struct LiveStudentResponse {
     user: PersonRef,
-    /// `not_started` | `in_progress` | `submitted` | `expired`.
+    /// `not_started` | `absent` | `in_progress` | `submitted` | `expired`.
+    /// `absent` is `not_started` after the window closed: the student never
+    /// sat and no longer can. Open exams have no window, so nobody is ever
+    /// absent from one.
     #[schema(example = "in_progress")]
     status: String,
     /// Which sitting the shown attempt is (1, 2, …); `null` before the first.
@@ -934,7 +937,11 @@ struct LiveStudentResponse {
 #[derive(Serialize, ToSchema)]
 struct LiveCountsResponse {
     enrolled: u64,
+    /// Enrolled with no attempt while the window is still open (or the exam
+    /// has no window).
     not_started: u64,
+    /// Enrolled with no attempt and the window closed — the no-shows.
+    absent: u64,
     in_progress: u64,
     submitted: u64,
     expired: u64,
@@ -1000,6 +1007,10 @@ async fn live_snapshot(exam: &Exam, db: &Database) -> Result<ExamLiveResponse, A
     }
     let people = person_map(roster.iter().map(|e| e.get_user().clone()), db).await?;
 
+    // Once the window closes the door is shut for good (starting answers
+    // 409), so "hasn't started" hardens into "was absent". Open exams have
+    // no window and never make that call.
+    let window_over = exam.get_ends_at().is_some_and(|ends| now >= ends);
     let mut students: Vec<LiveStudentResponse> = roster
         .iter()
         .map(|enrollment| {
@@ -1009,9 +1020,12 @@ async fn live_snapshot(exam: &Exam, db: &Database) -> Result<ExamLiveResponse, A
             let deadline = attempt.and_then(|a| a.deadline(exam));
             LiveStudentResponse {
                 user: PersonRef::resolve(&people, enrollment.get_user()),
-                status: status
-                    .map_or("not_started", AttemptStatus::as_str)
-                    .to_string(),
+                status: match status {
+                    Some(status) => status.as_str(),
+                    None if window_over => "absent",
+                    None => "not_started",
+                }
+                .to_string(),
                 attempt: attempt.map(ExamAttempt::get_seq),
                 attempts_used: used.get(key).copied().unwrap_or(0),
                 started_at: attempt.map(|a| a.get_started_at().as_millis()),
@@ -1035,6 +1049,7 @@ async fn live_snapshot(exam: &Exam, db: &Database) -> Result<ExamLiveResponse, A
     let counts = LiveCountsResponse {
         enrolled: students.len() as u64,
         not_started: count("not_started"),
+        absent: count("absent"),
         in_progress: count("in_progress"),
         submitted: count("submitted"),
         expired: count("expired"),
@@ -1050,10 +1065,11 @@ async fn live_snapshot(exam: &Exam, db: &Database) -> Result<ExamLiveResponse, A
 }
 
 /// A one-shot live snapshot of the exam: who's in, who's still writing (and
-/// on which sitting), who walked out of the room (`left_at`), time each
-/// student has left, and marks as they land. Requires teacher+ and
-/// management rights over the exam's course. For a self-updating feed of the
-/// same shape, see `GET /exams/{id}/live/stream`.
+/// on which sitting), who walked out of the room (`left_at`), who never
+/// showed at all (`absent`, once the window is over), time each student has
+/// left, and marks as they land. Requires teacher+ and management rights
+/// over the exam's course. For a self-updating feed of the same shape, see
+/// `GET /exams/{id}/live/stream`.
 #[utoipa::path(
     get,
     path = "/{id}/live",

@@ -3788,6 +3788,138 @@ async fn sync_attempt_lifecycle_feeds_the_live_monitor() {
     assert_eq!(res.status, StatusCode::FORBIDDEN);
 }
 
+/// Once the window closes, an enrolled student who never sat turns from
+/// `not_started` into `absent` on the monitor — started-but-unsubmitted stays
+/// `expired`, and an open exam (no window) never flags anyone.
+#[tokio::test]
+async fn closed_window_flags_no_shows_as_absent() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "abs_t", "teacher").await;
+    let ayse = login(&app, "ayse").await; // never shows up
+    let veli = login(&app, "veli").await; // submits
+    let cem = login(&app, "cem").await; // starts, never submits
+    let ayse_id = me_id(&app, &ayse).await;
+    let veli_id = me_id(&app, &veli).await;
+    let cem_id = me_id(&app, &cem).await;
+    let course = create_course(&app, &teacher, "history").await;
+    enroll(&app, &teacher, &course, &ayse_id).await;
+    enroll(&app, &teacher, &course, &veli_id).await;
+    enroll(&app, &teacher, &course, &cem_id).await;
+
+    let now = Timestamp::now().as_millis();
+    let exam = scheduled_exam(
+        &app,
+        &teacher,
+        &course,
+        json!({ "title": "midterm", "kind": "midterm", "weight": 2,
+                "mode": "sync", "starts_at": now - 50_000, "ends_at": now + 600_000 }),
+    )
+    .await;
+
+    for cookie in [&veli, &cem] {
+        let res = send(
+            &app,
+            "POST",
+            &format!("/exams/{exam}/attempt"),
+            Some(cookie),
+            None,
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    }
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt/finish"),
+        Some(&veli),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    // Window still open: the no-show is merely `not_started`.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/live"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["counts"]["not_started"], 1);
+    assert_eq!(res.body["counts"]["absent"], 0);
+    assert_eq!(res.body["students"][0]["user"]["username"], "ayse");
+    assert_eq!(res.body["students"][0]["status"], "not_started");
+
+    // The teacher cuts the window short (inside the backdating grace): the
+    // exam is over, and the gap hardens into an absence.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/exams/{exam}"),
+        Some(&teacher),
+        Some(json!({ "ends_at": now - 10_000 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    let res = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/live"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["counts"]["enrolled"], 3);
+    assert_eq!(res.body["counts"]["not_started"], 0);
+    assert_eq!(res.body["counts"]["absent"], 1);
+    assert_eq!(res.body["counts"]["submitted"], 1);
+    assert_eq!(res.body["counts"]["expired"], 1);
+    let students = res.body["students"].as_array().expect("students");
+    assert_eq!(students[0]["user"]["username"], "ayse");
+    assert_eq!(students[0]["status"], "absent");
+    assert_eq!(students[1]["user"]["username"], "cem");
+    assert_eq!(students[1]["status"], "expired");
+    assert_eq!(students[2]["user"]["username"], "veli");
+    assert_eq!(students[2]["status"], "submitted");
+
+    // Absence is informational — the mark stays a human call, and the
+    // teacher may still record one for the no-show.
+    assert!(students[0]["mark"].is_null());
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/results"),
+        Some(&teacher),
+        Some(json!({ "mark": 0, "user_id": ayse_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    // An open exam has no window: never started is never absent.
+    let open = scheduled_exam(
+        &app,
+        &teacher,
+        &course,
+        json!({ "title": "essay", "kind": "homework", "weight": 1, "mode": "open" }),
+    )
+    .await;
+    let res = send(
+        &app,
+        "GET",
+        &format!("/exams/{open}/live"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["counts"]["not_started"], 3);
+    assert_eq!(res.body["counts"]["absent"], 0);
+}
+
 #[tokio::test]
 async fn async_deadline_is_start_plus_duration_clamped_to_window() {
     let (app, db) = app_and_db().await;

@@ -460,10 +460,14 @@ deadline rules mid-sitting would be a different exam (`409`).
 
 The course's manager (its creator, or manager+) watches it all live:
 `GET /exams/{id}/live` returns one snapshot —
-the enrolled roster joined with attempts and marks (`not_started` |
+the enrolled roster joined with attempts and marks (`not_started` | `absent` |
 `in_progress` | `submitted` | `expired`, per-student `attempt` /
 `attempts_used` / `left_at` / `deadline` / `remaining_ms` / `mark`, always the
-latest sitting) plus summary counts, all judged at a single `now`.
+latest sitting) plus summary counts, all judged at a single `now`. Once the
+window closes, `not_started` hardens into `absent` — the no-shows, flagged
+right in the roster (open exams have no window, so never an `absent`). The
+flag is informational: an absent student still has no mark until the teacher
+records one through `POST /exams/{id}/results`.
 `GET /exams/{id}/live/stream` is the same JSON as Server-Sent Events: a
 `snapshot` event immediately on connect, then every ~2 s — attendance, ticking
 clocks, submissions, and marks land without polling:
