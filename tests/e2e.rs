@@ -448,7 +448,7 @@ async fn live_exam_stream_pushes_snapshots_over_http() {
     let exam: Value = teacher
         .post(format!("{base}/courses/{course_id}/exams"))
         .json(&json!({
-            "title": "final", "kind": "final", "weight": 2,
+            "title": "final", "kind": "final",
             "mode": "sync", "starts_at": now - 1_000, "ends_at": now + 600_000,
         }))
         .send()
@@ -655,7 +655,7 @@ async fn exam_room_fixture(window_ms: i64) -> ExamRoom {
     let exam: Value = teacher
         .post(format!("{base}/courses/{course_id}/exams"))
         .json(&json!({
-            "title": "final", "kind": "final", "weight": 2,
+            "title": "final", "kind": "final",
             "mode": "sync", "starts_at": now - 1_000, "ends_at": now + window_ms,
         }))
         .send()
@@ -847,7 +847,7 @@ async fn exam_room_rejects_bad_handshakes() {
     let unscheduled: Value = room
         .teacher
         .post(format!("{}/courses/{}/exams", room.base, room.course_id))
-        .json(&json!({ "title": "homework", "kind": "homework", "weight": 1 }))
+        .json(&json!({ "title": "homework", "kind": "homework" }))
         .send()
         .await
         .unwrap()
@@ -1176,7 +1176,7 @@ async fn exam_room_close_after_a_retake_leaves_the_new_sitting_alone() {
         .teacher
         .post(format!("{}/courses/{}/exams", room.base, room.course_id))
         .json(&json!({
-            "title": "practice", "kind": "quiz", "weight": 1,
+            "title": "practice", "kind": "quiz",
             "mode": "open", "max_attempts": 2, "allow_rejoin": false,
         }))
         .send()
@@ -1280,7 +1280,7 @@ async fn exam_room_messages_bind_to_their_own_sitting() {
         .teacher
         .post(format!("{}/courses/{}/exams", room.base, room.course_id))
         .json(&json!({
-            "title": "practice", "kind": "quiz", "weight": 1,
+            "title": "practice", "kind": "quiz",
             "mode": "open", "max_attempts": 2,
         }))
         .send()
@@ -1465,7 +1465,7 @@ async fn exam_room_open_mode_runs_untimed_and_retakes() {
         .teacher
         .post(format!("{}/courses/{}/exams", room.base, room.course_id))
         .json(&json!({
-            "title": "practice", "kind": "quiz", "weight": 1,
+            "title": "practice", "kind": "quiz",
             "mode": "open", "max_attempts": 2,
         }))
         .send()

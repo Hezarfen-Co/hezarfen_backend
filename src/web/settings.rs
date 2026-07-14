@@ -6,7 +6,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::constant::SETTINGS_UPDATE_RETRIES;
-use crate::domain::settings::{GradeBand, Settings};
+use crate::domain::settings::{ExamKindDef, GradeBand, Settings};
 use crate::error::{AppError, ErrorResponse};
 use crate::state::AppState;
 
@@ -14,6 +14,19 @@ use super::{CurrentUser, RequireManager};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new().routes(routes!(get_settings, update_settings))
+}
+
+/// One exam kind the school runs, with its weight in course averages. An exam
+/// of this kind counts `weight` times into `Σ(mark×weight) / Σ(weight)`.
+#[derive(Serialize, Deserialize, ToSchema)]
+struct ExamKindDto {
+    /// The `kind` value exams carry, 1–50 characters.
+    #[schema(example = "midterm")]
+    name: String,
+    /// The kind's weight in the course average, `1`–`100`. Editing it
+    /// re-weights every exam of this kind at once.
+    #[schema(example = 2)]
+    weight: i64,
 }
 
 /// One grade-display band: marks at or above `min` (and below the next band's
@@ -28,13 +41,19 @@ struct GradeBandDto {
     label: String,
 }
 
-/// The school's policy: which exam kinds exist, which attendance statuses the
-/// roll call accepts, and how numeric marks display as grades.
+/// The school's policy: which exam kinds exist (and their weights in course
+/// averages), which attendance statuses the roll call accepts, and how
+/// numeric marks display as grades.
 #[derive(Serialize, ToSchema)]
 struct SettingsResponse {
-    /// Accepted `kind` values for new exams.
-    #[schema(example = json!(["homework", "quiz", "midterm", "final", "project", "oral"]))]
-    exam_kinds: Vec<String>,
+    /// Accepted `kind` values for new exams, each with its weight in the
+    /// course average.
+    #[schema(example = json!([
+        {"name": "midterm", "weight": 2},
+        {"name": "final", "weight": 3},
+        {"name": "oral", "weight": 1},
+    ]))]
+    exam_kinds: Vec<ExamKindDto>,
     /// Accepted `status` values for attendance marking. Always contains the
     /// core four (`present`, `absent`, `late`, `excused`).
     #[schema(example = json!(["present", "absent", "late", "excused"]))]
@@ -46,7 +65,14 @@ struct SettingsResponse {
 impl SettingsResponse {
     fn new(settings: &Settings) -> Self {
         Self {
-            exam_kinds: settings.get_exam_kinds().to_vec(),
+            exam_kinds: settings
+                .get_exam_kinds()
+                .iter()
+                .map(|kind| ExamKindDto {
+                    name: kind.get_name().to_string(),
+                    weight: kind.get_weight(),
+                })
+                .collect(),
             attendance_statuses: settings.get_attendance_statuses().to_vec(),
             grade_bands: settings
                 .get_grade_bands()
@@ -62,9 +88,9 @@ impl SettingsResponse {
 
 #[derive(Deserialize, ToSchema)]
 struct UpdateSettings {
-    /// Replaces the whole list when present: 1–20 unique entries, each 1–50
-    /// characters.
-    exam_kinds: Option<Vec<String>>,
+    /// Replaces the whole list when present: 1–20 entries with unique names,
+    /// each name 1–50 characters, each weight `1`–`100`.
+    exam_kinds: Option<Vec<ExamKindDto>>,
     /// Replaces the whole list when present; must keep `present`, `absent`,
     /// `late`, `excused` (the attendance rate is defined over them).
     attendance_statuses: Option<Vec<String>>,
@@ -97,7 +123,10 @@ async fn get_settings(
 /// Update the school's policy. Requires manager+. Omitted fields keep their
 /// value; a present field replaces its list wholesale. Existing rows are
 /// untouched — a removed exam kind or status lives on in old records; only
-/// new writes are held to the new lists.
+/// new writes are held to the new lists. Kind weights, though, apply live:
+/// mark reports read them at request time, so editing a weight re-weights
+/// every exam of that kind, and an exam whose kind was removed from the list
+/// counts with weight 1 until the kind returns.
 #[utoipa::path(
     patch,
     path = "/",
@@ -124,10 +153,13 @@ async fn update_settings(
     for _ in 0..SETTINGS_UPDATE_RETRIES {
         let current = Settings::load(&st.db).await?;
 
-        let exam_kinds = req
-            .exam_kinds
-            .clone()
-            .unwrap_or_else(|| current.get_exam_kinds().to_vec());
+        let exam_kinds = match &req.exam_kinds {
+            Some(kinds) => kinds
+                .iter()
+                .map(|kind| ExamKindDef::try_new(&kind.name, kind.weight))
+                .collect::<Result<Vec<_>, _>>()?,
+            None => current.get_exam_kinds().to_vec(),
+        };
         let attendance_statuses = req
             .attendance_statuses
             .clone()

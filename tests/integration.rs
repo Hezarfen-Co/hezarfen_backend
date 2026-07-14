@@ -874,13 +874,14 @@ async fn exams_are_course_scoped_and_course_guarded() {
         "POST",
         &format!("/courses/{course_id}/exams"),
         Some(&ali),
-        Some(json!({ "title": "ch3", "description": "algebra", "kind": "quiz", "weight": 2 })),
+        Some(json!({ "title": "ch3", "description": "algebra", "kind": "quiz" })),
     )
     .await;
     assert_eq!(ex.status, StatusCode::CREATED);
     assert_eq!(ex.body["kind"], "quiz");
     assert_eq!(ex.body["course"], course_id);
-    assert_eq!(ex.body["weight"], 2);
+    // Weight lives on the kind (settings), not the exam.
+    assert_eq!(ex.body.get("weight"), None);
     let exam_id = id_of(&ex.body);
 
     // A teacher outside the course sees none of it: not the exam, not the
@@ -971,7 +972,7 @@ async fn exams_are_course_scoped_and_course_guarded() {
         StatusCode::FORBIDDEN
     );
 
-    // Course creator edits (partial) — kind flips homework, title/weight kept.
+    // Course creator edits (partial) — kind flips homework, title kept.
     let res = send(
         &app,
         "PATCH",
@@ -983,7 +984,6 @@ async fn exams_are_course_scoped_and_course_guarded() {
     assert_eq!(res.status, StatusCode::OK);
     assert_eq!(res.body["kind"], "homework");
     assert_eq!(res.body["title"], "ch3");
-    assert_eq!(res.body["weight"], 2);
 }
 
 #[tokio::test]
@@ -1000,7 +1000,7 @@ async fn exam_input_validation() {
             "POST",
             &exams_uri,
             Some(&ali),
-            Some(json!({"title":"  ","kind":"quiz","weight":1}))
+            Some(json!({"title":"  ","kind":"quiz"}))
         )
         .await
         .status,
@@ -1013,7 +1013,7 @@ async fn exam_input_validation() {
             "POST",
             &exams_uri,
             Some(&ali),
-            Some(json!({"title":"t","kind":"essay","weight":1}))
+            Some(json!({"title":"t","kind":"essay"}))
         )
         .await
         .status,
@@ -1025,40 +1025,11 @@ async fn exam_input_validation() {
             "POST",
             &exams_uri,
             Some(&ali),
-            Some(json!({"title":"t","kind":"final","weight":1}))
+            Some(json!({"title":"t","kind":"final"}))
         )
         .await
         .status,
         StatusCode::CREATED
-    );
-    // Weight out of range or missing -> 400 / 422.
-    for weight in [json!(0), json!(101), json!(-1)] {
-        assert_eq!(
-            send(
-                &app,
-                "POST",
-                &exams_uri,
-                Some(&ali),
-                Some(json!({"title":"t","kind":"quiz","weight":weight}))
-            )
-            .await
-            .status,
-            StatusCode::BAD_REQUEST,
-            "weight {weight}"
-        );
-    }
-    assert_eq!(
-        send(
-            &app,
-            "POST",
-            &exams_uri,
-            Some(&ali),
-            Some(json!({"title":"t","kind":"quiz"}))
-        )
-        .await
-        .status,
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "missing weight is a body schema error"
     );
     // Missing exam -> 404.
     assert_eq!(
@@ -1079,7 +1050,7 @@ async fn grading_upsert_and_own_result() {
 
     let course_id = create_course(&app, &teacher, "algebra").await;
     enroll(&app, &teacher, &course_id, &alice_id).await;
-    let exam_id = create_exam(&app, &teacher, &course_id, "mt", "quiz", 1).await;
+    let exam_id = create_exam(&app, &teacher, &course_id, "mt", "quiz").await;
 
     // Before grading, the student's own result is 404.
     assert_eq!(
@@ -1211,7 +1182,7 @@ async fn grading_rbac_and_validation() {
 
     let course_id = create_course(&app, &teacher, "algebra").await;
     enroll(&app, &teacher, &course_id, &alice_id).await;
-    let exam_id = create_exam(&app, &teacher, &course_id, "e", "homework", 1).await;
+    let exam_id = create_exam(&app, &teacher, &course_id, "e", "homework").await;
 
     // Students cannot create exams, grade anyone, list all results, or delete a result.
     assert_eq!(
@@ -1220,7 +1191,7 @@ async fn grading_rbac_and_validation() {
             "POST",
             &format!("/courses/{course_id}/exams"),
             Some(&alice),
-            Some(json!({"title":"x","kind":"quiz","weight":1}))
+            Some(json!({"title":"x","kind":"quiz"}))
         )
         .await
         .status,
@@ -1326,7 +1297,7 @@ async fn deleting_exam_cascades_results() {
 
     let course_id = create_course(&app, &teacher, "algebra").await;
     enroll(&app, &teacher, &course_id, &alice_id).await;
-    let exam_id = create_exam(&app, &teacher, &course_id, "e", "quiz", 1).await;
+    let exam_id = create_exam(&app, &teacher, &course_id, "e", "quiz").await;
     send(
         &app,
         "POST",
@@ -1702,7 +1673,7 @@ async fn exam_creation_lives_under_courses() {
             "POST",
             "/exams",
             Some(&teacher),
-            Some(json!({"title":"t","kind":"quiz","weight":1}))
+            Some(json!({"title":"t","kind":"quiz"}))
         )
         .await
         .status,
@@ -1710,18 +1681,17 @@ async fn exam_creation_lives_under_courses() {
     );
 
     let course_id = create_course(&app, &teacher, "algebra").await;
-    // Creation inside the course echoes course + weight.
+    // Creation inside the course echoes the course.
     let res = send(
         &app,
         "POST",
         &format!("/courses/{course_id}/exams"),
         Some(&teacher),
-        Some(json!({"title":"mt","kind":"midterm","weight":3})),
+        Some(json!({"title":"mt","kind":"midterm"})),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED);
     assert_eq!(res.body["course"], course_id);
-    assert_eq!(res.body["weight"], 3);
 
     // A teacher who doesn't manage the course cannot add exams to it.
     assert_eq!(
@@ -1730,7 +1700,7 @@ async fn exam_creation_lives_under_courses() {
             "POST",
             &format!("/courses/{course_id}/exams"),
             Some(&veli),
-            Some(json!({"title":"x","kind":"quiz","weight":1}))
+            Some(json!({"title":"x","kind":"quiz"}))
         )
         .await
         .status,
@@ -1790,7 +1760,7 @@ async fn grading_requires_enrollment() {
     let alice_id = me_id(&app, &alice).await;
 
     let course_id = create_course(&app, &teacher, "algebra").await;
-    let exam_id = create_exam(&app, &teacher, &course_id, "mt", "quiz", 1).await;
+    let exam_id = create_exam(&app, &teacher, &course_id, "mt", "quiz").await;
     let grade_uri = format!("/exams/{exam_id}/results");
     let grade_body = json!({ "mark": 70, "user_id": alice_id });
 
@@ -1882,7 +1852,7 @@ async fn exam_writes_follow_course_management() {
     let course_id = create_course(&app, &teacher, "algebra").await;
 
     // A manager creates an exam in the teacher's course...
-    let exam_id = create_exam(&app, &boss, &course_id, "mt", "midterm", 2).await;
+    let exam_id = create_exam(&app, &boss, &course_id, "mt", "midterm").await;
 
     // ...and the course creator (not the exam's creator) can edit and delete it.
     assert_eq!(
@@ -1891,11 +1861,11 @@ async fn exam_writes_follow_course_management() {
             "PATCH",
             &format!("/exams/{exam_id}"),
             Some(&teacher),
-            Some(json!({"weight":5}))
+            Some(json!({"title":"renamed"}))
         )
         .await
-        .body["weight"],
-        5
+        .body["title"],
+        "renamed"
     );
     // An unrelated teacher still cannot.
     assert_eq!(
@@ -1904,7 +1874,7 @@ async fn exam_writes_follow_course_management() {
             "PATCH",
             &format!("/exams/{exam_id}"),
             Some(&veli),
-            Some(json!({"weight":1}))
+            Some(json!({"title":"hijack"}))
         )
         .await
         .status,
@@ -1936,7 +1906,7 @@ async fn exam_statistics_summarize_results() {
     let course_id = create_course(&app, &teacher, "algebra").await;
     enroll(&app, &teacher, &course_id, &alice_id).await;
     enroll(&app, &teacher, &course_id, &bob_id).await;
-    let exam_id = create_exam(&app, &teacher, &course_id, "mt", "quiz", 1).await;
+    let exam_id = create_exam(&app, &teacher, &course_id, "mt", "quiz").await;
     let stats_uri = format!("/exams/{exam_id}/statistics");
 
     // Nothing graded yet: zero count, null aggregates.
@@ -1974,19 +1944,37 @@ async fn exam_statistics_summarize_results() {
 }
 
 #[tokio::test]
-async fn weighted_averages_follow_exam_weights() {
+async fn weighted_averages_follow_kind_weights() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "teacher", "teacher").await;
+    let manager = login_as(&app, &db, "boss", "manager").await;
     let alice = login(&app, "alice").await;
     let alice_id = me_id(&app, &alice).await;
+
+    // Weights are school policy, per kind: quizzes count once, midterms three
+    // times (the defaults are all 1).
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&manager),
+        Some(json!({ "exam_kinds": [
+            {"name": "quiz", "weight": 1},
+            {"name": "midterm", "weight": 3},
+            {"name": "final", "weight": 4},
+            {"name": "homework", "weight": 1},
+        ]})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
 
     // Course A: quiz (w1, mark 50) + midterm (w3, mark 90) -> (50 + 270) / 4 = 80.
     let algebra = create_course(&app, &teacher, "algebra").await;
     enroll(&app, &teacher, &algebra, &alice_id).await;
-    let quiz = create_exam(&app, &teacher, &algebra, "quiz", "quiz", 1).await;
-    let midterm = create_exam(&app, &teacher, &algebra, "midterm", "midterm", 3).await;
+    let quiz = create_exam(&app, &teacher, &algebra, "quiz", "quiz").await;
+    let midterm = create_exam(&app, &teacher, &algebra, "midterm", "midterm").await;
     // A third exam stays ungraded and must not drag the average.
-    create_exam(&app, &teacher, &algebra, "final", "final", 4).await;
+    create_exam(&app, &teacher, &algebra, "final", "final").await;
     for (exam, mark) in [(&quiz, 50), (&midterm, 90)] {
         let res = send(
             &app,
@@ -2002,7 +1990,7 @@ async fn weighted_averages_follow_exam_weights() {
     // Course B: enrolled, nothing graded -> null average.
     let physics = create_course(&app, &teacher, "physics").await;
     enroll(&app, &teacher, &physics, &alice_id).await;
-    create_exam(&app, &teacher, &physics, "hw", "homework", 1).await;
+    create_exam(&app, &teacher, &physics, "hw", "homework").await;
 
     let report = send(&app, "GET", "/marks/me", Some(&alice), None).await;
     assert_eq!(report.status, StatusCode::OK);
@@ -2019,11 +2007,88 @@ async fn weighted_averages_follow_exam_weights() {
 
     assert_eq!(algebra_block["average"], 80.0);
     assert_eq!(algebra_block["results"].as_array().unwrap().len(), 2);
+    // Each entry carries its kind's resolved weight.
+    let midterm_entry = algebra_block["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["kind"] == "midterm")
+        .unwrap();
+    assert_eq!(midterm_entry["weight"], 3);
     assert_eq!(physics_block["average"], serde_json::Value::Null);
     assert_eq!(physics_block["results"].as_array().unwrap().len(), 0);
     // Overall skips the null course instead of zeroing it.
     assert_eq!(report.body["overall_average"], 80.0);
     assert_eq!(report.body["user"], alice_id);
+}
+
+/// Kind weights resolve at report time: editing a kind's weight re-weights
+/// already-graded exams, and a kind removed from settings counts once.
+#[tokio::test]
+async fn kind_weight_edits_reweight_reports_live() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "teacher", "teacher").await;
+    let manager = login_as(&app, &db, "boss", "manager").await;
+    let alice = login(&app, "alice").await;
+    let alice_id = me_id(&app, &alice).await;
+
+    let course = create_course(&app, &teacher, "algebra").await;
+    enroll(&app, &teacher, &course, &alice_id).await;
+    let quiz = create_exam(&app, &teacher, &course, "q", "quiz").await;
+    let oral = create_exam(&app, &teacher, &course, "o", "oral").await;
+    for (exam, mark) in [(&quiz, 40), (&oral, 80)] {
+        let res = send(
+            &app,
+            "POST",
+            &format!("/exams/{exam}/results"),
+            Some(&teacher),
+            Some(json!({ "mark": mark, "user_id": alice_id })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK);
+    }
+
+    // Default weights (all 1): plain mean of 40 and 80.
+    let report = send(&app, "GET", "/marks/me", Some(&alice), None).await;
+    assert_eq!(report.body["courses"][0]["average"], 60.0);
+
+    // Triple the oral weight — the already-graded exam follows immediately:
+    // (40 + 240) / 4 = 70.
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&manager),
+        Some(json!({ "exam_kinds": [
+            {"name": "quiz", "weight": 1},
+            {"name": "oral", "weight": 3},
+        ]})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    let report = send(&app, "GET", "/marks/me", Some(&alice), None).await;
+    assert_eq!(report.body["courses"][0]["average"], 70.0);
+
+    // Retire the oral kind altogether: its exam keeps counting, weight 1.
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&manager),
+        Some(json!({ "exam_kinds": [{"name": "quiz", "weight": 1}] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    let report = send(&app, "GET", "/marks/me", Some(&alice), None).await;
+    assert_eq!(report.body["courses"][0]["average"], 60.0);
+    let oral_entry = report.body["courses"][0]["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["kind"] == "oral")
+        .unwrap()
+        .clone();
+    assert_eq!(oral_entry["weight"], 1);
 }
 
 #[tokio::test]
@@ -2077,7 +2142,7 @@ async fn course_data_is_walled_off_from_other_teachers() {
 
     let course_id = create_course(&app, &owner, "algebra").await;
     enroll(&app, &owner, &course_id, &alice_id).await;
-    let exam_id = create_exam(&app, &owner, &course_id, "mt", "quiz", 2).await;
+    let exam_id = create_exam(&app, &owner, &course_id, "mt", "quiz").await;
     let res = send(
         &app,
         "POST",
@@ -2179,7 +2244,7 @@ async fn deleting_course_cascades_enrollments_exams_and_results() {
 
     let course_id = create_course(&app, &teacher, "algebra").await;
     enroll(&app, &teacher, &course_id, &alice_id).await;
-    let exam_id = create_exam(&app, &teacher, &course_id, "mt", "quiz", 1).await;
+    let exam_id = create_exam(&app, &teacher, &course_id, "mt", "quiz").await;
     send(
         &app,
         "POST",
@@ -2805,7 +2870,7 @@ async fn concurrent_exam_grades_never_collide() {
     let student_id = me_id(&app, &student).await;
     let course_id = create_course(&app, &teacher, "algebra").await;
     enroll(&app, &teacher, &course_id, &student_id).await;
-    let exam_id = create_exam(&app, &teacher, &course_id, "e", "quiz", 1).await;
+    let exam_id = create_exam(&app, &teacher, &course_id, "e", "quiz").await;
 
     let mut handles = Vec::new();
     for mark in 0..24i64 {
@@ -2989,7 +3054,7 @@ async fn graders_cannot_grade_themselves() {
     let course_id = create_course(&app, &teacher, "algebra").await;
     enroll(&app, &teacher, &course_id, &teacher_id).await;
     enroll(&app, &teacher, &course_id, &boss_id).await;
-    let exam_id = create_exam(&app, &teacher, &course_id, "t", "quiz", 1).await;
+    let exam_id = create_exam(&app, &teacher, &course_id, "t", "quiz").await;
 
     // Self-grading is forbidden at every privilege level, not just for teachers.
     // (The teacher owns the course; the manager clears the gate by role.)
@@ -3410,7 +3475,7 @@ async fn exam_scheduling_validates_and_echoes() {
         &teacher,
         &course,
         json!({
-            "title": "midterm", "kind": "midterm", "weight": 2,
+            "title": "midterm", "kind": "midterm",
             "mode": "sync", "starts_at": now + 60_000, "ends_at": now + 120_000,
         }),
     )
@@ -3427,7 +3492,7 @@ async fn exam_scheduling_validates_and_echoes() {
         &teacher,
         &course,
         json!({
-            "title": "takehome", "kind": "quiz", "weight": 1,
+            "title": "takehome", "kind": "quiz",
             "mode": "async", "starts_at": now, "ends_at": now + 7_200_000,
             "duration_ms": 5_400_000,
         }),
@@ -3443,7 +3508,7 @@ async fn exam_scheduling_validates_and_echoes() {
         &app,
         &teacher,
         &course,
-        json!({ "title": "homework", "kind": "homework", "weight": 1 }),
+        json!({ "title": "homework", "kind": "homework" }),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED);
@@ -3461,7 +3526,7 @@ async fn exam_scheduling_validates_and_echoes() {
         &teacher,
         &course,
         json!({
-            "title": "practice", "kind": "quiz", "weight": 1, "mode": "open",
+            "title": "practice", "kind": "quiz", "mode": "open",
             "duration_ms": 5_400_000, "max_attempts": 0, "allow_rejoin": false,
         }),
     )
@@ -3478,80 +3543,80 @@ async fn exam_scheduling_validates_and_echoes() {
     for (label, body) in [
         (
             "unknown mode",
-            json!({ "title": "x", "kind": "quiz", "weight": 1, "mode": "weekly",
+            json!({ "title": "x", "kind": "quiz", "mode": "weekly",
                     "starts_at": now, "ends_at": now + 1_000 }),
         ),
         (
             "times without mode",
-            json!({ "title": "x", "kind": "quiz", "weight": 1, "starts_at": now }),
+            json!({ "title": "x", "kind": "quiz", "starts_at": now }),
         ),
         (
             "duration without mode",
-            json!({ "title": "x", "kind": "quiz", "weight": 1, "duration_ms": 60_000 }),
+            json!({ "title": "x", "kind": "quiz", "duration_ms": 60_000 }),
         ),
         (
             "sync missing ends_at",
-            json!({ "title": "x", "kind": "quiz", "weight": 1, "mode": "sync",
+            json!({ "title": "x", "kind": "quiz", "mode": "sync",
                     "starts_at": now }),
         ),
         (
             "sync with duration",
-            json!({ "title": "x", "kind": "quiz", "weight": 1, "mode": "sync",
+            json!({ "title": "x", "kind": "quiz", "mode": "sync",
                     "starts_at": now, "ends_at": now + 1_000, "duration_ms": 60_000 }),
         ),
         (
             "async without duration",
-            json!({ "title": "x", "kind": "quiz", "weight": 1, "mode": "async",
+            json!({ "title": "x", "kind": "quiz", "mode": "async",
                     "starts_at": now, "ends_at": now + 1_000 }),
         ),
         (
             "backwards window",
-            json!({ "title": "x", "kind": "quiz", "weight": 1, "mode": "sync",
+            json!({ "title": "x", "kind": "quiz", "mode": "sync",
                     "starts_at": now + 2_000, "ends_at": now + 1_000 }),
         ),
         (
             "empty window",
-            json!({ "title": "x", "kind": "quiz", "weight": 1, "mode": "sync",
+            json!({ "title": "x", "kind": "quiz", "mode": "sync",
                     "starts_at": now, "ends_at": now }),
         ),
         (
             "duration too short",
-            json!({ "title": "x", "kind": "quiz", "weight": 1, "mode": "async",
+            json!({ "title": "x", "kind": "quiz", "mode": "async",
                     "starts_at": now, "ends_at": now + 90_000_000, "duration_ms": 59_999 }),
         ),
         (
             "duration too long",
-            json!({ "title": "x", "kind": "quiz", "weight": 1, "mode": "async",
+            json!({ "title": "x", "kind": "quiz", "mode": "async",
                     "starts_at": now, "ends_at": now + 90_000_000, "duration_ms": 86_400_001 }),
         ),
         (
             "past starts_at",
-            json!({ "title": "x", "kind": "quiz", "weight": 1, "mode": "sync",
+            json!({ "title": "x", "kind": "quiz", "mode": "sync",
                     "starts_at": now - 3_600_000, "ends_at": now + 3_600_000 }),
         ),
         (
             // starts_at is future so the rejection can only come from ends_at.
             "past ends_at",
-            json!({ "title": "x", "kind": "quiz", "weight": 1, "mode": "sync",
+            json!({ "title": "x", "kind": "quiz", "mode": "sync",
                     "starts_at": now + 3_600_000, "ends_at": now - 3_600_000 }),
         ),
         (
             "open with a window",
-            json!({ "title": "x", "kind": "quiz", "weight": 1, "mode": "open",
+            json!({ "title": "x", "kind": "quiz", "mode": "open",
                     "starts_at": now + 60_000, "ends_at": now + 120_000 }),
         ),
         (
             "open with only an ends_at",
-            json!({ "title": "x", "kind": "quiz", "weight": 1, "mode": "open",
+            json!({ "title": "x", "kind": "quiz", "mode": "open",
                     "ends_at": now + 120_000 }),
         ),
         (
             "negative attempt limit",
-            json!({ "title": "x", "kind": "quiz", "weight": 1, "max_attempts": -1 }),
+            json!({ "title": "x", "kind": "quiz", "max_attempts": -1 }),
         ),
         (
             "attempt limit over the cap",
-            json!({ "title": "x", "kind": "quiz", "weight": 1, "max_attempts": 101 }),
+            json!({ "title": "x", "kind": "quiz", "max_attempts": 101 }),
         ),
     ] {
         let res = create_exam_with(&app, &teacher, &course, body).await;
@@ -3574,7 +3639,7 @@ async fn schedule_times_cannot_be_backdated() {
         &app,
         &teacher,
         &course,
-        json!({ "title": "running", "kind": "quiz", "weight": 1,
+        json!({ "title": "running", "kind": "quiz",
                 "mode": "sync", "starts_at": now - 1_000, "ends_at": now + 600_000 }),
     )
     .await;
@@ -3623,7 +3688,7 @@ async fn schedule_times_cannot_be_backdated() {
         &app,
         &teacher,
         &course,
-        json!({ "title": "graced", "kind": "quiz", "weight": 1,
+        json!({ "title": "graced", "kind": "quiz",
                 "mode": "sync", "starts_at": now - 30_000, "ends_at": now + 600_000 }),
     )
     .await;
@@ -3658,7 +3723,7 @@ async fn sync_attempt_lifecycle_feeds_the_live_monitor() {
         &app,
         &teacher,
         &course,
-        json!({ "title": "final", "kind": "final", "weight": 3,
+        json!({ "title": "final", "kind": "final",
                 "mode": "sync", "starts_at": now - 1_000, "ends_at": ends }),
     )
     .await;
@@ -3811,7 +3876,7 @@ async fn closed_window_flags_no_shows_as_absent() {
         &app,
         &teacher,
         &course,
-        json!({ "title": "midterm", "kind": "midterm", "weight": 2,
+        json!({ "title": "midterm", "kind": "midterm",
                 "mode": "sync", "starts_at": now - 50_000, "ends_at": now + 600_000 }),
     )
     .await;
@@ -3904,7 +3969,7 @@ async fn closed_window_flags_no_shows_as_absent() {
         &app,
         &teacher,
         &course,
-        json!({ "title": "essay", "kind": "homework", "weight": 1, "mode": "open" }),
+        json!({ "title": "essay", "kind": "homework", "mode": "open" }),
     )
     .await;
     let res = send(
@@ -3935,7 +4000,7 @@ async fn async_deadline_is_start_plus_duration_clamped_to_window() {
         &app,
         &teacher,
         &course,
-        json!({ "title": "quiz", "kind": "quiz", "weight": 1,
+        json!({ "title": "quiz", "kind": "quiz",
                 "mode": "async", "starts_at": now - 1_000, "ends_at": now + 6_000_000,
                 "duration_ms": 60_000 }),
     )
@@ -3958,7 +4023,7 @@ async fn async_deadline_is_start_plus_duration_clamped_to_window() {
         &app,
         &teacher,
         &course,
-        json!({ "title": "quiz2", "kind": "quiz", "weight": 1,
+        json!({ "title": "quiz2", "kind": "quiz",
                 "mode": "async", "starts_at": now - 1_000, "ends_at": ends,
                 "duration_ms": 60_000 }),
     )
@@ -3986,7 +4051,7 @@ async fn attempts_gate_on_schedule_enrollment_and_window() {
     let now = Timestamp::now().as_millis();
 
     // Unscheduled exams cannot be sat at all.
-    let unscheduled = create_exam(&app, &teacher, &course, "hw", "homework", 1).await;
+    let unscheduled = create_exam(&app, &teacher, &course, "hw", "homework").await;
     let res = send(
         &app,
         "POST",
@@ -4002,7 +4067,7 @@ async fn attempts_gate_on_schedule_enrollment_and_window() {
         &app,
         &teacher,
         &course,
-        json!({ "title": "later", "kind": "quiz", "weight": 1,
+        json!({ "title": "later", "kind": "quiz",
                 "mode": "sync", "starts_at": now + 600_000, "ends_at": now + 1_200_000 }),
     )
     .await;
@@ -4021,7 +4086,7 @@ async fn attempts_gate_on_schedule_enrollment_and_window() {
         &teacher,
         &course,
         // Inside the backdating grace, yet already closed by the clock.
-        json!({ "title": "gone", "kind": "quiz", "weight": 1,
+        json!({ "title": "gone", "kind": "quiz",
                 "mode": "sync", "starts_at": now - 50_000, "ends_at": now - 10_000 }),
     )
     .await;
@@ -4040,7 +4105,7 @@ async fn attempts_gate_on_schedule_enrollment_and_window() {
         &app,
         &teacher,
         &course,
-        json!({ "title": "open", "kind": "quiz", "weight": 1,
+        json!({ "title": "open", "kind": "quiz",
                 "mode": "sync", "starts_at": now - 1_000, "ends_at": now + 600_000 }),
     )
     .await;
@@ -4090,7 +4155,7 @@ async fn finish_rejects_double_submit_missing_attempt_and_expiry() {
         &app,
         &teacher,
         &course,
-        json!({ "title": "final", "kind": "final", "weight": 1,
+        json!({ "title": "final", "kind": "final",
                 "mode": "sync", "starts_at": now - 1_000, "ends_at": now + 600_000 }),
     )
     .await;
@@ -4140,7 +4205,7 @@ async fn finish_rejects_double_submit_missing_attempt_and_expiry() {
         &app,
         &teacher,
         &course,
-        json!({ "title": "blitz", "kind": "quiz", "weight": 1,
+        json!({ "title": "blitz", "kind": "quiz",
                 "mode": "sync", "starts_at": now - 1_000,
                 "ends_at": Timestamp::now().as_millis() + 1_500 }),
     )
@@ -4195,7 +4260,7 @@ async fn mode_freezes_after_attempts_but_times_extend_live() {
         &app,
         &teacher,
         &course,
-        json!({ "title": "final", "kind": "final", "weight": 1,
+        json!({ "title": "final", "kind": "final",
                 "mode": "sync", "starts_at": now - 1_000, "ends_at": ends }),
     )
     .await;
@@ -4305,7 +4370,7 @@ async fn attempts_cascade_with_exam_and_course_deletion() {
     let course = create_course(&app, &teacher, "hist").await;
     enroll(&app, &teacher, &course, &student_id).await;
     let now = Timestamp::now().as_millis();
-    let schedule = json!({ "title": "final", "kind": "final", "weight": 1,
+    let schedule = json!({ "title": "final", "kind": "final",
                            "mode": "sync", "starts_at": now - 1_000, "ends_at": now + 600_000 });
 
     // Deleting the exam removes its attempts.
@@ -4382,7 +4447,7 @@ async fn open_exams_sit_anytime_and_retakes_respect_the_limit() {
         &app,
         &teacher,
         &course,
-        json!({ "title": "drill", "kind": "quiz", "weight": 1,
+        json!({ "title": "drill", "kind": "quiz",
                 "mode": "open", "max_attempts": 2 }),
     )
     .await;
@@ -4573,7 +4638,7 @@ async fn open_duration_and_sync_retakes_shape_the_deadline_and_monitor() {
         &app,
         &teacher,
         &course,
-        json!({ "title": "sprint", "kind": "quiz", "weight": 1,
+        json!({ "title": "sprint", "kind": "quiz",
                 "mode": "open", "duration_ms": 60_000 }),
     )
     .await;
@@ -4602,7 +4667,7 @@ async fn open_duration_and_sync_retakes_shape_the_deadline_and_monitor() {
         &app,
         &teacher,
         &course,
-        json!({ "title": "final", "kind": "final", "weight": 1,
+        json!({ "title": "final", "kind": "final",
                 "mode": "sync", "starts_at": now - 1_000, "ends_at": ends,
                 "max_attempts": 3 }),
     )
@@ -4687,7 +4752,7 @@ async fn live_stream_is_sse_and_teacher_scoped() {
         &app,
         &teacher,
         &course,
-        json!({ "title": "final", "kind": "final", "weight": 1,
+        json!({ "title": "final", "kind": "final",
                 "mode": "sync", "starts_at": now - 1_000, "ends_at": now + 600_000 }),
     )
     .await;
@@ -4770,7 +4835,7 @@ async fn open_exam_with_student(
         app,
         teacher,
         &course,
-        json!({ "title": "final", "kind": "final", "weight": 1,
+        json!({ "title": "final", "kind": "final",
                 "mode": "sync", "starts_at": now - 1_000, "ends_at": now + 600_000 }),
     )
     .await;
@@ -4784,7 +4849,7 @@ async fn question_crud_validation_and_rbac() {
     let other_teacher = login_as(&app, &db, "q_t2", "teacher").await;
     let student = login(&app, "quinn").await;
     let course = create_course(&app, &teacher, "logic").await;
-    let exam = create_exam(&app, &teacher, &course, "final", "final", 1).await;
+    let exam = create_exam(&app, &teacher, &course, "final", "final").await;
 
     // A choice question echoes its full authoring view, correct included.
     let res = send(
@@ -4996,7 +5061,7 @@ async fn question_crud_validation_and_rbac() {
     assert_eq!(res.status, StatusCode::FORBIDDEN);
 
     // Unknown ids are 404s — including a question under the wrong exam.
-    let other_exam = create_exam(&app, &teacher, &course, "quiz", "quiz", 1).await;
+    let other_exam = create_exam(&app, &teacher, &course, "quiz", "quiz").await;
     for (method, uri) in [
         ("POST", "/exams/missing/questions".to_string()),
         ("GET", "/exams/missing/questions".to_string()),
@@ -5311,7 +5376,7 @@ async fn answer_saves_gate_on_attempt_state_and_kind() {
     )
     .await;
     assert_eq!(res.status, StatusCode::NOT_FOUND);
-    let foreign_exam = create_exam(&app, &teacher, &course, "other", "quiz", 1).await;
+    let foreign_exam = create_exam(&app, &teacher, &course, "other", "quiz").await;
     let foreign_q = create_question(
         &app,
         &teacher,
@@ -5511,7 +5576,7 @@ async fn answer_saves_stop_at_the_deadline() {
         &app,
         &teacher,
         &course,
-        json!({ "title": "blitz", "kind": "quiz", "weight": 1,
+        json!({ "title": "blitz", "kind": "quiz",
                 "mode": "sync", "starts_at": now - 1_000, "ends_at": now + 1_500 }),
     )
     .await;
@@ -5848,7 +5913,7 @@ async fn questions_and_answers_cascade_with_deletes() {
         &app,
         &teacher,
         &course,
-        json!({ "title": "retake", "kind": "quiz", "weight": 1,
+        json!({ "title": "retake", "kind": "quiz",
                 "mode": "sync", "starts_at": now - 1_000, "ends_at": now + 600_000 }),
     )
     .await;
@@ -5908,7 +5973,7 @@ async fn question_patch_revalidates_the_stale_kind_bundle() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "rv_t", "teacher").await;
     let course = create_course(&app, &teacher, "sets").await;
-    let exam = create_exam(&app, &teacher, &course, "final", "final", 1).await;
+    let exam = create_exam(&app, &teacher, &course, "final", "final").await;
     let question = create_question(
         &app,
         &teacher,
@@ -5989,7 +6054,7 @@ async fn question_authoring_follows_course_management() {
     let teacher = login_as(&app, &db, "own_t", "teacher").await;
     let boss = login_as(&app, &db, "own_m", "manager").await;
     let course = create_course(&app, &teacher, "greek").await;
-    let exam = create_exam(&app, &teacher, &course, "final", "final", 1).await;
+    let exam = create_exam(&app, &teacher, &course, "final", "final").await;
 
     // A manager+ authors questions in anyone's course, like every other
     // course-management write.
@@ -7167,7 +7232,7 @@ async fn course_catalog_lists_a_creator_enrolled_course_once() {
 
     // The exam catalog derives from the same visible set and must not double
     // the course's exams either.
-    let exam = create_exam(&app, &teacher, &course, "mt", "quiz", 1).await;
+    let exam = create_exam(&app, &teacher, &course, "mt", "quiz").await;
     let res = send(&app, "GET", "/exams", Some(&teacher), None).await;
     let exams = res.body.as_array().unwrap();
     assert_eq!(exams.len(), 1, "one exam listed once: {exams:?}");
@@ -7187,12 +7252,20 @@ async fn settings_serve_defaults_and_gate_edits_to_manager() {
     let res = send(&app, "GET", "/settings", None, None).await;
     assert_eq!(res.status, StatusCode::UNAUTHORIZED);
 
-    // Any authenticated user reads; the defaults mirror the old constants.
+    // Any authenticated user reads; the defaults mirror the old constants,
+    // every kind weighing 1 until the school says otherwise.
     let res = send(&app, "GET", "/settings", Some(&student), None).await;
     assert_eq!(res.status, StatusCode::OK);
     assert_eq!(
         res.body["exam_kinds"],
-        json!(["homework", "quiz", "midterm", "final", "project", "oral"])
+        json!([
+            {"name": "homework", "weight": 1},
+            {"name": "quiz", "weight": 1},
+            {"name": "midterm", "weight": 1},
+            {"name": "final", "weight": 1},
+            {"name": "project", "weight": 1},
+            {"name": "oral", "weight": 1},
+        ])
     );
     assert_eq!(
         res.body["attendance_statuses"],
@@ -7207,7 +7280,7 @@ async fn settings_serve_defaults_and_gate_edits_to_manager() {
             "PATCH",
             "/settings",
             Some(cookie),
-            Some(json!({ "exam_kinds": ["lab"] })),
+            Some(json!({ "exam_kinds": [{"name": "lab", "weight": 1}] })),
         )
         .await;
         assert_eq!(res.status, StatusCode::FORBIDDEN);
@@ -7219,11 +7292,20 @@ async fn settings_serve_defaults_and_gate_edits_to_manager() {
         "PATCH",
         "/settings",
         Some(&manager),
-        Some(json!({ "exam_kinds": ["lab", "Quiz"] })),
+        Some(json!({ "exam_kinds": [
+            {"name": "lab", "weight": 2},
+            {"name": "Quiz", "weight": 1},
+        ]})),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK);
-    assert_eq!(res.body["exam_kinds"], json!(["lab", "Quiz"]));
+    assert_eq!(
+        res.body["exam_kinds"],
+        json!([
+            {"name": "lab", "weight": 2},
+            {"name": "Quiz", "weight": 1},
+        ])
+    );
     assert_eq!(
         res.body["attendance_statuses"],
         json!(["present", "absent", "late", "excused"])
@@ -7231,7 +7313,8 @@ async fn settings_serve_defaults_and_gate_edits_to_manager() {
 
     // Every reader sees the new policy at once.
     let res = send(&app, "GET", "/settings", Some(&student), None).await;
-    assert_eq!(res.body["exam_kinds"], json!(["lab", "Quiz"]));
+    assert_eq!(res.body["exam_kinds"][0]["name"], "lab");
+    assert_eq!(res.body["exam_kinds"][0]["weight"], 2);
 }
 
 #[tokio::test]
@@ -7240,11 +7323,19 @@ async fn settings_validation_rejects_bad_lists_and_bands() {
     let manager = login_as(&app, &db, "val.manager", "manager").await;
 
     let bad = [
-        json!({ "exam_kinds": [] }),      // a school needs at least one kind
-        json!({ "exam_kinds": ["   "] }), // blank entry
-        json!({ "exam_kinds": ["Lab", "lab"] }), // case-insensitive duplicate
+        json!({ "exam_kinds": [] }), // a school needs at least one kind
+        json!({ "exam_kinds": [{"name": "   ", "weight": 1}] }), // blank name
+        // Case-insensitive duplicate names.
+        json!({ "exam_kinds": [
+            {"name": "Lab", "weight": 1},
+            {"name": "lab", "weight": 2},
+        ]}),
+        // Weights are held to 1–100.
+        json!({ "exam_kinds": [{"name": "quiz", "weight": 0}] }),
+        json!({ "exam_kinds": [{"name": "quiz", "weight": 101}] }),
+        json!({ "exam_kinds": [{"name": "quiz", "weight": -1}] }),
         json!({ "attendance_statuses": ["present", "absent", "late"] }), // core dropped
-        json!({ "grade_bands": [{ "min": 50, "label": "CC" }] }), // no band starts at 0
+        json!({ "grade_bands": [{ "min": 50, "label": "CC" }] }),        // no band starts at 0
         json!({ "grade_bands": [{ "min": 0, "label": "F" }, { "min": 0, "label": "E" }] }),
         json!({ "grade_bands": [{ "min": -1, "label": "F" }] }),
         json!({ "grade_bands": [{ "min": 101, "label": "A" }] }),
@@ -7275,7 +7366,7 @@ async fn exam_kinds_follow_settings_for_new_writes_only() {
     let manager = login_as(&app, &db, "kind.manager", "manager").await;
 
     let course = create_course(&app, &teacher, "Chemistry").await;
-    let exam = create_exam(&app, &teacher, &course, "Midterm", "midterm", 1).await;
+    let exam = create_exam(&app, &teacher, &course, "Midterm", "midterm").await;
 
     // The school swaps its kind list wholesale.
     let res = send(
@@ -7283,7 +7374,7 @@ async fn exam_kinds_follow_settings_for_new_writes_only() {
         "PATCH",
         "/settings",
         Some(&manager),
-        Some(json!({ "exam_kinds": ["lab"] })),
+        Some(json!({ "exam_kinds": [{"name": "lab", "weight": 1}] })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK);
@@ -7293,7 +7384,7 @@ async fn exam_kinds_follow_settings_for_new_writes_only() {
         &app,
         &teacher,
         &course,
-        json!({ "title": "Retired kind", "kind": "midterm", "weight": 1 }),
+        json!({ "title": "Retired kind", "kind": "midterm" }),
     )
     .await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST);
@@ -7301,7 +7392,7 @@ async fn exam_kinds_follow_settings_for_new_writes_only() {
         &app,
         &teacher,
         &course,
-        json!({ "title": "Lab 1", "kind": "lab", "weight": 1 }),
+        json!({ "title": "Lab 1", "kind": "lab" }),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED);
@@ -7449,7 +7540,7 @@ async fn grade_bands_label_the_marks_report() {
 
     let course = create_course(&app, &teacher, "Physics").await;
     enroll(&app, &teacher, &course, &student_id).await;
-    let exam = create_exam(&app, &teacher, &course, "Final", "final", 2).await;
+    let exam = create_exam(&app, &teacher, &course, "Final", "final").await;
     let res = send(
         &app,
         "POST",
@@ -7814,7 +7905,7 @@ async fn grade_band_boundary_applies_to_the_weighted_average() {
     let course = create_course(&app, &teacher, "Calculus").await;
     enroll(&app, &teacher, &course, &student_id).await;
     for (title, mark) in [("Quiz A", 80), ("Quiz B", 90)] {
-        let exam = create_exam(&app, &teacher, &course, title, "quiz", 1).await;
+        let exam = create_exam(&app, &teacher, &course, title, "quiz").await;
         let res = send(
             &app,
             "POST",
@@ -7851,16 +7942,25 @@ async fn settings_accept_admin_edits_trim_entries_and_noop_on_empty_patch() {
     assert_eq!(res.status, StatusCode::OK);
     assert_eq!(res.body["exam_kinds"].as_array().unwrap().len(), 6);
 
-    // Admin clears the manager bar (hierarchy, not equality), and entries
+    // Admin clears the manager bar (hierarchy, not equality), and kind names
     // arrive trimmed on the wire.
     let res = send(
         &app,
         "PATCH",
         "/settings",
         Some(&admin),
-        Some(json!({ "exam_kinds": ["  lab  ", "quiz"] })),
+        Some(json!({ "exam_kinds": [
+            {"name": "  lab  ", "weight": 2},
+            {"name": "quiz", "weight": 1},
+        ]})),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK);
-    assert_eq!(res.body["exam_kinds"], json!(["lab", "quiz"]));
+    assert_eq!(
+        res.body["exam_kinds"],
+        json!([
+            {"name": "lab", "weight": 2},
+            {"name": "quiz", "weight": 1},
+        ])
+    );
 }

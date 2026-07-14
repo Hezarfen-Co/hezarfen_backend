@@ -321,7 +321,7 @@ mod tests {
     use crate::database::init_mem;
     use crate::domain::course::CourseId;
     use crate::domain::exam::{
-        ExamAttemptLimit, ExamDescription, ExamKind, ExamMode, ExamSchedule, ExamTitle, ExamWeight,
+        ExamAttemptLimit, ExamDescription, ExamKind, ExamMode, ExamSchedule, ExamTitle,
     };
     use crate::domain::exam_answer::ExamAnswer;
     use crate::domain::exam_question::{ExamQuestion, QuestionKind, QuestionPoints, QuestionSpec};
@@ -339,7 +339,6 @@ mod tests {
             ExamTitle::try_new("practice").unwrap(),
             ExamDescription::try_new("").unwrap(),
             ExamKind::try_new("quiz", &kinds).unwrap(),
-            ExamWeight::try_new(1).unwrap(),
             ExamSchedule::try_new(Some(ExamMode::try_new("open").unwrap()), None, None, None)
                 .unwrap(),
             ExamAttemptLimit::try_new(max_attempts).unwrap(),

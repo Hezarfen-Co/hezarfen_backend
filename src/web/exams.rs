@@ -18,7 +18,7 @@ use crate::domain::course::Course;
 use crate::domain::enrollment::Enrollment;
 use crate::domain::exam::{
     Exam, ExamAttemptLimit, ExamDescription, ExamDuration, ExamId, ExamKind, ExamMode,
-    ExamSchedule, ExamTitle, ExamWeight,
+    ExamSchedule, ExamTitle,
 };
 use crate::domain::exam_answer::{ExamAnswer, auto_score};
 use crate::domain::exam_attempt::{AttemptStatus, ExamAttempt};
@@ -68,8 +68,10 @@ pub fn routes() -> OpenApiRouter<AppState> {
 struct UpdateExam {
     title: Option<String>,
     description: Option<String>,
+    /// The assessment form — one of the school's exam kinds (`GET /settings`).
+    /// Changing it re-weights the exam: the course average uses the kind's
+    /// settings-configured weight.
     kind: Option<String>,
-    weight: Option<i64>,
     /// `sync`, `async`, or `open`. Omit to keep the current mode; send `null`
     /// to turn the exam back into an offline draft. Frozen once anyone has
     /// started an attempt. Switching to `open` requires clearing
@@ -232,7 +234,7 @@ async fn get_exam(
     request_body = UpdateExam,
     responses(
         (status = 200, description = "Updated exam", body = ExamResponse),
-        (status = 400, description = "Invalid fields, kind, weight, attempt limit, or schedule (malformed window, or newly set times in the past)", body = ErrorResponse),
+        (status = 400, description = "Invalid fields, kind, attempt limit, or schedule (malformed window, or newly set times in the past)", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
@@ -272,10 +274,6 @@ async fn update_exam(
             ExamKind::try_new(kind, school.get_exam_kinds())?
         }
         None => exam.get_kind().clone(),
-    };
-    let weight = match req.weight {
-        Some(weight) => ExamWeight::try_new(weight)?,
-        None => exam.get_weight(),
     };
 
     // Merge the schedule (set / clear / keep per field), then re-validate it
@@ -331,7 +329,6 @@ async fn update_exam(
             title,
             description,
             kind,
-            weight,
             schedule,
             max_attempts,
             allow_rejoin,

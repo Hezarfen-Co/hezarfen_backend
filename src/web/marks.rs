@@ -33,6 +33,9 @@ struct MarkEntry {
     exam: String,
     title: String,
     kind: String,
+    /// The kind's weight from the school settings, resolved at request time —
+    /// how many times this mark counts into the course average. `1` when the
+    /// school no longer lists the kind.
     weight: i64,
     mark: i64,
     /// The mark's label from the school's grade bands (`GET /settings`);
@@ -71,7 +74,8 @@ struct MarksReport {
 }
 
 /// `Σ(mark×weight) / Σ(weight)`; `None` when there is nothing to average. The
-/// zero-denominator guard is structural — `ExamWeight` already forbids 0.
+/// zero-denominator guard is structural — kind weights are 1–100 and retired
+/// kinds resolve to 1, so a weight is never 0.
 fn weighted_average(pairs: &[(i64, i64)]) -> Option<f64> {
     let total_weight: i64 = pairs.iter().map(|(_, weight)| weight).sum();
     if total_weight == 0 {
@@ -82,10 +86,10 @@ fn weighted_average(pairs: &[(i64, i64)]) -> Option<f64> {
 }
 
 /// Assemble the report: for each enrolled course, join the course's exams
-/// (weights) with the user's graded results, then average. A `viewer` narrows
-/// the report to the courses that viewer manages (self-reports and manager+
-/// reports pass `None` and see everything); the overall average follows the
-/// narrowed set.
+/// with the user's graded results, weigh each mark by its exam kind's
+/// settings weight, then average. A `viewer` narrows the report to the
+/// courses that viewer manages (self-reports and manager+ reports pass `None`
+/// and see everything); the overall average follows the narrowed set.
 async fn build_report(
     user: &UserId,
     viewer: Option<&User>,
@@ -96,7 +100,7 @@ async fn build_report(
         courses.retain(|course| can_manage_course(course, viewer));
     }
 
-    // One settings read labels the whole report.
+    // One settings read weighs and labels the whole report.
     let school = Settings::load(db).await?;
 
     let mut blocks = Vec::with_capacity(courses.len());
@@ -113,18 +117,23 @@ async fn build_report(
             let Some(exam) = by_key.get(result.get_exam().key()) else {
                 continue;
             };
+            // The kind's current settings weight; an exam keeps a retired
+            // kind, and its marks then count once.
+            let weight = school
+                .exam_kind_weight(exam.get_kind().as_str())
+                .unwrap_or(1);
             entries.push(MarkEntry {
                 exam: exam.get_id().key().to_string(),
                 title: exam.get_title().as_str().to_string(),
                 kind: exam.get_kind().as_str().to_string(),
-                weight: exam.get_weight().as_i64(),
+                weight,
                 mark: result.get_mark().as_i64(),
                 grade: school
                     .grade_label(result.get_mark().as_i64() as f64)
                     .map(str::to_string),
                 graded_by: result.get_graded_by().key().to_string(),
             });
-            pairs.push((result.get_mark().as_i64(), exam.get_weight().as_i64()));
+            pairs.push((result.get_mark().as_i64(), weight));
         }
 
         let average = weighted_average(&pairs);

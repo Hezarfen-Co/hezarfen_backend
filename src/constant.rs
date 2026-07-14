@@ -51,10 +51,18 @@ pub const DEFAULT_ATTENDANCE_STATUSES: [&str; 4] = ["present", "absent", "late",
 
 pub const MAX_SESSION_TOPIC_LEN: usize = 200;
 
-/// The default exam kinds; schools replace the list via `PATCH /settings`.
-/// Informational metadata only — `weight` drives the course average.
-pub const DEFAULT_EXAM_KINDS: [&str; 6] =
-    ["homework", "quiz", "midterm", "final", "project", "oral"];
+/// The default exam kinds with their weights; schools replace the list via
+/// `PATCH /settings`. An exam's kind decides how heavily it counts into the
+/// course average — the defaults all weigh 1 (a plain average) so weighting
+/// is opt-in policy, not baked-in opinion.
+pub const DEFAULT_EXAM_KINDS: [(&str, i64); 6] = [
+    ("homework", 1),
+    ("quiz", 1),
+    ("midterm", 1),
+    ("final", 1),
+    ("project", 1),
+    ("oral", 1),
+];
 
 /// Bounds for the school-editable lists in settings (exam kinds, attendance
 /// statuses): entry count and per-entry character length.
@@ -117,10 +125,11 @@ pub const MAX_ANSWER_TEXT_LEN: usize = 10_000;
 pub const MIN_MARK: i64 = 0;
 pub const MAX_MARK: i64 = 100;
 
-/// Inclusive bounds for an exam's weight in the course average. The minimum of
-/// 1 keeps every graded exam counted and the average's denominator non-zero.
-pub const MIN_EXAM_WEIGHT: i64 = 1;
-pub const MAX_EXAM_WEIGHT: i64 = 100;
+/// Inclusive bounds for an exam kind's weight in the course average. The
+/// minimum of 1 keeps every graded exam counted and the average's denominator
+/// non-zero.
+pub const MIN_EXAM_KIND_WEIGHT: i64 = 1;
+pub const MAX_EXAM_KIND_WEIGHT: i64 = 100;
 
 pub const SESSION_DURATION_DAYS: i64 = 7;
 

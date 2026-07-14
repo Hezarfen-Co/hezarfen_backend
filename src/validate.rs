@@ -2,11 +2,10 @@
 //! the value, so an existing newtype is always valid (parse, don't validate).
 
 use crate::constant::{
-    EXAM_MODES, MAX_EMAIL_LEN, MAX_EXAM_ATTEMPTS, MAX_EXAM_DURATION_MS, MAX_EXAM_WEIGHT, MAX_MARK,
-    MAX_PASSWORD_LEN, MAX_PHONE_DIGITS, MAX_QUESTION_POINTS, MAX_USERNAME_LEN,
-    MIN_EXAM_DURATION_MS, MIN_EXAM_WEIGHT, MIN_MARK, MIN_PASSWORD_LEN, MIN_PHONE_DIGITS,
-    MIN_QUESTION_POINTS, MIN_USERNAME_LEN, QUESTION_KINDS, UNLIMITED_EXAM_ATTEMPTS,
-    USERNAME_SEPARATORS,
+    EXAM_MODES, MAX_EMAIL_LEN, MAX_EXAM_ATTEMPTS, MAX_EXAM_DURATION_MS, MAX_MARK, MAX_PASSWORD_LEN,
+    MAX_PHONE_DIGITS, MAX_QUESTION_POINTS, MAX_USERNAME_LEN, MIN_EXAM_DURATION_MS, MIN_MARK,
+    MIN_PASSWORD_LEN, MIN_PHONE_DIGITS, MIN_QUESTION_POINTS, MIN_USERNAME_LEN, QUESTION_KINDS,
+    UNLIMITED_EXAM_ATTEMPTS, USERNAME_SEPARATORS,
 };
 use crate::error::ValidationError;
 
@@ -264,17 +263,6 @@ pub fn validate_mark(value: i64) -> Result<(), ValidationError> {
     }
 }
 
-pub fn validate_weight(value: i64) -> Result<(), ValidationError> {
-    if (MIN_EXAM_WEIGHT..=MAX_EXAM_WEIGHT).contains(&value) {
-        Ok(())
-    } else {
-        Err(ValidationError::Invalid {
-            field: "weight",
-            reason: "must be between 1 and 100",
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,15 +430,5 @@ mod tests {
         }
         assert!(validate_mark(-1).is_err());
         assert!(validate_mark(101).is_err());
-    }
-
-    #[tokio::test]
-    async fn weight_rules() {
-        for weight in [1, 50, 100] {
-            assert!(validate_weight(weight).is_ok());
-        }
-        assert!(validate_weight(0).is_err());
-        assert!(validate_weight(-1).is_err());
-        assert!(validate_weight(101).is_err());
     }
 }

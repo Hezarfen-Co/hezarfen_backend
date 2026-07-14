@@ -1,5 +1,6 @@
-//! School-adjustable policy: which exam kinds exist, which attendance
-//! statuses the roll call accepts, and how numeric marks display as grades.
+//! School-adjustable policy: which exam kinds exist (and how much each
+//! weighs in course averages), which attendance statuses the roll call
+//! accepts, and how numeric marks display as grades.
 //!
 //! One singleton record (`settings:school` — one school per deployment). An
 //! absent record means "the defaults from `constant.rs`", so a fresh or
@@ -8,14 +9,55 @@
 use surrealdb::types::{RecordId, SurrealValue};
 
 use crate::constant::{
-    DEFAULT_ATTENDANCE_STATUSES, DEFAULT_EXAM_KINDS, MAX_GRADE_BANDS, MAX_GRADE_LABEL_LEN,
-    MAX_MARK, MAX_SETTINGS_ITEM_LEN, MAX_SETTINGS_LIST_LEN, MIN_MARK,
+    DEFAULT_ATTENDANCE_STATUSES, DEFAULT_EXAM_KINDS, MAX_EXAM_KIND_WEIGHT, MAX_GRADE_BANDS,
+    MAX_GRADE_LABEL_LEN, MAX_MARK, MAX_SETTINGS_ITEM_LEN, MAX_SETTINGS_LIST_LEN,
+    MIN_EXAM_KIND_WEIGHT, MIN_MARK,
 };
 use crate::database::{Database, SETTINGS_TABLE};
 use crate::error::{AppError, ValidationError};
 
 /// The singleton's fixed key: one school per deployment, one settings row.
 const SETTINGS_KEY: &str = "school";
+
+/// One exam kind the school runs (`"midterm"`, `"oral"`, …) with its weight:
+/// how many times an exam of that kind counts into its course's average.
+/// Weight lives here, not on the exam — reweighting a kind reweights every
+/// exam of that kind at once.
+#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+pub struct ExamKindDef {
+    name: String,
+    weight: i64,
+}
+
+impl ExamKindDef {
+    pub fn try_new(name: &str, weight: i64) -> Result<Self, ValidationError> {
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > MAX_SETTINGS_ITEM_LEN {
+            return Err(ValidationError::Invalid {
+                field: "exam_kinds",
+                reason: "kind names must be 1 to 50 characters",
+            });
+        }
+        if !(MIN_EXAM_KIND_WEIGHT..=MAX_EXAM_KIND_WEIGHT).contains(&weight) {
+            return Err(ValidationError::Invalid {
+                field: "exam_kinds",
+                reason: "kind weights must be between 1 and 100",
+            });
+        }
+        Ok(Self {
+            name: name.to_string(),
+            weight,
+        })
+    }
+
+    pub fn get_name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn get_weight(&self) -> i64 {
+        self.weight
+    }
+}
 
 /// One grade-display band: marks at or above `min` (and below the next band's
 /// `min`) render as `label`. Display only — storage and averaging stay numeric.
@@ -61,7 +103,7 @@ impl GradeBand {
 #[derive(Debug, Clone, SurrealValue)]
 pub struct Settings {
     id: RecordId,
-    exam_kinds: Vec<String>,
+    exam_kinds: Vec<ExamKindDef>,
     attendance_statuses: Vec<String>,
     grade_bands: Vec<GradeBand>,
 }
@@ -76,7 +118,12 @@ impl Settings {
     pub fn defaults() -> Self {
         Self {
             id: Self::record_id(),
-            exam_kinds: DEFAULT_EXAM_KINDS.map(String::from).to_vec(),
+            exam_kinds: DEFAULT_EXAM_KINDS
+                .map(|(name, weight)| ExamKindDef {
+                    name: name.to_string(),
+                    weight,
+                })
+                .to_vec(),
             attendance_statuses: DEFAULT_ATTENDANCE_STATUSES.map(String::from).to_vec(),
             grade_bands: Vec::new(),
         }
@@ -89,11 +136,17 @@ impl Settings {
     /// display), otherwise their mins are unique and one band must start at 0
     /// so every mark maps to a label.
     pub fn try_new(
-        exam_kinds: Vec<String>,
+        exam_kinds: Vec<ExamKindDef>,
         attendance_statuses: Vec<String>,
         grade_bands: Vec<GradeBand>,
     ) -> Result<Self, ValidationError> {
-        let exam_kinds = validate_list("exam_kinds", exam_kinds)?;
+        // Per-entry rules (name shape, weight range) hold structurally on any
+        // `ExamKindDef`; here only the list-level rules need checking.
+        let names: Vec<String> = exam_kinds
+            .iter()
+            .map(|kind| kind.get_name().to_string())
+            .collect();
+        validate_list("exam_kinds", names)?;
         let attendance_statuses = validate_list("attendance_statuses", attendance_statuses)?;
         if DEFAULT_ATTENDANCE_STATUSES
             .iter()
@@ -138,8 +191,19 @@ impl Settings {
         })
     }
 
-    pub fn get_exam_kinds(&self) -> &[String] {
+    pub fn get_exam_kinds(&self) -> &[ExamKindDef] {
         &self.exam_kinds
+    }
+
+    /// The weight of the kind named `kind` (exact match, like kind
+    /// validation), or `None` when the school no longer lists it. Callers
+    /// averaging marks fall back to weight 1 — an exam keeps its retired kind
+    /// (settings edits never rewrite history), so it must still count.
+    pub fn exam_kind_weight(&self, kind: &str) -> Option<i64> {
+        self.exam_kinds
+            .iter()
+            .find(|def| def.get_name() == kind)
+            .map(ExamKindDef::get_weight)
     }
 
     pub fn get_attendance_statuses(&self) -> &[String] {
@@ -255,8 +319,18 @@ fn validate_list(field: &'static str, values: Vec<String>) -> Result<Vec<String>
 mod tests {
     use super::*;
 
-    fn kinds(list: &[&str]) -> Vec<String> {
-        list.iter().map(|s| s.to_string()).collect()
+    fn kinds(list: &[&str]) -> Vec<ExamKindDef> {
+        list.iter()
+            .map(|s| ExamKindDef::try_new(s, 1).unwrap())
+            .collect()
+    }
+
+    fn names(settings: &Settings) -> Vec<&str> {
+        settings
+            .get_exam_kinds()
+            .iter()
+            .map(ExamKindDef::get_name)
+            .collect()
     }
 
     fn bands(list: &[(i64, &str)]) -> Vec<GradeBand> {
@@ -279,19 +353,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lists_are_trimmed_bounded_and_deduped() {
+    async fn kind_defs_hold_name_and_weight_rules() {
+        // Names are trimmed; blank or over-long names die.
+        assert_eq!(
+            ExamKindDef::try_new("  lab  ", 1).unwrap().get_name(),
+            "lab"
+        );
+        assert!(ExamKindDef::try_new("  ", 1).is_err());
+        assert!(ExamKindDef::try_new(&"x".repeat(51), 1).is_err());
+        // Weights are held to 1–100 — 0 would erase the kind's exams from the
+        // average, and negatives would corrupt it.
+        for weight in [1, 50, 100] {
+            assert_eq!(
+                ExamKindDef::try_new("oral", weight).unwrap().get_weight(),
+                weight
+            );
+        }
+        assert!(ExamKindDef::try_new("oral", 0).is_err());
+        assert!(ExamKindDef::try_new("oral", -1).is_err());
+        assert!(ExamKindDef::try_new("oral", 101).is_err());
+    }
+
+    #[tokio::test]
+    async fn lists_are_bounded_and_deduped() {
         let statuses = Settings::defaults().get_attendance_statuses().to_vec();
-        // Trimming happens before storage.
-        let s = Settings::try_new(kinds(&["  lab  ", "quiz"]), statuses.clone(), vec![]).unwrap();
-        assert_eq!(s.get_exam_kinds(), ["lab", "quiz"]);
-        // Empty list, blank entry, over-long entry, and case-insensitive
-        // duplicates are all rejected.
+        let s = Settings::try_new(kinds(&["lab", "quiz"]), statuses.clone(), vec![]).unwrap();
+        assert_eq!(names(&s), ["lab", "quiz"]);
+        // Empty list and case-insensitive duplicate names are rejected.
         assert!(Settings::try_new(vec![], statuses.clone(), vec![]).is_err());
-        assert!(Settings::try_new(kinds(&["  "]), statuses.clone(), vec![]).is_err());
-        assert!(Settings::try_new(kinds(&[&"x".repeat(51)]), statuses.clone(), vec![]).is_err());
         assert!(Settings::try_new(kinds(&["Lab", "lab"]), statuses.clone(), vec![]).is_err());
-        let too_many: Vec<String> = (0..21).map(|i| format!("kind{i}")).collect();
+        let too_many: Vec<ExamKindDef> = (0..21)
+            .map(|i| ExamKindDef::try_new(&format!("kind{i}"), 1).unwrap())
+            .collect();
         assert!(Settings::try_new(too_many, statuses, vec![]).is_err());
+    }
+
+    #[tokio::test]
+    async fn kind_weights_resolve_by_exact_name() {
+        let statuses = Settings::defaults().get_attendance_statuses().to_vec();
+        let s = Settings::try_new(
+            vec![
+                ExamKindDef::try_new("midterm", 2).unwrap(),
+                ExamKindDef::try_new("final", 3).unwrap(),
+            ],
+            statuses,
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(s.exam_kind_weight("final"), Some(3));
+        assert_eq!(s.exam_kind_weight("midterm"), Some(2));
+        // Exact match, case included — same contract as kind validation.
+        assert_eq!(s.exam_kind_weight("Final"), None);
+        assert_eq!(s.exam_kind_weight("oral"), None);
     }
 
     #[tokio::test]
@@ -364,7 +477,7 @@ mod tests {
         .await
         .unwrap();
         let loaded = Settings::load(&db).await.unwrap();
-        assert_eq!(loaded.get_exam_kinds(), ["lab"]);
+        assert_eq!(names(&loaded), ["lab"]);
         assert_eq!(loaded.get_grade_bands().len(), 2);
         assert_eq!(loaded.grade_label(60.0), Some("P"));
         // A second save lands on the same singleton row, not a new one.
@@ -376,7 +489,7 @@ mod tests {
         let mut result = db.query("SELECT * FROM settings").await.unwrap();
         let rows: Vec<Settings> = result.take(0).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get_exam_kinds(), ["quiz"]);
+        assert_eq!(names(&rows[0]), ["quiz"]);
     }
 
     #[tokio::test]
@@ -410,7 +523,7 @@ mod tests {
         // B's edit must survive A's stale write attempt.
         let after = Settings::load(&db).await.unwrap();
         assert_eq!(
-            after.get_exam_kinds(),
+            names(&after),
             ["lab"],
             "a concurrent editor's exam kinds must not be silently reverted"
         );
@@ -428,7 +541,7 @@ mod tests {
         .await
         .unwrap()
         .expect("a merge over the current row applies");
-        assert_eq!(saved.get_exam_kinds(), ["lab"]);
+        assert_eq!(names(&saved), ["lab"]);
         assert_eq!(saved.get_grade_bands().len(), 2);
     }
 
@@ -448,7 +561,7 @@ mod tests {
         .await
         .unwrap()
         .expect("the first save applies");
-        assert_eq!(saved.get_exam_kinds(), ["lab"]);
+        assert_eq!(names(&saved), ["lab"]);
         let mut result = db.query("SELECT * FROM settings").await.unwrap();
         let rows: Vec<Settings> = result.take(0).unwrap();
         assert_eq!(rows.len(), 1, "still one singleton row");

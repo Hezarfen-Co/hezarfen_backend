@@ -4,12 +4,13 @@ use ulid::Ulid;
 use crate::constant::{MAX_EXAM_DESCRIPTION_LEN, MAX_EXAM_TITLE_LEN, UNLIMITED_EXAM_ATTEMPTS};
 use crate::database::{Database, EXAM_TABLE};
 use crate::domain::course::CourseId;
+use crate::domain::settings::ExamKindDef;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 use crate::validate::{
     validate_attempt_limit, validate_exam_duration, validate_exam_mode, validate_optional,
-    validate_required, validate_weight,
+    validate_required,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
@@ -65,16 +66,16 @@ impl ExamDescription {
 }
 
 /// A validated exam kind — one of the school's configured kinds
-/// ([`crate::domain::settings::Settings::get_exam_kinds`]). Informational
-/// metadata only — `weight` drives the course average. Stored exams keep
-/// their kind even if the school later edits the list; only new writes are
-/// held to the current one.
+/// ([`crate::domain::settings::Settings::get_exam_kinds`]). The kind carries
+/// the exam's weight in the course average (set per kind in settings, not per
+/// exam). Stored exams keep their kind even if the school later edits the
+/// list; only new writes are held to the current one.
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct ExamKind(String);
 
 impl ExamKind {
-    pub fn try_new(value: &str, allowed: &[String]) -> Result<Self, ValidationError> {
-        if !allowed.iter().any(|kind| kind == value) {
+    pub fn try_new(value: &str, allowed: &[ExamKindDef]) -> Result<Self, ValidationError> {
+        if !allowed.iter().any(|kind| kind.get_name() == value) {
             return Err(ValidationError::Invalid {
                 field: "kind",
                 reason: "is not one of this school's exam kinds (see GET /settings)",
@@ -85,22 +86,6 @@ impl ExamKind {
 
     pub fn as_str(&self) -> &str {
         &self.0
-    }
-}
-
-/// A validated exam weight, held to `[MIN_EXAM_WEIGHT, MAX_EXAM_WEIGHT]`. The
-/// exam counts `weight` times into its course's average.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, SurrealValue)]
-pub struct ExamWeight(i64);
-
-impl ExamWeight {
-    pub fn try_new(value: i64) -> Result<Self, ValidationError> {
-        validate_weight(value)?;
-        Ok(Self(value))
-    }
-
-    pub fn as_i64(&self) -> i64 {
-        self.0
     }
 }
 
@@ -262,7 +247,6 @@ pub struct Exam {
     title: ExamTitle,
     description: ExamDescription,
     kind: ExamKind,
-    weight: ExamWeight,
     // The schedule, flattened into columns (SCHEMAFULL keeps them typed).
     // Always written through an `ExamSchedule`, so the invariants above hold
     // for every stored row; pre-schedule rows read back as all-`None`.
@@ -299,10 +283,6 @@ impl Exam {
 
     pub fn get_kind(&self) -> &ExamKind {
         &self.kind
-    }
-
-    pub fn get_weight(&self) -> ExamWeight {
-        self.weight
     }
 
     pub fn get_mode(&self) -> Option<&ExamMode> {
@@ -357,7 +337,6 @@ impl Exam {
         title: ExamTitle,
         description: ExamDescription,
         kind: ExamKind,
-        weight: ExamWeight,
         schedule: ExamSchedule,
         max_attempts: ExamAttemptLimit,
         allow_rejoin: bool,
@@ -370,7 +349,6 @@ impl Exam {
             title,
             description,
             kind,
-            weight,
             mode: schedule.mode,
             starts_at: schedule.starts_at,
             ends_at: schedule.ends_at,
@@ -432,7 +410,6 @@ impl Exam {
         title: ExamTitle,
         description: ExamDescription,
         kind: ExamKind,
-        weight: ExamWeight,
         schedule: ExamSchedule,
         max_attempts: ExamAttemptLimit,
         allow_rejoin: bool,
@@ -441,7 +418,6 @@ impl Exam {
         self.title = title;
         self.description = description;
         self.kind = kind;
-        self.weight = weight;
         self.mode = schedule.mode;
         self.starts_at = schedule.starts_at;
         self.ends_at = schedule.ends_at;
@@ -489,7 +465,7 @@ mod tests {
 
     #[tokio::test]
     async fn kind_must_be_in_the_allowed_list() {
-        let allowed: Vec<String> = crate::domain::settings::Settings::defaults()
+        let allowed: Vec<ExamKindDef> = crate::domain::settings::Settings::defaults()
             .get_exam_kinds()
             .to_vec();
         for kind in ["homework", "quiz", "midterm", "final", "project", "oral"] {
@@ -498,20 +474,12 @@ mod tests {
         assert!(ExamKind::try_new("essay", &allowed).is_err());
         assert!(ExamKind::try_new("", &allowed).is_err());
         // A school-defined list swaps the acceptance set wholesale.
-        let custom = vec!["lab".to_string()];
+        let custom = vec![ExamKindDef::try_new("lab", 2).unwrap()];
         assert!(ExamKind::try_new("lab", &custom).is_ok());
         assert!(ExamKind::try_new("midterm", &custom).is_err());
         // Matching is exact, case included — the settings list is the wire
         // truth, not a case-folded suggestion.
         assert!(ExamKind::try_new("Lab", &custom).is_err());
-    }
-
-    #[tokio::test]
-    async fn weight_range_is_enforced() {
-        assert_eq!(ExamWeight::try_new(1).unwrap().as_i64(), 1);
-        assert_eq!(ExamWeight::try_new(100).unwrap().as_i64(), 100);
-        assert!(ExamWeight::try_new(0).is_err());
-        assert!(ExamWeight::try_new(101).is_err());
     }
 
     #[tokio::test]

@@ -143,20 +143,20 @@ pub async fn create_course(app: &Router, cookie: &str, title: &str) -> String {
 }
 
 /// Create an exam inside `course` as `cookie` (asserts 201); returns its id.
+/// The exam's weight in the course average comes from its kind (settings).
 pub async fn create_exam(
     app: &Router,
     cookie: &str,
     course: &str,
     title: &str,
     kind: &str,
-    weight: i64,
 ) -> String {
     let res = send(
         app,
         "POST",
         &format!("/courses/{course}/exams"),
         Some(cookie),
-        Some(json!({ "title": title, "kind": kind, "weight": weight })),
+        Some(json!({ "title": title, "kind": kind })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "create exam {title}");

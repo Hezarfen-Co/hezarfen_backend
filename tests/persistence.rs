@@ -206,8 +206,9 @@ async fn profile_survives_reopen() {
     }
 }
 
-/// A course with an enrollment, a weighted exam, and a graded mark survives a
-/// close + reopen — the weighted report is rebuilt from disk.
+/// A course with an enrollment, an exam whose kind carries a weight, and a
+/// graded mark survives a close + reopen — the weighted report (settings
+/// included) is rebuilt from disk.
 #[tokio::test]
 async fn course_marks_survive_reopen() {
     let dir = tempfile::tempdir().unwrap();
@@ -215,7 +216,8 @@ async fn course_marks_survive_reopen() {
     let teacher_creds = json!({ "username": "hoca", "password": "secret1" });
     let student_creds = json!({ "username": "ali", "password": "secret1" });
 
-    // First boot: teacher sets up a course, enrolls the student, grades 80.
+    // First boot: the manager-teacher weighs midterms double, sets up a
+    // course, enrolls the student, grades 80.
     {
         let db = database::init(&cfg).await.expect("first open");
         let app = build_router(state(db.clone()));
@@ -227,7 +229,7 @@ async fn course_marks_survive_reopen() {
                 StatusCode::CREATED
             );
         }
-        set_role(&db, "hoca", "teacher").await;
+        set_role(&db, "hoca", "manager").await;
         let teacher = send(
             &app,
             "POST",
@@ -250,9 +252,24 @@ async fn course_marks_survive_reopen() {
         .unwrap();
         let student_id = me_id(&app, &student).await;
 
+        assert_eq!(
+            send(
+                &app,
+                "PATCH",
+                "/settings",
+                Some(&teacher),
+                Some(json!({ "exam_kinds": [
+                    {"name": "midterm", "weight": 2},
+                    {"name": "quiz", "weight": 1},
+                ]})),
+            )
+            .await
+            .status,
+            StatusCode::OK
+        );
         let course_id = create_course(&app, &teacher, "algebra").await;
         enroll(&app, &teacher, &course_id, &student_id).await;
-        let exam_id = create_exam(&app, &teacher, &course_id, "midterm", "midterm", 2).await;
+        let exam_id = create_exam(&app, &teacher, &course_id, "midterm", "midterm").await;
         assert_eq!(
             send(
                 &app,
@@ -267,7 +284,8 @@ async fn course_marks_survive_reopen() {
         );
     }
 
-    // Second boot: the report, roster, and exam weight are all rebuilt from disk.
+    // Second boot: the report, roster, and kind weight (via the settings row)
+    // are all rebuilt from disk.
     {
         let db = reopen(&cfg).await;
         let app = build_router(state(db));
@@ -328,7 +346,10 @@ async fn settings_and_terms_survive_reopen() {
             "/settings",
             Some(&cookie),
             Some(json!({
-                "exam_kinds": ["lab", "quiz"],
+                "exam_kinds": [
+                    { "name": "lab", "weight": 2 },
+                    { "name": "quiz", "weight": 1 },
+                ],
                 "grade_bands": [{ "min": 0, "label": "F" }, { "min": 50, "label": "P" }],
             })),
         )
@@ -368,7 +389,13 @@ async fn settings_and_terms_survive_reopen() {
 
     let res = send(&app, "GET", "/settings", Some(&cookie), None).await;
     assert_eq!(res.status, StatusCode::OK);
-    assert_eq!(res.body["exam_kinds"], json!(["lab", "quiz"]));
+    assert_eq!(
+        res.body["exam_kinds"],
+        json!([
+            { "name": "lab", "weight": 2 },
+            { "name": "quiz", "weight": 1 },
+        ])
+    );
     assert_eq!(res.body["grade_bands"][0]["label"], "P");
 
     let res = send(&app, "GET", &format!("/terms/{term}"), Some(&cookie), None).await;

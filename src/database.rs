@@ -121,7 +121,6 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS title ON exam TYPE string;
     DEFINE FIELD IF NOT EXISTS description ON exam TYPE string;
     DEFINE FIELD IF NOT EXISTS kind ON exam TYPE string;
-    DEFINE FIELD IF NOT EXISTS weight ON exam TYPE int;
     DEFINE FIELD IF NOT EXISTS mode ON exam TYPE option<string>;
     DEFINE FIELD IF NOT EXISTS starts_at ON exam TYPE option<int>;
     DEFINE FIELD IF NOT EXISTS ends_at ON exam TYPE option<int>;
@@ -172,7 +171,9 @@ const MIGRATION: &str = "
     DEFINE INDEX IF NOT EXISTS exam_result_exam_user ON exam_result FIELDS exam, user UNIQUE;
 
     DEFINE TABLE IF NOT EXISTS settings SCHEMAFULL;
-    DEFINE FIELD IF NOT EXISTS exam_kinds ON settings TYPE array<string>;
+    DEFINE FIELD IF NOT EXISTS exam_kinds ON settings TYPE array<object>;
+    DEFINE FIELD IF NOT EXISTS exam_kinds.*.name ON settings TYPE string;
+    DEFINE FIELD IF NOT EXISTS exam_kinds.*.weight ON settings TYPE int;
     DEFINE FIELD IF NOT EXISTS attendance_statuses ON settings TYPE array<string>;
     DEFINE FIELD IF NOT EXISTS grade_bands ON settings TYPE array<object>;
     DEFINE FIELD IF NOT EXISTS grade_bands.*.min ON settings TYPE int;

@@ -14,7 +14,7 @@ use crate::domain::course_session::{CourseSession, SessionTopic};
 use crate::domain::enrollment::Enrollment;
 use crate::domain::exam::{
     Exam, ExamAttemptLimit, ExamDescription, ExamDuration, ExamKind, ExamMode, ExamSchedule,
-    ExamTitle, ExamWeight,
+    ExamTitle,
 };
 use crate::domain::role::Role;
 use crate::domain::settings::Settings;
@@ -75,12 +75,10 @@ struct CreateExamInCourse {
     description: Option<String>,
     /// The assessment form — one of the school's exam kinds (`GET /settings`;
     /// defaults: `homework`, `quiz`, `midterm`, `final`, `project`, `oral`).
-    /// Informational — `weight` drives the course average.
+    /// The kind's settings-configured weight decides how heavily the exam
+    /// counts into the course average.
     #[schema(example = "midterm")]
     kind: String,
-    /// How many times this exam counts into the course average, `1`–`100`.
-    #[schema(example = 3)]
-    weight: i64,
     /// `sync` (one fixed window for everyone), `async` (each student starts
     /// inside the window and gets `duration_ms`), or `open` (no window — sit
     /// anytime). Omit for an offline-graded draft that cannot be sat.
@@ -487,12 +485,13 @@ async fn unenroll(
 // ---- exams in a course ----------------------------------------------------
 
 /// Create an exam inside a course. Requires teacher+ and course management
-/// rights; the exam's marks count `weight` times into the course average.
-/// Omit `mode` for an offline-graded draft nobody can sit; `sync`/`async`
-/// take a window (async also `duration_ms`), `open` is sittable anytime with
-/// an optional per-attempt `duration_ms`. `max_attempts` (default 1, `0` =
-/// unlimited) meters retakes and `allow_rejoin` (default `true`) is the
-/// exam-room door — both stay editable while the exam runs.
+/// rights; the exam's marks count into the course average with its kind's
+/// weight (`GET /settings`). Omit `mode` for an offline-graded draft nobody
+/// can sit; `sync`/`async` take a window (async also `duration_ms`), `open`
+/// is sittable anytime with an optional per-attempt `duration_ms`.
+/// `max_attempts` (default 1, `0` = unlimited) meters retakes and
+/// `allow_rejoin` (default `true`) is the exam-room door — both stay editable
+/// while the exam runs.
 #[utoipa::path(
     post,
     path = "/{id}/exams",
@@ -502,7 +501,7 @@ async fn unenroll(
     request_body = CreateExamInCourse,
     responses(
         (status = 201, description = "Exam created", body = ExamResponse),
-        (status = 400, description = "Invalid fields, kind, weight, attempt limit, or schedule (malformed window, or times in the past)", body = ErrorResponse),
+        (status = 400, description = "Invalid fields, kind, attempt limit, or schedule (malformed window, or times in the past)", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
@@ -527,7 +526,6 @@ async fn create_exam_in_course(
     let description = ExamDescription::try_new(&req.description.unwrap_or_default())?;
     let school = Settings::load(&st.db).await?;
     let kind = ExamKind::try_new(&req.kind, school.get_exam_kinds())?;
-    let weight = ExamWeight::try_new(req.weight)?;
     let starts_at = req.starts_at.map(Timestamp::from_millis);
     let ends_at = req.ends_at.map(Timestamp::from_millis);
     check_not_past("starts_at", starts_at)?;
@@ -548,7 +546,6 @@ async fn create_exam_in_course(
         title,
         description,
         kind,
-        weight,
         schedule,
         max_attempts,
         req.allow_rejoin.unwrap_or(true),

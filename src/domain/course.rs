@@ -61,7 +61,8 @@ impl CourseDescription {
 }
 
 /// A course: the unit exams and enrollments hang off. Marks are computed per
-/// course from its exams' weights. May belong to an academic term.
+/// course, each exam weighted by its kind's settings weight. May belong to an
+/// academic term.
 #[derive(Debug, Clone, SurrealValue)]
 pub struct Course {
     id: CourseId,

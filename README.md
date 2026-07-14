@@ -6,8 +6,10 @@ Session-cookie auth with four hierarchical roles (`student < teacher < manager
 < admin`). Notes are per-user. Attendance is event + attendees: create an event,
 then mark users present / absent / late / excused. Marks are course-shaped
 (Google Classroom style): a teacher creates a course, enrolls students, adds
-weighted exams inside it, and grades; students read a per-course weighted
-average and an overall average from their mark report. Exams run **sync** (one
+exams inside it, and grades; students read a per-course weighted average and
+an overall average from their mark report — each exam weighted by its **kind**
+(midterms can count double, orals once: weights are set per kind in settings,
+not per exam). Exams run **sync** (one
 fixed window), **async** (start anytime inside the window, with a personal
 time budget), or **open** (sit anytime, optionally timed per attempt);
 students *sit* them via attempts — retakes metered by a per-exam limit
@@ -18,9 +20,10 @@ and marks land live on a monitor endpoint (snapshot or SSE stream). Courses also
 sessions** with teacher-taken roll call (students never self-mark a lesson),
 staff clock in/out on a server-stamped **work log**, and every user has an
 **attendance report** (event + per-course lesson tallies with rates).
-School-varying policy is data, not code: exam kinds, attendance statuses, and
-grade-display bands live in an editable **settings** singleton, and academic
-**terms** are plain rows courses can link to (see "Per-school policy").
+School-varying policy is data, not code: exam kinds (each with its weight in
+course averages), attendance statuses, and grade-display bands live in an
+editable **settings** singleton, and academic **terms** are plain rows courses
+can link to (see "Per-school policy").
 
 Every field is a validated newtype (`Username(String)`, `NoteTitle(String)`, …)
 constructed only after its restrictions pass — invalid input can't be
@@ -272,11 +275,11 @@ marks/attendance reports narrow to the courses the caller manages.
 | POST   | `/sessions/{id}/attendance`      | teacher | `{status, user_id}` — roll call: session teacher/course manager mark **enrolled** students; the teacher's own row needs manager+ |
 | GET    | `/sessions/{id}/attendance`      | teacher | List the session's roll call (session teacher or course manager) |
 | DELETE | `/sessions/{id}/attendance/{user}` | teacher | Remove a roll-call row (same rights as marking) |
-| POST   | `/courses/{id}/exams`            | teacher | `{title, description?, kind, weight, mode?, starts_at?, ends_at?, duration_ms?, max_attempts?, allow_rejoin?}` — add an exam (course manager) |
+| POST   | `/courses/{id}/exams`            | teacher | `{title, description?, kind, mode?, starts_at?, ends_at?, duration_ms?, max_attempts?, allow_rejoin?}` — add an exam (course manager); its weight comes from the kind |
 | GET    | `/courses/{id}/exams`            | student | List the course's exams (enrolled, creator, or manager+) |
 | GET    | `/exams`                         | student | The caller's visible exams: their courses' (manager+: all) |
 | GET    | `/exams/{id}`                    | student | Get exam (enrolled, creator, or manager+) |
-| PATCH  | `/exams/{id}`                    | teacher | Edit exam incl. `weight`, schedule, `max_attempts`, `allow_rejoin` (course manager; `course` immutable, `mode` frozen once attempted — the rest stays live) |
+| PATCH  | `/exams/{id}`                    | teacher | Edit exam incl. `kind` (re-weights it), schedule, `max_attempts`, `allow_rejoin` (course manager; `course` immutable, `mode` frozen once attempted — the rest stays live) |
 | DELETE | `/exams/{id}`                    | teacher | Delete exam + its results, attempts, questions, and answers (course manager) |
 | POST   | `/exams/{id}/results`            | teacher | `{mark, user_id}` — grade an **enrolled** student (upsert; course manager) |
 | GET    | `/exams/{id}/results`            | teacher | List every result for the exam (course manager) |
@@ -306,7 +309,7 @@ marks/attendance reports narrow to the courses the caller manages.
 | DELETE | `/work/entries/{id}`             | manager | Delete a work entry (open or closed) |
 | GET    | `/attendance/me`                 | student | Own attendance report: events + sessions + per-course tallies |
 | GET    | `/attendance/{user}`             | teacher | A user's attendance report, narrowed to the caller's courses (manager+: full) |
-| GET    | `/settings`                      | student | The school's policy: `exam_kinds`, `attendance_statuses`, `grade_bands` |
+| GET    | `/settings`                      | student | The school's policy: `exam_kinds` (`{name, weight}` each), `attendance_statuses`, `grade_bands` |
 | PATCH  | `/settings`                      | manager | Replace any subset of the three lists, each wholesale; concurrent edits merge, never silently revert each other (see "Per-school policy") |
 | POST   | `/terms`                         | manager | `{name, starts_at, ends_at}` — past dates allowed (calendar backfill) |
 | GET    | `/terms`                         | student | List terms, newest first        |
@@ -318,8 +321,10 @@ marks/attendance reports narrow to the courses the caller manages.
 the core four `present | absent | late | excused` always exist, plus whatever
 the school added.
 `kind` must be one of the school's exam kinds (`GET /settings`; defaults:
-`homework | quiz | midterm | final | project | oral`) — informational
-metadata; the average is driven by `weight`, an integer `1`–`100` set per exam.
+`homework | quiz | midterm | final | project | oral`). The kind carries the
+exam's weight in the course average — an integer `1`–`100` set per **kind** in
+settings (defaults all `1`), resolved when a report is read; an exam whose
+kind was later removed from settings counts with weight `1`.
 A course may carry a `term_id` (`null` = unassigned); on `PATCH
 /courses/{id}`, an omitted `term_id` keeps the link and an explicit `null`
 clears it.
@@ -364,10 +369,15 @@ Every school runs differently; the parts that vary are data, not code. One
 editable `settings` singleton (`GET /settings` for any signed-in user,
 `PATCH /settings` for manager+) carries three knobs:
 
-- **`exam_kinds`** — the accepted `kind` values for new exams. Defaults to
-  `homework, quiz, midterm, final, project, oral`; replace the list with
-  whatever the school grades (`lab`, `presentation`, …). Kinds stay
-  informational — `weight` drives every average.
+- **`exam_kinds`** — the accepted `kind` values for new exams, each an
+  object `{name, weight}`. The weight (`1`–`100`) is how many times an exam
+  of that kind counts into its course average — weighting is school policy,
+  set once per kind, never per exam. Defaults to `homework, quiz, midterm,
+  final, project, oral`, all weighing `1` (a plain average); replace the
+  list with whatever the school grades and weighs (`{"name": "final",
+  "weight": 3}`, …). Reports resolve weights live: editing a weight
+  re-weights every exam of that kind at once, and an exam keeping a
+  since-removed kind counts with weight `1`.
 - **`attendance_statuses`** — what attendance marking accepts. The core four
   (`present`, `absent`, `late`, `excused`) are mandatory because the
   attendance rate is defined over them (`(present+late) /
@@ -482,10 +492,10 @@ along with results; unenrolling mid-exam hides the student from the monitor
 roster but keeps the attempt and mark rows, mirroring the marks report.
 
 > **Upgrading a pre-course database**: `exam` rows created before courses
-> existed lack the now-required `course` and `weight` fields and will fail to
-> deserialize. For a dev database, delete `./data/hezarfen.db` and reboot; to
-> keep data, backfill manually with the SurrealDB CLI (server stopped), e.g.
-> `UPDATE exam SET course = course:<id>, weight = 1 WHERE course = NONE;`
+> existed lack the now-required `course` field and will fail to deserialize.
+> For a dev database, delete `./data/hezarfen.db` and reboot; to keep data,
+> backfill manually with the SurrealDB CLI (server stopped), e.g.
+> `UPDATE exam SET course = course:<id> WHERE course = NONE;`
 > after creating a course to attach them to.
 >
 > **Upgrading to the attempts/rejoin build needs nothing manual**: the boot
@@ -493,6 +503,12 @@ roster but keeps the attempt and mark rows, mirroring the marks report.
 > `seq = 1` on existing rows, and swaps the single-attempt unique index for
 > the per-sitting one. Pre-upgrade attempts keep their record ids and count
 > as sitting #1.
+>
+> **Upgrading to the kind-weight build is a clean break**: weights moved off
+> exams onto the settings `exam_kinds` entries (`{name, weight}` objects) with
+> no data migration. A database from an older build has string kinds and a
+> per-exam `weight` column the code no longer understands — delete
+> `./data/hezarfen.db` and reboot.
 
 ## Taking an exam: questions, answers & the exam room
 
@@ -679,6 +695,9 @@ curl -s -b $JAR $BASE/events/$EV/attendance -H 'content-type: application/json' 
 curl -s -b $JAR $BASE/events/$EV/attendance
 
 # courses + weighted marks (as a teacher)
+# optional, manager+: weigh midterms triple — school policy, per kind
+curl -s -b $JAR -X PATCH $BASE/settings -H 'content-type: application/json' \
+  -d '{"exam_kinds":[{"name":"midterm","weight":3},{"name":"quiz","weight":1}]}'
 # find the student to enroll (here: a registered user "veli"): fragment
 # search over username/name, role-narrowed (teacher+)
 SID=$(curl -s -b $JAR "$BASE/users/search?q=vel&role=student" \
@@ -688,7 +707,7 @@ CO=$(curl -s -b $JAR $BASE/courses -H 'content-type: application/json' \
 curl -s -b $JAR $BASE/courses/$CO/enrollments -H 'content-type: application/json' \
   -d "{\"user_id\":\"$SID\"}"
 EX=$(curl -s -b $JAR $BASE/courses/$CO/exams -H 'content-type: application/json' \
-  -d '{"title":"midterm","kind":"midterm","weight":3}' | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+  -d '{"title":"midterm","kind":"midterm"}' | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
 curl -s -b $JAR $BASE/exams/$EX/results -H 'content-type: application/json' \
   -d "{\"mark\":90,\"user_id\":\"$SID\"}"
 curl -s -b $JAR $BASE/exams/$EX/statistics

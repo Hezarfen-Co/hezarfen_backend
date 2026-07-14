@@ -207,8 +207,9 @@ pub struct ExamResponse {
     pub course: String,
     pub title: String,
     pub description: String,
+    /// The assessment form. Its weight in the course average is school policy:
+    /// `GET /settings` maps each kind to a weight.
     pub kind: String,
-    pub weight: i64,
     /// `sync`, `async`, or `open`; `null` for an offline-graded draft
     /// (not sittable).
     #[schema(example = "sync")]
@@ -237,7 +238,6 @@ impl ExamResponse {
             title: exam.get_title().as_str().to_string(),
             description: exam.get_description().as_str().to_string(),
             kind: exam.get_kind().as_str().to_string(),
-            weight: exam.get_weight().as_i64(),
             mode: exam.get_mode().map(|m| m.as_str().to_string()),
             starts_at: exam.get_starts_at().map(|t| t.as_millis()),
             ends_at: exam.get_ends_at().map(|t| t.as_millis()),
