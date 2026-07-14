@@ -13,8 +13,8 @@ time budget), or **open** (sit anytime, optionally timed per attempt);
 students *sit* them via attempts — retakes metered by a per-exam limit
 (`0` = unlimited), leaving the exam room governed by a teacher-controlled
 rejoin door — and teachers watch attendance, per-student remaining time,
-sittings, walk-outs, submissions, and marks land live on a monitor endpoint
-(snapshot or SSE stream). Courses also carry **lesson
+sittings, walk-outs, no-shows (`absent` once the window closes), submissions,
+and marks land live on a monitor endpoint (snapshot or SSE stream). Courses also carry **lesson
 sessions** with teacher-taken roll call (students never self-mark a lesson),
 staff clock in/out on a server-stamped **work log**, and every user has an
 **attendance report** (event + per-course lesson tallies with rates).
@@ -294,7 +294,7 @@ marks/attendance reports narrow to the courses the caller manages.
 | POST   | `/exams/{id}/attempt/answers`    | student | `{question_id, selected? \| text?}` — autosave one answer while enrolled and `in_progress` (and not locked out by a closed rejoin door) |
 | GET    | `/exams/{id}/attempts/{user}/answers` | teacher | A student's answer sheet: `is_correct` flags + suggested `auto_score` (course manager) |
 | GET    | `/exams/{id}/attempt/ws`         | student | **WebSocket** exam room: state ticks, autosave, finish; entering clears `left_at`, leaving stamps it (see "Taking an exam") |
-| GET    | `/exams/{id}/live`               | teacher | Live monitor snapshot: roster × latest attempts × marks + per-student progress/`left_at`/`attempts_used` + counts (course manager) |
+| GET    | `/exams/{id}/live`               | teacher | Live monitor snapshot: roster × latest attempts × marks + per-student progress/`left_at`/`attempts_used` + counts; no-shows turn `absent` once the window closes (course manager) |
 | GET    | `/exams/{id}/live/stream`        | teacher | The same snapshot as SSE `snapshot` events every ~2s (course manager) |
 | GET    | `/marks/me`                      | student | The caller's mark report (per-course + overall averages) |
 | GET    | `/marks/{user}`                  | teacher | A user's mark report, narrowed to the caller's courses (manager+: full) |
