@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -23,8 +23,8 @@ use crate::state::AppState;
 
 use super::courses::{can_manage_course, can_view_course};
 use super::{
-    CurrentUser, PersonRef, RequireTeacher, SessionResponse, check_not_past, check_time_range,
-    person_map, set_or_clear,
+    CurrentUser, Page, PageParams, PersonRef, RequireTeacher, SessionResponse, check_not_past,
+    check_time_range, paginate, person_map, set_or_clear,
 };
 
 pub fn routes() -> OpenApiRouter<AppState> {
@@ -333,17 +333,19 @@ async fn mark_roll_call(
     Ok(Json(SessionAttendanceResponse::new(&attendance, &people)))
 }
 
-/// List a session's roll call. Same rights as taking it: the session's
-/// teacher or a course manager — students see their own tallies via
-/// `GET /attendance/me`.
+/// List a session's roll call, paged via `?limit=&offset=` (omit `limit` for
+/// the whole roster). Same rights as taking it: the session's teacher or a
+/// course manager — students see their own tallies via `GET /attendance/me`.
+/// Returns a `{items, total, limit, offset}` envelope.
 #[utoipa::path(
     get,
     path = "/{id}/attendance",
     tag = "sessions",
     security(("session_cookie" = [])),
-    params(("id" = String, Path, description = "Session id")),
+    params(("id" = String, Path, description = "Session id"), PageParams),
     responses(
-        (status = 200, description = "Roll-call roster", body = [SessionAttendanceResponse]),
+        (status = 200, description = "A page of the roll-call roster (all of it when unpaged)", body = Page<SessionAttendanceResponse>),
+        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the session teacher or a course manager", body = ErrorResponse),
         (status = 404, description = "Session not found", body = ErrorResponse),
@@ -353,7 +355,9 @@ async fn list_roll_call(
     State(st): State<AppState>,
     RequireTeacher(user): RequireTeacher,
     Path(id): Path<String>,
-) -> Result<Json<Vec<SessionAttendanceResponse>>, AppError> {
+    Query(page): Query<PageParams>,
+) -> Result<Json<Page<SessionAttendanceResponse>>, AppError> {
+    let (limit, offset) = page.resolve()?;
     let (session, course) = session_with_course(&id, &st.db).await?;
     if !can_roll_call(&session, &course, &user) {
         return Err(AppError::Forbidden(
@@ -361,19 +365,20 @@ async fn list_roll_call(
         ));
     }
     let roster = SessionAttendance::list_for_session(session.get_id(), &st.db).await?;
+    let total = roster.len() as i64;
+    // Join people onto the page alone — the lookup shrinks with the window.
+    let rows = paginate(&roster, limit, offset);
     let people = person_map(
-        roster
-            .iter()
+        rows.iter()
             .flat_map(|a| [a.get_user().clone(), a.get_marked_by().clone()]),
         &st.db,
     )
     .await?;
-    Ok(Json(
-        roster
-            .iter()
-            .map(|a| SessionAttendanceResponse::new(a, &people))
-            .collect(),
-    ))
+    let items = rows
+        .iter()
+        .map(|a| SessionAttendanceResponse::new(a, &people))
+        .collect();
+    Ok(Json(Page::new(items, total, limit, offset)))
 }
 
 /// Remove a user's roll-call row from a session. Same rights as marking:

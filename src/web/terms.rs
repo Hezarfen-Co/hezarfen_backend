@@ -1,5 +1,5 @@
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -12,7 +12,7 @@ use crate::domain::timestamp::Timestamp;
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
 
-use super::{CurrentUser, RequireManager, check_time_range};
+use super::{CurrentUser, Page, PageParams, RequireManager, check_time_range, paginate};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -110,23 +110,34 @@ async fn create_term(
 }
 
 /// List every term, newest first. Any authenticated user — students need the
-/// calendar to make sense of their courses.
+/// calendar to make sense of their courses. Paged via `?limit=&offset=` (omit
+/// `limit` for the full list); returns a `{items, total, limit, offset}`
+/// envelope.
 #[utoipa::path(
     get,
     path = "/",
     tag = "terms",
     security(("session_cookie" = [])),
+    params(PageParams),
     responses(
-        (status = 200, description = "All terms", body = [TermResponse]),
+        (status = 200, description = "A page of terms (the full list when unpaged)", body = Page<TermResponse>),
+        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
     ),
 )]
 async fn list_terms(
     State(st): State<AppState>,
     CurrentUser(_user): CurrentUser,
-) -> Result<Json<Vec<TermResponse>>, AppError> {
+    Query(page): Query<PageParams>,
+) -> Result<Json<Page<TermResponse>>, AppError> {
+    let (limit, offset) = page.resolve()?;
     let terms = Term::list_all(&st.db).await?;
-    Ok(Json(terms.iter().map(TermResponse::new).collect()))
+    let total = terms.len() as i64;
+    let items = paginate(&terms, limit, offset)
+        .iter()
+        .map(TermResponse::new)
+        .collect();
+    Ok(Json(Page::new(items, total, limit, offset)))
 }
 
 /// Fetch a single term by id.

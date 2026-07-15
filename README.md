@@ -228,6 +228,19 @@ monitor) additionally need **course-management rights** (creator or manager+):
 one teacher cannot look into another teacher's course, and the per-user
 marks/attendance reports narrow to the courses the caller manages.
 
+**Paging.** Every list endpoint below (the rows tagged **· paged**) accepts
+`?limit=&offset=` and returns a `{ items, total, limit, offset }` envelope
+rather than a bare array. `total` is the full row count *before* the window, so
+a frontend can show "100 of 256" and page with `offset`. Paging is **opt-in**:
+omit `limit` and you get every remaining row (the echoed `limit` is then
+`null`), so a caller that sends no parameters still receives the whole list —
+nothing silently truncates. `limit` must be `1`–`500`, `offset` defaults to `0`
+and must be ≥ 0 (bad values are `400`), and an `offset` at or past the end
+returns an empty `items` (not an error). Deliberately **not** paged — these keep
+their existing shapes: the student exam-room reads
+`/exams/{id}/attempt/questions` and `/attempt/answers`, the `/marks` and
+`/attendance` report objects, the `/exams/{id}/live` monitor, and `/settings`.
+
 | Method | Path                             | Auth    | Description                     |
 |--------|----------------------------------|---------|---------------------------------|
 | GET    | `/health`                        | no      | Liveness check                  |
@@ -240,49 +253,49 @@ marks/attendance reports narrow to the courses the caller manages.
 | POST   | `/auth/logout`                   | no      | Clear session (no-op if none)   |
 | GET    | `/auth/me`                       | student | Current user (incl. `role` and personal info) |
 | PATCH  | `/users/me`                      | student | Update own personal info (see below) |
-| GET    | `/users/search`                  | teacher | `?q=<fragment>&role=<role?>` — find users by username/name fragment (pickers); ≤10 refs, no contact info |
-| GET    | `/users`                         | admin   | List all users                  |
+| GET    | `/users/search`                  | teacher | `?q=<fragment>&role=<role?>` — find users by username/name fragment (pickers); refs only, no contact info · paged |
+| GET    | `/users`                         | admin   | List all users · paged          |
 | GET    | `/users/{id}`                    | admin   | Get one user                    |
 | PATCH  | `/users/{id}/role`               | admin   | `{role}` — set a user's role    |
 | PATCH  | `/users/{id}/profile`            | admin   | Update any user's personal info |
 | POST   | `/notes`                         | student | `{title, content?}`             |
-| GET    | `/notes`                         | student | List own notes                  |
+| GET    | `/notes`                         | student | List own notes · paged          |
 | GET    | `/notes/{id}`                    | student | Get own note                    |
 | PATCH  | `/notes/{id}`                    | student | `{title?, content?}`            |
 | DELETE | `/notes/{id}`                    | student | Delete own note                 |
 | POST   | `/events`                        | teacher | `{title, description?, starts_at?, ends_at?}` |
-| GET    | `/events`                        | student | List all events                 |
+| GET    | `/events`                        | student | List all events · paged         |
 | GET    | `/events/{id}`                   | student | Get event                       |
 | PATCH  | `/events/{id}`                   | teacher | Edit event (creator, or manager+ for any) |
 | DELETE | `/events/{id}`                   | teacher | Delete event (creator, or manager+ for any) |
 | POST   | `/events/{id}/attendance`        | student | `{status, user_id?}` — self if `user_id` omitted; marking others needs teacher+ |
-| GET    | `/events/{id}/attendance`        | teacher | List attendance for event (students read their own tallies via `/attendance/me`) |
+| GET    | `/events/{id}/attendance`        | teacher | List attendance for event (students read their own tallies via `/attendance/me`) · paged |
 | DELETE | `/events/{id}/attendance/{user}` | teacher | Remove a user's attendance      |
 | POST   | `/courses`                       | teacher | `{title, description?}` (creator manages it) |
-| GET    | `/courses`                       | student | The caller's visible courses: created + enrolled (manager+: all) |
-| GET    | `/courses/me`                    | student | The caller's **enrolled** courses |
+| GET    | `/courses`                       | student | The caller's visible courses: created + enrolled (manager+: all) · paged |
+| GET    | `/courses/me`                    | student | The caller's **enrolled** courses · paged |
 | GET    | `/courses/{id}`                  | student | Get course (enrolled, creator, or manager+) |
 | PATCH  | `/courses/{id}`                  | teacher | Edit course (creator, or manager+ for any) |
 | DELETE | `/courses/{id}`                  | teacher | Delete course + its exams, results, enrollments (creator, or manager+) |
 | POST   | `/courses/{id}/enrollments`      | teacher | `{user_id}` — enroll a user (idempotent upsert; course manager) |
-| GET    | `/courses/{id}/enrollments`      | teacher | List the course roster (course manager) |
+| GET    | `/courses/{id}/enrollments`      | teacher | List the course roster (course manager) · paged |
 | DELETE | `/courses/{id}/enrollments/{user}` | teacher | Unenroll (keeps recorded results; course manager) |
 | POST   | `/courses/{id}/sessions`         | teacher | `{topic?, teacher_id?, starts_at, ends_at?}` — add a lesson (course manager; teacher defaults to the caller) |
-| GET    | `/courses/{id}/sessions`         | student | List the course's sessions, most recent first (enrolled, creator, or manager+) |
+| GET    | `/courses/{id}/sessions`         | student | List the course's sessions, most recent first (enrolled, creator, or manager+) · paged |
 | GET    | `/sessions/{id}`                 | student | Get session (enrolled, session teacher, or course manager) |
 | PATCH  | `/sessions/{id}`                 | teacher | Edit session (course manager; `null` clears `ends_at`) |
 | DELETE | `/sessions/{id}`                 | teacher | Delete session + its roll call (course manager) |
 | POST   | `/sessions/{id}/attendance`      | teacher | `{status, user_id}` — roll call: session teacher/course manager mark **enrolled** students; the teacher's own row needs manager+ |
-| GET    | `/sessions/{id}/attendance`      | teacher | List the session's roll call (session teacher or course manager) |
+| GET    | `/sessions/{id}/attendance`      | teacher | List the session's roll call (session teacher or course manager) · paged |
 | DELETE | `/sessions/{id}/attendance/{user}` | teacher | Remove a roll-call row (same rights as marking) |
 | POST   | `/courses/{id}/exams`            | teacher | `{title, description?, kind, mode?, starts_at?, ends_at?, duration_ms?, max_attempts?, allow_rejoin?}` — add an exam (course manager); its weight comes from the kind |
-| GET    | `/courses/{id}/exams`            | student | List the course's exams (enrolled, creator, or manager+) |
-| GET    | `/exams`                         | student | The caller's visible exams: their courses' (manager+: all) |
+| GET    | `/courses/{id}/exams`            | student | List the course's exams (enrolled, creator, or manager+) · paged |
+| GET    | `/exams`                         | student | The caller's visible exams: their courses' (manager+: all) · paged |
 | GET    | `/exams/{id}`                    | student | Get exam (enrolled, creator, or manager+) |
 | PATCH  | `/exams/{id}`                    | teacher | Edit exam incl. `kind` (re-weights it), schedule, `max_attempts`, `allow_rejoin` (course manager; `course` immutable, `mode` frozen once attempted — the rest stays live) |
 | DELETE | `/exams/{id}`                    | teacher | Delete exam + its results, attempts, questions, and answers (course manager) |
 | POST   | `/exams/{id}/results`            | teacher | `{mark, user_id}` — grade an **enrolled** student (upsert; course manager) |
-| GET    | `/exams/{id}/results`            | teacher | List every result for the exam (course manager) |
+| GET    | `/exams/{id}/results`            | teacher | List every result for the exam (course manager) · paged |
 | GET    | `/exams/{id}/result`             | student | The caller's **own** result (`404` until graded) |
 | DELETE | `/exams/{id}/results/{user}`     | teacher | Remove a student's result (course manager) |
 | GET    | `/exams/{id}/statistics`         | teacher | `{graded, average, min, max}` over the exam's results (course manager) |
@@ -290,7 +303,7 @@ marks/attendance reports narrow to the courses the caller manages.
 | GET    | `/exams/{id}/attempt`            | student | Own latest attempt: status, `attempt`/`attempts_used`/`max_attempts`, deadline, `remaining_ms`, `left_at`, mark, progress (`answered`/`question_count`), server `now` |
 | POST   | `/exams/{id}/attempt/finish`     | student | Submit the attempt (`409` once the deadline passed); allowed even while locked out of the room |
 | POST   | `/exams/{id}/questions`          | teacher | `{text, kind, points, choices?, correct?}` — add a question (course manager; frozen once attempted) |
-| GET    | `/exams/{id}/questions`          | teacher | The full question list, `correct` included (course manager) |
+| GET    | `/exams/{id}/questions`          | teacher | The full question list, `correct` included (course manager) · paged |
 | PATCH  | `/exams/{id}/questions/{qid}`    | teacher | Edit a question — the kind bundle revalidates as a unit (course manager; frozen once attempted) |
 | DELETE | `/exams/{id}/questions/{qid}`    | teacher | Delete a question + its answers (course manager; frozen once attempted) |
 | GET    | `/exams/{id}/attempt/questions`  | student | The sitting view: no `correct`, own answers embedded (requires enrollment + an attempt) |
@@ -303,8 +316,8 @@ marks/attendance reports narrow to the courses the caller manages.
 | GET    | `/marks/{user}`                  | teacher | A user's mark report, narrowed to the caller's courses (manager+: full) |
 | POST   | `/work/check-in`                 | teacher | Open a work stint (server-stamped; `409` if already open) |
 | POST   | `/work/check-out`                | teacher | Close the open stint (`409` if none open) |
-| GET    | `/work/me`                       | teacher | Own work log, newest first (open stint has `check_out: null`) |
-| GET    | `/work/{user}`                   | manager | A staff member's work log       |
+| GET    | `/work/me`                       | teacher | Own work log, newest first (open stint has `check_out: null`) · paged |
+| GET    | `/work/{user}`                   | manager | A staff member's work log · paged |
 | PATCH  | `/work/entries/{id}`             | manager | `{check_in?, check_out?}` — correct a **closed** stint (`409` on open) |
 | DELETE | `/work/entries/{id}`             | manager | Delete a work entry (open or closed) |
 | GET    | `/attendance/me`                 | student | Own attendance report: events + sessions + per-course tallies |
@@ -312,7 +325,7 @@ marks/attendance reports narrow to the courses the caller manages.
 | GET    | `/settings`                      | student | The school's policy: `exam_kinds` (`{name, weight}` each), `attendance_statuses`, `grade_bands` |
 | PATCH  | `/settings`                      | manager | Replace any subset of the three lists, each wholesale; concurrent edits merge, never silently revert each other (see "Per-school policy") |
 | POST   | `/terms`                         | manager | `{name, starts_at, ends_at}` — past dates allowed (calendar backfill) |
-| GET    | `/terms`                         | student | List terms, newest first        |
+| GET    | `/terms`                         | student | List terms, newest first · paged |
 | GET    | `/terms/{id}`                    | student | Get one term                    |
 | PATCH  | `/terms/{id}`                    | manager | Edit a term (the merged range must stay ordered) |
 | DELETE | `/terms/{id}`                    | manager | Delete a term — linked courses are unlinked, never deleted |

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -26,8 +26,8 @@ use crate::state::AppState;
 use super::sessions::resolve_session_teacher;
 use super::terms::resolve_term;
 use super::{
-    CourseResponse, CurrentUser, ExamResponse, PersonRef, RequireTeacher, SessionResponse,
-    check_not_past, check_time_range, person_map, set_or_clear,
+    CourseResponse, CurrentUser, ExamResponse, Page, PageParams, PersonRef, RequireTeacher,
+    SessionResponse, check_not_past, check_time_range, paginate, person_map, set_or_clear,
 };
 
 pub fn routes() -> OpenApiRouter<AppState> {
@@ -199,42 +199,64 @@ async fn create_course(
 }
 
 /// List the courses visible to the caller: every course for manager+,
-/// otherwise the courses they created plus the ones they're enrolled in.
+/// otherwise the courses they created plus the ones they're enrolled in. Paged
+/// via `?limit=&offset=` (omit `limit` for the full list); returns a
+/// `{items, total, limit, offset}` envelope.
 #[utoipa::path(
     get,
     path = "/",
     tag = "courses",
     security(("session_cookie" = [])),
+    params(PageParams),
     responses(
-        (status = 200, description = "The caller's visible courses", body = [CourseResponse]),
+        (status = 200, description = "A page of the caller's visible courses (all of them when unpaged)", body = Page<CourseResponse>),
+        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
     ),
 )]
 async fn list_courses(
     State(st): State<AppState>,
     CurrentUser(user): CurrentUser,
-) -> Result<Json<Vec<CourseResponse>>, AppError> {
+    Query(page): Query<PageParams>,
+) -> Result<Json<Page<CourseResponse>>, AppError> {
+    let (limit, offset) = page.resolve()?;
     let courses = visible_courses(&user, &st.db).await?;
-    Ok(Json(courses.iter().map(CourseResponse::new).collect()))
+    let total = courses.len() as i64;
+    let items = paginate(&courses, limit, offset)
+        .iter()
+        .map(CourseResponse::new)
+        .collect();
+    Ok(Json(Page::new(items, total, limit, offset)))
 }
 
-/// The courses the current user is enrolled in.
+/// The courses the current user is enrolled in, paged via `?limit=&offset=`
+/// (omit `limit` for all of them); returns a `{items, total, limit, offset}`
+/// envelope.
 #[utoipa::path(
     get,
     path = "/me",
     tag = "courses",
     security(("session_cookie" = [])),
+    params(PageParams),
     responses(
-        (status = 200, description = "The caller's enrolled courses", body = [CourseResponse]),
+        (status = 200, description = "A page of the caller's enrolled courses (all of them when unpaged)", body = Page<CourseResponse>),
+        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
     ),
 )]
 async fn my_courses(
     State(st): State<AppState>,
     CurrentUser(user): CurrentUser,
-) -> Result<Json<Vec<CourseResponse>>, AppError> {
+    Query(page): Query<PageParams>,
+) -> Result<Json<Page<CourseResponse>>, AppError> {
+    let (limit, offset) = page.resolve()?;
     let courses = Course::list_enrolled(user.get_id(), &st.db).await?;
-    Ok(Json(courses.iter().map(CourseResponse::new).collect()))
+    let total = courses.len() as i64;
+    let items = paginate(&courses, limit, offset)
+        .iter()
+        .map(CourseResponse::new)
+        .collect();
+    Ok(Json(Page::new(items, total, limit, offset)))
 }
 
 /// Fetch a single course by id. Visible to its enrolled users, its creator,
@@ -398,16 +420,19 @@ async fn enroll(
     Ok(Json(EnrollmentResponse::new(&enrollment, &people)))
 }
 
-/// List a course's roster. Requires teacher+ and course management rights —
-/// students see their own courses via `GET /courses/me`.
+/// List a course's roster, paged via `?limit=&offset=` (omit `limit` for the
+/// whole roster). Requires teacher+ and course management rights — students see
+/// their own courses via `GET /courses/me`. Returns a
+/// `{items, total, limit, offset}` envelope.
 #[utoipa::path(
     get,
     path = "/{id}/enrollments",
     tag = "courses",
     security(("session_cookie" = [])),
-    params(("id" = String, Path, description = "Course id")),
+    params(("id" = String, Path, description = "Course id"), PageParams),
     responses(
-        (status = 200, description = "All enrollments", body = [EnrollmentResponse]),
+        (status = 200, description = "A page of enrollments (the whole roster when unpaged)", body = Page<EnrollmentResponse>),
+        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
@@ -417,7 +442,9 @@ async fn list_roster(
     State(st): State<AppState>,
     RequireTeacher(user): RequireTeacher,
     Path(id): Path<String>,
-) -> Result<Json<Vec<EnrollmentResponse>>, AppError> {
+    Query(page): Query<PageParams>,
+) -> Result<Json<Page<EnrollmentResponse>>, AppError> {
+    let (limit, offset) = page.resolve()?;
     // Course must exist — a missing course is a 404, not an empty roster.
     let course = Course::read(&CourseId::from_key(&id), &st.db)
         .await?
@@ -428,19 +455,20 @@ async fn list_roster(
         ));
     }
     let enrollments = Enrollment::list_for_course(course.get_id(), &st.db).await?;
+    let total = enrollments.len() as i64;
+    // Join people onto the page alone — the lookup shrinks with the window.
+    let rows = paginate(&enrollments, limit, offset);
     let people = person_map(
-        enrollments
-            .iter()
+        rows.iter()
             .flat_map(|e| [e.get_user().clone(), e.get_enrolled_by().clone()]),
         &st.db,
     )
     .await?;
-    Ok(Json(
-        enrollments
-            .iter()
-            .map(|e| EnrollmentResponse::new(e, &people))
-            .collect(),
-    ))
+    let items = rows
+        .iter()
+        .map(|e| EnrollmentResponse::new(e, &people))
+        .collect();
+    Ok(Json(Page::new(items, total, limit, offset)))
 }
 
 /// Unenroll a user from a course. Requires teacher+ and course management
@@ -555,16 +583,18 @@ async fn create_exam_in_course(
     Ok((StatusCode::CREATED, Json(ExamResponse::new(&exam))))
 }
 
-/// List a course's exams. Visible to the course's enrolled users, its
-/// creator, and managers/admins.
+/// List a course's exams, paged via `?limit=&offset=` (omit `limit` for all of
+/// them). Visible to the course's enrolled users, its creator, and
+/// managers/admins. Returns a `{items, total, limit, offset}` envelope.
 #[utoipa::path(
     get,
     path = "/{id}/exams",
     tag = "courses",
     security(("session_cookie" = [])),
-    params(("id" = String, Path, description = "Course id")),
+    params(("id" = String, Path, description = "Course id"), PageParams),
     responses(
-        (status = 200, description = "The course's exams", body = [ExamResponse]),
+        (status = 200, description = "A page of the course's exams (all of them when unpaged)", body = Page<ExamResponse>),
+        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not enrolled, not the creator, and not a manager/admin", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
@@ -574,7 +604,9 @@ async fn list_course_exams(
     State(st): State<AppState>,
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
-) -> Result<Json<Vec<ExamResponse>>, AppError> {
+    Query(page): Query<PageParams>,
+) -> Result<Json<Page<ExamResponse>>, AppError> {
+    let (limit, offset) = page.resolve()?;
     // Course must exist — a missing course is a 404, not an empty exam list.
     let course = Course::read(&CourseId::from_key(&id), &st.db)
         .await?
@@ -585,7 +617,12 @@ async fn list_course_exams(
         ));
     }
     let exams = Exam::list_for_course(course.get_id(), &st.db).await?;
-    Ok(Json(exams.iter().map(ExamResponse::new).collect()))
+    let total = exams.len() as i64;
+    let items = paginate(&exams, limit, offset)
+        .iter()
+        .map(ExamResponse::new)
+        .collect();
+    Ok(Json(Page::new(items, total, limit, offset)))
 }
 
 // ---- sessions in a course --------------------------------------------------
@@ -662,16 +699,19 @@ async fn create_session_in_course(
     ))
 }
 
-/// List a course's lesson sessions, most recent first. Visible to the
-/// course's enrolled users, its creator, and managers/admins.
+/// List a course's lesson sessions, most recent first, paged via
+/// `?limit=&offset=` (omit `limit` for all of them). Visible to the course's
+/// enrolled users, its creator, and managers/admins. Returns a
+/// `{items, total, limit, offset}` envelope.
 #[utoipa::path(
     get,
     path = "/{id}/sessions",
     tag = "courses",
     security(("session_cookie" = [])),
-    params(("id" = String, Path, description = "Course id")),
+    params(("id" = String, Path, description = "Course id"), PageParams),
     responses(
-        (status = 200, description = "The course's sessions", body = [SessionResponse]),
+        (status = 200, description = "A page of the course's sessions (all of them when unpaged)", body = Page<SessionResponse>),
+        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not enrolled, not the creator, and not a manager/admin", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
@@ -681,7 +721,9 @@ async fn list_course_sessions(
     State(st): State<AppState>,
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
-) -> Result<Json<Vec<SessionResponse>>, AppError> {
+    Query(page): Query<PageParams>,
+) -> Result<Json<Page<SessionResponse>>, AppError> {
+    let (limit, offset) = page.resolve()?;
     // Course must exist — a missing course is a 404, not an empty list.
     let course = Course::read(&CourseId::from_key(&id), &st.db)
         .await?
@@ -692,11 +734,13 @@ async fn list_course_sessions(
         ));
     }
     let sessions = CourseSession::list_for_course(course.get_id(), &st.db).await?;
-    let people = person_map(sessions.iter().map(|s| s.get_teacher().clone()), &st.db).await?;
-    Ok(Json(
-        sessions
-            .iter()
-            .map(|s| SessionResponse::new(s, &people))
-            .collect(),
-    ))
+    let total = sessions.len() as i64;
+    // Join teachers onto the page alone — the lookup shrinks with the window.
+    let rows = paginate(&sessions, limit, offset);
+    let people = person_map(rows.iter().map(|s| s.get_teacher().clone()), &st.db).await?;
+    let items = rows
+        .iter()
+        .map(|s| SessionResponse::new(s, &people))
+        .collect();
+    Ok(Json(Page::new(items, total, limit, offset)))
 }

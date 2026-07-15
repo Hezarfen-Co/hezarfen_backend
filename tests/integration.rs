@@ -301,12 +301,7 @@ async fn notes_crud_is_scoped_to_owner() {
 
     // Owner sees exactly one; other user sees none and gets 404 on direct access.
     assert_eq!(
-        send(&app, "GET", "/notes", Some(&ali), None)
-            .await
-            .body
-            .as_array()
-            .unwrap()
-            .len(),
+        common::items(&send(&app, "GET", "/notes", Some(&ali), None).await.body).len(),
         1
     );
     assert_eq!(
@@ -316,12 +311,7 @@ async fn notes_crud_is_scoped_to_owner() {
         StatusCode::NOT_FOUND
     );
     assert_eq!(
-        send(&app, "GET", "/notes", Some(&veli), None)
-            .await
-            .body
-            .as_array()
-            .unwrap()
-            .len(),
+        common::items(&send(&app, "GET", "/notes", Some(&veli), None).await.body).len(),
         0
     );
 
@@ -471,12 +461,7 @@ async fn events_are_shared_but_creator_guarded() {
         StatusCode::OK
     );
     assert_eq!(
-        send(&app, "GET", "/events", Some(&veli), None)
-            .await
-            .body
-            .as_array()
-            .unwrap()
-            .len(),
+        common::items(&send(&app, "GET", "/events", Some(&veli), None).await.body).len(),
         1
     );
 
@@ -597,7 +582,7 @@ async fn attendance_marking_and_upsert() {
 
     // Two rows total.
     assert_eq!(
-        send(
+        common::items(&send(
             &app,
             "GET",
             &format!("/events/{event_id}/attendance"),
@@ -605,9 +590,7 @@ async fn attendance_marking_and_upsert() {
             None
         )
         .await
-        .body
-        .as_array()
-        .unwrap()
+        .body)
         .len(),
         2
     );
@@ -626,7 +609,7 @@ async fn attendance_marking_and_upsert() {
         StatusCode::NO_CONTENT
     );
     assert_eq!(
-        send(
+        common::items(&send(
             &app,
             "GET",
             &format!("/events/{event_id}/attendance"),
@@ -634,9 +617,7 @@ async fn attendance_marking_and_upsert() {
             None
         )
         .await
-        .body
-        .as_array()
-        .unwrap()
+        .body)
         .len(),
         1
     );
@@ -893,12 +874,7 @@ async fn exams_are_course_scoped_and_course_guarded() {
         StatusCode::FORBIDDEN
     );
     assert_eq!(
-        send(&app, "GET", "/exams", Some(&veli), None)
-            .await
-            .body
-            .as_array()
-            .unwrap()
-            .len(),
+        common::items(&send(&app, "GET", "/exams", Some(&veli), None).await.body).len(),
         0
     );
     assert_eq!(
@@ -922,16 +898,11 @@ async fn exams_are_course_scoped_and_course_guarded() {
         StatusCode::OK
     );
     assert_eq!(
-        send(&app, "GET", "/exams", Some(&ali), None)
-            .await
-            .body
-            .as_array()
-            .unwrap()
-            .len(),
+        common::items(&send(&app, "GET", "/exams", Some(&ali), None).await.body).len(),
         1
     );
     assert_eq!(
-        send(
+        common::items(&send(
             &app,
             "GET",
             &format!("/courses/{course_id}/exams"),
@@ -939,9 +910,7 @@ async fn exams_are_course_scoped_and_course_guarded() {
             None
         )
         .await
-        .body
-        .as_array()
-        .unwrap()
+        .body)
         .len(),
         1
     );
@@ -1117,7 +1086,7 @@ async fn grading_upsert_and_own_result() {
 
     // Teacher sees the full list (one row).
     assert_eq!(
-        send(
+        common::items(&send(
             &app,
             "GET",
             &format!("/exams/{exam_id}/results"),
@@ -1125,9 +1094,7 @@ async fn grading_upsert_and_own_result() {
             None
         )
         .await
-        .body
-        .as_array()
-        .unwrap()
+        .body)
         .len(),
         1
     );
@@ -1382,12 +1349,7 @@ async fn courses_are_owner_scoped_and_creator_guarded() {
         StatusCode::FORBIDDEN
     );
     assert_eq!(
-        send(&app, "GET", "/courses", Some(&veli), None)
-            .await
-            .body
-            .as_array()
-            .unwrap()
-            .len(),
+        common::items(&send(&app, "GET", "/courses", Some(&veli), None).await.body).len(),
         0
     );
 
@@ -1406,12 +1368,7 @@ async fn courses_are_owner_scoped_and_creator_guarded() {
             StatusCode::OK
         );
         assert_eq!(
-            send(&app, "GET", "/courses", Some(caller), None)
-                .await
-                .body
-                .as_array()
-                .unwrap()
-                .len(),
+            common::items(&send(&app, "GET", "/courses", Some(caller), None).await.body).len(),
             1
         );
     }
@@ -1535,7 +1492,7 @@ async fn enrollment_upsert_roster_and_my_courses() {
         None,
     )
     .await;
-    assert_eq!(roster.body.as_array().unwrap().len(), 1);
+    assert_eq!(common::items(&roster.body).len(), 1);
     assert_eq!(
         send(
             &app,
@@ -1551,21 +1508,21 @@ async fn enrollment_upsert_roster_and_my_courses() {
 
     // /courses/me shows the course for alice, stays empty for bob.
     assert_eq!(
-        send(&app, "GET", "/courses/me", Some(&alice), None)
-            .await
-            .body
-            .as_array()
-            .unwrap()
-            .len(),
+        common::items(
+            &send(&app, "GET", "/courses/me", Some(&alice), None)
+                .await
+                .body,
+        )
+        .len(),
         1
     );
     assert_eq!(
-        send(&app, "GET", "/courses/me", Some(&bob), None)
-            .await
-            .body
-            .as_array()
-            .unwrap()
-            .len(),
+        common::items(
+            &send(&app, "GET", "/courses/me", Some(&bob), None)
+                .await
+                .body,
+        )
+        .len(),
         0
     );
 
@@ -1736,7 +1693,7 @@ async fn exam_creation_lives_under_courses() {
         StatusCode::OK
     );
     assert_eq!(
-        send(
+        common::items(&send(
             &app,
             "GET",
             &format!("/courses/{course_id}/exams"),
@@ -1744,9 +1701,7 @@ async fn exam_creation_lives_under_courses() {
             None
         )
         .await
-        .body
-        .as_array()
-        .unwrap()
+        .body)
         .len(),
         1
     );
@@ -1814,12 +1769,7 @@ async fn grading_requires_enrollment() {
         StatusCode::BAD_REQUEST
     );
     assert_eq!(
-        send(&app, "GET", &grade_uri, Some(&teacher), None)
-            .await
-            .body
-            .as_array()
-            .unwrap()
-            .len(),
+        common::items(&send(&app, "GET", &grade_uri, Some(&teacher), None).await.body).len(),
         1
     );
     assert_eq!(
@@ -2227,7 +2177,7 @@ async fn course_data_is_walled_off_from_other_teachers() {
         for uri in ["/courses", "/exams"] {
             let res = send(&app, "GET", uri, Some(caller), None).await;
             assert_eq!(
-                res.body.as_array().unwrap().len(),
+                common::items(&res.body).len(),
                 visible,
                 "{uri} as seen by caller"
             );
@@ -2305,12 +2255,12 @@ async fn deleting_course_cascades_enrollments_exams_and_results() {
         StatusCode::NOT_FOUND
     );
     assert_eq!(
-        send(&app, "GET", "/courses/me", Some(&alice), None)
-            .await
-            .body
-            .as_array()
-            .unwrap()
-            .len(),
+        common::items(
+            &send(&app, "GET", "/courses/me", Some(&alice), None)
+                .await
+                .body,
+        )
+        .len(),
         0
     );
     assert_eq!(
@@ -2363,7 +2313,7 @@ async fn concurrent_enrollments_never_collide() {
     )
     .await;
     assert_eq!(
-        roster.body.as_array().unwrap().len(),
+        common::items(&roster.body).len(),
         1,
         "upsert keeps a single row"
     );
@@ -2527,7 +2477,7 @@ async fn admin_manages_roles_with_guards() {
     // Admin lists users (at least admin + alice).
     let list = send(&app, "GET", "/users", Some(&admin), None).await;
     assert_eq!(list.status, StatusCode::OK);
-    assert!(list.body.as_array().unwrap().len() >= 2);
+    assert!(common::items(&list.body).len() >= 2);
 
     // Admin promotes alice to teacher; the change is reflected in the response...
     let promoted = send(
@@ -2767,10 +2717,7 @@ async fn admin_reads_and_edits_any_profile_with_guards() {
 
     // The admin listing now carries the info columns too.
     let list = send(&app, "GET", "/users", Some(&admin), None).await;
-    let listed = list
-        .body
-        .as_array()
-        .unwrap()
+    let listed = common::items(&list.body)
         .iter()
         .find(|u| u["username"] == "alice")
         .expect("alice listed")
@@ -2855,7 +2802,7 @@ async fn concurrent_attendance_marks_never_collide() {
     )
     .await;
     assert_eq!(
-        roster.body.as_array().unwrap().len(),
+        common::items(&roster.body).len(),
         1,
         "upsert keeps a single row"
     );
@@ -2901,7 +2848,7 @@ async fn concurrent_exam_grades_never_collide() {
     )
     .await;
     assert_eq!(
-        results.body.as_array().unwrap().len(),
+        common::items(&results.body).len(),
         1,
         "upsert keeps a single row"
     );
@@ -3076,7 +3023,7 @@ async fn graders_cannot_grade_themselves() {
 
     // And the rejected attempts wrote nothing.
     assert_eq!(
-        send(
+        common::items(&send(
             &app,
             "GET",
             &format!("/exams/{exam_id}/results"),
@@ -3084,9 +3031,7 @@ async fn graders_cannot_grade_themselves() {
             None
         )
         .await
-        .body
-        .as_array()
-        .unwrap()
+        .body)
         .len(),
         0
     );
@@ -3416,7 +3361,7 @@ async fn admin_seed_is_idempotent() {
         res.cookie.expect("session cookie")
     };
     let res = send(&app, "GET", "/users", Some(&cookie), None).await;
-    let listed = res.body.as_array().expect("user list");
+    let listed = common::items(&res.body);
     assert_eq!(listed.len(), 1, "seed must not duplicate the account");
     assert_eq!(listed[0]["role"], "admin");
 }
@@ -4893,7 +4838,7 @@ async fn question_crud_validation_and_rbac() {
     )
     .await;
     assert_eq!(res.status, StatusCode::OK);
-    let questions = res.body.as_array().expect("questions");
+    let questions = common::items(&res.body);
     assert_eq!(questions.len(), 2);
     assert_eq!(id_of(&questions[0]), choice_q);
     assert_eq!(id_of(&questions[1]), text_q);
@@ -5109,7 +5054,7 @@ async fn question_crud_validation_and_rbac() {
         None,
     )
     .await;
-    assert_eq!(res.body.as_array().unwrap().len(), 1);
+    assert_eq!(common::items(&res.body).len(), 1);
 }
 
 #[tokio::test]
@@ -6044,8 +5989,8 @@ async fn question_patch_revalidates_the_stale_kind_bundle() {
         None,
     )
     .await;
-    assert_eq!(res.body[0]["choices"].as_array().unwrap().len(), 2);
-    assert_eq!(res.body[0]["correct"], 1);
+    assert_eq!(common::items(&res.body)[0]["choices"].as_array().unwrap().len(), 2);
+    assert_eq!(common::items(&res.body)[0]["correct"], 1);
 }
 
 #[tokio::test]
@@ -6317,8 +6262,8 @@ async fn session_crud_follows_course_management() {
     assert_eq!(res.status, StatusCode::OK);
     // owner's, the manager's, and the one taught by `rival` — newest starts_at
     // first, so the two `start` lessons precede the earlier `rival` one.
-    assert_eq!(res.body.as_array().unwrap().len(), 3);
-    assert_eq!(res.body[2]["starts_at"], now + 120_000);
+    assert_eq!(common::items(&res.body).len(), 3);
+    assert_eq!(common::items(&res.body)[2]["starts_at"], now + 120_000);
     let res = send(&app, "GET", "/courses/nope/sessions", Some(&student), None).await;
     assert_eq!(res.status, StatusCode::NOT_FOUND);
     let res = send(
@@ -6532,7 +6477,7 @@ async fn roll_call_rbac_and_upsert() {
     // get their own tallies via `/attendance/me`.
     let res = send(&app, "GET", &mark_uri, Some(&hoca), None).await;
     assert_eq!(res.status, StatusCode::OK);
-    let roster = res.body.as_array().unwrap();
+    let roster = common::items(&res.body);
     assert_eq!(roster.len(), 1);
     assert_eq!(roster[0]["status"], "absent");
     let res = send(&app, "GET", &mark_uri, Some(&ali), None).await;
@@ -6771,7 +6716,7 @@ async fn work_log_lifecycle_is_server_stamped_and_exclusive() {
     let res = send(&app, "POST", "/work/check-in", Some(&hoca), None).await;
     assert_eq!(res.status, StatusCode::CONFLICT);
     let res = send(&app, "GET", "/work/me", Some(&hoca), None).await;
-    let log = res.body.as_array().unwrap();
+    let log = common::items(&res.body);
     assert_eq!(log.len(), 1);
     assert_eq!(log[0]["check_in"].as_i64().unwrap(), first_in);
 
@@ -6787,7 +6732,7 @@ async fn work_log_lifecycle_is_server_stamped_and_exclusive() {
     let res = send(&app, "POST", "/work/check-in", Some(&hoca), None).await;
     assert_eq!(res.status, StatusCode::CREATED);
     let res = send(&app, "GET", "/work/me", Some(&hoca), None).await;
-    let log = res.body.as_array().unwrap();
+    let log = common::items(&res.body);
     assert_eq!(log.len(), 2);
     assert!(log[0]["check_out"].is_null(), "open stint sorts newest");
     assert!(!log[1]["check_out"].is_null());
@@ -6813,7 +6758,7 @@ async fn work_log_manager_reads_and_corrections() {
     assert_eq!(res.status, StatusCode::FORBIDDEN);
     let res = send(&app, "GET", &format!("/work/{hoca_id}"), Some(&boss), None).await;
     assert_eq!(res.status, StatusCode::OK);
-    assert_eq!(res.body.as_array().unwrap().len(), 2);
+    assert_eq!(common::items(&res.body).len(), 2);
     let res = send(&app, "GET", "/work/01UNKNOWN", Some(&boss), None).await;
     assert_eq!(res.status, StatusCode::NOT_FOUND);
 
@@ -7182,7 +7127,7 @@ async fn search_matches_are_literal_not_like_wildcards() {
     // Under LIKE semantics it would match every user with a name.
     let res = send(&app, "GET", "/users/search?q=%25", Some(&teacher), None).await;
     assert_eq!(res.status, StatusCode::OK);
-    let hits = res.body.as_array().unwrap();
+    let hits = common::items(&res.body);
     assert_eq!(hits.len(), 1, "`%` must match literally: {hits:?}");
     assert_eq!(hits[0]["username"], "percy");
 
@@ -7190,7 +7135,7 @@ async fn search_matches_are_literal_not_like_wildcards() {
     // semantics `_` is any-single-character and would match everyone.
     let res = send(&app, "GET", "/users/search?q=_", Some(&teacher), None).await;
     assert_eq!(res.status, StatusCode::OK);
-    let hits = res.body.as_array().unwrap();
+    let hits = common::items(&res.body);
     assert_eq!(hits.len(), 1, "`_` must match literally: {hits:?}");
     assert_eq!(hits[0]["username"], "under_score");
 }
@@ -7226,7 +7171,7 @@ async fn course_catalog_lists_a_creator_enrolled_course_once() {
 
     let res = send(&app, "GET", "/courses", Some(&teacher), None).await;
     assert_eq!(res.status, StatusCode::OK);
-    let courses = res.body.as_array().unwrap();
+    let courses = common::items(&res.body);
     assert_eq!(courses.len(), 1, "created+enrolled must dedup: {courses:?}");
     assert_eq!(courses[0]["id"], json!(course));
 
@@ -7234,7 +7179,7 @@ async fn course_catalog_lists_a_creator_enrolled_course_once() {
     // the course's exams either.
     let exam = create_exam(&app, &teacher, &course, "mt", "quiz").await;
     let res = send(&app, "GET", "/exams", Some(&teacher), None).await;
-    let exams = res.body.as_array().unwrap();
+    let exams = common::items(&res.body);
     assert_eq!(exams.len(), 1, "one exam listed once: {exams:?}");
     assert_eq!(exams[0]["id"], json!(exam));
 }
@@ -7640,7 +7585,7 @@ async fn terms_crud_gates_and_links_to_courses() {
     // Any authenticated user reads the calendar.
     let res = send(&app, "GET", "/terms", Some(&student), None).await;
     assert_eq!(res.status, StatusCode::OK);
-    assert_eq!(res.body.as_array().unwrap().len(), 1);
+    assert_eq!(common::items(&res.body).len(), 1);
 
     // Courses link to a term at creation; a bogus id is a 400, not a silent null.
     let res = send(
@@ -7809,10 +7754,7 @@ async fn terms_list_newest_first_require_auth_and_unlink_in_bulk() {
 
     // Newest (by starts_at) first.
     let res = send(&app, "GET", "/terms", Some(&teacher), None).await;
-    let names: Vec<&str> = res
-        .body
-        .as_array()
-        .unwrap()
+    let names: Vec<&str> = common::items(&res.body)
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();

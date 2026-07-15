@@ -83,12 +83,12 @@ async fn file_engine_runs_full_flow() {
     .await;
     assert_eq!(note.status, StatusCode::CREATED);
     assert_eq!(
-        send(&app, "GET", "/notes", Some(&cookie), None)
-            .await
-            .body
-            .as_array()
-            .unwrap()
-            .len(),
+        common::items(
+            &send(&app, "GET", "/notes", Some(&cookie), None)
+                .await
+                .body,
+        )
+        .len(),
         1
     );
 }
@@ -143,7 +143,7 @@ async fn data_survives_reopen() {
             "notes list body: {}",
             notes.body
         );
-        let rows = notes.body.as_array().unwrap();
+        let rows = common::items(&notes.body);
         assert_eq!(rows.len(), 1, "note survived reopen");
         assert_eq!(rows[0]["title"], "persisted");
     }
@@ -315,7 +315,7 @@ async fn course_marks_survive_reopen() {
             None,
         )
         .await;
-        assert_eq!(roster.body.as_array().unwrap().len(), 1, "roster intact");
+        assert_eq!(common::items(&roster.body).len(), 1, "roster intact");
     }
 }
 
@@ -403,7 +403,7 @@ async fn settings_and_terms_survive_reopen() {
     assert_eq!(res.body["name"], "2026 Fall");
 
     let res = send(&app, "GET", "/courses", Some(&cookie), None).await;
-    let courses = res.body.as_array().unwrap();
+    let courses = common::items(&res.body);
     assert_eq!(courses.len(), 1);
     assert_eq!(courses[0]["term"].as_str(), Some(term.as_str()));
 }

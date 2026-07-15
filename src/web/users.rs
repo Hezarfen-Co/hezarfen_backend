@@ -13,7 +13,9 @@ use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
 
 use super::dto::Role as RoleSchema;
-use super::{CurrentUser, PersonRef, RequireAdmin, RequireTeacher, UserResponse};
+use super::{
+    CurrentUser, Page, PageParams, PersonRef, RequireAdmin, RequireTeacher, UserResponse, paginate,
+};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -98,12 +100,20 @@ struct SearchUsers {
     /// Restrict matches to one role: `student`, `teacher`, `manager`, or
     /// `admin`. Omit to search every role.
     role: Option<String>,
+    /// Max matches to return. Omit for every match; when given, `1`–`500`.
+    #[param(minimum = 1, maximum = 500, example = 100)]
+    limit: Option<i64>,
+    /// Matches to skip from the start. Defaults to `0`.
+    #[param(minimum = 0, example = 0)]
+    offset: Option<i64>,
 }
 
 /// Find users by username or name — backs the pickers (enroll, grade, mark
 /// attendance). Requires teacher+. `role` narrows to one role (e.g.
-/// `role=student` for an enroll picker). Returns at most 10 matches, and only
-/// id/username/display name — no contact details.
+/// `role=student` for an enroll picker). Paged via `?limit=&offset=` like the
+/// other lists (omit `limit` for every match); returns a
+/// `{items, total, limit, offset}` envelope carrying only id/username/display
+/// name — no contact details.
 #[utoipa::path(
     get,
     path = "/search",
@@ -111,8 +121,8 @@ struct SearchUsers {
     security(("session_cookie" = [])),
     params(SearchUsers),
     responses(
-        (status = 200, description = "Matching users, at most 10", body = [PersonRef]),
-        (status = 400, description = "Empty query or unknown role", body = ErrorResponse),
+        (status = 200, description = "A page of matching users (all matches when unpaged)", body = Page<PersonRef>),
+        (status = 400, description = "Empty query, unknown role, or invalid limit/offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
     ),
@@ -121,26 +131,41 @@ async fn search_users(
     State(st): State<AppState>,
     _teacher: RequireTeacher,
     Query(req): Query<SearchUsers>,
-) -> Result<Json<Vec<PersonRef>>, AppError> {
+) -> Result<Json<Page<PersonRef>>, AppError> {
     if req.q.trim().is_empty() {
         return Err(AppError::Validation(ValidationError::Invalid {
             field: "q",
             reason: "must not be empty",
         }));
     }
+    let (limit, offset) = PageParams {
+        limit: req.limit,
+        offset: req.offset,
+    }
+    .resolve()?;
     let role = req.role.as_deref().map(Role::try_from_str).transpose()?;
     let users = User::search(&req.q, role, &st.db).await?;
-    Ok(Json(users.iter().map(PersonRef::new).collect()))
+    let total = users.len() as i64;
+    let items = paginate(&users, limit, offset)
+        .iter()
+        .map(PersonRef::new)
+        .collect();
+    Ok(Json(Page::new(items, total, limit, offset)))
 }
 
-/// List every user with their role. Admin only.
+/// List every user with their role, newest first. Admin only. Paged: pass
+/// `?limit=&offset=` to take a window (omit `limit` for the whole list); the
+/// response is a `{items, total, limit, offset}` envelope where `total` counts
+/// every user.
 #[utoipa::path(
     get,
     path = "/",
     tag = "users",
     security(("session_cookie" = [])),
+    params(PageParams),
     responses(
-        (status = 200, description = "All users", body = [UserResponse]),
+        (status = 200, description = "A page of users (the full list when unpaged)", body = Page<UserResponse>),
+        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires admin role", body = ErrorResponse),
     ),
@@ -148,9 +173,16 @@ async fn search_users(
 async fn list_users(
     State(st): State<AppState>,
     _admin: RequireAdmin,
-) -> Result<Json<Vec<UserResponse>>, AppError> {
+    Query(page): Query<PageParams>,
+) -> Result<Json<Page<UserResponse>>, AppError> {
+    let (limit, offset) = page.resolve()?;
     let users = User::list_all(&st.db).await?;
-    Ok(Json(users.iter().map(UserResponse::new).collect()))
+    let total = users.len() as i64;
+    let items = paginate(&users, limit, offset)
+        .iter()
+        .map(UserResponse::new)
+        .collect();
+    Ok(Json(Page::new(items, total, limit, offset)))
 }
 
 /// Update the caller's own personal info: name, surname, email, phone, birth

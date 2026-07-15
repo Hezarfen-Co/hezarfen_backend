@@ -32,7 +32,7 @@ use crate::state::AppState;
     info(
         title = "Hezarfen Backend API",
         version = env!("CARGO_PKG_VERSION"),
-        description = "Notes, events, attendance, courses, and weighted exam marks behind cookie-session auth. Exams run sync (one window), async (window + per-attempt duration), or open (sit anytime), with per-exam attempt limits (retakes) and a teacher-controlled rejoin door on the live exam room. Courses carry lesson sessions with teacher-taken roll call; staff clock in/out on a server-stamped work log; attendance reports tally events and per-course roll call with rates. School-varying policy (exam kinds with their course-average weights, attendance statuses, grade-display bands) lives in an editable settings singleton, and courses may link to academic terms.",
+        description = "Notes, events, attendance, courses, and weighted exam marks behind cookie-session auth. Exams run sync (one window), async (window + per-attempt duration), or open (sit anytime), with per-exam attempt limits (retakes) and a teacher-controlled rejoin door on the live exam room. Courses carry lesson sessions with teacher-taken roll call; staff clock in/out on a server-stamped work log; attendance reports tally events and per-course roll call with rates. School-varying policy (exam kinds with their course-average weights, attendance statuses, grade-display bands) lives in an editable settings singleton, and courses may link to academic terms. Every list endpoint accepts `?limit=&offset=` and returns a `{items, total, limit, offset}` page envelope — paging is opt-in, so omitting `limit` returns the full list and `total` always carries the unpaged count.",
     ),
     modifiers(&SecurityAddon),
     tags(

@@ -1,5 +1,5 @@
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -10,7 +10,7 @@ use crate::domain::note::{Note, NoteContent, NoteId, NoteTitle};
 use crate::error::{AppError, ErrorResponse};
 use crate::state::AppState;
 
-use super::CurrentUser;
+use super::{CurrentUser, Page, PageParams, paginate};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -73,23 +73,34 @@ async fn create(
     Ok((StatusCode::CREATED, Json(NoteResponse::new(&note))))
 }
 
-/// List all notes owned by the current user.
+/// List the notes owned by the current user, newest first. Paged via
+/// `?limit=&offset=` (omit `limit` for all of them); returns a
+/// `{items, total, limit, offset}` envelope.
 #[utoipa::path(
     get,
     path = "/",
     tag = "notes",
     security(("session_cookie" = [])),
+    params(PageParams),
     responses(
-        (status = 200, description = "The user's notes", body = [NoteResponse]),
+        (status = 200, description = "A page of the user's notes (all of them when unpaged)", body = Page<NoteResponse>),
+        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
     ),
 )]
 async fn list(
     State(st): State<AppState>,
     CurrentUser(user): CurrentUser,
-) -> Result<Json<Vec<NoteResponse>>, AppError> {
+    Query(page): Query<PageParams>,
+) -> Result<Json<Page<NoteResponse>>, AppError> {
+    let (limit, offset) = page.resolve()?;
     let notes = Note::list_for(user.get_id(), &st.db).await?;
-    Ok(Json(notes.iter().map(NoteResponse::new).collect()))
+    let total = notes.len() as i64;
+    let items = paginate(&notes, limit, offset)
+        .iter()
+        .map(NoteResponse::new)
+        .collect();
+    Ok(Json(Page::new(items, total, limit, offset)))
 }
 
 /// Fetch a single note by id (must be owned by the current user).

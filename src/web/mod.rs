@@ -19,9 +19,11 @@ pub mod work;
 
 mod dto;
 mod extractor;
+mod page;
 
 pub use dto::{CourseResponse, ExamResponse, PersonRef, SessionResponse, UserResponse, person_map};
 pub use extractor::{CurrentUser, RequireAdmin, RequireManager, RequireTeacher};
+pub use page::{Page, PageParams, paginate};
 
 use serde::{Deserialize, Deserializer};
 

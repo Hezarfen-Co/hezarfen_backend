@@ -121,6 +121,21 @@ pub fn id_of(v: &Value) -> String {
     v["id"].as_str().expect("id field").to_string()
 }
 
+/// The `items` array of a paginated list envelope (`{items, total, limit,
+/// offset}`) — the shape every `GET` list endpoint returns. Panics if `v`
+/// isn't such an envelope, so a test that points it at the wrong body fails
+/// loudly.
+pub fn items(v: &Value) -> &Vec<Value> {
+    v["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a paginated list envelope with items[], got {v}"))
+}
+
+/// The `total` count from a paginated list envelope.
+pub fn total(v: &Value) -> i64 {
+    v["total"].as_i64().expect("paginated envelope total")
+}
+
 /// The caller's own user id via `GET /auth/me`.
 pub async fn me_id(app: &Router, cookie: &str) -> String {
     let res = send(app, "GET", "/auth/me", Some(cookie), None).await;

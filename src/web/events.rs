@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -18,8 +18,8 @@ use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
 
 use super::{
-    CurrentUser, PersonRef, RequireTeacher, check_not_past, check_time_range, person_map,
-    set_or_clear,
+    CurrentUser, Page, PageParams, PersonRef, RequireTeacher, check_not_past, check_time_range,
+    paginate, person_map, set_or_clear,
 };
 
 pub fn routes() -> OpenApiRouter<AppState> {
@@ -160,23 +160,33 @@ async fn create_event(
     Ok((StatusCode::CREATED, Json(EventResponse::new(&event))))
 }
 
-/// List all events.
+/// List all events, newest first. Paged via `?limit=&offset=` (omit `limit`
+/// for every event); returns a `{items, total, limit, offset}` envelope.
 #[utoipa::path(
     get,
     path = "/",
     tag = "events",
     security(("session_cookie" = [])),
+    params(PageParams),
     responses(
-        (status = 200, description = "All events", body = [EventResponse]),
+        (status = 200, description = "A page of events (all of them when unpaged)", body = Page<EventResponse>),
+        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
     ),
 )]
 async fn list_events(
     State(st): State<AppState>,
     _user: CurrentUser,
-) -> Result<Json<Vec<EventResponse>>, AppError> {
+    Query(page): Query<PageParams>,
+) -> Result<Json<Page<EventResponse>>, AppError> {
+    let (limit, offset) = page.resolve()?;
     let events = Event::list_all(&st.db).await?;
-    Ok(Json(events.iter().map(EventResponse::new).collect()))
+    let total = events.len() as i64;
+    let items = paginate(&events, limit, offset)
+        .iter()
+        .map(EventResponse::new)
+        .collect();
+    Ok(Json(Page::new(items, total, limit, offset)))
 }
 
 /// Fetch a single event by id.
@@ -362,16 +372,19 @@ async fn mark(
     Ok(Json(AttendanceResponse::new(&attendance, &people)))
 }
 
-/// List the attendance roster for an event. Requires teacher+ — students see
-/// their own tallies via `GET /attendance/me`.
+/// List the attendance roster for an event, paged via `?limit=&offset=` (omit
+/// `limit` for the whole roster). Requires teacher+ — students see their own
+/// tallies via `GET /attendance/me`. Returns a `{items, total, limit, offset}`
+/// envelope.
 #[utoipa::path(
     get,
     path = "/{id}/attendance",
     tag = "events",
     security(("session_cookie" = [])),
-    params(("id" = String, Path, description = "Event id")),
+    params(("id" = String, Path, description = "Event id"), PageParams),
     responses(
-        (status = 200, description = "Attendance roster", body = [AttendanceResponse]),
+        (status = 200, description = "A page of the attendance roster (all of it when unpaged)", body = Page<AttendanceResponse>),
+        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
         (status = 404, description = "Event not found", body = ErrorResponse),
@@ -381,26 +394,29 @@ async fn list_attendance(
     State(st): State<AppState>,
     _teacher: RequireTeacher,
     Path(id): Path<String>,
-) -> Result<Json<Vec<AttendanceResponse>>, AppError> {
+    Query(page): Query<PageParams>,
+) -> Result<Json<Page<AttendanceResponse>>, AppError> {
+    let (limit, offset) = page.resolve()?;
     let event_id = EventId::from_key(&id);
     // Event must exist — a missing event is a 404, not an empty roster.
     Event::read(&event_id, &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
     let roster = Attendance::list_for_event(&event_id, &st.db).await?;
+    let total = roster.len() as i64;
+    // Join people onto the page alone — the lookup shrinks with the window.
+    let rows = paginate(&roster, limit, offset);
     let people = person_map(
-        roster
-            .iter()
+        rows.iter()
             .flat_map(|a| [a.get_user().clone(), a.get_marked_by().clone()]),
         &st.db,
     )
     .await?;
-    Ok(Json(
-        roster
-            .iter()
-            .map(|a| AttendanceResponse::new(a, &people))
-            .collect(),
-    ))
+    let items = rows
+        .iter()
+        .map(|a| AttendanceResponse::new(a, &people))
+        .collect();
+    Ok(Json(Page::new(items, total, limit, offset)))
 }
 
 /// Remove a user's attendance record from an event. Requires teacher+.

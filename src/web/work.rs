@@ -1,5 +1,5 @@
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -12,7 +12,7 @@ use crate::domain::work_entry::{WorkEntry, WorkEntryId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
 
-use super::{RequireManager, RequireTeacher};
+use super::{Page, PageParams, RequireManager, RequireTeacher, paginate};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -105,14 +105,18 @@ async fn check_out(
 }
 
 /// The caller's own work log, newest first — the open stint (if any) included
-/// (`check_out: null`). Requires teacher+ (staff).
+/// (`check_out: null`). Paged via `?limit=&offset=` (omit `limit` for the whole
+/// log). Requires teacher+ (staff). Returns a `{items, total, limit, offset}`
+/// envelope.
 #[utoipa::path(
     get,
     path = "/me",
     tag = "work",
     security(("session_cookie" = [])),
+    params(PageParams),
     responses(
-        (status = 200, description = "The caller's work log", body = [WorkEntryResponse]),
+        (status = 200, description = "A page of the caller's work log (the whole log when unpaged)", body = Page<WorkEntryResponse>),
+        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
     ),
@@ -120,20 +124,30 @@ async fn check_out(
 async fn my_work(
     State(st): State<AppState>,
     RequireTeacher(user): RequireTeacher,
-) -> Result<Json<Vec<WorkEntryResponse>>, AppError> {
+    Query(page): Query<PageParams>,
+) -> Result<Json<Page<WorkEntryResponse>>, AppError> {
+    let (limit, offset) = page.resolve()?;
     let entries = WorkEntry::list_for_user(user.get_id(), &st.db).await?;
-    Ok(Json(entries.iter().map(WorkEntryResponse::new).collect()))
+    let total = entries.len() as i64;
+    let items = paginate(&entries, limit, offset)
+        .iter()
+        .map(WorkEntryResponse::new)
+        .collect();
+    Ok(Json(Page::new(items, total, limit, offset)))
 }
 
-/// A staff member's work log. Requires manager+.
+/// A staff member's work log, newest first, paged via `?limit=&offset=` (omit
+/// `limit` for the whole log). Requires manager+. Returns a
+/// `{items, total, limit, offset}` envelope.
 #[utoipa::path(
     get,
     path = "/{user}",
     tag = "work",
     security(("session_cookie" = [])),
-    params(("user" = String, Path, description = "User id")),
+    params(("user" = String, Path, description = "User id"), PageParams),
     responses(
-        (status = 200, description = "The user's work log", body = [WorkEntryResponse]),
+        (status = 200, description = "A page of the user's work log (the whole log when unpaged)", body = Page<WorkEntryResponse>),
+        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "User not found", body = ErrorResponse),
@@ -143,14 +157,21 @@ async fn user_work(
     State(st): State<AppState>,
     _manager: RequireManager,
     Path(user): Path<String>,
-) -> Result<Json<Vec<WorkEntryResponse>>, AppError> {
+    Query(page): Query<PageParams>,
+) -> Result<Json<Page<WorkEntryResponse>>, AppError> {
+    let (limit, offset) = page.resolve()?;
     let target = UserId::from_key(&user);
     // User must exist — a missing user is a 404, not an empty log.
     User::read(&target, &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
     let entries = WorkEntry::list_for_user(&target, &st.db).await?;
-    Ok(Json(entries.iter().map(WorkEntryResponse::new).collect()))
+    let total = entries.len() as i64;
+    let items = paginate(&entries, limit, offset)
+        .iter()
+        .map(WorkEntryResponse::new)
+        .collect();
+    Ok(Json(Page::new(items, total, limit, offset)))
 }
 
 /// Correct a closed stint's instants. Requires manager+. An open stint can't

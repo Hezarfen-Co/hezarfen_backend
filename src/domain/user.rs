@@ -276,9 +276,9 @@ impl User {
 
     /// Case-insensitive fragment search over username, name, and surname —
     /// backs the user pickers. `role` narrows to one role (e.g. only students
-    /// for an enroll picker); `None` searches everyone. Capped at 10 rows:
-    /// pickers show a short list, and the cap keeps an over-broad fragment
-    /// from hauling the whole table.
+    /// for an enroll picker); `None` searches everyone. Returns every match,
+    /// ordered by username; the HTTP layer pages the result like any other list
+    /// (no built-in cap — an over-broad fragment is windowed by `?limit`).
     pub async fn search(
         query: &str,
         role: Option<Role>,
@@ -297,7 +297,7 @@ impl User {
                     OR string::lowercase(name ?? '') CONTAINS $q \
                     OR string::lowercase(surname ?? '') CONTAINS $q) \
                    {role_clause} \
-                 ORDER BY username LIMIT 10"
+                 ORDER BY username"
             ))
             .bind(("q", needle));
         if let Some(role) = role {

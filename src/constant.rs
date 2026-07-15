@@ -139,3 +139,9 @@ pub const SESSION_DURATION_DAYS: i64 = 7;
 /// submission must survive its own round trip — while still refusing
 /// genuinely past deadlines.
 pub const SCHEDULE_PAST_GRACE_MS: i64 = 60 * 1000;
+
+/// Upper bound on a list endpoint's `limit` page-size parameter. Omitting
+/// `limit` returns every (remaining) row; when supplied it must be
+/// `1..=MAX_PAGE_LIMIT`. The `#[param(maximum = ...)]` and the "1 and 500"
+/// wording in `web::page` mirror this literal — keep them in step.
+pub const MAX_PAGE_LIMIT: i64 = 500;

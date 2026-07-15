@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use serde::{Deserialize, Serialize};
@@ -35,7 +35,8 @@ use crate::state::AppState;
 
 use super::courses::{can_manage_course, can_view_course, visible_courses};
 use super::{
-    CurrentUser, ExamResponse, PersonRef, RequireTeacher, check_not_past, person_map, set_or_clear,
+    CurrentUser, ExamResponse, Page, PageParams, PersonRef, RequireTeacher, check_not_past,
+    paginate, person_map, set_or_clear,
 };
 
 pub fn routes() -> OpenApiRouter<AppState> {
@@ -161,21 +162,27 @@ async fn course_of(exam: &Exam, db: &Database) -> Result<Course, AppError> {
 // Exams are created inside a course: `POST /courses/{id}/exams`.
 
 /// List the exams visible to the caller: every exam for manager+, otherwise
-/// the exams of the courses they created or are enrolled in.
+/// the exams of the courses they created or are enrolled in. Paged via
+/// `?limit=&offset=` (omit `limit` for the full list); returns a
+/// `{items, total, limit, offset}` envelope.
 #[utoipa::path(
     get,
     path = "/",
     tag = "exams",
     security(("session_cookie" = [])),
+    params(PageParams),
     responses(
-        (status = 200, description = "The caller's visible exams", body = [ExamResponse]),
+        (status = 200, description = "A page of the caller's visible exams (all of them when unpaged)", body = Page<ExamResponse>),
+        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
     ),
 )]
 async fn list_exams(
     State(st): State<AppState>,
     CurrentUser(user): CurrentUser,
-) -> Result<Json<Vec<ExamResponse>>, AppError> {
+    Query(page): Query<PageParams>,
+) -> Result<Json<Page<ExamResponse>>, AppError> {
+    let (limit, offset) = page.resolve()?;
     let exams = if user.get_role().at_least(Role::Manager) {
         Exam::list_all(&st.db).await?
     } else {
@@ -183,7 +190,12 @@ async fn list_exams(
         let ids: Vec<_> = courses.iter().map(|c| c.get_id().clone()).collect();
         Exam::list_for_courses(&ids, &st.db).await?
     };
-    Ok(Json(exams.iter().map(ExamResponse::new).collect()))
+    let total = exams.len() as i64;
+    let items = paginate(&exams, limit, offset)
+        .iter()
+        .map(ExamResponse::new)
+        .collect();
+    Ok(Json(Page::new(items, total, limit, offset)))
 }
 
 /// Fetch a single exam by id. Visible to its course's enrolled users, the
@@ -443,17 +455,19 @@ async fn grade(
     Ok(Json(ExamResultResponse::new(&result, &people)))
 }
 
-/// List every result for an exam. Requires teacher+ and management rights
-/// over the exam's course — students read only their own via
-/// `GET /exams/{id}/result`.
+/// List an exam's results, paged via `?limit=&offset=` (omit `limit` for all
+/// of them). Requires teacher+ and management rights over the exam's course —
+/// students read only their own via `GET /exams/{id}/result`. Returns a
+/// `{items, total, limit, offset}` envelope.
 #[utoipa::path(
     get,
     path = "/{id}/results",
     tag = "exams",
     security(("session_cookie" = [])),
-    params(("id" = String, Path, description = "Exam id")),
+    params(("id" = String, Path, description = "Exam id"), PageParams),
     responses(
-        (status = 200, description = "All results", body = [ExamResultResponse]),
+        (status = 200, description = "A page of results (all of them when unpaged)", body = Page<ExamResultResponse>),
+        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
@@ -463,7 +477,9 @@ async fn list_results(
     State(st): State<AppState>,
     RequireTeacher(user): RequireTeacher,
     Path(id): Path<String>,
-) -> Result<Json<Vec<ExamResultResponse>>, AppError> {
+    Query(page): Query<PageParams>,
+) -> Result<Json<Page<ExamResultResponse>>, AppError> {
+    let (limit, offset) = page.resolve()?;
     // Exam must exist — a missing exam is a 404, not an empty result list.
     let exam = Exam::read(&ExamId::from_key(&id), &st.db)
         .await?
@@ -475,19 +491,20 @@ async fn list_results(
         ));
     }
     let results = ExamResult::list_for_exam(exam.get_id(), &st.db).await?;
+    let total = results.len() as i64;
+    // Join people onto the page alone — the lookup shrinks with the window.
+    let rows = paginate(&results, limit, offset);
     let people = person_map(
-        results
-            .iter()
+        rows.iter()
             .flat_map(|r| [r.get_user().clone(), r.get_graded_by().clone()]),
         &st.db,
     )
     .await?;
-    Ok(Json(
-        results
-            .iter()
-            .map(|r| ExamResultResponse::new(r, &people))
-            .collect(),
-    ))
+    let items = rows
+        .iter()
+        .map(|r| ExamResultResponse::new(r, &people))
+        .collect();
+    Ok(Json(Page::new(items, total, limit, offset)))
 }
 
 /// The current user's own result for an exam. Any authenticated user may read
@@ -1308,17 +1325,20 @@ async fn create_question(
     Ok((StatusCode::CREATED, Json(QuestionResponse::new(&question))))
 }
 
-/// The exam's full question list, `correct` indexes included — the answer
-/// key. Requires teacher+ and management rights over the exam's course.
-/// Students read questions through `GET /exams/{id}/attempt/questions`.
+/// The exam's question list, `correct` indexes included — the answer key,
+/// paged via `?limit=&offset=` (omit `limit` for the whole list). Requires
+/// teacher+ and management rights over the exam's course. Students read
+/// questions through `GET /exams/{id}/attempt/questions`. Returns a
+/// `{items, total, limit, offset}` envelope.
 #[utoipa::path(
     get,
     path = "/{id}/questions",
     tag = "exams",
     security(("session_cookie" = [])),
-    params(("id" = String, Path, description = "Exam id")),
+    params(("id" = String, Path, description = "Exam id"), PageParams),
     responses(
-        (status = 200, description = "The exam's questions", body = [QuestionResponse]),
+        (status = 200, description = "A page of the exam's questions (all of them when unpaged)", body = Page<QuestionResponse>),
+        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
@@ -1328,7 +1348,9 @@ async fn list_questions(
     State(st): State<AppState>,
     RequireTeacher(user): RequireTeacher,
     Path(id): Path<String>,
-) -> Result<Json<Vec<QuestionResponse>>, AppError> {
+    Query(page): Query<PageParams>,
+) -> Result<Json<Page<QuestionResponse>>, AppError> {
+    let (limit, offset) = page.resolve()?;
     let exam = Exam::read(&ExamId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -1339,7 +1361,12 @@ async fn list_questions(
         ));
     }
     let questions = ExamQuestion::list_for_exam(exam.get_id(), &st.db).await?;
-    Ok(Json(questions.iter().map(QuestionResponse::new).collect()))
+    let total = questions.len() as i64;
+    let items = paginate(&questions, limit, offset)
+        .iter()
+        .map(QuestionResponse::new)
+        .collect();
+    Ok(Json(Page::new(items, total, limit, offset)))
 }
 
 /// Edit a question. Requires teacher+ and management rights over the exam's

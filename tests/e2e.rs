@@ -177,12 +177,12 @@ async fn full_user_journey() {
         .json()
         .await
         .unwrap();
-    assert_eq!(roster.as_array().unwrap().len(), 1);
+    assert_eq!(roster["items"].as_array().unwrap().len(), 1);
     // People come back as refs — id plus something a human can read.
-    assert_eq!(roster[0]["user"]["id"], veli_id);
-    assert_eq!(roster[0]["user"]["username"], "veli");
-    assert_eq!(roster[0]["marked_by"]["username"], "ali");
-    assert_eq!(roster[0]["status"], "present");
+    assert_eq!(roster["items"][0]["user"]["id"], veli_id);
+    assert_eq!(roster["items"][0]["user"]["username"], "veli");
+    assert_eq!(roster["items"][0]["marked_by"]["username"], "ali");
+    assert_eq!(roster["items"][0]["status"], "present");
 
     // --- user search (for the pickers) -----------------------------------
     // Teacher+ finds people by fragment; the refs carry no contact details.
@@ -194,8 +194,8 @@ async fn full_user_journey() {
         .json()
         .await
         .unwrap();
-    assert_eq!(found[0]["username"], "veli");
-    assert!(found[0].get("email").is_none());
+    assert_eq!(found["items"][0]["username"], "veli");
+    assert!(found["items"][0].get("email").is_none());
 
     // Role filter narrows: veli is a student, so she matches `role=student`
     // but vanishes under `role=teacher`. An unknown role is a 400.
@@ -207,8 +207,8 @@ async fn full_user_journey() {
         .json()
         .await
         .unwrap();
-    assert_eq!(found.as_array().unwrap().len(), 1);
-    assert_eq!(found[0]["username"], "veli");
+    assert_eq!(found["items"].as_array().unwrap().len(), 1);
+    assert_eq!(found["items"][0]["username"], "veli");
 
     let found: Value = ali
         .get(format!("{base}/users/search?q=vel&role=teacher"))
@@ -218,7 +218,7 @@ async fn full_user_journey() {
         .json()
         .await
         .unwrap();
-    assert!(found.as_array().unwrap().is_empty());
+    assert!(found["items"].as_array().unwrap().is_empty());
 
     let res = ali
         .get(format!("{base}/users/search?q=vel&role=wizard"))
@@ -236,8 +236,8 @@ async fn full_user_journey() {
         .json()
         .await
         .unwrap();
-    assert_eq!(found.as_array().unwrap().len(), 1);
-    assert_eq!(found[0]["username"], "ali");
+    assert_eq!(found["items"].as_array().unwrap().len(), 1);
+    assert_eq!(found["items"][0]["username"], "ali");
 
     // Search matches profile names too, and the role filter applies to those
     // hits as well: "lic" only exists in ali's freshly set name, not in any
@@ -258,9 +258,9 @@ async fn full_user_journey() {
         .json()
         .await
         .unwrap();
-    assert_eq!(found.as_array().unwrap().len(), 1);
-    assert_eq!(found[0]["username"], "ali");
-    assert_eq!(found[0]["display_name"], "Alice");
+    assert_eq!(found["items"].as_array().unwrap().len(), 1);
+    assert_eq!(found["items"][0]["username"], "ali");
+    assert_eq!(found["items"][0]["display_name"], "Alice");
 
     let found: Value = ali
         .get(format!("{base}/users/search?q=lic&role=student"))
@@ -270,7 +270,7 @@ async fn full_user_journey() {
         .json()
         .await
         .unwrap();
-    assert!(found.as_array().unwrap().is_empty());
+    assert!(found["items"].as_array().unwrap().is_empty());
 
     let res = veli
         .get(format!("{base}/users/search?q=ali"))
@@ -381,7 +381,7 @@ async fn attendance_rollup_across_users() {
         .json()
         .await
         .unwrap();
-    assert_eq!(roster.as_array().unwrap().len(), 3);
+    assert_eq!(roster["items"].as_array().unwrap().len(), 3);
 
     // Unauthenticated client is refused.
     let res = client()
