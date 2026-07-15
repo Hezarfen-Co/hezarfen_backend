@@ -241,14 +241,29 @@ impl ExamAttempt {
 
     /// Stamp (or clear) the walked-out marker. The exam room sets it when the
     /// student's socket closes mid-attempt and clears it when they come back.
+    ///
+    /// Writes *only* the `left_at` field (never the whole row): the room's
+    /// teardown reads the attempt, sees it in progress, then stamps here — and
+    /// a submission that lands in that gap must survive. A whole-row write from
+    /// the pre-read snapshot would carry its blank `finished_at` back over the
+    /// fresh submission, silently un-submitting the exam (and, with
+    /// `allow_rejoin` off, locking the student out).
     pub async fn set_left(
-        mut self,
+        self,
         left_at: Option<Timestamp>,
         db: &Database,
     ) -> Result<ExamAttempt, AppError> {
-        self.left_at = left_at;
-        let updated: Option<ExamAttempt> = db.update(self.id.record()).content(self).await?;
-        updated.ok_or(AppError::NotFound)
+        let mut result = db
+            .query("UPDATE $id SET left_at = $left RETURN AFTER")
+            .bind(("id", self.id.record()))
+            .bind(("left", left_at))
+            .await?
+            .check()?;
+        result
+            .take::<Vec<ExamAttempt>>(0)?
+            .into_iter()
+            .next()
+            .ok_or(AppError::NotFound)
     }
 
     /// One sitting by id — the exam room re-reads its own attempt this way,
@@ -437,5 +452,61 @@ mod tests {
         let (resumed, created) = ExamAttempt::start(&exam, &user, &db).await.unwrap();
         assert!(!created);
         assert_eq!(resumed.get_seq(), 2);
+    }
+
+    #[tokio::test]
+    async fn stamping_left_never_reverts_a_submission() {
+        let db = init_mem().await.unwrap();
+        let (exam, _question) = open_exam_with_question(&db, 1).await;
+        let user = student();
+
+        // The student is sitting the exam.
+        let (attempt, _) = ExamAttempt::start(&exam, &user, &db).await.unwrap();
+        assert_eq!(attempt.get_seq(), 1);
+
+        // The exam-room teardown reads the attempt while it is still in
+        // progress (`stamp_left`'s read) — a snapshot with `finished_at` unset.
+        let stale = ExamAttempt::read(attempt.get_id(), &db)
+            .await
+            .unwrap()
+            .expect("attempt exists");
+        assert!(stale.get_finished_at().is_none());
+
+        // Before the teardown writes, the student submits (a REST finish, or a
+        // finish over another socket) — the submission lands.
+        let finished = ExamAttempt::read(attempt.get_id(), &db)
+            .await
+            .unwrap()
+            .expect("attempt exists")
+            .finish(&db)
+            .await
+            .unwrap();
+        assert!(finished.get_finished_at().is_some());
+
+        // Now the last socket's teardown stamps `left_at` from its stale
+        // snapshot. Stamping the walk-out must touch only `left_at` — it must
+        // not carry the snapshot's blank `finished_at` back over the fresh
+        // submission, or the student's submitted exam silently reopens (and,
+        // with `allow_rejoin` off, locks them out of a room they left after
+        // finishing).
+        stale.set_left(Some(Timestamp::now()), &db).await.unwrap();
+
+        let after = ExamAttempt::read(attempt.get_id(), &db)
+            .await
+            .unwrap()
+            .expect("attempt still exists");
+        assert!(
+            after.get_finished_at().is_some(),
+            "stamping left_at must not revert a submission that raced it"
+        );
+        assert!(
+            after.get_left_at().is_some(),
+            "the walk-out is still recorded"
+        );
+        assert_eq!(
+            after.status(&exam, Timestamp::now()),
+            AttemptStatus::Submitted,
+            "the attempt stays submitted"
+        );
     }
 }
