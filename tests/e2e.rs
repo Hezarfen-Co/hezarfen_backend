@@ -501,6 +501,167 @@ async fn live_exam_stream_pushes_snapshots_over_http() {
     assert!(body.contains("\"enrolled\":1"), "{body}");
 }
 
+/// Read the open SSE stream `res` until a `snapshot` event whose parsed JSON
+/// satisfies `want`, and return that snapshot. `buf` carries bytes between
+/// calls, so a partial event at the end of one read completes in the next and
+/// events already buffered are drained before more are pulled. Panics if
+/// nothing matching arrives within `within`.
+async fn next_matching_snapshot(
+    res: &mut reqwest::Response,
+    buf: &mut String,
+    within: std::time::Duration,
+    want: impl Fn(&Value) -> bool,
+) -> Value {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        // Drain every complete event (`\n\n`-terminated) already buffered
+        // before pulling more bytes — keep-alive comments and non-snapshot
+        // frames are skipped, non-matching snapshots consumed and dropped.
+        while let Some(end) = buf.find("\n\n") {
+            let event: String = buf.drain(..end + 2).collect();
+            if !event.contains("event: snapshot") {
+                continue;
+            }
+            let data = event
+                .lines()
+                .find_map(|line| line.strip_prefix("data:"))
+                .expect("a snapshot event carries a data line")
+                .trim();
+            let snapshot: Value = serde_json::from_str(data).expect("snapshot is json");
+            if want(&snapshot) {
+                return snapshot;
+            }
+        }
+        let chunk = tokio::time::timeout_at(deadline, res.chunk())
+            .await
+            .expect("an SSE event before the deadline")
+            .expect("stream stays open")
+            .expect("stream yields data");
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+    }
+}
+
+/// The teacher's monitor updates *live* on one held-open connection: after the
+/// first snapshot lands, a student's submission must surface in a *later* event
+/// on the *same* stream, no reconnect. Guards against a monitor that replays a
+/// cached first snapshot or stops re-reading the exam each tick — the split
+/// coverage (one-shot `/live` correctness + a single streamed event) would miss
+/// that.
+#[tokio::test]
+async fn live_stream_reflects_a_status_change_on_the_open_connection() {
+    let (base, db) = spawn_server().await;
+    let teacher = client();
+    register(&teacher, &base, "hoca").await;
+    promote(&db, "hoca", "teacher").await;
+    login(&teacher, &base, "hoca").await;
+
+    let student = client();
+    register(&student, &base, "veli").await;
+    login(&student, &base, "veli").await;
+    let student_id: Value = student
+        .get(format!("{base}/auth/me"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let student_id = student_id["id"].as_str().unwrap().to_string();
+
+    let now: Value = teacher
+        .get(format!("{base}/time"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let now = now["now"].as_i64().unwrap();
+
+    let course: Value = teacher
+        .post(format!("{base}/courses"))
+        .json(&json!({ "title": "algebra" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let course_id = course["id"].as_str().unwrap();
+    let res = teacher
+        .post(format!("{base}/courses/{course_id}/enrollments"))
+        .json(&json!({ "user_id": student_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let exam: Value = teacher
+        .post(format!("{base}/courses/{course_id}/exams"))
+        .json(&json!({
+            "title": "final", "kind": "final",
+            "mode": "sync", "starts_at": now - 1_000, "ends_at": now + 600_000,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let exam_id = exam["id"].as_str().unwrap();
+
+    // The student sits down — in progress, nothing submitted.
+    let res = student
+        .post(format!("{base}/exams/{exam_id}/attempt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+
+    // The teacher opens the live stream and reads the first snapshot.
+    let mut res = teacher
+        .get(format!("{base}/exams/{exam_id}/live/stream"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(
+        res.headers()
+            .get("content-type")
+            .expect("content-type")
+            .to_str()
+            .unwrap()
+            .starts_with("text/event-stream")
+    );
+
+    let mut buf = String::new();
+    let first =
+        next_matching_snapshot(&mut res, &mut buf, std::time::Duration::from_secs(5), |s| {
+            s["counts"]["in_progress"].as_i64() == Some(1)
+        })
+        .await;
+    assert_eq!(first["counts"]["submitted"], 0, "{first}");
+    assert_eq!(first["students"][0]["user"]["username"], "veli");
+    assert_eq!(first["students"][0]["status"], "in_progress", "{first}");
+
+    // The student submits while the teacher's stream stays open.
+    let res_finish = student
+        .post(format!("{base}/exams/{exam_id}/attempt/finish"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res_finish.status(), StatusCode::OK);
+
+    // A later event on the same connection must carry the change — the monitor
+    // re-reads and recomputes each tick, it does not replay the first snapshot.
+    let later =
+        next_matching_snapshot(&mut res, &mut buf, std::time::Duration::from_secs(8), |s| {
+            s["counts"]["submitted"].as_i64() == Some(1)
+        })
+        .await;
+    assert_eq!(later["counts"]["in_progress"], 0, "{later}");
+    assert_eq!(later["students"][0]["status"], "submitted", "{later}");
+}
+
 /// Log in without a cookie jar and hand back the raw `session=<token>` pair —
 /// the exact header value the WebSocket handshake needs (tungstenite carries
 /// no jar of its own).
