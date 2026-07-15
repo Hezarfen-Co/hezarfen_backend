@@ -266,9 +266,10 @@ async fn delete_session(
 // ---- roll call --------------------------------------------------------------
 
 /// Record a user's roll-call state for a session. The session's teacher or a
-/// course manager marks **enrolled students**; marking the **session's
-/// teacher** requires manager+ (staff presence is management's call, so a
-/// teacher can't mark themselves present). Students never self-mark a lesson.
+/// course manager marks **enrolled students** (only students attend classes);
+/// marking the **session's teacher** requires manager+ (staff presence is
+/// management's call, so a teacher can't mark themselves present). Students
+/// never self-mark a lesson.
 #[utoipa::path(
     post,
     path = "/{id}/attendance",
@@ -278,7 +279,7 @@ async fn delete_session(
     request_body = MarkRollCall,
     responses(
         (status = 200, description = "Roll-call state recorded", body = SessionAttendanceResponse),
-        (status = 400, description = "Invalid status, unknown user, or target not on the roster", body = ErrorResponse),
+        (status = 400, description = "Invalid status, unknown user, target not a student, or not on the roster", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the session teacher or a course manager; or marking the teacher without manager+", body = ErrorResponse),
         (status = 404, description = "Session not found", body = ErrorResponse),
@@ -316,15 +317,25 @@ async fn mark_roll_call(
                 "marking the session's teacher requires manager role or higher",
             ));
         }
-    } else if Enrollment::read_for_user(session.get_course(), &target, &st.db)
-        .await?
-        .is_none()
-    {
-        // Everyone else on a lesson's roster comes from the enrollment list.
-        return Err(AppError::Validation(ValidationError::Invalid {
-            field: "user_id",
-            reason: "target user is not enrolled in this course",
-        }));
+    } else {
+        // Everyone else on a lesson's roster is an enrolled student. Only
+        // students attend classes; checking the live role keeps a stale
+        // enrollment (left by a promotion) from putting staff on the roll.
+        if target_user.get_role() != Role::Student {
+            return Err(AppError::Validation(ValidationError::Invalid {
+                field: "user_id",
+                reason: "only students can be marked present in a lesson",
+            }));
+        }
+        if Enrollment::read_for_user(session.get_course(), &target, &st.db)
+            .await?
+            .is_none()
+        {
+            return Err(AppError::Validation(ValidationError::Invalid {
+                field: "user_id",
+                reason: "target user is not enrolled in this course",
+            }));
+        }
     }
 
     let attendance =

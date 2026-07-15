@@ -376,7 +376,9 @@ async fn delete_course(
 // ---- enrollments ----------------------------------------------------------
 
 /// Enroll a user into a course (idempotent upsert). Requires teacher+ and
-/// course management rights.
+/// course management rights. Only students can be enrolled — enrollment is
+/// student membership, and it gates sitting exams, being graded, and the class
+/// roster, all student-only.
 #[utoipa::path(
     post,
     path = "/{id}/enrollments",
@@ -386,7 +388,7 @@ async fn delete_course(
     request_body = EnrollUser,
     responses(
         (status = 200, description = "Enrolled (or already enrolled)", body = EnrollmentResponse),
-        (status = 400, description = "Unknown user", body = ErrorResponse),
+        (status = 400, description = "Unknown user, or user is not a student", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
@@ -414,6 +416,16 @@ async fn enroll(
             reason: "target user does not exist",
         }));
     };
+
+    // Enrollment is student membership: it gates sitting exams, being graded,
+    // and appearing on a lesson roster — all student-only. Staff run courses,
+    // they don't enroll in them.
+    if target_user.get_role() != Role::Student {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "user_id",
+            reason: "only students can be enrolled in a course",
+        }));
+    }
 
     let enrollment = Enrollment::enroll(course.get_id(), &target, user.get_id(), &st.db).await?;
     let people = PersonRef::map_of(&[&target_user, &user]);

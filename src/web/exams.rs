@@ -387,8 +387,9 @@ async fn delete_exam(
 // ---- results ------------------------------------------------------------
 
 /// Record (or overwrite) a student's mark for an exam. Requires teacher+ and
-/// management rights over the exam's course; the target must be enrolled.
-/// Students never grade — and nobody grades themselves.
+/// management rights over the exam's course; the target must be a student and
+/// enrolled. Only students carry marks; students never grade — and nobody
+/// grades themselves.
 #[utoipa::path(
     post,
     path = "/{id}/results",
@@ -398,7 +399,7 @@ async fn delete_exam(
     request_body = GradeResult,
     responses(
         (status = 200, description = "Result recorded", body = ExamResultResponse),
-        (status = 400, description = "Invalid mark, unknown user, or user not enrolled", body = ErrorResponse),
+        (status = 400, description = "Invalid mark, unknown user, user not a student, or not enrolled", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator (and not a manager/admin), or attempted to grade yourself", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
@@ -438,6 +439,15 @@ async fn grade(
             reason: "target user does not exist",
         }));
     };
+
+    // Only students carry marks — the grade system is theirs alone. A stale
+    // enrollment left behind by a promotion can't reopen grading for staff.
+    if target_user.get_role() != Role::Student {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "user_id",
+            reason: "only students can be graded",
+        }));
+    }
 
     // ... and be enrolled in the exam's course.
     if Enrollment::read_for_user(exam.get_course(), &target, &st.db)
@@ -741,9 +751,10 @@ async fn attempts_used(exam: &ExamId, user: &UserId, db: &Database) -> Result<u6
     Ok(ExamAttempt::list_for_user(exam, user, db).await?.len() as u64)
 }
 
-/// Start, resume, or retake the caller's attempt. Requires enrollment in the
-/// exam's course, a sittable exam (`sync`/`async`/`open` mode), and — when a
-/// window exists — the window to be open. A still-running attempt is returned
+/// Start, resume, or retake the caller's attempt. Requires the student role
+/// (staff run exams, they don't sit them), enrollment in the exam's course, a
+/// sittable exam (`sync`/`async`/`open` mode), and — when a window exists — the
+/// window to be open. A still-running attempt is returned
 /// as-is (`200` instead of `201`), so a reconnecting client gets its original
 /// clock back — re-starting never resets the time. Once the latest attempt is
 /// submitted or expired, re-posting starts the next sitting (`201`, blank
@@ -758,7 +769,7 @@ async fn attempts_used(exam: &ExamId, user: &UserId, db: &Database) -> Result<u6
         (status = 201, description = "Attempt started (first sitting or a retake)", body = AttemptResponse),
         (status = 200, description = "Running attempt resumed (unchanged)", body = AttemptResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not enrolled in the exam's course", body = ErrorResponse),
+        (status = 403, description = "Not a student, or not enrolled in the exam's course", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
         (status = 409, description = "Draft exam, outside the window, or no attempts remaining", body = ErrorResponse),
     ),
@@ -772,6 +783,7 @@ async fn start_attempt(
         .await?
         .ok_or(AppError::NotFound)?;
     ensure_sittable(&exam)?;
+    ensure_student(&user)?;
     ensure_enrolled(&exam, user.get_id(), &st.db).await?;
     let now = Timestamp::now();
     if let Some(starts_at) = exam.get_starts_at()
@@ -1589,8 +1601,9 @@ pub(crate) async fn save_answer_checked(
 }
 
 /// The tail of the answer write path, given the sitting to write in: the
-/// enrollment wall (leaving the course closes the sheet, mid-exam included),
-/// the rejoin gate, the question lookup, and the upsert.
+/// student wall and the enrollment wall (a promotion out of `student` or an
+/// unenrollment closes the sheet, mid-exam included), the rejoin gate, the
+/// question lookup, and the upsert.
 pub(crate) async fn save_answer_in(
     exam: &Exam,
     attempt: &ExamAttempt,
@@ -1599,10 +1612,36 @@ pub(crate) async fn save_answer_in(
     text: Option<String>,
     db: &Database,
 ) -> Result<ExamAnswer, AppError> {
+    ensure_student_now(attempt.get_user(), db).await?;
     ensure_enrolled(exam, attempt.get_user(), db).await?;
     check_rejoin(exam, attempt)?;
     let question = question_of_exam(exam.get_id(), question_id, db).await?;
     ExamAnswer::save(&question, attempt.get_user(), selected, text, db).await
+}
+
+/// A 403 unless `user` is a student. Sitting an exam is a student action —
+/// teachers and above run exams, they never take them — so the sit paths
+/// (start, room, save) enforce it on the *current* role. Checking the live
+/// role, not just enrollment, closes the gap a mid-exam promotion would open
+/// and neutralizes any stale non-student enrollment. Reading one's own attempt
+/// and finishing stay ungated: a non-student has no attempt to read, and
+/// finishing only submits work already saved.
+pub(crate) fn ensure_student(user: &User) -> Result<(), AppError> {
+    if user.get_role() != Role::Student {
+        return Err(AppError::Forbidden("only students can sit exams"));
+    }
+    Ok(())
+}
+
+/// The answer path's live edition of [`ensure_student`]: re-read the row and
+/// judge the *current* role, exactly like the enrollment wall beside it. Both
+/// save paths run through here (REST per request, the exam room per message),
+/// so a promotion out of `student` mid-exam closes the sheet on the very next
+/// save — the room's door check is not the last word for a socket that
+/// outlives the role.
+pub(crate) async fn ensure_student_now(user: &UserId, db: &Database) -> Result<(), AppError> {
+    let user = User::read(user, db).await?.ok_or(AppError::Unauthorized)?;
+    ensure_student(&user)
 }
 
 /// A 403 unless `user` is enrolled in the exam's course — the same wall the
@@ -1688,8 +1727,9 @@ async fn attempt_questions(
 
 /// Save (or overwrite) one answer in the caller's in-progress attempt.
 /// `choice` questions take `selected`; `text` questions take `text`. Requires
-/// enrollment in the exam's course — an unenrollment mid-exam closes the
-/// sheet. Rejected once the attempt is submitted or its deadline has passed —
+/// the student role and enrollment in the exam's course — an unenrollment (or a
+/// promotion out of `student`) mid-exam closes the sheet. Rejected once the
+/// attempt is submitted or its deadline has passed —
 /// the server clock, not the client's, is the judge — and rejected while the
 /// student has left the exam room with the exam's rejoin door closed.
 #[utoipa::path(
@@ -1703,7 +1743,7 @@ async fn attempt_questions(
         (status = 200, description = "Answer saved", body = AnswerSavedResponse),
         (status = 400, description = "Payload doesn't match the question's kind", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not enrolled in the exam's course", body = ErrorResponse),
+        (status = 403, description = "Not a student, or not enrolled in the exam's course", body = ErrorResponse),
         (status = 404, description = "No such exam, question, or attempt", body = ErrorResponse),
         (status = 409, description = "Attempt already submitted, time is up, or rejoin is closed", body = ErrorResponse),
     ),
@@ -1717,6 +1757,7 @@ async fn save_answer(
     let exam = Exam::read(&ExamId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
+    ensure_student(&user)?;
     let answer = save_answer_checked(
         &exam,
         user.get_id(),

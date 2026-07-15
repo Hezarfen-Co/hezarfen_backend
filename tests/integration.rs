@@ -7,7 +7,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use common::{
     app_and_db, create_course, create_exam, create_exam_with, create_session, enroll, id_of, login,
-    login_as, me_id, mem_app, send,
+    login_as, me_id, mem_app, send, set_role,
 };
 use hezarfen_backend::domain::exam::ExamId;
 use hezarfen_backend::domain::exam_attempt::ExamAttempt;
@@ -2989,7 +2989,10 @@ async fn padded_usernames_are_canonicalized_not_distinct_accounts() {
 
 /// Regression: the grade endpoint verified the exam, the mark, and that the
 /// target exists — but never that the grader isn't the target, so any teacher
-/// could write their own mark. "Grading never targets oneself" (README).
+/// could write their own mark. "Grading never targets oneself" (README). The
+/// self-check precedes the target-role and enrollment checks, so it holds even
+/// though staff — the only ones who can grade — are never enrolled or
+/// gradeable themselves.
 #[tokio::test]
 async fn graders_cannot_grade_themselves() {
     let (app, db) = app_and_db().await;
@@ -2997,10 +3000,11 @@ async fn graders_cannot_grade_themselves() {
     let boss = login_as(&app, &db, "boss", "manager").await;
     let teacher_id = me_id(&app, &teacher).await;
     let boss_id = me_id(&app, &boss).await;
+    let student = login(&app, "veli").await;
+    let student_id = me_id(&app, &student).await;
 
     let course_id = create_course(&app, &teacher, "algebra").await;
-    enroll(&app, &teacher, &course_id, &teacher_id).await;
-    enroll(&app, &teacher, &course_id, &boss_id).await;
+    enroll(&app, &teacher, &course_id, &student_id).await;
     let exam_id = create_exam(&app, &teacher, &course_id, "t", "quiz").await;
 
     // Self-grading is forbidden at every privilege level, not just for teachers.
@@ -3036,16 +3040,152 @@ async fn graders_cannot_grade_themselves() {
         0
     );
 
-    // Grading someone *else* still works (boss grades teacher).
+    // Grading someone *else* still works (boss grades the enrolled student).
     let res = send(
         &app,
         "POST",
         &format!("/exams/{exam_id}/results"),
         Some(&boss),
-        Some(json!({ "mark": 90, "user_id": teacher_id })),
+        Some(json!({ "mark": 90, "user_id": student_id })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK);
+}
+
+/// Enrollment is student membership: staff (teacher/manager/admin) can't be
+/// enrolled, so they never gain the seat that gates sitting exams, being
+/// graded, and the class roster. A plain student enrolls fine.
+#[tokio::test]
+async fn only_students_can_be_enrolled() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "teacher", "teacher").await;
+    let colleague = login_as(&app, &db, "colleague", "teacher").await;
+    let manager = login_as(&app, &db, "boss", "manager").await;
+    let colleague_id = me_id(&app, &colleague).await;
+    let manager_id = me_id(&app, &manager).await;
+
+    let course = create_course(&app, &teacher, "algebra").await;
+
+    // A fellow teacher and a manager are both refused — staff don't enroll.
+    for staff_id in [&colleague_id, &manager_id] {
+        let res = send(
+            &app,
+            "POST",
+            &format!("/courses/{course}/enrollments"),
+            Some(&teacher),
+            Some(json!({ "user_id": staff_id })),
+        )
+        .await;
+        assert_eq!(
+            res.status,
+            StatusCode::BAD_REQUEST,
+            "enrolling staff must be rejected"
+        );
+    }
+
+    // A student enrolls without complaint (the helper asserts 200).
+    let student = login(&app, "veli").await;
+    let student_id = me_id(&app, &student).await;
+    enroll(&app, &teacher, &course, &student_id).await;
+}
+
+/// The student-only rule is enforced on the *live* role, not merely at enroll
+/// time. A student enrolled mid-course, then promoted to staff, keeps the
+/// enrollment row — but it goes inert: they can no longer sit the exam, save
+/// answers, be graded, or be marked present. This is the "stale rows stay
+/// inert" decision, made airtight by the action-time checks.
+#[tokio::test]
+async fn promotion_out_of_student_freezes_the_seat() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "teacher", "teacher").await;
+    let student = login(&app, "veli").await;
+    let student_id = me_id(&app, &student).await;
+
+    let course = create_course(&app, &teacher, "algebra").await;
+    enroll(&app, &teacher, &course, &student_id).await;
+    let future = Timestamp::now().as_millis() + 3_600_000;
+    let session = create_session(&app, &teacher, &course, future).await;
+    let exam = scheduled_exam(
+        &app,
+        &teacher,
+        &course,
+        json!({ "title": "essay", "kind": "quiz", "mode": "open" }),
+    )
+    .await;
+
+    // While still a student, the seat works: they can start a sitting.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "student sits: {}", res.body);
+
+    // Promote the enrolled student to teacher; the enrollment row survives.
+    set_role(&db, "veli", "teacher").await;
+
+    // Sitting is now refused — the live role, not the stale seat, decides.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::FORBIDDEN,
+        "promoted user can't start a sitting"
+    );
+
+    // Nor can they save into the attempt they opened while still a student.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt/answers"),
+        Some(&student),
+        Some(json!({ "question_id": "nope", "selected": 0 })),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::FORBIDDEN,
+        "promoted user can't save answers"
+    );
+
+    // Grading the promoted user is refused — only students carry marks.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/results"),
+        Some(&teacher),
+        Some(json!({ "mark": 80, "user_id": student_id })),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::BAD_REQUEST,
+        "promoted user can't be graded"
+    );
+
+    // Roll call is refused too — only students attend classes.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/sessions/{session}/attendance"),
+        Some(&teacher),
+        Some(json!({ "status": "present", "user_id": student_id })),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::BAD_REQUEST,
+        "promoted user can't be rolled"
+    );
 }
 
 /// Regression: `User::create` pre-checks the username and then inserts, so two
@@ -7158,18 +7298,27 @@ async fn search_rejects_a_blank_query() {
 
 // --- courses: catalog dedup -------------------------------------------------
 
-/// A teacher who is also enrolled in their own course sees it once in the
-/// catalog, not twice — the created and enrolled sources are deduplicated.
+/// A user who both created a course (while staff) and is enrolled in it (after
+/// a demotion to student) sees it once in the catalog, not twice — the created
+/// and enrolled sources are deduplicated. Enrollment is student-only now, so
+/// that overlap can only arise across a role change; the dedup must still hold.
 #[tokio::test]
 async fn course_catalog_lists_a_creator_enrolled_course_once() {
     let (app, db) = app_and_db().await;
-    let teacher = login_as(&app, &db, "teacher", "teacher").await;
-    let teacher_id = me_id(&app, &teacher).await;
+    let creator = login_as(&app, &db, "teacher", "teacher").await;
+    let boss = login_as(&app, &db, "boss", "manager").await;
+    let creator_id = me_id(&app, &creator).await;
 
-    let course = create_course(&app, &teacher, "algebra").await;
-    enroll(&app, &teacher, &course, &teacher_id).await;
+    let course = create_course(&app, &creator, "algebra").await;
+    // Author the exam while still staff, before the demotion below.
+    let exam = create_exam(&app, &creator, &course, "mt", "quiz").await;
 
-    let res = send(&app, "GET", "/courses", Some(&teacher), None).await;
+    // Demote the creator to student, then have a manager enroll them into their
+    // own course: they now show up in both the created and enrolled sources.
+    set_role(&db, "teacher", "student").await;
+    enroll(&app, &boss, &course, &creator_id).await;
+
+    let res = send(&app, "GET", "/courses", Some(&creator), None).await;
     assert_eq!(res.status, StatusCode::OK);
     let courses = common::items(&res.body);
     assert_eq!(courses.len(), 1, "created+enrolled must dedup: {courses:?}");
@@ -7177,8 +7326,7 @@ async fn course_catalog_lists_a_creator_enrolled_course_once() {
 
     // The exam catalog derives from the same visible set and must not double
     // the course's exams either.
-    let exam = create_exam(&app, &teacher, &course, "mt", "quiz").await;
-    let res = send(&app, "GET", "/exams", Some(&teacher), None).await;
+    let res = send(&app, "GET", "/exams", Some(&creator), None).await;
     let exams = common::items(&res.body);
     assert_eq!(exams.len(), 1, "one exam listed once: {exams:?}");
     assert_eq!(exams[0]["id"], json!(exam));

@@ -24,7 +24,9 @@
 //! Every save and every tick re-reads the exam and attempt, so the deadline
 //! stays server-authoritative: a teacher extending `ends_at` (or `duration_ms`)
 //! mid-exam moves this room's clock on the next tick, and a stale client can
-//! never write past its real deadline.
+//! never write past its real deadline. Every save also re-judges the sitter —
+//! live role and enrollment — so a promotion out of `student` or an
+//! unenrollment mid-exam closes the sheet with no reconnect needed.
 //!
 //! The room is also the presence signal behind the rejoin policy: connecting
 //! clears the attempt's `left_at`, and the *last* socket of the sitting to
@@ -60,7 +62,9 @@ use crate::domain::user::UserId;
 use crate::error::AppError;
 use crate::state::AppState;
 use crate::web::CurrentUser;
-use crate::web::exams::{check_rejoin, ensure_enrolled, save_answer_in, writable_attempt};
+use crate::web::exams::{
+    check_rejoin, ensure_enrolled, ensure_student, save_answer_in, writable_attempt,
+};
 
 /// What the client asked for, tagged by `type`.
 #[derive(Deserialize)]
@@ -79,10 +83,11 @@ enum ClientMessage {
 
 /// Upgrade into the caller's exam room. All gates run *before* the upgrade so
 /// a rejected client gets a proper HTTP status instead of an instant close:
-/// unknown exam (404), draft with no mode (409), not enrolled (403), no
-/// attempt yet (404 — `POST /exams/{id}/attempt` first), submitted or expired
-/// (409), left the room while rejoin is closed (409). Entering the room
-/// clears the attempt's `left_at` — the student is back inside.
+/// unknown exam (404), draft with no mode (409), not a student (403), not
+/// enrolled (403), no attempt yet (404 — `POST /exams/{id}/attempt` first),
+/// submitted or expired (409), left the room while rejoin is closed (409).
+/// Entering the room clears the attempt's `left_at` — the student is back
+/// inside.
 pub async fn attempt_ws(
     State(st): State<AppState>,
     CurrentUser(user): CurrentUser,
@@ -97,6 +102,7 @@ pub async fn attempt_ws(
             "this exam is not scheduled — there is nothing to sit (give it a mode: sync, async, or open)",
         ));
     }
+    ensure_student(&user)?;
     ensure_enrolled(&exam, user.get_id(), &st.db).await?;
     let attempt = writable_attempt(&exam, user.get_id(), &st.db).await?;
     check_rejoin(&exam, &attempt)?;

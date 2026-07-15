@@ -758,6 +758,7 @@ async fn ws_frame_of_type(ws: &mut WsStream, kind: &str) -> Value {
 /// `window_ms` from now.
 struct ExamRoom {
     base: String,
+    db: Database,
     teacher: Client,
     student: Client,
     student_id: String,
@@ -840,6 +841,7 @@ async fn exam_room_fixture(window_ms: i64) -> ExamRoom {
     let cookie = raw_session_cookie(&base, "veli").await;
     ExamRoom {
         base,
+        db,
         teacher,
         student,
         student_id,
@@ -1058,6 +1060,89 @@ async fn exam_room_rejects_bad_handshakes() {
             .err(),
         Some(409)
     );
+}
+
+/// A promotion out of `student` mid-exam closes the open room's answer sheet
+/// on the very next save: the role wall is re-judged per save against the
+/// live row — like the enrollment wall — so the door check is never the last
+/// word for a socket that outlives the role. A demotion back reopens the
+/// sheet on the same socket: it is a live check, not a latch.
+#[tokio::test]
+async fn exam_room_promotion_mid_exam_closes_the_sheet() {
+    let room = exam_room_fixture(600_000).await;
+    let ExamRoom {
+        base,
+        db,
+        teacher,
+        student,
+        student_id,
+        cookie,
+        exam_id,
+        question_id,
+        ..
+    } = &room;
+    let res = student
+        .post(format!("{base}/exams/{exam_id}/attempt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let mut ws = ws_open(base, exam_id, Some(cookie)).await.expect("upgrade");
+
+    // While the sitter is a student the sheet is open — save one answer.
+    ws_send(
+        &mut ws,
+        json!({ "type": "answer", "question_id": question_id, "selected": 1 }),
+    )
+    .await;
+    ws_frame_of_type(&mut ws, "saved").await;
+
+    // Mid-exam, with the socket still open, the sitter stops being a student.
+    promote(db, "veli", "teacher").await;
+
+    // The very next save is refused over the same socket...
+    ws_send(
+        &mut ws,
+        json!({ "type": "answer", "question_id": question_id, "selected": 0 }),
+    )
+    .await;
+    let error = ws_frame_of_type(&mut ws, "error").await;
+    assert!(
+        error["message"].as_str().unwrap().contains("only students"),
+        "{error}"
+    );
+
+    // ... and over REST — the two paths share the wall.
+    let res = student
+        .post(format!("{base}/exams/{exam_id}/attempt/answers"))
+        .json(&json!({ "question_id": question_id, "selected": 0 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+    // The refused writes left no trace: the sheet still holds the original.
+    let sheet: Value = teacher
+        .get(format!(
+            "{base}/exams/{exam_id}/attempts/{student_id}/answers"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(sheet["answers"].as_array().unwrap().len(), 1);
+    assert_eq!(sheet["answers"][0]["selected"], 1);
+
+    // Demoted back, the same socket writes again — no reconnect required.
+    promote(db, "veli", "student").await;
+    ws_send(
+        &mut ws,
+        json!({ "type": "answer", "question_id": question_id, "selected": 0 }),
+    )
+    .await;
+    ws_frame_of_type(&mut ws, "saved").await;
 }
 
 /// A teacher extending `ends_at` mid-exam moves the open room's countdown on

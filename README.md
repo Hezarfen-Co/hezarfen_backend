@@ -6,7 +6,8 @@ Session-cookie auth with four hierarchical roles (`student < teacher < manager
 < admin`). Notes are per-user. Attendance is event + attendees: create an event,
 then mark users present / absent / late / excused. Marks are course-shaped
 (Google Classroom style): a teacher creates a course, enrolls students, adds
-exams inside it, and grades; students read a per-course weighted average and
+exams inside it, and grades — enrolling, sitting exams, roll call, and marks are
+all student-only, staff never take part; students read a per-course weighted average and
 an overall average from their mark report — each exam weighted by its **kind**
 (midterms can count double, orals once: weights are set per kind in settings,
 not per exam). Exams run **sync** (one
@@ -162,23 +163,23 @@ effect on the user's very next call (no re-login).
 | View a course's sessions                 | student      | Only inside **visible** courses: enrolled, creator, or `manager`+ |
 | List a session's roll call               | teacher      | The **session's teacher**, or anyone with course-management rights |
 | Create / edit / delete a course session  | teacher      | Course-management rights (course creator, or `manager`+) |
-| Take a session's roll call (mark/remove **enrolled students**) | teacher | The **session's teacher**, or anyone with course-management rights |
+| Take a session's roll call (mark/remove **enrolled students**) | teacher | The **session's teacher**, or anyone with course-management rights; only students sit on a roster |
 | Mark / remove the **session teacher's** presence row | manager | Staff presence is management's call — the teacher can't self-mark |
 | Work check-in / check-out; view **own** work log | teacher | Instants are server-stamped, never client-supplied |
 | View / correct / delete **any** staff work log entry | manager | Corrections only on closed entries |
 | Read **own** attendance report           | student      |                                               |
 | Read another user's attendance report    | teacher      | Narrowed to the caller's managed courses; `manager`+ sees all |
 | View **visible** courses/exams; read **own** result, courses, mark report | student | Visible = enrolled (teachers: + created; `manager`+: all) |
-| Sit a sittable exam (`sync`/`async`/`open`): start / resume / retake / read / submit **own** attempt | student | Must be enrolled; window (where one exists) and `max_attempts` enforced by the server |
-| Answer questions inside **own** attempt (REST autosave or the exam-room WebSocket) | student | Attempt must be `in_progress`; deadline judged by the server clock; blocked after leaving the room while `allow_rejoin` is off |
+| Sit a sittable exam (`sync`/`async`/`open`): start / resume / retake / read / submit **own** attempt | student | **Students only** — staff never sit; must be enrolled; window (where one exists) and `max_attempts` enforced by the server |
+| Answer questions inside **own** attempt (REST autosave or the exam-room WebSocket) | student | **Students only**; attempt must be `in_progress`; deadline judged by the server clock; blocked after leaving the room while `allow_rejoin` is off |
 | Author an exam's questions (add/edit/delete)  | teacher | Course-management rights; frozen once anyone has an attempt |
 | Read a question list (with `correct`) or a student's answer sheet | teacher | Course-management rights — one teacher can't read another's answer key |
 | Watch an exam's live monitor (snapshot or SSE stream) | teacher | Course-management rights |
 | Create courses                           | teacher      | The creator manages the course                 |
-| Manage inside a course: edit/delete it, enroll/unenroll, add/edit/delete its exams, grade, remove results | teacher | Only the **course creator**, or a `manager`+ for any course |
+| Manage inside a course: edit/delete it, enroll/unenroll **students**, add/edit/delete its exams, grade, remove results | teacher | Only the **course creator**, or a `manager`+ for any course; only students can be enrolled |
 | View a course's roster, an exam's result list / statistics | teacher | Course-management rights |
 | Read another user's mark report          | teacher      | Narrowed to the caller's managed courses; `manager`+ sees all |
-| Grade students                           | teacher      | Target must be **enrolled**; grading never targets oneself |
+| Grade students                           | teacher      | Target must be an **enrolled student**; grading never targets oneself |
 | Edit **own** personal info (name, surname, email, phone, birth date) | student | Every account carries the same optional info fields |
 | Read the school settings and the term list | student | Clients need them to render kind/status pickers, grades, and the calendar |
 | Edit school settings; create / edit / delete terms | manager | School policy (exam kinds, attendance statuses, grade bands) and the academic calendar are management's call |
@@ -277,7 +278,7 @@ their existing shapes: the student exam-room reads
 | GET    | `/courses/{id}`                  | student | Get course (enrolled, creator, or manager+) |
 | PATCH  | `/courses/{id}`                  | teacher | Edit course (creator, or manager+ for any) |
 | DELETE | `/courses/{id}`                  | teacher | Delete course + its exams, results, enrollments (creator, or manager+) |
-| POST   | `/courses/{id}/enrollments`      | teacher | `{user_id}` — enroll a user (idempotent upsert; course manager) |
+| POST   | `/courses/{id}/enrollments`      | teacher | `{user_id}` — enroll a **student** (idempotent upsert; course manager; only students can be enrolled) |
 | GET    | `/courses/{id}/enrollments`      | teacher | List the course roster (course manager) · paged |
 | DELETE | `/courses/{id}/enrollments/{user}` | teacher | Unenroll (keeps recorded results; course manager) |
 | POST   | `/courses/{id}/sessions`         | teacher | `{topic?, teacher_id?, starts_at, ends_at?}` — add a lesson (course manager; teacher defaults to the caller) |
@@ -285,7 +286,7 @@ their existing shapes: the student exam-room reads
 | GET    | `/sessions/{id}`                 | student | Get session (enrolled, session teacher, or course manager) |
 | PATCH  | `/sessions/{id}`                 | teacher | Edit session (course manager; `null` clears `ends_at`) |
 | DELETE | `/sessions/{id}`                 | teacher | Delete session + its roll call (course manager) |
-| POST   | `/sessions/{id}/attendance`      | teacher | `{status, user_id}` — roll call: session teacher/course manager mark **enrolled** students; the teacher's own row needs manager+ |
+| POST   | `/sessions/{id}/attendance`      | teacher | `{status, user_id}` — roll call: session teacher/course manager mark **enrolled students** (students only); the teacher's own row needs manager+ |
 | GET    | `/sessions/{id}/attendance`      | teacher | List the session's roll call (session teacher or course manager) · paged |
 | DELETE | `/sessions/{id}/attendance/{user}` | teacher | Remove a roll-call row (same rights as marking) |
 | POST   | `/courses/{id}/exams`            | teacher | `{title, description?, kind, mode?, starts_at?, ends_at?, duration_ms?, max_attempts?, allow_rejoin?}` — add an exam (course manager); its weight comes from the kind |
@@ -294,12 +295,12 @@ their existing shapes: the student exam-room reads
 | GET    | `/exams/{id}`                    | student | Get exam (enrolled, creator, or manager+) |
 | PATCH  | `/exams/{id}`                    | teacher | Edit exam incl. `kind` (re-weights it), schedule, `max_attempts`, `allow_rejoin` (course manager; `course` immutable, `mode` frozen once attempted — the rest stays live) |
 | DELETE | `/exams/{id}`                    | teacher | Delete exam + its results, attempts, questions, and answers (course manager) |
-| POST   | `/exams/{id}/results`            | teacher | `{mark, user_id}` — grade an **enrolled** student (upsert; course manager) |
+| POST   | `/exams/{id}/results`            | teacher | `{mark, user_id}` — grade an **enrolled student** (upsert; course manager; students only) |
 | GET    | `/exams/{id}/results`            | teacher | List every result for the exam (course manager) · paged |
 | GET    | `/exams/{id}/result`             | student | The caller's **own** result (`404` until graded) |
 | DELETE | `/exams/{id}/results/{user}`     | teacher | Remove a student's result (course manager) |
 | GET    | `/exams/{id}/statistics`         | teacher | `{graded, average, min, max}` over the exam's results (course manager) |
-| POST   | `/exams/{id}/attempt`            | student | Start (`201`), resume (`200`), or retake (`201`, blank sheet) the caller's attempt — enrolled; window open where one exists; `409` once `max_attempts` is spent |
+| POST   | `/exams/{id}/attempt`            | student | Start (`201`), resume (`200`), or retake (`201`, blank sheet) the caller's attempt — students only; enrolled; window open where one exists; `409` once `max_attempts` is spent |
 | GET    | `/exams/{id}/attempt`            | student | Own latest attempt: status, `attempt`/`attempts_used`/`max_attempts`, deadline, `remaining_ms`, `left_at`, mark, progress (`answered`/`question_count`), server `now` |
 | POST   | `/exams/{id}/attempt/finish`     | student | Submit the attempt (`409` once the deadline passed); allowed even while locked out of the room |
 | POST   | `/exams/{id}/questions`          | teacher | `{text, kind, points, choices?, correct?}` — add a question (course manager; frozen once attempted) |
@@ -307,9 +308,9 @@ their existing shapes: the student exam-room reads
 | PATCH  | `/exams/{id}/questions/{qid}`    | teacher | Edit a question — the kind bundle revalidates as a unit (course manager; frozen once attempted) |
 | DELETE | `/exams/{id}/questions/{qid}`    | teacher | Delete a question + its answers (course manager; frozen once attempted) |
 | GET    | `/exams/{id}/attempt/questions`  | student | The sitting view: no `correct`, own answers embedded (requires enrollment + an attempt) |
-| POST   | `/exams/{id}/attempt/answers`    | student | `{question_id, selected? \| text?}` — autosave one answer while enrolled and `in_progress` (and not locked out by a closed rejoin door) |
+| POST   | `/exams/{id}/attempt/answers`    | student | `{question_id, selected? \| text?}` — autosave one answer while a student, enrolled, and `in_progress` (and not locked out by a closed rejoin door) |
 | GET    | `/exams/{id}/attempts/{user}/answers` | teacher | A student's answer sheet: `is_correct` flags + suggested `auto_score` (course manager) |
-| GET    | `/exams/{id}/attempt/ws`         | student | **WebSocket** exam room: state ticks, autosave, finish; entering clears `left_at`, leaving stamps it (see "Taking an exam") |
+| GET    | `/exams/{id}/attempt/ws`         | student | **WebSocket** exam room (students only): state ticks, autosave, finish; entering clears `left_at`, leaving stamps it (see "Taking an exam") |
 | GET    | `/exams/{id}/live`               | teacher | Live monitor snapshot: roster × latest attempts × marks + per-student progress/`left_at`/`attempts_used` + counts; no-shows turn `absent` once the window closes (course manager) |
 | GET    | `/exams/{id}/live/stream`        | teacher | The same snapshot as SSE `snapshot` events every ~2s (course manager) |
 | GET    | `/marks/me`                      | student | The caller's mark report (per-course + overall averages) |
@@ -459,8 +460,9 @@ A student **sits** an exam through attempts (sitting 1, 2, … — each row id i
 the composite `exam_user[_seq]` key, so a sitting exists at most once by
 construction):
 
-- `POST /exams/{id}/attempt` starts, resumes, or retakes (enrolled; window
-  open where one exists — `open` exams start anytime). While the latest
+- `POST /exams/{id}/attempt` starts, resumes, or retakes (students only —
+  staff never sit; enrolled; window open where one exists — `open` exams start
+  anytime). While the latest
   sitting runs, re-posting returns it unchanged (`200`, not `201`):
   reconnecting never resets the clock. Once it is submitted or expired,
   re-posting mints the next sitting (`201`) **from a blank answer sheet** —
@@ -558,8 +560,9 @@ clock on every save):
   upsert: one row per question+user, re-answering overwrites. The payload must
   match the question's kind (`selected` indexing a choice, or `text`
   ≤ 10 000 chars — empty clears the draft); mismatches are `400`s. Requires
-  enrollment (`403`): an unenrollment mid-exam closes the sheet (the exam
-  room's door check, applied to every save — finishing stays open). Once the
+  the student role and enrollment (`403`): a promotion out of `student` or an
+  unenrollment mid-exam closes the sheet (the exam room's door checks,
+  re-applied to every save — finishing stays open). Once the
   attempt is submitted or past its deadline every save is a `409` — likewise
   while the student has left the exam room with `allow_rejoin` off; answers
   saved in time survive untouched for grading (until a retake wipes the sheet
@@ -573,9 +576,9 @@ suggestion to read while grading, never written anywhere.
 
 **The exam room (WebSocket)** — `GET /exams/{id}/attempt/ws`, cookie-authed
 like everything else; REST above remains the full fallback. Gates run before
-the upgrade: unknown exam `404`, draft with no mode `409`, not enrolled `403`,
-no attempt yet `404` (start it first), submitted/expired `409`, left while
-rejoin is closed `409`. Then JSON text frames:
+the upgrade: unknown exam `404`, draft with no mode `409`, not a student `403`,
+not enrolled `403`, no attempt yet `404` (start it first), submitted/expired
+`409`, left while rejoin is closed `409`. Then JSON text frames:
 
 | direction | frame |
 |-----------|-------|
@@ -639,7 +642,8 @@ are ordered by `starts_at` (a timetable, not a creation log).
 
 **Roll call** (`/sessions/{id}/attendance`) deliberately differs from event
 attendance: students never mark themselves. The session's teacher or a course
-manager marks **enrolled** students (an unenrolled target is a `400`), and the
+manager marks **enrolled** students — only students attend classes, so a
+non-student or unenrolled target is a `400` — and the
 **session teacher's own** presence row can only be written or removed by
 manager+ — staff presence is management's call, so a teacher can't declare
 themselves present. Listing the roll call follows the same rights as taking
