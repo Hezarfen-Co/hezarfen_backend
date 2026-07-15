@@ -11,6 +11,7 @@ pub type Database = Surreal<Db>;
 pub const USER_TABLE: &str = "user";
 pub const SESSION_TABLE: &str = "session";
 pub const NOTE_TABLE: &str = "note";
+pub const NOTE_FILE_TABLE: &str = "note_file";
 pub const EVENT_TABLE: &str = "event";
 pub const ATTENDANCE_TABLE: &str = "attendance";
 pub const EXAM_TABLE: &str = "exam";
@@ -56,6 +57,13 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS title ON note TYPE string;
     DEFINE FIELD IF NOT EXISTS content ON note TYPE string;
     DEFINE INDEX IF NOT EXISTS note_user ON note FIELDS user;
+
+    DEFINE TABLE IF NOT EXISTS note_file SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS note ON note_file TYPE record<note>;
+    DEFINE FIELD IF NOT EXISTS name ON note_file TYPE string;
+    DEFINE FIELD IF NOT EXISTS content_type ON note_file TYPE string;
+    DEFINE FIELD IF NOT EXISTS size ON note_file TYPE int;
+    DEFINE INDEX IF NOT EXISTS note_file_note ON note_file FIELDS note;
 
     DEFINE TABLE IF NOT EXISTS event SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS creator ON event TYPE record<user>;
@@ -174,6 +182,7 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS grade_bands ON settings TYPE array<object>;
     DEFINE FIELD IF NOT EXISTS grade_bands.*.min ON settings TYPE int;
     DEFINE FIELD IF NOT EXISTS grade_bands.*.label ON settings TYPE string;
+    DEFINE FIELD IF NOT EXISTS max_file_bytes ON settings TYPE option<int>;
 ";
 
 /// Open the file-backed database and apply the schema.

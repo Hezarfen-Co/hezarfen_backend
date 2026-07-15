@@ -60,7 +60,14 @@ async fn envelope_windows_and_total_is_stable() {
     assert_eq!(total(&res.body), 25);
 
     // Past the end — an empty page, not an error, and `total` stays honest.
-    let res = send(&app, "GET", "/users?limit=10&offset=999", Some(&admin), None).await;
+    let res = send(
+        &app,
+        "GET",
+        "/users?limit=10&offset=999",
+        Some(&admin),
+        None,
+    )
+    .await;
     assert_eq!(res.status, StatusCode::OK);
     assert!(items(&res.body).is_empty(), "offset past the end is empty");
     assert_eq!(total(&res.body), 25);
@@ -140,7 +147,11 @@ async fn user_search_is_paged_not_capped() {
     // Unpaged: every match comes back — no 10-row ceiling.
     let res = send(&app, "GET", "/users/search?q=grp", Some(&teacher), None).await;
     assert_eq!(res.status, StatusCode::OK);
-    assert_eq!(total(&res.body), 12, "all matches counted, not capped at 10");
+    assert_eq!(
+        total(&res.body),
+        12,
+        "all matches counted, not capped at 10"
+    );
     assert_eq!(items(&res.body).len(), 12);
 
     // Windowed like any other list — the tail is the remainder.
@@ -156,8 +167,19 @@ async fn user_search_is_paged_not_capped() {
     assert_eq!(items(&res.body).len(), 2, "offset 10 of 12 leaves 2");
 
     // Paging bounds are enforced, and a blank query is still refused.
-    let res = send(&app, "GET", "/users/search?q=grp&limit=0", Some(&teacher), None).await;
+    let res = send(
+        &app,
+        "GET",
+        "/users/search?q=grp&limit=0",
+        Some(&teacher),
+        None,
+    )
+    .await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST, "limit=0 is a 400");
     let res = send(&app, "GET", "/users/search?q=", Some(&teacher), None).await;
-    assert_eq!(res.status, StatusCode::BAD_REQUEST, "blank q is still a 400");
+    assert_eq!(
+        res.status,
+        StatusCode::BAD_REQUEST,
+        "blank q is still a 400"
+    );
 }

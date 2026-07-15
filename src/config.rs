@@ -15,6 +15,9 @@ pub struct Config {
     pub db_path: String,
     pub db_ns: String,
     pub db_name: String,
+    /// Directory for uploaded note-file blobs (`FILES_PATH`). Kept beside the
+    /// database inside the same volume so one mount persists everything.
+    pub files_path: String,
     /// Add the `Secure` attribute to the session cookie (HTTPS-only). Off by
     /// default so plain-HTTP local dev keeps working; enable behind TLS.
     pub cookie_secure: bool,
@@ -36,6 +39,7 @@ impl Config {
             db_path: env::var("DB_PATH").unwrap_or_else(|_| "./data/hezarfen.db".into()),
             db_ns: env::var("DB_NAMESPACE").unwrap_or_else(|_| "hezarfen".into()),
             db_name: env::var("DB_DATABASE").unwrap_or_else(|_| "hezarfen".into()),
+            files_path: env::var("FILES_PATH").unwrap_or_else(|_| "./data/files".into()),
             cookie_secure: parse_flag(env::var("COOKIE_SECURE").ok()),
             rate_limit: RateLimitConfig {
                 auth_per_minute: parse_limit(

@@ -13,6 +13,7 @@ services:
       DB_PATH: /data/hezarfen.db
       DB_NAMESPACE: hezarfen
       DB_DATABASE: hezarfen
+      FILES_PATH: /data/files
       RUST_LOG: info,hezarfen_backend=debug
       # First-boot admin seed: created once if the username doesn't exist yet.
       # Local-dev credentials — change or remove before exposing this anywhere.

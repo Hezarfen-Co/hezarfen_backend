@@ -13,8 +13,9 @@ disallowed_types = "deny"
 tokio = { version = "1", features = ["full"] }
 # IntervalStream for the live exam-monitor SSE tick.
 tokio-stream = "0.1"
-# "ws" backs the live exam room (WebSocket at /exams/{id}/attempt/ws).
-axum = { version = "0.8", features = ["ws"] }
+# "ws" backs the live exam room (WebSocket at /exams/{id}/attempt/ws);
+# "multipart" backs note file uploads (POST /notes/{id}/files).
+axum = { version = "0.8", features = ["ws", "multipart"] }
 axum-extra = { version = "0.10", features = ["cookie"] }
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 surrealdb = { version = "3", default-features = false, features = ["kv-surrealkv", "kv-mem"] }

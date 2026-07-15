@@ -18,8 +18,12 @@ async fn main() -> anyhow::Result<()> {
     let cfg = Config::from_env();
     let db = database::init(&cfg).await?;
     seed_admin(&cfg, &db).await?;
+    tokio::fs::create_dir_all(&cfg.files_path)
+        .await
+        .with_context(|| format!("failed to create the files directory {}", cfg.files_path))?;
     let app = build_router(AppState {
         db,
+        files_path: cfg.files_path.clone().into(),
         cookie_secure: cfg.cookie_secure,
         rate_limit: cfg.rate_limit.clone(),
         exam_presence: Default::default(),

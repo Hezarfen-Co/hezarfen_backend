@@ -51,6 +51,10 @@ pub enum AppError {
     Forbidden(&'static str),
     #[error("conflict: {0}")]
     Conflict(&'static str),
+    /// A request body (file upload) over the allowed size. Owned string: the
+    /// school-configured limit is only known at runtime.
+    #[error("payload too large: {0}")]
+    PayloadTooLarge(String),
     #[error("too many requests")]
     TooManyRequests { retry_after_secs: u64 },
     #[error("database error")]
@@ -82,6 +86,7 @@ impl IntoResponse for AppError {
             AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".to_string()),
             AppError::Forbidden(m) => (StatusCode::FORBIDDEN, m.to_string()),
             AppError::Conflict(m) => (StatusCode::CONFLICT, m.to_string()),
+            AppError::PayloadTooLarge(m) => (StatusCode::PAYLOAD_TOO_LARGE, m.clone()),
             AppError::Db(e) => {
                 tracing::error!("database error: {e}");
                 (

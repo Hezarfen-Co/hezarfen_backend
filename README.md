@@ -3,7 +3,10 @@
 Note, attendance, course + weighted exam mark backend. **Rust (edition 2024) · axum · SurrealDB 3 (embedded surrealkv) · tokio.**
 
 Session-cookie auth with four hierarchical roles (`student < teacher < manager
-< admin`). Notes are per-user. Attendance is event + attendees: create an event,
+< admin`). Notes are per-user and carry **file attachments** (PDFs, documents,
+…): blobs live on disk next to the database, metadata in the database, and the
+per-file size cap is school policy in settings (`max_file_bytes`, default
+5 MiB). Attendance is event + attendees: create an event,
 then mark users present / absent / late / excused. Marks are course-shaped
 (Google Classroom style): a teacher creates a course, enrolls students, adds
 exams inside it, and grades — enrolling, sitting exams, roll call, and marks are
@@ -22,9 +25,9 @@ sessions** with teacher-taken roll call (students never self-mark a lesson),
 staff clock in/out on a server-stamped **work log**, and every user has an
 **attendance report** (event + per-course lesson tallies with rates).
 School-varying policy is data, not code: exam kinds (each with its weight in
-course averages), attendance statuses, and grade-display bands live in an
-editable **settings** singleton, and academic **terms** are plain rows courses
-can link to (see "Per-school policy").
+course averages), attendance statuses, grade-display bands, and the note-file
+size limit live in an editable **settings** singleton, and academic **terms**
+are plain rows courses can link to (see "Per-school policy").
 
 Every field is a validated newtype (`Username(String)`, `NoteTitle(String)`, …)
 constructed only after its restrictions pass — invalid input can't be
@@ -40,8 +43,10 @@ cargo run
 ```
 
 Boots on `http://127.0.0.1:8080`, storing data in `./data/hezarfen.db`
-(embedded surrealkv — no external DB server). Interactive API docs (Swagger UI)
-are served at `/swagger`, the raw OpenAPI spec at `/api-docs/openapi.json`.
+(embedded surrealkv — no external DB server) and uploaded note files in
+`./data/files/` (`FILES_PATH`, created at startup). Interactive API docs
+(Swagger UI) are served at `/swagger`, the raw OpenAPI spec at
+`/api-docs/openapi.json`.
 
 ## Run in a container (podman)
 
@@ -54,7 +59,8 @@ podman compose down            # stop (data survives in the volume)
 The `Containerfile` is a two-stage build (Rust builder with cargo cache
 mounts, `debian:trixie-slim` runtime, non-root user). Since the database is
 embedded there is only one service; its data lives in the named volume
-`hezarfen-data`, mounted at `/data`. `HOST` is forced to `0.0.0.0` inside the
+`hezarfen-data`, mounted at `/data` — the database and the uploaded note
+files (`/data/files`) together, so that one volume persists everything. `HOST` is forced to `0.0.0.0` inside the
 container so the published port works. Production knobs (`COOKIE_SECURE`,
 `CORS_ALLOWED_ORIGINS`, rate limits, `TRUST_PROXY`) are commented in
 `compose.yaml` — uncomment as needed. Works with `docker compose` too.
@@ -154,7 +160,7 @@ effect on the user's very next call (no re-login).
 | Action                                   | Minimum role | Notes                                         |
 |------------------------------------------|--------------|-----------------------------------------------|
 | Register / login / view own account      | (any)        | Registration always creates a `student`       |
-| View events, own notes; CRUD notes       | student      | Everyone can read events and keep notes       |
+| View events, own notes; CRUD notes + their files | student | Everyone can read events and keep notes; note files (upload/download) are walled per owner like the notes themselves |
 | Mark **own** attendance                  | student      | Anyone can mark themselves                     |
 | Mark **another user's** attendance       | teacher      |                                               |
 | Create events; remove attendance rows    | teacher      |                                               |
@@ -182,7 +188,7 @@ effect on the user's very next call (no re-login).
 | Grade students                           | teacher      | Target must be an **enrolled student**; grading never targets oneself |
 | Edit **own** personal info (name, surname, email, phone, birth date) | student | Every account carries the same optional info fields |
 | Read the school settings and the term list | student | Clients need them to render kind/status pickers, grades, and the calendar |
-| Edit school settings; create / edit / delete terms | manager | School policy (exam kinds, attendance statuses, grade bands) and the academic calendar are management's call |
+| Edit school settings; create / edit / delete terms | manager | School policy (exam kinds, attendance statuses, grade bands, the note-file size limit) and the academic calendar are management's call |
 | List users; look up one user; change a user's role; edit **any** user's personal info | admin | An admin cannot change **their own** role |
 
 ### Bootstrapping the first admin
@@ -263,7 +269,11 @@ their existing shapes: the student exam-room reads
 | GET    | `/notes`                         | student | List own notes · paged          |
 | GET    | `/notes/{id}`                    | student | Get own note                    |
 | PATCH  | `/notes/{id}`                    | student | `{title?, content?}`            |
-| DELETE | `/notes/{id}`                    | student | Delete own note                 |
+| DELETE | `/notes/{id}`                    | student | Delete own note (its files go with it) |
+| POST   | `/notes/{id}/files`              | student | Attach a file: `multipart/form-data`, one `file` part (`filename` required) — ≤ the school's `max_file_bytes`, ≤ 10 files per note |
+| GET    | `/notes/{id}/files`              | student | List a note's files (metadata: `{id, name, content_type, size}`) · paged |
+| GET    | `/notes/{id}/files/{file_id}`    | student | Download the bytes (original filename + content type in the headers) |
+| DELETE | `/notes/{id}/files/{file_id}`    | student | Delete one file                 |
 | POST   | `/events`                        | teacher | `{title, description?, starts_at?, ends_at?}` |
 | GET    | `/events`                        | student | List all events · paged         |
 | GET    | `/events/{id}`                   | student | Get event                       |
@@ -323,8 +333,8 @@ their existing shapes: the student exam-room reads
 | DELETE | `/work/entries/{id}`             | manager | Delete a work entry (open or closed) |
 | GET    | `/attendance/me`                 | student | Own attendance report: events + sessions + per-course tallies |
 | GET    | `/attendance/{user}`             | teacher | A user's attendance report, narrowed to the caller's courses (manager+: full) |
-| GET    | `/settings`                      | student | The school's policy: `exam_kinds` (`{name, weight}` each), `attendance_statuses`, `grade_bands` |
-| PATCH  | `/settings`                      | manager | Replace any subset of the three lists, each wholesale; concurrent edits merge, never silently revert each other (see "Per-school policy") |
+| GET    | `/settings`                      | student | The school's policy: `exam_kinds` (`{name, weight}` each), `attendance_statuses`, `grade_bands`, `max_file_bytes` |
+| PATCH  | `/settings`                      | manager | Replace any subset of the fields (lists wholesale); concurrent edits merge, never silently revert each other (see "Per-school policy") |
 | POST   | `/terms`                         | manager | `{name, starts_at, ends_at}` — past dates allowed (calendar backfill) |
 | GET    | `/terms`                         | student | List terms, newest first · paged |
 | GET    | `/terms/{id}`                    | student | Get one term                    |
@@ -381,7 +391,7 @@ unlike emails).
 
 Every school runs differently; the parts that vary are data, not code. One
 editable `settings` singleton (`GET /settings` for any signed-in user,
-`PATCH /settings` for manager+) carries three knobs:
+`PATCH /settings` for manager+) carries four knobs:
 
 - **`exam_kinds`** — the accepted `kind` values for new exams, each an
   object `{name, weight}`. The weight (`1`–`100`) is how many times an exam
@@ -403,6 +413,10 @@ editable `settings` singleton (`GET /settings` for any signed-in user,
   averaging stay `0`–`100` forever — bands only add `grade`,
   `average_grade`, and `overall_grade` labels to the mark report, so a school
   can switch display scales without touching a single stored mark.
+- **`max_file_bytes`** — the per-file size cap for note uploads, in bytes:
+  `1024` (1 KiB) to `26214400` (25 MiB; a server hard cap — uploads buffer in
+  memory), default `5242880` (5 MiB). Checked at upload time only:
+  lowering it never touches already-stored files.
 
 A `PATCH` replaces only the fields it carries, each wholesale, and validation
 is all-or-nothing. Concurrent edits are safe: each save applies only if the
@@ -702,6 +716,14 @@ curl -s -b $JAR $BASE/notes -H 'content-type: application/json' \
   -d '{"title":"first","content":"hello"}'
 curl -s -b $JAR $BASE/notes
 
+# note files (multipart; -F sets filename + content type from the file)
+NO=$(curl -s -b $JAR $BASE/notes -H 'content-type: application/json' \
+  -d '{"title":"with file"}' | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+FI=$(curl -s -b $JAR $BASE/notes/$NO/files -F 'file=@plan.pdf' \
+  | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+curl -s -b $JAR $BASE/notes/$NO/files            # list metadata
+curl -s -b $JAR -OJ $BASE/notes/$NO/files/$FI    # download, original filename
+
 # events + attendance
 # Creating events needs teacher+; grant it first (see "Bootstrapping" above —
 # e.g. UPDATE user SET role='teacher' WHERE username='ali'), else this is 403.
@@ -758,7 +780,7 @@ src/
   error.rs         ValidationError + AppError -> HTTP responses
   database.rs      embedded surrealkv connect + SCHEMAFULL migration
   rate_limit.rs    fixed-window per-IP limiter (both tiers) + middleware
-  state.rs         AppState { db, cookie_secure, rate_limit }
+  state.rs         AppState { db, files_path, cookie_secure, rate_limit }
   domain/          validated newtypes + entities (derive SurrealValue),
                    each owning its persistence
     user.rs        UserId · Username · Password · PasswordHash · User (has role)
@@ -766,6 +788,8 @@ src/
     session.rs     SessionId · SessionToken · Session (7-day expiry)
     timestamp.rs   Timestamp (unix-millisecond instant)
     note.rs        NoteId · NoteTitle · NoteContent · Note
+    note_file.rs   NoteFileId · FileName · FileContentType · NoteFile (metadata row;
+                   blob on disk under FILES_PATH, named by the row's ULID)
     event.rs       EventId · EventTitle · EventDescription · Event
     attendance.rs  AttendanceId · AttendanceStatus · Attendance
     course.rs      CourseId · CourseTitle · CourseDescription · Course

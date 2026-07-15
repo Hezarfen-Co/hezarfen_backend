@@ -36,6 +36,7 @@ fn config_at(dir: &TempDir) -> Config {
         db_path: dir.path().join("hezarfen.db").to_str().unwrap().to_string(),
         db_ns: "hezarfen".into(),
         db_name: "hezarfen".into(),
+        files_path: dir.path().join("files").to_str().unwrap().to_string(),
         cookie_secure: false,
         rate_limit: RateLimitConfig::unlimited(),
         admin_username: None,
@@ -43,9 +44,12 @@ fn config_at(dir: &TempDir) -> Config {
     }
 }
 
-fn state(db: Database) -> AppState {
+/// Mirror `main`: the blob directory is created at boot, beside the database.
+fn state(db: Database, cfg: &Config) -> AppState {
+    std::fs::create_dir_all(&cfg.files_path).expect("files dir");
     AppState {
         db,
+        files_path: cfg.files_path.clone().into(),
         cookie_secure: false,
         rate_limit: RateLimitConfig::unlimited(),
         exam_presence: Default::default(),
@@ -56,10 +60,9 @@ fn state(db: Database) -> AppState {
 #[tokio::test]
 async fn file_engine_runs_full_flow() {
     let dir = tempfile::tempdir().unwrap();
-    let db = database::init(&config_at(&dir))
-        .await
-        .expect("open file db");
-    let app = build_router(state(db));
+    let cfg = config_at(&dir);
+    let db = database::init(&cfg).await.expect("open file db");
+    let app = build_router(state(db, &cfg));
 
     let creds = json!({ "username": "ali", "password": "secret1" });
     assert_eq!(
@@ -83,12 +86,7 @@ async fn file_engine_runs_full_flow() {
     .await;
     assert_eq!(note.status, StatusCode::CREATED);
     assert_eq!(
-        common::items(
-            &send(&app, "GET", "/notes", Some(&cookie), None)
-                .await
-                .body,
-        )
-        .len(),
+        common::items(&send(&app, "GET", "/notes", Some(&cookie), None).await.body,).len(),
         1
     );
 }
@@ -104,7 +102,7 @@ async fn data_survives_reopen() {
     // First boot: create a user and a note, then drop the handle.
     {
         let db = database::init(&cfg).await.expect("first open");
-        let app = build_router(state(db));
+        let app = build_router(state(db, &cfg));
         assert_eq!(
             send(&app, "POST", "/auth/register", None, Some(creds.clone()))
                 .await
@@ -132,7 +130,7 @@ async fn data_survives_reopen() {
     // Second boot from the same path: the user and note are still there.
     {
         let db = reopen(&cfg).await;
-        let app = build_router(state(db));
+        let app = build_router(state(db, &cfg));
         let login = send(&app, "POST", "/auth/login", None, Some(creds)).await;
         assert_eq!(login.status, StatusCode::OK, "user survived reopen");
         let cookie = login.cookie.unwrap();
@@ -149,6 +147,63 @@ async fn data_survives_reopen() {
     }
 }
 
+/// A note's uploaded file — its metadata row in the database and its blob on
+/// disk — comes back after a close + reopen, byte for byte.
+#[tokio::test]
+async fn note_files_survive_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config_at(&dir);
+    let creds = json!({ "username": "ali", "password": "secret1" });
+    let bytes = b"%PDF-1.4 persisted".to_vec();
+    let file_uri;
+
+    // First boot: create a note and upload a file onto it.
+    {
+        let db = database::init(&cfg).await.expect("first open");
+        let app = build_router(state(db, &cfg));
+        send(&app, "POST", "/auth/register", None, Some(creds.clone())).await;
+        let cookie = send(&app, "POST", "/auth/login", None, Some(creds.clone()))
+            .await
+            .cookie
+            .unwrap();
+        let note = send(
+            &app,
+            "POST",
+            "/notes",
+            Some(&cookie),
+            Some(json!({ "title": "with attachment" })),
+        )
+        .await;
+        let note_id = note.body["id"].as_str().unwrap().to_string();
+        let up = common::upload_file(
+            &app,
+            &cookie,
+            &note_id,
+            "plan.pdf",
+            "application/pdf",
+            &bytes,
+        )
+        .await;
+        assert_eq!(up.status, StatusCode::CREATED, "{}", up.body);
+        file_uri = format!("/notes/{note_id}/files/{}", up.body["id"].as_str().unwrap());
+    }
+
+    // Second boot: metadata and bytes are both still there.
+    {
+        let db = reopen(&cfg).await;
+        let app = build_router(state(db, &cfg));
+        let cookie = send(&app, "POST", "/auth/login", None, Some(creds))
+            .await
+            .cookie
+            .unwrap();
+        let (status, headers, body) =
+            common::send_raw(&app, "GET", &file_uri, Some(&cookie), None, Vec::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, bytes, "blob bytes survived reopen");
+        assert_eq!(headers["content-type"], "application/pdf");
+    }
+}
+
 /// Personal info written through `PATCH /users/me` is still on the account
 /// after a close + reopen.
 #[tokio::test]
@@ -160,7 +215,7 @@ async fn profile_survives_reopen() {
     // First boot: register and fill in the profile.
     {
         let db = database::init(&cfg).await.expect("first open");
-        let app = build_router(state(db));
+        let app = build_router(state(db, &cfg));
         assert_eq!(
             send(&app, "POST", "/auth/register", None, Some(creds.clone()))
                 .await
@@ -191,7 +246,7 @@ async fn profile_survives_reopen() {
     // Second boot: the info comes back from disk.
     {
         let db = reopen(&cfg).await;
-        let app = build_router(state(db));
+        let app = build_router(state(db, &cfg));
         let cookie = send(&app, "POST", "/auth/login", None, Some(creds))
             .await
             .cookie
@@ -220,7 +275,7 @@ async fn course_marks_survive_reopen() {
     // course, enrolls the student, grades 80.
     {
         let db = database::init(&cfg).await.expect("first open");
-        let app = build_router(state(db.clone()));
+        let app = build_router(state(db.clone(), &cfg));
         for creds in [&teacher_creds, &student_creds] {
             assert_eq!(
                 send(&app, "POST", "/auth/register", None, Some((*creds).clone()))
@@ -288,7 +343,7 @@ async fn course_marks_survive_reopen() {
     // are all rebuilt from disk.
     {
         let db = reopen(&cfg).await;
-        let app = build_router(state(db));
+        let app = build_router(state(db, &cfg));
         let student = send(&app, "POST", "/auth/login", None, Some(student_creds))
             .await
             .cookie
@@ -330,7 +385,7 @@ async fn settings_and_terms_survive_reopen() {
     let term;
     {
         let db = database::init(&cfg).await.expect("open file db");
-        let app = build_router(state(db.clone()));
+        let app = build_router(state(db.clone(), &cfg));
 
         let creds = json!({ "username": "boss", "password": "secret1" });
         send(&app, "POST", "/auth/register", None, Some(creds.clone())).await;
@@ -380,7 +435,7 @@ async fn settings_and_terms_survive_reopen() {
 
     // New handle at the same path — a fresh boot, migration re-applied.
     let db = reopen(&cfg).await;
-    let app = build_router(state(db));
+    let app = build_router(state(db, &cfg));
     let creds = json!({ "username": "boss", "password": "secret1" });
     let cookie = send(&app, "POST", "/auth/login", None, Some(creds))
         .await

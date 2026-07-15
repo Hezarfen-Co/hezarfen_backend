@@ -15,6 +15,9 @@ async fn spawn_server() -> (String, Database) {
     let db = database::init_mem().await.expect("in-memory db");
     let app = build_router(AppState {
         db: db.clone(),
+        // Kept (not auto-deleted) so the directory outlives this helper;
+        // it's under the OS temp dir, reclaimed like any other temp file.
+        files_path: tempfile::tempdir().expect("files dir").keep(),
         cookie_secure: false,
         // Every request here comes from 127.0.0.1, so per-IP limits would
         // meter the whole suite as one client. Off; `rate_limit.rs` covers it.

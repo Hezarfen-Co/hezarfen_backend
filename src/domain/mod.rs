@@ -13,6 +13,7 @@ pub mod exam_attempt;
 pub mod exam_question;
 pub mod exam_result;
 pub mod note;
+pub mod note_file;
 pub mod profile;
 pub mod role;
 pub mod session;

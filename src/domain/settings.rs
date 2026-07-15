@@ -1,17 +1,22 @@
 //! School-adjustable policy: which exam kinds exist (and how much each
 //! weighs in course averages), which attendance statuses the roll call
-//! accepts, and how numeric marks display as grades.
+//! accepts, how numeric marks display as grades, and how large an uploaded
+//! note file may be.
 //!
 //! One singleton record (`settings:school` — one school per deployment). An
 //! absent record means "the defaults from `constant.rs`", so a fresh or
-//! pre-existing database needs no seeding and behaves exactly as before.
+//! pre-existing database needs no seeding and behaves exactly as before. The
+//! same holds per field: `max_file_bytes` is `option<int>` and reads as the
+//! default while unset, so rows saved before the field existed keep working
+//! without a backfill (backfills crash boots — `DEFAULT` never rescues
+//! existing rows, and `UPDATE` re-validates whole records).
 
 use surrealdb::types::{RecordId, SurrealValue};
 
 use crate::constant::{
-    DEFAULT_ATTENDANCE_STATUSES, DEFAULT_EXAM_KINDS, MAX_EXAM_KIND_WEIGHT, MAX_GRADE_BANDS,
-    MAX_GRADE_LABEL_LEN, MAX_MARK, MAX_SETTINGS_ITEM_LEN, MAX_SETTINGS_LIST_LEN,
-    MIN_EXAM_KIND_WEIGHT, MIN_MARK,
+    DEFAULT_ATTENDANCE_STATUSES, DEFAULT_EXAM_KINDS, DEFAULT_MAX_FILE_BYTES, MAX_EXAM_KIND_WEIGHT,
+    MAX_GRADE_BANDS, MAX_GRADE_LABEL_LEN, MAX_MARK, MAX_MAX_FILE_BYTES, MAX_SETTINGS_ITEM_LEN,
+    MAX_SETTINGS_LIST_LEN, MIN_EXAM_KIND_WEIGHT, MIN_MARK, MIN_MAX_FILE_BYTES,
 };
 use crate::database::{Database, SETTINGS_TABLE};
 use crate::error::{AppError, ValidationError};
@@ -106,6 +111,9 @@ pub struct Settings {
     exam_kinds: Vec<ExamKindDef>,
     attendance_statuses: Vec<String>,
     grade_bands: Vec<GradeBand>,
+    /// Per-file byte cap for note uploads. `None` = the row predates the
+    /// field (or the defaults) — reads as `DEFAULT_MAX_FILE_BYTES`.
+    max_file_bytes: Option<i64>,
 }
 
 impl Settings {
@@ -126,6 +134,7 @@ impl Settings {
                 .to_vec(),
             attendance_statuses: DEFAULT_ATTENDANCE_STATUSES.map(String::from).to_vec(),
             grade_bands: Vec::new(),
+            max_file_bytes: None,
         }
     }
 
@@ -134,12 +143,21 @@ impl Settings {
     /// core attendance statuses can never be removed (the attendance rate's
     /// semantics are defined over them). Bands may be empty (numeric-only
     /// display), otherwise their mins are unique and one band must start at 0
-    /// so every mark maps to a label.
+    /// so every mark maps to a label. The upload cap must sit inside the
+    /// server's hard bounds — the ceiling protects memory and disk, whatever
+    /// the school would prefer.
     pub fn try_new(
         exam_kinds: Vec<ExamKindDef>,
         attendance_statuses: Vec<String>,
         grade_bands: Vec<GradeBand>,
+        max_file_bytes: i64,
     ) -> Result<Self, ValidationError> {
+        if !(MIN_MAX_FILE_BYTES..=MAX_MAX_FILE_BYTES).contains(&max_file_bytes) {
+            return Err(ValidationError::Invalid {
+                field: "max_file_bytes",
+                reason: "must be between 1024 (1 KiB) and 26214400 (25 MiB)",
+            });
+        }
         // Per-entry rules (name shape, weight range) hold structurally on any
         // `ExamKindDef`; here only the list-level rules need checking.
         let names: Vec<String> = exam_kinds
@@ -188,6 +206,7 @@ impl Settings {
             exam_kinds,
             attendance_statuses,
             grade_bands,
+            max_file_bytes: Some(max_file_bytes),
         })
     }
 
@@ -212,6 +231,12 @@ impl Settings {
 
     pub fn get_grade_bands(&self) -> &[GradeBand] {
         &self.grade_bands
+    }
+
+    /// The per-file upload cap in bytes; the built-in default while the
+    /// school never set one (including rows saved before the field existed).
+    pub fn get_max_file_bytes(&self) -> i64 {
+        self.max_file_bytes.unwrap_or(DEFAULT_MAX_FILE_BYTES)
     }
 
     /// The label of the band `mark` falls into: the band with the greatest
@@ -263,7 +288,8 @@ impl Settings {
                  UPDATE $id CONTENT $new
                      WHERE exam_kinds = $ek
                        AND attendance_statuses = $st
-                       AND grade_bands = $gb;
+                       AND grade_bands = $gb
+                       AND max_file_bytes = $mf;
                  COMMIT TRANSACTION;",
             )
             .bind(("expected", expected.clone()))
@@ -272,6 +298,7 @@ impl Settings {
             .bind(("ek", expected.exam_kinds.clone()))
             .bind(("st", expected.attendance_statuses.clone()))
             .bind(("gb", expected.grade_bands.clone()))
+            .bind(("mf", expected.max_file_bytes))
             .await?
             .check()?;
         // Statement slots count BEGIN too: the guarded UPDATE is slot 2. An
@@ -346,6 +373,7 @@ mod tests {
             defaults.get_exam_kinds().to_vec(),
             defaults.get_attendance_statuses().to_vec(),
             defaults.get_grade_bands().to_vec(),
+            defaults.get_max_file_bytes(),
         )
         .unwrap();
         assert_eq!(rebuilt.get_exam_kinds(), defaults.get_exam_kinds());
@@ -377,15 +405,31 @@ mod tests {
     #[tokio::test]
     async fn lists_are_bounded_and_deduped() {
         let statuses = Settings::defaults().get_attendance_statuses().to_vec();
-        let s = Settings::try_new(kinds(&["lab", "quiz"]), statuses.clone(), vec![]).unwrap();
+        let s = Settings::try_new(
+            kinds(&["lab", "quiz"]),
+            statuses.clone(),
+            vec![],
+            DEFAULT_MAX_FILE_BYTES,
+        )
+        .unwrap();
         assert_eq!(names(&s), ["lab", "quiz"]);
         // Empty list and case-insensitive duplicate names are rejected.
-        assert!(Settings::try_new(vec![], statuses.clone(), vec![]).is_err());
-        assert!(Settings::try_new(kinds(&["Lab", "lab"]), statuses.clone(), vec![]).is_err());
+        assert!(
+            Settings::try_new(vec![], statuses.clone(), vec![], DEFAULT_MAX_FILE_BYTES).is_err()
+        );
+        assert!(
+            Settings::try_new(
+                kinds(&["Lab", "lab"]),
+                statuses.clone(),
+                vec![],
+                DEFAULT_MAX_FILE_BYTES
+            )
+            .is_err()
+        );
         let too_many: Vec<ExamKindDef> = (0..21)
             .map(|i| ExamKindDef::try_new(&format!("kind{i}"), 1).unwrap())
             .collect();
-        assert!(Settings::try_new(too_many, statuses, vec![]).is_err());
+        assert!(Settings::try_new(too_many, statuses, vec![], DEFAULT_MAX_FILE_BYTES).is_err());
     }
 
     #[tokio::test]
@@ -398,6 +442,7 @@ mod tests {
             ],
             statuses,
             vec![],
+            DEFAULT_MAX_FILE_BYTES,
         )
         .unwrap();
         assert_eq!(s.exam_kind_weight("final"), Some(3));
@@ -412,13 +457,13 @@ mod tests {
         let kinds = Settings::defaults().get_exam_kinds().to_vec();
         // Extras on top of the core are fine.
         let extended = statuses_with(&["online"]);
-        assert!(Settings::try_new(kinds.clone(), extended, vec![]).is_ok());
+        assert!(Settings::try_new(kinds.clone(), extended, vec![], DEFAULT_MAX_FILE_BYTES).is_ok());
         // Dropping any core status is not.
         let missing: Vec<String> = statuses_with(&[])
             .into_iter()
             .filter(|s| s != "late")
             .collect();
-        assert!(Settings::try_new(kinds, missing, vec![]).is_err());
+        assert!(Settings::try_new(kinds, missing, vec![], DEFAULT_MAX_FILE_BYTES).is_err());
     }
 
     fn statuses_with(extra: &[&str]) -> Vec<String> {
@@ -444,6 +489,7 @@ mod tests {
                 defaults.get_exam_kinds().to_vec(),
                 defaults.get_attendance_statuses().to_vec(),
                 b,
+                DEFAULT_MAX_FILE_BYTES,
             )
         };
         // Empty = numeric-only display.
@@ -453,6 +499,53 @@ mod tests {
         assert!(ok(bands(&[(0, "F"), (0, "E")])).is_err());
         assert!(ok(bands(&[(50, "CC"), (85, "AA")])).is_err());
         assert!(ok(bands(&[(0, "FF"), (50, "CC"), (85, "AA")])).is_ok());
+    }
+
+    #[tokio::test]
+    async fn max_file_bytes_is_bounded() {
+        let defaults = Settings::defaults();
+        let with_cap = |cap: i64| {
+            Settings::try_new(
+                defaults.get_exam_kinds().to_vec(),
+                defaults.get_attendance_statuses().to_vec(),
+                vec![],
+                cap,
+            )
+        };
+        for cap in [
+            MIN_MAX_FILE_BYTES,
+            DEFAULT_MAX_FILE_BYTES,
+            MAX_MAX_FILE_BYTES,
+        ] {
+            assert_eq!(with_cap(cap).unwrap().get_max_file_bytes(), cap);
+        }
+        assert!(with_cap(MIN_MAX_FILE_BYTES - 1).is_err());
+        assert!(with_cap(MAX_MAX_FILE_BYTES + 1).is_err());
+        assert!(with_cap(0).is_err());
+        assert!(with_cap(-1).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_row_predating_max_file_bytes_reads_the_default() {
+        let db = crate::database::init_mem().await.unwrap();
+        // The defaults carry no explicit cap, so this writes a row without the
+        // field — exactly what a volume from before the field looks like.
+        Settings::defaults().save(&db).await.unwrap();
+        let loaded = Settings::load(&db).await.unwrap();
+        assert_eq!(loaded.get_max_file_bytes(), DEFAULT_MAX_FILE_BYTES);
+        // And a snapshot of that old row still passes the compare-and-set.
+        let saved = Settings::try_new(
+            loaded.get_exam_kinds().to_vec(),
+            loaded.get_attendance_statuses().to_vec(),
+            vec![],
+            4096,
+        )
+        .unwrap()
+        .save_if_unchanged(&loaded, &db)
+        .await
+        .unwrap()
+        .expect("a merge over an old-shape row applies");
+        assert_eq!(saved.get_max_file_bytes(), 4096);
     }
 
     #[tokio::test]
@@ -471,6 +564,7 @@ mod tests {
             kinds(&["lab"]),
             statuses.clone(),
             bands(&[(0, "F"), (50, "P")]),
+            2048,
         )
         .unwrap()
         .save(&db)
@@ -480,8 +574,9 @@ mod tests {
         assert_eq!(names(&loaded), ["lab"]);
         assert_eq!(loaded.get_grade_bands().len(), 2);
         assert_eq!(loaded.grade_label(60.0), Some("P"));
+        assert_eq!(loaded.get_max_file_bytes(), 2048);
         // A second save lands on the same singleton row, not a new one.
-        Settings::try_new(kinds(&["quiz"]), statuses, vec![])
+        Settings::try_new(kinds(&["quiz"]), statuses, vec![], DEFAULT_MAX_FILE_BYTES)
             .unwrap()
             .save(&db)
             .await
@@ -500,11 +595,16 @@ mod tests {
         // Editor A snapshots the policy (the defaults — no row yet)...
         let stale = Settings::load(&db).await.unwrap();
         // ...then editor B lands a new exam-kind list first.
-        Settings::try_new(kinds(&["lab"]), statuses.clone(), vec![])
-            .unwrap()
-            .save(&db)
-            .await
-            .unwrap();
+        Settings::try_new(
+            kinds(&["lab"]),
+            statuses.clone(),
+            vec![],
+            DEFAULT_MAX_FILE_BYTES,
+        )
+        .unwrap()
+        .save(&db)
+        .await
+        .unwrap();
 
         // A's merge over the stale snapshot (kinds kept "as loaded", bands
         // changed) — exactly what a concurrent PATCH /settings computes —
@@ -513,6 +613,7 @@ mod tests {
             stale.get_exam_kinds().to_vec(),
             stale.get_attendance_statuses().to_vec(),
             bands(&[(0, "F"), (50, "P")]),
+            stale.get_max_file_bytes(),
         )
         .unwrap()
         .save_if_unchanged(&stale, &db)
@@ -535,6 +636,7 @@ mod tests {
             fresh.get_exam_kinds().to_vec(),
             fresh.get_attendance_statuses().to_vec(),
             bands(&[(0, "F"), (50, "P")]),
+            fresh.get_max_file_bytes(),
         )
         .unwrap()
         .save_if_unchanged(&fresh, &db)
@@ -555,6 +657,7 @@ mod tests {
             kinds(&["lab"]),
             current.get_attendance_statuses().to_vec(),
             vec![],
+            current.get_max_file_bytes(),
         )
         .unwrap()
         .save_if_unchanged(&current, &db)
@@ -574,6 +677,7 @@ mod tests {
             defaults.get_exam_kinds().to_vec(),
             defaults.get_attendance_statuses().to_vec(),
             bands(&[(0, "FF"), (50, "CC"), (85, "AA")]),
+            DEFAULT_MAX_FILE_BYTES,
         )
         .unwrap();
         assert_eq!(s.grade_label(0.0), Some("FF"));

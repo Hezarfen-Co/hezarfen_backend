@@ -428,6 +428,372 @@ async fn note_validation_and_missing_ids() {
     );
 }
 
+// --- note files ------------------------------------------------------------
+
+/// Create a note as `cookie`; returns its id.
+async fn create_note(app: &axum::Router, cookie: &str, title: &str) -> String {
+    let res = send(
+        app,
+        "POST",
+        "/notes",
+        Some(cookie),
+        Some(json!({ "title": title })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "create note {title}");
+    id_of(&res.body)
+}
+
+#[tokio::test]
+async fn note_files_upload_download_delete_roundtrip() {
+    let app = mem_app().await;
+    let ali = login(&app, "ali").await;
+    let note = create_note(&app, &ali, "with file").await;
+
+    let bytes = b"%PDF-1.4 fake but binary \x00\x01\x02".to_vec();
+    let up = common::upload_file(&app, &ali, &note, "plan.pdf", "application/pdf", &bytes).await;
+    assert_eq!(up.status, StatusCode::CREATED, "{}", up.body);
+    assert_eq!(up.body["name"], "plan.pdf");
+    assert_eq!(up.body["content_type"], "application/pdf");
+    assert_eq!(up.body["size"], bytes.len() as i64);
+    let file_id = id_of(&up.body);
+
+    // Listed under the note (paged envelope).
+    let list = send(
+        &app,
+        "GET",
+        &format!("/notes/{note}/files"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(list.status, StatusCode::OK);
+    assert_eq!(common::total(&list.body), 1);
+    assert_eq!(common::items(&list.body)[0]["name"], "plan.pdf");
+
+    // Download returns the exact bytes with the declared type and filename.
+    let (status, headers, body) = common::send_raw(
+        &app,
+        "GET",
+        &format!("/notes/{note}/files/{file_id}"),
+        Some(&ali),
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, bytes);
+    assert_eq!(headers["content-type"], "application/pdf");
+    assert_eq!(
+        headers["content-disposition"],
+        "attachment; filename=\"plan.pdf\"; filename*=UTF-8''plan.pdf"
+    );
+
+    // Delete; the file is gone from the list, download 404s, blob removed.
+    assert_eq!(
+        send(
+            &app,
+            "DELETE",
+            &format!("/notes/{note}/files/{file_id}"),
+            Some(&ali),
+            None
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
+    let list = send(
+        &app,
+        "GET",
+        &format!("/notes/{note}/files"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&list.body), 0);
+    assert_eq!(
+        send(
+            &app,
+            "GET",
+            &format!("/notes/{note}/files/{file_id}"),
+            Some(&ali),
+            None
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
+    );
+    assert!(
+        !common::files_dir().join(&file_id).exists(),
+        "blob must be unlinked with its row"
+    );
+}
+
+#[tokio::test]
+async fn note_files_are_scoped_to_the_notes_owner() {
+    let app = mem_app().await;
+    let ali = login(&app, "ali").await;
+    let veli = login(&app, "veli").await;
+    let note = create_note(&app, &ali, "mine").await;
+    let up = common::upload_file(&app, &ali, &note, "a.txt", "text/plain", b"hi").await;
+    assert_eq!(up.status, StatusCode::CREATED);
+    let file_id = id_of(&up.body);
+
+    // Another user can't upload to, list, download from, or delete on the note.
+    let foreign = common::upload_file(&app, &veli, &note, "b.txt", "text/plain", b"x").await;
+    assert_eq!(foreign.status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        send(
+            &app,
+            "GET",
+            &format!("/notes/{note}/files"),
+            Some(&veli),
+            None
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
+    );
+    for method in ["GET", "DELETE"] {
+        assert_eq!(
+            send(
+                &app,
+                method,
+                &format!("/notes/{note}/files/{file_id}"),
+                Some(&veli),
+                None
+            )
+            .await
+            .status,
+            StatusCode::NOT_FOUND,
+            "{method}"
+        );
+    }
+
+    // A file id under someone else's note id doesn't resolve either.
+    let veli_note = create_note(&app, &veli, "veli's").await;
+    assert_eq!(
+        send(
+            &app,
+            "GET",
+            &format!("/notes/{veli_note}/files/{file_id}"),
+            Some(&veli),
+            None
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn note_file_size_follows_the_school_limit() {
+    let (app, db) = app_and_db().await;
+    let boss = login_as(&app, &db, "boss", "manager").await;
+    let ali = login(&app, "ali").await;
+    let note = create_note(&app, &ali, "sized").await;
+
+    // Lower the school cap to 1 KiB.
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&boss),
+        Some(json!({ "max_file_bytes": 1024 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["max_file_bytes"], 1024);
+
+    // Over the cap dies with 413; at the cap passes.
+    let big = common::upload_file(&app, &ali, &note, "big.bin", "", &vec![7u8; 1025]).await;
+    assert_eq!(big.status, StatusCode::PAYLOAD_TOO_LARGE, "{}", big.body);
+    let fits = common::upload_file(&app, &ali, &note, "fits.bin", "", &vec![7u8; 1024]).await;
+    assert_eq!(fits.status, StatusCode::CREATED, "{}", fits.body);
+    // A blank part content type falls back to octet-stream.
+    assert_eq!(fits.body["content_type"], "application/octet-stream");
+
+    // Raising the cap unlocks bigger files at once.
+    assert_eq!(
+        send(
+            &app,
+            "PATCH",
+            "/settings",
+            Some(&boss),
+            Some(json!({ "max_file_bytes": 10_000 })),
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    let now_fits = common::upload_file(&app, &ali, &note, "big.bin", "", &vec![7u8; 1025]).await;
+    assert_eq!(now_fits.status, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn settings_bound_the_file_limit() {
+    let (app, db) = app_and_db().await;
+    let boss = login_as(&app, &db, "boss", "manager").await;
+
+    // The default is visible to any authenticated user.
+    let res = send(&app, "GET", "/settings", Some(&boss), None).await;
+    assert_eq!(res.body["max_file_bytes"], 5 * 1024 * 1024);
+
+    // Outside the hard bounds -> 400 (and the stored value is untouched).
+    for bad in [0, 1023, 25 * 1024 * 1024 + 1] {
+        let res = send(
+            &app,
+            "PATCH",
+            "/settings",
+            Some(&boss),
+            Some(json!({ "max_file_bytes": bad })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::BAD_REQUEST, "cap {bad}");
+    }
+    let res = send(&app, "GET", "/settings", Some(&boss), None).await;
+    assert_eq!(res.body["max_file_bytes"], 5 * 1024 * 1024);
+
+    // Editing another field leaves the cap alone.
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&boss),
+        Some(json!({ "max_file_bytes": 2048 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&boss),
+        Some(json!({ "grade_bands": [{ "min": 0, "label": "F" }] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["max_file_bytes"], 2048);
+}
+
+#[tokio::test]
+async fn note_file_count_is_capped() {
+    let app = mem_app().await;
+    let ali = login(&app, "ali").await;
+    let note = create_note(&app, &ali, "full").await;
+
+    for i in 0..10 {
+        let up = common::upload_file(&app, &ali, &note, &format!("f{i}.txt"), "", b"x").await;
+        assert_eq!(up.status, StatusCode::CREATED, "file {i}");
+    }
+    let over = common::upload_file(&app, &ali, &note, "f10.txt", "", b"x").await;
+    assert_eq!(over.status, StatusCode::CONFLICT);
+
+    // Deleting one frees a slot.
+    let list = send(
+        &app,
+        "GET",
+        &format!("/notes/{note}/files"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    let victim = id_of(&common::items(&list.body)[0]);
+    assert_eq!(
+        send(
+            &app,
+            "DELETE",
+            &format!("/notes/{note}/files/{victim}"),
+            Some(&ali),
+            None
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
+    let retry = common::upload_file(&app, &ali, &note, "f10.txt", "", b"x").await;
+    assert_eq!(retry.status, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn note_file_upload_validation() {
+    let app = mem_app().await;
+    let ali = login(&app, "ali").await;
+    let note = create_note(&app, &ali, "strict").await;
+
+    // Empty file, filename with a path separator, no file field at all: 400.
+    let empty = common::upload_file(&app, &ali, &note, "e.txt", "", b"").await;
+    assert_eq!(empty.status, StatusCode::BAD_REQUEST, "{}", empty.body);
+    let traversal = common::upload_file(&app, &ali, &note, "../../etc/passwd", "", b"data").await;
+    assert_eq!(traversal.status, StatusCode::BAD_REQUEST);
+
+    // A body whose only part isn't named "file" has no upload in it.
+    let stray = common::multipart_file("y.txt", "", b"data");
+    let stray = String::from_utf8(stray)
+        .unwrap()
+        .replace("name=\"file\"", "name=\"attachment\"");
+    let (status, _, _) = common::send_raw(
+        &app,
+        "POST",
+        &format!("/notes/{note}/files"),
+        Some(&ali),
+        Some("multipart/form-data; boundary=hezarfen-test-boundary"),
+        stray.into_bytes(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Non-ASCII filenames are fine — stored and encoded on download.
+    let turkish =
+        common::upload_file(&app, &ali, &note, "ödev 1.pdf", "application/pdf", b"pdf").await;
+    assert_eq!(turkish.status, StatusCode::CREATED);
+    let (status, headers, _) = common::send_raw(
+        &app,
+        "GET",
+        &format!("/notes/{note}/files/{}", id_of(&turkish.body)),
+        Some(&ali),
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers["content-disposition"],
+        "attachment; filename=\"_dev 1.pdf\"; filename*=UTF-8''%C3%B6dev%201.pdf"
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_note_removes_its_files() {
+    let (app, db) = app_and_db().await;
+    let ali = login(&app, "ali").await;
+    let note = create_note(&app, &ali, "doomed").await;
+    let up = common::upload_file(&app, &ali, &note, "gone.txt", "", b"bye").await;
+    assert_eq!(up.status, StatusCode::CREATED);
+    let file_id = id_of(&up.body);
+
+    assert_eq!(
+        send(&app, "DELETE", &format!("/notes/{note}"), Some(&ali), None)
+            .await
+            .status,
+        StatusCode::NO_CONTENT
+    );
+
+    // Row and blob are both gone.
+    let mut rows = db
+        .query("SELECT * FROM note_file")
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    let left: Vec<serde_json::Value> = rows.take(0).unwrap();
+    assert!(left.is_empty(), "note_file rows must cascade: {left:?}");
+    assert!(
+        !common::files_dir().join(&file_id).exists(),
+        "blob must be unlinked when its note dies"
+    );
+}
+
 // --- events + attendance -------------------------------------------------
 
 #[tokio::test]
@@ -582,15 +948,17 @@ async fn attendance_marking_and_upsert() {
 
     // Two rows total.
     assert_eq!(
-        common::items(&send(
-            &app,
-            "GET",
-            &format!("/events/{event_id}/attendance"),
-            Some(&ali),
-            None
+        common::items(
+            &send(
+                &app,
+                "GET",
+                &format!("/events/{event_id}/attendance"),
+                Some(&ali),
+                None
+            )
+            .await
+            .body
         )
-        .await
-        .body)
         .len(),
         2
     );
@@ -609,15 +977,17 @@ async fn attendance_marking_and_upsert() {
         StatusCode::NO_CONTENT
     );
     assert_eq!(
-        common::items(&send(
-            &app,
-            "GET",
-            &format!("/events/{event_id}/attendance"),
-            Some(&ali),
-            None
+        common::items(
+            &send(
+                &app,
+                "GET",
+                &format!("/events/{event_id}/attendance"),
+                Some(&ali),
+                None
+            )
+            .await
+            .body
         )
-        .await
-        .body)
         .len(),
         1
     );
@@ -902,15 +1272,17 @@ async fn exams_are_course_scoped_and_course_guarded() {
         1
     );
     assert_eq!(
-        common::items(&send(
-            &app,
-            "GET",
-            &format!("/courses/{course_id}/exams"),
-            Some(&ali),
-            None
+        common::items(
+            &send(
+                &app,
+                "GET",
+                &format!("/courses/{course_id}/exams"),
+                Some(&ali),
+                None
+            )
+            .await
+            .body
         )
-        .await
-        .body)
         .len(),
         1
     );
@@ -1086,15 +1458,17 @@ async fn grading_upsert_and_own_result() {
 
     // Teacher sees the full list (one row).
     assert_eq!(
-        common::items(&send(
-            &app,
-            "GET",
-            &format!("/exams/{exam_id}/results"),
-            Some(&teacher),
-            None
+        common::items(
+            &send(
+                &app,
+                "GET",
+                &format!("/exams/{exam_id}/results"),
+                Some(&teacher),
+                None
+            )
+            .await
+            .body
         )
-        .await
-        .body)
         .len(),
         1
     );
@@ -1693,15 +2067,17 @@ async fn exam_creation_lives_under_courses() {
         StatusCode::OK
     );
     assert_eq!(
-        common::items(&send(
-            &app,
-            "GET",
-            &format!("/courses/{course_id}/exams"),
-            Some(&alice),
-            None
+        common::items(
+            &send(
+                &app,
+                "GET",
+                &format!("/courses/{course_id}/exams"),
+                Some(&alice),
+                None
+            )
+            .await
+            .body
         )
-        .await
-        .body)
         .len(),
         1
     );
@@ -1769,7 +2145,12 @@ async fn grading_requires_enrollment() {
         StatusCode::BAD_REQUEST
     );
     assert_eq!(
-        common::items(&send(&app, "GET", &grade_uri, Some(&teacher), None).await.body).len(),
+        common::items(
+            &send(&app, "GET", &grade_uri, Some(&teacher), None)
+                .await
+                .body
+        )
+        .len(),
         1
     );
     assert_eq!(
@@ -3027,15 +3408,17 @@ async fn graders_cannot_grade_themselves() {
 
     // And the rejected attempts wrote nothing.
     assert_eq!(
-        common::items(&send(
-            &app,
-            "GET",
-            &format!("/exams/{exam_id}/results"),
-            Some(&teacher),
-            None
+        common::items(
+            &send(
+                &app,
+                "GET",
+                &format!("/exams/{exam_id}/results"),
+                Some(&teacher),
+                None
+            )
+            .await
+            .body
         )
-        .await
-        .body)
         .len(),
         0
     );
@@ -3122,7 +3505,12 @@ async fn promotion_out_of_student_freezes_the_seat() {
         None,
     )
     .await;
-    assert_eq!(res.status, StatusCode::CREATED, "student sits: {}", res.body);
+    assert_eq!(
+        res.status,
+        StatusCode::CREATED,
+        "student sits: {}",
+        res.body
+    );
 
     // Promote the enrolled student to teacher; the enrollment row survives.
     set_role(&db, "veli", "teacher").await;
@@ -3336,6 +3724,7 @@ async fn session_cookie_secure_attribute_follows_config() {
     let db = database::init_mem().await.unwrap();
     let app = build_router(AppState {
         db,
+        files_path: common::files_dir(),
         cookie_secure: true,
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
         exam_presence: Default::default(),
@@ -6129,7 +6518,13 @@ async fn question_patch_revalidates_the_stale_kind_bundle() {
         None,
     )
     .await;
-    assert_eq!(common::items(&res.body)[0]["choices"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        common::items(&res.body)[0]["choices"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
     assert_eq!(common::items(&res.body)[0]["correct"], 1);
 }
 

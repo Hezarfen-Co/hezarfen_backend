@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::database::Database;
@@ -8,6 +9,10 @@ use crate::rate_limit::RateLimitConfig;
 #[derive(Clone)]
 pub struct AppState {
     pub db: Database,
+    /// Directory holding uploaded note-file blobs, one file per
+    /// `note_file` row, named by the row's key
+    /// (from [`crate::config::Config::files_path`]).
+    pub files_path: PathBuf,
     /// Whether the session cookie carries the `Secure` attribute
     /// (from [`crate::config::Config::cookie_secure`]).
     pub cookie_secure: bool,

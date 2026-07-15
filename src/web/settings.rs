@@ -60,6 +60,9 @@ struct SettingsResponse {
     attendance_statuses: Vec<String>,
     /// Grade-display bands, highest first. Empty = marks display numeric-only.
     grade_bands: Vec<GradeBandDto>,
+    /// Per-file size limit for note uploads, in bytes.
+    #[schema(example = 5_242_880)]
+    max_file_bytes: i64,
 }
 
 impl SettingsResponse {
@@ -82,6 +85,7 @@ impl SettingsResponse {
                     label: band.get_label().to_string(),
                 })
                 .collect(),
+            max_file_bytes: settings.get_max_file_bytes(),
         }
     }
 }
@@ -97,6 +101,10 @@ struct UpdateSettings {
     /// Replaces the whole set when present. `[]` clears the bands (numeric-only
     /// marks); otherwise mins are unique and one band must start at `0`.
     grade_bands: Option<Vec<GradeBandDto>>,
+    /// Per-file size limit for note uploads, in bytes:
+    /// `1024` (1 KiB) – `26214400` (25 MiB). The ceiling is a server hard cap.
+    #[schema(example = 5_242_880)]
+    max_file_bytes: Option<i64>,
 }
 
 /// The school's current policy. Any authenticated user — clients need it to
@@ -126,7 +134,8 @@ async fn get_settings(
 /// new writes are held to the new lists. Kind weights, though, apply live:
 /// mark reports read them at request time, so editing a weight re-weights
 /// every exam of that kind, and an exam whose kind was removed from the list
-/// counts with weight 1 until the kind returns.
+/// counts with weight 1 until the kind returns. `max_file_bytes` likewise
+/// applies at upload time only — already-stored files keep their size.
 #[utoipa::path(
     patch,
     path = "/",
@@ -135,7 +144,7 @@ async fn get_settings(
     request_body = UpdateSettings,
     responses(
         (status = 200, description = "Updated policy", body = SettingsResponse),
-        (status = 400, description = "Invalid lists or bands", body = ErrorResponse),
+        (status = 400, description = "Invalid lists, bands, or file limit", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 409, description = "Concurrent edits kept changing the settings mid-save", body = ErrorResponse),
@@ -171,8 +180,12 @@ async fn update_settings(
                 .collect::<Result<Vec<_>, _>>()?,
             None => current.get_grade_bands().to_vec(),
         };
+        let max_file_bytes = req
+            .max_file_bytes
+            .unwrap_or_else(|| current.get_max_file_bytes());
 
-        let settings = Settings::try_new(exam_kinds, attendance_statuses, grade_bands)?;
+        let settings =
+            Settings::try_new(exam_kinds, attendance_statuses, grade_bands, max_file_bytes)?;
         if let Some(saved) = settings.save_if_unchanged(&current, &st.db).await? {
             return Ok(Json(SettingsResponse::new(&saved)));
         }

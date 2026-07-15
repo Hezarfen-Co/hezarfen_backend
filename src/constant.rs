@@ -35,6 +35,26 @@ pub const MAX_PHONE_DIGITS: usize = 15;
 pub const MAX_NOTE_TITLE_LEN: usize = 200;
 pub const MAX_NOTE_CONTENT_LEN: usize = 10_000;
 
+/// How many files one note may carry.
+pub const MAX_NOTE_FILES: usize = 10;
+
+/// Bounds for a note file's original filename and its MIME content type.
+pub const MAX_FILE_NAME_LEN: usize = 255;
+pub const MAX_FILE_CONTENT_TYPE_LEN: usize = 100;
+
+/// The school-adjustable per-file upload size limit (`max_file_bytes` in
+/// settings): its default and the inclusive range a manager may set. The
+/// ceiling is a server-protection hard cap — uploads buffer in memory and land
+/// in single disk files, so it must stay modest no matter the school's wish.
+pub const DEFAULT_MAX_FILE_BYTES: i64 = 5 * 1024 * 1024;
+pub const MIN_MAX_FILE_BYTES: i64 = 1024;
+pub const MAX_MAX_FILE_BYTES: i64 = 25 * 1024 * 1024;
+
+/// Headroom on top of `MAX_MAX_FILE_BYTES` for the upload route's HTTP body
+/// cap: multipart boundaries, part headers, and the filename ride alongside
+/// the file bytes themselves.
+pub const UPLOAD_BODY_OVERHEAD_BYTES: usize = 64 * 1024;
+
 pub const MAX_EVENT_TITLE_LEN: usize = 200;
 pub const MAX_EVENT_DESCRIPTION_LEN: usize = 2_000;
 

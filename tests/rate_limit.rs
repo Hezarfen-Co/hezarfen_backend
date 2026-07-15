@@ -21,6 +21,7 @@ async fn app_with(rate_limit: RateLimitConfig) -> Router {
     let db = database::init_mem().await.expect("in-memory db");
     build_router(AppState {
         db,
+        files_path: tempfile::tempdir().expect("files dir").keep(),
         cookie_secure: false,
         rate_limit,
         exam_presence: Default::default(),
@@ -311,6 +312,7 @@ async fn spawn_server(rate_limit: RateLimitConfig) -> String {
     let db = database::init_mem().await.expect("in-memory db");
     let app = build_router(AppState {
         db,
+        files_path: tempfile::tempdir().expect("files dir").keep(),
         cookie_secure: false,
         rate_limit,
         exam_presence: Default::default(),

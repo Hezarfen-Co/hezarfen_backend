@@ -1,21 +1,40 @@
+use std::path::{Path as FsPath, PathBuf};
+
 use axum::Json;
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::extract::multipart::MultipartError;
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
+use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
+use axum::http::{HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use crate::constant::{MAX_MAX_FILE_BYTES, MAX_NOTE_FILES, UPLOAD_BODY_OVERHEAD_BYTES};
 use crate::domain::note::{Note, NoteContent, NoteId, NoteTitle};
-use crate::error::{AppError, ErrorResponse};
+use crate::domain::note_file::{FileContentType, FileName, NoteFile, NoteFileId};
+use crate::domain::settings::Settings;
+use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
 
 use super::{CurrentUser, Page, PageParams, paginate};
 
 pub fn routes() -> OpenApiRouter<AppState> {
+    // The file routes get their own HTTP body cap: the server-wide hard
+    // ceiling plus multipart framing headroom (axum's 2 MB default would
+    // reject legal uploads). The school's actual — usually smaller — limit
+    // from settings is enforced while the stream is read.
+    let files = OpenApiRouter::new()
+        .routes(routes!(upload_file, list_files))
+        .routes(routes!(download_file, delete_file))
+        .layer(DefaultBodyLimit::max(
+            MAX_MAX_FILE_BYTES as usize + UPLOAD_BODY_OVERHEAD_BYTES,
+        ));
     OpenApiRouter::new()
         .routes(routes!(create, list))
         .routes(routes!(get_one, update, delete_one))
+        .merge(files)
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -165,7 +184,7 @@ async fn update(
     Ok(Json(NoteResponse::new(&updated)))
 }
 
-/// Delete a note owned by the current user.
+/// Delete a note owned by the current user, along with its files.
 #[utoipa::path(
     delete,
     path = "/{id}",
@@ -186,6 +205,353 @@ async fn delete_one(
     let note = Note::read_owned(&NoteId::from_key(&id), user.get_id(), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
+    // Rows go first (the note delete cascades them), blobs after: a crash in
+    // between strands at worst an unreachable blob, never a row whose blob is
+    // already gone.
+    let files = NoteFile::list_for(note.get_id(), &st.db).await?;
     note.delete(&st.db).await?;
+    for file in &files {
+        remove_blob(&st.files_path, file.get_id()).await;
+    }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// A note file's stored metadata; the bytes themselves come from the
+/// download endpoint.
+#[derive(Serialize, ToSchema)]
+struct NoteFileResponse {
+    id: String,
+    /// The uploader's original filename.
+    #[schema(example = "homework.pdf")]
+    name: String,
+    /// MIME type as declared on upload.
+    #[schema(example = "application/pdf")]
+    content_type: String,
+    /// File size in bytes.
+    #[schema(example = 24_576)]
+    size: i64,
+}
+
+impl NoteFileResponse {
+    fn new(file: &NoteFile) -> Self {
+        Self {
+            id: file.get_id().key().to_string(),
+            name: file.get_name().as_str().to_string(),
+            content_type: file.get_content_type().as_str().to_string(),
+            size: file.get_size(),
+        }
+    }
+}
+
+/// Schema-only mirror of the upload form; the handler reads the multipart
+/// stream directly.
+#[derive(ToSchema)]
+#[allow(dead_code)]
+struct UploadFileForm {
+    /// The file part. Its `filename` (required) and `Content-Type` are stored
+    /// alongside the bytes.
+    #[schema(value_type = String, format = Binary)]
+    file: String,
+}
+
+/// Attach a file to a note owned by the current user. `multipart/form-data`
+/// with the file under a `file` field; its `filename` is required. At most
+/// 10 files per note; each file at most the school's `max_file_bytes`
+/// (settings, default 5 MiB).
+#[utoipa::path(
+    post,
+    path = "/{id}/files",
+    tag = "notes",
+    security(("session_cookie" = [])),
+    params(("id" = String, Path, description = "Note id")),
+    request_body(content = UploadFileForm, content_type = "multipart/form-data"),
+    responses(
+        (status = 201, description = "File stored", body = NoteFileResponse),
+        (status = 400, description = "Missing file field, invalid filename or content type, or empty file", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 404, description = "Note not found", body = ErrorResponse),
+        (status = 409, description = "The note already holds the maximum number of files", body = ErrorResponse),
+        (status = 413, description = "File exceeds the school's size limit", body = ErrorResponse),
+    ),
+)]
+async fn upload_file(
+    State(st): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    Path(id): Path<String>,
+    mut multipart: Multipart,
+) -> Result<(StatusCode, Json<NoteFileResponse>), AppError> {
+    let note = Note::read_owned(&NoteId::from_key(&id), user.get_id(), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if NoteFile::list_for(note.get_id(), &st.db).await?.len() >= MAX_NOTE_FILES {
+        return Err(AppError::Conflict(
+            "the note already holds the maximum of 10 files — delete one first",
+        ));
+    }
+    let limit = Settings::load(&st.db).await?.get_max_file_bytes();
+
+    let mut field = loop {
+        match multipart.next_field().await.map_err(multipart_error)? {
+            Some(field) if field.name() == Some("file") => break field,
+            Some(_) => continue, // ignore stray extra fields
+            None => {
+                return Err(AppError::Validation(ValidationError::Invalid {
+                    field: "file",
+                    reason: "the multipart body must carry a 'file' field",
+                }));
+            }
+        }
+    };
+    let name = FileName::try_new(field.file_name().unwrap_or_default())?;
+    let content_type = FileContentType::try_new(field.content_type().unwrap_or_default())?;
+
+    // Read the part chunkwise so an oversized upload dies at the limit, not
+    // after buffering whole. The check is on real bytes received — a lying
+    // Content-Length can't sneak past it.
+    let mut data = Vec::new();
+    while let Some(chunk) = field.chunk().await.map_err(multipart_error)? {
+        if data.len() + chunk.len() > limit as usize {
+            return Err(AppError::PayloadTooLarge(format!(
+                "the file exceeds the school's limit of {limit} bytes"
+            )));
+        }
+        data.extend_from_slice(&chunk);
+    }
+    if data.is_empty() {
+        return Err(AppError::Validation(ValidationError::Empty("file")));
+    }
+
+    // Blob first, row second — a stored row always points at a real blob. If
+    // the row insert fails, take the fresh blob back out.
+    let file = NoteFile::new(note.get_id(), name, content_type, data.len() as i64);
+    let path = blob_path(&st.files_path, file.get_id());
+    tokio::fs::write(&path, &data)
+        .await
+        .map_err(|err| AppError::Internal(format!("failed to store the file blob: {err}")))?;
+    match file.insert(&st.db).await {
+        Ok(created) => Ok((StatusCode::CREATED, Json(NoteFileResponse::new(&created)))),
+        Err(err) => {
+            let _ = tokio::fs::remove_file(&path).await;
+            Err(err)
+        }
+    }
+}
+
+/// List a note's files (metadata only), newest first. Paged via
+/// `?limit=&offset=`.
+#[utoipa::path(
+    get,
+    path = "/{id}/files",
+    tag = "notes",
+    security(("session_cookie" = [])),
+    params(("id" = String, Path, description = "Note id"), PageParams),
+    responses(
+        (status = 200, description = "A page of the note's files", body = Page<NoteFileResponse>),
+        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 404, description = "Note not found", body = ErrorResponse),
+    ),
+)]
+async fn list_files(
+    State(st): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    Path(id): Path<String>,
+    Query(page): Query<PageParams>,
+) -> Result<Json<Page<NoteFileResponse>>, AppError> {
+    let (limit, offset) = page.resolve()?;
+    let note = Note::read_owned(&NoteId::from_key(&id), user.get_id(), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let files = NoteFile::list_for(note.get_id(), &st.db).await?;
+    let total = files.len() as i64;
+    let items = paginate(&files, limit, offset)
+        .iter()
+        .map(NoteFileResponse::new)
+        .collect();
+    Ok(Json(Page::new(items, total, limit, offset)))
+}
+
+/// Download a note file's bytes. `Content-Type` is the one declared on
+/// upload; `Content-Disposition` carries the original filename.
+#[utoipa::path(
+    get,
+    path = "/{id}/files/{file_id}",
+    tag = "notes",
+    security(("session_cookie" = [])),
+    params(
+        ("id" = String, Path, description = "Note id"),
+        ("file_id" = String, Path, description = "File id"),
+    ),
+    responses(
+        (status = 200, description = "The file bytes", content_type = "application/octet-stream"),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 404, description = "Note or file not found", body = ErrorResponse),
+    ),
+)]
+async fn download_file(
+    State(st): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    Path((id, file_id)): Path<(String, String)>,
+) -> Result<Response, AppError> {
+    let note = Note::read_owned(&NoteId::from_key(&id), user.get_id(), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let file = NoteFile::read_for(&NoteFileId::from_key(&file_id), note.get_id(), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let bytes = tokio::fs::read(blob_path(&st.files_path, file.get_id()))
+        .await
+        .map_err(|err| {
+            // The row exists but its blob doesn't — that's server-side damage
+            // (a lost volume path), not a client 404.
+            AppError::Internal(format!(
+                "missing blob for note file {}: {err}",
+                file.get_id().key()
+            ))
+        })?;
+    // The stored content type is validated ASCII without control characters,
+    // so it always parses; the fallback is for belt and braces.
+    let content_type = HeaderValue::from_str(file.get_content_type().as_str())
+        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+    let disposition = HeaderValue::from_str(&content_disposition(file.get_name().as_str()))
+        .unwrap_or_else(|_| HeaderValue::from_static("attachment"));
+    Ok((
+        [
+            (CONTENT_TYPE, content_type),
+            (CONTENT_DISPOSITION, disposition),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+/// Delete a note file (row first, then its blob).
+#[utoipa::path(
+    delete,
+    path = "/{id}/files/{file_id}",
+    tag = "notes",
+    security(("session_cookie" = [])),
+    params(
+        ("id" = String, Path, description = "Note id"),
+        ("file_id" = String, Path, description = "File id"),
+    ),
+    responses(
+        (status = 204, description = "Deleted"),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 404, description = "Note or file not found", body = ErrorResponse),
+    ),
+)]
+async fn delete_file(
+    State(st): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    Path((id, file_id)): Path<(String, String)>,
+) -> Result<StatusCode, AppError> {
+    let note = Note::read_owned(&NoteId::from_key(&id), user.get_id(), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let file = NoteFile::read_for(&NoteFileId::from_key(&file_id), note.get_id(), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let file = file.delete(&st.db).await?;
+    remove_blob(&st.files_path, file.get_id()).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Where a file row's blob lives: one file under the configured directory,
+/// named by the row's server-generated key — user input never shapes a path.
+fn blob_path(files_path: &FsPath, id: &NoteFileId) -> PathBuf {
+    files_path.join(id.key())
+}
+
+/// Best-effort blob removal after its row is gone. Failure only strands an
+/// unreachable file on disk, so it is logged rather than surfaced.
+async fn remove_blob(files_path: &FsPath, id: &NoteFileId) {
+    let path = blob_path(files_path, id);
+    if let Err(err) = tokio::fs::remove_file(&path).await
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!("failed to remove blob {}: {err}", path.display());
+    }
+}
+
+/// Multipart read failures: the route-level body cap maps to 413 like the
+/// school-limit check; anything else is a malformed body.
+fn multipart_error(err: MultipartError) -> AppError {
+    if err.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        AppError::PayloadTooLarge("the upload exceeds the server's absolute body cap".to_string())
+    } else {
+        AppError::Validation(ValidationError::Invalid {
+            field: "file",
+            reason: "malformed multipart body",
+        })
+    }
+}
+
+/// `Content-Disposition` for a download: an ASCII-safe `filename` fallback
+/// plus the RFC 5987 `filename*` form so non-ASCII names (`ödev.pdf`) survive.
+fn content_disposition(name: &str) -> String {
+    let fallback: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_graphic() && c != '"' && c != '\\' || c == ' ' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!(
+        "attachment; filename=\"{fallback}\"; filename*=UTF-8''{}",
+        rfc5987_encode(name)
+    )
+}
+
+/// Percent-encode everything outside RFC 5987's `attr-char` set, on UTF-8
+/// bytes.
+fn rfc5987_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'a'..=b'z'
+            | b'A'..=b'Z'
+            | b'0'..=b'9'
+            | b'!'
+            | b'#'
+            | b'$'
+            | b'&'
+            | b'+'
+            | b'-'
+            | b'.'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'|'
+            | b'~' => out.push(byte as char),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn disposition_keeps_ascii_and_encodes_the_rest() {
+        assert_eq!(
+            content_disposition("plan.pdf"),
+            "attachment; filename=\"plan.pdf\"; filename*=UTF-8''plan.pdf"
+        );
+        // Non-ASCII survives in the RFC 5987 form; the fallback degrades.
+        assert_eq!(
+            content_disposition("ödev 1.pdf"),
+            "attachment; filename=\"_dev 1.pdf\"; filename*=UTF-8''%C3%B6dev%201.pdf"
+        );
+        // Quotes can't break out of the quoted fallback.
+        assert_eq!(
+            content_disposition("a\"b.pdf"),
+            "attachment; filename=\"a_b.pdf\"; filename*=UTF-8''a%22b.pdf"
+        );
+    }
 }

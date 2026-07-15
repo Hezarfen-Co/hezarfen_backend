@@ -127,7 +127,15 @@ impl Note {
         updated.ok_or(AppError::NotFound)
     }
 
+    /// Delete the note and cascade-remove its attachment rows. Blob files on
+    /// disk are the web layer's to remove (it lists them before calling this);
+    /// a crash in between leaves at worst an unreachable blob, never a row
+    /// pointing at nothing.
     pub async fn delete(self, db: &Database) -> Result<Note, AppError> {
+        db.query("DELETE note_file WHERE note = $note")
+            .bind(("note", self.id.record()))
+            .await?
+            .check()?;
         let deleted: Option<Note> = db.delete(self.id.record()).await?;
         deleted.ok_or(AppError::NotFound)
     }

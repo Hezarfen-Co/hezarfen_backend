@@ -2,14 +2,18 @@
 //! Drives an `axum::Router` in-process via `tower::ServiceExt::oneshot`.
 #![allow(dead_code)]
 
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
 use axum::Router;
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::{HeaderMap, Request, StatusCode};
 use hezarfen_backend::database::Database;
 use hezarfen_backend::rate_limit::RateLimitConfig;
 use hezarfen_backend::state::AppState;
 use hezarfen_backend::{build_router, database};
 use serde_json::{Value, json};
+use tempfile::TempDir;
 use tower::ServiceExt;
 
 pub struct Res {
@@ -19,6 +23,18 @@ pub struct Res {
     pub cookie: Option<String>,
 }
 
+/// One shared blob directory for every in-memory app in this test process.
+/// Blob names are per-row ULIDs, so apps never collide; the static keeps the
+/// `TempDir` (and so the directory) alive for the whole run.
+static FILES_DIR: OnceLock<TempDir> = OnceLock::new();
+
+pub fn files_dir() -> PathBuf {
+    FILES_DIR
+        .get_or_init(|| tempfile::tempdir().expect("files tempdir"))
+        .path()
+        .to_path_buf()
+}
+
 /// A router plus a handle to its (shared) in-memory database. Tests that need to
 /// grant roles use the handle to seed them directly — the app's only role
 /// bootstrap path is out-of-band, exactly like production's manual SQL.
@@ -26,6 +42,7 @@ pub async fn app_and_db() -> (Router, Database) {
     let db = database::init_mem().await.expect("in-memory db");
     let app = build_router(AppState {
         db: db.clone(),
+        files_path: files_dir(),
         cookie_secure: false,
         // Off, so suites hammering the API never trip a limit; the dedicated
         // `rate_limit` test binary opts into tight configs on purpose.
@@ -104,6 +121,86 @@ pub async fn send(
         status,
         body,
         cookie,
+    }
+}
+
+/// Send one request with a raw body and content type; returns the raw
+/// response (status, headers, body bytes) — for driving the file endpoints.
+pub async fn send_raw(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    cookie: Option<&str>,
+    content_type: Option<&str>,
+    body: Vec<u8>,
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(c) = cookie {
+        builder = builder.header("cookie", c);
+    }
+    if let Some(ct) = content_type {
+        builder = builder.header("content-type", ct);
+    }
+    let response = app
+        .clone()
+        .oneshot(builder.body(Body::from(body)).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    (status, headers, bytes)
+}
+
+const MULTIPART_BOUNDARY: &str = "hezarfen-test-boundary";
+
+/// A `multipart/form-data` body with a single `file` part.
+pub fn multipart_file(filename: &str, content_type: &str, bytes: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(format!("--{MULTIPART_BOUNDARY}\r\n").as_bytes());
+    body.extend_from_slice(
+        format!("Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n")
+            .as_bytes(),
+    );
+    body.extend_from_slice(format!("Content-Type: {content_type}\r\n\r\n").as_bytes());
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(format!("\r\n--{MULTIPART_BOUNDARY}--\r\n").as_bytes());
+    body
+}
+
+/// Upload `bytes` as a file onto `note` (no assertion). Parses the JSON body
+/// like `send`.
+pub async fn upload_file(
+    app: &Router,
+    cookie: &str,
+    note: &str,
+    filename: &str,
+    content_type: &str,
+    bytes: &[u8],
+) -> Res {
+    let (status, _, body) = send_raw(
+        app,
+        "POST",
+        &format!("/notes/{note}/files"),
+        Some(cookie),
+        Some(&format!(
+            "multipart/form-data; boundary={MULTIPART_BOUNDARY}"
+        )),
+        multipart_file(filename, content_type, bytes),
+    )
+    .await;
+    let body = if body.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&body).unwrap_or(Value::Null)
+    };
+    Res {
+        status,
+        body,
+        cookie: None,
     }
 }
 
