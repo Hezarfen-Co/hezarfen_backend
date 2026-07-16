@@ -107,6 +107,7 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS creator ON course TYPE record<user>;
     DEFINE FIELD IF NOT EXISTS title ON course TYPE string;
     DEFINE FIELD IF NOT EXISTS description ON course TYPE string;
+    DEFINE FIELD IF NOT EXISTS kind ON course TYPE string DEFAULT 'course';
     DEFINE FIELD IF NOT EXISTS term ON course TYPE option<record<term>>;
 
     DEFINE TABLE IF NOT EXISTS enrollment SCHEMAFULL;
@@ -209,6 +210,8 @@ const MIGRATION: &str = "
 /// Idempotent: each backfill's `WHERE` only matches unconverted rows.
 const BACKFILL: &str = "
     UPDATE user SET role = 'student' WHERE role = NONE;
+
+    UPDATE course SET kind = 'course' WHERE kind = NONE;
 
     UPDATE event SET audience = { kind: 'school' } WHERE audience = NONE OR audience = {};
 

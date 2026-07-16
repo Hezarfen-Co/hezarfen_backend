@@ -2132,6 +2132,71 @@ async fn course_input_validation() {
     );
 }
 
+/// A course is `course` by default, may be born a `study` (etüt), the kind is
+/// PATCH-editable, and anything else is a 400.
+#[tokio::test]
+async fn course_kind_defaults_validates_and_edits() {
+    let (app, db) = app_and_db().await;
+    let ali = login_as(&app, &db, "ali", "teacher").await;
+
+    let plain = send(
+        &app,
+        "POST",
+        "/courses",
+        Some(&ali),
+        Some(json!({"title":"algebra"})),
+    )
+    .await;
+    assert_eq!(plain.status, StatusCode::CREATED);
+    assert_eq!(plain.body["kind"], "course");
+
+    let etut = send(
+        &app,
+        "POST",
+        "/courses",
+        Some(&ali),
+        Some(json!({"title":"evening etut", "kind":"study"})),
+    )
+    .await;
+    assert_eq!(etut.status, StatusCode::CREATED);
+    assert_eq!(etut.body["kind"], "study");
+
+    assert_eq!(
+        send(
+            &app,
+            "POST",
+            "/courses",
+            Some(&ali),
+            Some(json!({"title":"nope", "kind":"etut"}))
+        )
+        .await
+        .status,
+        StatusCode::BAD_REQUEST
+    );
+
+    // PATCH flips the kind; omitting it keeps the current one.
+    let id = id_of(&plain.body);
+    let flipped = send(
+        &app,
+        "PATCH",
+        &format!("/courses/{id}"),
+        Some(&ali),
+        Some(json!({"kind":"study"})),
+    )
+    .await;
+    assert_eq!(flipped.status, StatusCode::OK);
+    assert_eq!(flipped.body["kind"], "study");
+    let renamed = send(
+        &app,
+        "PATCH",
+        &format!("/courses/{id}"),
+        Some(&ali),
+        Some(json!({"title":"geometry"})),
+    )
+    .await;
+    assert_eq!(renamed.body["kind"], "study", "omitted kind is kept");
+}
+
 #[tokio::test]
 async fn enrollment_upsert_roster_and_my_courses() {
     let (app, db) = app_and_db().await;

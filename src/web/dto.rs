@@ -160,6 +160,10 @@ pub struct CourseResponse {
     #[schema(example = "Algebra")]
     pub title: String,
     pub description: String,
+    /// `course` (a regular class) or `study` (a supervised study session —
+    /// etüt). Behaviorally identical; a label for the UI.
+    #[schema(example = "course")]
+    pub kind: String,
     /// The academic term this course belongs to (`GET /terms`); `null` when
     /// unassigned.
     pub term: Option<String>,
@@ -172,6 +176,7 @@ impl CourseResponse {
             creator: course.get_creator().key().to_string(),
             title: course.get_title().as_str().to_string(),
             description: course.get_description().as_str().to_string(),
+            kind: course.get_kind().as_str().to_string(),
             term: course.get_term().map(|term| term.key().to_string()),
         }
     }

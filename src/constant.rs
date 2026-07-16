@@ -99,6 +99,12 @@ pub const SETTINGS_UPDATE_RETRIES: usize = 3;
 
 pub const MAX_TERM_NAME_LEN: usize = 100;
 
+/// The only accepted course kinds. `course`: a regular class (ders). `study`:
+/// a supervised study session (etüt). Behaviorally identical — the kind is a
+/// label for the UI, everything else (enrollment, exams, sessions, marks)
+/// works the same.
+pub const COURSE_KINDS: [&str; 2] = ["course", "study"];
+
 /// The only accepted exam modes. `sync`: everyone sits the exam inside one
 /// fixed window. `async`: each student starts inside the window and gets their
 /// own `duration_ms` slice of it. `open`: no window — students sit anytime,
