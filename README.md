@@ -27,7 +27,10 @@ staff clock in/out on a server-stamped **work log**, and every user has an
 School-varying policy is data, not code: exam kinds (each with its weight in
 course averages), attendance statuses, grade-display bands, and the note-file
 size limit live in an editable **settings** singleton, and academic **terms**
-are plain rows courses can link to (see "Per-school policy").
+are plain rows courses can link to (see "Per-school policy"). Each account
+also carries its own **UI preferences** — theme (`light`/`dark`) and language
+(`tr`/`en`) — self-managed, admin-editable for anyone, `null` until chosen so
+the client can fall back to the device preference.
 
 Every field is a validated newtype (`Username(String)`, `NoteTitle(String)`, …)
 constructed only after its restrictions pass — invalid input can't be
@@ -187,9 +190,10 @@ effect on the user's very next call (no re-login).
 | Read another user's mark report          | teacher      | Narrowed to the caller's managed courses; `manager`+ sees all |
 | Grade students                           | teacher      | Target must be an **enrolled student**; grading never targets oneself |
 | Edit **own** personal info (name, surname, email, phone, birth date) | student | Every account carries the same optional info fields |
+| Edit **own** UI preferences (theme, language) | student | `null` until chosen — the client then follows the device preference |
 | Read the school settings and the term list | student | Clients need them to render kind/status pickers, grades, and the calendar |
 | Edit school settings; create / edit / delete terms | manager | School policy (exam kinds, attendance statuses, grade bands, the note-file size limit) and the academic calendar are management's call |
-| List users; look up one user; change a user's role; edit **any** user's personal info | admin | An admin cannot change **their own** role |
+| List users; look up one user; change a user's role; edit **any** user's personal info or UI preferences | admin | An admin cannot change **their own** role |
 
 ### Bootstrapping the first admin
 
@@ -260,11 +264,13 @@ their existing shapes: the student exam-room reads
 | POST   | `/auth/logout`                   | no      | Clear session (no-op if none)   |
 | GET    | `/auth/me`                       | student | Current user (incl. `role` and personal info) |
 | PATCH  | `/users/me`                      | student | Update own personal info (see below) |
+| PATCH  | `/users/me/preferences`          | student | `{theme?, language?}` — own UI preferences (see below) |
 | GET    | `/users/search`                  | teacher | `?q=<fragment>&role=<role?>` — find users by username/name fragment (pickers); refs only, no contact info · paged |
 | GET    | `/users`                         | admin   | List all users · paged          |
 | GET    | `/users/{id}`                    | admin   | Get one user                    |
 | PATCH  | `/users/{id}/role`               | admin   | `{role}` — set a user's role    |
 | PATCH  | `/users/{id}/profile`            | admin   | Update any user's personal info |
+| PATCH  | `/users/{id}/preferences`        | admin   | Update any user's UI preferences |
 | POST   | `/notes`                         | student | `{title, content?}`             |
 | GET    | `/notes`                         | student | List own notes · paged          |
 | GET    | `/notes/{id}`                    | student | Get own note                    |
@@ -386,6 +392,13 @@ rejected at `/auth/register` only — the `ADMIN_USERNAME` bootstrap may still
 seed them. A duplicate username on register is a `409`; that this reveals the
 name is taken is a deliberate tradeoff (usernames are public handles here,
 unlike emails).
+UI preferences (`theme`: `light`/`dark`, `language`: `tr`/`en`) ride on the
+same account row and come back on every user response (`/auth/me` included).
+`PATCH /users/me/preferences` (or the admin `PATCH /users/{id}/preferences`)
+uses the same field semantics as the profile patch: omitted keeps, `""` clears
+back to `null` ("never chose" — the client then follows the device
+preference), anything else must be one of the listed values or the whole patch
+is a `400`.
 
 ## Per-school policy (settings & terms)
 

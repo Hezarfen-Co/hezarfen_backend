@@ -6,6 +6,7 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use ulid::Ulid;
 
 use crate::database::{Database, USER_TABLE};
+use crate::domain::preferences::{Language, Theme};
 use crate::domain::profile::{BirthDate, Email, PersonName, Phone};
 use crate::domain::role::Role;
 use crate::error::{AppError, ValidationError};
@@ -132,6 +133,10 @@ pub struct User {
     email: Option<Email>,
     phone: Option<Phone>,
     birth_date: Option<BirthDate>,
+    // Frontend UI preferences. Optional like the personal info: `None` means
+    // "never chose", which the frontend renders as the device preference.
+    theme: Option<Theme>,
+    language: Option<Language>,
 }
 
 impl User {
@@ -171,6 +176,14 @@ impl User {
         self.birth_date.as_ref()
     }
 
+    pub fn get_theme(&self) -> Option<Theme> {
+        self.theme
+    }
+
+    pub fn get_language(&self) -> Option<Language> {
+        self.language
+    }
+
     /// Register a new account. New users always start as [`Role::Student`];
     /// elevation is a separate, admin-only action (see [`User::set_role`]).
     pub async fn create(
@@ -194,6 +207,8 @@ impl User {
             email: None,
             phone: None,
             birth_date: None,
+            theme: None,
+            language: None,
         };
         let created: Result<Option<User>, surrealdb::Error> =
             db.create(user.id.record()).content(user.clone()).await;
@@ -331,6 +346,22 @@ impl User {
         self.email = email;
         self.phone = phone;
         self.birth_date = birth_date;
+        let updated: Option<User> = db.update(self.id.record()).content(self).await?;
+        updated.ok_or(AppError::NotFound)
+    }
+
+    /// Overwrite the UI-preference fields wholesale. Same contract as
+    /// [`User::set_profile`]: each argument is the final value (`None` clears
+    /// back to "never chose"), merging is the HTTP layer's job, the caller
+    /// authorizes.
+    pub async fn set_preferences(
+        mut self,
+        theme: Option<Theme>,
+        language: Option<Language>,
+        db: &Database,
+    ) -> Result<User, AppError> {
+        self.theme = theme;
+        self.language = language;
         let updated: Option<User> = db.update(self.id.record()).content(self).await?;
         updated.ok_or(AppError::NotFound)
     }

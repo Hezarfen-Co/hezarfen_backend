@@ -261,6 +261,54 @@ async fn profile_survives_reopen() {
     }
 }
 
+/// UI preferences written through `PATCH /users/me/preferences` are still on
+/// the account after a close + reopen.
+#[tokio::test]
+async fn preferences_survive_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config_at(&dir);
+    let creds = json!({ "username": "ali", "password": "secret1" });
+
+    // First boot: register and choose a theme + language.
+    {
+        let db = database::init(&cfg).await.expect("first open");
+        let app = build_router(state(db, &cfg));
+        assert_eq!(
+            send(&app, "POST", "/auth/register", None, Some(creds.clone()))
+                .await
+                .status,
+            StatusCode::CREATED
+        );
+        let cookie = send(&app, "POST", "/auth/login", None, Some(creds.clone()))
+            .await
+            .cookie
+            .unwrap();
+        let res = send(
+            &app,
+            "PATCH",
+            "/users/me/preferences",
+            Some(&cookie),
+            Some(json!({ "theme": "dark", "language": "tr" })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK);
+    }
+
+    // Second boot: the choices come back from disk.
+    {
+        let db = reopen(&cfg).await;
+        let app = build_router(state(db, &cfg));
+        let cookie = send(&app, "POST", "/auth/login", None, Some(creds))
+            .await
+            .cookie
+            .unwrap();
+        let me = send(&app, "GET", "/auth/me", Some(&cookie), None).await;
+        assert_eq!(me.status, StatusCode::OK);
+        assert_eq!(me.body["theme"], "dark");
+        assert_eq!(me.body["language"], "tr");
+    }
+}
+
 /// A course with an enrollment, an exam whose kind carries a weight, and a
 /// graded mark survives a close + reopen — the weighted report (settings
 /// included) is rebuilt from disk.

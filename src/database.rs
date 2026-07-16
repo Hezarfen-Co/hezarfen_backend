@@ -42,6 +42,8 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS email ON user TYPE option<string>;
     DEFINE FIELD IF NOT EXISTS phone ON user TYPE option<string>;
     DEFINE FIELD IF NOT EXISTS birth_date ON user TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS theme ON user TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS language ON user TYPE option<string>;
     DEFINE INDEX IF NOT EXISTS user_username ON user FIELDS username UNIQUE;
     UPDATE user SET role = 'student' WHERE role = NONE;
 

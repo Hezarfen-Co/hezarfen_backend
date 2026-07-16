@@ -3126,6 +3126,176 @@ async fn admin_reads_and_edits_any_profile_with_guards() {
     );
 }
 
+// --- users: UI preferences (theme, language) ------------------------------
+
+#[tokio::test]
+async fn preferences_start_null_and_update_via_me_preferences() {
+    let app = mem_app().await;
+    let bob = login(&app, "bob").await;
+
+    // A fresh account has never chosen — both come back null.
+    let me = send(&app, "GET", "/auth/me", Some(&bob), None).await;
+    assert_eq!(me.status, StatusCode::OK);
+    assert!(me.body["theme"].is_null(), "theme should start null");
+    assert!(me.body["language"].is_null(), "language should start null");
+
+    // Set both through the self-service endpoint.
+    let res = send(
+        &app,
+        "PATCH",
+        "/users/me/preferences",
+        Some(&bob),
+        Some(json!({ "theme": "dark", "language": "tr" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["theme"], "dark");
+    assert_eq!(res.body["language"], "tr");
+
+    // Partial patch: only the theme changes, the language survives.
+    let res = send(
+        &app,
+        "PATCH",
+        "/users/me/preferences",
+        Some(&bob),
+        Some(json!({ "theme": "light" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["theme"], "light");
+    assert_eq!(res.body["language"], "tr");
+
+    // Empty string clears back to "never chose"; the other stays.
+    let res = send(
+        &app,
+        "PATCH",
+        "/users/me/preferences",
+        Some(&bob),
+        Some(json!({ "theme": "" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert!(res.body["theme"].is_null());
+    assert_eq!(res.body["language"], "tr");
+
+    // The merged state is what /auth/me reports afterwards.
+    let me = send(&app, "GET", "/auth/me", Some(&bob), None).await;
+    assert!(me.body["theme"].is_null());
+    assert_eq!(me.body["language"], "tr");
+
+    // No session -> 401.
+    assert_eq!(
+        send(
+            &app,
+            "PATCH",
+            "/users/me/preferences",
+            None,
+            Some(json!({"theme":"dark"}))
+        )
+        .await
+        .status,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn preferences_reject_invalid_values() {
+    let app = mem_app().await;
+    let bob = login(&app, "bob").await;
+
+    let bad = [
+        json!({ "theme": "solarized" }),
+        json!({ "theme": "Dark" }),
+        json!({ "language": "turkish" }),
+        json!({ "language": "de" }),
+        json!({ "theme": "dark", "language": "nope" }),
+    ];
+    for body in bad {
+        let res = send(
+            &app,
+            "PATCH",
+            "/users/me/preferences",
+            Some(&bob),
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::BAD_REQUEST, "should reject {body}");
+    }
+
+    // A rejected patch must not have half-applied: both are still null.
+    let me = send(&app, "GET", "/auth/me", Some(&bob), None).await;
+    assert!(me.body["theme"].is_null(), "theme should still be null");
+    assert!(
+        me.body["language"].is_null(),
+        "language should still be null"
+    );
+}
+
+#[tokio::test]
+async fn admin_edits_any_preferences_with_guards() {
+    let (app, db) = app_and_db().await;
+    let admin = login_as(&app, &db, "boss", "admin").await;
+    let alice = login(&app, "alice").await;
+    let alice_id = id_of(&send(&app, "GET", "/auth/me", Some(&alice), None).await.body);
+    let admin_id = id_of(&send(&app, "GET", "/auth/me", Some(&admin), None).await.body);
+
+    // A student cannot touch someone else's preferences.
+    assert_eq!(
+        send(
+            &app,
+            "PATCH",
+            &format!("/users/{admin_id}/preferences"),
+            Some(&alice),
+            Some(json!({"theme":"dark"}))
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
+
+    // Admin sets alice's preferences on her behalf.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/users/{alice_id}/preferences"),
+        Some(&admin),
+        Some(json!({ "theme": "dark", "language": "en" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["theme"], "dark");
+    assert_eq!(res.body["language"], "en");
+
+    // Admin reads them on the single-user lookup; alice sees them on /auth/me.
+    let one = send(
+        &app,
+        "GET",
+        &format!("/users/{alice_id}"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(one.body["theme"], "dark");
+    assert_eq!(one.body["language"], "en");
+    let me = send(&app, "GET", "/auth/me", Some(&alice), None).await;
+    assert_eq!(me.body["theme"], "dark");
+    assert_eq!(me.body["language"], "en");
+
+    // Unknown id -> 404.
+    assert_eq!(
+        send(
+            &app,
+            "PATCH",
+            "/users/does-not-exist/preferences",
+            Some(&admin),
+            Some(json!({"theme":"dark"}))
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
+    );
+}
+
 // --- regression: race safety, session hygiene, CORS ----------------------
 
 /// #1 — Many concurrent marks for the *same* (event, user). A find-then-insert

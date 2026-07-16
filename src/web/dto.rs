@@ -123,6 +123,14 @@ pub struct UserResponse {
     pub phone: Option<String>,
     #[schema(example = "1990-01-02")]
     pub birth_date: Option<String>,
+    /// UI color scheme: `light` or `dark`. `null` = never chosen — the client
+    /// should fall back to the device preference.
+    #[schema(example = "dark")]
+    pub theme: Option<String>,
+    /// UI language (ISO 639-1): `tr` or `en`. `null` = never chosen — the
+    /// client should fall back to the device language.
+    #[schema(example = "tr")]
+    pub language: Option<String>,
 }
 
 impl UserResponse {
@@ -136,6 +144,8 @@ impl UserResponse {
             email: user.get_email().map(|v| v.as_str().to_string()),
             phone: user.get_phone().map(|v| v.as_str().to_string()),
             birth_date: user.get_birth_date().map(|v| v.as_str().to_string()),
+            theme: user.get_theme().map(|v| v.as_str().to_string()),
+            language: user.get_language().map(|v| v.as_str().to_string()),
         }
     }
 }

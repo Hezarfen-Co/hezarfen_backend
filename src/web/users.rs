@@ -6,6 +6,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::database::Database;
+use crate::domain::preferences::{Language, Theme};
 use crate::domain::profile::{BirthDate, Email, PersonName, Phone};
 use crate::domain::role::Role;
 use crate::domain::user::{User, UserId};
@@ -21,10 +22,12 @@ pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(list_users))
         .routes(routes!(update_my_profile))
+        .routes(routes!(update_my_preferences))
         .routes(routes!(search_users))
         .routes(routes!(get_user))
         .routes(routes!(set_role))
         .routes(routes!(update_user_profile))
+        .routes(routes!(update_user_preferences))
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -50,6 +53,20 @@ struct UpdateProfile {
     /// Birth date in `YYYY-MM-DD` form.
     #[schema(example = "1990-01-02")]
     birth_date: Option<String>,
+}
+
+/// Partial UI-preference update. Same field semantics as [`UpdateProfile`]:
+/// omitted (or `null`) keeps the current value, an empty string clears it back
+/// to "never chose" (the client then follows the device preference), anything
+/// else is validated and set.
+#[derive(Deserialize, ToSchema)]
+struct UpdatePreferences {
+    /// `light` or `dark`.
+    #[schema(example = "dark")]
+    theme: Option<String>,
+    /// `tr` or `en` (ISO 639-1).
+    #[schema(example = "tr")]
+    language: Option<String>,
 }
 
 /// Resolve one patched field: absent keeps the current value, `""` clears it,
@@ -90,6 +107,26 @@ async fn apply_profile(
     let updated = user
         .set_profile(name, surname, email, phone, birth_date, db)
         .await?;
+    Ok(UserResponse::new(&updated))
+}
+
+/// Merge `req` over `user`'s current preferences and persist. Shared by the
+/// self-service and admin preference endpoints — they differ only in whose row
+/// they load and who may call them.
+async fn apply_preferences(
+    user: User,
+    req: &UpdatePreferences,
+    db: &Database,
+) -> Result<UserResponse, AppError> {
+    let theme = merge_field(user.get_theme().as_ref(), req.theme.as_deref(), |v| {
+        Theme::try_from_str(v)
+    })?;
+    let language = merge_field(
+        user.get_language().as_ref(),
+        req.language.as_deref(),
+        Language::try_from_str,
+    )?;
+    let updated = user.set_preferences(theme, language, db).await?;
     Ok(UserResponse::new(&updated))
 }
 
@@ -208,6 +245,31 @@ async fn update_my_profile(
     Ok(Json(apply_profile(user, &req, &st.db).await?))
 }
 
+/// Update the caller's own UI preferences: `theme` (`light`/`dark`) and
+/// `language` (`tr`/`en`). Any authenticated role. Omitted fields stay as they
+/// are; an empty string clears one back to "never chose" (the client then
+/// follows the device preference). Read them back on any user response, e.g.
+/// `GET /auth/me`.
+#[utoipa::path(
+    patch,
+    path = "/me/preferences",
+    tag = "users",
+    security(("session_cookie" = [])),
+    request_body = UpdatePreferences,
+    responses(
+        (status = 200, description = "Updated user", body = UserResponse),
+        (status = 400, description = "Invalid theme or language", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+    ),
+)]
+async fn update_my_preferences(
+    State(st): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    Json(req): Json<UpdatePreferences>,
+) -> Result<Json<UserResponse>, AppError> {
+    Ok(Json(apply_preferences(user, &req, &st.db).await?))
+}
+
 /// Fetch one user with their role and personal info. Admin only.
 #[utoipa::path(
     get,
@@ -261,6 +323,36 @@ async fn update_user_profile(
         .await?
         .ok_or(AppError::NotFound)?;
     Ok(Json(apply_profile(user, &req, &st.db).await?))
+}
+
+/// Update any user's UI preferences. Admin only — everyone else manages their
+/// own through `PATCH /users/me/preferences`, which this mirrors field for
+/// field.
+#[utoipa::path(
+    patch,
+    path = "/{id}/preferences",
+    tag = "users",
+    security(("session_cookie" = [])),
+    params(("id" = String, Path, description = "User id")),
+    request_body = UpdatePreferences,
+    responses(
+        (status = 200, description = "Updated user", body = UserResponse),
+        (status = 400, description = "Invalid theme or language", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires admin role", body = ErrorResponse),
+        (status = 404, description = "User not found", body = ErrorResponse),
+    ),
+)]
+async fn update_user_preferences(
+    State(st): State<AppState>,
+    _admin: RequireAdmin,
+    Path(id): Path<String>,
+    Json(req): Json<UpdatePreferences>,
+) -> Result<Json<UserResponse>, AppError> {
+    let user = User::read(&UserId::from_key(&id), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(Json(apply_preferences(user, &req, &st.db).await?))
 }
 
 /// Set a user's role. Admin only. An admin cannot change their own role — that
