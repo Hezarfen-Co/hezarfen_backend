@@ -8,8 +8,11 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use crate::constant::MAX_EVENT_AUDIENCE_USERS;
+use crate::database::Database;
 use crate::domain::attendance::{Attendance, AttendanceStatus};
-use crate::domain::event::{Event, EventDescription, EventId, EventTitle};
+use crate::domain::course::{Course, CourseId};
+use crate::domain::event::{Event, EventAudience, EventDescription, EventId, EventTitle};
 use crate::domain::role::Role;
 use crate::domain::settings::Settings;
 use crate::domain::timestamp::Timestamp;
@@ -28,6 +31,91 @@ pub fn routes() -> OpenApiRouter<AppState> {
         .routes(routes!(get_event, update_event, delete_event))
         .routes(routes!(mark, list_attendance))
         .routes(routes!(remove_attendance))
+        .routes(routes!(roster))
+}
+
+/// An event's audience on the wire — who is expected to attend. Tagged by
+/// `kind`; the extra field each kind needs rides alongside it.
+#[derive(Serialize, Deserialize, Clone, ToSchema)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum AudienceDto {
+    /// Everybody in the school. The default when a create request omits
+    /// `audience` entirely.
+    School,
+    /// Every user holding exactly this role — `student`, `teacher`, `manager`,
+    /// or `admin` (no implied "and above").
+    Role { role: String },
+    /// The students currently enrolled in this course (live — enrollment
+    /// changes move people in and out).
+    Course { course: String },
+    /// A hand-picked list of user ids (at most `100`, deduplicated).
+    Users { users: Vec<String> },
+}
+
+impl AudienceDto {
+    /// Validate the wire form into the domain audience: the role must parse,
+    /// the course must exist, and a `users` list must be non-empty, within the
+    /// cap, and name only existing users.
+    async fn into_domain(self, db: &Database) -> Result<EventAudience, AppError> {
+        match self {
+            AudienceDto::School => Ok(EventAudience::School),
+            AudienceDto::Role { role } => Ok(EventAudience::Role {
+                role: Role::try_from_str(&role)?,
+            }),
+            AudienceDto::Course { course } => {
+                let course = CourseId::from_key(&course);
+                if Course::read(&course, db).await?.is_none() {
+                    return Err(AppError::Validation(ValidationError::Invalid {
+                        field: "audience",
+                        reason: "course does not exist",
+                    }));
+                }
+                Ok(EventAudience::Course { course })
+            }
+            AudienceDto::Users { users } => {
+                let mut seen = std::collections::HashSet::new();
+                let users: Vec<UserId> = users
+                    .iter()
+                    .filter(|key| seen.insert(key.as_str()))
+                    .map(|key| UserId::from_key(key))
+                    .collect();
+                if users.is_empty() {
+                    return Err(AppError::Validation(ValidationError::Invalid {
+                        field: "audience",
+                        reason: "users must not be empty",
+                    }));
+                }
+                if users.len() > MAX_EVENT_AUDIENCE_USERS {
+                    return Err(AppError::Validation(ValidationError::Invalid {
+                        field: "audience",
+                        reason: "users lists more than 100 people — target a role or course instead",
+                    }));
+                }
+                if User::list_by_ids(&users, db).await?.len() != users.len() {
+                    return Err(AppError::Validation(ValidationError::Invalid {
+                        field: "audience",
+                        reason: "users lists a user that does not exist",
+                    }));
+                }
+                Ok(EventAudience::Users { users })
+            }
+        }
+    }
+
+    fn from_domain(audience: &EventAudience) -> Self {
+        match audience {
+            EventAudience::School => AudienceDto::School,
+            EventAudience::Role { role } => AudienceDto::Role {
+                role: role.as_str().to_string(),
+            },
+            EventAudience::Course { course } => AudienceDto::Course {
+                course: course.key().to_string(),
+            },
+            EventAudience::Users { users } => AudienceDto::Users {
+                users: users.iter().map(|user| user.key().to_string()).collect(),
+            },
+        }
+    }
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -35,6 +123,9 @@ struct CreateEvent {
     #[schema(example = "Sprint demo")]
     title: String,
     description: Option<String>,
+    /// Who the event is for (its expected-attendee roster). Omit for a
+    /// school-wide event.
+    audience: Option<AudienceDto>,
     /// Unix-millisecond timestamps. Must not be in the past.
     #[schema(example = 1_900_000_000_000_i64)]
     starts_at: Option<i64>,
@@ -45,6 +136,10 @@ struct CreateEvent {
 struct UpdateEvent {
     title: Option<String>,
     description: Option<String>,
+    /// Replaces the audience wholesale when present; omit to keep the current
+    /// one. Attendance rows for people the change drops out of the roster stay
+    /// stored — they just stop appearing on the roster report.
+    audience: Option<AudienceDto>,
     /// Unix-millisecond timestamp. Omit to keep the current value; send `null`
     /// to clear it. A newly set value must not be in the past.
     #[serde(default, deserialize_with = "set_or_clear")]
@@ -63,7 +158,8 @@ struct MarkAttendance {
     /// four are `present`, `absent`, `late`, `excused`).
     #[schema(example = "present")]
     status: String,
-    /// Target user id. Defaults to the caller when omitted.
+    /// Target user id — must be in the event's audience. Defaults to the
+    /// caller when omitted.
     user_id: Option<String>,
 }
 
@@ -73,6 +169,7 @@ struct EventResponse {
     creator: String,
     title: String,
     description: String,
+    audience: AudienceDto,
     starts_at: Option<i64>,
     ends_at: Option<i64>,
 }
@@ -84,6 +181,7 @@ impl EventResponse {
             creator: event.get_creator().key().to_string(),
             title: event.get_title().as_str().to_string(),
             description: event.get_description().as_str().to_string(),
+            audience: AudienceDto::from_domain(event.get_audience()),
             starts_at: event.get_starts_at().map(|t| t.as_millis()),
             ends_at: event.get_ends_at().map(|t| t.as_millis()),
         }
@@ -122,7 +220,10 @@ impl AttendanceResponse {
 
 // ---- events -------------------------------------------------------------
 
-/// Create an event owned by the current user. Requires the `teacher` role or higher.
+/// Create an event owned by the current user. Requires the `teacher` role or
+/// higher. `audience` targets it at a role, a course's enrollment, or a
+/// hand-picked user list; omitted it is school-wide. Everyone still sees every
+/// event — the audience is the expected-attendee roster, not a visibility wall.
 #[utoipa::path(
     post,
     path = "/",
@@ -131,7 +232,7 @@ impl AttendanceResponse {
     request_body = CreateEvent,
     responses(
         (status = 201, description = "Event created", body = EventResponse),
-        (status = 400, description = "Invalid fields, time range, or times in the past", body = ErrorResponse),
+        (status = 400, description = "Invalid fields, audience, time range, or times in the past", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
     ),
@@ -143,6 +244,10 @@ async fn create_event(
 ) -> Result<(StatusCode, Json<EventResponse>), AppError> {
     let title = EventTitle::try_new(&req.title)?;
     let description = EventDescription::try_new(&req.description.unwrap_or_default())?;
+    let audience = match req.audience {
+        Some(audience) => audience.into_domain(&st.db).await?,
+        None => EventAudience::School,
+    };
     let starts_at = req.starts_at.map(Timestamp::from_millis);
     let ends_at = req.ends_at.map(Timestamp::from_millis);
     check_not_past("starts_at", starts_at)?;
@@ -152,6 +257,7 @@ async fn create_event(
         user.get_id(),
         title,
         description,
+        audience,
         starts_at,
         ends_at,
         &st.db,
@@ -215,7 +321,9 @@ async fn get_event(
 
 /// Update an event. Requires teacher+; the creator may edit their own event and
 /// managers/admins may edit anyone's. Omitted fields keep their value; an
-/// explicit `null` clears `starts_at`/`ends_at`.
+/// explicit `null` clears `starts_at`/`ends_at`. A provided `audience` replaces
+/// the current one wholesale — attendance rows for people it drops stay stored
+/// but leave the roster report.
 #[utoipa::path(
     patch,
     path = "/{id}",
@@ -225,7 +333,7 @@ async fn get_event(
     request_body = UpdateEvent,
     responses(
         (status = 200, description = "Updated event", body = EventResponse),
-        (status = 400, description = "Invalid fields, time range, or times in the past", body = ErrorResponse),
+        (status = 400, description = "Invalid fields, audience, time range, or times in the past", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
@@ -254,6 +362,10 @@ async fn update_event(
         Some(ref description) => EventDescription::try_new(description)?,
         None => event.get_description().clone(),
     };
+    let audience = match req.audience {
+        Some(audience) => audience.into_domain(&st.db).await?,
+        None => event.get_audience().clone(),
+    };
     // A provided value sets the field, an explicit `null` clears it, and an
     // omitted one keeps the current value. Only set values are held to the
     // no-past rule — a kept time of an event already underway may be past.
@@ -276,7 +388,7 @@ async fn update_event(
     check_time_range(starts_at, ends_at)?;
 
     let updated = event
-        .update(title, description, starts_at, ends_at, &st.db)
+        .update(title, description, audience, starts_at, ends_at, &st.db)
         .await?;
     Ok(Json(EventResponse::new(&updated)))
 }
@@ -315,9 +427,9 @@ async fn delete_event(
 
 // ---- attendance ---------------------------------------------------------
 
-/// Mark attendance for a user on an event (defaults to the caller). Anyone may
-/// mark their own attendance; marking someone else requires the `teacher` role
-/// or higher.
+/// Mark attendance for a user on an event (defaults to the caller). Taking
+/// attendance is a teacher+ action — students never mark, not even themselves —
+/// and the target must be in the event's audience.
 #[utoipa::path(
     post,
     path = "/{id}/attendance",
@@ -327,21 +439,20 @@ async fn delete_event(
     request_body = MarkAttendance,
     responses(
         (status = 200, description = "Attendance recorded", body = AttendanceResponse),
-        (status = 400, description = "Invalid status or unknown user", body = ErrorResponse),
+        (status = 400, description = "Invalid status, unknown user, or target outside the event's audience", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Marking another user requires teacher role or higher", body = ErrorResponse),
+        (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
         (status = 404, description = "Event not found", body = ErrorResponse),
     ),
 )]
 async fn mark(
     State(st): State<AppState>,
-    CurrentUser(user): CurrentUser,
+    RequireTeacher(user): RequireTeacher,
     Path(id): Path<String>,
     Json(req): Json<MarkAttendance>,
 ) -> Result<Json<AttendanceResponse>, AppError> {
     let event_id = EventId::from_key(&id);
-    // Event must exist.
-    Event::read(&event_id, &st.db)
+    let event = Event::read(&event_id, &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
 
@@ -352,13 +463,6 @@ async fn mark(
         None => user.get_id().clone(),
     };
 
-    // Marking anyone other than yourself is a teacher+ action.
-    if &target != user.get_id() && !user.get_role().at_least(Role::Teacher) {
-        return Err(AppError::Forbidden(
-            "only teachers can mark attendance for other users",
-        ));
-    }
-
     // Target user must exist.
     let Some(target_user) = User::read(&target, &st.db).await? else {
         return Err(AppError::Validation(ValidationError::Invalid {
@@ -366,6 +470,15 @@ async fn mark(
             reason: "target user does not exist",
         }));
     };
+
+    // Only expected attendees can be marked. The marker needn't be in the
+    // audience — a teacher takes roll of a student-targeted event.
+    if !event.get_audience().includes(&target_user, &st.db).await? {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "user_id",
+            reason: "target user is not in this event's audience",
+        }));
+    }
 
     let attendance = Attendance::mark(&event_id, &target, status, user.get_id(), &st.db).await?;
     let people = PersonRef::map_of(&[&target_user, &user]);
@@ -447,4 +560,83 @@ async fn remove_attendance(
         return Err(AppError::NotFound);
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---- roster ---------------------------------------------------------------
+
+/// One expected attendee on the roster report: who they are and how (whether)
+/// they were marked.
+#[derive(Serialize, ToSchema)]
+struct RosterEntry {
+    user: PersonRef,
+    /// The recorded attendance status; `null` = expected but never marked —
+    /// the "missed" signal once the event is over.
+    status: Option<String>,
+    /// Who recorded it; `null` while unmarked.
+    marked_by: Option<PersonRef>,
+}
+
+/// The event's expected-attendee roster joined with its attendance marks — the
+/// who-came/who-missed report. Resolved live from the audience (today's role
+/// holders, current enrollment), so it always reflects the present roster;
+/// attendance rows for people no longer in the audience are omitted here (they
+/// remain in `GET /events/{id}/attendance`). Requires teacher+. Paged via
+/// `?limit=&offset=` (omit `limit` for the whole roster).
+#[utoipa::path(
+    get,
+    path = "/{id}/roster",
+    tag = "events",
+    security(("session_cookie" = [])),
+    params(("id" = String, Path, description = "Event id"), PageParams),
+    responses(
+        (status = 200, description = "A page of the expected-attendee roster (all of it when unpaged)", body = Page<RosterEntry>),
+        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
+        (status = 404, description = "Event not found", body = ErrorResponse),
+    ),
+)]
+async fn roster(
+    State(st): State<AppState>,
+    _teacher: RequireTeacher,
+    Path(id): Path<String>,
+    Query(page): Query<PageParams>,
+) -> Result<Json<Page<RosterEntry>>, AppError> {
+    let (limit, offset) = page.resolve()?;
+    let event_id = EventId::from_key(&id);
+    let event = Event::read(&event_id, &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+    let mut members = event.get_audience().members(&st.db).await?;
+    // ULID keys sort by creation instant — a stable order keeps pages coherent.
+    members.sort_by(|a, b| a.key().cmp(b.key()));
+    let marks = Attendance::list_for_event(&event_id, &st.db).await?;
+    let by_user: HashMap<&str, &Attendance> = marks
+        .iter()
+        .map(|attendance| (attendance.get_user().key(), attendance))
+        .collect();
+
+    let total = members.len() as i64;
+    // Join people onto the page alone — the lookup shrinks with the window.
+    let window = paginate(&members, limit, offset);
+    let ids = window.iter().cloned().chain(window.iter().filter_map(|m| {
+        by_user
+            .get(m.key())
+            .map(|attendance| attendance.get_marked_by().clone())
+    }));
+    let people = person_map(ids, &st.db).await?;
+    let items = window
+        .iter()
+        .map(|member| {
+            let mark = by_user.get(member.key());
+            RosterEntry {
+                user: PersonRef::resolve(&people, member),
+                status: mark.map(|attendance| attendance.get_status().as_str().to_string()),
+                marked_by: mark
+                    .map(|attendance| PersonRef::resolve(&people, attendance.get_marked_by())),
+            }
+        })
+        .collect();
+    Ok(Json(Page::new(items, total, limit, offset)))
 }

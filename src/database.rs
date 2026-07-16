@@ -71,8 +71,14 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS creator ON event TYPE record<user>;
     DEFINE FIELD IF NOT EXISTS title ON event TYPE string;
     DEFINE FIELD IF NOT EXISTS description ON event TYPE string;
+    DEFINE FIELD IF NOT EXISTS audience ON event TYPE object;
+    DEFINE FIELD IF NOT EXISTS audience.kind ON event TYPE string;
+    DEFINE FIELD IF NOT EXISTS audience.role ON event TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS audience.course ON event TYPE option<record<course>>;
+    DEFINE FIELD IF NOT EXISTS audience.users ON event TYPE option<array<record<user>>>;
     DEFINE FIELD IF NOT EXISTS starts_at ON event TYPE option<int>;
     DEFINE FIELD IF NOT EXISTS ends_at ON event TYPE option<int>;
+    UPDATE event SET audience = { kind: 'school' } WHERE audience = NONE;
 
     DEFINE TABLE IF NOT EXISTS attendance SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS event ON attendance TYPE record<event>;

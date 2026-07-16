@@ -190,6 +190,8 @@ async fn protected_routes_require_session() {
         ("POST", "/notes"),
         ("GET", "/events"),
         ("POST", "/events"),
+        ("POST", "/events/x/attendance"),
+        ("GET", "/events/x/roster"),
         ("GET", "/exams"),
         ("GET", "/courses"),
         ("POST", "/courses"),
@@ -1209,6 +1211,285 @@ async fn event_timestamps_echo_and_validate() {
         .await;
         assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
     }
+}
+
+#[tokio::test]
+async fn event_audience_defaults_validates_and_echoes() {
+    let (app, db) = app_and_db().await;
+    let ali = login_as(&app, &db, "ali", "teacher").await;
+    let veli = login(&app, "veli").await; // student
+    let veli_id = me_id(&app, &veli).await;
+
+    // Omitted audience = school-wide, and it echoes on every read.
+    let ev = send(
+        &app,
+        "POST",
+        "/events",
+        Some(&ali),
+        Some(json!({ "title": "assembly" })),
+    )
+    .await;
+    assert_eq!(ev.status, StatusCode::CREATED);
+    assert_eq!(ev.body["audience"]["kind"], "school");
+
+    // A role audience round-trips…
+    let ev = send(
+        &app,
+        "POST",
+        "/events",
+        Some(&ali),
+        Some(json!({ "title": "orientation", "audience": { "kind": "role", "role": "student" } })),
+    )
+    .await;
+    assert_eq!(ev.status, StatusCode::CREATED);
+    assert_eq!(ev.body["audience"]["role"], "student");
+    let event_id = id_of(&ev.body);
+
+    // …a PATCH without `audience` keeps it, and a sent one replaces it.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/events/{event_id}"),
+        Some(&ali),
+        Some(json!({ "title": "orientation day" })),
+    )
+    .await;
+    assert_eq!(res.body["audience"]["role"], "student");
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/events/{event_id}"),
+        Some(&ali),
+        Some(json!({ "audience": { "kind": "users", "users": [veli_id, veli_id] } })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    // The duplicated id collapsed to one entry.
+    assert_eq!(res.body["audience"]["users"].as_array().unwrap().len(), 1);
+
+    // Invalid audiences are rejected: unknown role, ghost course, ghost user,
+    // an empty hand-picked list, and one past the 100-user cap.
+    for audience in [
+        json!({ "kind": "role", "role": "wizard" }),
+        json!({ "kind": "course", "course": "nope" }),
+        json!({ "kind": "users", "users": ["ghost"] }),
+        json!({ "kind": "users", "users": [] }),
+        json!({ "kind": "users",
+                "users": (0..101).map(|n| format!("u{n}")).collect::<Vec<_>>() }),
+    ] {
+        let res = send(
+            &app,
+            "POST",
+            "/events",
+            Some(&ali),
+            Some(json!({ "title": "bad", "audience": audience })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::BAD_REQUEST, "{audience}");
+    }
+    // An unknown kind never deserializes.
+    let res = send(
+        &app,
+        "POST",
+        "/events",
+        Some(&ali),
+        Some(json!({ "title": "bad", "audience": { "kind": "galaxy" } })),
+    )
+    .await;
+    assert!(res.status.is_client_error(), "{}", res.status);
+}
+
+#[tokio::test]
+async fn event_audience_gates_marking() {
+    let (app, db) = app_and_db().await;
+    let ali = login_as(&app, &db, "ali", "teacher").await;
+    let veli = login(&app, "veli").await; // student
+    let mina = login(&app, "mina").await; // student
+    let veli_id = me_id(&app, &veli).await;
+    let mina_id = me_id(&app, &mina).await;
+    let ali_id = me_id(&app, &ali).await;
+
+    let create = |audience: serde_json::Value| {
+        let app = &app;
+        let ali = &ali;
+        async move {
+            let res = send(
+                app,
+                "POST",
+                "/events",
+                Some(ali),
+                Some(json!({ "title": "ev", "audience": audience })),
+            )
+            .await;
+            assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+            id_of(&res.body)
+        }
+    };
+    let mark = |event: String, user: String| {
+        let app = &app;
+        let ali = &ali;
+        async move {
+            send(
+                app,
+                "POST",
+                &format!("/events/{event}/attendance"),
+                Some(ali),
+                Some(json!({ "status": "present", "user_id": user })),
+            )
+            .await
+            .status
+        }
+    };
+
+    // Role audience: students are markable, the (teacher) marker is not —
+    // including implicitly, via the marker-defaults-to-caller path.
+    let ev = create(json!({ "kind": "role", "role": "student" })).await;
+    assert_eq!(mark(ev.clone(), veli_id.clone()).await, StatusCode::OK);
+    assert_eq!(
+        mark(ev.clone(), ali_id.clone()).await,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        send(
+            &app,
+            "POST",
+            &format!("/events/{ev}/attendance"),
+            Some(&ali),
+            Some(json!({ "status": "present" })),
+        )
+        .await
+        .status,
+        StatusCode::BAD_REQUEST,
+        "caller-defaulted target must still clear the audience gate"
+    );
+
+    // Course audience: enrollment decides, live.
+    let course = create_course(&app, &ali, "algebra").await;
+    enroll(&app, &ali, &course, &veli_id).await;
+    let ev = create(json!({ "kind": "course", "course": course })).await;
+    assert_eq!(mark(ev.clone(), veli_id.clone()).await, StatusCode::OK);
+    assert_eq!(
+        mark(ev.clone(), mina_id.clone()).await,
+        StatusCode::BAD_REQUEST
+    );
+
+    // Hand-picked audience: the list is the roster.
+    let ev = create(json!({ "kind": "users", "users": [mina_id.clone()] })).await;
+    assert_eq!(mark(ev.clone(), mina_id.clone()).await, StatusCode::OK);
+    assert_eq!(
+        mark(ev.clone(), veli_id.clone()).await,
+        StatusCode::BAD_REQUEST
+    );
+
+    // School audience: everyone is expected — the teacher may mark themselves.
+    let ev = create(json!({ "kind": "school" })).await;
+    assert_eq!(mark(ev.clone(), ali_id.clone()).await, StatusCode::OK);
+    assert_eq!(mark(ev, veli_id.clone()).await, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn event_roster_joins_expected_with_marks() {
+    let (app, db) = app_and_db().await;
+    let ali = login_as(&app, &db, "ali", "teacher").await;
+    let s1 = login(&app, "selin").await;
+    let s2 = login(&app, "zeynep").await;
+    let s1_id = me_id(&app, &s1).await;
+    let course = create_course(&app, &ali, "algebra").await;
+    enroll(&app, &ali, &course, &s1_id).await;
+    enroll(&app, &ali, &course, &me_id(&app, &s2).await).await;
+
+    let ev = send(
+        &app,
+        "POST",
+        "/events",
+        Some(&ali),
+        Some(json!({ "title": "field trip",
+                     "audience": { "kind": "course", "course": course } })),
+    )
+    .await;
+    let event_id = id_of(&ev.body);
+    let roster_uri = format!("/events/{event_id}/roster");
+
+    // Before any marks: every expected attendee, all unmarked.
+    let res = send(&app, "GET", &roster_uri, Some(&ali), None).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(common::total(&res.body), 2);
+    assert!(
+        common::items(&res.body)
+            .iter()
+            .all(|entry| entry["status"].is_null() && entry["marked_by"].is_null())
+    );
+
+    // Mark one: the roster shows who came and who's still missing.
+    send(
+        &app,
+        "POST",
+        &format!("/events/{event_id}/attendance"),
+        Some(&ali),
+        Some(json!({ "status": "present", "user_id": s1_id })),
+    )
+    .await;
+    let res = send(&app, "GET", &roster_uri, Some(&ali), None).await;
+    let items = common::items(&res.body);
+    assert_eq!(items.len(), 2);
+    let marked: Vec<_> = items
+        .iter()
+        .filter(|entry| entry["status"] == "present")
+        .collect();
+    assert_eq!(marked.len(), 1);
+    assert_eq!(marked[0]["user"]["id"], s1_id);
+    assert_eq!(marked[0]["marked_by"]["username"], "ali");
+    assert_eq!(
+        items
+            .iter()
+            .filter(|entry| entry["status"].is_null())
+            .count(),
+        1
+    );
+
+    // The roster pages like any list.
+    let res = send(
+        &app,
+        "GET",
+        &format!("{roster_uri}?limit=1&offset=1"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(common::items(&res.body).len(), 1);
+    assert_eq!(common::total(&res.body), 2);
+
+    // Dropping someone from the audience (unenroll) drops them from the
+    // roster report — their recorded mark stays in the attendance listing.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/courses/{course}/enrollments/{s1_id}"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    let res = send(&app, "GET", &roster_uri, Some(&ali), None).await;
+    assert_eq!(common::total(&res.body), 1);
+    assert!(common::items(&res.body)[0]["status"].is_null());
+    let res = send(
+        &app,
+        "GET",
+        &format!("/events/{event_id}/attendance"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 1, "stale mark stays recorded");
+
+    // A missing event has no roster — 404, not an empty page.
+    assert_eq!(
+        send(&app, "GET", "/events/nope/roster", Some(&ali), None)
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
 }
 
 // --- exams + results -----------------------------------------------------
@@ -2718,7 +2999,7 @@ async fn students_cannot_create_events() {
 }
 
 #[tokio::test]
-async fn students_mark_only_themselves() {
+async fn students_never_mark_attendance() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "teacher", "teacher").await;
     let alice = login(&app, "alice").await; // student
@@ -2737,7 +3018,7 @@ async fn students_mark_only_themselves() {
         .body,
     );
 
-    // A student may mark their own attendance.
+    // Taking attendance is teacher+: a student cannot mark even themselves…
     assert_eq!(
         send(
             &app,
@@ -2748,9 +3029,9 @@ async fn students_mark_only_themselves() {
         )
         .await
         .status,
-        StatusCode::OK
+        StatusCode::FORBIDDEN
     );
-    // But not someone else's.
+    // …let alone someone else.
     assert_eq!(
         send(
             &app,
@@ -2763,12 +3044,24 @@ async fn students_mark_only_themselves() {
         .status,
         StatusCode::FORBIDDEN
     );
-    // And cannot remove attendance rows.
+    // And cannot remove attendance rows or read the roster report.
     assert_eq!(
         send(
             &app,
             "DELETE",
             &format!("/events/{ev}/attendance/{bob_id}"),
+            Some(&alice),
+            None
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        send(
+            &app,
+            "GET",
+            &format!("/events/{ev}/roster"),
             Some(&alice),
             None
         )
@@ -7603,7 +7896,7 @@ async fn attendance_report_tallies_events_and_sessions_per_course() {
     assert!(res.body["events"]["rate"].is_null());
     assert!(res.body["courses"].as_array().unwrap().is_empty());
 
-    // Two event rows: one self-marked, one teacher-marked.
+    // Two event rows, both teacher-marked (students never mark).
     let ev1 = send(
         &app,
         "POST",
@@ -7625,8 +7918,8 @@ async fn attendance_report_tallies_events_and_sessions_per_course() {
         &app,
         "POST",
         &format!("/events/{ev1}/attendance"),
-        Some(&ali),
-        Some(json!({ "status": "present" })),
+        Some(&owner),
+        Some(json!({ "status": "present", "user_id": ali_id })),
     )
     .await;
     send(
@@ -8093,6 +8386,7 @@ async fn attendance_statuses_follow_settings_and_bucket_in_reports() {
     let (app, db) = app_and_db().await;
     let manager = login_as(&app, &db, "att.manager", "manager").await;
     let student = login(&app, "att.student").await;
+    let student_id = me_id(&app, &student).await;
 
     // Add a school-specific status on top of the mandatory core.
     let res = send(
@@ -8123,8 +8417,8 @@ async fn attendance_statuses_follow_settings_and_bucket_in_reports() {
         &app,
         "POST",
         &format!("/events/{event}/attendance"),
-        Some(&student),
-        Some(json!({ "status": "online" })),
+        Some(&manager),
+        Some(json!({ "status": "online", "user_id": student_id })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK);
@@ -8132,8 +8426,8 @@ async fn attendance_statuses_follow_settings_and_bucket_in_reports() {
         &app,
         "POST",
         &format!("/events/{event}/attendance"),
-        Some(&student),
-        Some(json!({ "status": "maybe" })),
+        Some(&manager),
+        Some(json!({ "status": "maybe", "user_id": student_id })),
     )
     .await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST);
@@ -8161,8 +8455,8 @@ async fn attendance_statuses_follow_settings_and_bucket_in_reports() {
         &app,
         "POST",
         &format!("/events/{event}/attendance"),
-        Some(&student),
-        Some(json!({ "status": "online" })),
+        Some(&manager),
+        Some(json!({ "status": "online", "user_id": student_id })),
     )
     .await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST);

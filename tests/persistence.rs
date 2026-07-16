@@ -510,3 +510,86 @@ async fn settings_and_terms_survive_reopen() {
     assert_eq!(courses.len(), 1);
     assert_eq!(courses[0]["term"].as_str(), Some(term.as_str()));
 }
+
+/// Event rows written before the `audience` column existed are backfilled to
+/// school-wide on the next boot (`UPDATE event SET audience = { kind: 'school' }
+/// WHERE audience = NONE`), so an old volume keeps serving its events.
+#[tokio::test]
+async fn legacy_events_backfill_to_school_audience() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config_at(&dir);
+    let creds = json!({ "username": "ali", "password": "secret1" });
+    let event_id;
+
+    // First boot: a normal event — then strip its audience the way an old
+    // binary's schema would have left it: drop the column definitions so
+    // SCHEMAFULL stops enforcing them, and unset the field on the row.
+    {
+        let db = database::init(&cfg).await.expect("first open");
+        let app = build_router(state(db.clone(), &cfg));
+        assert_eq!(
+            send(&app, "POST", "/auth/register", None, Some(creds.clone()))
+                .await
+                .status,
+            StatusCode::CREATED
+        );
+        set_role(&db, "ali", "teacher").await;
+        let cookie = send(&app, "POST", "/auth/login", None, Some(creds.clone()))
+            .await
+            .cookie
+            .unwrap();
+        let res = send(
+            &app,
+            "POST",
+            "/events",
+            Some(&cookie),
+            Some(json!({ "title": "before audiences" })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED);
+        event_id = common::id_of(&res.body);
+
+        db.query(
+            "REMOVE FIELD IF EXISTS audience.users ON TABLE event;
+             REMOVE FIELD IF EXISTS audience.course ON TABLE event;
+             REMOVE FIELD IF EXISTS audience.role ON TABLE event;
+             REMOVE FIELD IF EXISTS audience.kind ON TABLE event;
+             REMOVE FIELD IF EXISTS audience ON TABLE event;
+             UPDATE event SET audience = NONE;",
+        )
+        .await
+        .expect("strip audience")
+        .check()
+        .expect("strip audience check");
+    }
+
+    // Second boot re-runs the migration: the field definitions come back and
+    // the backfill stamps the legacy row school-wide — it reads, lists, and
+    // rosters like any new event.
+    let db = reopen(&cfg).await;
+    let app = build_router(state(db, &cfg));
+    let cookie = send(&app, "POST", "/auth/login", None, Some(creds))
+        .await
+        .cookie
+        .unwrap();
+    let res = send(
+        &app,
+        "GET",
+        &format!("/events/{event_id}"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["audience"]["kind"], "school");
+    let res = send(
+        &app,
+        "GET",
+        &format!("/events/{event_id}/roster"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(common::total(&res.body), 1, "whole school = the one user");
+}

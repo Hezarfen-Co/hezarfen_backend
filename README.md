@@ -6,8 +6,12 @@ Session-cookie auth with four hierarchical roles (`student < teacher < manager
 < admin`). Notes are per-user and carry **file attachments** (PDFs, documents,
 …): blobs live on disk next to the database, metadata in the database, and the
 per-file size cap is school policy in settings (`max_file_bytes`, default
-5 MiB). Attendance is event + attendees: create an event,
-then mark users present / absent / late / excused. Marks are course-shaped
+5 MiB). Attendance is event + attendees: create an event with an **audience**
+(the whole school, one role, a course's enrollment, or a hand-picked list —
+omit for school-wide), then teachers mark the expected attendees present /
+absent / late / excused (students never self-mark), and a **roster report**
+shows who was expected and who missed. Every event stays visible to everyone —
+the audience is a roster, not a wall. Marks are course-shaped
 (Google Classroom style): a teacher creates a course, enrolls students, adds
 exams inside it, and grades — enrolling, sitting exams, roll call, and marks are
 all student-only, staff never take part; students read a per-course weighted average and
@@ -164,10 +168,9 @@ effect on the user's very next call (no re-login).
 |------------------------------------------|--------------|-----------------------------------------------|
 | Register / login / view own account      | (any)        | Registration always creates a `student`       |
 | View events, own notes; CRUD notes + their files | student | Everyone can read events and keep notes; note files (upload/download) are walled per owner like the notes themselves |
-| Mark **own** attendance                  | student      | Anyone can mark themselves                     |
-| Mark **another user's** attendance       | teacher      |                                               |
-| Create events; remove attendance rows    | teacher      |                                               |
-| List an event's attendance roster        | teacher      | Students read their own tallies via the attendance report |
+| Mark event attendance; remove attendance rows | teacher | Only users in the event's **audience** can be marked; students never mark — a teacher+ may mark anyone expected, themselves included |
+| Create events                            | teacher      | The audience (school / role / course / user list) is set at creation and editable later |
+| List an event's attendance or its roster report | teacher | Students read their own tallies via the attendance report |
 | Edit / delete an event                   | teacher      | Only the **creator**, or a `manager`+ for any event |
 | View a course's sessions                 | student      | Only inside **visible** courses: enrolled, creator, or `manager`+ |
 | List a session's roll call               | teacher      | The **session's teacher**, or anyone with course-management rights |
@@ -280,13 +283,14 @@ their existing shapes: the student exam-room reads
 | GET    | `/notes/{id}/files`              | student | List a note's files (metadata: `{id, name, content_type, size}`) · paged |
 | GET    | `/notes/{id}/files/{file_id}`    | student | Download the bytes (original filename + content type in the headers) |
 | DELETE | `/notes/{id}/files/{file_id}`    | student | Delete one file                 |
-| POST   | `/events`                        | teacher | `{title, description?, starts_at?, ends_at?}` |
+| POST   | `/events`                        | teacher | `{title, description?, audience?, starts_at?, ends_at?}` — `audience` defaults to school-wide |
 | GET    | `/events`                        | student | List all events · paged         |
 | GET    | `/events/{id}`                   | student | Get event                       |
-| PATCH  | `/events/{id}`                   | teacher | Edit event (creator, or manager+ for any) |
+| PATCH  | `/events/{id}`                   | teacher | Edit event (creator, or manager+ for any); a sent `audience` replaces the old one wholesale |
 | DELETE | `/events/{id}`                   | teacher | Delete event (creator, or manager+ for any) |
-| POST   | `/events/{id}/attendance`        | student | `{status, user_id?}` — self if `user_id` omitted; marking others needs teacher+ |
-| GET    | `/events/{id}/attendance`        | teacher | List attendance for event (students read their own tallies via `/attendance/me`) · paged |
+| POST   | `/events/{id}/attendance`        | teacher | `{status, user_id?}` — mark someone in the event's **audience** (the caller when `user_id` omitted); students never mark |
+| GET    | `/events/{id}/attendance`        | teacher | List recorded attendance for event (students read their own tallies via `/attendance/me`) · paged |
+| GET    | `/events/{id}/roster`            | teacher | Who-missed report: every expected attendee with their status (`null` = never marked) + `marked_by` · paged |
 | DELETE | `/events/{id}/attendance/{user}` | teacher | Remove a user's attendance      |
 | POST   | `/courses`                       | teacher | `{title, description?}` (creator manages it) |
 | GET    | `/courses`                       | student | The caller's visible courses: created + enrolled (manager+: all) · paged |
@@ -373,6 +377,17 @@ Event `starts_at`/`ends_at` are optional **unix-millisecond** integers; if both
 are given, `ends_at` must not precede `starts_at`, and neither may be set in
 the past (else `400`). On `PATCH`, an omitted time keeps its value and an
 explicit `null` clears it.
+An event's `audience` is a tagged object — `{"kind": "school"}` (the default),
+`{"kind": "role", "role": "student"}` (that exact role, no "and above"),
+`{"kind": "course", "course": "<id>"}` (the course's current enrollment), or
+`{"kind": "users", "users": ["<id>", …]}` (hand-picked, ≤ 100, deduplicated) —
+and is the event's **expected-attendee roster**, resolved live at read time:
+role changes and (un)enrollments move people in and out by themselves. It never
+hides the event — everyone sees every event. Only audience members can be
+marked; `GET /events/{id}/roster` joins the live roster with the recorded marks
+(`status: null` = expected but never marked). Attendance rows for people a
+later audience edit (or unenrollment / role change) dropped stay stored and
+listed under `/events/{id}/attendance`, but leave the roster report.
 Reading a child collection of a missing parent (`/events/{id}/attendance`,
 `/exams/{id}/results`, `/courses/{id}/enrollments`, `/courses/{id}/exams`,
 `/courses/{id}/sessions`, `/sessions/{id}/attendance`) is a `404`, not an

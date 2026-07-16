@@ -289,6 +289,18 @@ impl User {
         Ok(result.take::<Vec<User>>(0)?)
     }
 
+    /// Every user holding exactly `role` — e.g. the roster of a role-targeted
+    /// event. Exact match, not `at_least`: "all teachers" means teachers, not
+    /// managers and admins too.
+    pub async fn list_by_role(role: Role, db: &Database) -> Result<Vec<User>, AppError> {
+        let mut result = db
+            .query("SELECT * FROM user WHERE role = $role ORDER BY id DESC")
+            .bind(("role", role))
+            .await?
+            .check()?;
+        Ok(result.take::<Vec<User>>(0)?)
+    }
+
     /// Case-insensitive fragment search over username, name, and surname —
     /// backs the user pickers. `role` narrows to one role (e.g. only students
     /// for an enroll picker); `None` searches everyone. Returns every match,
