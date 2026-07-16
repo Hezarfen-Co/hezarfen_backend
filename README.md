@@ -15,7 +15,9 @@ by seat: teachers register students (never the other way round), staff
 register only themselves, an optional `capacity` caps the seats, and the list
 closes the moment the event starts. Every event stays visible to everyone —
 the audience is a roster, not a wall. Marks are course-shaped
-(Google Classroom style): a teacher creates a course, enrolls students, adds
+(Google Classroom style): a teacher creates a course — kind **`course`** (a
+regular class) or **`study`** (a supervised study session — *etüt*; same
+behavior, different label) — enrolls students, adds
 exams inside it, and grades — enrolling, sitting exams, roll call, and marks are
 all student-only, staff never take part; students read a per-course weighted average and
 an overall average from their mark report — each exam weighted by its **kind**
@@ -237,6 +239,11 @@ surrealkv path (`./data/hezarfen.db`, namespace/database `hezarfen`).
 `Auth` is the minimum role; `no` means no session required, `student` means any
 logged-in user.
 
+A course is either a regular class (kind `course`, the default) or an *etüt*
+(kind `study` — a supervised study session). The two kinds behave identically
+everywhere — enrollment, exams, sessions, marks — the kind is a label the UI
+renders differently, settable at creation and editable later.
+
 Course data is walled per course. A course, its exams, and its sessions are
 **visible** only to its enrolled users, its creator, and manager+ — a student
 sees just the classes they were added to, and the `/courses` / `/exams`
@@ -298,7 +305,7 @@ their existing shapes: the student exam-room reads
 | DELETE | `/events/{id}/attendance/{user}` | teacher | Remove a user's attendance      |
 | POST   | `/events/{id}/register`          | teacher | `{user_id?}` — seat a **student** (or yourself when omitted) on a registration event's signup list; idempotent, `409` once full or started |
 | DELETE | `/events/{id}/register/{user}`   | teacher | Free a seat (same self-or-student rule); `409` once the event started |
-| POST   | `/courses`                       | teacher | `{title, description?}` (creator manages it) |
+| POST   | `/courses`                       | teacher | `{title, description?, kind?, term_id?}` — `kind` is `course` (default) or `study` (etüt) (creator manages it) |
 | GET    | `/courses`                       | student | The caller's visible courses: created + enrolled (manager+: all) · paged |
 | GET    | `/courses/me`                    | student | The caller's **enrolled** courses · paged |
 | GET    | `/courses/{id}`                  | student | Get course (enrolled, creator, or manager+) |

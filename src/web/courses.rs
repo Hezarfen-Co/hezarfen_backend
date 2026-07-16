@@ -9,7 +9,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::database::Database;
-use crate::domain::course::{Course, CourseDescription, CourseId, CourseTitle};
+use crate::domain::course::{Course, CourseDescription, CourseId, CourseKind, CourseTitle};
 use crate::domain::course_session::{CourseSession, SessionTopic};
 use crate::domain::enrollment::Enrollment;
 use crate::domain::exam::{
@@ -46,6 +46,10 @@ struct CreateCourse {
     #[schema(example = "Algebra")]
     title: String,
     description: Option<String>,
+    /// `course` (a regular class — the default) or `study` (a supervised
+    /// study session — etüt). Behaviorally identical; a label for the UI.
+    #[schema(example = "course")]
+    kind: Option<String>,
     /// The academic term this course belongs to (`GET /terms`). Optional.
     term_id: Option<String>,
 }
@@ -54,6 +58,8 @@ struct CreateCourse {
 struct UpdateCourse {
     title: Option<String>,
     description: Option<String>,
+    /// `course` or `study` (etüt). Omit to keep the current kind.
+    kind: Option<String>,
     /// Omit to keep the current term, send `null` to unlink, or send a term
     /// id to (re)assign.
     #[serde(default, deserialize_with = "set_or_clear")]
@@ -172,7 +178,9 @@ pub(crate) async fn visible_courses(user: &User, db: &Database) -> Result<Vec<Co
 
 // ---- courses ------------------------------------------------------------
 
-/// Create a course owned by the current user. Requires the `teacher` role or higher.
+/// Create a course owned by the current user. Requires the `teacher` role or
+/// higher. `kind` picks the flavor — `course` (a regular class, the default)
+/// or `study` (a supervised study session — etüt); both behave identically.
 #[utoipa::path(
     post,
     path = "/",
@@ -181,7 +189,7 @@ pub(crate) async fn visible_courses(user: &User, db: &Database) -> Result<Vec<Co
     request_body = CreateCourse,
     responses(
         (status = 201, description = "Course created", body = CourseResponse),
-        (status = 400, description = "Invalid fields", body = ErrorResponse),
+        (status = 400, description = "Invalid fields or kind", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
     ),
@@ -193,8 +201,12 @@ async fn create_course(
 ) -> Result<(StatusCode, Json<CourseResponse>), AppError> {
     let title = CourseTitle::try_new(&req.title)?;
     let description = CourseDescription::try_new(&req.description.unwrap_or_default())?;
+    let kind = match req.kind {
+        Some(ref kind) => CourseKind::try_new(kind)?,
+        None => CourseKind::course(),
+    };
     let term = resolve_term(req.term_id.as_deref(), &st.db).await?;
-    let course = Course::create(user.get_id(), title, description, term, &st.db).await?;
+    let course = Course::create(user.get_id(), title, description, kind, term, &st.db).await?;
     Ok((StatusCode::CREATED, Json(CourseResponse::new(&course))))
 }
 
@@ -301,7 +313,7 @@ async fn get_course(
     request_body = UpdateCourse,
     responses(
         (status = 200, description = "Updated course", body = CourseResponse),
-        (status = 400, description = "Invalid fields", body = ErrorResponse),
+        (status = 400, description = "Invalid fields or kind", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
@@ -330,13 +342,19 @@ async fn update_course(
         Some(ref description) => CourseDescription::try_new(description)?,
         None => course.get_description().clone(),
     };
+    let kind = match req.kind {
+        Some(ref kind) => CourseKind::try_new(kind)?,
+        None => course.get_kind().clone(),
+    };
     let term = match req.term_id {
         // Explicit `null` clears the link; a value must name a real term.
         Some(update) => resolve_term(update.as_deref(), &st.db).await?,
         None => course.get_term().cloned(),
     };
 
-    let updated = course.update(title, description, term, &st.db).await?;
+    let updated = course
+        .update(title, description, kind, term, &st.db)
+        .await?;
     Ok(Json(CourseResponse::new(&updated)))
 }
 

@@ -6,7 +6,7 @@ use crate::database::{COURSE_TABLE, Database};
 use crate::domain::term::TermId;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
-use crate::validate::{validate_optional, validate_required};
+use crate::validate::{validate_course_kind, validate_optional, validate_required};
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct CourseId(RecordId);
@@ -60,15 +60,39 @@ impl CourseDescription {
     }
 }
 
+/// A validated course kind: `course` (a regular class — ders) or `study` (a
+/// supervised study session — etüt). Purely a label; both kinds behave
+/// identically.
+#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+pub struct CourseKind(String);
+
+impl CourseKind {
+    pub fn try_new(value: &str) -> Result<Self, ValidationError> {
+        validate_course_kind(value)?;
+        Ok(Self(value.to_string()))
+    }
+
+    /// The classic kind — what every course is unless said otherwise.
+    pub fn course() -> Self {
+        Self("course".to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// A course: the unit exams and enrollments hang off. Marks are computed per
 /// course, each exam weighted by its kind's settings weight. May belong to an
-/// academic term.
+/// academic term. Comes in two behaviorally identical kinds: `course` and
+/// `study` (etüt).
 #[derive(Debug, Clone, SurrealValue)]
 pub struct Course {
     id: CourseId,
     creator: UserId,
     title: CourseTitle,
     description: CourseDescription,
+    kind: CourseKind,
     term: Option<TermId>,
 }
 
@@ -89,6 +113,10 @@ impl Course {
         &self.description
     }
 
+    pub fn get_kind(&self) -> &CourseKind {
+        &self.kind
+    }
+
     pub fn get_term(&self) -> Option<&TermId> {
         self.term.as_ref()
     }
@@ -101,6 +129,7 @@ impl Course {
         creator: &UserId,
         title: CourseTitle,
         description: CourseDescription,
+        kind: CourseKind,
         term: Option<TermId>,
         db: &Database,
     ) -> Result<Course, AppError> {
@@ -109,6 +138,7 @@ impl Course {
             creator: creator.clone(),
             title,
             description,
+            kind,
             term,
         };
         let created: Option<Course> = db.create(course.id.record()).content(course).await?;
@@ -171,11 +201,13 @@ impl Course {
         mut self,
         title: CourseTitle,
         description: CourseDescription,
+        kind: CourseKind,
         term: Option<TermId>,
         db: &Database,
     ) -> Result<Course, AppError> {
         self.title = title;
         self.description = description;
+        self.kind = kind;
         self.term = term;
         let updated: Option<Course> = db.update(self.id.record()).content(self).await?;
         updated.ok_or(AppError::NotFound)
@@ -220,5 +252,13 @@ mod tests {
     #[tokio::test]
     async fn description_is_optional() {
         assert!(CourseDescription::try_new("").is_ok());
+    }
+
+    #[tokio::test]
+    async fn kind_is_course_or_study() {
+        assert!(CourseKind::try_new("course").is_ok());
+        assert!(CourseKind::try_new("study").is_ok());
+        assert!(CourseKind::try_new("etut").is_err());
+        assert_eq!(CourseKind::course().as_str(), "course");
     }
 }

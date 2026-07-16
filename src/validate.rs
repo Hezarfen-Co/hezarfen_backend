@@ -2,10 +2,10 @@
 //! the value, so an existing newtype is always valid (parse, don't validate).
 
 use crate::constant::{
-    EXAM_MODES, MAX_EMAIL_LEN, MAX_EXAM_ATTEMPTS, MAX_EXAM_DURATION_MS, MAX_MARK, MAX_PASSWORD_LEN,
-    MAX_PHONE_DIGITS, MAX_QUESTION_POINTS, MAX_USERNAME_LEN, MIN_EXAM_DURATION_MS, MIN_MARK,
-    MIN_PASSWORD_LEN, MIN_PHONE_DIGITS, MIN_QUESTION_POINTS, MIN_USERNAME_LEN, QUESTION_KINDS,
-    UNLIMITED_EXAM_ATTEMPTS, USERNAME_SEPARATORS,
+    COURSE_KINDS, EXAM_MODES, MAX_EMAIL_LEN, MAX_EXAM_ATTEMPTS, MAX_EXAM_DURATION_MS, MAX_MARK,
+    MAX_PASSWORD_LEN, MAX_PHONE_DIGITS, MAX_QUESTION_POINTS, MAX_USERNAME_LEN,
+    MIN_EXAM_DURATION_MS, MIN_MARK, MIN_PASSWORD_LEN, MIN_PHONE_DIGITS, MIN_QUESTION_POINTS,
+    MIN_USERNAME_LEN, QUESTION_KINDS, UNLIMITED_EXAM_ATTEMPTS, USERNAME_SEPARATORS,
 };
 use crate::error::ValidationError;
 
@@ -197,6 +197,17 @@ pub fn validate_phone(value: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
+pub fn validate_course_kind(value: &str) -> Result<(), ValidationError> {
+    if COURSE_KINDS.contains(&value) {
+        Ok(())
+    } else {
+        Err(ValidationError::Invalid {
+            field: "kind",
+            reason: "must be one of: course, study",
+        })
+    }
+}
+
 pub fn validate_exam_mode(value: &str) -> Result<(), ValidationError> {
     if EXAM_MODES.contains(&value) {
         Ok(())
@@ -372,6 +383,15 @@ mod tests {
         assert!(validate_phone("1234567890123456").is_err()); // 16 digits, too many
         assert!(validate_phone("call-me-maybe").is_err()); // letters
         assert!(validate_phone("55+5123456").is_err()); // + only allowed in front
+    }
+
+    #[tokio::test]
+    async fn course_kind_rules() {
+        for kind in ["course", "study"] {
+            assert!(validate_course_kind(kind).is_ok());
+        }
+        assert!(validate_course_kind("etut").is_err());
+        assert!(validate_course_kind("").is_err());
     }
 
     #[tokio::test]
