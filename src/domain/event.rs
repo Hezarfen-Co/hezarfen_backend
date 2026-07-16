@@ -7,6 +7,7 @@ use crate::constant::{MAX_EVENT_DESCRIPTION_LEN, MAX_EVENT_TITLE_LEN};
 use crate::database::{Database, EVENT_TABLE};
 use crate::domain::course::CourseId;
 use crate::domain::enrollment::Enrollment;
+use crate::domain::registration::Registration;
 use crate::domain::role::Role;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
@@ -66,13 +67,14 @@ impl EventDescription {
 }
 
 /// Who an event is aimed at: the expected-attendee roster. Membership is
-/// resolved live against today's users/enrollments — never snapshotted — so a
-/// role change or (un)enrollment moves people in and out of rosters by itself.
-/// The audience does not gate *seeing* the event (the calendar stays
-/// school-visible); it defines who counts as expected and who may be marked.
+/// resolved live against today's users/enrollments/registrations — never
+/// snapshotted — so a role change, (un)enrollment, or (un)registration moves
+/// people in and out of rosters by itself. The audience does not gate *seeing*
+/// the event (the calendar stays school-visible); it defines who counts as
+/// expected and who may be marked.
 ///
 /// Stored internally tagged: `{kind: 'school'}`, `{kind: 'role', role: 'student'}`,
-/// `{kind: 'course', course: course:…}`, `{kind: 'users', users: [user:…]}`.
+/// `{kind: 'course', course: course:…}`, `{kind: 'registration', capacity: 30}`.
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 #[surreal(tag = "kind", rename_all = "lowercase")]
 pub enum EventAudience {
@@ -81,17 +83,26 @@ pub enum EventAudience {
     /// Every user holding exactly this role ("all students", "all teachers").
     Role { role: Role },
     /// A course's enrolled students. Staff running the course are not implied
-    /// members — a mixed gathering wants `Users` or a role audience.
+    /// members — a mixed gathering wants a registration or role audience.
     Course { course: CourseId },
-    /// A hand-picked list. Bounded by `MAX_EVENT_AUDIENCE_USERS` at the web
-    /// layer; a member row deleted later simply stops resolving.
-    Users { users: Vec<UserId> },
+    /// A signup list built one person at a time through the register
+    /// endpoints — teachers place students, staff take their own seat. The
+    /// list is capped at `capacity` seats when set (`None` = unlimited) and
+    /// closes once the event starts. Rows survive an audience change inertly.
+    Registration { capacity: Option<i64> },
 }
 
 impl EventAudience {
-    /// Is `user` in the roster right now? The point check behind marking —
-    /// cheaper than resolving the whole roster when the target is known.
-    pub async fn includes(&self, user: &User, db: &Database) -> Result<bool, AppError> {
+    /// Is `user` in `event`'s roster right now? The point check behind
+    /// marking — cheaper than resolving the whole roster when the target is
+    /// known. `event` must be the event this audience came from: the
+    /// registration kind resolves against that event's signup rows.
+    pub async fn includes(
+        &self,
+        event: &EventId,
+        user: &User,
+        db: &Database,
+    ) -> Result<bool, AppError> {
         match self {
             EventAudience::School => Ok(true),
             EventAudience::Role { role } => Ok(user.get_role() == *role),
@@ -100,14 +111,18 @@ impl EventAudience {
                     .await?
                     .is_some())
             }
-            EventAudience::Users { users } => Ok(users.contains(user.get_id())),
+            EventAudience::Registration { .. } => {
+                Ok(Registration::read_for_user(event, user.get_id(), db)
+                    .await?
+                    .is_some())
+            }
         }
     }
 
-    /// The full roster, as it stands right now — the who-missed report's
-    /// backbone. `Users` ids that no longer resolve to a row are kept; the
-    /// caller degrades their display like any stale reference.
-    pub async fn members(&self, db: &Database) -> Result<Vec<UserId>, AppError> {
+    /// `event`'s full roster, as it stands right now — the who-missed
+    /// report's backbone. Registered ids that no longer resolve to a user row
+    /// are kept; the caller degrades their display like any stale reference.
+    pub async fn members(&self, event: &EventId, db: &Database) -> Result<Vec<UserId>, AppError> {
         match self {
             EventAudience::School => Ok(User::list_all(db)
                 .await?
@@ -124,7 +139,11 @@ impl EventAudience {
                 .iter()
                 .map(|enrollment| enrollment.get_user().clone())
                 .collect()),
-            EventAudience::Users { users } => Ok(users.clone()),
+            EventAudience::Registration { .. } => Ok(Registration::list_for_event(event, db)
+                .await?
+                .iter()
+                .map(|registration| registration.get_user().clone())
+                .collect()),
         }
     }
 }
@@ -225,9 +244,9 @@ impl Event {
         updated.ok_or(AppError::NotFound)
     }
 
-    /// Delete the event and cascade-remove its attendance rows.
+    /// Delete the event and cascade-remove its attendance and signup rows.
     pub async fn delete(self, db: &Database) -> Result<Event, AppError> {
-        db.query("DELETE attendance WHERE event = $ev")
+        db.query("DELETE attendance WHERE event = $ev; DELETE registration WHERE event = $ev;")
             .bind(("ev", self.id.record()))
             .await?
             .check()?;
@@ -275,10 +294,12 @@ mod tests {
                 "course",
             ),
             (
-                EventAudience::Users {
-                    users: vec![UserId::from_key("u1"), UserId::from_key("u2")],
-                },
-                "users",
+                EventAudience::Registration { capacity: Some(30) },
+                "registration",
+            ),
+            (
+                EventAudience::Registration { capacity: None },
+                "registration",
             ),
         ];
         for (audience, kind) in cases {
@@ -293,5 +314,23 @@ mod tests {
             );
             assert_eq!(EventAudience::from_value(value).unwrap(), audience);
         }
+    }
+
+    /// The database strips `NONE`-valued optional columns and the boot
+    /// conversion writes a bare `{kind: 'registration'}` — an object with no
+    /// `capacity` key at all must decode as an uncapped registration.
+    #[tokio::test]
+    async fn registration_audience_decodes_without_capacity_key() {
+        use surrealdb::types::Value;
+
+        let value = EventAudience::Registration { capacity: None }.into_value();
+        let Value::Object(mut object) = value else {
+            panic!("audience must encode as an object, got {value:?}");
+        };
+        object.remove("capacity");
+        assert_eq!(
+            EventAudience::from_value(Value::Object(object)).unwrap(),
+            EventAudience::Registration { capacity: None }
+        );
     }
 }

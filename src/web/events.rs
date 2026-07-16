@@ -8,11 +8,11 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::constant::MAX_EVENT_AUDIENCE_USERS;
 use crate::database::Database;
 use crate::domain::attendance::{Attendance, AttendanceStatus};
 use crate::domain::course::{Course, CourseId};
 use crate::domain::event::{Event, EventAudience, EventDescription, EventId, EventTitle};
+use crate::domain::registration::Registration;
 use crate::domain::role::Role;
 use crate::domain::settings::Settings;
 use crate::domain::timestamp::Timestamp;
@@ -32,6 +32,8 @@ pub fn routes() -> OpenApiRouter<AppState> {
         .routes(routes!(mark, list_attendance))
         .routes(routes!(remove_attendance))
         .routes(routes!(roster))
+        .routes(routes!(register))
+        .routes(routes!(unregister))
 }
 
 /// An event's audience on the wire — who is expected to attend. Tagged by
@@ -48,14 +50,18 @@ enum AudienceDto {
     /// The students currently enrolled in this course (live — enrollment
     /// changes move people in and out).
     Course { course: String },
-    /// A hand-picked list of user ids (at most `100`, deduplicated).
-    Users { users: Vec<String> },
+    /// A signup list built through `POST /events/{id}/register` — teachers
+    /// place students, staff take their own seat. `capacity` caps the seats;
+    /// `null` or omitted = unlimited. The list closes when the event starts.
+    Registration {
+        #[serde(default)]
+        capacity: Option<i64>,
+    },
 }
 
 impl AudienceDto {
     /// Validate the wire form into the domain audience: the role must parse,
-    /// the course must exist, and a `users` list must be non-empty, within the
-    /// cap, and name only existing users.
+    /// the course must exist, and a registration capacity must be positive.
     async fn into_domain(self, db: &Database) -> Result<EventAudience, AppError> {
         match self {
             AudienceDto::School => Ok(EventAudience::School),
@@ -72,32 +78,14 @@ impl AudienceDto {
                 }
                 Ok(EventAudience::Course { course })
             }
-            AudienceDto::Users { users } => {
-                let mut seen = std::collections::HashSet::new();
-                let users: Vec<UserId> = users
-                    .iter()
-                    .filter(|key| seen.insert(key.as_str()))
-                    .map(|key| UserId::from_key(key))
-                    .collect();
-                if users.is_empty() {
+            AudienceDto::Registration { capacity } => {
+                if capacity.is_some_and(|capacity| capacity < 1) {
                     return Err(AppError::Validation(ValidationError::Invalid {
                         field: "audience",
-                        reason: "users must not be empty",
+                        reason: "capacity must be at least 1",
                     }));
                 }
-                if users.len() > MAX_EVENT_AUDIENCE_USERS {
-                    return Err(AppError::Validation(ValidationError::Invalid {
-                        field: "audience",
-                        reason: "users lists more than 100 people — target a role or course instead",
-                    }));
-                }
-                if User::list_by_ids(&users, db).await?.len() != users.len() {
-                    return Err(AppError::Validation(ValidationError::Invalid {
-                        field: "audience",
-                        reason: "users lists a user that does not exist",
-                    }));
-                }
-                Ok(EventAudience::Users { users })
+                Ok(EventAudience::Registration { capacity })
             }
         }
     }
@@ -111,8 +99,8 @@ impl AudienceDto {
             EventAudience::Course { course } => AudienceDto::Course {
                 course: course.key().to_string(),
             },
-            EventAudience::Users { users } => AudienceDto::Users {
-                users: users.iter().map(|user| user.key().to_string()).collect(),
+            EventAudience::Registration { capacity } => AudienceDto::Registration {
+                capacity: *capacity,
             },
         }
     }
@@ -222,8 +210,9 @@ impl AttendanceResponse {
 
 /// Create an event owned by the current user. Requires the `teacher` role or
 /// higher. `audience` targets it at a role, a course's enrollment, or a
-/// hand-picked user list; omitted it is school-wide. Everyone still sees every
-/// event — the audience is the expected-attendee roster, not a visibility wall.
+/// registration list (filled via `POST /events/{id}/register`); omitted it is
+/// school-wide. Everyone still sees every event — the audience is the
+/// expected-attendee roster, not a visibility wall.
 #[utoipa::path(
     post,
     path = "/",
@@ -322,8 +311,9 @@ async fn get_event(
 /// Update an event. Requires teacher+; the creator may edit their own event and
 /// managers/admins may edit anyone's. Omitted fields keep their value; an
 /// explicit `null` clears `starts_at`/`ends_at`. A provided `audience` replaces
-/// the current one wholesale — attendance rows for people it drops stay stored
-/// but leave the roster report.
+/// the current one wholesale — attendance and signup rows for people it drops
+/// stay stored but leave the roster report (signups resurface if the event is
+/// switched back to the registration kind).
 #[utoipa::path(
     patch,
     path = "/{id}",
@@ -473,7 +463,11 @@ async fn mark(
 
     // Only expected attendees can be marked. The marker needn't be in the
     // audience — a teacher takes roll of a student-targeted event.
-    if !event.get_audience().includes(&target_user, &st.db).await? {
+    if !event
+        .get_audience()
+        .includes(event.get_id(), &target_user, &st.db)
+        .await?
+    {
         return Err(AppError::Validation(ValidationError::Invalid {
             field: "user_id",
             reason: "target user is not in this event's audience",
@@ -578,7 +572,8 @@ struct RosterEntry {
 
 /// The event's expected-attendee roster joined with its attendance marks — the
 /// who-came/who-missed report. Resolved live from the audience (today's role
-/// holders, current enrollment), so it always reflects the present roster;
+/// holders, current enrollment, the current signup list), so it always reflects
+/// the present roster;
 /// attendance rows for people no longer in the audience are omitted here (they
 /// remain in `GET /events/{id}/attendance`). Requires teacher+. Paged via
 /// `?limit=&offset=` (omit `limit` for the whole roster).
@@ -608,7 +603,7 @@ async fn roster(
         .await?
         .ok_or(AppError::NotFound)?;
 
-    let mut members = event.get_audience().members(&st.db).await?;
+    let mut members = event.get_audience().members(event.get_id(), &st.db).await?;
     // ULID keys sort by creation instant — a stable order keeps pages coherent.
     members.sort_by(|a, b| a.key().cmp(b.key()));
     let marks = Attendance::list_for_event(&event_id, &st.db).await?;
@@ -639,4 +634,158 @@ async fn roster(
         })
         .collect();
     Ok(Json(Page::new(items, total, limit, offset)))
+}
+
+// ---- registration ---------------------------------------------------------
+
+#[derive(Deserialize, ToSchema)]
+struct RegisterUser {
+    /// Target user id — must name a student (staff take seats only for
+    /// themselves). Defaults to the caller when omitted.
+    user_id: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct RegistrationResponse {
+    event: String,
+    /// Who holds the seat.
+    user: PersonRef,
+    /// Who placed them on the list.
+    registered_by: PersonRef,
+}
+
+/// The shared gate for touching a signup list: the event must carry the
+/// registration audience, and the list must still be open — it closes the
+/// moment the event starts (a timeless event never closes). Returns the seat
+/// cap for the register path.
+fn check_registration_open(event: &Event) -> Result<Option<i64>, AppError> {
+    let EventAudience::Registration { capacity } = event.get_audience() else {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "audience",
+            reason: "this event does not take registrations",
+        }));
+    };
+    if let Some(starts_at) = event.get_starts_at()
+        && Timestamp::now().as_millis() >= starts_at.as_millis()
+    {
+        return Err(AppError::Conflict(
+            "registration closed when the event started",
+        ));
+    }
+    Ok(*capacity)
+}
+
+/// Put a user on a registration-audience event's signup list. Requires
+/// teacher+. `user_id` must name a student — students are placed by staff and
+/// never register themselves; omit it to take a seat yourself (staff
+/// self-serve, so registering another teacher/manager is refused). Registering
+/// the same person twice is a no-op returning the existing seat. The list
+/// closes when the event starts and refuses to grow past `capacity`.
+#[utoipa::path(
+    post,
+    path = "/{id}/register",
+    tag = "events",
+    security(("session_cookie" = [])),
+    params(("id" = String, Path, description = "Event id")),
+    request_body = RegisterUser,
+    responses(
+        (status = 200, description = "Seat taken (or already held)", body = RegistrationResponse),
+        (status = 400, description = "Not a registration event, or the target is unknown", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires teacher role or higher, or the target is another staff member", body = ErrorResponse),
+        (status = 404, description = "Event not found", body = ErrorResponse),
+        (status = 409, description = "The event is full, or it already started", body = ErrorResponse),
+    ),
+)]
+async fn register(
+    State(st): State<AppState>,
+    RequireTeacher(user): RequireTeacher,
+    Path(id): Path<String>,
+    Json(req): Json<RegisterUser>,
+) -> Result<Json<RegistrationResponse>, AppError> {
+    let event_id = EventId::from_key(&id);
+    let event = Event::read(&event_id, &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let capacity = check_registration_open(&event)?;
+
+    let target = match req.user_id {
+        Some(ref key) => UserId::from_key(key),
+        None => user.get_id().clone(),
+    };
+    let Some(target_user) = User::read(&target, &st.db).await? else {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "user_id",
+            reason: "target user does not exist",
+        }));
+    };
+    // Students are placed by staff; staff hold only their own seat.
+    if &target != user.get_id() && target_user.get_role() != Role::Student {
+        return Err(AppError::Forbidden(
+            "staff register themselves — only students can be registered for",
+        ));
+    }
+
+    let registration =
+        Registration::register(&event_id, &target, user.get_id(), capacity, &st.db).await?;
+    let people = PersonRef::map_of(&[&target_user, &user]);
+    Ok(Json(RegistrationResponse {
+        event: registration.get_event().key().to_string(),
+        user: PersonRef::resolve(&people, registration.get_user()),
+        registered_by: PersonRef::resolve(&people, registration.get_registered_by()),
+    }))
+}
+
+/// Take a user off the signup list — the register rules mirrored: teacher+,
+/// students' seats or your own (another staff member's seat only if their
+/// account no longer exists), and only while the list is open (the event
+/// hasn't started). Attendance already marked stays recorded.
+#[utoipa::path(
+    delete,
+    path = "/{id}/register/{user}",
+    tag = "events",
+    security(("session_cookie" = [])),
+    params(
+        ("id" = String, Path, description = "Event id"),
+        ("user" = String, Path, description = "User id"),
+    ),
+    responses(
+        (status = 204, description = "Seat freed"),
+        (status = 400, description = "Not a registration event", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires teacher role or higher, or the target is another staff member", body = ErrorResponse),
+        (status = 404, description = "Event not found, or the user holds no seat", body = ErrorResponse),
+        (status = 409, description = "The event already started", body = ErrorResponse),
+    ),
+)]
+async fn unregister(
+    State(st): State<AppState>,
+    RequireTeacher(user): RequireTeacher,
+    Path((id, target)): Path<(String, String)>,
+) -> Result<StatusCode, AppError> {
+    let event_id = EventId::from_key(&id);
+    let event = Event::read(&event_id, &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    check_registration_open(&event)?;
+
+    let target = UserId::from_key(&target);
+    // A deleted account's leftover seat is fair game for any teacher+; a
+    // living staff member's seat is theirs alone.
+    if &target != user.get_id()
+        && let Some(target_user) = User::read(&target, &st.db).await?
+        && target_user.get_role() != Role::Student
+    {
+        return Err(AppError::Forbidden(
+            "staff unregister themselves — only students' seats can be freed",
+        ));
+    }
+
+    if Registration::remove(&event_id, &target, &st.db)
+        .await?
+        .is_none()
+    {
+        return Err(AppError::NotFound);
+    }
+    Ok(StatusCode::NO_CONTENT)
 }

@@ -1217,8 +1217,6 @@ async fn event_timestamps_echo_and_validate() {
 async fn event_audience_defaults_validates_and_echoes() {
     let (app, db) = app_and_db().await;
     let ali = login_as(&app, &db, "ali", "teacher").await;
-    let veli = login(&app, "veli").await; // student
-    let veli_id = me_id(&app, &veli).await;
 
     // Omitted audience = school-wide, and it echoes on every read.
     let ev = send(
@@ -1260,22 +1258,32 @@ async fn event_audience_defaults_validates_and_echoes() {
         "PATCH",
         &format!("/events/{event_id}"),
         Some(&ali),
-        Some(json!({ "audience": { "kind": "users", "users": [veli_id, veli_id] } })),
+        Some(json!({ "audience": { "kind": "registration", "capacity": 5 } })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK);
-    // The duplicated id collapsed to one entry.
-    assert_eq!(res.body["audience"]["users"].as_array().unwrap().len(), 1);
+    assert_eq!(res.body["audience"]["capacity"], 5);
 
-    // Invalid audiences are rejected: unknown role, ghost course, ghost user,
-    // an empty hand-picked list, and one past the 100-user cap.
+    // An omitted capacity echoes as null: an uncapped signup list.
+    let res = send(
+        &app,
+        "POST",
+        "/events",
+        Some(&ali),
+        Some(json!({ "title": "trip", "audience": { "kind": "registration" } })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED);
+    assert_eq!(res.body["audience"]["kind"], "registration");
+    assert!(res.body["audience"]["capacity"].is_null());
+
+    // Invalid audiences are rejected: unknown role, ghost course, and
+    // non-positive capacities.
     for audience in [
         json!({ "kind": "role", "role": "wizard" }),
         json!({ "kind": "course", "course": "nope" }),
-        json!({ "kind": "users", "users": ["ghost"] }),
-        json!({ "kind": "users", "users": [] }),
-        json!({ "kind": "users",
-                "users": (0..101).map(|n| format!("u{n}")).collect::<Vec<_>>() }),
+        json!({ "kind": "registration", "capacity": 0 }),
+        json!({ "kind": "registration", "capacity": -3 }),
     ] {
         let res = send(
             &app,
@@ -1287,16 +1295,22 @@ async fn event_audience_defaults_validates_and_echoes() {
         .await;
         assert_eq!(res.status, StatusCode::BAD_REQUEST, "{audience}");
     }
-    // An unknown kind never deserializes.
-    let res = send(
-        &app,
-        "POST",
-        "/events",
-        Some(&ali),
-        Some(json!({ "title": "bad", "audience": { "kind": "galaxy" } })),
-    )
-    .await;
-    assert!(res.status.is_client_error(), "{}", res.status);
+    // An unknown kind never deserializes — including the retired hand-picked
+    // `users` kind, gone in the registration clean break.
+    for audience in [
+        json!({ "kind": "galaxy" }),
+        json!({ "kind": "users", "users": ["ghost"] }),
+    ] {
+        let res = send(
+            &app,
+            "POST",
+            "/events",
+            Some(&ali),
+            Some(json!({ "title": "bad", "audience": audience })),
+        )
+        .await;
+        assert!(res.status.is_client_error(), "{audience}: {}", res.status);
+    }
 }
 
 #[tokio::test]
@@ -1373,8 +1387,17 @@ async fn event_audience_gates_marking() {
         StatusCode::BAD_REQUEST
     );
 
-    // Hand-picked audience: the list is the roster.
-    let ev = create(json!({ "kind": "users", "users": [mina_id.clone()] })).await;
+    // Registration audience: the signup list is the roster.
+    let ev = create(json!({ "kind": "registration" })).await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/events/{ev}/register"),
+        Some(&ali),
+        Some(json!({ "user_id": mina_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     assert_eq!(mark(ev.clone(), mina_id.clone()).await, StatusCode::OK);
     assert_eq!(
         mark(ev.clone(), veli_id.clone()).await,
@@ -3069,6 +3092,331 @@ async fn students_never_mark_attendance() {
         .status,
         StatusCode::FORBIDDEN
     );
+}
+
+/// Registration seats follow the placement rule — teachers seat students and
+/// themselves, never other staff; students never touch the endpoints — and a
+/// repeat register is a no-op on the same single row. Deleting the event
+/// removes its signup rows with it.
+#[tokio::test]
+async fn event_registration_follows_placement_rules() {
+    let (app, db) = app_and_db().await;
+    let ali = login_as(&app, &db, "ali", "teacher").await;
+    let deniz = login_as(&app, &db, "deniz", "teacher").await;
+    let veli = login(&app, "veli").await; // student
+    let veli_id = me_id(&app, &veli).await;
+    let ali_id = me_id(&app, &ali).await;
+    let deniz_id = me_id(&app, &deniz).await;
+
+    let res = send(
+        &app,
+        "POST",
+        "/events",
+        Some(&ali),
+        Some(json!({ "title": "seminar", "audience": { "kind": "registration" } })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED);
+    let ev = id_of(&res.body);
+    let register_uri = format!("/events/{ev}/register");
+
+    // Students can't register — not even themselves.
+    let res = send(&app, "POST", &register_uri, Some(&veli), Some(json!({}))).await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+
+    // A teacher seats a student; the row names who placed whom.
+    let res = send(
+        &app,
+        "POST",
+        &register_uri,
+        Some(&ali),
+        Some(json!({ "user_id": veli_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["user"]["id"], veli_id);
+    assert_eq!(res.body["registered_by"]["id"], ali_id);
+
+    // Registering the same student again is a no-op on the same seat.
+    let res = send(
+        &app,
+        "POST",
+        &register_uri,
+        Some(&deniz),
+        Some(json!({ "user_id": veli_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    let roster = send(
+        &app,
+        "GET",
+        &format!("/events/{ev}/roster"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&roster.body), 1, "upsert keeps a single seat");
+
+    // A teacher takes their own seat by omitting the target…
+    let res = send(&app, "POST", &register_uri, Some(&ali), Some(json!({}))).await;
+    assert_eq!(res.status, StatusCode::OK);
+    // …but never seats another staff member, and ghosts don't register.
+    let res = send(
+        &app,
+        "POST",
+        &register_uri,
+        Some(&ali),
+        Some(json!({ "user_id": deniz_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    let res = send(
+        &app,
+        "POST",
+        &register_uri,
+        Some(&ali),
+        Some(json!({ "user_id": "ghost" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+
+    // Non-registration events refuse the endpoint outright.
+    let school = send(
+        &app,
+        "POST",
+        "/events",
+        Some(&ali),
+        Some(json!({ "title": "assembly" })),
+    )
+    .await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/events/{}/register", id_of(&school.body)),
+        Some(&ali),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+
+    // Unregistering mirrors the rule: students never, staff seats are their
+    // own, students' seats are anyone's (teacher+) to free.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("{register_uri}/{ali_id}"),
+        Some(&veli),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("{register_uri}/{ali_id}"),
+        Some(&deniz),
+        None,
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::FORBIDDEN,
+        "staff seat is not deniz's"
+    );
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("{register_uri}/{veli_id}"),
+        Some(&deniz),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("{register_uri}/{veli_id}"),
+        Some(&deniz),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND, "seat already freed");
+
+    // Deleting the event cascades its signup rows away.
+    let res = send(&app, "DELETE", &format!("/events/{ev}"), Some(&ali), None).await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    let left: Vec<hezarfen_backend::domain::registration::Registration> =
+        db.select("registration").await.unwrap();
+    assert!(left.is_empty(), "event delete leaves no seats behind");
+}
+
+/// A capacity caps live seats, not history: re-registering never double-counts,
+/// freeing a seat reopens it, and shrinking the cap below the current count
+/// only blocks new seats.
+#[tokio::test]
+async fn event_registration_capacity_caps_seats() {
+    let (app, db) = app_and_db().await;
+    let ali = login_as(&app, &db, "ali", "teacher").await;
+    let veli = login(&app, "veli").await;
+    let mina = login(&app, "mina").await;
+    let veli_id = me_id(&app, &veli).await;
+    let mina_id = me_id(&app, &mina).await;
+
+    let res = send(
+        &app,
+        "POST",
+        "/events",
+        Some(&ali),
+        Some(json!({ "title": "workshop",
+                     "audience": { "kind": "registration", "capacity": 1 } })),
+    )
+    .await;
+    let ev = id_of(&res.body);
+    let register_uri = format!("/events/{ev}/register");
+    let register = |user: String| {
+        let app = &app;
+        let ali = &ali;
+        let uri = &register_uri;
+        async move {
+            send(
+                app,
+                "POST",
+                uri,
+                Some(ali),
+                Some(json!({ "user_id": user })),
+            )
+            .await
+            .status
+        }
+    };
+
+    assert_eq!(register(veli_id.clone()).await, StatusCode::OK);
+    assert_eq!(
+        register(mina_id.clone()).await,
+        StatusCode::CONFLICT,
+        "full"
+    );
+    assert_eq!(
+        register(veli_id.clone()).await,
+        StatusCode::OK,
+        "re-register of a seated user never counts against the cap"
+    );
+
+    // Freeing the seat reopens the list.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("{register_uri}/{veli_id}"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    assert_eq!(register(mina_id.clone()).await, StatusCode::OK);
+
+    // Shrinking the cap under the current count keeps the seats and only
+    // refuses growth.
+    assert_eq!(
+        send(
+            &app,
+            "PATCH",
+            &format!("/events/{ev}"),
+            Some(&ali),
+            Some(json!({ "audience": { "kind": "registration", "capacity": 2 } })),
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    assert_eq!(register(veli_id.clone()).await, StatusCode::OK);
+    assert_eq!(
+        send(
+            &app,
+            "PATCH",
+            &format!("/events/{ev}"),
+            Some(&ali),
+            Some(json!({ "audience": { "kind": "registration", "capacity": 1 } })),
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    let roster = send(
+        &app,
+        "GET",
+        &format!("/events/{ev}/roster"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(
+        common::total(&roster.body),
+        2,
+        "shrink keeps existing seats"
+    );
+}
+
+/// The signup list freezes the moment the event starts — both directions.
+/// (The create-time no-past grace lets a just-started event exist, which is
+/// exactly a closed list.)
+#[tokio::test]
+async fn event_registration_closes_at_start() {
+    let (app, db) = app_and_db().await;
+    let ali = login_as(&app, &db, "ali", "teacher").await;
+    let veli = login(&app, "veli").await;
+    let veli_id = me_id(&app, &veli).await;
+    let now = Timestamp::now().as_millis();
+
+    // Started 30s ago: inside the scheduling grace, so creation passes — but
+    // the list is already closed.
+    let res = send(
+        &app,
+        "POST",
+        "/events",
+        Some(&ali),
+        Some(json!({ "title": "underway", "starts_at": now - 30_000,
+                     "audience": { "kind": "registration" } })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let ev = id_of(&res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/events/{ev}/register"),
+        Some(&ali),
+        Some(json!({ "user_id": veli_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/events/{ev}/register/{veli_id}"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "unregister freezes too");
+
+    // A future or timeless event keeps its list open.
+    for body in [
+        json!({ "title": "later", "starts_at": now + 3_600_000,
+                "audience": { "kind": "registration" } }),
+        json!({ "title": "whenever", "audience": { "kind": "registration" } }),
+    ] {
+        let res = send(&app, "POST", "/events", Some(&ali), Some(body)).await;
+        let ev = id_of(&res.body);
+        let res = send(
+            &app,
+            "POST",
+            &format!("/events/{ev}/register"),
+            Some(&ali),
+            Some(json!({ "user_id": veli_id })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    }
 }
 
 #[tokio::test]

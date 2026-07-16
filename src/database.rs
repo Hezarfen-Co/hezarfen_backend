@@ -14,6 +14,7 @@ pub const NOTE_TABLE: &str = "note";
 pub const NOTE_FILE_TABLE: &str = "note_file";
 pub const EVENT_TABLE: &str = "event";
 pub const ATTENDANCE_TABLE: &str = "attendance";
+pub const REGISTRATION_TABLE: &str = "registration";
 pub const EXAM_TABLE: &str = "exam";
 pub const EXAM_RESULT_TABLE: &str = "exam_result";
 pub const EXAM_ATTEMPT_TABLE: &str = "exam_attempt";
@@ -29,9 +30,12 @@ pub const TERM_TABLE: &str = "term";
 
 /// SCHEMAFULL schema: every column is typed, references use `record<..>`.
 /// Idempotent — safe to run on every boot: `IF NOT EXISTS` guards the
-/// definitions, the backfill `UPDATE ... WHERE <field> = NONE` lines only
-/// touch rows written before their column existed, and `REMOVE ... IF EXISTS`
-/// retires schema (like the single-attempt unique index) exactly once.
+/// definitions and `REMOVE ... IF EXISTS` retires schema (like the
+/// single-attempt unique index) exactly once. DDL only — data backfills live
+/// in `BACKFILL`, which runs as a *separate* query: statements inside one
+/// batch see the schema as it stood when the batch started, so an UPDATE next
+/// to a fresh `DEFINE FIELD audience.*` writes against the old field set and
+/// SCHEMAFULL silently strips the very keys being backfilled.
 const MIGRATION: &str = "
     DEFINE TABLE IF NOT EXISTS user SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS username ON user TYPE string;
@@ -45,7 +49,6 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS theme ON user TYPE option<string>;
     DEFINE FIELD IF NOT EXISTS language ON user TYPE option<string>;
     DEFINE INDEX IF NOT EXISTS user_username ON user FIELDS username UNIQUE;
-    UPDATE user SET role = 'student' WHERE role = NONE;
 
     DEFINE TABLE IF NOT EXISTS session SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS user ON session TYPE record<user>;
@@ -75,10 +78,10 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS audience.kind ON event TYPE string;
     DEFINE FIELD IF NOT EXISTS audience.role ON event TYPE option<string>;
     DEFINE FIELD IF NOT EXISTS audience.course ON event TYPE option<record<course>>;
-    DEFINE FIELD IF NOT EXISTS audience.users ON event TYPE option<array<record<user>>>;
+    DEFINE FIELD IF NOT EXISTS audience.capacity ON event TYPE option<int>;
+    REMOVE FIELD IF EXISTS audience.users ON TABLE event;
     DEFINE FIELD IF NOT EXISTS starts_at ON event TYPE option<int>;
     DEFINE FIELD IF NOT EXISTS ends_at ON event TYPE option<int>;
-    UPDATE event SET audience = { kind: 'school' } WHERE audience = NONE;
 
     DEFINE TABLE IF NOT EXISTS attendance SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS event ON attendance TYPE record<event>;
@@ -87,6 +90,13 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS marked_by ON attendance TYPE record<user>;
     DEFINE INDEX IF NOT EXISTS attendance_event_user ON attendance FIELDS event, user UNIQUE;
     DEFINE INDEX IF NOT EXISTS attendance_user ON attendance FIELDS user;
+
+    DEFINE TABLE IF NOT EXISTS registration SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS event ON registration TYPE record<event>;
+    DEFINE FIELD IF NOT EXISTS user ON registration TYPE record<user>;
+    DEFINE FIELD IF NOT EXISTS registered_by ON registration TYPE record<user>;
+    DEFINE INDEX IF NOT EXISTS registration_event_user ON registration FIELDS event, user UNIQUE;
+    DEFINE INDEX IF NOT EXISTS registration_event ON registration FIELDS event;
 
     DEFINE TABLE IF NOT EXISTS term SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS name ON term TYPE string;
@@ -193,6 +203,32 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS max_file_bytes ON settings TYPE option<int>;
 ";
 
+/// Data backfills for rows written by older binaries. Runs *after* (and apart
+/// from) the DDL batch so every statement sees the freshly defined schema —
+/// see the `MIGRATION` doc for why sharing the batch corrupts the writes.
+/// Idempotent: each backfill's `WHERE` only matches unconverted rows.
+const BACKFILL: &str = "
+    UPDATE user SET role = 'student' WHERE role = NONE;
+
+    UPDATE event SET audience = { kind: 'school' } WHERE audience = NONE OR audience = {};
+
+    -- The hand-picked `users` audience retired into `registration` (2026-07-16):
+    -- each listed user becomes a signup row credited to the event's creator, and
+    -- the event becomes an uncapped registration list. Runs once — converted
+    -- events no longer match the `kind = 'users'` filter. (`?? []`: an empty
+    -- statement-subquery evaluates to NONE, which FOR refuses to iterate.)
+    FOR $ev IN ((SELECT id, creator, audience FROM event WHERE audience.kind = 'users') ?? []) {
+        FOR $usr IN ($ev.audience.users ?? []) {
+            UPSERT type::record('registration', string::concat(record::id($ev.id), '_', record::id($usr))) CONTENT {
+                event: $ev.id,
+                user: $usr,
+                registered_by: $ev.creator,
+            };
+        };
+        UPDATE $ev.id SET audience = { kind: 'registration' };
+    };
+";
+
 /// Open the file-backed database and apply the schema.
 pub async fn init(cfg: &Config) -> Result<Database, AppError> {
     let db = Surreal::new::<SurrealKv>(cfg.db_path.clone()).await?;
@@ -213,5 +249,6 @@ pub async fn init_mem() -> Result<Database, AppError> {
 
 async fn migrate(db: &Database) -> Result<(), AppError> {
     db.query(MIGRATION).await?.check()?;
+    db.query(BACKFILL).await?.check()?;
     Ok(())
 }

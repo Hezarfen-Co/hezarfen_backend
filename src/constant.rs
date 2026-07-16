@@ -58,12 +58,6 @@ pub const UPLOAD_BODY_OVERHEAD_BYTES: usize = 64 * 1024;
 pub const MAX_EVENT_TITLE_LEN: usize = 200;
 pub const MAX_EVENT_DESCRIPTION_LEN: usize = 2_000;
 
-/// How many users a hand-picked (`kind: "users"`) event audience may list.
-/// Bigger groups have a broader kind: a whole role or a course's enrollment.
-/// The "100" wording in `web::events`' rejection reason and the `AudienceDto`
-/// docs mirrors this literal — keep them in step.
-pub const MAX_EVENT_AUDIENCE_USERS: usize = 100;
-
 pub const MAX_EXAM_TITLE_LEN: usize = 200;
 pub const MAX_EXAM_DESCRIPTION_LEN: usize = 2_000;
 

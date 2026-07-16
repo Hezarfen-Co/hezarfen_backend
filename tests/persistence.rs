@@ -593,3 +593,110 @@ async fn legacy_events_backfill_to_school_audience() {
     assert_eq!(res.status, StatusCode::OK);
     assert_eq!(common::total(&res.body), 1, "whole school = the one user");
 }
+
+/// Event rows carrying the retired hand-picked (`users`) audience convert on
+/// the next boot: the audience becomes an uncapped registration list and each
+/// listed user gets a signup row credited to the event's creator — the old
+/// roster survives the clean break byte for byte.
+#[tokio::test]
+async fn legacy_users_audiences_convert_to_registrations() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config_at(&dir);
+    let creds = json!({ "username": "ali", "password": "secret1" });
+    let event_id;
+    let student_id;
+
+    // First boot: a registration-audience event — then rewrite it into the
+    // shape an old binary left behind: restore the `audience.users` column
+    // definition and store a hand-picked list on the row.
+    {
+        let db = database::init(&cfg).await.expect("first open");
+        let app = build_router(state(db.clone(), &cfg));
+        assert_eq!(
+            send(&app, "POST", "/auth/register", None, Some(creds.clone()))
+                .await
+                .status,
+            StatusCode::CREATED
+        );
+        set_role(&db, "ali", "teacher").await;
+        let cookie = send(&app, "POST", "/auth/login", None, Some(creds.clone()))
+            .await
+            .cookie
+            .unwrap();
+        let student = json!({ "username": "veli", "password": "secret1" });
+        assert_eq!(
+            send(&app, "POST", "/auth/register", None, Some(student.clone()))
+                .await
+                .status,
+            StatusCode::CREATED
+        );
+        let student_cookie = send(&app, "POST", "/auth/login", None, Some(student))
+            .await
+            .cookie
+            .unwrap();
+        student_id = common::me_id(&app, &student_cookie).await;
+
+        let res = send(
+            &app,
+            "POST",
+            "/events",
+            Some(&cookie),
+            Some(json!({ "title": "trip", "audience": { "kind": "registration" } })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED);
+        event_id = common::id_of(&res.body);
+
+        db.query(format!(
+            "DEFINE FIELD OVERWRITE audience.users ON TABLE event TYPE option<array<record<user>>>;
+             UPDATE event SET audience = {{ kind: 'users', users: [type::record('user', $usr)] }}
+                 WHERE id = type::record('event', '{event_id}');"
+        ))
+        .bind(("usr", student_id.clone()))
+        .await
+        .expect("rewrite to legacy users audience")
+        .check()
+        .expect("rewrite check");
+    }
+
+    // Second boot runs the conversion: the audience reads back as an uncapped
+    // registration list, the listed student holds a seat credited to the
+    // creator, and the roster (and marking gate) see them.
+    let db = reopen(&cfg).await;
+    let app = build_router(state(db, &cfg));
+    let cookie = send(&app, "POST", "/auth/login", None, Some(creds))
+        .await
+        .cookie
+        .unwrap();
+    let res = send(
+        &app,
+        "GET",
+        &format!("/events/{event_id}"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["audience"]["kind"], "registration");
+    assert!(res.body["audience"]["capacity"].is_null());
+    let res = send(
+        &app,
+        "GET",
+        &format!("/events/{event_id}/roster"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(common::total(&res.body), 1, "the listed user became a seat");
+    assert_eq!(common::items(&res.body)[0]["user"]["id"], student_id);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/events/{event_id}/attendance"),
+        Some(&cookie),
+        Some(json!({ "status": "present", "user_id": student_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "converted seat is markable");
+}

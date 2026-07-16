@@ -7,10 +7,13 @@ Session-cookie auth with four hierarchical roles (`student < teacher < manager
 …): blobs live on disk next to the database, metadata in the database, and the
 per-file size cap is school policy in settings (`max_file_bytes`, default
 5 MiB). Attendance is event + attendees: create an event with an **audience**
-(the whole school, one role, a course's enrollment, or a hand-picked list —
-omit for school-wide), then teachers mark the expected attendees present /
-absent / late / excused (students never self-mark), and a **roster report**
-shows who was expected and who missed. Every event stays visible to everyone —
+(the whole school, one role, a course's enrollment, or a **registration**
+signup list — omit for school-wide), then teachers mark the expected attendees
+present / absent / late / excused (students never self-mark), and a **roster
+report** shows who was expected and who missed. Registration lists fill seat
+by seat: teachers register students (never the other way round), staff
+register only themselves, an optional `capacity` caps the seats, and the list
+closes the moment the event starts. Every event stays visible to everyone —
 the audience is a roster, not a wall. Marks are course-shaped
 (Google Classroom style): a teacher creates a course, enrolls students, adds
 exams inside it, and grades — enrolling, sitting exams, roll call, and marks are
@@ -169,7 +172,8 @@ effect on the user's very next call (no re-login).
 | Register / login / view own account      | (any)        | Registration always creates a `student`       |
 | View events, own notes; CRUD notes + their files | student | Everyone can read events and keep notes; note files (upload/download) are walled per owner like the notes themselves |
 | Mark event attendance; remove attendance rows | teacher | Only users in the event's **audience** can be marked; students never mark — a teacher+ may mark anyone expected, themselves included |
-| Create events                            | teacher      | The audience (school / role / course / user list) is set at creation and editable later |
+| Create events                            | teacher      | The audience (school / role / course / registration) is set at creation and editable later |
+| Register users onto a registration event | teacher      | Teachers place **students** (students never register themselves) and take a seat for **themselves** — never for another staff member. Unregistering mirrors the same rule |
 | List an event's attendance or its roster report | teacher | Students read their own tallies via the attendance report |
 | Edit / delete an event                   | teacher      | Only the **creator**, or a `manager`+ for any event |
 | View a course's sessions                 | student      | Only inside **visible** courses: enrolled, creator, or `manager`+ |
@@ -292,6 +296,8 @@ their existing shapes: the student exam-room reads
 | GET    | `/events/{id}/attendance`        | teacher | List recorded attendance for event (students read their own tallies via `/attendance/me`) · paged |
 | GET    | `/events/{id}/roster`            | teacher | Who-missed report: every expected attendee with their status (`null` = never marked) + `marked_by` · paged |
 | DELETE | `/events/{id}/attendance/{user}` | teacher | Remove a user's attendance      |
+| POST   | `/events/{id}/register`          | teacher | `{user_id?}` — seat a **student** (or yourself when omitted) on a registration event's signup list; idempotent, `409` once full or started |
+| DELETE | `/events/{id}/register/{user}`   | teacher | Free a seat (same self-or-student rule); `409` once the event started |
 | POST   | `/courses`                       | teacher | `{title, description?}` (creator manages it) |
 | GET    | `/courses`                       | student | The caller's visible courses: created + enrolled (manager+: all) · paged |
 | GET    | `/courses/me`                    | student | The caller's **enrolled** courses · paged |
@@ -380,14 +386,24 @@ explicit `null` clears it.
 An event's `audience` is a tagged object — `{"kind": "school"}` (the default),
 `{"kind": "role", "role": "student"}` (that exact role, no "and above"),
 `{"kind": "course", "course": "<id>"}` (the course's current enrollment), or
-`{"kind": "users", "users": ["<id>", …]}` (hand-picked, ≤ 100, deduplicated) —
-and is the event's **expected-attendee roster**, resolved live at read time:
-role changes and (un)enrollments move people in and out by themselves. It never
-hides the event — everyone sees every event. Only audience members can be
-marked; `GET /events/{id}/roster` joins the live roster with the recorded marks
-(`status: null` = expected but never marked). Attendance rows for people a
-later audience edit (or unenrollment / role change) dropped stay stored and
-listed under `/events/{id}/attendance`, but leave the roster report.
+`{"kind": "registration", "capacity": 30}` (a signup list; `capacity` optional,
+`null` = unlimited) — and is the event's **expected-attendee roster**, resolved
+live at read time: role changes, (un)enrollments, and (un)registrations move
+people in and out by themselves. It never hides the event — everyone sees every
+event. Only audience members can be marked; `GET /events/{id}/roster` joins the
+live roster with the recorded marks (`status: null` = expected but never
+marked). Attendance rows for people a later audience edit (or unenrollment /
+role change) dropped stay stored and listed under `/events/{id}/attendance`,
+but leave the roster report.
+A registration list fills through `POST /events/{id}/register`: teachers place
+students (a student never registers, not even themselves) and take seats only
+for themselves — registering another staff member is refused. Re-registering
+someone is a no-op, a full list is a `409`, and the list freezes the moment
+the event starts (register and unregister both). Signup rows survive an
+audience switch inertly and resurface if the event returns to the registration
+kind; deleting the event deletes them. Pre-existing hand-picked (`users`)
+audiences convert on boot: each listed user becomes a signup row credited to
+the event's creator, and the audience becomes an uncapped registration list.
 Reading a child collection of a missing parent (`/events/{id}/attendance`,
 `/exams/{id}/results`, `/courses/{id}/enrollments`, `/courses/{id}/exams`,
 `/courses/{id}/sessions`, `/sessions/{id}/attendance`) is a `404`, not an
