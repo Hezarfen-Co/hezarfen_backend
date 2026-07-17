@@ -1,18 +1,28 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
+use tokio::sync::Mutex;
 
 use crate::database::{Database, REGISTRATION_TABLE};
 use crate::domain::event::EventId;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 
+/// Serializes seat-taking. A `BEGIN…COMMIT` around the count can't do this:
+/// SurrealDB transactions don't conflict-check a cross-record `count()`
+/// against a concurrent insert (write-skew), so two racing registrations both
+/// saw a free seat and a full event over-admitted. The database is embedded —
+/// this process is the only writer — so one process-wide lock is sufficient.
+// ponytail: global lock, per-event locks (or DB-side serialization) if
+// registration ever sees real contention.
+static REGISTER_LOCK: Mutex<()> = Mutex::const_new(());
+
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct RegistrationId(RecordId);
 
 impl RegistrationId {
     /// A deterministic id for the (event, user) pair — the same pair always
-    /// maps to the same record id, so registering is one atomic UPSERT with
-    /// no find-then-insert race and one-row-per-pair by construction (the
-    /// enrollment trick). ULID keys are alphanumeric, so `_` is unambiguous.
+    /// maps to the same record id, so one-row-per-pair holds by construction
+    /// (the enrollment trick) even if a write ever slipped past the register
+    /// lock. ULID keys are alphanumeric, so `_` is unambiguous.
     pub fn composite(event: &EventId, user: &UserId) -> Self {
         Self(RecordId::new(
             REGISTRATION_TABLE,
@@ -62,10 +72,10 @@ impl Registration {
     }
 
     /// Register (idempotently) `user` onto `event`, refusing when a `capacity`
-    /// cap is set and every seat is taken. The seat count is re-read inside the
-    /// transaction and the THROW cancels the UPSERT, so a full event never
-    /// over-admits through the check-then-write gap; re-registering someone
-    /// already listed never counts against the cap (and returns their row).
+    /// cap is set and every seat is taken. Someone already listed gets their
+    /// existing row back untouched — a true no-op that never counts against
+    /// the cap and never rewrites who placed them. The whole check-then-write
+    /// runs under [`REGISTER_LOCK`], so a full event never over-admits.
     pub async fn register(
         event: &EventId,
         user: &UserId,
@@ -73,44 +83,26 @@ impl Registration {
         capacity: Option<i64>,
         db: &Database,
     ) -> Result<Registration, AppError> {
+        let _guard = REGISTER_LOCK.lock().await;
+        if let Some(existing) = Self::read_for_user(event, user, db).await? {
+            return Ok(existing);
+        }
+        if let Some(capacity) = capacity
+            && Self::list_for_event(event, db).await?.len() as i64 >= capacity
+        {
+            return Err(AppError::Conflict("the event is full"));
+        }
         let registration = Registration {
             id: RegistrationId::composite(event, user),
             event: event.clone(),
             user: user.clone(),
             registered_by: registered_by.clone(),
         };
-        let mut result = db
-            .query(
-                "BEGIN TRANSACTION;
-                 LET $already = (SELECT VALUE id FROM registration WHERE event = $ev AND user = $usr);
-                 LET $count = (SELECT count() FROM registration WHERE event = $ev GROUP ALL)[0].count ?? 0;
-                 IF $cap != NONE AND array::len($already) = 0 AND $count >= $cap { THROW 'event_full' };
-                 UPSERT $id CONTENT $registration;
-                 COMMIT TRANSACTION;",
-            )
-            .bind(("ev", event.record()))
-            .bind(("usr", user.record()))
-            .bind(("cap", capacity))
-            .bind(("id", registration.id.record()))
-            .bind(("registration", registration))
+        let created: Option<Registration> = db
+            .create(registration.id.record())
+            .content(registration)
             .await?;
-        // An aborted transaction errors *every* slot, most with a generic
-        // "not executed" — only the THROW's own slot names the reason, so scan
-        // them all for the marker instead of trusting the first (`check`-style)
-        // error.
-        let mut errors = result.take_errors();
-        if errors
-            .values()
-            .any(|error| error.to_string().contains("event_full"))
-        {
-            return Err(AppError::Conflict("the event is full"));
-        }
-        if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-            return Err(error.into());
-        }
-        // Statement slots count BEGIN and the LETs too: the UPSERT is slot 4.
-        let saved: Option<Registration> = result.take::<Vec<Registration>>(4)?.into_iter().next();
-        saved.ok_or_else(|| AppError::Internal("failed to register user".into()))
+        created.ok_or_else(|| AppError::Internal("failed to register user".into()))
     }
 
     /// Some(_) iff `user` holds a seat on `event` — the audience point check.

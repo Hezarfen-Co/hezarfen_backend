@@ -3421,6 +3421,122 @@ async fn event_registration_capacity_caps_seats() {
     );
 }
 
+/// Regression: re-registering an already-seated student used to be an UPSERT
+/// that silently rewrote `registered_by` to the second caller. The documented
+/// contract is a no-op — the seat and its audit trail come back unchanged.
+#[tokio::test]
+async fn re_registering_returns_the_seat_untouched() {
+    let (app, db) = app_and_db().await;
+    let ali = login_as(&app, &db, "ali", "teacher").await;
+    let deniz = login_as(&app, &db, "deniz", "teacher").await;
+    let veli = login(&app, "veli").await;
+    let veli_id = me_id(&app, &veli).await;
+    let ali_id = me_id(&app, &ali).await;
+
+    let res = send(
+        &app,
+        "POST",
+        "/events",
+        Some(&ali),
+        Some(json!({ "title": "seminar", "audience": { "kind": "registration" } })),
+    )
+    .await;
+    let uri = format!("/events/{}/register", id_of(&res.body));
+
+    let first = send(
+        &app,
+        "POST",
+        &uri,
+        Some(&ali),
+        Some(json!({ "user_id": veli_id })),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::OK);
+    assert_eq!(first.body["registered_by"]["id"], ali_id);
+
+    let second = send(
+        &app,
+        "POST",
+        &uri,
+        Some(&deniz),
+        Some(json!({ "user_id": veli_id })),
+    )
+    .await;
+    assert_eq!(second.status, StatusCode::OK);
+    assert_eq!(
+        second.body["registered_by"]["id"], ali_id,
+        "re-registering must not rewrite who placed the student"
+    );
+}
+
+/// Regression: the capacity check used to run inside a `BEGIN…COMMIT` whose
+/// cross-record `count()` SurrealDB does not conflict-check against a
+/// concurrent insert (write-skew) — two racing placements both saw the last
+/// seat free and a capacity-1 event admitted 2. The register path now
+/// serializes the check-then-write, so exactly one wins and the loser gets
+/// the same 409 as a sequential over-fill.
+#[tokio::test]
+async fn concurrent_placements_never_exceed_capacity() {
+    let (app, db) = app_and_db().await;
+    let ali = login_as(&app, &db, "ali", "teacher").await;
+    let veli = login(&app, "veli").await;
+    let ayse = login(&app, "ayse").await;
+    let veli_id = me_id(&app, &veli).await;
+    let ayse_id = me_id(&app, &ayse).await;
+
+    let res = send(
+        &app,
+        "POST",
+        "/events",
+        Some(&ali),
+        Some(json!({ "title": "trip", "audience": { "kind": "registration", "capacity": 1 } })),
+    )
+    .await;
+    let ev = id_of(&res.body);
+    let uri = format!("/events/{ev}/register");
+
+    for _round in 0..10 {
+        for uid in [&veli_id, &ayse_id] {
+            let _ = send(&app, "DELETE", &format!("{uri}/{uid}"), Some(&ali), None).await;
+        }
+        let (a, b) = tokio::join!(
+            send(
+                &app,
+                "POST",
+                &uri,
+                Some(&ali),
+                Some(json!({ "user_id": veli_id })),
+            ),
+            send(
+                &app,
+                "POST",
+                &uri,
+                Some(&ali),
+                Some(json!({ "user_id": ayse_id })),
+            ),
+        );
+        for status in [a.status, b.status] {
+            assert!(
+                status == StatusCode::OK || status == StatusCode::CONFLICT,
+                "a lost capacity race must be a 409, got {status}"
+            );
+        }
+        let roster = send(
+            &app,
+            "GET",
+            &format!("/events/{ev}/roster"),
+            Some(&ali),
+            None,
+        )
+        .await;
+        assert!(
+            common::total(&roster.body) <= 1,
+            "capacity 1 must never over-admit, roster={}",
+            roster.body
+        );
+    }
+}
+
 /// The signup list freezes the moment the event starts — both directions.
 /// (The create-time no-past grace lets a just-started event exist, which is
 /// exactly a closed list.)
@@ -9647,6 +9763,48 @@ async fn grade_band_boundary_applies_to_the_weighted_average() {
     assert!(grades.contains(&("Quiz A", "FF")));
     assert!(grades.contains(&("Quiz B", "AA")));
     assert_eq!(res.body["overall_grade"], "AA");
+}
+
+/// Two managers patch DIFFERENT fields concurrently. Neither edit may be lost
+/// and neither request may 500 — the compare-and-set loop absorbs the
+/// conflict and re-merges (the guard `save_if_unchanged` exists for).
+#[tokio::test]
+async fn concurrent_settings_patches_both_land() {
+    for _round in 0..10 {
+        let (app, db) = app_and_db().await;
+        let mavi = login_as(&app, &db, "mavi", "manager").await;
+        let kara = login_as(&app, &db, "kara", "manager").await;
+
+        let (a, b) = tokio::join!(
+            send(
+                &app,
+                "PATCH",
+                "/settings",
+                Some(&mavi),
+                Some(
+                    json!({ "grade_bands": [ { "min": 0, "label": "F" }, { "min": 50, "label": "P" } ] })
+                ),
+            ),
+            send(
+                &app,
+                "PATCH",
+                "/settings",
+                Some(&kara),
+                Some(json!({ "max_file_bytes": 4096 })),
+            ),
+        );
+        assert_eq!(a.status, StatusCode::OK, "bands patch: {}", a.body);
+        assert_eq!(b.status, StatusCode::OK, "bytes patch: {}", b.body);
+
+        let after = send(&app, "GET", "/settings", Some(&mavi), None).await;
+        assert_eq!(after.body["max_file_bytes"], 4096, "{}", after.body);
+        assert_eq!(
+            after.body["grade_bands"].as_array().unwrap().len(),
+            2,
+            "both concurrent edits must survive: {}",
+            after.body
+        );
+    }
 }
 
 #[tokio::test]
