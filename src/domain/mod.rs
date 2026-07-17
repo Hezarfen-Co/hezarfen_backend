@@ -21,6 +21,7 @@ pub mod role;
 pub mod session;
 pub mod session_attendance;
 pub mod settings;
+pub mod subject;
 pub mod term;
 pub mod timestamp;
 pub mod user;

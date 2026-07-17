@@ -6,6 +6,7 @@ use crate::constant::{
 };
 use crate::database::{Database, EXAM_QUESTION_TABLE};
 use crate::domain::exam::ExamId;
+use crate::domain::subject::SubjectId;
 use crate::error::{AppError, ValidationError};
 use crate::validate::{validate_question_kind, validate_question_points, validate_required};
 
@@ -161,11 +162,14 @@ impl QuestionSpec {
 
 /// One question of an exam. Order within the exam is the id's ULID order
 /// (creation order); the kind-dependent columns always satisfy the
-/// [`QuestionSpec`] invariants because every write goes through one.
+/// [`QuestionSpec`] invariants because every write goes through one. Every
+/// question links to a subject of the exam's course — the handlers verify the
+/// subject's course matches before any write.
 #[derive(Debug, Clone, SurrealValue)]
 pub struct ExamQuestion {
     id: ExamQuestionId,
     exam: ExamId,
+    subject: SubjectId,
     text: QuestionText,
     kind: QuestionKind,
     points: QuestionPoints,
@@ -180,6 +184,10 @@ impl ExamQuestion {
 
     pub fn get_exam(&self) -> &ExamId {
         &self.exam
+    }
+
+    pub fn get_subject(&self) -> &SubjectId {
+        &self.subject
     }
 
     pub fn get_text(&self) -> &QuestionText {
@@ -215,6 +223,7 @@ impl ExamQuestion {
 
     pub async fn create(
         exam: &ExamId,
+        subject: SubjectId,
         text: QuestionText,
         points: QuestionPoints,
         spec: QuestionSpec,
@@ -223,6 +232,7 @@ impl ExamQuestion {
         let question = ExamQuestion {
             id: ExamQuestionId::generate(),
             exam: exam.clone(),
+            subject,
             text,
             points,
             kind: spec.kind,
@@ -254,13 +264,26 @@ impl ExamQuestion {
         Ok(result.take::<Vec<ExamQuestion>>(0)?)
     }
 
+    /// Whether any question anywhere references `subject` — the gate that
+    /// blocks deleting a subject still in use.
+    pub async fn any_for_subject(subject: &SubjectId, db: &Database) -> Result<bool, AppError> {
+        let mut result = db
+            .query("SELECT VALUE id FROM exam_question WHERE subject = $subject LIMIT 1")
+            .bind(("subject", subject.record()))
+            .await?
+            .check()?;
+        Ok(!result.take::<Vec<RecordId>>(0)?.is_empty())
+    }
+
     pub async fn update(
         mut self,
+        subject: SubjectId,
         text: QuestionText,
         points: QuestionPoints,
         spec: QuestionSpec,
         db: &Database,
     ) -> Result<ExamQuestion, AppError> {
+        self.subject = subject;
         self.text = text;
         self.points = points;
         self.kind = spec.kind;
@@ -287,6 +310,7 @@ impl ExamQuestion {
         ExamQuestion {
             id: ExamQuestionId::generate(),
             exam: exam.clone(),
+            subject: SubjectId::generate(),
             text: QuestionText::try_new(text).unwrap(),
             points: QuestionPoints::try_new(points).unwrap(),
             kind: spec.kind,

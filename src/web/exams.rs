@@ -34,6 +34,7 @@ use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
 
 use super::courses::{can_manage_course, can_view_course, visible_courses};
+use super::subjects::subject_in_course;
 use super::{
     CurrentUser, ExamResponse, Page, PageParams, PersonRef, RequireTeacher, check_not_past,
     paginate, person_map, set_or_clear,
@@ -1199,6 +1200,10 @@ async fn exam_live_stream(
 
 #[derive(Deserialize, ToSchema)]
 struct CreateQuestion {
+    /// The subject this question belongs to — one of the exam's course's
+    /// subjects (`GET /courses/{id}/subjects`). Required.
+    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    subject_id: String,
     /// The question itself.
     #[schema(example = "What is 2 + 2?")]
     text: String,
@@ -1218,6 +1223,10 @@ struct CreateQuestion {
 
 #[derive(Deserialize, ToSchema)]
 struct UpdateQuestion {
+    /// Re-tag the question with another of the course's subjects. Omit to
+    /// keep the current one — a question always has a subject, so there is no
+    /// clearing it.
+    subject_id: Option<String>,
     text: Option<String>,
     points: Option<i64>,
     /// `choice` or `text`. Switching kinds needs the other fields to follow:
@@ -1241,6 +1250,8 @@ struct UpdateQuestion {
 struct QuestionResponse {
     id: String,
     exam: String,
+    /// The subject this question belongs to (`GET /subjects/{id}`).
+    subject: String,
     text: String,
     /// `choice` or `text`.
     #[schema(example = "choice")]
@@ -1256,6 +1267,7 @@ impl QuestionResponse {
         Self {
             id: question.get_id().key().to_string(),
             exam: question.get_exam().key().to_string(),
+            subject: question.get_subject().key().to_string(),
             text: question.get_text().as_str().to_string(),
             kind: question.get_kind().as_str().to_string(),
             points: question.get_points().as_i64(),
@@ -1295,8 +1307,10 @@ async fn question_of_exam(
 }
 
 /// Add a question to an exam. Requires teacher+ and management rights over the
-/// exam's course. `choice` questions carry 2–10 `choices` plus the `correct`
-/// index; `text` questions carry neither. Locked once attempts exist.
+/// exam's course. `subject_id` must name one of the course's subjects
+/// (`GET /courses/{id}/subjects`) — every question belongs to a subject.
+/// `choice` questions carry 2–10 `choices` plus the `correct` index; `text`
+/// questions carry neither. Locked once attempts exist.
 #[utoipa::path(
     post,
     path = "/{id}/questions",
@@ -1306,7 +1320,7 @@ async fn question_of_exam(
     request_body = CreateQuestion,
     responses(
         (status = 201, description = "Question created", body = QuestionResponse),
-        (status = 400, description = "Invalid text, kind, points, choices, or correct", body = ErrorResponse),
+        (status = 400, description = "Invalid text, kind, points, choices, or correct — or an unknown subject, or one from another course", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
@@ -1330,10 +1344,11 @@ async fn create_question(
     }
     ensure_questions_editable(exam.get_id(), &st.db).await?;
 
+    let subject = subject_in_course(&req.subject_id, course.get_id(), &st.db).await?;
     let text = QuestionText::try_new(&req.text)?;
     let points = QuestionPoints::try_new(req.points)?;
     let spec = QuestionSpec::try_new(QuestionKind::try_new(&req.kind)?, req.choices, req.correct)?;
-    let question = ExamQuestion::create(exam.get_id(), text, points, spec, &st.db).await?;
+    let question = ExamQuestion::create(exam.get_id(), subject, text, points, spec, &st.db).await?;
     Ok((StatusCode::CREATED, Json(QuestionResponse::new(&question))))
 }
 
@@ -1384,7 +1399,8 @@ async fn list_questions(
 /// Edit a question. Requires teacher+ and management rights over the exam's
 /// course. Omitted fields keep their value; `kind`/`choices`/`correct` are
 /// re-validated as a unit, so a kind switch must bring the matching fields
-/// along. Locked once attempts exist.
+/// along. `subject_id` re-tags within the course's subjects. Locked once
+/// attempts exist.
 #[utoipa::path(
     patch,
     path = "/{id}/questions/{qid}",
@@ -1397,7 +1413,7 @@ async fn list_questions(
     request_body = UpdateQuestion,
     responses(
         (status = 200, description = "Updated question", body = QuestionResponse),
-        (status = 400, description = "Invalid text, kind, points, choices, or correct", body = ErrorResponse),
+        (status = 400, description = "Invalid text, kind, points, choices, or correct — or an unknown subject, or one from another course", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "No such exam, or no such question in it", body = ErrorResponse),
@@ -1422,6 +1438,10 @@ async fn update_question(
     ensure_questions_editable(exam.get_id(), &st.db).await?;
     let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
 
+    let subject = match req.subject_id {
+        Some(ref subject_id) => subject_in_course(subject_id, course.get_id(), &st.db).await?,
+        None => question.get_subject().clone(),
+    };
     let text = match req.text {
         Some(ref text) => QuestionText::try_new(text)?,
         None => question.get_text().clone(),
@@ -1448,7 +1468,7 @@ async fn update_question(
     };
     let spec = QuestionSpec::try_new(kind, choices, correct)?;
 
-    let updated = question.update(text, points, spec, &st.db).await?;
+    let updated = question.update(subject, text, points, spec, &st.db).await?;
     Ok(Json(QuestionResponse::new(&updated)))
 }
 
@@ -1522,6 +1542,8 @@ impl AnswerStateResponse {
 #[derive(Serialize, ToSchema)]
 struct AttemptQuestionResponse {
     id: String,
+    /// The subject this question belongs to (`GET /subjects/{id}`).
+    subject: String,
     text: String,
     /// `choice` or `text`.
     #[schema(example = "choice")]
@@ -1711,6 +1733,7 @@ async fn attempt_questions(
             .iter()
             .map(|question| AttemptQuestionResponse {
                 id: question.get_id().key().to_string(),
+                subject: question.get_subject().key().to_string(),
                 text: question.get_text().as_str().to_string(),
                 kind: question.get_kind().as_str().to_string(),
                 points: question.get_points().as_i64(),

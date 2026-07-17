@@ -6,8 +6,8 @@ mod common;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use common::{
-    app_and_db, create_course, create_exam, create_exam_with, create_session, enroll, id_of, login,
-    login_as, me_id, mem_app, send, set_role,
+    app_and_db, create_course, create_exam, create_exam_with, create_session, create_subject,
+    enroll, id_of, login, login_as, me_id, mem_app, send, set_role,
 };
 use hezarfen_backend::domain::exam::ExamId;
 use hezarfen_backend::domain::exam_attempt::ExamAttempt;
@@ -5792,6 +5792,7 @@ async fn open_exams_sit_anytime_and_retakes_respect_the_limit() {
     let student = login(&app, "omer").await;
     let student_id = me_id(&app, &student).await;
     let course = create_course(&app, &teacher, "practice").await;
+    let subject = create_subject(&app, &teacher, &course, "drills").await;
     enroll(&app, &teacher, &course, &student_id).await;
     let exam = scheduled_exam(
         &app,
@@ -5805,6 +5806,7 @@ async fn open_exams_sit_anytime_and_retakes_respect_the_limit() {
         &app,
         &teacher,
         &exam,
+        &subject,
         json!({ "text": "2 + 2?", "kind": "choice", "points": 10,
                 "choices": ["3", "4"], "correct": 1 }),
     )
@@ -6143,16 +6145,283 @@ async fn live_stream_is_sse_and_teacher_scoped() {
     assert_eq!(res.status, StatusCode::NOT_FOUND);
 }
 
+// --- subjects ---------------------------------------------------------------
+
+#[tokio::test]
+async fn subject_crud_validation_and_rbac() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "sub_t", "teacher").await;
+    let other_teacher = login_as(&app, &db, "sub_t2", "teacher").await;
+    let boss = login_as(&app, &db, "sub_m", "manager").await;
+    let student = login(&app, "selin").await;
+    let student_id = me_id(&app, &student).await;
+    let course = create_course(&app, &teacher, "calculus").await;
+    enroll(&app, &teacher, &course, &student_id).await;
+
+    // Create echoes the full shape; description defaults to empty.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/courses/{course}/subjects"),
+        Some(&teacher),
+        Some(json!({ "name": "limits", "description": "epsilon-delta" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    assert_eq!(res.body["course"], course);
+    assert_eq!(res.body["name"], "limits");
+    assert_eq!(res.body["description"], "epsilon-delta");
+    let subject = id_of(&res.body);
+    let second = create_subject(&app, &teacher, &course, "derivatives").await;
+
+    // Validation: a blank name is a 400, a missing course a 404.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/courses/{course}/subjects"),
+        Some(&teacher),
+        Some(json!({ "name": "  " })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+    let res = send(
+        &app,
+        "POST",
+        "/courses/missing/subjects",
+        Some(&teacher),
+        Some(json!({ "name": "orphan" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+
+    // Writes are management-gated: students lack the role, a rival teacher
+    // the rights; a manager passes everywhere.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/courses/{course}/subjects"),
+        Some(&student),
+        Some(json!({ "name": "nope" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/courses/{course}/subjects"),
+        Some(&other_teacher),
+        Some(json!({ "name": "nope" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/subjects/{subject}"),
+        Some(&other_teacher),
+        Some(json!({ "name": "hijack" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/subjects/{second}"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+
+    // Reads follow course visibility: the enrolled student and a manager see
+    // the list and the subject, the rival teacher sees neither.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/courses/{course}/subjects"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let listed = common::items(&res.body);
+    assert_eq!(listed.len(), 2, "creation order");
+    assert_eq!(id_of(&listed[0]), subject);
+    assert_eq!(id_of(&listed[1]), second);
+    assert_eq!(common::total(&res.body), 2);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/subjects/{subject}"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["name"], "limits");
+    let res = send(
+        &app,
+        "GET",
+        &format!("/courses/{course}/subjects"),
+        Some(&other_teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/subjects/{subject}"),
+        Some(&other_teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+
+    // PATCH keeps omitted fields; a manager may edit anyone's.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/subjects/{subject}"),
+        Some(&boss),
+        Some(json!({ "name": "limits & continuity" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["name"], "limits & continuity");
+    assert_eq!(res.body["description"], "epsilon-delta", "kept by omission");
+
+    // Unknown ids are 404s.
+    for (method, body) in [
+        ("GET", None),
+        ("PATCH", Some(json!({ "name": "x" }))),
+        ("DELETE", None),
+    ] {
+        let res = send(&app, method, "/subjects/missing", Some(&teacher), body).await;
+        assert_eq!(res.status, StatusCode::NOT_FOUND, "{method}");
+    }
+
+    // Delete works while nothing references the subject.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/subjects/{second}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/subjects/{second}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn subject_delete_blocks_while_questions_reference_it() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "sdb_t", "teacher").await;
+    let course = create_course(&app, &teacher, "history").await;
+    let tagged = create_subject(&app, &teacher, &course, "antiquity").await;
+    let spare = create_subject(&app, &teacher, &course, "middle ages").await;
+    let exam = create_exam(&app, &teacher, &course, "final", "final").await;
+    let question = create_question(
+        &app,
+        &teacher,
+        &exam,
+        &tagged,
+        json!({ "text": "When?", "kind": "text", "points": 10 }),
+    )
+    .await;
+
+    // Referenced: the delete is a conflict, and the subject survives.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/subjects/{tagged}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/subjects/{tagged}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+
+    // Re-tag the question elsewhere: the old subject frees up, the new one
+    // locks.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/exams/{exam}/questions/{question}"),
+        Some(&teacher),
+        Some(json!({ "subject_id": spare })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/subjects/{tagged}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/subjects/{spare}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT);
+
+    // Deleting the question releases the last reference.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/exams/{exam}/questions/{question}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/subjects/{spare}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+}
+
 // --- exam questions + answers (taking an exam) -----------------------------
 
-/// Create a question via `POST /exams/{exam}/questions` (asserts 201);
-/// returns its id.
+/// Create a question tagged with `subject` via `POST /exams/{exam}/questions`
+/// (asserts 201); returns its id.
 async fn create_question(
     app: &axum::Router,
     cookie: &str,
     exam: &str,
-    body: serde_json::Value,
+    subject: &str,
+    mut body: serde_json::Value,
 ) -> String {
+    body["subject_id"] = json!(subject);
     let res = send(
         app,
         "POST",
@@ -6170,15 +6439,16 @@ async fn create_question(
     id_of(&res.body)
 }
 
-/// A course with an open sync window and one enrolled student, the spine of
-/// the question/answer tests. Returns (course, exam).
+/// A course with an open sync window, one subject, and one enrolled student —
+/// the spine of the question/answer tests. Returns (course, exam, subject).
 async fn open_exam_with_student(
     app: &axum::Router,
     teacher: &str,
     student_id: &str,
     course_title: &str,
-) -> (String, String) {
+) -> (String, String, String) {
     let course = create_course(app, teacher, course_title).await;
+    let subject = create_subject(app, teacher, &course, "general").await;
     enroll(app, teacher, &course, student_id).await;
     let now = Timestamp::now().as_millis();
     let exam = scheduled_exam(
@@ -6189,7 +6459,7 @@ async fn open_exam_with_student(
                 "mode": "sync", "starts_at": now - 1_000, "ends_at": now + 600_000 }),
     )
     .await;
-    (course, exam)
+    (course, exam, subject)
 }
 
 #[tokio::test]
@@ -6199,6 +6469,7 @@ async fn question_crud_validation_and_rbac() {
     let other_teacher = login_as(&app, &db, "q_t2", "teacher").await;
     let student = login(&app, "quinn").await;
     let course = create_course(&app, &teacher, "logic").await;
+    let subject = create_subject(&app, &teacher, &course, "propositions").await;
     let exam = create_exam(&app, &teacher, &course, "final", "final").await;
 
     // A choice question echoes its full authoring view, correct included.
@@ -6207,12 +6478,15 @@ async fn question_crud_validation_and_rbac() {
         "POST",
         &format!("/exams/{exam}/questions"),
         Some(&teacher),
-        Some(json!({ "text": "2 + 2?", "kind": "choice", "points": 10,
-                     "choices": ["3", "4", "5"], "correct": 1 })),
+        Some(
+            json!({ "subject_id": subject, "text": "2 + 2?", "kind": "choice", "points": 10,
+                     "choices": ["3", "4", "5"], "correct": 1 }),
+        ),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
     assert_eq!(res.body["exam"], exam);
+    assert_eq!(res.body["subject"], subject);
     assert_eq!(res.body["kind"], "choice");
     assert_eq!(res.body["points"], 10);
     assert_eq!(res.body["choices"][1], "4");
@@ -6225,7 +6499,7 @@ async fn question_crud_validation_and_rbac() {
         "POST",
         &format!("/exams/{exam}/questions"),
         Some(&teacher),
-        Some(json!({ "text": "Explain.", "kind": "text", "points": 20 })),
+        Some(json!({ "subject_id": subject, "text": "Explain.", "kind": "text", "points": 20 })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
@@ -6304,6 +6578,8 @@ async fn question_crud_validation_and_rbac() {
             json!({ "text": "x", "kind": "text", "points": 1, "correct": 0 }),
         ),
     ] {
+        let mut body = body;
+        body["subject_id"] = json!(subject);
         let res = send(
             &app,
             "POST",
@@ -6315,8 +6591,26 @@ async fn question_crud_validation_and_rbac() {
         assert_eq!(res.status, StatusCode::BAD_REQUEST, "{label}: {}", res.body);
     }
 
+    // The subject must exist and belong to the exam's own course.
+    let other_course = create_course(&app, &teacher, "rhetoric").await;
+    let foreign_subject = create_subject(&app, &teacher, &other_course, "fallacies").await;
+    for (label, subject_id) in [
+        ("unknown subject", "missing"),
+        ("foreign subject", foreign_subject.as_str()),
+    ] {
+        let res = send(
+            &app,
+            "POST",
+            &format!("/exams/{exam}/questions"),
+            Some(&teacher),
+            Some(json!({ "subject_id": subject_id, "text": "x", "kind": "text", "points": 1 })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::BAD_REQUEST, "{label}: {}", res.body);
+    }
+
     // Authoring needs management rights over the course; reading needs teacher+.
-    let question_body = json!({ "text": "x", "kind": "text", "points": 1 });
+    let question_body = json!({ "subject_id": subject, "text": "x", "kind": "text", "points": 1 });
     let res = send(
         &app,
         "POST",
@@ -6361,6 +6655,30 @@ async fn question_crud_validation_and_rbac() {
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     assert_eq!(res.body["points"], 15);
     assert_eq!(res.body["correct"], 1, "kind bundle kept");
+    assert_eq!(res.body["subject"], subject, "subject kept by omission");
+
+    // Re-tagging stays inside the course: another of its subjects is fine, a
+    // foreign course's subject is a 400.
+    let second_subject = create_subject(&app, &teacher, &course, "predicates").await;
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/exams/{exam}/questions/{choice_q}"),
+        Some(&teacher),
+        Some(json!({ "subject_id": second_subject })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["subject"], second_subject);
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/exams/{exam}/questions/{choice_q}"),
+        Some(&teacher),
+        Some(json!({ "subject_id": foreign_subject })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
 
     // Switching to text must clear the bundle explicitly...
     let res = send(
@@ -6424,7 +6742,9 @@ async fn question_crud_validation_and_rbac() {
         ),
     ] {
         let body = match method {
-            "POST" => Some(json!({ "text": "x", "kind": "text", "points": 1 })),
+            "POST" => {
+                Some(json!({ "subject_id": subject, "text": "x", "kind": "text", "points": 1 }))
+            }
             "PATCH" => Some(json!({ "points": 2 })),
             _ => None,
         };
@@ -6468,11 +6788,13 @@ async fn questions_freeze_once_attempts_start() {
     let teacher = login_as(&app, &db, "frz_t", "teacher").await;
     let student = login(&app, "firat").await;
     let student_id = me_id(&app, &student).await;
-    let (_course, exam) = open_exam_with_student(&app, &teacher, &student_id, "algo").await;
+    let (_course, exam, subject) =
+        open_exam_with_student(&app, &teacher, &student_id, "algo").await;
     let question = create_question(
         &app,
         &teacher,
         &exam,
+        &subject,
         json!({ "text": "2 + 2?", "kind": "choice", "points": 10,
                 "choices": ["3", "4"], "correct": 1 }),
     )
@@ -6494,7 +6816,7 @@ async fn questions_freeze_once_attempts_start() {
         "POST",
         &format!("/exams/{exam}/questions"),
         Some(&teacher),
-        Some(json!({ "text": "late", "kind": "text", "points": 1 })),
+        Some(json!({ "subject_id": subject, "text": "late", "kind": "text", "points": 1 })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
@@ -6524,11 +6846,12 @@ async fn student_question_view_hides_correct_and_embeds_answers() {
     let teacher = login_as(&app, &db, "sv_t", "teacher").await;
     let student = login(&app, "sona").await;
     let student_id = me_id(&app, &student).await;
-    let (_course, exam) = open_exam_with_student(&app, &teacher, &student_id, "art").await;
+    let (_course, exam, subject) = open_exam_with_student(&app, &teacher, &student_id, "art").await;
     let choice_q = create_question(
         &app,
         &teacher,
         &exam,
+        &subject,
         json!({ "text": "2 + 2?", "kind": "choice", "points": 10,
                 "choices": ["3", "4"], "correct": 1 }),
     )
@@ -6537,6 +6860,7 @@ async fn student_question_view_hides_correct_and_embeds_answers() {
         &app,
         &teacher,
         &exam,
+        &subject,
         json!({ "text": "Explain.", "kind": "text", "points": 20 }),
     )
     .await;
@@ -6597,11 +6921,12 @@ async fn answer_saves_gate_on_attempt_state_and_kind() {
     let teacher = login_as(&app, &db, "ans_t", "teacher").await;
     let student = login(&app, "arda").await;
     let student_id = me_id(&app, &student).await;
-    let (course, exam) = open_exam_with_student(&app, &teacher, &student_id, "phys").await;
+    let (course, exam, subject) = open_exam_with_student(&app, &teacher, &student_id, "phys").await;
     let choice_q = create_question(
         &app,
         &teacher,
         &exam,
+        &subject,
         json!({ "text": "2 + 2?", "kind": "choice", "points": 10,
                 "choices": ["3", "4", "5"], "correct": 1 }),
     )
@@ -6610,6 +6935,7 @@ async fn answer_saves_gate_on_attempt_state_and_kind() {
         &app,
         &teacher,
         &exam,
+        &subject,
         json!({ "text": "Explain.", "kind": "text", "points": 20 }),
     )
     .await;
@@ -6731,6 +7057,7 @@ async fn answer_saves_gate_on_attempt_state_and_kind() {
         &app,
         &teacher,
         &foreign_exam,
+        &subject,
         json!({ "text": "not yours", "kind": "choice", "points": 1,
                 "choices": ["a", "b"], "correct": 0 }),
     )
@@ -6800,11 +7127,12 @@ async fn unenrollment_cuts_the_sittings_reads_and_writes() {
     let teacher = login_as(&app, &db, "cut_t", "teacher").await;
     let student = login(&app, "cansu").await;
     let student_id = me_id(&app, &student).await;
-    let (course, exam) = open_exam_with_student(&app, &teacher, &student_id, "chem").await;
+    let (course, exam, subject) = open_exam_with_student(&app, &teacher, &student_id, "chem").await;
     let question = create_question(
         &app,
         &teacher,
         &exam,
+        &subject,
         json!({ "text": "2 + 2?", "kind": "choice", "points": 10,
                 "choices": ["3", "4"], "correct": 1 }),
     )
@@ -6917,6 +7245,7 @@ async fn answer_saves_stop_at_the_deadline() {
     let student = login(&app, "dila").await;
     let student_id = me_id(&app, &student).await;
     let course = create_course(&app, &teacher, "geo").await;
+    let subject = create_subject(&app, &teacher, &course, "general").await;
     enroll(&app, &teacher, &course, &student_id).await;
     let now = Timestamp::now().as_millis();
 
@@ -6934,6 +7263,7 @@ async fn answer_saves_stop_at_the_deadline() {
         &app,
         &teacher,
         &exam,
+        &subject,
         json!({ "text": "quick", "kind": "choice", "points": 1,
                 "choices": ["a", "b"], "correct": 0 }),
     )
@@ -6993,11 +7323,13 @@ async fn teacher_answer_sheet_judges_choices_and_suggests_a_score() {
     let teacher = login_as(&app, &db, "sc_t", "teacher").await;
     let student = login(&app, "sena").await;
     let student_id = me_id(&app, &student).await;
-    let (_course, exam) = open_exam_with_student(&app, &teacher, &student_id, "chem").await;
+    let (_course, exam, subject) =
+        open_exam_with_student(&app, &teacher, &student_id, "chem").await;
     let q1 = create_question(
         &app,
         &teacher,
         &exam,
+        &subject,
         json!({ "text": "2 + 2?", "kind": "choice", "points": 10,
                 "choices": ["3", "4"], "correct": 1 }),
     )
@@ -7006,6 +7338,7 @@ async fn teacher_answer_sheet_judges_choices_and_suggests_a_score() {
         &app,
         &teacher,
         &exam,
+        &subject,
         json!({ "text": "3 + 3?", "kind": "choice", "points": 20,
                 "choices": ["6", "7"], "correct": 0 }),
     )
@@ -7014,6 +7347,7 @@ async fn teacher_answer_sheet_judges_choices_and_suggests_a_score() {
         &app,
         &teacher,
         &exam,
+        &subject,
         json!({ "text": "Explain.", "kind": "text", "points": 30 }),
     )
     .await;
@@ -7082,12 +7416,13 @@ async fn live_monitor_tracks_answer_progress() {
     let bora = login(&app, "bora").await;
     let ayla_id = me_id(&app, &ayla).await;
     let bora_id = me_id(&app, &bora).await;
-    let (course, exam) = open_exam_with_student(&app, &teacher, &ayla_id, "stats").await;
+    let (course, exam, subject) = open_exam_with_student(&app, &teacher, &ayla_id, "stats").await;
     enroll(&app, &teacher, &course, &bora_id).await;
     let question = create_question(
         &app,
         &teacher,
         &exam,
+        &subject,
         json!({ "text": "2 + 2?", "kind": "choice", "points": 10,
                 "choices": ["3", "4"], "correct": 1 }),
     )
@@ -7096,6 +7431,7 @@ async fn live_monitor_tracks_answer_progress() {
         &app,
         &teacher,
         &exam,
+        &subject,
         json!({ "text": "Explain.", "kind": "text", "points": 20 }),
     )
     .await;
@@ -7153,11 +7489,12 @@ async fn questions_and_answers_cascade_with_deletes() {
     let teacher = login_as(&app, &db, "qc_t", "teacher").await;
     let student = login(&app, "cem").await;
     let student_id = me_id(&app, &student).await;
-    let (course, exam) = open_exam_with_student(&app, &teacher, &student_id, "geo2").await;
+    let (course, exam, subject) = open_exam_with_student(&app, &teacher, &student_id, "geo2").await;
     let q1 = create_question(
         &app,
         &teacher,
         &exam,
+        &subject,
         json!({ "text": "2 + 2?", "kind": "choice", "points": 10,
                 "choices": ["3", "4"], "correct": 1 }),
     )
@@ -7166,6 +7503,7 @@ async fn questions_and_answers_cascade_with_deletes() {
         &app,
         &teacher,
         &exam,
+        &subject,
         json!({ "text": "Explain.", "kind": "text", "points": 20 }),
     )
     .await;
@@ -7271,6 +7609,7 @@ async fn questions_and_answers_cascade_with_deletes() {
         &app,
         &teacher,
         &exam2,
+        &subject,
         json!({ "text": "2 + 2?", "kind": "choice", "points": 10,
                 "choices": ["3", "4"], "correct": 1 }),
     )
@@ -7316,6 +7655,16 @@ async fn questions_and_answers_cascade_with_deletes() {
             .unwrap()
             .is_empty()
     );
+    // The course's subjects go down with it too.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/subjects/{subject}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND, "subject cascaded");
 }
 
 #[tokio::test]
@@ -7323,11 +7672,13 @@ async fn question_patch_revalidates_the_stale_kind_bundle() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "rv_t", "teacher").await;
     let course = create_course(&app, &teacher, "sets").await;
+    let subject = create_subject(&app, &teacher, &course, "unions").await;
     let exam = create_exam(&app, &teacher, &course, "final", "final").await;
     let question = create_question(
         &app,
         &teacher,
         &exam,
+        &subject,
         json!({ "text": "pick", "kind": "choice", "points": 10,
                 "choices": ["a", "b", "c"], "correct": 2 }),
     )
@@ -7410,6 +7761,7 @@ async fn question_authoring_follows_course_management() {
     let teacher = login_as(&app, &db, "own_t", "teacher").await;
     let boss = login_as(&app, &db, "own_m", "manager").await;
     let course = create_course(&app, &teacher, "greek").await;
+    let subject = create_subject(&app, &boss, &course, "alphabet").await;
     let exam = create_exam(&app, &teacher, &course, "final", "final").await;
 
     // A manager+ authors questions in anyone's course, like every other
@@ -7418,6 +7770,7 @@ async fn question_authoring_follows_course_management() {
         &app,
         &boss,
         &exam,
+        &subject,
         json!({ "text": "pick", "kind": "choice", "points": 10,
                 "choices": ["a", "b"], "correct": 0 }),
     )
@@ -7448,11 +7801,13 @@ async fn concurrent_answer_saves_never_collide() {
     let teacher = login_as(&app, &db, "cc_t", "teacher").await;
     let student = login(&app, "cana").await;
     let student_id = me_id(&app, &student).await;
-    let (_course, exam) = open_exam_with_student(&app, &teacher, &student_id, "race").await;
+    let (_course, exam, subject) =
+        open_exam_with_student(&app, &teacher, &student_id, "race").await;
     let question = create_question(
         &app,
         &teacher,
         &exam,
+        &subject,
         json!({ "text": "pick", "kind": "choice", "points": 10,
                 "choices": ["a", "b", "c"], "correct": 0 }),
     )

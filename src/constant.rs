@@ -64,6 +64,9 @@ pub const MAX_EXAM_DESCRIPTION_LEN: usize = 2_000;
 pub const MAX_COURSE_TITLE_LEN: usize = 200;
 pub const MAX_COURSE_DESCRIPTION_LEN: usize = 2_000;
 
+pub const MAX_SUBJECT_NAME_LEN: usize = 200;
+pub const MAX_SUBJECT_DESCRIPTION_LEN: usize = 2_000;
+
 /// The default attendance states, and also the mandatory core: a school may
 /// add its own statuses via `PATCH /settings`, but these four can never be
 /// removed — the attendance rate's semantics are defined over them.

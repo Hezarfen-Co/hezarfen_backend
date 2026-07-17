@@ -18,6 +18,7 @@ use crate::domain::exam::{
 };
 use crate::domain::role::Role;
 use crate::domain::settings::Settings;
+use crate::domain::subject::{Subject, SubjectDescription, SubjectName};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
@@ -27,7 +28,8 @@ use super::sessions::resolve_session_teacher;
 use super::terms::resolve_term;
 use super::{
     CourseResponse, CurrentUser, ExamResponse, Page, PageParams, PersonRef, RequireTeacher,
-    SessionResponse, check_not_past, check_time_range, paginate, person_map, set_or_clear,
+    SessionResponse, SubjectResponse, check_not_past, check_time_range, paginate, person_map,
+    set_or_clear,
 };
 
 pub fn routes() -> OpenApiRouter<AppState> {
@@ -39,6 +41,7 @@ pub fn routes() -> OpenApiRouter<AppState> {
         .routes(routes!(unenroll))
         .routes(routes!(create_exam_in_course, list_course_exams))
         .routes(routes!(create_session_in_course, list_course_sessions))
+        .routes(routes!(create_subject_in_course, list_course_subjects))
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -651,6 +654,99 @@ async fn list_course_exams(
     let items = paginate(&exams, limit, offset)
         .iter()
         .map(ExamResponse::new)
+        .collect();
+    Ok(Json(Page::new(items, total, limit, offset)))
+}
+
+// ---- subjects in a course ---------------------------------------------------
+// The course's curriculum topics. Every exam question links to one, so the
+// list doubles as the tag picker when authoring questions.
+
+#[derive(Deserialize, ToSchema)]
+struct CreateSubject {
+    #[schema(example = "Limits and continuity")]
+    name: String,
+    description: Option<String>,
+}
+
+/// Create a subject inside a course. Requires teacher+ and course management
+/// rights. Subjects are the course's curriculum topics — every exam question
+/// must be tagged with one of its course's subjects.
+#[utoipa::path(
+    post,
+    path = "/{id}/subjects",
+    tag = "subjects",
+    security(("session_cookie" = [])),
+    params(("id" = String, Path, description = "Course id")),
+    request_body = CreateSubject,
+    responses(
+        (status = 201, description = "Subject created", body = SubjectResponse),
+        (status = 400, description = "Invalid name or description", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 404, description = "Course not found", body = ErrorResponse),
+    ),
+)]
+async fn create_subject_in_course(
+    State(st): State<AppState>,
+    RequireTeacher(user): RequireTeacher,
+    Path(id): Path<String>,
+    Json(req): Json<CreateSubject>,
+) -> Result<(StatusCode, Json<SubjectResponse>), AppError> {
+    let course = Course::read(&CourseId::from_key(&id), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if !can_manage_course(&course, &user) {
+        return Err(AppError::Forbidden(
+            "only the course creator or a manager/admin can add subjects to this course",
+        ));
+    }
+
+    let name = SubjectName::try_new(&req.name)?;
+    let description = SubjectDescription::try_new(&req.description.unwrap_or_default())?;
+    let subject = Subject::create(course.get_id(), name, description, &st.db).await?;
+    Ok((StatusCode::CREATED, Json(SubjectResponse::new(&subject))))
+}
+
+/// List a course's subjects in creation order, paged via `?limit=&offset=`
+/// (omit `limit` for all of them). Visible to the course's enrolled users, its
+/// creator, and managers/admins. Returns a `{items, total, limit, offset}`
+/// envelope.
+#[utoipa::path(
+    get,
+    path = "/{id}/subjects",
+    tag = "subjects",
+    security(("session_cookie" = [])),
+    params(("id" = String, Path, description = "Course id"), PageParams),
+    responses(
+        (status = 200, description = "A page of the course's subjects (all of them when unpaged)", body = Page<SubjectResponse>),
+        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not enrolled, not the creator, and not a manager/admin", body = ErrorResponse),
+        (status = 404, description = "Course not found", body = ErrorResponse),
+    ),
+)]
+async fn list_course_subjects(
+    State(st): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    Path(id): Path<String>,
+    Query(page): Query<PageParams>,
+) -> Result<Json<Page<SubjectResponse>>, AppError> {
+    let (limit, offset) = page.resolve()?;
+    // Course must exist — a missing course is a 404, not an empty list.
+    let course = Course::read(&CourseId::from_key(&id), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if !can_view_course(&course, &user, &st.db).await? {
+        return Err(AppError::Forbidden(
+            "only enrolled users, the course creator, or a manager/admin can view this course",
+        ));
+    }
+    let subjects = Subject::list_for_course(course.get_id(), &st.db).await?;
+    let total = subjects.len() as i64;
+    let items = paginate(&subjects, limit, offset)
+        .iter()
+        .map(SubjectResponse::new)
         .collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
