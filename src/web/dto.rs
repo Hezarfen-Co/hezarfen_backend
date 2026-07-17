@@ -10,6 +10,7 @@ use crate::domain::course::Course;
 use crate::domain::course_session::CourseSession;
 use crate::domain::exam::Exam;
 use crate::domain::role::Role as DomainRole;
+use crate::domain::subject::Subject;
 use crate::domain::user::{User, UserId};
 use crate::error::AppError;
 
@@ -178,6 +179,31 @@ impl CourseResponse {
             description: course.get_description().as_str().to_string(),
             kind: course.get_kind().as_str().to_string(),
             term: course.get_term().map(|term| term.key().to_string()),
+        }
+    }
+}
+
+/// Public shape of a subject (one topic of a course's curriculum). Shared by
+/// `courses` (in-course creation and listing) and `subjects` (lookup, edit,
+/// delete).
+#[derive(Serialize, ToSchema)]
+pub struct SubjectResponse {
+    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    pub id: String,
+    /// The course whose curriculum this subject belongs to.
+    pub course: String,
+    #[schema(example = "Limits and continuity")]
+    pub name: String,
+    pub description: String,
+}
+
+impl SubjectResponse {
+    pub fn new(subject: &Subject) -> Self {
+        Self {
+            id: subject.get_id().key().to_string(),
+            course: subject.get_course().key().to_string(),
+            name: subject.get_name().as_str().to_string(),
+            description: subject.get_description().as_str().to_string(),
         }
     }
 }

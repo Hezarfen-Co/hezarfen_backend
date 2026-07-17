@@ -254,6 +254,21 @@ pub async fn create_course(app: &Router, cookie: &str, title: &str) -> String {
     id_of(&res.body)
 }
 
+/// Create a subject inside `course` as `cookie` (asserts 201); returns its id.
+/// Every exam question must be tagged with one of its course's subjects.
+pub async fn create_subject(app: &Router, cookie: &str, course: &str, name: &str) -> String {
+    let res = send(
+        app,
+        "POST",
+        &format!("/courses/{course}/subjects"),
+        Some(cookie),
+        Some(json!({ "name": name })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "create subject {name}");
+    id_of(&res.body)
+}
+
 /// Create an exam inside `course` as `cookie` (asserts 201); returns its id.
 /// The exam's weight in the course average comes from its kind (settings).
 pub async fn create_exam(

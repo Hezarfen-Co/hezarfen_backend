@@ -17,7 +17,9 @@ closes the moment the event starts. Every event stays visible to everyone —
 the audience is a roster, not a wall. Marks are course-shaped
 (Google Classroom style): a teacher creates a course — kind **`course`** (a
 regular class) or **`study`** (a supervised study session — *etüt*; same
-behavior, different label) — enrolls students, adds
+behavior, different label) — lays out its **subjects** (curriculum topics —
+every exam question must be tagged with one of its course's subjects, so
+results can later be read per topic), enrolls students, adds
 exams inside it, and grades — enrolling, sitting exams, roll call, and marks are
 all student-only, staff never take part; students read a per-course weighted average and
 an overall average from their mark report — each exam weighted by its **kind**
@@ -187,14 +189,14 @@ effect on the user's very next call (no re-login).
 | View / correct / delete **any** staff work log entry | manager | Corrections only on closed entries |
 | Read **own** attendance report           | student      |                                               |
 | Read another user's attendance report    | teacher      | Narrowed to the caller's managed courses; `manager`+ sees all |
-| View **visible** courses/exams; read **own** result, courses, mark report | student | Visible = enrolled (teachers: + created; `manager`+: all) |
+| View **visible** courses/exams and a course's subjects; read **own** result, courses, mark report | student | Visible = enrolled (teachers: + created; `manager`+: all) |
 | Sit a sittable exam (`sync`/`async`/`open`): start / resume / retake / read / submit **own** attempt | student | **Students only** — staff never sit; must be enrolled; window (where one exists) and `max_attempts` enforced by the server |
 | Answer questions inside **own** attempt (REST autosave or the exam-room WebSocket) | student | **Students only**; attempt must be `in_progress`; deadline judged by the server clock; blocked after leaving the room while `allow_rejoin` is off |
 | Author an exam's questions (add/edit/delete)  | teacher | Course-management rights; frozen once anyone has an attempt |
 | Read a question list (with `correct`) or a student's answer sheet | teacher | Course-management rights — one teacher can't read another's answer key |
 | Watch an exam's live monitor (snapshot or SSE stream) | teacher | Course-management rights |
 | Create courses                           | teacher      | The creator manages the course                 |
-| Manage inside a course: edit/delete it, enroll/unenroll **students**, add/edit/delete its exams, grade, remove results | teacher | Only the **course creator**, or a `manager`+ for any course; only students can be enrolled |
+| Manage inside a course: edit/delete it, enroll/unenroll **students**, add/edit/delete its exams and **subjects**, grade, remove results | teacher | Only the **course creator**, or a `manager`+ for any course; only students can be enrolled; a subject still referenced by exam questions won't delete (`409`) |
 | View a course's roster, an exam's result list / statistics | teacher | Course-management rights |
 | Read another user's mark report          | teacher      | Narrowed to the caller's managed courses; `manager`+ sees all |
 | Grade students                           | teacher      | Target must be an **enrolled student**; grading never targets oneself |
@@ -244,7 +246,8 @@ A course is either a regular class (kind `course`, the default) or an *etüt*
 everywhere — enrollment, exams, sessions, marks — the kind is a label the UI
 renders differently, settable at creation and editable later.
 
-Course data is walled per course. A course, its exams, and its sessions are
+Course data is walled per course. A course, its exams, its sessions, and its
+subjects are
 **visible** only to its enrolled users, its creator, and manager+ — a student
 sees just the classes they were added to, and the `/courses` / `/exams`
 catalogs are filtered accordingly. Teacher-level reads *inside* a course
@@ -310,12 +313,17 @@ their existing shapes: the student exam-room reads
 | GET    | `/courses/me`                    | student | The caller's **enrolled** courses · paged |
 | GET    | `/courses/{id}`                  | student | Get course (enrolled, creator, or manager+) |
 | PATCH  | `/courses/{id}`                  | teacher | Edit course (creator, or manager+ for any) |
-| DELETE | `/courses/{id}`                  | teacher | Delete course + its exams, results, enrollments (creator, or manager+) |
+| DELETE | `/courses/{id}`                  | teacher | Delete course + its exams, results, enrollments, subjects (creator, or manager+) |
 | POST   | `/courses/{id}/enrollments`      | teacher | `{user_id}` — enroll a **student** (idempotent upsert; course manager; only students can be enrolled) |
 | GET    | `/courses/{id}/enrollments`      | teacher | List the course roster (course manager) · paged |
 | DELETE | `/courses/{id}/enrollments/{user}` | teacher | Unenroll (keeps recorded results; course manager) |
 | POST   | `/courses/{id}/sessions`         | teacher | `{topic?, teacher_id?, starts_at, ends_at?}` — add a lesson (course manager; teacher defaults to the caller) |
 | GET    | `/courses/{id}/sessions`         | student | List the course's sessions, most recent first (enrolled, creator, or manager+) · paged |
+| POST   | `/courses/{id}/subjects`         | teacher | `{name, description?}` — add a curriculum subject (course manager) |
+| GET    | `/courses/{id}/subjects`         | student | List the course's subjects, creation order (enrolled, creator, or manager+) · paged |
+| GET    | `/subjects/{id}`                 | student | Get subject (enrolled, creator, or manager+) |
+| PATCH  | `/subjects/{id}`                 | teacher | Edit a subject's name/description (course manager; its course is fixed) |
+| DELETE | `/subjects/{id}`                 | teacher | Delete a subject (course manager); `409` while exam questions reference it |
 | GET    | `/sessions/{id}`                 | student | Get session (enrolled, session teacher, or course manager) |
 | PATCH  | `/sessions/{id}`                 | teacher | Edit session (course manager; `null` clears `ends_at`) |
 | DELETE | `/sessions/{id}`                 | teacher | Delete session + its roll call (course manager) |
@@ -336,7 +344,7 @@ their existing shapes: the student exam-room reads
 | POST   | `/exams/{id}/attempt`            | student | Start (`201`), resume (`200`), or retake (`201`, blank sheet) the caller's attempt — students only; enrolled; window open where one exists; `409` once `max_attempts` is spent |
 | GET    | `/exams/{id}/attempt`            | student | Own latest attempt: status, `attempt`/`attempts_used`/`max_attempts`, deadline, `remaining_ms`, `left_at`, mark, progress (`answered`/`question_count`), server `now` |
 | POST   | `/exams/{id}/attempt/finish`     | student | Submit the attempt (`409` once the deadline passed); allowed even while locked out of the room |
-| POST   | `/exams/{id}/questions`          | teacher | `{text, kind, points, choices?, correct?}` — add a question (course manager; frozen once attempted) |
+| POST   | `/exams/{id}/questions`          | teacher | `{subject_id, text, kind, points, choices?, correct?}` — add a question tagged with one of the course's subjects (course manager; frozen once attempted) |
 | GET    | `/exams/{id}/questions`          | teacher | The full question list, `correct` included (course manager) · paged |
 | PATCH  | `/exams/{id}/questions/{qid}`    | teacher | Edit a question — the kind bundle revalidates as a unit (course manager; frozen once attempted) |
 | DELETE | `/exams/{id}/questions/{qid}`    | teacher | Delete a question + its answers (course manager; frozen once attempted) |
@@ -385,7 +393,16 @@ exams in that course (`null` while nothing is graded — ungraded exams are
 skipped, not zeroed). The overall average is the plain mean of the non-null
 course averages. Unenrolling keeps result rows: the marks drop out of the
 report until re-enrollment, but stay visible on the exam itself. Deleting a
-course cascades its exams, their results, and all enrollments.
+course cascades its exams, their results, all enrollments, and its subjects.
+A **subject** is one topic of a course's curriculum (`name` ≤ 200 chars,
+optional `description` ≤ 2000): every exam question carries a mandatory
+`subject_id` naming one of *its own course's* subjects (an unknown or
+foreign-course subject is a `400`), so exam content is always attributable to
+a topic. A subject's course link is fixed at creation, and a subject still
+referenced by questions refuses deletion with a `409` — re-tag (PATCH the
+questions' `subject_id`) or delete those questions first. Questions written
+before subjects existed are **destroyed on boot** (answers first) — the clean
+break instead of inventing a placeholder topic.
 Event `starts_at`/`ends_at` are optional **unix-millisecond** integers; if both
 are given, `ends_at` must not precede `starts_at`, and neither may be set in
 the past (else `400`). On `PATCH`, an omitted time keeps its value and an
@@ -413,8 +430,8 @@ audiences convert on boot: each listed user becomes a signup row credited to
 the event's creator, and the audience becomes an uncapped registration list.
 Reading a child collection of a missing parent (`/events/{id}/attendance`,
 `/exams/{id}/results`, `/courses/{id}/enrollments`, `/courses/{id}/exams`,
-`/courses/{id}/sessions`, `/sessions/{id}/attendance`) is a `404`, not an
-empty list.
+`/courses/{id}/sessions`, `/courses/{id}/subjects`,
+`/sessions/{id}/attendance`) is a `404`, not an empty list.
 Personal info (`name`, `surname`, `email`, `phone`, `birth_date`) is the same
 optional set on every account, whatever the role, and is `null` until filled
 in. On `PATCH /users/me` (or the admin `PATCH /users/{id}/profile`) each field
@@ -598,7 +615,9 @@ attempt, autosaved as they go; choice questions are machine-checked as a
 `POST /exams/{id}/results`.
 
 **Questions** (`POST/GET/PATCH/DELETE /exams/{id}/questions[/{qid}]`,
-course-management rights): each has `text` (≤ 2000 chars), `points` `1`–`100`
+course-management rights): each has a mandatory `subject_id` (one of the
+course's subjects, `GET /courses/{id}/subjects` — the topic the question
+belongs to), `text` (≤ 2000 chars), `points` `1`–`100`
 (its share of the auto-score), and a `kind`:
 
 - `kind: "choice"` — carries `choices` (2–10 options, each ≤ 500 chars) and

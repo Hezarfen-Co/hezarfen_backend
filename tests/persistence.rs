@@ -700,3 +700,146 @@ async fn legacy_users_audiences_convert_to_registrations() {
     .await;
     assert_eq!(res.status, StatusCode::OK, "converted seat is markable");
 }
+
+/// Exam-question rows written before subjects existed (2026-07) are destroyed
+/// on the next boot, answers first — a subject is mandatory and there is
+/// nothing truthful to backfill. The exam and the course's subjects survive.
+#[tokio::test]
+async fn legacy_subjectless_questions_are_destroyed_on_boot() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config_at(&dir);
+    let creds = json!({ "username": "ali", "password": "secret1" });
+    let exam_id;
+    let subject_id;
+
+    // First boot: a full exam — course, subject, open exam, one answered
+    // question — then strip the question's subject the way an old binary's
+    // schema would have left it.
+    {
+        let db = database::init(&cfg).await.expect("first open");
+        let app = build_router(state(db.clone(), &cfg));
+        assert_eq!(
+            send(&app, "POST", "/auth/register", None, Some(creds.clone()))
+                .await
+                .status,
+            StatusCode::CREATED
+        );
+        set_role(&db, "ali", "teacher").await;
+        let cookie = send(&app, "POST", "/auth/login", None, Some(creds.clone()))
+            .await
+            .cookie
+            .unwrap();
+        let student = json!({ "username": "veli", "password": "secret1" });
+        assert_eq!(
+            send(&app, "POST", "/auth/register", None, Some(student.clone()))
+                .await
+                .status,
+            StatusCode::CREATED
+        );
+        let student_cookie = send(&app, "POST", "/auth/login", None, Some(student))
+            .await
+            .cookie
+            .unwrap();
+        let student_id = common::me_id(&app, &student_cookie).await;
+
+        let course = create_course(&app, &cookie, "algebra").await;
+        enroll(&app, &cookie, &course, &student_id).await;
+        let res = send(
+            &app,
+            "POST",
+            &format!("/courses/{course}/subjects"),
+            Some(&cookie),
+            Some(json!({ "name": "arithmetic" })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED);
+        subject_id = common::id_of(&res.body);
+        let res = send(
+            &app,
+            "POST",
+            &format!("/courses/{course}/exams"),
+            Some(&cookie),
+            Some(json!({ "title": "drill", "kind": "quiz", "mode": "open" })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED);
+        exam_id = common::id_of(&res.body);
+        let res = send(
+            &app,
+            "POST",
+            &format!("/exams/{exam_id}/questions"),
+            Some(&cookie),
+            Some(
+                json!({ "subject_id": subject_id, "text": "2 + 2?", "kind": "choice",
+                         "points": 10, "choices": ["3", "4"], "correct": 1 }),
+            ),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+        let question_id = common::id_of(&res.body);
+        let res = send(
+            &app,
+            "POST",
+            &format!("/exams/{exam_id}/attempt"),
+            Some(&student_cookie),
+            None,
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+        let res = send(
+            &app,
+            "POST",
+            &format!("/exams/{exam_id}/attempt/answers"),
+            Some(&student_cookie),
+            Some(json!({ "question_id": question_id, "selected": 1 })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+        db.query(
+            "REMOVE FIELD IF EXISTS subject ON TABLE exam_question;
+             UPDATE exam_question SET subject = NONE;",
+        )
+        .await
+        .expect("strip subject")
+        .check()
+        .expect("strip subject check");
+    }
+
+    // Second boot re-runs the migration and the destroy-backfill: the
+    // subjectless question and its answer are gone, the exam and subject
+    // still stand.
+    let db = reopen(&cfg).await;
+    let app = build_router(state(db.clone(), &cfg));
+    let cookie = send(&app, "POST", "/auth/login", None, Some(creds))
+        .await
+        .cookie
+        .unwrap();
+    let res = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam_id}/questions"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(common::total(&res.body), 0, "legacy questions destroyed");
+    let res = send(
+        &app,
+        "GET",
+        &format!("/subjects/{subject_id}"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "the subject itself survives");
+    let mut result = db
+        .query("SELECT VALUE id FROM exam_answer")
+        .await
+        .expect("count answers")
+        .check()
+        .expect("count answers check");
+    let answers: Vec<surrealdb::types::RecordId> = result.take(0).expect("answer rows");
+    assert!(answers.is_empty(), "orphaned answers destroyed");
+}

@@ -13,6 +13,7 @@ pub mod marks;
 pub mod notes;
 pub mod sessions;
 pub mod settings;
+pub mod subjects;
 pub mod terms;
 pub mod users;
 pub mod work;
@@ -21,7 +22,10 @@ mod dto;
 mod extractor;
 mod page;
 
-pub use dto::{CourseResponse, ExamResponse, PersonRef, SessionResponse, UserResponse, person_map};
+pub use dto::{
+    CourseResponse, ExamResponse, PersonRef, SessionResponse, SubjectResponse, UserResponse,
+    person_map,
+};
 pub use extractor::{CurrentUser, RequireAdmin, RequireManager, RequireTeacher};
 pub use page::{Page, PageParams, paginate};
 

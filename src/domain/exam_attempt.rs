@@ -370,6 +370,7 @@ mod tests {
         .unwrap();
         let question = ExamQuestion::create(
             exam.get_id(),
+            crate::domain::subject::SubjectId::generate(),
             crate::domain::exam_question::QuestionText::try_new("3 + 3?").unwrap(),
             QuestionPoints::try_new(5).unwrap(),
             spec,

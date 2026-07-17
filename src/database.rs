@@ -27,6 +27,7 @@ pub const SESSION_ATTENDANCE_TABLE: &str = "session_attendance";
 pub const WORK_ENTRY_TABLE: &str = "work_entry";
 pub const SETTINGS_TABLE: &str = "settings";
 pub const TERM_TABLE: &str = "term";
+pub const SUBJECT_TABLE: &str = "subject";
 
 /// SCHEMAFULL schema: every column is typed, references use `record<..>`.
 /// Idempotent — safe to run on every boot: `IF NOT EXISTS` guards the
@@ -110,6 +111,12 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS kind ON course TYPE string DEFAULT 'course';
     DEFINE FIELD IF NOT EXISTS term ON course TYPE option<record<term>>;
 
+    DEFINE TABLE IF NOT EXISTS subject SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS course ON subject TYPE record<course>;
+    DEFINE FIELD IF NOT EXISTS name ON subject TYPE string;
+    DEFINE FIELD IF NOT EXISTS description ON subject TYPE string;
+    DEFINE INDEX IF NOT EXISTS subject_course ON subject FIELDS course;
+
     DEFINE TABLE IF NOT EXISTS enrollment SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS course ON enrollment TYPE record<course>;
     DEFINE FIELD IF NOT EXISTS user ON enrollment TYPE record<user>;
@@ -173,7 +180,9 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS points ON exam_question TYPE int;
     DEFINE FIELD IF NOT EXISTS choices ON exam_question TYPE option<array<string>>;
     DEFINE FIELD IF NOT EXISTS correct ON exam_question TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS subject ON exam_question TYPE record<subject>;
     DEFINE INDEX IF NOT EXISTS exam_question_exam ON exam_question FIELDS exam;
+    DEFINE INDEX IF NOT EXISTS exam_question_subject ON exam_question FIELDS subject;
 
     DEFINE TABLE IF NOT EXISTS exam_answer SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS exam ON exam_answer TYPE record<exam>;
@@ -214,6 +223,12 @@ const BACKFILL: &str = "
     UPDATE course SET kind = 'course' WHERE kind = NONE;
 
     UPDATE event SET audience = { kind: 'school' } WHERE audience = NONE OR audience = {};
+
+    -- Questions written before subjects existed (2026-07-17) are destroyed, not
+    -- backfilled: a subject is mandatory and there is nothing truthful to
+    -- assign. Their answers go first so no answer row outlives its question.
+    DELETE exam_answer WHERE question IN (SELECT VALUE id FROM exam_question WHERE subject = NONE);
+    DELETE exam_question WHERE subject = NONE;
 
     -- The hand-picked `users` audience retired into `registration` (2026-07-16):
     -- each listed user becomes a signup row credited to the event's creator, and

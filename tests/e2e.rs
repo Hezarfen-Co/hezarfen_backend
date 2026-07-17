@@ -767,6 +767,7 @@ struct ExamRoom {
     student_id: String,
     cookie: String,
     course_id: String,
+    subject_id: String,
     exam_id: String,
     question_id: String,
 }
@@ -810,6 +811,16 @@ async fn exam_room_fixture(window_ms: i64) -> ExamRoom {
         .await
         .unwrap();
     let course_id = course["id"].as_str().unwrap().to_string();
+    let subject: Value = teacher
+        .post(format!("{base}/courses/{course_id}/subjects"))
+        .json(&json!({ "name": "arithmetic" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let subject_id = subject["id"].as_str().unwrap().to_string();
     let res = teacher
         .post(format!("{base}/courses/{course_id}/enrollments"))
         .json(&json!({ "user_id": student_id }))
@@ -832,8 +843,10 @@ async fn exam_room_fixture(window_ms: i64) -> ExamRoom {
     let exam_id = exam["id"].as_str().unwrap().to_string();
     let question: Value = teacher
         .post(format!("{base}/exams/{exam_id}/questions"))
-        .json(&json!({ "text": "2 + 2?", "kind": "choice", "points": 10,
-                       "choices": ["3", "4"], "correct": 1 }))
+        .json(
+            &json!({ "subject_id": subject_id, "text": "2 + 2?", "kind": "choice",
+                       "points": 10, "choices": ["3", "4"], "correct": 1 }),
+        )
         .send()
         .await
         .unwrap()
@@ -850,6 +863,7 @@ async fn exam_room_fixture(window_ms: i64) -> ExamRoom {
         student_id,
         cookie,
         course_id,
+        subject_id,
         exam_id,
         question_id,
     }
@@ -875,7 +889,8 @@ async fn exam_room_websocket_round_trip() {
     // A second question so progress counts have something to be partial over.
     let res = teacher
         .post(format!("{base}/exams/{exam_id}/questions"))
-        .json(&json!({ "text": "Explain.", "kind": "text", "points": 20 }))
+        .json(&json!({ "subject_id": room.subject_id, "text": "Explain.",
+                       "kind": "text", "points": 20 }))
         .send()
         .await
         .unwrap();
@@ -1438,8 +1453,10 @@ async fn exam_room_close_after_a_retake_leaves_the_new_sitting_alone() {
     let question: Value = room
         .teacher
         .post(format!("{}/exams/{exam_id}/questions", room.base))
-        .json(&json!({ "text": "3 + 3?", "kind": "choice", "points": 5,
-                       "choices": ["5", "6"], "correct": 1 }))
+        .json(
+            &json!({ "subject_id": room.subject_id, "text": "3 + 3?", "kind": "choice",
+                       "points": 5, "choices": ["5", "6"], "correct": 1 }),
+        )
         .send()
         .await
         .unwrap()
@@ -1542,8 +1559,10 @@ async fn exam_room_messages_bind_to_their_own_sitting() {
     let question: Value = room
         .teacher
         .post(format!("{}/exams/{exam_id}/questions", room.base))
-        .json(&json!({ "text": "3 + 3?", "kind": "choice", "points": 5,
-                       "choices": ["5", "6"], "correct": 1 }))
+        .json(
+            &json!({ "subject_id": room.subject_id, "text": "3 + 3?", "kind": "choice",
+                       "points": 5, "choices": ["5", "6"], "correct": 1 }),
+        )
         .send()
         .await
         .unwrap()
@@ -1727,8 +1746,10 @@ async fn exam_room_open_mode_runs_untimed_and_retakes() {
     let question: Value = room
         .teacher
         .post(format!("{}/exams/{exam_id}/questions", room.base))
-        .json(&json!({ "text": "3 + 3?", "kind": "choice", "points": 5,
-                       "choices": ["5", "6"], "correct": 1 }))
+        .json(
+            &json!({ "subject_id": room.subject_id, "text": "3 + 3?", "kind": "choice",
+                       "points": 5, "choices": ["5", "6"], "correct": 1 }),
+        )
         .send()
         .await
         .unwrap()

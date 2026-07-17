@@ -215,8 +215,8 @@ impl Course {
 
     /// Delete the course and cascade-remove everything inside it: results and
     /// attempts of its exams, its enrollments, its sessions with their roll
-    /// call, and the exams themselves. The children go in one transaction so a
-    /// crash can't leave an exam pointing at a deleted course.
+    /// call, its subjects, and the exams themselves. The children go in one
+    /// transaction so a crash can't leave an exam pointing at a deleted course.
     pub async fn delete(self, db: &Database) -> Result<Course, AppError> {
         db.query(
             "BEGIN TRANSACTION;
@@ -227,6 +227,7 @@ impl Course {
              DELETE session_attendance WHERE course = $course;
              DELETE course_session WHERE course = $course;
              DELETE enrollment WHERE course = $course;
+             DELETE subject WHERE course = $course;
              DELETE exam WHERE course = $course;
              COMMIT TRANSACTION;",
         )
