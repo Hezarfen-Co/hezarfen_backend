@@ -28,8 +28,8 @@
 //! live role and enrollment — so a promotion out of `student` or an
 //! unenrollment mid-exam closes the sheet with no reconnect needed.
 //!
-//! The room is also the presence signal behind the rejoin policy: connecting
-//! clears the attempt's `left_at`, and the *last* socket of the sitting to
+//! The room is also the presence signal behind the rejoin policy: joining the
+//! room clears the attempt's `left_at`, and the *last* socket of the sitting to
 //! close while the attempt is still running stamps it — a student closing one
 //! of two tabs hasn't left, and a lingering socket from an already-finished
 //! sitting can never mark a later retake as left. With the exam's
@@ -66,6 +66,21 @@ use crate::web::exams::{
     check_rejoin, ensure_enrolled, ensure_student, save_answer_in, writable_attempt,
 };
 
+/// Serializes every presence transition with its matching `left_at` write:
+/// `enter` + clear at room start and `leave` + maybe-stamp at room teardown
+/// are each one critical section, so any join and any teardown run wholly
+/// before or wholly after each other. Teardown first: its stamp lands, then
+/// the join's clear overwrites it — the student is present and unmarked.
+/// Join first: the teardown's `leave` sees the joiner's socket still counted,
+/// so it never stamps. No ordering leaves a present student stamped as left —
+/// the reconnect-vs-teardown race that used to lock students out with
+/// `allow_rejoin` off (cleared at the door, stamped after, present forever
+/// refused). The database is embedded — this process is the only writer — so
+/// one process-wide lock is sufficient, same as `REGISTER_LOCK`.
+// ponytail: global lock, per-attempt locks if room churn ever shows up in a
+// profile.
+static PRESENCE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// What the client asked for, tagged by `type`.
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -86,8 +101,13 @@ enum ClientMessage {
 /// unknown exam (404), draft with no mode (409), not a student (403), not
 /// enrolled (403), no attempt yet (404 — `POST /exams/{id}/attempt` first),
 /// submitted or expired (409), left the room while rejoin is closed (409).
-/// Entering the room clears the attempt's `left_at` — the student is back
-/// inside.
+///
+/// The rejoin gate here is a read-only fast-fail for a proper 409; the
+/// authoritative clear of `left_at` happens inside the room task, under
+/// [`PRESENCE_LOCK`], atomically with the presence count — milliseconds after
+/// this gate, which no HTTP caller can observe. Clearing it here instead
+/// (before the socket counts as present) is exactly the ordering that let a
+/// dying socket's teardown stamp a student who was already reconnecting.
 pub async fn attempt_ws(
     State(st): State<AppState>,
     CurrentUser(user): CurrentUser,
@@ -106,11 +126,6 @@ pub async fn attempt_ws(
     ensure_enrolled(&exam, user.get_id(), &st.db).await?;
     let attempt = writable_attempt(&exam, user.get_id(), &st.db).await?;
     check_rejoin(&exam, &attempt)?;
-    let attempt = if attempt.get_left_at().is_some() {
-        attempt.set_left(None, &st.db).await?
-    } else {
-        attempt
-    };
 
     let user_id = user.get_id().clone();
     Ok(ws.on_upgrade(move |socket| room(socket, st, exam, attempt, user_id)))
@@ -122,8 +137,20 @@ pub async fn attempt_ws(
 async fn room(mut socket: WebSocket, st: AppState, exam: Exam, attempt: ExamAttempt, user: UserId) {
     let exam_id = exam.get_id().clone();
     let attempt_id = attempt.get_id().clone();
-    // This socket counts as presence in the sitting's room until it closes.
-    st.exam_presence.enter(attempt_id.key());
+    // Join critical section: this socket counts as presence in the sitting's
+    // room until it closes, and joining clears the walk-out marker — one
+    // atomic step under PRESENCE_LOCK, so a dying socket's teardown either
+    // stamps before this (and the clear overwrites it) or sees this socket
+    // counted (and never stamps). The clear is unconditional: the door's
+    // snapshot may predate a stamp that raced the upgrade. Best-effort — a
+    // failed clear leaves the stamp for the next join or the teacher's door.
+    {
+        let _guard = PRESENCE_LOCK.lock().await;
+        st.exam_presence.enter(attempt_id.key());
+        if let Err(err) = attempt.set_left(None, &st.db).await {
+            tracing::warn!("exam room could not clear left_at on join: {err}");
+        }
+    }
     let mut tick = tokio::time::interval(Duration::from_secs(EXAM_WS_TICK_SECS));
     loop {
         tokio::select! {
@@ -153,11 +180,16 @@ async fn room(mut socket: WebSocket, st: AppState, exam: Exam, attempt: ExamAtte
     // Best-effort closing handshake — a bare TCP teardown reads as an error
     // on the client; a Close frame reads as "the room is over".
     let _ = socket.send(Message::Close(None)).await;
-    // Only the last socket out means the student actually left the room. If
-    // this sitting is still running, stamp the walk-out — with `allow_rejoin`
-    // off this is what locks further answering. Terminal exits (finished or
-    // expired, and any sitting superseded by a retake is terminal) need no
-    // stamp. Best-effort: a failed stamp only means it goes unrecorded.
+    // Leave critical section: only the last socket out means the student
+    // actually left the room, and the count-down and its stamp are one atomic
+    // step under PRESENCE_LOCK (a join racing this either lands wholly before
+    // — its socket keeps the count up, no stamp — or wholly after, clearing
+    // whatever this stamps). If this sitting is still running, stamp the
+    // walk-out — with `allow_rejoin` off this is what locks further
+    // answering. Terminal exits (finished or expired, and any sitting
+    // superseded by a retake is terminal) need no stamp. Best-effort: a
+    // failed stamp only means it goes unrecorded.
+    let _guard = PRESENCE_LOCK.lock().await;
     if st.exam_presence.leave(attempt_id.key()) {
         stamp_left(&exam_id, &attempt_id, &st.db).await;
     }
