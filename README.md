@@ -13,7 +13,8 @@ present / absent / late / excused (students never self-mark), and a **roster
 report** shows who was expected and who missed. Registration lists fill seat
 by seat: teachers register students (never the other way round), staff
 register only themselves, an optional `capacity` caps the seats, and the list
-closes the moment the event starts. Every event stays visible to everyone —
+closes the moment the event starts (or, for an event with only an end time —
+a pure signup deadline — the moment that end passes). Every event stays visible to everyone —
 the audience is a roster, not a wall. Marks are course-shaped
 (Google Classroom style): a teacher creates a course — kind **`course`** (a
 regular class) or **`study`** (a supervised study session — *etüt*; same
@@ -423,7 +424,8 @@ A registration list fills through `POST /events/{id}/register`: teachers place
 students (a student never registers, not even themselves) and take seats only
 for themselves — registering another staff member is refused. Re-registering
 someone is a no-op, a full list is a `409`, and the list freezes the moment
-the event starts (register and unregister both). Signup rows survive an
+the event starts — or, when only `ends_at` is set (a pure signup deadline),
+the moment it passes (register and unregister both). Signup rows survive an
 audience switch inertly and resurface if the event returns to the registration
 kind; deleting the event deletes them. Pre-existing hand-picked (`users`)
 audiences convert on boot: each listed user becomes a signup row credited to

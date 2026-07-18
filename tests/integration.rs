@@ -717,6 +717,59 @@ async fn note_file_count_is_capped() {
     assert_eq!(retry.status, StatusCode::CREATED);
 }
 
+/// Regression: the 10-file cap was a bare count-then-write — concurrent
+/// uploads all read the same pre-count and pushed a note past the cap (the
+/// same write-skew as the event-capacity over-admit; SurrealDB transactions
+/// don't conflict-check a cross-record count against an insert). The insert
+/// now recounts under a lock, so the outcome is race-order independent:
+/// exactly enough uploads win to land on the cap, the rest get the same 409
+/// as a sequential over-fill.
+#[tokio::test]
+async fn concurrent_uploads_never_exceed_the_file_cap() {
+    let app = mem_app().await;
+    let ali = login(&app, "ali").await;
+    let note = create_note(&app, &ali, "contested").await;
+
+    for i in 0..8 {
+        let up = common::upload_file(&app, &ali, &note, &format!("f{i}.txt"), "", b"x").await;
+        assert_eq!(up.status, StatusCode::CREATED, "seed file {i}");
+    }
+
+    // Four racers for the two remaining slots.
+    let results = tokio::join!(
+        common::upload_file(&app, &ali, &note, "r0.txt", "", b"x"),
+        common::upload_file(&app, &ali, &note, "r1.txt", "", b"x"),
+        common::upload_file(&app, &ali, &note, "r2.txt", "", b"x"),
+        common::upload_file(&app, &ali, &note, "r3.txt", "", b"x"),
+    );
+    let statuses = [
+        results.0.status,
+        results.1.status,
+        results.2.status,
+        results.3.status,
+    ];
+    for status in statuses {
+        assert!(
+            status == StatusCode::CREATED || status == StatusCode::CONFLICT,
+            "a lost cap race must be a 409, got {status}"
+        );
+    }
+
+    let list = send(
+        &app,
+        "GET",
+        &format!("/notes/{note}/files"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(
+        common::total(&list.body),
+        10,
+        "the cap must hold exactly under concurrency, statuses={statuses:?}"
+    );
+}
+
 #[tokio::test]
 async fn note_file_upload_validation() {
     let app = mem_app().await;
@@ -3467,6 +3520,13 @@ async fn re_registering_returns_the_seat_untouched() {
         second.body["registered_by"]["id"], ali_id,
         "re-registering must not rewrite who placed the student"
     );
+    // Regression: the response used to resolve people only from {target,
+    // caller}, so the original registrar degraded to a bare ULID username.
+    assert_eq!(
+        second.body["registered_by"]["username"], "ali",
+        "the original registrar must resolve to a person, not a bare id"
+    );
+    assert_eq!(second.body["user"]["username"], "veli");
 }
 
 /// Regression: the capacity check used to run inside a `BEGIN…COMMIT` whose
@@ -3580,9 +3640,40 @@ async fn event_registration_closes_at_start() {
     .await;
     assert_eq!(res.status, StatusCode::CONFLICT, "unregister freezes too");
 
-    // A future or timeless event keeps its list open.
+    // Regression: an ends_at-only event (a pure signup deadline) used to stay
+    // open forever — the gate read starts_at alone. Ended 30s ago: inside the
+    // creation grace, but the list is closed.
+    let res = send(
+        &app,
+        "POST",
+        "/events",
+        Some(&ali),
+        Some(json!({ "title": "deadline passed", "ends_at": now - 30_000,
+                     "audience": { "kind": "registration" } })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let ev = id_of(&res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/events/{ev}/register"),
+        Some(&ali),
+        Some(json!({ "user_id": veli_id })),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::CONFLICT,
+        "an event whose end has passed takes no signups"
+    );
+
+    // A future or timeless event keeps its list open — a future signup
+    // deadline (ends_at only) included.
     for body in [
         json!({ "title": "later", "starts_at": now + 3_600_000,
+                "audience": { "kind": "registration" } }),
+        json!({ "title": "deadline ahead", "ends_at": now + 3_600_000,
                 "audience": { "kind": "registration" } }),
         json!({ "title": "whenever", "audience": { "kind": "registration" } }),
     ] {

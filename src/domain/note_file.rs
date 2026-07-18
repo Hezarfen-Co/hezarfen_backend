@@ -6,12 +6,19 @@
 //! before blob on delete); this module owns the rows.
 
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
+use tokio::sync::Mutex;
 use ulid::Ulid;
 
-use crate::constant::{MAX_FILE_CONTENT_TYPE_LEN, MAX_FILE_NAME_LEN};
+use crate::constant::{MAX_FILE_CONTENT_TYPE_LEN, MAX_FILE_NAME_LEN, MAX_NOTE_FILES};
 use crate::database::{Database, NOTE_FILE_TABLE};
 use crate::domain::note::NoteId;
 use crate::error::{AppError, ValidationError};
+
+/// Serializes the files-per-note cap check against the insert (see
+/// [`NoteFile::insert`]). The database is embedded — this process is the only
+/// writer — so one process-wide lock is sufficient.
+// ponytail: global lock, per-note locks if uploads ever see real contention.
+static FILE_CAP_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct NoteFileId(RecordId);
@@ -148,8 +155,19 @@ impl NoteFile {
         self.size
     }
 
-    /// Persist the row assembled by [`Self::new`].
+    /// Persist the row assembled by [`Self::new`], refusing once its note
+    /// already holds [`MAX_NOTE_FILES`]. The count-then-create runs under
+    /// [`FILE_CAP_LOCK`] — a `BEGIN…COMMIT` can't enforce the cap because
+    /// SurrealDB doesn't conflict-check a cross-record count against a
+    /// concurrent insert (write-skew), the same story as
+    /// `Registration::register`.
     pub async fn insert(self, db: &Database) -> Result<NoteFile, AppError> {
+        let _guard = FILE_CAP_LOCK.lock().await;
+        if Self::list_for(&self.note, db).await?.len() >= MAX_NOTE_FILES {
+            return Err(AppError::Conflict(
+                "the note already holds the maximum of 10 files — delete one first",
+            ));
+        }
         let created: Option<NoteFile> = db.create(self.id.record()).content(self).await?;
         created.ok_or_else(|| AppError::Internal("failed to create note file".into()))
     }

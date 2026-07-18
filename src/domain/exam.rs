@@ -429,20 +429,25 @@ impl Exam {
     }
 
     /// Delete the exam and cascade-remove its result, attempt, question, and
-    /// answer rows.
+    /// answer rows — all in one transaction, so a failure can't leave an
+    /// emptied-out exam shell behind.
     pub async fn delete(self, db: &Database) -> Result<Exam, AppError> {
-        db.query(
-            "BEGIN TRANSACTION;
-             DELETE exam_result WHERE exam = $ex;
-             DELETE exam_attempt WHERE exam = $ex;
-             DELETE exam_answer WHERE exam = $ex;
-             DELETE exam_question WHERE exam = $ex;
-             COMMIT TRANSACTION;",
-        )
-        .bind(("ex", self.id.record()))
-        .await?
-        .check()?;
-        let deleted: Option<Exam> = db.delete(self.id.record()).await?;
+        let mut result = db
+            .query(
+                "BEGIN TRANSACTION;
+                 DELETE exam_result WHERE exam = $ex;
+                 DELETE exam_attempt WHERE exam = $ex;
+                 DELETE exam_answer WHERE exam = $ex;
+                 DELETE exam_question WHERE exam = $ex;
+                 DELETE $ex RETURN BEFORE;
+                 COMMIT TRANSACTION;",
+            )
+            .bind(("ex", self.id.record()))
+            .await?
+            .check()?;
+        // Statement slots count BEGIN and the child deletes: the exam's own
+        // DELETE is slot 5.
+        let deleted: Option<Exam> = result.take::<Vec<Exam>>(5)?.into_iter().next();
         deleted.ok_or(AppError::NotFound)
     }
 }
