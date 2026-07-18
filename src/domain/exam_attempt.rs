@@ -197,9 +197,17 @@ impl ExamAttempt {
         match created {
             Ok(Some(created)) => Ok((created, true)),
             Ok(None) => Err(AppError::Internal("failed to start exam attempt".into())),
+            // Only a still-running row proves the loss was a double-start
+            // collision (the winner's fresh sitting); a terminal or missing
+            // latest means the create genuinely failed — surface that instead
+            // of passing a finished sitting off as a resume.
             Err(err) => match Self::read_latest_for_user(exam.get_id(), user, db).await? {
-                Some(existing) => Ok((existing, false)),
-                None => Err(err.into()),
+                Some(existing)
+                    if existing.status(exam, Timestamp::now()) == AttemptStatus::InProgress =>
+                {
+                    Ok((existing, false))
+                }
+                _ => Err(err.into()),
             },
         }
     }

@@ -656,8 +656,9 @@ struct RegistrationResponse {
 
 /// The shared gate for touching a signup list: the event must carry the
 /// registration audience, and the list must still be open — it closes the
-/// moment the event starts (a timeless event never closes). Returns the seat
-/// cap for the register path.
+/// moment the event starts, or, for an ends_at-only event (a pure signup
+/// deadline), the moment that end passes (a truly timeless event never
+/// closes). Returns the seat cap for the register path.
 fn check_registration_open(event: &Event) -> Result<Option<i64>, AppError> {
     let EventAudience::Registration { capacity } = event.get_audience() else {
         return Err(AppError::Validation(ValidationError::Invalid {
@@ -665,11 +666,12 @@ fn check_registration_open(event: &Event) -> Result<Option<i64>, AppError> {
             reason: "this event does not take registrations",
         }));
     };
-    if let Some(starts_at) = event.get_starts_at()
-        && Timestamp::now().as_millis() >= starts_at.as_millis()
+    // ends_at can't precede starts_at, so when both exist starts_at governs.
+    if let Some(closes_at) = event.get_starts_at().or(event.get_ends_at())
+        && Timestamp::now().as_millis() >= closes_at.as_millis()
     {
         return Err(AppError::Conflict(
-            "registration closed when the event started",
+            "registration closed — the event has started or ended",
         ));
     }
     Ok(*capacity)
@@ -680,7 +682,8 @@ fn check_registration_open(event: &Event) -> Result<Option<i64>, AppError> {
 /// never register themselves; omit it to take a seat yourself (staff
 /// self-serve, so registering another teacher/manager is refused). Registering
 /// the same person twice is a no-op returning the existing seat. The list
-/// closes when the event starts and refuses to grow past `capacity`.
+/// closes when the event starts (or its ends_at-only deadline passes) and
+/// refuses to grow past `capacity`.
 #[utoipa::path(
     post,
     path = "/{id}/register",
@@ -694,7 +697,7 @@ fn check_registration_open(event: &Event) -> Result<Option<i64>, AppError> {
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires teacher role or higher, or the target is another staff member", body = ErrorResponse),
         (status = 404, description = "Event not found", body = ErrorResponse),
-        (status = 409, description = "The event is full, or it already started", body = ErrorResponse),
+        (status = 409, description = "The event is full, or it already started or ended", body = ErrorResponse),
     ),
 )]
 async fn register(
@@ -728,7 +731,17 @@ async fn register(
 
     let registration =
         Registration::register(&event_id, &target, user.get_id(), capacity, &st.db).await?;
-    let people = PersonRef::map_of(&[&target_user, &user]);
+    // Resolve from the row, not the request: a re-register returns the
+    // existing seat, whose registered_by is the *original* placer — someone
+    // the {target, caller} pair may not contain.
+    let people = person_map(
+        [
+            registration.get_user().clone(),
+            registration.get_registered_by().clone(),
+        ],
+        &st.db,
+    )
+    .await?;
     Ok(Json(RegistrationResponse {
         event: registration.get_event().key().to_string(),
         user: PersonRef::resolve(&people, registration.get_user()),
@@ -739,7 +752,8 @@ async fn register(
 /// Take a user off the signup list — the register rules mirrored: teacher+,
 /// students' seats or your own (another staff member's seat only if their
 /// account no longer exists), and only while the list is open (the event
-/// hasn't started). Attendance already marked stays recorded.
+/// hasn't started or, ends_at-only, passed). Attendance already marked stays
+/// recorded.
 #[utoipa::path(
     delete,
     path = "/{id}/register/{user}",
@@ -755,7 +769,7 @@ async fn register(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires teacher role or higher, or the target is another staff member", body = ErrorResponse),
         (status = 404, description = "Event not found, or the user holds no seat", body = ErrorResponse),
-        (status = 409, description = "The event already started", body = ErrorResponse),
+        (status = 409, description = "The event already started or ended", body = ErrorResponse),
     ),
 )]
 async fn unregister(

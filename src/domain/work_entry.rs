@@ -99,29 +99,43 @@ impl WorkEntry {
             .ok_or(AppError::Conflict("already checked in — check out first"))
     }
 
-    /// Close `user`'s open stint. The `DELETE .. RETURN BEFORE` is an atomic
-    /// take: of two racing check-outs exactly one receives the row (the other
-    /// gets the conflict). The closed stint is then re-filed under a ULID id,
-    /// freeing the open slot for the next check-in.
+    /// Close `user`'s open stint: atomically take the open row and re-file it
+    /// under a ULID id, freeing the open slot for the next check-in. Take and
+    /// re-file share one transaction — a failed re-file rolls the take back,
+    /// so a stint can never vanish half-closed. Of two racing check-outs
+    /// exactly one receives the row (the other gets the conflict).
     pub async fn check_out(user: &UserId, db: &Database) -> Result<WorkEntry, AppError> {
         let mut result = db
-            .query("DELETE $open RETURN BEFORE")
+            .query(
+                "BEGIN TRANSACTION;
+                 LET $before = (DELETE $open RETURN BEFORE);
+                 IF array::len($before) = 0 { THROW 'not_checked_in' };
+                 CREATE $closed CONTENT {
+                     user: $before[0].user,
+                     check_in: $before[0].check_in,
+                     check_out: $out,
+                 };
+                 COMMIT TRANSACTION;",
+            )
             .bind(("open", WorkEntryId::open_for(user).record()))
-            .await?
-            .check()?;
-        let open = result
-            .take::<Vec<WorkEntry>>(0)?
-            .into_iter()
-            .next()
-            .ok_or(AppError::Conflict("not checked in"))?;
-
-        let closed = WorkEntry {
-            id: WorkEntryId::generate(),
-            user: open.user,
-            check_in: open.check_in,
-            check_out: Some(Timestamp::now()),
-        };
-        let saved: Option<WorkEntry> = db.create(closed.id.record()).content(closed).await?;
+            .bind(("closed", WorkEntryId::generate().record()))
+            .bind(("out", Timestamp::now()))
+            .await?;
+        // An aborted transaction errors *every* slot, most with a generic
+        // "not executed" — only the THROW's own slot names the reason, so scan
+        // them all for the marker instead of trusting the first.
+        let mut errors = result.take_errors();
+        if errors
+            .values()
+            .any(|error| error.to_string().contains("not_checked_in"))
+        {
+            return Err(AppError::Conflict("not checked in"));
+        }
+        if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+            return Err(error.into());
+        }
+        // Statement slots count BEGIN, the LET, and the IF: the CREATE is slot 3.
+        let saved: Option<WorkEntry> = result.take::<Vec<WorkEntry>>(3)?.into_iter().next();
         saved.ok_or_else(|| AppError::Internal("failed to close work entry".into()))
     }
 

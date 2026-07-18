@@ -11,7 +11,7 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::constant::{MAX_MAX_FILE_BYTES, MAX_NOTE_FILES, UPLOAD_BODY_OVERHEAD_BYTES};
+use crate::constant::{MAX_MAX_FILE_BYTES, UPLOAD_BODY_OVERHEAD_BYTES};
 use crate::domain::note::{Note, NoteContent, NoteId, NoteTitle};
 use crate::domain::note_file::{FileContentType, FileName, NoteFile, NoteFileId};
 use crate::domain::settings::Settings;
@@ -283,11 +283,8 @@ async fn upload_file(
     let note = Note::read_owned(&NoteId::from_key(&id), user.get_id(), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    if NoteFile::list_for(note.get_id(), &st.db).await?.len() >= MAX_NOTE_FILES {
-        return Err(AppError::Conflict(
-            "the note already holds the maximum of 10 files — delete one first",
-        ));
-    }
+    // The 10-file cap is enforced inside `NoteFile::insert` (count and create
+    // under one lock) — checking it here too would just race.
     let limit = Settings::load(&st.db).await?.get_max_file_bytes();
 
     let mut field = loop {
