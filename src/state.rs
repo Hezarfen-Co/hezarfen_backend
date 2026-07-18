@@ -27,6 +27,12 @@ pub struct AppState {
 /// attempt's record key. The room counts itself in on entry and out on exit,
 /// and only the last socket out stamps the walk-out (`left_at`) — a student
 /// closing one of two tabs never counts as having left the exam.
+///
+/// The inner mutex only guards the map (never held across an await — keep it
+/// that way). Each count transition and its matching `left_at` DB write are
+/// serialized as one critical section by the exam room's `PRESENCE_LOCK`
+/// (see `web::exam_ws`), so "clear on join" and "stamp on last-out" stay
+/// atomic with the counts they depend on.
 #[derive(Clone, Default)]
 pub struct ExamPresence(Arc<Mutex<HashMap<String, usize>>>);
 
