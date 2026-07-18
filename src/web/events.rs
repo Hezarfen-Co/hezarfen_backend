@@ -654,29 +654,6 @@ struct RegistrationResponse {
     registered_by: PersonRef,
 }
 
-/// The shared gate for touching a signup list: the event must carry the
-/// registration audience, and the list must still be open — it closes the
-/// moment the event starts, or, for an ends_at-only event (a pure signup
-/// deadline), the moment that end passes (a truly timeless event never
-/// closes). Returns the seat cap for the register path.
-fn check_registration_open(event: &Event) -> Result<Option<i64>, AppError> {
-    let EventAudience::Registration { capacity } = event.get_audience() else {
-        return Err(AppError::Validation(ValidationError::Invalid {
-            field: "audience",
-            reason: "this event does not take registrations",
-        }));
-    };
-    // ends_at can't precede starts_at, so when both exist starts_at governs.
-    if let Some(closes_at) = event.get_starts_at().or(event.get_ends_at())
-        && Timestamp::now().as_millis() >= closes_at.as_millis()
-    {
-        return Err(AppError::Conflict(
-            "registration closed — the event has started or ended",
-        ));
-    }
-    Ok(*capacity)
-}
-
 /// Put a user on a registration-audience event's signup list. Requires
 /// teacher+. `user_id` must name a student — students are placed by staff and
 /// never register themselves; omit it to take a seat yourself (staff
@@ -710,7 +687,9 @@ async fn register(
     let event = Event::read(&event_id, &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    let capacity = check_registration_open(&event)?;
+    // Fast-fail gate; the authoritative re-check runs inside
+    // `Registration::register` under its lock.
+    event.registration_capacity()?;
 
     let target = match req.user_id {
         Some(ref key) => UserId::from_key(key),
@@ -729,8 +708,7 @@ async fn register(
         ));
     }
 
-    let registration =
-        Registration::register(&event_id, &target, user.get_id(), capacity, &st.db).await?;
+    let registration = Registration::register(&event_id, &target, user.get_id(), &st.db).await?;
     // Resolve from the row, not the request: a re-register returns the
     // existing seat, whose registered_by is the *original* placer — someone
     // the {target, caller} pair may not contain.
@@ -781,7 +759,7 @@ async fn unregister(
     let event = Event::read(&event_id, &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    check_registration_open(&event)?;
+    event.registration_capacity()?;
 
     let target = UserId::from_key(&target);
     // A deleted account's leftover seat is fair game for any teacher+; a

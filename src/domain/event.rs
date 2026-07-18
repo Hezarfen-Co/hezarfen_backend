@@ -192,6 +192,29 @@ impl Event {
         &self.creator == user
     }
 
+    /// The shared gate for touching a signup list: the event must carry the
+    /// registration audience, and the list must still be open — it closes the
+    /// moment the event starts, or, for an ends_at-only event (a pure signup
+    /// deadline), the moment that end passes (a truly timeless event never
+    /// closes). Returns the seat cap for the register path.
+    pub fn registration_capacity(&self) -> Result<Option<i64>, AppError> {
+        let EventAudience::Registration { capacity } = &self.audience else {
+            return Err(AppError::Validation(ValidationError::Invalid {
+                field: "audience",
+                reason: "this event does not take registrations",
+            }));
+        };
+        // ends_at can't precede starts_at, so when both exist starts_at governs.
+        if let Some(closes_at) = self.starts_at.or(self.ends_at)
+            && Timestamp::now().as_millis() >= closes_at.as_millis()
+        {
+            return Err(AppError::Conflict(
+                "registration closed — the event has started or ended",
+            ));
+        }
+        Ok(*capacity)
+    }
+
     pub async fn create(
         creator: &UserId,
         title: EventTitle,
@@ -314,6 +337,55 @@ mod tests {
             );
             assert_eq!(EventAudience::from_value(value).unwrap(), audience);
         }
+    }
+
+    fn event_with(
+        audience: EventAudience,
+        starts_at: Option<Timestamp>,
+        ends_at: Option<Timestamp>,
+    ) -> Event {
+        Event {
+            id: EventId::generate(),
+            creator: UserId::from_key("u1"),
+            title: EventTitle::try_new("signup").unwrap(),
+            description: EventDescription::try_new("").unwrap(),
+            audience,
+            starts_at,
+            ends_at,
+        }
+    }
+
+    #[tokio::test]
+    async fn registration_capacity_gates_and_echoes_cap() {
+        let open = |capacity| EventAudience::Registration { capacity };
+        let past = Some(Timestamp::from_millis(Timestamp::now().as_millis() - 1));
+
+        assert!(matches!(
+            event_with(EventAudience::School, None, None).registration_capacity(),
+            Err(AppError::Validation(_))
+        ));
+        assert_eq!(
+            event_with(open(None), None, None)
+                .registration_capacity()
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            event_with(open(Some(30)), None, None)
+                .registration_capacity()
+                .unwrap(),
+            Some(30)
+        );
+        // Started events close the list; an ends_at-only deadline in the past
+        // does too.
+        assert!(matches!(
+            event_with(open(Some(30)), past, None).registration_capacity(),
+            Err(AppError::Conflict(_))
+        ));
+        assert!(matches!(
+            event_with(open(None), None, past).registration_capacity(),
+            Err(AppError::Conflict(_))
+        ));
     }
 
     /// The database strips `NONE`-valued optional columns and the boot
