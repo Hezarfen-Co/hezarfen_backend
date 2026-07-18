@@ -117,6 +117,9 @@ async fn login(
         .path("/")
         .http_only(true)
         .secure(st.cookie_secure)
+        // Lax is part of the CORS defense: it keeps this cookie off cross-site
+        // requests. Before relaxing toward SameSite=None, first make sure
+        // `cors_layer` (lib.rs) can never mirror origins with credentials on.
         .same_site(SameSite::Lax)
         .max_age(time::Duration::days(SESSION_DURATION_DAYS))
         .build();
