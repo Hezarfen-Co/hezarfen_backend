@@ -109,6 +109,16 @@ impl Enrollment {
         Ok(result.take::<Vec<Enrollment>>(0)?)
     }
 
+    /// Drop every enrollment `user` holds, across all courses. Only students
+    /// enroll, so promotion out of `student` calls this to clear the rosters.
+    pub async fn delete_for_user(user: &UserId, db: &Database) -> Result<(), AppError> {
+        db.query("DELETE enrollment WHERE user = $usr")
+            .bind(("usr", user.record()))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
     pub async fn remove(
         course: &CourseId,
         user: &UserId,

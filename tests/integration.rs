@@ -4556,10 +4556,11 @@ async fn only_students_can_be_enrolled() {
 }
 
 /// The student-only rule is enforced on the *live* role, not merely at enroll
-/// time. A student enrolled mid-course, then promoted to staff, keeps the
-/// enrollment row — but it goes inert: they can no longer sit the exam, save
-/// answers, be graded, or be marked present. This is the "stale rows stay
-/// inert" decision, made airtight by the action-time checks.
+/// time. This flips the role directly in the DB (bypassing the admin endpoint,
+/// which also sweeps enrollments — and boot sweeps rows like this one), so the
+/// enrollment row is still present — but inert: they can no longer sit the
+/// exam, save answers, be graded, or be marked present. The action-time checks
+/// alone hold, with no help from roster hygiene.
 #[tokio::test]
 async fn promotion_out_of_student_freezes_the_seat() {
     let (app, db) = app_and_db().await;
@@ -4657,6 +4658,65 @@ async fn promotion_out_of_student_freezes_the_seat() {
         StatusCode::BAD_REQUEST,
         "promoted user can't be rolled"
     );
+}
+
+/// Promotion through the admin role endpoint doesn't just freeze the seat —
+/// it deletes the user's enrollment rows outright, so a promoted user drops
+/// off course rosters and live-monitor counts instead of lingering.
+#[tokio::test]
+async fn promotion_via_role_endpoint_sweeps_enrollments() {
+    let (app, db) = app_and_db().await;
+    let admin = login_as(&app, &db, "boss", "admin").await;
+    let teacher = login_as(&app, &db, "teacher", "teacher").await;
+    let student = login(&app, "veli").await;
+    let student_id = me_id(&app, &student).await;
+
+    let course = create_course(&app, &teacher, "algebra").await;
+    enroll(&app, &teacher, &course, &student_id).await;
+    let roster = send(
+        &app,
+        "GET",
+        &format!("/courses/{course}/enrollments"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&roster.body), 1);
+
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/users/{student_id}/role"),
+        Some(&admin),
+        Some(json!({ "role": "teacher" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    let roster = send(
+        &app,
+        "GET",
+        &format!("/courses/{course}/enrollments"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(
+        common::total(&roster.body),
+        0,
+        "promoted user left the roster: {}",
+        roster.body
+    );
+
+    // Really deleted, not merely filtered out of the listing.
+    let mut result = db
+        .query("SELECT VALUE id FROM enrollment")
+        .await
+        .expect("count enrollments")
+        .check()
+        .expect("count enrollments check");
+    let rows: Vec<surrealdb::types::RecordId> = result.take(0).expect("enrollment rows");
+    assert!(rows.is_empty(), "enrollment rows deleted from the DB");
 }
 
 /// Regression: `User::create` pre-checks the username and then inserts, so two
