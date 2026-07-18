@@ -4862,6 +4862,13 @@ async fn session_cookie_secure_attribute_follows_config() {
         !plain.contains("Secure"),
         "dev cookie must not be Secure: {plain}"
     );
+    // SameSite=Lax is the cookie-side half of the CORS defense: dev mirror
+    // mode (see `cors_layer`) is only safe as long as this cookie never rides
+    // cross-site requests.
+    assert!(
+        plain.contains("SameSite=Lax"),
+        "cookie must stay SameSite=Lax: {plain}"
+    );
 
     // With the flag on: Secure present.
     let db = database::init_mem().await.unwrap();
@@ -4970,27 +4977,68 @@ async fn patch_null_clears_event_times() {
     assert!(res.body["ends_at"].is_null());
 }
 
-/// #4 — CORS echoes the caller's origin and allows credentials, never `*`
-/// (which browsers reject for cookie-bearing requests).
+/// #4 — mirror mode (no `CORS_ALLOWED_ORIGINS`) reflects the caller's origin,
+/// never `*`, but must NOT advertise credentials: reflecting arbitrary origins
+/// with credentials would let any website ride a visitor's session cookie.
 #[tokio::test]
-async fn cors_is_credential_safe_not_wildcard() {
+async fn cors_mirror_mode_reflects_origin_without_credentials() {
     let app = mem_app().await;
     let req = Request::builder()
         .method("GET")
         .uri("/health")
-        .header("origin", "https://client.example")
+        .header("origin", "https://evil.example")
         .body(Body::empty())
         .unwrap();
     let res = app.oneshot(req).await.unwrap();
     let headers = res.headers();
     assert_eq!(
         headers.get("access-control-allow-origin").unwrap(),
-        "https://client.example",
+        "https://evil.example",
         "origin must be reflected, not wildcarded"
     );
+    // tower-http omits the header entirely when credentials are off.
+    assert!(
+        headers.get("access-control-allow-credentials").is_none(),
+        "mirror mode must never send allow-credentials"
+    );
+}
+
+/// Allowlist mode: a listed origin gets both the origin echo and
+/// `allow-credentials: true`; an unlisted origin gets no origin header at all.
+/// `cors_layer` takes the allowlist as a parameter, so this needs no
+/// process-global env mutation (which would race other tests).
+#[tokio::test]
+async fn cors_allowlist_mode_credits_only_listed_origins() {
+    async fn probe(origin: &str) -> axum::http::HeaderMap {
+        let app = axum::Router::new()
+            .route("/ping", axum::routing::get(|| async { "pong" }))
+            .layer(hezarfen_backend::cors_layer(vec![
+                "https://app.example".parse().unwrap(),
+            ]));
+        let req = Request::builder()
+            .method("GET")
+            .uri("/ping")
+            .header("origin", origin)
+            .body(Body::empty())
+            .unwrap();
+        app.oneshot(req).await.unwrap().headers().clone()
+    }
+
+    let listed = probe("https://app.example").await;
     assert_eq!(
-        headers.get("access-control-allow-credentials").unwrap(),
+        listed.get("access-control-allow-origin").unwrap(),
+        "https://app.example",
+    );
+    assert_eq!(
+        listed.get("access-control-allow-credentials").unwrap(),
         "true",
+        "the allowlisted origin must keep credentialed CORS"
+    );
+
+    let unlisted = probe("https://evil.example").await;
+    assert!(
+        unlisted.get("access-control-allow-origin").is_none(),
+        "an unlisted origin must not be echoed"
     );
 }
 

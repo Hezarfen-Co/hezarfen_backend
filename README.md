@@ -78,7 +78,9 @@ embedded there is only one service; its data lives in the named volume
 files (`/data/files`) together, so that one volume persists everything. `HOST` is forced to `0.0.0.0` inside the
 container so the published port works. Production knobs (`COOKIE_SECURE`,
 `CORS_ALLOWED_ORIGINS`, rate limits, `TRUST_PROXY`) are commented in
-`compose.yaml` — uncomment as needed. Works with `docker compose` too.
+`compose.yaml` — uncomment as needed. Leaving `CORS_ALLOWED_ORIGINS` unset
+means dev mirror mode without credentials; a cookie-using browser frontend
+must be allowlisted explicitly. Works with `docker compose` too.
 
 Without compose:
 
@@ -153,11 +155,13 @@ directly — the header is client-forged in that case.
 ## CORS
 
 Cookie-authenticated APIs can't use a wildcard `Access-Control-Allow-Origin`
-(browsers refuse it on credentialed requests), so the server always advertises
-`Access-Control-Allow-Credentials: true` and, by default, reflects the
-request's `Origin` — dev-friendly, effectively open. In production set
-`CORS_ALLOWED_ORIGINS` to a comma-separated allowlist to restrict which
-browser origins may call the API.
+(browsers refuse it on credentialed requests), so origins listed in the
+comma-separated `CORS_ALLOWED_ORIGINS` allowlist are echoed back with
+`Access-Control-Allow-Credentials: true`. When the allowlist is unset the
+server reflects the request's `Origin` — dev-friendly — but **without**
+credentials: mirroring with credentials would let any website ride a
+visitor's session cookie. A browser frontend that needs the session cookie
+cross-origin must therefore be allowlisted explicitly.
 
 ## Roles & access control
 

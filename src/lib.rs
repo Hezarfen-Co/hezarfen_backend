@@ -101,6 +101,13 @@ pub fn build_router(state: AppState) -> Router {
         state.rate_limit.trust_proxy,
     );
 
+    let cors_allowlist = cors_allowlist_from_env();
+    if state.cookie_secure && cors_allowlist.is_empty() {
+        tracing::warn!(
+            "COOKIE_SECURE is on but CORS_ALLOWED_ORIGINS is unset: production should list its frontend origins explicitly; mirror mode runs uncredentialed, so browser frontends cannot send the session cookie"
+        );
+    }
+
     router
         .merge(SwaggerUi::new("/swagger").url("/api-docs/openapi.json", api))
         .with_state(state)
@@ -108,16 +115,37 @@ pub fn build_router(state: AppState) -> Router {
             let limiter = api_limiter.clone();
             async move { limiter.enforce(req, next).await }
         }))
-        .layer(cors_layer())
+        .layer(cors_layer(cors_allowlist))
         .layer(TraceLayer::new_for_http())
+}
+
+/// Parse the `CORS_ALLOWED_ORIGINS` (comma-separated) allowlist; empty when unset.
+fn cors_allowlist_from_env() -> Vec<HeaderValue> {
+    std::env::var("CORS_ALLOWED_ORIGINS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+        .filter_map(|origin| origin.parse().ok())
+        .collect()
 }
 
 /// CORS for a cookie-authenticated API. `CorsLayer::permissive()` would send
 /// `Access-Control-Allow-Origin: *`, which browsers refuse to combine with
-/// credentialed (cookie) requests — so instead reflect the caller's origin, or a
-/// `CORS_ALLOWED_ORIGINS` (comma-separated) allowlist when set, and advertise
-/// `Access-Control-Allow-Credentials: true`.
-fn cors_layer() -> CorsLayer {
+/// credentialed (cookie) requests — so origins from the `CORS_ALLOWED_ORIGINS`
+/// allowlist are echoed back with `Access-Control-Allow-Credentials: true`.
+///
+/// With no allowlist (dev) the caller's origin is mirrored, but WITHOUT
+/// credentials: mirror + credentials would let any website ride a visitor's
+/// session cookie, so the two must NEVER be recombined (the cookie's
+/// `SameSite=Lax` in `web/auth.rs` is the only other guard on that door). A
+/// cross-origin dev frontend can't send the Lax cookie anyway, so credentials
+/// bought nothing in mirror mode; a credentialed browser frontend requires
+/// listing its origin in `CORS_ALLOWED_ORIGINS`.
+///
+/// Takes the allowlist as a parameter (env read once in `build_router`) so
+/// tests can exercise both modes without racing on process-global env vars.
+pub fn cors_layer(allowlist: Vec<HeaderValue>) -> CorsLayer {
     let layer = CorsLayer::new()
         .allow_methods([
             Method::GET,
@@ -126,21 +154,16 @@ fn cors_layer() -> CorsLayer {
             Method::DELETE,
             Method::OPTIONS,
         ])
-        .allow_headers([header::CONTENT_TYPE])
-        .allow_credentials(true);
-
-    let allowlist: Vec<HeaderValue> = std::env::var("CORS_ALLOWED_ORIGINS")
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|origin| !origin.is_empty())
-        .filter_map(|origin| origin.parse().ok())
-        .collect();
+        .allow_headers([header::CONTENT_TYPE]);
 
     if allowlist.is_empty() {
-        layer.allow_origin(AllowOrigin::mirror_request())
+        layer
+            .allow_origin(AllowOrigin::mirror_request())
+            .allow_credentials(false)
     } else {
-        layer.allow_origin(AllowOrigin::list(allowlist))
+        layer
+            .allow_origin(AllowOrigin::list(allowlist))
+            .allow_credentials(true)
     }
 }
 
