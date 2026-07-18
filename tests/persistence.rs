@@ -843,3 +843,89 @@ async fn legacy_subjectless_questions_are_destroyed_on_boot() {
     let answers: Vec<surrealdb::types::RecordId> = result.take(0).expect("answer rows");
     assert!(answers.is_empty(), "orphaned answers destroyed");
 }
+
+/// Enrollment rows whose user is no longer a student — promoted before the
+/// role endpoint swept enrollments (2026-07-18), or deleted outright — are
+/// removed by the boot backfill. A real student's row survives.
+#[tokio::test]
+async fn stale_staff_enrollments_are_swept_on_boot() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config_at(&dir);
+    let creds = json!({ "username": "ali", "password": "secret1" });
+    let course;
+    let keeper_id;
+
+    // First boot: a course with three enrolled students, then age two rows the
+    // way a pre-fix binary could have — flip one student to teacher directly
+    // in the DB, and delete the other's user record entirely.
+    {
+        let db = database::init(&cfg).await.expect("first open");
+        let app = build_router(state(db.clone(), &cfg));
+        assert_eq!(
+            send(&app, "POST", "/auth/register", None, Some(creds.clone()))
+                .await
+                .status,
+            StatusCode::CREATED
+        );
+        set_role(&db, "ali", "teacher").await;
+        let cookie = send(&app, "POST", "/auth/login", None, Some(creds.clone()))
+            .await
+            .cookie
+            .unwrap();
+        course = create_course(&app, &cookie, "algebra").await;
+
+        let mut ids = Vec::new();
+        for name in ["veli", "ayse", "can"] {
+            let student = json!({ "username": name, "password": "secret1" });
+            assert_eq!(
+                send(&app, "POST", "/auth/register", None, Some(student.clone()))
+                    .await
+                    .status,
+                StatusCode::CREATED
+            );
+            let student_cookie = send(&app, "POST", "/auth/login", None, Some(student))
+                .await
+                .cookie
+                .unwrap();
+            let id = me_id(&app, &student_cookie).await;
+            enroll(&app, &cookie, &course, &id).await;
+            ids.push(id);
+        }
+        keeper_id = ids[1].clone();
+        set_role(&db, "veli", "teacher").await;
+        db.query("DELETE user WHERE username = 'can'")
+            .await
+            .expect("delete user")
+            .check()
+            .expect("delete user check");
+    }
+
+    // Second boot: the backfill swept the promoted user's row and the deleted
+    // user's dangling row; the remaining student's enrollment is intact.
+    let db = reopen(&cfg).await;
+    let app = build_router(state(db, &cfg));
+    let cookie = send(&app, "POST", "/auth/login", None, Some(creds))
+        .await
+        .cookie
+        .unwrap();
+    let roster = send(
+        &app,
+        "GET",
+        &format!("/courses/{course}/enrollments"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(roster.status, StatusCode::OK, "{}", roster.body);
+    assert_eq!(
+        common::total(&roster.body),
+        1,
+        "stale rows swept: {}",
+        roster.body
+    );
+    assert_eq!(
+        common::items(&roster.body)[0]["user"]["id"],
+        keeper_id.as_str(),
+        "the real student's row survives"
+    );
+}

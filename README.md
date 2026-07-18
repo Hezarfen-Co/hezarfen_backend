@@ -286,7 +286,7 @@ their existing shapes: the student exam-room reads
 | GET    | `/users/search`                  | teacher | `?q=<fragment>&role=<role?>` — find users by username/name fragment (pickers); refs only, no contact info · paged |
 | GET    | `/users`                         | admin   | List all users · paged          |
 | GET    | `/users/{id}`                    | admin   | Get one user                    |
-| PATCH  | `/users/{id}/role`               | admin   | `{role}` — set a user's role    |
+| PATCH  | `/users/{id}/role`               | admin   | `{role}` — set a user's role; promotion out of `student` drops the user's course enrollments (only students enroll) |
 | PATCH  | `/users/{id}/profile`            | admin   | Update any user's personal info |
 | PATCH  | `/users/{id}/preferences`        | admin   | Update any user's UI preferences |
 | POST   | `/notes`                         | student | `{title, content?}`             |

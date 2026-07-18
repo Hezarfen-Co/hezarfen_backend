@@ -245,6 +245,11 @@ const BACKFILL: &str = "
         };
         UPDATE $ev.id SET audience = { kind: 'registration' };
     };
+
+    -- Promotion out of student now deletes the user's enrollments (2026-07-18);
+    -- this sweeps rows promoted before that fix. A deleted user reads as
+    -- `user.role = NONE`, which is also != 'student' — those rows go too.
+    DELETE enrollment WHERE user.role != 'student';
 ";
 
 /// Open the file-backed database and apply the schema.

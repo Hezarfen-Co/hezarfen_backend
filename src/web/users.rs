@@ -6,6 +6,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::database::Database;
+use crate::domain::enrollment::Enrollment;
 use crate::domain::preferences::{Language, Theme};
 use crate::domain::profile::{BirthDate, Email, PersonName, Phone};
 use crate::domain::role::Role;
@@ -358,6 +359,8 @@ async fn update_user_preferences(
 /// Set a user's role. Admin only. An admin cannot change their own role — that
 /// guard keeps a sole admin from accidentally locking everyone out of role
 /// management (recover such a lockout with the SurrealQL in the README).
+/// Setting any non-`student` role also drops the user's course enrollments —
+/// only students enroll, so a promoted user leaves every roster.
 #[utoipa::path(
     patch,
     path = "/{id}/role",
@@ -388,5 +391,11 @@ async fn set_role(
         .await?
         .ok_or(AppError::NotFound)?;
     let updated = user.set_role(role, &st.db).await?;
+    // Roster hygiene: only students enroll, so a non-student sheds all their
+    // enrollment rows (security checks re-read the live role and never
+    // trusted these; this just stops them polluting rosters and counts).
+    if role != Role::Student {
+        Enrollment::delete_for_user(&target, &st.db).await?;
+    }
     Ok(Json(UserResponse::new(&updated)))
 }
