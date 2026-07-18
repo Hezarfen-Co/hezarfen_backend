@@ -2,7 +2,7 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use tokio::sync::Mutex;
 
 use crate::database::{Database, REGISTRATION_TABLE};
-use crate::domain::event::EventId;
+use crate::domain::event::{Event, EventId};
 use crate::domain::user::UserId;
 use crate::error::AppError;
 
@@ -71,22 +71,27 @@ impl Registration {
         &self.registered_by
     }
 
-    /// Register (idempotently) `user` onto `event`, refusing when a `capacity`
+    /// Register (idempotently) `user` onto `event`, refusing when a capacity
     /// cap is set and every seat is taken. Someone already listed gets their
     /// existing row back untouched — a true no-op that never counts against
     /// the cap and never rewrites who placed them. The whole check-then-write
-    /// runs under [`REGISTER_LOCK`], so a full event never over-admits.
+    /// runs under [`REGISTER_LOCK`], and the gate + cap are re-derived from a
+    /// fresh event read under that lock, so neither a racing registration nor
+    /// a concurrent capacity/audience/schedule PATCH can over-admit.
     pub async fn register(
         event: &EventId,
         user: &UserId,
         registered_by: &UserId,
-        capacity: Option<i64>,
         db: &Database,
     ) -> Result<Registration, AppError> {
         let _guard = REGISTER_LOCK.lock().await;
         if let Some(existing) = Self::read_for_user(event, user, db).await? {
             return Ok(existing);
         }
+        let capacity = Event::read(event, db)
+            .await?
+            .ok_or(AppError::NotFound)?
+            .registration_capacity()?;
         if let Some(capacity) = capacity
             && Self::list_for_event(event, db).await?.len() as i64 >= capacity
         {
