@@ -8,7 +8,10 @@ students to a parent account, and the parent reads those students' mark,
 attendance, and pomodoro reports — that's the whole role. Notes are per-user and carry **file attachments** (PDFs, documents,
 …): blobs live on disk next to the database, metadata in the database, and the
 per-file size cap is school policy in settings (`max_file_bytes`, default
-5 MiB). Attendance is event + attendees: create an event with an **audience**
+5 MiB). Any two users can **message** each other, mail-style — subject +
+body into the recipient's inbox, each side filing its own copy through
+archive/trash with a read flag the sender sees as a receipt (the one place a
+`parent` writes). Attendance is event + attendees: create an event with an **audience**
 (the whole school, one role, a course's enrollment, or a **registration**
 signup list — omit for school-wide), then teachers mark the expected attendees
 present / absent / late / excused (students never self-mark), and a **roster
@@ -195,7 +198,9 @@ the tie is the parent's whole power — they list their students
 (`GET /users/me/students`) and read each one's mark, attendance, and pomodoro
 reports in full. Student-only checks are exact (`role == student`), so a
 parent can never enroll, sit an exam, be graded, or land on a roll call; and
-sitting below every staff bar, they can't touch anything else either. A role
+sitting below every staff bar, they can't touch anything else either — except
+messages, which any role sends and receives (that's how a parent reaches a
+teacher). A role
 change off either end of a tie (the parent stops being a `parent`, the
 student stops being a `student`) drops the tie, exactly like promotion drops
 course enrollments.
@@ -204,6 +209,7 @@ course enrollments.
 |------------------------------------------|--------------|-----------------------------------------------|
 | Register / login / view own account      | (any)        | Registration always creates a `student`       |
 | View events, own notes; CRUD notes + their files | student | Everyone can read events and keep notes; note files (upload/download) are walled per owner like the notes themselves |
+| Send / read / file / delete messages     | (any)        | One-to-one, any user to any user (`parent` included — the role's one write); each party only ever touches their own copy |
 | Mark event attendance; remove attendance rows | teacher | Only users in the event's **audience** can be marked; students never mark — a teacher+ may mark anyone expected, themselves included |
 | Create events                            | teacher      | The audience (school / role / course / registration) is set at creation and editable later |
 | Register users onto a registration event | teacher      | Teachers place **students** (students never register themselves) and take a seat for **themselves** — never for another staff member. Unregistering mirrors the same rule |
@@ -337,6 +343,10 @@ their existing shapes: the student exam-room reads
 | GET    | `/notes/{id}/files`              | student | List a note's files (metadata: `{id, name, content_type, size}`) · paged |
 | GET    | `/notes/{id}/files/{file_id}`    | student | Download the bytes (original filename + content type in the headers) |
 | DELETE | `/notes/{id}/files/{file_id}`    | student | Delete one file                 |
+| POST   | `/messages`                      | student | `{recipient_id, subject, body?, label?}` — send to any user (every role incl. `parent`; not yourself); `label` is a free-text badge tag |
+| GET    | `/messages`                      | student | `?folder=inbox\|sent\|archive\|trash` (default `inbox`) `&read=` — the caller's folder, newest first; `?folder=inbox&read=false&limit=1` → `total` is the unread badge · paged |
+| PATCH  | `/messages/{id}`                 | student | `{read?, folder?}` — read flag (recipient only) and/or move **own copy** (recipient: `inbox`/`archive`/`trash`; sender: `sent`/`trash`) |
+| DELETE | `/messages/{id}`                 | student | Permanently delete **own copy** — only from the trash (`409` elsewhere); the row vanishes once both sides deleted |
 | POST   | `/events`                        | teacher | `{title, description?, audience?, starts_at?, ends_at?}` — `audience` defaults to school-wide |
 | GET    | `/events`                        | student | List all events · paged         |
 | GET    | `/events/{id}`                   | student | Get event                       |
@@ -508,6 +518,29 @@ uses the same field semantics as the profile patch: omitted keeps, `""` clears
 back to `null` ("never chose" — the client then follows the device
 preference), anything else must be one of the listed values or the whole patch
 is a `400`.
+
+## Messaging
+
+One-to-one, mail-style (subject + body + an optional free-text `label` the UI
+renders as a badge — "Etüt", "Sınav"; no threads): any user writes to any
+user — student to teacher, parent to teacher, teacher to student; only
+messaging yourself is refused. A single stored message serves both parties,
+but each **owns their copy independently**: the recipient's moves through
+`inbox` → `archive`/`trash` and carries the `read` flag (the sender sees it
+as a read receipt); the sender's moves through `sent` → `trash`. Filing or
+deleting your copy never changes the other side's view.
+
+Listing is per folder — `GET /messages?folder=` with `inbox` (default),
+`sent`, `archive`, or `trash` (trash shows both received and sent copies you
+trashed) — newest first, paged, with sender/recipient rendered as person refs
+plus their role. `?read=false` narrows to unread (`true` to read), and since
+`total` counts the filtered view, `?folder=inbox&read=false&limit=1` is the
+one-row unread-badge query. `PATCH /messages/{id}` flips `read` (recipient only) or
+moves your copy (`folder`), restoring from trash included. `DELETE` is
+permanent, allowed only while your copy sits in the trash (`409` otherwise),
+and physically removes the row once both sides have deleted theirs. Replying
+is just sending a new message back — the frontend prefixes the subject if it
+wants an `Re:`.
 
 ## Per-school policy (settings & terms)
 

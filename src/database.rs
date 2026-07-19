@@ -11,6 +11,7 @@ pub type Database = Surreal<Db>;
 pub const USER_TABLE: &str = "user";
 pub const SESSION_TABLE: &str = "session";
 pub const NOTE_TABLE: &str = "note";
+pub const MESSAGE_TABLE: &str = "message";
 pub const NOTE_FILE_TABLE: &str = "note_file";
 pub const EVENT_TABLE: &str = "event";
 pub const ATTENDANCE_TABLE: &str = "attendance";
@@ -66,6 +67,19 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS title ON note TYPE string;
     DEFINE FIELD IF NOT EXISTS content ON note TYPE string;
     DEFINE INDEX IF NOT EXISTS note_user ON note FIELDS user;
+
+    DEFINE TABLE IF NOT EXISTS message SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS sender ON message TYPE record<user>;
+    DEFINE FIELD IF NOT EXISTS recipient ON message TYPE record<user>;
+    DEFINE FIELD IF NOT EXISTS subject ON message TYPE string;
+    DEFINE FIELD IF NOT EXISTS body ON message TYPE string;
+    DEFINE FIELD IF NOT EXISTS label ON message TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS sent_at ON message TYPE int;
+    DEFINE FIELD IF NOT EXISTS read ON message TYPE bool DEFAULT false;
+    DEFINE FIELD IF NOT EXISTS sender_folder ON message TYPE string DEFAULT 'sent';
+    DEFINE FIELD IF NOT EXISTS recipient_folder ON message TYPE string DEFAULT 'inbox';
+    DEFINE INDEX IF NOT EXISTS message_sender ON message FIELDS sender;
+    DEFINE INDEX IF NOT EXISTS message_recipient ON message FIELDS recipient;
 
     DEFINE TABLE IF NOT EXISTS note_file SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS note ON note_file TYPE record<note>;

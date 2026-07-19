@@ -38,6 +38,12 @@ pub const MAX_NOTE_CONTENT_LEN: usize = 10_000;
 /// How many files one note may carry.
 pub const MAX_NOTE_FILES: usize = 10;
 
+pub const MAX_MESSAGE_SUBJECT_LEN: usize = 200;
+pub const MAX_MESSAGE_BODY_LEN: usize = 10_000;
+/// A message's optional sender-chosen tag ("Etüt", "Sınav", …) — free text,
+/// rendered as a badge by the UI.
+pub const MAX_MESSAGE_LABEL_LEN: usize = 50;
+
 /// Bounds for a note file's original filename and its MIME content type.
 pub const MAX_FILE_NAME_LEN: usize = 255;
 pub const MAX_FILE_CONTENT_TYPE_LEN: usize = 100;
