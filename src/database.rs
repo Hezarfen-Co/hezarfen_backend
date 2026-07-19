@@ -112,6 +112,7 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS description ON course TYPE string;
     DEFINE FIELD IF NOT EXISTS kind ON course TYPE string DEFAULT 'course';
     DEFINE FIELD IF NOT EXISTS term ON course TYPE option<record<term>>;
+    DEFINE FIELD IF NOT EXISTS capacity ON course TYPE option<int>;
 
     DEFINE TABLE IF NOT EXISTS subject SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS course ON subject TYPE record<course>;

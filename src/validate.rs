@@ -203,7 +203,7 @@ pub fn validate_course_kind(value: &str) -> Result<(), ValidationError> {
     } else {
         Err(ValidationError::Invalid {
             field: "kind",
-            reason: "must be one of: course, study",
+            reason: "must be one of: course, study, club",
         })
     }
 }
@@ -387,10 +387,11 @@ mod tests {
 
     #[tokio::test]
     async fn course_kind_rules() {
-        for kind in ["course", "study"] {
+        for kind in ["course", "study", "club"] {
             assert!(validate_course_kind(kind).is_ok());
         }
         assert!(validate_course_kind("etut").is_err());
+        assert!(validate_course_kind("kulup").is_err());
         assert!(validate_course_kind("").is_err());
     }
 

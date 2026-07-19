@@ -161,13 +161,17 @@ pub struct CourseResponse {
     #[schema(example = "Algebra")]
     pub title: String,
     pub description: String,
-    /// `course` (a regular class) or `study` (a supervised study session —
-    /// etüt). Behaviorally identical; a label for the UI.
+    /// `course` (a regular class), `study` (a supervised study session —
+    /// etüt), or `club` (a student club — kulüp). Behaviorally identical; a
+    /// label for the UI.
     #[schema(example = "course")]
     pub kind: String,
     /// The academic term this course belongs to (`GET /terms`); `null` when
     /// unassigned.
     pub term: Option<String>,
+    /// Seat cap enforced when enrolling; `null` = unlimited.
+    #[schema(example = 12)]
+    pub capacity: Option<i64>,
 }
 
 impl CourseResponse {
@@ -179,6 +183,7 @@ impl CourseResponse {
             description: course.get_description().as_str().to_string(),
             kind: course.get_kind().as_str().to_string(),
             term: course.get_term().map(|term| term.key().to_string()),
+            capacity: course.get_capacity(),
         }
     }
 }
