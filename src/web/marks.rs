@@ -18,7 +18,7 @@ use crate::error::{AppError, ErrorResponse};
 use crate::state::AppState;
 
 use super::courses::can_manage_course;
-use super::{CourseResponse, CurrentUser, RequireTeacher, person_map};
+use super::{CourseResponse, CurrentUser, ensure_can_observe, person_map};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -177,9 +177,10 @@ async fn my_marks(
     Ok(Json(build_report(user.get_id(), None, &st.db).await?))
 }
 
-/// Any user's mark report. Requires teacher+. Managers and admins see every
-/// course; a teacher sees only the target's courses they manage — the rest of
-/// the report (other teachers' courses) stays out of reach.
+/// Any user's mark report. Requires teacher+, or a parent tied to the target
+/// student. Managers, admins, and parents see every course; a teacher sees
+/// only the target's courses they manage — the rest of the report (other
+/// teachers' courses) stays out of reach.
 #[utoipa::path(
     get,
     path = "/{user}",
@@ -189,21 +190,24 @@ async fn my_marks(
     responses(
         (status = 200, description = "The user's mark report, narrowed to the caller's courses", body = MarksReport),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
+        (status = 403, description = "Requires teacher role or higher, or a parent link to this student", body = ErrorResponse),
         (status = 404, description = "User not found", body = ErrorResponse),
     ),
 )]
 async fn user_marks(
     State(st): State<AppState>,
-    RequireTeacher(teacher): RequireTeacher,
+    CurrentUser(caller): CurrentUser,
     Path(user): Path<String>,
 ) -> Result<Json<MarksReport>, AppError> {
     let target = UserId::from_key(&user);
+    ensure_can_observe(&caller, &target, &st.db).await?;
     // User must exist — a missing user is a 404, not an empty report.
     User::read(&target, &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    let viewer = (!teacher.get_role().at_least(Role::Manager)).then_some(&teacher);
+    // Only an exactly-teacher caller is narrowed to their managed courses;
+    // manager+ and a linked parent read the full report.
+    let viewer = (caller.get_role() == Role::Teacher).then_some(&caller);
     Ok(Json(build_report(&target, viewer, &st.db).await?))
 }
 

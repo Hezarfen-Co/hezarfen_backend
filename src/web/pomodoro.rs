@@ -12,7 +12,7 @@ use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse};
 use crate::state::AppState;
 
-use super::{CurrentUser, PageParams, RequireTeacher, paginate};
+use super::{CurrentUser, PageParams, ensure_can_observe, paginate};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -178,8 +178,8 @@ async fn my_pomodoro(
 }
 
 /// A student's pomodoro log, newest first, with `total_focus_ms` — the same
-/// shape as `/me`. Requires teacher+ (study oversight). Paged via
-/// `?limit=&offset=`.
+/// shape as `/me`. Requires teacher+ (study oversight), or a parent tied to
+/// the target student. Paged via `?limit=&offset=`.
 #[utoipa::path(
     get,
     path = "/{user}",
@@ -190,18 +190,19 @@ async fn my_pomodoro(
         (status = 200, description = "A page of the user's pomodoro log with the unpaged focus total", body = PomodoroLog),
         (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
+        (status = 403, description = "Requires teacher role or higher, or a parent link to this student", body = ErrorResponse),
         (status = 404, description = "User not found", body = ErrorResponse),
     ),
 )]
 async fn user_pomodoro(
     State(st): State<AppState>,
-    _teacher: RequireTeacher,
+    CurrentUser(caller): CurrentUser,
     Path(user): Path<String>,
     Query(page): Query<PageParams>,
 ) -> Result<Json<PomodoroLog>, AppError> {
     let (limit, offset) = page.resolve()?;
     let target = UserId::from_key(&user);
+    ensure_can_observe(&caller, &target, &st.db).await?;
     // User must exist — a missing user is a 404, not an empty log.
     User::read(&target, &st.db)
         .await?

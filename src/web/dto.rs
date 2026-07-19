@@ -14,13 +14,15 @@ use crate::domain::subject::Subject;
 use crate::domain::user::{User, UserId};
 use crate::error::AppError;
 
-/// The four access roles, lowest to highest privilege. The web-facing mirror of
+/// The five access roles, lowest to highest privilege (`parent` is a read-only
+/// observer of its linked students). The web-facing mirror of
 /// [`crate::domain::role::Role`] — it carries the serde + OpenAPI derives (which
 /// the domain type deliberately omits), so it renders as a proper `enum` in the
 /// docs. Serializes to the same lowercase strings the domain stores.
 #[derive(Serialize, Clone, Copy, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
+    Parent,
     Student,
     Teacher,
     Manager,
@@ -30,6 +32,7 @@ pub enum Role {
 impl From<DomainRole> for Role {
     fn from(role: DomainRole) -> Self {
         match role {
+            DomainRole::Parent => Role::Parent,
             DomainRole::Student => Role::Student,
             DomainRole::Teacher => Role::Teacher,
             DomainRole::Manager => Role::Manager,

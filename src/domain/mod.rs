@@ -14,6 +14,7 @@ pub mod exam_question;
 pub mod exam_result;
 pub mod note;
 pub mod note_file;
+pub mod parent_link;
 pub mod pomodoro;
 pub mod preferences;
 pub mod profile;
