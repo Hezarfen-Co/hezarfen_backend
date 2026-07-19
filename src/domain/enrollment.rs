@@ -1,9 +1,15 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
+use tokio::sync::Mutex;
 
 use crate::database::{Database, ENROLLMENT_TABLE};
-use crate::domain::course::CourseId;
+use crate::domain::course::{Course, CourseId};
 use crate::domain::user::UserId;
 use crate::error::AppError;
+
+/// Serializes enrolls so the capacity check (count, then write) can't
+/// over-admit under concurrency — the database's optimistic transactions
+/// don't serialize cross-record counts against concurrent inserts.
+static ENROLL_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct EnrollmentId(RecordId);
@@ -62,13 +68,31 @@ impl Enrollment {
     /// Enroll (idempotently) `user` into `course`. One row per (course, user),
     /// keyed by a deterministic composite id so this is a single atomic UPSERT —
     /// concurrent enrolls for the same pair converge on one row instead of
-    /// racing the unique index into a 500.
+    /// racing the unique index into a 500. When the course carries a capacity,
+    /// a full roster refuses new members (409) — the whole check-then-write
+    /// runs under [`ENROLL_LOCK`], and the cap is re-derived from a fresh
+    /// course read inside it, since neither the transaction model nor a
+    /// caller-supplied course survives a concurrent capacity PATCH. An already
+    /// enrolled user is returned as-is even when the roster is full.
     pub async fn enroll(
         course: &CourseId,
         user: &UserId,
         enrolled_by: &UserId,
         db: &Database,
     ) -> Result<Enrollment, AppError> {
+        let _guard = ENROLL_LOCK.lock().await;
+        if let Some(existing) = Self::read_for_user(course, user, db).await? {
+            return Ok(existing);
+        }
+        let capacity = Course::read(course, db)
+            .await?
+            .ok_or(AppError::NotFound)?
+            .get_capacity();
+        if let Some(capacity) = capacity
+            && Self::list_for_course(course, db).await?.len() as i64 >= capacity
+        {
+            return Err(AppError::Conflict("the course is full"));
+        }
         let enrollment = Enrollment {
             id: EnrollmentId::composite(course, user),
             course: course.clone(),

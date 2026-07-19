@@ -2360,6 +2360,87 @@ async fn enrollment_upsert_roster_and_my_courses() {
 }
 
 #[tokio::test]
+async fn capacity_caps_the_roster() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "teacher", "teacher").await;
+    let alice = login(&app, "alice").await; // student
+    let bob = login(&app, "bob").await; // student
+    let alice_id = me_id(&app, &alice).await;
+    let bob_id = me_id(&app, &bob).await;
+
+    // A zero-seat club is nonsense.
+    assert_eq!(
+        send(
+            &app,
+            "POST",
+            "/courses",
+            Some(&teacher),
+            Some(json!({ "title": "chess", "kind": "club", "capacity": 0 })),
+        )
+        .await
+        .status,
+        StatusCode::BAD_REQUEST
+    );
+
+    // A one-seat club.
+    let created = send(
+        &app,
+        "POST",
+        "/courses",
+        Some(&teacher),
+        Some(json!({ "title": "chess", "kind": "club", "capacity": 1 })),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED);
+    assert_eq!(created.body["kind"], "club");
+    assert_eq!(created.body["capacity"], 1);
+    let course_id = id_of(&created.body);
+
+    // The seat goes to alice; bob bounces off the full roster; re-enrolling
+    // the member stays an idempotent OK even at the cap.
+    let enroll = |cookie: String, user_id: String| {
+        let app = app.clone();
+        let path = format!("/courses/{course_id}/enrollments");
+        async move {
+            send(
+                &app,
+                "POST",
+                &path,
+                Some(&cookie),
+                Some(json!({ "user_id": user_id })),
+            )
+            .await
+            .status
+        }
+    };
+    assert_eq!(
+        enroll(teacher.clone(), alice_id.clone()).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        enroll(teacher.clone(), bob_id.clone()).await,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        enroll(teacher.clone(), alice_id.clone()).await,
+        StatusCode::OK
+    );
+
+    // `null` lifts the cap and the door reopens.
+    let lifted = send(
+        &app,
+        "PATCH",
+        &format!("/courses/{course_id}"),
+        Some(&teacher),
+        Some(json!({ "capacity": null })),
+    )
+    .await;
+    assert_eq!(lifted.status, StatusCode::OK);
+    assert!(lifted.body["capacity"].is_null());
+    assert_eq!(enroll(teacher.clone(), bob_id).await, StatusCode::OK);
+}
+
+#[tokio::test]
 async fn enrollment_requires_course_management() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "teacher", "teacher").await;

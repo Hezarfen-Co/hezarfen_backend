@@ -60,9 +60,9 @@ impl CourseDescription {
     }
 }
 
-/// A validated course kind: `course` (a regular class — ders) or `study` (a
-/// supervised study session — etüt). Purely a label; both kinds behave
-/// identically.
+/// A validated course kind: `course` (a regular class — ders), `study` (a
+/// supervised study session — etüt), or `club` (a student club — kulüp).
+/// Purely a label; all kinds behave identically.
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct CourseKind(String);
 
@@ -84,8 +84,10 @@ impl CourseKind {
 
 /// A course: the unit exams and enrollments hang off. Marks are computed per
 /// course, each exam weighted by its kind's settings weight. May belong to an
-/// academic term. Comes in two behaviorally identical kinds: `course` and
-/// `study` (etüt).
+/// academic term. Comes in three behaviorally identical kinds: `course`,
+/// `study` (etüt), and `club` (kulüp). An optional `capacity` caps the roster
+/// at enroll time (`None` = unlimited); rows written before the field existed
+/// decode as uncapped.
 #[derive(Debug, Clone, SurrealValue)]
 pub struct Course {
     id: CourseId,
@@ -94,6 +96,7 @@ pub struct Course {
     description: CourseDescription,
     kind: CourseKind,
     term: Option<TermId>,
+    capacity: Option<i64>,
 }
 
 impl Course {
@@ -121,6 +124,11 @@ impl Course {
         self.term.as_ref()
     }
 
+    /// The seat cap enforced at enroll time; `None` = unlimited.
+    pub fn get_capacity(&self) -> Option<i64> {
+        self.capacity
+    }
+
     pub fn is_creator(&self, user: &UserId) -> bool {
         &self.creator == user
     }
@@ -131,6 +139,7 @@ impl Course {
         description: CourseDescription,
         kind: CourseKind,
         term: Option<TermId>,
+        capacity: Option<i64>,
         db: &Database,
     ) -> Result<Course, AppError> {
         let course = Course {
@@ -140,6 +149,7 @@ impl Course {
             description,
             kind,
             term,
+            capacity,
         };
         let created: Option<Course> = db.create(course.id.record()).content(course).await?;
         created.ok_or_else(|| AppError::Internal("failed to create course".into()))
@@ -203,12 +213,14 @@ impl Course {
         description: CourseDescription,
         kind: CourseKind,
         term: Option<TermId>,
+        capacity: Option<i64>,
         db: &Database,
     ) -> Result<Course, AppError> {
         self.title = title;
         self.description = description;
         self.kind = kind;
         self.term = term;
+        self.capacity = capacity;
         let updated: Option<Course> = db.update(self.id.record()).content(self).await?;
         updated.ok_or(AppError::NotFound)
     }
@@ -259,10 +271,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kind_is_course_or_study() {
+    async fn kind_is_course_study_or_club() {
         assert!(CourseKind::try_new("course").is_ok());
         assert!(CourseKind::try_new("study").is_ok());
+        assert!(CourseKind::try_new("club").is_ok());
         assert!(CourseKind::try_new("etut").is_err());
         assert_eq!(CourseKind::course().as_str(), "course");
+    }
+
+    /// The database strips `NONE`-valued optional columns, and every course
+    /// row written before the capacity field existed has no `capacity` key at
+    /// all — both must decode as an uncapped course.
+    #[tokio::test]
+    async fn course_decodes_without_capacity_key() {
+        use surrealdb::types::Value;
+
+        let course = Course {
+            id: CourseId::generate(),
+            creator: UserId::from_key("01J8XZ0K3Q8G7X2M4N5P6R7S8T"),
+            title: CourseTitle::try_new("chess").unwrap(),
+            description: CourseDescription::try_new("").unwrap(),
+            kind: CourseKind::try_new("club").unwrap(),
+            term: None,
+            capacity: Some(12),
+        };
+        let Value::Object(mut object) = course.into_value() else {
+            panic!("course must encode as an object");
+        };
+        object.remove("capacity");
+        let decoded = Course::from_value(Value::Object(object)).unwrap();
+        assert_eq!(decoded.get_capacity(), None);
     }
 }

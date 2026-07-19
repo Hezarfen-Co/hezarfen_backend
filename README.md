@@ -17,8 +17,10 @@ closes the moment the event starts (or, for an event with only an end time —
 a pure signup deadline — the moment that end passes). Every event stays visible to everyone —
 the audience is a roster, not a wall. Marks are course-shaped
 (Google Classroom style): a teacher creates a course — kind **`course`** (a
-regular class) or **`study`** (a supervised study session — *etüt*; same
-behavior, different label) — lays out its **subjects** (curriculum topics —
+regular class), **`study`** (a supervised study session — *etüt*), or
+**`club`** (a student club — *kulüp*; same behavior, different label),
+optionally capped by a `capacity` that refuses new enrolls once the roster is
+full — lays out its **subjects** (curriculum topics —
 every exam question must be tagged with one of its course's subjects, so
 results can later be read per topic), enrolls students, adds
 exams inside it, and grades — enrolling, sitting exams, roll call, and marks are
@@ -257,10 +259,14 @@ surrealkv path (`./data/hezarfen.db`, namespace/database `hezarfen`).
 `Auth` is the minimum role; `no` means no session required, `student` means any
 logged-in user.
 
-A course is either a regular class (kind `course`, the default) or an *etüt*
-(kind `study` — a supervised study session). The two kinds behave identically
-everywhere — enrollment, exams, sessions, marks — the kind is a label the UI
-renders differently, settable at creation and editable later.
+A course is a regular class (kind `course`, the default), an *etüt* (kind
+`study` — a supervised study session), or a *kulüp* (kind `club` — a student
+club). The three kinds behave identically everywhere — enrollment, exams,
+sessions, marks — the kind is a label the UI renders differently, settable at
+creation and editable later. A course may also carry a `capacity`: once the
+roster reaches it, new enrolls are refused with `409` (members already on the
+roster are unaffected, even if the cap is later lowered below them; `null`
+lifts the cap).
 
 Course data is walled per course. A course, its exams, its sessions, and its
 subjects are
@@ -324,13 +330,13 @@ their existing shapes: the student exam-room reads
 | DELETE | `/events/{id}/attendance/{user}` | teacher | Remove a user's attendance      |
 | POST   | `/events/{id}/register`          | teacher | `{user_id?}` — seat a **student** (or yourself when omitted) on a registration event's signup list; idempotent, `409` once full or started |
 | DELETE | `/events/{id}/register/{user}`   | teacher | Free a seat (same self-or-student rule); `409` once the event started |
-| POST   | `/courses`                       | teacher | `{title, description?, kind?, term_id?}` — `kind` is `course` (default) or `study` (etüt) (creator manages it) |
+| POST   | `/courses`                       | teacher | `{title, description?, kind?, term_id?, capacity?}` — `kind` is `course` (default), `study` (etüt), or `club` (kulüp); `capacity` caps the roster (creator manages it) |
 | GET    | `/courses`                       | student | The caller's visible courses: created + enrolled (manager+: all) · paged |
 | GET    | `/courses/me`                    | student | The caller's **enrolled** courses · paged |
 | GET    | `/courses/{id}`                  | student | Get course (enrolled, creator, or manager+) |
-| PATCH  | `/courses/{id}`                  | teacher | Edit course (creator, or manager+ for any) |
+| PATCH  | `/courses/{id}`                  | teacher | Edit course incl. `kind` and `capacity` (`null` lifts the cap) (creator, or manager+ for any) |
 | DELETE | `/courses/{id}`                  | teacher | Delete course + its exams, results, enrollments, subjects (creator, or manager+) |
-| POST   | `/courses/{id}/enrollments`      | teacher | `{user_id}` — enroll a **student** (idempotent upsert; course manager; only students can be enrolled) |
+| POST   | `/courses/{id}/enrollments`      | teacher | `{user_id}` — enroll a **student** (idempotent upsert; course manager; only students can be enrolled; `409` once a capped course is full) |
 | GET    | `/courses/{id}/enrollments`      | teacher | List the course roster (course manager) · paged |
 | DELETE | `/courses/{id}/enrollments/{user}` | teacher | Unenroll (keeps recorded results; course manager) |
 | POST   | `/courses/{id}/sessions`         | teacher | `{topic?, teacher_id?, starts_at, ends_at?}` — add a lesson (course manager; teacher defaults to the caller) |

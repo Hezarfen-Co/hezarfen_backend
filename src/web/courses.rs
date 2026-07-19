@@ -50,25 +50,36 @@ struct CreateCourse {
     #[schema(example = "Algebra")]
     title: String,
     description: Option<String>,
-    /// `course` (a regular class — the default) or `study` (a supervised
-    /// study session — etüt). Behaviorally identical; a label for the UI.
+    /// `course` (a regular class — the default), `study` (a supervised study
+    /// session — etüt), or `club` (a student club — kulüp). Behaviorally
+    /// identical; a label for the UI.
     #[schema(example = "course")]
     kind: Option<String>,
     /// The academic term this course belongs to (`GET /terms`). Optional.
     term_id: Option<String>,
+    /// Seat cap enforced when enrolling, at least 1. Omit for unlimited.
+    #[schema(example = 12)]
+    capacity: Option<i64>,
 }
 
 #[derive(Deserialize, ToSchema)]
 struct UpdateCourse {
     title: Option<String>,
     description: Option<String>,
-    /// `course` or `study` (etüt). Omit to keep the current kind.
+    /// `course`, `study` (etüt), or `club` (kulüp). Omit to keep the current
+    /// kind.
     kind: Option<String>,
     /// Omit to keep the current term, send `null` to unlink, or send a term
     /// id to (re)assign.
     #[serde(default, deserialize_with = "set_or_clear")]
     #[schema(value_type = Option<String>)]
     term_id: Option<Option<String>>,
+    /// Omit to keep the current cap, send `null` to lift it, or send a value
+    /// (at least 1) to (re)cap. Lowering below the current roster keeps the
+    /// roster — only new enrolls are refused.
+    #[serde(default, deserialize_with = "set_or_clear")]
+    #[schema(value_type = Option<i64>, example = 12)]
+    capacity: Option<Option<i64>>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -186,9 +197,22 @@ pub(crate) async fn visible_courses(user: &User, db: &Database) -> Result<Vec<Co
 
 // ---- courses ------------------------------------------------------------
 
+/// A seat cap, when given, must be positive — `null`/omitted means unlimited.
+fn check_capacity(capacity: Option<i64>) -> Result<(), AppError> {
+    if capacity.is_some_and(|capacity| capacity < 1) {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "capacity",
+            reason: "capacity must be at least 1",
+        }));
+    }
+    Ok(())
+}
+
 /// Create a course owned by the current user. Requires the `teacher` role or
-/// higher. `kind` picks the flavor — `course` (a regular class, the default)
-/// or `study` (a supervised study session — etüt); both behave identically.
+/// higher. `kind` picks the flavor — `course` (a regular class, the default),
+/// `study` (a supervised study session — etüt), or `club` (a student club —
+/// kulüp); all behave identically. `capacity` caps the roster at enroll time
+/// (omit for unlimited).
 #[utoipa::path(
     post,
     path = "/",
@@ -197,7 +221,7 @@ pub(crate) async fn visible_courses(user: &User, db: &Database) -> Result<Vec<Co
     request_body = CreateCourse,
     responses(
         (status = 201, description = "Course created", body = CourseResponse),
-        (status = 400, description = "Invalid fields or kind", body = ErrorResponse),
+        (status = 400, description = "Invalid fields, kind, or capacity", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
     ),
@@ -214,7 +238,17 @@ async fn create_course(
         None => CourseKind::course(),
     };
     let term = resolve_term(req.term_id.as_deref(), &st.db).await?;
-    let course = Course::create(user.get_id(), title, description, kind, term, &st.db).await?;
+    check_capacity(req.capacity)?;
+    let course = Course::create(
+        user.get_id(),
+        title,
+        description,
+        kind,
+        term,
+        req.capacity,
+        &st.db,
+    )
+    .await?;
     Ok((StatusCode::CREATED, Json(CourseResponse::new(&course))))
 }
 
@@ -321,7 +355,7 @@ async fn get_course(
     request_body = UpdateCourse,
     responses(
         (status = 200, description = "Updated course", body = CourseResponse),
-        (status = 400, description = "Invalid fields or kind", body = ErrorResponse),
+        (status = 400, description = "Invalid fields, kind, or capacity", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
@@ -359,9 +393,17 @@ async fn update_course(
         Some(update) => resolve_term(update.as_deref(), &st.db).await?,
         None => course.get_term().cloned(),
     };
+    let capacity = match req.capacity {
+        // Explicit `null` lifts the cap; a value must be positive.
+        Some(update) => {
+            check_capacity(update)?;
+            update
+        }
+        None => course.get_capacity(),
+    };
 
     let updated = course
-        .update(title, description, kind, term, &st.db)
+        .update(title, description, kind, term, capacity, &st.db)
         .await?;
     Ok(Json(CourseResponse::new(&updated)))
 }
@@ -411,7 +453,8 @@ async fn delete_course(
 /// Enroll a user into a course (idempotent upsert). Requires teacher+ and
 /// course management rights. Only students can be enrolled — enrollment is
 /// student membership, and it gates sitting exams, being graded, and the class
-/// roster, all student-only.
+/// roster, all student-only. A course with a `capacity` refuses new members
+/// once the roster is full (someone already enrolled is returned as-is).
 #[utoipa::path(
     post,
     path = "/{id}/enrollments",
@@ -425,6 +468,7 @@ async fn delete_course(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
+        (status = 409, description = "The course is full", body = ErrorResponse),
     ),
 )]
 async fn enroll(

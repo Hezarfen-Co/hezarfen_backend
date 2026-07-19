@@ -112,7 +112,7 @@ pub const MAX_TERM_NAME_LEN: usize = 100;
 /// a supervised study session (etüt). Behaviorally identical — the kind is a
 /// label for the UI, everything else (enrollment, exams, sessions, marks)
 /// works the same.
-pub const COURSE_KINDS: [&str; 2] = ["course", "study"];
+pub const COURSE_KINDS: [&str; 3] = ["course", "study", "club"];
 
 /// The only accepted exam modes. `sync`: everyone sits the exam inside one
 /// fixed window. `async`: each student starts inside the window and gets their
