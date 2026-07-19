@@ -209,6 +209,12 @@ async fn protected_routes_require_session() {
         ("GET", "/exams/x/attempt/questions"),
         ("POST", "/exams/x/attempt/answers"),
         ("GET", "/exams/x/attempts/u/answers"),
+        ("POST", "/exams/x/questions/y/image"),
+        ("GET", "/exams/x/questions/y/image"),
+        ("DELETE", "/exams/x/questions/y/image"),
+        ("POST", "/exams/x/questions/y/choices/0/image"),
+        ("GET", "/exams/x/questions/y/choices/0/image"),
+        ("DELETE", "/exams/x/questions/y/choices/0/image"),
         // The WebSocket room authenticates before it upgrades.
         ("GET", "/exams/x/attempt/ws"),
         ("POST", "/courses/x/sessions"),
@@ -10057,4 +10063,362 @@ async fn settings_accept_admin_edits_trim_entries_and_noop_on_empty_patch() {
             {"name": "quiz", "weight": 1},
         ])
     );
+}
+
+// --- question images ---------------------------------------------------------
+
+/// POST `bytes` as a multipart image upload to `path`; returns (status, json).
+async fn post_image(
+    app: &axum::Router,
+    cookie: &str,
+    path: &str,
+    content_type: &str,
+    bytes: &[u8],
+) -> (StatusCode, serde_json::Value) {
+    let (status, _, body) = common::send_raw(
+        app,
+        "POST",
+        path,
+        Some(cookie),
+        Some("multipart/form-data; boundary=hezarfen-test-boundary"),
+        common::multipart_file("pic.png", content_type, bytes),
+    )
+    .await;
+    let body = if body.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null)
+    };
+    (status, body)
+}
+
+/// Every stored question-image blob name, straight from the table.
+async fn image_blob_keys(db: &hezarfen_backend::database::Database) -> Vec<String> {
+    let mut result = db
+        .query("SELECT VALUE file FROM question_image")
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    result.take::<Vec<String>>(0).unwrap()
+}
+
+/// The full life of question images: teacher uploads (question + choice slots,
+/// rasters only, choice slots bounded), metadata on both question views,
+/// bytes behind the sitting wall, replace swaps the blob, a choices PATCH
+/// drops the option pictures, and every delete path takes the blobs with it.
+#[tokio::test]
+async fn question_images_author_serve_and_cascade() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "img_t", "teacher").await;
+    let student = login(&app, "img_s").await;
+    let student_id = me_id(&app, &student).await;
+    let outsider = login(&app, "img_o").await;
+
+    let course = create_course(&app, &teacher, "geography").await;
+    let subject = create_subject(&app, &teacher, &course, "maps").await;
+    enroll(&app, &teacher, &course, &student_id).await;
+    let exam = scheduled_exam(
+        &app,
+        &teacher,
+        &course,
+        json!({ "title": "map quiz", "kind": "quiz", "mode": "open" }),
+    )
+    .await;
+    let question = create_question(
+        &app,
+        &teacher,
+        &exam,
+        &subject,
+        json!({ "text": "Which city is marked?", "kind": "choice", "points": 10,
+                "choices": ["Ankara", "İzmir"], "correct": 0 }),
+    )
+    .await;
+    let essay = create_question(
+        &app,
+        &teacher,
+        &exam,
+        &subject,
+        json!({ "text": "Describe the marked region.", "kind": "text", "points": 10 }),
+    )
+    .await;
+
+    let q_image = format!("/exams/{exam}/questions/{question}/image");
+    let png = b"png-bytes-question".as_slice();
+
+    // SVG is out (script risk); unknown types are out; rasters land.
+    let (status, body) = post_image(&app, &teacher, &q_image, "image/svg+xml", b"<svg/>").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = post_image(&app, &teacher, &q_image, "application/pdf", b"%PDF").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = post_image(&app, &teacher, &q_image, "image/png", png).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["content_type"], "image/png");
+    assert_eq!(body["size"], png.len() as i64);
+
+    // A classical (text) question takes an illustration too — but no option
+    // pictures, and no out-of-range slot anywhere.
+    let (status, body) = post_image(
+        &app,
+        &teacher,
+        &format!("/exams/{exam}/questions/{essay}/image"),
+        "image/jpeg",
+        b"jpeg-essay",
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, _) = post_image(
+        &app,
+        &teacher,
+        &format!("/exams/{exam}/questions/{essay}/choices/0/image"),
+        "image/png",
+        b"x",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "text questions take no option pictures"
+    );
+    let (status, _) = post_image(
+        &app,
+        &teacher,
+        &format!("/exams/{exam}/questions/{question}/choices/2/image"),
+        "image/png",
+        b"x",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "slot must index a choice");
+
+    // Option picture on choice 1, and the author view carries all the metas.
+    let choice_image = format!("/exams/{exam}/questions/{question}/choices/1/image");
+    let (status, _) = post_image(&app, &teacher, &choice_image, "image/webp", b"webp-choice").await;
+    assert_eq!(status, StatusCode::CREATED);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/questions"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    let listed = &common::items(&res.body)[0];
+    assert_eq!(listed["image"]["content_type"], "image/png");
+    assert!(listed["choice_images"][0].is_null());
+    assert_eq!(listed["choice_images"][1]["content_type"], "image/webp");
+
+    // Replace swaps the blob under the same slot: one row, fresh bytes.
+    let keys_before = image_blob_keys(&db).await;
+    let png2 = b"png-bytes-question-v2".as_slice();
+    let (status, body) = post_image(&app, &teacher, &q_image, "image/png", png2).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["size"], png2.len() as i64);
+    let keys_after = image_blob_keys(&db).await;
+    assert_eq!(keys_before.len(), keys_after.len(), "replace adds no row");
+    for stale in keys_before.iter().filter(|k| !keys_after.contains(k)) {
+        assert!(
+            !common::files_dir().join(stale).exists(),
+            "replaced blob lingers on disk"
+        );
+    }
+
+    // The bytes sit behind the sitting wall: outsiders 403, enrolled students
+    // 404 until an attempt exists, then 200 with the guard headers on.
+    let (status, _, _) =
+        common::send_raw(&app, "GET", &q_image, Some(&outsider), None, Vec::new()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _, _) =
+        common::send_raw(&app, "GET", &q_image, Some(&student), None, Vec::new()).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "no early peek before the attempt"
+    );
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let (status, headers, bytes) =
+        common::send_raw(&app, "GET", &q_image, Some(&student), None, Vec::new()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, png2);
+    assert_eq!(headers["content-type"], "image/png");
+    assert_eq!(headers["x-content-type-options"], "nosniff");
+    assert_eq!(headers["cache-control"], "private, no-store");
+    let (status, _, bytes) =
+        common::send_raw(&app, "GET", &choice_image, Some(&student), None, Vec::new()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, b"webp-choice");
+
+    // The sitting view embeds the same metadata the author sees (sans key).
+    let res = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/attempt/questions"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body[0]["image"]["content_type"], "image/png");
+    assert_eq!(
+        res.body[0]["choice_images"][1]["content_type"],
+        "image/webp"
+    );
+    assert_eq!(res.body[1]["image"]["content_type"], "image/jpeg");
+    assert!(res.body[1]["choice_images"].is_null());
+
+    // Images freeze with the rest of the question once attempts exist.
+    let (status, body) = post_image(&app, &teacher, &q_image, "image/png", b"late").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let res = send(&app, "DELETE", &q_image, Some(&teacher), None).await;
+    assert_eq!(res.status, StatusCode::CONFLICT);
+
+    // Deleting the exam takes every image row and blob with it.
+    let keys = image_blob_keys(&db).await;
+    assert_eq!(keys.len(), 3);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/exams/{exam}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    assert!(
+        image_blob_keys(&db).await.is_empty(),
+        "rows survived the cascade"
+    );
+    for key in &keys {
+        assert!(
+            !common::files_dir().join(key).exists(),
+            "blob {key} survived the exam delete"
+        );
+    }
+}
+
+/// The authoring edits that reshape a question also groom its images: a
+/// replaced `choices` list drops the option pictures (the illustration
+/// stays), an explicit image DELETE removes row + blob, and deleting the
+/// question sweeps the rest.
+#[tokio::test]
+async fn question_image_edits_follow_the_choices() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "imge_t", "teacher").await;
+    let course = create_course(&app, &teacher, "history").await;
+    let subject = create_subject(&app, &teacher, &course, "eras").await;
+    let exam = scheduled_exam(
+        &app,
+        &teacher,
+        &course,
+        json!({ "title": "eras", "kind": "quiz", "mode": "open" }),
+    )
+    .await;
+    let question = create_question(
+        &app,
+        &teacher,
+        &exam,
+        &subject,
+        json!({ "text": "Pick the era.", "kind": "choice", "points": 5,
+                "choices": ["Bronze", "Iron"], "correct": 1 }),
+    )
+    .await;
+    let base = format!("/exams/{exam}/questions/{question}");
+    for (path, bytes) in [
+        (format!("{base}/image"), b"illustration".as_slice()),
+        (format!("{base}/choices/0/image"), b"bronze".as_slice()),
+        (format!("{base}/choices/1/image"), b"iron".as_slice()),
+    ] {
+        let (status, body) = post_image(&app, &teacher, &path, "image/png", bytes).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    // A points-only PATCH touches no images.
+    let res = send(
+        &app,
+        "PATCH",
+        &base,
+        Some(&teacher),
+        Some(json!({ "points": 7 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert!(res.body["image"].is_object());
+    assert!(res.body["choice_images"][0].is_object());
+    assert!(res.body["choice_images"][1].is_object());
+
+    // Replacing the choices drops the option pictures, keeps the illustration.
+    let keys_before = image_blob_keys(&db).await;
+    let res = send(
+        &app,
+        "PATCH",
+        &base,
+        Some(&teacher),
+        Some(json!({ "choices": ["Stone", "Bronze", "Iron"], "correct": 2 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert!(res.body["image"].is_object(), "illustration must survive");
+    assert_eq!(
+        res.body["choice_images"],
+        json!([null, null, null]),
+        "option pictures must not follow a replaced list"
+    );
+    let keys_after = image_blob_keys(&db).await;
+    assert_eq!(keys_after.len(), 1);
+    for dropped in keys_before.iter().filter(|k| !keys_after.contains(k)) {
+        assert!(
+            !common::files_dir().join(dropped).exists(),
+            "dropped option blob lingers"
+        );
+    }
+
+    // Explicit image DELETE: 204 once, 404 after, blob gone.
+    let (status, _) = post_image(
+        &app,
+        &teacher,
+        &format!("{base}/choices/0/image"),
+        "image/gif",
+        b"gif",
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("{base}/choices/0/image"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("{base}/choices/0/image"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+
+    // Deleting the question sweeps its remaining image rows and blobs.
+    let keys = image_blob_keys(&db).await;
+    assert_eq!(keys.len(), 1);
+    let res = send(&app, "DELETE", &base, Some(&teacher), None).await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    assert!(image_blob_keys(&db).await.is_empty());
+    for key in &keys {
+        assert!(
+            !common::files_dir().join(key).exists(),
+            "blob {key} survived the question delete"
+        );
+    }
 }

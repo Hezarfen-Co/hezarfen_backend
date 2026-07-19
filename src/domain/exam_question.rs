@@ -293,13 +293,17 @@ impl ExamQuestion {
         updated.ok_or(AppError::NotFound)
     }
 
-    /// Delete the question and cascade-remove its answers, so no answer row
-    /// can point at a missing question.
+    /// Delete the question and cascade-remove its answers and image rows, so
+    /// neither can point at a missing question. The image *blobs* are the web
+    /// layer's to remove — it collects their names before calling this.
     pub async fn delete(self, db: &Database) -> Result<ExamQuestion, AppError> {
-        db.query("DELETE exam_answer WHERE question = $q")
-            .bind(("q", self.id.record()))
-            .await?
-            .check()?;
+        db.query(
+            "DELETE exam_answer WHERE question = $q;
+             DELETE question_image WHERE question = $q;",
+        )
+        .bind(("q", self.id.record()))
+        .await?
+        .check()?;
         let deleted: Option<ExamQuestion> = db.delete(self.id.record()).await?;
         deleted.ok_or(AppError::NotFound)
     }

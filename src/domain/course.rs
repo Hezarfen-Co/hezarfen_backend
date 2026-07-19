@@ -213,16 +213,19 @@ impl Course {
         updated.ok_or(AppError::NotFound)
     }
 
-    /// Delete the course and cascade-remove everything inside it: results and
-    /// attempts of its exams, its enrollments, its sessions with their roll
-    /// call, its subjects, and the exams themselves. The children go in one
-    /// transaction so a crash can't leave an exam pointing at a deleted course.
+    /// Delete the course and cascade-remove everything inside it: results,
+    /// attempts, and question images of its exams, its enrollments, its
+    /// sessions with their roll call, its subjects, and the exams themselves.
+    /// The children go in one transaction so a crash can't leave an exam
+    /// pointing at a deleted course. The image *blobs* are the web layer's to
+    /// remove — it collects their names before calling this.
     pub async fn delete(self, db: &Database) -> Result<Course, AppError> {
         db.query(
             "BEGIN TRANSACTION;
              DELETE exam_result WHERE exam IN (SELECT VALUE id FROM exam WHERE course = $course);
              DELETE exam_attempt WHERE exam IN (SELECT VALUE id FROM exam WHERE course = $course);
              DELETE exam_answer WHERE exam IN (SELECT VALUE id FROM exam WHERE course = $course);
+             DELETE question_image WHERE exam IN (SELECT VALUE id FROM exam WHERE course = $course);
              DELETE exam_question WHERE exam IN (SELECT VALUE id FROM exam WHERE course = $course);
              DELETE session_attendance WHERE course = $course;
              DELETE course_session WHERE course = $course;

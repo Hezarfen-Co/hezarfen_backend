@@ -30,7 +30,11 @@ fixed window), **async** (start anytime inside the window, with a personal
 time budget), or **open** (sit anytime, optionally timed per attempt);
 students *sit* them via attempts — retakes metered by a per-exam limit
 (`0` = unlimited), leaving the exam room governed by a teacher-controlled
-rejoin door — and teachers watch attendance, per-student remaining time,
+rejoin door. Questions can carry **images**: any question may hold one
+illustration (a map above the prompt), and each option of a choice question
+may be a picture of its own (pick the right city off the map) — raster
+uploads capped by the same `max_file_bytes` policy as note files. Teachers
+watch attendance, per-student remaining time,
 sittings, walk-outs, no-shows (`absent` once the window closes), submissions,
 and marks land live on a monitor endpoint (snapshot or SSE stream). Courses also carry **lesson
 sessions** with teacher-taken roll call (students never self-mark a lesson),
@@ -197,7 +201,7 @@ effect on the user's very next call (no re-login).
 | View **visible** courses/exams and a course's subjects; read **own** result, courses, mark report | student | Visible = enrolled (teachers: + created; `manager`+: all) |
 | Sit a sittable exam (`sync`/`async`/`open`): start / resume / retake / read / submit **own** attempt | student | **Students only** — staff never sit; must be enrolled; window (where one exists) and `max_attempts` enforced by the server |
 | Answer questions inside **own** attempt (REST autosave or the exam-room WebSocket) | student | **Students only**; attempt must be `in_progress`; deadline judged by the server clock; blocked after leaving the room while `allow_rejoin` is off |
-| Author an exam's questions (add/edit/delete)  | teacher | Course-management rights; frozen once anyone has an attempt |
+| Author an exam's questions (add/edit/delete, incl. question + option images) | teacher | Course-management rights; frozen once anyone has an attempt |
 | Read a question list (with `correct`) or a student's answer sheet | teacher | Course-management rights — one teacher can't read another's answer key |
 | Watch an exam's live monitor (snapshot or SSE stream) | teacher | Course-management rights |
 | Create courses                           | teacher      | The creator manages the course                 |
@@ -340,7 +344,7 @@ their existing shapes: the student exam-room reads
 | GET    | `/exams`                         | student | The caller's visible exams: their courses' (manager+: all) · paged |
 | GET    | `/exams/{id}`                    | student | Get exam (enrolled, creator, or manager+) |
 | PATCH  | `/exams/{id}`                    | teacher | Edit exam incl. `kind` (re-weights it), schedule, `max_attempts`, `allow_rejoin` (course manager; `course` immutable, `mode` frozen once attempted — the rest stays live) |
-| DELETE | `/exams/{id}`                    | teacher | Delete exam + its results, attempts, questions, and answers (course manager) |
+| DELETE | `/exams/{id}`                    | teacher | Delete exam + its results, attempts, questions, answers, and question images (course manager) |
 | POST   | `/exams/{id}/results`            | teacher | `{mark, user_id}` — grade an **enrolled student** (upsert; course manager; students only) |
 | GET    | `/exams/{id}/results`            | teacher | List every result for the exam (course manager) · paged |
 | GET    | `/exams/{id}/result`             | student | The caller's **own** result (`404` until graded) |
@@ -353,7 +357,13 @@ their existing shapes: the student exam-room reads
 | GET    | `/exams/{id}/questions`          | teacher | The full question list, `correct` included (course manager) · paged |
 | PATCH  | `/exams/{id}/questions/{qid}`    | teacher | Edit a question — the kind bundle revalidates as a unit (course manager; frozen once attempted) |
 | DELETE | `/exams/{id}/questions/{qid}`    | teacher | Delete a question + its answers (course manager; frozen once attempted) |
-| GET    | `/exams/{id}/attempt/questions`  | student | The sitting view: no `correct`, own answers embedded (requires enrollment + an attempt) |
+| GET    | `/exams/{id}/attempt/questions`  | student | The sitting view: no `correct`, own answers embedded, image metadata included (requires enrollment + an attempt) |
+| POST   | `/exams/{id}/questions/{qid}/image` | teacher | Attach/replace the question's illustration: `multipart/form-data`, one `file` part — raster images only (`png`/`jpeg`/`webp`/`gif`), ≤ `max_file_bytes` (course manager; frozen once attempted) |
+| GET    | `/exams/{id}/questions/{qid}/image` | student | The illustration bytes (course manager anytime; students enrolled + attempt started) |
+| DELETE | `/exams/{id}/questions/{qid}/image` | teacher | Remove the illustration (course manager; frozen once attempted) |
+| POST   | `/exams/{id}/questions/{qid}/choices/{index}/image` | teacher | Attach/replace option `index`'s picture (`choice` questions; same form and limits as above) |
+| GET    | `/exams/{id}/questions/{qid}/choices/{index}/image` | student | The option picture's bytes (same access as the illustration) |
+| DELETE | `/exams/{id}/questions/{qid}/choices/{index}/image` | teacher | Remove one option picture (course manager; frozen once attempted) |
 | POST   | `/exams/{id}/attempt/answers`    | student | `{question_id, selected? \| text?}` — autosave one answer while a student, enrolled, and `in_progress` (and not locked out by a closed rejoin door) |
 | GET    | `/exams/{id}/attempts/{user}/answers` | teacher | A student's answer sheet: `is_correct` flags + suggested `auto_score` (course manager) |
 | GET    | `/exams/{id}/attempt/ws`         | student | **WebSocket** exam room (students only): state ticks, autosave, finish; entering clears `left_at`, leaving stamps it (see "Taking an exam") |
@@ -487,10 +497,10 @@ editable `settings` singleton (`GET /settings` for any signed-in user,
   averaging stay `0`–`100` forever — bands only add `grade`,
   `average_grade`, and `overall_grade` labels to the mark report, so a school
   can switch display scales without touching a single stored mark.
-- **`max_file_bytes`** — the per-file size cap for note uploads, in bytes:
-  `1024` (1 KiB) to `26214400` (25 MiB; a server hard cap — uploads buffer in
-  memory), default `5242880` (5 MiB). Checked at upload time only:
-  lowering it never touches already-stored files.
+- **`max_file_bytes`** — the per-file size cap for uploads (note files and
+  exam question images alike), in bytes: `1024` (1 KiB) to `26214400` (25 MiB;
+  a server hard cap — uploads buffer in memory), default `5242880` (5 MiB).
+  Checked at upload time only: lowering it never touches already-stored files.
 
 A `PATCH` replaces only the fields it carries, each wholesale, and validation
 is all-or-nothing. Concurrent edits are safe: each save applies only if the
@@ -590,9 +600,10 @@ const es = new EventSource(`${BASE}/exams/${id}/live/stream`, { withCredentials:
 es.addEventListener("snapshot", (e) => render(JSON.parse(e.data)));
 ```
 
-Deleting an exam (or its course) cascades attempts, questions, and answers
-along with results; unenrolling mid-exam hides the student from the monitor
-roster but keeps the attempt and mark rows, mirroring the marks report.
+Deleting an exam (or its course) cascades attempts, questions, answers, and
+question images (blobs included) along with results; unenrolling mid-exam
+hides the student from the monitor roster but keeps the attempt and mark
+rows, mirroring the marks report.
 
 > **Upgrading a pre-course database**: `exam` rows created before courses
 > existed lack the now-required `course` field and will fail to deserialize.
@@ -635,7 +646,28 @@ switching a question to `text` needs explicit `"choices": null, "correct":
 null`, switching to `choice` must bring both along. Presentation order is
 creation order. The whole list **freezes once anyone has started an attempt**
 (`409` on create/edit/delete) — editing questions under a sitting student
-would fork what "the exam" means. Deleting a question cascades its answers.
+would fork what "the exam" means. Deleting a question cascades its answers
+and images.
+
+**Question images**: any question may carry one **illustration** (`POST
+/exams/{id}/questions/{qid}/image` — the map the prompt asks about, on
+`choice` and `text` questions alike), and each option of a `choice` question
+may carry a **picture** of its own (`POST .../choices/{index}/image` — so
+the options themselves can be images: four map crops, pick the right one).
+Uploads are `multipart/form-data` with a single `file` part, capped by the
+school's `max_file_bytes`; the declared content type must be `image/png`,
+`image/jpeg`, `image/webp`, or `image/gif` (rasters only — SVG can script,
+and these bytes render inline for the whole class). One image per slot:
+re-uploading replaces, `DELETE` on the same paths removes, and replacing a
+question's `choices` list drops all its option pictures (the illustration
+stays — re-upload against the new list). Image writes follow question
+authoring exactly: course-management rights, frozen once attempts exist.
+Both question views (`GET /exams/{id}/questions` and the sitting view)
+embed the metadata as `image: {content_type, size} | null` and
+`choice_images: [...|null]` aligned with `choices`; the bytes come from the
+`GET` endpoints above — course managers anytime, students through the same
+enrollment + started-attempt wall as the sitting view (no early peek at the
+pictures either), served with `Cache-Control: private, no-store`.
 
 **Answering** (student, attempt `in_progress`, deadline judged by the server
 clock on every save):

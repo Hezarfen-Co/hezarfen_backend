@@ -19,6 +19,7 @@ pub const EXAM_TABLE: &str = "exam";
 pub const EXAM_RESULT_TABLE: &str = "exam_result";
 pub const EXAM_ATTEMPT_TABLE: &str = "exam_attempt";
 pub const EXAM_QUESTION_TABLE: &str = "exam_question";
+pub const QUESTION_IMAGE_TABLE: &str = "question_image";
 pub const EXAM_ANSWER_TABLE: &str = "exam_answer";
 pub const COURSE_TABLE: &str = "course";
 pub const ENROLLMENT_TABLE: &str = "enrollment";
@@ -183,6 +184,16 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS subject ON exam_question TYPE record<subject>;
     DEFINE INDEX IF NOT EXISTS exam_question_exam ON exam_question FIELDS exam;
     DEFINE INDEX IF NOT EXISTS exam_question_subject ON exam_question FIELDS subject;
+
+    DEFINE TABLE IF NOT EXISTS question_image SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS exam ON question_image TYPE record<exam>;
+    DEFINE FIELD IF NOT EXISTS question ON question_image TYPE record<exam_question>;
+    DEFINE FIELD IF NOT EXISTS slot ON question_image TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS file ON question_image TYPE string;
+    DEFINE FIELD IF NOT EXISTS content_type ON question_image TYPE string;
+    DEFINE FIELD IF NOT EXISTS size ON question_image TYPE int;
+    DEFINE INDEX IF NOT EXISTS question_image_exam ON question_image FIELDS exam;
+    DEFINE INDEX IF NOT EXISTS question_image_question ON question_image FIELDS question;
 
     DEFINE TABLE IF NOT EXISTS exam_answer SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS exam ON exam_answer TYPE record<exam>;

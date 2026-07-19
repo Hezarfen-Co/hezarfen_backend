@@ -55,6 +55,12 @@ pub const MAX_MAX_FILE_BYTES: i64 = 25 * 1024 * 1024;
 /// the file bytes themselves.
 pub const UPLOAD_BODY_OVERHEAD_BYTES: usize = 64 * 1024;
 
+/// The content types a question image may declare — raster formats only. SVG
+/// is deliberately out: it can carry scripts, and these bytes are served for
+/// inline display to everyone sitting the exam.
+pub const QUESTION_IMAGE_CONTENT_TYPES: [&str; 4] =
+    ["image/png", "image/jpeg", "image/webp", "image/gif"];
+
 pub const MAX_EVENT_TITLE_LEN: usize = 200;
 pub const MAX_EVENT_DESCRIPTION_LEN: usize = 2_000;
 

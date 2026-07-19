@@ -16,6 +16,7 @@ use crate::domain::exam::{
     Exam, ExamAttemptLimit, ExamDescription, ExamDuration, ExamKind, ExamMode, ExamSchedule,
     ExamTitle,
 };
+use crate::domain::question_image::QuestionImage;
 use crate::domain::role::Role;
 use crate::domain::settings::Settings;
 use crate::domain::subject::{Subject, SubjectDescription, SubjectName};
@@ -29,7 +30,7 @@ use super::terms::resolve_term;
 use super::{
     CourseResponse, CurrentUser, ExamResponse, Page, PageParams, PersonRef, RequireTeacher,
     SessionResponse, SubjectResponse, check_not_past, check_time_range, paginate, person_map,
-    set_or_clear,
+    remove_blob, set_or_clear,
 };
 
 pub fn routes() -> OpenApiRouter<AppState> {
@@ -362,8 +363,9 @@ async fn update_course(
 }
 
 /// Delete a course. Requires teacher+; the creator may delete their own course
-/// and managers/admins may delete anyone's. Cascades the course's exams, their
-/// results, and all enrollments.
+/// and managers/admins may delete anyone's. Cascades the course's exams (with
+/// their results, questions, answers, and question images), its sessions and
+/// roll call, its subjects, and all enrollments.
 #[utoipa::path(
     delete,
     path = "/{id}",
@@ -390,7 +392,13 @@ async fn delete_course(
             "only the course creator or a manager/admin can delete this course",
         ));
     }
+    // Rows go first (the delete cascades them), blobs after — a crash in
+    // between strands at worst an unreachable blob.
+    let image_files = QuestionImage::file_keys_for_course(course.get_id(), &st.db).await?;
     course.delete(&st.db).await?;
+    for file in &image_files {
+        remove_blob(&st.files_path, file).await;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
