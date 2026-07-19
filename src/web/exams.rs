@@ -50,13 +50,15 @@ use super::{
 /// Serializes the exam subsystem's cross-record check-then-writes, which
 /// `BEGIN…COMMIT` cannot (write skew) — same reasoning as `REGISTER_LOCK`.
 /// Read side: the answer saves (REST and the exam room), holding the sheet
-/// open from the writable-attempt gate through the upsert; saves stay
-/// concurrent with each other. Write side: attempt starts (the max-attempts
-/// count and the retake's answer wipe) and the structural teacher writes
-/// whose 409 guards read attempt or question rows first — exam mode/schedule
+/// open from the writable-attempt gate through the upsert, and the grade
+/// write (draft gate through the result upsert); these stay concurrent with
+/// each other. Write side: attempt starts (the max-attempts count and the
+/// retake's answer wipe) and the structural teacher writes whose 409 guards
+/// read attempt, question, or result rows first — exam mode/schedule/draft
 /// updates, question create/update/delete, subject delete. So a save can
-/// never land on a sheet a retake just wiped, and a first attempt can never
-/// slip between a freeze-gate read and the write it was meant to freeze.
+/// never land on a sheet a retake just wiped, a first attempt can never
+/// slip between a freeze-gate read and the write it was meant to freeze,
+/// and a mark can never land on an exam mid-flight into hiding.
 // ponytail: global RwLock, shard per-exam if save latency ever matters.
 pub(crate) static EXAM_LOCK: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
 
@@ -113,8 +115,8 @@ struct UpdateExam {
     /// settings-configured weight.
     kind: Option<String>,
     /// `sync`, `async`, or `open`. Omit to keep the current mode; send `null`
-    /// to turn the exam back into an offline draft. Frozen once anyone has
-    /// started an attempt. Switching to `open` requires clearing
+    /// to turn the exam back into an offline-graded one. Frozen once anyone
+    /// has started an attempt. Switching to `open` requires clearing
     /// `starts_at`/`ends_at` in the same request.
     #[serde(default, deserialize_with = "set_or_clear")]
     #[schema(value_type = Option<String>)]
@@ -143,6 +145,10 @@ struct UpdateExam {
     /// Whether students who left the exam room may come back in. Omit to
     /// keep. Editable live — the teacher's door handle for the running room.
     allow_rejoin: Option<bool>,
+    /// `false` publishes a draft (students can now see and sit it); `true`
+    /// pulls a published exam back into hiding — allowed only while nobody
+    /// has attempted it and nothing is graded (`409` otherwise). Omit to keep.
+    draft: Option<bool>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -201,7 +207,8 @@ async fn course_of(exam: &Exam, db: &Database) -> Result<Course, AppError> {
 // Exams are created inside a course: `POST /courses/{id}/exams`.
 
 /// List the exams visible to the caller: every exam for manager+, otherwise
-/// the exams of the courses they created or are enrolled in. Paged via
+/// the exams of the courses they created or are enrolled in — minus other
+/// people's drafts (a draft shows only to its course's managers). Paged via
 /// `?limit=&offset=` (omit `limit` for the full list); returns a
 /// `{items, total, limit, offset}` envelope.
 #[utoipa::path(
@@ -227,7 +234,16 @@ async fn list_exams(
     } else {
         let courses = visible_courses(&user, &st.db).await?;
         let ids: Vec<_> = courses.iter().map(|c| c.get_id().clone()).collect();
-        Exam::list_for_courses(&ids, &st.db).await?
+        // Drafts show only where the caller manages the course (as its
+        // creator — the manager+ path above already saw everything).
+        let managed: Vec<&str> = courses
+            .iter()
+            .filter(|c| can_manage_course(c, &user))
+            .map(|c| c.get_id().key())
+            .collect();
+        let mut exams = Exam::list_for_courses(&ids, &st.db).await?;
+        exams.retain(|exam| !exam.is_draft() || managed.contains(&exam.get_course().key()));
+        exams
     };
     let total = exams.len() as i64;
     let items = paginate(&exams, limit, offset)
@@ -238,7 +254,9 @@ async fn list_exams(
 }
 
 /// Fetch a single exam by id. Visible to its course's enrolled users, the
-/// course creator, and managers/admins.
+/// course creator, and managers/admins — except drafts, which only the
+/// course's managers see (everyone else gets a `404`, as if the exam doesn't
+/// exist yet — because it doesn't, officially).
 #[utoipa::path(
     get,
     path = "/{id}",
@@ -249,7 +267,7 @@ async fn list_exams(
         (status = 200, description = "The exam", body = ExamResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not enrolled in the exam's course, not its creator, and not a manager/admin", body = ErrorResponse),
-        (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 404, description = "Not found (or a draft the caller may not see)", body = ErrorResponse),
     ),
 )]
 async fn get_exam(
@@ -266,6 +284,11 @@ async fn get_exam(
             "only enrolled users, the course creator, or a manager/admin can view this exam",
         ));
     }
+    // A draft doesn't exist for anyone but its course's managers — 404, not
+    // 403, so its existence never leaks to the students it's hidden from.
+    if exam.is_draft() && !can_manage_course(&course, &user) {
+        return Err(AppError::NotFound);
+    }
     Ok(Json(ExamResponse::new(&exam)))
 }
 
@@ -276,6 +299,9 @@ async fn get_exam(
 /// `mode` is frozen once anyone has started an attempt — times, duration,
 /// `max_attempts`, and `allow_rejoin` stay editable so a running exam can be
 /// extended, granted retakes, or have its rejoin door opened live.
+/// `draft: false` publishes a draft; `draft: true` re-hides an exam, but only
+/// while it has no attempts and no results (`409` otherwise) — students never
+/// lose sight of an exam they've already sat or been graded on.
 #[utoipa::path(
     patch,
     path = "/{id}",
@@ -289,7 +315,7 @@ async fn get_exam(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "Mode change after attempts started", body = ErrorResponse),
+        (status = 409, description = "Mode change after attempts started, or re-drafting an exam that has attempts or results", body = ErrorResponse),
     ),
 )]
 async fn update_exam(
@@ -362,10 +388,11 @@ async fn update_exam(
         None => exam.get_max_attempts(),
     };
     let allow_rejoin = req.allow_rejoin.unwrap_or_else(|| exam.get_allow_rejoin());
+    let draft = req.draft.unwrap_or_else(|| exam.is_draft());
 
-    // Switching sync <-> async <-> open (or back to a draft) would silently
-    // rewrite the deadline rules under students who already sat down;
-    // extending times, the attempt limit, and the rejoin door are the
+    // Switching sync <-> async <-> open (or back to unscheduled) would
+    // silently rewrite the deadline rules under students who already sat
+    // down; extending times, the attempt limit, and the rejoin door are the
     // supported live adjustments instead. Gate read and write share one
     // writer lease of [`EXAM_LOCK`], so a first attempt can't land in the
     // gap and leave a sat exam's mode flipped under it.
@@ -377,6 +404,20 @@ async fn update_exam(
             "cannot change the exam mode after attempts have started",
         ));
     }
+    // Re-drafting hides the exam — never out from under a student who already
+    // sat it or holds a mark on it. Same writer lease: a first attempt or an
+    // in-flight grade (readers) can't slip between this gate and the write.
+    if draft && !exam.is_draft() {
+        let sat = ExamAttempt::any_for_exam(exam.get_id(), &st.db).await?;
+        let graded = !ExamResult::list_for_exam(exam.get_id(), &st.db)
+            .await?
+            .is_empty();
+        if sat || graded {
+            return Err(AppError::Conflict(
+                "cannot turn a published exam back into a draft after attempts or results exist",
+            ));
+        }
+    }
 
     let updated = exam
         .update(
@@ -386,6 +427,7 @@ async fn update_exam(
             schedule,
             max_attempts,
             allow_rejoin,
+            draft,
             &st.db,
         )
         .await?;
@@ -437,7 +479,8 @@ async fn delete_exam(
 /// Record (or overwrite) a student's mark for an exam. Requires teacher+ and
 /// management rights over the exam's course; the target must be a student and
 /// enrolled. Only students carry marks; students never grade — and nobody
-/// grades themselves.
+/// grades themselves. A draft can't be graded (`409`) — a mark would point at
+/// an exam its student can't see.
 #[utoipa::path(
     post,
     path = "/{id}/results",
@@ -451,6 +494,7 @@ async fn delete_exam(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator (and not a manager/admin), or attempted to grade yourself", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
+        (status = 409, description = "The exam is a draft", body = ErrorResponse),
     ),
 )]
 async fn grade(
@@ -460,6 +504,11 @@ async fn grade(
     Json(req): Json<GradeResult>,
 ) -> Result<Json<ExamResultResponse>, AppError> {
     let exam_id = ExamId::from_key(&id);
+    // Reader lease of [`EXAM_LOCK`] from the exam read through the result
+    // write: the draft gate below must be judged against the same row the
+    // mark lands under, or a concurrent re-draft (a writer, which checks for
+    // results) could slip between them and leave a mark on a hidden exam.
+    let _guard = EXAM_LOCK.read().await;
     // Exam must exist.
     let exam = Exam::read(&exam_id, &st.db)
         .await?
@@ -468,6 +517,11 @@ async fn grade(
     if !can_manage_course(&course, &teacher) {
         return Err(AppError::Forbidden(
             "only the course creator or a manager/admin can grade this exam",
+        ));
+    }
+    if exam.is_draft() {
+        return Err(AppError::Conflict(
+            "this exam is a draft — publish it before grading",
         ));
     }
 
@@ -781,11 +835,16 @@ async fn attempt_progress(
     Ok((answered, question_count))
 }
 
-/// A 409 unless the exam can be sat at all: it needs a mode (`sync`, `async`,
-/// or `open`) — a modeless exam is an offline-graded draft. Enrollment and
-/// window checks for the caller are the caller's own state — hence `Conflict`
-/// (a state problem), not validation.
-fn ensure_sittable(exam: &Exam) -> Result<(), AppError> {
+/// Rejects sitting an exam that can't be sat. A draft is a `404`, not a
+/// `409` — sitting is a student act, drafts are invisible to students, and a
+/// state-specific error would leak the existence this feature hides. A
+/// modeless (offline-graded) exam is a `409`: visible, just nothing to sit.
+/// Enrollment and window checks for the caller are the caller's own state —
+/// also `Conflict`, not validation.
+pub(crate) fn ensure_sittable(exam: &Exam) -> Result<(), AppError> {
+    if exam.is_draft() {
+        return Err(AppError::NotFound);
+    }
     if exam.get_mode().is_none() {
         return Err(AppError::Conflict(
             "this exam is not scheduled — there is nothing to sit (give it a mode: sync, async, or open)",
@@ -818,8 +877,8 @@ async fn attempts_used(exam: &ExamId, user: &UserId, db: &Database) -> Result<u6
         (status = 200, description = "Running attempt resumed (unchanged)", body = AttemptResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not a student, or not enrolled in the exam's course", body = ErrorResponse),
-        (status = 404, description = "Exam not found", body = ErrorResponse),
-        (status = 409, description = "Draft exam, outside the window, or no attempts remaining", body = ErrorResponse),
+        (status = 404, description = "Exam not found (drafts are invisible here)", body = ErrorResponse),
+        (status = 409, description = "Unscheduled (offline-graded) exam, outside the window, or no attempts remaining", body = ErrorResponse),
     ),
 )]
 async fn start_attempt(
@@ -830,8 +889,9 @@ async fn start_attempt(
     // Writer lease of [`EXAM_LOCK`] from the exam read through the start: the
     // sittable/window gates must be judged against the same exam row the
     // attempt lands under (the mirror of `update_exam`'s re-derive — without
-    // it, a mode change at legally-zero attempts could slip between this
-    // gate and the insert, leaving an attempt on a draft exam). The lease
+    // it, a mode change or re-draft at legally-zero attempts could slip
+    // between this gate and the insert, leaving an attempt on an unsittable
+    // exam). The lease
     // also keeps the max-attempts count and the retake's wipe-and-create
     // from interleaving with an in-flight answer save (a reader). Dropped
     // before the response reads — they only describe the row.

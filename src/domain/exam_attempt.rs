@@ -366,6 +366,7 @@ mod tests {
                 .unwrap(),
             ExamAttemptLimit::try_new(max_attempts).unwrap(),
             true,
+            false,
             db,
         )
         .await

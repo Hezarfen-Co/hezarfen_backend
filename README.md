@@ -30,7 +30,9 @@ fixed window), **async** (start anytime inside the window, with a personal
 time budget), or **open** (sit anytime, optionally timed per attempt);
 students *sit* them via attempts — retakes metered by a per-exam limit
 (`0` = unlimited), leaving the exam room governed by a teacher-controlled
-rejoin door. Questions can carry **images**: any question may hold one
+rejoin door. Writing an exam takes a while, so it can be saved as a
+**draft** — invisible to students, unsittable, ungradable — and published
+when it's ready. Questions can carry **images**: any question may hold one
 illustration (a map above the prompt), and each option of a choice question
 may be a picture of its own (pick the right city off the map) — raster
 uploads capped by the same `max_file_bytes` policy as note files. Teachers
@@ -203,7 +205,7 @@ effect on the user's very next call (no re-login).
 | View **any** user's pomodoro log          | teacher      | Study oversight — same shape as `/pomodoro/me`, incl. the unpaged `total_focus_ms` |
 | Read **own** attendance report           | student      |                                               |
 | Read another user's attendance report    | teacher      | Narrowed to the caller's managed courses; `manager`+ sees all |
-| View **visible** courses/exams and a course's subjects; read **own** result, courses, mark report | student | Visible = enrolled (teachers: + created; `manager`+: all) |
+| View **visible** courses/exams and a course's subjects; read **own** result, courses, mark report | student | Visible = enrolled (teachers: + created; `manager`+: all); exam **drafts** show only to the course's managers |
 | Sit a sittable exam (`sync`/`async`/`open`): start / resume / retake / read / submit **own** attempt | student | **Students only** — staff never sit; must be enrolled; window (where one exists) and `max_attempts` enforced by the server |
 | Answer questions inside **own** attempt (REST autosave or the exam-room WebSocket) | student | **Students only**; attempt must be `in_progress`; deadline judged by the server clock; blocked after leaving the room while `allow_rejoin` is off |
 | Author an exam's questions (add/edit/delete, incl. question + option images) | teacher | Course-management rights; frozen once anyone has an attempt |
@@ -344,13 +346,13 @@ their existing shapes: the student exam-room reads
 | POST   | `/sessions/{id}/attendance`      | teacher | `{status, user_id}` — roll call: session teacher/course manager mark **enrolled students** (students only); the teacher's own row needs manager+ |
 | GET    | `/sessions/{id}/attendance`      | teacher | List the session's roll call (session teacher or course manager) · paged |
 | DELETE | `/sessions/{id}/attendance/{user}` | teacher | Remove a roll-call row (same rights as marking) |
-| POST   | `/courses/{id}/exams`            | teacher | `{title, description?, kind, mode?, starts_at?, ends_at?, duration_ms?, max_attempts?, allow_rejoin?}` — add an exam (course manager); its weight comes from the kind |
-| GET    | `/courses/{id}/exams`            | student | List the course's exams (enrolled, creator, or manager+) · paged |
-| GET    | `/exams`                         | student | The caller's visible exams: their courses' (manager+: all) · paged |
-| GET    | `/exams/{id}`                    | student | Get exam (enrolled, creator, or manager+) |
-| PATCH  | `/exams/{id}`                    | teacher | Edit exam incl. `kind` (re-weights it), schedule, `max_attempts`, `allow_rejoin` (course manager; `course` immutable, `mode` frozen once attempted — the rest stays live) |
+| POST   | `/courses/{id}/exams`            | teacher | `{title, description?, kind, mode?, starts_at?, ends_at?, duration_ms?, max_attempts?, allow_rejoin?, draft?}` — add an exam (course manager); its weight comes from the kind; `draft: true` keeps it hidden while it's written |
+| GET    | `/courses/{id}/exams`            | student | List the course's exams (enrolled, creator, or manager+; drafts appear to course managers only) · paged |
+| GET    | `/exams`                         | student | The caller's visible exams: their courses' (manager+: all; drafts of managed courses only) · paged |
+| GET    | `/exams/{id}`                    | student | Get exam (enrolled, creator, or manager+; a draft is a `404` for everyone but its course's managers) |
+| PATCH  | `/exams/{id}`                    | teacher | Edit exam incl. `kind` (re-weights it), schedule, `max_attempts`, `allow_rejoin`, `draft` (course manager; `course` immutable, `mode` frozen once attempted, re-drafting frozen once attempts/results exist — the rest stays live) |
 | DELETE | `/exams/{id}`                    | teacher | Delete exam + its results, attempts, questions, answers, and question images (course manager) |
-| POST   | `/exams/{id}/results`            | teacher | `{mark, user_id}` — grade an **enrolled student** (upsert; course manager; students only) |
+| POST   | `/exams/{id}/results`            | teacher | `{mark, user_id}` — grade an **enrolled student** (upsert; course manager; students only; drafts can't be graded, `409`) |
 | GET    | `/exams/{id}/results`            | teacher | List every result for the exam (course manager) · paged |
 | GET    | `/exams/{id}/result`             | student | The caller's **own** result (`404` until graded) |
 | DELETE | `/exams/{id}/results/{user}`     | teacher | Remove a student's result (course manager) |
@@ -535,10 +537,21 @@ keeps every school's data physically isolated.
 
 ## Exam modes, attempts, retakes, rejoin & live monitoring
 
-An exam is a **draft** by default (all schedule fields `null`) — graded
-offline; attempts on it are a `409` ("nothing to sit"). Making it sittable
-means giving it a `mode`, as one consistent unit (validated together on
-create and after every `PATCH` merge):
+Preparing an exam is slow work, so an exam can be created as a **draft**
+(`draft: true`): only the course's managers see it (to students it's a `404`
+that might as well not exist — lists, direct reads, and attempts all hide
+it), nobody can sit it, and grading it is a `409`. The teacher builds the
+questions in peace and publishes with `PATCH /exams/{id}` `{"draft": false}`.
+An exam can go back into hiding the same way — but only while it has **no
+attempts and no results**; after that, re-drafting is a `409` (students never
+lose sight of an exam they've sat or been graded on). Existing exams (and
+those created without the flag) are published from the start.
+
+Separately from drafts, a published exam without a `mode` (all schedule
+fields `null`) is **offline-graded** — a paper exam whose marks are entered
+by hand; students see it and their marks, but attempts on it are a `409`
+("nothing to sit"). Making an exam sittable means giving it a `mode`, as one
+consistent unit (validated together on create and after every `PATCH` merge):
 
 - `mode: "sync"` + `starts_at` + `ends_at` — everyone sits inside one window;
   every attempt's deadline is `ends_at`.
@@ -587,8 +600,8 @@ construction):
 Deadlines are **recomputed from the exam's current schedule on every read**,
 never stored: a teacher who `PATCH`es `ends_at` (or a `duration_ms`)
 while the exam runs moves every running deadline instantly. What's frozen once
-anyone has started is only `mode` (including back to a draft) — swapping the
-deadline rules mid-sitting would be a different exam (`409`).
+anyone has started is only `mode` (including back to unscheduled) — swapping
+the deadline rules mid-sitting would be a different exam (`409`).
 
 The course's manager (its creator, or manager+) watches it all live:
 `GET /exams/{id}/live` returns one snapshot —
@@ -707,9 +720,10 @@ suggestion to read while grading, never written anywhere.
 
 **The exam room (WebSocket)** — `GET /exams/{id}/attempt/ws`, cookie-authed
 like everything else; REST above remains the full fallback. Gates run before
-the upgrade: unknown exam `404`, draft with no mode `409`, not a student `403`,
-not enrolled `403`, no attempt yet `404` (start it first), submitted/expired
-`409`, left while rejoin is closed `409`. Then JSON text frames:
+the upgrade: unknown or draft exam `404`, unscheduled (no mode) `409`, not a
+student `403`, not enrolled `403`, no attempt yet `404` (start it first),
+submitted/expired `409`, left while rejoin is closed `409`. Then JSON text
+frames:
 
 | direction | frame |
 |-----------|-------|

@@ -10502,3 +10502,144 @@ async fn question_image_edits_follow_the_choices() {
         );
     }
 }
+
+// --- exam drafts ---------------------------------------------------------
+
+#[tokio::test]
+async fn draft_exams_hide_from_students_until_published() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "draft_t", "teacher").await;
+    let student = login(&app, "draft_s").await;
+    let student_id = me_id(&app, &student).await;
+    let course = create_course(&app, &teacher, "history").await;
+    enroll(&app, &teacher, &course, &student_id).await;
+
+    // Saved as a draft: an open (sittable-were-it-published) exam.
+    let res = create_exam_with(
+        &app,
+        &teacher,
+        &course,
+        json!({ "title": "wip final", "kind": "final", "mode": "open", "draft": true }),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    assert_eq!(res.body["draft"], true);
+    let exam = id_of(&res.body);
+
+    // The manager sees it everywhere, flagged.
+    let mine = send(&app, "GET", "/exams", Some(&teacher), None).await;
+    assert_eq!(common::items(&mine.body).len(), 1);
+    assert_eq!(common::items(&mine.body)[0]["draft"], true);
+
+    // The enrolled student sees nothing: not in either list, a 404 on direct
+    // read, and a 404 (not a telltale 409) on sitting.
+    let listed = send(&app, "GET", "/exams", Some(&student), None).await;
+    assert_eq!(common::items(&listed.body).len(), 0);
+    let in_course = send(
+        &app,
+        "GET",
+        &format!("/courses/{course}/exams"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(common::items(&in_course.body).len(), 0);
+    for (method, path) in [
+        ("GET", format!("/exams/{exam}")),
+        ("POST", format!("/exams/{exam}/attempt")),
+    ] {
+        let res = send(&app, method, &path, Some(&student), None).await;
+        assert_eq!(res.status, StatusCode::NOT_FOUND, "{method} {path}");
+    }
+
+    // Grading a draft is refused — a mark must never point at a hidden exam.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/results"),
+        Some(&teacher),
+        Some(json!({ "mark": 90, "user_id": student_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+
+    // Publish. The student now sees and sits it.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/exams/{exam}"),
+        Some(&teacher),
+        Some(json!({ "draft": false })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["draft"], false);
+    let listed = send(&app, "GET", "/exams", Some(&student), None).await;
+    assert_eq!(common::items(&listed.body).len(), 1);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+
+    // Once sat, the exam can't be pulled back into hiding.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/exams/{exam}"),
+        Some(&teacher),
+        Some(json!({ "draft": true })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+}
+
+#[tokio::test]
+async fn results_alone_also_freeze_re_drafting() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "redraft_t", "teacher").await;
+    let student = login(&app, "redraft_s").await;
+    let student_id = me_id(&app, &student).await;
+    let course = create_course(&app, &teacher, "geo").await;
+    enroll(&app, &teacher, &course, &student_id).await;
+
+    // A published offline-graded exam (no mode, no attempts — marks by hand).
+    let exam = create_exam(&app, &teacher, &course, "field trip report", "project").await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/results"),
+        Some(&teacher),
+        Some(json!({ "mark": 75, "user_id": student_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    // No attempts exist, but the graded result freezes re-drafting too.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/exams/{exam}"),
+        Some(&teacher),
+        Some(json!({ "draft": true })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+
+    // Ungraded siblings still re-draft freely.
+    let other = create_exam(&app, &teacher, &course, "map quiz", "quiz").await;
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/exams/{other}"),
+        Some(&teacher),
+        Some(json!({ "draft": true })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["draft"], true);
+}

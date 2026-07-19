@@ -239,7 +239,7 @@ impl SessionResponse {
 
 /// Public shape of an exam. Shared by `exams` (CRUD/results) and `courses`
 /// (in-course creation and listing). The schedule fields are all `null` for an
-/// offline-graded draft (no mode); see the create/update endpoints for the
+/// offline-graded exam (no mode); see the create/update endpoints for the
 /// rules tying them together.
 #[derive(Serialize, ToSchema)]
 pub struct ExamResponse {
@@ -251,7 +251,7 @@ pub struct ExamResponse {
     /// The assessment form. Its weight in the course average is school policy:
     /// `GET /settings` maps each kind to a weight.
     pub kind: String,
-    /// `sync`, `async`, or `open`; `null` for an offline-graded draft
+    /// `sync`, `async`, or `open`; `null` for an offline-graded exam
     /// (not sittable).
     #[schema(example = "sync")]
     pub mode: Option<String>,
@@ -268,6 +268,9 @@ pub struct ExamResponse {
     /// Whether a student who left the exam room may come back in and keep
     /// answering. Teachers can flip this live.
     pub allow_rejoin: bool,
+    /// Still being prepared: visible only to the course's managers, not
+    /// sittable, not gradable. Publish by `PATCH`ing `draft: false`.
+    pub draft: bool,
 }
 
 impl ExamResponse {
@@ -285,6 +288,7 @@ impl ExamResponse {
             duration_ms: exam.get_duration_ms().map(|d| d.as_millis()),
             max_attempts: exam.get_max_attempts().as_i64(),
             allow_rejoin: exam.get_allow_rejoin(),
+            draft: exam.is_draft(),
         }
     }
 }
