@@ -26,6 +26,7 @@ pub const ENROLLMENT_TABLE: &str = "enrollment";
 pub const COURSE_SESSION_TABLE: &str = "course_session";
 pub const SESSION_ATTENDANCE_TABLE: &str = "session_attendance";
 pub const WORK_ENTRY_TABLE: &str = "work_entry";
+pub const POMODORO_SESSION_TABLE: &str = "pomodoro_session";
 pub const SETTINGS_TABLE: &str = "settings";
 pub const TERM_TABLE: &str = "term";
 pub const SUBJECT_TABLE: &str = "subject";
@@ -149,6 +150,12 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS check_in ON work_entry TYPE int;
     DEFINE FIELD IF NOT EXISTS check_out ON work_entry TYPE option<int>;
     DEFINE INDEX IF NOT EXISTS work_entry_user ON work_entry FIELDS user;
+
+    DEFINE TABLE IF NOT EXISTS pomodoro_session SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS user ON pomodoro_session TYPE record<user>;
+    DEFINE FIELD IF NOT EXISTS started_at ON pomodoro_session TYPE int;
+    DEFINE FIELD IF NOT EXISTS finished_at ON pomodoro_session TYPE option<int>;
+    DEFINE INDEX IF NOT EXISTS pomodoro_session_user ON pomodoro_session FIELDS user;
 
     DEFINE TABLE IF NOT EXISTS exam SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS creator ON exam TYPE record<user>;

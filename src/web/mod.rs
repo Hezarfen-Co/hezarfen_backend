@@ -11,6 +11,7 @@ pub mod exam_ws;
 pub mod exams;
 pub mod marks;
 pub mod notes;
+pub mod pomodoro;
 pub mod sessions;
 pub mod settings;
 pub mod subjects;

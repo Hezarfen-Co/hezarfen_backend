@@ -38,7 +38,10 @@ watch attendance, per-student remaining time,
 sittings, walk-outs, no-shows (`absent` once the window closes), submissions,
 and marks land live on a monitor endpoint (snapshot or SSE stream). Courses also carry **lesson
 sessions** with teacher-taken roll call (students never self-mark a lesson),
-staff clock in/out on a server-stamped **work log**, and every user has an
+staff clock in/out on a server-stamped **work log**, students track study time
+with a server-stamped **pomodoro log** (the timer runs in the frontend; the
+backend records the focus stints, and teachers can read any student's log),
+and every user has an
 **attendance report** (event + per-course lesson tallies with rates).
 School-varying policy is data, not code: exam kinds (each with its weight in
 course averages), attendance statuses, grade-display bands, and the note-file
@@ -196,6 +199,8 @@ effect on the user's very next call (no re-login).
 | Mark / remove the **session teacher's** presence row | manager | Staff presence is management's call — the teacher can't self-mark |
 | Work check-in / check-out; view **own** work log | teacher | Instants are server-stamped, never client-supplied |
 | View / correct / delete **any** staff work log entry | manager | Corrections only on closed entries |
+| Start / finish a pomodoro focus session; view **own** pomodoro log | student | **Students only** start; instants server-stamped; starting discards a dangling unfinished session |
+| View **any** user's pomodoro log          | teacher      | Study oversight — same shape as `/pomodoro/me`, incl. the unpaged `total_focus_ms` |
 | Read **own** attendance report           | student      |                                               |
 | Read another user's attendance report    | teacher      | Narrowed to the caller's managed courses; `manager`+ sees all |
 | View **visible** courses/exams and a course's subjects; read **own** result, courses, mark report | student | Visible = enrolled (teachers: + created; `manager`+: all) |
@@ -377,6 +382,10 @@ their existing shapes: the student exam-room reads
 | GET    | `/work/{user}`                   | manager | A staff member's work log · paged |
 | PATCH  | `/work/entries/{id}`             | manager | `{check_in?, check_out?}` — correct a **closed** stint (`409` on open) |
 | DELETE | `/work/entries/{id}`             | manager | Delete a work entry (open or closed) |
+| POST   | `/pomodoro/start`                | student | Start a focus session (server-stamped; **students only** — a dangling unfinished session is discarded and replaced) |
+| POST   | `/pomodoro/finish`               | student | Close the running session (`409` if none running) |
+| GET    | `/pomodoro/me`                   | student | Own pomodoro log, newest first, + unpaged `total_focus_ms` · paged |
+| GET    | `/pomodoro/{user}`               | teacher | A user's pomodoro log, same shape · paged |
 | GET    | `/attendance/me`                 | student | Own attendance report: events + sessions + per-course tallies |
 | GET    | `/attendance/{user}`             | teacher | A user's attendance report, narrowed to the caller's courses (manager+: full) |
 | GET    | `/settings`                      | student | The school's policy: `exam_kinds` (`{name, weight}` each), `attendance_statuses`, `grade_bands`, `max_file_bytes` |
@@ -751,7 +760,7 @@ The live monitor rides along: each roster row now carries `answered` and
 The student's own `GET /exams/{id}/attempt` echoes the same
 `answered`/`question_count` pair.
 
-## Lesson sessions, roll call, the work log & attendance reports
+## Lesson sessions, roll call, the work log, pomodoro & attendance reports
 
 Events cover ad-hoc gatherings; **sessions** are a course's lessons. A session
 belongs to a course and carries a `teacher` (defaults to whoever creates it;
@@ -784,6 +793,20 @@ running clock. `GET /work/me` lists your stints newest-first (the open one has
 anyone's log (`GET /work/{user}`), corrects a **closed** stint's instants
 (`PATCH /work/entries/{id}`, `409` while open — check out or delete instead),
 and deletes entries.
+
+The **pomodoro log** (`/pomodoro`) is the students' study-time twin of the
+work log. The frontend owns the timer — the visible countdown, the work/break
+rhythm, the durations; the backend stores no timing policy and records only
+**focus stints**, stamped by the server clock exactly like work stints.
+`POST /pomodoro/start` opens a session and — unlike a work check-in — always
+succeeds for a student: a dangling unfinished session (a laptop closed
+mid-timer) is **discarded and replaced**, because it recorded no focus and
+must not lock the student out of the next one. `POST /pomodoro/finish` closes
+the running session (`409` when nothing runs); breaks are never reported.
+Logs return the usual page envelope plus `total_focus_ms`, the unpaged sum of
+every finished session's duration: `GET /pomodoro/me` for your own,
+`GET /pomodoro/{user}` for teacher+ (study oversight). Only students start
+sessions — pomodoro is the study tool, the work log is the staff timesheet.
 
 **Attendance reports** mirror the marks report: `GET /attendance/me` for any
 logged-in user, `GET /attendance/{user}` for teacher+ — narrowed to the
@@ -874,6 +897,10 @@ curl -s -b $JAR $BASE/work/me
 # ...and as the student:
 curl -s -b $STUDENT_JAR $BASE/marks/me
 curl -s -b $STUDENT_JAR $BASE/attendance/me
+# pomodoro: start when the timer starts, finish when it rings
+curl -s -b $STUDENT_JAR -X POST $BASE/pomodoro/start
+curl -s -b $STUDENT_JAR -X POST $BASE/pomodoro/finish
+curl -s -b $STUDENT_JAR $BASE/pomodoro/me
 ```
 
 ## Layout

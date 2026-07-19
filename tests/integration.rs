@@ -231,6 +231,10 @@ async fn protected_routes_require_session() {
         ("GET", "/work/u"),
         ("PATCH", "/work/entries/x"),
         ("DELETE", "/work/entries/x"),
+        ("POST", "/pomodoro/start"),
+        ("POST", "/pomodoro/finish"),
+        ("GET", "/pomodoro/me"),
+        ("GET", "/pomodoro/u"),
         ("GET", "/attendance/me"),
         ("GET", "/attendance/u"),
     ] {
@@ -8843,6 +8847,82 @@ async fn work_log_lifecycle_is_server_stamped_and_exclusive() {
     assert_eq!(log.len(), 2);
     assert!(log[0]["check_out"].is_null(), "open stint sorts newest");
     assert!(!log[1]["check_out"].is_null());
+}
+
+// --- pomodoro ----------------------------------------------------------------
+
+#[tokio::test]
+async fn pomodoro_restart_replaces_finish_closes_and_teachers_read() {
+    let (app, db) = app_and_db().await;
+    let ali = login(&app, "ali").await;
+    let hoca = login_as(&app, &db, "hoca", "teacher").await;
+    let ali_id = me_id(&app, &ali).await;
+
+    // Students only on start; finishing with nothing running conflicts.
+    let res = send(&app, "POST", "/pomodoro/start", Some(&hoca), None).await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    let res = send(&app, "POST", "/pomodoro/finish", Some(&ali), None).await;
+    assert_eq!(res.status, StatusCode::CONFLICT);
+
+    let res = send(&app, "POST", "/pomodoro/start", Some(&ali), None).await;
+    assert_eq!(res.status, StatusCode::CREATED);
+    assert!(res.body["finished_at"].is_null());
+    let first_start = res.body["started_at"].as_i64().unwrap();
+
+    // A restart discards the dangling session: one row, clock reset allowed.
+    let res = send(&app, "POST", "/pomodoro/start", Some(&ali), None).await;
+    assert_eq!(res.status, StatusCode::CREATED);
+    assert!(res.body["started_at"].as_i64().unwrap() >= first_start);
+    let res = send(&app, "GET", "/pomodoro/me", Some(&ali), None).await;
+    assert_eq!(common::items(&res.body).len(), 1);
+    assert_eq!(
+        res.body["total_focus_ms"], 0,
+        "running session counts nothing"
+    );
+
+    let res = send(&app, "POST", "/pomodoro/finish", Some(&ali), None).await;
+    assert_eq!(res.status, StatusCode::OK);
+    let finished_at = res.body["finished_at"].as_i64().unwrap();
+    let duration = res.body["duration_ms"].as_i64().unwrap();
+    assert_eq!(
+        duration,
+        finished_at - res.body["started_at"].as_i64().unwrap()
+    );
+    let res = send(&app, "POST", "/pomodoro/finish", Some(&ali), None).await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "already finished");
+
+    // The open slot is free again; the log keeps both sessions, newest first,
+    // and the focus total sums only the finished one.
+    let res = send(&app, "POST", "/pomodoro/start", Some(&ali), None).await;
+    assert_eq!(res.status, StatusCode::CREATED);
+    let res = send(&app, "GET", "/pomodoro/me", Some(&ali), None).await;
+    let log = common::items(&res.body);
+    assert_eq!(log.len(), 2);
+    assert!(log[0]["finished_at"].is_null(), "open session sorts newest");
+    assert_eq!(res.body["total_focus_ms"].as_i64().unwrap(), duration);
+
+    // Reading someone's log is teacher+; unknown users are 404.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/pomodoro/{ali_id}"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/pomodoro/{ali_id}"),
+        Some(&hoca),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(common::items(&res.body).len(), 2);
+    let res = send(&app, "GET", "/pomodoro/01UNKNOWN", Some(&hoca), None).await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
