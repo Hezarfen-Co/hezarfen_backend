@@ -44,8 +44,8 @@ enum AudienceDto {
     /// Everybody in the school. The default when a create request omits
     /// `audience` entirely.
     School,
-    /// Every user holding exactly this role — `student`, `teacher`, `manager`,
-    /// or `admin` (no implied "and above").
+    /// Every user holding exactly this role — `parent`, `student`, `teacher`,
+    /// `manager`, or `admin` (no implied "and above").
     Role { role: String },
     /// The students currently enrolled in this course (live — enrollment
     /// changes move people in and out).

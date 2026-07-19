@@ -2,11 +2,16 @@ use surrealdb::types::SurrealValue;
 
 use crate::error::ValidationError;
 
-/// The four access levels, in ascending order of privilege.
+/// The five access levels, in ascending order of privilege.
 ///
 /// The variants are declared low-to-high, so the derived `Ord` matches the
 /// hierarchy: `Role::Admin > Role::Teacher`. That ordering is exactly what
 /// [`Role::at_least`] relies on — a higher role satisfies any lower requirement.
+///
+/// `Parent` sits at the bottom: a read-only observer of the students linked to
+/// it (see `domain::parent_link`). It clears no `at_least` bar and fails every
+/// exact `== Student` gate, so parents can't sit exams, enroll, or be marked on
+/// a roll call — they only read their own students' reports.
 ///
 /// `#[surreal(untagged, rename_all = "lowercase")]` makes each variant serialize
 /// to a bare lowercase string (`"student"`, `"teacher"`, …) instead of the
@@ -15,6 +20,7 @@ use crate::error::ValidationError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, SurrealValue)]
 #[surreal(untagged, rename_all = "lowercase")]
 pub enum Role {
+    Parent,
     Student,
     Teacher,
     Manager,
@@ -23,11 +29,18 @@ pub enum Role {
 
 impl Role {
     /// Every role, lowest privilege first.
-    pub const ALL: [Role; 4] = [Role::Student, Role::Teacher, Role::Manager, Role::Admin];
+    pub const ALL: [Role; 5] = [
+        Role::Parent,
+        Role::Student,
+        Role::Teacher,
+        Role::Manager,
+        Role::Admin,
+    ];
 
     /// The wire/storage form. Must stay in lockstep with `rename_all = "lowercase"`.
     pub fn as_str(self) -> &'static str {
         match self {
+            Role::Parent => "parent",
             Role::Student => "student",
             Role::Teacher => "teacher",
             Role::Manager => "manager",
@@ -42,7 +55,7 @@ impl Role {
             .find(|role| role.as_str() == value)
             .ok_or(ValidationError::Invalid {
                 field: "role",
-                reason: "must be one of: student, teacher, manager, admin",
+                reason: "must be one of: parent, student, teacher, manager, admin",
             })
     }
 
@@ -59,9 +72,19 @@ mod tests {
 
     #[tokio::test]
     async fn hierarchy_orders_low_to_high() {
+        assert!(Role::Parent < Role::Student);
         assert!(Role::Student < Role::Teacher);
         assert!(Role::Teacher < Role::Manager);
         assert!(Role::Manager < Role::Admin);
+    }
+
+    #[tokio::test]
+    async fn parent_clears_no_bar_above_itself() {
+        // A parent is an observer: it must never satisfy a staff (or even
+        // student) requirement through the hierarchy.
+        assert!(Role::Parent.at_least(Role::Parent));
+        assert!(!Role::Parent.at_least(Role::Student));
+        assert!(!Role::Parent.at_least(Role::Teacher));
     }
 
     #[tokio::test]

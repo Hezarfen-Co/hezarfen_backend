@@ -39,8 +39,33 @@ use serde::{Deserialize, Deserializer};
 use utoipa::ToSchema;
 
 use crate::constant::SCHEDULE_PAST_GRACE_MS;
+use crate::database::Database;
+use crate::domain::parent_link::ParentLink;
+use crate::domain::role::Role;
 use crate::domain::timestamp::Timestamp;
+use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ValidationError};
+
+/// May `caller` read `target`'s per-student reports (marks, attendance,
+/// pomodoro)? Teacher+ always may (per-endpoint narrowing is the caller's
+/// business); a parent may exactly when a `parent_link` row ties them to the
+/// target. Everyone else — students included — gets a 403 (self-reads go
+/// through the `/me` endpoints).
+pub(crate) async fn ensure_can_observe(
+    caller: &User,
+    target: &UserId,
+    db: &Database,
+) -> Result<(), AppError> {
+    if caller.get_role().at_least(Role::Teacher) {
+        return Ok(());
+    }
+    if caller.get_role() == Role::Parent && ParentLink::exists(caller.get_id(), target, db).await? {
+        return Ok(());
+    }
+    Err(AppError::Forbidden(
+        "requires teacher role or higher, or a parent link to this student",
+    ))
+}
 
 /// If both ends are present, `ends_at` must not precede `starts_at`. Shared by
 /// everything that carries a time range (events, course sessions).

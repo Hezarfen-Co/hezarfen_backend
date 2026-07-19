@@ -2,8 +2,10 @@
 
 Note, attendance, course + weighted exam mark backend. **Rust (edition 2024) · axum · SurrealDB 3 (embedded surrealkv) · tokio.**
 
-Session-cookie auth with four hierarchical roles (`student < teacher < manager
-< admin`). Notes are per-user and carry **file attachments** (PDFs, documents,
+Session-cookie auth with five hierarchical roles (`parent < student < teacher
+< manager < admin`). A **`parent`** observes and changes nothing: admins tie
+students to a parent account, and the parent reads those students' mark,
+attendance, and pomodoro reports — that's the whole role. Notes are per-user and carry **file attachments** (PDFs, documents,
 …): blobs live on disk next to the database, metadata in the database, and the
 per-file size cap is school policy in settings (`max_file_bytes`, default
 5 MiB). Attendance is event + attendees: create an event with an **audience**
@@ -176,16 +178,27 @@ cross-origin must therefore be allowlisted explicitly.
 
 ## Roles & access control
 
-Every user has one of four roles, ranked lowest to highest:
+Every user has one of five roles, ranked lowest to highest:
 
 ```
-student  <  teacher  <  manager  <  admin
+parent  <  student  <  teacher  <  manager  <  admin
 ```
 
 The check is **hierarchical** — a higher role satisfies any lower requirement
 (an admin can do anything a teacher can). New accounts always register as
 `student`; a role read is re-checked on every request, so a role change takes
 effect on the user's very next call (no re-login).
+
+`parent` is the read-only observer at the bottom of the ladder: an admin ties
+any number of students to a parent account (`POST /users/{id}/students`), and
+the tie is the parent's whole power — they list their students
+(`GET /users/me/students`) and read each one's mark, attendance, and pomodoro
+reports in full. Student-only checks are exact (`role == student`), so a
+parent can never enroll, sit an exam, be graded, or land on a roll call; and
+sitting below every staff bar, they can't touch anything else either. A role
+change off either end of a tie (the parent stops being a `parent`, the
+student stops being a `student`) drops the tie, exactly like promotion drops
+course enrollments.
 
 | Action                                   | Minimum role | Notes                                         |
 |------------------------------------------|--------------|-----------------------------------------------|
@@ -204,9 +217,9 @@ effect on the user's very next call (no re-login).
 | Work check-in / check-out; view **own** work log | teacher | Instants are server-stamped, never client-supplied |
 | View / correct / delete **any** staff work log entry | manager | Corrections only on closed entries |
 | Start / finish a pomodoro focus session; view **own** pomodoro log | student | **Students only** start; instants server-stamped; starting discards a dangling unfinished session |
-| View **any** user's pomodoro log          | teacher      | Study oversight — same shape as `/pomodoro/me`, incl. the unpaged `total_focus_ms` |
+| View **any** user's pomodoro log          | teacher      | Study oversight — same shape as `/pomodoro/me`, incl. the unpaged `total_focus_ms`; a `parent` reads their linked students' |
 | Read **own** attendance report           | student      |                                               |
-| Read another user's attendance report    | teacher      | Narrowed to the caller's managed courses; `manager`+ sees all |
+| Read another user's attendance report    | teacher      | Narrowed to the caller's managed courses; `manager`+ sees all; a `parent` sees a linked student's in full |
 | View **visible** courses/exams and a course's subjects; read **own** result, courses, mark report | student | Visible = enrolled (teachers: + created; `manager`+: all); exam **drafts** show only to the course's managers |
 | Sit a sittable exam (`sync`/`async`/`open`): start / resume / retake / read / submit **own** attempt | student | **Students only** — staff never sit; must be enrolled; window (where one exists) and `max_attempts` enforced by the server |
 | Answer questions inside **own** attempt (REST autosave or the exam-room WebSocket) | student | **Students only**; attempt must be `in_progress`; deadline judged by the server clock; blocked after leaving the room while `allow_rejoin` is off |
@@ -216,13 +229,14 @@ effect on the user's very next call (no re-login).
 | Create courses                           | teacher      | The creator manages the course                 |
 | Manage inside a course: edit/delete it, enroll/unenroll **students**, add/edit/delete its exams and **subjects**, grade, remove results | teacher | Only the **course creator**, or a `manager`+ for any course; only students can be enrolled; a subject still referenced by exam questions won't delete (`409`) |
 | View a course's roster, an exam's result list / statistics | teacher | Course-management rights |
-| Read another user's mark report          | teacher      | Narrowed to the caller's managed courses; `manager`+ sees all |
+| Read another user's mark report          | teacher      | Narrowed to the caller's managed courses; `manager`+ sees all; a `parent` sees a linked student's in full |
 | Grade students                           | teacher      | Target must be an **enrolled student**; grading never targets oneself |
 | Edit **own** personal info (name, surname, email, phone, birth date) | student | Every account carries the same optional info fields |
 | Edit **own** UI preferences (theme, language) | student | `null` until chosen — the client then follows the device preference |
+| List **own** linked students             | parent       | Read-only: the list plus each student's mark/attendance/pomodoro reports — a parent changes nothing, anywhere |
 | Read the school settings and the term list | student | Clients need them to render kind/status pickers, grades, and the calendar |
 | Edit school settings; create / edit / delete terms | manager | School policy (exam kinds, attendance statuses, grade bands, the note-file size limit) and the academic calendar are management's call |
-| List users; look up one user; change a user's role; edit **any** user's personal info or UI preferences | admin | An admin cannot change **their own** role |
+| List users; look up one user; change a user's role; edit **any** user's personal info or UI preferences; tie/untie students to a `parent` account | admin | An admin cannot change **their own** role |
 
 ### Bootstrapping the first admin
 
@@ -304,12 +318,16 @@ their existing shapes: the student exam-room reads
 | GET    | `/auth/me`                       | student | Current user (incl. `role` and personal info) |
 | PATCH  | `/users/me`                      | student | Update own personal info (see below) |
 | PATCH  | `/users/me/preferences`          | student | `{theme?, language?}` — own UI preferences (see below) |
+| GET    | `/users/me/students`             | parent  | The caller's linked students (refs, sorted by username) · paged |
 | GET    | `/users/search`                  | teacher | `?q=<fragment>&role=<role?>` — find users by username/name fragment (pickers); refs only, no contact info · paged |
 | GET    | `/users`                         | admin   | List all users · paged          |
 | GET    | `/users/{id}`                    | admin   | Get one user                    |
 | PATCH  | `/users/{id}/role`               | admin   | `{role}` — set a user's role; promotion out of `student` drops the user's course enrollments (only students enroll) |
 | PATCH  | `/users/{id}/profile`            | admin   | Update any user's personal info |
 | PATCH  | `/users/{id}/preferences`        | admin   | Update any user's UI preferences |
+| POST   | `/users/{id}/students`           | admin   | `{user_id}` — tie a **student** to a **parent** account `{id}` (idempotent); the tie is the parent's read grant |
+| GET    | `/users/{id}/students`           | admin   | List a parent's linked students · paged |
+| DELETE | `/users/{id}/students/{student}` | admin   | Untie a student from a parent (student data untouched) |
 | POST   | `/notes`                         | student | `{title, content?}`             |
 | GET    | `/notes`                         | student | List own notes · paged          |
 | GET    | `/notes/{id}`                    | student | Get own note                    |
@@ -383,7 +401,7 @@ their existing shapes: the student exam-room reads
 | GET    | `/exams/{id}/live`               | teacher | Live monitor snapshot: roster × latest attempts × marks + per-student progress/`left_at`/`attempts_used` + counts; no-shows turn `absent` once the window closes (course manager) |
 | GET    | `/exams/{id}/live/stream`        | teacher | The same snapshot as SSE `snapshot` events every ~2s (course manager) |
 | GET    | `/marks/me`                      | student | The caller's mark report (per-course + overall averages) |
-| GET    | `/marks/{user}`                  | teacher | A user's mark report, narrowed to the caller's courses (manager+: full) |
+| GET    | `/marks/{user}`                  | teacher* | A user's mark report, narrowed to the caller's courses (manager+: full); *or a `parent` linked to `{user}` — full |
 | POST   | `/work/check-in`                 | teacher | Open a work stint (server-stamped; `409` if already open) |
 | POST   | `/work/check-out`                | teacher | Close the open stint (`409` if none open) |
 | GET    | `/work/me`                       | teacher | Own work log, newest first (open stint has `check_out: null`) · paged |
@@ -393,9 +411,9 @@ their existing shapes: the student exam-room reads
 | POST   | `/pomodoro/start`                | student | Start a focus session (server-stamped; **students only** — a dangling unfinished session is discarded and replaced) |
 | POST   | `/pomodoro/finish`               | student | Close the running session (`409` if none running) |
 | GET    | `/pomodoro/me`                   | student | Own pomodoro log, newest first, + unpaged `total_focus_ms` · paged |
-| GET    | `/pomodoro/{user}`               | teacher | A user's pomodoro log, same shape · paged |
+| GET    | `/pomodoro/{user}`               | teacher* | A user's pomodoro log, same shape · paged; *or a `parent` linked to `{user}` |
 | GET    | `/attendance/me`                 | student | Own attendance report: events + sessions + per-course tallies |
-| GET    | `/attendance/{user}`             | teacher | A user's attendance report, narrowed to the caller's courses (manager+: full) |
+| GET    | `/attendance/{user}`             | teacher* | A user's attendance report, narrowed to the caller's courses (manager+: full); *or a `parent` linked to `{user}` — full |
 | GET    | `/settings`                      | student | The school's policy: `exam_kinds` (`{name, weight}` each), `attendance_statuses`, `grade_bands`, `max_file_bytes` |
 | PATCH  | `/settings`                      | manager | Replace any subset of the fields (lists wholesale); concurrent edits merge, never silently revert each other (see "Per-school policy") |
 | POST   | `/terms`                         | manager | `{name, starts_at, ends_at}` — past dates allowed (calendar backfill) |
@@ -415,7 +433,10 @@ kind was later removed from settings counts with weight `1`.
 A course may carry a `term_id` (`null` = unassigned); on `PATCH
 /courses/{id}`, an omitted `term_id` keeps the link and an explicit `null`
 clears it.
-`role` ∈ `student | teacher | manager | admin`. Ids in responses are ULIDs.
+`role` ∈ `parent | student | teacher | manager | admin`. Ids in responses are
+ULIDs. `parent` accounts are made by an admin (register as `student`, then
+`PATCH /users/{id}/role`) and observe only the students an admin tied to them
+— see "Roles & access control".
 An exam `mark` is an integer `0`–`100`; it lives in its own `exam_result` row,
 never in a `note`. Students never grade anyone — grading is teacher+ with
 course-management rights, and the target must be enrolled in the exam's course;

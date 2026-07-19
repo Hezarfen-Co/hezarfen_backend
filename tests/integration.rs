@@ -10730,3 +10730,315 @@ async fn results_alone_also_freeze_re_drafting() {
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     assert_eq!(res.body["draft"], true);
 }
+
+// --- parent role ---------------------------------------------------------
+
+/// The tie lifecycle: admin-only, role-checked on both ends, idempotent, and
+/// symmetric between the admin listing and the parent's own `/me/students`.
+#[tokio::test]
+async fn parent_links_are_admin_managed_and_role_checked() {
+    let (app, db) = app_and_db().await;
+    let admin = login_as(&app, &db, "boss", "admin").await;
+    let teacher = login_as(&app, &db, "teacher", "teacher").await;
+    let parent = login_as(&app, &db, "mom", "parent").await;
+    let parent_id = me_id(&app, &parent).await;
+    let ali = login(&app, "ali").await;
+    let ali_id = me_id(&app, &ali).await;
+    let teacher_id = me_id(&app, &teacher).await;
+
+    // Only an admin ties.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/users/{parent_id}/students"),
+        Some(&teacher),
+        Some(json!({ "user_id": ali_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+
+    // Both ends are role-checked: the target must be a parent…
+    let res = send(
+        &app,
+        "POST",
+        &format!("/users/{teacher_id}/students"),
+        Some(&admin),
+        Some(json!({ "user_id": ali_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+    // …the student must be a student…
+    let res = send(
+        &app,
+        "POST",
+        &format!("/users/{parent_id}/students"),
+        Some(&admin),
+        Some(json!({ "user_id": teacher_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+    // …and both must exist.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/users/{parent_id}/students"),
+        Some(&admin),
+        Some(json!({ "user_id": "01ZZZZZZZZZZZZZZZZZZZZZZZZ" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+    let res = send(
+        &app,
+        "POST",
+        "/users/01ZZZZZZZZZZZZZZZZZZZZZZZZ/students",
+        Some(&admin),
+        Some(json!({ "user_id": ali_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+
+    // A valid tie lands, and linking again is a no-op returning the same tie.
+    for _ in 0..2 {
+        let res = send(
+            &app,
+            "POST",
+            &format!("/users/{parent_id}/students"),
+            Some(&admin),
+            Some(json!({ "user_id": ali_id })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+        assert_eq!(res.body["student"]["id"], json!(ali_id));
+        assert_eq!(res.body["parent"]["id"], json!(parent_id));
+    }
+
+    // Admin listing and the parent's own listing agree.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/users/{parent_id}/students"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(common::total(&res.body), 1);
+    let res = send(&app, "GET", "/users/me/students", Some(&parent), None).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(common::items(&res.body)[0]["id"], json!(ali_id));
+    // /me/students is the parent's view — everyone else is refused.
+    let res = send(&app, "GET", "/users/me/students", Some(&ali), None).await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+
+    // Untie: once, then the tie is gone.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/users/{parent_id}/students/{ali_id}"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/users/{parent_id}/students/{ali_id}"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+}
+
+/// The tie is the parent's whole power: linked students' reports open up (in
+/// full — no course narrowing), everyone else's stay walled, and every write
+/// a parent might try is refused.
+#[tokio::test]
+async fn parent_observes_linked_students_and_nothing_else() {
+    let (app, db) = app_and_db().await;
+    let admin = login_as(&app, &db, "boss", "admin").await;
+    let teacher = login_as(&app, &db, "teacher", "teacher").await;
+    let parent = login_as(&app, &db, "mom", "parent").await;
+    let parent_id = me_id(&app, &parent).await;
+    let ali = login(&app, "ali").await;
+    let ali_id = me_id(&app, &ali).await;
+    let bob = login(&app, "bob").await;
+    let bob_id = me_id(&app, &bob).await;
+
+    // ali gets a graded exam in a course the parent has nothing to do with.
+    let course = create_course(&app, &teacher, "algebra").await;
+    enroll(&app, &teacher, &course, &ali_id).await;
+    let exam = create_exam(&app, &teacher, &course, "midterm", "quiz").await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/results"),
+        Some(&teacher),
+        Some(json!({ "mark": 70, "user_id": ali_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    let res = send(
+        &app,
+        "POST",
+        &format!("/users/{parent_id}/students"),
+        Some(&admin),
+        Some(json!({ "user_id": ali_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    // Linked student: all three reports open, and the mark report is FULL —
+    // the parent manages no courses, so narrowing would blank it.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/marks/{ali_id}"),
+        Some(&parent),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["courses"][0]["results"][0]["mark"], 70);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/attendance/{ali_id}"),
+        Some(&parent),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/pomodoro/{ali_id}"),
+        Some(&parent),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    // Unlinked student: every report stays walled.
+    for uri in [
+        format!("/marks/{bob_id}"),
+        format!("/attendance/{bob_id}"),
+        format!("/pomodoro/{bob_id}"),
+    ] {
+        let res = send(&app, "GET", &uri, Some(&parent), None).await;
+        assert_eq!(res.status, StatusCode::FORBIDDEN, "{uri} must stay walled");
+    }
+
+    // A parent writes nothing: not a student (pomodoro, sitting), not staff
+    // (courses, grading, search), and the tie grants no write-through.
+    let res = send(&app, "POST", "/pomodoro/start", Some(&parent), None).await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    let res = send(
+        &app,
+        "POST",
+        "/courses",
+        Some(&parent),
+        Some(json!({ "title": "sneaky" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    // A sittable exam (the modeless `exam` would 409 as unsittable before any
+    // role question arises): the student-only wall answers first.
+    let sittable = create_exam_with(
+        &app,
+        &teacher,
+        &course,
+        json!({ "title": "anytime", "kind": "quiz", "mode": "open" }),
+    )
+    .await;
+    assert_eq!(sittable.status, StatusCode::CREATED, "{}", sittable.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{}/attempt", id_of(&sittable.body)),
+        Some(&parent),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+    let res = send(&app, "GET", "/users/search?q=ali", Some(&parent), None).await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+}
+
+/// A role change off either end of a tie sweeps it, exactly like promotion
+/// sweeps enrollments — no dead read grants left behind.
+#[tokio::test]
+async fn role_change_sweeps_parent_links() {
+    let (app, db) = app_and_db().await;
+    let admin = login_as(&app, &db, "boss", "admin").await;
+    let parent = login_as(&app, &db, "mom", "parent").await;
+    let parent_id = me_id(&app, &parent).await;
+    let ali = login(&app, "ali").await;
+    let ali_id = me_id(&app, &ali).await;
+
+    let res = send(
+        &app,
+        "POST",
+        &format!("/users/{parent_id}/students"),
+        Some(&admin),
+        Some(json!({ "user_id": ali_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    // The student side leaves the student role: the tie dies with it.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/users/{ali_id}/role"),
+        Some(&admin),
+        Some(json!({ "role": "teacher" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(&app, "GET", "/users/me/students", Some(&parent), None).await;
+    assert_eq!(common::total(&res.body), 0, "tie must die with the role");
+    let res = send(
+        &app,
+        "GET",
+        &format!("/marks/{ali_id}"),
+        Some(&parent),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+
+    // The parent side leaves the parent role: its remaining ties die too.
+    let bob = login(&app, "bob").await;
+    let bob_id = me_id(&app, &bob).await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/users/{parent_id}/students"),
+        Some(&admin),
+        Some(json!({ "user_id": bob_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/users/{parent_id}/role"),
+        Some(&admin),
+        Some(json!({ "role": "student" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    // Really deleted, not merely hidden by the role checks.
+    let mut result = db
+        .query("SELECT VALUE id FROM parent_link")
+        .await
+        .expect("count parent links")
+        .check()
+        .expect("count parent links check");
+    let rows: Vec<surrealdb::types::RecordId> = result.take(0).expect("parent link rows");
+    assert!(rows.is_empty(), "parent_link rows deleted from the DB");
+}

@@ -23,6 +23,7 @@ pub const QUESTION_IMAGE_TABLE: &str = "question_image";
 pub const EXAM_ANSWER_TABLE: &str = "exam_answer";
 pub const COURSE_TABLE: &str = "course";
 pub const ENROLLMENT_TABLE: &str = "enrollment";
+pub const PARENT_LINK_TABLE: &str = "parent_link";
 pub const COURSE_SESSION_TABLE: &str = "course_session";
 pub const SESSION_ATTENDANCE_TABLE: &str = "session_attendance";
 pub const WORK_ENTRY_TABLE: &str = "work_entry";
@@ -126,6 +127,14 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS enrolled_by ON enrollment TYPE record<user>;
     DEFINE INDEX IF NOT EXISTS enrollment_course_user ON enrollment FIELDS course, user UNIQUE;
     DEFINE INDEX IF NOT EXISTS enrollment_user ON enrollment FIELDS user;
+
+    DEFINE TABLE IF NOT EXISTS parent_link SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS parent ON parent_link TYPE record<user>;
+    DEFINE FIELD IF NOT EXISTS student ON parent_link TYPE record<user>;
+    DEFINE FIELD IF NOT EXISTS linked_by ON parent_link TYPE record<user>;
+    DEFINE INDEX IF NOT EXISTS parent_link_parent_student ON parent_link FIELDS parent, student UNIQUE;
+    DEFINE INDEX IF NOT EXISTS parent_link_parent ON parent_link FIELDS parent;
+    DEFINE INDEX IF NOT EXISTS parent_link_student ON parent_link FIELDS student;
 
     DEFINE TABLE IF NOT EXISTS course_session SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS course ON course_session TYPE record<course>;
