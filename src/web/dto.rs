@@ -157,7 +157,8 @@ impl UserResponse {
 pub struct CourseResponse {
     #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
     pub id: String,
-    pub creator: String,
+    /// Who created (and owns) the course.
+    pub creator: PersonRef,
     #[schema(example = "Algebra")]
     pub title: String,
     pub description: String,
@@ -175,10 +176,10 @@ pub struct CourseResponse {
 }
 
 impl CourseResponse {
-    pub fn new(course: &Course) -> Self {
+    pub fn new(course: &Course, people: &HashMap<String, PersonRef>) -> Self {
         Self {
             id: course.get_id().key().to_string(),
-            creator: course.get_creator().key().to_string(),
+            creator: PersonRef::resolve(people, course.get_creator()),
             title: course.get_title().as_str().to_string(),
             description: course.get_description().as_str().to_string(),
             kind: course.get_kind().as_str().to_string(),
