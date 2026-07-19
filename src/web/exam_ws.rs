@@ -63,7 +63,8 @@ use crate::error::AppError;
 use crate::state::AppState;
 use crate::web::CurrentUser;
 use crate::web::exams::{
-    EXAM_LOCK, check_rejoin, ensure_enrolled, ensure_student, save_answer_in, writable_attempt,
+    EXAM_LOCK, check_rejoin, ensure_enrolled, ensure_sittable, ensure_student, save_answer_in,
+    writable_attempt,
 };
 
 /// Serializes every presence transition with its matching `left_at` write:
@@ -98,9 +99,10 @@ enum ClientMessage {
 
 /// Upgrade into the caller's exam room. All gates run *before* the upgrade so
 /// a rejected client gets a proper HTTP status instead of an instant close:
-/// unknown exam (404), draft with no mode (409), not a student (403), not
-/// enrolled (403), no attempt yet (404 — `POST /exams/{id}/attempt` first),
-/// submitted or expired (409), left the room while rejoin is closed (409).
+/// unknown or draft exam (404), unscheduled with no mode (409), not a student
+/// (403), not enrolled (403), no attempt yet (404 — `POST /exams/{id}/attempt`
+/// first), submitted or expired (409), left the room while rejoin is closed
+/// (409).
 ///
 /// The rejoin gate here is a read-only fast-fail for a proper 409; the
 /// authoritative clear of `left_at` happens inside the room task, under
@@ -117,11 +119,7 @@ pub async fn attempt_ws(
     let exam = Exam::read(&ExamId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    if exam.get_mode().is_none() {
-        return Err(AppError::Conflict(
-            "this exam is not scheduled — there is nothing to sit (give it a mode: sync, async, or open)",
-        ));
-    }
+    ensure_sittable(&exam)?;
     ensure_student(&user)?;
     ensure_enrolled(&exam, user.get_id(), &st.db).await?;
     let attempt = writable_attempt(&exam, user.get_id(), &st.db).await?;

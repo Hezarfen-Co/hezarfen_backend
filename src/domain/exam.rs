@@ -159,7 +159,7 @@ impl ExamAttemptLimit {
 /// hand always satisfies:
 ///
 /// - no mode → no `starts_at`/`ends_at`/`duration_ms` (an offline-graded
-///   draft; attempts are rejected),
+///   exam; attempts are rejected),
 /// - `sync` → `starts_at` + `ends_at`, no duration (everyone's deadline is
 ///   `ends_at`),
 /// - `async` → `starts_at` + `ends_at` + `duration_ms` (a student who starts
@@ -258,6 +258,10 @@ pub struct Exam {
     // migration (limit 1, rejoin open), so reads never see them missing.
     max_attempts: ExamAttemptLimit,
     allow_rejoin: bool,
+    // Work-in-progress marker: a draft is visible only to its course's
+    // managers, cannot be sat, and cannot be graded. Rows predating the
+    // column are backfilled published (`false`).
+    draft: bool,
 }
 
 impl Exam {
@@ -311,6 +315,12 @@ impl Exam {
         self.allow_rejoin
     }
 
+    /// Whether the exam is still being prepared — hidden from students, not
+    /// sittable, not gradable, until published.
+    pub fn is_draft(&self) -> bool {
+        self.draft
+    }
+
     /// The stored schedule as the validated bundle (for merge-on-update).
     /// Bypasses `try_new`: the fields were written through an `ExamSchedule`,
     /// so the invariants already hold.
@@ -340,6 +350,7 @@ impl Exam {
         schedule: ExamSchedule,
         max_attempts: ExamAttemptLimit,
         allow_rejoin: bool,
+        draft: bool,
         db: &Database,
     ) -> Result<Exam, AppError> {
         let exam = Exam {
@@ -355,6 +366,7 @@ impl Exam {
             duration_ms: schedule.duration_ms,
             max_attempts,
             allow_rejoin,
+            draft,
         };
         let created: Option<Exam> = db.create(exam.id.record()).content(exam).await?;
         created.ok_or_else(|| AppError::Internal("failed to create exam".into()))
@@ -413,6 +425,7 @@ impl Exam {
         schedule: ExamSchedule,
         max_attempts: ExamAttemptLimit,
         allow_rejoin: bool,
+        draft: bool,
         db: &Database,
     ) -> Result<Exam, AppError> {
         self.title = title;
@@ -424,6 +437,7 @@ impl Exam {
         self.duration_ms = schedule.duration_ms;
         self.max_attempts = max_attempts;
         self.allow_rejoin = allow_rejoin;
+        self.draft = draft;
         let updated: Option<Exam> = db.update(self.id.record()).content(self).await?;
         updated.ok_or(AppError::NotFound)
     }

@@ -91,7 +91,7 @@ struct CreateExamInCourse {
     kind: String,
     /// `sync` (one fixed window for everyone), `async` (each student starts
     /// inside the window and gets `duration_ms`), or `open` (no window — sit
-    /// anytime). Omit for an offline-graded draft that cannot be sat.
+    /// anytime). Omit for an offline-graded exam that cannot be sat.
     #[schema(example = "sync")]
     mode: Option<String>,
     /// Window open, UTC unix-milliseconds. Required for `sync`/`async`,
@@ -112,6 +112,10 @@ struct CreateExamInCourse {
     /// Whether a student who left the exam room may come back in and keep
     /// answering. Defaults to `true`; editable live while the exam runs.
     allow_rejoin: Option<bool>,
+    /// Save as a work-in-progress draft: visible only to the course's
+    /// managers, not sittable, not gradable, until published via
+    /// `PATCH /exams/{id}` with `draft: false`. Defaults to `false`.
+    draft: Option<bool>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -555,12 +559,14 @@ async fn unenroll(
 
 /// Create an exam inside a course. Requires teacher+ and course management
 /// rights; the exam's marks count into the course average with its kind's
-/// weight (`GET /settings`). Omit `mode` for an offline-graded draft nobody
+/// weight (`GET /settings`). Omit `mode` for an offline-graded exam nobody
 /// can sit; `sync`/`async` take a window (async also `duration_ms`), `open`
 /// is sittable anytime with an optional per-attempt `duration_ms`.
 /// `max_attempts` (default 1, `0` = unlimited) meters retakes and
 /// `allow_rejoin` (default `true`) is the exam-room door — both stay editable
-/// while the exam runs.
+/// while the exam runs. Send `draft: true` to keep the exam private while
+/// it's still being written: only the course's managers see it, and sitting
+/// and grading are blocked until it's published (`PATCH` `draft: false`).
 #[utoipa::path(
     post,
     path = "/{id}/exams",
@@ -618,6 +624,7 @@ async fn create_exam_in_course(
         schedule,
         max_attempts,
         req.allow_rejoin.unwrap_or(true),
+        req.draft.unwrap_or(false),
         &st.db,
     )
     .await?;
@@ -626,7 +633,8 @@ async fn create_exam_in_course(
 
 /// List a course's exams, paged via `?limit=&offset=` (omit `limit` for all of
 /// them). Visible to the course's enrolled users, its creator, and
-/// managers/admins. Returns a `{items, total, limit, offset}` envelope.
+/// managers/admins — but drafts appear only to the course's managers.
+/// Returns a `{items, total, limit, offset}` envelope.
 #[utoipa::path(
     get,
     path = "/{id}/exams",
@@ -657,7 +665,11 @@ async fn list_course_exams(
             "only enrolled users, the course creator, or a manager/admin can view this course",
         ));
     }
-    let exams = Exam::list_for_course(course.get_id(), &st.db).await?;
+    let mut exams = Exam::list_for_course(course.get_id(), &st.db).await?;
+    // Drafts are the managers' workbench — enrolled students don't see them.
+    if !can_manage_course(&course, &user) {
+        exams.retain(|exam| !exam.is_draft());
+    }
     let total = exams.len() as i64;
     let items = paginate(&exams, limit, offset)
         .iter()

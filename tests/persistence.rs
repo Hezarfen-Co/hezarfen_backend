@@ -929,3 +929,85 @@ async fn stale_staff_enrollments_are_swept_on_boot() {
         "the real student's row survives"
     );
 }
+
+/// Exam rows written before the draft flag existed (2026-07-19) backfill to
+/// published (`draft = false`) on the next boot — an old volume's exams stay
+/// exactly as visible as they were.
+#[tokio::test]
+async fn legacy_exams_backfill_to_published() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config_at(&dir);
+    let teacher_creds = json!({ "username": "ali", "password": "secret1" });
+    let student_creds = json!({ "username": "ayse", "password": "secret1" });
+    let exam_id;
+
+    // First boot: a normal exam — then strip `draft` the way an old binary's
+    // schema would have left it.
+    {
+        let db = database::init(&cfg).await.expect("first open");
+        let app = build_router(state(db.clone(), &cfg));
+        for creds in [&teacher_creds, &student_creds] {
+            assert_eq!(
+                send(&app, "POST", "/auth/register", None, Some((*creds).clone()))
+                    .await
+                    .status,
+                StatusCode::CREATED
+            );
+        }
+        set_role(&db, "ali", "teacher").await;
+        let teacher = send(
+            &app,
+            "POST",
+            "/auth/login",
+            None,
+            Some(teacher_creds.clone()),
+        )
+        .await
+        .cookie
+        .unwrap();
+        let student = send(
+            &app,
+            "POST",
+            "/auth/login",
+            None,
+            Some(student_creds.clone()),
+        )
+        .await
+        .cookie
+        .unwrap();
+        let student_id = me_id(&app, &student).await;
+        let course = create_course(&app, &teacher, "algebra").await;
+        enroll(&app, &teacher, &course, &student_id).await;
+        exam_id = create_exam(&app, &teacher, &course, "midterm", "midterm").await;
+
+        db.query(
+            "REMOVE FIELD IF EXISTS draft ON TABLE exam;
+             UPDATE exam SET draft = NONE;",
+        )
+        .await
+        .expect("strip draft")
+        .check()
+        .expect("strip draft check");
+    }
+
+    // Second boot re-runs the migration: the legacy exam reads back published
+    // and the enrolled student still sees it.
+    let db = reopen(&cfg).await;
+    let app = build_router(state(db, &cfg));
+    let student = send(&app, "POST", "/auth/login", None, Some(student_creds))
+        .await
+        .cookie
+        .unwrap();
+    let res = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam_id}"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["draft"], false);
+    let listed = send(&app, "GET", "/exams", Some(&student), None).await;
+    assert_eq!(common::items(&listed.body).len(), 1);
+}
