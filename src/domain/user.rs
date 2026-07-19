@@ -303,28 +303,36 @@ impl User {
 
     /// Case-insensitive fragment search over username, name, and surname —
     /// backs the user pickers. `role` narrows to one role (e.g. only students
-    /// for an enroll picker); `None` searches everyone. Returns every match,
-    /// ordered by username; the HTTP layer pages the result like any other list
-    /// (no built-in cap — an over-broad fragment is windowed by `?limit`).
+    /// for an enroll picker); `None` searches everyone. A blank `query`
+    /// matches everyone, so blank + `role` is a role-scoped listing. Returns
+    /// every match, ordered by username; the HTTP layer pages the result like
+    /// any other list (no built-in cap — an over-broad fragment is windowed
+    /// by `?limit`).
     pub async fn search(
         query: &str,
         role: Option<Role>,
         db: &Database,
     ) -> Result<Vec<User>, AppError> {
         let needle = query.trim().to_lowercase();
-        let role_clause = if role.is_some() {
-            "AND role = $role"
+        let mut clauses = Vec::new();
+        if !needle.is_empty() {
+            clauses.push(
+                "(string::lowercase(username) CONTAINS $q \
+                  OR string::lowercase(name ?? '') CONTAINS $q \
+                  OR string::lowercase(surname ?? '') CONTAINS $q)",
+            );
+        }
+        if role.is_some() {
+            clauses.push("role = $role");
+        }
+        let where_clause = if clauses.is_empty() {
+            "true".to_string()
         } else {
-            ""
+            clauses.join(" AND ")
         };
         let mut query = db
             .query(format!(
-                "SELECT * FROM user WHERE \
-                   (string::lowercase(username) CONTAINS $q \
-                    OR string::lowercase(name ?? '') CONTAINS $q \
-                    OR string::lowercase(surname ?? '') CONTAINS $q) \
-                   {role_clause} \
-                 ORDER BY username"
+                "SELECT * FROM user WHERE {where_clause} ORDER BY username"
             ))
             .bind(("q", needle));
         if let Some(role) = role {

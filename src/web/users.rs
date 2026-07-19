@@ -133,7 +133,8 @@ async fn apply_preferences(
 
 #[derive(Deserialize, IntoParams)]
 struct SearchUsers {
-    /// Case-insensitive fragment of a username, name, or surname.
+    /// Case-insensitive fragment of a username, name, or surname. May be
+    /// blank when `role` is given — that lists the whole role.
     q: String,
     /// Restrict matches to one role: `student`, `teacher`, `manager`, or
     /// `admin`. Omit to search every role.
@@ -148,10 +149,10 @@ struct SearchUsers {
 
 /// Find users by username or name — backs the pickers (enroll, grade, mark
 /// attendance). Requires teacher+. `role` narrows to one role (e.g.
-/// `role=student` for an enroll picker). Paged via `?limit=&offset=` like the
-/// other lists (omit `limit` for every match); returns a
-/// `{items, total, limit, offset}` envelope carrying only id/username/display
-/// name — no contact details.
+/// `role=student` for an enroll picker); a blank `q` with a `role` lists
+/// everyone in that role. Paged via `?limit=&offset=` like the other lists
+/// (omit `limit` for every match); returns a `{items, total, limit, offset}`
+/// envelope carrying only id/username/display name — no contact details.
 #[utoipa::path(
     get,
     path = "/search",
@@ -160,7 +161,7 @@ struct SearchUsers {
     params(SearchUsers),
     responses(
         (status = 200, description = "A page of matching users (all matches when unpaged)", body = Page<PersonRef>),
-        (status = 400, description = "Empty query, unknown role, or invalid limit/offset", body = ErrorResponse),
+        (status = 400, description = "Blank query without a role, unknown role, or invalid limit/offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
     ),
@@ -170,10 +171,10 @@ async fn search_users(
     _teacher: RequireTeacher,
     Query(req): Query<SearchUsers>,
 ) -> Result<Json<Page<PersonRef>>, AppError> {
-    if req.q.trim().is_empty() {
+    if req.q.trim().is_empty() && req.role.is_none() {
         return Err(AppError::Validation(ValidationError::Invalid {
             field: "q",
-            reason: "must not be empty",
+            reason: "must not be empty unless role is given",
         }));
     }
     let (limit, offset) = PageParams {
