@@ -335,17 +335,36 @@ impl User {
     }
 
     /// Overwrite this user's role. The caller is responsible for authorizing it.
-    pub async fn set_role(mut self, role: Role, db: &Database) -> Result<User, AppError> {
-        self.role = role;
-        let updated: Option<User> = db.update(self.id.record()).content(self).await?;
-        updated.ok_or(AppError::NotFound)
+    ///
+    /// Writes *only* the `role` field (never the whole row): the row mixes
+    /// admin-owned (role) and self-service (profile, preferences) fields, and
+    /// each writer starts from a snapshot read at request start. A whole-row
+    /// write would carry the snapshot's copy of the *other* group back over a
+    /// concurrent edit — an in-flight profile save silently reverting an
+    /// admin's demotion, or this write erasing a profile edit that raced it.
+    /// [`User::set_profile`] and [`User::set_preferences`] are scoped for the
+    /// same reason.
+    pub async fn set_role(self, role: Role, db: &Database) -> Result<User, AppError> {
+        let mut result = db
+            .query("UPDATE $id SET role = $role RETURN AFTER")
+            .bind(("id", self.id.record()))
+            .bind(("role", role))
+            .await?
+            .check()?;
+        result
+            .take::<Vec<User>>(0)?
+            .into_iter()
+            .next()
+            .ok_or(AppError::NotFound)
     }
 
     /// Overwrite the personal-info fields wholesale. Each argument is the final
     /// value (`None` clears); merging "keep what wasn't sent" against the
-    /// current row is the HTTP layer's job. The caller authorizes.
+    /// current row is the HTTP layer's job. The caller authorizes. Writes only
+    /// the five profile fields — see [`User::set_role`] for why the writers
+    /// are field-scoped.
     pub async fn set_profile(
-        mut self,
+        self,
         name: Option<PersonName>,
         surname: Option<PersonName>,
         email: Option<Email>,
@@ -353,29 +372,49 @@ impl User {
         birth_date: Option<BirthDate>,
         db: &Database,
     ) -> Result<User, AppError> {
-        self.name = name;
-        self.surname = surname;
-        self.email = email;
-        self.phone = phone;
-        self.birth_date = birth_date;
-        let updated: Option<User> = db.update(self.id.record()).content(self).await?;
-        updated.ok_or(AppError::NotFound)
+        let mut result = db
+            .query(
+                "UPDATE $id SET name = $name, surname = $surname, email = $email, \
+                 phone = $phone, birth_date = $birth_date RETURN AFTER",
+            )
+            .bind(("id", self.id.record()))
+            .bind(("name", name))
+            .bind(("surname", surname))
+            .bind(("email", email))
+            .bind(("phone", phone))
+            .bind(("birth_date", birth_date))
+            .await?
+            .check()?;
+        result
+            .take::<Vec<User>>(0)?
+            .into_iter()
+            .next()
+            .ok_or(AppError::NotFound)
     }
 
     /// Overwrite the UI-preference fields wholesale. Same contract as
     /// [`User::set_profile`]: each argument is the final value (`None` clears
     /// back to "never chose"), merging is the HTTP layer's job, the caller
-    /// authorizes.
+    /// authorizes. Writes only `theme` and `language` — see [`User::set_role`]
+    /// for why the writers are field-scoped.
     pub async fn set_preferences(
-        mut self,
+        self,
         theme: Option<Theme>,
         language: Option<Language>,
         db: &Database,
     ) -> Result<User, AppError> {
-        self.theme = theme;
-        self.language = language;
-        let updated: Option<User> = db.update(self.id.record()).content(self).await?;
-        updated.ok_or(AppError::NotFound)
+        let mut result = db
+            .query("UPDATE $id SET theme = $theme, language = $language RETURN AFTER")
+            .bind(("id", self.id.record()))
+            .bind(("theme", theme))
+            .bind(("language", language))
+            .await?
+            .check()?;
+        result
+            .take::<Vec<User>>(0)?
+            .into_iter()
+            .next()
+            .ok_or(AppError::NotFound)
     }
 
     pub async fn find_by_username(username: &str, db: &Database) -> Result<Option<User>, AppError> {
@@ -391,6 +430,48 @@ impl User {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::database::init_mem;
+
+    #[tokio::test]
+    async fn a_stale_profile_write_cannot_revert_a_role_change() {
+        let db = init_mem().await.unwrap();
+        let user = User::create(
+            Username::try_new("aysenur").unwrap(),
+            Password::try_new("secret1").unwrap().hash().unwrap(),
+            &db,
+        )
+        .await
+        .unwrap();
+
+        // A PATCH /users/me handler reads its snapshot (role = student)...
+        let stale = User::read(user.get_id(), &db).await.unwrap().unwrap();
+
+        // ...then an admin's role change commits before the profile save runs.
+        User::read(user.get_id(), &db)
+            .await
+            .unwrap()
+            .unwrap()
+            .set_role(Role::Teacher, &db)
+            .await
+            .unwrap();
+
+        // The in-flight save lands from the stale snapshot. It must write only
+        // the profile fields — not carry the snapshot's old role back over the
+        // admin's change.
+        let name = PersonName::try_new("name", "Ayşenur").unwrap();
+        stale
+            .set_profile(Some(name.clone()), None, None, None, None, &db)
+            .await
+            .unwrap();
+
+        let after = User::read(user.get_id(), &db).await.unwrap().unwrap();
+        assert_eq!(
+            after.get_role(),
+            Role::Teacher,
+            "the role change must survive the racing profile write"
+        );
+        assert_eq!(after.get_name(), Some(&name), "the profile edit itself lands");
+    }
 
     #[tokio::test]
     async fn username_newtype_validates() {

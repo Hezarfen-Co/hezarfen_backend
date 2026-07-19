@@ -40,6 +40,19 @@ use super::{
     paginate, person_map, set_or_clear,
 };
 
+/// Serializes the exam subsystem's cross-record check-then-writes, which
+/// `BEGIN…COMMIT` cannot (write skew) — same reasoning as `REGISTER_LOCK`.
+/// Read side: the answer saves (REST and the exam room), holding the sheet
+/// open from the writable-attempt gate through the upsert; saves stay
+/// concurrent with each other. Write side: attempt starts (the max-attempts
+/// count and the retake's answer wipe) and the structural teacher writes
+/// whose 409 guards read attempt or question rows first — exam mode/schedule
+/// updates, question create/update/delete, subject delete. So a save can
+/// never land on a sheet a retake just wiped, and a first attempt can never
+/// slip between a freeze-gate read and the write it was meant to freeze.
+// ponytail: global RwLock, shard per-exam if save latency ever matters.
+pub(crate) static EXAM_LOCK: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         // Plain route: OpenApiRouter can't describe a WebSocket upgrade, so
@@ -328,7 +341,10 @@ async fn update_exam(
     // Switching sync <-> async <-> open (or back to a draft) would silently
     // rewrite the deadline rules under students who already sat down;
     // extending times, the attempt limit, and the rejoin door are the
-    // supported live adjustments instead.
+    // supported live adjustments instead. Gate read and write share one
+    // writer lease of [`EXAM_LOCK`], so a first attempt can't land in the
+    // gap and leave a sat exam's mode flipped under it.
+    let _guard = EXAM_LOCK.write().await;
     let mode_changed =
         schedule.get_mode().map(ExamMode::as_str) != exam.get_mode().map(ExamMode::as_str);
     if mode_changed && ExamAttempt::any_for_exam(exam.get_id(), &st.db).await? {
@@ -780,6 +796,15 @@ async fn start_attempt(
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<AttemptResponse>), AppError> {
+    // Writer lease of [`EXAM_LOCK`] from the exam read through the start: the
+    // sittable/window gates must be judged against the same exam row the
+    // attempt lands under (the mirror of `update_exam`'s re-derive — without
+    // it, a mode change at legally-zero attempts could slip between this
+    // gate and the insert, leaving an attempt on a draft exam). The lease
+    // also keeps the max-attempts count and the retake's wipe-and-create
+    // from interleaving with an in-flight answer save (a reader). Dropped
+    // before the response reads — they only describe the row.
+    let guard = EXAM_LOCK.write().await;
     let exam = Exam::read(&ExamId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -799,6 +824,7 @@ async fn start_attempt(
     }
 
     let (attempt, created) = ExamAttempt::start(&exam, user.get_id(), &st.db).await?;
+    drop(guard);
     let mark = ExamResult::read_for_user(exam.get_id(), user.get_id(), &st.db)
         .await?
         .map(|r| r.get_mark());
@@ -1342,6 +1368,10 @@ async fn create_question(
             "only the course creator or a manager/admin can author questions",
         ));
     }
+    // Writer lease of [`EXAM_LOCK`]: the freeze gate, the subject check, and
+    // the create are one unit — no first attempt can slip past the gate, and
+    // no subject delete can invalidate a subject this just validated.
+    let _guard = EXAM_LOCK.write().await;
     ensure_questions_editable(exam.get_id(), &st.db).await?;
 
     let subject = subject_in_course(&req.subject_id, course.get_id(), &st.db).await?;
@@ -1435,6 +1465,9 @@ async fn update_question(
             "only the course creator or a manager/admin can edit questions",
         ));
     }
+    // Writer lease of [`EXAM_LOCK`]: the freeze gate, the subject check, and
+    // the update are one unit — see `create_question`.
+    let _guard = EXAM_LOCK.write().await;
     ensure_questions_editable(exam.get_id(), &st.db).await?;
     let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
 
@@ -1505,6 +1538,10 @@ async fn delete_question(
             "only the course creator or a manager/admin can delete questions",
         ));
     }
+    // Writer lease of [`EXAM_LOCK`]: freeze gate + delete are one unit — a
+    // first attempt slipping past the gate would sit an exam whose question
+    // list forks from what `auto_score` later judges.
+    let _guard = EXAM_LOCK.write().await;
     ensure_questions_editable(exam.get_id(), &st.db).await?;
     let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
     question.delete(&st.db).await?;
@@ -1618,6 +1655,10 @@ pub(crate) async fn save_answer_checked(
     text: Option<String>,
     db: &Database,
 ) -> Result<ExamAnswer, AppError> {
+    // Reader lease of [`EXAM_LOCK`]: the writable gate and the upsert are
+    // one unit, or a retake's wipe-and-create (a writer) slips in between
+    // and this stale save lands on the fresh blank sheet.
+    let _guard = EXAM_LOCK.read().await;
     let attempt = writable_attempt(exam, user, db).await?;
     save_answer_in(exam, &attempt, question_id, selected, text, db).await
 }

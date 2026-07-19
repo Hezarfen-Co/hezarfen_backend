@@ -5042,6 +5042,26 @@ async fn cors_allowlist_mode_credits_only_listed_origins() {
     );
 }
 
+/// Both CORS modes share one layer base, so a single probe proves the exposed
+/// headers: without them, cross-origin JS reads `null` for the documented
+/// `Retry-After` (429s) and `Content-Disposition` (download filename) headers.
+#[tokio::test]
+async fn cors_exposes_retry_after_and_content_disposition() {
+    let app = mem_app().await;
+    let req = Request::builder()
+        .method("GET")
+        .uri("/health")
+        .header("origin", "https://app.example")
+        .body(Body::empty())
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        res.headers().get("access-control-expose-headers").unwrap(),
+        "retry-after,content-disposition",
+        "contract headers must be readable by cross-origin JS"
+    );
+}
+
 // --- admin seed (ADMIN_USERNAME / ADMIN_PASSWORD bootstrap) ----------------
 
 /// The seed creates a ready-to-use admin: login works with the configured
