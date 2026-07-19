@@ -10,6 +10,7 @@ pub mod events;
 pub mod exam_ws;
 pub mod exams;
 pub mod marks;
+pub mod messages;
 pub mod notes;
 pub mod pomodoro;
 pub mod sessions;

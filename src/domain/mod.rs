@@ -12,6 +12,7 @@ pub mod exam_answer;
 pub mod exam_attempt;
 pub mod exam_question;
 pub mod exam_result;
+pub mod message;
 pub mod note;
 pub mod note_file;
 pub mod parent_link;

@@ -11042,3 +11042,212 @@ async fn role_change_sweeps_parent_links() {
     let rows: Vec<surrealdb::types::RecordId> = result.take(0).expect("parent link rows");
     assert!(rows.is_empty(), "parent_link rows deleted from the DB");
 }
+
+// --- messages ------------------------------------------------------------
+
+#[tokio::test]
+async fn messages_flow_through_folders_per_side() {
+    let (app, db) = app_and_db().await;
+    let ali = login(&app, "ali").await; // student
+    let hoca = login_as(&app, &db, "hoca", "teacher").await;
+    let hoca_id = me_id(&app, &hoca).await;
+
+    // Send lands in the recipient's inbox unread; the sender holds a `sent` copy.
+    let res = send(
+        &app,
+        "POST",
+        "/messages",
+        Some(&ali),
+        Some(json!({ "recipient_id": hoca_id, "subject": "etüt", "body": "10 dk gecikebilirim", "label": " Etüt " })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED);
+    assert_eq!(res.body["folder"], "sent");
+    assert_eq!(res.body["read"], false);
+    assert_eq!(res.body["label"], "Etüt", "label stored trimmed");
+    assert_eq!(res.body["sender"]["username"], "ali");
+    assert_eq!(res.body["sender_role"], "student");
+    assert_eq!(res.body["recipient_role"], "teacher");
+    let msg_id = id_of(&res.body);
+
+    // Recipient's inbox shows it; their copy says `inbox`.
+    let inbox = send(&app, "GET", "/messages", Some(&hoca), None).await;
+    let items = common::items(&inbox.body);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["folder"], "inbox");
+    assert_eq!(items[0]["subject"], "etüt");
+
+    // Only the recipient flips the read flag; the sender sees the receipt.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/messages/{msg_id}"),
+        Some(&ali),
+        Some(json!({ "read": true })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    // `?read=` narrows; `total` on the filtered view is the unread badge.
+    let unread = send(&app, "GET", "/messages?folder=inbox&read=false&limit=1", Some(&hoca), None).await;
+    assert_eq!(unread.body["total"], 1);
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/messages/{msg_id}"),
+        Some(&hoca),
+        Some(json!({ "read": true })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    let unread = send(&app, "GET", "/messages?folder=inbox&read=false&limit=1", Some(&hoca), None).await;
+    assert_eq!(unread.body["total"], 0);
+    let sent = send(&app, "GET", "/messages?folder=sent", Some(&ali), None).await;
+    assert_eq!(common::items(&sent.body)[0]["read"], true);
+
+    // Each side only moves through its own folders.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/messages/{msg_id}"),
+        Some(&hoca),
+        Some(json!({ "folder": "sent" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/messages/{msg_id}"),
+        Some(&hoca),
+        Some(json!({ "folder": "archive" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    let inbox = send(&app, "GET", "/messages", Some(&hoca), None).await;
+    assert_eq!(common::items(&inbox.body).len(), 0);
+    let archive = send(&app, "GET", "/messages?folder=archive", Some(&hoca), None).await;
+    assert_eq!(common::items(&archive.body).len(), 1);
+
+    // Permanent delete only from the trash; it never touches the other copy.
+    let res = send(&app, "DELETE", &format!("/messages/{msg_id}"), Some(&hoca), None).await;
+    assert_eq!(res.status, StatusCode::CONFLICT);
+    send(
+        &app,
+        "PATCH",
+        &format!("/messages/{msg_id}"),
+        Some(&hoca),
+        Some(json!({ "folder": "trash" })),
+    )
+    .await;
+    let trash = send(&app, "GET", "/messages?folder=trash", Some(&hoca), None).await;
+    assert_eq!(common::items(&trash.body).len(), 1);
+    let res = send(&app, "DELETE", &format!("/messages/{msg_id}"), Some(&hoca), None).await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    let trash = send(&app, "GET", "/messages?folder=trash", Some(&hoca), None).await;
+    assert_eq!(common::items(&trash.body).len(), 0);
+    // Deleted side is no longer a party at all.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/messages/{msg_id}"),
+        Some(&hoca),
+        Some(json!({ "folder": "inbox" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+    // Sender still holds their copy…
+    let sent = send(&app, "GET", "/messages?folder=sent", Some(&ali), None).await;
+    assert_eq!(common::items(&sent.body).len(), 1);
+
+    // …and once the sender trashes + deletes too, the row itself is gone.
+    send(
+        &app,
+        "PATCH",
+        &format!("/messages/{msg_id}"),
+        Some(&ali),
+        Some(json!({ "folder": "trash" })),
+    )
+    .await;
+    let res = send(&app, "DELETE", &format!("/messages/{msg_id}"), Some(&ali), None).await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    let mut result = db
+        .query("SELECT VALUE id FROM message")
+        .await
+        .expect("count messages")
+        .check()
+        .expect("count messages check");
+    let rows: Vec<surrealdb::types::RecordId> = result.take(0).expect("message rows");
+    assert!(rows.is_empty(), "both-sides-deleted row is removed");
+}
+
+#[tokio::test]
+async fn messages_guard_parties_recipients_and_folders() {
+    let (app, db) = app_and_db().await;
+    let ali = login(&app, "ali").await;
+    let ali_id = me_id(&app, &ali).await;
+    let veli = login(&app, "veli").await;
+    let parent = login_as(&app, &db, "anne", "parent").await;
+
+    // Sending to yourself or to nobody fails.
+    let res = send(
+        &app,
+        "POST",
+        "/messages",
+        Some(&ali),
+        Some(json!({ "recipient_id": ali_id, "subject": "hi" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+    let res = send(
+        &app,
+        "POST",
+        "/messages",
+        Some(&ali),
+        Some(json!({ "recipient_id": "01J8XZ0K3Q8G7X2M4N5P6R7S8T", "subject": "hi" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+
+    // A parent writes like anyone else — messaging is the role's one pen.
+    let res = send(
+        &app,
+        "POST",
+        "/messages",
+        Some(&parent),
+        Some(json!({ "recipient_id": ali_id, "subject": "görüşme", "body": "uygun mu?" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED);
+    assert_eq!(res.body["sender_role"], "parent");
+    assert_eq!(res.body["label"], serde_json::Value::Null, "no label sent, none stored");
+    let msg_id = id_of(&res.body);
+
+    // A third user is not a party: sees nothing, touches nothing.
+    let inbox = send(&app, "GET", "/messages", Some(&veli), None).await;
+    assert_eq!(common::items(&inbox.body).len(), 0);
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/messages/{msg_id}"),
+        Some(&veli),
+        Some(json!({ "read": true })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+    let res = send(&app, "DELETE", &format!("/messages/{msg_id}"), Some(&veli), None).await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+
+    // Unknown folder names and oversized labels are refused.
+    let res = send(&app, "GET", "/messages?folder=spam", Some(&ali), None).await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+    let veli_id = me_id(&app, &veli).await;
+    let res = send(
+        &app,
+        "POST",
+        "/messages",
+        Some(&ali),
+        Some(json!({ "recipient_id": veli_id, "subject": "hi", "label": "x".repeat(51) })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+}
