@@ -110,7 +110,12 @@ async fn load_people(messages: &[Message], db: &Database) -> Result<People, AppE
     let mut seen = HashSet::new();
     let ids: Vec<UserId> = messages
         .iter()
-        .flat_map(|message| [message.get_sender().clone(), message.get_recipient().clone()])
+        .flat_map(|message| {
+            [
+                message.get_sender().clone(),
+                message.get_recipient().clone(),
+            ]
+        })
         .filter(|id| seen.insert(id.key().to_string()))
         .collect();
     let users = User::list_by_ids(&ids, db).await?;
@@ -274,13 +279,12 @@ async fn update_message(
         .await?
         .ok_or(AppError::NotFound)?;
 
-    if let Some(read) = req.read {
-        if message.is_sender(user.get_id()) {
-            return Err(AppError::Forbidden(
-                "only the recipient can change the read flag",
-            ));
-        }
-        message = message.set_read(read, &st.db).await?;
+    // Validate the whole patch before touching the row: a rejected folder
+    // must not leave a half-applied read flag behind.
+    if req.read.is_some() && message.is_sender(user.get_id()) {
+        return Err(AppError::Forbidden(
+            "only the recipient can change the read flag",
+        ));
     }
     if let Some(ref folder) = req.folder {
         let allowed: &[&str] = if message.is_sender(user.get_id()) {
@@ -294,6 +298,11 @@ async fn update_message(
                 reason: "not a folder this side of the message can move to",
             }));
         }
+    }
+    if let Some(read) = req.read {
+        message = message.set_read(read, &st.db).await?;
+    }
+    if let Some(ref folder) = req.folder {
         message = message.move_to(user.get_id(), folder, &st.db).await?;
     }
 
@@ -325,11 +334,6 @@ async fn delete_message(
     let message = Message::read_for(&MessageId::from_key(&id), user.get_id(), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    if message.folder_of(user.get_id()) != "trash" {
-        return Err(AppError::Conflict(
-            "only messages in the trash can be permanently deleted",
-        ));
-    }
     message.delete_for(user.get_id(), &st.db).await?;
     Ok(StatusCode::NO_CONTENT)
 }

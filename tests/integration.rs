@@ -11088,7 +11088,14 @@ async fn messages_flow_through_folders_per_side() {
     .await;
     assert_eq!(res.status, StatusCode::FORBIDDEN);
     // `?read=` narrows; `total` on the filtered view is the unread badge.
-    let unread = send(&app, "GET", "/messages?folder=inbox&read=false&limit=1", Some(&hoca), None).await;
+    let unread = send(
+        &app,
+        "GET",
+        "/messages?folder=inbox&read=false&limit=1",
+        Some(&hoca),
+        None,
+    )
+    .await;
     assert_eq!(unread.body["total"], 1);
     let res = send(
         &app,
@@ -11099,7 +11106,14 @@ async fn messages_flow_through_folders_per_side() {
     )
     .await;
     assert_eq!(res.status, StatusCode::OK);
-    let unread = send(&app, "GET", "/messages?folder=inbox&read=false&limit=1", Some(&hoca), None).await;
+    let unread = send(
+        &app,
+        "GET",
+        "/messages?folder=inbox&read=false&limit=1",
+        Some(&hoca),
+        None,
+    )
+    .await;
     assert_eq!(unread.body["total"], 0);
     let sent = send(&app, "GET", "/messages?folder=sent", Some(&ali), None).await;
     assert_eq!(common::items(&sent.body)[0]["read"], true);
@@ -11129,7 +11143,14 @@ async fn messages_flow_through_folders_per_side() {
     assert_eq!(common::items(&archive.body).len(), 1);
 
     // Permanent delete only from the trash; it never touches the other copy.
-    let res = send(&app, "DELETE", &format!("/messages/{msg_id}"), Some(&hoca), None).await;
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/messages/{msg_id}"),
+        Some(&hoca),
+        None,
+    )
+    .await;
     assert_eq!(res.status, StatusCode::CONFLICT);
     send(
         &app,
@@ -11141,7 +11162,14 @@ async fn messages_flow_through_folders_per_side() {
     .await;
     let trash = send(&app, "GET", "/messages?folder=trash", Some(&hoca), None).await;
     assert_eq!(common::items(&trash.body).len(), 1);
-    let res = send(&app, "DELETE", &format!("/messages/{msg_id}"), Some(&hoca), None).await;
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/messages/{msg_id}"),
+        Some(&hoca),
+        None,
+    )
+    .await;
     assert_eq!(res.status, StatusCode::NO_CONTENT);
     let trash = send(&app, "GET", "/messages?folder=trash", Some(&hoca), None).await;
     assert_eq!(common::items(&trash.body).len(), 0);
@@ -11168,7 +11196,14 @@ async fn messages_flow_through_folders_per_side() {
         Some(json!({ "folder": "trash" })),
     )
     .await;
-    let res = send(&app, "DELETE", &format!("/messages/{msg_id}"), Some(&ali), None).await;
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/messages/{msg_id}"),
+        Some(&ali),
+        None,
+    )
+    .await;
     assert_eq!(res.status, StatusCode::NO_CONTENT);
     let mut result = db
         .query("SELECT VALUE id FROM message")
@@ -11219,7 +11254,11 @@ async fn messages_guard_parties_recipients_and_folders() {
     .await;
     assert_eq!(res.status, StatusCode::CREATED);
     assert_eq!(res.body["sender_role"], "parent");
-    assert_eq!(res.body["label"], serde_json::Value::Null, "no label sent, none stored");
+    assert_eq!(
+        res.body["label"],
+        serde_json::Value::Null,
+        "no label sent, none stored"
+    );
     let msg_id = id_of(&res.body);
 
     // A third user is not a party: sees nothing, touches nothing.
@@ -11234,7 +11273,14 @@ async fn messages_guard_parties_recipients_and_folders() {
     )
     .await;
     assert_eq!(res.status, StatusCode::NOT_FOUND);
-    let res = send(&app, "DELETE", &format!("/messages/{msg_id}"), Some(&veli), None).await;
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/messages/{msg_id}"),
+        Some(&veli),
+        None,
+    )
+    .await;
     assert_eq!(res.status, StatusCode::NOT_FOUND);
 
     // Unknown folder names and oversized labels are refused.
@@ -11250,4 +11296,139 @@ async fn messages_guard_parties_recipients_and_folders() {
     )
     .await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST);
+}
+
+/// A patch that fails validation must not half-apply: the read flag stays
+/// untouched when the folder part of the same body is rejected.
+#[tokio::test]
+async fn messages_rejected_patch_leaves_no_side_effects() {
+    let (app, db) = app_and_db().await;
+    let ali = login(&app, "ali").await;
+    let hoca = login_as(&app, &db, "hoca", "teacher").await;
+    let hoca_id = me_id(&app, &hoca).await;
+
+    let res = send(
+        &app,
+        "POST",
+        "/messages",
+        Some(&ali),
+        Some(json!({ "recipient_id": hoca_id, "subject": "s", "body": "b" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED);
+    let msg_id = id_of(&res.body);
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/messages/{msg_id}"),
+        Some(&hoca),
+        Some(json!({ "read": true })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+
+    // Recipient can't move to `sent`; the bundled read flip must not land.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/messages/{msg_id}"),
+        Some(&hoca),
+        Some(json!({ "read": false, "folder": "sent" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+    let unread = send(
+        &app,
+        "GET",
+        "/messages?folder=inbox&read=false",
+        Some(&hoca),
+        None,
+    )
+    .await;
+    assert_eq!(
+        common::items(&unread.body).len(),
+        0,
+        "rejected patch must not flip the read flag"
+    );
+}
+
+/// The read-only parent role must bounce off every notes surface — they were
+/// gated on bare authentication before the parent role existed.
+#[tokio::test]
+async fn parent_role_cannot_touch_notes() {
+    let (app, db) = app_and_db().await;
+    let parent = login_as(&app, &db, "baba", "parent").await;
+
+    let res = send(
+        &app,
+        "POST",
+        "/notes",
+        Some(&parent),
+        Some(json!({ "title": "not" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+    let res = send(&app, "GET", "/notes", Some(&parent), None).await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+
+    // Student and up keep the pen.
+    let ali = login(&app, "ali").await;
+    let res = send(
+        &app,
+        "POST",
+        "/notes",
+        Some(&ali),
+        Some(json!({ "title": "ok" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+}
+
+/// A parent link whose student side stopped being a student (a role sweep
+/// losing a race with link creation) must be inert, exactly like a stale
+/// enrollment: the report reads re-check the live role.
+#[tokio::test]
+async fn stale_parent_link_is_inert_after_role_change() {
+    let (app, db) = app_and_db().await;
+    let admin = login_as(&app, &db, "boss", "admin").await;
+    let parent = login_as(&app, &db, "anne", "parent").await;
+    let parent_id = me_id(&app, &parent).await;
+    let ali = login(&app, "ali").await;
+    let ali_id = me_id(&app, &ali).await;
+
+    let res = send(
+        &app,
+        "POST",
+        &format!("/users/{parent_id}/students"),
+        Some(&admin),
+        Some(json!({ "user_id": ali_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/marks/{ali_id}"),
+        Some(&parent),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    // Promote the student straight in the DB — the endpoint's sweep never
+    // fires, leaving the link row behind like a lost race would.
+    common::set_role(&db, "ali", "teacher").await;
+
+    for path in [
+        format!("/marks/{ali_id}"),
+        format!("/attendance/{ali_id}"),
+        format!("/pomodoro/{ali_id}"),
+    ] {
+        let res = send(&app, "GET", &path, Some(&parent), None).await;
+        assert_eq!(
+            res.status,
+            StatusCode::FORBIDDEN,
+            "stale link must not grant {path}"
+        );
+    }
 }
