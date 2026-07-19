@@ -54,6 +54,26 @@ where
     }
 }
 
+/// Like [`CurrentUser`], but also requires at least the `student` role —
+/// keeps the read-only `parent` role out of write-capable surfaces.
+pub struct RequireStudent(pub User);
+
+impl<S> FromRequestParts<S> for RequireStudent
+where
+    S: Send + Sync,
+    AppState: FromRef<S>,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let user = authed_user(parts, state).await?;
+        if !user.get_role().at_least(Role::Student) {
+            return Err(AppError::Forbidden("requires student role or higher"));
+        }
+        Ok(RequireStudent(user))
+    }
+}
+
 /// Like [`CurrentUser`], but also requires at least the `teacher` role.
 /// Authenticated-but-under-privileged callers get `403`.
 pub struct RequireTeacher(pub User);

@@ -324,6 +324,11 @@ async fn update_exam(
     Path(id): Path<String>,
     Json(req): Json<UpdateExam>,
 ) -> Result<Json<ExamResponse>, AppError> {
+    // Take the writer lease before the row read: the merge defaults and the
+    // mode/draft gates below all judge this snapshot, so a publish or mode
+    // change landing between an unlocked read and the gates would be silently
+    // written back over.
+    let _guard = EXAM_LOCK.write().await;
     let exam = Exam::read(&ExamId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -393,10 +398,9 @@ async fn update_exam(
     // Switching sync <-> async <-> open (or back to unscheduled) would
     // silently rewrite the deadline rules under students who already sat
     // down; extending times, the attempt limit, and the rejoin door are the
-    // supported live adjustments instead. Gate read and write share one
-    // writer lease of [`EXAM_LOCK`], so a first attempt can't land in the
-    // gap and leave a sat exam's mode flipped under it.
-    let _guard = EXAM_LOCK.write().await;
+    // supported live adjustments instead. Gate read and write share the
+    // handler-wide writer lease of [`EXAM_LOCK`], so a first attempt can't
+    // land in the gap and leave a sat exam's mode flipped under it.
     let mode_changed =
         schedule.get_mode().map(ExamMode::as_str) != exam.get_mode().map(ExamMode::as_str);
     if mode_changed && ExamAttempt::any_for_exam(exam.get_id(), &st.db).await? {

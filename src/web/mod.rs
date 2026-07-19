@@ -28,7 +28,7 @@ pub use dto::{
     CourseResponse, ExamResponse, PersonRef, SessionResponse, SubjectResponse, UserResponse,
     person_map,
 };
-pub use extractor::{CurrentUser, RequireAdmin, RequireManager, RequireTeacher};
+pub use extractor::{CurrentUser, RequireAdmin, RequireManager, RequireStudent, RequireTeacher};
 pub use page::{Page, PageParams, paginate};
 
 use std::path::{Path as FsPath, PathBuf};
@@ -50,8 +50,8 @@ use crate::error::{AppError, ValidationError};
 /// May `caller` read `target`'s per-student reports (marks, attendance,
 /// pomodoro)? Teacher+ always may (per-endpoint narrowing is the caller's
 /// business); a parent may exactly when a `parent_link` row ties them to the
-/// target. Everyone else — students included — gets a 403 (self-reads go
-/// through the `/me` endpoints).
+/// target *and* the target still holds the student role. Everyone else —
+/// students included — gets a 403 (self-reads go through the `/me` endpoints).
 pub(crate) async fn ensure_can_observe(
     caller: &User,
     target: &UserId,
@@ -60,7 +60,17 @@ pub(crate) async fn ensure_can_observe(
     if caller.get_role().at_least(Role::Teacher) {
         return Ok(());
     }
-    if caller.get_role() == Role::Parent && ParentLink::exists(caller.get_id(), target, db).await? {
+    // The link row alone is not the grant: like stale enrollments, a link
+    // whose student side changed role (a sweep lost a race with link_student)
+    // must be inert, so the target's live role is re-read here. Missing or
+    // non-student targets fall through to the same 403 — a parent never gets
+    // an existence oracle.
+    if caller.get_role() == Role::Parent
+        && ParentLink::exists(caller.get_id(), target, db).await?
+        && User::read(target, db)
+            .await?
+            .is_some_and(|target| target.get_role() == Role::Student)
+    {
         return Ok(());
     }
     Err(AppError::Forbidden(

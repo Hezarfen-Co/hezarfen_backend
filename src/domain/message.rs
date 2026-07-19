@@ -267,11 +267,32 @@ impl Message {
             .ok_or(AppError::NotFound)
     }
 
-    /// Permanently drop `user`'s side. The row itself is removed once both
-    /// sides are gone — judged on the post-write row, so two concurrent
-    /// deletes can't leak an all-deleted row.
+    /// Permanently drop `user`'s side — only if that side currently sits in
+    /// the trash; the gate rides in the `UPDATE`'s `WHERE` so a concurrent
+    /// move back to the inbox can't slip past a check-then-act window. The
+    /// row itself is removed once both sides are gone — judged on the
+    /// post-write row, so two concurrent deletes can't leak an all-deleted
+    /// row.
     pub async fn delete_for(self, user: &UserId, db: &Database) -> Result<(), AppError> {
-        let after = self.move_to(user, DELETED_FOLDER, db).await?;
+        let field = if self.is_sender(user) {
+            "sender_folder"
+        } else {
+            "recipient_folder"
+        };
+        let mut result = db
+            .query(format!(
+                "UPDATE $id SET {field} = $deleted WHERE {field} = $trash RETURN AFTER"
+            ))
+            .bind(("id", self.id.record()))
+            .bind(("deleted", DELETED_FOLDER.to_string()))
+            .bind(("trash", "trash".to_string()))
+            .await?
+            .check()?;
+        let Some(after) = result.take::<Vec<Message>>(0)?.into_iter().next() else {
+            return Err(AppError::Conflict(
+                "only messages in the trash can be permanently deleted",
+            ));
+        };
         if after.sender_folder == DELETED_FOLDER && after.recipient_folder == DELETED_FOLDER {
             let _: Option<Message> = db.delete(after.id.record()).await?;
         }

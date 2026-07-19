@@ -16,7 +16,7 @@ use crate::error::{AppError, ErrorResponse};
 use crate::state::AppState;
 
 use super::{
-    CurrentUser, Page, PageParams, UploadFileForm, blob_path, paginate, read_upload, remove_blob,
+    Page, PageParams, RequireStudent, UploadFileForm, blob_path, paginate, read_upload, remove_blob,
 };
 
 pub fn routes() -> OpenApiRouter<AppState> {
@@ -78,11 +78,12 @@ impl NoteResponse {
         (status = 201, description = "Note created", body = NoteResponse),
         (status = 400, description = "Invalid title or content", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires the student role or higher", body = ErrorResponse),
     ),
 )]
 async fn create(
     State(st): State<AppState>,
-    CurrentUser(user): CurrentUser,
+    RequireStudent(user): RequireStudent,
     Json(req): Json<CreateNote>,
 ) -> Result<(StatusCode, Json<NoteResponse>), AppError> {
     let title = NoteTitle::try_new(&req.title)?;
@@ -104,11 +105,12 @@ async fn create(
         (status = 200, description = "A page of the user's notes (all of them when unpaged)", body = Page<NoteResponse>),
         (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires the student role or higher", body = ErrorResponse),
     ),
 )]
 async fn list(
     State(st): State<AppState>,
-    CurrentUser(user): CurrentUser,
+    RequireStudent(user): RequireStudent,
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<NoteResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
@@ -131,12 +133,13 @@ async fn list(
     responses(
         (status = 200, description = "The note", body = NoteResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires the student role or higher", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
     ),
 )]
 async fn get_one(
     State(st): State<AppState>,
-    CurrentUser(user): CurrentUser,
+    RequireStudent(user): RequireStudent,
     Path(id): Path<String>,
 ) -> Result<Json<NoteResponse>, AppError> {
     let note = Note::read_owned(&NoteId::from_key(&id), user.get_id(), &st.db)
@@ -157,12 +160,13 @@ async fn get_one(
         (status = 200, description = "Updated note", body = NoteResponse),
         (status = 400, description = "Invalid title or content", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires the student role or higher", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
     ),
 )]
 async fn update(
     State(st): State<AppState>,
-    CurrentUser(user): CurrentUser,
+    RequireStudent(user): RequireStudent,
     Path(id): Path<String>,
     Json(req): Json<UpdateNote>,
 ) -> Result<Json<NoteResponse>, AppError> {
@@ -193,12 +197,13 @@ async fn update(
     responses(
         (status = 204, description = "Deleted"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires the student role or higher", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
     ),
 )]
 async fn delete_one(
     State(st): State<AppState>,
-    CurrentUser(user): CurrentUser,
+    RequireStudent(user): RequireStudent,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
     let note = Note::read_owned(&NoteId::from_key(&id), user.get_id(), &st.db)
@@ -257,6 +262,7 @@ impl NoteFileResponse {
         (status = 201, description = "File stored", body = NoteFileResponse),
         (status = 400, description = "Missing file field, invalid filename or content type, or empty file", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires the student role or higher", body = ErrorResponse),
         (status = 404, description = "Note not found", body = ErrorResponse),
         (status = 409, description = "The note already holds the maximum number of files", body = ErrorResponse),
         (status = 413, description = "File exceeds the school's size limit", body = ErrorResponse),
@@ -264,7 +270,7 @@ impl NoteFileResponse {
 )]
 async fn upload_file(
     State(st): State<AppState>,
-    CurrentUser(user): CurrentUser,
+    RequireStudent(user): RequireStudent,
     Path(id): Path<String>,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<NoteFileResponse>), AppError> {
@@ -307,12 +313,13 @@ async fn upload_file(
         (status = 200, description = "A page of the note's files", body = Page<NoteFileResponse>),
         (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires the student role or higher", body = ErrorResponse),
         (status = 404, description = "Note not found", body = ErrorResponse),
     ),
 )]
 async fn list_files(
     State(st): State<AppState>,
-    CurrentUser(user): CurrentUser,
+    RequireStudent(user): RequireStudent,
     Path(id): Path<String>,
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<NoteFileResponse>>, AppError> {
@@ -343,12 +350,13 @@ async fn list_files(
     responses(
         (status = 200, description = "The file bytes", content_type = "application/octet-stream"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires the student role or higher", body = ErrorResponse),
         (status = 404, description = "Note or file not found", body = ErrorResponse),
     ),
 )]
 async fn download_file(
     State(st): State<AppState>,
-    CurrentUser(user): CurrentUser,
+    RequireStudent(user): RequireStudent,
     Path((id, file_id)): Path<(String, String)>,
 ) -> Result<Response, AppError> {
     let note = Note::read_owned(&NoteId::from_key(&id), user.get_id(), &st.db)
@@ -396,12 +404,13 @@ async fn download_file(
     responses(
         (status = 204, description = "Deleted"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires the student role or higher", body = ErrorResponse),
         (status = 404, description = "Note or file not found", body = ErrorResponse),
     ),
 )]
 async fn delete_file(
     State(st): State<AppState>,
-    CurrentUser(user): CurrentUser,
+    RequireStudent(user): RequireStudent,
     Path((id, file_id)): Path<(String, String)>,
 ) -> Result<StatusCode, AppError> {
     let note = Note::read_owned(&NoteId::from_key(&id), user.get_id(), &st.db)

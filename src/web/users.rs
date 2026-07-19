@@ -454,7 +454,8 @@ async fn students_page(
 /// Tie a student to a parent account. Admin only — family ties are school-office
 /// records, like roles. `{id}` must hold the `parent` role and `user_id` the
 /// `student` role; a parent may observe any number of students. Idempotent:
-/// linking the same pair again returns the existing tie. The tie grants the
+/// linking the same pair again keeps the one tie (the `linked_by` stamp moves
+/// to the latest linker, like re-enrolling). The tie grants the
 /// parent read access to the student's marks, attendance, and pomodoro reports
 /// — nothing else, and never any write.
 #[utoipa::path(
