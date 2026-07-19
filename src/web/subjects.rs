@@ -14,6 +14,7 @@ use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
 
 use super::courses::{can_manage_course, can_view_course};
+use super::exams::EXAM_LOCK;
 use super::{CurrentUser, RequireTeacher, SubjectResponse};
 
 pub fn routes() -> OpenApiRouter<AppState> {
@@ -164,6 +165,10 @@ async fn delete_subject(
             "only the course creator or a manager/admin can delete this subject",
         ));
     }
+    // Writer lease of [`EXAM_LOCK`]: the no-questions check and the delete
+    // are one unit, so a question create/update that just validated this
+    // subject can't land its row on a subject that vanished mid-flight.
+    let _guard = EXAM_LOCK.write().await;
     if ExamQuestion::any_for_subject(subject.get_id(), &st.db).await? {
         return Err(AppError::Conflict(
             "exam questions still reference this subject — re-tag or delete them first",

@@ -154,7 +154,10 @@ pub fn cors_layer(allowlist: Vec<HeaderValue>) -> CorsLayer {
             Method::DELETE,
             Method::OPTIONS,
         ])
-        .allow_headers([header::CONTENT_TYPE]);
+        .allow_headers([header::CONTENT_TYPE])
+        // Contract headers cross-origin JS must be able to read: `Retry-After`
+        // on 429s and `Content-Disposition` (original filename) on downloads.
+        .expose_headers([header::RETRY_AFTER, header::CONTENT_DISPOSITION]);
 
     if allowlist.is_empty() {
         layer

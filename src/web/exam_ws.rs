@@ -63,7 +63,7 @@ use crate::error::AppError;
 use crate::state::AppState;
 use crate::web::CurrentUser;
 use crate::web::exams::{
-    check_rejoin, ensure_enrolled, ensure_student, save_answer_in, writable_attempt,
+    EXAM_LOCK, check_rejoin, ensure_enrolled, ensure_student, save_answer_in, writable_attempt,
 };
 
 /// Serializes every presence transition with its matching `left_at` write:
@@ -364,7 +364,11 @@ async fn handle_message(
         } => {
             // Re-read the exam so the save is judged against the *current*
             // schedule, exactly like the REST path it shares — but write into
-            // the room's own sitting, never whatever is latest.
+            // the room's own sitting, never whatever is latest. Reader lease
+            // of [`EXAM_LOCK`] from the gates through the upsert, exactly
+            // like `save_answer_checked` — and dropped before the socket
+            // sends, so a slow client never stalls a writer.
+            let guard = EXAM_LOCK.read().await;
             let saved = match Exam::read(exam_id, db).await {
                 Ok(Some(exam)) => match writable_room_attempt(&exam, attempt_id, user, db).await {
                     Ok(attempt) => {
@@ -375,6 +379,7 @@ async fn handle_message(
                 Ok(None) => Err(AppError::NotFound),
                 Err(err) => Err(err),
             };
+            drop(guard);
             match saved {
                 Ok(answer) => {
                     send(
