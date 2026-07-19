@@ -249,7 +249,12 @@ async fn create_course(
         &st.db,
     )
     .await?;
-    Ok((StatusCode::CREATED, Json(CourseResponse::new(&course))))
+    // The creator is the caller — already loaded, no extra lookup.
+    let people = PersonRef::map_of(&[&user]);
+    Ok((
+        StatusCode::CREATED,
+        Json(CourseResponse::new(&course, &people)),
+    ))
 }
 
 /// List the courses visible to the caller: every course for manager+,
@@ -276,9 +281,12 @@ async fn list_courses(
     let (limit, offset) = page.resolve()?;
     let courses = visible_courses(&user, &st.db).await?;
     let total = courses.len() as i64;
-    let items = paginate(&courses, limit, offset)
+    let window = paginate(&courses, limit, offset);
+    // Join creators onto the page alone — the lookup shrinks with the window.
+    let people = person_map(window.iter().map(|c| c.get_creator().clone()), &st.db).await?;
+    let items = window
         .iter()
-        .map(CourseResponse::new)
+        .map(|course| CourseResponse::new(course, &people))
         .collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
@@ -306,9 +314,11 @@ async fn my_courses(
     let (limit, offset) = page.resolve()?;
     let courses = Course::list_enrolled(user.get_id(), &st.db).await?;
     let total = courses.len() as i64;
-    let items = paginate(&courses, limit, offset)
+    let window = paginate(&courses, limit, offset);
+    let people = person_map(window.iter().map(|c| c.get_creator().clone()), &st.db).await?;
+    let items = window
         .iter()
-        .map(CourseResponse::new)
+        .map(|course| CourseResponse::new(course, &people))
         .collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
@@ -341,7 +351,8 @@ async fn get_course(
             "only enrolled users, the course creator, or a manager/admin can view this course",
         ));
     }
-    Ok(Json(CourseResponse::new(&course)))
+    let people = person_map([course.get_creator().clone()], &st.db).await?;
+    Ok(Json(CourseResponse::new(&course, &people)))
 }
 
 /// Update a course. Requires teacher+; the creator may edit their own course
@@ -405,7 +416,8 @@ async fn update_course(
     let updated = course
         .update(title, description, kind, term, capacity, &st.db)
         .await?;
-    Ok(Json(CourseResponse::new(&updated)))
+    let people = person_map([updated.get_creator().clone()], &st.db).await?;
+    Ok(Json(CourseResponse::new(&updated, &people)))
 }
 
 /// Delete a course. Requires teacher+; the creator may delete their own course

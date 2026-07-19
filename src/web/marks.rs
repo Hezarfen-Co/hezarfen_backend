@@ -18,7 +18,7 @@ use crate::error::{AppError, ErrorResponse};
 use crate::state::AppState;
 
 use super::courses::can_manage_course;
-use super::{CourseResponse, CurrentUser, RequireTeacher};
+use super::{CourseResponse, CurrentUser, RequireTeacher, person_map};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -102,6 +102,7 @@ async fn build_report(
 
     // One settings read weighs and labels the whole report.
     let school = Settings::load(db).await?;
+    let people = person_map(courses.iter().map(|c| c.get_creator().clone()), db).await?;
 
     let mut blocks = Vec::with_capacity(courses.len());
     for course in &courses {
@@ -138,7 +139,7 @@ async fn build_report(
 
         let average = weighted_average(&pairs);
         blocks.push(CourseMarks {
-            course: CourseResponse::new(course),
+            course: CourseResponse::new(course, &people),
             average,
             average_grade: average.and_then(|a| school.grade_label(a).map(str::to_string)),
             results: entries,

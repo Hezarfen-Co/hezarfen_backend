@@ -17,7 +17,7 @@ use crate::error::{AppError, ErrorResponse};
 use crate::state::AppState;
 
 use super::courses::can_manage_course;
-use super::{CourseResponse, CurrentUser, RequireTeacher};
+use super::{CourseResponse, CurrentUser, RequireTeacher, person_map};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -119,6 +119,7 @@ async fn build_report(
     let courses = Course::list_by_ids(&course_ids, db).await?;
     let course_by_key: HashMap<&str, &Course> =
         courses.iter().map(|c| (c.get_id().key(), c)).collect();
+    let people = person_map(courses.iter().map(|c| c.get_creator().clone()), db).await?;
 
     let mut blocks = Vec::with_capacity(course_ids.len());
     let mut visible_rows: Vec<&SessionAttendance> = Vec::with_capacity(sessions.len());
@@ -134,7 +135,7 @@ async fn build_report(
         let rows = &by_course[course_id.key()];
         visible_rows.extend(rows.iter().copied());
         blocks.push(CourseAttendance {
-            course: CourseResponse::new(course),
+            course: CourseResponse::new(course, &people),
             counts: StatusCounts::tally(rows.iter().map(|r| r.get_status())),
         });
     }

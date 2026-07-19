@@ -2073,6 +2073,9 @@ async fn courses_are_owner_scoped_and_creator_guarded() {
     .await;
     assert_eq!(res.status, StatusCode::CREATED);
     assert_eq!(res.body["title"], "algebra");
+    // The creator comes back as an embedded person ref, not a bare id — the
+    // catalog renders names without a second users request.
+    assert_eq!(res.body["creator"]["username"], "ali");
     let course_id = id_of(&res.body);
 
     // Another teacher is not enrolled and doesn't manage it: no read, and the
@@ -2108,9 +2111,12 @@ async fn courses_are_owner_scoped_and_creator_guarded() {
             .status,
             StatusCode::OK
         );
+        let catalog = send(&app, "GET", "/courses", Some(caller), None).await.body;
+        let rows = common::items(&catalog);
+        assert_eq!(rows.len(), 1);
         assert_eq!(
-            common::items(&send(&app, "GET", "/courses", Some(caller), None).await.body).len(),
-            1
+            rows[0]["creator"]["username"], "ali",
+            "the catalog embeds the creator ref on every row"
         );
     }
 
