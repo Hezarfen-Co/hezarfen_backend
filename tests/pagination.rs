@@ -180,6 +180,28 @@ async fn user_search_is_paged_not_capped() {
     assert_eq!(
         res.status,
         StatusCode::BAD_REQUEST,
-        "blank q is still a 400"
+        "blank q without a role is still a 400"
     );
+
+    // Blank q scoped to a role is a listing, not an error.
+    let res = send(
+        &app,
+        "GET",
+        "/users/search?q=&role=student",
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(total(&res.body), 12, "blank q + role lists the whole role");
+    let res = send(
+        &app,
+        "GET",
+        "/users/search?q=&role=teacher",
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(total(&res.body), 1, "role scope excludes the students");
 }
