@@ -29,7 +29,13 @@ pub use dto::{
 pub use extractor::{CurrentUser, RequireAdmin, RequireManager, RequireTeacher};
 pub use page::{Page, PageParams, paginate};
 
+use std::path::{Path as FsPath, PathBuf};
+
+use axum::extract::Multipart;
+use axum::extract::multipart::MultipartError;
+use axum::http::StatusCode;
 use serde::{Deserialize, Deserializer};
+use utoipa::ToSchema;
 
 use crate::constant::SCHEDULE_PAST_GRACE_MS;
 use crate::domain::timestamp::Timestamp;
@@ -71,6 +77,105 @@ pub(crate) fn check_not_past(
         }));
     }
     Ok(())
+}
+
+// ---- uploaded blobs ---------------------------------------------------------
+// Note files and question images share one story: bytes on disk under the
+// configured directory in a file named by a server-generated ULID (user input
+// never shapes a path), metadata in a row. Upload writes the blob before the
+// row; delete removes the row before the blob — so a stored row always points
+// at a real blob and a crash strands at worst an unreachable file.
+
+/// Where a stored row's blob lives: one file under the configured directory,
+/// named by the row's server-generated key.
+pub(crate) fn blob_path(files_path: &FsPath, key: &str) -> PathBuf {
+    files_path.join(key)
+}
+
+/// Best-effort blob removal after its row is gone. Failure only strands an
+/// unreachable file on disk, so it is logged rather than surfaced.
+pub(crate) async fn remove_blob(files_path: &FsPath, key: &str) {
+    let path = blob_path(files_path, key);
+    if let Err(err) = tokio::fs::remove_file(&path).await
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!("failed to remove blob {}: {err}", path.display());
+    }
+}
+
+/// Multipart read failures: the route-level body cap maps to 413 like the
+/// school-limit check; anything else is a malformed body.
+pub(crate) fn multipart_error(err: MultipartError) -> AppError {
+    if err.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        AppError::PayloadTooLarge("the upload exceeds the server's absolute body cap".to_string())
+    } else {
+        AppError::Validation(ValidationError::Invalid {
+            field: "file",
+            reason: "malformed multipart body",
+        })
+    }
+}
+
+/// Schema-only mirror of an upload form; the handlers read the multipart
+/// stream directly.
+#[derive(ToSchema)]
+#[allow(dead_code)]
+pub(crate) struct UploadFileForm {
+    /// The file part. Its `Content-Type` (and, where required, `filename`)
+    /// are stored alongside the bytes.
+    #[schema(value_type = String, format = Binary)]
+    file: String,
+}
+
+/// One uploaded file's raw parts, as the client sent them — the caller
+/// validates what it cares about (notes need a filename, images an
+/// allowlisted content type).
+pub(crate) struct UploadedFile {
+    pub name: Option<String>,
+    pub content_type: Option<String>,
+    pub data: Vec<u8>,
+}
+
+/// Pull the `file` field out of a multipart body, reading it chunkwise so an
+/// oversized upload dies at `limit`, not after buffering whole — the check is
+/// on real bytes received, so a lying `Content-Length` can't sneak past it.
+/// Empty files are refused; stray extra fields are ignored.
+pub(crate) async fn read_upload(
+    multipart: &mut Multipart,
+    limit: i64,
+) -> Result<UploadedFile, AppError> {
+    let mut field = loop {
+        match multipart.next_field().await.map_err(multipart_error)? {
+            Some(field) if field.name() == Some("file") => break field,
+            Some(_) => continue,
+            None => {
+                return Err(AppError::Validation(ValidationError::Invalid {
+                    field: "file",
+                    reason: "the multipart body must carry a 'file' field",
+                }));
+            }
+        }
+    };
+    let name = field.file_name().map(str::to_string);
+    let content_type = field.content_type().map(str::to_string);
+
+    let mut data = Vec::new();
+    while let Some(chunk) = field.chunk().await.map_err(multipart_error)? {
+        if data.len() + chunk.len() > limit as usize {
+            return Err(AppError::PayloadTooLarge(format!(
+                "the file exceeds the school's limit of {limit} bytes"
+            )));
+        }
+        data.extend_from_slice(&chunk);
+    }
+    if data.is_empty() {
+        return Err(AppError::Validation(ValidationError::Empty("file")));
+    }
+    Ok(UploadedFile {
+        name,
+        content_type,
+        data,
+    })
 }
 
 /// Distinguishes an *absent* PATCH field from an explicit `null`: absent never

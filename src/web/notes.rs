@@ -1,7 +1,4 @@
-use std::path::{Path as FsPath, PathBuf};
-
 use axum::Json;
-use axum::extract::multipart::MultipartError;
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::http::{HeaderValue, StatusCode};
@@ -15,10 +12,12 @@ use crate::constant::{MAX_MAX_FILE_BYTES, UPLOAD_BODY_OVERHEAD_BYTES};
 use crate::domain::note::{Note, NoteContent, NoteId, NoteTitle};
 use crate::domain::note_file::{FileContentType, FileName, NoteFile, NoteFileId};
 use crate::domain::settings::Settings;
-use crate::error::{AppError, ErrorResponse, ValidationError};
+use crate::error::{AppError, ErrorResponse};
 use crate::state::AppState;
 
-use super::{CurrentUser, Page, PageParams, paginate};
+use super::{
+    CurrentUser, Page, PageParams, UploadFileForm, blob_path, paginate, read_upload, remove_blob,
+};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     // The file routes get their own HTTP body cap: the server-wide hard
@@ -211,7 +210,7 @@ async fn delete_one(
     let files = NoteFile::list_for(note.get_id(), &st.db).await?;
     note.delete(&st.db).await?;
     for file in &files {
-        remove_blob(&st.files_path, file.get_id()).await;
+        remove_blob(&st.files_path, file.get_id().key()).await;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -241,17 +240,6 @@ impl NoteFileResponse {
             size: file.get_size(),
         }
     }
-}
-
-/// Schema-only mirror of the upload form; the handler reads the multipart
-/// stream directly.
-#[derive(ToSchema)]
-#[allow(dead_code)]
-struct UploadFileForm {
-    /// The file part. Its `filename` (required) and `Content-Type` are stored
-    /// alongside the bytes.
-    #[schema(value_type = String, format = Binary)]
-    file: String,
 }
 
 /// Attach a file to a note owned by the current user. `multipart/form-data`
@@ -287,42 +275,15 @@ async fn upload_file(
     // under one lock) — checking it here too would just race.
     let limit = Settings::load(&st.db).await?.get_max_file_bytes();
 
-    let mut field = loop {
-        match multipart.next_field().await.map_err(multipart_error)? {
-            Some(field) if field.name() == Some("file") => break field,
-            Some(_) => continue, // ignore stray extra fields
-            None => {
-                return Err(AppError::Validation(ValidationError::Invalid {
-                    field: "file",
-                    reason: "the multipart body must carry a 'file' field",
-                }));
-            }
-        }
-    };
-    let name = FileName::try_new(field.file_name().unwrap_or_default())?;
-    let content_type = FileContentType::try_new(field.content_type().unwrap_or_default())?;
-
-    // Read the part chunkwise so an oversized upload dies at the limit, not
-    // after buffering whole. The check is on real bytes received — a lying
-    // Content-Length can't sneak past it.
-    let mut data = Vec::new();
-    while let Some(chunk) = field.chunk().await.map_err(multipart_error)? {
-        if data.len() + chunk.len() > limit as usize {
-            return Err(AppError::PayloadTooLarge(format!(
-                "the file exceeds the school's limit of {limit} bytes"
-            )));
-        }
-        data.extend_from_slice(&chunk);
-    }
-    if data.is_empty() {
-        return Err(AppError::Validation(ValidationError::Empty("file")));
-    }
+    let upload = read_upload(&mut multipart, limit).await?;
+    let name = FileName::try_new(&upload.name.unwrap_or_default())?;
+    let content_type = FileContentType::try_new(&upload.content_type.unwrap_or_default())?;
 
     // Blob first, row second — a stored row always points at a real blob. If
     // the row insert fails, take the fresh blob back out.
-    let file = NoteFile::new(note.get_id(), name, content_type, data.len() as i64);
-    let path = blob_path(&st.files_path, file.get_id());
-    tokio::fs::write(&path, &data)
+    let file = NoteFile::new(note.get_id(), name, content_type, upload.data.len() as i64);
+    let path = blob_path(&st.files_path, file.get_id().key());
+    tokio::fs::write(&path, &upload.data)
         .await
         .map_err(|err| AppError::Internal(format!("failed to store the file blob: {err}")))?;
     match file.insert(&st.db).await {
@@ -396,7 +357,7 @@ async fn download_file(
     let file = NoteFile::read_for(&NoteFileId::from_key(&file_id), note.get_id(), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    let bytes = tokio::fs::read(blob_path(&st.files_path, file.get_id()))
+    let bytes = tokio::fs::read(blob_path(&st.files_path, file.get_id().key()))
         .await
         .map_err(|err| {
             // The row exists but its blob doesn't — that's server-side damage
@@ -450,38 +411,8 @@ async fn delete_file(
         .await?
         .ok_or(AppError::NotFound)?;
     let file = file.delete(&st.db).await?;
-    remove_blob(&st.files_path, file.get_id()).await;
+    remove_blob(&st.files_path, file.get_id().key()).await;
     Ok(StatusCode::NO_CONTENT)
-}
-
-/// Where a file row's blob lives: one file under the configured directory,
-/// named by the row's server-generated key — user input never shapes a path.
-fn blob_path(files_path: &FsPath, id: &NoteFileId) -> PathBuf {
-    files_path.join(id.key())
-}
-
-/// Best-effort blob removal after its row is gone. Failure only strands an
-/// unreachable file on disk, so it is logged rather than surfaced.
-async fn remove_blob(files_path: &FsPath, id: &NoteFileId) {
-    let path = blob_path(files_path, id);
-    if let Err(err) = tokio::fs::remove_file(&path).await
-        && err.kind() != std::io::ErrorKind::NotFound
-    {
-        tracing::warn!("failed to remove blob {}: {err}", path.display());
-    }
-}
-
-/// Multipart read failures: the route-level body cap maps to 413 like the
-/// school-limit check; anything else is a malformed body.
-fn multipart_error(err: MultipartError) -> AppError {
-    if err.status() == StatusCode::PAYLOAD_TOO_LARGE {
-        AppError::PayloadTooLarge("the upload exceeds the server's absolute body cap".to_string())
-    } else {
-        AppError::Validation(ValidationError::Invalid {
-            field: "file",
-            reason: "malformed multipart body",
-        })
-    }
 }
 
 /// `Content-Disposition` for a download: an ASCII-safe `filename` fallback

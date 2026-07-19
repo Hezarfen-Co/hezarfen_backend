@@ -2,9 +2,11 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use axum::Json;
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, X_CONTENT_TYPE_OPTIONS};
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use tokio_stream::wrappers::IntervalStream;
 use tokio_stream::{Stream, StreamExt};
@@ -12,7 +14,10 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::constant::EXAM_LIVE_STREAM_INTERVAL_SECS;
+use crate::constant::{
+    EXAM_LIVE_STREAM_INTERVAL_SECS, MAX_MAX_FILE_BYTES, QUESTION_IMAGE_CONTENT_TYPES,
+    UPLOAD_BODY_OVERHEAD_BYTES,
+};
 use crate::database::Database;
 use crate::domain::course::Course;
 use crate::domain::enrollment::Enrollment;
@@ -26,6 +31,8 @@ use crate::domain::exam_question::{
     ExamQuestion, ExamQuestionId, QuestionKind, QuestionPoints, QuestionSpec, QuestionText,
 };
 use crate::domain::exam_result::{ExamResult, Mark};
+use crate::domain::note_file::FileContentType;
+use crate::domain::question_image::QuestionImage;
 use crate::domain::role::Role;
 use crate::domain::settings::Settings;
 use crate::domain::timestamp::Timestamp;
@@ -36,8 +43,8 @@ use crate::state::AppState;
 use super::courses::{can_manage_course, can_view_course, visible_courses};
 use super::subjects::subject_in_course;
 use super::{
-    CurrentUser, ExamResponse, Page, PageParams, PersonRef, RequireTeacher, check_not_past,
-    paginate, person_map, set_or_clear,
+    CurrentUser, ExamResponse, Page, PageParams, PersonRef, RequireTeacher, UploadFileForm,
+    blob_path, check_not_past, paginate, person_map, read_upload, remove_blob, set_or_clear,
 };
 
 /// Serializes the exam subsystem's cross-record check-then-writes, which
@@ -77,6 +84,24 @@ pub fn routes() -> OpenApiRouter<AppState> {
         .routes(routes!(attempt_questions))
         .routes(routes!(save_answer))
         .routes(routes!(attempt_answers))
+        // The image routes get their own HTTP body cap, like the note-file
+        // ones: the server-wide hard ceiling plus multipart framing headroom.
+        .merge(
+            OpenApiRouter::new()
+                .routes(routes!(
+                    upload_question_image,
+                    get_question_image,
+                    delete_question_image
+                ))
+                .routes(routes!(
+                    upload_choice_image,
+                    get_choice_image,
+                    delete_choice_image
+                ))
+                .layer(DefaultBodyLimit::max(
+                    MAX_MAX_FILE_BYTES as usize + UPLOAD_BODY_OVERHEAD_BYTES,
+                )),
+        )
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -368,8 +393,8 @@ async fn update_exam(
 }
 
 /// Delete an exam. Requires teacher+ and management rights over the exam's
-/// course (its creator, or manager/admin). Cascades the exam's result and
-/// attempt rows.
+/// course (its creator, or manager/admin). Cascades the exam's results,
+/// attempts, questions, answers, and question images (blobs included).
 #[utoipa::path(
     delete,
     path = "/{id}",
@@ -397,7 +422,13 @@ async fn delete_exam(
             "only the course creator or a manager/admin can delete this exam",
         ));
     }
+    // Rows go first (the delete cascades them), blobs after — a crash in
+    // between strands at worst an unreachable blob.
+    let images = QuestionImage::list_for_exam(exam.get_id(), &st.db).await?;
     exam.delete(&st.db).await?;
+    for image in &images {
+        remove_blob(&st.files_path, image.get_file()).await;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1260,7 +1291,8 @@ struct UpdateQuestion {
     /// when moving to `text`.
     kind: Option<String>,
     /// Omit to keep the stored options; send `null` to drop them (text
-    /// questions only).
+    /// questions only). Replacing or clearing the list also drops every
+    /// option picture — the old images belong to the old options.
     #[serde(default, deserialize_with = "set_or_clear")]
     #[schema(value_type = Option<Vec<String>>)]
     choices: Option<Option<Vec<String>>>,
@@ -1268,6 +1300,64 @@ struct UpdateQuestion {
     #[serde(default, deserialize_with = "set_or_clear")]
     #[schema(value_type = Option<i64>)]
     correct: Option<Option<i64>>,
+}
+
+/// A stored question image's metadata; the bytes come from the image
+/// endpoints (`GET .../image`, `GET .../choices/{index}/image`).
+#[derive(Serialize, ToSchema)]
+struct ImageMetaResponse {
+    /// MIME type as declared on upload (always one of the raster allowlist).
+    #[schema(example = "image/png")]
+    content_type: String,
+    /// Image size in bytes.
+    #[schema(example = 24_576)]
+    size: i64,
+}
+
+impl ImageMetaResponse {
+    fn new(image: &QuestionImage) -> Self {
+        Self {
+            content_type: image.get_content_type().as_str().to_string(),
+            size: image.get_size(),
+        }
+    }
+}
+
+/// The question's slot out of its image rows.
+fn image_meta(images: &[QuestionImage], slot: Option<i64>) -> Option<ImageMetaResponse> {
+    images
+        .iter()
+        .find(|image| image.get_slot() == slot)
+        .map(ImageMetaResponse::new)
+}
+
+/// The per-choice metas, aligned index-for-index with `choices` (`None`
+/// entries = that option has no picture); `None` whole for text questions.
+fn choice_image_metas(
+    question: &ExamQuestion,
+    images: &[QuestionImage],
+) -> Option<Vec<Option<ImageMetaResponse>>> {
+    question.get_choices().map(|choices| {
+        (0..choices.len() as i64)
+            .map(|index| image_meta(images, Some(index)))
+            .collect()
+    })
+}
+
+/// `exam`'s image rows bucketed by question key — one query feeding a whole
+/// question list.
+async fn images_by_question(
+    exam: &ExamId,
+    db: &Database,
+) -> Result<HashMap<String, Vec<QuestionImage>>, AppError> {
+    let mut buckets: HashMap<String, Vec<QuestionImage>> = HashMap::new();
+    for image in QuestionImage::list_for_exam(exam, db).await? {
+        buckets
+            .entry(image.get_question().key().to_string())
+            .or_default()
+            .push(image);
+    }
+    Ok(buckets)
 }
 
 /// A question as its author sees it — including the `correct` index. Never
@@ -1286,10 +1376,14 @@ struct QuestionResponse {
     choices: Option<Vec<String>>,
     /// Zero-based index of the right option (`choice` questions only).
     correct: Option<i64>,
+    /// The question's illustration, if one was uploaded (any kind).
+    image: Option<ImageMetaResponse>,
+    /// Per-option pictures, aligned with `choices` (`choice` questions only).
+    choice_images: Option<Vec<Option<ImageMetaResponse>>>,
 }
 
 impl QuestionResponse {
-    fn new(question: &ExamQuestion) -> Self {
+    fn new(question: &ExamQuestion, images: &[QuestionImage]) -> Self {
         Self {
             id: question.get_id().key().to_string(),
             exam: question.get_exam().key().to_string(),
@@ -1301,6 +1395,8 @@ impl QuestionResponse {
                 .get_choices()
                 .map(|choices| choices.iter().map(|c| c.as_str().to_string()).collect()),
             correct: question.get_correct(),
+            image: image_meta(images, None),
+            choice_images: choice_image_metas(question, images),
         }
     }
 }
@@ -1379,7 +1475,11 @@ async fn create_question(
     let points = QuestionPoints::try_new(req.points)?;
     let spec = QuestionSpec::try_new(QuestionKind::try_new(&req.kind)?, req.choices, req.correct)?;
     let question = ExamQuestion::create(exam.get_id(), subject, text, points, spec, &st.db).await?;
-    Ok((StatusCode::CREATED, Json(QuestionResponse::new(&question))))
+    // A question is born imageless — uploads come after, against its id.
+    Ok((
+        StatusCode::CREATED,
+        Json(QuestionResponse::new(&question, &[])),
+    ))
 }
 
 /// The exam's question list, `correct` indexes included — the answer key,
@@ -1418,10 +1518,18 @@ async fn list_questions(
         ));
     }
     let questions = ExamQuestion::list_for_exam(exam.get_id(), &st.db).await?;
+    let images = images_by_question(exam.get_id(), &st.db).await?;
     let total = questions.len() as i64;
     let items = paginate(&questions, limit, offset)
         .iter()
-        .map(QuestionResponse::new)
+        .map(|question| {
+            QuestionResponse::new(
+                question,
+                images
+                    .get(question.get_id().key())
+                    .map_or(&[][..], Vec::as_slice),
+            )
+        })
         .collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
@@ -1489,6 +1597,7 @@ async fn update_question(
         Some(ref kind) => QuestionKind::try_new(kind)?,
         None => question.get_kind().clone(),
     };
+    let choices_replaced = req.choices.is_some();
     let choices = match req.choices {
         Some(update) => update,
         None => question
@@ -1502,7 +1611,16 @@ async fn update_question(
     let spec = QuestionSpec::try_new(kind, choices, correct)?;
 
     let updated = question.update(subject, text, points, spec, &st.db).await?;
-    Ok(Json(QuestionResponse::new(&updated)))
+    // A replaced (or cleared) choice list orphans the old options' pictures —
+    // drop them all; the question's own illustration stays. Uploads re-attach
+    // against the new list.
+    if choices_replaced {
+        for image in QuestionImage::delete_choices_for(updated.get_id(), &st.db).await? {
+            remove_blob(&st.files_path, image.get_file()).await;
+        }
+    }
+    let images = QuestionImage::list_for_question(updated.get_id(), &st.db).await?;
+    Ok(Json(QuestionResponse::new(&updated, &images)))
 }
 
 /// Remove a question (and every answer to it). Requires teacher+ and
@@ -1544,7 +1662,387 @@ async fn delete_question(
     let _guard = EXAM_LOCK.write().await;
     ensure_questions_editable(exam.get_id(), &st.db).await?;
     let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
+    // Rows go first (the delete cascades them), blobs after — a crash in
+    // between strands at worst an unreachable blob.
+    let images = QuestionImage::list_for_question(question.get_id(), &st.db).await?;
     question.delete(&st.db).await?;
+    for image in &images {
+        remove_blob(&st.files_path, image.get_file()).await;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---- question images ----------------------------------------------------------
+// A question may carry one illustration (any kind — the map above the prompt)
+// and, on choice questions, one picture per option (pick the right city off
+// the map). Uploads are teacher authoring and freeze with the rest of the
+// question once attempts exist; metadata rides on the question DTOs, bytes
+// flow through the GET endpoints below, whose access follows the question's
+// own visibility (author side and sitting side alike).
+
+/// The exam, provided the caller may author its questions — the shared front
+/// half of every image write.
+async fn image_managed_exam(st: &AppState, user: &User, id: &str) -> Result<Exam, AppError> {
+    let exam = Exam::read(&ExamId::from_key(id), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let course = course_of(&exam, &st.db).await?;
+    if !can_manage_course(&course, user) {
+        return Err(AppError::Forbidden(
+            "only the course creator or a manager/admin can manage question images",
+        ));
+    }
+    Ok(exam)
+}
+
+/// A 403/404 unless the caller may see the exam's question content: course
+/// managers always, students through the same wall as
+/// `GET /exams/{id}/attempt/questions` — enrollment plus a started attempt,
+/// so there is no early peek at the pictures either.
+async fn ensure_question_content_visible(
+    st: &AppState,
+    exam: &Exam,
+    user: &User,
+) -> Result<(), AppError> {
+    let course = course_of(exam, &st.db).await?;
+    if can_manage_course(&course, user) {
+        return Ok(());
+    }
+    ensure_enrolled(exam, user.get_id(), &st.db).await?;
+    ExamAttempt::read_latest_for_user(exam.get_id(), user.get_id(), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(())
+}
+
+/// The declared content type, held to the raster allowlist — SVG stays out
+/// (it can script) since these bytes are rendered inline to whole classes.
+fn image_content_type(raw: &str) -> Result<FileContentType, AppError> {
+    let content_type = FileContentType::try_new(raw)?;
+    if !QUESTION_IMAGE_CONTENT_TYPES.contains(&content_type.as_str()) {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "content_type",
+            reason: "must be image/png, image/jpeg, image/webp, or image/gif",
+        }));
+    }
+    Ok(content_type)
+}
+
+/// The whole image write tail, shared by both upload endpoints: new blob to
+/// disk, row UPSERT (the deterministic per-slot id makes it a replace), then
+/// the replaced blob off disk. A failed row write takes the fresh blob back
+/// out; a stored row always points at a real blob.
+async fn store_image(
+    st: &AppState,
+    exam: &Exam,
+    question: &ExamQuestion,
+    slot: Option<i64>,
+    content_type: FileContentType,
+    data: &[u8],
+) -> Result<QuestionImage, AppError> {
+    let replaced = QuestionImage::read_slot(question.get_id(), slot, &st.db).await?;
+    let image = QuestionImage::new(
+        exam.get_id(),
+        question.get_id(),
+        slot,
+        content_type,
+        data.len() as i64,
+    );
+    let path = blob_path(&st.files_path, image.get_file());
+    tokio::fs::write(&path, data)
+        .await
+        .map_err(|err| AppError::Internal(format!("failed to store the image blob: {err}")))?;
+    match image.upsert(&st.db).await {
+        Ok(stored) => {
+            if let Some(replaced) = replaced {
+                remove_blob(&st.files_path, replaced.get_file()).await;
+            }
+            Ok(stored)
+        }
+        Err(err) => {
+            let _ = tokio::fs::remove_file(&path).await;
+            Err(err)
+        }
+    }
+}
+
+/// The stored bytes as an inline-displayable response: the declared (and
+/// allowlisted) content type, `nosniff`, and `no-store` — exam content has no
+/// business in shared caches, and a replaced image must not linger.
+async fn serve_image(st: &AppState, image: &QuestionImage) -> Result<Response, AppError> {
+    let bytes = tokio::fs::read(blob_path(&st.files_path, image.get_file()))
+        .await
+        .map_err(|err| {
+            // The row exists but its blob doesn't — server-side damage (a
+            // lost volume path), not a client 404.
+            AppError::Internal(format!(
+                "missing blob for question image {}: {err}",
+                image.get_file()
+            ))
+        })?;
+    let content_type = HeaderValue::from_str(image.get_content_type().as_str())
+        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+    Ok((
+        [
+            (CONTENT_TYPE, content_type),
+            (X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff")),
+            (CACHE_CONTROL, HeaderValue::from_static("private, no-store")),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+/// Attach (or replace) a question's illustration — any question kind may
+/// carry one, e.g. the map the prompt asks about. `multipart/form-data` with
+/// the image under a `file` field; the declared content type must be
+/// `image/png`, `image/jpeg`, `image/webp`, or `image/gif` (rasters only —
+/// no SVG), the bytes at most the school's `max_file_bytes` (settings).
+/// Requires teacher+ and management rights over the exam's course; frozen
+/// once attempts exist, like every other question edit.
+#[utoipa::path(
+    post,
+    path = "/{id}/questions/{qid}/image",
+    tag = "exams",
+    security(("session_cookie" = [])),
+    params(
+        ("id" = String, Path, description = "Exam id"),
+        ("qid" = String, Path, description = "Question id"),
+    ),
+    request_body(content = UploadFileForm, content_type = "multipart/form-data"),
+    responses(
+        (status = 201, description = "Image stored", body = ImageMetaResponse),
+        (status = 400, description = "Missing file field, empty file, or a content type outside the image allowlist", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 404, description = "No such exam, or no such question in it", body = ErrorResponse),
+        (status = 409, description = "Attempts have started — questions are frozen", body = ErrorResponse),
+        (status = 413, description = "Image exceeds the school's size limit", body = ErrorResponse),
+    ),
+)]
+async fn upload_question_image(
+    State(st): State<AppState>,
+    RequireTeacher(user): RequireTeacher,
+    Path((id, qid)): Path<(String, String)>,
+    mut multipart: Multipart,
+) -> Result<(StatusCode, Json<ImageMetaResponse>), AppError> {
+    let exam = image_managed_exam(&st, &user, &id).await?;
+    let limit = Settings::load(&st.db).await?.get_max_file_bytes();
+    // The body is consumed before the lock — a client's slow upload must not
+    // stall the exam subsystem.
+    let upload = read_upload(&mut multipart, limit).await?;
+    let content_type = image_content_type(&upload.content_type.unwrap_or_default())?;
+    // Writer lease of [`EXAM_LOCK`]: freeze gate + write are one unit, like
+    // every other question edit — see `create_question`.
+    let _guard = EXAM_LOCK.write().await;
+    ensure_questions_editable(exam.get_id(), &st.db).await?;
+    let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
+    let stored = store_image(&st, &exam, &question, None, content_type, &upload.data).await?;
+    Ok((StatusCode::CREATED, Json(ImageMetaResponse::new(&stored))))
+}
+
+/// The question's illustration bytes. Course managers read anytime; students
+/// through the same wall as the sitting view — enrollment plus a started
+/// attempt (404 before that, like the question list itself).
+#[utoipa::path(
+    get,
+    path = "/{id}/questions/{qid}/image",
+    tag = "exams",
+    security(("session_cookie" = [])),
+    params(
+        ("id" = String, Path, description = "Exam id"),
+        ("qid" = String, Path, description = "Question id"),
+    ),
+    responses(
+        (status = 200, description = "The image bytes", content_type = "image/*"),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not enrolled in the exam's course", body = ErrorResponse),
+        (status = 404, description = "No such exam, question, or image — or no attempt yet", body = ErrorResponse),
+    ),
+)]
+async fn get_question_image(
+    State(st): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    Path((id, qid)): Path<(String, String)>,
+) -> Result<Response, AppError> {
+    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    ensure_question_content_visible(&st, &exam, &user).await?;
+    let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
+    let image = QuestionImage::read_slot(question.get_id(), None, &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    serve_image(&st, &image).await
+}
+
+/// Remove a question's illustration. Requires teacher+ and management rights
+/// over the exam's course; frozen once attempts exist.
+#[utoipa::path(
+    delete,
+    path = "/{id}/questions/{qid}/image",
+    tag = "exams",
+    security(("session_cookie" = [])),
+    params(
+        ("id" = String, Path, description = "Exam id"),
+        ("qid" = String, Path, description = "Question id"),
+    ),
+    responses(
+        (status = 204, description = "Deleted"),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 404, description = "No such exam, question, or image", body = ErrorResponse),
+        (status = 409, description = "Attempts have started — questions are frozen", body = ErrorResponse),
+    ),
+)]
+async fn delete_question_image(
+    State(st): State<AppState>,
+    RequireTeacher(user): RequireTeacher,
+    Path((id, qid)): Path<(String, String)>,
+) -> Result<StatusCode, AppError> {
+    let exam = image_managed_exam(&st, &user, &id).await?;
+    let _guard = EXAM_LOCK.write().await;
+    ensure_questions_editable(exam.get_id(), &st.db).await?;
+    let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
+    let image = QuestionImage::read_slot(question.get_id(), None, &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let image = image.delete(&st.db).await?;
+    remove_blob(&st.files_path, image.get_file()).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Attach (or replace) one option's picture on a `choice` question — so the
+/// options themselves can be images (four map crops, pick the right one).
+/// Same form, limits, and rights as the question-image upload; `index` is the
+/// option's zero-based position. Replacing the question's `choices` list
+/// drops all its option pictures — re-upload against the new list.
+#[utoipa::path(
+    post,
+    path = "/{id}/questions/{qid}/choices/{index}/image",
+    tag = "exams",
+    security(("session_cookie" = [])),
+    params(
+        ("id" = String, Path, description = "Exam id"),
+        ("qid" = String, Path, description = "Question id"),
+        ("index" = i64, Path, description = "Zero-based choice index"),
+    ),
+    request_body(content = UploadFileForm, content_type = "multipart/form-data"),
+    responses(
+        (status = 201, description = "Image stored", body = ImageMetaResponse),
+        (status = 400, description = "Missing file field, empty file, a content type outside the image allowlist, a text question, or an index past the choices", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 404, description = "No such exam, or no such question in it", body = ErrorResponse),
+        (status = 409, description = "Attempts have started — questions are frozen", body = ErrorResponse),
+        (status = 413, description = "Image exceeds the school's size limit", body = ErrorResponse),
+    ),
+)]
+async fn upload_choice_image(
+    State(st): State<AppState>,
+    RequireTeacher(user): RequireTeacher,
+    Path((id, qid, index)): Path<(String, String, i64)>,
+    mut multipart: Multipart,
+) -> Result<(StatusCode, Json<ImageMetaResponse>), AppError> {
+    let exam = image_managed_exam(&st, &user, &id).await?;
+    let limit = Settings::load(&st.db).await?.get_max_file_bytes();
+    let upload = read_upload(&mut multipart, limit).await?;
+    let content_type = image_content_type(&upload.content_type.unwrap_or_default())?;
+    let _guard = EXAM_LOCK.write().await;
+    ensure_questions_editable(exam.get_id(), &st.db).await?;
+    let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
+    let Some(choices) = question.get_choices() else {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "index",
+            reason: "only choice questions take option pictures",
+        }));
+    };
+    if !(0..choices.len() as i64).contains(&index) {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "index",
+            reason: "must index one of the choices",
+        }));
+    }
+    let stored = store_image(
+        &st,
+        &exam,
+        &question,
+        Some(index),
+        content_type,
+        &upload.data,
+    )
+    .await?;
+    Ok((StatusCode::CREATED, Json(ImageMetaResponse::new(&stored))))
+}
+
+/// One option's picture bytes. Same access wall as the question-image read.
+#[utoipa::path(
+    get,
+    path = "/{id}/questions/{qid}/choices/{index}/image",
+    tag = "exams",
+    security(("session_cookie" = [])),
+    params(
+        ("id" = String, Path, description = "Exam id"),
+        ("qid" = String, Path, description = "Question id"),
+        ("index" = i64, Path, description = "Zero-based choice index"),
+    ),
+    responses(
+        (status = 200, description = "The image bytes", content_type = "image/*"),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not enrolled in the exam's course", body = ErrorResponse),
+        (status = 404, description = "No such exam, question, or image — or no attempt yet", body = ErrorResponse),
+    ),
+)]
+async fn get_choice_image(
+    State(st): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    Path((id, qid, index)): Path<(String, String, i64)>,
+) -> Result<Response, AppError> {
+    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    ensure_question_content_visible(&st, &exam, &user).await?;
+    let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
+    let image = QuestionImage::read_slot(question.get_id(), Some(index), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    serve_image(&st, &image).await
+}
+
+/// Remove one option's picture. Requires teacher+ and management rights over
+/// the exam's course; frozen once attempts exist.
+#[utoipa::path(
+    delete,
+    path = "/{id}/questions/{qid}/choices/{index}/image",
+    tag = "exams",
+    security(("session_cookie" = [])),
+    params(
+        ("id" = String, Path, description = "Exam id"),
+        ("qid" = String, Path, description = "Question id"),
+        ("index" = i64, Path, description = "Zero-based choice index"),
+    ),
+    responses(
+        (status = 204, description = "Deleted"),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 404, description = "No such exam, question, or image", body = ErrorResponse),
+        (status = 409, description = "Attempts have started — questions are frozen", body = ErrorResponse),
+    ),
+)]
+async fn delete_choice_image(
+    State(st): State<AppState>,
+    RequireTeacher(user): RequireTeacher,
+    Path((id, qid, index)): Path<(String, String, i64)>,
+) -> Result<StatusCode, AppError> {
+    let exam = image_managed_exam(&st, &user, &id).await?;
+    let _guard = EXAM_LOCK.write().await;
+    ensure_questions_editable(exam.get_id(), &st.db).await?;
+    let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
+    let image = QuestionImage::read_slot(question.get_id(), Some(index), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let image = image.delete(&st.db).await?;
+    remove_blob(&st.files_path, image.get_file()).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1587,6 +2085,12 @@ struct AttemptQuestionResponse {
     kind: String,
     points: i64,
     choices: Option<Vec<String>>,
+    /// The question's illustration, if any — bytes at
+    /// `GET /exams/{id}/questions/{qid}/image`.
+    image: Option<ImageMetaResponse>,
+    /// Per-option pictures aligned with `choices`, if any — bytes at
+    /// `GET /exams/{id}/questions/{qid}/choices/{index}/image`.
+    choice_images: Option<Vec<Option<ImageMetaResponse>>>,
     /// The caller's saved answer; `null` while unanswered.
     answer: Option<AnswerStateResponse>,
 }
@@ -1763,6 +2267,7 @@ async fn attempt_questions(
         .ok_or(AppError::NotFound)?;
 
     let questions = ExamQuestion::list_for_exam(exam.get_id(), &st.db).await?;
+    let images = images_by_question(exam.get_id(), &st.db).await?;
     let answers: HashMap<String, ExamAnswer> =
         ExamAnswer::list_for_exam_user(exam.get_id(), user.get_id(), &st.db)
             .await?
@@ -1772,18 +2277,25 @@ async fn attempt_questions(
     Ok(Json(
         questions
             .iter()
-            .map(|question| AttemptQuestionResponse {
-                id: question.get_id().key().to_string(),
-                subject: question.get_subject().key().to_string(),
-                text: question.get_text().as_str().to_string(),
-                kind: question.get_kind().as_str().to_string(),
-                points: question.get_points().as_i64(),
-                choices: question
-                    .get_choices()
-                    .map(|choices| choices.iter().map(|c| c.as_str().to_string()).collect()),
-                answer: answers
+            .map(|question| {
+                let question_images = images
                     .get(question.get_id().key())
-                    .map(AnswerStateResponse::new),
+                    .map_or(&[][..], Vec::as_slice);
+                AttemptQuestionResponse {
+                    id: question.get_id().key().to_string(),
+                    subject: question.get_subject().key().to_string(),
+                    text: question.get_text().as_str().to_string(),
+                    kind: question.get_kind().as_str().to_string(),
+                    points: question.get_points().as_i64(),
+                    choices: question
+                        .get_choices()
+                        .map(|choices| choices.iter().map(|c| c.as_str().to_string()).collect()),
+                    image: image_meta(question_images, None),
+                    choice_images: choice_image_metas(question, question_images),
+                    answer: answers
+                        .get(question.get_id().key())
+                        .map(AnswerStateResponse::new),
+                }
             })
             .collect(),
     ))

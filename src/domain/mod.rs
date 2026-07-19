@@ -16,6 +16,7 @@ pub mod note;
 pub mod note_file;
 pub mod preferences;
 pub mod profile;
+pub mod question_image;
 pub mod registration;
 pub mod role;
 pub mod session;

@@ -470,7 +470,11 @@ mod tests {
             Role::Teacher,
             "the role change must survive the racing profile write"
         );
-        assert_eq!(after.get_name(), Some(&name), "the profile edit itself lands");
+        assert_eq!(
+            after.get_name(),
+            Some(&name),
+            "the profile edit itself lands"
+        );
     }
 
     #[tokio::test]
