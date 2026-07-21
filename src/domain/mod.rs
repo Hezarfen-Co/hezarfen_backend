@@ -2,6 +2,7 @@
 //! own persistence. Types derive `surrealdb::types::SurrealValue` so the exact
 //! same typed value flows from HTTP input all the way into the database.
 
+pub mod answer_image;
 pub mod attendance;
 pub mod course;
 pub mod course_session;

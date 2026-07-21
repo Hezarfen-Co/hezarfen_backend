@@ -10610,6 +10610,17 @@ async fn image_blob_keys(db: &hezarfen_backend::database::Database) -> Vec<Strin
     result.take::<Vec<String>>(0).unwrap()
 }
 
+/// Every stored answer-image (student drawing) blob name, straight from the table.
+async fn answer_image_blob_keys(db: &hezarfen_backend::database::Database) -> Vec<String> {
+    let mut result = db
+        .query("SELECT VALUE file FROM answer_image")
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    result.take::<Vec<String>>(0).unwrap()
+}
+
 /// The full life of question images: teacher uploads (question + choice slots,
 /// rasters only, choice slots bounded), metadata on both question views,
 /// bytes behind the sitting wall, replace swaps the blob, a choices PATCH
@@ -10809,6 +10820,261 @@ async fn question_images_author_serve_and_cascade() {
             "blob {key} survived the exam delete"
         );
     }
+}
+
+/// The full life of a student's answer drawing: the student is the uploader
+/// (rasters only), the bytes sit behind the sitting wall (own GET 404 before an
+/// attempt, 200 after with the guard headers), the drawing meta rides both the
+/// student's own sitting view and the teacher grading sheet, the teacher reads
+/// the bytes via `/attempts/{user}/...` while an outsider cannot, a retake wipes
+/// the row *and* its on-disk blob, and deleting the exam takes rows + blobs.
+#[tokio::test]
+async fn student_answer_images_serve_and_cascade() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "ans_t", "teacher").await;
+    let student = login(&app, "ans_s").await;
+    let student_id = me_id(&app, &student).await;
+    let outsider = login(&app, "ans_o").await;
+
+    let course = create_course(&app, &teacher, "science").await;
+    let subject = create_subject(&app, &teacher, &course, "biology").await;
+    enroll(&app, &teacher, &course, &student_id).await;
+    // Retakes allowed (max_attempts: 2) so the wipe path is reachable.
+    let exam = scheduled_exam(
+        &app,
+        &teacher,
+        &course,
+        json!({ "title": "cell quiz", "kind": "quiz", "mode": "open", "max_attempts": 2 }),
+    )
+    .await;
+    let question = create_question(
+        &app,
+        &teacher,
+        &exam,
+        &subject,
+        json!({ "text": "Draw a cell.", "kind": "text", "points": 10 }),
+    )
+    .await;
+
+    let own = format!("/exams/{exam}/attempt/answers/{question}/image");
+    let png = b"png-drawing".as_slice();
+
+    // Before an attempt exists there is nothing to write into and no early
+    // peek: the write path 404s (no attempt), the own-read 404s too.
+    let (status, _) = post_image(&app, &student, &own, "image/png", png).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "no attempt yet");
+    let (status, _, _) = common::send_raw(&app, "GET", &own, Some(&student), None, Vec::new()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "no early peek before the attempt");
+
+    // The student sits the exam.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+
+    // The raster wall holds on the student's own upload: SVG/PDF out, rasters in.
+    let (status, body) = post_image(&app, &student, &own, "image/svg+xml", b"<svg/>").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = post_image(&app, &student, &own, "application/pdf", b"%PDF").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    for ct in ["image/png", "image/jpeg", "image/webp"] {
+        let (status, body) = post_image(&app, &student, &own, ct, png).await;
+        assert_eq!(status, StatusCode::CREATED, "{ct}: {body}");
+        assert_eq!(body["content_type"], ct);
+        assert_eq!(body["size"], png.len() as i64);
+    }
+    // Same (question, user) slot: three uploads collapse to one upserted row.
+    assert_eq!(
+        answer_image_blob_keys(&db).await.len(),
+        1,
+        "own slot upserts, adds no row"
+    );
+
+    // The student reads their own drawing back: 200, the guard headers, the
+    // bytes, and the content type of the last upload (webp).
+    let (status, headers, bytes) =
+        common::send_raw(&app, "GET", &own, Some(&student), None, Vec::new()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, png);
+    assert_eq!(headers["content-type"], "image/webp");
+    assert_eq!(headers["x-content-type-options"], "nosniff");
+    assert_eq!(headers["cache-control"], "private, no-store");
+
+    // An outsider (not enrolled) can't read the student's own route.
+    let (status, _, _) =
+        common::send_raw(&app, "GET", &own, Some(&outsider), None, Vec::new()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "outsiders can't peek");
+
+    // The drawing rides the student's own answer state — save the text answer
+    // it accompanies, then the sitting view embeds the drawing meta.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt/answers"),
+        Some(&student),
+        Some(json!({ "question_id": question, "text": "a cell, drawn and described" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/attempt/questions"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body[0]["answer"]["answer_image"]["content_type"], "image/webp");
+
+    // The teacher grading sheet carries the drawing meta and serves the bytes
+    // via the teacher route; the sheet row also exposes the flag.
+    let teacher_bytes = format!("/exams/{exam}/attempts/{student_id}/answers/{question}/image");
+    let res = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/attempts/{student_id}/answers"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["answers"][0]["answer_image"]["content_type"], "image/webp");
+    let (status, _, bytes) =
+        common::send_raw(&app, "GET", &teacher_bytes, Some(&teacher), None, Vec::new()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, png);
+    // An outsider student can't read the teacher grading route (not a teacher).
+    let (status, _, _) =
+        common::send_raw(&app, "GET", &teacher_bytes, Some(&outsider), None, Vec::new()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // A retake wipes the student's sheet — the answer-image row *and* its
+    // on-disk blob go, not just the row.
+    let pre = answer_image_blob_keys(&db).await;
+    assert_eq!(pre.len(), 1);
+    assert!(common::files_dir().join(&pre[0]).exists());
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt/finish"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "retake: {}", res.body);
+    assert_eq!(res.body["attempt"], 2, "the retake is the second sitting");
+    assert!(
+        answer_image_blob_keys(&db).await.is_empty(),
+        "the retake wiped the answer-image row"
+    );
+    assert!(
+        !common::files_dir().join(&pre[0]).exists(),
+        "the retake left the answer-image blob stranded on disk"
+    );
+
+    // A fresh drawing in the new sitting, then deleting the exam sweeps the
+    // rows and their blobs.
+    let (status, _) = post_image(&app, &student, &own, "image/png", png).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let keys = answer_image_blob_keys(&db).await;
+    assert_eq!(keys.len(), 1);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/exams/{exam}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    assert!(
+        answer_image_blob_keys(&db).await.is_empty(),
+        "answer-image rows survived the exam delete"
+    );
+    for key in &keys {
+        assert!(
+            !common::files_dir().join(key).exists(),
+            "answer-image blob {key} survived the exam delete"
+        );
+    }
+}
+
+/// A student who draws but types nothing still has their drawing surface in
+/// both the sitting view and the teacher grading sheet — the upload creates the
+/// backing (blank-text) answer row, since `answer_image` rides the answer payload.
+#[tokio::test]
+async fn answer_image_surfaces_for_a_drawing_only_answer() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "draw_t", "teacher").await;
+    let student = login(&app, "draw_s").await;
+    let student_id = me_id(&app, &student).await;
+
+    let course = create_course(&app, &teacher, "art").await;
+    let subject = create_subject(&app, &teacher, &course, "drawing").await;
+    enroll(&app, &teacher, &course, &student_id).await;
+    let exam = scheduled_exam(
+        &app,
+        &teacher,
+        &course,
+        json!({ "title": "sketch", "kind": "quiz", "mode": "open" }),
+    )
+    .await;
+    let question = create_question(
+        &app,
+        &teacher,
+        &exam,
+        &subject,
+        json!({ "text": "Draw a triangle.", "kind": "text", "points": 5 }),
+    )
+    .await;
+
+    // Sit, then upload a drawing WITHOUT ever saving a text answer.
+    let res = send(&app, "POST", &format!("/exams/{exam}/attempt"), Some(&student), None).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let own = format!("/exams/{exam}/attempt/answers/{question}/image");
+    let (status, body) = post_image(&app, &student, &own, "image/png", b"tri").await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // The sitting view carries the drawing meta with an empty typed answer.
+    let res = send(&app, "GET", &format!("/exams/{exam}/attempt/questions"), Some(&student), None).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body[0]["answer"]["answer_image"]["content_type"], "image/png");
+    assert_eq!(res.body[0]["answer"]["text"], "");
+
+    // The teacher grading sheet shows it too.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/attempts/{student_id}/answers"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["answers"][0]["answer_image"]["content_type"], "image/png");
+
+    // Removing the drawing drops the blank answer row it created — the question
+    // stops showing as answered rather than lingering as an empty text answer.
+    let (status, _, _) = common::send_raw(&app, "DELETE", &own, Some(&student), None, Vec::new()).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let res = send(&app, "GET", &format!("/exams/{exam}/attempt/questions"), Some(&student), None).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert!(res.body[0]["answer"].is_null(), "blank answer row dropped with its drawing");
 }
 
 /// The authoring edits that reshape a question also groom its images: a

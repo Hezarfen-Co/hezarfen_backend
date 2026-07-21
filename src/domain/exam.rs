@@ -443,9 +443,10 @@ impl Exam {
     }
 
     /// Delete the exam and cascade-remove its result, attempt, question,
-    /// answer, and question-image rows — all in one transaction, so a failure
-    /// can't leave an emptied-out exam shell behind. The image *blobs* are the
-    /// web layer's to remove — it collects their names before calling this.
+    /// answer, question-image, and answer-image rows — all in one transaction,
+    /// so a failure can't leave an emptied-out exam shell behind. The image
+    /// *blobs* (question and answer) are the web layer's to remove — it collects
+    /// their names before calling this.
     pub async fn delete(self, db: &Database) -> Result<Exam, AppError> {
         let mut result = db
             .query(
@@ -453,6 +454,7 @@ impl Exam {
                  DELETE exam_result WHERE exam = $ex;
                  DELETE exam_attempt WHERE exam = $ex;
                  DELETE exam_answer WHERE exam = $ex;
+                 DELETE answer_image WHERE exam = $ex;
                  DELETE question_image WHERE exam = $ex;
                  DELETE exam_question WHERE exam = $ex;
                  DELETE $ex RETURN BEFORE;
@@ -462,8 +464,8 @@ impl Exam {
             .await?
             .check()?;
         // Statement slots count BEGIN and the child deletes: the exam's own
-        // DELETE is slot 6.
-        let deleted: Option<Exam> = result.take::<Vec<Exam>>(6)?.into_iter().next();
+        // DELETE is slot 7.
+        let deleted: Option<Exam> = result.take::<Vec<Exam>>(7)?.into_iter().next();
         deleted.ok_or(AppError::NotFound)
     }
 }

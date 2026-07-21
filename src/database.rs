@@ -37,6 +37,7 @@ pub const EXAM_ATTEMPT_TABLE: &str = "exam_attempt";
 pub const EXAM_QUESTION_TABLE: &str = "exam_question";
 pub const QUESTION_IMAGE_TABLE: &str = "question_image";
 pub const EXAM_ANSWER_TABLE: &str = "exam_answer";
+pub const ANSWER_IMAGE_TABLE: &str = "answer_image";
 pub const COURSE_TABLE: &str = "course";
 pub const ENROLLMENT_TABLE: &str = "enrollment";
 pub const PARENT_LINK_TABLE: &str = "parent_link";
@@ -256,6 +257,16 @@ const MIGRATION: &str = "
     DEFINE INDEX IF NOT EXISTS exam_answer_question_user ON exam_answer FIELDS question, user UNIQUE;
     DEFINE INDEX IF NOT EXISTS exam_answer_exam_user ON exam_answer FIELDS exam, user;
     DEFINE INDEX IF NOT EXISTS exam_answer_exam ON exam_answer FIELDS exam;
+
+    DEFINE TABLE IF NOT EXISTS answer_image SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS exam ON answer_image TYPE record<exam>;
+    DEFINE FIELD IF NOT EXISTS question ON answer_image TYPE record<exam_question>;
+    DEFINE FIELD IF NOT EXISTS user ON answer_image TYPE record<user>;
+    DEFINE FIELD IF NOT EXISTS file ON answer_image TYPE string;
+    DEFINE FIELD IF NOT EXISTS content_type ON answer_image TYPE string;
+    DEFINE FIELD IF NOT EXISTS size ON answer_image TYPE int;
+    DEFINE INDEX IF NOT EXISTS answer_image_exam ON answer_image FIELDS exam;
+    DEFINE INDEX IF NOT EXISTS answer_image_user ON answer_image FIELDS user;
 
     DEFINE TABLE IF NOT EXISTS exam_result SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS exam ON exam_result TYPE record<exam>;

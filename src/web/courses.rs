@@ -9,6 +9,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::database::Database;
+use crate::domain::answer_image::AnswerImage;
 use crate::domain::course::{Course, CourseDescription, CourseId, CourseKind, CourseTitle};
 use crate::domain::course_session::{CourseSession, SessionTopic};
 use crate::domain::enrollment::Enrollment;
@@ -477,8 +478,9 @@ async fn delete_course(
     // Rows go first (the delete cascades them), blobs after — a crash in
     // between strands at worst an unreachable blob.
     let image_files = QuestionImage::file_keys_for_course(course.get_id(), &st.db).await?;
+    let answer_image_files = AnswerImage::file_keys_for_course(course.get_id(), &st.db).await?;
     course.delete(&st.db).await?;
-    for file in &image_files {
+    for file in image_files.iter().chain(&answer_image_files) {
         remove_blob(&st.files_path, file).await;
     }
     Ok(StatusCode::NO_CONTENT)
