@@ -2174,6 +2174,247 @@ async fn courses_are_owner_scoped_and_creator_guarded() {
     );
 }
 
+/// A manager can put a second teacher in charge of someone else's course. The
+/// assignee then manages everything inside it, but the course stays its
+/// creator's to delete — and a demotion takes the assignment away.
+#[tokio::test]
+async fn assigned_teacher_manages_course_without_owning_it() {
+    let (app, db) = app_and_db().await;
+    let ali = login_as(&app, &db, "ali", "teacher").await;
+    let veli = login_as(&app, &db, "veli", "teacher").await;
+    let boss = login_as(&app, &db, "boss", "manager").await;
+    let rektor = login_as(&app, &db, "rektor", "admin").await;
+    let veli_id = id_of(&send(&app, "GET", "/auth/me", Some(&veli), None).await.body);
+
+    let course_id = id_of(
+        &send(
+            &app,
+            "POST",
+            "/courses",
+            Some(&ali),
+            Some(json!({ "title": "algebra" })),
+        )
+        .await
+        .body,
+    );
+    let teachers = format!("/courses/{course_id}/teachers");
+
+    // Before assignment veli is just another teacher: no read, no write.
+    assert_eq!(
+        send(
+            &app,
+            "GET",
+            &format!("/courses/{course_id}"),
+            Some(&veli),
+            None
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
+
+    // Staffing is the office's call — the course's own creator cannot do it.
+    assert_eq!(
+        send(
+            &app,
+            "POST",
+            &teachers,
+            Some(&ali),
+            Some(json!({ "user_id": veli_id }))
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
+
+    // Only teacher+ can be assigned.
+    let student = login_as(&app, &db, "zeynep", "student").await;
+    let student_id = id_of(
+        &send(&app, "GET", "/auth/me", Some(&student), None)
+            .await
+            .body,
+    );
+    assert_eq!(
+        send(
+            &app,
+            "POST",
+            &teachers,
+            Some(&boss),
+            Some(json!({ "user_id": student_id }))
+        )
+        .await
+        .status,
+        StatusCode::BAD_REQUEST
+    );
+
+    // The manager assigns veli; the course echoes its staff back.
+    let res = send(
+        &app,
+        "POST",
+        &teachers,
+        Some(&boss),
+        Some(json!({ "user_id": veli_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["creator"]["username"], "ali");
+    assert_eq!(res.body["teachers"][0]["username"], "veli");
+
+    // Assigning twice is idempotent — no duplicate row in the list.
+    let again = send(
+        &app,
+        "POST",
+        &teachers,
+        Some(&boss),
+        Some(json!({ "user_id": veli_id })),
+    )
+    .await;
+    assert_eq!(again.status, StatusCode::OK);
+    assert_eq!(again.body["teachers"].as_array().unwrap().len(), 1);
+
+    // Veli now runs the course: it shows in their catalog, and they can edit
+    // it and enroll students.
+    let catalog = send(&app, "GET", "/courses", Some(&veli), None).await.body;
+    assert_eq!(common::items(&catalog).len(), 1);
+    assert_eq!(
+        send(
+            &app,
+            "PATCH",
+            &format!("/courses/{course_id}"),
+            Some(&veli),
+            Some(json!({"description":"letters"}))
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(
+            &app,
+            "POST",
+            &format!("/courses/{course_id}/enrollments"),
+            Some(&veli),
+            Some(json!({ "user_id": student_id }))
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+
+    // But the course is not theirs to delete, nor to re-staff.
+    assert_eq!(
+        send(
+            &app,
+            "DELETE",
+            &format!("/courses/{course_id}"),
+            Some(&veli),
+            None
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        send(
+            &app,
+            "DELETE",
+            &format!("{teachers}/{veli_id}"),
+            Some(&veli),
+            None
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
+
+    // Demoting veli below teacher sweeps the assignment: the course drops off
+    // their catalog and the rights go with it.
+    assert_eq!(
+        send(
+            &app,
+            "PATCH",
+            &format!("/users/{veli_id}/role"),
+            Some(&rektor),
+            Some(json!({"role":"student"}))
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    let after = send(
+        &app,
+        "GET",
+        &format!("/courses/{course_id}"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(
+        after.body["teachers"].as_array().unwrap().len(),
+        0,
+        "a demoted teacher is swept off the courses they were assigned to"
+    );
+
+    // Re-assign, then unassign by hand: the second removal is a 404.
+    send(
+        &app,
+        "PATCH",
+        &format!("/users/{veli_id}/role"),
+        Some(&rektor),
+        Some(json!({"role":"teacher"})),
+    )
+    .await;
+    assert_eq!(
+        send(
+            &app,
+            "POST",
+            &teachers,
+            Some(&boss),
+            Some(json!({ "user_id": veli_id }))
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(
+            &app,
+            "DELETE",
+            &format!("{teachers}/{veli_id}"),
+            Some(&boss),
+            None
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        send(
+            &app,
+            "DELETE",
+            &format!("{teachers}/{veli_id}"),
+            Some(&boss),
+            None
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        send(
+            &app,
+            "GET",
+            &format!("/courses/{course_id}"),
+            Some(&veli),
+            None
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN,
+        "unassigning takes the course back out of their reach"
+    );
+}
+
 #[tokio::test]
 async fn course_input_validation() {
     let (app, db) = app_and_db().await;
@@ -5032,7 +5273,11 @@ async fn db_down_refuses_before_touching_the_database() {
         .await
         .unwrap();
     assert_eq!(ok.status(), StatusCode::CREATED);
-    assert_eq!(count_rows(&db, "user").await, before + 1, "the write landed");
+    assert_eq!(
+        count_rows(&db, "user").await,
+        before + 1,
+        "the write landed"
+    );
 
     // Socket reported down: refused with a retryable 503, and — the point of
     // refusing at the edge rather than timing out — nothing was written.
@@ -11543,7 +11788,14 @@ async fn question_pool_lifecycle() {
 
     // Only students ask: the teacher is refused.
     let ask = json!({ "title": "Integral", "body": "∫x·eˣ dx?" });
-    let res = send(&app, "POST", "/questions", Some(&teacher), Some(ask.clone())).await;
+    let res = send(
+        &app,
+        "POST",
+        "/questions",
+        Some(&teacher),
+        Some(ask.clone()),
+    )
+    .await;
     assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
 
     let res = send(&app, "POST", "/questions", Some(&asker), Some(ask)).await;
@@ -11554,8 +11806,19 @@ async fn question_pool_lifecycle() {
     // Pending: the asker and the teacher see it; another student must not
     // even learn it exists — and it takes no solutions yet.
     for (cookie, visible) in [(&asker, true), (&teacher, true), (&stranger, false)] {
-        let res = send(&app, "GET", &format!("/questions/{qid}"), Some(cookie), None).await;
-        let expected = if visible { StatusCode::OK } else { StatusCode::NOT_FOUND };
+        let res = send(
+            &app,
+            "GET",
+            &format!("/questions/{qid}"),
+            Some(cookie),
+            None,
+        )
+        .await;
+        let expected = if visible {
+            StatusCode::OK
+        } else {
+            StatusCode::NOT_FOUND
+        };
         assert_eq!(res.status, expected, "{}", res.body);
     }
     let offer = json!({ "body": "Kısmi integrasyon." });
@@ -11571,7 +11834,14 @@ async fn question_pool_lifecycle() {
 
     // The teacher's ?status=pending list is the approval queue; approval is
     // teacher-gated and one-way.
-    let res = send(&app, "GET", "/questions?status=pending", Some(&teacher), None).await;
+    let res = send(
+        &app,
+        "GET",
+        "/questions?status=pending",
+        Some(&teacher),
+        None,
+    )
+    .await;
     assert_eq!(common::total(&res.body), 1);
     let res = send(
         &app,
@@ -11638,9 +11908,23 @@ async fn question_pool_lifecycle() {
     assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
 
     // Question delete (asker withdraws) cascades what's left.
-    let res = send(&app, "DELETE", &format!("/questions/{qid}"), Some(&asker), None).await;
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/questions/{qid}"),
+        Some(&asker),
+        None,
+    )
+    .await;
     assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
-    let res = send(&app, "GET", &format!("/questions/{qid}"), Some(&teacher), None).await;
+    let res = send(
+        &app,
+        "GET",
+        &format!("/questions/{qid}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
     assert_eq!(res.status, StatusCode::NOT_FOUND, "{}", res.body);
 }
 
@@ -11714,7 +11998,8 @@ async fn question_pool_image_upload_and_freeze() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(headers["content-type"], "image/png");
     assert_eq!(bytes, b"png-bytes");
-    let (status, _, _) = common::send_raw(&app, "GET", &uri, Some(&stranger), None, Vec::new()).await;
+    let (status, _, _) =
+        common::send_raw(&app, "GET", &uri, Some(&stranger), None, Vec::new()).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
     // Approval freezes the image with the text: replace and remove both 409.
@@ -11734,9 +12019,17 @@ async fn question_pool_image_upload_and_freeze() {
     assert_eq!(status, StatusCode::CONFLICT);
 
     // But the approved bytes are now school-wide, and ride the question meta.
-    let (status, _, _) = common::send_raw(&app, "GET", &uri, Some(&stranger), None, Vec::new()).await;
+    let (status, _, _) =
+        common::send_raw(&app, "GET", &uri, Some(&stranger), None, Vec::new()).await;
     assert_eq!(status, StatusCode::OK);
-    let res = send(&app, "GET", &format!("/questions/{qid}"), Some(&stranger), None).await;
+    let res = send(
+        &app,
+        "GET",
+        &format!("/questions/{qid}"),
+        Some(&stranger),
+        None,
+    )
+    .await;
     assert_eq!(res.body["image"]["content_type"], "image/png");
 }
 
@@ -11851,18 +12144,34 @@ async fn solution_images_edits_and_counts() {
     // Question rows tally their solutions, in the list and the single GET.
     let res = send(&app, "GET", "/questions?limit=5", Some(&asker), None).await;
     assert_eq!(res.body["items"][0]["solution_count"], 1);
-    let res = send(&app, "GET", &format!("/questions/{qid}"), Some(&asker), None).await;
+    let res = send(
+        &app,
+        "GET",
+        &format!("/questions/{qid}"),
+        Some(&asker),
+        None,
+    )
+    .await;
     assert_eq!(res.body["solution_count"], 1);
 
     // The author drops the photo; a second removal finds nothing.
-    let (status, _, _) = common::send_raw(&app, "DELETE", &uri, Some(&helper), None, Vec::new()).await;
+    let (status, _, _) =
+        common::send_raw(&app, "DELETE", &uri, Some(&helper), None, Vec::new()).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     let (status, _, _) = common::send_raw(&app, "GET", &uri, Some(&asker), None, Vec::new()).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    let (status, _, _) = common::send_raw(&app, "DELETE", &uri, Some(&helper), None, Vec::new()).await;
+    let (status, _, _) =
+        common::send_raw(&app, "DELETE", &uri, Some(&helper), None, Vec::new()).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
     // And the question delete still sweeps everything under it.
-    let res = send(&app, "DELETE", &format!("/questions/{qid}"), Some(&asker), None).await;
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/questions/{qid}"),
+        Some(&asker),
+        None,
+    )
+    .await;
     assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
 }

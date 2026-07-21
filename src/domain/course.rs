@@ -88,10 +88,17 @@ impl CourseKind {
 /// `study` (etüt), and `club` (kulüp). An optional `capacity` caps the roster
 /// at enroll time (`None` = unlimited); rows written before the field existed
 /// decode as uncapped.
+///
+/// `creator` owns the course for good — only they (or a manager+) may delete
+/// it. `teachers` are the staff a manager assigned to run it: full management
+/// rights inside the course, no power to delete it or change the assignment
+/// list. Rows written before the field existed decode with nobody assigned.
 #[derive(Debug, Clone, SurrealValue)]
 pub struct Course {
     id: CourseId,
     creator: UserId,
+    #[surreal(default)]
+    teachers: Vec<UserId>,
     title: CourseTitle,
     description: CourseDescription,
     kind: CourseKind,
@@ -133,6 +140,17 @@ impl Course {
         &self.creator == user
     }
 
+    /// The staff assigned to run this course, in assignment order.
+    pub fn get_teachers(&self) -> &[UserId] {
+        &self.teachers
+    }
+
+    /// Whether `user` was assigned to teach this course. Says nothing about
+    /// the creator — they own it whether or not they also appear here.
+    pub fn is_assigned(&self, user: &UserId) -> bool {
+        self.teachers.contains(user)
+    }
+
     pub async fn create(
         creator: &UserId,
         title: CourseTitle,
@@ -145,6 +163,7 @@ impl Course {
         let course = Course {
             id: CourseId::generate(),
             creator: creator.clone(),
+            teachers: Vec::new(),
             title,
             description,
             kind,
@@ -182,10 +201,11 @@ impl Course {
         Ok(result.take::<Vec<Course>>(0)?)
     }
 
-    /// The courses `user` created — a teacher's slice of the catalog.
-    pub async fn list_created(user: &UserId, db: &Database) -> Result<Vec<Course>, AppError> {
+    /// The courses `user` runs — the ones they created plus the ones a manager
+    /// assigned them to. A teacher's slice of the catalog.
+    pub async fn list_for_teacher(user: &UserId, db: &Database) -> Result<Vec<Course>, AppError> {
         let mut result = db
-            .query("SELECT * FROM course WHERE creator = $usr ORDER BY id DESC")
+            .query("SELECT * FROM course WHERE creator = $usr OR $usr IN teachers ORDER BY id DESC")
             .bind(("usr", user.record()))
             .await?
             .check()?;
@@ -223,6 +243,46 @@ impl Course {
         self.capacity = capacity;
         let updated: Option<Course> = db.update(self.id.record()).content(self).await?;
         updated.ok_or(AppError::NotFound)
+    }
+
+    /// Assign `teacher` to run this course, or return the course untouched if
+    /// they already run it — assignment is idempotent, like enrollment.
+    pub async fn assign_teacher(
+        mut self,
+        teacher: &UserId,
+        db: &Database,
+    ) -> Result<Course, AppError> {
+        if self.is_assigned(teacher) {
+            return Ok(self);
+        }
+        self.teachers.push(teacher.clone());
+        let updated: Option<Course> = db.update(self.id.record()).content(self).await?;
+        updated.ok_or(AppError::NotFound)
+    }
+
+    /// Drop `teacher` from this course. `None` when they weren't assigned, so
+    /// the web layer can answer 404 instead of pretending it removed someone.
+    pub async fn unassign_teacher(
+        mut self,
+        teacher: &UserId,
+        db: &Database,
+    ) -> Result<Option<Course>, AppError> {
+        if !self.is_assigned(teacher) {
+            return Ok(None);
+        }
+        self.teachers.retain(|assigned| assigned != teacher);
+        let updated: Option<Course> = db.update(self.id.record()).content(self).await?;
+        updated.map(Some).ok_or(AppError::NotFound)
+    }
+
+    /// Strip `user` from every course they were assigned to — the sweep for a
+    /// user demoted below `teacher`, who may no longer run anything.
+    pub async fn unassign_everywhere(user: &UserId, db: &Database) -> Result<(), AppError> {
+        db.query("UPDATE course SET teachers -= $usr WHERE $usr IN teachers")
+            .bind(("usr", user.record()))
+            .await?
+            .check()?;
+        Ok(())
     }
 
     /// Delete the course and cascade-remove everything inside it: results,
@@ -289,6 +349,7 @@ mod tests {
         let course = Course {
             id: CourseId::generate(),
             creator: UserId::from_key("01J8XZ0K3Q8G7X2M4N5P6R7S8T"),
+            teachers: Vec::new(),
             title: CourseTitle::try_new("chess").unwrap(),
             description: CourseDescription::try_new("").unwrap(),
             kind: CourseKind::try_new("club").unwrap(),
@@ -301,5 +362,35 @@ mod tests {
         object.remove("capacity");
         let decoded = Course::from_value(Value::Object(object)).unwrap();
         assert_eq!(decoded.get_capacity(), None);
+    }
+
+    /// Every course row written before teacher assignment existed has no
+    /// `teachers` key. The boot backfill fills them in, but a row read before
+    /// that lands must still decode — as a course nobody was assigned to,
+    /// never as a decode error that 500s the catalog.
+    #[tokio::test]
+    async fn course_decodes_without_teachers_key() {
+        use surrealdb::types::Value;
+
+        let assigned = UserId::from_key("01J8XZ0K3Q8G7X2M4N5P6R7S8U");
+        let course = Course {
+            id: CourseId::generate(),
+            creator: UserId::from_key("01J8XZ0K3Q8G7X2M4N5P6R7S8T"),
+            teachers: vec![assigned.clone()],
+            title: CourseTitle::try_new("chess").unwrap(),
+            description: CourseDescription::try_new("").unwrap(),
+            kind: CourseKind::try_new("club").unwrap(),
+            term: None,
+            capacity: None,
+        };
+        assert!(course.is_assigned(&assigned));
+
+        let Value::Object(mut object) = course.into_value() else {
+            panic!("course must encode as an object");
+        };
+        object.remove("teachers");
+        let decoded = Course::from_value(Value::Object(object)).unwrap();
+        assert!(decoded.get_teachers().is_empty());
+        assert!(!decoded.is_assigned(&assigned));
     }
 }

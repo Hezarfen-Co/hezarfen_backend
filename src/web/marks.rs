@@ -18,7 +18,7 @@ use crate::error::{AppError, ErrorResponse};
 use crate::state::AppState;
 
 use super::courses::can_manage_course;
-use super::{CourseResponse, CurrentUser, ensure_can_observe, person_map};
+use super::{CourseResponse, CurrentUser, course_people, ensure_can_observe, person_map};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -102,7 +102,7 @@ async fn build_report(
 
     // One settings read weighs and labels the whole report.
     let school = Settings::load(db).await?;
-    let people = person_map(courses.iter().map(|c| c.get_creator().clone()), db).await?;
+    let people = person_map(courses.iter().flat_map(course_people), db).await?;
 
     let mut blocks = Vec::with_capacity(courses.len());
     for course in &courses {

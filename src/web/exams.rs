@@ -280,7 +280,7 @@ async fn get_exam(
     let course = course_of(&exam, &st.db).await?;
     if !can_view_course(&course, &user, &st.db).await? {
         return Err(AppError::Forbidden(
-            "only enrolled users, the course creator, or a manager/admin can view this exam",
+            "only enrolled users, the course creator, an assigned teacher, or a manager/admin can view this exam",
         ));
     }
     // A draft doesn't exist for anyone but its course's managers — 404, not
@@ -312,7 +312,7 @@ async fn get_exam(
         (status = 200, description = "Updated exam", body = ExamResponse),
         (status = 400, description = "Invalid fields, kind, attempt limit, or schedule (malformed window, or newly set times in the past)", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
         (status = 409, description = "Mode change after attempts started, or re-drafting an exam that has attempts or results", body = ErrorResponse),
     ),
@@ -334,7 +334,7 @@ async fn update_exam(
     let course = course_of(&exam, &st.db).await?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the course creator or a manager/admin can edit this exam",
+            "only the course creator, an assigned teacher, or a manager/admin can edit this exam",
         ));
     }
 
@@ -449,7 +449,7 @@ async fn update_exam(
     responses(
         (status = 204, description = "Deleted"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
     ),
 )]
@@ -464,7 +464,7 @@ async fn delete_exam(
     let course = course_of(&exam, &st.db).await?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the course creator or a manager/admin can delete this exam",
+            "only the course creator, an assigned teacher, or a manager/admin can delete this exam",
         ));
     }
     // Rows go first (the delete cascades them), blobs after — a crash in
@@ -495,7 +495,7 @@ async fn delete_exam(
         (status = 200, description = "Result recorded", body = ExamResultResponse),
         (status = 400, description = "Invalid mark, unknown user, user not a student, or not enrolled", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator (and not a manager/admin), or attempted to grade yourself", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin), or attempted to grade yourself", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
         (status = 409, description = "The exam is a draft", body = ErrorResponse),
     ),
@@ -519,7 +519,7 @@ async fn grade(
     let course = course_of(&exam, &st.db).await?;
     if !can_manage_course(&course, &teacher) {
         return Err(AppError::Forbidden(
-            "only the course creator or a manager/admin can grade this exam",
+            "only the course creator, an assigned teacher, or a manager/admin can grade this exam",
         ));
     }
     if exam.is_draft() {
@@ -584,7 +584,7 @@ async fn grade(
         (status = 200, description = "A page of results (all of them when unpaged)", body = Page<ExamResultResponse>),
         (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
     ),
 )]
@@ -602,7 +602,7 @@ async fn list_results(
     let course = course_of(&exam, &st.db).await?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the course creator or a manager/admin can list results",
+            "only the course creator, an assigned teacher, or a manager/admin can list results",
         ));
     }
     let results = ExamResult::list_for_exam(exam.get_id(), &st.db).await?;
@@ -666,7 +666,7 @@ async fn my_result(
     responses(
         (status = 204, description = "Removed"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
     ),
 )]
@@ -681,7 +681,7 @@ async fn remove_result(
     let course = course_of(&exam, &st.db).await?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the course creator or a manager/admin can remove results",
+            "only the course creator, an assigned teacher, or a manager/admin can remove results",
         ));
     }
     let removed = ExamResult::remove(exam.get_id(), &UserId::from_key(&target), &st.db).await?;
@@ -702,7 +702,7 @@ async fn remove_result(
     responses(
         (status = 200, description = "The exam's mark statistics", body = ExamStatisticsResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
     ),
 )]
@@ -718,7 +718,7 @@ async fn exam_statistics(
     let course = course_of(&exam, &st.db).await?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the course creator or a manager/admin can view statistics",
+            "only the course creator, an assigned teacher, or a manager/admin can view statistics",
         ));
     }
     let results = ExamResult::list_for_exam(exam.get_id(), &st.db).await?;
@@ -1226,7 +1226,7 @@ async fn live_snapshot(exam: &Exam, db: &Database) -> Result<ExamLiveResponse, A
     responses(
         (status = 200, description = "Live snapshot", body = ExamLiveResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
     ),
 )]
@@ -1241,7 +1241,7 @@ async fn exam_live(
     let course = course_of(&exam, &st.db).await?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the course creator or a manager/admin can monitor this exam",
+            "only the course creator, an assigned teacher, or a manager/admin can monitor this exam",
         ));
     }
     Ok(Json(live_snapshot(&exam, &st.db).await?))
@@ -1263,7 +1263,7 @@ async fn exam_live(
     responses(
         (status = 200, description = "SSE feed of `snapshot` events (`ExamLiveResponse` as JSON)", content_type = "text/event-stream"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
     ),
 )]
@@ -1280,7 +1280,7 @@ async fn exam_live_stream(
     let course = course_of(&exam, &st.db).await?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the course creator or a manager/admin can monitor this exam",
+            "only the course creator, an assigned teacher, or a manager/admin can monitor this exam",
         ));
     }
 
@@ -1507,7 +1507,7 @@ async fn question_of_exam(
         (status = 201, description = "Question created", body = QuestionResponse),
         (status = 400, description = "Invalid text, kind, points, choices, or correct — or an unknown subject, or one from another course", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
         (status = 409, description = "Attempts have started — questions are frozen", body = ErrorResponse),
     ),
@@ -1524,7 +1524,7 @@ async fn create_question(
     let course = course_of(&exam, &st.db).await?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the course creator or a manager/admin can author questions",
+            "only the course creator, an assigned teacher, or a manager/admin can author questions",
         ));
     }
     // Writer lease of [`EXAM_LOCK`]: the freeze gate, the subject check, and
@@ -1560,7 +1560,7 @@ async fn create_question(
         (status = 200, description = "A page of the exam's questions (all of them when unpaged)", body = Page<QuestionResponse>),
         (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
     ),
 )]
@@ -1577,7 +1577,7 @@ async fn list_questions(
     let course = course_of(&exam, &st.db).await?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the course creator or a manager/admin can read the question list",
+            "only the course creator, an assigned teacher, or a manager/admin can read the question list",
         ));
     }
     let questions = ExamQuestion::list_for_exam(exam.get_id(), &st.db).await?;
@@ -1616,7 +1616,7 @@ async fn list_questions(
         (status = 200, description = "Updated question", body = QuestionResponse),
         (status = 400, description = "Invalid text, kind, points, choices, or correct — or an unknown subject, or one from another course", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "No such exam, or no such question in it", body = ErrorResponse),
         (status = 409, description = "Attempts have started — questions are frozen", body = ErrorResponse),
     ),
@@ -1633,7 +1633,7 @@ async fn update_question(
     let course = course_of(&exam, &st.db).await?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the course creator or a manager/admin can edit questions",
+            "only the course creator, an assigned teacher, or a manager/admin can edit questions",
         ));
     }
     // Writer lease of [`EXAM_LOCK`]: the freeze gate, the subject check, and
@@ -1700,7 +1700,7 @@ async fn update_question(
     responses(
         (status = 204, description = "Deleted"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "No such exam, or no such question in it", body = ErrorResponse),
         (status = 409, description = "Attempts have started — questions are frozen", body = ErrorResponse),
     ),
@@ -1716,7 +1716,7 @@ async fn delete_question(
     let course = course_of(&exam, &st.db).await?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the course creator or a manager/admin can delete questions",
+            "only the course creator, an assigned teacher, or a manager/admin can delete questions",
         ));
     }
     // Writer lease of [`EXAM_LOCK`]: freeze gate + delete are one unit — a
@@ -1752,7 +1752,7 @@ async fn image_managed_exam(st: &AppState, user: &User, id: &str) -> Result<Exam
     let course = course_of(&exam, &st.db).await?;
     if !can_manage_course(&course, user) {
         return Err(AppError::Forbidden(
-            "only the course creator or a manager/admin can manage question images",
+            "only the course creator, an assigned teacher, or a manager/admin can manage question images",
         ));
     }
     Ok(exam)
@@ -1842,7 +1842,7 @@ async fn serve_image(st: &AppState, image: &QuestionImage) -> Result<Response, A
         (status = 201, description = "Image stored", body = ImageMetaResponse),
         (status = 400, description = "Missing file field, empty file, or a content type outside the image allowlist", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "No such exam, or no such question in it", body = ErrorResponse),
         (status = 409, description = "Attempts have started — questions are frozen", body = ErrorResponse),
         (status = 413, description = "Image exceeds the school's size limit", body = ErrorResponse),
@@ -1918,7 +1918,7 @@ async fn get_question_image(
     responses(
         (status = 204, description = "Deleted"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "No such exam, question, or image", body = ErrorResponse),
         (status = 409, description = "Attempts have started — questions are frozen", body = ErrorResponse),
     ),
@@ -1960,7 +1960,7 @@ async fn delete_question_image(
         (status = 201, description = "Image stored", body = ImageMetaResponse),
         (status = 400, description = "Missing file field, empty file, a content type outside the image allowlist, a text question, or an index past the choices", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "No such exam, or no such question in it", body = ErrorResponse),
         (status = 409, description = "Attempts have started — questions are frozen", body = ErrorResponse),
         (status = 413, description = "Image exceeds the school's size limit", body = ErrorResponse),
@@ -2052,7 +2052,7 @@ async fn get_choice_image(
     responses(
         (status = 204, description = "Deleted"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "No such exam, question, or image", body = ErrorResponse),
         (status = 409, description = "Attempts have started — questions are frozen", body = ErrorResponse),
     ),
@@ -2398,7 +2398,7 @@ async fn save_answer(
     responses(
         (status = 200, description = "The student's answers, judged", body = AttemptAnswersResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "No such exam, or the student has no attempt", body = ErrorResponse),
     ),
 )]
@@ -2413,7 +2413,7 @@ async fn attempt_answers(
     let course = course_of(&exam, &st.db).await?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the course creator or a manager/admin can read answer sheets",
+            "only the course creator, an assigned teacher, or a manager/admin can read answer sheets",
         ));
     }
     let target = UserId::from_key(&target);

@@ -126,6 +126,8 @@ const MIGRATION: &str = "
 
     DEFINE TABLE IF NOT EXISTS course SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS creator ON course TYPE record<user>;
+    DEFINE FIELD IF NOT EXISTS teachers ON course TYPE array<record<user>> DEFAULT [];
+    DEFINE FIELD IF NOT EXISTS teachers[*] ON course TYPE record<user>;
     DEFINE FIELD IF NOT EXISTS title ON course TYPE string;
     DEFINE FIELD IF NOT EXISTS description ON course TYPE string;
     DEFINE FIELD IF NOT EXISTS kind ON course TYPE string DEFAULT 'course';
@@ -290,6 +292,10 @@ const BACKFILL: &str = "
     UPDATE user SET role = 'student' WHERE role = NONE;
 
     UPDATE course SET kind = 'course' WHERE kind = NONE;
+
+    -- Courses predate assignable teachers (2026-07-21): every existing course
+    -- was run by its creator alone, so it starts with nobody else assigned.
+    UPDATE course SET teachers = [] WHERE teachers = NONE;
 
     -- Exams predate the draft flag (2026-07-19): everything already out there
     -- was live for its course, so it stays published.
