@@ -29,7 +29,11 @@ full — lays out its **subjects** (curriculum topics —
 every exam question must be tagged with one of its course's subjects, so
 results can later be read per topic), enrolls students, adds
 exams inside it, and grades — enrolling, sitting exams, roll call, and marks are
-all student-only, staff never take part; students read a per-course weighted average and
+all student-only, staff never take part. A course is run by whoever created it
+plus any teachers a **manager assigns** to it (`POST /courses/{id}/teachers`):
+an assigned teacher manages everything inside the course — exams, sessions,
+subjects, roster, grading — but can't delete it or change who else teaches it,
+and a demotion below `teacher` sweeps their assignments away. Students read a per-course weighted average and
 an overall average from their mark report — each exam weighted by its **kind**
 (midterms can count double, orals once: weights are set per kind in settings,
 not per exam). Exams run **sync** (one
@@ -251,9 +255,9 @@ course enrollments.
 | Register users onto a registration event | teacher      | Teachers place **students** (students never register themselves) and take a seat for **themselves** — never for another staff member. Unregistering mirrors the same rule |
 | List an event's attendance or its roster report | teacher | Students read their own tallies via the attendance report |
 | Edit / delete an event                   | teacher      | Only the **creator**, or a `manager`+ for any event |
-| View a course's sessions                 | student      | Only inside **visible** courses: enrolled, creator, or `manager`+ |
+| View a course's sessions                 | student      | Only inside **visible** courses: enrolled, creator, assigned teacher, or `manager`+ |
 | List a session's roll call               | teacher      | The **session's teacher**, or anyone with course-management rights |
-| Create / edit / delete a course session  | teacher      | Course-management rights (course creator, or `manager`+) |
+| Create / edit / delete a course session  | teacher      | Course-management rights (course creator, an assigned teacher, or `manager`+) |
 | Take a session's roll call (mark/remove **enrolled students**) | teacher | The **session's teacher**, or anyone with course-management rights; only students sit on a roster |
 | Mark / remove the **session teacher's** presence row | manager | Staff presence is management's call — the teacher can't self-mark |
 | Work check-in / check-out; view **own** work log | teacher | Instants are server-stamped, never client-supplied |
@@ -265,14 +269,16 @@ course enrollments.
 | Approve a pending pool question; delete any question or solution | teacher | Approval publishes school-wide and **freezes** the content; rejection = deletion — moderation never edits, so teacher+ cannot rewrite a solution |
 | Read **own** attendance report           | student      |                                               |
 | Read another user's attendance report    | teacher      | Narrowed to the caller's managed courses; `manager`+ sees all; a `parent` sees a linked student's in full |
-| View **visible** courses/exams and a course's subjects; read **own** result, courses, mark report | student | Visible = enrolled (teachers: + created; `manager`+: all); exam **drafts** show only to the course's managers |
+| View **visible** courses/exams and a course's subjects; read **own** result, courses, mark report | student | Visible = enrolled (teachers: + created + assigned; `manager`+: all); exam **drafts** show only to the course's managers |
 | Sit a sittable exam (`sync`/`async`/`open`): start / resume / retake / read / submit **own** attempt | student | **Students only** — staff never sit; must be enrolled; window (where one exists) and `max_attempts` enforced by the server |
 | Answer questions inside **own** attempt (REST autosave or the exam-room WebSocket) | student | **Students only**; attempt must be `in_progress`; deadline judged by the server clock; blocked after leaving the room while `allow_rejoin` is off |
 | Author an exam's questions (add/edit/delete, incl. question + option images) | teacher | Course-management rights; frozen once anyone has an attempt |
 | Read a question list (with `correct`) or a student's answer sheet | teacher | Course-management rights — one teacher can't read another's answer key |
 | Watch an exam's live monitor (snapshot or SSE stream) | teacher | Course-management rights |
-| Create courses                           | teacher      | The creator manages the course                 |
-| Manage inside a course: edit/delete it, enroll/unenroll **students**, add/edit/delete its exams and **subjects**, grade, remove results | teacher | Only the **course creator**, or a `manager`+ for any course; only students can be enrolled; a subject still referenced by exam questions won't delete (`409`) |
+| Create courses                           | teacher      | The creator manages the course, and owns it for good |
+| Assign / unassign a course's teachers    | manager      | Staffing is the office's call — a course's own creator cannot hand rights to peers; the assignee must be `teacher`+ |
+| Delete a course                          | teacher      | Only the **creator**, or a `manager`+ — an assigned teacher runs the course but doesn't own it |
+| Manage inside a course: edit it, enroll/unenroll **students**, add/edit/delete its exams and **subjects**, grade, remove results | teacher | The **course creator**, a teacher **assigned** to it, or a `manager`+ for any course; only students can be enrolled; a subject still referenced by exam questions won't delete (`409`) |
 | View a course's roster, an exam's result list / statistics | teacher | Course-management rights |
 | Read another user's mark report          | teacher      | Narrowed to the caller's managed courses; `manager`+ sees all; a `parent` sees a linked student's in full |
 | Grade students                           | teacher      | Target must be an **enrolled student**; grading never targets oneself |
@@ -327,13 +333,29 @@ roster reaches it, new enrolls are refused with `409` (members already on the
 roster are unaffected, even if the cap is later lowered below them; `null`
 lifts the cap).
 
+**Who runs a course.** Its **creator** owns it for good — only they (or a
+manager+) may delete it. On top of that, a manager can **assign** any
+`teacher`+ to the course with `POST /courses/{id}/teachers` (`{user_id}`,
+idempotent) and drop them again with `DELETE /courses/{id}/teachers/{user}`.
+An assigned teacher gets full **course-management rights** — edit the course,
+enroll and unenroll students, add exams, sessions and subjects, grade, take
+roll call — but *not* the two owner powers: they cannot delete the course, and
+they cannot change who else teaches it. Staffing is deliberately the office's
+call, so a course's own creator cannot hand rights to their peers; only
+manager+ may touch the list. Every course response carries its `teachers`
+array alongside `creator`, and a user demoted below `teacher` is swept off
+every course they were assigned to (the mirror of promotion dropping
+enrollments).
+
 Course data is walled per course. A course, its exams, its sessions, and its
 subjects are
-**visible** only to its enrolled users, its creator, and manager+ — a student
+**visible** only to its enrolled users, its creator, its assigned teachers,
+and manager+ — a student
 sees just the classes they were added to, and the `/courses` / `/exams`
 catalogs are filtered accordingly. Teacher-level reads *inside* a course
 (roster, results, statistics, the question list, answer sheets, the live
-monitor) additionally need **course-management rights** (creator or manager+):
+monitor) additionally need **course-management rights** (creator, an assigned
+teacher, or manager+):
 one teacher cannot look into another teacher's course, and the per-user
 marks/attendance reports narrow to the courses the caller manages.
 
@@ -400,16 +422,18 @@ their existing shapes: the student exam-room reads
 | POST   | `/courses`                       | teacher | `{title, description?, kind?, term_id?, capacity?}` — `kind` is `course` (default), `study` (etüt), or `club` (kulüp); `capacity` caps the roster (creator manages it) |
 | GET    | `/courses`                       | student | The caller's visible courses: created + enrolled (manager+: all) · paged |
 | GET    | `/courses/me`                    | student | The caller's **enrolled** courses · paged |
-| GET    | `/courses/{id}`                  | student | Get course (enrolled, creator, or manager+) |
-| PATCH  | `/courses/{id}`                  | teacher | Edit course incl. `kind` and `capacity` (`null` lifts the cap) (creator, or manager+ for any) |
-| DELETE | `/courses/{id}`                  | teacher | Delete course + its exams, results, enrollments, subjects (creator, or manager+) |
+| GET    | `/courses/{id}`                  | student | Get course (enrolled, creator, assigned teacher, or manager+) |
+| PATCH  | `/courses/{id}`                  | teacher | Edit course incl. `kind` and `capacity` (`null` lifts the cap) (course manager) |
+| DELETE | `/courses/{id}`                  | teacher | Delete course + its exams, results, enrollments, subjects (creator, or manager+ — **not** an assigned teacher) |
+| POST   | `/courses/{id}/teachers`         | manager | `{user_id}` — assign a **teacher+** to run the course (idempotent; returns the course) |
+| DELETE | `/courses/{id}/teachers/{user}`  | manager | Unassign a teacher (`404` if they weren't assigned) |
 | POST   | `/courses/{id}/enrollments`      | teacher | `{user_id}` — enroll a **student** (idempotent upsert; course manager; only students can be enrolled; `409` once a capped course is full) |
 | GET    | `/courses/{id}/enrollments`      | teacher | List the course roster (course manager) · paged |
 | DELETE | `/courses/{id}/enrollments/{user}` | teacher | Unenroll (keeps recorded results; course manager) |
 | POST   | `/courses/{id}/sessions`         | teacher | `{topic?, teacher_id?, starts_at, ends_at?}` — add a lesson (course manager; teacher defaults to the caller) |
-| GET    | `/courses/{id}/sessions`         | student | List the course's sessions, most recent first (enrolled, creator, or manager+) · paged |
+| GET    | `/courses/{id}/sessions`         | student | List the course's sessions, most recent first (enrolled, creator, assigned teacher, or manager+) · paged |
 | POST   | `/courses/{id}/subjects`         | teacher | `{name, description?}` — add a curriculum subject (course manager) |
-| GET    | `/courses/{id}/subjects`         | student | List the course's subjects, creation order (enrolled, creator, or manager+) · paged |
+| GET    | `/courses/{id}/subjects`         | student | List the course's subjects, creation order (enrolled, creator, assigned teacher, or manager+) · paged |
 | GET    | `/subjects/{id}`                 | student | Get subject (enrolled, creator, or manager+) |
 | PATCH  | `/subjects/{id}`                 | teacher | Edit a subject's name/description (course manager; its course is fixed) |
 | DELETE | `/subjects/{id}`                 | teacher | Delete a subject (course manager); `409` while exam questions reference it |
@@ -420,7 +444,7 @@ their existing shapes: the student exam-room reads
 | GET    | `/sessions/{id}/attendance`      | teacher | List the session's roll call (session teacher or course manager) · paged |
 | DELETE | `/sessions/{id}/attendance/{user}` | teacher | Remove a roll-call row (same rights as marking) |
 | POST   | `/courses/{id}/exams`            | teacher | `{title, description?, kind, mode?, starts_at?, ends_at?, duration_ms?, max_attempts?, allow_rejoin?, draft?}` — add an exam (course manager); its weight comes from the kind; `draft: true` keeps it hidden while it's written |
-| GET    | `/courses/{id}/exams`            | student | List the course's exams (enrolled, creator, or manager+; drafts appear to course managers only) · paged |
+| GET    | `/courses/{id}/exams`            | student | List the course's exams (enrolled, creator, assigned teacher, or manager+; drafts appear to course managers only) · paged |
 | GET    | `/exams`                         | student | The caller's visible exams: their courses' (manager+: all; drafts of managed courses only) · paged |
 | GET    | `/exams/{id}`                    | student | Get exam (enrolled, creator, or manager+; a draft is a `404` for everyone but its course's managers) |
 | PATCH  | `/exams/{id}`                    | teacher | Edit exam incl. `kind` (re-weights it), schedule, `max_attempts`, `allow_rejoin`, `draft` (course manager; `course` immutable, `mode` frozen once attempted, re-drafting frozen once attempts/results exist — the rest stays live) |

@@ -134,7 +134,7 @@ fn can_roll_call(session: &CourseSession, course: &Course, user: &User) -> bool 
 // ---- sessions -------------------------------------------------------------
 
 /// Fetch a single session by id. Visible to its course's enrolled users, the
-/// session's teacher, the course creator, and managers/admins.
+/// session's teacher, the course's own teachers, and managers/admins.
 #[utoipa::path(
     get,
     path = "/{id}",
@@ -156,7 +156,7 @@ async fn get_session(
     let (session, course) = session_with_course(&id, &st.db).await?;
     if !session.is_teacher(user.get_id()) && !can_view_course(&course, &user, &st.db).await? {
         return Err(AppError::Forbidden(
-            "only enrolled users, the session teacher, the course creator, or a manager/admin can view this session",
+            "only enrolled users, the session teacher, the course's teachers, or a manager/admin can view this session",
         ));
     }
     let people = person_map([session.get_teacher().clone()], &st.db).await?;
@@ -176,7 +176,7 @@ async fn get_session(
         (status = 200, description = "Updated session", body = SessionResponse),
         (status = 400, description = "Invalid fields, time range, newly set times in the past, or teacher", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
     ),
 )]
@@ -189,7 +189,7 @@ async fn update_session(
     let (session, course) = session_with_course(&id, &st.db).await?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the course creator or a manager/admin can edit this session",
+            "only the course creator, an assigned teacher, or a manager/admin can edit this session",
         ));
     }
 
@@ -244,7 +244,7 @@ async fn update_session(
     responses(
         (status = 204, description = "Deleted"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
     ),
 )]
@@ -256,7 +256,7 @@ async fn delete_session(
     let (session, course) = session_with_course(&id, &st.db).await?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the course creator or a manager/admin can delete this session",
+            "only the course creator, an assigned teacher, or a manager/admin can delete this session",
         ));
     }
     session.delete(&st.db).await?;

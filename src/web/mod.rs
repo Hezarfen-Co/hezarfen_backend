@@ -27,7 +27,7 @@ mod page;
 
 pub use dto::{
     CourseResponse, ExamResponse, PersonRef, SessionResponse, SubjectResponse, UserResponse,
-    person_map,
+    course_people, person_map,
 };
 pub use extractor::{CurrentUser, RequireAdmin, RequireManager, RequireStudent, RequireTeacher};
 pub use page::{Page, PageParams, paginate};
@@ -168,11 +168,13 @@ pub(crate) async fn serve_inline_blob(
     file: &str,
     content_type: &FileContentType,
 ) -> Result<Response, AppError> {
-    let bytes = tokio::fs::read(blob_path(files_path, file)).await.map_err(|err| {
-        // The row exists but its blob doesn't — server-side damage (a lost
-        // volume path), not a client 404.
-        AppError::Internal(format!("missing blob for image {file}: {err}"))
-    })?;
+    let bytes = tokio::fs::read(blob_path(files_path, file))
+        .await
+        .map_err(|err| {
+            // The row exists but its blob doesn't — server-side damage (a lost
+            // volume path), not a client 404.
+            AppError::Internal(format!("missing blob for image {file}: {err}"))
+        })?;
     let content_type = HeaderValue::from_str(content_type.as_str())
         .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
     Ok((

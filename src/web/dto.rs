@@ -160,8 +160,13 @@ impl UserResponse {
 pub struct CourseResponse {
     #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
     pub id: String,
-    /// Who created (and owns) the course.
+    /// Who created (and owns) the course. Only they and managers/admins may
+    /// delete it or change who teaches it.
     pub creator: PersonRef,
+    /// The staff a manager assigned to run this course. They manage everything
+    /// inside it — exams, sessions, subjects, the roster, grading — but cannot
+    /// delete the course or change this list. Empty when nobody was assigned.
+    pub teachers: Vec<PersonRef>,
     #[schema(example = "Algebra")]
     pub title: String,
     pub description: String,
@@ -178,11 +183,23 @@ pub struct CourseResponse {
     pub capacity: Option<i64>,
 }
 
+/// Every person a [`CourseResponse`] names: the creator plus the teachers
+/// assigned to run it. Feed this into `person_map` so the response can resolve
+/// all of them — a name the map is missing renders as an unknown person.
+pub fn course_people(course: &Course) -> impl Iterator<Item = UserId> + '_ {
+    std::iter::once(course.get_creator().clone()).chain(course.get_teachers().iter().cloned())
+}
+
 impl CourseResponse {
     pub fn new(course: &Course, people: &HashMap<String, PersonRef>) -> Self {
         Self {
             id: course.get_id().key().to_string(),
             creator: PersonRef::resolve(people, course.get_creator()),
+            teachers: course
+                .get_teachers()
+                .iter()
+                .map(|teacher| PersonRef::resolve(people, teacher))
+                .collect(),
             title: course.get_title().as_str().to_string(),
             description: course.get_description().as_str().to_string(),
             kind: course.get_kind().as_str().to_string(),

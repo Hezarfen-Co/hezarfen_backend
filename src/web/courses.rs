@@ -28,9 +28,9 @@ use crate::state::AppState;
 use super::sessions::resolve_session_teacher;
 use super::terms::resolve_term;
 use super::{
-    CourseResponse, CurrentUser, ExamResponse, Page, PageParams, PersonRef, RequireTeacher,
-    SessionResponse, SubjectResponse, check_not_past, check_time_range, paginate, person_map,
-    remove_blob, set_or_clear,
+    CourseResponse, CurrentUser, ExamResponse, Page, PageParams, PersonRef, RequireManager,
+    RequireTeacher, SessionResponse, SubjectResponse, check_not_past, check_time_range,
+    course_people, paginate, person_map, remove_blob, set_or_clear,
 };
 
 pub fn routes() -> OpenApiRouter<AppState> {
@@ -38,6 +38,8 @@ pub fn routes() -> OpenApiRouter<AppState> {
         .routes(routes!(create_course, list_courses))
         .routes(routes!(my_courses))
         .routes(routes!(get_course, update_course, delete_course))
+        .routes(routes!(assign_teacher))
+        .routes(routes!(unassign_teacher))
         .routes(routes!(enroll, list_roster))
         .routes(routes!(unenroll))
         .routes(routes!(create_exam_in_course, list_course_exams))
@@ -85,6 +87,14 @@ struct UpdateCourse {
 #[derive(Deserialize, ToSchema)]
 struct EnrollUser {
     /// The user to enroll.
+    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    user_id: String,
+}
+
+#[derive(Deserialize, ToSchema)]
+struct AssignTeacher {
+    /// The staff member to put in charge of the course. Must hold the
+    /// `teacher` role or higher.
     #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
     user_id: String,
 }
@@ -150,10 +160,23 @@ impl EnrollmentResponse {
     }
 }
 
-/// Who may write inside a specific course (edit/delete it, enroll, add exams,
-/// grade): its creator, or anyone `manager` and above. Callers have already
-/// cleared the `teacher` bar via `RequireTeacher`.
+/// Who may write inside a specific course (edit it, enroll, add exams,
+/// sessions, subjects, grade): its creator, a teacher a manager assigned to
+/// it, or anyone `manager` and above. Callers have already cleared the
+/// `teacher` bar via `RequireTeacher`.
+///
+/// Deleting the course and changing its teacher list sit *above* this bar —
+/// see [`owns_course`].
 pub(crate) fn can_manage_course(course: &Course, user: &User) -> bool {
+    course.is_creator(user.get_id())
+        || course.is_assigned(user.get_id())
+        || user.get_role().at_least(Role::Manager)
+}
+
+/// Who may destroy a course: its creator, or anyone `manager` and above. An
+/// assigned teacher runs the course but does not own it — they cannot delete
+/// it out from under the person who made it.
+fn owns_course(course: &Course, user: &User) -> bool {
     course.is_creator(user.get_id()) || user.get_role().at_least(Role::Manager)
 }
 
@@ -181,7 +204,7 @@ pub(crate) async fn visible_courses(user: &User, db: &Database) -> Result<Vec<Co
     if user.get_role().at_least(Role::Manager) {
         return Course::list_all(db).await;
     }
-    let mut courses = Course::list_created(user.get_id(), db).await?;
+    let mut courses = Course::list_for_teacher(user.get_id(), db).await?;
     for course in Course::list_enrolled(user.get_id(), db).await? {
         if !courses
             .iter()
@@ -283,7 +306,7 @@ async fn list_courses(
     let total = courses.len() as i64;
     let window = paginate(&courses, limit, offset);
     // Join creators onto the page alone — the lookup shrinks with the window.
-    let people = person_map(window.iter().map(|c| c.get_creator().clone()), &st.db).await?;
+    let people = person_map(window.iter().flat_map(course_people), &st.db).await?;
     let items = window
         .iter()
         .map(|course| CourseResponse::new(course, &people))
@@ -315,7 +338,7 @@ async fn my_courses(
     let courses = Course::list_enrolled(user.get_id(), &st.db).await?;
     let total = courses.len() as i64;
     let window = paginate(&courses, limit, offset);
-    let people = person_map(window.iter().map(|c| c.get_creator().clone()), &st.db).await?;
+    let people = person_map(window.iter().flat_map(course_people), &st.db).await?;
     let items = window
         .iter()
         .map(|course| CourseResponse::new(course, &people))
@@ -334,7 +357,7 @@ async fn my_courses(
     responses(
         (status = 200, description = "The course", body = CourseResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not enrolled, not the creator, and not a manager/admin", body = ErrorResponse),
+        (status = 403, description = "Not enrolled, not the course creator or an assigned teacher, and not a manager/admin", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
     ),
 )]
@@ -348,15 +371,16 @@ async fn get_course(
         .ok_or(AppError::NotFound)?;
     if !can_view_course(&course, &user, &st.db).await? {
         return Err(AppError::Forbidden(
-            "only enrolled users, the course creator, or a manager/admin can view this course",
+            "only enrolled users, the course creator, an assigned teacher, or a manager/admin can view this course",
         ));
     }
-    let people = person_map([course.get_creator().clone()], &st.db).await?;
+    let people = person_map(course_people(&course), &st.db).await?;
     Ok(Json(CourseResponse::new(&course, &people)))
 }
 
-/// Update a course. Requires teacher+; the creator may edit their own course
-/// and managers/admins may edit anyone's. Omitted fields keep their value.
+/// Update a course. Requires teacher+ and course management rights — its
+/// creator, a teacher assigned to it, or a manager/admin. Omitted fields keep
+/// their value.
 #[utoipa::path(
     patch,
     path = "/{id}",
@@ -368,7 +392,7 @@ async fn get_course(
         (status = 200, description = "Updated course", body = CourseResponse),
         (status = 400, description = "Invalid fields, kind, or capacity", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
     ),
 )]
@@ -383,7 +407,7 @@ async fn update_course(
         .ok_or(AppError::NotFound)?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the course creator or a manager/admin can edit this course",
+            "only the course creator, an assigned teacher, or a manager/admin can edit this course",
         ));
     }
 
@@ -416,12 +440,12 @@ async fn update_course(
     let updated = course
         .update(title, description, kind, term, capacity, &st.db)
         .await?;
-    let people = person_map([updated.get_creator().clone()], &st.db).await?;
+    let people = person_map(course_people(&updated), &st.db).await?;
     Ok(Json(CourseResponse::new(&updated, &people)))
 }
 
-/// Delete a course. Requires teacher+; the creator may delete their own course
-/// and managers/admins may delete anyone's. Cascades the course's exams (with
+/// Delete a course. Requires teacher+; only its creator or a manager/admin may
+/// delete it — an assigned teacher runs the course but does not own it. Cascades the course's exams (with
 /// their results, questions, answers, and question images), its sessions and
 /// roll call, its subjects, and all enrollments.
 #[utoipa::path(
@@ -433,7 +457,7 @@ async fn update_course(
     responses(
         (status = 204, description = "Deleted"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
     ),
 )]
@@ -445,7 +469,7 @@ async fn delete_course(
     let course = Course::read(&CourseId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    if !can_manage_course(&course, &user) {
+    if !owns_course(&course, &user) {
         return Err(AppError::Forbidden(
             "only the course creator or a manager/admin can delete this course",
         ));
@@ -456,6 +480,97 @@ async fn delete_course(
     course.delete(&st.db).await?;
     for file in &image_files {
         remove_blob(&st.files_path, file).await;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---- assigned teachers ----------------------------------------------------
+
+/// Assign a teacher to a course (idempotent). Manager+ only — staffing is the
+/// office's call, so a course's own creator cannot hand management rights to
+/// their peers. The assignee must already hold the `teacher` role or higher;
+/// assigning gives them full management of the course (exams, sessions,
+/// subjects, roster, grading) but not the power to delete it or change this
+/// list. The course's assigned teachers are returned on every course response.
+#[utoipa::path(
+    post,
+    path = "/{id}/teachers",
+    tag = "courses",
+    security(("session_cookie" = [])),
+    params(("id" = String, Path, description = "Course id")),
+    request_body = AssignTeacher,
+    responses(
+        (status = 200, description = "Assigned (or already assigned)", body = CourseResponse),
+        (status = 400, description = "Unknown user, or user is not a teacher or higher", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
+        (status = 404, description = "Course not found", body = ErrorResponse),
+    ),
+)]
+async fn assign_teacher(
+    State(st): State<AppState>,
+    RequireManager(_manager): RequireManager,
+    Path(id): Path<String>,
+    Json(req): Json<AssignTeacher>,
+) -> Result<Json<CourseResponse>, AppError> {
+    let course = Course::read(&CourseId::from_key(&id), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+    let target = UserId::from_key(&req.user_id);
+    let Some(target_user) = User::read(&target, &st.db).await? else {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "user_id",
+            reason: "target user does not exist",
+        }));
+    };
+    // Assignment hands out course-management rights, which every gate behind
+    // it re-checks against the `teacher` bar — assigning anyone below it would
+    // write a row that can never be used.
+    if !target_user.get_role().at_least(Role::Teacher) {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "user_id",
+            reason: "assigned teacher must hold the teacher role or higher",
+        }));
+    }
+
+    let updated = course.assign_teacher(&target, &st.db).await?;
+    let people = person_map(course_people(&updated), &st.db).await?;
+    Ok(Json(CourseResponse::new(&updated, &people)))
+}
+
+/// Unassign a teacher from a course. Manager+ only. The course itself, its
+/// exams, sessions, and roster are untouched — the teacher just loses their
+/// management rights over it. A user who was never assigned is a 404.
+#[utoipa::path(
+    delete,
+    path = "/{id}/teachers/{user}",
+    tag = "courses",
+    security(("session_cookie" = [])),
+    params(
+        ("id" = String, Path, description = "Course id"),
+        ("user" = String, Path, description = "User id"),
+    ),
+    responses(
+        (status = 204, description = "Unassigned"),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
+        (status = 404, description = "Course not found, or that user was not assigned to it", body = ErrorResponse),
+    ),
+)]
+async fn unassign_teacher(
+    State(st): State<AppState>,
+    RequireManager(_manager): RequireManager,
+    Path((id, target)): Path<(String, String)>,
+) -> Result<StatusCode, AppError> {
+    let course = Course::read(&CourseId::from_key(&id), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let removed = course
+        .unassign_teacher(&UserId::from_key(&target), &st.db)
+        .await?;
+    if removed.is_none() {
+        return Err(AppError::NotFound);
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -478,7 +593,7 @@ async fn delete_course(
         (status = 200, description = "Enrolled (or already enrolled)", body = EnrollmentResponse),
         (status = 400, description = "Unknown user, or user is not a student", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
         (status = 409, description = "The course is full", body = ErrorResponse),
     ),
@@ -494,7 +609,7 @@ async fn enroll(
         .ok_or(AppError::NotFound)?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the course creator or a manager/admin can enroll users",
+            "only the course creator, an assigned teacher, or a manager/admin can enroll users",
         ));
     }
 
@@ -535,7 +650,7 @@ async fn enroll(
         (status = 200, description = "A page of enrollments (the whole roster when unpaged)", body = Page<EnrollmentResponse>),
         (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
     ),
 )]
@@ -552,7 +667,7 @@ async fn list_roster(
         .ok_or(AppError::NotFound)?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the course creator or a manager/admin can list the roster",
+            "only the course creator, an assigned teacher, or a manager/admin can list the roster",
         ));
     }
     let enrollments = Enrollment::list_for_course(course.get_id(), &st.db).await?;
@@ -587,7 +702,7 @@ async fn list_roster(
     responses(
         (status = 204, description = "Unenrolled"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
     ),
 )]
@@ -601,7 +716,7 @@ async fn unenroll(
         .ok_or(AppError::NotFound)?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the course creator or a manager/admin can unenroll users",
+            "only the course creator, an assigned teacher, or a manager/admin can unenroll users",
         ));
     }
     let removed = Enrollment::remove(course.get_id(), &UserId::from_key(&target), &st.db).await?;
@@ -634,7 +749,7 @@ async fn unenroll(
         (status = 201, description = "Exam created", body = ExamResponse),
         (status = 400, description = "Invalid fields, kind, attempt limit, or schedule (malformed window, or times in the past)", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
     ),
 )]
@@ -649,7 +764,7 @@ async fn create_exam_in_course(
         .ok_or(AppError::NotFound)?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the course creator or a manager/admin can add exams to this course",
+            "only the course creator, an assigned teacher, or a manager/admin can add exams to this course",
         ));
     }
 
@@ -701,7 +816,7 @@ async fn create_exam_in_course(
         (status = 200, description = "A page of the course's exams (all of them when unpaged)", body = Page<ExamResponse>),
         (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not enrolled, not the creator, and not a manager/admin", body = ErrorResponse),
+        (status = 403, description = "Not enrolled, not the course creator or an assigned teacher, and not a manager/admin", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
     ),
 )]
@@ -718,7 +833,7 @@ async fn list_course_exams(
         .ok_or(AppError::NotFound)?;
     if !can_view_course(&course, &user, &st.db).await? {
         return Err(AppError::Forbidden(
-            "only enrolled users, the course creator, or a manager/admin can view this course",
+            "only enrolled users, the course creator, an assigned teacher, or a manager/admin can view this course",
         ));
     }
     let mut exams = Exam::list_for_course(course.get_id(), &st.db).await?;
@@ -759,7 +874,7 @@ struct CreateSubject {
         (status = 201, description = "Subject created", body = SubjectResponse),
         (status = 400, description = "Invalid name or description", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
     ),
 )]
@@ -774,7 +889,7 @@ async fn create_subject_in_course(
         .ok_or(AppError::NotFound)?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the course creator or a manager/admin can add subjects to this course",
+            "only the course creator, an assigned teacher, or a manager/admin can add subjects to this course",
         ));
     }
 
@@ -798,7 +913,7 @@ async fn create_subject_in_course(
         (status = 200, description = "A page of the course's subjects (all of them when unpaged)", body = Page<SubjectResponse>),
         (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not enrolled, not the creator, and not a manager/admin", body = ErrorResponse),
+        (status = 403, description = "Not enrolled, not the course creator or an assigned teacher, and not a manager/admin", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
     ),
 )]
@@ -815,7 +930,7 @@ async fn list_course_subjects(
         .ok_or(AppError::NotFound)?;
     if !can_view_course(&course, &user, &st.db).await? {
         return Err(AppError::Forbidden(
-            "only enrolled users, the course creator, or a manager/admin can view this course",
+            "only enrolled users, the course creator, an assigned teacher, or a manager/admin can view this course",
         ));
     }
     let subjects = Subject::list_for_course(course.get_id(), &st.db).await?;
@@ -858,7 +973,7 @@ struct CreateSessionInCourse {
         (status = 201, description = "Session created", body = SessionResponse),
         (status = 400, description = "Invalid fields, time range, times in the past, or teacher", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
     ),
 )]
@@ -873,7 +988,7 @@ async fn create_session_in_course(
         .ok_or(AppError::NotFound)?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
-            "only the course creator or a manager/admin can add sessions to this course",
+            "only the course creator, an assigned teacher, or a manager/admin can add sessions to this course",
         ));
     }
 
@@ -915,7 +1030,7 @@ async fn create_session_in_course(
         (status = 200, description = "A page of the course's sessions (all of them when unpaged)", body = Page<SessionResponse>),
         (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not enrolled, not the creator, and not a manager/admin", body = ErrorResponse),
+        (status = 403, description = "Not enrolled, not the course creator or an assigned teacher, and not a manager/admin", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
     ),
 )]
@@ -932,7 +1047,7 @@ async fn list_course_sessions(
         .ok_or(AppError::NotFound)?;
     if !can_view_course(&course, &user, &st.db).await? {
         return Err(AppError::Forbidden(
-            "only enrolled users, the course creator, or a manager/admin can view this course",
+            "only enrolled users, the course creator, an assigned teacher, or a manager/admin can view this course",
         ));
     }
     let sessions = CourseSession::list_for_course(course.get_id(), &st.db).await?;

@@ -7,6 +7,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::database::Database;
+use crate::domain::course::Course;
 use crate::domain::enrollment::Enrollment;
 use crate::domain::parent_link::ParentLink;
 use crate::domain::preferences::{Language, Theme};
@@ -366,7 +367,8 @@ async fn update_user_preferences(
 /// guard keeps a sole admin from accidentally locking everyone out of role
 /// management (recover such a lockout with the SurrealQL in the README).
 /// Setting any non-`student` role also drops the user's course enrollments —
-/// only students enroll, so a promoted user leaves every roster.
+/// only students enroll, so a promoted user leaves every roster. Demoting below
+/// `teacher` drops their course teaching assignments for the mirror reason.
 #[utoipa::path(
     patch,
     path = "/{id}/role",
@@ -409,6 +411,12 @@ async fn set_role(
     }
     if role != Role::Parent {
         ParentLink::delete_where_parent(&target, &st.db).await?;
+    }
+    // Course staffing gets the same sweep: only teacher+ may be assigned to
+    // run a course, so a demotion drops every assignment instead of leaving
+    // rows that grant nothing and still list a demoted user as its teacher.
+    if !role.at_least(Role::Teacher) {
+        Course::unassign_everywhere(&target, &st.db).await?;
     }
     Ok(Json(UserResponse::new(&updated)))
 }
