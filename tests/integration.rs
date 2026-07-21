@@ -11432,3 +11432,342 @@ async fn stale_parent_link_is_inert_after_role_change() {
         );
     }
 }
+
+// --- the question pool ---------------------------------------------------
+
+/// The pool lifecycle end to end: a student asks (pending — invisible to
+/// other students, listed for teachers), a teacher approves (one-way, 409 on
+/// repeat), the pool opens school-wide, anyone offers solutions, and
+/// moderation deletes cascade.
+#[tokio::test]
+async fn question_pool_lifecycle() {
+    let (app, db) = app_and_db().await;
+    let asker = login(&app, "ali").await;
+    let stranger = login(&app, "veli").await;
+    let teacher = login_as(&app, &db, "hoca", "teacher").await;
+
+    // Only students ask: the teacher is refused.
+    let ask = json!({ "title": "Integral", "body": "∫x·eˣ dx?" });
+    let res = send(&app, "POST", "/questions", Some(&teacher), Some(ask.clone())).await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+
+    let res = send(&app, "POST", "/questions", Some(&asker), Some(ask)).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    assert_eq!(res.body["status"], "pending");
+    let qid = id_of(&res.body);
+
+    // Pending: the asker and the teacher see it; another student must not
+    // even learn it exists — and it takes no solutions yet.
+    for (cookie, visible) in [(&asker, true), (&teacher, true), (&stranger, false)] {
+        let res = send(&app, "GET", &format!("/questions/{qid}"), Some(cookie), None).await;
+        let expected = if visible { StatusCode::OK } else { StatusCode::NOT_FOUND };
+        assert_eq!(res.status, expected, "{}", res.body);
+    }
+    let offer = json!({ "body": "Kısmi integrasyon." });
+    let res = send(
+        &app,
+        "POST",
+        &format!("/questions/{qid}/solutions"),
+        Some(&asker),
+        Some(offer.clone()),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+
+    // The teacher's ?status=pending list is the approval queue; approval is
+    // teacher-gated and one-way.
+    let res = send(&app, "GET", "/questions?status=pending", Some(&teacher), None).await;
+    assert_eq!(common::total(&res.body), 1);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/questions/{qid}/approve"),
+        Some(&stranger),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/questions/{qid}/approve"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["status"], "approved");
+    assert_eq!(res.body["approved_by"]["username"], "hoca");
+    let res = send(
+        &app,
+        "POST",
+        &format!("/questions/{qid}/approve"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+
+    // Approved: school-wide — the stranger reads it and answers it.
+    let res = send(&app, "GET", "/questions", Some(&stranger), None).await;
+    assert_eq!(common::total(&res.body), 1);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/questions/{qid}/solutions"),
+        Some(&stranger),
+        Some(offer),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let sid = id_of(&res.body);
+
+    // Deleting the solution: a third party may not, its author may.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/questions/{qid}/solutions/{sid}"),
+        Some(&asker),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/questions/{qid}/solutions/{sid}"),
+        Some(&stranger),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+
+    // Question delete (asker withdraws) cascades what's left.
+    let res = send(&app, "DELETE", &format!("/questions/{qid}"), Some(&asker), None).await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    let res = send(&app, "GET", &format!("/questions/{qid}"), Some(&teacher), None).await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND, "{}", res.body);
+}
+
+/// Parents are observers: every pool surface (list, ask, answer) is closed to
+/// them.
+#[tokio::test]
+async fn question_pool_locks_parents_out() {
+    let (app, db) = app_and_db().await;
+    let parent = login_as(&app, &db, "anne", "parent").await;
+    let res = send(&app, "GET", "/questions", Some(&parent), None).await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+    let res = send(
+        &app,
+        "POST",
+        "/questions",
+        Some(&parent),
+        Some(json!({ "title": "t", "body": "b" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+}
+
+/// The question photo: asker-only upload while pending, SVG refused, bytes
+/// served under the question's visibility, approval freezes the slot.
+#[tokio::test]
+async fn question_pool_image_upload_and_freeze() {
+    let (app, db) = app_and_db().await;
+    let asker = login(&app, "ali").await;
+    let stranger = login(&app, "veli").await;
+    let teacher = login_as(&app, &db, "hoca", "teacher").await;
+
+    let res = send(
+        &app,
+        "POST",
+        "/questions",
+        Some(&asker),
+        Some(json!({ "title": "Harita", "body": "Hangi şehir?" })),
+    )
+    .await;
+    let qid = id_of(&res.body);
+    let upload = |cookie: &str, content_type: &str| {
+        let uri = format!("/questions/{qid}/image");
+        let body = common::multipart_file("soru.png", content_type, b"png-bytes");
+        let cookie = cookie.to_string();
+        let app = app.clone();
+        async move {
+            common::send_raw(
+                &app,
+                "POST",
+                &uri,
+                Some(&cookie),
+                Some("multipart/form-data; boundary=hezarfen-test-boundary"),
+                body,
+            )
+            .await
+        }
+    };
+
+    // SVG is out; the teacher isn't the asker; the asker's PNG lands.
+    let (status, _, _) = upload(&asker, "image/svg+xml").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _, _) = upload(&teacher, "image/png").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _, _) = upload(&asker, "image/png").await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Pending bytes follow pending visibility: asker yes, stranger no.
+    let uri = format!("/questions/{qid}/image");
+    let (status, headers, bytes) =
+        common::send_raw(&app, "GET", &uri, Some(&asker), None, Vec::new()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-type"], "image/png");
+    assert_eq!(bytes, b"png-bytes");
+    let (status, _, _) = common::send_raw(&app, "GET", &uri, Some(&stranger), None, Vec::new()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Approval freezes the image with the text: replace and remove both 409.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/questions/{qid}/approve"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let (status, _, _) = upload(&asker, "image/png").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _, _) =
+        common::send_raw(&app, "DELETE", &uri, Some(&asker), None, Vec::new()).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // But the approved bytes are now school-wide, and ride the question meta.
+    let (status, _, _) = common::send_raw(&app, "GET", &uri, Some(&stranger), None, Vec::new()).await;
+    assert_eq!(status, StatusCode::OK);
+    let res = send(&app, "GET", &format!("/questions/{qid}"), Some(&stranger), None).await;
+    assert_eq!(res.body["image"]["content_type"], "image/png");
+}
+
+/// The solution's photo and body stay the author's alone (no freeze — no
+/// moderation state to protect), bytes follow the question's visibility, and
+/// question rows tally their solutions.
+#[tokio::test]
+async fn solution_images_edits_and_counts() {
+    let (app, db) = app_and_db().await;
+    let asker = login(&app, "ali").await;
+    let helper = login(&app, "veli").await;
+    let teacher = login_as(&app, &db, "hoca", "teacher").await;
+
+    // An approved question with the helper's solution under it.
+    let res = send(
+        &app,
+        "POST",
+        "/questions",
+        Some(&asker),
+        Some(json!({ "title": "Limit", "body": "x→0 iken sin(x)/x?" })),
+    )
+    .await;
+    let qid = id_of(&res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/questions/{qid}/approve"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/questions/{qid}/solutions"),
+        Some(&helper),
+        Some(json!({ "body": "Birebir 1'e gider." })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    assert!(res.body["image"].is_null());
+    let sid = id_of(&res.body);
+
+    // Image writes are the author's: the asker is refused, the helper lands.
+    let uri = format!("/questions/{qid}/solutions/{sid}/image");
+    let upload = |cookie: &str| {
+        let uri = uri.clone();
+        let body = common::multipart_file("cozum.png", "image/png", b"png-bytes");
+        let cookie = cookie.to_string();
+        let app = app.clone();
+        async move {
+            common::send_raw(
+                &app,
+                "POST",
+                &uri,
+                Some(&cookie),
+                Some("multipart/form-data; boundary=hezarfen-test-boundary"),
+                body,
+            )
+            .await
+        }
+    };
+    let (status, _, _) = upload(&asker).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _, _) = upload(&teacher).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _, _) = upload(&helper).await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Bytes follow the question's visibility — approved, so any student
+    // reads them — and the meta rides the solution row.
+    let (status, headers, bytes) =
+        common::send_raw(&app, "GET", &uri, Some(&asker), None, Vec::new()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-type"], "image/png");
+    assert_eq!(bytes, b"png-bytes");
+    let res = send(
+        &app,
+        "GET",
+        &format!("/questions/{qid}/solutions"),
+        Some(&asker),
+        None,
+    )
+    .await;
+    assert_eq!(res.body["items"][0]["image"]["content_type"], "image/png");
+
+    // Body edits are author-only too — teacher+ moderate by deleting, never
+    // by rewriting.
+    let edit = json!({ "body": "Standart limit: sin(x)/x → 1." });
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/questions/{qid}/solutions/{sid}"),
+        Some(&asker),
+        Some(edit.clone()),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/questions/{qid}/solutions/{sid}"),
+        Some(&helper),
+        Some(edit),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["body"], "Standart limit: sin(x)/x → 1.");
+    assert_eq!(res.body["image"]["content_type"], "image/png");
+
+    // Question rows tally their solutions, in the list and the single GET.
+    let res = send(&app, "GET", "/questions?limit=5", Some(&asker), None).await;
+    assert_eq!(res.body["items"][0]["solution_count"], 1);
+    let res = send(&app, "GET", &format!("/questions/{qid}"), Some(&asker), None).await;
+    assert_eq!(res.body["solution_count"], 1);
+
+    // The author drops the photo; a second removal finds nothing.
+    let (status, _, _) = common::send_raw(&app, "DELETE", &uri, Some(&helper), None, Vec::new()).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _, _) = common::send_raw(&app, "GET", &uri, Some(&asker), None, Vec::new()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _, _) = common::send_raw(&app, "DELETE", &uri, Some(&helper), None, Vec::new()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // And the question delete still sweeps everything under it.
+    let res = send(&app, "DELETE", &format!("/questions/{qid}"), Some(&asker), None).await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+}

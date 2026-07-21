@@ -61,11 +61,17 @@ pub const MAX_MAX_FILE_BYTES: i64 = 25 * 1024 * 1024;
 /// the file bytes themselves.
 pub const UPLOAD_BODY_OVERHEAD_BYTES: usize = 64 * 1024;
 
-/// The content types a question image may declare — raster formats only. SVG
-/// is deliberately out: it can carry scripts, and these bytes are served for
-/// inline display to everyone sitting the exam.
+/// The content types an uploaded inline image (exam question images, pool
+/// question photos) may declare — raster formats only. SVG is deliberately
+/// out: it can carry scripts, and these bytes are served for inline display
+/// to whole classes.
 pub const QUESTION_IMAGE_CONTENT_TYPES: [&str; 4] =
     ["image/png", "image/jpeg", "image/webp", "image/gif"];
+
+/// Bounds for a pool question (the student-asked Q&A pool) and its solutions.
+pub const MAX_POOL_QUESTION_TITLE_LEN: usize = 200;
+pub const MAX_POOL_QUESTION_BODY_LEN: usize = 10_000;
+pub const MAX_SOLUTION_BODY_LEN: usize = 10_000;
 
 pub const MAX_EVENT_TITLE_LEN: usize = 200;
 pub const MAX_EVENT_DESCRIPTION_LEN: usize = 2_000;
@@ -140,6 +146,12 @@ pub const UNLIMITED_EXAM_ATTEMPTS: i64 = 0;
 
 /// Cadence of the live exam-monitor SSE stream (`GET /exams/{id}/live/stream`).
 pub const EXAM_LIVE_STREAM_INTERVAL_SECS: u64 = 2;
+
+/// Cadence of the background keepalive query on the database WebSocket. The
+/// traffic keeps the connection from being dropped as idle; when it does drop,
+/// the ping also makes the SDK notice and reconnect long before the next real
+/// request would.
+pub const DB_KEEPALIVE_INTERVAL_SECS: u64 = 30;
 
 /// Cadence of the `state` ticks on the student exam-room WebSocket
 /// (`GET /exams/{id}/attempt/ws`).

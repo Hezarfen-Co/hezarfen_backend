@@ -13,6 +13,7 @@ pub mod marks;
 pub mod messages;
 pub mod notes;
 pub mod pomodoro;
+pub mod questions;
 pub mod sessions;
 pub mod settings;
 pub mod subjects;
@@ -35,12 +36,15 @@ use std::path::{Path as FsPath, PathBuf};
 
 use axum::extract::Multipart;
 use axum::extract::multipart::MultipartError;
-use axum::http::StatusCode;
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, X_CONTENT_TYPE_OPTIONS};
+use axum::http::{HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Deserializer};
 use utoipa::ToSchema;
 
-use crate::constant::SCHEDULE_PAST_GRACE_MS;
+use crate::constant::{QUESTION_IMAGE_CONTENT_TYPES, SCHEDULE_PAST_GRACE_MS};
 use crate::database::Database;
+use crate::domain::note_file::FileContentType;
 use crate::domain::parent_link::ParentLink;
 use crate::domain::role::Role;
 use crate::domain::timestamp::Timestamp;
@@ -138,6 +142,48 @@ pub(crate) async fn remove_blob(files_path: &FsPath, key: &str) {
     {
         tracing::warn!("failed to remove blob {}: {err}", path.display());
     }
+}
+
+/// The declared content type of an inline-displayed image upload, held to the
+/// raster allowlist — SVG stays out (it can script) since these bytes are
+/// rendered inline to whole classes. Shared by exam question images and pool
+/// question photos.
+pub(crate) fn image_content_type(raw: &str) -> Result<FileContentType, AppError> {
+    let content_type = FileContentType::try_new(raw)?;
+    if !QUESTION_IMAGE_CONTENT_TYPES.contains(&content_type.as_str()) {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "content_type",
+            reason: "must be image/png, image/jpeg, image/webp, or image/gif",
+        }));
+    }
+    Ok(content_type)
+}
+
+/// A stored blob as an inline-displayable response: the declared (and
+/// allowlisted) content type, `nosniff`, and `no-store` — moderated/exam
+/// content has no business in shared caches, and a replaced image must not
+/// linger.
+pub(crate) async fn serve_inline_blob(
+    files_path: &FsPath,
+    file: &str,
+    content_type: &FileContentType,
+) -> Result<Response, AppError> {
+    let bytes = tokio::fs::read(blob_path(files_path, file)).await.map_err(|err| {
+        // The row exists but its blob doesn't — server-side damage (a lost
+        // volume path), not a client 404.
+        AppError::Internal(format!("missing blob for image {file}: {err}"))
+    })?;
+    let content_type = HeaderValue::from_str(content_type.as_str())
+        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+    Ok((
+        [
+            (CONTENT_TYPE, content_type),
+            (X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff")),
+            (CACHE_CONTROL, HeaderValue::from_static("private, no-store")),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 
 /// Multipart read failures: the route-level body cap maps to 413 like the
