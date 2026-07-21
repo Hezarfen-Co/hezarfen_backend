@@ -436,6 +436,10 @@ fn error_frame(err: &AppError) -> Value {
         AppError::Conflict(message) => (*message).to_string(),
         AppError::PayloadTooLarge(message) => message.clone(),
         AppError::TooManyRequests { .. } => "too many requests".to_string(),
+        AppError::DbUnavailable => {
+            tracing::warn!("exam room: database reconnecting");
+            "database reconnecting — retry shortly".to_string()
+        }
         AppError::Db(_) | AppError::Internal(_) => {
             tracing::error!("exam room error: {err}");
             "internal server error".to_string()

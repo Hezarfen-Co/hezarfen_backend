@@ -18,6 +18,7 @@ async fn main() -> anyhow::Result<()> {
     let cfg = Config::from_env();
     let db = database::init(&cfg).await?;
     seed_admin(&cfg, &db).await?;
+    keepalive(db.clone());
     tokio::fs::create_dir_all(&cfg.files_path)
         .await
         .with_context(|| format!("failed to create the files directory {}", cfg.files_path))?;
@@ -42,6 +43,25 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     tracing::info!("shutting down");
     Ok(())
+}
+
+/// Ping the database forever so the WebSocket never sits idle long enough to
+/// be dropped. A failed ping is the reconnect window itself — the SDK replays
+/// the session and heals on its own — so it logs at debug, not error.
+fn keepalive(db: Database) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+            hezarfen_backend::constant::DB_KEEPALIVE_INTERVAL_SECS,
+        ));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            match db.query("RETURN 1").await {
+                Ok(_) => tracing::debug!("database keepalive ping ok"),
+                Err(err) => tracing::debug!("database keepalive ping failed: {err}"),
+            }
+        }
+    });
 }
 
 /// Apply the `ADMIN_USERNAME` / `ADMIN_PASSWORD` bootstrap, if configured.
