@@ -162,7 +162,10 @@ impl PoolQuestion {
         created.ok_or_else(|| AppError::Internal("failed to create pool question".into()))
     }
 
-    pub async fn read(id: &PoolQuestionId, db: &Database) -> Result<Option<PoolQuestion>, AppError> {
+    pub async fn read(
+        id: &PoolQuestionId,
+        db: &Database,
+    ) -> Result<Option<PoolQuestion>, AppError> {
         Ok(db.select(id.record()).await?)
     }
 
@@ -355,7 +358,13 @@ mod tests {
 
         // The asker sees their own pending question plus the pool; a stranger
         // sees only the pool; the teacher view (list_all) sees everything.
-        assert_eq!(PoolQuestion::list_visible_to(&asker, &db).await.unwrap().len(), 2);
+        assert_eq!(
+            PoolQuestion::list_visible_to(&asker, &db)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
         let stranger_view = PoolQuestion::list_visible_to(&other, &db).await.unwrap();
         assert_eq!(stranger_view.len(), 1);
         assert_eq!(stranger_view[0].get_id(), published.get_id());
@@ -444,14 +453,27 @@ mod tests {
 
         // The swept solutions ride back with the question so the caller can
         // take their image blobs off disk.
-        let (removed, swept) = PoolQuestion::delete(q.get_id(), &db).await.unwrap().unwrap();
+        let (removed, swept) = PoolQuestion::delete(q.get_id(), &db)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(removed.get_id(), q.get_id());
         assert_eq!(swept.len(), 1);
         assert_eq!(swept[0].get_id(), offered.get_id());
         assert!(PoolQuestion::read(q.get_id(), &db).await.unwrap().is_none());
-        assert!(Solution::list_for(q.get_id(), &db).await.unwrap().is_empty());
+        assert!(
+            Solution::list_for(q.get_id(), &db)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         // Deleting the already-deleted is None, not an error.
-        assert!(PoolQuestion::delete(q.get_id(), &db).await.unwrap().is_none());
+        assert!(
+            PoolQuestion::delete(q.get_id(), &db)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

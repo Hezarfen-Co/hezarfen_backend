@@ -223,10 +223,7 @@ impl Solution {
 
     /// Detach the solution's image. Returns the *before* row — its
     /// `image_file` is the blob the caller must remove.
-    pub async fn clear_image(
-        id: &SolutionId,
-        db: &Database,
-    ) -> Result<Option<Solution>, AppError> {
+    pub async fn clear_image(id: &SolutionId, db: &Database) -> Result<Option<Solution>, AppError> {
         let mut result = db
             .query(
                 "UPDATE $s SET image_file = NONE, image_content_type = NONE, image_size = NONE \
@@ -276,7 +273,12 @@ mod tests {
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].get_id(), first.get_id());
         assert_eq!(listed[1].get_id(), second.get_id());
-        assert!(Solution::list_for(&question_b, &db).await.unwrap().is_empty());
+        assert!(
+            Solution::list_for(&question_b, &db)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         // Readable under its own question, invisible under another.
         assert!(
@@ -418,10 +420,9 @@ mod tests {
             }
         }
 
-        let counts =
-            Solution::counts_for(&[two.clone(), one.clone(), none.clone()], &db)
-                .await
-                .unwrap();
+        let counts = Solution::counts_for(&[two.clone(), one.clone(), none.clone()], &db)
+            .await
+            .unwrap();
         assert_eq!(counts.get(two.key()), Some(&2));
         assert_eq!(counts.get(one.key()), Some(&1));
         // No solutions = no entry; the caller reads the miss as zero.
@@ -435,7 +436,9 @@ mod tests {
         assert!(SolutionBody::try_new("   ").is_err());
         assert!(SolutionBody::try_new(&"x".repeat(10_001)).is_err());
         assert_eq!(
-            SolutionBody::try_new("Kısmi integrasyon.").unwrap().as_str(),
+            SolutionBody::try_new("Kısmi integrasyon.")
+                .unwrap()
+                .as_str(),
             "Kısmi integrasyon."
         );
     }
