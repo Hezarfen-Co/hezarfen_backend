@@ -17,6 +17,7 @@ use crate::constant::{
     EXAM_LIVE_STREAM_INTERVAL_SECS, MAX_MAX_FILE_BYTES, UPLOAD_BODY_OVERHEAD_BYTES,
 };
 use crate::database::Database;
+use crate::domain::answer_image::AnswerImage;
 use crate::domain::course::Course;
 use crate::domain::enrollment::Enrollment;
 use crate::domain::exam::{
@@ -99,6 +100,12 @@ pub fn routes() -> OpenApiRouter<AppState> {
                     get_choice_image,
                     delete_choice_image
                 ))
+                .routes(routes!(
+                    upload_answer_image,
+                    get_answer_image,
+                    delete_answer_image
+                ))
+                .routes(routes!(get_student_answer_image))
                 .layer(DefaultBodyLimit::max(
                     MAX_MAX_FILE_BYTES as usize + UPLOAD_BODY_OVERHEAD_BYTES,
                 )),
@@ -470,8 +477,12 @@ async fn delete_exam(
     // Rows go first (the delete cascades them), blobs after — a crash in
     // between strands at worst an unreachable blob.
     let images = QuestionImage::list_for_exam(exam.get_id(), &st.db).await?;
+    let answer_images = AnswerImage::list_for_exam(exam.get_id(), &st.db).await?;
     exam.delete(&st.db).await?;
     for image in &images {
+        remove_blob(&st.files_path, image.get_file()).await;
+    }
+    for image in &answer_images {
         remove_blob(&st.files_path, image.get_file()).await;
     }
     Ok(StatusCode::NO_CONTENT)
@@ -917,8 +928,20 @@ async fn start_attempt(
         return Err(AppError::Conflict("the exam has already ended"));
     }
 
+    // A retake wipes the student's previous answer rows inside `start`'s atomic
+    // transaction, but not their drawing blobs (the domain has no `files_path`).
+    // Collect the blob names before the wipe, then GC them after — but only if a
+    // wipe actually ran: a freshly created sitting past the first (`seq > 1`).
+    // A resume (`created == false`) or a first sitting wipes nothing.
+    let prior_answer_images =
+        AnswerImage::list_for_exam_user(exam.get_id(), user.get_id(), &st.db).await?;
     let (attempt, created) = ExamAttempt::start(&exam, user.get_id(), &st.db).await?;
     drop(guard);
+    if created && attempt.get_seq() > 1 {
+        for image in &prior_answer_images {
+            remove_blob(&st.files_path, image.get_file()).await;
+        }
+    }
     let mark = ExamResult::read_for_user(exam.get_id(), user.get_id(), &st.db)
         .await?
         .map(|r| r.get_mark());
@@ -1379,6 +1402,13 @@ struct ImageMetaResponse {
 
 impl ImageMetaResponse {
     fn new(image: &QuestionImage) -> Self {
+        Self {
+            content_type: image.get_content_type().as_str().to_string(),
+            size: image.get_size(),
+        }
+    }
+
+    fn from_answer(image: &AnswerImage) -> Self {
         Self {
             content_type: image.get_content_type().as_str().to_string(),
             size: image.get_size(),
@@ -2088,14 +2118,18 @@ struct AnswerStateResponse {
     text: Option<String>,
     /// When this answer was last saved, UTC unix-milliseconds.
     updated_at: i64,
+    /// The student's own drawn answer, if any — bytes at
+    /// `GET /exams/{id}/attempt/answers/{qid}/image`.
+    answer_image: Option<ImageMetaResponse>,
 }
 
 impl AnswerStateResponse {
-    fn new(answer: &ExamAnswer) -> Self {
+    fn new(answer: &ExamAnswer, answer_image: Option<ImageMetaResponse>) -> Self {
         Self {
             selected: answer.get_selected(),
             text: answer.get_text().map(|t| t.as_str().to_string()),
             updated_at: answer.get_updated_at().as_millis(),
+            answer_image,
         }
     }
 }
@@ -2302,6 +2336,12 @@ async fn attempt_questions(
             .into_iter()
             .map(|answer| (answer.get_question().key().to_string(), answer))
             .collect();
+    let answer_images: HashMap<String, AnswerImage> =
+        AnswerImage::list_for_exam_user(exam.get_id(), user.get_id(), &st.db)
+            .await?
+            .into_iter()
+            .map(|image| (image.get_question().key().to_string(), image))
+            .collect();
     Ok(Json(
         questions
             .iter()
@@ -2320,9 +2360,14 @@ async fn attempt_questions(
                         .map(|choices| choices.iter().map(|c| c.as_str().to_string()).collect()),
                     image: image_meta(question_images, None),
                     choice_images: choice_image_metas(question, question_images),
-                    answer: answers
-                        .get(question.get_id().key())
-                        .map(AnswerStateResponse::new),
+                    answer: answers.get(question.get_id().key()).map(|answer| {
+                        AnswerStateResponse::new(
+                            answer,
+                            answer_images
+                                .get(question.get_id().key())
+                                .map(ImageMetaResponse::from_answer),
+                        )
+                    }),
                 }
             })
             .collect(),
@@ -2425,6 +2470,12 @@ async fn attempt_answers(
 
     let questions = ExamQuestion::list_for_exam(exam.get_id(), &st.db).await?;
     let answers = ExamAnswer::list_for_exam_user(exam.get_id(), &target, &st.db).await?;
+    let answer_images: HashMap<String, AnswerImage> =
+        AnswerImage::list_for_exam_user(exam.get_id(), &target, &st.db)
+            .await?
+            .into_iter()
+            .map(|image| (image.get_question().key().to_string(), image))
+            .collect();
     let by_question: HashMap<&str, &ExamQuestion> = questions
         .iter()
         .map(|question| (question.get_id().key(), question))
@@ -2444,6 +2495,9 @@ async fn attempt_answers(
                 is_correct: by_question
                     .get(answer.get_question().key())
                     .and_then(|question| answer.is_correct(question)),
+                answer_image: answer_images
+                    .get(answer.get_question().key())
+                    .map(ImageMetaResponse::from_answer),
             })
             .collect(),
         auto_score: AutoScoreResponse { earned, possible },
@@ -2461,6 +2515,9 @@ struct StudentAnswerResponse {
     /// Whether `selected` hits the question's `correct`; `null` for text
     /// questions (the grader judges those).
     is_correct: Option<bool>,
+    /// The student's drawn answer, if any — bytes at
+    /// `GET /exams/{id}/attempts/{user}/answers/{qid}/image`.
+    answer_image: Option<ImageMetaResponse>,
 }
 
 /// The machine's scoring suggestion over the choice questions.
@@ -2481,4 +2538,248 @@ struct AttemptAnswersResponse {
     answers: Vec<StudentAnswerResponse>,
     /// The suggested score over choice questions — never the final mark.
     auto_score: AutoScoreResponse,
+}
+
+// ---- answer images ----------------------------------------------------------
+// A student's freehand drawing of their answer to a question — one per (exam,
+// user, question), the answer-side mirror of the teacher's question images.
+// It is a normal `image/png` (the frontend embeds its editable stroke JSON in a
+// PNG `tEXt` chunk, opaque to us), so it flows through the same raster
+// content-type wall and inline-serve path as every other exam image. The write
+// paths ride the exact `save_answer` gate chain; the reads follow the question
+// content's own visibility (own sitting view / teacher grading view).
+
+/// The answer-image write tail, mirroring [`store_image`]: new blob to disk,
+/// row UPSERT (the deterministic per-(question, user) id makes it a replace),
+/// then the replaced blob off disk. A failed row write takes the fresh blob
+/// back out; a stored row always points at a real blob.
+async fn store_answer_image(
+    st: &AppState,
+    exam: &Exam,
+    question: &ExamQuestion,
+    user: &UserId,
+    content_type: FileContentType,
+    data: &[u8],
+) -> Result<AnswerImage, AppError> {
+    let replaced = AnswerImage::read(question.get_id(), user, &st.db).await?;
+    let image = AnswerImage::new(
+        exam.get_id(),
+        question.get_id(),
+        user,
+        content_type,
+        data.len() as i64,
+    );
+    let path = blob_path(&st.files_path, image.get_file());
+    tokio::fs::write(&path, data)
+        .await
+        .map_err(|err| AppError::Internal(format!("failed to store the answer image blob: {err}")))?;
+    match image.upsert(&st.db).await {
+        Ok(stored) => {
+            if let Some(replaced) = replaced {
+                remove_blob(&st.files_path, replaced.get_file()).await;
+            }
+            Ok(stored)
+        }
+        Err(err) => {
+            let _ = tokio::fs::remove_file(&path).await;
+            Err(err)
+        }
+    }
+}
+
+/// Attach (or replace) the caller's drawn answer to a question inside their
+/// in-progress attempt. `multipart/form-data` with the drawing under a `file`
+/// field; the declared content type must be `image/png`, `image/jpeg`,
+/// `image/webp`, or `image/gif` (rasters only — no SVG), the bytes at most the
+/// school's `max_file_bytes`. Rides the exact `POST /exams/{id}/attempt/answers`
+/// gate chain: the student role, an in-progress attempt, current enrollment, and
+/// the rejoin door.
+#[utoipa::path(
+    post,
+    path = "/{id}/attempt/answers/{qid}/image",
+    tag = "exams",
+    security(("session_cookie" = [])),
+    params(
+        ("id" = String, Path, description = "Exam id"),
+        ("qid" = String, Path, description = "Question id"),
+    ),
+    request_body(content = UploadFileForm, content_type = "multipart/form-data"),
+    responses(
+        (status = 201, description = "Drawing stored", body = ImageMetaResponse),
+        (status = 400, description = "Missing file field, empty file, or a content type outside the image allowlist", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not a student, or not enrolled in the exam's course", body = ErrorResponse),
+        (status = 404, description = "No such exam, question, or attempt", body = ErrorResponse),
+        (status = 409, description = "Attempt already submitted, time is up, or rejoin is closed", body = ErrorResponse),
+        (status = 413, description = "Image exceeds the school's size limit", body = ErrorResponse),
+    ),
+)]
+async fn upload_answer_image(
+    State(st): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    Path((id, qid)): Path<(String, String)>,
+    mut multipart: Multipart,
+) -> Result<(StatusCode, Json<ImageMetaResponse>), AppError> {
+    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    ensure_student(&user)?;
+    let limit = Settings::load(&st.db).await?.get_max_file_bytes();
+    // The body is consumed before the lock — a client's slow upload must not
+    // stall the exam subsystem (mirrors the question-image upload).
+    let upload = read_upload(&mut multipart, limit).await?;
+    let content_type = image_content_type(&upload.content_type.unwrap_or_default())?;
+    // Reader lease of [`EXAM_LOCK`], exactly like `save_answer_checked`: the
+    // writable gate and the write are one unit, or a retake's wipe-and-create
+    // (a writer) slips in between and this stale drawing lands on the fresh
+    // blank sheet.
+    let _guard = EXAM_LOCK.read().await;
+    let attempt = writable_attempt(&exam, user.get_id(), &st.db).await?;
+    ensure_student_now(attempt.get_user(), &st.db).await?;
+    ensure_enrolled(&exam, attempt.get_user(), &st.db).await?;
+    check_rejoin(&exam, &attempt)?;
+    let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
+    let stored =
+        store_answer_image(&st, &exam, &question, user.get_id(), content_type, &upload.data).await?;
+    // A drawing-only answer (drew, typed nothing) still needs an ExamAnswer row,
+    // or the drawing never surfaces in the sitting/grading views — answer_image
+    // rides the answer payload. Create a blank text answer when absent, without
+    // clobbering typed text. Choice questions can't hold a blank answer (and the
+    // UI only offers drawing on text questions), so they are skipped. Removing
+    // the drawing later grooms this blank row away (see `delete_answer_image`).
+    if question.get_kind().as_str() != "choice"
+        && ExamAnswer::read(question.get_id(), user.get_id(), &st.db)
+            .await?
+            .is_none()
+    {
+        ExamAnswer::save(&question, user.get_id(), None, Some(String::new()), &st.db).await?;
+    }
+    Ok((StatusCode::CREATED, Json(ImageMetaResponse::from_answer(&stored))))
+}
+
+/// Clear the caller's drawn answer to a question. Same writable-attempt gate
+/// chain as the upload.
+#[utoipa::path(
+    delete,
+    path = "/{id}/attempt/answers/{qid}/image",
+    tag = "exams",
+    security(("session_cookie" = [])),
+    params(
+        ("id" = String, Path, description = "Exam id"),
+        ("qid" = String, Path, description = "Question id"),
+    ),
+    responses(
+        (status = 204, description = "Deleted"),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not a student, or not enrolled in the exam's course", body = ErrorResponse),
+        (status = 404, description = "No such exam, question, attempt, or drawing", body = ErrorResponse),
+        (status = 409, description = "Attempt already submitted, time is up, or rejoin is closed", body = ErrorResponse),
+    ),
+)]
+async fn delete_answer_image(
+    State(st): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    Path((id, qid)): Path<(String, String)>,
+) -> Result<StatusCode, AppError> {
+    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    ensure_student(&user)?;
+    let _guard = EXAM_LOCK.read().await;
+    let attempt = writable_attempt(&exam, user.get_id(), &st.db).await?;
+    ensure_student_now(attempt.get_user(), &st.db).await?;
+    ensure_enrolled(&exam, attempt.get_user(), &st.db).await?;
+    check_rejoin(&exam, &attempt)?;
+    let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
+    let image = AnswerImage::read(question.get_id(), user.get_id(), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let image = image.delete(&st.db).await?;
+    remove_blob(&st.files_path, image.get_file()).await;
+    // If the drawing was the whole answer (blank text, no choice — the row the
+    // upload created for a drawing-only answer), drop it too so it stops counting
+    // as answered. A typed answer keeps its row.
+    if let Some(answer) = ExamAnswer::read(question.get_id(), user.get_id(), &st.db).await? {
+        let blank = answer.get_selected().is_none()
+            && answer.get_text().map_or(true, |t| t.as_str().is_empty());
+        if blank {
+            ExamAnswer::delete(question.get_id(), user.get_id(), &st.db).await?;
+        }
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The caller's own drawn-answer bytes. Same visibility wall as the sitting
+/// question view — enrollment plus a started attempt (404 before that).
+#[utoipa::path(
+    get,
+    path = "/{id}/attempt/answers/{qid}/image",
+    tag = "exams",
+    security(("session_cookie" = [])),
+    params(
+        ("id" = String, Path, description = "Exam id"),
+        ("qid" = String, Path, description = "Question id"),
+    ),
+    responses(
+        (status = 200, description = "The drawing bytes", content_type = "image/*"),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not enrolled in the exam's course", body = ErrorResponse),
+        (status = 404, description = "No such exam, question, or drawing — or no attempt yet", body = ErrorResponse),
+    ),
+)]
+async fn get_answer_image(
+    State(st): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    Path((id, qid)): Path<(String, String)>,
+) -> Result<Response, AppError> {
+    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    ensure_question_content_visible(&st, &exam, &user).await?;
+    let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
+    let image = AnswerImage::read(question.get_id(), user.get_id(), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    super::serve_inline_blob(&st.files_path, image.get_file(), image.get_content_type()).await
+}
+
+/// One student's drawn-answer bytes, for the grader. Requires teacher+ and
+/// management rights over the exam's course — the `attempt_answers` gate.
+#[utoipa::path(
+    get,
+    path = "/{id}/attempts/{user}/answers/{qid}/image",
+    tag = "exams",
+    security(("session_cookie" = [])),
+    params(
+        ("id" = String, Path, description = "Exam id"),
+        ("user" = String, Path, description = "User id"),
+        ("qid" = String, Path, description = "Question id"),
+    ),
+    responses(
+        (status = 200, description = "The student's drawing bytes", content_type = "image/*"),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 404, description = "No such exam, question, or drawing", body = ErrorResponse),
+    ),
+)]
+async fn get_student_answer_image(
+    State(st): State<AppState>,
+    RequireTeacher(user): RequireTeacher,
+    Path((id, target, qid)): Path<(String, String, String)>,
+) -> Result<Response, AppError> {
+    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let course = course_of(&exam, &st.db).await?;
+    if !can_manage_course(&course, &user) {
+        return Err(AppError::Forbidden(
+            "only the course creator, an assigned teacher, or a manager/admin can read answer sheets",
+        ));
+    }
+    let target = UserId::from_key(&target);
+    let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
+    let image = AnswerImage::read(question.get_id(), &target, &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    super::serve_inline_blob(&st.files_path, image.get_file(), image.get_content_type()).await
 }

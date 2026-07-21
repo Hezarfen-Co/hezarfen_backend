@@ -226,6 +226,7 @@ impl ExamAttempt {
             .query(
                 "BEGIN TRANSACTION;
                  DELETE exam_answer WHERE exam = $ex AND user = $usr;
+                 DELETE answer_image WHERE exam = $ex AND user = $usr;
                  CREATE $id CONTENT $attempt;
                  COMMIT TRANSACTION;",
             )
@@ -235,8 +236,10 @@ impl ExamAttempt {
             .bind(("attempt", attempt))
             .await?
             .check()?;
-        // Statement slots count BEGIN and COMMIT too: the CREATE is slot 2.
-        Ok(result.take::<Vec<ExamAttempt>>(2)?.into_iter().next())
+        // Statement slots count BEGIN and COMMIT too, plus the two child
+        // wipes: the CREATE is slot 3. (The answer-image *blobs* are the web
+        // layer's to GC — `start_attempt` collects their names before this.)
+        Ok(result.take::<Vec<ExamAttempt>>(3)?.into_iter().next())
     }
 
     /// Stamp the submission time. The caller has already checked the deadline

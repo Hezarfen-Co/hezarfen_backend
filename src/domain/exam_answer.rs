@@ -163,6 +163,29 @@ impl ExamAnswer {
         saved.ok_or_else(|| AppError::Internal("failed to save exam answer".into()))
     }
 
+    /// One student's stored answer for a question, if any.
+    pub async fn read(
+        question: &ExamQuestionId,
+        user: &UserId,
+        db: &Database,
+    ) -> Result<Option<ExamAnswer>, AppError> {
+        Ok(db
+            .select(ExamAnswerId::composite(question, user).record())
+            .await?)
+    }
+
+    /// Drop one student's answer to a single question.
+    pub async fn delete(
+        question: &ExamQuestionId,
+        user: &UserId,
+        db: &Database,
+    ) -> Result<(), AppError> {
+        let _: Option<ExamAnswer> = db
+            .delete(ExamAnswerId::composite(question, user).record())
+            .await?;
+        Ok(())
+    }
+
     /// One student's answers across an exam, in question (ULID) order.
     pub async fn list_for_exam_user(
         exam: &ExamId,
