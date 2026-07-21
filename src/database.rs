@@ -1,12 +1,13 @@
-//! Embedded SurrealDB (surrealkv, file-backed) connection + schema.
+//! SurrealDB connection (WebSocket to a server; in-memory for tests) + schema.
 
 use surrealdb::Surreal;
-use surrealdb::engine::local::{Db, Mem, SurrealKv};
+use surrealdb::engine::any::Any;
+use surrealdb::opt::auth::Root;
 
 use crate::config::Config;
 use crate::error::AppError;
 
-pub type Database = Surreal<Db>;
+pub type Database = Surreal<Any>;
 
 pub const USER_TABLE: &str = "user";
 pub const SESSION_TABLE: &str = "session";
@@ -299,9 +300,14 @@ const BACKFILL: &str = "
     DELETE enrollment WHERE user.role != 'student';
 ";
 
-/// Open the file-backed database and apply the schema.
+/// Connect to the SurrealDB server, sign in as root, and apply the schema.
 pub async fn init(cfg: &Config) -> Result<Database, AppError> {
-    let db = Surreal::new::<SurrealKv>(cfg.db_path.clone()).await?;
+    let db = surrealdb::engine::any::connect(cfg.db_url.clone()).await?;
+    db.signin(Root {
+        username: cfg.db_user.clone(),
+        password: cfg.db_pass.clone(),
+    })
+    .await?;
     db.use_ns(cfg.db_ns.clone())
         .use_db(cfg.db_name.clone())
         .await?;
@@ -311,13 +317,15 @@ pub async fn init(cfg: &Config) -> Result<Database, AppError> {
 
 /// A fresh in-memory database with the schema applied. For tests.
 pub async fn init_mem() -> Result<Database, AppError> {
-    let db = Surreal::new::<Mem>(()).await?;
+    let db = surrealdb::engine::any::connect("memory").await?;
     db.use_ns("hezarfen").use_db("hezarfen").await?;
     migrate(&db).await?;
     Ok(db)
 }
 
-async fn migrate(db: &Database) -> Result<(), AppError> {
+/// Apply the schema + backfills. Idempotent — `init` runs it on every boot,
+/// and tests re-run it on a live handle to simulate a second boot.
+pub async fn migrate(db: &Database) -> Result<(), AppError> {
     db.query(MIGRATION).await?.check()?;
     db.query(BACKFILL).await?.check()?;
     Ok(())

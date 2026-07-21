@@ -1,4 +1,28 @@
 services:
+  surrealdb:
+    image: docker.io/surrealdb/surrealdb:v3
+    container_name: hezarfen-surrealdb
+    # Distroless image; its default `nonroot` user can't write a fresh named
+    # volume (created root-owned). Run as root — only this service touches
+    # surreal-data, the backend never mounts it.
+    user: "0"
+    command:
+      [
+        "start",
+        "--user", "root",
+        "--pass", "root",
+        "surrealkv:/data/hezarfen.db",
+      ]
+    volumes:
+      - surreal-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/surreal", "isready"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
   backend:
     build:
       context: .
@@ -10,7 +34,9 @@ services:
     environment:
       HOST: 0.0.0.0
       PORT: "8080"
-      DB_PATH: /data/hezarfen.db
+      DB_URL: ws://surrealdb:8000
+      DB_USER: root
+      DB_PASS: root
       DB_NAMESPACE: hezarfen
       DB_DATABASE: hezarfen
       FILES_PATH: /data/files
@@ -27,6 +53,9 @@ services:
       # TRUST_PROXY: "true"
     volumes:
       - hezarfen-data:/data
+    depends_on:
+      surrealdb:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/"]
@@ -37,3 +66,4 @@ services:
 
 volumes:
   hezarfen-data:
+  surreal-data:

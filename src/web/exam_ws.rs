@@ -76,8 +76,8 @@ use crate::web::exams::{
 /// so it never stamps. No ordering leaves a present student stamped as left —
 /// the reconnect-vs-teardown race that used to lock students out with
 /// `allow_rejoin` off (cleared at the door, stamped after, present forever
-/// refused). The database is embedded — this process is the only writer — so
-/// one process-wide lock is sufficient, same as `REGISTER_LOCK`.
+/// refused). This backend is the database's only writer (single
+/// instance) — so one process-wide lock is sufficient, same as `REGISTER_LOCK`.
 // ponytail: global lock, per-attempt locks if room churn ever shows up in a
 // profile.
 static PRESENCE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());

@@ -15,8 +15,8 @@ use crate::domain::note::NoteId;
 use crate::error::{AppError, ValidationError};
 
 /// Serializes the files-per-note cap check against the insert (see
-/// [`NoteFile::insert`]). The database is embedded — this process is the only
-/// writer — so one process-wide lock is sufficient.
+/// [`NoteFile::insert`]). This backend is the database's only
+/// writer (single instance) — so one process-wide lock is sufficient.
 // ponytail: global lock, per-note locks if uploads ever see real contention.
 static FILE_CAP_LOCK: Mutex<()> = Mutex::const_new(());
 
