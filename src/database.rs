@@ -7,7 +7,21 @@ use surrealdb::opt::auth::Root;
 use crate::config::Config;
 use crate::error::AppError;
 
-pub type Database = Surreal<Any>;
+/// The shared database handle.
+///
+/// `Arc` is load-bearing, not decoration. `Surreal`'s own `Clone` mints a
+/// fresh server-side session per clone (`Uuid::new_v4()` + a fire-and-forget
+/// `SessionId::Clone` to the router, SDK `lib.rs:340`), and axum clones the
+/// application state on every request — so a bare `Surreal<Any>` here means a
+/// new session, and a matching `SessionId::Drop`, for each request served.
+/// Under concurrency those lifecycle events race the queries riding on them:
+/// sessions disappear ("Session not found"), and a session whose signin has
+/// not been replayed answers "Anonymous access not allowed" / "Specify a
+/// namespace" — the same strings [`crate::error::is_session_replay_error`]
+/// treats as a transient reconnect, so the failures masquerade as one.
+///
+/// Cloning the `Arc` shares the single session established at boot instead.
+pub type Database = std::sync::Arc<Surreal<Any>>;
 
 pub const USER_TABLE: &str = "user";
 pub const SESSION_TABLE: &str = "session";
@@ -343,7 +357,7 @@ pub async fn init(cfg: &Config) -> Result<Database, AppError> {
         .use_db(cfg.db_name.clone())
         .await?;
     migrate(&db).await?;
-    Ok(db)
+    Ok(std::sync::Arc::new(db))
 }
 
 /// Dial the database, retrying until it answers.
@@ -356,7 +370,7 @@ pub async fn init(cfg: &Config) -> Result<Database, AppError> {
 ///
 /// Only the dial is retried. Bad credentials or a broken migration still fail
 /// hard, since no amount of waiting fixes those.
-async fn connect_with_retry(cfg: &Config) -> Database {
+async fn connect_with_retry(cfg: &Config) -> Surreal<Any> {
     let mut backoff = 1;
     loop {
         match surrealdb::engine::any::connect(cfg.db_url.clone()).await {
@@ -378,12 +392,12 @@ pub async fn init_mem() -> Result<Database, AppError> {
     let db = surrealdb::engine::any::connect("memory").await?;
     db.use_ns("hezarfen").use_db("hezarfen").await?;
     migrate(&db).await?;
-    Ok(db)
+    Ok(std::sync::Arc::new(db))
 }
 
 /// Apply the schema + backfills. Idempotent — `init` runs it on every boot,
 /// and tests re-run it on a live handle to simulate a second boot.
-pub async fn migrate(db: &Database) -> Result<(), AppError> {
+pub async fn migrate(db: &Surreal<Any>) -> Result<(), AppError> {
     db.query(MIGRATION).await?.check()?;
     db.query(BACKFILL).await?.check()?;
     Ok(())
