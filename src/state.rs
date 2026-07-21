@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::database::Database;
@@ -21,6 +22,47 @@ pub struct AppState {
     pub rate_limit: RateLimitConfig,
     /// Who is inside which exam room right now (see [`ExamPresence`]).
     pub exam_presence: ExamPresence,
+    /// Whether the database socket answered its last ping (see [`DbHealth`]).
+    pub db_up: DbHealth,
+}
+
+/// Last known state of the database WebSocket, published by the keepalive task
+/// in `main` and read by the guard layer in [`crate::build_router`].
+///
+/// It exists because a query issued while the socket is down does not fail —
+/// it hangs. The SDK's reconnect loop stops draining its request channel while
+/// it retries, so the query is parked until the database returns, and *then*
+/// executes. Refusing at the edge is what keeps a 503 honest: nothing was
+/// queued, so the caller's retry cannot double-apply a write.
+///
+/// Starts up: `init` only returns once a connection and the migration
+/// succeeded, so the first ping has nothing to correct.
+#[derive(Clone)]
+pub struct DbHealth(Arc<AtomicBool>);
+
+impl Default for DbHealth {
+    fn default() -> Self {
+        Self(Arc::new(AtomicBool::new(true)))
+    }
+}
+
+impl DbHealth {
+    /// Did the last ping answer?
+    pub fn is_up(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// Publish the latest ping verdict, logging only the transitions — a long
+    /// outage should not print a line every [`crate::constant::DB_KEEPALIVE_INTERVAL_SECS`].
+    pub fn set(&self, up: bool) {
+        if self.0.swap(up, Ordering::Relaxed) != up {
+            if up {
+                tracing::info!("database socket recovered — serving requests again");
+            } else {
+                tracing::error!("database socket down — refusing requests with 503");
+            }
+        }
+    }
 }
 
 /// How many exam-room sockets each attempt has open right now, keyed by the

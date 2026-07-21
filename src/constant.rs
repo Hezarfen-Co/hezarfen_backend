@@ -150,8 +150,29 @@ pub const EXAM_LIVE_STREAM_INTERVAL_SECS: u64 = 2;
 /// Cadence of the background keepalive query on the database WebSocket. The
 /// traffic keeps the connection from being dropped as idle; when it does drop,
 /// the ping also makes the SDK notice and reconnect long before the next real
-/// request would.
-pub const DB_KEEPALIVE_INTERVAL_SECS: u64 = 30;
+/// request would. Doubles as the liveness probe behind
+/// [`crate::state::DbHealth`], so this is also the widest window in which a
+/// request can reach a socket already known-dead — keep it short.
+pub const DB_KEEPALIVE_INTERVAL_SECS: u64 = 5;
+
+/// How long a keepalive ping may hang before the socket counts as down. The
+/// SDK parks queries indefinitely while it reconnects (its retry loop stops
+/// draining the request channel), so the ping needs its own deadline or the
+/// probe hangs with everything else and never reports.
+pub const DB_PING_TIMEOUT_SECS: u64 = 2;
+
+/// Ceiling on a single HTTP request. Backstop for requests that reached the
+/// database in the window between the socket dying and the keepalive noticing:
+/// without it they park until the database returns, which can be hours.
+/// Generous enough not to clip a legitimate slow upload at `max_file_bytes`.
+pub const REQUEST_TIMEOUT_SECS: u64 = 30;
+
+/// Backoff ceiling for the boot connection retry. The database is usually a
+/// sibling container coming up in parallel, so the first attempts fail; the
+/// process retries forever rather than exiting, because exiting turns a
+/// few-second wait into a container restart loop that outruns its budget and
+/// stays down.
+pub const DB_CONNECT_BACKOFF_MAX_SECS: u64 = 5;
 
 /// Cadence of the `state` ticks on the student exam-room WebSocket
 /// (`GET /exams/{id}/attempt/ws`).

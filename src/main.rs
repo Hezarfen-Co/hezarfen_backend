@@ -2,7 +2,7 @@ use anyhow::Context;
 use hezarfen_backend::config::Config;
 use hezarfen_backend::database::Database;
 use hezarfen_backend::domain::user::{Password, User, Username};
-use hezarfen_backend::state::AppState;
+use hezarfen_backend::state::{AppState, DbHealth};
 use hezarfen_backend::{build_router, database};
 
 #[tokio::main]
@@ -18,7 +18,8 @@ async fn main() -> anyhow::Result<()> {
     let cfg = Config::from_env();
     let db = database::init(&cfg).await?;
     seed_admin(&cfg, &db).await?;
-    keepalive(db.clone());
+    let db_up = DbHealth::default();
+    keepalive(db.clone(), db_up.clone());
     tokio::fs::create_dir_all(&cfg.files_path)
         .await
         .with_context(|| format!("failed to create the files directory {}", cfg.files_path))?;
@@ -28,6 +29,7 @@ async fn main() -> anyhow::Result<()> {
         cookie_secure: cfg.cookie_secure,
         rate_limit: cfg.rate_limit.clone(),
         exam_presence: Default::default(),
+        db_up,
     });
 
     let addr = format!("{}:{}", cfg.host, cfg.port);
@@ -46,19 +48,41 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Ping the database forever so the WebSocket never sits idle long enough to
-/// be dropped. A failed ping is the reconnect window itself — the SDK replays
-/// the session and heals on its own — so it logs at debug, not error.
-fn keepalive(db: Database) {
+/// be dropped, and publish each verdict to `health` so the request guard can
+/// refuse callers while the socket is down.
+///
+/// The ping needs its own deadline. A query issued while the socket is down
+/// does not fail — the SDK parks it until the connection returns, so an
+/// un-deadlined ping hangs exactly as long as the outage and never reports the
+/// outage it exists to detect.
+fn keepalive(db: Database, health: DbHealth) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(
             hezarfen_backend::constant::DB_KEEPALIVE_INTERVAL_SECS,
         ));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let ping_timeout = std::time::Duration::from_secs(
+            hezarfen_backend::constant::DB_PING_TIMEOUT_SECS,
+        );
         loop {
             interval.tick().await;
-            match db.query("RETURN 1").await {
-                Ok(_) => tracing::debug!("database keepalive ping ok"),
-                Err(err) => tracing::debug!("database keepalive ping failed: {err}"),
+            // ponytail: an abandoned ping stays queued in the SDK and replays
+            // when the socket heals, so a long outage lands a burst of no-op
+            // `RETURN 1`s on recovery. Harmless; probe over a raw TCP dial
+            // instead if that burst ever shows up in a profile.
+            match tokio::time::timeout(ping_timeout, db.query("RETURN 1")).await {
+                Ok(Ok(_)) => {
+                    health.set(true);
+                    tracing::debug!("database keepalive ping ok");
+                }
+                Ok(Err(err)) => {
+                    health.set(false);
+                    tracing::debug!("database keepalive ping failed: {err}");
+                }
+                Err(_) => {
+                    health.set(false);
+                    tracing::debug!("database keepalive ping timed out");
+                }
             }
         }
     });

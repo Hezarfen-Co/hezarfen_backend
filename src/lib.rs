@@ -11,6 +11,7 @@ pub mod web;
 use axum::extract::Request;
 use axum::http::{HeaderValue, Method, header};
 use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::json;
@@ -22,6 +23,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 use utoipa_swagger_ui::SwaggerUi;
 
+use crate::error::AppError;
 use crate::rate_limit::RateLimiter;
 use crate::state::AppState;
 
@@ -107,6 +109,8 @@ pub fn build_router(state: AppState) -> Router {
         state.rate_limit.trust_proxy,
     );
 
+    let db_up = state.db_up.clone();
+
     let cors_allowlist = cors_allowlist_from_env();
     if state.cookie_secure && cors_allowlist.is_empty() {
         tracing::warn!(
@@ -118,11 +122,43 @@ pub fn build_router(state: AppState) -> Router {
         .merge(SwaggerUi::new("/swagger").url("/api-docs/openapi.json", api))
         .with_state(state)
         .layer(middleware::from_fn(move |req: Request, next: Next| {
+            let health = db_up.clone();
+            async move { db_guard(health, req, next).await }
+        }))
+        .layer(middleware::from_fn(move |req: Request, next: Next| {
             let limiter = api_limiter.clone();
             async move { limiter.enforce(req, next).await }
         }))
         .layer(cors_layer(cors_allowlist))
         .layer(TraceLayer::new_for_http())
+}
+
+/// Refuse work the database cannot currently do, and cap how long any request
+/// may wait on it.
+///
+/// Both halves exist because a query issued while the database socket is down
+/// never fails — the SDK parks it until the connection returns, so without a
+/// guard a handler waits out the entire outage holding a connection open.
+///
+/// Order matters. The liveness check comes first and is the honest path: it
+/// answers before the request touches the database, so nothing is queued and
+/// the caller's retry cannot double-apply a write. The timeout only catches
+/// requests that slipped through in the window between the socket dying and
+/// the keepalive noticing — those are already queued, hence the weaker
+/// [`AppError::DbTimeout`] verdict.
+///
+/// Long-lived responses are unaffected: a WebSocket upgrade and an SSE stream
+/// both return their response immediately and do the work afterwards, so
+/// neither is measured against the timeout.
+async fn db_guard(health: state::DbHealth, req: Request, next: Next) -> Response {
+    if !health.is_up() {
+        return AppError::DbUnavailable.into_response();
+    }
+    let timeout = std::time::Duration::from_secs(constant::REQUEST_TIMEOUT_SECS);
+    match tokio::time::timeout(timeout, next.run(req)).await {
+        Ok(response) => response,
+        Err(_) => AppError::DbTimeout.into_response(),
+    }
 }
 
 /// Parse the `CORS_ALLOWED_ORIGINS` (comma-separated) allowlist; empty when unset.

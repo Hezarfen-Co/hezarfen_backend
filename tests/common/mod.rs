@@ -48,6 +48,7 @@ pub async fn app_and_db() -> (Router, Database) {
         // `rate_limit` test binary opts into tight configs on purpose.
         rate_limit: RateLimitConfig::unlimited(),
         exam_presence: Default::default(),
+        db_up: Default::default(),
     });
     (app, db)
 }

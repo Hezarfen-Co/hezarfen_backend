@@ -23,6 +23,7 @@ async fn spawn_server() -> (String, Database) {
         // meter the whole suite as one client. Off; `rate_limit.rs` covers it.
         rate_limit: RateLimitConfig::unlimited(),
         exam_presence: Default::default(),
+        db_up: Default::default(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
