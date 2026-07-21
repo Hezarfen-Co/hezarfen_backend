@@ -25,6 +25,7 @@ async fn reboot(db: &Database) -> Router {
         cookie_secure: false,
         rate_limit: RateLimitConfig::unlimited(),
         exam_presence: Default::default(),
+        db_up: Default::default(),
     })
 }
 

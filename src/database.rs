@@ -327,7 +327,7 @@ const BACKFILL: &str = "
 
 /// Connect to the SurrealDB server, sign in as root, and apply the schema.
 pub async fn init(cfg: &Config) -> Result<Database, AppError> {
-    let db = surrealdb::engine::any::connect(cfg.db_url.clone()).await?;
+    let db = connect_with_retry(cfg).await;
     db.signin(Root {
         username: cfg.db_user.clone(),
         password: cfg.db_pass.clone(),
@@ -338,6 +338,33 @@ pub async fn init(cfg: &Config) -> Result<Database, AppError> {
         .await?;
     migrate(&db).await?;
     Ok(db)
+}
+
+/// Dial the database, retrying until it answers.
+///
+/// Never gives up, because giving up is worse than waiting: the database is
+/// normally a sibling container booting in parallel, and a process that exits
+/// on the first refusal gets restarted by the runtime, fails again in ~100ms,
+/// and burns its whole restart budget inside a second — leaving the backend
+/// permanently down over a startup skew that would have cleared on its own.
+///
+/// Only the dial is retried. Bad credentials or a broken migration still fail
+/// hard, since no amount of waiting fixes those.
+async fn connect_with_retry(cfg: &Config) -> Database {
+    let mut backoff = 1;
+    loop {
+        match surrealdb::engine::any::connect(cfg.db_url.clone()).await {
+            Ok(db) => return db,
+            Err(err) => {
+                tracing::warn!(
+                    "database at {} unreachable ({err}) — retrying in {backoff}s",
+                    cfg.db_url
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                backoff = (backoff * 2).min(crate::constant::DB_CONNECT_BACKOFF_MAX_SECS);
+            }
+        }
+    }
 }
 
 /// A fresh in-memory database with the schema applied. For tests.

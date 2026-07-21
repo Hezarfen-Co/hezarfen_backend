@@ -4975,6 +4975,7 @@ async fn session_cookie_secure_attribute_follows_config() {
         cookie_secure: true,
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
         exam_presence: Default::default(),
+        db_up: Default::default(),
     });
     let secure = login_set_cookie(&app).await;
     assert!(
@@ -4985,6 +4986,100 @@ async fn session_cookie_secure_attribute_follows_config() {
         secure.contains("HttpOnly"),
         "Secure must not displace HttpOnly: {secure}"
     );
+}
+
+/// A query issued while the database socket is down does not fail — the SDK
+/// parks it until the connection returns and *then* runs it, so a handler that
+/// reaches the database mid-outage waits out the whole outage and any write it
+/// carries lands late. The guard layer refuses at the edge instead, before the
+/// request can touch the database, which is what makes the 503 safe to retry.
+#[tokio::test]
+async fn db_down_refuses_before_touching_the_database() {
+    async fn count_rows(db: &hezarfen_backend::database::Database, table: &str) -> usize {
+        let mut rows = db
+            .query(format!("SELECT id FROM {table}"))
+            .await
+            .expect("count query");
+        let ids: Vec<surrealdb::types::RecordId> = rows.take(0).expect("ids");
+        ids.len()
+    }
+
+    let db = database::init_mem().await.unwrap();
+    let db_up = hezarfen_backend::state::DbHealth::default();
+    let app = build_router(AppState {
+        db: db.clone(),
+        files_path: common::files_dir(),
+        cookie_secure: false,
+        rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
+        exam_presence: Default::default(),
+        db_up: db_up.clone(),
+    });
+
+    // Healthy: a login against the seeded user reaches the handler as usual.
+    let before: usize = count_rows(&db, "user").await;
+    let ok = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/register")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "gulsah", "password": "sifre12345"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), StatusCode::CREATED);
+    assert_eq!(count_rows(&db, "user").await, before + 1, "the write landed");
+
+    // Socket reported down: refused with a retryable 503, and — the point of
+    // refusing at the edge rather than timing out — nothing was written.
+    db_up.set(false);
+    let refused = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/register")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "kerem", "password": "sifre12345"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        refused.headers().get("retry-after").unwrap(),
+        "1",
+        "a pre-execution refusal must advertise that retrying is safe"
+    );
+    assert_eq!(
+        count_rows(&db, "user").await,
+        before + 1,
+        "a refused request must not have reached the database"
+    );
+
+    // Recovery flips back without a restart.
+    db_up.set(true);
+    let healed = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/register")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"username": "kerem", "password": "sifre12345"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(healed.status(), StatusCode::CREATED);
+    assert_eq!(count_rows(&db, "user").await, before + 2);
 }
 
 /// Regression: PATCH could set an event's times but never clear them — a JSON

@@ -66,6 +66,17 @@ pub enum AppError {
     /// self-healing, retryable.
     #[error("database unavailable")]
     DbUnavailable,
+    /// The request outran [`crate::constant::REQUEST_TIMEOUT_SECS`], which in
+    /// practice means it reached the database in the window between the socket
+    /// dying and the keepalive noticing, and got parked in the SDK's queue.
+    ///
+    /// Deliberately NOT `DbUnavailable`: that one promises the query was
+    /// refused before execution, so a retry is safe. A parked query is still
+    /// queued and *does* execute once the socket heals (verified: pings
+    /// abandoned during an outage all fire on reconnect), so retrying can
+    /// apply the same write twice. Same 503, honest message.
+    #[error("request timed out")]
+    DbTimeout,
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -118,6 +129,16 @@ impl IntoResponse for AppError {
                     StatusCode::SERVICE_UNAVAILABLE,
                     [(header::RETRY_AFTER, "1")],
                     Json(json!({ "error": "database reconnecting — retry shortly" })),
+                )
+                    .into_response();
+            }
+            // Same 503, but no Retry-After: the query may still be queued and
+            // land later, so a blind retry is not advertised as safe.
+            AppError::DbTimeout => {
+                tracing::error!("request timed out waiting on the database");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": "request timed out — the write may or may not have applied" })),
                 )
                     .into_response();
             }

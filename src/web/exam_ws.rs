@@ -440,6 +440,10 @@ fn error_frame(err: &AppError) -> Value {
             tracing::warn!("exam room: database reconnecting");
             "database reconnecting — retry shortly".to_string()
         }
+        AppError::DbTimeout => {
+            tracing::error!("exam room: database timed out");
+            "the database timed out — reload the room".to_string()
+        }
         AppError::Db(_) | AppError::Internal(_) => {
             tracing::error!("exam room error: {err}");
             "internal server error".to_string()

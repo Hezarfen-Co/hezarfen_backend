@@ -110,11 +110,29 @@ container so the published port works. Production knobs (`COOKIE_SECURE`,
 means dev mirror mode without credentials; a cookie-using browser frontend
 must be allowlisted explicitly. Works with `docker compose` too.
 
-The backend keeps its database WebSocket alive with a periodic trivial query,
-and the SDK reconnects on its own if the socket drops anyway (a `podman
-restart hezarfen-surrealdb`, say). During that brief reconnect window requests
-answer `503` with `Retry-After: 1` instead of a `500` — the outage is
-transient, so clients just retry a moment later.
+The backend survives the database going away, at boot and at runtime.
+
+At boot it retries the connection (1s doubling to 5s) until the server
+answers, rather than exiting. Exiting looks tidier but is worse: the container
+runtime restarts the process, it fails again in milliseconds, and a few
+seconds of startup skew burns the whole restart budget and leaves the backend
+down for good.
+
+At runtime a keepalive query every 5s doubles as a liveness probe. This
+matters more than it sounds: a query issued while the socket is down does
+*not* fail — the SDK's reconnect loop stops draining its request queue, so the
+query parks until the database returns and only *then* runs. Left alone, a
+request waits out the entire outage and any write it carries lands long after
+the caller gave up.
+
+So while the probe says the socket is down, requests are refused at the edge
+with `503` and `Retry-After: 1`, before they can reach the database. Nothing
+is queued, which is what makes that retry safe. Requests that slip through in
+the window between the socket dying and the probe noticing are capped at 30s
+and answer `503` *without* `Retry-After`, with a message saying the write may
+or may not have applied — they were already queued, so retrying them could
+apply the same write twice. WebSocket and SSE routes are unaffected: both
+return their response immediately and stream afterwards.
 
 Without compose:
 
