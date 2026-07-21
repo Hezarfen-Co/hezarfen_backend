@@ -1,6 +1,6 @@
 # hezarfen_backend
 
-Note, attendance, course + weighted exam mark backend. **Rust (edition 2024) · axum · SurrealDB 3 (embedded surrealkv) · tokio.**
+Note, attendance, course + weighted exam mark backend. **Rust (edition 2024) · axum · SurrealDB 3 (server, WebSocket) · tokio.**
 
 Session-cookie auth with five hierarchical roles (`parent < student < teacher
 < manager < admin`). A **`parent`** observes and changes nothing: admins tie
@@ -69,12 +69,14 @@ are ULIDs (time-sortable).
 ## Run
 
 ```sh
+surreal start --user root --pass root surrealkv:./data/hezarfen.db   # the DB server
 cp .env.example .env      # optional
 cargo run
 ```
 
-Boots on `http://127.0.0.1:8080`, storing data in `./data/hezarfen.db`
-(embedded surrealkv — no external DB server) and uploaded note files in
+Boots on `http://127.0.0.1:8080`, talking to the SurrealDB server at
+`DB_URL` (default `ws://127.0.0.1:8000`, root credentials via
+`DB_USER`/`DB_PASS`) and storing uploaded note files in
 `./data/files/` (`FILES_PATH`, created at startup). Interactive API docs
 (Swagger UI) are served at `/swagger`, the raw OpenAPI spec at
 `/api-docs/openapi.json`.
@@ -88,10 +90,11 @@ podman compose down            # stop (data survives in the volume)
 ```
 
 The `Containerfile` is a two-stage build (Rust builder with cargo cache
-mounts, `debian:trixie-slim` runtime, non-root user). Since the database is
-embedded there is only one service; its data lives in the named volume
-`hezarfen-data`, mounted at `/data` — the database and the uploaded note
-files (`/data/files`) together, so that one volume persists everything. `HOST` is forced to `0.0.0.0` inside the
+mounts, `debian:trixie-slim` runtime, non-root user). Two services: the
+`surrealdb` server (official image, surrealkv storage) and the backend, which
+waits for the server's healthcheck and connects over `ws://surrealdb:8000`.
+Each has its own named volume — `surreal-data` holds the database,
+`hezarfen-data` the uploaded note files (`/data/files`). `HOST` is forced to `0.0.0.0` inside the
 container so the published port works. Production knobs (`COOKIE_SECURE`,
 `CORS_ALLOWED_ORIGINS`, rate limits, `TRUST_PROXY`) are commented in
 `compose.yaml` — uncomment as needed. Leaving `CORS_ALLOWED_ORIGINS` unset
@@ -264,15 +267,15 @@ startup. `compose.yaml` ships with the credentials above for local dev.
 That admin can then promote everyone else through `PATCH /users/{id}/role`.
 
 Manual fallback (also the recovery path if the seeded name was squatted or the
-sole admin locked themselves out): with the server stopped, since the embedded
-store is single-writer, run
+sole admin locked themselves out): run
 
 ```surql
 UPDATE user SET role = 'admin' WHERE username = 'ada';
 ```
 
-against the embedded database — e.g. with the SurrealDB CLI pointed at the same
-surrealkv path (`./data/hezarfen.db`, namespace/database `hezarfen`).
+against the SurrealDB server — e.g.
+`surreal sql --conn ws://127.0.0.1:8000 --user root --pass root --ns hezarfen --db hezarfen`
+(in the container setup, `podman exec -it hezarfen-surrealdb /surreal sql ...`).
 
 ## Endpoints
 
@@ -987,7 +990,7 @@ src/
   constant.rs      validation limits
   validate.rs      field validators (used by every newtype's try_new)
   error.rs         ValidationError + AppError -> HTTP responses
-  database.rs      embedded surrealkv connect + SCHEMAFULL migration
+  database.rs      SurrealDB server connect (ws) + SCHEMAFULL migration
   rate_limit.rs    fixed-window per-IP limiter (both tiers) + middleware
   state.rs         AppState { db, files_path, cookie_secure, rate_limit }
   domain/          validated newtypes + entities (derive SurrealValue),

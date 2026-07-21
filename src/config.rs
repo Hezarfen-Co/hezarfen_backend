@@ -12,11 +12,14 @@ pub const DEFAULT_API_RATE_LIMIT: u32 = 300;
 pub struct Config {
     pub host: String,
     pub port: u16,
-    pub db_path: String,
+    /// SurrealDB server endpoint (`DB_URL`), e.g. `ws://127.0.0.1:8000`.
+    pub db_url: String,
+    /// Root credentials for the SurrealDB server (`DB_USER` / `DB_PASS`).
+    pub db_user: String,
+    pub db_pass: String,
     pub db_ns: String,
     pub db_name: String,
-    /// Directory for uploaded note-file blobs (`FILES_PATH`). Kept beside the
-    /// database inside the same volume so one mount persists everything.
+    /// Directory for uploaded note-file blobs (`FILES_PATH`).
     pub files_path: String,
     /// Add the `Secure` attribute to the session cookie (HTTPS-only). Off by
     /// default so plain-HTTP local dev keeps working; enable behind TLS.
@@ -36,7 +39,9 @@ impl Config {
         Self {
             host: env::var("HOST").unwrap_or_else(|_| "127.0.0.1".into()),
             port: parse_port(env::var("PORT").ok()),
-            db_path: env::var("DB_PATH").unwrap_or_else(|_| "./data/hezarfen.db".into()),
+            db_url: env::var("DB_URL").unwrap_or_else(|_| "ws://127.0.0.1:8000".into()),
+            db_user: env::var("DB_USER").unwrap_or_else(|_| "root".into()),
+            db_pass: env::var("DB_PASS").unwrap_or_else(|_| "root".into()),
             db_ns: env::var("DB_NAMESPACE").unwrap_or_else(|_| "hezarfen".into()),
             db_name: env::var("DB_DATABASE").unwrap_or_else(|_| "hezarfen".into()),
             files_path: env::var("FILES_PATH").unwrap_or_else(|_| "./data/files".into()),

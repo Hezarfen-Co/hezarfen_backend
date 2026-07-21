@@ -9,8 +9,8 @@ use crate::error::AppError;
 /// Serializes seat-taking. A `BEGIN…COMMIT` around the count can't do this:
 /// SurrealDB transactions don't conflict-check a cross-record `count()`
 /// against a concurrent insert (write-skew), so two racing registrations both
-/// saw a free seat and a full event over-admitted. The database is embedded —
-/// this process is the only writer — so one process-wide lock is sufficient.
+/// saw a free seat and a full event over-admitted. This backend is the database's only
+/// writer (single instance) — so one process-wide lock is sufficient.
 // ponytail: global lock, per-event locks (or DB-side serialization) if
 // registration ever sees real contention.
 static REGISTER_LOCK: Mutex<()> = Mutex::const_new(());

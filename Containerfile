@@ -31,11 +31,11 @@ COPY --from=builder /usr/local/bin/hezarfen_backend /usr/local/bin/hezarfen_back
 
 USER hezarfen
 
-# HOST must be 0.0.0.0 so the port mapping can reach the listener; the
-# embedded SurrealDB lives under /data (mount a volume there to persist).
+# HOST must be 0.0.0.0 so the port mapping can reach the listener. DB_URL
+# points at the SurrealDB server (the compose service); /data holds uploads.
 ENV HOST=0.0.0.0 \
     PORT=8080 \
-    DB_PATH=/data/hezarfen.db
+    DB_URL=ws://surrealdb:8000
 
 EXPOSE 8080
 

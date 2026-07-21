@@ -64,7 +64,7 @@ async fn seed_admin(cfg: &Config, db: &Database) -> anyhow::Result<()> {
 
 /// Resolve on SIGINT (Ctrl-C) or SIGTERM. As PID 1 in a container the process
 /// gets no default signal handling, so without this a `podman stop` waits out
-/// its grace period and SIGKILLs us — skipping the embedded store's clean close.
+/// its grace period and SIGKILLs us — dropping in-flight requests mid-write.
 async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
