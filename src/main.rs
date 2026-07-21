@@ -61,9 +61,8 @@ fn keepalive(db: Database, health: DbHealth) {
             hezarfen_backend::constant::DB_KEEPALIVE_INTERVAL_SECS,
         ));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let ping_timeout = std::time::Duration::from_secs(
-            hezarfen_backend::constant::DB_PING_TIMEOUT_SECS,
-        );
+        let ping_timeout =
+            std::time::Duration::from_secs(hezarfen_backend::constant::DB_PING_TIMEOUT_SECS);
         loop {
             interval.tick().await;
             // ponytail: an abandoned ping stays queued in the SDK and replays

@@ -167,12 +167,12 @@ impl PoolQuestionResponse {
             approved_by: question
                 .get_approved_by()
                 .map(|approver| PersonRef::resolve(people, approver)),
-            image: question.get_image_content_type().map(|content_type| {
-                PoolImageMeta {
+            image: question
+                .get_image_content_type()
+                .map(|content_type| PoolImageMeta {
                     content_type: content_type.as_str().to_string(),
                     size: question.get_image_size().unwrap_or(0),
-                }
-            }),
+                }),
             solution_count,
         }
     }
@@ -202,12 +202,12 @@ impl SolutionResponse {
             author: PersonRef::resolve(people, solution.get_author()),
             body: solution.get_body().as_str().to_string(),
             offered_at: solution.get_offered_at().as_millis(),
-            image: solution.get_image_content_type().map(|content_type| {
-                PoolImageMeta {
+            image: solution
+                .get_image_content_type()
+                .map(|content_type| PoolImageMeta {
                     content_type: content_type.as_str().to_string(),
                     size: solution.get_image_size().unwrap_or(0),
-                }
-            }),
+                }),
         }
     }
 }
@@ -220,8 +220,7 @@ async fn question_responses(
     st: &AppState,
 ) -> Result<Vec<PoolQuestionResponse>, AppError> {
     let ids = questions.iter().flat_map(|question| {
-        std::iter::once(question.get_asker().clone())
-            .chain(question.get_approved_by().cloned())
+        std::iter::once(question.get_asker().clone()).chain(question.get_approved_by().cloned())
     });
     let people = person_map(ids, &st.db).await?;
     let question_ids: Vec<PoolQuestionId> = questions
@@ -376,8 +375,8 @@ async fn approve_question(
     RequireTeacher(user): RequireTeacher,
     Path(id): Path<String>,
 ) -> Result<Json<PoolQuestionResponse>, AppError> {
-    let approved = PoolQuestion::approve(&PoolQuestionId::from_key(&id), user.get_id(), &st.db)
-        .await?;
+    let approved =
+        PoolQuestion::approve(&PoolQuestionId::from_key(&id), user.get_id(), &st.db).await?;
     let question = match approved {
         Some(question) => question,
         // Nothing was pending under that id: either it's already approved
