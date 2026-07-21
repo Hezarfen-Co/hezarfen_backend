@@ -58,9 +58,39 @@ pub enum AppError {
     #[error("too many requests")]
     TooManyRequests { retry_after_secs: u64 },
     #[error("database error")]
-    Db(#[from] surrealdb::Error),
+    Db(#[source] surrealdb::Error),
+    /// The database WebSocket dropped and is mid-reconnect. Covers a query in
+    /// flight when the socket died (the SDK fails it as a connection error)
+    /// and a query racing the SDK's replay of session state (signin,
+    /// namespace), which the server refuses before execution. Transient,
+    /// self-healing, retryable.
+    #[error("database unavailable")]
+    DbUnavailable,
     #[error("internal error: {0}")]
     Internal(String),
+}
+
+/// Is this database error a query refused during the SDK's post-reconnect
+/// session replay? Two signatures, matched narrowly: "Specify a namespace"
+/// (signin replayed, namespace not yet) and "Anonymous access not allowed"
+/// (signin not yet). The backend signs in as root, so neither can be a real
+/// authorization verdict — but a bare "Not enough permissions" could be, so
+/// that alone must never match.
+pub(crate) fn is_session_replay_error(message: &str) -> bool {
+    message.contains("Specify a namespace") || message.contains("Anonymous access not allowed")
+}
+
+impl From<surrealdb::Error> for AppError {
+    fn from(e: surrealdb::Error) -> Self {
+        // `is_connection()`: the SDK's own verdict that the socket itself
+        // failed ("Connection reset", "WebSocket error: ..."). Structurally
+        // distinct from query/permission errors, so it can't misfile one.
+        if e.is_connection() || is_session_replay_error(&e.to_string()) {
+            AppError::DbUnavailable
+        } else {
+            AppError::Db(e)
+        }
+    }
 }
 
 impl From<argon2::password_hash::Error> for AppError {
@@ -78,6 +108,16 @@ impl IntoResponse for AppError {
                     StatusCode::TOO_MANY_REQUESTS,
                     [(header::RETRY_AFTER, retry_after_secs.to_string())],
                     Json(json!({ "error": "too many requests" })),
+                )
+                    .into_response();
+            }
+            // Also carries a header: retry in a second, the reconnect is quick.
+            AppError::DbUnavailable => {
+                tracing::warn!("database reconnecting — refusing the query with 503");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [(header::RETRY_AFTER, "1")],
+                    Json(json!({ "error": "database reconnecting — retry shortly" })),
                 )
                     .into_response();
             }
@@ -103,5 +143,43 @@ impl IntoResponse for AppError {
             }
         };
         (status, Json(json!({ "error": message }))).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replay_signatures_classify_as_unavailable() {
+        // The two exact refusals a query racing the post-reconnect session
+        // replay gets, as they appear in the wire error.
+        assert!(is_session_replay_error("Specify a namespace to use"));
+        assert!(is_session_replay_error(
+            "Anonymous access not allowed: Not enough permissions to perform this action"
+        ));
+    }
+
+    #[test]
+    fn connection_errors_classify_as_unavailable() {
+        // What the SDK fails an in-flight query with when the socket dies —
+        // same wire error `clear_pending_requests` produces.
+        let e = surrealdb::Error::connection(
+            "Connection reset".to_string(),
+            surrealdb::types::ConnectionError::ConnectionFailed,
+        );
+        assert!(matches!(AppError::from(e), AppError::DbUnavailable));
+    }
+
+    #[test]
+    fn real_errors_stay_db_errors() {
+        // A genuine authorization verdict shares the suffix but must not match.
+        assert!(!is_session_replay_error(
+            "Not enough permissions to perform this action"
+        ));
+        assert!(!is_session_replay_error("Parse error: unexpected token"));
+        assert!(!is_session_replay_error(
+            "Database index `user_username` already contains 'admin'"
+        ));
     }
 }
