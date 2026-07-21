@@ -52,6 +52,15 @@ with a server-stamped **pomodoro log** (the timer runs in the frontend; the
 backend records the focus stints, and teachers can read any student's log),
 and every user has an
 **attendance report** (event + per-course lesson tallies with rates).
+A school-wide **question pool** runs on moderation: a student asks a question
+(optionally attaching one photo of the problem — raster only, same
+`max_file_bytes` cap), a teacher+ **approves** it into the pool (or deletes
+it — rejection is deletion, there is no rejected state), and every approved
+question is readable by the whole school with anyone free to offer
+**solutions** under it (parents stay out) — text plus an optional photo of
+the worked steps, both editable by the solution's author anytime; pending
+questions show only to their asker and to teacher+, and approval freezes the
+content so nothing unmoderated ever reaches the pool.
 School-varying policy is data, not code: exam kinds (each with its weight in
 course averages), attendance statuses, grade-display bands, and the note-file
 size limit live in an editable **settings** singleton, and academic **terms**
@@ -100,6 +109,12 @@ container so the published port works. Production knobs (`COOKIE_SECURE`,
 `compose.yaml` — uncomment as needed. Leaving `CORS_ALLOWED_ORIGINS` unset
 means dev mirror mode without credentials; a cookie-using browser frontend
 must be allowlisted explicitly. Works with `docker compose` too.
+
+The backend keeps its database WebSocket alive with a periodic trivial query,
+and the SDK reconnects on its own if the socket drops anyway (a `podman
+restart hezarfen-surrealdb`, say). During that brief reconnect window requests
+answer `503` with `Retry-After: 1` instead of a `500` — the outage is
+transient, so clients just retry a moment later.
 
 Without compose:
 
@@ -227,6 +242,9 @@ course enrollments.
 | View / correct / delete **any** staff work log entry | manager | Corrections only on closed entries |
 | Start / finish a pomodoro focus session; view **own** pomodoro log | student | **Students only** start; instants server-stamped; starting discards a dangling unfinished session |
 | View **any** user's pomodoro log          | teacher      | Study oversight — same shape as `/pomodoro/me`, incl. the unpaged `total_focus_ms`; a `parent` reads their linked students' |
+| Ask into the school question pool        | student      | **Students only** (exact); born `pending` — visible to the asker + teacher+ only; the asker may attach/replace/remove one photo while pending |
+| Read the pool; offer / edit / withdraw own solutions | student | Every `approved` question is school-wide (parents stay out); a solution's author edits its body and photo anytime (solutions never freeze) and deletes it, teacher+ delete any |
+| Approve a pending pool question; delete any question or solution | teacher | Approval publishes school-wide and **freezes** the content; rejection = deletion — moderation never edits, so teacher+ cannot rewrite a solution |
 | Read **own** attendance report           | student      |                                               |
 | Read another user's attendance report    | teacher      | Narrowed to the caller's managed courses; `manager`+ sees all; a `parent` sees a linked student's in full |
 | View **visible** courses/exams and a course's subjects; read **own** result, courses, mark report | student | Visible = enrolled (teachers: + created; `manager`+: all); exam **drafts** show only to the course's managers |
@@ -413,6 +431,21 @@ their existing shapes: the student exam-room reads
 | GET    | `/exams/{id}/attempt/ws`         | student | **WebSocket** exam room (students only): state ticks, autosave, finish; entering clears `left_at`, leaving stamps it (see "Taking an exam") |
 | GET    | `/exams/{id}/live`               | teacher | Live monitor snapshot: roster × latest attempts × marks + per-student progress/`left_at`/`attempts_used` + counts; no-shows turn `absent` once the window closes (course manager) |
 | GET    | `/exams/{id}/live/stream`        | teacher | The same snapshot as SSE `snapshot` events every ~2s (course manager) |
+| POST   | `/questions`                     | student | `{title, body}` — ask into the school question pool (**students only**); born `pending`, visible to the asker + teacher+ |
+| GET    | `/questions`                     | student | `?status=pending\|approved` — the pool questions visible to the caller, each with its `solution_count` · paged |
+| GET    | `/questions/{id}`                | student | Get one (a `pending` question is a `404` unless asker or teacher+) |
+| POST   | `/questions/{id}/approve`        | teacher | Approve a pending question — publishes it school-wide; content frozen after (`409` if already approved) |
+| DELETE | `/questions/{id}`                | student | Delete own question (teacher+: any); its solutions go with it |
+| POST   | `/questions/{id}/image`          | student | Attach/replace the problem photo (asker only): `multipart/form-data`, one `file` part, raster only, ≤ `max_file_bytes` |
+| GET    | `/questions/{id}/image`          | student | The photo bytes |
+| DELETE | `/questions/{id}/image`          | student | Remove the photo (asker only) |
+| POST   | `/questions/{id}/solutions`      | student | `{body}` — offer a solution on an approved question (anyone in the school) |
+| GET    | `/questions/{id}/solutions`      | student | The question's solutions, oldest first — a discussion thread · paged |
+| DELETE | `/questions/{id}/solutions/{sid}` | student | Delete a solution (author, or teacher+); its photo blob goes with it |
+| PATCH  | `/questions/{id}/solutions/{sid}` | student | `{body}` — edit own solution (author only, teacher+ included out; solutions never freeze) |
+| POST   | `/questions/{id}/solutions/{sid}/image` | student | Attach/replace the solution's photo (author only, anytime): `multipart/form-data`, one `file` part, raster only, ≤ `max_file_bytes` |
+| GET    | `/questions/{id}/solutions/{sid}/image` | student | The solution photo's bytes (access follows the question) |
+| DELETE | `/questions/{id}/solutions/{sid}/image` | student | Remove the solution's photo (author only) |
 | GET    | `/marks/me`                      | student | The caller's mark report (per-course + overall averages) |
 | GET    | `/marks/{user}`                  | teacher* | A user's mark report, narrowed to the caller's courses (manager+: full); *or a `parent` linked to `{user}` — full |
 | POST   | `/work/check-in`                 | teacher | Open a work stint (server-stamped; `409` if already open) |
@@ -544,6 +577,42 @@ permanent, allowed only while your copy sits in the trash (`409` otherwise),
 and physically removes the row once both sides have deleted theirs. Replying
 is just sending a new message back — the frontend prefixes the subject if it
 wants an `Re:`.
+
+## Question pool
+
+Students get stuck; the pool is where the school unsticks them — with a
+moderation gate so nothing unreviewed goes school-wide. `POST /questions`
+(students only, exact role) creates the question `pending`: only the asker
+and teacher+ can see it (anyone else gets a `404`, not a `403` — a pending
+question's existence is nobody else's business), and `GET
+/questions?status=pending` is a teacher's approval queue. The asker may
+attach **one photo** of the problem (`POST /questions/{id}/image`,
+`multipart/form-data` with a `file` part — raster types only, no SVG, ≤ the
+school's `max_file_bytes`), replace it, or remove it — while pending only.
+
+`POST /questions/{id}/approve` (teacher+) publishes it: the question becomes
+readable by every signed-in user above `parent`, and its content — title,
+body, photo — **freezes**, because an edit after approval would bypass the
+moderation that just happened. There is no rejected state and no edit
+endpoint: to fix a typo the asker deletes and re-asks; to reject, a teacher+
+deletes. Approving twice is a `409`; the response records `approved_by`.
+
+Anyone in the school (student through admin — not parents) may then offer a
+**solution**: `POST /questions/{id}/solutions` with a text body, listed
+oldest-first like a discussion thread (`GET`, paged). Solutions are the
+unmoderated half of the pool, so nothing about them ever freezes: the author
+— and only the author, teacher+ included out — may edit the body (`PATCH
+/questions/{id}/solutions/{sid}`) and attach one **photo** of the worked
+steps (`POST /questions/{id}/solutions/{sid}/image`, same raster-only rules
+and `max_file_bytes` cap as the question's photo), replace it, or remove it,
+at any time; moderation stays delete-only — a teacher+ removes a bad
+solution, never rewrites someone else's words. A solution is deleted by its
+author or by teacher+, its photo blob going with it; deleting a question —
+asker withdrawing, or teacher+ moderating — takes its solutions and every
+photo blob (its own and its solutions') with it. Each question row reports
+its `solution_count`, and questions and solutions embed their people as
+person refs (`{id, username, display_name}`), so the UI never shows a raw
+ULID.
 
 ## Per-school policy (settings & terms)
 
@@ -1017,13 +1086,32 @@ src/
     exam_answer.rs ExamAnswerId · AnswerText · ExamAnswer (one row per question+user) ·
                    auto_score (choice-question suggestion)
     exam_result.rs ExamResultId · Mark · ExamResult (one row per exam+user)
+    question_image.rs QuestionImageId · QuestionImage (question/choice picture
+                   metadata; bytes on disk under FILES_PATH)
+    profile.rs     PersonName · Email · Phone · BirthDate (personal-info newtypes)
+    preferences.rs Theme · Language (own UI preferences)
+    message.rs     MessageId · MessageSubject · MessageBody · MessageLabel ·
+                   Message (per-copy folders: inbox/sent/archive/trash)
+    parent_link.rs ParentLinkId · ParentLink (parent↔student tie = the parent's read grant)
+    registration.rs RegistrationId · Registration (a seat on a registration event's signup list)
+    subject.rs     SubjectId · SubjectName · SubjectDescription · Subject (course curriculum)
+    term.rs        TermId · TermName · Term (school term window)
+    settings.rs    ExamKindDef · GradeBand · Settings (per-school policy)
+    pomodoro.rs    PomodoroSessionId · PomodoroSession (student focus log)
+    pool_question.rs PoolQuestionId · PoolQuestionTitle · PoolQuestionBody ·
+                   PoolQuestion (student-asked question; teacher-approved into
+                   the school-wide pool; optional photo as metadata + disk blob)
+    solution.rs    SolutionId · SolutionBody · Solution (discussion thread on an
+                   approved pool question; dies with the question)
   web/             axum layer: DTOs (serde + OpenAPI schemas) + handlers +
                    auth extractors
     extractor.rs   CurrentUser · RequireTeacher · RequireManager · RequireAdmin
     dto.rs         shared UserResponse · CourseResponse · ExamResponse · SessionResponse schemas
     exam_ws.rs     the student exam-room WebSocket (state ticks, autosave, finish)
-    auth.rs  users.rs  notes.rs  events.rs  courses.rs  sessions.rs  exams.rs
-    marks.rs  work.rs  attendance.rs
+    page.rs        PageParams · Page<T> (shared pagination)
+    auth.rs  users.rs  notes.rs  messages.rs  events.rs  courses.rs  subjects.rs
+    sessions.rs  exams.rs  questions.rs  marks.rs  work.rs  pomodoro.rs
+    attendance.rs  settings.rs  terms.rs
 ```
 
 Tests: `cargo test` — unit (in-source), integration (`tower::oneshot` + in-memory

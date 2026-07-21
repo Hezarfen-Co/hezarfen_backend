@@ -3,10 +3,9 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
-use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, X_CONTENT_TYPE_OPTIONS};
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::StatusCode;
+use axum::response::Response;
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use tokio_stream::wrappers::IntervalStream;
 use tokio_stream::{Stream, StreamExt};
@@ -15,8 +14,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::constant::{
-    EXAM_LIVE_STREAM_INTERVAL_SECS, MAX_MAX_FILE_BYTES, QUESTION_IMAGE_CONTENT_TYPES,
-    UPLOAD_BODY_OVERHEAD_BYTES,
+    EXAM_LIVE_STREAM_INTERVAL_SECS, MAX_MAX_FILE_BYTES, UPLOAD_BODY_OVERHEAD_BYTES,
 };
 use crate::database::Database;
 use crate::domain::course::Course;
@@ -44,7 +42,8 @@ use super::courses::{can_manage_course, can_view_course, visible_courses};
 use super::subjects::subject_in_course;
 use super::{
     CurrentUser, ExamResponse, Page, PageParams, PersonRef, RequireTeacher, UploadFileForm,
-    blob_path, check_not_past, paginate, person_map, read_upload, remove_blob, set_or_clear,
+    blob_path, check_not_past, image_content_type, paginate, person_map, read_upload, remove_blob,
+    set_or_clear,
 };
 
 /// Serializes the exam subsystem's cross-record check-then-writes, which
@@ -1779,19 +1778,6 @@ async fn ensure_question_content_visible(
     Ok(())
 }
 
-/// The declared content type, held to the raster allowlist — SVG stays out
-/// (it can script) since these bytes are rendered inline to whole classes.
-fn image_content_type(raw: &str) -> Result<FileContentType, AppError> {
-    let content_type = FileContentType::try_new(raw)?;
-    if !QUESTION_IMAGE_CONTENT_TYPES.contains(&content_type.as_str()) {
-        return Err(AppError::Validation(ValidationError::Invalid {
-            field: "content_type",
-            reason: "must be image/png, image/jpeg, image/webp, or image/gif",
-        }));
-    }
-    Ok(content_type)
-}
-
 /// The whole image write tail, shared by both upload endpoints: new blob to
 /// disk, row UPSERT (the deterministic per-slot id makes it a replace), then
 /// the replaced blob off disk. A failed row write takes the fresh blob back
@@ -1830,31 +1816,9 @@ async fn store_image(
     }
 }
 
-/// The stored bytes as an inline-displayable response: the declared (and
-/// allowlisted) content type, `nosniff`, and `no-store` — exam content has no
-/// business in shared caches, and a replaced image must not linger.
+/// The stored bytes, served inline via [`super::serve_inline_blob`].
 async fn serve_image(st: &AppState, image: &QuestionImage) -> Result<Response, AppError> {
-    let bytes = tokio::fs::read(blob_path(&st.files_path, image.get_file()))
-        .await
-        .map_err(|err| {
-            // The row exists but its blob doesn't — server-side damage (a
-            // lost volume path), not a client 404.
-            AppError::Internal(format!(
-                "missing blob for question image {}: {err}",
-                image.get_file()
-            ))
-        })?;
-    let content_type = HeaderValue::from_str(image.get_content_type().as_str())
-        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
-    Ok((
-        [
-            (CONTENT_TYPE, content_type),
-            (X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff")),
-            (CACHE_CONTROL, HeaderValue::from_static("private, no-store")),
-        ],
-        bytes,
-    )
-        .into_response())
+    super::serve_inline_blob(&st.files_path, image.get_file(), image.get_content_type()).await
 }
 
 /// Attach (or replace) a question's illustration — any question kind may

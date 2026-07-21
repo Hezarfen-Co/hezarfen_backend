@@ -33,6 +33,8 @@ pub const POMODORO_SESSION_TABLE: &str = "pomodoro_session";
 pub const SETTINGS_TABLE: &str = "settings";
 pub const TERM_TABLE: &str = "term";
 pub const SUBJECT_TABLE: &str = "subject";
+pub const POOL_QUESTION_TABLE: &str = "pool_question";
+pub const SOLUTION_TABLE: &str = "solution";
 
 /// SCHEMAFULL schema: every column is typed, references use `record<..>`.
 /// Idempotent — safe to run on every boot: `IF NOT EXISTS` guards the
@@ -245,6 +247,29 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS mark ON exam_result TYPE int;
     DEFINE FIELD IF NOT EXISTS graded_by ON exam_result TYPE record<user>;
     DEFINE INDEX IF NOT EXISTS exam_result_exam_user ON exam_result FIELDS exam, user UNIQUE;
+
+    DEFINE TABLE IF NOT EXISTS pool_question SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS asker ON pool_question TYPE record<user>;
+    DEFINE FIELD IF NOT EXISTS title ON pool_question TYPE string;
+    DEFINE FIELD IF NOT EXISTS body ON pool_question TYPE string;
+    DEFINE FIELD IF NOT EXISTS status ON pool_question TYPE string DEFAULT 'pending';
+    DEFINE FIELD IF NOT EXISTS asked_at ON pool_question TYPE int;
+    DEFINE FIELD IF NOT EXISTS approved_by ON pool_question TYPE option<record<user>>;
+    DEFINE FIELD IF NOT EXISTS image_file ON pool_question TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS image_content_type ON pool_question TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS image_size ON pool_question TYPE option<int>;
+    DEFINE INDEX IF NOT EXISTS pool_question_status ON pool_question FIELDS status;
+    DEFINE INDEX IF NOT EXISTS pool_question_asker ON pool_question FIELDS asker;
+
+    DEFINE TABLE IF NOT EXISTS solution SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS question ON solution TYPE record<pool_question>;
+    DEFINE FIELD IF NOT EXISTS author ON solution TYPE record<user>;
+    DEFINE FIELD IF NOT EXISTS body ON solution TYPE string;
+    DEFINE FIELD IF NOT EXISTS offered_at ON solution TYPE int;
+    DEFINE FIELD IF NOT EXISTS image_file ON solution TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS image_content_type ON solution TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS image_size ON solution TYPE option<int>;
+    DEFINE INDEX IF NOT EXISTS solution_question ON solution FIELDS question;
 
     DEFINE TABLE IF NOT EXISTS settings SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS exam_kinds ON settings TYPE array<object>;
