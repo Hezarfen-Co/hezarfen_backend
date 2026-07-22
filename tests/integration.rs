@@ -12441,3 +12441,377 @@ async fn solution_images_edits_and_counts() {
     .await;
     assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
 }
+
+// --- drawing byte-fidelity (stroke-JSON tEXt passthrough) -------------------
+// The frontend's canvas saves a drawing as a PNG that also carries its
+// editable stroke JSON inside a custom `tEXt` chunk; the backend only ever
+// stores and re-serves the uploaded bytes (see `read_upload` / `serve_inline_blob`
+// in web/mod.rs). These tests build a real (if minimal) PNG with a `tEXt`
+// chunk and assert the round trip is byte-for-byte — if anyone ever adds
+// image re-encoding, compression, or thumbnailing, every stored drawing
+// silently stops being replayable, and this is what would catch it.
+
+/// CRC-32 (ISO-HDLC — the checksum PNG chunks and zlib both use), bit by bit:
+/// no table, since this only ever runs over a few dozen fixture bytes. No new
+/// crate for one checksum used to hand-build a PNG below.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in bytes {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+/// Pin the hand-rolled checksum against the standard CRC-32 check value.
+/// Nothing downstream ever validates a chunk's CRC (the server never parses
+/// PNG structure), so a broken implementation here would silently build
+/// fixtures that only *look* like PNGs — this is the one thing that would
+/// catch that.
+#[tokio::test]
+async fn crc32_matches_the_standard_check_value() {
+    assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+}
+
+/// Frame one PNG chunk: 4-byte big-endian length, 4-byte type, the data, then
+/// the CRC-32 over type+data.
+fn png_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+    let mut chunk = Vec::with_capacity(12 + data.len());
+    chunk.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    chunk.extend_from_slice(kind);
+    chunk.extend_from_slice(data);
+    let crc_body: Vec<u8> = kind.iter().chain(data.iter()).copied().collect();
+    chunk.extend_from_slice(&crc32(&crc_body).to_be_bytes());
+    chunk
+}
+
+/// A genuinely valid, minimal (1x1 grayscale) PNG carrying a custom `tEXt`
+/// chunk whose text is `marker` — the same trick the frontend uses to smuggle
+/// its editable stroke JSON inside a drawing's PNG bytes. Built inline (no
+/// binary fixture file) so the test commits exactly the bytes it later
+/// asserts on.
+fn png_with_text_chunk(marker: &str) -> Vec<u8> {
+    let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    // IHDR: 1x1 pixel, 8-bit depth, grayscale, no interlace.
+    png.extend(png_chunk(b"IHDR", &[0, 0, 0, 1, 0, 0, 0, 1, 8, 0, 0, 0, 0]));
+    // tEXt: keyword "Comment", NUL, then the marker — exactly where a real
+    // drawing's stroke JSON rides.
+    let mut text = b"Comment\0".to_vec();
+    text.extend_from_slice(marker.as_bytes());
+    png.extend(png_chunk(b"tEXt", &text));
+    // IDAT: one stored (uncompressed) deflate block over the single
+    // [filter=None, pixel=0] scanline, so this decodes as a real black pixel.
+    png.extend(png_chunk(
+        b"IDAT",
+        &[
+            0x78, 0x01, // zlib header
+            0x01, 0x02, 0x00, 0xFD, 0xFF, // stored block: BFINAL+BTYPE, LEN, NLEN
+            0x00, 0x00, // scanline: filter=None, pixel=0
+            0x00, 0x02, 0x00, 0x01, // Adler-32 of the scanline bytes
+        ],
+    ));
+    png.extend(png_chunk(b"IEND", &[]));
+    png
+}
+
+/// The primary invariant: a student's answer drawing survives its round trip
+/// byte-for-byte, `tEXt` chunk included — on both read paths that matter, the
+/// student's own (for editing) and the teacher's grading read (for replay).
+/// If the backend ever re-encodes or strips metadata from this PNG, the
+/// stroke JSON in the `tEXt` chunk is gone and the drawing stops replaying.
+#[tokio::test]
+async fn answer_image_round_trip_keeps_the_stroke_text_chunk_intact() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "rt_t", "teacher").await;
+    let student = login(&app, "rt_s").await;
+    let student_id = me_id(&app, &student).await;
+
+    let course = create_course(&app, &teacher, "art").await;
+    let subject = create_subject(&app, &teacher, &course, "sketching").await;
+    enroll(&app, &teacher, &course, &student_id).await;
+    let exam = scheduled_exam(
+        &app,
+        &teacher,
+        &course,
+        json!({ "title": "sketch quiz", "kind": "quiz", "mode": "open" }),
+    )
+    .await;
+    let question = create_question(
+        &app,
+        &teacher,
+        &exam,
+        &subject,
+        json!({ "text": "Draw a triangle.", "kind": "text", "points": 10 }),
+    )
+    .await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+
+    let png = png_with_text_chunk(r#"{"strokes":[[1,1],[2,2],[3,3]]}"#);
+    let own = format!("/exams/{exam}/attempt/answers/{question}/image");
+    let (status, body) = post_image(&app, &student, &own, "image/png", &png).await;
+    assert_eq!(status, StatusCode::CREATED, "{}", body);
+
+    // The student replays their own drawing from this route.
+    let (status, headers, bytes) =
+        common::send_raw(&app, "GET", &own, Some(&student), None, Vec::new()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-type"], "image/png");
+    assert_eq!(bytes, png, "the student's own read must be byte-identical");
+
+    // The teacher replays it too, via the grading route — same requirement.
+    let teacher_uri = format!("/exams/{exam}/attempts/{student_id}/answers/{question}/image");
+    let (status, _, bytes) =
+        common::send_raw(&app, "GET", &teacher_uri, Some(&teacher), None, Vec::new()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, png, "the grader read must be byte-identical too");
+}
+
+/// The pool question photo is a drawing too (a student can attach a photo or
+/// a canvas sketch of the problem) — same byte-for-byte requirement as an
+/// answer image, or a teacher replaying a hand-drawn question loses the
+/// stroke JSON in its `tEXt` chunk.
+#[tokio::test]
+async fn question_photo_round_trip_keeps_the_stroke_text_chunk_intact() {
+    let app = mem_app().await;
+    let asker = login(&app, "ali").await;
+    let res = send(
+        &app,
+        "POST",
+        "/questions",
+        Some(&asker),
+        Some(json!({ "title": "Şekil", "body": "Çizim ekli" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let qid = id_of(&res.body);
+
+    let png = png_with_text_chunk(r#"{"strokes":[[4,4],[5,5]]}"#);
+    let uri = format!("/questions/{qid}/image");
+    let (status, body) = post_image(&app, &asker, &uri, "image/png", &png).await;
+    assert_eq!(status, StatusCode::CREATED, "{}", body);
+
+    let (status, headers, bytes) =
+        common::send_raw(&app, "GET", &uri, Some(&asker), None, Vec::new()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-type"], "image/png");
+    assert_eq!(
+        bytes, png,
+        "the pool question photo must round-trip byte-for-byte"
+    );
+}
+
+/// Same story on a solution's worked-steps photo: the backend must never
+/// touch these bytes, or a replayed solution drawing loses its stroke JSON.
+#[tokio::test]
+async fn solution_photo_round_trip_keeps_the_stroke_text_chunk_intact() {
+    let (app, db) = app_and_db().await;
+    let asker = login(&app, "ali").await;
+    let helper = login(&app, "veli").await;
+    let teacher = login_as(&app, &db, "hoca", "teacher").await;
+
+    let res = send(
+        &app,
+        "POST",
+        "/questions",
+        Some(&asker),
+        Some(json!({ "title": "Limit", "body": "Çözüm arıyorum" })),
+    )
+    .await;
+    let qid = id_of(&res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/questions/{qid}/approve"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/questions/{qid}/solutions"),
+        Some(&helper),
+        Some(json!({ "body": "İşte çözüm." })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let sid = id_of(&res.body);
+
+    let png = png_with_text_chunk(r#"{"strokes":[[6,6],[7,7]]}"#);
+    let uri = format!("/questions/{qid}/solutions/{sid}/image");
+    let (status, body) = post_image(&app, &helper, &uri, "image/png", &png).await;
+    assert_eq!(status, StatusCode::CREATED, "{}", body);
+
+    let (status, headers, bytes) =
+        common::send_raw(&app, "GET", &uri, Some(&asker), None, Vec::new()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-type"], "image/png");
+    assert_eq!(
+        bytes, png,
+        "the solution photo must round-trip byte-for-byte"
+    );
+}
+
+/// The contrast to `question_pool_image_upload_and_freeze`'s 409-after-approval:
+/// a solution carries no moderation state, so its author replaces the photo
+/// freely at any time, even on a long-approved question.
+#[tokio::test]
+async fn solution_photo_replaces_freely_unlike_the_frozen_question_photo() {
+    let (app, db) = app_and_db().await;
+    let asker = login(&app, "ali").await;
+    let helper = login(&app, "veli").await;
+    let teacher = login_as(&app, &db, "hoca", "teacher").await;
+
+    let res = send(
+        &app,
+        "POST",
+        "/questions",
+        Some(&asker),
+        Some(json!({ "title": "Türev", "body": "Nasıl alınır?" })),
+    )
+    .await;
+    let qid = id_of(&res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/questions/{qid}/approve"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/questions/{qid}/solutions"),
+        Some(&helper),
+        Some(json!({ "body": "Cevap burada." })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let sid = id_of(&res.body);
+
+    let uri = format!("/questions/{qid}/solutions/{sid}/image");
+    let (status, _) = post_image(&app, &helper, &uri, "image/png", b"first-draft").await;
+    assert_eq!(status, StatusCode::CREATED);
+    // No freeze: a second replace on the same long-approved question still lands.
+    let (status, _) = post_image(&app, &helper, &uri, "image/png", b"second-draft").await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "a solution photo must never freeze"
+    );
+    let (status, _, bytes) =
+        common::send_raw(&app, "GET", &uri, Some(&helper), None, Vec::new()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, b"second-draft");
+}
+
+/// The other half of a pending question's photo visibility (the asker-vs-stranger
+/// half is already pinned by `question_pool_image_upload_and_freeze`): teacher+
+/// is the approval queue's other reader, so a pending photo must reach them too.
+#[tokio::test]
+async fn pool_question_pending_photo_reaches_teacher_too() {
+    let (app, db) = app_and_db().await;
+    let asker = login(&app, "ali").await;
+    let teacher = login_as(&app, &db, "hoca", "teacher").await;
+
+    let res = send(
+        &app,
+        "POST",
+        "/questions",
+        Some(&asker),
+        Some(json!({ "title": "Soru", "body": "Yardım lazım" })),
+    )
+    .await;
+    let qid = id_of(&res.body);
+    let uri = format!("/questions/{qid}/image");
+    let (status, _) = post_image(&app, &asker, &uri, "image/png", b"png-bytes").await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, _, bytes) =
+        common::send_raw(&app, "GET", &uri, Some(&teacher), None, Vec::new()).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "teacher+ must see a pending photo too"
+    );
+    assert_eq!(bytes, b"png-bytes");
+}
+
+/// `GET` on a pool photo needs student role or higher; parents are read-only
+/// report observers (see `question_pool_locks_parents_out`), so both photo
+/// routes must refuse them exactly like the rest of the pool.
+#[tokio::test]
+async fn pool_photo_reads_require_student_role() {
+    let (app, db) = app_and_db().await;
+    let asker = login(&app, "ali").await;
+    let helper = login(&app, "veli").await;
+    let teacher = login_as(&app, &db, "hoca", "teacher").await;
+    let parent = login_as(&app, &db, "anne", "parent").await;
+
+    let res = send(
+        &app,
+        "POST",
+        "/questions",
+        Some(&asker),
+        Some(json!({ "title": "Soru", "body": "Yardım lazım" })),
+    )
+    .await;
+    let qid = id_of(&res.body);
+    let q_uri = format!("/questions/{qid}/image");
+    let (status, _) = post_image(&app, &asker, &q_uri, "image/png", b"q-bytes").await;
+    assert_eq!(status, StatusCode::CREATED);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/questions/{qid}/approve"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/questions/{qid}/solutions"),
+        Some(&helper),
+        Some(json!({ "body": "Cevap burada." })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let sid = id_of(&res.body);
+    let s_uri = format!("/questions/{qid}/solutions/{sid}/image");
+    let (status, _) = post_image(&app, &helper, &s_uri, "image/png", b"s-bytes").await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, _, _) =
+        common::send_raw(&app, "GET", &q_uri, Some(&parent), None, Vec::new()).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "parents can't read a question photo"
+    );
+    let (status, _, _) =
+        common::send_raw(&app, "GET", &s_uri, Some(&parent), None, Vec::new()).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "parents can't read a solution photo"
+    );
+}
