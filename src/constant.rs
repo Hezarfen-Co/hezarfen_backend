@@ -85,6 +85,19 @@ pub const MAX_COURSE_DESCRIPTION_LEN: usize = 2_000;
 pub const MAX_SUBJECT_NAME_LEN: usize = 200;
 pub const MAX_SUBJECT_DESCRIPTION_LEN: usize = 2_000;
 
+pub const MAX_HOMEWORK_TITLE_LEN: usize = 200;
+pub const MAX_HOMEWORK_DESCRIPTION_LEN: usize = 2_000;
+
+/// A homework submission's optional free-text note, sent alongside its files.
+pub const MAX_HOMEWORK_TEXT_LEN: usize = 5_000;
+
+/// How many files one homework submission may carry.
+pub const MAX_HOMEWORK_FILES_PER_SUBMISSION: usize = 10;
+
+/// How many students a homework may be narrowed to. The whole-course default
+/// carries no assigned list at all, so this caps only an explicit subset.
+pub const MAX_HOMEWORK_ASSIGNED: usize = 200;
+
 /// The default attendance states, and also the mandatory core: a school may
 /// add its own statuses via `PATCH /settings`, but these four can never be
 /// removed — the attendance rate's semantics are defined over them.
@@ -132,6 +145,13 @@ pub const COURSE_KINDS: [&str; 3] = ["course", "study", "club"];
 /// with an optional per-attempt `duration_ms` (absent = unlimited time). An
 /// exam with no mode at all is an offline-graded draft and cannot be sat.
 pub const EXAM_MODES: [&str; 3] = ["sync", "async", "open"];
+
+/// The only accepted homework grades. `done`: submitted and complete;
+/// `incomplete`: submitted but lacking; `missing`: not done. A teacher-set
+/// `missing` is a deliberate verdict, distinct from the roster's *computed*
+/// missing (unsubmitted past due). The `HomeworkStatus` newtype enforces the
+/// set; the DDL carries no ASSERT (repo convention), exactly like `EXAM_MODES`.
+pub const HOMEWORK_STATUSES: [&str; 3] = ["done", "incomplete", "missing"];
 
 /// Inclusive bounds for an exam's per-attempt duration, milliseconds
 /// (1 minute to 24 hours). Required for `async`, optional for `open`.
