@@ -5,7 +5,7 @@ Note, attendance, course + weighted exam mark backend. **Rust (edition 2024) · 
 Session-cookie auth with five hierarchical roles (`parent < student < teacher
 < manager < admin`). A **`parent`** observes and changes nothing: admins tie
 students to a parent account, and the parent reads those students' mark,
-attendance, and pomodoro reports — that's the whole role. Notes are per-user and carry **file attachments** (PDFs, documents,
+attendance, pomodoro, and homework reports — that's the whole role. Notes are per-user and carry **file attachments** (PDFs, documents,
 …): blobs live on disk next to the database, metadata in the database, and the
 per-file size cap is school policy in settings (`max_file_bytes`, default
 5 MiB). Any two users can **message** each other, mail-style — subject +
@@ -49,7 +49,15 @@ may be a picture of its own (pick the right city off the map) — raster
 uploads capped by the same `max_file_bytes` policy as note files. Teachers
 watch attendance, per-student remaining time,
 sittings, walk-outs, no-shows (`absent` once the window closes), submissions,
-and marks land live on a monitor endpoint (snapshot or SSE stream). Courses also carry **lesson
+and marks land live on a monitor endpoint (snapshot or SSE stream). Courses also hand out
+**homework**: assigned to the whole class or a named subset (the unnamed never
+even see it), tagged with a course subject, due by a required future `due_at`
+— students hand in text and/or **files of any type** (same size cap, 10 per
+submission, served back only as forced downloads), editable until the teacher
+grades a status (`done`/`incomplete`/`missing`) with an optional 0–100 mark
+(grading freezes the hand-in until the grade is removed); lateness is computed
+from two stamps (first hand-in vs last touch), never stored, and homework
+marks stay out of the weighted `/marks` averages. Courses also carry **lesson
 sessions** with teacher-taken roll call (students never self-mark a lesson),
 staff clock in/out on a server-stamped **work log**, students track study time
 with a server-stamped **pomodoro log** (the timer runs in the frontend; the
@@ -235,8 +243,8 @@ effect on the user's very next call (no re-login).
 `parent` is the read-only observer at the bottom of the ladder: an admin ties
 any number of students to a parent account (`POST /users/{id}/students`), and
 the tie is the parent's whole power — they list their students
-(`GET /users/me/students`) and read each one's mark, attendance, and pomodoro
-reports in full. Student-only checks are exact (`role == student`), so a
+(`GET /users/me/students`) and read each one's mark, attendance, pomodoro,
+and homework reports in full. Student-only checks are exact (`role == student`), so a
 parent can never enroll, sit an exam, be graded, or land on a roll call; and
 sitting below every staff bar, they can't touch anything else either — except
 messages, which any role sends and receives (that's how a parent reaches a
@@ -278,13 +286,16 @@ course enrollments.
 | Create courses                           | teacher      | The creator manages the course, and owns it for good |
 | Assign / unassign a course's teachers    | manager      | Staffing is the office's call — a course's own creator cannot hand rights to peers; the assignee must be `teacher`+ |
 | Delete a course                          | teacher      | Only the **creator**, or a `manager`+ — an assigned teacher runs the course but doesn't own it |
-| Manage inside a course: edit it, enroll/unenroll **students**, add/edit/delete its exams and **subjects**, grade, remove results | teacher | The **course creator**, a teacher **assigned** to it, or a `manager`+ for any course; only students can be enrolled; a subject still referenced by exam questions won't delete (`409`) |
+| Manage inside a course: edit it, enroll/unenroll **students**, add/edit/delete its exams and **subjects**, grade, remove results | teacher | The **course creator**, a teacher **assigned** to it, or a `manager`+ for any course; only students can be enrolled; a subject still referenced by exam questions or homework won't delete (`409`) |
 | View a course's roster, an exam's result list / statistics | teacher | Course-management rights |
 | Read another user's mark report          | teacher      | Narrowed to the caller's managed courses; `manager`+ sees all; a `parent` sees a linked student's in full |
 | Grade students                           | teacher      | Target must be an **enrolled student**; grading never targets oneself |
+| Assign / edit / delete homework; grade it; read its roster | teacher | Course-management rights; an `assigned` subset (≤ 200 enrolled students) can't be narrowed over existing work (`409`); a grade (`done`/`incomplete`/`missing` + optional mark) freezes the submission until removed |
+| Submit **own** homework (text + files); read own submission and grade | student | **Students only** — staff never submit; enrolled + in the audience; editable until graded; ≤ 10 files of any type, each ≤ `max_file_bytes`, always downloaded as attachments |
+| Read another user's homework report      | teacher      | Narrowed to the caller's managed courses; `manager`+ sees all; a `parent` sees a linked student's in full — statuses/marks/flags, never files |
 | Edit **own** personal info (name, surname, email, phone, birth date) | student | Every account carries the same optional info fields |
 | Edit **own** UI preferences (theme, language) | student | `null` until chosen — the client then follows the device preference |
-| List **own** linked students             | parent       | Read-only: the list plus each student's mark/attendance/pomodoro reports — a parent changes nothing, anywhere |
+| List **own** linked students             | parent       | Read-only: the list plus each student's mark/attendance/pomodoro/homework reports — a parent changes nothing, anywhere |
 | Read the school settings and the term list | student | Clients need them to render kind/status pickers, grades, and the calendar |
 | Edit school settings; create / edit / delete terms | manager | School policy (exam kinds, attendance statuses, grade bands, the note-file size limit) and the academic calendar are management's call |
 | List users; look up one user; change a user's role; edit **any** user's personal info or UI preferences; tie/untie students to a `parent` account | admin | An admin cannot change **their own** role |
@@ -424,7 +435,7 @@ their existing shapes: the student exam-room reads
 | GET    | `/courses/me`                    | student | The caller's **enrolled** courses · paged |
 | GET    | `/courses/{id}`                  | student | Get course (enrolled, creator, assigned teacher, or manager+) |
 | PATCH  | `/courses/{id}`                  | teacher | Edit course incl. `kind` and `capacity` (`null` lifts the cap) (course manager) |
-| DELETE | `/courses/{id}`                  | teacher | Delete course + its exams, results, enrollments, subjects (creator, or manager+ — **not** an assigned teacher) |
+| DELETE | `/courses/{id}`                  | teacher | Delete course + its exams, results, enrollments, subjects, and homework (submissions, files, and grades included) (creator, or manager+ — **not** an assigned teacher) |
 | POST   | `/courses/{id}/teachers`         | manager | `{user_id}` — assign a **teacher+** to run the course (idempotent; returns the course) |
 | DELETE | `/courses/{id}/teachers/{user}`  | manager | Unassign a teacher (`404` if they weren't assigned) |
 | POST   | `/courses/{id}/enrollments`      | teacher | `{user_id}` — enroll a **student** (idempotent upsert; course manager; only students can be enrolled; `409` once a capped course is full) |
@@ -436,7 +447,7 @@ their existing shapes: the student exam-room reads
 | GET    | `/courses/{id}/subjects`         | student | List the course's subjects, creation order (enrolled, creator, assigned teacher, or manager+) · paged |
 | GET    | `/subjects/{id}`                 | student | Get subject (enrolled, creator, or manager+) |
 | PATCH  | `/subjects/{id}`                 | teacher | Edit a subject's name/description (course manager; its course is fixed) |
-| DELETE | `/subjects/{id}`                 | teacher | Delete a subject (course manager); `409` while exam questions reference it |
+| DELETE | `/subjects/{id}`                 | teacher | Delete a subject (course manager); `409` while exam questions or homework reference it |
 | GET    | `/sessions/{id}`                 | student | Get session (enrolled, session teacher, or course manager) |
 | PATCH  | `/sessions/{id}`                 | teacher | Edit session (course manager; `null` clears `ends_at`) |
 | DELETE | `/sessions/{id}`                 | teacher | Delete session + its roll call (course manager) |
@@ -477,6 +488,23 @@ their existing shapes: the student exam-room reads
 | GET    | `/exams/{id}/attempt/ws`         | student | **WebSocket** exam room (students only): state ticks, autosave, finish; entering clears `left_at`, leaving stamps it (see "Taking an exam") |
 | GET    | `/exams/{id}/live`               | teacher | Live monitor snapshot: roster × latest attempts × marks + per-student progress/`left_at`/`attempts_used` + counts; no-shows turn `absent` once the window closes (course manager) |
 | GET    | `/exams/{id}/live/stream`        | teacher | The same snapshot as SSE `snapshot` events every ~2s (course manager) |
+| POST   | `/courses/{id}/homework`         | teacher | `{title, description?, subject_id, due_at, assigned?}` — assign homework tagged with a course subject, due in the future; `assigned` names an enrolled-student subset, ≤ 200 (omit/`[]` = the whole course) (course manager) |
+| GET    | `/courses/{id}/homework`         | student | List the course's homework, newest first (enrolled, creator, assigned teacher, or manager+; students see only what they're assigned) · paged |
+| GET    | `/homework`                      | student | The caller's cross-course homework: their courses' (manager+: all; students only what they're assigned) · paged |
+| GET    | `/homework/{id}`                 | student | Get homework (course viewers; a subset homework is a `404` to students it doesn't name) |
+| PATCH  | `/homework/{id}`                 | teacher | Edit title/description/`due_at`/`subject_id`/`assigned` (course manager; a newly set due date is re-checked; `409` if narrowing `assigned` would strand an existing submission or grade — the blockers are named) |
+| DELETE | `/homework/{id}`                 | teacher | Delete homework + its submissions, files, and grades — file blobs included (course manager) |
+| POST   | `/homework/{id}/submission`      | student | `{text?}` — hand in / re-edit own work (**students only**, enrolled, assigned): text replaces whole (omit clears), `submitted_at` pins the first hand-in, `updated_at` moves; `409` once graded |
+| GET    | `/homework/{id}/submission`      | student | Own submission: text, both stamps, computed `late`, files, grade-if-any (`404` until submitted) |
+| DELETE | `/homework/{id}/submission`      | student | Withdraw own submission + its files and blobs (`409` once graded) |
+| POST   | `/homework/{id}/submission/files` | student | Attach a file to own submission: `multipart/form-data`, one `file` part — **any** content type, ≤ `max_file_bytes`, ≤ 10 per submission; auto-creates the submission (a photo-only homework is one request); `409` once graded or full |
+| GET    | `/homework/{id}/submission/files/{fid}` | student | The file bytes as a **forced download** (`Content-Disposition: attachment`) — the owning student, or a course manager; observers never |
+| DELETE | `/homework/{id}/submission/files/{fid}` | student | Remove own file, row then blob (`409` once graded) |
+| GET    | `/homework/{id}/submissions`     | teacher | The grading roster: one row per audience student × submission/files/grade + computed `late`/`missing`/`unenrolled` — a straggler's stale work stays visible (course manager) · paged |
+| POST   | `/homework/{id}/results`         | teacher | `{user, status, mark?}` — grade `done`/`incomplete`/`missing` (+ optional 0–100 mark) onto an enrolled, assigned **student** (upsert; course manager; never yourself; freezes the submission; unsubmitted work gradable — that's `missing`) |
+| GET    | `/homework/{id}/result`          | student | The caller's **own** grade (`404` until graded) — readable even when nothing was submitted (a `missing` verdict) |
+| DELETE | `/homework/{id}/results/{user}`  | teacher | Remove a student's grade — un-grading reopens their submission (course manager) |
+| GET    | `/homework/report/{user}`        | teacher* | Per-homework report rows — submitted/late/missing + the grade (manager+: full; a teacher: their managed courses); *or a `parent` linked to `{user}` — full, statuses and marks only, never files · paged |
 | POST   | `/questions`                     | student | `{title, body}` — ask into the school question pool (**students only**); born `pending`, visible to the asker + teacher+ |
 | GET    | `/questions`                     | student | `?status=pending\|approved` — the pool questions visible to the caller, each with its `solution_count` · paged |
 | GET    | `/questions/{id}`                | student | Get one (a `pending` question is a `404` unless asker or teacher+) |
@@ -576,8 +604,9 @@ audiences convert on boot: each listed user becomes a signup row credited to
 the event's creator, and the audience becomes an uncapped registration list.
 Reading a child collection of a missing parent (`/events/{id}/attendance`,
 `/exams/{id}/results`, `/courses/{id}/enrollments`, `/courses/{id}/exams`,
-`/courses/{id}/sessions`, `/courses/{id}/subjects`,
-`/sessions/{id}/attendance`) is a `404`, not an empty list.
+`/courses/{id}/sessions`, `/courses/{id}/subjects`, `/courses/{id}/homework`,
+`/homework/{id}/submissions`, `/sessions/{id}/attendance`) is a `404`, not an
+empty list.
 Personal info (`name`, `surname`, `email`, `phone`, `birth_date`) is the same
 optional set on every account, whatever the role, and is `null` until filled
 in. On `PATCH /users/me` (or the admin `PATCH /users/{id}/profile`) each field
@@ -973,6 +1002,75 @@ The live monitor rides along: each roster row now carries `answered` and
 The student's own `GET /exams/{id}/attempt` echoes the same
 `answered`/`question_count` pair.
 
+## Homework
+
+A course hands out **homework**: `POST /courses/{id}/homework` with a title,
+an optional description, a **required subject** (one of the course's own — and
+the same delete guard questions have: a subject with homework refuses deletion
+with a `409` until the homework is re-tagged via `PATCH /homework/{id}` or
+deleted), and a **required `due_at`** that must not lie in the past (same 60s
+grace as every schedule field; late *submissions* are fine — a late
+*assignment* is not).
+
+**Audience.** By default the whole course, resolved live: whoever is enrolled
+*when they act* — a student enrolled after the assignment sees and submits it
+like everyone else. `assigned` (at create or PATCH) instead pins a named
+subset of currently enrolled students (at most 200). The unnamed must not even
+learn a subset exists: lists omit it, and direct reads and submits answer
+`404` — the same no-leak a hidden exam draft gets. Narrowing the subset later
+is refused with a `409` that names the blockers while any submission or grade
+belongs to a student the new list would strand.
+
+**Submitting.** Students only — staff and parents never submit — enrolled and
+in the audience, re-checked on every write. A submission is optional text plus
+up to **10 files of any content type** (each ≤ the school's
+`max_file_bytes`): text is replaced whole on each `POST` (omit to clear),
+files are added and removed one by one, and a file upload with no prior
+submission auto-creates an empty one, so a photo-only homework is a single
+request. Two stamps tell the lateness story: `submitted_at` pins the **first**
+hand-in forever, `updated_at` moves on every text edit and file add/remove,
+and `late` is **computed on read** (`updated_at > due_at`), never stored — so
+touching work after the deadline flips it late, and a `due_at` edit re-grades
+lateness for free. Late submissions are always accepted, only flagged. File
+bytes always come back as a forced download (`Content-Disposition:
+attachment`): homework accepts any content type, so rendering an uploaded
+HTML/SVG inline would run it in the viewer's session.
+
+**Grading.** A course manager records a status — `done`, `incomplete`, or
+`missing` — plus an optional 0–100 `mark` per student
+(`POST /homework/{id}/results`, one upsert row per homework+student; the
+exam walls apply: live students only, enrolled, in the audience, never the
+grader themselves). A stored grade **freezes** that submission — text edits,
+file changes, withdrawal all `409` — until
+`DELETE /homework/{id}/results/{user}` removes it and reopens editing.
+Grading before the due date, or before anything was submitted, is allowed —
+the latter is how never-handed-in work gets its `missing` verdict, and
+`GET /homework/{id}/result` is where its student reads it (their submission
+endpoints have nothing to show). The teacher-set `missing` **status** is a
+deliberate verdict; the roster and the report *also* compute a `missing`
+**flag** for anyone unsubmitted past due — the two are independent. Homework
+marks stay out of `/marks`: the weighted course average remains exam-only
+(the exam *kind* named `homework` still lives there), so nothing
+double-counts.
+
+**Roster & report.** `GET /homework/{id}/submissions` (course manager) is the
+grading table: one row per audience student — plus any straggler outside the
+audience who still owns a submission or grade (an unenrollment, a promotion,
+or an audience change leaves work behind; it stays visible, flagged
+`unenrolled`, though a stale student can neither submit nor be graded).
+`GET /homework/report/{user}` is the fourth observer read beside marks,
+attendance, and pomodoro: teacher+ (an exactly-teacher caller narrowed to the
+courses they manage), or a **parent linked** to the student — per-homework
+rows of submitted/late/missing plus the grade; statuses and marks only,
+**never the files**.
+
+Every delete collects its garbage: withdrawing a submission, deleting a
+homework, and deleting the whole course each cascade the rows (submissions,
+files, grades) and unlink the file blobs from disk. Role changes never sweep
+homework rows: a promoted student's work stays readable on the roster behind
+the `unenrolled` flag, while the live-role gates refuse fresh edits and
+grades.
+
 ## Lesson sessions, roll call, the work log, pomodoro & attendance reports
 
 Events cover ad-hoc gatherings; **sessions** are a course's lessons. A session
@@ -1172,6 +1270,17 @@ src/
                    the school-wide pool; optional photo as metadata + disk blob)
     solution.rs    SolutionId · SolutionBody · Solution (discussion thread on an
                    approved pool question; dies with the question)
+    homework.rs    HomeworkId · HomeworkTitle · HomeworkDescription · Homework
+                   (per-course assignment; required subject; optional `assigned`
+                   student subset — absent/empty = the whole enrolled course)
+    homework_submission.rs HomeworkSubmissionId · SubmissionText ·
+                   HomeworkSubmission (one row per homework+user; immutable
+                   submitted_at + moving updated_at — `late` is computed)
+    homework_file.rs HomeworkFileId · HomeworkFile (submission attachment
+                   metadata; any content type; bytes on disk under FILES_PATH)
+    homework_result.rs HomeworkResultId · HomeworkStatus · HomeworkResult
+                   (teacher grade: done/incomplete/missing + optional Mark; one
+                   row per homework+user — its existence freezes the submission)
   web/             axum layer: DTOs (serde + OpenAPI schemas) + handlers +
                    auth extractors
     extractor.rs   CurrentUser · RequireTeacher · RequireManager · RequireAdmin
@@ -1179,8 +1288,8 @@ src/
     exam_ws.rs     the student exam-room WebSocket (state ticks, autosave, finish)
     page.rs        PageParams · Page<T> (shared pagination)
     auth.rs  users.rs  notes.rs  messages.rs  events.rs  courses.rs  subjects.rs
-    sessions.rs  exams.rs  questions.rs  marks.rs  work.rs  pomodoro.rs
-    attendance.rs  settings.rs  terms.rs
+    sessions.rs  exams.rs  homework.rs  questions.rs  marks.rs  work.rs
+    pomodoro.rs  attendance.rs  settings.rs  terms.rs
 ```
 
 Tests: `cargo test` — unit (in-source), integration (`tower::oneshot` + in-memory
