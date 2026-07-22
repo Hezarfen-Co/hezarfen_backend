@@ -143,8 +143,9 @@ impl Solution {
     }
 
     /// The question's solutions, oldest first — a discussion reads downward.
-    /// The id tiebreak keeps same-millisecond offers in a stable order (ULID
-    /// keys sort chronologically).
+    /// Ordered by `offered_at`; the `id` tiebreak only makes same-millisecond
+    /// offers *stable* across re-queries, not insertion-ordered (ULID low bits
+    /// are random within a millisecond, so same-ms order is arbitrary).
     pub async fn list_for(
         question: &PoolQuestionId,
         db: &Database,
@@ -252,22 +253,24 @@ mod tests {
         let question_b = PoolQuestionId::generate();
         let author = UserId::from_key(&Ulid::new().to_string());
 
-        let first = Solution::new(
+        // Distinct offer times so the assertion pins the real contract —
+        // older `offered_at` sorts first — not the same-millisecond `id`
+        // tiebreak, whose random ULID low bits would make the order a coin
+        // flip (two `now()` reads can land in one millisecond).
+        let mut first = Solution::new(
             &question_a,
             &author,
             SolutionBody::try_new("Önce türevi al.").unwrap(),
-        )
-        .insert(&db)
-        .await
-        .unwrap();
-        let second = Solution::new(
+        );
+        first.offered_at = Timestamp::from_millis(1);
+        let first = first.insert(&db).await.unwrap();
+        let mut second = Solution::new(
             &question_a,
             &author,
             SolutionBody::try_new("Ya da tablo yöntemi.").unwrap(),
-        )
-        .insert(&db)
-        .await
-        .unwrap();
+        );
+        second.offered_at = Timestamp::from_millis(2);
+        let second = second.insert(&db).await.unwrap();
 
         let listed = Solution::list_for(&question_a, &db).await.unwrap();
         assert_eq!(listed.len(), 2);
