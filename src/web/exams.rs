@@ -446,7 +446,7 @@ async fn update_exam(
 
 /// Delete an exam. Requires teacher+ and management rights over the exam's
 /// course (its creator, or manager/admin). Cascades the exam's results,
-/// attempts, questions, answers, and question images (blobs included).
+/// attempts, questions, answers, and question + answer images (blobs included).
 #[utoipa::path(
     delete,
     path = "/{id}",

@@ -448,7 +448,7 @@ their existing shapes: the student exam-room reads
 | GET    | `/exams`                         | student | The caller's visible exams: their courses' (manager+: all; drafts of managed courses only) · paged |
 | GET    | `/exams/{id}`                    | student | Get exam (enrolled, creator, or manager+; a draft is a `404` for everyone but its course's managers) |
 | PATCH  | `/exams/{id}`                    | teacher | Edit exam incl. `kind` (re-weights it), schedule, `max_attempts`, `allow_rejoin`, `draft` (course manager; `course` immutable, `mode` frozen once attempted, re-drafting frozen once attempts/results exist — the rest stays live) |
-| DELETE | `/exams/{id}`                    | teacher | Delete exam + its results, attempts, questions, answers, and question images (course manager) |
+| DELETE | `/exams/{id}`                    | teacher | Delete exam + its results, attempts, questions, answers, and question + answer images (course manager) |
 | POST   | `/exams/{id}/results`            | teacher | `{mark, user_id}` — grade an **enrolled student** (upsert; course manager; students only; drafts can't be graded, `409`) |
 | GET    | `/exams/{id}/results`            | teacher | List every result for the exam (course manager) · paged |
 | GET    | `/exams/{id}/result`             | student | The caller's **own** result (`404` until graded) |
@@ -470,6 +470,10 @@ their existing shapes: the student exam-room reads
 | DELETE | `/exams/{id}/questions/{qid}/choices/{index}/image` | teacher | Remove one option picture (course manager; frozen once attempted) |
 | POST   | `/exams/{id}/attempt/answers`    | student | `{question_id, selected? \| text?}` — autosave one answer while a student, enrolled, and `in_progress` (and not locked out by a closed rejoin door) |
 | GET    | `/exams/{id}/attempts/{user}/answers` | teacher | A student's answer sheet: `is_correct` flags + suggested `auto_score` (course manager) |
+| POST   | `/exams/{id}/attempt/answers/{qid}/image` | student | Attach/replace the caller's drawn answer to a question: `multipart/form-data`, one `file` part — raster images only (`png`/`jpeg`/`webp`/`gif`), ≤ `max_file_bytes` (own in-progress attempt; students only, enrolled, rejoin door open) |
+| GET    | `/exams/{id}/attempt/answers/{qid}/image` | student | The caller's own drawn-answer bytes, served inline (same wall as the sitting view: enrolled + attempt started) |
+| DELETE | `/exams/{id}/attempt/answers/{qid}/image` | student | Clear the caller's own drawn answer (own in-progress attempt) |
+| GET    | `/exams/{id}/attempts/{user}/answers/{qid}/image` | teacher | A student's drawn-answer bytes, inline, for the grader (course manager) |
 | GET    | `/exams/{id}/attempt/ws`         | student | **WebSocket** exam room (students only): state ticks, autosave, finish; entering clears `left_at`, leaving stamps it (see "Taking an exam") |
 | GET    | `/exams/{id}/live`               | teacher | Live monitor snapshot: roster × latest attempts × marks + per-student progress/`left_at`/`attempts_used` + counts; no-shows turn `absent` once the window closes (course manager) |
 | GET    | `/exams/{id}/live/stream`        | teacher | The same snapshot as SSE `snapshot` events every ~2s (course manager) |
@@ -797,7 +801,7 @@ es.addEventListener("snapshot", (e) => render(JSON.parse(e.data)));
 ```
 
 Deleting an exam (or its course) cascades attempts, questions, answers, and
-question images (blobs included) along with results; unenrolling mid-exam
+question + answer images (blobs included) along with results; unenrolling mid-exam
 hides the student from the monitor roster but keeps the attempt and mark
 rows, mirroring the marks report.
 
@@ -885,6 +889,26 @@ clock on every save):
   while the student has left the exam room with `allow_rejoin` off; answers
   saved in time survive untouched for grading (until a retake wipes the sheet
   for the next sitting).
+
+**Answer images**: the student side mirrors the teacher's question images. A
+student may attach one **drawing** to any question in their attempt — a
+sketched answer or worked steps — via `POST
+/exams/{id}/attempt/answers/{qid}/image` (`multipart/form-data`, one `file`
+part, the same raster allowlist and `max_file_bytes` cap as question images).
+One image per question: re-uploading replaces, `DELETE` on the same path
+removes. Writes ride the exact `POST /exams/{id}/attempt/answers` gate — the
+student role, enrollment, an `in_progress` attempt, and the rejoin door — so a
+drawing is just another autosaved answer; a drawing-only answer (nothing
+typed) still surfaces, and clearing it grooms the empty row away. The bytes
+come from `GET` on the same path (the caller's own, behind the sitting-view
+wall) and, for the grader, `GET /exams/{id}/attempts/{user}/answers/{qid}/image`
+(course-management rights); both serve inline with `Cache-Control: private,
+no-store`. The metadata rides the answer as `answer_image: {content_type,
+size} | null` on both the sitting view and the grading sheet. To the backend
+it is a normal raster PNG; the frontend piggybacks its editable stroke data in
+a PNG `tEXt` chunk, opaque here — stored on disk under `Config::files_path`
+by a ULID, metadata in the `answer_image` table, structurally identical to
+question images.
 
 **Grading view** (course-management rights): `GET /exams/{id}/attempts/{user}/answers` returns
 the student's sheet — every saved answer with `is_correct` (`true`/`false` for
@@ -1129,6 +1153,8 @@ src/
                    auto_score (choice-question suggestion)
     exam_result.rs ExamResultId · Mark · ExamResult (one row per exam+user)
     question_image.rs QuestionImageId · QuestionImage (question/choice picture
+                   metadata; bytes on disk under FILES_PATH)
+    answer_image.rs AnswerImageId · AnswerImage (student answer-drawing
                    metadata; bytes on disk under FILES_PATH)
     profile.rs     PersonName · Email · Phone · BirthDate (personal-info newtypes)
     preferences.rs Theme · Language (own UI preferences)
