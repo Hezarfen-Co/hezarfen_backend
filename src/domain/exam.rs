@@ -213,17 +213,6 @@ impl ExamSchedule {
                 if ends_at <= starts_at {
                     return Err(invalid("ends_at", "must be after starts_at"));
                 }
-                if let (Some(duration), Some(starts), Some(ends)) =
-                    (duration_ms, starts_at, ends_at)
-                {
-                    let window_ms = ends.as_millis().saturating_sub(starts.as_millis());
-                    if duration.as_millis() > window_ms {
-                        return Err(invalid(
-                            "duration_ms",
-                            "must fit within the starts_at..ends_at window",
-                        ));
-                    }
-                }
                 match (m.as_str(), duration_ms.is_some()) {
                     ("async", false) => {
                         return Err(invalid("duration_ms", "required for an async exam"));
@@ -235,6 +224,21 @@ impl ExamSchedule {
                         ));
                     }
                     _ => {}
+                }
+                // Below the match on purpose: a `sync` exam carrying a
+                // duration is answered by the match's root cause (it takes no
+                // duration at all), not by how the duration compares to the
+                // window. Only `async` reaches here with one to compare.
+                if let (Some(duration), Some(starts), Some(ends)) =
+                    (duration_ms, starts_at, ends_at)
+                {
+                    let window_ms = ends.as_millis().saturating_sub(starts.as_millis());
+                    if duration.as_millis() > window_ms {
+                        return Err(invalid(
+                            "duration_ms",
+                            "must fit within the starts_at..ends_at window",
+                        ));
+                    }
                 }
             }
         }
@@ -563,7 +567,15 @@ mod tests {
         assert!(ExamSchedule::try_new(mode("sync"), at(1), at(2), None).is_ok());
         assert!(ExamSchedule::try_new(mode("sync"), None, at(2), None).is_err());
         assert!(ExamSchedule::try_new(mode("sync"), at(1), None, None).is_err());
-        assert!(ExamSchedule::try_new(mode("sync"), at(1), at(2), dur).is_err());
+        // Over-long `dur` in a 1ms window, but the root cause is that sync
+        // takes no duration at all — that message wins over the window one.
+        assert!(matches!(
+            ExamSchedule::try_new(mode("sync"), at(1), at(2), dur),
+            Err(ValidationError::Invalid {
+                reason: "only async and open exams take a duration",
+                ..
+            })
+        ));
 
         // Async: window plus a per-student duration, which must fit inside it
         // (equal to the window is fine; the window `at(1), at(2)` above is
