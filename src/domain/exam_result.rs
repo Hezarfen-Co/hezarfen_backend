@@ -145,6 +145,22 @@ impl ExamResult {
         Ok(result.take::<Vec<ExamResult>>(0)?)
     }
 
+    /// True iff any exam of `kind` has produced a mark — the settings guard
+    /// against removing an exam kind that grades already depend on (weights are
+    /// read live from settings, so dropping the kind would silently re-weight
+    /// those marks).
+    pub async fn any_for_kind(kind: &str, db: &Database) -> Result<bool, AppError> {
+        let mut result = db
+            .query(
+                "SELECT VALUE id FROM exam_result
+                 WHERE exam IN (SELECT VALUE id FROM exam WHERE kind = $kind) LIMIT 1",
+            )
+            .bind(("kind", kind.to_string()))
+            .await?
+            .check()?;
+        Ok(!result.take::<Vec<RecordId>>(0)?.is_empty())
+    }
+
     pub async fn list_for_exam(exam: &ExamId, db: &Database) -> Result<Vec<ExamResult>, AppError> {
         let mut result = db
             .query("SELECT * FROM exam_result WHERE exam = $ex ORDER BY id DESC")

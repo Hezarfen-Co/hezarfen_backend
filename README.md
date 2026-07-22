@@ -435,7 +435,7 @@ their existing shapes: the student exam-room reads
 | GET    | `/courses/me`                    | student | The caller's **enrolled** courses · paged |
 | GET    | `/courses/{id}`                  | student | Get course (enrolled, creator, assigned teacher, or manager+) |
 | PATCH  | `/courses/{id}`                  | teacher | Edit course incl. `kind` and `capacity` (`null` lifts the cap) (course manager) |
-| DELETE | `/courses/{id}`                  | teacher | Delete course + its exams, results, enrollments, subjects, and homework (submissions, files, and grades included) (creator, or manager+ — **not** an assigned teacher) |
+| DELETE | `/courses/{id}`                  | teacher | Delete course + its exams, results, subjects, sessions, and homework (submissions, files, and grades included) (creator, or manager+ — **not** an assigned teacher; `409` while anyone is still enrolled) |
 | POST   | `/courses/{id}/teachers`         | manager | `{user_id}` — assign a **teacher+** to run the course (idempotent; returns the course) |
 | DELETE | `/courses/{id}/teachers/{user}`  | manager | Unassign a teacher (`404` if they weren't assigned) |
 | POST   | `/courses/{id}/enrollments`      | teacher | `{user_id}` — enroll a **student** (idempotent upsert; course manager; only students can be enrolled; `409` once a capped course is full) |
@@ -535,12 +535,12 @@ their existing shapes: the student exam-room reads
 | GET    | `/attendance/me`                 | student | Own attendance report: events + sessions + per-course tallies |
 | GET    | `/attendance/{user}`             | teacher* | A user's attendance report, narrowed to the caller's courses (manager+: full); *or a `parent` linked to `{user}` — full |
 | GET    | `/settings`                      | student | The school's policy: `exam_kinds` (`{name, weight}` each), `attendance_statuses`, `grade_bands`, `max_file_bytes` |
-| PATCH  | `/settings`                      | manager | Replace any subset of the fields (lists wholesale); concurrent edits merge, never silently revert each other (see "Per-school policy") |
+| PATCH  | `/settings`                      | manager | Replace any subset of the fields (lists wholesale); concurrent edits merge, never silently revert each other; `409` when a removed exam kind still has graded exams (see "Per-school policy") |
 | POST   | `/terms`                         | manager | `{name, starts_at, ends_at}` — past dates allowed (calendar backfill) |
 | GET    | `/terms`                         | student | List terms, newest first · paged |
 | GET    | `/terms/{id}`                    | student | Get one term                    |
 | PATCH  | `/terms/{id}`                    | manager | Edit a term (the merged range must stay ordered) |
-| DELETE | `/terms/{id}`                    | manager | Delete a term — linked courses are unlinked, never deleted |
+| DELETE | `/terms/{id}`                    | manager | Delete a term — `409` while any course still links to it |
 
 `status` must be one of the school's attendance statuses (`GET /settings`);
 the core four `present | absent | late | excused` always exist, plus whatever
@@ -565,8 +565,10 @@ A course average is `Σ(mark×weight) / Σ(weight)` over the student's **graded*
 exams in that course (`null` while nothing is graded — ungraded exams are
 skipped, not zeroed). The overall average is the plain mean of the non-null
 course averages. Unenrolling keeps result rows: the marks drop out of the
-report until re-enrollment, but stay visible on the exam itself. Deleting a
-course cascades its exams, their results, all enrollments, and its subjects.
+report until re-enrollment, but stay visible on the exam itself. A course
+with anyone still on its roster refuses deletion (`409`) — empty the roster
+first; once empty, deleting it cascades its exams, their results, its
+sessions and roll call, and its subjects.
 A **subject** is one topic of a course's curriculum (`name` ≤ 200 chars,
 optional `description` ≤ 2000): every exam question carries a mandatory
 `subject_id` naming one of *its own course's* subjects (an unknown or
@@ -702,8 +704,10 @@ editable `settings` singleton (`GET /settings` for any signed-in user,
   final, project, oral`, all weighing `1` (a plain average); replace the
   list with whatever the school grades and weighs (`{"name": "final",
   "weight": 3}`, …). Reports resolve weights live: editing a weight
-  re-weights every exam of that kind at once, and an exam keeping a
-  since-removed kind counts with weight `1`.
+  re-weights every exam of that kind at once. For the same reason a kind
+  whose exams already carry marks cannot be removed from the list (`409`):
+  those marks would silently re-weight. An unmarked kind leaves freely, and
+  an exam keeping a since-removed kind counts with weight `1`.
 - **`attendance_statuses`** — what attendance marking accepts. The core four
   (`present`, `absent`, `late`, `excused`) are mandatory because the
   attendance rate is defined over them (`(present+late) /
@@ -731,7 +735,9 @@ retired status — only **new writes** are held to the current lists.
 Academic structure is data too. **Terms** (`/terms`) model whatever calendar
 the school runs — semester, trimester, quarter systems are just rows with a
 name and a date range. Courses may link to one via `term_id` (nullable), and
-deleting a term only unlinks its courses. Term dates may lie in the past,
+deleting a term is refused with a `409` while any course still links to it —
+unlink those courses (`PATCH /courses/{id}` with `"term_id": null`) or delete
+them first, so the calendar never disappears under them. Term dates may lie in the past,
 deliberately: a school adopting the app mid-year backfills its calendar —
 unlike exam/lesson/event times, which reject backdating.
 

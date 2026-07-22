@@ -12,7 +12,7 @@ use crate::database::Database;
 use crate::domain::answer_image::AnswerImage;
 use crate::domain::course::{Course, CourseDescription, CourseId, CourseKind, CourseTitle};
 use crate::domain::course_session::{CourseSession, SessionTopic};
-use crate::domain::enrollment::Enrollment;
+use crate::domain::enrollment::{ENROLL_LOCK, Enrollment};
 use crate::domain::exam::{
     Exam, ExamAttemptLimit, ExamDescription, ExamDuration, ExamKind, ExamMode, ExamSchedule,
     ExamTitle,
@@ -23,6 +23,7 @@ use crate::domain::question_image::QuestionImage;
 use crate::domain::role::Role;
 use crate::domain::settings::Settings;
 use crate::domain::subject::{Subject, SubjectDescription, SubjectName};
+use crate::domain::term::TERM_LOCK;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
@@ -266,6 +267,13 @@ async fn create_course(
         Some(ref kind) => CourseKind::try_new(kind)?,
         None => CourseKind::course(),
     };
+    // [`TERM_LOCK`] holds the term lookup and the save together, so the link
+    // can't be written onto a term a concurrent delete just cleared. Only a
+    // write that actually links a term needs it.
+    let _term_guard = match req.term_id {
+        Some(_) => Some(TERM_LOCK.lock().await),
+        None => None,
+    };
     let term = resolve_term(req.term_id.as_deref(), &st.db).await?;
     check_capacity(req.capacity)?;
     let course = Course::create(
@@ -429,6 +437,12 @@ async fn update_course(
         Some(ref kind) => CourseKind::try_new(kind)?,
         None => course.get_kind().clone(),
     };
+    // Same [`TERM_LOCK`] window as create — held over the lookup and the save
+    // whenever this PATCH links a term (clearing or omitting needs no guard).
+    let _term_guard = match req.term_id {
+        Some(Some(_)) => Some(TERM_LOCK.lock().await),
+        _ => None,
+    };
     let term = match req.term_id {
         // Explicit `null` clears the link; a value must name a real term.
         Some(update) => resolve_term(update.as_deref(), &st.db).await?,
@@ -451,10 +465,12 @@ async fn update_course(
 }
 
 /// Delete a course. Requires teacher+; only its creator or a manager/admin may
-/// delete it — an assigned teacher runs the course but does not own it. Cascades the course's exams (with
-/// their results, questions, answers, and question images), its homework (with
-/// submissions, submission files, and grades), its sessions and roll call, its
-/// subjects, and all enrollments.
+/// delete it — an assigned teacher runs the course but does not own it.
+/// Refused with a 409 while anyone is still enrolled — empty the roster first,
+/// so a course that carries students is never dropped by accident. Once empty,
+/// it cascades the course's exams (with their results, questions, answers, and
+/// question images), its homework (with submissions, submission files, and
+/// grades), its sessions and roll call, and its subjects.
 #[utoipa::path(
     delete,
     path = "/{id}",
@@ -466,6 +482,7 @@ async fn update_course(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 409, description = "Students are still enrolled in this course", body = ErrorResponse),
     ),
 )]
 async fn delete_course(
@@ -479,6 +496,15 @@ async fn delete_course(
     if !owns_course(&course, &user) {
         return Err(AppError::Forbidden(
             "only the course creator or a manager/admin can delete this course",
+        ));
+    }
+    // [`ENROLL_LOCK`] holds the roster check and the delete together, so an
+    // enroll that just passed its capacity check can't land its row on a
+    // course that vanished mid-flight.
+    let _guard = ENROLL_LOCK.lock().await;
+    if Enrollment::any_for_course(course.get_id(), &st.db).await? {
+        return Err(AppError::Conflict(
+            "students are still enrolled in this course — remove them first",
         ));
     }
     // Rows go first (the delete cascades them), blobs after — a crash in

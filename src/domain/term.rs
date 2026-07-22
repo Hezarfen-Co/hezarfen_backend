@@ -7,6 +7,7 @@
 //! rule that guards exams/lessons/events deliberately does not apply here.
 
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
+use tokio::sync::Mutex;
 use ulid::Ulid;
 
 use crate::constant::MAX_TERM_NAME_LEN;
@@ -14,6 +15,17 @@ use crate::database::{Database, TERM_TABLE};
 use crate::domain::timestamp::Timestamp;
 use crate::error::{AppError, ValidationError};
 use crate::validate::validate_required;
+
+/// Serializes the term delete guard (does any course still link it?) against
+/// the course writes that assign a term, so a course can't land on a term that
+/// is already on its way out. Course writes take it only when they actually
+/// link a term.
+///
+/// Lock order: no path ever holds this and `ENROLL_LOCK` at the same time — the
+/// course writes that take this one touch no roster, and the course delete that
+/// takes `ENROLL_LOCK` touches no term — so the two cannot deadlock. Should a
+/// future path need both, take `ENROLL_LOCK` first.
+pub(crate) static TERM_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct TermId(RecordId);
@@ -123,13 +135,20 @@ impl Term {
         updated.ok_or(AppError::NotFound)
     }
 
-    /// Delete the term. Courses keep existing — they just lose the link, so
-    /// deleting a term can never take a course (or its marks) with it.
-    pub async fn delete(self, db: &Database) -> Result<Term, AppError> {
-        db.query("UPDATE course SET term = NONE WHERE term = $term")
-            .bind(("term", self.id.record()))
+    /// True iff any course still links to this term — the delete guard.
+    pub async fn any_course(id: &TermId, db: &Database) -> Result<bool, AppError> {
+        let mut result = db
+            .query("SELECT VALUE id FROM course WHERE term = $term LIMIT 1")
+            .bind(("term", id.record()))
             .await?
             .check()?;
+        Ok(!result.take::<Vec<RecordId>>(0)?.is_empty())
+    }
+
+    /// Delete the term. Callers must refuse while [`Term::any_course`] holds —
+    /// nothing here unlinks or cascades, so a term is only ever dropped once no
+    /// course points at it.
+    pub async fn delete(self, db: &Database) -> Result<Term, AppError> {
         let deleted: Option<Term> = db.delete(self.id.record()).await?;
         deleted.ok_or(AppError::NotFound)
     }

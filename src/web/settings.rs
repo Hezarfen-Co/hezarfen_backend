@@ -6,10 +6,12 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::constant::SETTINGS_UPDATE_RETRIES;
+use crate::domain::exam_result::ExamResult;
 use crate::domain::settings::{ExamKindDef, GradeBand, Settings};
 use crate::error::{AppError, ErrorResponse};
 use crate::state::AppState;
 
+use super::exams::EXAM_LOCK;
 use super::{CurrentUser, RequireManager};
 
 pub fn routes() -> OpenApiRouter<AppState> {
@@ -133,8 +135,10 @@ async fn get_settings(
 /// untouched — a removed exam kind or status lives on in old records; only
 /// new writes are held to the new lists. Kind weights, though, apply live:
 /// mark reports read them at request time, so editing a weight re-weights
-/// every exam of that kind, and an exam whose kind was removed from the list
-/// counts with weight 1 until the kind returns. `max_file_bytes` likewise
+/// every exam of that kind. For that reason a kind whose exams already carry
+/// marks cannot be dropped from the list (409) — those marks would silently
+/// re-weight to 1; an unmarked kind leaves freely, and an exam whose kind is
+/// gone counts with weight 1 until the kind returns. `max_file_bytes` likewise
 /// applies at upload time only — already-stored files keep their size.
 #[utoipa::path(
     patch,
@@ -147,7 +151,7 @@ async fn get_settings(
         (status = 400, description = "Invalid lists, bands, or file limit", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
-        (status = 409, description = "Concurrent edits kept changing the settings mid-save", body = ErrorResponse),
+        (status = 409, description = "A removed exam kind still has graded exams, or concurrent edits kept changing the settings mid-save", body = ErrorResponse),
     ),
 )]
 async fn update_settings(
@@ -159,6 +163,13 @@ async fn update_settings(
     // otherwise a concurrent PATCH of a *different* field would be silently
     // reverted by whichever whole-row write lands second. A refused save
     // reloads and re-merges, so both edits land.
+    // Writer lease of [`EXAM_LOCK`] while the kind list is being replaced: the
+    // no-marks check below and the save are one unit, so a grade (a reader)
+    // can't land the first mark of a kind that is being dropped mid-flight.
+    let _guard = match req.exam_kinds {
+        Some(_) => Some(EXAM_LOCK.write().await),
+        None => None,
+    };
     for _ in 0..SETTINGS_UPDATE_RETRIES {
         let current = Settings::load(&st.db).await?;
 
@@ -169,6 +180,22 @@ async fn update_settings(
                 .collect::<Result<Vec<_>, _>>()?,
             None => current.get_exam_kinds().to_vec(),
         };
+        // A kind that graded exams still count under cannot leave the list —
+        // weights are read live, so dropping it would silently re-weight every
+        // mark of that kind. Re-checked on every retry: the snapshot it is
+        // diffed against is the one the save is conditioned on.
+        for gone in current.get_exam_kinds().iter().filter(|kind| {
+            !exam_kinds
+                .iter()
+                .any(|new| new.get_name() == kind.get_name())
+        }) {
+            if ExamResult::any_for_kind(gone.get_name(), &st.db).await? {
+                return Err(AppError::ConflictOwned(format!(
+                    "exams of kind '{}' are already graded — the kind cannot be removed",
+                    gone.get_name()
+                )));
+            }
+        }
         let attendance_statuses = req
             .attendance_statuses
             .clone()

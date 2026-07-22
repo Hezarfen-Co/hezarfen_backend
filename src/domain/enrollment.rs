@@ -9,7 +9,9 @@ use crate::error::AppError;
 /// Serializes enrolls so the capacity check (count, then write) can't
 /// over-admit under concurrency — the database's optimistic transactions
 /// don't serialize cross-record counts against concurrent inserts.
-static ENROLL_LOCK: Mutex<()> = Mutex::const_new(());
+/// It also serializes the roster check of a course delete against a concurrent
+/// enroll, so a student can't join a course that is already on its way out.
+pub(crate) static ENROLL_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct EnrollmentId(RecordId);
@@ -119,6 +121,16 @@ impl Enrollment {
             .await?
             .check()?;
         Ok(result.take::<Vec<Enrollment>>(0)?.into_iter().next())
+    }
+
+    /// True iff anyone is still on the course's roster — the delete guard.
+    pub async fn any_for_course(course: &CourseId, db: &Database) -> Result<bool, AppError> {
+        let mut result = db
+            .query("SELECT VALUE id FROM enrollment WHERE course = $course LIMIT 1")
+            .bind(("course", course.record()))
+            .await?
+            .check()?;
+        Ok(!result.take::<Vec<RecordId>>(0)?.is_empty())
     }
 
     pub async fn list_for_course(

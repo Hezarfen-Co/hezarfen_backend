@@ -7,7 +7,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::database::Database;
-use crate::domain::term::{Term, TermId, TermName};
+use crate::domain::term::{TERM_LOCK, Term, TermId, TermName};
 use crate::domain::timestamp::Timestamp;
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
@@ -209,8 +209,10 @@ async fn update_term(
     Ok(Json(TermResponse::new(&updated)))
 }
 
-/// Delete a term. Requires manager+. Courses linked to it survive — they just
-/// lose the term link.
+/// Delete a term. Requires manager+. Refused with a 409 while any course still
+/// links to it — unlink those courses (`PATCH /courses/{id}` with
+/// `"term_id": null`) or delete them first, so a term is never dropped out from
+/// under the calendar its courses hang on.
 #[utoipa::path(
     delete,
     path = "/{id}",
@@ -218,10 +220,11 @@ async fn update_term(
     security(("session_cookie" = [])),
     params(("id" = String, Path, description = "Term id")),
     responses(
-        (status = 204, description = "Deleted (courses unlinked)"),
+        (status = 204, description = "Deleted"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 409, description = "Courses are still linked to this term", body = ErrorResponse),
     ),
 )]
 async fn delete_term(
@@ -232,6 +235,14 @@ async fn delete_term(
     let term = Term::read(&TermId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
+    // [`TERM_LOCK`] holds the link check and the delete together, so a course
+    // write that just resolved this term can't land its link on a dead row.
+    let _guard = TERM_LOCK.lock().await;
+    if Term::any_course(term.get_id(), &st.db).await? {
+        return Err(AppError::Conflict(
+            "courses are still linked to this term — unlink them first",
+        ));
+    }
     term.delete(&st.db).await?;
     Ok(StatusCode::NO_CONTENT)
 }

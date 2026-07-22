@@ -357,6 +357,21 @@ pub async fn create_session(app: &Router, cookie: &str, course: &str, starts_at:
     id_of(&res.body)
 }
 
+/// Drop `user_id` from `course`'s roster as `cookie` (asserts 204). Deleting a
+/// course is refused while anyone is still enrolled, so cascade tests empty the
+/// roster first.
+pub async fn unenroll(app: &Router, cookie: &str, course: &str, user_id: &str) {
+    let res = send(
+        app,
+        "DELETE",
+        &format!("/courses/{course}/enrollments/{user_id}"),
+        Some(cookie),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "unenroll {user_id}");
+}
+
 /// Enroll `user_id` into `course` as `cookie` (asserts 200).
 pub async fn enroll(app: &Router, cookie: &str, course: &str, user_id: &str) {
     let res = send(
