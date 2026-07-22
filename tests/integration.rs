@@ -6,8 +6,8 @@ mod common;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use common::{
-    app_and_db, create_course, create_exam, create_exam_with, create_session, create_subject,
-    enroll, id_of, login, login_as, me_id, mem_app, send, set_role,
+    app_and_db, create_course, create_exam, create_exam_with, create_homework, create_session,
+    create_subject, enroll, id_of, login, login_as, me_id, mem_app, send, set_role,
 };
 use hezarfen_backend::domain::exam::ExamId;
 use hezarfen_backend::domain::exam_attempt::ExamAttempt;
@@ -12894,4 +12894,1384 @@ async fn pool_photo_reads_require_student_role() {
         StatusCode::FORBIDDEN,
         "parents can't read a solution photo"
     );
+}
+
+// --- homework -------------------------------------------------------------
+
+/// A teacher-run course with a subject and two enrolled students — the stage
+/// most homework tests play on.
+struct HwWorld {
+    teacher: String,
+    ali: String,
+    ali_id: String,
+    veli: String,
+    veli_id: String,
+    course: String,
+    subject: String,
+}
+
+async fn hw_world(app: &axum::Router, db: &hezarfen_backend::database::Database) -> HwWorld {
+    let teacher = login_as(app, db, "teacher", "teacher").await;
+    let ali = login(app, "ali").await;
+    let ali_id = me_id(app, &ali).await;
+    let veli = login(app, "veli").await;
+    let veli_id = me_id(app, &veli).await;
+    let course = create_course(app, &teacher, "math").await;
+    let subject = create_subject(app, &teacher, &course, "algebra").await;
+    enroll(app, &teacher, &course, &ali_id).await;
+    enroll(app, &teacher, &course, &veli_id).await;
+    HwWorld {
+        teacher,
+        ali,
+        ali_id,
+        veli,
+        veli_id,
+        course,
+        subject,
+    }
+}
+
+/// POST the caller's submission (optional text) to `hw` — no assertion.
+async fn submit_hw(app: &axum::Router, cookie: &str, hw: &str, text: Option<&str>) -> common::Res {
+    let body = match text {
+        Some(text) => json!({ "text": text }),
+        None => json!({}),
+    };
+    send(
+        app,
+        "POST",
+        &format!("/homework/{hw}/submission"),
+        Some(cookie),
+        Some(body),
+    )
+    .await
+}
+
+/// Upload `bytes` as a file onto the caller's submission to `hw` — no
+/// assertion. Parses the JSON body like `send`.
+async fn upload_hw_file(
+    app: &axum::Router,
+    cookie: &str,
+    hw: &str,
+    filename: &str,
+    content_type: &str,
+    bytes: &[u8],
+) -> common::Res {
+    let (status, _, body) = common::send_raw(
+        app,
+        "POST",
+        &format!("/homework/{hw}/submission/files"),
+        Some(cookie),
+        Some("multipart/form-data; boundary=hezarfen-test-boundary"),
+        common::multipart_file(filename, content_type, bytes),
+    )
+    .await;
+    let body = if body.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null)
+    };
+    common::Res {
+        status,
+        body,
+        cookie: None,
+    }
+}
+
+/// POST a grade for `user` onto `hw` — no assertion.
+async fn grade_hw(
+    app: &axum::Router,
+    cookie: &str,
+    hw: &str,
+    user: &str,
+    status: &str,
+    mark: Option<i64>,
+) -> common::Res {
+    let mut body = json!({ "user": user, "status": status });
+    if let Some(mark) = mark {
+        body["mark"] = json!(mark);
+    }
+    send(
+        app,
+        "POST",
+        &format!("/homework/{hw}/results"),
+        Some(cookie),
+        Some(body),
+    )
+    .await
+}
+
+/// Every stored homework-file blob name, straight from the table.
+async fn homework_blob_keys(db: &hezarfen_backend::database::Database) -> Vec<String> {
+    let mut result = db
+        .query("SELECT VALUE file FROM homework_file")
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    result.take::<Vec<String>>(0).unwrap()
+}
+
+/// Row count of `table`, straight from the database — a cascade must really
+/// delete, not merely hide behind the role checks.
+async fn hw_row_count(db: &hezarfen_backend::database::Database, table: &str) -> usize {
+    let mut result = db
+        .query(format!("SELECT VALUE id FROM {table}"))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    result
+        .take::<Vec<surrealdb::types::RecordId>>(0)
+        .unwrap()
+        .len()
+}
+
+/// Creation validates the due date (60s grace), the subject's course, the
+/// subset's enrollment, and the subset cap — and stays teacher-only.
+#[tokio::test]
+async fn homework_create_validates_due_subject_and_subset() {
+    let (app, db) = app_and_db().await;
+    let w = hw_world(&app, &db).await;
+    let now = Timestamp::now().as_millis();
+
+    // due_at beyond the 60s grace lies in the past — rejected.
+    let res = common::create_homework_with(
+        &app,
+        &w.teacher,
+        &w.course,
+        json!({ "title": "old", "subject_id": w.subject, "due_at": now - 120_000 }),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+
+    // The subject must belong to this very course.
+    let other_course = create_course(&app, &w.teacher, "physics").await;
+    let foreign = create_subject(&app, &w.teacher, &other_course, "optics").await;
+    let res = common::create_homework_with(
+        &app,
+        &w.teacher,
+        &w.course,
+        json!({ "title": "x", "subject_id": foreign, "due_at": now + 3_600_000 }),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+
+    // Every assigned student must be enrolled…
+    let mehmet = login(&app, "mehmet").await;
+    let mehmet_id = me_id(&app, &mehmet).await;
+    let res = common::create_homework_with(
+        &app,
+        &w.teacher,
+        &w.course,
+        json!({ "title": "x", "subject_id": w.subject, "due_at": now + 3_600_000,
+                "assigned": [mehmet_id] }),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+
+    // …and the subset caps at 200 names (checked before enrollment, so fakes
+    // trip it without 201 signups).
+    let fakes: Vec<String> = (0..201).map(|i| format!("01FAKE{i:020}")).collect();
+    let res = common::create_homework_with(
+        &app,
+        &w.teacher,
+        &w.course,
+        json!({ "title": "x", "subject_id": w.subject, "due_at": now + 3_600_000,
+                "assigned": fakes }),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+
+    // Students don't assign homework.
+    let res = common::create_homework_with(
+        &app,
+        &w.ali,
+        &w.course,
+        json!({ "title": "x", "subject_id": w.subject, "due_at": now + 3_600_000 }),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+
+    // Within the grace counts as "due now" — accepted, like a plain future one.
+    let res = common::create_homework_with(
+        &app,
+        &w.teacher,
+        &w.course,
+        json!({ "title": "just now", "subject_id": w.subject, "due_at": now - 30_000 }),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let hw = create_homework(
+        &app,
+        &w.teacher,
+        &w.course,
+        &w.subject,
+        "ch. 3",
+        now + 3_600_000,
+    )
+    .await;
+    let res = send(&app, "GET", &format!("/homework/{hw}"), Some(&w.ali), None).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["title"], "ch. 3");
+    assert_eq!(res.body["subject"], w.subject.as_str());
+    assert!(
+        res.body["assigned"].is_null(),
+        "whole-course stores no subset"
+    );
+}
+
+/// A subset assignment must never leak to the students it leaves out (404s,
+/// list omissions), off-course teachers are walled off, the cross-course list
+/// narrows per caller, and staff never submit.
+#[tokio::test]
+async fn homework_subset_hides_from_outsiders() {
+    let (app, db) = app_and_db().await;
+    let w = hw_world(&app, &db).await;
+    let now = Timestamp::now().as_millis();
+
+    let res = common::create_homework_with(
+        &app,
+        &w.teacher,
+        &w.course,
+        json!({ "title": "secret drill", "subject_id": w.subject, "due_at": now + 3_600_000,
+                "assigned": [w.ali_id] }),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let hw = id_of(&res.body);
+
+    // ali is named: both lists carry it and the fetch works.
+    let uri = format!("/courses/{}/homework", w.course);
+    let res = send(&app, "GET", &uri, Some(&w.ali), None).await;
+    assert_eq!(common::total(&res.body), 1);
+    let res = send(&app, "GET", "/homework", Some(&w.ali), None).await;
+    assert_eq!(common::total(&res.body), 1);
+    // veli is enrolled but unnamed: the homework must not even seem to exist.
+    let res = send(&app, "GET", &uri, Some(&w.veli), None).await;
+    assert_eq!(
+        common::total(&res.body),
+        0,
+        "unnamed student sees no subset"
+    );
+    let res = send(&app, "GET", "/homework", Some(&w.veli), None).await;
+    assert_eq!(common::total(&res.body), 0);
+    let res = send(&app, "GET", &format!("/homework/{hw}"), Some(&w.veli), None).await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND, "404, never a 403 leak");
+    let res = submit_hw(&app, &w.veli, &hw, Some("hi")).await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+
+    // A teacher without management rights over the course is walled off.
+    let rival = login_as(&app, &db, "rival", "teacher").await;
+    let res = send(&app, "GET", &format!("/homework/{hw}"), Some(&rival), None).await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/homework/{hw}"),
+        Some(&rival),
+        Some(json!({ "title": "hijack" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/homework/{hw}/submissions"),
+        Some(&rival),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    let res = grade_hw(&app, &rival, &hw, &w.ali_id, "done", None).await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/homework/{hw}"),
+        Some(&rival),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+
+    // The cross-course list narrows per caller: manager+ everything, an
+    // off-course teacher nothing, the managing teacher their course's rows.
+    let boss = login_as(&app, &db, "boss", "manager").await;
+    let res = send(&app, "GET", "/homework", Some(&boss), None).await;
+    assert_eq!(common::total(&res.body), 1);
+    let res = send(&app, "GET", "/homework", Some(&rival), None).await;
+    assert_eq!(common::total(&res.body), 0);
+    let res = send(&app, "GET", "/homework", Some(&w.teacher), None).await;
+    assert_eq!(common::total(&res.body), 1);
+
+    // Staff never submit — a 403 on the live role, whatever they can see.
+    let res = submit_hw(&app, &boss, &hw, Some("i am staff")).await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+    let res = submit_hw(&app, &w.teacher, &hw, Some("me neither")).await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+}
+
+/// PATCH re-checks a newly set due date and subject, refuses a narrowing that
+/// would orphan existing work (naming the blockers), and leaves stored past
+/// due dates alone on unrelated edits.
+#[tokio::test]
+async fn homework_patch_rechecks_and_blocks_orphaning() {
+    let (app, db) = app_and_db().await;
+    let w = hw_world(&app, &db).await;
+    let now = Timestamp::now().as_millis();
+    let res = common::create_homework_with(
+        &app,
+        &w.teacher,
+        &w.course,
+        json!({ "title": "drill", "subject_id": w.subject, "due_at": now + 3_600_000,
+                "assigned": [w.ali_id, w.veli_id] }),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let hw = id_of(&res.body);
+
+    // A newly set due date must not be past…
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/homework/{hw}"),
+        Some(&w.teacher),
+        Some(json!({ "due_at": now - 120_000 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+
+    // …and a new subject must be the course's own.
+    let other_course = create_course(&app, &w.teacher, "physics").await;
+    let foreign = create_subject(&app, &w.teacher, &other_course, "optics").await;
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/homework/{hw}"),
+        Some(&w.teacher),
+        Some(json!({ "subject_id": foreign })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+    let algebra2 = create_subject(&app, &w.teacher, &w.course, "algebra II").await;
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/homework/{hw}"),
+        Some(&w.teacher),
+        Some(json!({ "subject_id": algebra2 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["subject"], algebra2.as_str());
+
+    // ali submits; narrowing to veli alone would strand that work — refused,
+    // naming the blocker. Narrowing to exactly ali passes.
+    let res = submit_hw(&app, &w.ali, &hw, Some("done")).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/homework/{hw}"),
+        Some(&w.teacher),
+        Some(json!({ "assigned": [w.veli_id] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+    assert!(
+        res.body["error"].as_str().unwrap().contains(&w.ali_id),
+        "the 409 names whose work blocks: {}",
+        res.body
+    );
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/homework/{hw}"),
+        Some(&w.teacher),
+        Some(json!({ "assigned": [w.ali_id] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    // Widening back to the whole course always passes.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/homework/{hw}"),
+        Some(&w.teacher),
+        Some(json!({ "assigned": [] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert!(res.body["assigned"].is_null());
+
+    // A title-only edit on a graced, already-due homework keeps its stored
+    // due date without tripping the not-past check.
+    let old = create_homework(&app, &w.teacher, &w.course, &w.subject, "old", now - 30_000).await;
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/homework/{old}"),
+        Some(&w.teacher),
+        Some(json!({ "title": "renamed" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+}
+
+/// Submitting creates once (201) and edits in place after (200): the
+/// first-hand-in stamp is pinned, text is replaced whole (omitting clears),
+/// and withdrawal removes it all.
+#[tokio::test]
+async fn homework_submission_lifecycle_and_stamps() {
+    let (app, db) = app_and_db().await;
+    let w = hw_world(&app, &db).await;
+    let now = Timestamp::now().as_millis();
+    let hw = create_homework(
+        &app,
+        &w.teacher,
+        &w.course,
+        &w.subject,
+        "essay",
+        now + 3_600_000,
+    )
+    .await;
+
+    let uri = format!("/homework/{hw}/submission");
+    let res = send(&app, "GET", &uri, Some(&w.ali), None).await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND, "nothing submitted yet");
+
+    let res = submit_hw(&app, &w.ali, &hw, Some("draft one")).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    assert_eq!(res.body["text"], "draft one");
+    assert_eq!(res.body["late"], false);
+    let submitted_at = res.body["submitted_at"].as_i64().unwrap();
+
+    let res = submit_hw(&app, &w.ali, &hw, Some("draft two")).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["text"], "draft two");
+    assert_eq!(
+        res.body["submitted_at"].as_i64().unwrap(),
+        submitted_at,
+        "the first-submit stamp never moves"
+    );
+    assert!(res.body["updated_at"].as_i64().unwrap() >= submitted_at);
+
+    // The text rides whole in each submit: omitting it clears.
+    let res = submit_hw(&app, &w.ali, &hw, None).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert!(res.body["text"].is_null());
+
+    // Reads are strictly own: veli asking gets veli's (absent) submission.
+    let res = send(&app, "GET", &uri, Some(&w.ali), None).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert!(res.body["result"].is_null());
+    let res = send(&app, "GET", &uri, Some(&w.veli), None).await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+
+    // Withdrawal, twice: gone, then nothing left to withdraw.
+    let res = send(&app, "DELETE", &uri, Some(&w.ali), None).await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    let res = send(&app, "GET", &uri, Some(&w.ali), None).await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+    let res = send(&app, "DELETE", &uri, Some(&w.ali), None).await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+}
+
+/// The late flag is computed against `due_at` on every read, and the roster
+/// computes `missing` for unsubmitted-past-due rows — no sleeping: a graced
+/// creation plants the due date ~30s in the past.
+#[tokio::test]
+async fn homework_lateness_is_computed_across_due() {
+    let (app, db) = app_and_db().await;
+    let w = hw_world(&app, &db).await;
+    let now = Timestamp::now().as_millis();
+
+    let overdue = create_homework(
+        &app,
+        &w.teacher,
+        &w.course,
+        &w.subject,
+        "late one",
+        now - 30_000,
+    )
+    .await;
+    let res = submit_hw(&app, &w.ali, &overdue, Some("sorry")).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    assert_eq!(res.body["late"], true, "touched after due_at");
+
+    let open = create_homework(
+        &app,
+        &w.teacher,
+        &w.course,
+        &w.subject,
+        "open one",
+        now + 3_600_000,
+    )
+    .await;
+    let res = submit_hw(&app, &w.ali, &open, Some("early")).await;
+    assert_eq!(res.body["late"], false);
+
+    // The roster mirrors the flag and derives `missing` for veli, who never
+    // submitted — a computation, not a teacher verdict.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/homework/{overdue}/submissions"),
+        Some(&w.teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(common::total(&res.body), 2);
+    let rows = common::items(&res.body);
+    let ali_row = rows
+        .iter()
+        .find(|row| row["user"] == w.ali_id.as_str())
+        .unwrap();
+    assert_eq!(ali_row["submission"]["late"], true);
+    assert_eq!(ali_row["missing"], false);
+    assert_eq!(ali_row["unenrolled"], false);
+    let veli_row = rows
+        .iter()
+        .find(|row| row["user"] == w.veli_id.as_str())
+        .unwrap();
+    assert!(veli_row["submission"].is_null());
+    assert_eq!(veli_row["missing"], true, "unsubmitted past due");
+}
+
+/// Grading walls: students never grade, nobody grades themselves, and the
+/// target must exist, hold the student role, be enrolled, and be in the
+/// audience; the verdict set is closed and the mark bounded. A regrade
+/// overwrites its one row, and the student reads the verdict back.
+#[tokio::test]
+async fn homework_grading_gates_and_bounds() {
+    let (app, db) = app_and_db().await;
+    let w = hw_world(&app, &db).await;
+    let now = Timestamp::now().as_millis();
+    let res = common::create_homework_with(
+        &app,
+        &w.teacher,
+        &w.course,
+        json!({ "title": "drill", "subject_id": w.subject, "due_at": now + 3_600_000,
+                "assigned": [w.ali_id] }),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let hw = id_of(&res.body);
+    let teacher_id = me_id(&app, &w.teacher).await;
+
+    let res = grade_hw(&app, &w.ali, &hw, &w.ali_id, "done", None).await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "students never grade");
+    let res = grade_hw(&app, &w.teacher, &hw, &teacher_id, "done", None).await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "no self-grading");
+    let res = grade_hw(
+        &app,
+        &w.teacher,
+        &hw,
+        "01ZZZZZZZZZZZZZZZZZZZZZZZZ",
+        "done",
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "target must exist");
+    let rival = login_as(&app, &db, "rival", "teacher").await;
+    let rival_id = me_id(&app, &rival).await;
+    let res = grade_hw(&app, &w.teacher, &hw, &rival_id, "done", None).await;
+    assert_eq!(
+        res.status,
+        StatusCode::BAD_REQUEST,
+        "only students carry grades"
+    );
+    let mehmet = login(&app, "mehmet").await;
+    let mehmet_id = me_id(&app, &mehmet).await;
+    let res = grade_hw(&app, &w.teacher, &hw, &mehmet_id, "done", None).await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "must be enrolled");
+    let res = grade_hw(&app, &w.teacher, &hw, &w.veli_id, "done", None).await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "outside the audience");
+    let res = grade_hw(&app, &w.teacher, &hw, &w.ali_id, "late", None).await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "junk status");
+    let res = grade_hw(&app, &w.teacher, &hw, &w.ali_id, "done", Some(101)).await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "mark over 100");
+    let res = grade_hw(&app, &w.teacher, &hw, &w.ali_id, "done", Some(-1)).await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "negative mark");
+
+    // 200 upsert semantics: the regrade overwrites, never stacks.
+    let res = grade_hw(&app, &w.teacher, &hw, &w.ali_id, "incomplete", None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["status"], "incomplete");
+    assert!(res.body["mark"].is_null());
+    let res = grade_hw(&app, &w.teacher, &hw, &w.ali_id, "done", Some(85)).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["mark"], 85);
+    assert_eq!(hw_row_count(&db, "homework_result").await, 1);
+
+    // The student reads their own verdict; ungraded means 404, for anyone.
+    let uri = format!("/homework/{hw}/result");
+    let res = send(&app, "GET", &uri, Some(&w.ali), None).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["status"], "done");
+    assert_eq!(res.body["mark"], 85);
+    let res = send(&app, "GET", &uri, Some(&w.veli), None).await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+}
+
+/// A stored grade freezes the submission — text, files, withdrawal — until
+/// the teacher removes it; and work never handed in can be graded `missing`,
+/// a verdict the student reads from `/result` despite having no submission.
+#[tokio::test]
+async fn homework_grade_freezes_until_removed() {
+    let (app, db) = app_and_db().await;
+    let w = hw_world(&app, &db).await;
+    let now = Timestamp::now().as_millis();
+    let hw = create_homework(
+        &app,
+        &w.teacher,
+        &w.course,
+        &w.subject,
+        "essay",
+        now + 3_600_000,
+    )
+    .await;
+
+    let res = submit_hw(&app, &w.ali, &hw, Some("v1")).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let up = upload_hw_file(&app, &w.ali, &hw, "draft.txt", "text/plain", b"notes").await;
+    assert_eq!(up.status, StatusCode::CREATED, "{}", up.body);
+    let fid = id_of(&up.body);
+
+    let res = grade_hw(&app, &w.teacher, &hw, &w.ali_id, "incomplete", None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = submit_hw(&app, &w.ali, &hw, Some("v2")).await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "text frozen");
+    let res = upload_hw_file(&app, &w.ali, &hw, "late.txt", "text/plain", b"more").await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "file add frozen");
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/homework/{hw}/submission/files/{fid}"),
+        Some(&w.ali),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "file delete frozen");
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/homework/{hw}/submission"),
+        Some(&w.ali),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "withdrawal frozen");
+    // The grade rides on the student's own submission read.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/homework/{hw}/submission"),
+        Some(&w.ali),
+        None,
+    )
+    .await;
+    assert_eq!(res.body["result"]["status"], "incomplete");
+
+    // Un-grading reopens the work; a second removal finds nothing.
+    let uri = format!("/homework/{hw}/results/{}", w.ali_id);
+    let res = send(&app, "DELETE", &uri, Some(&w.teacher), None).await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    let res = submit_hw(&app, &w.ali, &hw, Some("v2")).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(&app, "DELETE", &uri, Some(&w.teacher), None).await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+
+    // Never-submitted work still takes a `missing` verdict, and `/result` is
+    // where its student reads it — the submission endpoints have nothing.
+    let res = grade_hw(&app, &w.teacher, &hw, &w.veli_id, "missing", None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/homework/{hw}/submission"),
+        Some(&w.veli),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/homework/{hw}/result"),
+        Some(&w.veli),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["status"], "missing");
+}
+
+/// Files round-trip: a photo-first upload auto-creates the submission, the
+/// owner and the managing teacher download the exact bytes as a forced
+/// attachment, file ids are scoped to their homework, other students see
+/// nothing, and a delete unlinks the blob.
+#[tokio::test]
+async fn homework_files_roundtrip_and_scope() {
+    let (app, db) = app_and_db().await;
+    let w = hw_world(&app, &db).await;
+    let now = Timestamp::now().as_millis();
+    let hw = create_homework(
+        &app,
+        &w.teacher,
+        &w.course,
+        &w.subject,
+        "photo hw",
+        now + 3_600_000,
+    )
+    .await;
+
+    let bytes = b"%PDF-1.4 homework \x00\x01".to_vec();
+    let up = upload_hw_file(&app, &w.ali, &hw, "odev.pdf", "application/pdf", &bytes).await;
+    assert_eq!(up.status, StatusCode::CREATED, "{}", up.body);
+    assert_eq!(up.body["name"], "odev.pdf");
+    assert_eq!(up.body["content_type"], "application/pdf");
+    assert_eq!(up.body["size"], bytes.len() as i64);
+    let fid = id_of(&up.body);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/homework/{hw}/submission"),
+        Some(&w.ali),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "photo-first auto-creates");
+    assert!(res.body["text"].is_null());
+    assert_eq!(res.body["files"].as_array().unwrap().len(), 1);
+
+    // Owner and managing teacher read the same bytes — always an attachment:
+    // homework files take any content type, so inline HTML/SVG would be XSS.
+    let file_uri = format!("/homework/{hw}/submission/files/{fid}");
+    for viewer in [&w.ali, &w.teacher] {
+        let (status, headers, body) =
+            common::send_raw(&app, "GET", &file_uri, Some(viewer), None, Vec::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, bytes);
+        assert_eq!(headers["content-type"], "application/pdf");
+        assert_eq!(
+            headers["content-disposition"],
+            "attachment; filename=\"odev.pdf\"; filename*=UTF-8''odev.pdf"
+        );
+    }
+    // The id only resolves under its own homework, and never for a classmate.
+    let other = create_homework(
+        &app,
+        &w.teacher,
+        &w.course,
+        &w.subject,
+        "other",
+        now + 3_600_000,
+    )
+    .await;
+    let (status, _, _) = common::send_raw(
+        &app,
+        "GET",
+        &format!("/homework/{other}/submission/files/{fid}"),
+        Some(&w.teacher),
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "scoped to its homework");
+    let (status, _, _) =
+        common::send_raw(&app, "GET", &file_uri, Some(&w.veli), None, Vec::new()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "classmates see nothing");
+
+    // Delete removes the row and unlinks the blob.
+    let keys = homework_blob_keys(&db).await;
+    assert_eq!(keys.len(), 1);
+    let res = send(&app, "DELETE", &file_uri, Some(&w.ali), None).await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    assert!(
+        !common::files_dir().join(&keys[0]).exists(),
+        "blob must be unlinked with its row"
+    );
+    let res = send(
+        &app,
+        "GET",
+        &format!("/homework/{hw}/submission"),
+        Some(&w.ali),
+        None,
+    )
+    .await;
+    assert_eq!(res.body["files"].as_array().unwrap().len(), 0);
+}
+
+/// File limits: empty uploads are rejected, the 11th file trips the cap, and
+/// the school's `max_file_bytes` bounds each file (413 over, 201 at).
+#[tokio::test]
+async fn homework_file_limits_follow_cap_and_settings() {
+    let (app, db) = app_and_db().await;
+    let w = hw_world(&app, &db).await;
+    let boss = login_as(&app, &db, "boss", "manager").await;
+    let now = Timestamp::now().as_millis();
+    let hw = create_homework(
+        &app,
+        &w.teacher,
+        &w.course,
+        &w.subject,
+        "many files",
+        now + 3_600_000,
+    )
+    .await;
+
+    let res = upload_hw_file(&app, &w.ali, &hw, "empty.txt", "text/plain", b"").await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+
+    for i in 0..10 {
+        let res = upload_hw_file(&app, &w.ali, &hw, &format!("f{i}.txt"), "text/plain", b"x").await;
+        assert_eq!(res.status, StatusCode::CREATED, "file {i}: {}", res.body);
+    }
+    let res = upload_hw_file(&app, &w.ali, &hw, "f10.txt", "text/plain", b"x").await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+    assert_eq!(
+        homework_blob_keys(&db).await.len(),
+        10,
+        "the losing upload leaves no row"
+    );
+
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&boss),
+        Some(json!({ "max_file_bytes": 1024 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    let hw2 = create_homework(
+        &app,
+        &w.teacher,
+        &w.course,
+        &w.subject,
+        "sized",
+        now + 3_600_000,
+    )
+    .await;
+    let res = upload_hw_file(&app, &w.ali, &hw2, "big.bin", "", &vec![7u8; 1025]).await;
+    assert_eq!(res.status, StatusCode::PAYLOAD_TOO_LARGE, "{}", res.body);
+    let res = upload_hw_file(&app, &w.ali, &hw2, "fits.bin", "", &vec![7u8; 1024]).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    assert_eq!(res.body["content_type"], "application/octet-stream");
+}
+
+/// The roster carries the whole audience — and keeps a straggler's work
+/// visible (flagged `unenrolled`) instead of letting it vanish; a subset
+/// roster lists the named students only; the list pages.
+#[tokio::test]
+async fn homework_roster_covers_audience_and_stragglers() {
+    let (app, db) = app_and_db().await;
+    let w = hw_world(&app, &db).await;
+    let now = Timestamp::now().as_millis();
+
+    let hw = create_homework(
+        &app,
+        &w.teacher,
+        &w.course,
+        &w.subject,
+        "for all",
+        now + 3_600_000,
+    )
+    .await;
+    let roster_uri = format!("/homework/{hw}/submissions");
+    let res = send(&app, "GET", &roster_uri, Some(&w.teacher), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(common::total(&res.body), 2, "whole course, both enrolled");
+
+    // ali submits, then leaves the course: the work stays on the roster,
+    // flagged — and grading the straggler is refused.
+    let res = submit_hw(&app, &w.ali, &hw, Some("mine")).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/courses/{}/enrollments/{}", w.course, w.ali_id),
+        Some(&w.teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    let res = send(&app, "GET", &roster_uri, Some(&w.teacher), None).await;
+    assert_eq!(common::total(&res.body), 2, "the straggler's work stays");
+    let rows = common::items(&res.body);
+    let ali_row = rows
+        .iter()
+        .find(|row| row["user"] == w.ali_id.as_str())
+        .unwrap();
+    assert_eq!(ali_row["unenrolled"], true);
+    assert_eq!(ali_row["submission"]["text"], "mine");
+    let res = grade_hw(&app, &w.teacher, &hw, &w.ali_id, "done", None).await;
+    assert_eq!(
+        res.status,
+        StatusCode::BAD_REQUEST,
+        "no grading the unenrolled"
+    );
+
+    // The roster pages like every list.
+    let res = send(
+        &app,
+        "GET",
+        &format!("{roster_uri}?limit=1&offset=1"),
+        Some(&w.teacher),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 2);
+    assert_eq!(common::items(&res.body).len(), 1);
+    assert_eq!(res.body["limit"], 1);
+    assert_eq!(res.body["offset"], 1);
+
+    // A subset roster is the named students, nobody else.
+    enroll(&app, &w.teacher, &w.course, &w.ali_id).await;
+    let res = common::create_homework_with(
+        &app,
+        &w.teacher,
+        &w.course,
+        json!({ "title": "subset", "subject_id": w.subject, "due_at": now + 3_600_000,
+                "assigned": [w.ali_id] }),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let subset_hw = id_of(&res.body);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/homework/{subset_hw}/submissions"),
+        Some(&w.teacher),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 1);
+    assert_eq!(common::items(&res.body)[0]["user"], w.ali_id.as_str());
+}
+
+/// The observer report: full for manager+ and a linked parent, narrowed to
+/// managed courses for a teacher, walled for everyone else — and it carries
+/// statuses, marks, and flags, never file bytes.
+#[tokio::test]
+async fn homework_report_serves_observers_only() {
+    let (app, db) = app_and_db().await;
+    let w = hw_world(&app, &db).await;
+    let admin = login_as(&app, &db, "boss", "admin").await;
+    let now = Timestamp::now().as_millis();
+
+    // A second course under another teacher; ali sits in both.
+    let rival = login_as(&app, &db, "rival", "teacher").await;
+    let course2 = create_course(&app, &rival, "physics").await;
+    let subject2 = create_subject(&app, &rival, &course2, "optics").await;
+    enroll(&app, &rival, &course2, &w.ali_id).await;
+
+    // Three states across the two courses: graded, submitted-late, missing.
+    let graded = create_homework(
+        &app,
+        &w.teacher,
+        &w.course,
+        &w.subject,
+        "graded",
+        now + 3_600_000,
+    )
+    .await;
+    let res = submit_hw(&app, &w.ali, &graded, Some("done")).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let res = grade_hw(&app, &w.teacher, &graded, &w.ali_id, "done", Some(90)).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let overdue = create_homework(&app, &rival, &course2, &subject2, "overdue", now - 30_000).await;
+    let res = submit_hw(&app, &w.ali, &overdue, Some("late")).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let missing = create_homework(&app, &rival, &course2, &subject2, "skipped", now - 30_000).await;
+
+    // The admin reads all three rows, each in its computed state.
+    let report_uri = format!("/homework/report/{}", w.ali_id);
+    let res = send(&app, "GET", &report_uri, Some(&admin), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(common::total(&res.body), 3);
+    let rows = common::items(&res.body);
+    let graded_row = rows
+        .iter()
+        .find(|row| row["homework"] == graded.as_str())
+        .unwrap();
+    assert_eq!(graded_row["submitted"], true);
+    assert_eq!(graded_row["late"], false);
+    assert_eq!(graded_row["result"]["status"], "done");
+    assert_eq!(graded_row["result"]["mark"], 90);
+    let late_row = rows
+        .iter()
+        .find(|row| row["homework"] == overdue.as_str())
+        .unwrap();
+    assert_eq!(late_row["late"], true);
+    assert_eq!(late_row["missing"], false);
+    assert!(late_row["result"].is_null());
+    let missing_row = rows
+        .iter()
+        .find(|row| row["homework"] == missing.as_str())
+        .unwrap();
+    assert_eq!(missing_row["submitted"], false);
+    assert_eq!(missing_row["missing"], true);
+
+    // A teacher reads only the slice they manage.
+    let res = send(&app, "GET", &report_uri, Some(&w.teacher), None).await;
+    assert_eq!(common::total(&res.body), 1);
+    assert_eq!(common::items(&res.body)[0]["course"], w.course.as_str());
+
+    // A linked parent reads all of it (paged like every list)…
+    let mom = login_as(&app, &db, "mom", "parent").await;
+    let mom_id = me_id(&app, &mom).await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/users/{mom_id}/students"),
+        Some(&admin),
+        Some(json!({ "user_id": w.ali_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(&app, "GET", &report_uri, Some(&mom), None).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(common::total(&res.body), 3);
+    let res = send(
+        &app,
+        "GET",
+        &format!("{report_uri}?limit=2&offset=2"),
+        Some(&mom),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 3);
+    assert_eq!(common::items(&res.body).len(), 1);
+
+    // …but never the underlying work: no submission reads, no file bytes.
+    let up = upload_hw_file(&app, &w.ali, &overdue, "p.png", "image/png", b"png").await;
+    assert_eq!(up.status, StatusCode::CREATED, "{}", up.body);
+    let fid = id_of(&up.body);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/homework/{overdue}/submission"),
+        Some(&mom),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    let (status, _, _) = common::send_raw(
+        &app,
+        "GET",
+        &format!("/homework/{overdue}/submission/files/{fid}"),
+        Some(&mom),
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "reports, never bytes");
+
+    // Unlinked parent, the student themselves, and a ghost target all fail.
+    let dad = login_as(&app, &db, "dad", "parent").await;
+    let res = send(&app, "GET", &report_uri, Some(&dad), None).await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "unlinked parent");
+    let res = send(&app, "GET", &report_uri, Some(&w.ali), None).await;
+    assert_eq!(
+        res.status,
+        StatusCode::FORBIDDEN,
+        "self-reads use /homework"
+    );
+    let res = send(
+        &app,
+        "GET",
+        "/homework/report/01ZZZZZZZZZZZZZZZZZZZZZZZZ",
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+}
+
+/// Every delete path collects its garbage: withdrawing a submission, deleting
+/// a homework, and deleting the whole course each remove the database rows
+/// *and* the blobs on disk.
+#[tokio::test]
+async fn homework_gc_removes_rows_and_blobs() {
+    let (app, db) = app_and_db().await;
+    let w = hw_world(&app, &db).await;
+    let now = Timestamp::now().as_millis();
+
+    let hw1 = create_homework(
+        &app,
+        &w.teacher,
+        &w.course,
+        &w.subject,
+        "one",
+        now + 3_600_000,
+    )
+    .await;
+    let hw2 = create_homework(
+        &app,
+        &w.teacher,
+        &w.course,
+        &w.subject,
+        "two",
+        now + 3_600_000,
+    )
+    .await;
+    for (cookie, hw, name) in [
+        (&w.ali, &hw1, "a.txt"),
+        (&w.veli, &hw1, "b.txt"),
+        (&w.ali, &hw2, "c.txt"),
+    ] {
+        let res = upload_hw_file(&app, cookie, hw, name, "text/plain", b"data").await;
+        assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    }
+    let res = grade_hw(&app, &w.teacher, &hw1, &w.veli_id, "done", None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let keys = homework_blob_keys(&db).await;
+    assert_eq!(keys.len(), 3);
+    for key in &keys {
+        assert!(common::files_dir().join(key).exists(), "blob {key} on disk");
+    }
+
+    // Withdrawing a submission takes its file rows and blobs.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/homework/{hw2}/submission"),
+        Some(&w.ali),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    let remaining = homework_blob_keys(&db).await;
+    assert_eq!(remaining.len(), 2);
+    for gone in keys.iter().filter(|key| !remaining.contains(key)) {
+        assert!(
+            !common::files_dir().join(gone).exists(),
+            "withdrawn blob {gone} must be unlinked"
+        );
+    }
+
+    // Deleting the homework cascades submissions, files, and grades — blobs
+    // included.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/homework/{hw1}"),
+        Some(&w.teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    assert_eq!(hw_row_count(&db, "homework_submission").await, 0);
+    assert_eq!(hw_row_count(&db, "homework_file").await, 0);
+    assert_eq!(hw_row_count(&db, "homework_result").await, 0);
+    assert_eq!(hw_row_count(&db, "homework").await, 1, "hw2 remains");
+    for key in &remaining {
+        assert!(
+            !common::files_dir().join(key).exists(),
+            "blob {key} must die with the homework"
+        );
+    }
+
+    // Deleting the course takes everything left.
+    let res = upload_hw_file(&app, &w.ali, &hw2, "d.txt", "text/plain", b"data").await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let res = grade_hw(&app, &w.teacher, &hw2, &w.veli_id, "missing", None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let keys = homework_blob_keys(&db).await;
+    assert_eq!(keys.len(), 1);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/courses/{}", w.course),
+        Some(&w.teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    for table in [
+        "homework",
+        "homework_submission",
+        "homework_file",
+        "homework_result",
+    ] {
+        assert_eq!(
+            hw_row_count(&db, table).await,
+            0,
+            "{table} died with course"
+        );
+    }
+    for key in &keys {
+        assert!(
+            !common::files_dir().join(key).exists(),
+            "blob {key} must die with the course"
+        );
+    }
+}
+
+/// A promotion sweeps the enrollment but never the homework rows; the gates
+/// re-read the live role and deny, and the roster keeps the stale work
+/// visible, flagged `unenrolled`.
+#[tokio::test]
+async fn homework_rows_survive_promotion_but_gates_deny() {
+    let (app, db) = app_and_db().await;
+    let w = hw_world(&app, &db).await;
+    let admin = login_as(&app, &db, "boss", "admin").await;
+    let now = Timestamp::now().as_millis();
+    let hw = create_homework(
+        &app,
+        &w.teacher,
+        &w.course,
+        &w.subject,
+        "before",
+        now + 3_600_000,
+    )
+    .await;
+    let res = submit_hw(&app, &w.ali, &hw, Some("as a student")).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let res = grade_hw(&app, &w.teacher, &hw, &w.ali_id, "done", Some(70)).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/users/{}/role", w.ali_id),
+        Some(&admin),
+        Some(json!({ "role": "teacher" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(hw_row_count(&db, "homework_submission").await, 1);
+    assert_eq!(hw_row_count(&db, "homework_result").await, 1);
+
+    // Live-role gates: no submission access, no fresh grades onto staff.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/homework/{hw}/submission"),
+        Some(&w.ali),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    let res = submit_hw(&app, &w.ali, &hw, Some("as staff")).await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    let res = grade_hw(&app, &w.teacher, &hw, &w.ali_id, "done", None).await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "no longer a student");
+
+    // The roster keeps the stale work, flagged (the promotion swept the
+    // enrollment).
+    let res = send(
+        &app,
+        "GET",
+        &format!("/homework/{hw}/submissions"),
+        Some(&w.teacher),
+        None,
+    )
+    .await;
+    let rows = common::items(&res.body);
+    let row = rows
+        .iter()
+        .find(|row| row["user"] == w.ali_id.as_str())
+        .unwrap();
+    assert_eq!(row["unenrolled"], true);
+    assert_eq!(row["result"]["mark"], 70);
+}
+
+/// A subject with homework can't be deleted (409 naming homework) until the
+/// homework is re-tagged or removed — the guard the exam questions already
+/// have.
+#[tokio::test]
+async fn homework_blocks_subject_delete_until_retagged() {
+    let (app, db) = app_and_db().await;
+    let w = hw_world(&app, &db).await;
+    let now = Timestamp::now().as_millis();
+    let hw = create_homework(
+        &app,
+        &w.teacher,
+        &w.course,
+        &w.subject,
+        "tagged",
+        now + 3_600_000,
+    )
+    .await;
+
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/subjects/{}", w.subject),
+        Some(&w.teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+    assert!(
+        res.body["error"].as_str().unwrap().contains("homework"),
+        "{}",
+        res.body
+    );
+
+    // Re-tagging frees the old subject and guards the new one.
+    let second = create_subject(&app, &w.teacher, &w.course, "geometry").await;
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/homework/{hw}"),
+        Some(&w.teacher),
+        Some(json!({ "subject_id": second })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/subjects/{}", w.subject),
+        Some(&w.teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/subjects/{second}"),
+        Some(&w.teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT);
+}
+
+/// The two homework lists page through the standard envelope.
+#[tokio::test]
+async fn homework_lists_paginate() {
+    let (app, db) = app_and_db().await;
+    let w = hw_world(&app, &db).await;
+    let now = Timestamp::now().as_millis();
+    for i in 0..3 {
+        create_homework(
+            &app,
+            &w.teacher,
+            &w.course,
+            &w.subject,
+            &format!("hw {i}"),
+            now + 3_600_000,
+        )
+        .await;
+    }
+    for uri in [
+        format!("/courses/{}/homework?limit=2&offset=2", w.course),
+        "/homework?limit=2&offset=2".to_string(),
+    ] {
+        let res = send(&app, "GET", &uri, Some(&w.ali), None).await;
+        assert_eq!(res.status, StatusCode::OK, "{uri}");
+        assert_eq!(common::total(&res.body), 3, "{uri}");
+        assert_eq!(common::items(&res.body).len(), 1, "{uri}");
+        assert_eq!(res.body["limit"], 2);
+        assert_eq!(res.body["offset"], 2);
+    }
 }
