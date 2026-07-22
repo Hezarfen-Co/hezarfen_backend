@@ -50,6 +50,10 @@ pub const TERM_TABLE: &str = "term";
 pub const SUBJECT_TABLE: &str = "subject";
 pub const POOL_QUESTION_TABLE: &str = "pool_question";
 pub const SOLUTION_TABLE: &str = "solution";
+pub const HOMEWORK_TABLE: &str = "homework";
+pub const HOMEWORK_SUBMISSION_TABLE: &str = "homework_submission";
+pub const HOMEWORK_FILE_TABLE: &str = "homework_file";
+pub const HOMEWORK_RESULT_TABLE: &str = "homework_result";
 
 /// SCHEMAFULL schema: every column is typed, references use `record<..>`.
 /// Idempotent — safe to run on every boot: `IF NOT EXISTS` guards the
@@ -307,6 +311,50 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS grade_bands.*.min ON settings TYPE int;
     DEFINE FIELD IF NOT EXISTS grade_bands.*.label ON settings TYPE string;
     DEFINE FIELD IF NOT EXISTS max_file_bytes ON settings TYPE option<int>;
+
+    -- Homework (greenfield, 2026-07-22): a teacher assigns per course, students
+    -- submit files + optional text, a teacher grades a status + optional mark.
+    -- `course`/`created_by`/`created_at` are READONLY (a homework never moves
+    -- course, and stamps never rewrite); `subject` is NOT — it is re-taggable
+    -- via PATCH. `assigned` NONE/empty means the whole course. No BACKFILL: the
+    -- tables are new, so the whole migration stays additive and idempotent.
+    DEFINE TABLE IF NOT EXISTS homework SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS course ON homework TYPE record<course> READONLY;
+    DEFINE FIELD IF NOT EXISTS subject ON homework TYPE record<subject>;
+    DEFINE FIELD IF NOT EXISTS title ON homework TYPE string;
+    DEFINE FIELD IF NOT EXISTS description ON homework TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS due_at ON homework TYPE int;
+    DEFINE FIELD IF NOT EXISTS assigned ON homework TYPE option<array<record<user>>>;
+    DEFINE FIELD IF NOT EXISTS assigned[*] ON homework TYPE record<user>;
+    DEFINE FIELD IF NOT EXISTS created_by ON homework TYPE record<user> READONLY;
+    DEFINE FIELD IF NOT EXISTS created_at ON homework TYPE int READONLY;
+    DEFINE INDEX IF NOT EXISTS homework_course ON homework FIELDS course;
+
+    DEFINE TABLE IF NOT EXISTS homework_submission SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS homework ON homework_submission TYPE record<homework> READONLY;
+    DEFINE FIELD IF NOT EXISTS user ON homework_submission TYPE record<user> READONLY;
+    DEFINE FIELD IF NOT EXISTS text ON homework_submission TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS submitted_at ON homework_submission TYPE int READONLY;
+    DEFINE FIELD IF NOT EXISTS updated_at ON homework_submission TYPE int;
+    DEFINE INDEX IF NOT EXISTS homework_submission_homework ON homework_submission FIELDS homework;
+
+    DEFINE TABLE IF NOT EXISTS homework_file SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS submission ON homework_file TYPE record<homework_submission> READONLY;
+    DEFINE FIELD IF NOT EXISTS name ON homework_file TYPE string;
+    DEFINE FIELD IF NOT EXISTS content_type ON homework_file TYPE string;
+    DEFINE FIELD IF NOT EXISTS size ON homework_file TYPE int;
+    DEFINE FIELD IF NOT EXISTS file ON homework_file TYPE string READONLY;
+    DEFINE FIELD IF NOT EXISTS created_at ON homework_file TYPE int READONLY;
+    DEFINE INDEX IF NOT EXISTS homework_file_submission ON homework_file FIELDS submission;
+
+    DEFINE TABLE IF NOT EXISTS homework_result SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS homework ON homework_result TYPE record<homework> READONLY;
+    DEFINE FIELD IF NOT EXISTS user ON homework_result TYPE record<user> READONLY;
+    DEFINE FIELD IF NOT EXISTS status ON homework_result TYPE string;
+    DEFINE FIELD IF NOT EXISTS mark ON homework_result TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS graded_by ON homework_result TYPE record<user>;
+    DEFINE FIELD IF NOT EXISTS created_at ON homework_result TYPE int;
+    DEFINE INDEX IF NOT EXISTS homework_result_homework ON homework_result FIELDS homework;
 ";
 
 /// Data backfills for rows written by older binaries. Runs *after* (and apart

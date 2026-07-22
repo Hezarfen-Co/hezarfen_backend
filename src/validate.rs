@@ -2,10 +2,11 @@
 //! the value, so an existing newtype is always valid (parse, don't validate).
 
 use crate::constant::{
-    COURSE_KINDS, EXAM_MODES, MAX_EMAIL_LEN, MAX_EXAM_ATTEMPTS, MAX_EXAM_DURATION_MS, MAX_MARK,
-    MAX_PASSWORD_LEN, MAX_PHONE_DIGITS, MAX_QUESTION_POINTS, MAX_USERNAME_LEN,
-    MIN_EXAM_DURATION_MS, MIN_MARK, MIN_PASSWORD_LEN, MIN_PHONE_DIGITS, MIN_QUESTION_POINTS,
-    MIN_USERNAME_LEN, QUESTION_KINDS, UNLIMITED_EXAM_ATTEMPTS, USERNAME_SEPARATORS,
+    COURSE_KINDS, EXAM_MODES, HOMEWORK_STATUSES, MAX_EMAIL_LEN, MAX_EXAM_ATTEMPTS,
+    MAX_EXAM_DURATION_MS, MAX_MARK, MAX_PASSWORD_LEN, MAX_PHONE_DIGITS, MAX_QUESTION_POINTS,
+    MAX_USERNAME_LEN, MIN_EXAM_DURATION_MS, MIN_MARK, MIN_PASSWORD_LEN, MIN_PHONE_DIGITS,
+    MIN_QUESTION_POINTS, MIN_USERNAME_LEN, QUESTION_KINDS, UNLIMITED_EXAM_ATTEMPTS,
+    USERNAME_SEPARATORS,
 };
 use crate::error::ValidationError;
 
@@ -215,6 +216,17 @@ pub fn validate_exam_mode(value: &str) -> Result<(), ValidationError> {
         Err(ValidationError::Invalid {
             field: "mode",
             reason: "must be one of: sync, async, open",
+        })
+    }
+}
+
+pub fn validate_homework_status(value: &str) -> Result<(), ValidationError> {
+    if HOMEWORK_STATUSES.contains(&value) {
+        Ok(())
+    } else {
+        Err(ValidationError::Invalid {
+            field: "status",
+            reason: "must be one of: done, incomplete, missing",
         })
     }
 }
