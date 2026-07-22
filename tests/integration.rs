@@ -7,7 +7,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use common::{
     app_and_db, create_course, create_exam, create_exam_with, create_homework, create_session,
-    create_subject, enroll, id_of, login, login_as, me_id, mem_app, send, set_role,
+    create_subject, enroll, id_of, login, login_as, me_id, mem_app, send, set_role, unenroll,
 };
 use hezarfen_backend::domain::exam::ExamId;
 use hezarfen_backend::domain::exam_attempt::ExamAttempt;
@@ -3127,6 +3127,8 @@ async fn kind_weight_edits_reweight_reports_live() {
     enroll(&app, &teacher, &course, &alice_id).await;
     let quiz = create_exam(&app, &teacher, &course, "q", "quiz").await;
     let oral = create_exam(&app, &teacher, &course, "o", "oral").await;
+    // Ungraded for now — its kind gets retired below, out from under it.
+    let project = create_exam(&app, &teacher, &course, "p", "project").await;
     for (exam, mark) in [(&quiz, 40), (&oral, 80)] {
         let res = send(
             &app,
@@ -3160,26 +3162,30 @@ async fn kind_weight_edits_reweight_reports_live() {
     let report = send(&app, "GET", "/marks/me", Some(&alice), None).await;
     assert_eq!(report.body["courses"][0]["average"], 70.0);
 
-    // Retire the oral kind altogether: its exam keeps counting, weight 1.
+    // The PATCH above also retired `project` (allowed — no marks of that kind
+    // existed yet; a graded kind can't leave at all, see
+    // `exam_kind_removal_blocks_while_marks_exist`). Its exam lives on and
+    // counts with weight 1.
     let res = send(
         &app,
-        "PATCH",
-        "/settings",
-        Some(&manager),
-        Some(json!({ "exam_kinds": [{"name": "quiz", "weight": 1}] })),
+        "POST",
+        &format!("/exams/{project}/results"),
+        Some(&teacher),
+        Some(json!({ "mark": 60, "user_id": alice_id })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK);
+    // (40 + 240 + 60) / 5 = 68.
     let report = send(&app, "GET", "/marks/me", Some(&alice), None).await;
-    assert_eq!(report.body["courses"][0]["average"], 60.0);
-    let oral_entry = report.body["courses"][0]["results"]
+    assert_eq!(report.body["courses"][0]["average"], 68.0);
+    let project_entry = report.body["courses"][0]["results"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|entry| entry["kind"] == "oral")
+        .find(|entry| entry["kind"] == "project")
         .unwrap()
         .clone();
-    assert_eq!(oral_entry["weight"], 1);
+    assert_eq!(project_entry["weight"], 1);
 }
 
 #[tokio::test]
@@ -3345,6 +3351,7 @@ async fn deleting_course_cascades_enrollments_exams_and_results() {
     )
     .await;
 
+    unenroll(&app, &teacher, &course_id, &alice_id).await;
     assert_eq!(
         send(
             &app,
@@ -6561,6 +6568,7 @@ async fn attempts_cascade_with_exam_and_course_deletion() {
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED);
+    unenroll(&app, &teacher, &course, &student_id).await;
     let res = send(
         &app,
         "DELETE",
@@ -8429,6 +8437,7 @@ async fn questions_and_answers_cascade_with_deletes() {
     .await;
     assert_eq!(res.status, StatusCode::OK);
 
+    unenroll(&app, &teacher, &course, &student_id).await;
     let res = send(
         &app,
         "DELETE",
@@ -9235,6 +9244,7 @@ async fn deleting_session_or_course_cascades_roll_call() {
     assert_eq!(report.body["sessions"]["total"], 1);
 
     // ...and deleting the course removes the rest, sessions included.
+    unenroll(&app, &owner, &course, &ali_id).await;
     let res = send(
         &app,
         "DELETE",
@@ -10286,7 +10296,26 @@ async fn terms_crud_gates_and_links_to_courses() {
     .await;
     assert_eq!(res.body["term"].as_str(), Some(term.as_str()));
 
-    // Deleting the term unlinks its courses but never deletes them.
+    // A term a course still points at cannot be deleted; unlinking the course
+    // clears the way, and the course itself survives untouched.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/terms/{term}"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT);
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/courses/{course}"),
+        Some(&teacher),
+        Some(json!({ "term_id": null })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
     let res = send(
         &app,
         "DELETE",
@@ -10372,7 +10401,7 @@ async fn roll_call_accepts_school_statuses_and_buckets_session_reports() {
 }
 
 #[tokio::test]
-async fn terms_list_newest_first_require_auth_and_unlink_in_bulk() {
+async fn terms_list_newest_first_require_auth_and_guard_delete_per_term() {
     let (app, db) = app_and_db().await;
     let manager = login_as(&app, &db, "bulk.manager", "manager").await;
     let teacher = login_as(&app, &db, "bulk.teacher", "teacher").await;
@@ -10407,8 +10436,8 @@ async fn terms_list_newest_first_require_auth_and_unlink_in_bulk() {
         .collect();
     assert_eq!(names, ["2026 Spring", "2025 Fall"]);
 
-    // Deleting a term unlinks EVERY linked course in one stroke, and leaves
-    // courses on other terms alone.
+    // The delete guard counts EVERY linked course — unlinking one of two is
+    // not enough — and it is per term: a course on another term never blocks.
     let mut linked = Vec::new();
     for title in ["Algebra", "Geometry"] {
         let res = send(
@@ -10440,22 +10469,33 @@ async fn terms_list_newest_first_require_auth_and_unlink_in_bulk() {
         None,
     )
     .await;
-    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    assert_eq!(res.status, StatusCode::CONFLICT);
 
-    for course in &linked {
+    for (i, course) in linked.iter().enumerate() {
         let res = send(
             &app,
-            "GET",
+            "PATCH",
             &format!("/courses/{course}"),
             Some(&teacher),
+            Some(json!({ "term_id": null })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK);
+        // Still blocked until the LAST linked course lets go.
+        let res = send(
+            &app,
+            "DELETE",
+            &format!("/terms/{newer}"),
+            Some(&manager),
             None,
         )
         .await;
-        assert_eq!(
-            res.body["term"],
-            serde_json::Value::Null,
-            "unlinked {course}"
-        );
+        let expected = if i + 1 == linked.len() {
+            StatusCode::NO_CONTENT
+        } else {
+            StatusCode::CONFLICT
+        };
+        assert_eq!(res.status, expected, "after unlinking {course}");
     }
     let res = send(
         &app,
@@ -14084,6 +14124,8 @@ async fn homework_gc_removes_rows_and_blobs() {
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     let keys = homework_blob_keys(&db).await;
     assert_eq!(keys.len(), 1);
+    unenroll(&app, &w.teacher, &w.course, &w.ali_id).await;
+    unenroll(&app, &w.teacher, &w.course, &w.veli_id).await;
     let res = send(
         &app,
         "DELETE",
@@ -14274,4 +14316,113 @@ async fn homework_lists_paginate() {
         assert_eq!(res.body["limit"], 2);
         assert_eq!(res.body["offset"], 2);
     }
+}
+
+/// A course carrying students can't be deleted (409) until the roster is
+/// emptied — the cascade would otherwise take the enrollments with it.
+#[tokio::test]
+async fn course_delete_blocks_while_students_are_enrolled() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "cdb_t", "teacher").await;
+    let student = login(&app, "cdb_s").await;
+    let student_id = me_id(&app, &student).await;
+    let course = create_course(&app, &teacher, "Chemistry").await;
+    enroll(&app, &teacher, &course, &student_id).await;
+
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/courses/{course}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/courses/{course}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+
+    // Empty the roster: the delete goes through.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/courses/{course}/enrollments/{student_id}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/courses/{course}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+}
+
+/// An exam kind whose exams already carry marks can't leave the settings list
+/// (409) — weights are read live, so those marks would silently re-weight.
+/// Ungraded kinds still leave freely.
+#[tokio::test]
+async fn exam_kind_removal_blocks_while_marks_exist() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "ekd_t", "teacher").await;
+    let manager = login_as(&app, &db, "ekd_m", "manager").await;
+    let student = login(&app, "ekd_s").await;
+    let student_id = me_id(&app, &student).await;
+
+    let course = create_course(&app, &teacher, "Biology").await;
+    enroll(&app, &teacher, &course, &student_id).await;
+    let exam = create_exam(&app, &teacher, &course, "Final", "final").await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/results"),
+        Some(&teacher),
+        Some(json!({ "user_id": student_id, "mark": 70 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    // Dropping the graded kind is refused; the list is untouched.
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&manager),
+        Some(json!({ "exam_kinds": [{ "name": "quiz", "weight": 1 }] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+    let res = send(&app, "GET", "/settings", Some(&manager), None).await;
+    let kinds: Vec<String> = res.body["exam_kinds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|kind| kind["name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(kinds.contains(&"final".to_string()), "{}", res.body);
+    assert!(kinds.contains(&"quiz".to_string()), "{}", res.body);
+
+    // Keeping the graded kind, dropping the ungraded ones, is fine.
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&manager),
+        Some(json!({ "exam_kinds": [{ "name": "final", "weight": 5 }] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["exam_kinds"].as_array().unwrap().len(), 1);
+    assert_eq!(res.body["exam_kinds"][0]["weight"], 5);
 }
