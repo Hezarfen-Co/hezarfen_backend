@@ -206,8 +206,10 @@ impl HomeworkSubmission {
             .await?
             .check()?;
         // BEGIN is slot 0, the file wipe slot 1; the submission's DELETE is slot 2.
-        let deleted: Option<HomeworkSubmission> =
-            result.take::<Vec<HomeworkSubmission>>(2)?.into_iter().next();
+        let deleted: Option<HomeworkSubmission> = result
+            .take::<Vec<HomeworkSubmission>>(2)?
+            .into_iter()
+            .next();
         deleted.ok_or(AppError::NotFound)
     }
 }

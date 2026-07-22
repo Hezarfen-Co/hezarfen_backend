@@ -229,7 +229,10 @@ mod tests {
             .upsert(&db)
             .await
             .unwrap();
-        assert_eq!(AnswerImage::list_for_exam(&exam, &db).await.unwrap().len(), 2);
+        assert_eq!(
+            AnswerImage::list_for_exam(&exam, &db).await.unwrap().len(),
+            2
+        );
         assert!(
             AnswerImage::read(&question, &user, &db)
                 .await

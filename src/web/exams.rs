@@ -2570,9 +2570,9 @@ async fn store_answer_image(
         data.len() as i64,
     );
     let path = blob_path(&st.files_path, image.get_file());
-    tokio::fs::write(&path, data)
-        .await
-        .map_err(|err| AppError::Internal(format!("failed to store the answer image blob: {err}")))?;
+    tokio::fs::write(&path, data).await.map_err(|err| {
+        AppError::Internal(format!("failed to store the answer image blob: {err}"))
+    })?;
     match image.upsert(&st.db).await {
         Ok(stored) => {
             if let Some(replaced) = replaced {
@@ -2639,8 +2639,15 @@ async fn upload_answer_image(
     ensure_enrolled(&exam, attempt.get_user(), &st.db).await?;
     check_rejoin(&exam, &attempt)?;
     let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
-    let stored =
-        store_answer_image(&st, &exam, &question, user.get_id(), content_type, &upload.data).await?;
+    let stored = store_answer_image(
+        &st,
+        &exam,
+        &question,
+        user.get_id(),
+        content_type,
+        &upload.data,
+    )
+    .await?;
     // A drawing-only answer (drew, typed nothing) still needs an ExamAnswer row,
     // or the drawing never surfaces in the sitting/grading views — answer_image
     // rides the answer payload. Create a blank text answer when absent, without
@@ -2654,7 +2661,10 @@ async fn upload_answer_image(
     {
         ExamAnswer::save(&question, user.get_id(), None, Some(String::new()), &st.db).await?;
     }
-    Ok((StatusCode::CREATED, Json(ImageMetaResponse::from_answer(&stored))))
+    Ok((
+        StatusCode::CREATED,
+        Json(ImageMetaResponse::from_answer(&stored)),
+    ))
 }
 
 /// Clear the caller's drawn answer to a question. Same writable-attempt gate

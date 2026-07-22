@@ -10887,8 +10887,13 @@ async fn student_answer_images_serve_and_cascade() {
     // peek: the write path 404s (no attempt), the own-read 404s too.
     let (status, _) = post_image(&app, &student, &own, "image/png", png).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "no attempt yet");
-    let (status, _, _) = common::send_raw(&app, "GET", &own, Some(&student), None, Vec::new()).await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "no early peek before the attempt");
+    let (status, _, _) =
+        common::send_raw(&app, "GET", &own, Some(&student), None, Vec::new()).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "no early peek before the attempt"
+    );
 
     // The student sits the exam.
     let res = send(
@@ -10954,7 +10959,10 @@ async fn student_answer_images_serve_and_cascade() {
     )
     .await;
     assert_eq!(res.status, StatusCode::OK);
-    assert_eq!(res.body[0]["answer"]["answer_image"]["content_type"], "image/webp");
+    assert_eq!(
+        res.body[0]["answer"]["answer_image"]["content_type"],
+        "image/webp"
+    );
 
     // The teacher grading sheet carries the drawing meta and serves the bytes
     // via the teacher route; the sheet row also exposes the flag.
@@ -10968,14 +10976,31 @@ async fn student_answer_images_serve_and_cascade() {
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-    assert_eq!(res.body["answers"][0]["answer_image"]["content_type"], "image/webp");
-    let (status, _, bytes) =
-        common::send_raw(&app, "GET", &teacher_bytes, Some(&teacher), None, Vec::new()).await;
+    assert_eq!(
+        res.body["answers"][0]["answer_image"]["content_type"],
+        "image/webp"
+    );
+    let (status, _, bytes) = common::send_raw(
+        &app,
+        "GET",
+        &teacher_bytes,
+        Some(&teacher),
+        None,
+        Vec::new(),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(bytes, png);
     // An outsider student can't read the teacher grading route (not a teacher).
-    let (status, _, _) =
-        common::send_raw(&app, "GET", &teacher_bytes, Some(&outsider), None, Vec::new()).await;
+    let (status, _, _) = common::send_raw(
+        &app,
+        "GET",
+        &teacher_bytes,
+        Some(&outsider),
+        None,
+        Vec::new(),
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
     // A retake wipes the student's sheet — the answer-image row *and* its
@@ -11068,16 +11093,33 @@ async fn answer_image_surfaces_for_a_drawing_only_answer() {
     .await;
 
     // Sit, then upload a drawing WITHOUT ever saving a text answer.
-    let res = send(&app, "POST", &format!("/exams/{exam}/attempt"), Some(&student), None).await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt"),
+        Some(&student),
+        None,
+    )
+    .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
     let own = format!("/exams/{exam}/attempt/answers/{question}/image");
     let (status, body) = post_image(&app, &student, &own, "image/png", b"tri").await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
 
     // The sitting view carries the drawing meta with an empty typed answer.
-    let res = send(&app, "GET", &format!("/exams/{exam}/attempt/questions"), Some(&student), None).await;
+    let res = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/attempt/questions"),
+        Some(&student),
+        None,
+    )
+    .await;
     assert_eq!(res.status, StatusCode::OK);
-    assert_eq!(res.body[0]["answer"]["answer_image"]["content_type"], "image/png");
+    assert_eq!(
+        res.body[0]["answer"]["answer_image"]["content_type"],
+        "image/png"
+    );
     assert_eq!(res.body[0]["answer"]["text"], "");
 
     // The teacher grading sheet shows it too.
@@ -11090,15 +11132,29 @@ async fn answer_image_surfaces_for_a_drawing_only_answer() {
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-    assert_eq!(res.body["answers"][0]["answer_image"]["content_type"], "image/png");
+    assert_eq!(
+        res.body["answers"][0]["answer_image"]["content_type"],
+        "image/png"
+    );
 
     // Removing the drawing drops the blank answer row it created — the question
     // stops showing as answered rather than lingering as an empty text answer.
-    let (status, _, _) = common::send_raw(&app, "DELETE", &own, Some(&student), None, Vec::new()).await;
+    let (status, _, _) =
+        common::send_raw(&app, "DELETE", &own, Some(&student), None, Vec::new()).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
-    let res = send(&app, "GET", &format!("/exams/{exam}/attempt/questions"), Some(&student), None).await;
+    let res = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/attempt/questions"),
+        Some(&student),
+        None,
+    )
+    .await;
     assert_eq!(res.status, StatusCode::OK);
-    assert!(res.body[0]["answer"].is_null(), "blank answer row dropped with its drawing");
+    assert!(
+        res.body[0]["answer"].is_null(),
+        "blank answer row dropped with its drawing"
+    );
 }
 
 /// The authoring edits that reshape a question also groom its images: a
