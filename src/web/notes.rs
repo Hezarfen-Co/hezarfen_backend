@@ -426,7 +426,9 @@ async fn delete_file(
 
 /// `Content-Disposition` for a download: an ASCII-safe `filename` fallback
 /// plus the RFC 5987 `filename*` form so non-ASCII names (`ödev.pdf`) survive.
-fn content_disposition(name: &str) -> String {
+/// `attachment`, so an uploaded HTML/SVG never renders inline — shared with
+/// homework submission files, which take any content type.
+pub(crate) fn content_disposition(name: &str) -> String {
     let fallback: String = name
         .chars()
         .map(|c| {
