@@ -1,9 +1,9 @@
-//! Homework entity endpoints: the cross-course "my homework" list plus lookup,
-//! edit, and delete of one homework by id. Creation and the per-course listing
-//! live under `/courses/{id}/homework` (see [`super::courses`]); student
-//! submissions, files, grading, the roster, and the observer report arrive in
-//! later steps and reuse the visibility rule ([`Homework::student_sees`]), the
-//! [`HOMEWORK_LOCK`], and [`resolve_assigned`] from here.
+//! Homework entity endpoints: the cross-course "my homework" list, lookup,
+//! edit, and delete of one homework by id, the student's submission with its
+//! files, the teacher's grading and roster, and the observer report. Creation
+//! and the per-course listing live under `/courses/{id}/homework` (see
+//! [`super::courses`]); everything shares the visibility rule
+//! ([`Homework::student_sees`]) and the [`HOMEWORK_LOCK`].
 
 use axum::Json;
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
@@ -19,10 +19,13 @@ use crate::constant::{MAX_HOMEWORK_ASSIGNED, MAX_MAX_FILE_BYTES, UPLOAD_BODY_OVE
 use crate::database::Database;
 use crate::domain::course::{Course, CourseId};
 use crate::domain::enrollment::Enrollment;
+use crate::domain::exam_result::Mark;
 use crate::domain::homework::{Homework, HomeworkDescription, HomeworkId, HomeworkTitle};
 use crate::domain::homework_file::{HomeworkFile, HomeworkFileId};
-use crate::domain::homework_result::HomeworkResult;
-use crate::domain::homework_submission::{HomeworkSubmission, HomeworkSubmissionId, SubmissionText};
+use crate::domain::homework_result::{HomeworkResult, HomeworkStatus};
+use crate::domain::homework_submission::{
+    HomeworkSubmission, HomeworkSubmissionId, SubmissionText,
+};
 use crate::domain::note_file::{FileContentType, FileName};
 use crate::domain::role::Role;
 use crate::domain::settings::Settings;
@@ -36,7 +39,7 @@ use super::notes::content_disposition;
 use super::subjects::subject_in_course;
 use super::{
     CurrentUser, HomeworkResponse, Page, PageParams, RequireTeacher, UploadFileForm, blob_path,
-    check_not_past, paginate, read_upload, remove_blob, set_or_clear,
+    check_not_past, ensure_can_observe, paginate, read_upload, remove_blob, set_or_clear,
 };
 
 /// Serializes the homework subsystem's cross-record check-then-writes, which
@@ -65,10 +68,19 @@ pub fn routes() -> OpenApiRouter<AppState> {
         .layer(DefaultBodyLimit::max(
             MAX_MAX_FILE_BYTES as usize + UPLOAD_BODY_OVERHEAD_BYTES,
         ));
+    // `/report/{user}` and `/{id}` share a first segment; the router resolves
+    // the static `report` ahead of the `{id}` capture (matchit's
+    // static-beats-parameter rule), so the report never shadows a homework id —
+    // and ULID keys can't spell "report" anyway.
     OpenApiRouter::new()
         .routes(routes!(list_homework))
         .routes(routes!(get_homework, update_homework, delete_homework))
         .routes(routes!(submit, get_submission, delete_submission))
+        .routes(routes!(list_homework_submissions))
+        .routes(routes!(grade_homework))
+        .routes(routes!(remove_homework_result))
+        .routes(routes!(my_homework_result))
+        .routes(routes!(homework_report))
         .merge(files)
 }
 
@@ -97,7 +109,10 @@ pub(crate) async fn resolve_assigned(
     let mut users = Vec::with_capacity(keys.len());
     for key in keys {
         let user = UserId::from_key(&key);
-        if Enrollment::read_for_user(course, &user, db).await?.is_none() {
+        if Enrollment::read_for_user(course, &user, db)
+            .await?
+            .is_none()
+        {
             return Err(AppError::Validation(ValidationError::Invalid {
                 field: "assigned",
                 reason: "every assigned student must be enrolled in the course",
@@ -158,7 +173,10 @@ async fn list_homework(
         Homework::list_all(&st.db).await?
     } else {
         let courses = visible_courses(&user, &st.db).await?;
-        let ids: Vec<_> = courses.iter().map(|course| course.get_id().clone()).collect();
+        let ids: Vec<_> = courses
+            .iter()
+            .map(|course| course.get_id().clone())
+            .collect();
         // A student sees only the homework they are assigned; a teacher who
         // manages a course sees all of its homework (the manager+ path above
         // already saw everything).
@@ -275,6 +293,13 @@ async fn update_homework(
             "only the course creator, an assigned teacher, or a manager/admin can edit this homework",
         ));
     }
+
+    // Writer lease of [`HOMEWORK_LOCK`]: `ensure_no_orphans` below reads the
+    // live submissions and results, and the row write depends on what it saw —
+    // without the lease a submission (a reader) could land between the check
+    // and the write, orphaned by the narrowing that just missed it. The lease
+    // also pins the subject re-tag against a concurrent subject delete.
+    let _guard = HOMEWORK_LOCK.write().await;
 
     let title = match req.title {
         Some(ref title) => HomeworkTitle::try_new(title)?,
@@ -604,7 +629,12 @@ async fn submit(
     // A result can't exist here — the gate above would have 409'd.
     Ok((
         status,
-        Json(SubmissionResponse::new(&homework, &submission, &files, None)),
+        Json(SubmissionResponse::new(
+            &homework,
+            &submission,
+            &files,
+            None,
+        )),
     ))
 }
 
@@ -904,4 +934,416 @@ async fn delete_submission_file(
     // A removed file moves the submission's "last touched" clock (the late flag).
     HomeworkSubmission::touch(&submission, &st.db).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---- grading, roster, report ------------------------------------------------
+
+#[derive(Deserialize, ToSchema)]
+struct GradeHomework {
+    /// The student being graded.
+    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    user: String,
+    /// The verdict: `done`, `incomplete`, or `missing`.
+    #[schema(example = "done")]
+    status: String,
+    /// An optional 0–100 mark on top of the status; omit to grade on status
+    /// alone.
+    mark: Option<i64>,
+}
+
+/// Record (or overwrite) a student's grade for a homework: a status
+/// (`done`/`incomplete`/`missing`) plus an optional 0–100 mark. Requires
+/// teacher+ and management rights over the homework's course; the target must
+/// be a live student, enrolled in the course, and in the homework's audience.
+/// Nobody grades themselves. Grading before the due date, or before any
+/// submission exists (`missing` for work never handed in), is allowed. A stored
+/// grade freezes the student's submission until it is removed.
+#[utoipa::path(
+    post,
+    path = "/{id}/results",
+    tag = "homework",
+    security(("session_cookie" = [])),
+    params(("id" = String, Path, description = "Homework id")),
+    request_body = GradeHomework,
+    responses(
+        (status = 200, description = "Grade recorded", body = HomeworkResultResponse),
+        (status = 400, description = "Invalid status or mark, unknown user, user not a student, not enrolled, or not in the homework's audience", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin), or attempted to grade yourself", body = ErrorResponse),
+        (status = 404, description = "Homework not found", body = ErrorResponse),
+    ),
+)]
+async fn grade_homework(
+    State(st): State<AppState>,
+    RequireTeacher(teacher): RequireTeacher,
+    Path(id): Path<String>,
+    Json(req): Json<GradeHomework>,
+) -> Result<Json<HomeworkResultResponse>, AppError> {
+    // Writer lease of [`HOMEWORK_LOCK`], taken before the homework read: a
+    // grade is what freezes a submission, so it must not interleave with the
+    // read side's gate-through-write submission edits — and reading the
+    // homework under the lease keeps a homework delete (a fellow writer) from
+    // letting this upsert resurrect a result row under a vanished homework.
+    let _guard = HOMEWORK_LOCK.write().await;
+    let (homework, course) = homework_with_course(&id, &st.db).await?;
+    if !can_manage_course(&course, &teacher) {
+        return Err(AppError::Forbidden(
+            "only the course creator, an assigned teacher, or a manager/admin can grade this homework",
+        ));
+    }
+
+    let status = HomeworkStatus::try_new(&req.status)?;
+    let mark = req.mark.map(Mark::try_new).transpose()?;
+    let target = UserId::from_key(&req.user);
+
+    // Grading never targets oneself — no grader, whatever their role, may
+    // write their own grade.
+    if &target == teacher.get_id() {
+        return Err(AppError::Forbidden("grading yourself is not allowed"));
+    }
+
+    // Target user must exist.
+    let Some(target_user) = User::read(&target, &st.db).await? else {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "user",
+            reason: "target user does not exist",
+        }));
+    };
+
+    // Only students carry homework grades — the live role, so a stale
+    // enrollment left behind by a promotion can't reopen grading for staff.
+    if target_user.get_role() != Role::Student {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "user",
+            reason: "only students can be graded",
+        }));
+    }
+
+    // ... enrolled in the homework's course ...
+    if Enrollment::read_for_user(homework.get_course(), &target, &st.db)
+        .await?
+        .is_none()
+    {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "user",
+            reason: "target user is not enrolled in this course",
+        }));
+    }
+
+    // ... and in the homework's audience — a subset assignment is also the
+    // grading roster, so a grade can't land on a student the homework never
+    // named.
+    if !homework.student_sees(&target) {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "user",
+            reason: "target user is not in this homework's audience",
+        }));
+    }
+
+    let result = HomeworkResult::grade(
+        homework.get_id(),
+        &target,
+        status,
+        mark,
+        teacher.get_id(),
+        &st.db,
+    )
+    .await?;
+    Ok(Json(HomeworkResultResponse::new(&result)))
+}
+
+/// Remove a student's grade from a homework — un-grading, which unfreezes the
+/// student's submission and files for further edits. Requires teacher+ and
+/// management rights over the homework's course.
+#[utoipa::path(
+    delete,
+    path = "/{id}/results/{user}",
+    tag = "homework",
+    security(("session_cookie" = [])),
+    params(
+        ("id" = String, Path, description = "Homework id"),
+        ("user" = String, Path, description = "User id"),
+    ),
+    responses(
+        (status = 204, description = "Removed"),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 404, description = "No such homework, or no grade for this user", body = ErrorResponse),
+    ),
+)]
+async fn remove_homework_result(
+    State(st): State<AppState>,
+    RequireTeacher(user): RequireTeacher,
+    Path((id, target)): Path<(String, String)>,
+) -> Result<StatusCode, AppError> {
+    // Writer lease, before the read — the twin of grading's: removing the
+    // grade is what unfreezes the submission, so it must not straddle the read
+    // side's gate-through-write edits either.
+    let _guard = HOMEWORK_LOCK.write().await;
+    let (homework, course) = homework_with_course(&id, &st.db).await?;
+    if !can_manage_course(&course, &user) {
+        return Err(AppError::Forbidden(
+            "only the course creator, an assigned teacher, or a manager/admin can remove grades",
+        ));
+    }
+    let removed =
+        HomeworkResult::remove(homework.get_id(), &UserId::from_key(&target), &st.db).await?;
+    if removed.is_none() {
+        return Err(AppError::NotFound);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The caller's own grade for a homework. Any authenticated user may read
+/// their own; `404` while ungraded (or when the homework doesn't exist). This
+/// is the one read a student graded `missing` *without* ever submitting has —
+/// their submission endpoints 404 while nothing is submitted.
+#[utoipa::path(
+    get,
+    path = "/{id}/result",
+    tag = "homework",
+    security(("session_cookie" = [])),
+    params(("id" = String, Path, description = "Homework id")),
+    responses(
+        (status = 200, description = "The caller's grade", body = HomeworkResultResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 404, description = "No such homework, or not graded yet", body = ErrorResponse),
+    ),
+)]
+async fn my_homework_result(
+    State(st): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    Path(id): Path<String>,
+) -> Result<Json<HomeworkResultResponse>, AppError> {
+    let result = HomeworkResult::read_for(&HomeworkId::from_key(&id), user.get_id(), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(Json(HomeworkResultResponse::new(&result)))
+}
+
+/// The submission part of a roster row — the student's work without the grade,
+/// which sits beside it on the row (a graded-but-never-submitted student
+/// carries a grade and no submission).
+#[derive(Serialize, ToSchema)]
+struct HomeworkRosterSubmission {
+    /// The optional free-text note; `null` when none was given.
+    text: Option<String>,
+    /// First hand-in, UTC unix-milliseconds (immutable across re-submits).
+    submitted_at: i64,
+    /// Last touched — a text edit or a file add/delete — UTC unix-milliseconds.
+    updated_at: i64,
+    /// Whether the submission was last touched after the homework's `due_at`.
+    late: bool,
+    /// The attached files, newest first (metadata only).
+    files: Vec<HomeworkFileResponse>,
+}
+
+/// One student's line in a homework's teacher roster.
+#[derive(Serialize, ToSchema)]
+struct HomeworkRosterEntry {
+    /// The student.
+    user: String,
+    /// Their submission, if they handed anything in.
+    submission: Option<HomeworkRosterSubmission>,
+    /// Their grade, if the teacher recorded one.
+    result: Option<HomeworkResultResponse>,
+    /// Computed: nothing submitted and the due date has passed. Independent of
+    /// the teacher-set `missing` status, which is a deliberate verdict.
+    missing: bool,
+    /// Computed: the student is no longer enrolled in the course. Their stale
+    /// rows stay readable here, but they can't submit and can't be graded.
+    unenrolled: bool,
+}
+
+/// The teacher's roster for a homework, paged via `?limit=&offset=` (omit
+/// `limit` for all of it): one row per student in the audience — the assigned
+/// subset, or every currently enrolled student for a whole-course homework —
+/// plus any student outside it who still owns a submission or grade (an
+/// unenrollment or an audience change leaves work behind; it stays visible
+/// here, flagged). Each row carries the submission with its files and computed
+/// late flag, the grade, a computed `missing`, and a computed `unenrolled`.
+/// Requires teacher+ and management rights over the homework's course. Returns
+/// a `{items, total, limit, offset}` envelope.
+#[utoipa::path(
+    get,
+    path = "/{id}/submissions",
+    tag = "homework",
+    security(("session_cookie" = [])),
+    params(("id" = String, Path, description = "Homework id"), PageParams),
+    responses(
+        (status = 200, description = "A page of roster rows (all of them when unpaged)", body = Page<HomeworkRosterEntry>),
+        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 404, description = "Homework not found", body = ErrorResponse),
+    ),
+)]
+async fn list_homework_submissions(
+    State(st): State<AppState>,
+    RequireTeacher(user): RequireTeacher,
+    Path(id): Path<String>,
+    Query(page): Query<PageParams>,
+) -> Result<Json<Page<HomeworkRosterEntry>>, AppError> {
+    let (limit, offset) = page.resolve()?;
+    let (homework, course) = homework_with_course(&id, &st.db).await?;
+    if !can_manage_course(&course, &user) {
+        return Err(AppError::Forbidden(
+            "only the course creator, an assigned teacher, or a manager/admin can list submissions",
+        ));
+    }
+    let submissions = HomeworkSubmission::list_for_homework(homework.get_id(), &st.db).await?;
+    let results = HomeworkResult::list_for_homework(homework.get_id(), &st.db).await?;
+    let enrolled: Vec<String> = Enrollment::list_for_course(course.get_id(), &st.db)
+        .await?
+        .iter()
+        .map(|enrollment| enrollment.get_user().key().to_string())
+        .collect();
+    // The audience: the assigned subset as stored, or — whole-course — whoever
+    // is enrolled right now. Anyone outside it who still owns a submission or
+    // grade is appended rather than dropped: their stale rows are exactly what
+    // a narrowing 409 names as blockers, so the teacher must be able to see
+    // them. Sorted by student id for a stable page window.
+    let mut users: Vec<String> = match homework.get_assigned() {
+        Some(assigned) if !assigned.is_empty() => {
+            assigned.iter().map(|user| user.key().to_string()).collect()
+        }
+        _ => enrolled.clone(),
+    };
+    for holder in submissions
+        .iter()
+        .map(HomeworkSubmission::get_user)
+        .chain(results.iter().map(HomeworkResult::get_user))
+    {
+        let key = holder.key().to_string();
+        if !users.contains(&key) {
+            users.push(key);
+        }
+    }
+    users.sort();
+    users.dedup();
+    let total = users.len() as i64;
+    // Join the heavy parts (the file lists) onto the page alone.
+    let mut items = Vec::new();
+    for user_key in paginate(&users, limit, offset) {
+        let submission = match submissions
+            .iter()
+            .find(|submission| submission.get_user().key() == user_key)
+        {
+            Some(submission) => Some(HomeworkRosterSubmission {
+                text: submission.get_text().map(|text| text.as_str().to_string()),
+                submitted_at: submission.get_submitted_at().as_millis(),
+                updated_at: submission.get_updated_at().as_millis(),
+                late: submission.get_updated_at() > homework.get_due_at(),
+                files: HomeworkFile::list_for_submission(submission.get_id(), &st.db)
+                    .await?
+                    .iter()
+                    .map(HomeworkFileResponse::new)
+                    .collect(),
+            }),
+            None => None,
+        };
+        items.push(HomeworkRosterEntry {
+            user: user_key.clone(),
+            missing: submission.is_none() && Timestamp::now() > homework.get_due_at(),
+            unenrolled: !enrolled.contains(user_key),
+            submission,
+            result: results
+                .iter()
+                .find(|result| result.get_user().key() == user_key)
+                .map(HomeworkResultResponse::new),
+        });
+    }
+    Ok(Json(Page::new(items, total, limit, offset)))
+}
+
+/// One homework on a student's report: the assignment context plus what the
+/// student did with it and how it was graded, if it was.
+#[derive(Serialize, ToSchema)]
+struct HomeworkReportEntry {
+    /// The course the homework belongs to.
+    course: String,
+    /// The homework id.
+    homework: String,
+    title: String,
+    /// The course subject the homework is tagged with.
+    subject: String,
+    /// When it was due, UTC unix-milliseconds.
+    due_at: i64,
+    /// Whether the student has submitted anything.
+    submitted: bool,
+    /// Whether the submission was last touched after `due_at`.
+    late: bool,
+    /// Computed: nothing submitted and the due date has passed — independent
+    /// of a teacher-set `missing` status.
+    missing: bool,
+    /// The grade, once one exists.
+    result: Option<HomeworkResultResponse>,
+}
+
+/// A student's homework report across their enrolled courses, paged via
+/// `?limit=&offset=` (omit `limit` for all of it): one row per homework in
+/// their audience — submitted/late/missing state plus the grade once one
+/// exists. Statuses and marks, never the submitted files (observers get the
+/// report, not the bytes). Requires teacher+, or a parent linked to the target
+/// student. Managers, admins, and parents see every course; a teacher sees only
+/// the target's courses they manage. Returns a `{items, total, limit, offset}`
+/// envelope.
+#[utoipa::path(
+    get,
+    path = "/report/{user}",
+    tag = "homework",
+    security(("session_cookie" = [])),
+    params(("user" = String, Path, description = "User id"), PageParams),
+    responses(
+        (status = 200, description = "A page of the user's homework report (all of it when unpaged)", body = Page<HomeworkReportEntry>),
+        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires teacher role or higher, or a parent link to this student", body = ErrorResponse),
+        (status = 404, description = "User not found", body = ErrorResponse),
+    ),
+)]
+async fn homework_report(
+    State(st): State<AppState>,
+    CurrentUser(caller): CurrentUser,
+    Path(user): Path<String>,
+    Query(page): Query<PageParams>,
+) -> Result<Json<Page<HomeworkReportEntry>>, AppError> {
+    let (limit, offset) = page.resolve()?;
+    let target = UserId::from_key(&user);
+    ensure_can_observe(&caller, &target, &st.db).await?;
+    // User must exist — a missing user is a 404, not an empty report.
+    User::read(&target, &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    // Only an exactly-teacher caller is narrowed to their managed courses;
+    // manager+ and a linked parent read the full report (the marks idiom).
+    let mut courses = Course::list_enrolled(&target, &st.db).await?;
+    if caller.get_role() == Role::Teacher {
+        courses.retain(|course| can_manage_course(course, &caller));
+    }
+    let mut rows = Vec::new();
+    for course in &courses {
+        rows.extend(Homework::list_for_user_in_course(course.get_id(), &target, &st.db).await?);
+    }
+    let total = rows.len() as i64;
+    // Join submissions and grades onto the page alone.
+    let mut items = Vec::new();
+    for homework in paginate(&rows, limit, offset) {
+        let submission = HomeworkSubmission::read_for(homework.get_id(), &target, &st.db).await?;
+        let result = HomeworkResult::read_for(homework.get_id(), &target, &st.db).await?;
+        items.push(HomeworkReportEntry {
+            course: homework.get_course().key().to_string(),
+            homework: homework.get_id().key().to_string(),
+            title: homework.get_title().as_str().to_string(),
+            subject: homework.get_subject().key().to_string(),
+            due_at: homework.get_due_at().as_millis(),
+            submitted: submission.is_some(),
+            late: submission
+                .as_ref()
+                .is_some_and(|submission| submission.get_updated_at() > homework.get_due_at()),
+            missing: submission.is_none() && Timestamp::now() > homework.get_due_at(),
+            result: result.as_ref().map(HomeworkResultResponse::new),
+        });
+    }
+    Ok(Json(Page::new(items, total, limit, offset)))
 }

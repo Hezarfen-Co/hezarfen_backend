@@ -287,11 +287,12 @@ impl Course {
 
     /// Delete the course and cascade-remove everything inside it: results,
     /// attempts, answers, and question/answer images of its exams, its
+    /// homework with their submissions, submission files, and grades, its
     /// enrollments, its sessions with their roll call, its subjects, and the
     /// exams themselves. The children go in one transaction so a crash can't
-    /// leave an exam pointing at a deleted course. The image *blobs* (question
-    /// and answer) are the web layer's to remove — it collects their names
-    /// before calling this.
+    /// leave an exam pointing at a deleted course. The image and
+    /// homework-file *blobs* are the web layer's to remove — it collects
+    /// their names before calling this.
     pub async fn delete(self, db: &Database) -> Result<Course, AppError> {
         db.query(
             "BEGIN TRANSACTION;
@@ -301,10 +302,14 @@ impl Course {
              DELETE answer_image WHERE exam IN (SELECT VALUE id FROM exam WHERE course = $course);
              DELETE question_image WHERE exam IN (SELECT VALUE id FROM exam WHERE course = $course);
              DELETE exam_question WHERE exam IN (SELECT VALUE id FROM exam WHERE course = $course);
+             DELETE homework_file WHERE submission IN (SELECT VALUE id FROM homework_submission WHERE homework IN (SELECT VALUE id FROM homework WHERE course = $course));
+             DELETE homework_submission WHERE homework IN (SELECT VALUE id FROM homework WHERE course = $course);
+             DELETE homework_result WHERE homework IN (SELECT VALUE id FROM homework WHERE course = $course);
              DELETE session_attendance WHERE course = $course;
              DELETE course_session WHERE course = $course;
              DELETE enrollment WHERE course = $course;
              DELETE subject WHERE course = $course;
+             DELETE homework WHERE course = $course;
              DELETE exam WHERE course = $course;
              COMMIT TRANSACTION;",
         )
