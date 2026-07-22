@@ -54,6 +54,7 @@ use crate::state::AppState;
         (name = "marks", description = "Weighted mark reports per course and overall, labeled by the school's grade bands when configured. Each mark counts its exam kind's settings-configured weight times (weight 1 when the kind was since removed from settings). Own report at `/me`; another user's needs teacher+ (teachers narrowed to their courses) or a parent link to that student"),
         (name = "settings", description = "School policy, one singleton: exam kinds with their course-average weights, attendance statuses, grade-display bands, and the per-file upload size limit (`max_file_bytes` — note files and question images alike). Read: any authenticated user; edit: manager+"),
         (name = "subjects", description = "A course's curriculum topics. Created and listed under `/courses/{id}/subjects`; lookup/edit/delete at `/subjects/{id}`. Every exam question links to one of its course's subjects, so a subject in use cannot be deleted (409) — re-tag or delete the questions first. View follows the course (enrolled users, creator, assigned teachers, manager+); edit follows course management rights"),
+        (name = "homework", description = "Course homework: a teacher assigns it per course (`POST /courses/{id}/homework`), tagged with one of the course's subjects and given a future `due_at`, to the whole enrolled course or an optional `assigned` subset (empty means the whole course — whoever is enrolled when they submit; a subset cannot later be narrowed so as to strand work that already exists). Students submit optional text plus files (photos/documents); a submission touched after `due_at` is flagged late (computed, never stored) and stays editable until it is graded. A teacher grades a status (`done`/`incomplete`/`missing`) with an optional 0–100 mark — grading freezes the submission until the grade is removed, and beyond a teacher-set `missing` the roster and reports also compute a `missing` for anyone unsubmitted past due. Students see and fetch only the homework they are assigned (others 404, so a subset assignment never leaks); a linked parent reads a student's homework report — statuses, late flags, marks — but never the submitted files"),
         (name = "terms", description = "Academic terms (semester/trimester/quarter — whatever the school runs); courses may link to one. Read: any authenticated user; edit: manager+"),
     ),
 )]
@@ -98,6 +99,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/attendance", web::attendance::routes())
         .nest("/settings", web::settings::routes())
         .nest("/subjects", web::subjects::routes())
+        .nest("/homework", web::homework::routes())
         .nest("/terms", web::terms::routes())
         .split_for_parts();
 

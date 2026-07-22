@@ -434,6 +434,7 @@ fn error_frame(err: &AppError) -> Value {
         AppError::Unauthorized => "unauthorized".to_string(),
         AppError::Forbidden(message) => (*message).to_string(),
         AppError::Conflict(message) => (*message).to_string(),
+        AppError::ConflictOwned(message) => message.clone(),
         AppError::PayloadTooLarge(message) => message.clone(),
         AppError::TooManyRequests { .. } => "too many requests".to_string(),
         AppError::DbUnavailable => {

@@ -17,6 +17,7 @@ use crate::domain::exam::{
     Exam, ExamAttemptLimit, ExamDescription, ExamDuration, ExamKind, ExamMode, ExamSchedule,
     ExamTitle,
 };
+use crate::domain::homework::{Homework, HomeworkTitle};
 use crate::domain::question_image::QuestionImage;
 use crate::domain::role::Role;
 use crate::domain::settings::Settings;
@@ -26,12 +27,14 @@ use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
 
+use super::homework::{description_or_none, resolve_assigned};
 use super::sessions::resolve_session_teacher;
+use super::subjects::subject_in_course;
 use super::terms::resolve_term;
 use super::{
-    CourseResponse, CurrentUser, ExamResponse, Page, PageParams, PersonRef, RequireManager,
-    RequireTeacher, SessionResponse, SubjectResponse, check_not_past, check_time_range,
-    course_people, paginate, person_map, remove_blob, set_or_clear,
+    CourseResponse, CurrentUser, ExamResponse, HomeworkResponse, Page, PageParams, PersonRef,
+    RequireManager, RequireTeacher, SessionResponse, SubjectResponse, check_not_past,
+    check_time_range, course_people, paginate, person_map, remove_blob, set_or_clear,
 };
 
 pub fn routes() -> OpenApiRouter<AppState> {
@@ -46,6 +49,7 @@ pub fn routes() -> OpenApiRouter<AppState> {
         .routes(routes!(create_exam_in_course, list_course_exams))
         .routes(routes!(create_session_in_course, list_course_sessions))
         .routes(routes!(create_subject_in_course, list_course_subjects))
+        .routes(routes!(create_homework_in_course, list_course_homework))
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -940,6 +944,136 @@ async fn list_course_subjects(
     let items = paginate(&subjects, limit, offset)
         .iter()
         .map(SubjectResponse::new)
+        .collect();
+    Ok(Json(Page::new(items, total, limit, offset)))
+}
+
+// ---- homework in a course --------------------------------------------------
+// A teacher assigns homework per course, tagged with one of the course's
+// subjects and due at a future time. `assigned` optionally narrows it to a
+// subset of the enrolled students; omit it for the whole course.
+
+#[derive(Deserialize, ToSchema)]
+struct CreateHomework {
+    #[schema(example = "Read chapter 3 and answer Q1-Q5")]
+    title: String,
+    description: Option<String>,
+    /// The course subject this homework belongs to
+    /// (`GET /courses/{id}/subjects`). Required — every homework is tagged with
+    /// one of its course's subjects.
+    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    subject_id: String,
+    /// When the homework is due, UTC unix-milliseconds. Required; must not be
+    /// in the past. Late submissions are still accepted, just flagged late.
+    #[schema(example = 1_900_000_000_000_i64)]
+    due_at: i64,
+    /// The students this homework is for: a list of enrolled student ids. Omit,
+    /// send `null`, or send `[]` to assign the whole enrolled course (whoever is
+    /// enrolled when they submit); a subset caps at 200 named students.
+    assigned: Option<Vec<String>>,
+}
+
+/// Assign a homework inside a course. Requires teacher+ and course management
+/// rights. The homework is tagged with one of the course's subjects and given a
+/// future `due_at`; `assigned` optionally narrows it to a subset of the enrolled
+/// students (omit or empty = the whole course).
+#[utoipa::path(
+    post,
+    path = "/{id}/homework",
+    tag = "homework",
+    security(("session_cookie" = [])),
+    params(("id" = String, Path, description = "Course id")),
+    request_body = CreateHomework,
+    responses(
+        (status = 201, description = "Homework created", body = HomeworkResponse),
+        (status = 400, description = "Invalid fields, a due date in the past, an unknown subject (or one from another course), or an assigned student not enrolled / over the cap", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 404, description = "Course not found", body = ErrorResponse),
+    ),
+)]
+async fn create_homework_in_course(
+    State(st): State<AppState>,
+    RequireTeacher(user): RequireTeacher,
+    Path(id): Path<String>,
+    Json(req): Json<CreateHomework>,
+) -> Result<(StatusCode, Json<HomeworkResponse>), AppError> {
+    let course = Course::read(&CourseId::from_key(&id), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if !can_manage_course(&course, &user) {
+        return Err(AppError::Forbidden(
+            "only the course creator, an assigned teacher, or a manager/admin can add homework to this course",
+        ));
+    }
+
+    let title = HomeworkTitle::try_new(&req.title)?;
+    let description = match req.description.as_deref() {
+        Some(text) => description_or_none(text)?,
+        None => None,
+    };
+    let due_at = Timestamp::from_millis(req.due_at);
+    check_not_past("due_at", Some(due_at))?;
+    let subject = subject_in_course(&req.subject_id, course.get_id(), &st.db).await?;
+    let assigned = resolve_assigned(req.assigned, course.get_id(), &st.db).await?;
+    let homework = Homework::create(
+        course.get_id(),
+        &subject,
+        title,
+        description,
+        due_at,
+        assigned,
+        user.get_id(),
+        &st.db,
+    )
+    .await?;
+    Ok((StatusCode::CREATED, Json(HomeworkResponse::new(&homework))))
+}
+
+/// List a course's homework, newest first, paged via `?limit=&offset=` (omit
+/// `limit` for all of it). Visible to the course's enrolled users, its creator,
+/// its assigned teachers, and managers/admins — but a student sees only the
+/// homework they are assigned (whole-course ones plus subsets that name them).
+/// Returns a `{items, total, limit, offset}` envelope.
+#[utoipa::path(
+    get,
+    path = "/{id}/homework",
+    tag = "homework",
+    security(("session_cookie" = [])),
+    params(("id" = String, Path, description = "Course id"), PageParams),
+    responses(
+        (status = 200, description = "A page of the course's homework (all of it when unpaged)", body = Page<HomeworkResponse>),
+        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not enrolled, not the course creator or an assigned teacher, and not a manager/admin", body = ErrorResponse),
+        (status = 404, description = "Course not found", body = ErrorResponse),
+    ),
+)]
+async fn list_course_homework(
+    State(st): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    Path(id): Path<String>,
+    Query(page): Query<PageParams>,
+) -> Result<Json<Page<HomeworkResponse>>, AppError> {
+    let (limit, offset) = page.resolve()?;
+    // Course must exist — a missing course is a 404, not an empty homework list.
+    let course = Course::read(&CourseId::from_key(&id), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if !can_view_course(&course, &user, &st.db).await? {
+        return Err(AppError::Forbidden(
+            "only enrolled users, the course creator, an assigned teacher, or a manager/admin can view this course",
+        ));
+    }
+    let mut homework = Homework::list_for_course(course.get_id(), &st.db).await?;
+    // A student sees only the homework they are assigned; managers see all.
+    if !can_manage_course(&course, &user) {
+        homework.retain(|hw| hw.student_sees(user.get_id()));
+    }
+    let total = homework.len() as i64;
+    let items = paginate(&homework, limit, offset)
+        .iter()
+        .map(HomeworkResponse::new)
         .collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }

@@ -9,6 +9,7 @@ pub mod courses;
 pub mod events;
 pub mod exam_ws;
 pub mod exams;
+pub mod homework;
 pub mod marks;
 pub mod messages;
 pub mod notes;
@@ -26,8 +27,8 @@ mod extractor;
 mod page;
 
 pub use dto::{
-    CourseResponse, ExamResponse, PersonRef, SessionResponse, SubjectResponse, UserResponse,
-    course_people, person_map,
+    CourseResponse, ExamResponse, HomeworkResponse, PersonRef, SessionResponse, SubjectResponse,
+    UserResponse, course_people, person_map,
 };
 pub use extractor::{CurrentUser, RequireAdmin, RequireManager, RequireStudent, RequireTeacher};
 pub use page::{Page, PageParams, paginate};

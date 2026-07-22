@@ -9,6 +9,7 @@ use crate::database::Database;
 use crate::domain::course::Course;
 use crate::domain::course_session::CourseSession;
 use crate::domain::exam::Exam;
+use crate::domain::homework::Homework;
 use crate::domain::role::Role as DomainRole;
 use crate::domain::subject::Subject;
 use crate::domain::user::{User, UserId};
@@ -230,6 +231,52 @@ impl SubjectResponse {
             course: subject.get_course().key().to_string(),
             name: subject.get_name().as_str().to_string(),
             description: subject.get_description().as_str().to_string(),
+        }
+    }
+}
+
+/// Public shape of a homework assignment. Shared by `courses` (in-course
+/// creation and listing) and `homework` (cross-course list, lookup, edit).
+/// `assigned` is the student subset — `null` means the whole enrolled course
+/// (whoever is enrolled at submit time); a subset lists the named students' ids.
+/// `due_at`/`created_at` are UTC unix-milliseconds; lateness is judged per
+/// submission (against `due_at`), never stored on the homework itself.
+#[derive(Serialize, ToSchema)]
+pub struct HomeworkResponse {
+    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    pub id: String,
+    /// The course this homework belongs to.
+    pub course: String,
+    /// The course subject this homework is tagged with.
+    pub subject: String,
+    #[schema(example = "Read chapter 3")]
+    pub title: String,
+    pub description: Option<String>,
+    /// When the homework is due, UTC unix-milliseconds.
+    #[schema(example = 1_900_000_000_000_i64)]
+    pub due_at: i64,
+    /// The assigned student ids, or `null` for the whole enrolled course.
+    pub assigned: Option<Vec<String>>,
+    /// Who assigned the homework.
+    pub created_by: String,
+    /// When it was assigned, UTC unix-milliseconds.
+    pub created_at: i64,
+}
+
+impl HomeworkResponse {
+    pub fn new(homework: &Homework) -> Self {
+        Self {
+            id: homework.get_id().key().to_string(),
+            course: homework.get_course().key().to_string(),
+            subject: homework.get_subject().key().to_string(),
+            title: homework.get_title().as_str().to_string(),
+            description: homework.get_description().map(|d| d.as_str().to_string()),
+            due_at: homework.get_due_at().as_millis(),
+            assigned: homework
+                .get_assigned()
+                .map(|users| users.iter().map(|user| user.key().to_string()).collect()),
+            created_by: homework.get_created_by().key().to_string(),
+            created_at: homework.get_created_at().as_millis(),
         }
     }
 }

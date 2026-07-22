@@ -188,6 +188,36 @@ impl Homework {
         Ok(result.take::<Vec<Homework>>(0)?)
     }
 
+    /// Every homework in the system, newest first — the manager+ view of the
+    /// cross-course "my homework" list.
+    pub async fn list_all(db: &Database) -> Result<Vec<Homework>, AppError> {
+        let mut result = db
+            .query("SELECT * FROM homework ORDER BY id DESC")
+            .await?
+            .check()?;
+        Ok(result.take::<Vec<Homework>>(0)?)
+    }
+
+    /// Every homework of every course in `courses`, newest first (one query) —
+    /// the cross-course list over a caller's visible courses. The web layer
+    /// still trims each course's rows to what the caller may see (a student to
+    /// the ones they `student_sees`).
+    pub async fn list_for_courses(
+        courses: &[CourseId],
+        db: &Database,
+    ) -> Result<Vec<Homework>, AppError> {
+        if courses.is_empty() {
+            return Ok(Vec::new());
+        }
+        let records: Vec<RecordId> = courses.iter().map(CourseId::record).collect();
+        let mut result = db
+            .query("SELECT * FROM homework WHERE course IN $courses ORDER BY id DESC")
+            .bind(("courses", records))
+            .await?
+            .check()?;
+        Ok(result.take::<Vec<Homework>>(0)?)
+    }
+
     /// The homework of `course` that `user` is meant to see — whole-course ones
     /// plus any subset that names them — newest first. Backs a student's (or an
     /// observer's) per-course homework report; mirrors [`Homework::student_sees`]
