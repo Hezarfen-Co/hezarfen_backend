@@ -241,6 +241,19 @@ impl Homework {
         Ok(result.take::<Vec<Homework>>(0)?)
     }
 
+    /// Whether any homework still references `subject` — the subject delete
+    /// guard's question: a subject with homework can't be deleted until the
+    /// homework is re-tagged or removed. Mirrors
+    /// [`crate::domain::exam_question::ExamQuestion::any_for_subject`].
+    pub async fn any_for_subject(subject: &SubjectId, db: &Database) -> Result<bool, AppError> {
+        let mut result = db
+            .query("SELECT VALUE id FROM homework WHERE subject = $subject LIMIT 1")
+            .bind(("subject", subject.record()))
+            .await?
+            .check()?;
+        Ok(!result.take::<Vec<RecordId>>(0)?.is_empty())
+    }
+
     /// Re-tag, re-title, re-describe, re-schedule, or re-scope the homework.
     /// `course`, `created_by`, and `created_at` are untouched — the write
     /// re-sends them unchanged, which the `READONLY` schema permits (only a

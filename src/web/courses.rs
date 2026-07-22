@@ -18,6 +18,7 @@ use crate::domain::exam::{
     ExamTitle,
 };
 use crate::domain::homework::{Homework, HomeworkTitle};
+use crate::domain::homework_file::HomeworkFile;
 use crate::domain::question_image::QuestionImage;
 use crate::domain::role::Role;
 use crate::domain::settings::Settings;
@@ -27,7 +28,7 @@ use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
 
-use super::homework::{description_or_none, resolve_assigned};
+use super::homework::{HOMEWORK_LOCK, description_or_none, resolve_assigned};
 use super::sessions::resolve_session_teacher;
 use super::subjects::subject_in_course;
 use super::terms::resolve_term;
@@ -451,8 +452,9 @@ async fn update_course(
 
 /// Delete a course. Requires teacher+; only its creator or a manager/admin may
 /// delete it — an assigned teacher runs the course but does not own it. Cascades the course's exams (with
-/// their results, questions, answers, and question images), its sessions and
-/// roll call, its subjects, and all enrollments.
+/// their results, questions, answers, and question images), its homework (with
+/// submissions, submission files, and grades), its sessions and roll call, its
+/// subjects, and all enrollments.
 #[utoipa::path(
     delete,
     path = "/{id}",
@@ -483,8 +485,13 @@ async fn delete_course(
     // between strands at worst an unreachable blob.
     let image_files = QuestionImage::file_keys_for_course(course.get_id(), &st.db).await?;
     let answer_image_files = AnswerImage::file_keys_for_course(course.get_id(), &st.db).await?;
+    let homework_files = HomeworkFile::file_keys_for_course(course.get_id(), &st.db).await?;
     course.delete(&st.db).await?;
-    for file in image_files.iter().chain(&answer_image_files) {
+    for file in image_files
+        .iter()
+        .chain(&answer_image_files)
+        .chain(&homework_files)
+    {
         remove_blob(&st.files_path, file).await;
     }
     Ok(StatusCode::NO_CONTENT)
@@ -1014,6 +1021,11 @@ async fn create_homework_in_course(
     };
     let due_at = Timestamp::from_millis(req.due_at);
     check_not_past("due_at", Some(due_at))?;
+    // Reader lease of [`HOMEWORK_LOCK`], held from the subject check through
+    // the create: a subject delete (a writer, which checks for homework) can't
+    // vanish the subject between its validation here and the row landing with
+    // it.
+    let _guard = HOMEWORK_LOCK.read().await;
     let subject = subject_in_course(&req.subject_id, course.get_id(), &st.db).await?;
     let assigned = resolve_assigned(req.assigned, course.get_id(), &st.db).await?;
     let homework = Homework::create(

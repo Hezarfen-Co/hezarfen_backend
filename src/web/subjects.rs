@@ -9,12 +9,14 @@ use utoipa_axum::routes;
 use crate::database::Database;
 use crate::domain::course::{Course, CourseId};
 use crate::domain::exam_question::ExamQuestion;
+use crate::domain::homework::Homework;
 use crate::domain::subject::{Subject, SubjectDescription, SubjectId, SubjectName};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
 
 use super::courses::{can_manage_course, can_view_course};
 use super::exams::EXAM_LOCK;
+use super::homework::HOMEWORK_LOCK;
 use super::{CurrentUser, RequireTeacher, SubjectResponse};
 
 pub fn routes() -> OpenApiRouter<AppState> {
@@ -139,8 +141,9 @@ async fn update_subject(
 }
 
 /// Delete a subject. Requires teacher+ and management rights over its course.
-/// Refused with a 409 while any exam question still references it — re-tag or
-/// delete those questions first, so no question is left without a real subject.
+/// Refused with a 409 while any exam question or homework still references it —
+/// re-tag or delete those first, so nothing is left pointing at a subject that
+/// no longer exists.
 #[utoipa::path(
     delete,
     path = "/{id}",
@@ -152,7 +155,7 @@ async fn update_subject(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "Exam questions still reference this subject", body = ErrorResponse),
+        (status = 409, description = "Exam questions or homework still reference this subject", body = ErrorResponse),
     ),
 )]
 async fn delete_subject(
@@ -173,6 +176,18 @@ async fn delete_subject(
     if ExamQuestion::any_for_subject(subject.get_id(), &st.db).await? {
         return Err(AppError::Conflict(
             "exam questions still reference this subject — re-tag or delete them first",
+        ));
+    }
+    // The homework twin of the guard above, under [`HOMEWORK_LOCK`]'s writer
+    // lease: homework create validates its subject under the read side and the
+    // PATCH re-tag under the write side, so the no-homework check and the
+    // delete can't straddle a row that just adopted this subject. This is the
+    // only place both locks are held; the order is EXAM_LOCK, then
+    // HOMEWORK_LOCK.
+    let _homework_guard = HOMEWORK_LOCK.write().await;
+    if Homework::any_for_subject(subject.get_id(), &st.db).await? {
+        return Err(AppError::Conflict(
+            "homework still references this subject — re-tag or delete it first",
         ));
     }
     subject.delete(&st.db).await?;
