@@ -740,11 +740,12 @@ consistent unit (validated together on create and after every `PATCH` merge):
   *optional* — set it for a per-attempt countdown (`started_at +
   duration_ms`), omit it for unlimited time (the attempt only ends by
   submission).
-- `duration_ms` is 1 minute to 24 hours wherever it appears. `ends_at` must be
-  strictly after `starts_at`, and neither may be *set* in the past — on create
-  or `PATCH` (kept values are exempt, so a running exam stays editable). All
-  instants are the usual UTC unix-milliseconds, judged only by the server
-  clock (`GET /time` for sync).
+- `duration_ms` is 1 minute to 24 hours wherever it appears, and for `async`
+  cannot exceed the `starts_at`..`ends_at` window (equal to it is fine).
+  `ends_at` must be strictly after `starts_at`, and neither may be *set* in
+  the past — on create or `PATCH` (kept values are exempt, so a running exam
+  stays editable). All instants are the usual UTC unix-milliseconds, judged
+  only by the server clock (`GET /time` for sync).
 
 Two per-exam policy knobs ride along, both **live-editable** at any point:
 

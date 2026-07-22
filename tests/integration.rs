@@ -5624,6 +5624,20 @@ async fn exam_scheduling_validates_and_echoes() {
     assert_eq!(res.body["mode"], "async");
     assert_eq!(res.body["duration_ms"].as_i64(), Some(5_400_000));
 
+    // Async: a duration exactly as long as the window is fine — only
+    // strictly exceeding it is rejected (see "duration exceeds window" below).
+    scheduled_exam(
+        &app,
+        &teacher,
+        &course,
+        json!({
+            "title": "exact-fit", "kind": "quiz",
+            "mode": "async", "starts_at": now, "ends_at": now + 3_600_000,
+            "duration_ms": 3_600_000,
+        }),
+    )
+    .await;
+
     // Unscheduled: every schedule field stays null (pre-schedule behavior),
     // and the attempt policy shows its defaults.
     let res = create_exam_with(
@@ -5710,6 +5724,13 @@ async fn exam_scheduling_validates_and_echoes() {
             "duration too long",
             json!({ "title": "x", "kind": "quiz", "mode": "async",
                     "starts_at": now, "ends_at": now + 90_000_000, "duration_ms": 86_400_001 }),
+        ),
+        (
+            // Within the global 1min-24h bounds, but longer than its own
+            // window: a 90-minute duration inside a 60-minute window.
+            "duration exceeds window",
+            json!({ "title": "x", "kind": "quiz", "mode": "async",
+                    "starts_at": now, "ends_at": now + 3_600_000, "duration_ms": 5_400_000 }),
         ),
         (
             "past starts_at",
@@ -6139,14 +6160,17 @@ async fn async_deadline_is_start_plus_duration_clamped_to_window() {
     let started = res.body["started_at"].as_i64().expect("started_at");
     assert_eq!(res.body["deadline"].as_i64(), Some(started + 60_000));
 
-    // Tight window: `ends_at` clamps the personal deadline.
-    let ends = now + 30_000;
+    // Tight window: starting partway through it still lets `ends_at` clamp
+    // the personal deadline (duration_ms can be at most the full window now,
+    // so the clamp only bites once a student starts late inside it).
+    let starts = now - 40_000;
+    let ends = now + 20_000;
     let exam = scheduled_exam(
         &app,
         &teacher,
         &course,
         json!({ "title": "quiz2", "kind": "quiz",
-                "mode": "async", "starts_at": now - 1_000, "ends_at": ends,
+                "mode": "async", "starts_at": starts, "ends_at": ends,
                 "duration_ms": 60_000 }),
     )
     .await;
@@ -6393,7 +6417,7 @@ async fn mode_freezes_after_attempts_but_times_extend_live() {
         "PATCH",
         &format!("/exams/{exam}"),
         Some(&teacher),
-        Some(json!({ "mode": "async", "duration_ms": 3_600_000 })),
+        Some(json!({ "mode": "async", "duration_ms": 60_000 })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
@@ -6446,7 +6470,7 @@ async fn mode_freezes_after_attempts_but_times_extend_live() {
         "PATCH",
         &format!("/exams/{exam}"),
         Some(&teacher),
-        Some(json!({ "mode": "async", "duration_ms": 3_600_000 })),
+        Some(json!({ "mode": "async", "duration_ms": 60_000 })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);

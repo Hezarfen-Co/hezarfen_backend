@@ -317,7 +317,7 @@ async fn get_exam(
     request_body = UpdateExam,
     responses(
         (status = 200, description = "Updated exam", body = ExamResponse),
-        (status = 400, description = "Invalid fields, kind, attempt limit, or schedule (malformed window, or newly set times in the past)", body = ErrorResponse),
+        (status = 400, description = "Invalid fields, kind, attempt limit, or schedule (malformed window, duration exceeding the window, or newly set times in the past)", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),

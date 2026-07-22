@@ -749,7 +749,7 @@ async fn unenroll(
     request_body = CreateExamInCourse,
     responses(
         (status = 201, description = "Exam created", body = ExamResponse),
-        (status = 400, description = "Invalid fields, kind, attempt limit, or schedule (malformed window, or times in the past)", body = ErrorResponse),
+        (status = 400, description = "Invalid fields, kind, attempt limit, or schedule (malformed window, duration exceeding the window, or times in the past)", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
