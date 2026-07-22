@@ -304,6 +304,44 @@ pub async fn create_exam_with(app: &Router, cookie: &str, course: &str, body: Va
     .await
 }
 
+/// Create a homework inside `course` as `cookie` (asserts 201); returns its
+/// id. Tagged with `subject` (required — every homework carries one of its
+/// course's subjects) and due at `due_at` (unix-millis; must not lie past the
+/// 60s grace). Whole-course audience; use [`create_homework_with`] for an
+/// `assigned` subset.
+pub async fn create_homework(
+    app: &Router,
+    cookie: &str,
+    course: &str,
+    subject: &str,
+    title: &str,
+    due_at: i64,
+) -> String {
+    let res = send(
+        app,
+        "POST",
+        &format!("/courses/{course}/homework"),
+        Some(cookie),
+        Some(json!({ "title": title, "subject_id": subject, "due_at": due_at })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "create homework {title}");
+    id_of(&res.body)
+}
+
+/// Create a homework inside `course` from a full JSON body (no assertion) —
+/// for exercising the `assigned` subset and the validation rejects.
+pub async fn create_homework_with(app: &Router, cookie: &str, course: &str, body: Value) -> Res {
+    send(
+        app,
+        "POST",
+        &format!("/courses/{course}/homework"),
+        Some(cookie),
+        Some(body),
+    )
+    .await
+}
+
 /// Create a lesson session inside `course` as `cookie` (asserts 201); returns
 /// its id. The session's teacher defaults to the caller.
 pub async fn create_session(app: &Router, cookie: &str, course: &str, starts_at: i64) -> String {
