@@ -162,8 +162,9 @@ impl ExamAttemptLimit {
 ///   exam; attempts are rejected),
 /// - `sync` → `starts_at` + `ends_at`, no duration (everyone's deadline is
 ///   `ends_at`),
-/// - `async` → `starts_at` + `ends_at` + `duration_ms` (a student who starts
-///   at `t` gets until `min(t + duration_ms, ends_at)`),
+/// - `async` → `starts_at` + `ends_at` + `duration_ms`, with `duration_ms` no
+///   greater than the window (a student who starts at `t` gets until
+///   `min(t + duration_ms, ends_at)`),
 /// - `open` → no window; `duration_ms` optional (a student who starts at `t`
 ///   gets until `t + duration_ms`, or forever when absent),
 /// - `ends_at` strictly after `starts_at` whenever the window exists.
@@ -211,6 +212,17 @@ impl ExamSchedule {
                 }
                 if ends_at <= starts_at {
                     return Err(invalid("ends_at", "must be after starts_at"));
+                }
+                if let (Some(duration), Some(starts), Some(ends)) =
+                    (duration_ms, starts_at, ends_at)
+                {
+                    let window_ms = ends.as_millis().saturating_sub(starts.as_millis());
+                    if duration.as_millis() > window_ms {
+                        return Err(invalid(
+                            "duration_ms",
+                            "must fit within the starts_at..ends_at window",
+                        ));
+                    }
                 }
                 match (m.as_str(), duration_ms.is_some()) {
                     ("async", false) => {
@@ -553,8 +565,11 @@ mod tests {
         assert!(ExamSchedule::try_new(mode("sync"), at(1), None, None).is_err());
         assert!(ExamSchedule::try_new(mode("sync"), at(1), at(2), dur).is_err());
 
-        // Async: window plus a per-student duration.
-        assert!(ExamSchedule::try_new(mode("async"), at(1), at(2), dur).is_ok());
+        // Async: window plus a per-student duration, which must fit inside it
+        // (equal to the window is fine; the window `at(1), at(2)` above is
+        // too narrow for `dur`, so give it one exactly `dur` wide instead).
+        assert!(ExamSchedule::try_new(mode("async"), at(1), at(1 + 90 * 60 * 1000), dur).is_ok());
+        assert!(ExamSchedule::try_new(mode("async"), at(1), at(2), dur).is_err());
         assert!(ExamSchedule::try_new(mode("async"), at(1), at(2), None).is_err());
 
         // Open: no window, duration optional (limited or unlimited time).
