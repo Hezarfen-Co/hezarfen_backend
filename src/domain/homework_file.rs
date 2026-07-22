@@ -146,6 +146,29 @@ impl HomeworkFile {
         Ok(file.filter(|file| &file.submission == submission))
     }
 
+    /// Read a file by id only if it hangs off a submission to `homework` — the
+    /// grader's download scoping. The teacher download path carries the homework
+    /// id but not the owning student (unlike `read_for`, which needs the
+    /// submission), so this both finds the file and confirms it belongs under
+    /// `homework`: a teacher can't pass a homework they manage to read a file
+    /// from a different (perhaps unmanaged) one.
+    pub async fn read_in_homework(
+        id: &HomeworkFileId,
+        homework: &HomeworkId,
+        db: &Database,
+    ) -> Result<Option<HomeworkFile>, AppError> {
+        let mut result = db
+            .query(
+                "SELECT * FROM homework_file WHERE id = $id AND submission IN \
+                 (SELECT VALUE id FROM homework_submission WHERE homework = $hw)",
+            )
+            .bind(("id", id.record()))
+            .bind(("hw", homework.record()))
+            .await?
+            .check()?;
+        Ok(result.take::<Vec<HomeworkFile>>(0)?.into_iter().next())
+    }
+
     /// All of `submission`'s files, newest first.
     pub async fn list_for_submission(
         submission: &HomeworkSubmissionId,
@@ -261,6 +284,26 @@ mod tests {
                 .await
                 .unwrap(),
             1
+        );
+
+        // The grader's download scoping: found under its own homework, invisible
+        // under another — so a teacher can't read it by naming a homework they
+        // happen to manage.
+        assert!(
+            HomeworkFile::read_in_homework(stored.get_id(), &homework, &db)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            HomeworkFile::read_in_homework(
+                stored.get_id(),
+                &HomeworkId::from_key("01TESTHWBBBBBBBBBBBBBBBBBB"),
+                &db,
+            )
+            .await
+            .unwrap()
+            .is_none()
         );
 
         // The blob name is collectable for GC before a cascade wipes the rows.

@@ -138,6 +138,31 @@ impl HomeworkSubmission {
             .ok_or_else(|| AppError::Internal("failed to save homework submission".into()))
     }
 
+    /// Re-stamp a submission's `updated_at` to now, leaving its text and files
+    /// alone. A file add or delete modifies the submission as a whole, so its
+    /// "last touched" clock — which drives the computed late flag — must move
+    /// even though the text row is unchanged. Static because the file paths hold
+    /// the composite id, not always the row. A targeted single-field UPDATE, so
+    /// the `READONLY` `submitted_at` is never re-sent (a `.content()` would trip
+    /// its guard). Returns the re-stamped row, or a 404 if it has since vanished.
+    pub async fn touch(
+        id: &HomeworkSubmissionId,
+        db: &Database,
+    ) -> Result<HomeworkSubmission, AppError> {
+        let now = Timestamp::now();
+        let mut result = db
+            .query("UPDATE $id SET updated_at = $now RETURN AFTER")
+            .bind(("id", id.record()))
+            .bind(("now", now))
+            .await?
+            .check()?;
+        result
+            .take::<Vec<HomeworkSubmission>>(0)?
+            .into_iter()
+            .next()
+            .ok_or(AppError::NotFound)
+    }
+
     /// `user`'s submission to `homework`, if they have one.
     pub async fn read_for(
         homework: &HomeworkId,
@@ -228,6 +253,33 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn touch_moves_updated_at_but_not_submitted_at_or_text() {
+        let db = crate::database::init_mem().await.unwrap();
+        let homework = HomeworkId::generate();
+        let user = UserId::from_key("01TESTUSERAAAAAAAAAAAAAAAA");
+
+        let original = HomeworkSubmission::upsert(
+            &homework,
+            &user,
+            Some(SubmissionText::try_new("photo answer").unwrap()),
+            &db,
+        )
+        .await
+        .unwrap();
+        // A file add/delete touches the submission: updated_at moves (never
+        // backwards), while the first-submit stamp and the text stay put.
+        let touched = HomeworkSubmission::touch(original.get_id(), &db)
+            .await
+            .unwrap();
+        assert_eq!(touched.get_submitted_at(), original.get_submitted_at());
+        assert!(touched.get_updated_at() >= original.get_updated_at());
+        assert_eq!(
+            touched.get_text().map(SubmissionText::as_str),
+            Some("photo answer")
         );
     }
 }
