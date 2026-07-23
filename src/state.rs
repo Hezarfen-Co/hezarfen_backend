@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::ai::AiBridge;
 use crate::database::Database;
 use crate::rate_limit::RateLimitConfig;
 
@@ -24,6 +25,11 @@ pub struct AppState {
     pub exam_presence: ExamPresence,
     /// Whether the database socket answered its last ping (see [`DbHealth`]).
     pub db_up: DbHealth,
+    /// The QUIC bridge to the AI services, when one is configured
+    /// (`AI_QUIC_ADDR`). `None` means AI features are off for this deployment
+    /// — handlers must degrade rather than fail, since the core API has never
+    /// needed the bridge to work.
+    pub ai: Option<AiBridge>,
 }
 
 /// Last known state of the database WebSocket, published by the keepalive task

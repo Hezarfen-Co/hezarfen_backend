@@ -3,6 +3,7 @@
 //! validated domain newtypes before doing anything. Role-gated endpoints take a
 //! `RequireTeacher` / `RequireAdmin` extractor instead of `CurrentUser`.
 
+pub mod ai;
 pub mod attendance;
 pub mod auth;
 pub mod courses;

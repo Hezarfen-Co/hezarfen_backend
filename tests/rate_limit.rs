@@ -26,6 +26,7 @@ async fn app_with(rate_limit: RateLimitConfig) -> Router {
         rate_limit,
         exam_presence: Default::default(),
         db_up: Default::default(),
+        ai: None,
     })
 }
 
@@ -318,6 +319,7 @@ async fn spawn_server(rate_limit: RateLimitConfig) -> String {
         rate_limit,
         exam_presence: Default::default(),
         db_up: Default::default(),
+        ai: None,
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
