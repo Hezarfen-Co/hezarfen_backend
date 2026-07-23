@@ -1,0 +1,513 @@
+//! A teacher's published availability: "I am free here, book me". A slot is
+//! pure calendar — it carries no booking state at all. Whether it is taken is
+//! *derived* from its [`Appointment`] rows under [`APPOINTMENT_LOCK`], so a
+//! rejected or cancelled booking frees the slot again without any flag to
+//! reset (and without a UNIQUE index, which would keep a dead booking's seat).
+//!
+//! A recurring publish is expanded into concrete rows here, at write time,
+//! sharing one `series` id — no recurrence rule is ever evaluated at read
+//! time. Cancelling one week is then a plain row delete, and the whole series
+//! is still addressable through its id.
+
+use std::sync::{LazyLock, Mutex};
+
+use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
+use ulid::{Generator, Ulid};
+
+use crate::constant::{MAX_APPOINTMENT_NOTE_LEN, MAX_SLOT_OCCURRENCES};
+use crate::database::{APPOINTMENT_SLOT_TABLE, Database};
+use crate::domain::appointment::{APPOINTMENT_LOCK, Appointment};
+use crate::domain::timestamp::{MILLIS_PER_DAY, Timestamp};
+use crate::domain::user::UserId;
+use crate::error::{AppError, ValidationError};
+use crate::validate::validate_optional;
+
+/// One week, the only recurrence step this backend expands.
+const MILLIS_PER_WEEK: i64 = 7 * MILLIS_PER_DAY;
+
+/// Mints slot ids in write order. `Ulid::new()`'s random low bits sort
+/// arbitrarily among ids minted in the same millisecond, and a recurring
+/// publish writes its whole expansion inside one — which would scramble the
+/// `id` tie-break of the `ORDER BY starts_at, id` listings.
+static IDS: LazyLock<Mutex<Generator>> = LazyLock::new(|| Mutex::new(Generator::new()));
+
+fn next_ulid() -> Ulid {
+    let mut ids = IDS.lock().expect("slot id generator poisoned");
+    // The only error is exhausting the random bits *within* one millisecond
+    // (2^80 ids deep); it clears itself as the clock ticks, so retry rather
+    // than fall back to a random id and silently reintroduce the defect.
+    loop {
+        if let Ok(ulid) = ids.generate() {
+            break ulid;
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+pub struct AppointmentSlotId(RecordId);
+
+impl AppointmentSlotId {
+    pub fn generate() -> Self {
+        Self(RecordId::new(
+            APPOINTMENT_SLOT_TABLE,
+            next_ulid().to_string(),
+        ))
+    }
+
+    pub fn from_key(key: &str) -> Self {
+        Self(RecordId::new(APPOINTMENT_SLOT_TABLE, key))
+    }
+
+    pub fn record(&self) -> RecordId {
+        self.0.clone()
+    }
+
+    pub fn key(&self) -> &str {
+        match &self.0.key {
+            RecordIdKey::String(key) => key,
+            _ => "",
+        }
+    }
+}
+
+/// The id shared by every occurrence one recurring publish created. A plain
+/// ULID string (not a record id): it names a group, never a row.
+#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+pub struct SlotSeries(String);
+
+impl SlotSeries {
+    pub fn generate() -> Self {
+        Self(next_ulid().to_string())
+    }
+
+    pub fn from_key(key: &str) -> Self {
+        Self(key.to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+pub struct SlotNote(String);
+
+impl SlotNote {
+    pub fn try_new(value: &str) -> Result<Self, ValidationError> {
+        validate_optional("note", value, MAX_APPOINTMENT_NOTE_LEN)?;
+        Ok(Self(value.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The half-open window `[starts_at, ends_at)` a slot offers. Half-open is the
+/// whole point: back-to-back slots (10:00–10:30, 10:30–11:00) touch without
+/// overlapping, which is exactly how a teacher's hour is carved up.
+#[derive(Debug, Clone, SurrealValue)]
+pub struct AppointmentSlot {
+    id: AppointmentSlotId,
+    teacher: UserId,
+    starts_at: Timestamp,
+    ends_at: Timestamp,
+    note: Option<SlotNote>,
+    series: Option<SlotSeries>,
+    created_at: Timestamp,
+}
+
+impl AppointmentSlot {
+    pub fn get_id(&self) -> &AppointmentSlotId {
+        &self.id
+    }
+
+    pub fn get_teacher(&self) -> &UserId {
+        &self.teacher
+    }
+
+    pub fn get_starts_at(&self) -> Timestamp {
+        self.starts_at
+    }
+
+    pub fn get_ends_at(&self) -> Timestamp {
+        self.ends_at
+    }
+
+    pub fn get_note(&self) -> Option<&SlotNote> {
+        self.note.as_ref()
+    }
+
+    pub fn get_series(&self) -> Option<&SlotSeries> {
+        self.series.as_ref()
+    }
+
+    pub fn get_created_at(&self) -> Timestamp {
+        self.created_at
+    }
+
+    /// A slot must cover a real span of time — an empty or inverted window
+    /// could never be booked, and would break the touching-is-not-overlapping
+    /// rule the conflict guard rests on.
+    fn check_window(starts_at: Timestamp, ends_at: Timestamp) -> Result<(), ValidationError> {
+        if starts_at.as_millis() >= ends_at.as_millis() {
+            return Err(ValidationError::Invalid {
+                field: "ends_at",
+                reason: "must be after starts_at",
+            });
+        }
+        Ok(())
+    }
+
+    /// The concrete windows a weekly publish expands into: the first one, then
+    /// the same time each following week, up to and including `until`.
+    /// Pure — no clock, no database — so the caller can size the write before
+    /// making it. Refuses more than [`MAX_SLOT_OCCURRENCES`] occurrences.
+    pub fn weekly_windows(
+        starts_at: Timestamp,
+        ends_at: Timestamp,
+        until: Timestamp,
+    ) -> Result<Vec<(Timestamp, Timestamp)>, AppError> {
+        Self::check_window(starts_at, ends_at)?;
+        if until.as_millis() < starts_at.as_millis() {
+            return Err(ValidationError::Invalid {
+                field: "until",
+                reason: "must not be before the first slot",
+            }
+            .into());
+        }
+        let count = (until.as_millis() - starts_at.as_millis()) / MILLIS_PER_WEEK + 1;
+        if count > MAX_SLOT_OCCURRENCES as i64 {
+            return Err(ValidationError::TooLong {
+                field: "until",
+                max: MAX_SLOT_OCCURRENCES,
+                got: count as usize,
+            }
+            .into());
+        }
+        // Checked, not plain, arithmetic: `ends_at` is a caller-supplied i64 and
+        // a window near `i64::MAX` overflows on the very first shift — which in
+        // release wraps the end *below* the start, and an inverted window can
+        // never overlap anything, silently disabling the double-booking guard.
+        // Same spirit as `Timestamp::in_days`, but refusing instead of
+        // saturating: a saturated end would still invert.
+        let shifted = |base: Timestamp, week: i64| -> Option<Timestamp> {
+            week.checked_mul(MILLIS_PER_WEEK)
+                .and_then(|shift| base.as_millis().checked_add(shift))
+                .map(Timestamp::from_millis)
+        };
+        (0..count)
+            .map(|week| {
+                let (starts_at, ends_at) = shifted(starts_at, week)
+                    .zip(shifted(ends_at, week))
+                    .ok_or(ValidationError::Invalid {
+                        field: "ends_at",
+                        reason: "is too far ahead to repeat weekly",
+                    })?;
+                Self::check_window(starts_at, ends_at)?;
+                Ok((starts_at, ends_at))
+            })
+            .collect()
+    }
+
+    async fn insert(slot: AppointmentSlot, db: &Database) -> Result<AppointmentSlot, AppError> {
+        let created: Option<AppointmentSlot> = db.create(slot.id.record()).content(slot).await?;
+        created.ok_or_else(|| AppError::Internal("failed to create appointment slot".into()))
+    }
+
+    /// Publish one slot.
+    pub async fn create(
+        teacher: &UserId,
+        starts_at: Timestamp,
+        ends_at: Timestamp,
+        note: Option<SlotNote>,
+        db: &Database,
+    ) -> Result<AppointmentSlot, AppError> {
+        Self::check_window(starts_at, ends_at)?;
+        Self::insert(
+            AppointmentSlot {
+                id: AppointmentSlotId::generate(),
+                teacher: teacher.clone(),
+                starts_at,
+                ends_at,
+                note,
+                series: None,
+                created_at: Timestamp::now(),
+            },
+            db,
+        )
+        .await
+    }
+
+    /// Publish the same weekly window repeatedly, up to `until`. Every row
+    /// carries the same [`SlotSeries`], so the whole publish stays addressable
+    /// (and deletable) as one thing while each occurrence remains an ordinary,
+    /// independently bookable and independently cancellable slot.
+    pub async fn publish_weekly(
+        teacher: &UserId,
+        starts_at: Timestamp,
+        ends_at: Timestamp,
+        note: Option<SlotNote>,
+        until: Timestamp,
+        db: &Database,
+    ) -> Result<Vec<AppointmentSlot>, AppError> {
+        let windows = Self::weekly_windows(starts_at, ends_at, until)?;
+        let series = SlotSeries::generate();
+        let now = Timestamp::now();
+        let mut slots = Vec::with_capacity(windows.len());
+        for (starts_at, ends_at) in windows {
+            slots.push(
+                Self::insert(
+                    AppointmentSlot {
+                        id: AppointmentSlotId::generate(),
+                        teacher: teacher.clone(),
+                        starts_at,
+                        ends_at,
+                        note: note.clone(),
+                        series: Some(series.clone()),
+                        created_at: now,
+                    },
+                    db,
+                )
+                .await?,
+            );
+        }
+        Ok(slots)
+    }
+
+    pub async fn read(
+        id: &AppointmentSlotId,
+        db: &Database,
+    ) -> Result<Option<AppointmentSlot>, AppError> {
+        Ok(db.select(id.record()).await?)
+    }
+
+    /// A teacher's own calendar, earliest first.
+    pub async fn list_for_teacher(
+        teacher: &UserId,
+        db: &Database,
+    ) -> Result<Vec<AppointmentSlot>, AppError> {
+        let mut result = db
+            .query(
+                "SELECT * FROM appointment_slot WHERE teacher = $teacher \
+                 ORDER BY starts_at ASC, id ASC",
+            )
+            .bind(("teacher", teacher.record()))
+            .await?
+            .check()?;
+        Ok(result.take::<Vec<AppointmentSlot>>(0)?)
+    }
+
+    /// Every slot published from `starts_at` onwards, earliest first — the
+    /// bookable calendar a requester browses.
+    pub async fn list_upcoming(
+        from: Timestamp,
+        db: &Database,
+    ) -> Result<Vec<AppointmentSlot>, AppError> {
+        let mut result = db
+            .query(
+                "SELECT * FROM appointment_slot WHERE ends_at > $from \
+                 ORDER BY starts_at ASC, id ASC",
+            )
+            .bind(("from", from.as_millis()))
+            .await?
+            .check()?;
+        Ok(result.take::<Vec<AppointmentSlot>>(0)?)
+    }
+
+    pub async fn list_for_series(
+        series: &SlotSeries,
+        db: &Database,
+    ) -> Result<Vec<AppointmentSlot>, AppError> {
+        let mut result = db
+            .query(
+                "SELECT * FROM appointment_slot WHERE series = $series \
+                 ORDER BY starts_at ASC, id ASC",
+            )
+            .bind(("series", series.as_str().to_string()))
+            .await?
+            .check()?;
+        Ok(result.take::<Vec<AppointmentSlot>>(0)?)
+    }
+
+    /// Delete one slot, refusing (409) while a live booking sits on it — the
+    /// requester is expecting that meeting, so it must be rejected first.
+    /// Settled bookings (rejected/cancelled) are history of a slot that is
+    /// going away, so they cascade out with it, like [`Event::delete`]'s rows.
+    ///
+    /// The occupancy read and the delete run under [`APPOINTMENT_LOCK`], so a
+    /// booking cannot land between them and outlive its slot.
+    pub async fn delete(self, db: &Database) -> Result<AppointmentSlot, AppError> {
+        let _guard = APPOINTMENT_LOCK.lock().await;
+        Self::delete_locked(std::slice::from_ref(&self.id), db).await?;
+        Ok(self)
+    }
+
+    /// Delete a whole recurring publish, all-or-nothing: if *any* occurrence
+    /// still holds a live booking the entire series is refused, so the teacher
+    /// deals with the person waiting instead of silently keeping a stray week.
+    pub async fn delete_series(
+        series: &SlotSeries,
+        db: &Database,
+    ) -> Result<Vec<AppointmentSlot>, AppError> {
+        let _guard = APPOINTMENT_LOCK.lock().await;
+        let slots = Self::list_for_series(series, db).await?;
+        if slots.is_empty() {
+            return Err(AppError::NotFound);
+        }
+        let ids: Vec<AppointmentSlotId> = slots.iter().map(|slot| slot.id.clone()).collect();
+        Self::delete_locked(&ids, db).await?;
+        Ok(slots)
+    }
+
+    /// Shared body of both deletes. Caller must already hold
+    /// [`APPOINTMENT_LOCK`]: the live-booking check is only meaningful while
+    /// no booking can be written.
+    async fn delete_locked(ids: &[AppointmentSlotId], db: &Database) -> Result<(), AppError> {
+        for id in ids {
+            if Appointment::has_live_booking(id, db).await? {
+                return Err(AppError::Conflict(
+                    "the slot has a pending or approved booking",
+                ));
+            }
+        }
+        let records: Vec<RecordId> = ids.iter().map(|id| id.record()).collect();
+        let mut result = db
+            .query("DELETE appointment WHERE slot IN $slots; DELETE $slots RETURN BEFORE;")
+            .bind(("slots", records))
+            .await?
+            .check()?;
+        if result.take::<Vec<AppointmentSlot>>(1)?.is_empty() {
+            return Err(AppError::NotFound);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(millis: i64) -> Timestamp {
+        Timestamp::from_millis(millis)
+    }
+
+    #[tokio::test]
+    async fn note_is_optional_and_capped() {
+        assert!(SlotNote::try_new("").is_ok());
+        assert!(SlotNote::try_new(&"x".repeat(MAX_APPOINTMENT_NOTE_LEN)).is_ok());
+        assert!(SlotNote::try_new(&"x".repeat(MAX_APPOINTMENT_NOTE_LEN + 1)).is_err());
+    }
+
+    #[tokio::test]
+    async fn window_must_be_a_real_span() {
+        assert!(AppointmentSlot::check_window(at(10), at(20)).is_ok());
+        assert!(AppointmentSlot::check_window(at(20), at(20)).is_err());
+        assert!(AppointmentSlot::check_window(at(21), at(20)).is_err());
+    }
+
+    #[tokio::test]
+    async fn weekly_expansion_counts_whole_weeks_inclusive() {
+        let start = at(0);
+        let end = at(MILLIS_PER_DAY / 24);
+        // `until` on the third occurrence's own start — that week is included.
+        let windows = AppointmentSlot::weekly_windows(start, end, at(2 * MILLIS_PER_WEEK)).unwrap();
+        assert_eq!(windows.len(), 3);
+        assert_eq!(windows[2].0.as_millis(), 2 * MILLIS_PER_WEEK);
+        assert_eq!(
+            windows[2].1.as_millis(),
+            2 * MILLIS_PER_WEEK + MILLIS_PER_DAY / 24
+        );
+        // One millisecond short of the next week does not add an occurrence.
+        assert_eq!(
+            AppointmentSlot::weekly_windows(start, end, at(3 * MILLIS_PER_WEEK - 1))
+                .unwrap()
+                .len(),
+            3
+        );
+        // A single-shot week is still one occurrence.
+        assert_eq!(
+            AppointmentSlot::weekly_windows(start, end, start)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(AppointmentSlot::weekly_windows(at(MILLIS_PER_WEEK), end, at(0)).is_err());
+    }
+
+    #[tokio::test]
+    async fn weekly_expansion_refuses_more_than_the_cap() {
+        let start = at(0);
+        let end = at(1_000);
+        let last_ok = at((MAX_SLOT_OCCURRENCES as i64 - 1) * MILLIS_PER_WEEK);
+        assert_eq!(
+            AppointmentSlot::weekly_windows(start, end, last_ok)
+                .unwrap()
+                .len(),
+            MAX_SLOT_OCCURRENCES
+        );
+        assert!(matches!(
+            AppointmentSlot::weekly_windows(start, end, at(last_ok.as_millis() + MILLIS_PER_WEEK)),
+            Err(AppError::Validation(ValidationError::TooLong { .. }))
+        ));
+    }
+
+    /// A window ending near `i64::MAX` overflows on the first weekly shift.
+    /// Unchecked, release builds wrapped the end *below* the start and stored
+    /// inverted windows, which `Appointment::overlaps` can never flag — the
+    /// double-booking guard would have gone quietly blind.
+    #[tokio::test]
+    async fn a_shift_that_would_overflow_is_refused() {
+        let now = Timestamp::now();
+        assert!(matches!(
+            AppointmentSlot::weekly_windows(
+                now,
+                at(i64::MAX),
+                at(now.as_millis() + 51 * MILLIS_PER_WEEK),
+            ),
+            Err(AppError::Validation(ValidationError::Invalid {
+                field: "ends_at",
+                ..
+            }))
+        ));
+        // The un-shifted first occurrence alone is still fine.
+        assert_eq!(
+            AppointmentSlot::weekly_windows(now, at(i64::MAX), now)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// Every occurrence of one publish must carry the same series id, and ids
+    /// minted back-to-back must stay in write order (the `ORDER BY` tie-break).
+    #[tokio::test]
+    async fn a_publish_shares_one_series_and_orders_its_ids() {
+        let db = crate::database::init_mem().await.unwrap();
+        let teacher = UserId::from_key("t1");
+        let slots = AppointmentSlot::publish_weekly(
+            &teacher,
+            at(1_000),
+            at(2_000),
+            Some(SlotNote::try_new("veli toplantısı").unwrap()),
+            at(1_000 + 4 * MILLIS_PER_WEEK),
+            &db,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(slots.len(), 5);
+        let series = slots[0].get_series().cloned().unwrap();
+        assert!(slots.iter().all(|slot| slot.get_series() == Some(&series)));
+        assert!(
+            slots
+                .windows(2)
+                .all(|pair| pair[0].get_id().key() < pair[1].get_id().key())
+        );
+
+        let listed = AppointmentSlot::list_for_series(&series, &db)
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 5);
+    }
+}

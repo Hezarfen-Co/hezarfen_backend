@@ -133,6 +133,18 @@ pub const SETTINGS_UPDATE_RETRIES: usize = 3;
 
 pub const MAX_TERM_NAME_LEN: usize = 100;
 
+/// A published availability slot's optional note ("bring your report card").
+pub const MAX_APPOINTMENT_NOTE_LEN: usize = 500;
+
+/// Why a requester wants the meeting — required, and read by a human, so it
+/// stays short.
+pub const MAX_APPOINTMENT_REASON_LEN: usize = 1_000;
+
+/// How many concrete slot rows one recurring publish may expand into. Weekly
+/// occurrences over a full school year fit inside this; a runaway `until`
+/// (a decade out) is refused instead of writing thousands of rows.
+pub const MAX_SLOT_OCCURRENCES: usize = 52;
+
 /// The only accepted course kinds. `course`: a regular class (ders). `study`:
 /// a supervised study session (etüt). Behaviorally identical — the kind is a
 /// label for the UI, everything else (enrollment, exams, sessions, marks)

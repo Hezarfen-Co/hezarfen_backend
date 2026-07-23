@@ -56,6 +56,8 @@ pub const HOMEWORK_FILE_TABLE: &str = "homework_file";
 pub const HOMEWORK_RESULT_TABLE: &str = "homework_result";
 pub const CONVERSATION_TABLE: &str = "conversation";
 pub const CHAT_MESSAGE_TABLE: &str = "chat_message";
+pub const APPOINTMENT_SLOT_TABLE: &str = "appointment_slot";
+pub const APPOINTMENT_TABLE: &str = "appointment";
 
 /// SCHEMAFULL schema: every column is typed, references use `record<..>`.
 /// Idempotent — safe to run on every boot: `IF NOT EXISTS` guards the
@@ -391,6 +393,38 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS graded_by ON homework_result TYPE record<user>;
     DEFINE FIELD IF NOT EXISTS created_at ON homework_result TYPE int;
     DEFINE INDEX IF NOT EXISTS homework_result_homework ON homework_result FIELDS homework;
+
+    -- Appointments (greenfield, 2026-07-23): a teacher publishes availability
+    -- slots, a student or parent books one. `series` groups the occurrences a
+    -- weekly repeat expanded into, so one cancel deletes one row and a series
+    -- delete finds the rest. A booking's live/dead state is the `status`
+    -- string; occupancy is derived from it under the appointment lock rather
+    -- than stored, so a rejected or cancelled booking frees its slot again.
+    -- The `proposed_*` fields carry a teacher's counter-proposal on the same
+    -- row until the requester accepts. No BACKFILL: both tables are new.
+    DEFINE TABLE IF NOT EXISTS appointment_slot SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS teacher ON appointment_slot TYPE record<user>;
+    DEFINE FIELD IF NOT EXISTS starts_at ON appointment_slot TYPE int;
+    DEFINE FIELD IF NOT EXISTS ends_at ON appointment_slot TYPE int;
+    DEFINE FIELD IF NOT EXISTS note ON appointment_slot TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS series ON appointment_slot TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS created_at ON appointment_slot TYPE int;
+    DEFINE INDEX IF NOT EXISTS appointment_slot_teacher_starts ON appointment_slot FIELDS teacher, starts_at;
+    DEFINE INDEX IF NOT EXISTS appointment_slot_series ON appointment_slot FIELDS series;
+
+    DEFINE TABLE IF NOT EXISTS appointment SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS slot ON appointment TYPE record<appointment_slot>;
+    DEFINE FIELD IF NOT EXISTS requester ON appointment TYPE record<user>;
+    DEFINE FIELD IF NOT EXISTS status ON appointment TYPE string DEFAULT 'pending';
+    DEFINE FIELD IF NOT EXISTS reason ON appointment TYPE string;
+    DEFINE FIELD IF NOT EXISTS proposed_starts_at ON appointment TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS proposed_ends_at ON appointment TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS proposed_by ON appointment TYPE option<record<user>>;
+    DEFINE FIELD IF NOT EXISTS decided_by ON appointment TYPE option<record<user>>;
+    DEFINE FIELD IF NOT EXISTS created_at ON appointment TYPE int;
+    DEFINE INDEX IF NOT EXISTS appointment_slot_ref ON appointment FIELDS slot;
+    DEFINE INDEX IF NOT EXISTS appointment_requester ON appointment FIELDS requester;
+    DEFINE INDEX IF NOT EXISTS appointment_status ON appointment FIELDS status;
 ";
 
 /// Data backfills for rows written by older binaries. Runs *after* (and apart

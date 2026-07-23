@@ -4,6 +4,7 @@
 //! `RequireTeacher` / `RequireAdmin` extractor instead of `CurrentUser`.
 
 pub mod ai;
+pub mod appointments;
 pub mod attendance;
 pub mod auth;
 pub mod chat;
