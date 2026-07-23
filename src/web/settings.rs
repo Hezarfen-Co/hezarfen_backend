@@ -65,15 +65,15 @@ struct SettingsResponse {
     /// Per-file size limit for note uploads, in bytes.
     #[schema(example = 5_242_880)]
     max_file_bytes: i64,
-    /// How many prior turns of a conversation the chatbot is given as context.
+    /// How many prior turns of a thread the chatbot is given as context.
     #[schema(example = 10)]
-    chat_history_turns: i64,
-    /// How many chatbot conversations one user may keep.
+    chatbot_history_turns: i64,
+    /// How many chatbot threads one user may keep.
     #[schema(example = 50)]
-    max_chat_conversations: i64,
+    max_chatbot_threads: i64,
     /// Character limit on one chat message.
     #[schema(example = 4000)]
-    max_chat_message_len: i64,
+    max_chatbot_message_len: i64,
 }
 
 impl SettingsResponse {
@@ -97,9 +97,9 @@ impl SettingsResponse {
                 })
                 .collect(),
             max_file_bytes: settings.get_max_file_bytes(),
-            chat_history_turns: settings.get_chat_history_turns(),
-            max_chat_conversations: settings.get_max_chat_conversations(),
-            max_chat_message_len: settings.get_max_chat_message_len(),
+            chatbot_history_turns: settings.get_chatbot_history_turns(),
+            max_chatbot_threads: settings.get_max_chatbot_threads(),
+            max_chatbot_message_len: settings.get_max_chatbot_message_len(),
         }
     }
 }
@@ -119,18 +119,18 @@ struct UpdateSettings {
     /// `1024` (1 KiB) – `26214400` (25 MiB). The ceiling is a server hard cap.
     #[schema(example = 5_242_880)]
     max_file_bytes: Option<i64>,
-    /// How many prior turns of a conversation the chatbot is given as context,
+    /// How many prior turns of a thread the chatbot is given as context,
     /// `1`–`50`. Every turn is re-sent on every reply, so this costs tokens.
     #[schema(example = 10)]
-    chat_history_turns: Option<i64>,
-    /// How many chatbot conversations one user may keep, `1`–`500`. At the cap
-    /// the user deletes an old conversation before starting a new one.
+    chatbot_history_turns: Option<i64>,
+    /// How many chatbot threads one user may keep, `1`–`500`. At the cap
+    /// the user deletes an old thread before starting a new one.
     #[schema(example = 50)]
-    max_chat_conversations: Option<i64>,
+    max_chatbot_threads: Option<i64>,
     /// Character limit on one chat message, `100`–`8000`. The ceiling is a
     /// server hard cap.
     #[schema(example = 4000)]
-    max_chat_message_len: Option<i64>,
+    max_chatbot_message_len: Option<i64>,
 }
 
 /// The school's current policy. Any authenticated user — clients need it to
@@ -239,13 +239,13 @@ async fn update_settings(
         params.attendance_statuses = attendance_statuses;
         params.grade_bands = grade_bands;
         params.max_file_bytes = req.max_file_bytes.unwrap_or(params.max_file_bytes);
-        params.chat_history_turns = req.chat_history_turns.unwrap_or(params.chat_history_turns);
-        params.max_chat_conversations = req
-            .max_chat_conversations
-            .unwrap_or(params.max_chat_conversations);
-        params.max_chat_message_len = req
-            .max_chat_message_len
-            .unwrap_or(params.max_chat_message_len);
+        params.chatbot_history_turns = req.chatbot_history_turns.unwrap_or(params.chatbot_history_turns);
+        params.max_chatbot_threads = req
+            .max_chatbot_threads
+            .unwrap_or(params.max_chatbot_threads);
+        params.max_chatbot_message_len = req
+            .max_chatbot_message_len
+            .unwrap_or(params.max_chatbot_message_len);
 
         let settings = Settings::try_new(params)?;
         if let Some(saved) = settings.save_if_unchanged(&current, &st.db).await? {

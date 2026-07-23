@@ -24,7 +24,7 @@ async fn reboot(db: &Database) -> Router {
         files_path: common::files_dir(),
         cookie_secure: false,
         rate_limit: RateLimitConfig::unlimited(),
-        chat_limit: Default::default(),
+        chatbot_limit: Default::default(),
         exam_presence: Default::default(),
         db_up: Default::default(),
         ai: None,
@@ -729,13 +729,13 @@ async fn appointments_survive_remigration() {
 }
 
 /// A chatbot thread and every turn in it die together: deleting the
-/// conversation cascades its `chat_message` rows in one transaction, so no
+/// thread cascades its `chatbot_message` rows in one transaction, so no
 /// orphan survives a reboot. And the thread is owner-scoped end to end — a
-/// second user reads neither the conversation nor its messages.
+/// second user reads neither the thread nor its messages.
 #[tokio::test]
 async fn chat_thread_delete_cascades_and_stays_owner_scoped() {
-    use hezarfen_backend::domain::chat_message::{ChatContent, ChatMessage, MessageStatus};
-    use hezarfen_backend::domain::conversation::Conversation;
+    use hezarfen_backend::domain::chatbot_message::{ChatContent, ChatbotMessage, MessageStatus};
+    use hezarfen_backend::domain::chatbot_thread::ChatbotThread;
     use hezarfen_backend::domain::user::UserId;
 
     let (app, db) = common::app_and_db().await;
@@ -744,11 +744,11 @@ async fn chat_thread_delete_cascades_and_stays_owner_scoped() {
     let owner = UserId::from_key(&me_id(&app, &owner_cookie).await);
     let other = UserId::from_key(&me_id(&app, &other_cookie).await);
 
-    let conversation = Conversation::create(&owner, None, &db)
+    let thread = ChatbotThread::create(&owner, None, &db)
         .await
         .expect("create");
-    let id = conversation.get_id().clone();
-    let prompt = ChatMessage::append_user(
+    let id = thread.get_id().clone();
+    let prompt = ChatbotMessage::append_user(
         &id,
         &owner,
         ChatContent::try_new("selam").expect("content"),
@@ -756,12 +756,12 @@ async fn chat_thread_delete_cascades_and_stays_owner_scoped() {
     )
     .await
     .expect("append user");
-    let reply = ChatMessage::append_pending_assistant(&id, &owner, &db)
+    let reply = ChatbotMessage::append_pending_assistant(&id, &owner, &db)
         .await
         .expect("append assistant");
     assert_eq!(reply.get_status(), MessageStatus::Pending);
 
-    let reply = ChatMessage::complete(
+    let reply = ChatbotMessage::complete(
         reply.get_id(),
         ChatContent::try_new("aleykum selam").expect("content"),
         false,
@@ -773,56 +773,56 @@ async fn chat_thread_delete_cascades_and_stays_owner_scoped() {
     assert_eq!(reply.get_content().as_str(), "aleykum selam");
     assert!(reply.get_completed_at().is_some());
     assert_eq!(
-        ChatMessage::list_for_conversation(&id, &db)
+        ChatbotMessage::list_for_thread(&id, &db)
             .await
             .expect("thread")
             .len(),
         2
     );
 
-    // The other user sees nothing of it, by conversation or by message.
+    // The other user sees nothing of it, by thread or by message.
     assert!(
-        Conversation::read_for(&id, &other, &db)
+        ChatbotThread::read_for(&id, &other, &db)
             .await
-            .expect("cross-user conversation")
+            .expect("cross-user thread")
             .is_none()
     );
     assert!(
-        ChatMessage::read_for(prompt.get_id(), &other, &db)
+        ChatbotMessage::read_for(prompt.get_id(), &other, &db)
             .await
             .expect("cross-user message")
             .is_none()
     );
     assert_eq!(
-        Conversation::count_for_user(&other, &db)
+        ChatbotThread::count_for_user(&other, &db)
             .await
             .expect("count"),
         0
     );
     assert_eq!(
-        Conversation::count_for_user(&owner, &db)
+        ChatbotThread::count_for_user(&owner, &db)
             .await
             .expect("count"),
         1
     );
 
-    conversation.delete(&db).await.expect("delete");
+    thread.delete(&db).await.expect("delete");
     assert!(
-        Conversation::read_for(&id, &owner, &db)
+        ChatbotThread::read_for(&id, &owner, &db)
             .await
-            .expect("deleted conversation")
+            .expect("deleted thread")
             .is_none()
     );
     assert_eq!(
-        Conversation::list_for_user(&owner, &db)
+        ChatbotThread::list_for_user(&owner, &db)
             .await
             .unwrap()
             .len(),
         0
     );
-    // Not just the thread's own view: no `chat_message` row is left anywhere.
+    // Not just the thread's own view: no `chatbot_message` row is left anywhere.
     let mut left = db
-        .query("SELECT VALUE id FROM chat_message")
+        .query("SELECT VALUE id FROM chatbot_message")
         .await
         .expect("sweep")
         .check()
@@ -839,8 +839,8 @@ async fn chat_thread_delete_cascades_and_stays_owner_scoped() {
 /// read back as whole, which is exactly how they were shown at the time.
 #[tokio::test]
 async fn legacy_chat_turns_backfill_to_untruncated() {
-    use hezarfen_backend::domain::chat_message::{ChatContent, ChatMessage};
-    use hezarfen_backend::domain::conversation::Conversation;
+    use hezarfen_backend::domain::chatbot_message::{ChatContent, ChatbotMessage};
+    use hezarfen_backend::domain::chatbot_thread::ChatbotThread;
     use hezarfen_backend::domain::user::UserId;
 
     let (app, db) = common::app_and_db().await;
@@ -857,11 +857,11 @@ async fn legacy_chat_turns_backfill_to_untruncated() {
         .unwrap();
     let owner = UserId::from_key(&me_id(&app, &cookie).await);
 
-    let conversation = Conversation::create(&owner, None, &db)
+    let thread = ChatbotThread::create(&owner, None, &db)
         .await
         .expect("create");
-    let id = conversation.get_id().clone();
-    ChatMessage::append_user(
+    let id = thread.get_id().clone();
+    ChatbotMessage::append_user(
         &id,
         &owner,
         ChatContent::try_new("selam").expect("content"),
@@ -869,10 +869,10 @@ async fn legacy_chat_turns_backfill_to_untruncated() {
     )
     .await
     .expect("append user");
-    let reply = ChatMessage::append_pending_assistant(&id, &owner, &db)
+    let reply = ChatbotMessage::append_pending_assistant(&id, &owner, &db)
         .await
         .expect("append assistant");
-    ChatMessage::complete(
+    ChatbotMessage::complete(
         reply.get_id(),
         ChatContent::try_new("aleykum selam").expect("content"),
         false,
@@ -883,8 +883,8 @@ async fn legacy_chat_turns_backfill_to_untruncated() {
 
     // Strip the column the way a pre-flag binary's schema would have left it.
     db.query(
-        "REMOVE FIELD IF EXISTS truncated ON TABLE chat_message;
-         UPDATE chat_message SET truncated = NONE;",
+        "REMOVE FIELD IF EXISTS truncated ON TABLE chatbot_message;
+         UPDATE chatbot_message SET truncated = NONE;",
     )
     .await
     .expect("strip truncated")
@@ -901,7 +901,7 @@ async fn legacy_chat_turns_backfill_to_untruncated() {
     let res = send(
         &app,
         "GET",
-        &format!("/chat/conversations/{}/messages", id.key()),
+        &format!("/chatbot/threads/{}/messages", id.key()),
         Some(&cookie),
         None,
     )

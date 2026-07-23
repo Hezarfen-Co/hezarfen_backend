@@ -95,7 +95,7 @@ stream on that one connection — no correlation ids, no head-of-line blocking.
 The bridge's certificate is published at `GET /ai/certificate` so a service can
 pin it before dialling (see "AI bridge (QUIC)").
 The first thing riding that bridge is the **chatbot**: every signed-in user
-(`parent` included) keeps private conversations with an AI service, free-form —
+(`parent` included) keeps private threads with an AI service, free-form —
 no rule tables, no canned answers, the backend only owns auth, limits,
 persistence and the payload format. Sending is asynchronous because an
 inference outlives a request: the turn plus an empty `pending` answer are
@@ -234,7 +234,7 @@ a `Retry-After` header (seconds). Set a limit to `0` to disable that tier —
 useful for load tests.
 
 Sending a chatbot message adds a third tier, and it is keyed by **user id**,
-not by IP (`RATE_LIMIT_CHAT_PER_MINUTE`, default 20), because an inference
+not by IP (`RATE_LIMIT_CHATBOT_PER_MINUTE`, default 20), because an inference
 costs the school real money and a shared-IP classroom must not spend one
 student's budget on another's. `0` disables it like the other two. It is
 charged before anything is written, so a `429` leaves no trace (see
@@ -576,21 +576,21 @@ their existing shapes: the student exam-room reads
 | GET    | `/pomodoro/{user}`               | teacher* | A user's pomodoro log, same shape · paged; *or a `parent` linked to `{user}` |
 | GET    | `/attendance/me`                 | student | Own attendance report: events + sessions + per-course tallies |
 | GET    | `/attendance/{user}`             | teacher* | A user's attendance report, narrowed to the caller's courses (manager+: full); *or a `parent` linked to `{user}` — full |
-| GET    | `/settings`                      | student | The school's policy: `exam_kinds` (`{name, weight}` each), `attendance_statuses`, `grade_bands`, `max_file_bytes`, `chat_history_turns`, `max_chat_conversations`, `max_chat_message_len` |
+| GET    | `/settings`                      | student | The school's policy: `exam_kinds` (`{name, weight}` each), `attendance_statuses`, `grade_bands`, `max_file_bytes`, `chatbot_history_turns`, `max_chatbot_threads`, `max_chatbot_message_len` |
 | PATCH  | `/settings`                      | manager | Replace any subset of the fields (lists wholesale); concurrent edits merge, never silently revert each other; `400` on "Invalid lists, bands, file limit, or chat limits"; `409` when a removed exam kind still has graded exams (see "Per-school policy") |
 | POST   | `/terms`                         | manager | `{name, starts_at, ends_at}` — past dates allowed (calendar backfill) |
 | GET    | `/terms`                         | student | List terms, newest first · paged |
 | GET    | `/terms/{id}`                    | student | Get one term                    |
 | PATCH  | `/terms/{id}`                    | manager | Edit a term (the merged range must stay ordered) |
 | DELETE | `/terms/{id}`                    | manager | Delete a term — `409` while any course still links to it |
-| POST   | `/chat/conversations`            | student | `{title?}` — start a chatbot conversation (every role incl. `parent`, always private to its owner); `409` at `max_chat_conversations` |
-| GET    | `/chat/conversations`            | student | The caller's conversations, newest activity first · paged |
-| PATCH  | `/chat/conversations/{id}`       | student | `{title}` — rename own conversation (`null` or blank clears it back to untitled); counts as activity, so the thread moves to the top. Nothing auto-titles a thread |
-| DELETE | `/chat/conversations/{id}`       | student | Delete own conversation and every message in it (someone else's is a `404`, never a `403`) |
-| GET    | `/chat/conversations/{id}/messages` | student | The conversation's turns, oldest first — user and assistant rows alike · paged |
-| POST   | `/chat/conversations/{id}/messages` | student | `{content}` (≤ `max_chat_message_len`) — send a turn; `202 {message_id, status: "pending"}`, the answer is fetched after (`503` when no AI service offers `chat.reply` — nothing is written; `429` + `Retry-After` on the send tier) |
-| GET    | `/chat/conversations/{id}/messages/{mid}` | student | Poll one turn: `pending` until the answer lands, then `complete` + `content` or `failed` + `error_code` |
-| GET    | `/chat/conversations/{id}/messages/{mid}/stream` | student | **SSE** on the same row: `delta` chunks then one `done` — or one `error` — and close; an already-finished answer replays (see "Chatbot") |
+| POST   | `/chatbot/threads`            | student | `{title?}` — start a chatbot thread (every role incl. `parent`, always private to its owner); `409` at `max_chatbot_threads` |
+| GET    | `/chatbot/threads`            | student | The caller's threads, newest activity first · paged |
+| PATCH  | `/chatbot/threads/{id}`       | student | `{title}` — rename own thread (`null` or blank clears it back to untitled); counts as activity, so the thread moves to the top. Nothing auto-titles a thread |
+| DELETE | `/chatbot/threads/{id}`       | student | Delete own thread and every message in it (someone else's is a `404`, never a `403`) |
+| GET    | `/chatbot/threads/{id}/messages` | student | The thread's turns, oldest first — user and assistant rows alike · paged |
+| POST   | `/chatbot/threads/{id}/messages` | student | `{content}` (≤ `max_chatbot_message_len`) — send a turn; `202 {message_id, status: "pending"}`, the answer is fetched after (`503` when no AI service offers `chat.reply` — nothing is written; `429` + `Retry-After` on the send tier) |
+| GET    | `/chatbot/threads/{id}/messages/{mid}` | student | Poll one turn: `pending` until the answer lands, then `complete` + `content` or `failed` + `error_code` |
+| GET    | `/chatbot/threads/{id}/messages/{mid}/stream` | student | **SSE** on the same row: `delta` chunks then one `done` — or one `error` — and close; an already-finished answer replays (see "Chatbot") |
 
 `status` must be one of the school's attendance statuses (`GET /settings`);
 the core four `present | absent | late | excused` always exist, plus whatever
@@ -904,16 +904,16 @@ editable `settings` singleton (`GET /settings` for any signed-in user,
   exam question images alike), in bytes: `1024` (1 KiB) to `26214400` (25 MiB;
   a server hard cap — uploads buffer in memory), default `5242880` (5 MiB).
   Checked at upload time only: lowering it never touches already-stored files.
-- **`chat_history_turns`** — how many prior **messages** of a conversation the
+- **`chatbot_history_turns`** — how many prior **messages** of a thread the
   chatbot is given as context, `1`–`50` (default `10`). The unit is messages,
   not exchanges: a question and its answer are two, so the default remembers
   five question/answer pairs. Every one of them is re-sent on every reply, so
   the number is both what the bot remembers and what each answer costs.
-- **`max_chat_conversations`** — how many chatbot conversations one user may
+- **`max_chatbot_threads`** — how many chatbot threads one user may
   keep, `1`–`500` (default `50`); at the cap the user deletes an old one
   first. Storage protection, not a usage quota — that is the per-minute
   message limit.
-- **`max_chat_message_len`** — character limit on one chat message,
+- **`max_chatbot_message_len`** — character limit on one chat message,
   `100`–`8000` (default `4000`); the ceiling is a server hard cap, because
   the message and its history must fit one bridge frame.
 
@@ -1564,18 +1564,18 @@ only as trustworthy as that HTTP hop. On an untrusted network set
 
 ## Chatbot
 
-Every signed-in user — `parent` included — keeps private conversations with an
+Every signed-in user — `parent` included — keeps private threads with an
 AI service. The backend is a **relay**: it owns auth, the limits, the thread,
 the payload format, and the last look at the answer before anyone sees it; the
 words are the service's. There are deliberately **no rule, intent or
-canned-answer tables** — the conversation is free-form, and a school that wants
+canned-answer tables** — the thread is free-form, and a school that wants
 different behaviour changes its AI service, not this backend. A thread is
 private to its owner: no teacher, no admin, nobody reads someone else's, and
-another user's conversation is a `404`, never a `403`.
+another user's thread is a `404`, never a `403`.
 
 ### Sending is two-phase, and that is the point
 
-`POST /chat/conversations/{id}/messages` answers `202 {message_id, status:
+`POST /chatbot/threads/{id}/messages` answers `202 {message_id, status:
 "pending"}` instead of the answer, because an inference outlives a normal
 request (and the request-timeout layer that guards every handler). Before the
 AI is even called, two rows are written: the user's turn, and an **empty
@@ -1586,9 +1586,9 @@ outlives the HTTP request.
 
 The client then reads that row either way it likes:
 
-- **poll** `GET /chat/conversations/{id}/messages/{mid}` — `pending` until it
+- **poll** `GET /chatbot/threads/{id}/messages/{mid}` — `pending` until it
   settles, then `complete` with `content` or `failed` with `error_code`;
-- **stream** `GET /chat/conversations/{id}/messages/{mid}/stream` — the same
+- **stream** `GET /chatbot/threads/{id}/messages/{mid}/stream` — the same
   row over Server-Sent Events.
 
 Both read the same row, so they can never disagree, in any state.
@@ -1622,7 +1622,7 @@ unchanged frontend.
 ### The message DTO
 
 ```json
-{ "id": "01J8…", "conversation_id": "01J8…", "role": "assistant",
+{ "id": "01J8…", "thread_id": "01J8…", "role": "assistant",
   "status": "complete", "content": "…", "truncated": false, "error_code": null,
   "created_at": 1761820800000, "completed_at": 1761820803120 }
 ```
@@ -1631,7 +1631,7 @@ unchanged frontend.
 `failed` (a user turn is always `complete`). `content` is empty while pending,
 `error_code` is set only when failed, `completed_at` is `null` until the turn
 settles. `truncated` is `true` when `content` is only the first part of what
-the assistant answered — the rest was over `max_chat_message_len` and was cut;
+the assistant answered — the rest was over `max_chatbot_message_len` and was cut;
 it is always `false` for a user turn and for a failed one. Show it: a clipped
 answer that looks whole is worse than one the reader knows is clipped. The same
 DTO is what the SSE `done` event carries, so the streaming and polling reads
@@ -1642,10 +1642,10 @@ agree about `truncated` exactly as they do about every other field.
 | code | when |
 | --- | --- |
 | `202` | the turn was accepted; the answer is on its way |
-| `400` | empty message, or longer than the school's `max_chat_message_len` |
-| `404` | no such conversation or message — or not the caller's |
-| `409` | already at `max_chat_conversations`; delete a thread first |
-| `429` | over `RATE_LIMIT_CHAT_PER_MINUTE` messages/minute for this **user**; see `Retry-After` |
+| `400` | empty message, or longer than the school's `max_chatbot_message_len` |
+| `404` | no such thread or message — or not the caller's |
+| `409` | already at `max_chatbot_threads`; delete a thread first |
+| `429` | over `RATE_LIMIT_CHATBOT_PER_MINUTE` messages/minute for this **user**; see `Retry-After` |
 | `503` | no connected service offers `chat.reply` — **nothing was written**, retry later |
 
 The `503` ordering matters: the bridge is checked before the rows exist, so an
@@ -1666,7 +1666,7 @@ three independent mechanisms:
 
 Two more verdicts come from inspecting the answer: an **empty** reply is
 reported as `failed`/`empty_reply` (a blank bubble is indistinguishable from a
-bug), and an **over-long** one is truncated to `max_chat_message_len` — a
+bug), and an **over-long** one is truncated to `max_chatbot_message_len` — a
 clipped answer still helps, a discarded one does not — with `truncated: true`
 on the stored turn, so the clip is never passed off as the whole answer.
 
@@ -1689,14 +1689,14 @@ Requests then arrive as ordinary `hab/1` `Request` frames whose `payload` is:
 ```
 
 `history` is **oldest first** (index 0 is furthest back), optional (absent or
-`[]` = a fresh conversation), and **excludes** the new message — that one is
-`message`. It carries the last `chat_history_turns` **settled messages** —
+`[]` = a fresh thread), and **excludes** the new message — that one is
+`message`. It carries the last `chatbot_history_turns` **settled messages** —
 entries, not exchanges: the default `10` is five question/answer pairs, and
 `history` is exactly that many entries long whenever the thread holds enough
 of them. Only settled turns count: a failed answer is skipped and the window
 reaches further back for a usable one, rather than coming up short. All of it
 is re-sent on every request, which is why the service may be stateless: it can
-restart, scale out, or be replaced mid-conversation without losing context.
+restart, scale out, or be replaced mid-thread without losing context.
 
 The answer is a `Response::Ok` whose payload is:
 
@@ -1770,10 +1770,10 @@ src/
     subject.rs     SubjectId · SubjectName · SubjectDescription · Subject (course curriculum)
     term.rs        TermId · TermName · Term (school term window)
     settings.rs    ExamKindDef · GradeBand · Settings (per-school policy)
-    conversation.rs ConversationId · ConversationTitle · Conversation (one
+    chatbot_thread.rs ChatbotThreadId · ChatbotThreadTitle · ChatbotThread (one
                    chatbot thread, private to its owner)
-    chat_message.rs ChatMessageId · ChatContent · MessageRole · MessageStatus ·
-                   ChatMessage (one turn; the assistant row is written
+    chatbot_message.rs ChatbotMessageId · ChatContent · MessageRole · MessageStatus ·
+                   ChatbotMessage (one turn; the assistant row is written
                    `pending` before the AI call and settled after)
     appointment_slot.rs AppointmentSlotId · SlotSeries · SlotNote ·
                    AppointmentSlot (a teacher's published availability; a
@@ -1807,7 +1807,7 @@ src/
     auth.rs  users.rs  notes.rs  messages.rs  events.rs  appointments.rs
     courses.rs  subjects.rs  sessions.rs  exams.rs  homework.rs  questions.rs
     marks.rs  work.rs  pomodoro.rs  attendance.rs  settings.rs  terms.rs
-    ai.rs  chat.rs
+    ai.rs  chatbot.rs
 ```
 
 Tests: `cargo test` — unit (in-source), integration (`tower::oneshot` + in-memory

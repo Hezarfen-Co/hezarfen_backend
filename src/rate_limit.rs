@@ -95,13 +95,13 @@ impl Default for UserRateLimiter {
     /// The chatbot tier at its shipped default, for tests and any caller that
     /// has no [`crate::config::Config`] to hand.
     fn default() -> Self {
-        Self::per_user_minute(crate::config::DEFAULT_CHAT_RATE_LIMIT)
+        Self::per_user_minute(crate::config::DEFAULT_CHATBOT_RATE_LIMIT)
     }
 }
 
 impl UserRateLimiter {
     /// The chatbot tier: `max` messages per user per minute, from
-    /// `RATE_LIMIT_CHAT_PER_MINUTE`. `max == 0` disables it, like the IP tiers.
+    /// `RATE_LIMIT_CHATBOT_PER_MINUTE`. `max == 0` disables it, like the IP tiers.
     pub fn per_user_minute(max: u32) -> Self {
         Self::new(max, false)
     }
@@ -346,7 +346,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn users_get_independent_windows_that_reset() {
         let limiter = UserRateLimiter::default();
-        for _ in 0..crate::config::DEFAULT_CHAT_RATE_LIMIT {
+        for _ in 0..crate::config::DEFAULT_CHATBOT_RATE_LIMIT {
             assert!(limiter.enforce_user("user:a").is_ok());
         }
         assert!(matches!(

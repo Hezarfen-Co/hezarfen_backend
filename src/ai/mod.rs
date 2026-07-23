@@ -18,7 +18,7 @@
 //! * [`tls`] — the listener's certificate
 //!
 //! The transport is generic; the features land on top of it. So far that is
-//! the chatbot (`web::chat`), which routes on the `chat.reply` capability.
+//! the chatbot (`web::chatbot`), which routes on the `chat.reply` capability.
 
 pub mod chat;
 pub mod error;

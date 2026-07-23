@@ -5,7 +5,7 @@
 //! a code) — and if that task dies with the process, the boot sweep in
 //! `database.rs` fails the row instead.
 //!
-//! `user_id` is duplicated from the conversation onto every message so an
+//! `user_id` is duplicated from the thread onto every message so an
 //! ownership check is one read, with no join.
 
 use std::sync::{LazyLock, Mutex};
@@ -13,9 +13,9 @@ use std::sync::{LazyLock, Mutex};
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use ulid::{Generator, Ulid};
 
-use crate::constant::{CHAT_PENDING_STALE_SECS, MAX_CHAT_MESSAGE_LEN};
+use crate::constant::{CHATBOT_PENDING_STALE_SECS, MAX_CHATBOT_MESSAGE_LEN};
 use crate::database::{CHAT_MESSAGE_TABLE, Database};
-use crate::domain::conversation::ConversationId;
+use crate::domain::chatbot_thread::ChatbotThreadId;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
@@ -33,7 +33,7 @@ const MAX_ERROR_CODE_LEN: usize = 64;
 /// Mints message ids in write order. Unlike `Ulid::new()`, whose 80 random
 /// low bits sort arbitrarily among ids minted in the same millisecond, this
 /// increments the previous id — so the `id` tie-break in the `ORDER BY` of
-/// [`ChatMessage::list_for_conversation`] / [`ChatMessage::list_tail`] is the
+/// [`ChatbotMessage::list_for_thread`] / [`ChatbotMessage::list_tail`] is the
 /// order the rows were written. The user prompt and the assistant row one POST
 /// writes back-to-back routinely share a millisecond, and a random tie-break
 /// there renders the answer *above* its own question — and hands the AI
@@ -41,9 +41,9 @@ const MAX_ERROR_CODE_LEN: usize = 64;
 static IDS: LazyLock<Mutex<Generator>> = LazyLock::new(|| Mutex::new(Generator::new()));
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct ChatMessageId(RecordId);
+pub struct ChatbotMessageId(RecordId);
 
-impl ChatMessageId {
+impl ChatbotMessageId {
     pub fn generate() -> Self {
         let mut ids = IDS.lock().expect("chat id generator poisoned");
         // The only error is overflow of the random bits *within* one
@@ -115,13 +115,13 @@ impl MessageStatus {
 }
 
 /// One turn's text. The hard ceiling only — the school-adjustable
-/// `max_chat_message_len` is the web layer's to enforce, below this.
+/// `max_chatbot_message_len` is the web layer's to enforce, below this.
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct ChatContent(String);
 
 impl ChatContent {
     pub fn try_new(value: &str) -> Result<Self, ValidationError> {
-        validate_required("content", value, MAX_CHAT_MESSAGE_LEN)?;
+        validate_required("content", value, MAX_CHATBOT_MESSAGE_LEN)?;
         Ok(Self(value.to_string()))
     }
 
@@ -137,9 +137,9 @@ impl ChatContent {
 }
 
 #[derive(Debug, Clone, SurrealValue)]
-pub struct ChatMessage {
-    id: ChatMessageId,
-    conversation_id: ConversationId,
+pub struct ChatbotMessage {
+    id: ChatbotMessageId,
+    thread_id: ChatbotThreadId,
     user_id: UserId,
     role: MessageRole,
     content: ChatContent,
@@ -153,13 +153,13 @@ pub struct ChatMessage {
     completed_at: Option<Timestamp>,
 }
 
-impl ChatMessage {
-    pub fn get_id(&self) -> &ChatMessageId {
+impl ChatbotMessage {
+    pub fn get_id(&self) -> &ChatbotMessageId {
         &self.id
     }
 
-    pub fn get_conversation_id(&self) -> &ConversationId {
-        &self.conversation_id
+    pub fn get_thread_id(&self) -> &ChatbotThreadId {
+        &self.thread_id
     }
 
     pub fn get_user_id(&self) -> &UserId {
@@ -194,7 +194,7 @@ impl ChatMessage {
         self.completed_at
     }
 
-    /// A row still `pending` past [`CHAT_PENDING_STALE_SECS`] has lost the task
+    /// A row still `pending` past [`CHATBOT_PENDING_STALE_SECS`] has lost the task
     /// that owed it an answer; present it as failed.
     ///
     /// Read-time projection, not a lazy write-back: the read paths (poll loop,
@@ -204,7 +204,7 @@ impl ChatMessage {
     /// (a dead process) already happens once, at boot. The stored row stays
     /// truthful; only the answer handed to the caller is projected.
     fn projected(mut self) -> Self {
-        let stale_at = self.created_at.as_millis() + CHAT_PENDING_STALE_SECS * 1_000;
+        let stale_at = self.created_at.as_millis() + CHATBOT_PENDING_STALE_SECS * 1_000;
         if self.status == MessageStatus::Pending && Timestamp::now().as_millis() > stale_at {
             self.status = MessageStatus::Failed;
             self.error_code = Some(STALE_ERROR_CODE.to_string());
@@ -212,24 +212,24 @@ impl ChatMessage {
         self
     }
 
-    async fn insert(message: ChatMessage, db: &Database) -> Result<ChatMessage, AppError> {
-        let created: Option<ChatMessage> = db.create(message.id.record()).content(message).await?;
+    async fn insert(message: ChatbotMessage, db: &Database) -> Result<ChatbotMessage, AppError> {
+        let created: Option<ChatbotMessage> = db.create(message.id.record()).content(message).await?;
         created.ok_or_else(|| AppError::Internal("failed to create chat message".into()))
     }
 
     /// Append the user's prompt. Nothing is awaited for it, so it is born
     /// complete.
     pub async fn append_user(
-        conversation: &ConversationId,
+        thread: &ChatbotThreadId,
         user: &UserId,
         content: ChatContent,
         db: &Database,
-    ) -> Result<ChatMessage, AppError> {
+    ) -> Result<ChatbotMessage, AppError> {
         let now = Timestamp::now();
         Self::insert(
-            ChatMessage {
-                id: ChatMessageId::generate(),
-                conversation_id: conversation.clone(),
+            ChatbotMessage {
+                id: ChatbotMessageId::generate(),
+                thread_id: thread.clone(),
                 user_id: user.clone(),
                 role: MessageRole::User,
                 content,
@@ -247,14 +247,14 @@ impl ChatMessage {
     /// Reserve the assistant's answer *before* the AI call: the row exists,
     /// empty and `pending`, so a reload finds the turn and can wait on it.
     pub async fn append_pending_assistant(
-        conversation: &ConversationId,
+        thread: &ChatbotThreadId,
         user: &UserId,
         db: &Database,
-    ) -> Result<ChatMessage, AppError> {
+    ) -> Result<ChatbotMessage, AppError> {
         Self::insert(
-            ChatMessage {
-                id: ChatMessageId::generate(),
-                conversation_id: conversation.clone(),
+            ChatbotMessage {
+                id: ChatbotMessageId::generate(),
+                thread_id: thread.clone(),
                 user_id: user.clone(),
                 role: MessageRole::Assistant,
                 content: ChatContent::empty(),
@@ -271,22 +271,22 @@ impl ChatMessage {
 
     /// The whole thread, oldest first — the order both the UI and the AI
     /// history payload read in.
-    pub async fn list_for_conversation(
-        conversation: &ConversationId,
+    pub async fn list_for_thread(
+        thread: &ChatbotThreadId,
         db: &Database,
-    ) -> Result<Vec<ChatMessage>, AppError> {
+    ) -> Result<Vec<ChatbotMessage>, AppError> {
         let mut result = db
             .query(
-                "SELECT * FROM chat_message WHERE conversation_id = $conv \
+                "SELECT * FROM chatbot_message WHERE thread_id = $conv \
                  ORDER BY created_at ASC, id ASC",
             )
-            .bind(("conv", conversation.record()))
+            .bind(("conv", thread.record()))
             .await?
             .check()?;
         Ok(result
-            .take::<Vec<ChatMessage>>(0)?
+            .take::<Vec<ChatbotMessage>>(0)?
             .into_iter()
-            .map(ChatMessage::projected)
+            .map(ChatbotMessage::projected)
             .collect())
     }
 
@@ -294,23 +294,23 @@ impl ChatMessage {
     /// AI service as context. Taken newest-first in the database (so the
     /// `LIMIT` keeps the *recent* end) and flipped back here.
     pub async fn list_tail(
-        conversation: &ConversationId,
+        thread: &ChatbotThreadId,
         limit: usize,
         db: &Database,
-    ) -> Result<Vec<ChatMessage>, AppError> {
+    ) -> Result<Vec<ChatbotMessage>, AppError> {
         let mut result = db
             .query(
-                "SELECT * FROM chat_message WHERE conversation_id = $conv \
+                "SELECT * FROM chatbot_message WHERE thread_id = $conv \
                  ORDER BY created_at DESC, id DESC LIMIT $limit",
             )
-            .bind(("conv", conversation.record()))
+            .bind(("conv", thread.record()))
             .bind(("limit", limit as i64))
             .await?
             .check()?;
-        let mut messages: Vec<ChatMessage> = result
-            .take::<Vec<ChatMessage>>(0)?
+        let mut messages: Vec<ChatbotMessage> = result
+            .take::<Vec<ChatbotMessage>>(0)?
             .into_iter()
-            .map(ChatMessage::projected)
+            .map(ChatbotMessage::projected)
             .collect();
         messages.reverse();
         Ok(messages)
@@ -323,35 +323,35 @@ impl ChatMessage {
     /// instead of reaching further back. No projection is applied — it only
     /// ever rewrites a `pending` row, and none is selected here.
     pub async fn list_settled_tail(
-        conversation: &ConversationId,
+        thread: &ChatbotThreadId,
         limit: usize,
         db: &Database,
-    ) -> Result<Vec<ChatMessage>, AppError> {
+    ) -> Result<Vec<ChatbotMessage>, AppError> {
         let mut result = db
             .query(
-                "SELECT * FROM chat_message WHERE conversation_id = $conv \
+                "SELECT * FROM chatbot_message WHERE thread_id = $conv \
                  AND status = 'complete' AND content != '' \
                  ORDER BY created_at DESC, id DESC LIMIT $limit",
             )
-            .bind(("conv", conversation.record()))
+            .bind(("conv", thread.record()))
             .bind(("limit", limit as i64))
             .await?
             .check()?;
-        let mut messages: Vec<ChatMessage> = result.take(0)?;
+        let mut messages: Vec<ChatbotMessage> = result.take(0)?;
         messages.reverse();
         Ok(messages)
     }
 
     /// Read one turn only if `user` owns it — the poll loop's read.
     pub async fn read_for(
-        id: &ChatMessageId,
+        id: &ChatbotMessageId,
         user: &UserId,
         db: &Database,
-    ) -> Result<Option<ChatMessage>, AppError> {
-        let message: Option<ChatMessage> = db.select(id.record()).await?;
+    ) -> Result<Option<ChatbotMessage>, AppError> {
+        let message: Option<ChatbotMessage> = db.select(id.record()).await?;
         Ok(message
             .filter(|message| &message.user_id == user)
-            .map(ChatMessage::projected))
+            .map(ChatbotMessage::projected))
     }
 
     /// Land the answer, recording whether it had to be clipped to fit the
@@ -359,32 +359,32 @@ impl ChatMessage {
     /// `WHERE`, so a late reply can't overwrite a row the boot sweep (or a
     /// timeout) already failed, and two answers can't both apply.
     pub async fn complete(
-        id: &ChatMessageId,
+        id: &ChatbotMessageId,
         text: ChatContent,
         truncated: bool,
         db: &Database,
-    ) -> Result<ChatMessage, AppError> {
+    ) -> Result<ChatbotMessage, AppError> {
         Self::settle(id, Some(text), truncated, None, db).await
     }
 
     /// Mark the answer failed with a short code (`unavailable`, the service's
-    /// own error code, …). Same pending gate as [`ChatMessage::complete`].
+    /// own error code, …). Same pending gate as [`ChatbotMessage::complete`].
     pub async fn fail(
-        id: &ChatMessageId,
+        id: &ChatbotMessageId,
         error_code: &str,
         db: &Database,
-    ) -> Result<ChatMessage, AppError> {
+    ) -> Result<ChatbotMessage, AppError> {
         // A failed turn has no text, so there is nothing that could be clipped.
         Self::settle(id, None, false, Some(error_code), db).await
     }
 
     async fn settle(
-        id: &ChatMessageId,
+        id: &ChatbotMessageId,
         text: Option<ChatContent>,
         truncated: bool,
         error_code: Option<&str>,
         db: &Database,
-    ) -> Result<ChatMessage, AppError> {
+    ) -> Result<ChatbotMessage, AppError> {
         let status = if text.is_some() {
             MessageStatus::Complete
         } else {
@@ -407,7 +407,7 @@ impl ChatMessage {
             .await?
             .check()?;
         result
-            .take::<Vec<ChatMessage>>(0)?
+            .take::<Vec<ChatbotMessage>>(0)?
             .into_iter()
             .next()
             .ok_or(AppError::NotFound)
@@ -422,8 +422,8 @@ mod tests {
     #[tokio::test]
     async fn content_is_required_and_capped() {
         assert!(ChatContent::try_new("").is_err());
-        assert!(ChatContent::try_new(&"x".repeat(MAX_CHAT_MESSAGE_LEN)).is_ok());
-        assert!(ChatContent::try_new(&"x".repeat(MAX_CHAT_MESSAGE_LEN + 1)).is_err());
+        assert!(ChatContent::try_new(&"x".repeat(MAX_CHATBOT_MESSAGE_LEN)).is_ok());
+        assert!(ChatContent::try_new(&"x".repeat(MAX_CHATBOT_MESSAGE_LEN + 1)).is_err());
     }
 
     #[tokio::test]
@@ -455,24 +455,24 @@ mod tests {
         // inverted a fifth of the pairs; here every pair must read back
         // question-then-answer, from both read paths.
         let db = crate::database::init_mem().await.unwrap();
-        let conversation = ConversationId::from_key("c");
+        let thread = ChatbotThreadId::from_key("c");
         let user = UserId::from_key("u");
         const TURNS: usize = 200;
 
         for turn in 0..TURNS {
             let content = ChatContent::try_new(&format!("soru {turn}")).unwrap();
-            ChatMessage::append_user(&conversation, &user, content, &db)
+            ChatbotMessage::append_user(&thread, &user, content, &db)
                 .await
                 .unwrap();
-            ChatMessage::append_pending_assistant(&conversation, &user, &db)
+            ChatbotMessage::append_pending_assistant(&thread, &user, &db)
                 .await
                 .unwrap();
         }
 
-        let whole = ChatMessage::list_for_conversation(&conversation, &db)
+        let whole = ChatbotMessage::list_for_thread(&thread, &db)
             .await
             .unwrap();
-        let tail = ChatMessage::list_tail(&conversation, TURNS * 2, &db)
+        let tail = ChatbotMessage::list_tail(&thread, TURNS * 2, &db)
             .await
             .unwrap();
         for messages in [&whole, &tail] {
@@ -488,9 +488,9 @@ mod tests {
     #[tokio::test]
     async fn stale_pending_projects_as_failed() {
         let aged = |secs: i64| {
-            ChatMessage {
-                id: ChatMessageId::generate(),
-                conversation_id: ConversationId::from_key("c"),
+            ChatbotMessage {
+                id: ChatbotMessageId::generate(),
+                thread_id: ChatbotThreadId::from_key("c"),
                 user_id: UserId::from_key("u"),
                 role: MessageRole::Assistant,
                 content: ChatContent::empty(),
@@ -507,7 +507,7 @@ mod tests {
         assert_eq!(fresh.get_status(), MessageStatus::Pending);
         assert_eq!(fresh.get_error_code(), None);
 
-        let stale = aged(CHAT_PENDING_STALE_SECS + 1);
+        let stale = aged(CHATBOT_PENDING_STALE_SECS + 1);
         assert_eq!(stale.get_status(), MessageStatus::Failed);
         assert_eq!(stale.get_error_code(), Some(STALE_ERROR_CODE));
     }

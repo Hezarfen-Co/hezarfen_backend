@@ -2,7 +2,7 @@
 //!
 //! The backend owns everything except the answer itself — auth, the per-user
 //! rate limit, the thread, the payload format, and the last look at the reply
-//! before it is stored. There are no intent or rule tables: the conversation is
+//! before it is stored. There are no intent or rule tables: the thread is
 //! free-form on purpose.
 //!
 //! Sending is asynchronous by design. `POST .../messages` writes the user's
@@ -30,12 +30,12 @@ use utoipa_axum::routes;
 
 use crate::ai::chat::{ChatReplyPayload, ChatRequestPayload, ChatRole, ChatTurn};
 use crate::ai::{AiBridge, AiError};
-use crate::constant::{AI_CHAT_CAPABILITY, CHAT_STREAM_POLL_MS, MAX_CHAT_MESSAGE_LEN};
+use crate::constant::{AI_CHAT_CAPABILITY, CHAT_STREAM_POLL_MS, MAX_CHATBOT_MESSAGE_LEN};
 use crate::database::Database;
-use crate::domain::chat_message::{
-    ChatContent, ChatMessage, ChatMessageId, MessageRole, MessageStatus,
+use crate::domain::chatbot_message::{
+    ChatContent, ChatbotMessage, ChatbotMessageId, MessageRole, MessageStatus,
 };
-use crate::domain::conversation::{Conversation, ConversationId, ConversationTitle};
+use crate::domain::chatbot_thread::{ChatbotThread, ChatbotThreadId, ChatbotThreadTitle};
 use crate::domain::settings::Settings;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ErrorResponse, ValidationError};
@@ -45,8 +45,8 @@ use super::{CurrentUser, Page, PageParams, paginate};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
-        .routes(routes!(create_conversation, list_conversations))
-        .routes(routes!(rename_conversation, delete_conversation))
+        .routes(routes!(create_thread, list_threads))
+        .routes(routes!(rename_thread, delete_thread))
         .routes(routes!(list_messages, send_message))
         .routes(routes!(read_message))
         .routes(routes!(stream_message))
@@ -57,10 +57,10 @@ pub fn routes() -> OpenApiRouter<AppState> {
 const REPLY_CHUNKS: usize = 8;
 const MIN_CHUNK_CHARS: usize = 24;
 
-// ---- conversations ----------------------------------------------------------
+// ---- threads ----------------------------------------------------------
 
 #[derive(Deserialize, ToSchema)]
-struct CreateConversation {
+struct CreateChatbotThread {
     /// Optional thread name, up to 200 characters. Blank counts as absent —
     /// an untitled thread is normal (the UI labels it from its first turn).
     #[schema(example = "Fizik ödevi")]
@@ -70,7 +70,7 @@ struct CreateConversation {
 /// One chatbot thread. `updated_at` moves on every turn, and the list is
 /// sorted by it, so the thread just written to is always first.
 #[derive(Serialize, ToSchema)]
-struct ConversationResponse {
+struct ChatbotThreadResponse {
     #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
     id: String,
     #[schema(example = "Fizik ödevi")]
@@ -81,55 +81,55 @@ struct ConversationResponse {
     updated_at: i64,
 }
 
-impl ConversationResponse {
-    fn new(conversation: &Conversation) -> Self {
+impl ChatbotThreadResponse {
+    fn new(thread: &ChatbotThread) -> Self {
         Self {
-            id: conversation.get_id().key().to_string(),
-            title: conversation
+            id: thread.get_id().key().to_string(),
+            title: thread
                 .get_title()
                 .map(|title| title.as_str().to_string()),
-            created_at: conversation.get_created_at().as_millis(),
-            updated_at: conversation.get_updated_at().as_millis(),
+            created_at: thread.get_created_at().as_millis(),
+            updated_at: thread.get_updated_at().as_millis(),
         }
     }
 }
 
 /// Start a new chatbot thread, optionally named. Every authenticated role may
 /// chat, parents included. A user may keep up to the school's
-/// `max_chat_conversations` threads; at the cap the request is refused (409)
+/// `max_chatbot_threads` threads; at the cap the request is refused (409)
 /// until an old thread is deleted — the cap is storage protection, not a
 /// usage quota (that is the per-minute message limit).
 #[utoipa::path(
     post,
-    path = "/conversations",
-    tag = "chat",
+    path = "/threads",
+    tag = "chatbot",
     security(("session_cookie" = [])),
-    request_body = CreateConversation,
+    request_body = CreateChatbotThread,
     responses(
-        (status = 201, description = "The new thread", body = ConversationResponse),
+        (status = 201, description = "The new thread", body = ChatbotThreadResponse),
         (status = 400, description = "Invalid title", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 409, description = "At the school's conversation cap", body = ErrorResponse),
+        (status = 409, description = "At the school's thread cap", body = ErrorResponse),
     ),
 )]
-async fn create_conversation(
+async fn create_thread(
     State(st): State<AppState>,
     CurrentUser(user): CurrentUser,
-    Json(req): Json<CreateConversation>,
-) -> Result<(StatusCode, Json<ConversationResponse>), AppError> {
+    Json(req): Json<CreateChatbotThread>,
+) -> Result<(StatusCode, Json<ChatbotThreadResponse>), AppError> {
     // Blank is "untitled", not an error — same rule as a message's label.
     let title = match req.title.as_deref().map(str::trim).unwrap_or_default() {
         "" => None,
-        value => Some(ConversationTitle::try_new(value)?),
+        value => Some(ChatbotThreadTitle::try_new(value)?),
     };
 
     // The cap is checked and the row written as one critical section in the
     // domain: counting here and creating after would over-admit under
     // concurrency (the database does not serialize a count against inserts).
-    let conversation = Conversation::create_capped(user.get_id(), title, &st.db).await?;
+    let thread = ChatbotThread::create_capped(user.get_id(), title, &st.db).await?;
     Ok((
         StatusCode::CREATED,
-        Json(ConversationResponse::new(&conversation)),
+        Json(ChatbotThreadResponse::new(&thread)),
     ))
 }
 
@@ -137,33 +137,33 @@ async fn create_conversation(
 /// `?limit=&offset=`. Nobody — no teacher, no admin — reads anyone else's.
 #[utoipa::path(
     get,
-    path = "/conversations",
-    tag = "chat",
+    path = "/threads",
+    tag = "chatbot",
     security(("session_cookie" = [])),
     params(PageParams),
     responses(
-        (status = 200, description = "A page of the caller's threads", body = Page<ConversationResponse>),
+        (status = 200, description = "A page of the caller's threads", body = Page<ChatbotThreadResponse>),
         (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
     ),
 )]
-async fn list_conversations(
+async fn list_threads(
     State(st): State<AppState>,
     CurrentUser(user): CurrentUser,
     Query(page): Query<PageParams>,
-) -> Result<Json<Page<ConversationResponse>>, AppError> {
+) -> Result<Json<Page<ChatbotThreadResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let conversations = Conversation::list_for_user(user.get_id(), &st.db).await?;
-    let total = conversations.len() as i64;
-    let items = paginate(&conversations, limit, offset)
+    let threads = ChatbotThread::list_for_user(user.get_id(), &st.db).await?;
+    let total = threads.len() as i64;
+    let items = paginate(&threads, limit, offset)
         .iter()
-        .map(ConversationResponse::new)
+        .map(ChatbotThreadResponse::new)
         .collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 
 #[derive(Deserialize, ToSchema)]
-struct RenameConversation {
+struct RenameChatbotThread {
     /// The new name, up to 200 characters. `null` — or blank — clears it back
     /// to untitled, the same rule the create route applies.
     #[schema(example = "Fizik ödevi")]
@@ -179,65 +179,65 @@ struct RenameConversation {
 /// title, and the AI service is never asked for one.
 #[utoipa::path(
     patch,
-    path = "/conversations/{id}",
-    tag = "chat",
+    path = "/threads/{id}",
+    tag = "chatbot",
     security(("session_cookie" = [])),
-    params(("id" = String, Path, description = "Conversation id")),
-    request_body = RenameConversation,
+    params(("id" = String, Path, description = "ChatbotThread id")),
+    request_body = RenameChatbotThread,
     responses(
-        (status = 200, description = "The renamed thread", body = ConversationResponse),
+        (status = 200, description = "The renamed thread", body = ChatbotThreadResponse),
         (status = 400, description = "Invalid title", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 404, description = "Not found (or not the caller's)", body = ErrorResponse),
     ),
 )]
-async fn rename_conversation(
+async fn rename_thread(
     State(st): State<AppState>,
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
-    Json(req): Json<RenameConversation>,
-) -> Result<Json<ConversationResponse>, AppError> {
+    Json(req): Json<RenameChatbotThread>,
+) -> Result<Json<ChatbotThreadResponse>, AppError> {
     let title = match req.title.as_deref().map(str::trim).unwrap_or_default() {
         "" => None,
-        value => Some(ConversationTitle::try_new(value)?),
+        value => Some(ChatbotThreadTitle::try_new(value)?),
     };
-    let conversation = own_conversation(&id, user.get_id(), &st.db).await?;
-    let renamed = conversation.rename(title, &st.db).await?;
-    Ok(Json(ConversationResponse::new(&renamed)))
+    let thread = own_thread(&id, user.get_id(), &st.db).await?;
+    let renamed = thread.rename(title, &st.db).await?;
+    Ok(Json(ChatbotThreadResponse::new(&renamed)))
 }
 
 /// Delete a thread and every turn in it, permanently. Owner only; someone
 /// else's thread is a `404`, never a `403` (its existence is not leaked).
 #[utoipa::path(
     delete,
-    path = "/conversations/{id}",
-    tag = "chat",
+    path = "/threads/{id}",
+    tag = "chatbot",
     security(("session_cookie" = [])),
-    params(("id" = String, Path, description = "Conversation id")),
+    params(("id" = String, Path, description = "ChatbotThread id")),
     responses(
         (status = 204, description = "Deleted, with its messages"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 404, description = "Not found (or not the caller's)", body = ErrorResponse),
     ),
 )]
-async fn delete_conversation(
+async fn delete_thread(
     State(st): State<AppState>,
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    let conversation = own_conversation(&id, user.get_id(), &st.db).await?;
-    conversation.delete(&st.db).await?;
+    let thread = own_thread(&id, user.get_id(), &st.db).await?;
+    thread.delete(&st.db).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// Read a thread the caller owns, or `404`. A foreign id is indistinguishable
 /// from a missing one.
-async fn own_conversation(
+async fn own_thread(
     id: &str,
     user: &UserId,
     db: &Database,
-) -> Result<Conversation, AppError> {
-    Conversation::read_for(&ConversationId::from_key(id), user, db)
+) -> Result<ChatbotThread, AppError> {
+    ChatbotThread::read_for(&ChatbotThreadId::from_key(id), user, db)
         .await?
         .ok_or(AppError::NotFound)
 }
@@ -245,15 +245,15 @@ async fn own_conversation(
 // ---- turns ------------------------------------------------------------------
 
 #[derive(Deserialize, ToSchema)]
-struct SendChatMessage {
+struct SendChatbotMessage {
     /// What to ask. Required, and capped by the school's
-    /// `max_chat_message_len` (`GET /settings`).
+    /// `max_chatbot_message_len` (`GET /settings`).
     #[schema(example = "Newton'un ikinci yasasını açıklar mısın?")]
     content: String,
 }
 
 /// The receipt for an accepted turn. The answer is *not* here: it is being
-/// fetched. Poll `GET /chat/conversations/{id}/messages/{mid}` or open its
+/// fetched. Poll `GET /chatbot/threads/{id}/messages/{mid}` or open its
 /// `/stream`.
 #[derive(Serialize, ToSchema)]
 struct AcceptedResponse {
@@ -268,11 +268,11 @@ struct AcceptedResponse {
 /// One turn. `content` is empty while `status` is `pending`; `error_code` is
 /// set only when `status` is `failed`.
 #[derive(Serialize, ToSchema)]
-struct ChatMessageResponse {
+struct ChatbotMessageResponse {
     #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
     id: String,
     #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
-    conversation_id: String,
+    thread_id: String,
     /// `user` or `assistant`.
     #[schema(example = "assistant")]
     role: String,
@@ -281,7 +281,7 @@ struct ChatMessageResponse {
     status: String,
     content: String,
     /// `true` when `content` is only the first part of what the assistant
-    /// answered — the rest was over the school's `max_chat_message_len` and was
+    /// answered — the rest was over the school's `max_chatbot_message_len` and was
     /// cut. Always `false` for a user turn and for a failed one. Show the user
     /// that the answer is incomplete; asking again shortens nothing, so the way
     /// out is a narrower question (or a bigger cap).
@@ -299,11 +299,11 @@ struct ChatMessageResponse {
     completed_at: Option<i64>,
 }
 
-impl ChatMessageResponse {
-    fn new(message: &ChatMessage) -> Self {
+impl ChatbotMessageResponse {
+    fn new(message: &ChatbotMessage) -> Self {
         Self {
             id: message.get_id().key().to_string(),
-            conversation_id: message.get_conversation_id().key().to_string(),
+            thread_id: message.get_thread_id().key().to_string(),
             role: message.get_role().as_str().to_string(),
             status: message.get_status().as_str().to_string(),
             content: message.get_content().as_str().to_string(),
@@ -318,12 +318,12 @@ impl ChatMessageResponse {
 /// The whole thread, oldest first. Paged via `?limit=&offset=`. Owner only.
 #[utoipa::path(
     get,
-    path = "/conversations/{id}/messages",
-    tag = "chat",
+    path = "/threads/{id}/messages",
+    tag = "chatbot",
     security(("session_cookie" = [])),
-    params(("id" = String, Path, description = "Conversation id"), PageParams),
+    params(("id" = String, Path, description = "ChatbotThread id"), PageParams),
     responses(
-        (status = 200, description = "A page of the thread's turns", body = Page<ChatMessageResponse>),
+        (status = 200, description = "A page of the thread's turns", body = Page<ChatbotMessageResponse>),
         (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 404, description = "Not found (or not the caller's)", body = ErrorResponse),
@@ -334,14 +334,14 @@ async fn list_messages(
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
     Query(page): Query<PageParams>,
-) -> Result<Json<Page<ChatMessageResponse>>, AppError> {
+) -> Result<Json<Page<ChatbotMessageResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let conversation = own_conversation(&id, user.get_id(), &st.db).await?;
-    let messages = ChatMessage::list_for_conversation(conversation.get_id(), &st.db).await?;
+    let thread = own_thread(&id, user.get_id(), &st.db).await?;
+    let messages = ChatbotMessage::list_for_thread(thread.get_id(), &st.db).await?;
     let total = messages.len() as i64;
     let items = paginate(&messages, limit, offset)
         .iter()
-        .map(ChatMessageResponse::new)
+        .map(ChatbotMessageResponse::new)
         .collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
@@ -358,14 +358,14 @@ async fn list_messages(
 /// the boot sweep repairs whatever a process death left behind.
 #[utoipa::path(
     post,
-    path = "/conversations/{id}/messages",
-    tag = "chat",
+    path = "/threads/{id}/messages",
+    tag = "chatbot",
     security(("session_cookie" = [])),
-    params(("id" = String, Path, description = "Conversation id")),
-    request_body = SendChatMessage,
+    params(("id" = String, Path, description = "ChatbotThread id")),
+    request_body = SendChatbotMessage,
     responses(
         (status = 202, description = "Accepted; the answer is on its way", body = AcceptedResponse),
-        (status = 400, description = "Empty message, or longer than the school's `max_chat_message_len`", body = ErrorResponse),
+        (status = 400, description = "Empty message, or longer than the school's `max_chatbot_message_len`", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 404, description = "Not found (or not the caller's)", body = ErrorResponse),
         (status = 429, description = "Over the per-user message rate limit; see `Retry-After`", body = ErrorResponse),
@@ -376,12 +376,12 @@ async fn send_message(
     State(st): State<AppState>,
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
-    Json(req): Json<SendChatMessage>,
+    Json(req): Json<SendChatbotMessage>,
 ) -> Result<Response, AppError> {
     // Charged first: a rejected turn must cost nothing and leave no row.
-    st.chat_limit.enforce_user(user.get_id().key())?;
+    st.chatbot_limit.enforce_user(user.get_id().key())?;
 
-    let conversation = own_conversation(&id, user.get_id(), &st.db).await?;
+    let thread = own_thread(&id, user.get_id(), &st.db).await?;
     let settings = Settings::load(&st.db).await?;
     let reply_cap = content_cap(&settings);
     let length = req.content.chars().count();
@@ -406,23 +406,23 @@ async fn send_message(
         return Ok(unavailable("no AI service is connected right now"));
     }
 
-    let prompt = ChatMessage::append_user(
-        conversation.get_id(),
+    let prompt = ChatbotMessage::append_user(
+        thread.get_id(),
         user.get_id(),
         content.clone(),
         &st.db,
     )
     .await?;
     let answer =
-        ChatMessage::append_pending_assistant(conversation.get_id(), user.get_id(), &st.db).await?;
+        ChatbotMessage::append_pending_assistant(thread.get_id(), user.get_id(), &st.db).await?;
     // Never fatal: both rows are already written, and failing here would strand
     // the pending one with no task to answer it (it would only settle 300s
     // later, by projection). `updated_at` is the list's sort key — cosmetic
     // next to a turn that has been accepted.
-    if let Err(err) = conversation.touch(&st.db).await {
+    if let Err(err) = thread.touch(&st.db).await {
         tracing::warn!(
-            "could not stamp activity on conversation {}: {err}",
-            conversation.get_id().key()
+            "could not stamp activity on thread {}: {err}",
+            thread.get_id().key()
         );
     }
 
@@ -431,10 +431,10 @@ async fn send_message(
     tokio::spawn(answer_turn(
         bridge,
         st.db.clone(),
-        conversation.get_id().clone(),
+        thread.get_id().clone(),
         [prompt.get_id().clone(), answer.get_id().clone()],
         content.as_str().to_string(),
-        settings.get_chat_history_turns().max(0) as usize,
+        settings.get_chatbot_history_turns().max(0) as usize,
         reply_cap,
     ));
 
@@ -451,7 +451,7 @@ async fn send_message(
 /// The school's per-message character cap, never above the domain's hard
 /// ceiling. Applied to what the user sends *and* to what the service answers.
 fn content_cap(settings: &Settings) -> usize {
-    (settings.get_max_chat_message_len().max(0) as usize).min(MAX_CHAT_MESSAGE_LEN)
+    (settings.get_max_chatbot_message_len().max(0) as usize).min(MAX_CHATBOT_MESSAGE_LEN)
 }
 
 /// The AI-unavailable `503`. Built here rather than as an `AppError` variant:
@@ -477,9 +477,9 @@ fn unavailable(message: &str) -> Response {
 async fn answer_turn(
     bridge: AiBridge,
     db: Database,
-    conversation: ConversationId,
+    thread: ChatbotThreadId,
     // The two rows this turn just wrote; both are excluded from the history.
-    fresh: [ChatMessageId; 2],
+    fresh: [ChatbotMessageId; 2],
     prompt: String,
     history_turns: usize,
     reply_cap: usize,
@@ -488,7 +488,7 @@ async fn answer_turn(
     let settled = match fetch_reply(
         &bridge,
         &db,
-        &conversation,
+        &thread,
         &fresh,
         prompt,
         history_turns,
@@ -496,16 +496,16 @@ async fn answer_turn(
     )
     .await
     {
-        Ok((text, truncated)) => ChatMessage::complete(&answer_id, text, truncated, &db).await,
+        Ok((text, truncated)) => ChatbotMessage::complete(&answer_id, text, truncated, &db).await,
         Err(code) => {
             tracing::warn!("chat answer {} failed: {code}", answer_id.key());
-            ChatMessage::fail(&answer_id, &code, &db).await
+            ChatbotMessage::fail(&answer_id, &code, &db).await
         }
     };
     match settled {
         Ok(_) => {}
         // The row was no longer `pending`: the boot sweep or a stale-timeout
-        // already spoke for it, or the conversation was deleted mid-flight.
+        // already spoke for it, or the thread was deleted mid-flight.
         // Benign — the user is not waiting on this row any more.
         Err(AppError::NotFound) => {
             tracing::info!("chat answer {} was already settled", answer_id.key());
@@ -518,13 +518,13 @@ async fn answer_turn(
 async fn fetch_reply(
     bridge: &AiBridge,
     db: &Database,
-    conversation: &ConversationId,
-    fresh: &[ChatMessageId; 2],
+    thread: &ChatbotThreadId,
+    fresh: &[ChatbotMessageId; 2],
     prompt: String,
     history_turns: usize,
     reply_cap: usize,
 ) -> Result<(ChatContent, bool), String> {
-    let history = match history_for(db, conversation, fresh, history_turns).await {
+    let history = match history_for(db, thread, fresh, history_turns).await {
         Ok(history) => history,
         Err(err) => {
             tracing::warn!("could not load chat history: {err}");
@@ -571,21 +571,21 @@ async fn fetch_reply(
     Ok((content, truncated))
 }
 
-/// The tail of the conversation replayed to the service: oldest first, only
+/// The tail of the thread replayed to the service: oldest first, only
 /// settled turns with text, and never the two rows this turn just wrote (the
 /// new prompt rides in `message`, the answer does not exist yet).
 async fn history_for(
     db: &Database,
-    conversation: &ConversationId,
-    fresh: &[ChatMessageId; 2],
+    thread: &ChatbotThreadId,
+    fresh: &[ChatbotMessageId; 2],
     turns: usize,
 ) -> Result<Vec<ChatTurn>, AppError> {
     // The query counts only settled rows with text, so a run of failed answers
     // makes the window reach *further back* instead of shrinking it — that is
-    // what "the last `chat_history_turns` settled turns" means. +2 so dropping
+    // what "the last `chatbot_history_turns` settled turns" means. +2 so dropping
     // this turn's own two rows cannot shorten it either (only the user one can
     // match: the assistant row is still `pending`).
-    let tail = ChatMessage::list_settled_tail(conversation, turns.saturating_add(2), db).await?;
+    let tail = ChatbotMessage::list_settled_tail(thread, turns.saturating_add(2), db).await?;
     let mut history: Vec<ChatTurn> = tail
         .iter()
         .filter(|message| !fresh.contains(message.get_id()))
@@ -629,15 +629,15 @@ fn failure_code(err: AiError) -> String {
 /// so the two can never disagree about a turn's state.
 #[utoipa::path(
     get,
-    path = "/conversations/{id}/messages/{mid}",
-    tag = "chat",
+    path = "/threads/{id}/messages/{mid}",
+    tag = "chatbot",
     security(("session_cookie" = [])),
     params(
-        ("id" = String, Path, description = "Conversation id"),
+        ("id" = String, Path, description = "ChatbotThread id"),
         ("mid" = String, Path, description = "Message id"),
     ),
     responses(
-        (status = 200, description = "The turn, in whatever state it is", body = ChatMessageResponse),
+        (status = 200, description = "The turn, in whatever state it is", body = ChatbotMessageResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 404, description = "Not found (or not the caller's)", body = ErrorResponse),
     ),
@@ -646,28 +646,28 @@ async fn read_message(
     State(st): State<AppState>,
     CurrentUser(user): CurrentUser,
     Path((id, mid)): Path<(String, String)>,
-) -> Result<Json<ChatMessageResponse>, AppError> {
+) -> Result<Json<ChatbotMessageResponse>, AppError> {
     let message = own_message(&id, &mid, user.get_id(), &st.db).await?;
-    Ok(Json(ChatMessageResponse::new(&message)))
+    Ok(Json(ChatbotMessageResponse::new(&message)))
 }
 
 /// Read one turn only if the caller owns it *and* it belongs to the named
-/// conversation — a mismatched pair is a `404`, like a foreign one.
+/// thread — a mismatched pair is a `404`, like a foreign one.
 async fn own_message(
-    conversation: &str,
+    thread: &str,
     message: &str,
     user: &UserId,
     db: &Database,
-) -> Result<ChatMessage, AppError> {
-    ChatMessage::read_for(&ChatMessageId::from_key(message), user, db)
+) -> Result<ChatbotMessage, AppError> {
+    ChatbotMessage::read_for(&ChatbotMessageId::from_key(message), user, db)
         .await?
-        .filter(|message| message.get_conversation_id().key() == conversation)
+        .filter(|message| message.get_thread_id().key() == thread)
         .ok_or(AppError::NotFound)
 }
 
 /// Watch one turn as Server-Sent Events: `delta` chunks of the answer, then a
 /// single `done` carrying the finished message, or one `error`. The stream
-/// closes after `done`/`error` — one stream per turn, not per conversation.
+/// closes after `done`/`error` — one stream per turn, not per thread.
 ///
 /// Works whatever state the turn is in when the stream opens: an answer that
 /// already landed replays as `delta`s and a `done` straight away, so a client
@@ -675,11 +675,11 @@ async fn own_message(
 /// (cookies ride along on same-site / credentialed requests).
 #[utoipa::path(
     get,
-    path = "/conversations/{id}/messages/{mid}/stream",
-    tag = "chat",
+    path = "/threads/{id}/messages/{mid}/stream",
+    tag = "chatbot",
     security(("session_cookie" = [])),
     params(
-        ("id" = String, Path, description = "Conversation id"),
+        ("id" = String, Path, description = "ChatbotThread id"),
         ("mid" = String, Path, description = "Message id"),
     ),
     responses(
@@ -699,7 +699,7 @@ async fn stream_message(
 
     let (tx, rx) = mpsc::channel(REPLY_CHUNKS + 2);
     let (message_id, user_id, db) = (
-        ChatMessageId::from_key(&mid),
+        ChatbotMessageId::from_key(&mid),
         user.get_id().clone(),
         st.db.clone(),
     );
@@ -719,7 +719,7 @@ async fn stream_message(
                 _ = ticker.tick() => {}
                 _ = tx.closed() => return,
             }
-            let message = match ChatMessage::read_for(&message_id, &user_id, &db).await {
+            let message = match ChatbotMessage::read_for(&message_id, &user_id, &db).await {
                 Ok(Some(message)) => message,
                 // Deleted mid-stream (the thread went away) — say so and stop.
                 Ok(None) => {
@@ -744,7 +744,7 @@ async fn stream_message(
                             return;
                         }
                     }
-                    let done = json!({ "message": ChatMessageResponse::new(&message) });
+                    let done = json!({ "message": ChatbotMessageResponse::new(&message) });
                     let _ = send(&tx, "done", done).await;
                     return;
                 }
@@ -845,43 +845,43 @@ mod tests {
         // shrink it: filtering a fixed-size tail after the fact handed the
         // service a handful of unanswered prompts and nothing older.
         let db = crate::database::init_mem().await.unwrap();
-        let conversation = ConversationId::from_key("c");
+        let thread = ChatbotThreadId::from_key("c");
         let user = UserId::from_key("u");
         let say = |text: String| ChatContent::try_new(&text).unwrap();
 
         for turn in 0..10 {
-            ChatMessage::append_user(&conversation, &user, say(format!("soru {turn}")), &db)
+            ChatbotMessage::append_user(&thread, &user, say(format!("soru {turn}")), &db)
                 .await
                 .unwrap();
-            let answer = ChatMessage::append_pending_assistant(&conversation, &user, &db)
+            let answer = ChatbotMessage::append_pending_assistant(&thread, &user, &db)
                 .await
                 .unwrap();
-            ChatMessage::complete(answer.get_id(), say(format!("cevap {turn}")), false, &db)
+            ChatbotMessage::complete(answer.get_id(), say(format!("cevap {turn}")), false, &db)
                 .await
                 .unwrap();
         }
         // Five turns in a row whose answer never landed.
         for turn in 0..5 {
-            ChatMessage::append_user(&conversation, &user, say(format!("kayıp {turn}")), &db)
+            ChatbotMessage::append_user(&thread, &user, say(format!("kayıp {turn}")), &db)
                 .await
                 .unwrap();
-            let answer = ChatMessage::append_pending_assistant(&conversation, &user, &db)
+            let answer = ChatbotMessage::append_pending_assistant(&thread, &user, &db)
                 .await
                 .unwrap();
-            ChatMessage::fail(answer.get_id(), "timed_out", &db)
+            ChatbotMessage::fail(answer.get_id(), "timed_out", &db)
                 .await
                 .unwrap();
         }
         // And this turn's own two rows, which never belong in the history.
-        let prompt = ChatMessage::append_user(&conversation, &user, say("yeni".into()), &db)
+        let prompt = ChatbotMessage::append_user(&thread, &user, say("yeni".into()), &db)
             .await
             .unwrap();
-        let pending = ChatMessage::append_pending_assistant(&conversation, &user, &db)
+        let pending = ChatbotMessage::append_pending_assistant(&thread, &user, &db)
             .await
             .unwrap();
         let fresh = [prompt.get_id().clone(), pending.get_id().clone()];
 
-        let history = history_for(&db, &conversation, &fresh, 6).await.unwrap();
+        let history = history_for(&db, &thread, &fresh, 6).await.unwrap();
         let texts: Vec<&str> = history.iter().map(|turn| turn.content.as_str()).collect();
         assert_eq!(
             texts,
