@@ -132,6 +132,189 @@ async fn paged_roster_still_embeds_people_on_the_page() {
     }
 }
 
+/// Far enough ahead to clear the not-in-the-past guard without touching the
+/// clock, so the appointment lists below never race the wall clock.
+const SLOT_START: i64 = 1_900_000_000_000;
+const WEEK: i64 = 7 * 24 * 60 * 60 * 1000;
+
+/// Publish `n` weekly occurrences as `teacher`; returns their ids, earliest
+/// first — the order both appointment lists page in.
+async fn publish_slots(app: &axum::Router, teacher: &str, n: i64) -> Vec<String> {
+    let res = send(
+        app,
+        "POST",
+        "/appointments/slots",
+        Some(teacher),
+        Some(json!({
+            "starts_at": SLOT_START,
+            "ends_at": SLOT_START + 1_800_000,
+            "repeat_weekly": true,
+            "until": SLOT_START + (n - 1) * WEEK,
+        })),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::CREATED,
+        "publish slots: {}",
+        res.body
+    );
+    let slots = res
+        .body
+        .as_array()
+        .expect("publish returns an array")
+        .clone();
+    assert_eq!(slots.len() as i64, n, "one row per week");
+    slots
+        .iter()
+        .map(|slot| slot["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn appointment_slots_are_paged() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "ali", "teacher").await;
+    publish_slots(&app, &teacher, 6).await;
+
+    // Unpaged: the whole calendar, `limit` echoes null, `total` counts it all.
+    let res = send(&app, "GET", "/appointments/slots", Some(&teacher), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(total(&res.body), 6);
+    assert_eq!(items(&res.body).len(), 6, "omitting limit returns them all");
+    assert!(res.body["limit"].is_null());
+    assert_eq!(res.body["offset"], 0);
+
+    // A window: `total` still carries the unpaged count.
+    let res = send(
+        &app,
+        "GET",
+        "/appointments/slots?limit=2&offset=4",
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(total(&res.body), 6, "total is the unpaged count");
+    assert_eq!(items(&res.body).len(), 2);
+    assert_eq!(res.body["limit"], 2);
+    assert_eq!(res.body["offset"], 4);
+
+    // Past the end — empty page, honest total, and the person join still rides
+    // along on the rows that do come back.
+    let res = send(
+        &app,
+        "GET",
+        "/appointments/slots?limit=2&offset=99",
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert!(items(&res.body).is_empty());
+    assert_eq!(total(&res.body), 6);
+
+    // A student browses the same calendar — bookable slots, paged identically.
+    let student = login(&app, "ayse").await;
+    let res = send(
+        &app,
+        "GET",
+        "/appointments/slots?limit=3&offset=0",
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(total(&res.body), 6);
+    let page = items(&res.body);
+    assert_eq!(page.len(), 3);
+    for slot in page {
+        assert_eq!(
+            slot["teacher"]["username"], "ali",
+            "teacher ref present on the page: {slot}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn appointments_are_paged() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "ali", "teacher").await;
+    let student = login(&app, "ayse").await;
+    // Five weekly slots, all booked by the same student. Distinct weeks, so no
+    // booking collides with another.
+    let slots = publish_slots(&app, &teacher, 5).await;
+    for slot in &slots {
+        let res = send(
+            &app,
+            "POST",
+            "/appointments",
+            Some(&student),
+            Some(json!({ "slot": slot, "reason": "ödev" })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED, "book {slot}: {}", res.body);
+    }
+
+    // Unpaged: every booking the student asked for.
+    let res = send(&app, "GET", "/appointments", Some(&student), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(total(&res.body), 5);
+    assert_eq!(items(&res.body).len(), 5, "omitting limit returns them all");
+    assert!(res.body["limit"].is_null());
+    assert_eq!(res.body["offset"], 0);
+
+    // Consecutive windows are disjoint and share one total.
+    let res = send(
+        &app,
+        "GET",
+        "/appointments?limit=2&offset=0",
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(total(&res.body), 5, "total is the unpaged count");
+    assert_eq!(res.body["limit"], 2);
+    let page1: Vec<_> = items(&res.body).iter().map(|a| a["id"].clone()).collect();
+    let res = send(
+        &app,
+        "GET",
+        "/appointments?limit=2&offset=2",
+        Some(&student),
+        None,
+    )
+    .await;
+    let page2: Vec<_> = items(&res.body).iter().map(|a| a["id"].clone()).collect();
+    assert!(page2.iter().all(|id| !page1.contains(id)));
+
+    // The tail is the remainder, and the slot/person join runs over the page.
+    let res = send(
+        &app,
+        "GET",
+        "/appointments?limit=2&offset=4",
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(total(&res.body), 5);
+    let page = items(&res.body);
+    assert_eq!(page.len(), 1, "offset 4 of 5 leaves 1");
+    assert_eq!(page[0]["requester"]["username"], "ayse");
+    assert_eq!(page[0]["teacher"]["username"], "ali");
+
+    // The teacher's inbox is the same five bookings, paged the same way.
+    let res = send(
+        &app,
+        "GET",
+        "/appointments?limit=3&offset=0",
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(total(&res.body), 5, "the teacher's inbox counts all five");
+    assert_eq!(items(&res.body).len(), 3);
+}
+
 #[tokio::test]
 async fn user_search_is_paged_not_capped() {
     // `/users/search` used to hard-cap at 10 rows; it now pages like the rest.

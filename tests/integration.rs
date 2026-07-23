@@ -15424,3 +15424,722 @@ async fn chat_rate_limit_tier_is_configurable_and_zero_disables_it() {
         );
     }
 }
+
+// --- appointments ----------------------------------------------------------
+
+const HOUR_MS: i64 = 3_600_000;
+const WEEK_MS: i64 = 7 * 24 * HOUR_MS;
+
+/// Publish availability from a full JSON body (no assertion). The response is
+/// always an array: one element for a one-off, one per occurrence for a weekly.
+async fn publish_slots(app: &axum::Router, cookie: &str, body: serde_json::Value) -> common::Res {
+    send(app, "POST", "/appointments/slots", Some(cookie), Some(body)).await
+}
+
+/// Publish one slot as `cookie` (asserts 201); returns its id.
+async fn publish_slot(app: &axum::Router, cookie: &str, starts_at: i64, ends_at: i64) -> String {
+    let res = publish_slots(
+        app,
+        cookie,
+        json!({ "starts_at": starts_at, "ends_at": ends_at }),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::CREATED,
+        "publish slot: {}",
+        res.body
+    );
+    res.body[0]["id"].as_str().expect("slot id").to_string()
+}
+
+/// Ask for a meeting on `slot` (no assertion).
+async fn book_slot(app: &axum::Router, cookie: &str, slot: &str) -> common::Res {
+    send(
+        app,
+        "POST",
+        "/appointments",
+        Some(cookie),
+        Some(json!({ "slot": slot, "reason": "görüşmek istiyorum" })),
+    )
+    .await
+}
+
+/// Book `slot`, asserting it lands pending; returns the booking id.
+async fn book_ok(app: &axum::Router, cookie: &str, slot: &str) -> String {
+    let res = book_slot(app, cookie, slot).await;
+    assert_eq!(res.status, StatusCode::CREATED, "book slot: {}", res.body);
+    assert_eq!(res.body["status"], "pending");
+    id_of(&res.body)
+}
+
+/// `PATCH /appointments/{id}/{action}` — approve, reject, cancel, or either
+/// answer to a counter-proposal (no assertion, no body).
+async fn decide(app: &axum::Router, cookie: &str, id: &str, action: &str) -> common::Res {
+    send(
+        app,
+        "PATCH",
+        &format!("/appointments/{id}/{action}"),
+        Some(cookie),
+        None,
+    )
+    .await
+}
+
+/// Counter-propose another window for `id` (no assertion).
+async fn propose(
+    app: &axum::Router,
+    cookie: &str,
+    id: &str,
+    starts_at: i64,
+    ends_at: i64,
+) -> common::Res {
+    send(
+        app,
+        "PATCH",
+        &format!("/appointments/{id}/reschedule"),
+        Some(cookie),
+        Some(json!({ "starts_at": starts_at, "ends_at": ends_at })),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn appointment_book_and_approve_holds_the_slot() {
+    let (app, db) = app_and_db().await;
+    let ali = login_as(&app, &db, "ali", "teacher").await;
+    let ali_id = me_id(&app, &ali).await;
+    let veli = login(&app, "veli").await;
+    let veli_id = me_id(&app, &veli).await;
+    let ayse = login(&app, "ayse").await;
+    let now = Timestamp::now().as_millis();
+
+    let res = publish_slots(
+        &app,
+        &ali,
+        json!({ "starts_at": now + HOUR_MS, "ends_at": now + 2 * HOUR_MS,
+                "note": "ofis saati" }),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    assert_eq!(res.body.as_array().expect("array body").len(), 1);
+    let slot = res.body[0]["id"].as_str().expect("slot id").to_string();
+    assert_eq!(res.body[0]["teacher"]["id"], ali_id.as_str());
+    assert_eq!(res.body[0]["note"], "ofis saati");
+    assert!(res.body[0]["series"].is_null(), "a one-off has no series");
+
+    // Booking lands pending, echoing the slot's own window.
+    let res = book_slot(&app, &veli, &slot).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    assert_eq!(res.body["status"], "pending");
+    assert_eq!(res.body["requester"]["id"], veli_id.as_str());
+    assert_eq!(res.body["teacher"]["id"], ali_id.as_str());
+    assert_eq!(res.body["starts_at"], now + HOUR_MS);
+    assert!(res.body["decided_by"].is_null(), "pending has no decider");
+    let booking = id_of(&res.body);
+
+    // The pending request already holds the slot against everyone else.
+    let res = book_slot(&app, &ayse, &slot).await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+
+    let res = decide(&app, &ali, &booking, "approve").await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["status"], "approved");
+    assert_eq!(res.body["decided_by"]["id"], ali_id.as_str());
+
+    // Both sides read it back from their own list.
+    let mine = send(&app, "GET", "/appointments", Some(&veli), None).await;
+    assert_eq!(common::items(&mine.body).len(), 1);
+    let inbox = send(&app, "GET", "/appointments", Some(&ali), None).await;
+    assert_eq!(common::items(&inbox.body)[0]["id"], booking.as_str());
+}
+
+#[tokio::test]
+async fn rejecting_a_booking_frees_the_slot() {
+    let (app, db) = app_and_db().await;
+    let ali = login_as(&app, &db, "ali", "teacher").await;
+    let veli = login(&app, "veli").await;
+    let ayse = login(&app, "ayse").await;
+    let now = Timestamp::now().as_millis();
+    let slot = publish_slot(&app, &ali, now + HOUR_MS, now + 2 * HOUR_MS).await;
+
+    let booking = book_ok(&app, &veli, &slot).await;
+    let res = decide(&app, &ali, &booking, "reject").await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["status"], "rejected");
+
+    // Occupancy counts live rows only, so the next person may take it.
+    let res = book_slot(&app, &ayse, &slot).await;
+    assert_eq!(
+        res.status,
+        StatusCode::CREATED,
+        "a rejected booking must not keep the seat: {}",
+        res.body
+    );
+    // And the rejected one cannot be decided twice.
+    let res = decide(&app, &ali, &booking, "approve").await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+}
+
+#[tokio::test]
+async fn approval_refuses_a_teacher_double_booking() {
+    let (app, db) = app_and_db().await;
+    let ali = login_as(&app, &db, "ali", "teacher").await;
+    let veli = login(&app, "veli").await;
+    let ayse = login(&app, "ayse").await;
+    let now = Timestamp::now().as_millis();
+
+    // Two overlapping windows on the same calendar, one requester each: the
+    // request is fine (a wish), the second approval is not.
+    let first = publish_slot(&app, &ali, now + HOUR_MS, now + 2 * HOUR_MS).await;
+    let second = publish_slot(&app, &ali, now + HOUR_MS + 600_000, now + 3 * HOUR_MS).await;
+    let one = book_ok(&app, &veli, &first).await;
+    let two = book_ok(&app, &ayse, &second).await;
+
+    assert_eq!(
+        decide(&app, &ali, &one, "approve").await.status,
+        StatusCode::OK
+    );
+    let res = decide(&app, &ali, &two, "approve").await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+    // Refused, not half-applied: it is still pending and still decidable.
+    let res = decide(&app, &ali, &two, "reject").await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+}
+
+#[tokio::test]
+async fn approval_refuses_a_requester_double_booking() {
+    let (app, db) = app_and_db().await;
+    let ali = login_as(&app, &db, "ali", "teacher").await;
+    let mert = login_as(&app, &db, "mert", "teacher").await;
+    let veli = login(&app, "veli").await;
+    let now = Timestamp::now().as_millis();
+
+    // One student, two different teachers, overlapping times. Both requests
+    // stand (nothing is committed yet); the second approval collides.
+    let first = publish_slot(&app, &ali, now + HOUR_MS, now + 2 * HOUR_MS).await;
+    let second = publish_slot(&app, &mert, now + HOUR_MS + 600_000, now + 3 * HOUR_MS).await;
+    let one = book_ok(&app, &veli, &first).await;
+    let two = book_ok(&app, &veli, &second).await;
+
+    assert_eq!(
+        decide(&app, &ali, &one, "approve").await.status,
+        StatusCode::OK
+    );
+    let res = decide(&app, &mert, &two, "approve").await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+
+    // Booking a fresh overlap once one is committed is refused up front.
+    let third = publish_slot(&app, &mert, now + HOUR_MS, now + 2 * HOUR_MS).await;
+    let res = book_slot(&app, &veli, &third).await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+}
+
+#[tokio::test]
+async fn touching_windows_never_collide() {
+    let (app, db) = app_and_db().await;
+    let ali = login_as(&app, &db, "ali", "teacher").await;
+    let veli = login(&app, "veli").await;
+    let now = Timestamp::now().as_millis();
+
+    // Half-open windows: 10:00–11:00 and 11:00–12:00 are back-to-back, not a
+    // clash — for the teacher and for the student alike.
+    let first = publish_slot(&app, &ali, now + HOUR_MS, now + 2 * HOUR_MS).await;
+    let second = publish_slot(&app, &ali, now + 2 * HOUR_MS, now + 3 * HOUR_MS).await;
+    let one = book_ok(&app, &veli, &first).await;
+    let two = book_ok(&app, &veli, &second).await;
+
+    for booking in [&one, &two] {
+        let res = decide(&app, &ali, booking, "approve").await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+        assert_eq!(res.body["status"], "approved");
+    }
+}
+
+#[tokio::test]
+async fn reschedule_returns_to_pending_until_the_requester_accepts() {
+    let (app, db) = app_and_db().await;
+    let ali = login_as(&app, &db, "ali", "teacher").await;
+    let ali_id = me_id(&app, &ali).await;
+    let veli = login(&app, "veli").await;
+    let ayse = login(&app, "ayse").await;
+    let now = Timestamp::now().as_millis();
+    let slot = publish_slot(&app, &ali, now + HOUR_MS, now + 2 * HOUR_MS).await;
+    let booking = book_ok(&app, &veli, &slot).await;
+    assert_eq!(
+        decide(&app, &ali, &booking, "approve").await.status,
+        StatusCode::OK
+    );
+
+    // A counter-proposal un-commits the approved meeting rather than moving it
+    // silently.
+    let res = propose(&app, &ali, &booking, now + 3 * HOUR_MS, now + 4 * HOUR_MS).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["status"], "pending");
+    assert!(res.body["decided_by"].is_null(), "approval was withdrawn");
+    assert_eq!(res.body["proposed_starts_at"], now + 3 * HOUR_MS);
+    assert_eq!(res.body["proposed_ends_at"], now + 4 * HOUR_MS);
+    assert_eq!(res.body["proposed_by"]["id"], ali_id.as_str());
+    // The effective window already reads as the proposed one.
+    assert_eq!(res.body["starts_at"], now + 3 * HOUR_MS);
+
+    // Only the requester may answer it.
+    let res = decide(&app, &ayse, &booking, "reschedule/accept").await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+    let res = decide(&app, &ali, &booking, "reschedule/accept").await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+
+    let res = decide(&app, &veli, &booking, "reschedule/accept").await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["status"], "approved");
+    assert_eq!(res.body["starts_at"], now + 3 * HOUR_MS);
+    assert_eq!(res.body["ends_at"], now + 4 * HOUR_MS);
+}
+
+#[tokio::test]
+async fn a_started_proposal_is_refused() {
+    let (app, db) = app_and_db().await;
+    let ali = login_as(&app, &db, "ali", "teacher").await;
+    let veli = login(&app, "veli").await;
+    let now = Timestamp::now().as_millis();
+    let slot = publish_slot(&app, &ali, now + HOUR_MS, now + 2 * HOUR_MS).await;
+    let booking = book_ok(&app, &veli, &slot).await;
+
+    // A proposal 30s into the past is inside the publishing grace, so the times
+    // themselves validate — but the window is already underway, and a meeting
+    // that began is one `cancel` refuses to undo. Refused at the proposal, not
+    // left for the requester to agree to.
+    let res = propose(&app, &ali, &booking, now - 30_000, now + HOUR_MS).await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+    // Refused, not half-applied: the teacher can still propose a real time.
+    let res = send(&app, "GET", "/appointments", Some(&veli), None).await;
+    assert_eq!(common::items(&res.body)[0]["status"], "pending");
+    assert!(
+        common::items(&res.body)[0]["proposed_starts_at"].is_null(),
+        "a refused proposal leaves nothing behind"
+    );
+
+    assert_eq!(
+        propose(&app, &ali, &booking, now + 3 * HOUR_MS, now + 4 * HOUR_MS)
+            .await
+            .status,
+        StatusCode::OK
+    );
+    let res = decide(&app, &veli, &booking, "reschedule/accept").await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["status"], "approved");
+}
+
+#[tokio::test]
+async fn declining_a_reschedule_cancels_the_booking() {
+    let (app, db) = app_and_db().await;
+    let ali = login_as(&app, &db, "ali", "teacher").await;
+    let veli = login(&app, "veli").await;
+    let ayse = login(&app, "ayse").await;
+    let now = Timestamp::now().as_millis();
+    let slot = publish_slot(&app, &ali, now + HOUR_MS, now + 2 * HOUR_MS).await;
+    let booking = book_ok(&app, &veli, &slot).await;
+
+    // Nothing proposed yet: there is nothing to decline.
+    let res = decide(&app, &veli, &booking, "reschedule/decline").await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+
+    assert_eq!(
+        propose(&app, &ali, &booking, now + 3 * HOUR_MS, now + 4 * HOUR_MS)
+            .await
+            .status,
+        StatusCode::OK
+    );
+    let res = decide(&app, &veli, &booking, "reschedule/decline").await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["status"], "cancelled");
+    // The refused proposal stays readable on the cancelled row.
+    assert_eq!(res.body["proposed_starts_at"], now + 3 * HOUR_MS);
+
+    // And the slot is free again.
+    let res = book_slot(&app, &ayse, &slot).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+}
+
+/// Declining cancels, so it answers to the cancel deadline. The guard lives in
+/// `Appointment::cancel` itself — when it sat in the cancel *handler*, decline
+/// went straight past it and called off a meeting already underway.
+#[tokio::test]
+async fn declining_a_started_reschedule_is_refused() {
+    let (app, db) = app_and_db().await;
+    let ali = login_as(&app, &db, "ali", "teacher").await;
+    let veli = login(&app, "veli").await;
+    let now = Timestamp::now().as_millis();
+    let slot = publish_slot(&app, &ali, now + HOUR_MS, now + 2 * HOUR_MS).await;
+    let booking = book_ok(&app, &veli, &slot).await;
+
+    // A proposal that is still ahead when made, and underway a moment later:
+    // the only way an effective window opens with the booking still live.
+    let opens_at = Timestamp::now().as_millis() + 700;
+    assert_eq!(
+        propose(&app, &ali, &booking, opens_at, opens_at + HOUR_MS)
+            .await
+            .status,
+        StatusCode::OK
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    let res = decide(&app, &veli, &booking, "reschedule/decline").await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+    // The plain cancel door answers the same, and the booking survives both.
+    let res = decide(&app, &veli, &booking, "cancel").await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+    let res = send(&app, "GET", "/appointments", Some(&veli), None).await;
+    assert_eq!(common::items(&res.body)[0]["status"], "pending");
+
+    // Moved back into the future, declining cancels as it always did.
+    assert_eq!(
+        propose(&app, &ali, &booking, now + 3 * HOUR_MS, now + 4 * HOUR_MS)
+            .await
+            .status,
+        StatusCode::OK
+    );
+    let res = decide(&app, &veli, &booking, "reschedule/decline").await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["status"], "cancelled");
+}
+
+#[tokio::test]
+async fn accepting_a_reschedule_re_runs_the_overlap_guard() {
+    let (app, db) = app_and_db().await;
+    let ali = login_as(&app, &db, "ali", "teacher").await;
+    let mert = login_as(&app, &db, "mert", "teacher").await;
+    let veli = login(&app, "veli").await;
+    let now = Timestamp::now().as_millis();
+
+    // Committed with ali at +5h.
+    let taken = publish_slot(&app, &ali, now + 5 * HOUR_MS, now + 6 * HOUR_MS).await;
+    let committed = book_ok(&app, &veli, &taken).await;
+    assert_eq!(
+        decide(&app, &ali, &committed, "approve").await.status,
+        StatusCode::OK
+    );
+
+    // Mert counter-proposes straight onto that hour; accepting would commit
+    // the student twice, so it is refused.
+    let slot = publish_slot(&app, &mert, now + HOUR_MS, now + 2 * HOUR_MS).await;
+    let booking = book_ok(&app, &veli, &slot).await;
+    assert_eq!(
+        propose(&app, &mert, &booking, now + 5 * HOUR_MS, now + 6 * HOUR_MS)
+            .await
+            .status,
+        StatusCode::OK
+    );
+    let res = decide(&app, &veli, &booking, "reschedule/accept").await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+    assert_eq!(
+        send(&app, "GET", "/appointments", Some(&veli), None)
+            .await
+            .body["items"][0]["status"],
+        "pending",
+        "a refused acceptance leaves the booking pending"
+    );
+}
+
+#[tokio::test]
+async fn either_side_cancels_until_the_window_opens() {
+    let (app, db) = app_and_db().await;
+    let ali = login_as(&app, &db, "ali", "teacher").await;
+    let veli = login(&app, "veli").await;
+    let ayse = login(&app, "ayse").await;
+    let now = Timestamp::now().as_millis();
+
+    // The requester's own call, on an approved meeting.
+    let slot = publish_slot(&app, &ali, now + HOUR_MS, now + 2 * HOUR_MS).await;
+    let booking = book_ok(&app, &veli, &slot).await;
+    assert_eq!(
+        decide(&app, &ali, &booking, "approve").await.status,
+        StatusCode::OK
+    );
+    let res = decide(&app, &veli, &booking, "cancel").await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["status"], "cancelled");
+
+    // The slot's teacher may too.
+    let booking = book_ok(&app, &ayse, &slot).await;
+    let res = decide(&app, &ali, &booking, "cancel").await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["status"], "cancelled");
+    // An outsider may not, and a settled booking cannot be cancelled twice.
+    let booking = book_ok(&app, &veli, &slot).await;
+    let res = decide(&app, &ayse, &booking, "cancel").await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+    assert_eq!(
+        decide(&app, &veli, &booking, "cancel").await.status,
+        StatusCode::OK
+    );
+    let res = decide(&app, &veli, &booking, "cancel").await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+}
+
+#[tokio::test]
+async fn a_started_slot_cannot_be_booked() {
+    let (app, db) = app_and_db().await;
+    let ali = login_as(&app, &db, "ali", "teacher").await;
+    let veli = login(&app, "veli").await;
+    let now = Timestamp::now().as_millis();
+
+    // A window that opened 30s ago is inside the publishing grace, so the slot
+    // is created — but the meeting has begun, and a meeting that began is
+    // history, not a plan. Booking it would land a row `cancel` refuses to
+    // undo, stuck for good.
+    let underway = publish_slot(&app, &ali, now - 30_000, now + HOUR_MS).await;
+    let res = book_slot(&app, &veli, &underway).await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+
+    // A window still ahead is untouched by the guard.
+    let upcoming = publish_slot(&app, &ali, now + HOUR_MS, now + 2 * HOUR_MS).await;
+    let res = book_slot(&app, &veli, &upcoming).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+}
+
+#[tokio::test]
+async fn slot_delete_waits_for_the_booking_to_settle() {
+    let (app, db) = app_and_db().await;
+    let ali = login_as(&app, &db, "ali", "teacher").await;
+    let veli = login(&app, "veli").await;
+    let now = Timestamp::now().as_millis();
+    let slot = publish_slot(&app, &ali, now + HOUR_MS, now + 2 * HOUR_MS).await;
+    let booking = book_ok(&app, &veli, &slot).await;
+
+    let uri = format!("/appointments/slots/{slot}");
+    let res = send(&app, "DELETE", &uri, Some(&ali), None).await;
+    assert_eq!(
+        res.status,
+        StatusCode::CONFLICT,
+        "someone is waiting on this slot: {}",
+        res.body
+    );
+    assert_eq!(
+        decide(&app, &veli, &booking, "cancel").await.status,
+        StatusCode::OK
+    );
+    let res = send(&app, "DELETE", &uri, Some(&ali), None).await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    assert_eq!(
+        send(&app, "DELETE", &uri, Some(&ali), None).await.status,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn weekly_slots_share_a_series_and_are_dropped_together() {
+    let (app, db) = app_and_db().await;
+    let ali = login_as(&app, &db, "ali", "teacher").await;
+    let veli = login(&app, "veli").await;
+    let now = Timestamp::now().as_millis();
+    let starts_at = now + HOUR_MS;
+
+    // `until` is inclusive, so three weeks out is four occurrences.
+    let res = publish_slots(
+        &app,
+        &ali,
+        json!({ "starts_at": starts_at, "ends_at": starts_at + HOUR_MS,
+                "repeat_weekly": true, "until": starts_at + 3 * WEEK_MS }),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let slots = res.body.as_array().expect("array body").clone();
+    assert_eq!(slots.len(), 4);
+    let series = slots[0]["series"].as_str().expect("series id").to_string();
+    for (week, slot) in slots.iter().enumerate() {
+        assert_eq!(slot["series"], series.as_str(), "one publish, one series");
+        assert_eq!(slot["starts_at"], starts_at + week as i64 * WEEK_MS);
+    }
+
+    // `repeat_weekly` without an end, and past the 52-occurrence cap.
+    let res = publish_slots(
+        &app,
+        &ali,
+        json!({ "starts_at": starts_at, "ends_at": starts_at + HOUR_MS,
+                "repeat_weekly": true }),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+    let res = publish_slots(
+        &app,
+        &ali,
+        json!({ "starts_at": starts_at, "ends_at": starts_at + HOUR_MS,
+                "repeat_weekly": true, "until": starts_at + 52 * WEEK_MS }),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::BAD_REQUEST,
+        "53 occurrences: {}",
+        res.body
+    );
+
+    // An end at `i64::MAX` clears every gate — future, not inverted, 52
+    // occurrences — and then overflows on the first weekly shift. Unchecked it
+    // wrapped the end below the start, and an inverted window never overlaps
+    // anything, so the double-booking guard would have gone blind.
+    let res = publish_slots(
+        &app,
+        &ali,
+        json!({ "starts_at": starts_at, "ends_at": i64::MAX,
+                "repeat_weekly": true, "until": starts_at + 51 * WEEK_MS }),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::BAD_REQUEST,
+        "a shift that overflows: {}",
+        res.body
+    );
+
+    // All-or-nothing: one waiting requester anywhere in the series blocks it.
+    let booked = slots[1]["id"].as_str().expect("slot id");
+    let booking = book_ok(&app, &veli, booked).await;
+    let uri = format!("/appointments/slots/series/{series}");
+    let res = send(&app, "DELETE", &uri, Some(&ali), None).await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+
+    assert_eq!(
+        decide(&app, &ali, &booking, "reject").await.status,
+        StatusCode::OK
+    );
+    let res = send(&app, "DELETE", &uri, Some(&ali), None).await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    let res = send(&app, "GET", "/appointments/slots", Some(&ali), None).await;
+    assert_eq!(common::total(&res.body), 0, "the whole series went");
+    assert_eq!(
+        send(&app, "DELETE", &uri, Some(&ali), None).await.status,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn only_students_and_parents_book_appointments() {
+    let (app, db) = app_and_db().await;
+    let ali = login_as(&app, &db, "ali", "teacher").await;
+    let mert = login_as(&app, &db, "mert", "teacher").await;
+    let mudur = login_as(&app, &db, "mudur", "manager").await;
+    let admin = login_as(&app, &db, "yonetici", "admin").await;
+    let anne = login_as(&app, &db, "anne", "parent").await;
+    let veli = login(&app, "veli").await;
+    let now = Timestamp::now().as_millis();
+    let slot = publish_slot(&app, &ali, now + HOUR_MS, now + 2 * HOUR_MS).await;
+
+    // Staff arrange between themselves off this API.
+    for (who, label) in [(&mert, "teacher"), (&mudur, "manager"), (&admin, "admin")] {
+        let res = book_slot(&app, who, &slot).await;
+        assert_eq!(res.status, StatusCode::FORBIDDEN, "{label}: {}", res.body);
+    }
+    // A parent books for themselves — the parent-teacher conference.
+    let res = book_slot(&app, &anne, &slot).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let second = publish_slot(&app, &ali, now + 3 * HOUR_MS, now + 4 * HOUR_MS).await;
+    let res = book_slot(&app, &veli, &second).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+}
+
+#[tokio::test]
+async fn only_the_slots_teacher_decides_its_bookings() {
+    let (app, db) = app_and_db().await;
+    let ali = login_as(&app, &db, "ali", "teacher").await;
+    let mert = login_as(&app, &db, "mert", "teacher").await;
+    let mudur = login_as(&app, &db, "mudur", "manager").await;
+    let veli = login(&app, "veli").await;
+    let now = Timestamp::now().as_millis();
+    let slot = publish_slot(&app, &ali, now + HOUR_MS, now + 2 * HOUR_MS).await;
+    let booking = book_ok(&app, &veli, &slot).await;
+
+    // Another teacher's calendar is not theirs to run.
+    for action in ["approve", "reject"] {
+        let res = decide(&app, &mert, &booking, action).await;
+        assert_eq!(res.status, StatusCode::FORBIDDEN, "{action}: {}", res.body);
+    }
+    let res = propose(&app, &mert, &booking, now + 3 * HOUR_MS, now + 4 * HOUR_MS).await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/appointments/slots/{slot}"),
+        Some(&mert),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+    // The requester cannot approve their own request either.
+    assert_eq!(
+        decide(&app, &veli, &booking, "approve").await.status,
+        StatusCode::FORBIDDEN
+    );
+    // A manager may decide anyone's.
+    let res = decide(&app, &mudur, &booking, "approve").await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["status"], "approved");
+}
+
+#[tokio::test]
+async fn appointment_times_must_be_sane_and_future() {
+    let (app, db) = app_and_db().await;
+    let ali = login_as(&app, &db, "ali", "teacher").await;
+    let veli = login(&app, "veli").await;
+    let now = Timestamp::now().as_millis();
+
+    // Past (beyond the 60s grace), empty, and inverted windows.
+    for (body, label) in [
+        (
+            json!({ "starts_at": now - 10 * HOUR_MS, "ends_at": now - 9 * HOUR_MS }),
+            "past",
+        ),
+        (
+            json!({ "starts_at": now + HOUR_MS, "ends_at": now + HOUR_MS }),
+            "empty",
+        ),
+        (
+            json!({ "starts_at": now + 2 * HOUR_MS, "ends_at": now + HOUR_MS }),
+            "inverted",
+        ),
+    ] {
+        let res = publish_slots(&app, &ali, body).await;
+        assert_eq!(res.status, StatusCode::BAD_REQUEST, "{label}: {}", res.body);
+    }
+
+    let slot = publish_slot(&app, &ali, now + HOUR_MS, now + 2 * HOUR_MS).await;
+    let booking = book_ok(&app, &veli, &slot).await;
+    // A counter-proposal answers to the same rules.
+    for (starts_at, ends_at, label) in [
+        (now - 10 * HOUR_MS, now - 9 * HOUR_MS, "past"),
+        (now + HOUR_MS, now + HOUR_MS, "empty"),
+        (now + 2 * HOUR_MS, now + HOUR_MS, "inverted"),
+    ] {
+        let res = propose(&app, &ali, &booking, starts_at, ends_at).await;
+        assert_eq!(res.status, StatusCode::BAD_REQUEST, "{label}: {}", res.body);
+    }
+    // A blank reason is refused too — the teacher decides on it.
+    let res = send(
+        &app,
+        "POST",
+        "/appointments",
+        Some(&veli),
+        Some(json!({ "slot": slot, "reason": "" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+}
+
+#[tokio::test]
+async fn a_demoted_teachers_slots_go_inert() {
+    let (app, db) = app_and_db().await;
+    let ali = login_as(&app, &db, "ali", "teacher").await;
+    let veli = login(&app, "veli").await;
+    let now = Timestamp::now().as_millis();
+    let slot = publish_slot(&app, &ali, now + HOUR_MS, now + 2 * HOUR_MS).await;
+
+    let res = send(&app, "GET", "/appointments/slots", Some(&veli), None).await;
+    assert_eq!(common::items(&res.body).len(), 1, "{}", res.body);
+
+    // The row survives the demotion; the offer does not.
+    set_role(&db, "ali", "student").await;
+    let res = send(&app, "GET", "/appointments/slots", Some(&veli), None).await;
+    assert_eq!(common::total(&res.body), 0, "an inert slot is not offered");
+    let res = book_slot(&app, &veli, &slot).await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+}

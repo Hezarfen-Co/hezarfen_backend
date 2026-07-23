@@ -574,6 +574,160 @@ async fn legacy_exams_backfill_to_published() {
     assert_eq!(common::items(&listed.body).len(), 1);
 }
 
+/// A recurring publish and the booking sitting on it survive a second boot:
+/// the slot's `note` and shared `series`, and the booking's counter-proposal
+/// triple, `decided_by` and `status`, all come back untouched by the
+/// re-applied migration. Every time in this schema is a unix-millisecond
+/// `TYPE int` — never a `datetime` — so the round trip is asserted on odd
+/// millisecond values, which any lossy conversion would round off.
+#[tokio::test]
+async fn appointments_survive_remigration() {
+    /// Far enough ahead to clear `check_not_past` without touching the clock,
+    /// and deliberately not a round number of seconds.
+    const START: i64 = 1_900_000_000_123;
+    const END: i64 = 1_900_000_003_777;
+    const WEEK: i64 = 7 * 24 * 60 * 60 * 1000;
+    const PROPOSED_START: i64 = START + 5_000_001;
+    const PROPOSED_END: i64 = START + 8_000_003;
+
+    let (app, db) = common::app_and_db().await;
+    let teacher_creds = json!({ "username": "ali", "password": "secret1" });
+    let student_creds = json!({ "username": "ayse", "password": "secret1" });
+    for creds in [&teacher_creds, &student_creds] {
+        assert_eq!(
+            send(&app, "POST", "/auth/register", None, Some((*creds).clone()))
+                .await
+                .status,
+            StatusCode::CREATED
+        );
+    }
+    set_role(&db, "ali", "teacher").await;
+    let teacher = send(
+        &app,
+        "POST",
+        "/auth/login",
+        None,
+        Some(teacher_creds.clone()),
+    )
+    .await
+    .cookie
+    .unwrap();
+    let student = send(
+        &app,
+        "POST",
+        "/auth/login",
+        None,
+        Some(student_creds.clone()),
+    )
+    .await
+    .cookie
+    .unwrap();
+
+    // A weekly publish: three occurrences sharing one series id and one note.
+    let res = send(
+        &app,
+        "POST",
+        "/appointments/slots",
+        Some(&teacher),
+        Some(json!({
+            "starts_at": START,
+            "ends_at": END,
+            "note": "veli görüşmesi",
+            "repeat_weekly": true,
+            "until": START + 2 * WEEK,
+        })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let published = res
+        .body
+        .as_array()
+        .expect("publish returns an array")
+        .clone();
+    assert_eq!(published.len(), 3, "{}", res.body);
+    let slot_id = published[0]["id"].as_str().unwrap().to_string();
+    let series = published[0]["series"].as_str().unwrap().to_string();
+    let slot_created_at = published[0]["created_at"].as_i64().unwrap();
+
+    // Book the first occurrence, counter-propose another time, accept it — the
+    // row then carries every optional column at once: a proposal triple, a
+    // decider, and `approved`.
+    let res = send(
+        &app,
+        "POST",
+        "/appointments",
+        Some(&student),
+        Some(json!({ "slot": slot_id, "reason": "ödev" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let appointment = common::id_of(&res.body);
+    let created_at = res.body["created_at"].as_i64().unwrap();
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/appointments/{appointment}/reschedule"),
+        Some(&teacher),
+        Some(json!({ "starts_at": PROPOSED_START, "ends_at": PROPOSED_END })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/appointments/{appointment}/reschedule/accept"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    // Second boot: migration re-applied over live data.
+    let app = reboot(&db).await;
+    let teacher = send(&app, "POST", "/auth/login", None, Some(teacher_creds))
+        .await
+        .cookie
+        .unwrap();
+    let student = send(&app, "POST", "/auth/login", None, Some(student_creds))
+        .await
+        .cookie
+        .unwrap();
+
+    let res = send(&app, "GET", "/appointments/slots", Some(&teacher), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(common::total(&res.body), 3, "{}", res.body);
+    let slots = common::items(&res.body);
+    assert_eq!(slots[0]["id"], slot_id.as_str());
+    assert_eq!(slots[0]["starts_at"], START, "exact unix-ms, not rounded");
+    assert_eq!(slots[0]["ends_at"], END);
+    assert_eq!(slots[0]["note"], "veli görüşmesi");
+    assert_eq!(slots[0]["created_at"], slot_created_at);
+    for (week, slot) in slots.iter().enumerate() {
+        assert_eq!(slot["series"], series.as_str(), "one series, all weeks");
+        assert_eq!(slot["starts_at"], START + week as i64 * WEEK);
+        assert_eq!(slot["ends_at"], END + week as i64 * WEEK);
+    }
+
+    let res = send(&app, "GET", "/appointments", Some(&student), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(common::total(&res.body), 1, "{}", res.body);
+    let booking = &common::items(&res.body)[0];
+    assert_eq!(booking["id"], appointment.as_str());
+    assert_eq!(booking["slot"], slot_id.as_str());
+    assert_eq!(booking["status"], "approved");
+    assert_eq!(booking["reason"], "ödev");
+    assert_eq!(booking["proposed_starts_at"], PROPOSED_START);
+    assert_eq!(booking["proposed_ends_at"], PROPOSED_END);
+    assert_eq!(booking["proposed_by"]["username"], "ali");
+    assert_eq!(booking["decided_by"]["username"], "ayse");
+    // The accepted proposal *is* the meeting's time; the slot's own window lost.
+    assert_eq!(booking["starts_at"], PROPOSED_START);
+    assert_eq!(booking["ends_at"], PROPOSED_END);
+    assert_eq!(booking["teacher"]["username"], "ali");
+    assert_eq!(booking["requester"]["username"], "ayse");
+    assert_eq!(booking["created_at"], created_at);
+}
+
 /// A chatbot thread and every turn in it die together: deleting the
 /// conversation cascades its `chat_message` rows in one transaction, so no
 /// orphan survives a reboot. And the thread is owner-scoped end to end — a
