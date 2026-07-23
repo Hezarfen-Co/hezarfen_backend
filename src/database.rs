@@ -54,8 +54,8 @@ pub const HOMEWORK_TABLE: &str = "homework";
 pub const HOMEWORK_SUBMISSION_TABLE: &str = "homework_submission";
 pub const HOMEWORK_FILE_TABLE: &str = "homework_file";
 pub const HOMEWORK_RESULT_TABLE: &str = "homework_result";
-pub const CONVERSATION_TABLE: &str = "conversation";
-pub const CHAT_MESSAGE_TABLE: &str = "chat_message";
+pub const CHATBOT_THREAD_TABLE: &str = "chatbot_thread";
+pub const CHAT_MESSAGE_TABLE: &str = "chatbot_message";
 pub const APPOINTMENT_SLOT_TABLE: &str = "appointment_slot";
 pub const APPOINTMENT_TABLE: &str = "appointment";
 
@@ -120,30 +120,30 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS size ON note_file TYPE int;
     DEFINE INDEX IF NOT EXISTS note_file_note ON note_file FIELDS note;
 
-    -- Chatbot relay (2026-07-23): a `conversation` groups the turns, one
-    -- `chat_message` is one turn. `user_id` rides on the message too so an
+    -- Chatbot relay (2026-07-23): a `thread` groups the turns, one
+    -- `chatbot_message` is one turn. `user_id` rides on the message too so an
     -- ownership check needs no join. An assistant turn is born `pending` and
     -- is completed (or failed) by the task holding the AI-bridge stream —
     -- hence the BACKFILL sweep, since that task dies with the process.
-    DEFINE TABLE IF NOT EXISTS conversation SCHEMAFULL;
-    DEFINE FIELD IF NOT EXISTS user_id ON conversation TYPE record<user> READONLY;
-    DEFINE FIELD IF NOT EXISTS title ON conversation TYPE option<string>;
-    DEFINE FIELD IF NOT EXISTS created_at ON conversation TYPE int READONLY;
-    DEFINE FIELD IF NOT EXISTS updated_at ON conversation TYPE int;
-    DEFINE INDEX IF NOT EXISTS conversation_user_updated ON conversation FIELDS user_id, updated_at;
+    DEFINE TABLE IF NOT EXISTS chatbot_thread SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS user_id ON chatbot_thread TYPE record<user> READONLY;
+    DEFINE FIELD IF NOT EXISTS title ON chatbot_thread TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS created_at ON chatbot_thread TYPE int READONLY;
+    DEFINE FIELD IF NOT EXISTS updated_at ON chatbot_thread TYPE int;
+    DEFINE INDEX IF NOT EXISTS chatbot_thread_user_updated ON chatbot_thread FIELDS user_id, updated_at;
 
-    DEFINE TABLE IF NOT EXISTS chat_message SCHEMAFULL;
-    DEFINE FIELD IF NOT EXISTS conversation_id ON chat_message TYPE record<conversation> READONLY;
-    DEFINE FIELD IF NOT EXISTS user_id ON chat_message TYPE record<user> READONLY;
-    DEFINE FIELD IF NOT EXISTS role ON chat_message TYPE string READONLY;
-    DEFINE FIELD IF NOT EXISTS content ON chat_message TYPE string;
-    DEFINE FIELD IF NOT EXISTS status ON chat_message TYPE string;
-    DEFINE FIELD IF NOT EXISTS truncated ON chat_message TYPE bool DEFAULT false;
-    DEFINE FIELD IF NOT EXISTS error_code ON chat_message TYPE option<string>;
-    DEFINE FIELD IF NOT EXISTS created_at ON chat_message TYPE int READONLY;
-    DEFINE FIELD IF NOT EXISTS completed_at ON chat_message TYPE option<int>;
-    DEFINE INDEX IF NOT EXISTS chat_message_conversation_created ON chat_message FIELDS conversation_id, created_at;
-    DEFINE INDEX IF NOT EXISTS chat_message_user ON chat_message FIELDS user_id;
+    DEFINE TABLE IF NOT EXISTS chatbot_message SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS thread_id ON chatbot_message TYPE record<chatbot_thread> READONLY;
+    DEFINE FIELD IF NOT EXISTS user_id ON chatbot_message TYPE record<user> READONLY;
+    DEFINE FIELD IF NOT EXISTS role ON chatbot_message TYPE string READONLY;
+    DEFINE FIELD IF NOT EXISTS content ON chatbot_message TYPE string;
+    DEFINE FIELD IF NOT EXISTS status ON chatbot_message TYPE string;
+    DEFINE FIELD IF NOT EXISTS truncated ON chatbot_message TYPE bool DEFAULT false;
+    DEFINE FIELD IF NOT EXISTS error_code ON chatbot_message TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS created_at ON chatbot_message TYPE int READONLY;
+    DEFINE FIELD IF NOT EXISTS completed_at ON chatbot_message TYPE option<int>;
+    DEFINE INDEX IF NOT EXISTS chatbot_message_thread_created ON chatbot_message FIELDS thread_id, created_at;
+    DEFINE INDEX IF NOT EXISTS chatbot_message_user ON chatbot_message FIELDS user_id;
 
     DEFINE TABLE IF NOT EXISTS event SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS creator ON event TYPE record<user>;
@@ -346,9 +346,9 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS grade_bands.*.min ON settings TYPE int;
     DEFINE FIELD IF NOT EXISTS grade_bands.*.label ON settings TYPE string;
     DEFINE FIELD IF NOT EXISTS max_file_bytes ON settings TYPE option<int>;
-    DEFINE FIELD IF NOT EXISTS chat_history_turns ON settings TYPE option<int>;
-    DEFINE FIELD IF NOT EXISTS max_chat_conversations ON settings TYPE option<int>;
-    DEFINE FIELD IF NOT EXISTS max_chat_message_len ON settings TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS chatbot_history_turns ON settings TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS max_chatbot_threads ON settings TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS max_chatbot_message_len ON settings TYPE option<int>;
 
     -- Homework (greenfield, 2026-07-22): a teacher assigns per course, students
     -- submit files + optional text, a teacher grades a status + optional mark.
@@ -471,12 +471,12 @@ const BACKFILL: &str = "
     -- Turns written before the clipped-answer flag existed (2026-07-23): the
     -- clip was silent then, so nothing can be recovered — they read as whole,
     -- which is what they were presented as all along.
-    UPDATE chat_message SET truncated = false WHERE truncated = NONE;
+    UPDATE chatbot_message SET truncated = false WHERE truncated = NONE;
 
     -- An assistant turn is answered by an in-process task, so a restart leaves
     -- its row `pending` with nobody left to complete it: fail it at boot rather
-    -- than let a reader wait out `CHAT_PENDING_STALE_SECS` on every load.
-    UPDATE chat_message SET status = 'failed', error_code = 'interrupted',
+    -- than let a reader wait out `CHATBOT_PENDING_STALE_SECS` on every load.
+    UPDATE chatbot_message SET status = 'failed', error_code = 'interrupted',
         completed_at = time::unix(time::now()) * 1000 WHERE status = 'pending';
 
     -- Promotion out of student now deletes the user's enrollments (2026-07-18);
@@ -546,14 +546,14 @@ pub async fn migrate(db: &Surreal<Any>) -> Result<(), AppError> {
 #[cfg(test)]
 mod tests {
     #[tokio::test]
-    async fn boot_fails_chat_messages_left_pending() {
+    async fn boot_fails_chatbot_messages_left_pending() {
         let db = super::init_mem().await.unwrap();
         db.query(
             "CREATE user:u SET username = 'u', password_hash = 'x';
-             CREATE conversation:c SET user_id = user:u, created_at = 1, updated_at = 1;
-             CREATE chat_message:m SET conversation_id = conversation:c, user_id = user:u,
+             CREATE chatbot_thread:c SET user_id = user:u, created_at = 1, updated_at = 1;
+             CREATE chatbot_message:m SET thread_id = chatbot_thread:c, user_id = user:u,
                  role = 'assistant', content = '', status = 'pending', created_at = 1;
-             CREATE chat_message:done SET conversation_id = conversation:c, user_id = user:u,
+             CREATE chatbot_message:done SET thread_id = chatbot_thread:c, user_id = user:u,
                  role = 'assistant', content = 'hi', status = 'complete', created_at = 1;",
         )
         .await
@@ -566,7 +566,7 @@ mod tests {
         super::migrate(&db).await.unwrap();
 
         let mut rows = db
-            .query("SELECT id, status, error_code, completed_at FROM chat_message ORDER BY id")
+            .query("SELECT id, status, error_code, completed_at FROM chatbot_message ORDER BY id")
             .await
             .unwrap();
         let rows: Vec<serde_json::Value> = rows.take(0).unwrap();

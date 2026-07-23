@@ -27,7 +27,7 @@ async fn spawn_server_with_ai(ai: Option<hezarfen_backend::ai::AiBridge>) -> (St
         // Every request here comes from 127.0.0.1, so per-IP limits would
         // meter the whole suite as one client. Off; `rate_limit.rs` covers it.
         rate_limit: RateLimitConfig::unlimited(),
-        chat_limit: Default::default(),
+        chatbot_limit: Default::default(),
         exam_presence: Default::default(),
         db_up: Default::default(),
         ai,
@@ -1936,7 +1936,7 @@ async fn chat_service(text: &str) -> ChatService {
 /// Open a thread and ask one question. Returns (thread id, reserved answer id).
 async fn ask(client: &Client, base: &str) -> (String, String) {
     let thread: Value = client
-        .post(format!("{base}/chat/conversations"))
+        .post(format!("{base}/chatbot/threads"))
         .json(&json!({ "title": "Fizik" }))
         .send()
         .await
@@ -1944,10 +1944,10 @@ async fn ask(client: &Client, base: &str) -> (String, String) {
         .json()
         .await
         .unwrap();
-    let conversation = thread["id"].as_str().expect("thread id").to_string();
+    let thread = thread["id"].as_str().expect("thread id").to_string();
 
     let res = client
-        .post(format!("{base}/chat/conversations/{conversation}/messages"))
+        .post(format!("{base}/chatbot/threads/{thread}/messages"))
         .json(&json!({ "content": "ikinci yasa nedir?" }))
         .send()
         .await
@@ -1959,7 +1959,7 @@ async fn ask(client: &Client, base: &str) -> (String, String) {
         .as_str()
         .expect("message id")
         .to_string();
-    (conversation, mid)
+    (thread, mid)
 }
 
 /// Read the SSE stream until its terminal event (`done` or `error`), returning
@@ -2036,18 +2036,18 @@ fn assert_deltas_then_done(events: &[(String, Value)], mid: &str, answer: &str) 
 /// must reach the same conclusion about the very same turn.
 #[tokio::test]
 async fn chat_stream_and_poll_agree_that_an_answer_was_truncated() {
-    let cap = hezarfen_backend::constant::DEFAULT_MAX_CHAT_MESSAGE_LEN as usize;
+    let cap = hezarfen_backend::constant::DEFAULT_MAX_CHATBOT_MESSAGE_LEN as usize;
     let service = chat_service(&"é".repeat(cap + 500)).await;
     let (base, _db) = spawn_server_with_ai(Some(service.bridge.clone())).await;
     let ali = client();
     register(&ali, &base, "ali").await;
     login(&ali, &base, "ali").await;
 
-    let (conversation, mid) = ask(&ali, &base).await;
+    let (thread, mid) = ask(&ali, &base).await;
 
     let mut res = ali
         .get(format!(
-            "{base}/chat/conversations/{conversation}/messages/{mid}/stream"
+            "{base}/chatbot/threads/{thread}/messages/{mid}/stream"
         ))
         .send()
         .await
@@ -2071,7 +2071,7 @@ async fn chat_stream_and_poll_agree_that_an_answer_was_truncated() {
     // The same row, read the other way: identical verdict, field for field.
     let polled: Value = ali
         .get(format!(
-            "{base}/chat/conversations/{conversation}/messages/{mid}"
+            "{base}/chatbot/threads/{thread}/messages/{mid}"
         ))
         .send()
         .await
@@ -2091,13 +2091,13 @@ async fn chat_stream_delivers_deltas_then_done_over_http() {
     register(&ali, &base, "ali").await;
     login(&ali, &base, "ali").await;
 
-    let (conversation, mid) = ask(&ali, &base).await;
+    let (thread, mid) = ask(&ali, &base).await;
 
     // The client opens the stream while the turn is still in flight; it stays
     // open until the answer lands, then closes after `done`.
     let mut res = ali
         .get(format!(
-            "{base}/chat/conversations/{conversation}/messages/{mid}/stream"
+            "{base}/chatbot/threads/{thread}/messages/{mid}/stream"
         ))
         .send()
         .await
@@ -2137,7 +2137,7 @@ async fn chat_stream_replays_an_answer_that_already_landed() {
     register(&ali, &base, "ali").await;
     login(&ali, &base, "ali").await;
 
-    let (conversation, mid) = ask(&ali, &base).await;
+    let (thread, mid) = ask(&ali, &base).await;
 
     // Wait — by polling, never by sleeping — until the turn has settled, so the
     // stream below opens strictly after the answer landed.
@@ -2145,7 +2145,7 @@ async fn chat_stream_replays_an_answer_that_already_landed() {
     for _ in 0..500 {
         let turn: Value = ali
             .get(format!(
-                "{base}/chat/conversations/{conversation}/messages/{mid}"
+                "{base}/chatbot/threads/{thread}/messages/{mid}"
             ))
             .send()
             .await
@@ -2164,7 +2164,7 @@ async fn chat_stream_replays_an_answer_that_already_landed() {
 
     let mut res = ali
         .get(format!(
-            "{base}/chat/conversations/{conversation}/messages/{mid}/stream"
+            "{base}/chatbot/threads/{thread}/messages/{mid}/stream"
         ))
         .send()
         .await

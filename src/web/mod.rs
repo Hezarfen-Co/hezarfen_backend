@@ -7,7 +7,7 @@ pub mod ai;
 pub mod appointments;
 pub mod attendance;
 pub mod auth;
-pub mod chat;
+pub mod chatbot;
 pub mod courses;
 pub mod events;
 pub mod exam_ws;

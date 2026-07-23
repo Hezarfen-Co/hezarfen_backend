@@ -14,12 +14,12 @@
 use surrealdb::types::{RecordId, SurrealValue};
 
 use crate::constant::{
-    DEFAULT_ATTENDANCE_STATUSES, DEFAULT_CHAT_HISTORY_TURNS, DEFAULT_EXAM_KINDS,
-    DEFAULT_MAX_CHAT_CONVERSATIONS, DEFAULT_MAX_CHAT_MESSAGE_LEN, DEFAULT_MAX_FILE_BYTES,
-    MAX_CHAT_HISTORY_TURNS, MAX_EXAM_KIND_WEIGHT, MAX_GRADE_BANDS, MAX_GRADE_LABEL_LEN, MAX_MARK,
-    MAX_MAX_CHAT_CONVERSATIONS, MAX_MAX_CHAT_MESSAGE_LEN, MAX_MAX_FILE_BYTES,
-    MAX_SETTINGS_ITEM_LEN, MAX_SETTINGS_LIST_LEN, MIN_CHAT_HISTORY_TURNS, MIN_EXAM_KIND_WEIGHT,
-    MIN_MARK, MIN_MAX_CHAT_CONVERSATIONS, MIN_MAX_CHAT_MESSAGE_LEN, MIN_MAX_FILE_BYTES,
+    DEFAULT_ATTENDANCE_STATUSES, DEFAULT_CHATBOT_HISTORY_TURNS, DEFAULT_EXAM_KINDS,
+    DEFAULT_MAX_CHATBOT_THREADS, DEFAULT_MAX_CHATBOT_MESSAGE_LEN, DEFAULT_MAX_FILE_BYTES,
+    MAX_CHATBOT_HISTORY_TURNS, MAX_EXAM_KIND_WEIGHT, MAX_GRADE_BANDS, MAX_GRADE_LABEL_LEN, MAX_MARK,
+    MAX_MAX_CHATBOT_THREADS, MAX_MAX_CHATBOT_MESSAGE_LEN, MAX_MAX_FILE_BYTES,
+    MAX_SETTINGS_ITEM_LEN, MAX_SETTINGS_LIST_LEN, MIN_CHATBOT_HISTORY_TURNS, MIN_EXAM_KIND_WEIGHT,
+    MIN_MARK, MIN_MAX_CHATBOT_THREADS, MIN_MAX_CHATBOT_MESSAGE_LEN, MIN_MAX_FILE_BYTES,
 };
 use crate::database::{Database, SETTINGS_TABLE};
 use crate::error::{AppError, ValidationError};
@@ -118,9 +118,9 @@ pub struct Settings {
     /// field (or the defaults) — reads as `DEFAULT_MAX_FILE_BYTES`.
     max_file_bytes: Option<i64>,
     /// Chatbot knobs, `None`-while-unset exactly like `max_file_bytes`.
-    chat_history_turns: Option<i64>,
-    max_chat_conversations: Option<i64>,
-    max_chat_message_len: Option<i64>,
+    chatbot_history_turns: Option<i64>,
+    max_chatbot_threads: Option<i64>,
+    max_chatbot_message_len: Option<i64>,
 }
 
 /// Everything [`Settings::try_new`] validates, in one struct — the knobs
@@ -132,9 +132,9 @@ pub struct SettingsParams {
     pub attendance_statuses: Vec<String>,
     pub grade_bands: Vec<GradeBand>,
     pub max_file_bytes: i64,
-    pub chat_history_turns: i64,
-    pub max_chat_conversations: i64,
-    pub max_chat_message_len: i64,
+    pub chatbot_history_turns: i64,
+    pub max_chatbot_threads: i64,
+    pub max_chatbot_message_len: i64,
 }
 
 impl Settings {
@@ -156,9 +156,9 @@ impl Settings {
             attendance_statuses: DEFAULT_ATTENDANCE_STATUSES.map(String::from).to_vec(),
             grade_bands: Vec::new(),
             max_file_bytes: None,
-            chat_history_turns: None,
-            max_chat_conversations: None,
-            max_chat_message_len: None,
+            chatbot_history_turns: None,
+            max_chatbot_threads: None,
+            max_chatbot_message_len: None,
         }
     }
 
@@ -170,9 +170,9 @@ impl Settings {
             attendance_statuses: self.attendance_statuses.clone(),
             grade_bands: self.grade_bands.clone(),
             max_file_bytes: self.get_max_file_bytes(),
-            chat_history_turns: self.get_chat_history_turns(),
-            max_chat_conversations: self.get_max_chat_conversations(),
-            max_chat_message_len: self.get_max_chat_message_len(),
+            chatbot_history_turns: self.get_chatbot_history_turns(),
+            max_chatbot_threads: self.get_max_chatbot_threads(),
+            max_chatbot_message_len: self.get_max_chatbot_message_len(),
         }
     }
 
@@ -190,9 +190,9 @@ impl Settings {
             attendance_statuses,
             grade_bands,
             max_file_bytes,
-            chat_history_turns,
-            max_chat_conversations,
-            max_chat_message_len,
+            chatbot_history_turns,
+            max_chatbot_threads,
+            max_chatbot_message_len,
         } = params;
         in_range(
             "max_file_bytes",
@@ -201,21 +201,21 @@ impl Settings {
             "must be between 1024 (1 KiB) and 26214400 (25 MiB)",
         )?;
         in_range(
-            "chat_history_turns",
-            chat_history_turns,
-            MIN_CHAT_HISTORY_TURNS..=MAX_CHAT_HISTORY_TURNS,
+            "chatbot_history_turns",
+            chatbot_history_turns,
+            MIN_CHATBOT_HISTORY_TURNS..=MAX_CHATBOT_HISTORY_TURNS,
             "must be between 1 and 50",
         )?;
         in_range(
-            "max_chat_conversations",
-            max_chat_conversations,
-            MIN_MAX_CHAT_CONVERSATIONS..=MAX_MAX_CHAT_CONVERSATIONS,
+            "max_chatbot_threads",
+            max_chatbot_threads,
+            MIN_MAX_CHATBOT_THREADS..=MAX_MAX_CHATBOT_THREADS,
             "must be between 1 and 500",
         )?;
         in_range(
-            "max_chat_message_len",
-            max_chat_message_len,
-            MIN_MAX_CHAT_MESSAGE_LEN..=MAX_MAX_CHAT_MESSAGE_LEN,
+            "max_chatbot_message_len",
+            max_chatbot_message_len,
+            MIN_MAX_CHATBOT_MESSAGE_LEN..=MAX_MAX_CHATBOT_MESSAGE_LEN,
             "must be between 100 and 8000 characters",
         )?;
         // Per-entry rules (name shape, weight range) hold structurally on any
@@ -267,9 +267,9 @@ impl Settings {
             attendance_statuses,
             grade_bands,
             max_file_bytes: Some(max_file_bytes),
-            chat_history_turns: Some(chat_history_turns),
-            max_chat_conversations: Some(max_chat_conversations),
-            max_chat_message_len: Some(max_chat_message_len),
+            chatbot_history_turns: Some(chatbot_history_turns),
+            max_chatbot_threads: Some(max_chatbot_threads),
+            max_chatbot_message_len: Some(max_chatbot_message_len),
         })
     }
 
@@ -302,25 +302,25 @@ impl Settings {
         self.max_file_bytes.unwrap_or(DEFAULT_MAX_FILE_BYTES)
     }
 
-    /// How many prior conversation turns ride along as context on an AI
+    /// How many prior thread turns ride along as context on an AI
     /// request; the built-in default while the school never set one.
-    pub fn get_chat_history_turns(&self) -> i64 {
-        self.chat_history_turns
-            .unwrap_or(DEFAULT_CHAT_HISTORY_TURNS)
+    pub fn get_chatbot_history_turns(&self) -> i64 {
+        self.chatbot_history_turns
+            .unwrap_or(DEFAULT_CHATBOT_HISTORY_TURNS)
     }
 
-    /// How many conversations one user may keep; the built-in default while
+    /// How many threads one user may keep; the built-in default while
     /// the school never set one.
-    pub fn get_max_chat_conversations(&self) -> i64 {
-        self.max_chat_conversations
-            .unwrap_or(DEFAULT_MAX_CHAT_CONVERSATIONS)
+    pub fn get_max_chatbot_threads(&self) -> i64 {
+        self.max_chatbot_threads
+            .unwrap_or(DEFAULT_MAX_CHATBOT_THREADS)
     }
 
     /// Character cap on one chat message; the built-in default while the
     /// school never set one.
-    pub fn get_max_chat_message_len(&self) -> i64 {
-        self.max_chat_message_len
-            .unwrap_or(DEFAULT_MAX_CHAT_MESSAGE_LEN)
+    pub fn get_max_chatbot_message_len(&self) -> i64 {
+        self.max_chatbot_message_len
+            .unwrap_or(DEFAULT_MAX_CHATBOT_MESSAGE_LEN)
     }
 
     /// The label of the band `mark` falls into: the band with the greatest
@@ -374,9 +374,9 @@ impl Settings {
                        AND attendance_statuses = $st
                        AND grade_bands = $gb
                        AND max_file_bytes = $mf
-                       AND chat_history_turns = $ct
-                       AND max_chat_conversations = $cc
-                       AND max_chat_message_len = $cl;
+                       AND chatbot_history_turns = $ct
+                       AND max_chatbot_threads = $cc
+                       AND max_chatbot_message_len = $cl;
                  COMMIT TRANSACTION;",
             )
             .bind(("expected", expected.clone()))
@@ -386,9 +386,9 @@ impl Settings {
             .bind(("st", expected.attendance_statuses.clone()))
             .bind(("gb", expected.grade_bands.clone()))
             .bind(("mf", expected.max_file_bytes))
-            .bind(("ct", expected.chat_history_turns))
-            .bind(("cc", expected.max_chat_conversations))
-            .bind(("cl", expected.max_chat_message_len))
+            .bind(("ct", expected.chatbot_history_turns))
+            .bind(("cc", expected.max_chatbot_threads))
+            .bind(("cl", expected.max_chatbot_message_len))
             .await?
             .check()?;
         // Statement slots count BEGIN too: the guarded UPDATE is slot 2. An
@@ -450,7 +450,7 @@ fn validate_list(field: &'static str, values: Vec<String>) -> Result<Vec<String>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constant::MAX_CHAT_MESSAGE_LEN;
+    use crate::constant::MAX_CHATBOT_MESSAGE_LEN;
 
     fn kinds(list: &[&str]) -> Vec<ExamKindDef> {
         list.iter()
@@ -618,49 +618,49 @@ mod tests {
     #[tokio::test]
     async fn chat_knobs_are_bounded() {
         // Each knob is held to its own inclusive range; the edges are legal.
-        let turns = |chat_history_turns| {
+        let turns = |chatbot_history_turns| {
             Settings::try_new(SettingsParams {
-                chat_history_turns,
+                chatbot_history_turns,
                 ..params()
             })
         };
         assert_eq!(
-            turns(MAX_CHAT_HISTORY_TURNS)
+            turns(MAX_CHATBOT_HISTORY_TURNS)
                 .unwrap()
-                .get_chat_history_turns(),
-            MAX_CHAT_HISTORY_TURNS
+                .get_chatbot_history_turns(),
+            MAX_CHATBOT_HISTORY_TURNS
         );
-        assert!(turns(MIN_CHAT_HISTORY_TURNS).is_ok());
+        assert!(turns(MIN_CHATBOT_HISTORY_TURNS).is_ok());
         assert!(turns(0).is_err());
-        assert!(turns(MAX_CHAT_HISTORY_TURNS + 1).is_err());
+        assert!(turns(MAX_CHATBOT_HISTORY_TURNS + 1).is_err());
 
-        let convos = |max_chat_conversations| {
+        let convos = |max_chatbot_threads| {
             Settings::try_new(SettingsParams {
-                max_chat_conversations,
+                max_chatbot_threads,
                 ..params()
             })
         };
         assert_eq!(
-            convos(7).unwrap().get_max_chat_conversations(),
+            convos(7).unwrap().get_max_chatbot_threads(),
             7,
             "an in-range cap survives validation"
         );
-        assert!(convos(MIN_MAX_CHAT_CONVERSATIONS).is_ok());
-        assert!(convos(MAX_MAX_CHAT_CONVERSATIONS).is_ok());
+        assert!(convos(MIN_MAX_CHATBOT_THREADS).is_ok());
+        assert!(convos(MAX_MAX_CHATBOT_THREADS).is_ok());
         assert!(convos(0).is_err());
-        assert!(convos(MAX_MAX_CHAT_CONVERSATIONS + 1).is_err());
+        assert!(convos(MAX_MAX_CHATBOT_THREADS + 1).is_err());
 
-        let len = |max_chat_message_len| {
+        let len = |max_chatbot_message_len| {
             Settings::try_new(SettingsParams {
-                max_chat_message_len,
+                max_chatbot_message_len,
                 ..params()
             })
         };
-        assert!(len(MIN_MAX_CHAT_MESSAGE_LEN).is_ok());
-        assert!(len(MAX_MAX_CHAT_MESSAGE_LEN).is_ok());
-        assert!(len(MIN_MAX_CHAT_MESSAGE_LEN - 1).is_err());
+        assert!(len(MIN_MAX_CHATBOT_MESSAGE_LEN).is_ok());
+        assert!(len(MAX_MAX_CHATBOT_MESSAGE_LEN).is_ok());
+        assert!(len(MIN_MAX_CHATBOT_MESSAGE_LEN - 1).is_err());
         // The ceiling is the newtype's hard cap: no school can raise it.
-        assert!(len(MAX_CHAT_MESSAGE_LEN as i64 + 1).is_err());
+        assert!(len(MAX_CHATBOT_MESSAGE_LEN as i64 + 1).is_err());
     }
 
     #[tokio::test]
@@ -671,14 +671,14 @@ mod tests {
         Settings::defaults().save(&db).await.unwrap();
         let loaded = Settings::load(&db).await.unwrap();
         assert_eq!(loaded.get_max_file_bytes(), DEFAULT_MAX_FILE_BYTES);
-        assert_eq!(loaded.get_chat_history_turns(), DEFAULT_CHAT_HISTORY_TURNS);
+        assert_eq!(loaded.get_chatbot_history_turns(), DEFAULT_CHATBOT_HISTORY_TURNS);
         assert_eq!(
-            loaded.get_max_chat_conversations(),
-            DEFAULT_MAX_CHAT_CONVERSATIONS
+            loaded.get_max_chatbot_threads(),
+            DEFAULT_MAX_CHATBOT_THREADS
         );
         assert_eq!(
-            loaded.get_max_chat_message_len(),
-            DEFAULT_MAX_CHAT_MESSAGE_LEN
+            loaded.get_max_chatbot_message_len(),
+            DEFAULT_MAX_CHATBOT_MESSAGE_LEN
         );
         // And a snapshot of that old row still passes the compare-and-set.
         let saved = Settings::try_new(SettingsParams {
@@ -708,7 +708,7 @@ mod tests {
             exam_kinds: kinds(&["lab"]),
             grade_bands: bands(&[(0, "F"), (50, "P")]),
             max_file_bytes: 2048,
-            chat_history_turns: 3,
+            chatbot_history_turns: 3,
             ..params()
         })
         .unwrap()
@@ -720,7 +720,7 @@ mod tests {
         assert_eq!(loaded.get_grade_bands().len(), 2);
         assert_eq!(loaded.grade_label(60.0), Some("P"));
         assert_eq!(loaded.get_max_file_bytes(), 2048);
-        assert_eq!(loaded.get_chat_history_turns(), 3);
+        assert_eq!(loaded.get_chatbot_history_turns(), 3);
         // A second save lands on the same singleton row, not a new one.
         Settings::try_new(SettingsParams {
             exam_kinds: kinds(&["quiz"]),

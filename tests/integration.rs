@@ -9,8 +9,8 @@ use common::{
     app_and_db, create_course, create_exam, create_exam_with, create_homework, create_session,
     create_subject, enroll, id_of, login, login_as, me_id, mem_app, send, set_role, unenroll,
 };
-use hezarfen_backend::domain::chat_message::ChatMessage;
-use hezarfen_backend::domain::conversation::ConversationId;
+use hezarfen_backend::domain::chatbot_message::ChatbotMessage;
+use hezarfen_backend::domain::chatbot_thread::ChatbotThreadId;
 use hezarfen_backend::domain::exam::ExamId;
 use hezarfen_backend::domain::exam_attempt::ExamAttempt;
 use hezarfen_backend::domain::session::Session;
@@ -5224,7 +5224,7 @@ async fn session_cookie_secure_attribute_follows_config() {
         files_path: common::files_dir(),
         cookie_secure: true,
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
-        chat_limit: Default::default(),
+        chatbot_limit: Default::default(),
         exam_presence: Default::default(),
         db_up: Default::default(),
         ai: None,
@@ -5263,7 +5263,7 @@ async fn db_down_refuses_before_touching_the_database() {
         files_path: common::files_dir(),
         cookie_secure: false,
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
-        chat_limit: Default::default(),
+        chatbot_limit: Default::default(),
         exam_presence: Default::default(),
         db_up: db_up.clone(),
         ai: None,
@@ -14616,10 +14616,10 @@ async fn chat_app(ai: Option<AiBridge>) -> (axum::Router, Database) {
 }
 
 /// The same, with an explicit per-user chat tier — what
-/// `RATE_LIMIT_CHAT_PER_MINUTE` configures in production.
+/// `RATE_LIMIT_CHATBOT_PER_MINUTE` configures in production.
 async fn chat_app_limited(
     ai: Option<AiBridge>,
-    chat_limit: hezarfen_backend::rate_limit::UserRateLimiter,
+    chatbot_limit: hezarfen_backend::rate_limit::UserRateLimiter,
 ) -> (axum::Router, Database) {
     let db = database::init_mem().await.expect("in-memory db");
     let app = build_router(AppState {
@@ -14627,7 +14627,7 @@ async fn chat_app_limited(
         files_path: common::files_dir(),
         cookie_secure: false,
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
-        chat_limit,
+        chatbot_limit,
         exam_presence: Default::default(),
         db_up: Default::default(),
         ai,
@@ -14635,17 +14635,17 @@ async fn chat_app_limited(
     (app, db)
 }
 
-/// How many `conversation` and `chat_message` rows exist, anywhere.
+/// How many `thread` and `chatbot_message` rows exist, anywhere.
 async fn chat_rows(db: &Database) -> (usize, usize) {
     let mut res = db
-        .query("SELECT VALUE id FROM conversation; SELECT VALUE id FROM chat_message;")
+        .query("SELECT VALUE id FROM chatbot_thread; SELECT VALUE id FROM chatbot_message;")
         .await
         .expect("count query")
         .check()
         .expect("count check");
-    let conversations: Vec<surrealdb::types::RecordId> = res.take(0).expect("conversation ids");
-    let messages: Vec<surrealdb::types::RecordId> = res.take(1).expect("chat_message ids");
-    (conversations.len(), messages.len())
+    let threads: Vec<surrealdb::types::RecordId> = res.take(0).expect("thread ids");
+    let messages: Vec<surrealdb::types::RecordId> = res.take(1).expect("chatbot_message ids");
+    (threads.len(), messages.len())
 }
 
 /// Open a thread (asserts 201) and return its id.
@@ -14653,7 +14653,7 @@ async fn new_thread(app: &axum::Router, cookie: &str) -> String {
     let res = send(
         app,
         "POST",
-        "/chat/conversations",
+        "/chatbot/threads",
         Some(cookie),
         Some(json!({})),
     )
@@ -14665,13 +14665,13 @@ async fn new_thread(app: &axum::Router, cookie: &str) -> String {
 async fn post_turn(
     app: &axum::Router,
     cookie: &str,
-    conversation: &str,
+    thread: &str,
     content: &str,
 ) -> common::Res {
     send(
         app,
         "POST",
-        &format!("/chat/conversations/{conversation}/messages"),
+        &format!("/chatbot/threads/{thread}/messages"),
         Some(cookie),
         Some(json!({ "content": content })),
     )
@@ -14683,13 +14683,13 @@ async fn post_turn(
 async fn open_stream(
     app: &axum::Router,
     cookie: &str,
-    conversation: &str,
+    thread: &str,
     mid: &str,
 ) -> StatusCode {
     let request = Request::builder()
         .method("GET")
         .uri(format!(
-            "/chat/conversations/{conversation}/messages/{mid}/stream"
+            "/chatbot/threads/{thread}/messages/{mid}/stream"
         ))
         .header("cookie", cookie)
         .body(Body::empty())
@@ -14706,7 +14706,7 @@ async fn chat_send_is_accepted_with_a_reserved_assistant_row() {
     let res = send(
         &app,
         "POST",
-        "/chat/conversations",
+        "/chatbot/threads",
         Some(&cookie),
         Some(json!({ "title": "Fizik" })),
     )
@@ -14715,11 +14715,11 @@ async fn chat_send_is_accepted_with_a_reserved_assistant_row() {
     assert_eq!(res.body["title"], "Fizik");
     assert!(res.body["created_at"].is_i64(), "{}", res.body);
     assert!(res.body["updated_at"].is_i64(), "{}", res.body);
-    let conversation = id_of(&res.body);
+    let thread = id_of(&res.body);
 
     // The receipt: the reserved row's id and nothing else. The answer is not
     // here — it is being fetched.
-    let res = post_turn(&app, &cookie, &conversation, "ikinci yasa nedir?").await;
+    let res = post_turn(&app, &cookie, &thread, "ikinci yasa nedir?").await;
     assert_eq!(res.status, StatusCode::ACCEPTED, "{}", res.body);
     assert_eq!(res.body["status"], "pending");
     let mid = res.body["message_id"].as_str().expect("message_id");
@@ -14736,13 +14736,13 @@ async fn chat_send_is_accepted_with_a_reserved_assistant_row() {
     let res = send(
         &app,
         "GET",
-        &format!("/chat/conversations/{conversation}/messages/{mid}"),
+        &format!("/chatbot/threads/{thread}/messages/{mid}"),
         Some(&cookie),
         None,
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-    assert_eq!(res.body["conversation_id"], conversation);
+    assert_eq!(res.body["thread_id"], thread);
     assert_eq!(res.body["role"], "assistant");
     assert_eq!(res.body["status"], "pending");
     assert_eq!(res.body["content"], "");
@@ -14756,7 +14756,7 @@ async fn chat_send_is_accepted_with_a_reserved_assistant_row() {
     let res = send(
         &app,
         "GET",
-        &format!("/chat/conversations/{conversation}/messages"),
+        &format!("/chatbot/threads/{thread}/messages"),
         Some(&cookie),
         None,
     )
@@ -14788,9 +14788,9 @@ async fn chat_send_without_a_service_is_503_and_writes_nothing() {
     for ai in [None, Some(idle)] {
         let (app, db) = chat_app(ai).await;
         let cookie = login(&app, "ali").await;
-        let conversation = new_thread(&app, &cookie).await;
+        let thread = new_thread(&app, &cookie).await;
 
-        let res = post_turn(&app, &cookie, &conversation, "bir soru").await;
+        let res = post_turn(&app, &cookie, &thread, "bir soru").await;
         assert_eq!(res.status, StatusCode::SERVICE_UNAVAILABLE, "{}", res.body);
         assert!(
             res.body["error"]
@@ -14826,8 +14826,8 @@ async fn chat_lists_are_paged() {
     // list. Order is compared element for element: the id tie-break makes it
     // deterministic even for the two rows one POST writes in a millisecond.
     for (uri, expected) in [
-        ("/chat/conversations".to_string(), 3),
-        (format!("/chat/conversations/{}/messages", threads[0]), 6),
+        ("/chatbot/threads".to_string(), 3),
+        (format!("/chatbot/threads/{}/messages", threads[0]), 6),
     ] {
         let res = send(
             &app,
@@ -14895,8 +14895,8 @@ async fn chat_threads_are_invisible_to_everyone_else() {
     let ai = chat_bridge().await;
     let (app, db) = chat_app(Some(ai.bridge.clone())).await;
     let ali = login(&app, "ali").await;
-    let conversation = new_thread(&app, &ali).await;
-    let res = post_turn(&app, &ali, &conversation, "bir soru").await;
+    let thread = new_thread(&app, &ali).await;
+    let res = post_turn(&app, &ali, &thread, "bir soru").await;
     assert_eq!(res.status, StatusCode::ACCEPTED, "{}", res.body);
     let mid = res.body["message_id"].as_str().unwrap().to_string();
 
@@ -14909,21 +14909,21 @@ async fn chat_threads_are_invisible_to_everyone_else() {
         for (method, uri) in [
             (
                 "GET",
-                format!("/chat/conversations/{conversation}/messages"),
+                format!("/chatbot/threads/{thread}/messages"),
             ),
             (
                 "GET",
-                format!("/chat/conversations/{conversation}/messages/{mid}"),
+                format!("/chatbot/threads/{thread}/messages/{mid}"),
             ),
             (
                 "GET",
-                format!("/chat/conversations/{conversation}/messages/{mid}/stream"),
+                format!("/chatbot/threads/{thread}/messages/{mid}/stream"),
             ),
-            ("DELETE", format!("/chat/conversations/{conversation}")),
-            ("PATCH", format!("/chat/conversations/{conversation}")),
+            ("DELETE", format!("/chatbot/threads/{thread}")),
+            ("PATCH", format!("/chatbot/threads/{thread}")),
             (
                 "POST",
-                format!("/chat/conversations/{conversation}/messages"),
+                format!("/chatbot/threads/{thread}/messages"),
             ),
         ] {
             let body = match method {
@@ -14935,13 +14935,13 @@ async fn chat_threads_are_invisible_to_everyone_else() {
             assert_eq!(res.status, StatusCode::NOT_FOUND, "{name} {method} {uri}");
         }
         // Nor does someone else's thread show up in their own list.
-        let res = send(&app, "GET", "/chat/conversations", Some(&other), None).await;
+        let res = send(&app, "GET", "/chatbot/threads", Some(&other), None).await;
         assert!(common::items(&res.body).is_empty(), "{}", res.body);
     }
 
     // And the owner still has everything, untouched.
     assert_eq!(chat_rows(&db).await, (1, 2));
-    let res = send(&app, "GET", "/chat/conversations", Some(&ali), None).await;
+    let res = send(&app, "GET", "/chatbot/threads", Some(&ali), None).await;
     assert_eq!(common::items(&res.body).len(), 1, "{}", res.body);
 }
 
@@ -14954,7 +14954,7 @@ async fn chat_thread_count_is_capped_by_the_school() {
         "PATCH",
         "/settings",
         Some(&manager),
-        Some(json!({ "max_chat_conversations": 1 })),
+        Some(json!({ "max_chatbot_threads": 1 })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
@@ -14964,7 +14964,7 @@ async fn chat_thread_count_is_capped_by_the_school() {
     let res = send(
         &app,
         "POST",
-        "/chat/conversations",
+        "/chatbot/threads",
         Some(&ali),
         Some(json!({})),
     )
@@ -14979,7 +14979,7 @@ async fn chat_thread_count_is_capped_by_the_school() {
     let res = send(
         &app,
         "DELETE",
-        &format!("/chat/conversations/{first}"),
+        &format!("/chatbot/threads/{first}"),
         Some(&ali),
         None,
     )
@@ -15004,7 +15004,7 @@ async fn concurrent_thread_creation_never_passes_the_cap() {
         "PATCH",
         "/settings",
         Some(&manager),
-        Some(json!({ "max_chat_conversations": CAP })),
+        Some(json!({ "max_chatbot_threads": CAP })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
@@ -15021,7 +15021,7 @@ async fn concurrent_thread_creation_never_passes_the_cap() {
                 send(
                     &app,
                     "POST",
-                    "/chat/conversations",
+                    "/chatbot/threads",
                     Some(&cookie),
                     Some(json!({})),
                 )
@@ -15054,18 +15054,18 @@ async fn chat_turn_stamps_thread_activity() {
     let ai = chat_bridge().await;
     let (app, _db) = chat_app(Some(ai.bridge.clone())).await;
     let ali = login(&app, "ali").await;
-    let conversation = new_thread(&app, &ali).await;
-    let before = send(&app, "GET", "/chat/conversations", Some(&ali), None).await;
+    let thread = new_thread(&app, &ali).await;
+    let before = send(&app, "GET", "/chatbot/threads", Some(&ali), None).await;
     let opened = common::items(&before.body)[0]["updated_at"]
         .as_i64()
         .unwrap();
 
     // The stamp is in whole milliseconds; make sure the clock has moved.
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    let res = post_turn(&app, &ali, &conversation, "bir soru").await;
+    let res = post_turn(&app, &ali, &thread, "bir soru").await;
     assert_eq!(res.status, StatusCode::ACCEPTED, "{}", res.body);
 
-    let after = send(&app, "GET", "/chat/conversations", Some(&ali), None).await;
+    let after = send(&app, "GET", "/chatbot/threads", Some(&ali), None).await;
     let stamped = common::items(&after.body)[0]["updated_at"]
         .as_i64()
         .unwrap();
@@ -15083,11 +15083,11 @@ async fn chat_stream_stops_polling_when_the_client_hangs_up() {
     // count below is not drowned in the QUIC service's task churn.
     let (app, db) = chat_app(None).await;
     let ali = login(&app, "ali").await;
-    let conversation = new_thread(&app, &ali).await;
+    let thread = new_thread(&app, &ali).await;
     let me = send(&app, "GET", "/auth/me", Some(&ali), None).await;
     let user = UserId::from_key(me.body["id"].as_str().unwrap());
     let pending =
-        ChatMessage::append_pending_assistant(&ConversationId::from_key(&conversation), &user, &db)
+        ChatbotMessage::append_pending_assistant(&ChatbotThreadId::from_key(&thread), &user, &db)
             .await
             .expect("reserve an assistant row");
     let mid = pending.get_id().key().to_string();
@@ -15108,7 +15108,7 @@ async fn chat_stream_stops_polling_when_the_client_hangs_up() {
     let request = Request::builder()
         .method("GET")
         .uri(format!(
-            "/chat/conversations/{conversation}/messages/{mid}/stream"
+            "/chatbot/threads/{thread}/messages/{mid}/stream"
         ))
         .header("cookie", &ali)
         .body(Body::empty())
@@ -15140,25 +15140,25 @@ async fn chat_content_is_required_and_capped_by_the_school() {
         "PATCH",
         "/settings",
         Some(&manager),
-        Some(json!({ "max_chat_message_len": 100 })),
+        Some(json!({ "max_chatbot_message_len": 100 })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
 
     let ali = login(&app, "ali").await;
-    let conversation = new_thread(&app, &ali).await;
+    let thread = new_thread(&app, &ali).await;
 
     for empty in ["", "   ", "\n\t"] {
-        let res = post_turn(&app, &ali, &conversation, empty).await;
+        let res = post_turn(&app, &ali, &thread, empty).await;
         assert_eq!(res.status, StatusCode::BAD_REQUEST, "{empty:?} accepted");
     }
     // Counted in characters, not bytes: 101 multi-byte characters is 101.
-    let res = post_turn(&app, &ali, &conversation, &"é".repeat(101)).await;
+    let res = post_turn(&app, &ali, &thread, &"é".repeat(101)).await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
     // Nothing rejected was written.
     assert_eq!(chat_rows(&db).await, (1, 0));
 
-    let res = post_turn(&app, &ali, &conversation, &"é".repeat(100)).await;
+    let res = post_turn(&app, &ali, &thread, &"é".repeat(100)).await;
     assert_eq!(res.status, StatusCode::ACCEPTED, "{}", res.body);
 }
 
@@ -15170,10 +15170,10 @@ async fn chat_rate_limit_refuses_before_anything_is_written() {
     let ai = chat_bridge().await;
     let (app, db) = chat_app(Some(ai.bridge.clone())).await;
     let ali = login(&app, "ali").await;
-    let conversation = new_thread(&app, &ali).await;
+    let thread = new_thread(&app, &ali).await;
 
     for n in 1..=20 {
-        let res = post_turn(&app, &ali, &conversation, &format!("soru {n}")).await;
+        let res = post_turn(&app, &ali, &thread, &format!("soru {n}")).await;
         assert_eq!(res.status, StatusCode::ACCEPTED, "turn {n}: {}", res.body);
     }
     let before = chat_rows(&db).await;
@@ -15182,7 +15182,7 @@ async fn chat_rate_limit_refuses_before_anything_is_written() {
     let (status, headers, _) = common::send_raw(
         &app,
         "POST",
-        &format!("/chat/conversations/{conversation}/messages"),
+        &format!("/chatbot/threads/{thread}/messages"),
         Some(&ali),
         Some("application/json"),
         json!({ "content": "yirmi birinci" })
@@ -15222,16 +15222,16 @@ async fn every_role_may_chat_parents_included() {
         ("patron", "admin"),
     ] {
         let cookie = login_as(&app, &db, name, role).await;
-        let conversation = new_thread(&app, &cookie).await;
+        let thread = new_thread(&app, &cookie).await;
 
-        let res = post_turn(&app, &cookie, &conversation, "bir soru").await;
+        let res = post_turn(&app, &cookie, &thread, "bir soru").await;
         assert_eq!(res.status, StatusCode::ACCEPTED, "{role}: {}", res.body);
         let mid = res.body["message_id"].as_str().unwrap().to_string();
 
         let res = send(
             &app,
             "GET",
-            &format!("/chat/conversations/{conversation}/messages/{mid}"),
+            &format!("/chatbot/threads/{thread}/messages/{mid}"),
             Some(&cookie),
             None,
         )
@@ -15241,7 +15241,7 @@ async fn every_role_may_chat_parents_included() {
         let res = send(
             &app,
             "GET",
-            &format!("/chat/conversations/{conversation}/messages"),
+            &format!("/chatbot/threads/{thread}/messages"),
             Some(&cookie),
             None,
         )
@@ -15250,19 +15250,19 @@ async fn every_role_may_chat_parents_included() {
         assert_eq!(common::items(&res.body).len(), 2, "{role}: {}", res.body);
 
         assert_eq!(
-            open_stream(&app, &cookie, &conversation, &mid).await,
+            open_stream(&app, &cookie, &thread, &mid).await,
             StatusCode::OK,
             "{role} may open the stream"
         );
 
-        let res = send(&app, "GET", "/chat/conversations", Some(&cookie), None).await;
+        let res = send(&app, "GET", "/chatbot/threads", Some(&cookie), None).await;
         assert_eq!(res.status, StatusCode::OK, "{role}: {}", res.body);
         assert_eq!(common::items(&res.body).len(), 1, "{role}: {}", res.body);
 
         let res = send(
             &app,
             "DELETE",
-            &format!("/chat/conversations/{conversation}"),
+            &format!("/chatbot/threads/{thread}"),
             Some(&cookie),
             None,
         )
@@ -15284,7 +15284,7 @@ async fn chat_thread_can_be_renamed_and_cleared() {
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     let second = new_thread(&app, &ali).await;
 
-    let listed = send(&app, "GET", "/chat/conversations", Some(&ali), None).await;
+    let listed = send(&app, "GET", "/chatbot/threads", Some(&ali), None).await;
     let items = common::items(&listed.body);
     assert_eq!(id_of(&items[0]), second, "newest activity first");
     let before = items[1]["updated_at"].as_i64().expect("updated_at");
@@ -15295,7 +15295,7 @@ async fn chat_thread_can_be_renamed_and_cleared() {
     let res = send(
         &app,
         "PATCH",
-        &format!("/chat/conversations/{first}"),
+        &format!("/chatbot/threads/{first}"),
         Some(&ali),
         Some(json!({ "title": "  Fizik ödevi  " })),
     )
@@ -15307,7 +15307,7 @@ async fn chat_thread_can_be_renamed_and_cleared() {
     assert!(stamped > before, "{stamped} !> {before}");
 
     // The rename is durable and re-sorted the list.
-    let listed = send(&app, "GET", "/chat/conversations", Some(&ali), None).await;
+    let listed = send(&app, "GET", "/chatbot/threads", Some(&ali), None).await;
     let items = common::items(&listed.body);
     assert_eq!(id_of(&items[0]), first, "the renamed thread is now first");
     assert_eq!(items[0]["title"], "Fizik ödevi");
@@ -15317,7 +15317,7 @@ async fn chat_thread_can_be_renamed_and_cleared() {
         let res = send(
             &app,
             "PATCH",
-            &format!("/chat/conversations/{first}"),
+            &format!("/chatbot/threads/{first}"),
             Some(&ali),
             Some(clearing.clone()),
         )
@@ -15329,7 +15329,7 @@ async fn chat_thread_can_be_renamed_and_cleared() {
         send(
             &app,
             "PATCH",
-            &format!("/chat/conversations/{first}"),
+            &format!("/chatbot/threads/{first}"),
             Some(&ali),
             Some(json!({ "title": "geri" })),
         )
@@ -15340,7 +15340,7 @@ async fn chat_thread_can_be_renamed_and_cleared() {
     let res = send(
         &app,
         "PATCH",
-        &format!("/chat/conversations/{first}"),
+        &format!("/chatbot/threads/{first}"),
         Some(&ali),
         Some(json!({ "title": "é".repeat(201) })),
     )
@@ -15349,7 +15349,7 @@ async fn chat_thread_can_be_renamed_and_cleared() {
     let res = send(
         &app,
         "PATCH",
-        &format!("/chat/conversations/{first}"),
+        &format!("/chatbot/threads/{first}"),
         Some(&ali),
         Some(json!({ "title": "é".repeat(200) })),
     )
@@ -15360,7 +15360,7 @@ async fn chat_thread_can_be_renamed_and_cleared() {
     let res = send(
         &app,
         "PATCH",
-        "/chat/conversations/nosuchthread",
+        "/chatbot/threads/nosuchthread",
         Some(&ali),
         Some(json!({ "title": "hayalet" })),
     )
@@ -15370,7 +15370,7 @@ async fn chat_thread_can_be_renamed_and_cleared() {
     let res = send(
         &app,
         "GET",
-        &format!("/chat/conversations/{second}/messages"),
+        &format!("/chatbot/threads/{second}/messages"),
         Some(&ali),
         None,
     )
@@ -15380,7 +15380,7 @@ async fn chat_thread_can_be_renamed_and_cleared() {
 
 #[tokio::test]
 async fn chat_rate_limit_tier_is_configurable_and_zero_disables_it() {
-    // `RATE_LIMIT_CHAT_PER_MINUTE`, the third tier, behaves like the two IP
+    // `RATE_LIMIT_CHATBOT_PER_MINUTE`, the third tier, behaves like the two IP
     // ones: the configured number is honoured exactly and `0` switches it off.
     // No bridge is needed — the limiter is charged before the availability
     // gate, so a metered turn answers 503 and only the refused one answers 429.
@@ -15388,9 +15388,9 @@ async fn chat_rate_limit_tier_is_configurable_and_zero_disables_it() {
 
     let (app, _db) = chat_app_limited(None, UserRateLimiter::per_user_minute(3)).await;
     let ali = login(&app, "ali").await;
-    let conversation = new_thread(&app, &ali).await;
+    let thread = new_thread(&app, &ali).await;
     for n in 1..=3 {
-        let res = post_turn(&app, &ali, &conversation, &format!("soru {n}")).await;
+        let res = post_turn(&app, &ali, &thread, &format!("soru {n}")).await;
         assert_eq!(
             res.status,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -15398,7 +15398,7 @@ async fn chat_rate_limit_tier_is_configurable_and_zero_disables_it() {
             res.body
         );
     }
-    let res = post_turn(&app, &ali, &conversation, "dorduncu").await;
+    let res = post_turn(&app, &ali, &thread, "dorduncu").await;
     assert_eq!(res.status, StatusCode::TOO_MANY_REQUESTS, "{}", res.body);
     // Per user, still: a second caller starts with a full budget.
     let veli = login(&app, "veli").await;
@@ -15413,9 +15413,9 @@ async fn chat_rate_limit_tier_is_configurable_and_zero_disables_it() {
     // `0` disables the tier: well past the shipped default, nothing is refused.
     let (app, _db) = chat_app_limited(None, UserRateLimiter::per_user_minute(0)).await;
     let ali = login(&app, "ali").await;
-    let conversation = new_thread(&app, &ali).await;
+    let thread = new_thread(&app, &ali).await;
     for n in 1..=40 {
-        let res = post_turn(&app, &ali, &conversation, &format!("soru {n}")).await;
+        let res = post_turn(&app, &ali, &thread, &format!("soru {n}")).await;
         assert_eq!(
             res.status,
             StatusCode::SERVICE_UNAVAILABLE,

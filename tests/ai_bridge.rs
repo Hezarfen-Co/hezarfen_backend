@@ -805,7 +805,7 @@ async fn fetch_certificate(ai: Option<AiBridge>) -> (axum::http::StatusCode, Val
         files_path: std::env::temp_dir(),
         cookie_secure: false,
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
-        chat_limit: Default::default(),
+        chatbot_limit: Default::default(),
         exam_presence: Default::default(),
         db_up: Default::default(),
         ai,
@@ -924,7 +924,7 @@ fn payloads_are_opaque(v: Value) -> Value {
 
 use axum::Router;
 use axum::http::StatusCode;
-use hezarfen_backend::constant::{AI_CHAT_CAPABILITY, DEFAULT_MAX_CHAT_MESSAGE_LEN};
+use hezarfen_backend::constant::{AI_CHAT_CAPABILITY, DEFAULT_MAX_CHATBOT_MESSAGE_LEN};
 use hezarfen_backend::database::Database;
 use surrealdb::types::RecordId;
 
@@ -938,7 +938,7 @@ async fn chat_app(bridge: &AiBridge) -> (Router, Database) {
         files_path: common::files_dir(),
         cookie_secure: false,
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
-        chat_limit: Default::default(),
+        chatbot_limit: Default::default(),
         exam_presence: Default::default(),
         db_up: Default::default(),
         ai: Some(bridge.clone()),
@@ -952,7 +952,7 @@ async fn chat_user(app: &Router, name: &str) -> (String, String) {
     let res = common::send(
         app,
         "POST",
-        "/chat/conversations",
+        "/chatbot/threads",
         Some(&cookie),
         Some(json!({})),
     )
@@ -963,11 +963,11 @@ async fn chat_user(app: &Router, name: &str) -> (String, String) {
 }
 
 /// Ask one question (asserts `202`) and return the reserved assistant row's id.
-async fn ask(app: &Router, cookie: &str, conversation: &str, text: &str) -> String {
+async fn ask(app: &Router, cookie: &str, thread: &str, text: &str) -> String {
     let res = common::send(
         app,
         "POST",
-        &format!("/chat/conversations/{conversation}/messages"),
+        &format!("/chatbot/threads/{thread}/messages"),
         Some(cookie),
         Some(json!({ "content": text })),
     )
@@ -982,12 +982,12 @@ async fn ask(app: &Router, cookie: &str, conversation: &str, text: &str) -> Stri
 
 /// Poll a turn until it leaves `pending`. Bounded polling rather than a sleep
 /// sized to the answering task: the round trip settles when it settles.
-async fn settled(app: &Router, cookie: &str, conversation: &str, mid: &str) -> Value {
+async fn settled(app: &Router, cookie: &str, thread: &str, mid: &str) -> Value {
     for _ in 0..500 {
         let res = common::send(
             app,
             "GET",
-            &format!("/chat/conversations/{conversation}/messages/{mid}"),
+            &format!("/chatbot/threads/{thread}/messages/{mid}"),
             Some(cookie),
             None,
         )
@@ -1012,10 +1012,10 @@ async fn a_chat_turn_settles_complete_with_the_services_text() {
     .await;
     await_workers(&bridge, 1).await;
     let (app, _db) = chat_app(&bridge).await;
-    let (cookie, conversation) = chat_user(&app, "ali").await;
+    let (cookie, thread) = chat_user(&app, "ali").await;
 
-    let mid = ask(&app, &cookie, &conversation, "ikinci yasa nedir?").await;
-    let turn = settled(&app, &cookie, &conversation, &mid).await;
+    let mid = ask(&app, &cookie, &thread, "ikinci yasa nedir?").await;
+    let turn = settled(&app, &cookie, &thread, &mid).await;
     assert_eq!(turn["status"], "complete", "{turn}");
     assert_eq!(turn["content"], "F = ma");
     assert_eq!(turn["role"], "assistant");
@@ -1050,28 +1050,28 @@ async fn the_history_a_service_receives_is_oldest_first_without_the_new_turn() {
     .await;
     await_workers(&bridge, 1).await;
     let (app, db) = chat_app(&bridge).await;
-    let (cookie, conversation) = chat_user(&app, "ali").await;
+    let (cookie, thread) = chat_user(&app, "ali").await;
     let user = common::me_id(&app, &cookie).await;
 
-    let first = ask(&app, &cookie, &conversation, "birinci soru").await;
+    let first = ask(&app, &cookie, &thread, "birinci soru").await;
     assert_eq!(
-        settled(&app, &cookie, &conversation, &first).await["status"],
+        settled(&app, &cookie, &thread, &first).await["status"],
         "complete"
     );
 
     db.query(
-        "CREATE chat_message:h3 SET conversation_id = $conv, user_id = $usr, role = 'assistant',
+        "CREATE chatbot_message:h3 SET thread_id = $conv, user_id = $usr, role = 'assistant',
              content = '', status = 'pending', created_at = 1002;",
     )
-    .bind(("conv", RecordId::new("conversation", conversation.as_str())))
+    .bind(("conv", RecordId::new("chatbot_thread", thread.as_str())))
     .bind(("usr", RecordId::new("user", user.as_str())))
     .await
     .expect("seed history")
     .check()
     .expect("seed history");
 
-    let mid = ask(&app, &cookie, &conversation, "ikinci soru").await;
-    let turn = settled(&app, &cookie, &conversation, &mid).await;
+    let mid = ask(&app, &cookie, &thread, "ikinci soru").await;
+    let turn = settled(&app, &cookie, &thread, &mid).await;
     assert_eq!(turn["status"], "complete", "{turn}");
 
     let seen = service.seen();
@@ -1103,10 +1103,10 @@ async fn a_refused_chat_turn_carries_the_services_own_error_code() {
     .await;
     await_workers(&bridge, 1).await;
     let (app, _db) = chat_app(&bridge).await;
-    let (cookie, conversation) = chat_user(&app, "ali").await;
+    let (cookie, thread) = chat_user(&app, "ali").await;
 
-    let mid = ask(&app, &cookie, &conversation, "bir soru").await;
-    let turn = settled(&app, &cookie, &conversation, &mid).await;
+    let mid = ask(&app, &cookie, &thread, "bir soru").await;
+    let turn = settled(&app, &cookie, &thread, &mid).await;
     assert_eq!(turn["status"], "failed", "{turn}");
     assert_eq!(turn["error_code"], "quota_exhausted");
     assert_eq!(turn["content"], "", "a failed turn shows no text");
@@ -1120,7 +1120,7 @@ async fn an_over_long_chat_answer_is_clipped_rather_than_failed() {
     // truncated (a clipped answer still helps), and on a character boundary —
     // a byte-wise clip of a multi-byte script would render as garbage. The cut
     // is flagged, so the UI never passes a clipped answer off as the whole one.
-    let cap = DEFAULT_MAX_CHAT_MESSAGE_LEN as usize;
+    let cap = DEFAULT_MAX_CHATBOT_MESSAGE_LEN as usize;
     let bridge = bridge().await;
     let _service = connect_service(
         &bridge,
@@ -1130,10 +1130,10 @@ async fn an_over_long_chat_answer_is_clipped_rather_than_failed() {
     .await;
     await_workers(&bridge, 1).await;
     let (app, _db) = chat_app(&bridge).await;
-    let (cookie, conversation) = chat_user(&app, "ali").await;
+    let (cookie, thread) = chat_user(&app, "ali").await;
 
-    let mid = ask(&app, &cookie, &conversation, "uzun cevap ver").await;
-    let turn = settled(&app, &cookie, &conversation, &mid).await;
+    let mid = ask(&app, &cookie, &thread, "uzun cevap ver").await;
+    let turn = settled(&app, &cookie, &thread, &mid).await;
     assert_eq!(turn["status"], "complete", "{turn}");
     let text = turn["content"].as_str().expect("content");
     assert_eq!(text.chars().count(), cap);
@@ -1154,10 +1154,10 @@ async fn a_blank_chat_answer_fails_as_empty_reply() {
     .await;
     await_workers(&bridge, 1).await;
     let (app, _db) = chat_app(&bridge).await;
-    let (cookie, conversation) = chat_user(&app, "ali").await;
+    let (cookie, thread) = chat_user(&app, "ali").await;
 
-    let mid = ask(&app, &cookie, &conversation, "bir soru").await;
-    let turn = settled(&app, &cookie, &conversation, &mid).await;
+    let mid = ask(&app, &cookie, &thread, "bir soru").await;
+    let turn = settled(&app, &cookie, &thread, &mid).await;
     assert_eq!(turn["status"], "failed", "{turn}");
     assert_eq!(turn["error_code"], "empty_reply");
 }

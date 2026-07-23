@@ -30,7 +30,7 @@ async fn main() -> anyhow::Result<()> {
         files_path: cfg.files_path.clone().into(),
         cookie_secure: cfg.cookie_secure,
         rate_limit: cfg.rate_limit.clone(),
-        chat_limit: UserRateLimiter::per_user_minute(cfg.chat_per_minute),
+        chatbot_limit: UserRateLimiter::per_user_minute(cfg.chatbot_per_minute),
         exam_presence: Default::default(),
         db_up,
         ai,
