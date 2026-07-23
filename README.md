@@ -73,6 +73,14 @@ question is readable by the whole school with anyone free to offer
 the worked steps, both editable by the solution's author anytime; pending
 questions show only to their asker and to teacher+, and approval freezes the
 content so nothing unmoderated ever reaches the pool.
+Teachers keep an **appointment calendar**: a teacher+ publishes availability
+slots (one-off, or repeating weekly up to an `until` date as a series that
+deletes as one), and students and parents book a slot with a reason — the
+booking lands `pending` until the teacher approves it, rejects it, or
+counter-proposes another time (which sends it back to `pending` for the
+requester to accept or decline); either side may cancel until the meeting
+starts, one live booking holds a slot, and no approved meeting may overlap
+another for the teacher or the requester (see "Appointments").
 School-varying policy is data, not code: exam kinds (each with its weight in
 course averages), attendance statuses, grade-display bands, the note-file
 size limit, and the chatbot's limits live in an editable **settings** singleton, and academic **terms**
@@ -452,6 +460,18 @@ their existing shapes: the student exam-room reads
 | DELETE | `/events/{id}/attendance/{user}` | teacher | Remove a user's attendance      |
 | POST   | `/events/{id}/register`          | teacher | `{user_id?}` — seat a **student** (or yourself when omitted) on a registration event's signup list; idempotent, `409` once full or started |
 | DELETE | `/events/{id}/register/{user}`   | teacher | Free a seat (same self-or-student rule); `409` once the event started |
+| POST   | `/appointments/slots`            | teacher | `{starts_at, ends_at, note?, repeat_weekly?, until?}` — publish availability on **own** calendar; always answers an **array** (one element for a one-off, one per weekly occurrence, ≤ 52, sharing a `series`); `400` if a weekly shift would run off the end of time |
+| GET    | `/appointments/slots`            | student | Teacher+: own calendar (past included). Everyone else: the bookable calendar — future slots only, demoted teachers' slots left out · paged |
+| DELETE | `/appointments/slots/{id}`       | teacher | Withdraw one slot (its teacher, or manager+); `409` while a pending/approved booking sits on it |
+| DELETE | `/appointments/slots/series/{series}` | teacher | Withdraw a whole recurring publish (same rights); `409` if **any** occurrence has a live booking |
+| POST   | `/appointments`                  | student | `{slot, reason}` — book a slot; **students and parents only** (a parent books for themselves); lands `pending`, `409` if the slot's window has already started, the slot is taken, the caller is busy at that time, or its teacher is no longer staff |
+| GET    | `/appointments`                  | student | Teacher+: bookings on own slots (the request inbox). Everyone else: own requests · paged |
+| PATCH  | `/appointments/{id}/approve`     | teacher | Confirm a pending booking (slot's teacher, or manager+); `409` when settled, when the effective window has already started, or when the time collides with another approved meeting of either side |
+| PATCH  | `/appointments/{id}/reject`      | teacher | Turn it down (same rights); the slot frees up |
+| PATCH  | `/appointments/{id}/cancel`      | student | Call it off — the requester or the slot's teacher (manager+ too); `409` once settled or the meeting has started |
+| PATCH  | `/appointments/{id}/reschedule`  | teacher | `{starts_at, ends_at}` — counter-propose another time (same rights); the booking goes back to `pending`; `409` if the proposed window has already started |
+| PATCH  | `/appointments/{id}/reschedule/accept` | student | Requester only: approval at the proposed time (the overlap guard runs again) |
+| PATCH  | `/appointments/{id}/reschedule/decline` | student | Requester only: refuse the proposal — this **cancels** the booking, so the cancel deadline applies (`409` once the meeting's window has started) |
 | POST   | `/courses`                       | teacher | `{title, description?, kind?, term_id?, capacity?}` — `kind` is `course` (default), `study` (etüt), or `club` (kulüp); `capacity` caps the roster (creator manages it) |
 | GET    | `/courses`                       | student | The caller's visible courses: created + enrolled (manager+: all) · paged |
 | GET    | `/courses/me`                    | student | The caller's **enrolled** courses · paged |
@@ -661,6 +681,126 @@ uses the same field semantics as the profile patch: omitted keeps, `""` clears
 back to `null` ("never chose" — the client then follows the device
 preference), anything else must be one of the listed values or the whole patch
 is a `400`.
+
+## Appointments
+
+Office hours and parent-teacher conferences, booked instead of arranged by
+message. A teacher+ **publishes availability**; a student or a parent
+**books** one of those windows with a reason; the teacher **decides**. Two
+rows carry it: an `appointment_slot` (the offer) and an `appointment` (the
+booking sitting on it) — a slot is never "half booked", and a refused request
+stays readable instead of vanishing.
+
+A slot is a window on one teacher's calendar: `starts_at`/`ends_at` (unix
+milliseconds, `starts_at` strictly before `ends_at`, neither in the past — the
+usual 60-second grace) plus an optional `note` (≤ 500 chars) shown to
+requesters ("office hours", "veli görüşmesi"). Windows are **half-open**, so
+10:00–10:30 and 10:30–11:00 are two slots, not a collision. `POST
+/appointments/slots` publishes on the caller's *own* calendar (managers and
+admins included — the calendar always belongs to whoever posted) and **always
+answers an array**: one element for a one-off, one per occurrence for a
+recurring publish.
+
+`repeat_weekly: true` with an `until` expands the same window every seven days
+up to and including `until`, server-side, into **concrete rows** sharing a
+`series` id — no recurrence rule is stored, so one week can be cancelled
+without touching the rest. At most 52 occurrences (a year); asking for more is
+a `400`, as is `repeat_weekly` without `until` — and so is a window sitting so
+far ahead that shifting it by a week would run off the end of representable
+time (the shift is checked, never wrapped: a wrapped end would land *before*
+its start, and an inverted window can never overlap anything, which would
+quietly disable the double-booking guard). Delete one occurrence with
+`DELETE /appointments/slots/{id}`, the whole publish with `DELETE
+/appointments/slots/series/{series}`.
+
+```json
+POST /appointments/slots
+{ "starts_at": 1900000000000, "ends_at": 1900001800000,
+  "note": "office hours", "repeat_weekly": true, "until": 1901209600000 }
+
+201 [ { "id": "01J8…A", "teacher": {"id": "01J8…T", "username": "ayse",
+        "display_name": "Ayşe Yılmaz"},
+        "starts_at": 1900000000000, "ends_at": 1900001800000,
+        "note": "office hours", "series": "01J8…S", "created_at": 1899… },
+      { "id": "01J8…B", …, "starts_at": 1900604800000, "series": "01J8…S" } ]
+```
+
+`GET /appointments/slots` is two lists behind one path: a teacher+ reads
+**their own** calendar, past occurrences included; everyone else reads the
+**bookable** calendar — future slots only, earliest first. A teacher demoted
+after publishing leaves **inert** slots: their live role is re-read, so those
+slots drop out of the bookable list and booking one is refused with a `409`.
+The list does not say whether a slot is already taken — booking a taken one
+answers `409`.
+
+**Booking.** `POST /appointments` (`{slot, reason}` — the reason is required,
+≤ 1000 chars) is for **students and parents only**; staff arrange between
+themselves off this API. A parent books for *themselves* — this is the
+parent-teacher conference, not a booking on behalf of a child. The request
+lands `pending`, always: publishing availability is not consent to a
+particular person and a particular topic, so approve/reject still applies.
+
+A booking is `pending`, `approved`, `rejected`, or `cancelled`. The first two
+are **live** and hold the slot; rejecting or cancelling frees it for someone
+else immediately (occupancy is counted live, never stored as a flag). The
+decisions:
+
+- `PATCH /{id}/approve` — the slot's teacher (or manager+) confirms. Refused
+  (`409`) when the effective window has already started.
+- `PATCH /{id}/reject` — turns it down; the slot frees up.
+- `PATCH /{id}/cancel` — either side, the requester or the teacher, from
+  either live state. Refused (`409`) once the meeting's window has started: a
+  meeting that already began is history, not a plan. The guard sits in the
+  domain's `cancel` itself, under the appointment lock and on a fresh read, so
+  every way of cancelling — the decline below included — inherits it.
+- `PATCH /{id}/reschedule` (`{starts_at, ends_at}`) — the teacher
+  **counter-proposes**. The times land on the *same* row as
+  `proposed_starts_at`/`proposed_ends_at`, the status goes back to `pending`
+  and `decided_by` clears, because leaving it `approved` would silently move a
+  confirmed appointment. The slot stays held meanwhile. A window that has
+  already opened is refused (`409`): the 60-second grace on the times is for
+  clock skew, not for proposing into a meeting already underway — one nobody
+  could then cancel.
+- `PATCH /{id}/reschedule/accept` — the **requester** only: this *is* approval
+  at the new time, so the overlap guard runs again — and so does the
+  already-started guard (`409`). Agreeing to a window that has begun does not
+  help: the meeting could never be cancelled. The booking stays `pending`, so
+  the teacher just proposes a time that can still happen.
+- `PATCH /{id}/reschedule/decline` — the requester only, and it **cancels the
+  booking**: the proposal replaced the time that was asked for, so there is
+  nothing to fall back to. The row stays readable as `cancelled` with the
+  refused proposal still on it — book another slot instead. Declining *is* a
+  cancel, so it answers to the cancel deadline too (`409` once the effective
+  window has started).
+
+A booking's effective window is the accepted counter-proposal when there is
+one and the slot's own window otherwise; that is what `starts_at`/`ends_at` on
+an `AppointmentResponse` report, and what the cancel deadline is judged on.
+
+**No double-booking.** Two `approved` meetings may never overlap for the same
+teacher *or* the same requester (`409`). The guard runs at approval — the
+moment anyone is actually committed — and again on accepting a counter-proposal,
+because the time moved. Approval also refuses (`409`) an **effective window
+that has already started** (the proposal's when one stands, the slot's
+otherwise), for the same reason booking one is refused. Requesting is checked more loosely: a booking is
+refused up front only when the slot's window has already started (booking it
+would create a meeting `cancel` refuses to undo — the 60-second publish grace
+is for clock skew, not for booking into the past), when the slot is already
+taken, or when the *requester* is already committed at that hour; a clash on the teacher's side is theirs to
+resolve when they decide, since refusing a request against a window they
+themselves published would only confuse. Touching windows never conflict.
+
+Deletion follows the same rule as the rest of the codebase: a slot carrying a
+live (pending or approved) booking refuses to go (`409`) — reject or cancel
+that booking first — and a series delete is all-or-nothing, `409` if *any*
+occurrence still carries one, so the person waiting is dealt with rather than
+left stranded on a stray week. Settled (rejected/cancelled) bookings cascade
+away with their slot.
+
+`GET /appointments` is likewise two lists: a teacher+ sees the bookings aimed
+at their own slots (their request inbox), everyone else the ones they
+requested, newest first, paged. Managers and admins read their own inbox here
+too — they may still decide any booking by id.
 
 ## Messaging
 
@@ -1635,6 +1775,12 @@ src/
     chat_message.rs ChatMessageId · ChatContent · MessageRole · MessageStatus ·
                    ChatMessage (one turn; the assistant row is written
                    `pending` before the AI call and settled after)
+    appointment_slot.rs AppointmentSlotId · SlotSeries · SlotNote ·
+                   AppointmentSlot (a teacher's published availability; a
+                   recurring publish is expanded into rows sharing a series id)
+    appointment.rs AppointmentId · AppointmentStatus · AppointmentReason ·
+                   Appointment (a booking on a slot; occupancy and overlap are
+                   derived under APPOINTMENT_LOCK, never stored)
     pomodoro.rs    PomodoroSessionId · PomodoroSession (student focus log)
     pool_question.rs PoolQuestionId · PoolQuestionTitle · PoolQuestionBody ·
                    PoolQuestion (student-asked question; teacher-approved into
@@ -1658,9 +1804,10 @@ src/
     dto.rs         shared UserResponse · CourseResponse · ExamResponse · SessionResponse schemas
     exam_ws.rs     the student exam-room WebSocket (state ticks, autosave, finish)
     page.rs        PageParams · Page<T> (shared pagination)
-    auth.rs  users.rs  notes.rs  messages.rs  events.rs  courses.rs  subjects.rs
-    sessions.rs  exams.rs  homework.rs  questions.rs  marks.rs  work.rs
-    pomodoro.rs  attendance.rs  settings.rs  terms.rs  ai.rs  chat.rs
+    auth.rs  users.rs  notes.rs  messages.rs  events.rs  appointments.rs
+    courses.rs  subjects.rs  sessions.rs  exams.rs  homework.rs  questions.rs
+    marks.rs  work.rs  pomodoro.rs  attendance.rs  settings.rs  terms.rs
+    ai.rs  chat.rs
 ```
 
 Tests: `cargo test` — unit (in-source), integration (`tower::oneshot` + in-memory

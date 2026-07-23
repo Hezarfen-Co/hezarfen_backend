@@ -3,6 +3,8 @@
 //! same typed value flows from HTTP input all the way into the database.
 
 pub mod answer_image;
+pub mod appointment;
+pub mod appointment_slot;
 pub mod attendance;
 pub mod chat_message;
 pub mod conversation;
