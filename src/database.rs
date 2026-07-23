@@ -293,7 +293,14 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS selected ON exam_answer TYPE option<int>;
     DEFINE FIELD IF NOT EXISTS text ON exam_answer TYPE option<string>;
     DEFINE FIELD IF NOT EXISTS updated_at ON exam_answer TYPE int;
-    DEFINE INDEX IF NOT EXISTS exam_answer_question_user ON exam_answer FIELDS question, user UNIQUE;
+    -- `seq` numbers the sitting an answer belongs to (1, 2, …), mirroring
+    -- exam_attempt. It rides the record key too, so a retake's answer is a new
+    -- row, not an overwrite of the prior sitting.
+    DEFINE FIELD IF NOT EXISTS seq ON exam_answer TYPE int DEFAULT 1;
+    -- Retire the pre-history unique index: (question, user) is no longer unique
+    -- once a student re-sits; (question, user, seq) is.
+    REMOVE INDEX IF EXISTS exam_answer_question_user ON exam_answer;
+    DEFINE INDEX IF NOT EXISTS exam_answer_question_user_seq ON exam_answer FIELDS question, user, seq UNIQUE;
     DEFINE INDEX IF NOT EXISTS exam_answer_exam_user ON exam_answer FIELDS exam, user;
     DEFINE INDEX IF NOT EXISTS exam_answer_exam ON exam_answer FIELDS exam;
 
@@ -304,6 +311,9 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS file ON answer_image TYPE string;
     DEFINE FIELD IF NOT EXISTS content_type ON answer_image TYPE string;
     DEFINE FIELD IF NOT EXISTS size ON answer_image TYPE int;
+    -- `seq` numbers the sitting this drawing belongs to; it rides the record
+    -- key so a retake's image never overwrites the prior sitting's.
+    DEFINE FIELD IF NOT EXISTS seq ON answer_image TYPE int DEFAULT 1;
     DEFINE INDEX IF NOT EXISTS answer_image_exam ON answer_image FIELDS exam;
     DEFINE INDEX IF NOT EXISTS answer_image_user ON answer_image FIELDS user;
 
@@ -312,7 +322,11 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS user ON exam_result TYPE record<user>;
     DEFINE FIELD IF NOT EXISTS mark ON exam_result TYPE int;
     DEFINE FIELD IF NOT EXISTS graded_by ON exam_result TYPE record<user>;
-    DEFINE INDEX IF NOT EXISTS exam_result_exam_user ON exam_result FIELDS exam, user UNIQUE;
+    -- `seq` numbers the sitting a mark belongs to; a retake earns its own mark
+    -- row, and the latest seq is the student's standing.
+    DEFINE FIELD IF NOT EXISTS seq ON exam_result TYPE int DEFAULT 1;
+    REMOVE INDEX IF EXISTS exam_result_exam_user ON exam_result;
+    DEFINE INDEX IF NOT EXISTS exam_result_exam_user_seq ON exam_result FIELDS exam, user, seq UNIQUE;
 
     DEFINE TABLE IF NOT EXISTS pool_question SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS asker ON pool_question TYPE record<user>;
@@ -483,6 +497,14 @@ const BACKFILL: &str = "
     -- this sweeps rows promoted before that fix. A deleted user reads as
     -- `user.role = NONE`, which is also != 'student' — those rows go too.
     DELETE enrollment WHERE user.role != 'student';
+
+    -- Per-attempt history (2026-07-24): answers, drawings, and marks written
+    -- before retakes stopped wiping belong to the student's first sitting.
+    -- They already use the bare (seq==1) record key, so only the denormalized
+    -- `seq` field needs stamping.
+    UPDATE exam_answer SET seq = 1 WHERE seq = NONE;
+    UPDATE answer_image SET seq = 1 WHERE seq = NONE;
+    UPDATE exam_result SET seq = 1 WHERE seq = NONE;
 ";
 
 /// Connect to the SurrealDB server, sign in as root, and apply the schema.

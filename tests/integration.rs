@@ -10995,8 +10995,8 @@ async fn student_answer_images_serve_and_cascade() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
-    // A retake wipes the student's sheet — the answer-image row *and* its
-    // on-disk blob go, not just the row.
+    // A retake keeps the prior sitting's sheet — per-attempt history — so the
+    // seq-1 answer-image row *and* its on-disk blob survive the new sitting.
     let pre = answer_image_blob_keys(&db).await;
     assert_eq!(pre.len(), 1);
     assert!(common::files_dir().join(&pre[0]).exists());
@@ -11019,21 +11019,22 @@ async fn student_answer_images_serve_and_cascade() {
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "retake: {}", res.body);
     assert_eq!(res.body["attempt"], 2, "the retake is the second sitting");
-    assert!(
-        answer_image_blob_keys(&db).await.is_empty(),
-        "the retake wiped the answer-image row"
+    assert_eq!(
+        answer_image_blob_keys(&db).await.len(),
+        1,
+        "the retake kept the prior sitting's answer-image row (history)"
     );
     assert!(
-        !common::files_dir().join(&pre[0]).exists(),
-        "the retake left the answer-image blob stranded on disk"
+        common::files_dir().join(&pre[0]).exists(),
+        "the retake kept the prior sitting's answer-image blob on disk"
     );
 
-    // A fresh drawing in the new sitting, then deleting the exam sweeps the
-    // rows and their blobs.
+    // A fresh drawing in the new sitting adds a second row alongside the kept
+    // one; deleting the exam then sweeps every sitting's rows and blobs.
     let (status, _) = post_image(&app, &student, &own, "image/png", png).await;
     assert_eq!(status, StatusCode::CREATED);
     let keys = answer_image_blob_keys(&db).await;
-    assert_eq!(keys.len(), 1);
+    assert_eq!(keys.len(), 2, "seq-1 and seq-2 drawings coexist");
     let res = send(
         &app,
         "DELETE",
@@ -16088,4 +16089,214 @@ async fn a_demoted_teachers_slots_go_inert() {
     assert_eq!(common::total(&res.body), 0, "an inert slot is not offered");
     let res = book_slot(&app, &veli, &slot).await;
     assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+}
+
+// --- per-attempt history (retakes preserve prior sittings) ------------------
+
+/// Sit an exam, answer + draw, retake, answer + draw differently — then the
+/// teacher's per-attempt history endpoints still surface the seq-1 sitting
+/// alongside seq-2: the attempts list is `[1, 2]`, and each seq's answer text
+/// and drawing bytes are its own, not the latest sitting's.
+#[tokio::test]
+async fn attempt_history_preserves_each_prior_sitting() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "hist_t", "teacher").await;
+    let student = login(&app, "hist_s").await;
+    let student_id = me_id(&app, &student).await;
+
+    let course = create_course(&app, &teacher, "biology").await;
+    let subject = create_subject(&app, &teacher, &course, "cells").await;
+    enroll(&app, &teacher, &course, &student_id).await;
+    let exam = scheduled_exam(
+        &app,
+        &teacher,
+        &course,
+        json!({ "title": "cell quiz", "kind": "quiz", "mode": "open", "max_attempts": 2 }),
+    )
+    .await;
+    let question = create_question(
+        &app,
+        &teacher,
+        &exam,
+        &subject,
+        json!({ "text": "Name an organelle.", "kind": "text", "points": 10 }),
+    )
+    .await;
+    let own_image = format!("/exams/{exam}/attempt/answers/{question}/image");
+
+    // Seq 1: answer, draw, finish.
+    let res = send(&app, "POST", &format!("/exams/{exam}/attempt"), Some(&student), None).await;
+    assert_eq!(res.status, StatusCode::CREATED, "sit seq 1: {}", res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt/answers"),
+        Some(&student),
+        Some(json!({ "question_id": question, "text": "mitochondria" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let (status, _) = post_image(&app, &student, &own_image, "image/png", b"seq1-draw").await;
+    assert_eq!(status, StatusCode::CREATED);
+    send(&app, "POST", &format!("/exams/{exam}/attempt/finish"), Some(&student), None).await;
+    // Seq 2: retake, answer + draw differently.
+    let res = send(&app, "POST", &format!("/exams/{exam}/attempt"), Some(&student), None).await;
+    assert_eq!(res.body["attempt"], 2, "retake is the second sitting");
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt/answers"),
+        Some(&student),
+        Some(json!({ "question_id": question, "text": "chloroplast" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let (status, _) = post_image(&app, &student, &own_image, "image/png", b"seq2-draw").await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // The attempts list carries both sittings, ascending.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/students/{student_id}/attempts"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body, json!([1, 2]));
+
+    // Each sitting keeps its own answer text — seq 1 was NOT overwritten.
+    let seq1 = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/students/{student_id}/attempts/1/answers"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    let seq2 = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/students/{student_id}/attempts/2/answers"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(seq1.body["answers"][0]["text"], "mitochondria");
+    assert_eq!(seq2.body["answers"][0]["text"], "chloroplast");
+    assert_ne!(seq1.body["answers"][0]["text"], seq2.body["answers"][0]["text"]);
+
+    // Each sitting keeps its own drawing bytes.
+    for (seq, want) in [(1, b"seq1-draw".as_slice()), (2, b"seq2-draw".as_slice())] {
+        let uri = format!("/exams/{exam}/students/{student_id}/attempts/{seq}/answers/{question}/image");
+        let (status, _, bytes) =
+            common::send_raw(&app, "GET", &uri, Some(&teacher), None, Vec::new()).await;
+        assert_eq!(status, StatusCode::OK, "seq {seq} image");
+        assert_eq!(bytes, want, "seq {seq} kept its own drawing");
+    }
+}
+
+/// The grade-of-record follows the latest sitting: grading seq 1, then seq 2
+/// with a different mark, leaves the roster read showing seq 2's mark — while
+/// the full mark-history endpoint returns both, oldest first.
+#[tokio::test]
+async fn grade_of_record_is_latest_but_history_keeps_both() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "grd_t", "teacher").await;
+    let student = login(&app, "grd_s").await;
+    let student_id = me_id(&app, &student).await;
+
+    let course = create_course(&app, &teacher, "algebra").await;
+    enroll(&app, &teacher, &course, &student_id).await;
+    let exam = scheduled_exam(
+        &app,
+        &teacher,
+        &course,
+        json!({ "title": "drill", "kind": "quiz", "mode": "open", "max_attempts": 2 }),
+    )
+    .await;
+
+    let results_uri = format!("/exams/{exam}/results");
+
+    // Seq 1: sit, grade 40, finish.
+    send(&app, "POST", &format!("/exams/{exam}/attempt"), Some(&student), None).await;
+    let res = send(
+        &app,
+        "POST",
+        &results_uri,
+        Some(&teacher),
+        Some(json!({ "mark": 40, "user_id": student_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    send(&app, "POST", &format!("/exams/{exam}/attempt/finish"), Some(&student), None).await;
+    // Seq 2: retake, grade 90 — the mark lands on the new sitting.
+    send(&app, "POST", &format!("/exams/{exam}/attempt"), Some(&student), None).await;
+    let res = send(
+        &app,
+        "POST",
+        &results_uri,
+        Some(&teacher),
+        Some(json!({ "mark": 90, "user_id": student_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    // The roster (latest-per-pair) reports one row, at seq 2's mark.
+    let res = send(&app, "GET", &format!("/exams/{exam}/results"), Some(&teacher), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let rows = common::items(&res.body);
+    assert_eq!(rows.len(), 1, "one grade-of-record per student");
+    assert_eq!(rows[0]["mark"], 90, "latest sitting is the grade-of-record");
+
+    // The history endpoint keeps both marks, oldest first.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/students/{student_id}/marks"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let marks: Vec<i64> = res
+        .body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["mark"].as_i64().unwrap())
+        .collect();
+    assert_eq!(marks, vec![40, 90], "both sittings' marks, oldest first");
+}
+
+/// The per-attempt history endpoints are teacher-only: an enrolled student
+/// asking for another student's history is refused, like every grader read.
+#[tokio::test]
+async fn attempt_history_endpoints_are_teacher_walled() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "wall_t", "teacher").await;
+    let student = login(&app, "wall_s").await;
+    let student_id = me_id(&app, &student).await;
+    let snooper = login(&app, "wall_o").await;
+
+    let course = create_course(&app, &teacher, "history").await;
+    enroll(&app, &teacher, &course, &student_id).await;
+    let exam = scheduled_exam(
+        &app,
+        &teacher,
+        &course,
+        json!({ "title": "quiz", "kind": "quiz", "mode": "open" }),
+    )
+    .await;
+
+    // A non-teacher student is refused on every history route for another student.
+    for uri in [
+        format!("/exams/{exam}/students/{student_id}/attempts"),
+        format!("/exams/{exam}/students/{student_id}/attempts/1/answers"),
+        format!("/exams/{exam}/students/{student_id}/marks"),
+    ] {
+        let res = send(&app, "GET", &uri, Some(&snooper), None).await;
+        assert_eq!(res.status, StatusCode::FORBIDDEN, "{uri}");
+    }
 }

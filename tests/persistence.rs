@@ -8,7 +8,7 @@ mod common;
 
 use axum::Router;
 use axum::http::StatusCode;
-use common::{create_course, create_exam, enroll, me_id, send, set_role};
+use common::{create_course, create_exam, create_subject, enroll, me_id, send, set_role};
 use hezarfen_backend::database::Database;
 use hezarfen_backend::rate_limit::RateLimitConfig;
 use hezarfen_backend::state::AppState;
@@ -726,6 +726,140 @@ async fn appointments_survive_remigration() {
     assert_eq!(booking["teacher"]["username"], "ali");
     assert_eq!(booking["requester"]["username"], "ayse");
     assert_eq!(booking["created_at"], created_at);
+}
+
+/// Per-attempt exam history is durable, not just an in-request join: two
+/// sittings' answers and marks (keyed by `seq`) written before a reboot come
+/// back with the right seq afterwards — the seq-1 answer keeps its own text and
+/// both marks survive, oldest first, with seq 2 as the grade-of-record.
+#[tokio::test]
+async fn attempt_history_survives_remigration() {
+    let (app, db) = common::app_and_db().await;
+    let teacher_creds = json!({ "username": "ali", "password": "secret1" });
+    let student_creds = json!({ "username": "ayse", "password": "secret1" });
+    for creds in [&teacher_creds, &student_creds] {
+        assert_eq!(
+            send(&app, "POST", "/auth/register", None, Some((*creds).clone()))
+                .await
+                .status,
+            StatusCode::CREATED
+        );
+    }
+    set_role(&db, "ali", "teacher").await;
+    let teacher = send(&app, "POST", "/auth/login", None, Some(teacher_creds.clone()))
+        .await
+        .cookie
+        .unwrap();
+    let student = send(&app, "POST", "/auth/login", None, Some(student_creds.clone()))
+        .await
+        .cookie
+        .unwrap();
+    let student_id = me_id(&app, &student).await;
+
+    let course = create_course(&app, &teacher, "biology").await;
+    let subject = create_subject(&app, &teacher, &course, "cells").await;
+    enroll(&app, &teacher, &course, &student_id).await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/courses/{course}/exams"),
+        Some(&teacher),
+        Some(json!({ "title": "quiz", "kind": "quiz", "mode": "open", "max_attempts": 2 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let exam = common::id_of(&res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/questions"),
+        Some(&teacher),
+        Some(json!({ "subject_id": subject, "text": "Name an organelle.",
+                     "kind": "text", "points": 10 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let question = common::id_of(&res.body);
+
+    // Two sittings: distinct answer text + distinct mark on each.
+    for (text, mark) in [("mitochondria", 40), ("chloroplast", 90)] {
+        assert_eq!(
+            send(&app, "POST", &format!("/exams/{exam}/attempt"), Some(&student), None)
+                .await
+                .status,
+            StatusCode::CREATED
+        );
+        let res = send(
+            &app,
+            "POST",
+            &format!("/exams/{exam}/attempt/answers"),
+            Some(&student),
+            Some(json!({ "question_id": question, "text": text })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+        let res = send(
+            &app,
+            "POST",
+            &format!("/exams/{exam}/results"),
+            Some(&teacher),
+            Some(json!({ "mark": mark, "user_id": student_id })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+        send(&app, "POST", &format!("/exams/{exam}/attempt/finish"), Some(&student), None).await;
+    }
+
+    // Second boot: migration re-applied over the two sittings' live rows.
+    let app = reboot(&db).await;
+    let teacher = send(&app, "POST", "/auth/login", None, Some(teacher_creds))
+        .await
+        .cookie
+        .unwrap();
+
+    let res = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/students/{student_id}/attempts"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body, json!([1, 2]), "both sittings survived the reboot");
+
+    // The seq-1 answer kept its own text through the reopen.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/students/{student_id}/attempts/1/answers"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["answers"][0]["text"], "mitochondria");
+
+    // Both marks survive, oldest first; the roster's grade-of-record is seq 2.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/students/{student_id}/marks"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let marks: Vec<i64> = res
+        .body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["mark"].as_i64().unwrap())
+        .collect();
+    assert_eq!(marks, vec![40, 90], "both sittings' marks durable, oldest first");
+    let res = send(&app, "GET", &format!("/exams/{exam}/results"), Some(&teacher), None).await;
+    assert_eq!(common::items(&res.body)[0]["mark"], 90, "seq 2 is grade-of-record");
 }
 
 /// A chatbot thread and every turn in it die together: deleting the

@@ -79,6 +79,9 @@ pub fn routes() -> OpenApiRouter<AppState> {
         .routes(routes!(attempt_questions))
         .routes(routes!(save_answer))
         .routes(routes!(attempt_answers))
+        .routes(routes!(student_attempts))
+        .routes(routes!(student_attempt_answers))
+        .routes(routes!(student_marks_history))
         // The image routes get their own HTTP body cap, like the note-file
         // ones: the server-wide hard ceiling plus multipart framing headroom.
         .merge(
@@ -99,6 +102,7 @@ pub fn routes() -> OpenApiRouter<AppState> {
                     delete_answer_image
                 ))
                 .routes(routes!(get_student_answer_image))
+                .routes(routes!(student_attempt_answer_image))
                 .layer(DefaultBodyLimit::max(
                     MAX_MAX_FILE_BYTES as usize + UPLOAD_BODY_OVERHEAD_BYTES,
                 )),
@@ -569,7 +573,13 @@ async fn grade(
         }));
     }
 
-    let result = ExamResult::grade(&exam_id, &target, mark, teacher.get_id(), &st.db).await?;
+    // The mark lands on the student's current sitting; the latest seq is the
+    // grade-of-record. An offline-graded exam has no sitting — grade its base
+    // seq (1).
+    let seq = ExamAttempt::read_latest_for_user(&exam_id, &target, &st.db)
+        .await?
+        .map_or(1, |a| a.get_seq());
+    let result = ExamResult::grade(&exam_id, &target, seq, mark, teacher.get_id(), &st.db).await?;
     let people = PersonRef::map_of(&[&target_user, &teacher]);
     Ok(Json(ExamResultResponse::new(&result, &people)))
 }
@@ -835,9 +845,12 @@ impl AttemptResponse {
 async fn attempt_progress(
     exam: &ExamId,
     user: &UserId,
+    seq: i64,
     db: &Database,
 ) -> Result<(u64, u64), AppError> {
-    let answered = ExamAnswer::list_for_exam_user(exam, user, db).await?.len() as u64;
+    let answered = ExamAnswer::list_for_exam_user(exam, user, seq, db)
+        .await?
+        .len() as u64;
     let question_count = ExamQuestion::list_for_exam(exam, db).await?.len() as u64;
     Ok((answered, question_count))
 }
@@ -921,24 +934,17 @@ async fn start_attempt(
         return Err(AppError::Conflict("the exam has already ended"));
     }
 
-    // A retake wipes the student's previous answer rows inside `start`'s atomic
-    // transaction, but not their drawing blobs (the domain has no `files_path`).
-    // Collect the blob names before the wipe, then GC them after — but only if a
-    // wipe actually ran: a freshly created sitting past the first (`seq > 1`).
-    // A resume (`created == false`) or a first sitting wipes nothing.
-    let prior_answer_images =
-        AnswerImage::list_for_exam_user(exam.get_id(), user.get_id(), &st.db).await?;
+    // A retake no longer wipes the prior sitting — each attempt's answers,
+    // drawings, and marks stay put at their own seq (per-attempt history), so
+    // there are no orphaned blobs to GC here. The exam-delete cascade still
+    // cleans every sitting's blobs.
     let (attempt, created) = ExamAttempt::start(&exam, user.get_id(), &st.db).await?;
     drop(guard);
-    if created && attempt.get_seq() > 1 {
-        for image in &prior_answer_images {
-            remove_blob(&st.files_path, image.get_file()).await;
-        }
-    }
     let mark = ExamResult::read_for_user(exam.get_id(), user.get_id(), &st.db)
         .await?
         .map(|r| r.get_mark());
-    let (answered, question_count) = attempt_progress(exam.get_id(), user.get_id(), &st.db).await?;
+    let (answered, question_count) =
+        attempt_progress(exam.get_id(), user.get_id(), attempt.get_seq(), &st.db).await?;
     let used = attempts_used(exam.get_id(), user.get_id(), &st.db).await?;
     let people = PersonRef::map_of(&[&user]);
     let status = if created {
@@ -990,7 +996,8 @@ async fn my_attempt(
     let mark = ExamResult::read_for_user(exam.get_id(), user.get_id(), &st.db)
         .await?
         .map(|r| r.get_mark());
-    let (answered, question_count) = attempt_progress(exam.get_id(), user.get_id(), &st.db).await?;
+    let (answered, question_count) =
+        attempt_progress(exam.get_id(), user.get_id(), attempt.get_seq(), &st.db).await?;
     let used = attempts_used(exam.get_id(), user.get_id(), &st.db).await?;
     let people = PersonRef::map_of(&[&user]);
     Ok(Json(AttemptResponse::new(
@@ -1048,7 +1055,8 @@ async fn finish_attempt(
     let mark = ExamResult::read_for_user(exam.get_id(), user.get_id(), &st.db)
         .await?
         .map(|r| r.get_mark());
-    let (answered, question_count) = attempt_progress(exam.get_id(), user.get_id(), &st.db).await?;
+    let (answered, question_count) =
+        attempt_progress(exam.get_id(), user.get_id(), finished.get_seq(), &st.db).await?;
     let used = attempts_used(exam.get_id(), user.get_id(), &st.db).await?;
     let people = PersonRef::map_of(&[&user]);
     Ok(Json(AttemptResponse::new(
@@ -1159,12 +1167,18 @@ async fn live_snapshot(exam: &Exam, db: &Database) -> Result<ExamLiveResponse, A
         })
         .collect();
     let question_count = ExamQuestion::list_for_exam(exam.get_id(), db).await?.len() as u64;
-    // Per-student progress: answer count and the latest save instant.
+    // Per-student progress: answer count and the latest save instant. The
+    // per-exam read now returns every sitting's rows across all students, so
+    // each answer is scoped to that student's *current* sitting — matching its
+    // seq to their latest attempt — or a re-sitting student's count would
+    // double up their prior attempts.
     let mut progress: HashMap<String, (u64, i64)> = HashMap::new();
     for answer in ExamAnswer::list_for_exam(exam.get_id(), db).await? {
-        let entry = progress
-            .entry(answer.get_user().key().to_string())
-            .or_insert((0, i64::MIN));
+        let key = answer.get_user().key().to_string();
+        if attempts.get(&key).map(ExamAttempt::get_seq) != Some(answer.get_seq()) {
+            continue;
+        }
+        let entry = progress.entry(key).or_insert((0, i64::MIN));
         entry.0 += 1;
         entry.1 = entry.1.max(answer.get_updated_at().as_millis());
     }
@@ -2170,7 +2184,15 @@ pub(crate) async fn save_answer_in(
     ensure_enrolled(exam, attempt.get_user(), db).await?;
     check_rejoin(exam, attempt)?;
     let question = question_of_exam(exam.get_id(), question_id, db).await?;
-    ExamAnswer::save(&question, attempt.get_user(), selected, text, db).await
+    ExamAnswer::save(
+        &question,
+        attempt.get_user(),
+        attempt.get_seq(),
+        selected,
+        text,
+        db,
+    )
+    .await
 }
 
 /// A 403 unless `user` is a student. Sitting an exam is a student action —
@@ -2248,21 +2270,23 @@ async fn attempt_questions(
         .ok_or(AppError::NotFound)?;
     ensure_enrolled(&exam, user.get_id(), &st.db).await?;
     // The question list is for sitting students; without an attempt there is
-    // nothing to sit behind — and no early peek at the questions.
-    ExamAttempt::read_latest_for_user(exam.get_id(), user.get_id(), &st.db)
+    // nothing to sit behind — and no early peek at the questions. The embedded
+    // answers are the *current* sitting's only, so the seq scopes the reads.
+    let seq = ExamAttempt::read_latest_for_user(exam.get_id(), user.get_id(), &st.db)
         .await?
-        .ok_or(AppError::NotFound)?;
+        .ok_or(AppError::NotFound)?
+        .get_seq();
 
     let questions = ExamQuestion::list_for_exam(exam.get_id(), &st.db).await?;
     let images = images_by_question(exam.get_id(), &st.db).await?;
     let answers: HashMap<String, ExamAnswer> =
-        ExamAnswer::list_for_exam_user(exam.get_id(), user.get_id(), &st.db)
+        ExamAnswer::list_for_exam_user(exam.get_id(), user.get_id(), seq, &st.db)
             .await?
             .into_iter()
             .map(|answer| (answer.get_question().key().to_string(), answer))
             .collect();
     let answer_images: HashMap<String, AnswerImage> =
-        AnswerImage::list_for_exam_user(exam.get_id(), user.get_id(), &st.db)
+        AnswerImage::list_for_exam_user(exam.get_id(), user.get_id(), seq, &st.db)
             .await?
             .into_iter()
             .map(|image| (image.get_question().key().to_string(), image))
@@ -2387,16 +2411,29 @@ async fn attempt_answers(
         ));
     }
     let target = UserId::from_key(&target);
-    // No attempt means no answer sheet — a 404, not an empty one. Answers are
-    // always the latest sitting's: a retake starts from a blank sheet.
-    ExamAttempt::read_latest_for_user(exam.get_id(), &target, &st.db)
+    // No attempt means no answer sheet — a 404, not an empty one. This grading
+    // view shows the *latest* sitting; prior sittings live under the
+    // per-attempt history endpoints.
+    let seq = ExamAttempt::read_latest_for_user(exam.get_id(), &target, &st.db)
         .await?
-        .ok_or(AppError::NotFound)?;
+        .ok_or(AppError::NotFound)?
+        .get_seq();
+    Ok(Json(answer_sheet(&exam, &target, seq, &st.db).await?))
+}
 
-    let questions = ExamQuestion::list_for_exam(exam.get_id(), &st.db).await?;
-    let answers = ExamAnswer::list_for_exam_user(exam.get_id(), &target, &st.db).await?;
+/// One sitting's judged answer sheet: the `seq`th attempt's answers, drawing
+/// refs, correctness flags, and auto-score suggestion. Shared by the latest-
+/// sitting grading view and the per-attempt history endpoint.
+async fn answer_sheet(
+    exam: &Exam,
+    target: &UserId,
+    seq: i64,
+    db: &Database,
+) -> Result<AttemptAnswersResponse, AppError> {
+    let questions = ExamQuestion::list_for_exam(exam.get_id(), db).await?;
+    let answers = ExamAnswer::list_for_exam_user(exam.get_id(), target, seq, db).await?;
     let answer_images: HashMap<String, AnswerImage> =
-        AnswerImage::list_for_exam_user(exam.get_id(), &target, &st.db)
+        AnswerImage::list_for_exam_user(exam.get_id(), target, seq, db)
             .await?
             .into_iter()
             .map(|image| (image.get_question().key().to_string(), image))
@@ -2406,10 +2443,10 @@ async fn attempt_answers(
         .map(|question| (question.get_id().key(), question))
         .collect();
     let (earned, possible) = auto_score(&questions, &answers);
-    let people = person_map([target.clone()], &st.db).await?;
-    Ok(Json(AttemptAnswersResponse {
+    let people = person_map([target.clone()], db).await?;
+    Ok(AttemptAnswersResponse {
         exam: exam.get_id().key().to_string(),
-        user: PersonRef::resolve(&people, &target),
+        user: PersonRef::resolve(&people, target),
         answers: answers
             .iter()
             .map(|answer| StudentAnswerResponse {
@@ -2426,7 +2463,7 @@ async fn attempt_answers(
             })
             .collect(),
         auto_score: AutoScoreResponse { earned, possible },
-    }))
+    })
 }
 
 /// One row of a student's answer sheet, as the grader sees it.
@@ -2483,14 +2520,16 @@ async fn store_answer_image(
     exam: &Exam,
     question: &ExamQuestion,
     user: &UserId,
+    seq: i64,
     content_type: FileContentType,
     data: &[u8],
 ) -> Result<AnswerImage, AppError> {
-    let replaced = AnswerImage::read(question.get_id(), user, &st.db).await?;
+    let replaced = AnswerImage::read(question.get_id(), user, seq, &st.db).await?;
     let image = AnswerImage::new(
         exam.get_id(),
         question.get_id(),
         user,
+        seq,
         content_type,
         data.len() as i64,
     );
@@ -2564,11 +2603,13 @@ async fn upload_answer_image(
     ensure_enrolled(&exam, attempt.get_user(), &st.db).await?;
     check_rejoin(&exam, &attempt)?;
     let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
+    let seq = attempt.get_seq();
     let stored = store_answer_image(
         &st,
         &exam,
         &question,
         user.get_id(),
+        seq,
         content_type,
         &upload.data,
     )
@@ -2580,11 +2621,19 @@ async fn upload_answer_image(
     // UI only offers drawing on text questions), so they are skipped. Removing
     // the drawing later grooms this blank row away (see `delete_answer_image`).
     if question.get_kind().as_str() != "choice"
-        && ExamAnswer::read(question.get_id(), user.get_id(), &st.db)
+        && ExamAnswer::read(question.get_id(), user.get_id(), seq, &st.db)
             .await?
             .is_none()
     {
-        ExamAnswer::save(&question, user.get_id(), None, Some(String::new()), &st.db).await?;
+        ExamAnswer::save(
+            &question,
+            user.get_id(),
+            seq,
+            None,
+            Some(String::new()),
+            &st.db,
+        )
+        .await?;
     }
     Ok((
         StatusCode::CREATED,
@@ -2626,7 +2675,8 @@ async fn delete_answer_image(
     ensure_enrolled(&exam, attempt.get_user(), &st.db).await?;
     check_rejoin(&exam, &attempt)?;
     let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
-    let image = AnswerImage::read(question.get_id(), user.get_id(), &st.db)
+    let seq = attempt.get_seq();
+    let image = AnswerImage::read(question.get_id(), user.get_id(), seq, &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
     let image = image.delete(&st.db).await?;
@@ -2634,11 +2684,11 @@ async fn delete_answer_image(
     // If the drawing was the whole answer (blank text, no choice — the row the
     // upload created for a drawing-only answer), drop it too so it stops counting
     // as answered. A typed answer keeps its row.
-    if let Some(answer) = ExamAnswer::read(question.get_id(), user.get_id(), &st.db).await? {
+    if let Some(answer) = ExamAnswer::read(question.get_id(), user.get_id(), seq, &st.db).await? {
         let blank = answer.get_selected().is_none()
             && answer.get_text().map_or(true, |t| t.as_str().is_empty());
         if blank {
-            ExamAnswer::delete(question.get_id(), user.get_id(), &st.db).await?;
+            ExamAnswer::delete(question.get_id(), user.get_id(), seq, &st.db).await?;
         }
     }
     Ok(StatusCode::NO_CONTENT)
@@ -2672,7 +2722,12 @@ async fn get_answer_image(
         .ok_or(AppError::NotFound)?;
     ensure_question_content_visible(&st, &exam, &user).await?;
     let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
-    let image = AnswerImage::read(question.get_id(), user.get_id(), &st.db)
+    // The caller's current sitting — the drawing belongs to their latest seq.
+    let seq = ExamAttempt::read_latest_for_user(exam.get_id(), user.get_id(), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?
+        .get_seq();
+    let image = AnswerImage::read(question.get_id(), user.get_id(), seq, &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
     super::serve_inline_blob(&st.files_path, image.get_file(), image.get_content_type()).await
@@ -2713,8 +2768,177 @@ async fn get_student_answer_image(
     }
     let target = UserId::from_key(&target);
     let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
-    let image = AnswerImage::read(question.get_id(), &target, &st.db)
+    // The grader's default view is the latest sitting; per-attempt drawings
+    // come from the history image endpoint.
+    let seq = ExamAttempt::read_latest_for_user(exam.get_id(), &target, &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?
+        .get_seq();
+    let image = AnswerImage::read(question.get_id(), &target, seq, &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
     super::serve_inline_blob(&st.files_path, image.get_file(), image.get_content_type()).await
+}
+
+// ---- per-attempt history ----------------------------------------------------
+// The grading views above show the latest sitting; these expose every prior
+// sitting a re-taking student left behind. Same wall as grading: teacher+ who
+// manages the exam's course. A student never reaches another student's sheet,
+// and a student's own prior attempts are staff-visible by design.
+
+/// The exam plus the manage-rights check the grading and history reads share.
+async fn gradable_exam(st: &AppState, user: &User, id: &str) -> Result<Exam, AppError> {
+    let exam = Exam::read(&ExamId::from_key(id), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let course = course_of(&exam, &st.db).await?;
+    if !can_manage_course(&course, user) {
+        return Err(AppError::Forbidden(
+            "only the course creator, an assigned teacher, or a manager/admin can read answer sheets",
+        ));
+    }
+    Ok(exam)
+}
+
+/// The sitting numbers a student has left at an exam — every seq that carries
+/// answers or a mark, ascending. Requires teacher+ and management rights over
+/// the exam's course. Drives the FE's attempt-by-attempt picker.
+#[utoipa::path(
+    get,
+    path = "/{id}/students/{user}/attempts",
+    tag = "exams",
+    security(("session_cookie" = [])),
+    params(
+        ("id" = String, Path, description = "Exam id"),
+        ("user" = String, Path, description = "User id"),
+    ),
+    responses(
+        (status = 200, description = "The student's sitting numbers, ascending", body = [i64]),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 404, description = "Exam not found", body = ErrorResponse),
+    ),
+)]
+async fn student_attempts(
+    State(st): State<AppState>,
+    RequireTeacher(user): RequireTeacher,
+    Path((id, target)): Path<(String, String)>,
+) -> Result<Json<Vec<i64>>, AppError> {
+    let exam = gradable_exam(&st, &user, &id).await?;
+    let target = UserId::from_key(&target);
+    let mut seqs = ExamAnswer::list_seqs_for_user(exam.get_id(), &target, &st.db).await?;
+    for result in ExamResult::list_all_for_exam_user(exam.get_id(), &target, &st.db).await? {
+        seqs.push(result.get_seq());
+    }
+    seqs.sort_unstable();
+    seqs.dedup();
+    Ok(Json(seqs))
+}
+
+/// One prior sitting's judged answer sheet — the `seq`th attempt's answers,
+/// drawing refs, correctness flags, and auto-score suggestion. Requires
+/// teacher+ and management rights over the exam's course. Serves an empty
+/// sheet for a seq the student never wrote in.
+#[utoipa::path(
+    get,
+    path = "/{id}/students/{user}/attempts/{seq}/answers",
+    tag = "exams",
+    security(("session_cookie" = [])),
+    params(
+        ("id" = String, Path, description = "Exam id"),
+        ("user" = String, Path, description = "User id"),
+        ("seq" = i64, Path, description = "Sitting number (1, 2, …)"),
+    ),
+    responses(
+        (status = 200, description = "That sitting's answers, judged", body = AttemptAnswersResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 404, description = "Exam not found", body = ErrorResponse),
+    ),
+)]
+async fn student_attempt_answers(
+    State(st): State<AppState>,
+    RequireTeacher(user): RequireTeacher,
+    Path((id, target, seq)): Path<(String, String, i64)>,
+) -> Result<Json<AttemptAnswersResponse>, AppError> {
+    let exam = gradable_exam(&st, &user, &id).await?;
+    let target = UserId::from_key(&target);
+    Ok(Json(answer_sheet(&exam, &target, seq, &st.db).await?))
+}
+
+/// A prior sitting's drawn-answer bytes. Requires teacher+ and management
+/// rights over the exam's course — the seq-scoped mirror of the grader's
+/// latest-sitting drawing read.
+#[utoipa::path(
+    get,
+    path = "/{id}/students/{user}/attempts/{seq}/answers/{qid}/image",
+    tag = "exams",
+    security(("session_cookie" = [])),
+    params(
+        ("id" = String, Path, description = "Exam id"),
+        ("user" = String, Path, description = "User id"),
+        ("seq" = i64, Path, description = "Sitting number (1, 2, …)"),
+        ("qid" = String, Path, description = "Question id"),
+    ),
+    responses(
+        (status = 200, description = "The student's drawing bytes", content_type = "image/*"),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 404, description = "No such exam, question, or drawing", body = ErrorResponse),
+    ),
+)]
+async fn student_attempt_answer_image(
+    State(st): State<AppState>,
+    RequireTeacher(user): RequireTeacher,
+    Path((id, target, seq, qid)): Path<(String, String, i64, String)>,
+) -> Result<Response, AppError> {
+    let exam = gradable_exam(&st, &user, &id).await?;
+    let target = UserId::from_key(&target);
+    let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
+    let image = AnswerImage::read(question.get_id(), &target, seq, &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    super::serve_inline_blob(&st.files_path, image.get_file(), image.get_content_type()).await
+}
+
+/// A student's full mark history at an exam — every sitting's mark, oldest
+/// first (the grade-of-record is the latest). Requires teacher+ and management
+/// rights over the exam's course.
+#[utoipa::path(
+    get,
+    path = "/{id}/students/{user}/marks",
+    tag = "exams",
+    security(("session_cookie" = [])),
+    params(
+        ("id" = String, Path, description = "Exam id"),
+        ("user" = String, Path, description = "User id"),
+    ),
+    responses(
+        (status = 200, description = "The student's per-sitting marks, oldest first", body = [ExamResultResponse]),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 404, description = "Exam not found", body = ErrorResponse),
+    ),
+)]
+async fn student_marks_history(
+    State(st): State<AppState>,
+    RequireTeacher(user): RequireTeacher,
+    Path((id, target)): Path<(String, String)>,
+) -> Result<Json<Vec<ExamResultResponse>>, AppError> {
+    let exam = gradable_exam(&st, &user, &id).await?;
+    let target = UserId::from_key(&target);
+    let results = ExamResult::list_all_for_exam_user(exam.get_id(), &target, &st.db).await?;
+    let people = person_map(
+        results
+            .iter()
+            .flat_map(|r| [r.get_user().clone(), r.get_graded_by().clone()]),
+        &st.db,
+    )
+    .await?;
+    Ok(Json(
+        results
+            .iter()
+            .map(|r| ExamResultResponse::new(r, &people))
+            .collect(),
+    ))
 }
