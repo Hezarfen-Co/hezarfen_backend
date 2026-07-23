@@ -80,6 +80,12 @@ are plain rows courses can link to (see "Per-school policy"). Each account
 also carries its own **UI preferences** — theme (`light`/`dark`) and language
 (`tr`/`en`) — self-managed, admin-editable for anyone, `null` until chosen so
 the client can fall back to the device preference.
+The **AI features live in separate projects**, so the backend also opens a
+QUIC **AI bridge** (`AI_QUIC_ADDR`, off by default): AI services dial in,
+register the capabilities they serve, and each request rides its own QUIC
+stream on that one connection — no correlation ids, no head-of-line blocking.
+The bridge's certificate is published at `GET /ai/certificate` so a service can
+pin it before dialling (see "AI bridge (QUIC)").
 
 Every field is a validated newtype (`Username(String)`, `NoteTitle(String)`, …)
 constructed only after its restrictions pass — invalid input can't be
@@ -390,6 +396,7 @@ their existing shapes: the student exam-room reads
 | GET    | `/time`                          | no      | Server clock: `{now}` UTC unix-millis (frontend sync) |
 | GET    | `/swagger`                       | no      | Interactive API docs (Swagger UI) |
 | GET    | `/api-docs/openapi.json`         | no      | Raw OpenAPI 3 spec              |
+| GET    | `/ai/certificate`                | no      | The AI bridge's certificate (PEM + sha256) for a service to pin; `404` when the bridge is off |
 | POST   | `/auth/register`                 | no      | `{username, password}` (new users are `student`) |
 | POST   | `/auth/login`                    | no      | `{username, password}` -> cookie|
 | POST   | `/auth/logout`                   | no      | Clear session (no-op if none)   |
@@ -1220,6 +1227,155 @@ curl -s -b $STUDENT_JAR -X POST $BASE/pomodoro/finish
 curl -s -b $STUDENT_JAR $BASE/pomodoro/me
 ```
 
+## AI bridge (QUIC)
+
+The AI features are separate projects — separate repos, separate processes,
+probably not Rust. They talk to this backend over a QUIC bridge rather than
+HTTP.
+
+Why QUIC: stream multiplexing lives in the transport. Each request rides its
+own **bidirectional stream** on the service's single long-lived connection, so
+concurrent requests need no correlation-id bookkeeping and never head-of-line
+block each other — a 30-second inference on one stream does not delay the
+answer on another. Connection setup (and the TLS handshake) happens once, not
+per request.
+
+**The backend listens; the services dial in.** A service can therefore sit
+behind NAT, restart without the backend knowing its address, and scale out by
+opening a second connection — each connection is an independent worker.
+
+Off by default: with `AI_QUIC_ADDR` unset the bridge never starts and the rest
+of the API is unaffected.
+
+### Handshake
+
+The service connects with ALPN `hab/1`, then opens the **control stream** (the
+first client-initiated bidi stream) and writes one `Hello`:
+
+```json
+{ "protocol": "hab/1", "service": "ocr", "capabilities": ["ocr.extract"],
+  "token": "<AI_SHARED_TOKEN>", "max_concurrent": 8 }
+```
+
+The backend answers one `Greeting` and leaves the stream open:
+
+```json
+{ "type": "welcome", "worker_id": "01J...", "protocol": "hab/1" }
+{ "type": "rejected", "code": "unauthorized", "message": "invalid token" }
+```
+
+Reject codes: `unsupported_protocol`, `unauthorized`, `no_capabilities`,
+`malformed`. The token is compared in constant time; the handshake must
+complete within 10s.
+
+The control stream carries no further frames. **Its closure is the goodbye** —
+there is no heartbeat. A service that dies silently is dropped by the QUIC idle
+timeout (30s, with a 10s keepalive) and deregistered then.
+
+`max_concurrent` is advisory and clamped to `1..=64` (default 8). Requests
+beyond it are refused with "busy" rather than queued.
+
+### Requests
+
+For each request the **backend** opens a bidi stream, writes one `Request`,
+finishes its send side, and reads one `Response`:
+
+```json
+{ "id": "01J...", "capability": "ocr.extract", "deadline_ms": 30000,
+  "payload": { "image": "<base64>" } }
+```
+
+```json
+{ "status": "ok",  "id": "01J...", "payload": { "text": "..." } }
+{ "status": "err", "id": "01J...", "code": "unsupported_image",
+  "message": "only png and jpeg" }
+```
+
+`id` is a trace id for logs on both sides — correlation is the stream, not the
+id. It must still be echoed: an answer carrying a different id means the
+service lost track of whose work it is, and the payload is refused. `payload`
+is opaque to the transport; its shape belongs to the capability.
+
+`deadline_ms` is when the backend gives up. A service should abandon the work
+rather than answer late. A handled failure is an `err` frame; a crash is just a
+dropped stream.
+
+### Framing
+
+`u32` big-endian byte length, then that many bytes of JSON. One frame per
+message. The length is validated against the 8 MiB cap **before** any buffer is
+allocated. JSON rather than a binary codec so a service in any language can
+speak it in ~20 lines.
+
+### Routing
+
+Requests route by exact capability string to the **least-loaded** worker
+offering it (ties broken by worker id). Least-inflight rather than
+round-robin because AI request costs are wildly uneven — round-robin would
+pile a second long inference onto a busy worker while an idle one sits next
+to it. Selection and the in-flight increment happen under one lock, so
+concurrent dispatches cannot overshoot `max_concurrent`.
+
+Failure modes the caller sees: `NoWorker` (nothing registered — retryable),
+`Busy` (all at capacity — retryable), `Timeout` (may still be running on the
+far side, so it promises nothing), `Remote` (the service's considered no —
+not retryable), `Protocol` / `IdMismatch` (broken peer), `Transport`.
+
+### Conformance suite
+
+`tests/ai_protocol.rs` is the wire contract, enforced on every `cargo test`. It
+speaks `hab/1` with a client that imports none of the crate's protocol types —
+frames built as byte literals, answers parsed as untyped JSON — so it fails on
+exactly the changes a service in another language would notice: a renamed
+field, a re-tagged enum, a flipped length-prefix endianness, a newly-required
+`Hello` field. (`tests/ai_bridge.rs` drives real QUIC clients too, but shares
+the Rust structs with the backend, so it cannot see those.)
+
+It is also the reference implementation: its `raw` module is the whole client
+side of the protocol in about a hundred lines — handshake, framing, request
+loop — and is the shortest thing to port when writing a new service.
+
+Guarantees it pins beyond the frame shapes: unknown fields in `Hello` and in a
+response are accepted (a newer service may run against an older backend);
+payloads pass through byte-for-byte whatever their JSON shape; request ids are
+unique; answers may come back in any order; a service that drops one request
+stream fails only that request; a service that ignores `deadline_ms` finds its
+stream torn down rather than delivering a late answer.
+
+### TLS, auth & finding the certificate
+
+QUIC has no plaintext mode. With `AI_TLS_CERT`/`AI_TLS_KEY` unset, a
+self-signed certificate is generated at boot and its sha256 fingerprint logged
+— services pin that instead of installing a CA. The certificate authenticates
+*the backend*; the shared token in `Hello` authenticates *the service*.
+
+So a service does not have to be handed a file out of band, the certificate is
+published over HTTP:
+
+```
+GET /ai/certificate          # no auth; 404 when the bridge is disabled
+{ "protocol": "hab/1",
+  "certificate_pem": "-----BEGIN CERTIFICATE-----\n...",
+  "fingerprint_sha256": "6745e8..." }
+```
+
+Unauthenticated on purpose: a server certificate is handed to every peer during
+the TLS handshake anyway, so publishing it discloses nothing. The private key
+never leaves the process, and the shared token — the thing that actually
+authenticates a service — is *not* served here.
+
+**A service must re-fetch this on every reconnect, not once at startup.** With
+no PEM pair configured the bridge re-selfsigns at each boot, so a certificate
+pinned once goes stale the moment the backend restarts; a reconnect loop that
+only redials would then fail forever. The service startup sequence is: `GET
+/ai/certificate` → trust that PEM → dial QUIC → `Hello` → serve; on any
+connection loss, start again from the fetch.
+
+Note what this is not: fetch-then-pin over plain HTTP is trust-on-first-use,
+only as trustworthy as that HTTP hop. On an untrusted network set
+`AI_TLS_CERT`/`AI_TLS_KEY` to a real certificate and distribute it out of band
+— the endpoint then simply serves that, stable across restarts.
+
 ## Layout
 
 ```
@@ -1232,7 +1388,14 @@ src/
   error.rs         ValidationError + AppError -> HTTP responses
   database.rs      SurrealDB server connect (ws) + SCHEMAFULL migration
   rate_limit.rs    fixed-window per-IP limiter (both tiers) + middleware
-  state.rs         AppState { db, files_path, cookie_secure, rate_limit }
+  state.rs         AppState { db, files_path, cookie_secure, rate_limit, ai }
+  ai/              QUIC bridge to the out-of-process AI services
+                   (see "AI bridge (QUIC)"; the HTTP half is web/ai.rs)
+    protocol.rs    Hello/Greeting/Request/Response + length-prefixed JSON framing
+    server.rs      AiBridge: listener, handshake, dispatch over per-request streams
+    registry.rs    connected workers, capability routing, least-inflight leases
+    tls.rs         listener certificate (PEM or self-signed) + fingerprint
+    error.rs       AiError
   domain/          validated newtypes + entities (derive SurrealValue),
                    each owning its persistence
     user.rs        UserId · Username · Password · PasswordHash · User (has role)
@@ -1295,10 +1458,12 @@ src/
     page.rs        PageParams · Page<T> (shared pagination)
     auth.rs  users.rs  notes.rs  messages.rs  events.rs  courses.rs  subjects.rs
     sessions.rs  exams.rs  homework.rs  questions.rs  marks.rs  work.rs
-    pomodoro.rs  attendance.rs  settings.rs  terms.rs
+    pomodoro.rs  attendance.rs  settings.rs  terms.rs  ai.rs
 ```
 
 Tests: `cargo test` — unit (in-source), integration (`tower::oneshot` + in-memory
 db), rate-limit (both tiers, proxy-header and peer-address keying, shipped
 limits over every route), e2e (real TCP + reqwest cookie jar), persistence
-(tempfile file engine, including close + reopen).
+(tempfile file engine, including close + reopen), ai-bridge (real QUIC on
+loopback against a fake AI service), ai-protocol (the `hab/1` wire contract,
+driven by a client that shares no code with the backend).
