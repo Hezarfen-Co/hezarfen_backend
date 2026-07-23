@@ -35,6 +35,12 @@ time = "0.3"
 utoipa = { version = "5.5.0", features = ["axum_extras"] }
 utoipa-axum = "0.2.0"
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
+quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rcgen = { version = "0.14.8", default-features = false, features = ["pem", "ring"] }
+rustls-pemfile = "2.2.0"
+rustls = { version = "0.23.42", default-features = false, features = ["logging", "ring", "std", "tls12"] }
+sha2 = "0.11.0"
+base64 = "0.22.1"
 
 [dev-dependencies]
 # test-util enables tokio::time::pause/advance for the rate limiter tests.

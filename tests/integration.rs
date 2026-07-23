@@ -5224,6 +5224,7 @@ async fn session_cookie_secure_attribute_follows_config() {
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
         exam_presence: Default::default(),
         db_up: Default::default(),
+        ai: None,
     });
     let secure = login_set_cookie(&app).await;
     assert!(
@@ -5261,6 +5262,7 @@ async fn db_down_refuses_before_touching_the_database() {
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
         exam_presence: Default::default(),
         db_up: db_up.clone(),
+        ai: None,
     });
 
     // Healthy: a login against the seeded user reaches the handler as usual.

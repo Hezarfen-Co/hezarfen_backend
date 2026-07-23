@@ -1,5 +1,6 @@
 use std::env;
 
+use crate::constant::AI_DEFAULT_REQUEST_TIMEOUT_SECS;
 use crate::rate_limit::RateLimitConfig;
 
 /// Default requests-per-minute-per-IP for `/auth/login` + `/auth/register`.
@@ -32,6 +33,21 @@ pub struct Config {
     /// username doesn't exist yet. Blank values count as unset.
     pub admin_username: Option<String>,
     pub admin_password: Option<String>,
+    /// AI bridge listen address (`AI_QUIC_ADDR`, e.g. `0.0.0.0:8090`). Unset
+    /// leaves the bridge off entirely: the API runs exactly as before and any
+    /// AI-backed feature reports that no service is connected.
+    pub ai_quic_addr: Option<String>,
+    /// Shared secret every AI service must present (`AI_SHARED_TOKEN`).
+    /// Required whenever `ai_quic_addr` is set — the bridge refuses to start
+    /// without one rather than listening unauthenticated.
+    pub ai_shared_token: Option<String>,
+    /// PEM certificate/key for the bridge listener (`AI_TLS_CERT` /
+    /// `AI_TLS_KEY`). Both unset means a self-signed pair is generated at boot
+    /// and its fingerprint logged for the services to pin.
+    pub ai_tls_cert: Option<String>,
+    pub ai_tls_key: Option<String>,
+    /// Default per-request deadline for AI calls (`AI_REQUEST_TIMEOUT_SECS`).
+    pub ai_request_timeout_secs: u64,
 }
 
 impl Config {
@@ -59,6 +75,14 @@ impl Config {
             },
             admin_username: parse_optional(env::var("ADMIN_USERNAME").ok()),
             admin_password: parse_optional(env::var("ADMIN_PASSWORD").ok()),
+            ai_quic_addr: parse_optional(env::var("AI_QUIC_ADDR").ok()),
+            ai_shared_token: parse_optional(env::var("AI_SHARED_TOKEN").ok()),
+            ai_tls_cert: parse_optional(env::var("AI_TLS_CERT").ok()),
+            ai_tls_key: parse_optional(env::var("AI_TLS_KEY").ok()),
+            ai_request_timeout_secs: parse_timeout(
+                env::var("AI_REQUEST_TIMEOUT_SECS").ok(),
+                AI_DEFAULT_REQUEST_TIMEOUT_SECS,
+            ),
         }
     }
 }
@@ -72,6 +96,16 @@ fn parse_optional(value: Option<String>) -> Option<String> {
 /// unparseable. An explicit `0` is honoured: it turns that tier off.
 fn parse_limit(value: Option<String>, default: u32) -> u32 {
     value.and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+}
+
+/// Parse a timeout in seconds. Unlike a rate limit, `0` is *not* honoured —
+/// a zero deadline would fail every AI request instantly, which is never what
+/// an operator means — so it falls back with the rest of the garbage.
+fn parse_timeout(value: Option<String>, default: u64) -> u64 {
+    value
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default)
 }
 
 /// Parse the `PORT` value, falling back to 8080 when unset or unparseable.
@@ -92,7 +126,16 @@ fn parse_flag(value: Option<String>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_flag, parse_limit, parse_port};
+    use super::{parse_flag, parse_limit, parse_port, parse_timeout};
+
+    #[tokio::test]
+    async fn timeout_falls_back_on_absent_garbage_and_zero() {
+        assert_eq!(parse_timeout(None, 30), 30);
+        assert_eq!(parse_timeout(Some("nope".into()), 30), 30);
+        // A zero deadline would time out every AI call before it started.
+        assert_eq!(parse_timeout(Some("0".into()), 30), 30);
+        assert_eq!(parse_timeout(Some(" 120 ".into()), 30), 120);
+    }
 
     #[tokio::test]
     async fn limit_defaults_when_absent_or_garbage() {

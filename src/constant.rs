@@ -239,3 +239,40 @@ pub const SCHEDULE_PAST_GRACE_MS: i64 = 60 * 1000;
 /// `1..=MAX_PAGE_LIMIT`. The `#[param(maximum = ...)]` and the "1 and 500"
 /// wording in `web::page` mirror this literal — keep them in step.
 pub const MAX_PAGE_LIMIT: i64 = 500;
+
+/// Wire-protocol identifier for the AI bridge, sent in [`crate::ai::protocol::Hello`]
+/// and used as the QUIC ALPN. Bump both together on a breaking frame change:
+/// ALPN mismatch rejects an old service at the TLS handshake, before it can
+/// send a frame we would misparse.
+pub const AI_PROTOCOL: &str = "hab/1";
+pub const AI_ALPN: &[u8] = b"hab/1";
+
+/// Hard ceiling on one AI-bridge frame. Checked against the length prefix
+/// before the body buffer is allocated. Generous because a payload may carry a
+/// base64 question image, but bounded so a bad length cannot exhaust memory.
+pub const AI_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
+/// Default wait for one AI request before the stream is abandoned
+/// (`AI_REQUEST_TIMEOUT_SECS`). Model inference is slow, so this is far longer
+/// than [`REQUEST_TIMEOUT_SECS`] — AI calls must not sit on an HTTP request
+/// path that the outer timeout would kill first.
+pub const AI_DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
+
+/// Upper bound on a worker's self-declared `max_concurrent`, and the value
+/// used when it declares none. A worker that claims a huge number would let
+/// the registry pile every request onto one service.
+pub const AI_MAX_CONCURRENT_PER_WORKER: usize = 64;
+pub const AI_DEFAULT_CONCURRENT_PER_WORKER: usize = 8;
+
+/// QUIC idle timeout and keepalive for a service connection. The keepalive is
+/// well under the idle timeout so an idle-but-healthy service is never dropped
+/// for being quiet; a service that actually died is deregistered within the
+/// idle window without any application-level heartbeat frame.
+pub const AI_IDLE_TIMEOUT_SECS: u64 = 30;
+pub const AI_KEEPALIVE_SECS: u64 = 10;
+
+/// How long a dialling AI service has to complete its `Hello`/`Welcome`
+/// exchange before the connection is dropped. Short: the handshake is one
+/// frame each way, and an unauthenticated connection must not be able to
+/// occupy the listener indefinitely.
+pub const AI_HANDSHAKE_TIMEOUT_SECS: u64 = 10;

@@ -1,3 +1,4 @@
+pub mod ai;
 pub mod config;
 pub mod constant;
 pub mod database;
@@ -39,6 +40,7 @@ use crate::state::AppState;
     modifiers(&SecurityAddon),
     tags(
         (name = "meta", description = "Liveness and service metadata"),
+        (name = "ai", description = "AI-bridge discovery. The AI features run as separate services that dial IN to this backend over QUIC (protocol/ALPN `hab/1`, address `AI_QUIC_ADDR`) and register the capabilities they serve; each request then rides its own QUIC bidirectional stream on that one connection. `GET /ai/certificate` publishes the bridge listener's certificate (PEM + SHA-256 fingerprint) so a service can pin it before dialling — public, because a server certificate is presented to every peer during the TLS handshake anyway, while the shared token that actually authenticates a service (`AI_SHARED_TOKEN`) is configured out of band. With no certificate configured the bridge self-signs afresh at each boot, so a service must re-fetch this on every reconnect, not only at startup. `404` when the bridge is disabled (`AI_QUIC_ADDR` unset). See the README's \"AI bridge (QUIC)\" section for the frame-level protocol"),
         (name = "auth", description = "Registration, login, session lifecycle"),
         (name = "users", description = "User info: self-service profile and UI preferences (theme `light`/`dark`, language `tr`/`en` — returned on every user response, `null` until chosen), name search for the pickers (teacher+, optionally role-filtered), plus listing, lookup, and role/profile/preferences administration (admin only). Also the parent↔student ties: admins link students to a `parent` account under `/users/{id}/students` (link, list, unlink — a role change on either side drops its ties), and a parent lists their own students at `/users/me/students`; the tie grants the parent read access to those students' mark, attendance, pomodoro, and homework reports and nothing else"),
         (name = "notes", description = "Per-user notes CRUD, plus file attachments per note (multipart upload, download, delete — at most 10 per note, each at most the school's settings-configured `max_file_bytes`)"),
@@ -84,6 +86,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/", get(health))
         .routes(routes!(health))
         .routes(routes!(server_time))
+        .nest("/ai", web::ai::routes())
         .nest("/auth", web::auth::routes(&state.rate_limit))
         .nest("/users", web::users::routes())
         .nest("/notes", web::notes::routes())

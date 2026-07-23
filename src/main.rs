@@ -1,4 +1,5 @@
 use anyhow::Context;
+use hezarfen_backend::ai::{AiBridge, BridgeConfig};
 use hezarfen_backend::config::Config;
 use hezarfen_backend::database::Database;
 use hezarfen_backend::domain::user::{Password, User, Username};
@@ -23,6 +24,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&cfg.files_path)
         .await
         .with_context(|| format!("failed to create the files directory {}", cfg.files_path))?;
+    let ai = start_ai_bridge(&cfg).await?;
     let app = build_router(AppState {
         db,
         files_path: cfg.files_path.clone().into(),
@@ -30,6 +32,7 @@ async fn main() -> anyhow::Result<()> {
         rate_limit: cfg.rate_limit.clone(),
         exam_presence: Default::default(),
         db_up,
+        ai,
     });
 
     let addr = format!("{}:{}", cfg.host, cfg.port);
@@ -45,6 +48,38 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     tracing::info!("shutting down");
     Ok(())
+}
+
+/// Start the QUIC bridge the AI services dial into, if one is configured.
+///
+/// Unconfigured is a supported deployment, not a degraded one: the school API
+/// predates the AI features and must keep running without them, so an absent
+/// `AI_QUIC_ADDR` returns `None` and nothing else changes. A *misconfigured*
+/// bridge is the opposite — a bad address, an unreadable certificate or a
+/// missing token means the operator asked for AI and would otherwise get a
+/// silently dead feature, so that fails the boot.
+async fn start_ai_bridge(cfg: &Config) -> anyhow::Result<Option<AiBridge>> {
+    let Some(raw_addr) = cfg.ai_quic_addr.as_deref() else {
+        tracing::info!("AI bridge disabled (AI_QUIC_ADDR unset)");
+        return Ok(None);
+    };
+    let addr = raw_addr
+        .parse()
+        .with_context(|| format!("AI_QUIC_ADDR `{raw_addr}` is not a socket address"))?;
+    let token = cfg
+        .ai_shared_token
+        .clone()
+        .context("AI_SHARED_TOKEN must be set when AI_QUIC_ADDR is")?;
+    let bridge = AiBridge::bind(BridgeConfig {
+        addr,
+        token,
+        cert_path: cfg.ai_tls_cert.clone(),
+        key_path: cfg.ai_tls_key.clone(),
+        request_timeout: std::time::Duration::from_secs(cfg.ai_request_timeout_secs),
+    })
+    .await
+    .context("failed to start the AI bridge")?;
+    Ok(Some(bridge))
 }
 
 /// Ping the database forever so the WebSocket never sits idle long enough to
