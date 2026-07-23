@@ -2,8 +2,8 @@
 //!
 //! REST remains the fallback (`POST /exams/{id}/attempt/answers` etc.); the
 //! socket exists so a sitting student gets autosave acks and a live,
-//! server-judged countdown without polling. The teacher monitor deliberately
-//! stays on SSE (`/exams/{id}/live/stream`) — it only ever flows one way.
+//! server-judged countdown without polling. The teacher monitor polls the
+//! one-shot snapshot (`GET /exams/{id}/live`) instead.
 //!
 //! Wire protocol (JSON text frames):
 //!

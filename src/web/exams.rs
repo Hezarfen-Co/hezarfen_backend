@@ -1,21 +1,15 @@
 use std::collections::HashMap;
-use std::time::Duration;
 
 use axum::Json;
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
-use axum::response::sse::{Event, KeepAlive, Sse};
 use serde::{Deserialize, Serialize};
-use tokio_stream::wrappers::IntervalStream;
-use tokio_stream::{Stream, StreamExt};
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::constant::{
-    EXAM_LIVE_STREAM_INTERVAL_SECS, MAX_MAX_FILE_BYTES, UPLOAD_BODY_OVERHEAD_BYTES,
-};
+use crate::constant::{MAX_MAX_FILE_BYTES, UPLOAD_BODY_OVERHEAD_BYTES};
 use crate::database::Database;
 use crate::domain::answer_image::AnswerImage;
 use crate::domain::course::Course;
@@ -80,7 +74,6 @@ pub fn routes() -> OpenApiRouter<AppState> {
         .routes(routes!(start_attempt, my_attempt))
         .routes(routes!(finish_attempt))
         .routes(routes!(exam_live))
-        .routes(routes!(exam_live_stream))
         .routes(routes!(create_question, list_questions))
         .routes(routes!(update_question, delete_question))
         .routes(routes!(attempt_questions))
@@ -1238,8 +1231,7 @@ async fn live_snapshot(exam: &Exam, db: &Database) -> Result<ExamLiveResponse, A
 /// on which sitting), who walked out of the room (`left_at`), who never
 /// showed at all (`absent`, once the window is over), time each student has
 /// left, and marks as they land. Requires teacher+ and management rights
-/// over the exam's course. For a self-updating feed of the same shape, see
-/// `GET /exams/{id}/live/stream`.
+/// over the exam's course. Poll it to keep a monitor up to date.
 #[utoipa::path(
     get,
     path = "/{id}/live",
@@ -1268,73 +1260,6 @@ async fn exam_live(
         ));
     }
     Ok(Json(live_snapshot(&exam, &st.db).await?))
-}
-
-/// The live snapshot as a Server-Sent-Events stream: one `snapshot` event
-/// (the `ExamLiveResponse` JSON) immediately on connect and then every couple
-/// of seconds, so attendance, remaining time, submissions, and marks update
-/// without polling. Requires teacher+ and management rights over the exam's
-/// course. Consume with `EventSource` (cookies ride along on same-site /
-/// credentialed requests). If the exam disappears mid-stream an `error` event
-/// is sent instead.
-#[utoipa::path(
-    get,
-    path = "/{id}/live/stream",
-    tag = "exams",
-    security(("session_cookie" = [])),
-    params(("id" = String, Path, description = "Exam id")),
-    responses(
-        (status = 200, description = "SSE feed of `snapshot` events (`ExamLiveResponse` as JSON)", content_type = "text/event-stream"),
-        (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
-        (status = 404, description = "Exam not found", body = ErrorResponse),
-    ),
-)]
-async fn exam_live_stream(
-    State(st): State<AppState>,
-    RequireTeacher(user): RequireTeacher,
-    Path(id): Path<String>,
-) -> Result<Sse<impl Stream<Item = Result<Event, axum::Error>>>, AppError> {
-    let exam_id = ExamId::from_key(&id);
-    // A missing exam is a 404 up front; after this the response is a stream.
-    let exam = Exam::read(&exam_id, &st.db)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    let course = course_of(&exam, &st.db).await?;
-    if !can_manage_course(&course, &user) {
-        return Err(AppError::Forbidden(
-            "only the course creator, an assigned teacher, or a manager/admin can monitor this exam",
-        ));
-    }
-
-    // First tick fires immediately, so the monitor paints on connect. The
-    // exam is re-read every tick: schedule edits (deadline extensions) show
-    // up mid-stream.
-    let interval = tokio::time::interval(Duration::from_secs(EXAM_LIVE_STREAM_INTERVAL_SECS));
-    let stream = IntervalStream::new(interval).then(move |_| {
-        let db = st.db.clone();
-        let exam_id = exam_id.clone();
-        async move {
-            let snapshot = match Exam::read(&exam_id, &db).await {
-                Ok(Some(exam)) => live_snapshot(&exam, &db).await,
-                Ok(None) => Err(AppError::NotFound),
-                Err(err) => Err(err),
-            };
-            match snapshot {
-                Ok(snapshot) => Event::default().event("snapshot").json_data(&snapshot),
-                // Exam deleted mid-stream or a db hiccup: say so without
-                // leaking internals and keep the stream alive — the client
-                // decides whether to hang on or close.
-                Err(err) => {
-                    tracing::warn!("live exam stream snapshot failed: {err}");
-                    Event::default()
-                        .event("error")
-                        .json_data(serde_json::json!({ "error": "live snapshot unavailable" }))
-                }
-            }
-        }
-    });
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
 // ---- questions --------------------------------------------------------------
