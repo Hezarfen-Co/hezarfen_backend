@@ -176,9 +176,6 @@ pub const MAX_EXAM_DURATION_MS: i64 = 24 * 60 * 60 * 1000;
 pub const MAX_EXAM_ATTEMPTS: i64 = 100;
 pub const UNLIMITED_EXAM_ATTEMPTS: i64 = 0;
 
-/// Cadence of the live exam-monitor SSE stream (`GET /exams/{id}/live/stream`).
-pub const EXAM_LIVE_STREAM_INTERVAL_SECS: u64 = 2;
-
 /// Cadence of the background keepalive query on the database WebSocket. The
 /// traffic keeps the connection from being dropped as idle; when it does drop,
 /// the ping also makes the SDK notice and reconnect long before the next real

@@ -311,7 +311,7 @@ course enrollments.
 | Answer questions inside **own** attempt (REST autosave or the exam-room WebSocket) | student | **Students only**; attempt must be `in_progress`; deadline judged by the server clock; blocked after leaving the room while `allow_rejoin` is off |
 | Author an exam's questions (add/edit/delete, incl. question + option images) | teacher | Course-management rights; frozen once anyone has an attempt |
 | Read a question list (with `correct`) or a student's answer sheet | teacher | Course-management rights — one teacher can't read another's answer key |
-| Watch an exam's live monitor (snapshot or SSE stream) | teacher | Course-management rights |
+| Watch an exam's live monitor (poll the snapshot) | teacher | Course-management rights |
 | Create courses                           | teacher      | The creator manages the course, and owns it for good |
 | Assign / unassign a course's teachers    | manager      | Staffing is the office's call — a course's own creator cannot hand rights to peers; the assignee must be `teacher`+ |
 | Delete a course                          | teacher      | Only the **creator**, or a `manager`+ — an assigned teacher runs the course but doesn't own it |
@@ -528,8 +528,7 @@ their existing shapes: the student exam-room reads
 | DELETE | `/exams/{id}/attempt/answers/{qid}/image` | student | Clear the caller's own drawn answer (own in-progress attempt) |
 | GET    | `/exams/{id}/attempts/{user}/answers/{qid}/image` | teacher | A student's drawn-answer bytes, inline, for the grader (course manager) |
 | GET    | `/exams/{id}/attempt/ws`         | student | **WebSocket** exam room (students only): state ticks, autosave, finish; entering clears `left_at`, leaving stamps it (see "Taking an exam") |
-| GET    | `/exams/{id}/live`               | teacher | Live monitor snapshot: roster × latest attempts × marks + per-student progress/`left_at`/`attempts_used` + counts; no-shows turn `absent` once the window closes (course manager) |
-| GET    | `/exams/{id}/live/stream`        | teacher | The same snapshot as SSE `snapshot` events every ~2s (course manager) |
+| GET    | `/exams/{id}/live`               | teacher | Live monitor snapshot: roster × latest attempts × marks + per-student progress/`left_at`/`attempts_used` + counts; no-shows turn `absent` once the window closes (course manager); poll to keep a monitor current |
 | POST   | `/courses/{id}/homework`         | teacher | `{title, description?, subject_id, due_at, assigned?}` — assign homework tagged with a course subject, due in the future; `assigned` names an enrolled-student subset, ≤ 200 (omit/`[]` = the whole course) (course manager) |
 | GET    | `/courses/{id}/homework`         | student | List the course's homework, newest first (enrolled, creator, assigned teacher, or manager+; students see only what they're assigned) · paged |
 | GET    | `/homework`                      | student | The caller's cross-course homework: their courses' (manager+: all; students only what they're assigned) · paged |
@@ -1019,15 +1018,9 @@ latest sitting) plus summary counts, all judged at a single `now`. Once the
 window closes, `not_started` hardens into `absent` — the no-shows, flagged
 right in the roster (open exams have no window, so never an `absent`). The
 flag is informational: an absent student still has no mark until the teacher
-records one through `POST /exams/{id}/results`.
-`GET /exams/{id}/live/stream` is the same JSON as Server-Sent Events: a
-`snapshot` event immediately on connect, then every ~2 s — attendance, ticking
-clocks, submissions, and marks land without polling:
-
-```js
-const es = new EventSource(`${BASE}/exams/${id}/live/stream`, { withCredentials: true });
-es.addEventListener("snapshot", (e) => render(JSON.parse(e.data)));
-```
+records one through `POST /exams/{id}/results`. Poll `GET /exams/{id}/live` to
+keep a monitor current — attendance, ticking clocks, submissions, and marks all
+ride in each snapshot.
 
 Deleting an exam (or its course) cascades attempts, questions, answers, and
 question + answer images (blobs included) along with results; unenrolling mid-exam

@@ -203,7 +203,6 @@ async fn protected_routes_require_session() {
         ("GET", "/exams/x/attempt"),
         ("POST", "/exams/x/attempt/finish"),
         ("GET", "/exams/x/live"),
-        ("GET", "/exams/x/live/stream"),
         ("POST", "/exams/x/questions"),
         ("GET", "/exams/x/questions"),
         ("PATCH", "/exams/x/questions/y"),
@@ -3258,7 +3257,6 @@ async fn course_data_is_walled_off_from_other_teachers() {
         format!("/exams/{exam_id}/results"),
         format!("/exams/{exam_id}/statistics"),
         format!("/exams/{exam_id}/live"),
-        format!("/exams/{exam_id}/live/stream"),
         format!("/exams/{exam_id}/questions"),
         format!("/exams/{exam_id}/attempts/{alice_id}/answers"),
     ] {
@@ -6901,58 +6899,6 @@ async fn open_duration_and_sync_retakes_shape_the_deadline_and_monitor() {
     )
     .await;
     assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
-}
-
-#[tokio::test]
-async fn live_stream_is_sse_and_teacher_scoped() {
-    let (app, db) = app_and_db().await;
-    let teacher = login_as(&app, &db, "sse_t", "teacher").await;
-    let student = login(&app, "selin").await;
-    let course = create_course(&app, &teacher, "geo").await;
-    let now = Timestamp::now().as_millis();
-    let exam = scheduled_exam(
-        &app,
-        &teacher,
-        &course,
-        json!({ "title": "final", "kind": "final",
-                "mode": "sync", "starts_at": now - 1_000, "ends_at": now + 600_000 }),
-    )
-    .await;
-
-    // Teacher: 200 with SSE headers. The body is an endless stream, so only
-    // the head of the response is inspected (common::send would hang).
-    let request = Request::builder()
-        .method("GET")
-        .uri(format!("/exams/{exam}/live/stream"))
-        .header("cookie", &teacher)
-        .body(Body::empty())
-        .unwrap();
-    let response = app.clone().oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let content_type = response
-        .headers()
-        .get("content-type")
-        .expect("content-type")
-        .to_str()
-        .unwrap();
-    assert!(
-        content_type.starts_with("text/event-stream"),
-        "{content_type}"
-    );
-    drop(response);
-
-    // Students can't watch the monitor; a missing exam is a 404 up front.
-    let res = send(
-        &app,
-        "GET",
-        &format!("/exams/{exam}/live/stream"),
-        Some(&student),
-        None,
-    )
-    .await;
-    assert_eq!(res.status, StatusCode::FORBIDDEN);
-    let res = send(&app, "GET", "/exams/nope/live/stream", Some(&teacher), None).await;
-    assert_eq!(res.status, StatusCode::NOT_FOUND);
 }
 
 // --- subjects ---------------------------------------------------------------
