@@ -17,8 +17,8 @@
 //! * [`registry`] — who is connected and who gets the next request
 //! * [`tls`] — the listener's certificate
 //!
-//! Nothing here is wired into a route yet: this is the transport, and the
-//! individual AI features land on top of it.
+//! The transport is generic; the features land on top of it. So far that is
+//! the chatbot (`web::chat`), which routes on the `chat.reply` capability.
 
 pub mod chat;
 pub mod error;
@@ -31,3 +31,40 @@ pub use chat::{ChatReplyPayload, ChatRequestPayload, ChatRole, ChatTurn};
 pub use error::AiError;
 pub use registry::{AiRegistry, WorkerSnapshot};
 pub use server::{AiBridge, BridgeConfig};
+
+use crate::config::Config;
+
+/// Start the QUIC bridge the AI services dial into, if one is configured.
+///
+/// Unconfigured is a supported deployment, not a degraded one: the school API
+/// predates the AI features and must keep running without them, so an absent
+/// `AI_QUIC_ADDR` returns `None` and nothing else changes. A *misconfigured*
+/// bridge is the opposite — a bad address, an unreadable certificate or a
+/// missing token means the operator asked for AI and would otherwise get a
+/// silently dead feature, so that fails the boot.
+///
+/// In particular a set address with no `AI_SHARED_TOKEN` must never fall back
+/// to listening: an unauthenticated bridge would let anyone who can reach the
+/// UDP port register a worker and answer real users' messages.
+pub async fn start_bridge(cfg: &Config) -> Result<Option<AiBridge>, AiError> {
+    let Some(raw_addr) = cfg.ai_quic_addr.as_deref() else {
+        tracing::info!("AI bridge disabled (AI_QUIC_ADDR unset)");
+        return Ok(None);
+    };
+    let addr = raw_addr
+        .parse()
+        .map_err(|e| AiError::Setup(format!("AI_QUIC_ADDR `{raw_addr}` is not an address: {e}")))?;
+    let token = cfg
+        .ai_shared_token
+        .clone()
+        .ok_or_else(|| AiError::Setup("AI_SHARED_TOKEN must be set when AI_QUIC_ADDR is".into()))?;
+    let bridge = AiBridge::bind(BridgeConfig {
+        addr,
+        token,
+        cert_path: cfg.ai_tls_cert.clone(),
+        key_path: cfg.ai_tls_key.clone(),
+        request_timeout: std::time::Duration::from_secs(cfg.ai_request_timeout_secs),
+    })
+    .await?;
+    Ok(Some(bridge))
+}
