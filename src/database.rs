@@ -102,6 +102,12 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS read ON message TYPE bool DEFAULT false;
     DEFINE FIELD IF NOT EXISTS sender_folder ON message TYPE string DEFAULT 'sent';
     DEFINE FIELD IF NOT EXISTS recipient_folder ON message TYPE string DEFAULT 'inbox';
+    -- Where each side's copy sat before it was filed into archive/trash, so a
+    -- restore lands where it came from. NONE while the copy is in its home
+    -- folder — and on rows filed before this field existed (2026-07-23), which
+    -- restore to the home folder just as they always did.
+    DEFINE FIELD IF NOT EXISTS sender_origin ON message TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS recipient_origin ON message TYPE option<string>;
     DEFINE INDEX IF NOT EXISTS message_sender ON message FIELDS sender;
     DEFINE INDEX IF NOT EXISTS message_recipient ON message FIELDS recipient;
 

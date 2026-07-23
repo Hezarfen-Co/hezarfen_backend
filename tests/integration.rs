@@ -11947,6 +11947,92 @@ async fn messages_flow_through_folders_per_side() {
     assert!(rows.is_empty(), "both-sides-deleted row is removed");
 }
 
+/// A filed copy remembers the folder it left, so restoring lands where it
+/// came from instead of always in the inbox.
+#[tokio::test]
+async fn messages_remember_the_folder_a_filed_copy_came_from() {
+    let (app, db) = app_and_db().await;
+    let ali = login(&app, "ali").await; // student
+    let hoca = login_as(&app, &db, "hoca", "teacher").await;
+    let hoca_id = me_id(&app, &hoca).await;
+
+    let res = send(
+        &app,
+        "POST",
+        "/messages",
+        Some(&ali),
+        Some(json!({ "recipient_id": hoca_id, "subject": "etüt" })),
+    )
+    .await;
+    let msg_id = res.body["id"].as_str().expect("message id").to_string();
+    assert!(
+        res.body["previous_folder"].is_null(),
+        "a home copy has none"
+    );
+
+    let file = |actor: &'static str, folder: &'static str| {
+        let app = app.clone();
+        let (ali, hoca) = (ali.clone(), hoca.clone());
+        let msg_id = msg_id.clone();
+        async move {
+            let session = if actor == "ali" { ali } else { hoca };
+            let res = send(
+                &app,
+                "PATCH",
+                &format!("/messages/{msg_id}"),
+                Some(&session),
+                Some(json!({ "folder": folder })),
+            )
+            .await;
+            assert_eq!(res.status, StatusCode::OK, "move to {folder}");
+            res.body["previous_folder"].clone()
+        }
+    };
+
+    // inbox → archive → trash walks the memory one hop at a time.
+    assert_eq!(file("hoca", "archive").await, json!("inbox"));
+    assert_eq!(file("hoca", "trash").await, json!("archive"));
+    // Restoring to the remembered folder puts the copy back there — with no
+    // memory of its own, since it came out of the trash and the trash is
+    // never a restore target. It falls back to the home folder.
+    assert!(file("hoca", "archive").await.is_null());
+    let archive = send(&app, "GET", "/messages?folder=archive", Some(&hoca), None).await;
+    assert_eq!(common::items(&archive.body).len(), 1);
+    // Back home clears the stamp for good.
+    assert!(file("hoca", "inbox").await.is_null());
+
+    // A no-op move keeps the memory it already had.
+    assert_eq!(file("hoca", "archive").await, json!("inbox"));
+    assert_eq!(file("hoca", "archive").await, json!("inbox"));
+
+    // The sender's side has only one home, so its trash always points at it.
+    assert_eq!(file("ali", "trash").await, json!("sent"));
+    // The two sides' memories are independent.
+    let trash = send(&app, "GET", "/messages?folder=trash", Some(&ali), None).await;
+    assert_eq!(common::items(&trash.body)[0]["previous_folder"], "sent");
+    let archive = send(&app, "GET", "/messages?folder=archive", Some(&hoca), None).await;
+    assert_eq!(common::items(&archive.body)[0]["previous_folder"], "inbox");
+
+    // Deleting drops the stamp with the rest of that side's copy.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/messages/{msg_id}"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    let mut result = db
+        .query("SELECT VALUE sender_origin FROM message")
+        .await
+        .expect("read origins")
+        .check()
+        .expect("read origins check");
+    let origins: Vec<Option<String>> = result.take(0).expect("origin rows");
+    assert_eq!(origins, vec![None], "the deleted side keeps no origin");
+}
+
 #[tokio::test]
 async fn messages_guard_parties_recipients_and_folders() {
     let (app, db) = app_and_db().await;

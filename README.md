@@ -673,13 +673,24 @@ but each **owns their copy independently**: the recipient's moves through
 as a read receipt); the sender's moves through `sent` → `trash`. Filing or
 deleting your copy never changes the other side's view.
 
+Every copy remembers where it was filed from, so it can go back there. Moving
+into `archive`/`trash` stamps the folder you left onto the copy's
+`previous_folder`, and restoring is a `PATCH` of `folder` back to that value:
+an inbox message you archive and then trash returns to `archive`, and from
+there to `inbox`. Two folders are never stamped — the trash itself (pulling a
+copy out of the trash must not leave it pointing back at the discard pile) and
+the folder you are already in — and moving back to `inbox`/`sent` clears the
+stamp. `previous_folder` is therefore `null` for any copy sitting in its home
+folder, and for copies filed before the field existed; both mean "restore to
+`inbox`" (`sent` for the sender's copy).
+
 Listing is per folder — `GET /messages?folder=` with `inbox` (default),
 `sent`, `archive`, or `trash` (trash shows both received and sent copies you
 trashed) — newest first, paged, with sender/recipient rendered as person refs
 plus their role. `?read=false` narrows to unread (`true` to read), and since
 `total` counts the filtered view, `?folder=inbox&read=false&limit=1` is the
 one-row unread-badge query. `PATCH /messages/{id}` flips `read` (recipient only) or
-moves your copy (`folder`), restoring from trash included. `DELETE` is
+moves your copy (`folder`), restoring included. `DELETE` is
 permanent, allowed only while your copy sits in the trash (`409` otherwise),
 and physically removes the row once both sides have deleted theirs. Replying
 is just sending a new message back — the frontend prefixes the subject if it
