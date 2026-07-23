@@ -1161,3 +1161,84 @@ async fn a_blank_chat_answer_fails_as_empty_reply() {
     assert_eq!(turn["status"], "failed", "{turn}");
     assert_eq!(turn["error_code"], "empty_reply");
 }
+
+// ------------------------------------------------------------- boot wiring --
+//
+// `ai::start_bridge` is the seam between deployment config and the listener.
+// Its branches are the ones an operator hits, and the failure branch is the
+// one that matters most: a set address with no token must refuse to boot
+// rather than listen unauthenticated, since anyone able to reach the UDP port
+// could otherwise register a worker and answer real users' messages.
+
+/// A config with the AI fields under the test's control. Everything else comes
+/// from the usual defaults — these tests never touch the database.
+fn ai_config(addr: Option<&str>, token: Option<&str>) -> hezarfen_backend::config::Config {
+    let mut cfg = hezarfen_backend::config::Config::from_env();
+    cfg.ai_quic_addr = addr.map(str::to_string);
+    cfg.ai_shared_token = token.map(str::to_string);
+    cfg.ai_tls_cert = None;
+    cfg.ai_tls_key = None;
+    cfg
+}
+
+#[tokio::test]
+async fn no_address_means_no_bridge_not_a_failed_boot() {
+    // The school API predates the AI features and must still boot without
+    // them, so "unconfigured" is a supported deployment, not a degraded one.
+    let bridge = hezarfen_backend::ai::start_bridge(&ai_config(None, None))
+        .await
+        .unwrap_or_else(|e| panic!("an unconfigured bridge is not an error: {e}"));
+    assert!(bridge.is_none(), "nothing should be listening");
+}
+
+#[tokio::test]
+async fn an_address_without_a_token_refuses_to_boot() {
+    // The security branch: never fall back to an unauthenticated listener.
+    //
+    // Two layers refuse this — `start_bridge` on the absent env var, and
+    // `AiBridge::bind` on an empty token — so the assertion pins the message
+    // to *this* layer's wording (`AI_QUIC_ADDR`). Asserting only on
+    // "AI_SHARED_TOKEN" would match either, and would still pass with this
+    // branch deleted.
+    let Err(err) = hezarfen_backend::ai::start_bridge(&ai_config(Some("127.0.0.1:0"), None)).await
+    else {
+        panic!("a tokenless bridge must not start");
+    };
+    assert!(
+        matches!(&err, AiError::Setup(m) if m.contains("AI_SHARED_TOKEN") && m.contains("AI_QUIC_ADDR")),
+        "got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_bad_address_fails_the_boot_rather_than_going_quiet() {
+    // The operator asked for AI; a typo must not degrade to a silently dead
+    // feature they only notice when a student sends the first message.
+    let Err(err) =
+        hezarfen_backend::ai::start_bridge(&ai_config(Some("not-an-address"), Some(TOKEN))).await
+    else {
+        panic!("a malformed address must not be ignored");
+    };
+    assert!(
+        matches!(&err, AiError::Setup(m) if m.contains("AI_QUIC_ADDR")),
+        "got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_configured_bridge_listens_and_serves_a_real_handshake() {
+    // The whole point of the wiring: what `start_bridge` returns is a live
+    // listener, not just a constructed value — so dial it for real.
+    let bridge = hezarfen_backend::ai::start_bridge(&ai_config(Some("127.0.0.1:0"), Some(TOKEN)))
+        .await
+        .unwrap_or_else(|e| panic!("a fully configured bridge starts: {e}"))
+        .expect("a configured bridge is Some");
+    let _service = connect_service(
+        &bridge,
+        hello("tutor", &[AI_CHAT_CAPABILITY]),
+        Behaviour::Echo,
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    assert_eq!(bridge.workers().len(), 1);
+}
