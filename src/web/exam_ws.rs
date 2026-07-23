@@ -314,9 +314,10 @@ async fn state_frame(
     let remaining_ms = (status == AttemptStatus::InProgress)
         .then(|| deadline.map(|d| (d.as_millis() - now.as_millis()).max(0)))
         .flatten();
-    let answered = ExamAnswer::list_for_exam_user(exam.get_id(), attempt.get_user(), db)
-        .await?
-        .len();
+    let answered =
+        ExamAnswer::list_for_exam_user(exam.get_id(), attempt.get_user(), attempt.get_seq(), db)
+            .await?
+            .len();
     let question_count = ExamQuestion::list_for_exam(exam.get_id(), db).await?.len();
     let frame = json!({
         "type": "state",

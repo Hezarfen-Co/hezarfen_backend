@@ -151,11 +151,10 @@ impl ExamAttempt {
     ///   re-"starting" can never buy more time.
     /// - A terminal latest attempt (submitted or expired) starts sitting
     ///   `seq + 1` if the exam's `max_attempts` allows another, and is a
-    ///   conflict otherwise. A retake begins from a blank sheet: the student's
-    ///   previous answers are wiped in the same transaction that creates the
-    ///   new row ([`Self::wipe_and_create`]), so a lost race (or a failed
-    ///   create) rolls the wipe back — no answer sheet is ever destroyed
-    ///   without its retake existing.
+    ///   conflict otherwise. A retake preserves every prior sitting: the new
+    ///   row is created at the new `seq` and the student's earlier answers,
+    ///   drawings, and marks stay put at their own seq — the fresh sitting
+    ///   simply writes into an empty higher seq.
     ///
     /// The composite id makes each create atomic; a concurrent double-start
     /// races on the same seq, loses to the unique id, and reads the winner's
@@ -189,11 +188,8 @@ impl ExamAttempt {
             finished_at: None,
             left_at: None,
         };
-        let created: Result<Option<ExamAttempt>, surrealdb::Error> = if next_seq == 1 {
-            db.create(attempt.id.record()).content(attempt).await
-        } else {
-            Self::wipe_and_create(attempt, db).await
-        };
+        let created: Result<Option<ExamAttempt>, surrealdb::Error> =
+            db.create(attempt.id.record()).content(attempt).await;
         match created {
             Ok(Some(created)) => Ok((created, true)),
             Ok(None) => Err(AppError::Internal("failed to start exam attempt".into())),
@@ -210,36 +206,6 @@ impl ExamAttempt {
                 _ => Err(err.into()),
             },
         }
-    }
-
-    /// Wipe the student's previous answers and create the retake row in one
-    /// transaction. Atomicity is the point: a create that fails (a concurrent
-    /// double-start lost the race on the composite id, or the database
-    /// hiccuped) cancels the whole transaction, wipe included — otherwise a
-    /// stale loser could delete answers freshly saved into the winner's
-    /// sitting, or destroy a graded sheet without a retake ever existing.
-    async fn wipe_and_create(
-        attempt: ExamAttempt,
-        db: &Database,
-    ) -> Result<Option<ExamAttempt>, surrealdb::Error> {
-        let mut result = db
-            .query(
-                "BEGIN TRANSACTION;
-                 DELETE exam_answer WHERE exam = $ex AND user = $usr;
-                 DELETE answer_image WHERE exam = $ex AND user = $usr;
-                 CREATE $id CONTENT $attempt;
-                 COMMIT TRANSACTION;",
-            )
-            .bind(("ex", attempt.exam.record()))
-            .bind(("usr", attempt.user.record()))
-            .bind(("id", attempt.id.record()))
-            .bind(("attempt", attempt))
-            .await?
-            .check()?;
-        // Statement slots count BEGIN and COMMIT too, plus the two child
-        // wipes: the CREATE is slot 3. (The answer-image *blobs* are the web
-        // layer's to GC — `start_attempt` collects their names before this.)
-        Ok(result.take::<Vec<ExamAttempt>>(3)?.into_iter().next())
     }
 
     /// Stamp the submission time. The caller has already checked the deadline
@@ -398,7 +364,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_retake_starts_from_a_blank_sheet() {
+    async fn a_retake_preserves_the_prior_sittings_sheet() {
         let db = init_mem().await.unwrap();
         let (exam, question) = open_exam_with_question(&db, 2).await;
         let user = student();
@@ -406,24 +372,30 @@ mod tests {
         let (first, created) = ExamAttempt::start(&exam, &user, &db).await.unwrap();
         assert!(created);
         assert_eq!(first.get_seq(), 1);
-        ExamAnswer::save(&question, &user, Some(1), None, &db)
+        ExamAnswer::save(&question, &user, 1, Some(1), None, &db)
             .await
             .unwrap();
         first.finish(&db).await.unwrap();
 
-        // The retake lands as sitting #2 with the sheet wiped in the same
-        // transaction that created it.
+        // The retake lands as sitting #2 without touching sitting #1's answers.
         let (second, created) = ExamAttempt::start(&exam, &user, &db).await.unwrap();
         assert!(created);
         assert_eq!(second.get_seq(), 2);
-        let answers = ExamAnswer::list_for_exam_user(exam.get_id(), &user, &db)
+
+        // Sitting #1's answer is still there, read at its own seq.
+        let prior = ExamAnswer::read(question.get_id(), &user, 1, &db)
             .await
             .unwrap();
-        assert!(answers.is_empty(), "a retake starts blank");
+        assert!(prior.is_some(), "the retake must preserve seq 1's answer");
+        // The new sitting starts blank at its own seq.
+        let fresh = ExamAnswer::list_for_exam_user(exam.get_id(), &user, 2, &db)
+            .await
+            .unwrap();
+        assert!(fresh.is_empty(), "seq 2 starts blank");
     }
 
     #[tokio::test]
-    async fn a_lost_retake_race_cannot_wipe_the_winners_sheet() {
+    async fn a_lost_retake_race_cannot_touch_the_winners_sheet() {
         let db = init_mem().await.unwrap();
         let (exam, question) = open_exam_with_question(&db, 3).await;
         let user = student();
@@ -434,13 +406,13 @@ mod tests {
         let (winner, created) = ExamAttempt::start(&exam, &user, &db).await.unwrap();
         assert!(created);
         assert_eq!(winner.get_seq(), 2);
-        ExamAnswer::save(&question, &user, Some(1), None, &db)
+        ExamAnswer::save(&question, &user, 2, Some(1), None, &db)
             .await
             .unwrap();
 
         // A stale double-start races on the same seq and loses to the
-        // composite id — and the aborted transaction must roll its wipe back,
-        // leaving the winner's fresh answer untouched.
+        // composite id: the duplicate create is rejected, and with no wipe in
+        // the path the winner's fresh answer is untouched either way.
         let loser = ExamAttempt {
             id: ExamAttemptId::composite(exam.get_id(), &user, 2),
             exam: exam.get_id().clone(),
@@ -450,15 +422,16 @@ mod tests {
             finished_at: None,
             left_at: None,
         };
-        let lost = ExamAttempt::wipe_and_create(loser, &db).await;
-        assert!(lost.is_err(), "the duplicate create must fail");
-        let answers = ExamAnswer::list_for_exam_user(exam.get_id(), &user, &db)
+        let lost: Result<Option<ExamAttempt>, surrealdb::Error> =
+            db.create(loser.id.record()).content(loser).await;
+        assert!(lost.is_err(), "the duplicate-seq create must be rejected");
+        let answers = ExamAnswer::list_for_exam_user(exam.get_id(), &user, 2, &db)
             .await
             .unwrap();
         assert_eq!(
             answers.len(),
             1,
-            "the lost race must not wipe the winner's saved answer"
+            "the lost race must not disturb the winner's saved answer"
         );
 
         // The public path shrugs the race off: a re-start resumes the winner.

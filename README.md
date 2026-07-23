@@ -40,8 +40,9 @@ not per exam). Exams run **sync** (one
 fixed window), **async** (start anytime inside the window, with a personal
 time budget), or **open** (sit anytime, optionally timed per attempt);
 students *sit* them via attempts — retakes metered by a per-exam limit
-(`0` = unlimited), leaving the exam room governed by a teacher-controlled
-rejoin door. Writing an exam takes a while, so it can be saved as a
+(`0` = unlimited), each sitting keeping its own answers, drawings, and mark
+so staff can read a student's full attempt history, leaving the exam room
+governed by a teacher-controlled rejoin door. Writing an exam takes a while, so it can be saved as a
 **draft** — invisible to students, unsittable, ungradable — and published
 when it's ready. Questions can carry **images**: any question may hold one
 illustration (a map above the prompt), and each option of a choice question
@@ -527,6 +528,10 @@ their existing shapes: the student exam-room reads
 | GET    | `/exams/{id}/attempt/answers/{qid}/image` | student | The caller's own drawn-answer bytes, served inline (same wall as the sitting view: enrolled + attempt started) |
 | DELETE | `/exams/{id}/attempt/answers/{qid}/image` | student | Clear the caller's own drawn answer (own in-progress attempt) |
 | GET    | `/exams/{id}/attempts/{user}/answers/{qid}/image` | teacher | A student's drawn-answer bytes, inline, for the grader (course manager) |
+| GET    | `/exams/{id}/students/{user}/attempts` | teacher | The sitting numbers a student has left (answers ⋃ marks), ascending — the per-attempt history picker (course manager) |
+| GET    | `/exams/{id}/students/{user}/attempts/{seq}/answers` | teacher | One prior sitting's answer sheet: `is_correct` flags + suggested `auto_score` (course manager) |
+| GET    | `/exams/{id}/students/{user}/attempts/{seq}/answers/{qid}/image` | teacher | One prior sitting's drawn-answer bytes, inline (course manager) |
+| GET    | `/exams/{id}/students/{user}/marks` | teacher | A student's full per-sitting mark history, oldest first — the latest seq is the grade-of-record (course manager) |
 | GET    | `/exams/{id}/attempt/ws`         | student | **WebSocket** exam room (students only): state ticks, autosave, finish; entering clears `left_at`, leaving stamps it (see "Taking an exam") |
 | GET    | `/exams/{id}/live`               | teacher | Live monitor snapshot: roster × latest attempts × marks + per-student progress/`left_at`/`attempts_used` + counts; no-shows turn `absent` once the window closes (course manager); poll to keep a monitor current |
 | POST   | `/courses/{id}/homework`         | teacher | `{title, description?, subject_id, due_at, assigned?}` — assign homework tagged with a course subject, due in the future; `assigned` names an enrolled-student subset, ≤ 200 (omit/`[]` = the whole course) (course manager) |
@@ -1109,8 +1114,10 @@ clock on every save):
   re-applied to every save — finishing stays open). Once the
   attempt is submitted or past its deadline every save is a `409` — likewise
   while the student has left the exam room with `allow_rejoin` off; answers
-  saved in time survive untouched for grading (until a retake wipes the sheet
-  for the next sitting).
+  saved in time survive untouched for grading. Each sitting keeps its own
+  answers, drawings, and mark, keyed by the attempt's `seq` — a retake starts
+  from a blank sheet without erasing the prior one, so the full per-attempt
+  history stays readable (see the grading view).
 
 **Answer images**: the student side mirrors the teacher's question images. A
 student may attach one **drawing** to any question in their attempt — a
@@ -1133,10 +1140,21 @@ by a ULID, metadata in the `answer_image` table, structurally identical to
 question images.
 
 **Grading view** (course-management rights): `GET /exams/{id}/attempts/{user}/answers` returns
-the student's sheet — every saved answer with `is_correct` (`true`/`false` for
-choice, `null` for text: that's the grader's call) plus
+the student's **latest** sitting's sheet — every saved answer with `is_correct`
+(`true`/`false` for choice, `null` for text: that's the grader's call) plus
 `auto_score: {earned, possible}` summing the choice questions' points. It is a
 suggestion to read while grading, never written anywhere.
+
+**Per-attempt history** (course-management rights): prior sittings stay
+readable. `GET /exams/{id}/students/{user}/attempts` lists the sitting numbers
+a student has (every `seq` carrying answers or a mark, ascending);
+`GET /exams/{id}/students/{user}/attempts/{seq}/answers` is the grading sheet
+for one of them (drawing bytes at
+`GET /exams/{id}/students/{user}/attempts/{seq}/answers/{qid}/image`); and
+`GET /exams/{id}/students/{user}/marks` is the full per-sitting mark history,
+oldest first. Grading (`POST /exams/{id}/results`) always lands on the current
+sitting, and the latest seq is the grade-of-record — the roster, report, and
+statistics reads all show it.
 
 **The exam room (WebSocket)** — `GET /exams/{id}/attempt/ws`, cookie-authed
 like everything else; REST above remains the full fallback. Gates run before

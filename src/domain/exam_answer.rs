@@ -13,16 +13,21 @@ use crate::validate::validate_optional;
 pub struct ExamAnswerId(RecordId);
 
 impl ExamAnswerId {
-    /// A deterministic id for the (question, user) pair — the question key is
-    /// its own ULID, so the pair key is unambiguous. Saving is a single atomic
-    /// UPSERT: re-answering overwrites the one row instead of racing the
-    /// unique index into a 500. ULID keys are alphanumeric, so `_` is an
-    /// unambiguous joiner.
-    pub fn composite(question: &ExamQuestionId, user: &UserId) -> Self {
-        Self(RecordId::new(
-            EXAM_ANSWER_TABLE,
-            format!("{}_{}", question.key(), user.key()),
-        ))
+    /// A deterministic id for the (question, user, seq) triple — the question
+    /// key is its own ULID, so the triple key is unambiguous. Saving is a
+    /// single atomic UPSERT keyed by seq: re-answering *within a sitting*
+    /// overwrites its one row, but a retake's `seq` writes a new row, so every
+    /// sitting keeps its own answer history. The first sitting keeps the
+    /// historical `{question}_{user}` shape (rows written before history
+    /// existed stay addressable); later sittings append their number. ULID
+    /// keys are alphanumeric, so `_` is an unambiguous joiner.
+    pub fn composite(question: &ExamQuestionId, user: &UserId, seq: i64) -> Self {
+        let key = if seq == 1 {
+            format!("{}_{}", question.key(), user.key())
+        } else {
+            format!("{}_{}_{}", question.key(), user.key(), seq)
+        };
+        Self(RecordId::new(EXAM_ANSWER_TABLE, key))
     }
 
     pub fn record(&self) -> RecordId {
@@ -62,6 +67,7 @@ pub struct ExamAnswer {
     exam: ExamId,
     question: ExamQuestionId,
     user: UserId,
+    seq: i64,
     selected: Option<i64>,
     text: Option<AnswerText>,
     updated_at: Timestamp,
@@ -84,6 +90,11 @@ impl ExamAnswer {
         &self.user
     }
 
+    /// Which sitting this answer belongs to — 1 for the first attempt, up.
+    pub fn get_seq(&self) -> i64 {
+        self.seq
+    }
+
     pub fn get_selected(&self) -> Option<i64> {
         self.selected
     }
@@ -103,14 +114,17 @@ impl ExamAnswer {
         Some(self.selected == Some(correct))
     }
 
-    /// Save (or overwrite) `user`'s answer to `question` — the one write path,
-    /// shared by the REST handler and the WebSocket room. The payload must
-    /// match the question's kind: a choice question takes `selected` (indexing
-    /// one of its choices), a text question takes `text`. The caller has
-    /// already checked that the attempt is in progress.
+    /// Save (or overwrite) `user`'s answer to `question` for sitting `seq` —
+    /// the one write path, shared by the REST handler and the WebSocket room.
+    /// The payload must match the question's kind: a choice question takes
+    /// `selected` (indexing one of its choices), a text question takes `text`.
+    /// The caller has already checked that the attempt is in progress. Keyed
+    /// by `seq`, so a retake's save is a new row, not an overwrite of an
+    /// earlier sitting's answer.
     pub async fn save(
         question: &ExamQuestion,
         user: &UserId,
+        seq: i64,
         selected: Option<i64>,
         text: Option<String>,
         db: &Database,
@@ -151,10 +165,11 @@ impl ExamAnswer {
             }
         };
         let answer = ExamAnswer {
-            id: ExamAnswerId::composite(question.get_id(), user),
+            id: ExamAnswerId::composite(question.get_id(), user, seq),
             exam: question.get_exam().clone(),
             question: question.get_id().clone(),
             user: user.clone(),
+            seq,
             selected,
             text,
             updated_at: Timestamp::now(),
@@ -163,44 +178,72 @@ impl ExamAnswer {
         saved.ok_or_else(|| AppError::Internal("failed to save exam answer".into()))
     }
 
-    /// One student's stored answer for a question, if any.
+    /// One student's stored answer for a question in sitting `seq`, if any.
     pub async fn read(
         question: &ExamQuestionId,
         user: &UserId,
+        seq: i64,
         db: &Database,
     ) -> Result<Option<ExamAnswer>, AppError> {
         Ok(db
-            .select(ExamAnswerId::composite(question, user).record())
+            .select(ExamAnswerId::composite(question, user, seq).record())
             .await?)
     }
 
-    /// Drop one student's answer to a single question.
+    /// Drop one student's answer to a single question in sitting `seq`.
     pub async fn delete(
         question: &ExamQuestionId,
         user: &UserId,
+        seq: i64,
         db: &Database,
     ) -> Result<(), AppError> {
         let _: Option<ExamAnswer> = db
-            .delete(ExamAnswerId::composite(question, user).record())
+            .delete(ExamAnswerId::composite(question, user, seq).record())
             .await?;
         Ok(())
     }
 
-    /// One student's answers across an exam, in question (ULID) order.
+    /// One student's answers for a single sitting (`seq`) across an exam, in
+    /// question (ULID) order — the live-sitting read-back and, for a past
+    /// `seq`, that attempt's answer sheet.
     pub async fn list_for_exam_user(
         exam: &ExamId,
         user: &UserId,
+        seq: i64,
         db: &Database,
     ) -> Result<Vec<ExamAnswer>, AppError> {
         let mut result = db
             .query(
-                "SELECT * FROM exam_answer WHERE exam = $ex AND user = $usr ORDER BY question ASC",
+                "SELECT * FROM exam_answer WHERE exam = $ex AND user = $usr AND seq = $seq
+                 ORDER BY question ASC",
+            )
+            .bind(("ex", exam.record()))
+            .bind(("usr", user.record()))
+            .bind(("seq", seq))
+            .await?
+            .check()?;
+        Ok(result.take::<Vec<ExamAnswer>>(0)?)
+    }
+
+    /// The distinct sittings a student has any answer for at `exam`, ascending
+    /// — the index a history view lists attempts from.
+    pub async fn list_seqs_for_user(
+        exam: &ExamId,
+        user: &UserId,
+        db: &Database,
+    ) -> Result<Vec<i64>, AppError> {
+        let mut result = db
+            .query(
+                "SELECT VALUE seq FROM exam_answer WHERE exam = $ex AND user = $usr
+                 ORDER BY seq ASC",
             )
             .bind(("ex", exam.record()))
             .bind(("usr", user.record()))
             .await?
             .check()?;
-        Ok(result.take::<Vec<ExamAnswer>>(0)?)
+        let mut seqs = result.take::<Vec<i64>>(0)?;
+        seqs.dedup();
+        Ok(seqs)
     }
 
     /// Every answer of an exam — the live monitor aggregates these per student.
@@ -274,10 +317,11 @@ mod tests {
 
     fn answer(question: &ExamQuestion, user: &UserId, selected: Option<i64>) -> ExamAnswer {
         ExamAnswer {
-            id: ExamAnswerId::composite(question.get_id(), user),
+            id: ExamAnswerId::composite(question.get_id(), user, 1),
             exam: question.get_exam().clone(),
             question: question.get_id().clone(),
             user: user.clone(),
+            seq: 1,
             selected,
             text: selected
                 .is_none()
@@ -288,6 +332,23 @@ mod tests {
 
     fn student() -> UserId {
         UserId::from_key("01TESTUSERAAAAAAAAAAAAAAAA")
+    }
+
+    #[tokio::test]
+    async fn seqs_key_distinct_rows_but_seq_one_keeps_the_bare_key() {
+        let question = ExamQuestionId::from_key("01TESTQUESTIONAAAAAAAAAAAA");
+        let user = student();
+        // seq 1 keeps the pre-history bare `{question}_{user}` key…
+        let first = ExamAnswerId::composite(&question, &user, 1);
+        assert_eq!(
+            first.key(),
+            format!("{}_{}", question.key(), user.key()),
+            "seq 1 stays addressable at its historical key"
+        );
+        // …and a later sitting is a *different* id, so its answer is a new row.
+        let second = ExamAnswerId::composite(&question, &user, 2);
+        assert_ne!(first, second, "two seqs must not collide onto one row");
+        assert_eq!(second.key(), format!("{}_{}_2", question.key(), user.key()));
     }
 
     #[tokio::test]

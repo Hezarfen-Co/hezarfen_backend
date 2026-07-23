@@ -4,11 +4,13 @@
 //! metadata; the bytes live on disk under [`crate::config::Config::files_path`]
 //! in a file named by `file` — a fresh server-generated ULID per upload, so no
 //! user input ever shapes a disk path and a replace never overwrites bytes in
-//! place. The row id is *deterministic* per (question, user) — the same shape
-//! as [`crate::domain::exam_answer::ExamAnswerId::composite`] — so "one drawing
-//! per student per question" holds by construction and a replace is a plain
-//! UPSERT. The web layer owns the blob I/O and its ordering (new blob before
-//! row, row before old blob); this module owns the rows.
+//! place. The row id is *deterministic* per (question, user, seq) — the same
+//! shape as [`crate::domain::exam_attempt::ExamAttemptId::composite`] — so "one
+//! drawing per student per question per sitting" holds by construction and a
+//! replace within a sitting is a plain UPSERT, while a retake (`seq + 1`)
+//! accumulates its own rows instead of overwriting. The web layer owns the
+//! blob I/O and its ordering (new blob before row, row before old blob); this
+//! module owns the rows.
 
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use ulid::Ulid;
@@ -25,15 +27,20 @@ use crate::error::AppError;
 pub struct AnswerImageId(RecordId);
 
 impl AnswerImageId {
-    /// The one id a (question, user) pair can have: `{question}_{user}` — the
-    /// same deterministic shape as [`crate::domain::exam_answer::ExamAnswerId::composite`],
-    /// so "one drawing per student per question" needs no index. ULID keys are
-    /// alphanumeric, so `_` is an unambiguous joiner.
-    pub fn composite(question: &ExamQuestionId, user: &UserId) -> Self {
-        Self(RecordId::new(
-            ANSWER_IMAGE_TABLE,
-            format!("{}_{}", question.key(), user.key()),
-        ))
+    /// The one id a (question, user, seq) triple can have — the same
+    /// deterministic shape as [`crate::domain::exam_attempt::ExamAttemptId::composite`],
+    /// so "one drawing per student per question per sitting" needs no index.
+    /// The first sitting keeps the historical `{question}_{user}` shape (rows
+    /// written before per-attempt history existed stay addressable); later
+    /// sittings append their number. ULID keys are alphanumeric, so `_` is an
+    /// unambiguous joiner.
+    pub fn composite(question: &ExamQuestionId, user: &UserId, seq: i64) -> Self {
+        let key = if seq == 1 {
+            format!("{}_{}", question.key(), user.key())
+        } else {
+            format!("{}_{}_{}", question.key(), user.key(), seq)
+        };
+        Self(RecordId::new(ANSWER_IMAGE_TABLE, key))
     }
 
     pub fn record(&self) -> RecordId {
@@ -58,6 +65,9 @@ pub struct AnswerImage {
     exam: ExamId,
     question: ExamQuestionId,
     user: UserId,
+    /// Which sitting this drawing belongs to — 1 for the first attempt,
+    /// counting up, so retakes accumulate instead of overwriting.
+    seq: i64,
     /// The blob's on-disk name — a fresh ULID every upload.
     file: String,
     content_type: FileContentType,
@@ -72,14 +82,16 @@ impl AnswerImage {
         exam: &ExamId,
         question: &ExamQuestionId,
         user: &UserId,
+        seq: i64,
         content_type: FileContentType,
         size: i64,
     ) -> Self {
         Self {
-            id: AnswerImageId::composite(question, user),
+            id: AnswerImageId::composite(question, user, seq),
             exam: exam.clone(),
             question: question.clone(),
             user: user.clone(),
+            seq,
             file: Ulid::new().to_string(),
             content_type,
             size,
@@ -88,6 +100,11 @@ impl AnswerImage {
 
     pub fn get_question(&self) -> &ExamQuestionId {
         &self.question
+    }
+
+    /// Which sitting this drawing belongs to — 1 for the first attempt.
+    pub fn get_seq(&self) -> i64 {
+        self.seq
     }
 
     pub fn get_file(&self) -> &str {
@@ -110,14 +127,15 @@ impl AnswerImage {
         written.ok_or_else(|| AppError::Internal("failed to store answer image".into()))
     }
 
-    /// The student's drawing for one question, if any.
+    /// The student's drawing for one question in one sitting, if any.
     pub async fn read(
         question: &ExamQuestionId,
         user: &UserId,
+        seq: i64,
         db: &Database,
     ) -> Result<Option<AnswerImage>, AppError> {
         Ok(db
-            .select(AnswerImageId::composite(question, user).record())
+            .select(AnswerImageId::composite(question, user, seq).record())
             .await?)
     }
 
@@ -131,21 +149,44 @@ impl AnswerImage {
         Ok(result.take::<Vec<AnswerImage>>(0)?)
     }
 
-    /// One student's answer drawings across an exam — the parallel to
+    /// One student's answer drawings for a single sitting — the parallel to
     /// [`crate::domain::exam_answer::ExamAnswer::list_for_exam_user`], feeding
-    /// the sitting/grading answer-image maps and the retake blob-GC.
+    /// the sitting/grading answer-image maps for that attempt's `seq`.
     pub async fn list_for_exam_user(
         exam: &ExamId,
         user: &UserId,
+        seq: i64,
         db: &Database,
     ) -> Result<Vec<AnswerImage>, AppError> {
         let mut result = db
-            .query("SELECT * FROM answer_image WHERE exam = $ex AND user = $usr")
+            .query("SELECT * FROM answer_image WHERE exam = $ex AND user = $usr AND seq = $seq")
+            .bind(("ex", exam.record()))
+            .bind(("usr", user.record()))
+            .bind(("seq", seq))
+            .await?
+            .check()?;
+        Ok(result.take::<Vec<AnswerImage>>(0)?)
+    }
+
+    /// The distinct sittings (`seq`, ascending) this student has any answer
+    /// drawing for at this exam — the history index behind a per-attempt view.
+    pub async fn list_seqs_for_user(
+        exam: &ExamId,
+        user: &UserId,
+        db: &Database,
+    ) -> Result<Vec<i64>, AppError> {
+        let mut result = db
+            .query(
+                "SELECT VALUE seq FROM answer_image \
+                 WHERE exam = $ex AND user = $usr ORDER BY seq",
+            )
             .bind(("ex", exam.record()))
             .bind(("usr", user.record()))
             .await?
             .check()?;
-        Ok(result.take::<Vec<AnswerImage>>(0)?)
+        let mut seqs = result.take::<Vec<i64>>(0)?;
+        seqs.dedup();
+        Ok(seqs)
     }
 
     /// The blob names behind every answer drawing of every exam of `course` —
@@ -201,40 +242,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_replaces_per_student_and_question() {
+    async fn upsert_replaces_within_a_sitting_but_not_across_them() {
         let db = crate::database::init_mem().await.unwrap();
         let exam = ExamId::generate();
         let question = ExamQuestionId::generate();
         let user = student();
 
-        let first = AnswerImage::new(&exam, &question, &user, png(), 3)
+        let first = AnswerImage::new(&exam, &question, &user, 1, png(), 3)
             .upsert(&db)
             .await
             .unwrap();
-        let second = AnswerImage::new(&exam, &question, &user, png(), 5)
+        let second = AnswerImage::new(&exam, &question, &user, 1, png(), 5)
             .upsert(&db)
             .await
             .unwrap();
-        // Same (question, user), same row — the replace swapped the blob pointer.
+        // Same (question, user, seq), same row — the replace swapped the blob.
         assert_ne!(first.get_file(), second.get_file());
-        let rows = AnswerImage::list_for_exam_user(&exam, &user, &db)
+        let rows = AnswerImage::list_for_exam_user(&exam, &user, 1, &db)
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get_size(), 5);
 
-        // Another student's drawing for the same question is its own row.
+        // A retake (seq 2) accumulates: it is its own row, not an overwrite.
+        AnswerImage::new(&exam, &question, &user, 2, png(), 9)
+            .upsert(&db)
+            .await
+            .unwrap();
+        assert_eq!(
+            AnswerImage::list_for_exam_user(&exam, &user, 1, &db)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the seq-2 image must not overwrite seq-1"
+        );
+        assert_eq!(
+            AnswerImage::list_for_exam_user(&exam, &user, 2, &db)
+                .await
+                .unwrap()[0]
+                .get_size(),
+            9
+        );
+        assert_eq!(
+            AnswerImage::list_seqs_for_user(&exam, &user, &db)
+                .await
+                .unwrap(),
+            vec![1, 2]
+        );
+
+        // Another student's drawing for the same question/sitting is its own row.
         let other = UserId::from_key("01TESTSTUDENTBBBBBBBBBBBBB");
-        AnswerImage::new(&exam, &question, &other, png(), 7)
+        AnswerImage::new(&exam, &question, &other, 1, png(), 7)
             .upsert(&db)
             .await
             .unwrap();
         assert_eq!(
             AnswerImage::list_for_exam(&exam, &db).await.unwrap().len(),
-            2
+            3
         );
         assert!(
-            AnswerImage::read(&question, &user, &db)
+            AnswerImage::read(&question, &user, 2, &db)
                 .await
                 .unwrap()
                 .is_some()
@@ -247,12 +315,12 @@ mod tests {
         let exam_a = ExamId::generate();
         let exam_b = ExamId::generate();
         let user = student();
-        AnswerImage::new(&exam_a, &ExamQuestionId::generate(), &user, png(), 1)
+        AnswerImage::new(&exam_a, &ExamQuestionId::generate(), &user, 1, png(), 1)
             .upsert(&db)
             .await
             .unwrap();
         assert_eq!(
-            AnswerImage::list_for_exam_user(&exam_a, &user, &db)
+            AnswerImage::list_for_exam_user(&exam_a, &user, 1, &db)
                 .await
                 .unwrap()
                 .len(),
@@ -265,12 +333,12 @@ mod tests {
                 .is_empty()
         );
 
-        // delete_for_exam_user clears the student's sheet.
+        // delete_for_exam_user clears the student's sheet across all sittings.
         AnswerImage::delete_for_exam_user(&exam_a, &user, &db)
             .await
             .unwrap();
         assert!(
-            AnswerImage::list_for_exam_user(&exam_a, &user, &db)
+            AnswerImage::list_for_exam_user(&exam_a, &user, 1, &db)
                 .await
                 .unwrap()
                 .is_empty()
