@@ -10,8 +10,7 @@ use utoipa_axum::routes;
 
 use crate::database::Database;
 use crate::domain::message::{
-    Message, MessageBody, MessageId, MessageLabel, MessageSubject, RECIPIENT_FOLDERS,
-    SENDER_FOLDERS,
+    Folder, Message, MessageBody, MessageId, MessageLabel, MessageSubject,
 };
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
@@ -25,10 +24,6 @@ pub fn routes() -> OpenApiRouter<AppState> {
         .routes(routes!(send_message, list))
         .routes(routes!(update_message, delete_message))
 }
-
-/// The folders a message list can show. `inbox` and `archive` hold received
-/// messages, `sent` holds sent ones, `trash` holds both sides' trashed copies.
-const FOLDERS: [&str; 4] = ["inbox", "sent", "archive", "trash"];
 
 #[derive(Deserialize, ToSchema)]
 struct SendMessage {
@@ -50,8 +45,8 @@ struct UpdateMessage {
     /// Mark read (`true`) or unread (`false`). Recipient only.
     read: Option<bool>,
     /// Move the caller's copy: a recipient may file into `inbox`, `archive`,
-    /// or `trash`; a sender into `sent` or `trash`. Restoring from the trash
-    /// is moving back to `inbox`/`sent`.
+    /// or `trash`; a sender into `sent` or `trash`. Restoring is moving back
+    /// to the copy's `previous_folder`.
     #[schema(example = "archive")]
     folder: Option<String>,
 }
@@ -87,6 +82,12 @@ struct MessageResponse {
     read: bool,
     #[schema(example = "inbox")]
     folder: String,
+    /// Where the caller's copy sat before it was filed into `archive`/`trash`
+    /// — `PATCH` `folder` back to this to restore it. `null` whenever the copy
+    /// is not filed away, and on copies filed before this was recorded; both
+    /// mean "restore to `inbox`" (`sent` for the sender's copy).
+    #[schema(example = "inbox")]
+    previous_folder: Option<String>,
 }
 
 /// `PersonRef` plus role, keyed by user id — messages show *who* wrote and
@@ -148,7 +149,10 @@ impl MessageResponse {
             label: message.get_label().map(|label| label.as_str().to_string()),
             sent_at: message.get_sent_at().as_millis(),
             read: message.is_read(),
-            folder: message.folder_of(caller).to_string(),
+            folder: message.folder_of(caller).as_str().to_string(),
+            previous_folder: message
+                .origin_of(caller)
+                .map(|folder| folder.as_str().to_string()),
         }
     }
 }
@@ -231,15 +235,12 @@ async fn list(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<MessageResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let folder = filter.folder.unwrap_or_else(|| "inbox".to_string());
-    if !FOLDERS.contains(&folder.as_str()) {
-        return Err(AppError::Validation(ValidationError::Invalid {
-            field: "folder",
-            reason: "must be one of: inbox, sent, archive, trash",
-        }));
-    }
+    let folder = match filter.folder {
+        Some(ref folder) => Folder::try_new(folder)?,
+        None => Folder::Inbox,
+    };
 
-    let messages = Message::list_folder(user.get_id(), &folder, filter.read, &st.db).await?;
+    let messages = Message::list_folder(user.get_id(), folder, filter.read, &st.db).await?;
     let total = messages.len() as i64;
     let slice = paginate(&messages, limit, offset);
     let people = load_people(slice, &st.db).await?;
@@ -253,7 +254,10 @@ async fn list(
 /// Update the caller's view of a message: flip the read flag (recipient
 /// only) and/or move the caller's copy between folders. Each side files
 /// independently — archiving or trashing never touches the other party's
-/// copy. Omitted fields change nothing.
+/// copy. Filing into `archive`/`trash` records the folder left behind as the
+/// copy's `previous_folder`, so restoring is a move back to that value
+/// (`inbox`, or `sent` for the sender's copy, when it is `null`). Omitted
+/// fields change nothing.
 #[utoipa::path(
     patch,
     path = "/{id}",
@@ -286,23 +290,23 @@ async fn update_message(
             "only the recipient can change the read flag",
         ));
     }
-    if let Some(ref folder) = req.folder {
-        let allowed: &[&str] = if message.is_sender(user.get_id()) {
-            &SENDER_FOLDERS
-        } else {
-            &RECIPIENT_FOLDERS
-        };
-        if !allowed.contains(&folder.as_str()) {
-            return Err(AppError::Validation(ValidationError::Invalid {
-                field: "folder",
-                reason: "not a folder this side of the message can move to",
-            }));
+    let folder = match req.folder {
+        Some(ref folder) => {
+            let folder = Folder::try_new(folder)?;
+            if !Folder::allowed_for(message.is_sender(user.get_id())).contains(&folder) {
+                return Err(AppError::Validation(ValidationError::Invalid {
+                    field: "folder",
+                    reason: "not a folder this side of the message can move to",
+                }));
+            }
+            Some(folder)
         }
-    }
+        None => None,
+    };
     if let Some(read) = req.read {
         message = message.set_read(read, &st.db).await?;
     }
-    if let Some(ref folder) = req.folder {
+    if let Some(folder) = folder {
         message = message.move_to(user.get_id(), folder, &st.db).await?;
     }
 
