@@ -12,6 +12,11 @@ use serde_json::{Value, json};
 /// `http://127.0.0.1:54321`) plus a handle to its database, so a test can grant
 /// roles the same out-of-band way production does.
 async fn spawn_server() -> (String, Database) {
+    spawn_server_with_ai(None).await
+}
+
+/// [`spawn_server`], with the AI bridge the chatbot relays through wired in.
+async fn spawn_server_with_ai(ai: Option<hezarfen_backend::ai::AiBridge>) -> (String, Database) {
     let db = database::init_mem().await.expect("in-memory db");
     let app = build_router(AppState {
         db: db.clone(),
@@ -22,9 +27,10 @@ async fn spawn_server() -> (String, Database) {
         // Every request here comes from 127.0.0.1, so per-IP limits would
         // meter the whole suite as one client. Off; `rate_limit.rs` covers it.
         rate_limit: RateLimitConfig::unlimited(),
+        chat_limit: Default::default(),
         exam_presence: Default::default(),
         db_up: Default::default(),
-        ai: None,
+        ai,
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1806,4 +1812,364 @@ async fn exam_room_open_mode_runs_untimed_and_retakes() {
     assert_eq!(state["attempt"], 2, "{state}");
     assert_eq!(state["answered"], 0, "{state}");
     ws.close(None).await.unwrap();
+}
+
+// --- chatbot SSE ---------------------------------------------------------
+//
+// The full production topology in one process: a browser-shaped HTTP client
+// over real TCP, the backend, a real QUIC bridge, and an AI service dialled in
+// from outside. What is pinned is what an `EventSource` actually observes —
+// `delta`s then a `done` — including for the client that connects *after* the
+// answer already landed, which must not hang waiting for a stream of an event
+// that has been and gone.
+
+use hezarfen_backend::ai::protocol::Response as AiResponse;
+use hezarfen_backend::ai::protocol::{
+    Greeting, Hello, Request as AiRequest, read_frame, write_frame,
+};
+use hezarfen_backend::ai::{AiBridge, BridgeConfig};
+use hezarfen_backend::constant::{AI_ALPN, AI_CHAT_CAPABILITY, AI_PROTOCOL};
+use std::time::Duration;
+
+const AI_TOKEN: &str = "e2e-ai-token";
+
+/// A bridge with a fake `chat.reply` service dialled into it, answering every
+/// turn with `text`. Holding it keeps the registration alive.
+struct ChatService {
+    bridge: AiBridge,
+    _endpoint: quinn::Endpoint,
+    _conn: quinn::Connection,
+    _control: (quinn::SendStream, quinn::RecvStream),
+}
+
+async fn chat_service(text: &str) -> ChatService {
+    let bridge = AiBridge::bind(BridgeConfig {
+        addr: "127.0.0.1:0".parse().unwrap(),
+        token: AI_TOKEN.to_string(),
+        cert_path: None,
+        key_path: None,
+        request_timeout: Duration::from_secs(10),
+    })
+    .await
+    .expect("bridge binds on an ephemeral port");
+
+    // Pin the bridge's own certificate, exactly as a production service does.
+    hezarfen_backend::ai::tls::install_crypto_provider();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(bridge.certificate()).expect("pin the leaf");
+    let mut tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![AI_ALPN.to_vec()];
+    let mut config = quinn::ClientConfig::new(std::sync::Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("QUIC-usable TLS"),
+    ));
+    let mut transport = quinn::TransportConfig::default();
+    // Requests arrive as server-initiated streams.
+    transport.max_concurrent_bidi_streams(64u32.into());
+    config.transport_config(std::sync::Arc::new(transport));
+    let mut endpoint =
+        quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("client bind");
+    endpoint.set_default_client_config(config);
+
+    let conn = endpoint
+        .connect(bridge.local_addr().unwrap(), "localhost")
+        .expect("dial")
+        .await
+        .expect("QUIC handshake");
+    let (mut send, mut recv) = conn.open_bi().await.expect("control stream");
+    write_frame(
+        &mut send,
+        &Hello {
+            protocol: AI_PROTOCOL.to_string(),
+            service: "e2e-tutor".to_string(),
+            capabilities: vec![AI_CHAT_CAPABILITY.to_string()],
+            token: AI_TOKEN.to_string(),
+            max_concurrent: None,
+        },
+    )
+    .await
+    .expect("send Hello");
+    let greeting: Greeting = read_frame(&mut recv).await.expect("read Greeting");
+    assert!(matches!(greeting, Greeting::Welcome { .. }), "{greeting:?}");
+
+    let answer = text.to_string();
+    let serving = conn.clone();
+    tokio::spawn(async move {
+        while let Ok((mut send, mut recv)) = serving.accept_bi().await {
+            let answer = answer.clone();
+            tokio::spawn(async move {
+                let Ok(request) = read_frame::<_, AiRequest>(&mut recv).await else {
+                    return;
+                };
+                let response = AiResponse::Ok {
+                    id: request.id.clone(),
+                    payload: json!({ "text": answer }),
+                };
+                let _ = write_frame(&mut send, &response).await;
+                let _ = send.finish();
+                let _ = send.stopped().await;
+            });
+        }
+    });
+
+    // Registration completes after the welcome is on the wire.
+    for _ in 0..300 {
+        if bridge.has_capability(AI_CHAT_CAPABILITY) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        bridge.has_capability(AI_CHAT_CAPABILITY),
+        "the fake service never registered"
+    );
+
+    ChatService {
+        bridge,
+        _endpoint: endpoint,
+        _conn: conn,
+        _control: (send, recv),
+    }
+}
+
+/// Open a thread and ask one question. Returns (thread id, reserved answer id).
+async fn ask(client: &Client, base: &str) -> (String, String) {
+    let thread: Value = client
+        .post(format!("{base}/chat/conversations"))
+        .json(&json!({ "title": "Fizik" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let conversation = thread["id"].as_str().expect("thread id").to_string();
+
+    let res = client
+        .post(format!("{base}/chat/conversations/{conversation}/messages"))
+        .json(&json!({ "content": "ikinci yasa nedir?" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::ACCEPTED);
+    let receipt: Value = res.json().await.unwrap();
+    assert_eq!(receipt["status"], "pending");
+    let mid = receipt["message_id"]
+        .as_str()
+        .expect("message id")
+        .to_string();
+    (conversation, mid)
+}
+
+/// Read the SSE stream until its terminal event (`done` or `error`), returning
+/// every `(event, data)` pair in arrival order. Bounded: a stream that never
+/// terminates fails the test instead of hanging the suite.
+async fn read_sse_to_end(res: &mut reqwest::Response, within: Duration) -> Vec<(String, Value)> {
+    let deadline = tokio::time::Instant::now() + within;
+    let mut buf = String::new();
+    let mut events = Vec::new();
+    loop {
+        while let Some(end) = buf.find("\n\n") {
+            let frame: String = buf.drain(..end + 2).collect();
+            let Some(name) = frame
+                .lines()
+                .find_map(|line| line.strip_prefix("event:"))
+                .map(|name| name.trim().to_string())
+            else {
+                continue; // a keep-alive comment
+            };
+            let data = frame
+                .lines()
+                .find_map(|line| line.strip_prefix("data:"))
+                .expect("every chat event carries a data line")
+                .trim();
+            let terminal = name == "done" || name == "error";
+            events.push((
+                name,
+                serde_json::from_str(data).expect("event data is json"),
+            ));
+            if terminal {
+                return events;
+            }
+        }
+        let chunk = tokio::time::timeout_at(deadline, res.chunk())
+            .await
+            .expect("the stream terminates before the deadline")
+            .expect("stream stays open")
+            .expect("stream yields data");
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+    }
+}
+
+/// The answer the fake service gives: long enough that the relay cuts it into
+/// several `delta`s rather than emitting it whole.
+fn long_answer() -> String {
+    "kuvvet kutle carpi ivmedir. ".repeat(8)
+}
+
+/// Assert one full chat stream: `delta`s that rejoin into `answer`, then a
+/// `done` carrying the finished message.
+fn assert_deltas_then_done(events: &[(String, Value)], mid: &str, answer: &str) {
+    let (last, deltas) = events.split_last().expect("at least a terminal event");
+    assert!(!deltas.is_empty(), "no delta arrived: {events:?}");
+    assert!(deltas.iter().all(|(name, _)| name == "delta"), "{events:?}");
+    let text: String = deltas
+        .iter()
+        .map(|(_, data)| data["text"].as_str().expect("delta carries text"))
+        .collect();
+    assert_eq!(text, answer, "the deltas must rejoin into the answer");
+
+    assert_eq!(last.0, "done", "{events:?}");
+    let message = &last.1["message"];
+    assert_eq!(message["id"], mid);
+    assert_eq!(message["role"], "assistant");
+    assert_eq!(message["status"], "complete");
+    assert_eq!(message["content"], answer);
+    assert_eq!(message["truncated"], false, "{message}");
+    assert!(message["error_code"].is_null(), "{message}");
+}
+
+/// The SSE `done` payload and the polling read are contractually required to
+/// agree in every state — including about a clipped answer. A frontend that
+/// streams must be able to tell the user the text was cut, and one that polls
+/// must reach the same conclusion about the very same turn.
+#[tokio::test]
+async fn chat_stream_and_poll_agree_that_an_answer_was_truncated() {
+    let cap = hezarfen_backend::constant::DEFAULT_MAX_CHAT_MESSAGE_LEN as usize;
+    let service = chat_service(&"é".repeat(cap + 500)).await;
+    let (base, _db) = spawn_server_with_ai(Some(service.bridge.clone())).await;
+    let ali = client();
+    register(&ali, &base, "ali").await;
+    login(&ali, &base, "ali").await;
+
+    let (conversation, mid) = ask(&ali, &base).await;
+
+    let mut res = ali
+        .get(format!(
+            "{base}/chat/conversations/{conversation}/messages/{mid}/stream"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let events = read_sse_to_end(&mut res, Duration::from_secs(10)).await;
+    let (name, data) = events.last().expect("a terminal event");
+    assert_eq!(name, "done", "{events:?}");
+    let streamed = &data["message"];
+    assert_eq!(streamed["status"], "complete", "{streamed}");
+    assert_eq!(streamed["truncated"], true, "{streamed}");
+    assert_eq!(
+        streamed["content"]
+            .as_str()
+            .expect("content")
+            .chars()
+            .count(),
+        cap
+    );
+
+    // The same row, read the other way: identical verdict, field for field.
+    let polled: Value = ali
+        .get(format!(
+            "{base}/chat/conversations/{conversation}/messages/{mid}"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(&polled, streamed, "the two reads must not disagree");
+}
+
+#[tokio::test]
+async fn chat_stream_delivers_deltas_then_done_over_http() {
+    let answer = long_answer();
+    let service = chat_service(&answer).await;
+    let (base, _db) = spawn_server_with_ai(Some(service.bridge.clone())).await;
+    let ali = client();
+    register(&ali, &base, "ali").await;
+    login(&ali, &base, "ali").await;
+
+    let (conversation, mid) = ask(&ali, &base).await;
+
+    // The client opens the stream while the turn is still in flight; it stays
+    // open until the answer lands, then closes after `done`.
+    let mut res = ali
+        .get(format!(
+            "{base}/chat/conversations/{conversation}/messages/{mid}/stream"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let content_type = res
+        .headers()
+        .get("content-type")
+        .expect("content-type")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "{content_type}"
+    );
+
+    let events = read_sse_to_end(&mut res, Duration::from_secs(10)).await;
+    assert_deltas_then_done(&events, &mid, &answer);
+
+    // The stream is closed after `done` — one stream per turn, not per thread.
+    assert!(
+        res.chunk().await.unwrap().is_none(),
+        "the stream must close after done"
+    );
+}
+
+#[tokio::test]
+async fn chat_stream_replays_an_answer_that_already_landed() {
+    // A client that reconnects late (reload, dropped connection, a second tab)
+    // gets the same delta*+done as one that was watching all along. Nothing is
+    // "missed": the stream reads the row, not a live feed.
+    let answer = long_answer();
+    let service = chat_service(&answer).await;
+    let (base, _db) = spawn_server_with_ai(Some(service.bridge.clone())).await;
+    let ali = client();
+    register(&ali, &base, "ali").await;
+    login(&ali, &base, "ali").await;
+
+    let (conversation, mid) = ask(&ali, &base).await;
+
+    // Wait — by polling, never by sleeping — until the turn has settled, so the
+    // stream below opens strictly after the answer landed.
+    let mut settled = Value::Null;
+    for _ in 0..500 {
+        let turn: Value = ali
+            .get(format!(
+                "{base}/chat/conversations/{conversation}/messages/{mid}"
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if turn["status"] != "pending" {
+            settled = turn;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(settled["status"], "complete", "{settled}");
+    assert_eq!(settled["content"], answer);
+
+    let mut res = ali
+        .get(format!(
+            "{base}/chat/conversations/{conversation}/messages/{mid}/stream"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let events = read_sse_to_end(&mut res, Duration::from_secs(10)).await;
+    assert_deltas_then_done(&events, &mid, &answer);
 }

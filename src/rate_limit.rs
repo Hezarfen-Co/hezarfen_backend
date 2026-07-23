@@ -1,11 +1,14 @@
-//! Per-client-IP rate limiting, hand-rolled on a fixed 60-second window — no
-//! extra crates, no background tasks.
+//! Rate limiting, hand-rolled on a fixed 60-second window — no extra crates,
+//! no background tasks. The counter is keyed generically: by client IP for the
+//! middleware tiers below, by user id for the per-user chatbot tier
+//! ([`UserRateLimiter`]), which cannot be middleware because the caller is only
+//! known once `CurrentUser` has run.
 //!
-//! Two tiers are wired in: a strict one on the credential endpoints
+//! Two IP tiers are wired in: a strict one on the credential endpoints
 //! (`/auth/login`, `/auth/register`) in [`crate::web::auth::routes`] to blunt
 //! brute-force and enumeration attempts, and a generous catch-all over the
-//! whole API in [`crate::build_router`]. Both
-//! are configured per-minute via environment variables (see
+//! whole API in [`crate::build_router`]. Those two, and the per-user chat tier,
+//! are all configured per-minute via environment variables (see
 //! [`crate::config::Config`]); a limit of `0` switches that tier off entirely,
 //! which is also what the test suites use to stay unaffected.
 //!
@@ -22,6 +25,7 @@
 //! sitting; argon2 keeps each allowed login attempt expensive anyway.
 
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -40,7 +44,7 @@ use crate::error::AppError;
 /// swept out on the next check. Keeps memory bounded without a reaper task.
 const PURGE_AT: usize = 10_000;
 
-/// Rate-limit knobs, sourced from the environment (see `.env.example`) and
+/// Per-IP rate-limit knobs, sourced from the environment (see `.env.example`) and
 /// carried in [`crate::state::AppState`]. A `0` limit disables that tier.
 #[derive(Clone, Debug)]
 pub struct RateLimitConfig {
@@ -65,15 +69,16 @@ impl RateLimitConfig {
     }
 }
 
-/// A fixed-window counter per client IP: `max` requests per `window`, shared
+/// A fixed-window counter per caller `K`: `max` requests per `window`, shared
 /// across clones (clones see the same buckets, so one limiter can be captured
 /// by a middleware closure and cloned per request for free).
 #[derive(Clone)]
-pub struct RateLimiter {
+pub struct RateLimiter<K = IpAddr> {
     max: u32,
     window: Duration,
+    /// Only meaningful for the IP tiers; the keyed tiers never look at it.
     trust_proxy: bool,
-    buckets: Arc<Mutex<HashMap<IpAddr, Bucket>>>,
+    buckets: Arc<Mutex<HashMap<K, Bucket>>>,
 }
 
 struct Bucket {
@@ -81,16 +86,41 @@ struct Bucket {
     count: u32,
 }
 
-impl RateLimiter {
+/// The per-user tier, keyed by user record key instead of client IP. Lives in
+/// [`crate::state::AppState`] and is called from inside a handler, after
+/// `CurrentUser` has identified the caller.
+pub type UserRateLimiter = RateLimiter<String>;
+
+impl Default for UserRateLimiter {
+    /// The chatbot tier at its shipped default, for tests and any caller that
+    /// has no [`crate::config::Config`] to hand.
+    fn default() -> Self {
+        Self::per_user_minute(crate::config::DEFAULT_CHAT_RATE_LIMIT)
+    }
+}
+
+impl UserRateLimiter {
+    /// The chatbot tier: `max` messages per user per minute, from
+    /// `RATE_LIMIT_CHAT_PER_MINUTE`. `max == 0` disables it, like the IP tiers.
+    pub fn per_user_minute(max: u32) -> Self {
+        Self::new(max, false)
+    }
+
+    /// Count one message from `user_id`, answering `429` with a `Retry-After`
+    /// once the user is over the cap. The handler-side twin of [`RateLimiter::enforce`].
+    pub fn enforce_user(&self, user_id: &str) -> Result<(), AppError> {
+        self.check(user_id.to_string()).map_err(|retry_after_secs| {
+            tracing::warn!(%user_id, retry_after_secs, "per-user rate limit exceeded");
+            AppError::TooManyRequests { retry_after_secs }
+        })
+    }
+}
+
+impl RateLimiter<IpAddr> {
     /// A limiter allowing `max` requests per fixed one-minute window. `max == 0`
     /// means disabled: every check passes and nothing is recorded.
     pub fn per_minute(max: u32, trust_proxy: bool) -> Self {
-        Self {
-            max,
-            window: Duration::from_secs(60),
-            trust_proxy,
-            buckets: Arc::new(Mutex::new(HashMap::new())),
-        }
+        Self::new(max, trust_proxy)
     }
 
     /// Axum middleware entry point: identify the caller, count the request,
@@ -105,10 +135,22 @@ impl RateLimiter {
             }
         }
     }
+}
 
-    /// Count one request from `ip`. `Err` carries the whole seconds (rounded
+impl<K: Eq + Hash> RateLimiter<K> {
+    /// A limiter allowing `max` requests per fixed one-minute window.
+    fn new(max: u32, trust_proxy: bool) -> Self {
+        Self {
+            max,
+            window: Duration::from_secs(60),
+            trust_proxy,
+            buckets: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Count one request from `key`. `Err` carries the whole seconds (rounded
     /// up, at least 1) until the window resets — the `Retry-After` value.
-    fn check(&self, ip: IpAddr) -> Result<(), u64> {
+    fn check(&self, key: K) -> Result<(), u64> {
         if self.max == 0 {
             return Ok(());
         }
@@ -120,7 +162,7 @@ impl RateLimiter {
             buckets.retain(|_, b| now.duration_since(b.window_start) < self.window);
         }
 
-        let bucket = buckets.entry(ip).or_insert(Bucket {
+        let bucket = buckets.entry(key).or_insert(Bucket {
             window_start: now,
             count: 0,
         });
@@ -297,6 +339,29 @@ mod tests {
         assert!(limiter.check(ip(1)).is_ok());
         assert!(limiter.check(ip(1)).is_err());
         assert!(limiter.check(ip(2)).is_ok());
+    }
+
+    /// The keyed tier the chatbot handler calls: users are metered
+    /// independently, refused past the cap, and freed again a minute later.
+    #[tokio::test(start_paused = true)]
+    async fn users_get_independent_windows_that_reset() {
+        let limiter = UserRateLimiter::default();
+        for _ in 0..crate::config::DEFAULT_CHAT_RATE_LIMIT {
+            assert!(limiter.enforce_user("user:a").is_ok());
+        }
+        assert!(matches!(
+            limiter.enforce_user("user:a"),
+            Err(AppError::TooManyRequests {
+                retry_after_secs: 60
+            })
+        ));
+        assert!(
+            limiter.enforce_user("user:b").is_ok(),
+            "another user must not inherit a's window"
+        );
+
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert!(limiter.enforce_user("user:a").is_ok());
     }
 
     #[tokio::test(start_paused = true)]

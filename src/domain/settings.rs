@@ -14,9 +14,12 @@
 use surrealdb::types::{RecordId, SurrealValue};
 
 use crate::constant::{
-    DEFAULT_ATTENDANCE_STATUSES, DEFAULT_EXAM_KINDS, DEFAULT_MAX_FILE_BYTES, MAX_EXAM_KIND_WEIGHT,
-    MAX_GRADE_BANDS, MAX_GRADE_LABEL_LEN, MAX_MARK, MAX_MAX_FILE_BYTES, MAX_SETTINGS_ITEM_LEN,
-    MAX_SETTINGS_LIST_LEN, MIN_EXAM_KIND_WEIGHT, MIN_MARK, MIN_MAX_FILE_BYTES,
+    DEFAULT_ATTENDANCE_STATUSES, DEFAULT_CHAT_HISTORY_TURNS, DEFAULT_EXAM_KINDS,
+    DEFAULT_MAX_CHAT_CONVERSATIONS, DEFAULT_MAX_CHAT_MESSAGE_LEN, DEFAULT_MAX_FILE_BYTES,
+    MAX_CHAT_HISTORY_TURNS, MAX_EXAM_KIND_WEIGHT, MAX_GRADE_BANDS, MAX_GRADE_LABEL_LEN, MAX_MARK,
+    MAX_MAX_CHAT_CONVERSATIONS, MAX_MAX_CHAT_MESSAGE_LEN, MAX_MAX_FILE_BYTES,
+    MAX_SETTINGS_ITEM_LEN, MAX_SETTINGS_LIST_LEN, MIN_CHAT_HISTORY_TURNS, MIN_EXAM_KIND_WEIGHT,
+    MIN_MARK, MIN_MAX_CHAT_CONVERSATIONS, MIN_MAX_CHAT_MESSAGE_LEN, MIN_MAX_FILE_BYTES,
 };
 use crate::database::{Database, SETTINGS_TABLE};
 use crate::error::{AppError, ValidationError};
@@ -114,6 +117,24 @@ pub struct Settings {
     /// Per-file byte cap for note uploads. `None` = the row predates the
     /// field (or the defaults) — reads as `DEFAULT_MAX_FILE_BYTES`.
     max_file_bytes: Option<i64>,
+    /// Chatbot knobs, `None`-while-unset exactly like `max_file_bytes`.
+    chat_history_turns: Option<i64>,
+    max_chat_conversations: Option<i64>,
+    max_chat_message_len: Option<i64>,
+}
+
+/// Everything [`Settings::try_new`] validates, in one struct — the knobs
+/// outgrew a readable argument list. Take a resolved snapshot with
+/// [`Settings::params`] and overwrite only the fields being changed; that is
+/// exactly what `PATCH /settings` merges.
+pub struct SettingsParams {
+    pub exam_kinds: Vec<ExamKindDef>,
+    pub attendance_statuses: Vec<String>,
+    pub grade_bands: Vec<GradeBand>,
+    pub max_file_bytes: i64,
+    pub chat_history_turns: i64,
+    pub max_chat_conversations: i64,
+    pub max_chat_message_len: i64,
 }
 
 impl Settings {
@@ -135,6 +156,23 @@ impl Settings {
             attendance_statuses: DEFAULT_ATTENDANCE_STATUSES.map(String::from).to_vec(),
             grade_bands: Vec::new(),
             max_file_bytes: None,
+            chat_history_turns: None,
+            max_chat_conversations: None,
+            max_chat_message_len: None,
+        }
+    }
+
+    /// This policy as editable parameters, every optional knob resolved to the
+    /// value it currently reads as.
+    pub fn params(&self) -> SettingsParams {
+        SettingsParams {
+            exam_kinds: self.exam_kinds.clone(),
+            attendance_statuses: self.attendance_statuses.clone(),
+            grade_bands: self.grade_bands.clone(),
+            max_file_bytes: self.get_max_file_bytes(),
+            chat_history_turns: self.get_chat_history_turns(),
+            max_chat_conversations: self.get_max_chat_conversations(),
+            max_chat_message_len: self.get_max_chat_message_len(),
         }
     }
 
@@ -145,19 +183,41 @@ impl Settings {
     /// display), otherwise their mins are unique and one band must start at 0
     /// so every mark maps to a label. The upload cap must sit inside the
     /// server's hard bounds — the ceiling protects memory and disk, whatever
-    /// the school would prefer.
-    pub fn try_new(
-        exam_kinds: Vec<ExamKindDef>,
-        attendance_statuses: Vec<String>,
-        grade_bands: Vec<GradeBand>,
-        max_file_bytes: i64,
-    ) -> Result<Self, ValidationError> {
-        if !(MIN_MAX_FILE_BYTES..=MAX_MAX_FILE_BYTES).contains(&max_file_bytes) {
-            return Err(ValidationError::Invalid {
-                field: "max_file_bytes",
-                reason: "must be between 1024 (1 KiB) and 26214400 (25 MiB)",
-            });
-        }
+    /// the school would prefer, and the same holds for the chatbot knobs.
+    pub fn try_new(params: SettingsParams) -> Result<Self, ValidationError> {
+        let SettingsParams {
+            exam_kinds,
+            attendance_statuses,
+            grade_bands,
+            max_file_bytes,
+            chat_history_turns,
+            max_chat_conversations,
+            max_chat_message_len,
+        } = params;
+        in_range(
+            "max_file_bytes",
+            max_file_bytes,
+            MIN_MAX_FILE_BYTES..=MAX_MAX_FILE_BYTES,
+            "must be between 1024 (1 KiB) and 26214400 (25 MiB)",
+        )?;
+        in_range(
+            "chat_history_turns",
+            chat_history_turns,
+            MIN_CHAT_HISTORY_TURNS..=MAX_CHAT_HISTORY_TURNS,
+            "must be between 1 and 50",
+        )?;
+        in_range(
+            "max_chat_conversations",
+            max_chat_conversations,
+            MIN_MAX_CHAT_CONVERSATIONS..=MAX_MAX_CHAT_CONVERSATIONS,
+            "must be between 1 and 500",
+        )?;
+        in_range(
+            "max_chat_message_len",
+            max_chat_message_len,
+            MIN_MAX_CHAT_MESSAGE_LEN..=MAX_MAX_CHAT_MESSAGE_LEN,
+            "must be between 100 and 8000 characters",
+        )?;
         // Per-entry rules (name shape, weight range) hold structurally on any
         // `ExamKindDef`; here only the list-level rules need checking.
         let names: Vec<String> = exam_kinds
@@ -207,6 +267,9 @@ impl Settings {
             attendance_statuses,
             grade_bands,
             max_file_bytes: Some(max_file_bytes),
+            chat_history_turns: Some(chat_history_turns),
+            max_chat_conversations: Some(max_chat_conversations),
+            max_chat_message_len: Some(max_chat_message_len),
         })
     }
 
@@ -237,6 +300,27 @@ impl Settings {
     /// school never set one (including rows saved before the field existed).
     pub fn get_max_file_bytes(&self) -> i64 {
         self.max_file_bytes.unwrap_or(DEFAULT_MAX_FILE_BYTES)
+    }
+
+    /// How many prior conversation turns ride along as context on an AI
+    /// request; the built-in default while the school never set one.
+    pub fn get_chat_history_turns(&self) -> i64 {
+        self.chat_history_turns
+            .unwrap_or(DEFAULT_CHAT_HISTORY_TURNS)
+    }
+
+    /// How many conversations one user may keep; the built-in default while
+    /// the school never set one.
+    pub fn get_max_chat_conversations(&self) -> i64 {
+        self.max_chat_conversations
+            .unwrap_or(DEFAULT_MAX_CHAT_CONVERSATIONS)
+    }
+
+    /// Character cap on one chat message; the built-in default while the
+    /// school never set one.
+    pub fn get_max_chat_message_len(&self) -> i64 {
+        self.max_chat_message_len
+            .unwrap_or(DEFAULT_MAX_CHAT_MESSAGE_LEN)
     }
 
     /// The label of the band `mark` falls into: the band with the greatest
@@ -289,7 +373,10 @@ impl Settings {
                      WHERE exam_kinds = $ek
                        AND attendance_statuses = $st
                        AND grade_bands = $gb
-                       AND max_file_bytes = $mf;
+                       AND max_file_bytes = $mf
+                       AND chat_history_turns = $ct
+                       AND max_chat_conversations = $cc
+                       AND max_chat_message_len = $cl;
                  COMMIT TRANSACTION;",
             )
             .bind(("expected", expected.clone()))
@@ -299,11 +386,29 @@ impl Settings {
             .bind(("st", expected.attendance_statuses.clone()))
             .bind(("gb", expected.grade_bands.clone()))
             .bind(("mf", expected.max_file_bytes))
+            .bind(("ct", expected.chat_history_turns))
+            .bind(("cc", expected.max_chat_conversations))
+            .bind(("cl", expected.max_chat_message_len))
             .await?
             .check()?;
         // Statement slots count BEGIN too: the guarded UPDATE is slot 2. An
         // empty slot means the row no longer matched `expected`.
         Ok(result.take::<Vec<Settings>>(2)?.into_iter().next())
+    }
+}
+
+/// Shared bounds check for the numeric knobs (upload cap, chatbot limits):
+/// each is held to a server-defined inclusive range.
+fn in_range(
+    field: &'static str,
+    value: i64,
+    range: std::ops::RangeInclusive<i64>,
+    reason: &'static str,
+) -> Result<(), ValidationError> {
+    if range.contains(&value) {
+        Ok(())
+    } else {
+        Err(ValidationError::Invalid { field, reason })
     }
 }
 
@@ -345,6 +450,7 @@ fn validate_list(field: &'static str, values: Vec<String>) -> Result<Vec<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constant::MAX_CHAT_MESSAGE_LEN;
 
     fn kinds(list: &[&str]) -> Vec<ExamKindDef> {
         list.iter()
@@ -360,6 +466,12 @@ mod tests {
             .collect()
     }
 
+    /// The defaults as tweakable params — every site below overrides only the
+    /// fields it is testing (`..params()`).
+    fn params() -> SettingsParams {
+        Settings::defaults().params()
+    }
+
     fn bands(list: &[(i64, &str)]) -> Vec<GradeBand> {
         list.iter()
             .map(|(min, label)| GradeBand::try_new(*min, label).unwrap())
@@ -369,13 +481,7 @@ mod tests {
     #[tokio::test]
     async fn defaults_are_a_valid_policy() {
         let defaults = Settings::defaults();
-        let rebuilt = Settings::try_new(
-            defaults.get_exam_kinds().to_vec(),
-            defaults.get_attendance_statuses().to_vec(),
-            defaults.get_grade_bands().to_vec(),
-            defaults.get_max_file_bytes(),
-        )
-        .unwrap();
+        let rebuilt = Settings::try_new(defaults.params()).unwrap();
         assert_eq!(rebuilt.get_exam_kinds(), defaults.get_exam_kinds());
         assert!(defaults.get_grade_bands().is_empty());
     }
@@ -404,46 +510,32 @@ mod tests {
 
     #[tokio::test]
     async fn lists_are_bounded_and_deduped() {
-        let statuses = Settings::defaults().get_attendance_statuses().to_vec();
-        let s = Settings::try_new(
-            kinds(&["lab", "quiz"]),
-            statuses.clone(),
-            vec![],
-            DEFAULT_MAX_FILE_BYTES,
-        )
-        .unwrap();
+        let with_kinds = |exam_kinds| {
+            Settings::try_new(SettingsParams {
+                exam_kinds,
+                ..params()
+            })
+        };
+        let s = with_kinds(kinds(&["lab", "quiz"])).unwrap();
         assert_eq!(names(&s), ["lab", "quiz"]);
         // Empty list and case-insensitive duplicate names are rejected.
-        assert!(
-            Settings::try_new(vec![], statuses.clone(), vec![], DEFAULT_MAX_FILE_BYTES).is_err()
-        );
-        assert!(
-            Settings::try_new(
-                kinds(&["Lab", "lab"]),
-                statuses.clone(),
-                vec![],
-                DEFAULT_MAX_FILE_BYTES
-            )
-            .is_err()
-        );
+        assert!(with_kinds(vec![]).is_err());
+        assert!(with_kinds(kinds(&["Lab", "lab"])).is_err());
         let too_many: Vec<ExamKindDef> = (0..21)
             .map(|i| ExamKindDef::try_new(&format!("kind{i}"), 1).unwrap())
             .collect();
-        assert!(Settings::try_new(too_many, statuses, vec![], DEFAULT_MAX_FILE_BYTES).is_err());
+        assert!(with_kinds(too_many).is_err());
     }
 
     #[tokio::test]
     async fn kind_weights_resolve_by_exact_name() {
-        let statuses = Settings::defaults().get_attendance_statuses().to_vec();
-        let s = Settings::try_new(
-            vec![
+        let s = Settings::try_new(SettingsParams {
+            exam_kinds: vec![
                 ExamKindDef::try_new("midterm", 2).unwrap(),
                 ExamKindDef::try_new("final", 3).unwrap(),
             ],
-            statuses,
-            vec![],
-            DEFAULT_MAX_FILE_BYTES,
-        )
+            ..params()
+        })
         .unwrap();
         assert_eq!(s.exam_kind_weight("final"), Some(3));
         assert_eq!(s.exam_kind_weight("midterm"), Some(2));
@@ -454,16 +546,20 @@ mod tests {
 
     #[tokio::test]
     async fn core_attendance_statuses_are_mandatory() {
-        let kinds = Settings::defaults().get_exam_kinds().to_vec();
+        let with_statuses = |attendance_statuses| {
+            Settings::try_new(SettingsParams {
+                attendance_statuses,
+                ..params()
+            })
+        };
         // Extras on top of the core are fine.
-        let extended = statuses_with(&["online"]);
-        assert!(Settings::try_new(kinds.clone(), extended, vec![], DEFAULT_MAX_FILE_BYTES).is_ok());
+        assert!(with_statuses(statuses_with(&["online"])).is_ok());
         // Dropping any core status is not.
         let missing: Vec<String> = statuses_with(&[])
             .into_iter()
             .filter(|s| s != "late")
             .collect();
-        assert!(Settings::try_new(kinds, missing, vec![], DEFAULT_MAX_FILE_BYTES).is_err());
+        assert!(with_statuses(missing).is_err());
     }
 
     fn statuses_with(extra: &[&str]) -> Vec<String> {
@@ -483,14 +579,11 @@ mod tests {
         assert!(GradeBand::try_new(50, &"x".repeat(21)).is_err());
         assert_eq!(GradeBand::try_new(50, "  CC ").unwrap().get_label(), "CC");
 
-        let defaults = Settings::defaults();
-        let ok = |b: Vec<GradeBand>| {
-            Settings::try_new(
-                defaults.get_exam_kinds().to_vec(),
-                defaults.get_attendance_statuses().to_vec(),
-                b,
-                DEFAULT_MAX_FILE_BYTES,
-            )
+        let ok = |grade_bands| {
+            Settings::try_new(SettingsParams {
+                grade_bands,
+                ..params()
+            })
         };
         // Empty = numeric-only display.
         assert!(ok(vec![]).is_ok());
@@ -503,14 +596,11 @@ mod tests {
 
     #[tokio::test]
     async fn max_file_bytes_is_bounded() {
-        let defaults = Settings::defaults();
-        let with_cap = |cap: i64| {
-            Settings::try_new(
-                defaults.get_exam_kinds().to_vec(),
-                defaults.get_attendance_statuses().to_vec(),
-                vec![],
-                cap,
-            )
+        let with_cap = |max_file_bytes| {
+            Settings::try_new(SettingsParams {
+                max_file_bytes,
+                ..params()
+            })
         };
         for cap in [
             MIN_MAX_FILE_BYTES,
@@ -526,20 +616,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_row_predating_max_file_bytes_reads_the_default() {
+    async fn chat_knobs_are_bounded() {
+        // Each knob is held to its own inclusive range; the edges are legal.
+        let turns = |chat_history_turns| {
+            Settings::try_new(SettingsParams {
+                chat_history_turns,
+                ..params()
+            })
+        };
+        assert_eq!(
+            turns(MAX_CHAT_HISTORY_TURNS)
+                .unwrap()
+                .get_chat_history_turns(),
+            MAX_CHAT_HISTORY_TURNS
+        );
+        assert!(turns(MIN_CHAT_HISTORY_TURNS).is_ok());
+        assert!(turns(0).is_err());
+        assert!(turns(MAX_CHAT_HISTORY_TURNS + 1).is_err());
+
+        let convos = |max_chat_conversations| {
+            Settings::try_new(SettingsParams {
+                max_chat_conversations,
+                ..params()
+            })
+        };
+        assert_eq!(
+            convos(7).unwrap().get_max_chat_conversations(),
+            7,
+            "an in-range cap survives validation"
+        );
+        assert!(convos(MIN_MAX_CHAT_CONVERSATIONS).is_ok());
+        assert!(convos(MAX_MAX_CHAT_CONVERSATIONS).is_ok());
+        assert!(convos(0).is_err());
+        assert!(convos(MAX_MAX_CHAT_CONVERSATIONS + 1).is_err());
+
+        let len = |max_chat_message_len| {
+            Settings::try_new(SettingsParams {
+                max_chat_message_len,
+                ..params()
+            })
+        };
+        assert!(len(MIN_MAX_CHAT_MESSAGE_LEN).is_ok());
+        assert!(len(MAX_MAX_CHAT_MESSAGE_LEN).is_ok());
+        assert!(len(MIN_MAX_CHAT_MESSAGE_LEN - 1).is_err());
+        // The ceiling is the newtype's hard cap: no school can raise it.
+        assert!(len(MAX_CHAT_MESSAGE_LEN as i64 + 1).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_row_predating_the_optional_knobs_reads_the_defaults() {
         let db = crate::database::init_mem().await.unwrap();
-        // The defaults carry no explicit cap, so this writes a row without the
-        // field — exactly what a volume from before the field looks like.
+        // The defaults carry no explicit knobs, so this writes a row without
+        // those fields — exactly what a volume from before them looks like.
         Settings::defaults().save(&db).await.unwrap();
         let loaded = Settings::load(&db).await.unwrap();
         assert_eq!(loaded.get_max_file_bytes(), DEFAULT_MAX_FILE_BYTES);
+        assert_eq!(loaded.get_chat_history_turns(), DEFAULT_CHAT_HISTORY_TURNS);
+        assert_eq!(
+            loaded.get_max_chat_conversations(),
+            DEFAULT_MAX_CHAT_CONVERSATIONS
+        );
+        assert_eq!(
+            loaded.get_max_chat_message_len(),
+            DEFAULT_MAX_CHAT_MESSAGE_LEN
+        );
         // And a snapshot of that old row still passes the compare-and-set.
-        let saved = Settings::try_new(
-            loaded.get_exam_kinds().to_vec(),
-            loaded.get_attendance_statuses().to_vec(),
-            vec![],
-            4096,
-        )
+        let saved = Settings::try_new(SettingsParams {
+            max_file_bytes: 4096,
+            ..loaded.params()
+        })
         .unwrap()
         .save_if_unchanged(&loaded, &db)
         .await
@@ -559,13 +704,13 @@ mod tests {
         );
         // Save a custom policy and read it back — bands (nested objects under
         // a FLEXIBLE field) must survive the trip.
-        let statuses = Settings::defaults().get_attendance_statuses().to_vec();
-        Settings::try_new(
-            kinds(&["lab"]),
-            statuses.clone(),
-            bands(&[(0, "F"), (50, "P")]),
-            2048,
-        )
+        Settings::try_new(SettingsParams {
+            exam_kinds: kinds(&["lab"]),
+            grade_bands: bands(&[(0, "F"), (50, "P")]),
+            max_file_bytes: 2048,
+            chat_history_turns: 3,
+            ..params()
+        })
         .unwrap()
         .save(&db)
         .await
@@ -575,12 +720,16 @@ mod tests {
         assert_eq!(loaded.get_grade_bands().len(), 2);
         assert_eq!(loaded.grade_label(60.0), Some("P"));
         assert_eq!(loaded.get_max_file_bytes(), 2048);
+        assert_eq!(loaded.get_chat_history_turns(), 3);
         // A second save lands on the same singleton row, not a new one.
-        Settings::try_new(kinds(&["quiz"]), statuses, vec![], DEFAULT_MAX_FILE_BYTES)
-            .unwrap()
-            .save(&db)
-            .await
-            .unwrap();
+        Settings::try_new(SettingsParams {
+            exam_kinds: kinds(&["quiz"]),
+            ..params()
+        })
+        .unwrap()
+        .save(&db)
+        .await
+        .unwrap();
         let mut result = db.query("SELECT * FROM settings").await.unwrap();
         let rows: Vec<Settings> = result.take(0).unwrap();
         assert_eq!(rows.len(), 1);
@@ -590,17 +739,14 @@ mod tests {
     #[tokio::test]
     async fn a_stale_snapshot_cannot_revert_a_newer_policy() {
         let db = crate::database::init_mem().await.unwrap();
-        let statuses = Settings::defaults().get_attendance_statuses().to_vec();
 
         // Editor A snapshots the policy (the defaults — no row yet)...
         let stale = Settings::load(&db).await.unwrap();
         // ...then editor B lands a new exam-kind list first.
-        Settings::try_new(
-            kinds(&["lab"]),
-            statuses.clone(),
-            vec![],
-            DEFAULT_MAX_FILE_BYTES,
-        )
+        Settings::try_new(SettingsParams {
+            exam_kinds: kinds(&["lab"]),
+            ..params()
+        })
         .unwrap()
         .save(&db)
         .await
@@ -609,12 +755,10 @@ mod tests {
         // A's merge over the stale snapshot (kinds kept "as loaded", bands
         // changed) — exactly what a concurrent PATCH /settings computes —
         // must be refused, not applied.
-        let refused = Settings::try_new(
-            stale.get_exam_kinds().to_vec(),
-            stale.get_attendance_statuses().to_vec(),
-            bands(&[(0, "F"), (50, "P")]),
-            stale.get_max_file_bytes(),
-        )
+        let refused = Settings::try_new(SettingsParams {
+            grade_bands: bands(&[(0, "F"), (50, "P")]),
+            ..stale.params()
+        })
         .unwrap()
         .save_if_unchanged(&stale, &db)
         .await
@@ -632,12 +776,10 @@ mod tests {
 
         // A's retry — reload, re-merge, save again — lands both edits.
         let fresh = Settings::load(&db).await.unwrap();
-        let saved = Settings::try_new(
-            fresh.get_exam_kinds().to_vec(),
-            fresh.get_attendance_statuses().to_vec(),
-            bands(&[(0, "F"), (50, "P")]),
-            fresh.get_max_file_bytes(),
-        )
+        let saved = Settings::try_new(SettingsParams {
+            grade_bands: bands(&[(0, "F"), (50, "P")]),
+            ..fresh.params()
+        })
         .unwrap()
         .save_if_unchanged(&fresh, &db)
         .await
@@ -653,12 +795,10 @@ mod tests {
         // No row yet: `load` reports the defaults, and a save conditioned on
         // that snapshot must apply (seeding the singleton on the way).
         let current = Settings::load(&db).await.unwrap();
-        let saved = Settings::try_new(
-            kinds(&["lab"]),
-            current.get_attendance_statuses().to_vec(),
-            vec![],
-            current.get_max_file_bytes(),
-        )
+        let saved = Settings::try_new(SettingsParams {
+            exam_kinds: kinds(&["lab"]),
+            ..current.params()
+        })
         .unwrap()
         .save_if_unchanged(&current, &db)
         .await
@@ -672,13 +812,10 @@ mod tests {
 
     #[tokio::test]
     async fn grade_label_picks_the_greatest_min_at_or_below() {
-        let defaults = Settings::defaults();
-        let s = Settings::try_new(
-            defaults.get_exam_kinds().to_vec(),
-            defaults.get_attendance_statuses().to_vec(),
-            bands(&[(0, "FF"), (50, "CC"), (85, "AA")]),
-            DEFAULT_MAX_FILE_BYTES,
-        )
+        let s = Settings::try_new(SettingsParams {
+            grade_bands: bands(&[(0, "FF"), (50, "CC"), (85, "AA")]),
+            ..params()
+        })
         .unwrap();
         assert_eq!(s.grade_label(0.0), Some("FF"));
         assert_eq!(s.grade_label(49.9), Some("FF"));

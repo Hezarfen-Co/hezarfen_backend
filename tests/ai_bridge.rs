@@ -7,6 +7,8 @@
 //! or timeout shows up here rather than the first time a Python service dials
 //! in.
 
+mod common;
+
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -125,6 +127,8 @@ enum Behaviour {
     Echo,
     /// Answer after a delay — a slow model.
     SlowEcho(Duration),
+    /// Answer a chatbot turn with a fixed reply text (`{"text": ...}`).
+    Reply(String),
     /// Answer with a handled failure.
     Fail { code: String, message: String },
     /// Accept the stream and never answer, holding it open.
@@ -176,6 +180,10 @@ fn serve(conn: quinn::Connection, behaviour: Behaviour, seen: Arc<Mutex<Vec<Requ
                         barrier.wait().await;
                         Some(echo(&request))
                     }
+                    Behaviour::Reply(text) => Some(Response::Ok {
+                        id: request.id.clone(),
+                        payload: json!({ "text": text }),
+                    }),
                     Behaviour::Fail { code, message } => Some(Response::Err {
                         id: request.id.clone(),
                         code,
@@ -797,6 +805,7 @@ async fn fetch_certificate(ai: Option<AiBridge>) -> (axum::http::StatusCode, Val
         files_path: std::env::temp_dir(),
         cookie_secure: false,
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
+        chat_limit: Default::default(),
         exam_presence: Default::default(),
         db_up: Default::default(),
         ai,
@@ -904,4 +913,251 @@ async fn a_regenerated_certificate_is_republished() {
 #[allow(dead_code)]
 fn payloads_are_opaque(v: Value) -> Value {
     v
+}
+
+// ------------------------------------------------------------- chat relay --
+//
+// The chatbot end to end: a real HTTP handler, a real QUIC round trip, and a
+// fake service standing in for the model. These pin the `chat.reply` payload
+// contract another language implements against, and the rule that a turn
+// always settles — whatever the service answers.
+
+use axum::Router;
+use axum::http::StatusCode;
+use hezarfen_backend::constant::{AI_CHAT_CAPABILITY, DEFAULT_MAX_CHAT_MESSAGE_LEN};
+use hezarfen_backend::database::Database;
+use surrealdb::types::RecordId;
+
+/// A router wired to `bridge`, plus a handle to its in-memory database.
+async fn chat_app(bridge: &AiBridge) -> (Router, Database) {
+    let db = hezarfen_backend::database::init_mem()
+        .await
+        .expect("mem db");
+    let app = hezarfen_backend::build_router(hezarfen_backend::state::AppState {
+        db: db.clone(),
+        files_path: common::files_dir(),
+        cookie_secure: false,
+        rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
+        chat_limit: Default::default(),
+        exam_presence: Default::default(),
+        db_up: Default::default(),
+        ai: Some(bridge.clone()),
+    });
+    (app, db)
+}
+
+/// Register, log in, and open one thread. Returns (session cookie, thread id).
+async fn chat_user(app: &Router, name: &str) -> (String, String) {
+    let cookie = common::login(app, name).await;
+    let res = common::send(
+        app,
+        "POST",
+        "/chat/conversations",
+        Some(&cookie),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let id = common::id_of(&res.body);
+    (cookie, id)
+}
+
+/// Ask one question (asserts `202`) and return the reserved assistant row's id.
+async fn ask(app: &Router, cookie: &str, conversation: &str, text: &str) -> String {
+    let res = common::send(
+        app,
+        "POST",
+        &format!("/chat/conversations/{conversation}/messages"),
+        Some(cookie),
+        Some(json!({ "content": text })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::ACCEPTED, "{}", res.body);
+    assert_eq!(res.body["status"], "pending");
+    res.body["message_id"]
+        .as_str()
+        .expect("message_id")
+        .to_string()
+}
+
+/// Poll a turn until it leaves `pending`. Bounded polling rather than a sleep
+/// sized to the answering task: the round trip settles when it settles.
+async fn settled(app: &Router, cookie: &str, conversation: &str, mid: &str) -> Value {
+    for _ in 0..500 {
+        let res = common::send(
+            app,
+            "GET",
+            &format!("/chat/conversations/{conversation}/messages/{mid}"),
+            Some(cookie),
+            None,
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+        if res.body["status"] != "pending" {
+            return res.body;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the turn never settled");
+}
+
+#[tokio::test]
+async fn a_chat_turn_settles_complete_with_the_services_text() {
+    let bridge = bridge().await;
+    let service = connect_service(
+        &bridge,
+        hello("tutor", &[AI_CHAT_CAPABILITY]),
+        Behaviour::Reply("F = ma".into()),
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (app, _db) = chat_app(&bridge).await;
+    let (cookie, conversation) = chat_user(&app, "ali").await;
+
+    let mid = ask(&app, &cookie, &conversation, "ikinci yasa nedir?").await;
+    let turn = settled(&app, &cookie, &conversation, &mid).await;
+    assert_eq!(turn["status"], "complete", "{turn}");
+    assert_eq!(turn["content"], "F = ma");
+    assert_eq!(turn["role"], "assistant");
+    assert_eq!(turn["truncated"], false, "an answer that fit was not cut");
+    assert!(turn["error_code"].is_null(), "{turn}");
+    assert!(turn["completed_at"].is_i64(), "{turn}");
+
+    // The prompt reached the service verbatim, under the documented capability,
+    // and a first turn carries no history.
+    let seen = service.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].capability, AI_CHAT_CAPABILITY);
+    assert_eq!(seen[0].payload["message"], "ikinci yasa nedir?");
+    assert_eq!(seen[0].payload["history"], json!([]));
+}
+
+#[tokio::test]
+async fn the_history_a_service_receives_is_oldest_first_without_the_new_turn() {
+    // The contract a service in any language implements against: `history` is
+    // the tail *before* this turn, oldest first, settled turns only — and the
+    // new prompt rides in `message` alone, never duplicated into the history.
+    //
+    // The prior turn goes through the real API — both of its rows land in the
+    // same millisecond, so this also pins the ordering tie-break. Only the
+    // never-answered row is seeded: nothing in the API leaves one behind.
+    let bridge = bridge().await;
+    let service = connect_service(
+        &bridge,
+        hello("tutor", &[AI_CHAT_CAPABILITY]),
+        Behaviour::Reply("birinci cevap".into()),
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (app, db) = chat_app(&bridge).await;
+    let (cookie, conversation) = chat_user(&app, "ali").await;
+    let user = common::me_id(&app, &cookie).await;
+
+    let first = ask(&app, &cookie, &conversation, "birinci soru").await;
+    assert_eq!(
+        settled(&app, &cookie, &conversation, &first).await["status"],
+        "complete"
+    );
+
+    db.query(
+        "CREATE chat_message:h3 SET conversation_id = $conv, user_id = $usr, role = 'assistant',
+             content = '', status = 'pending', created_at = 1002;",
+    )
+    .bind(("conv", RecordId::new("conversation", conversation.as_str())))
+    .bind(("usr", RecordId::new("user", user.as_str())))
+    .await
+    .expect("seed history")
+    .check()
+    .expect("seed history");
+
+    let mid = ask(&app, &cookie, &conversation, "ikinci soru").await;
+    let turn = settled(&app, &cookie, &conversation, &mid).await;
+    assert_eq!(turn["status"], "complete", "{turn}");
+
+    let seen = service.seen();
+    assert_eq!(seen.len(), 2, "one dispatch per turn, never a re-send");
+    assert_eq!(seen[1].payload["message"], "ikinci soru");
+    assert_eq!(
+        seen[1].payload["history"],
+        json!([
+            { "role": "user", "content": "birinci soru" },
+            { "role": "assistant", "content": "birinci cevap" },
+        ]),
+        "oldest first, no new turn, no unsettled turn"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_chat_turn_carries_the_services_own_error_code() {
+    // A service may define codes this backend has never heard of; they reach
+    // the browser verbatim so the UI can explain the real reason.
+    let bridge = bridge().await;
+    let _service = connect_service(
+        &bridge,
+        hello("tutor", &[AI_CHAT_CAPABILITY]),
+        Behaviour::Fail {
+            code: "quota_exhausted".into(),
+            message: "no credit left".into(),
+        },
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (app, _db) = chat_app(&bridge).await;
+    let (cookie, conversation) = chat_user(&app, "ali").await;
+
+    let mid = ask(&app, &cookie, &conversation, "bir soru").await;
+    let turn = settled(&app, &cookie, &conversation, &mid).await;
+    assert_eq!(turn["status"], "failed", "{turn}");
+    assert_eq!(turn["error_code"], "quota_exhausted");
+    assert_eq!(turn["content"], "", "a failed turn shows no text");
+    assert_eq!(turn["truncated"], false, "and nothing to have been cut");
+    assert!(turn["completed_at"].is_i64(), "{turn}");
+}
+
+#[tokio::test]
+async fn an_over_long_chat_answer_is_clipped_rather_than_failed() {
+    // The service is a trust boundary: an answer past the school's cap is
+    // truncated (a clipped answer still helps), and on a character boundary —
+    // a byte-wise clip of a multi-byte script would render as garbage. The cut
+    // is flagged, so the UI never passes a clipped answer off as the whole one.
+    let cap = DEFAULT_MAX_CHAT_MESSAGE_LEN as usize;
+    let bridge = bridge().await;
+    let _service = connect_service(
+        &bridge,
+        hello("tutor", &[AI_CHAT_CAPABILITY]),
+        Behaviour::Reply("é".repeat(cap + 500)),
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (app, _db) = chat_app(&bridge).await;
+    let (cookie, conversation) = chat_user(&app, "ali").await;
+
+    let mid = ask(&app, &cookie, &conversation, "uzun cevap ver").await;
+    let turn = settled(&app, &cookie, &conversation, &mid).await;
+    assert_eq!(turn["status"], "complete", "{turn}");
+    let text = turn["content"].as_str().expect("content");
+    assert_eq!(text.chars().count(), cap);
+    assert!(text.chars().all(|c| c == 'é'), "clipped mid-character");
+    assert_eq!(turn["truncated"], true, "the clip must be visible: {turn}");
+}
+
+#[tokio::test]
+async fn a_blank_chat_answer_fails_as_empty_reply() {
+    // A blank bubble is indistinguishable from a bug, so it is reported as one
+    // rather than stored as an answer.
+    let bridge = bridge().await;
+    let _service = connect_service(
+        &bridge,
+        hello("tutor", &[AI_CHAT_CAPABILITY]),
+        Behaviour::Reply("   \n ".into()),
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (app, _db) = chat_app(&bridge).await;
+    let (cookie, conversation) = chat_user(&app, "ali").await;
+
+    let mid = ask(&app, &cookie, &conversation, "bir soru").await;
+    let turn = settled(&app, &cookie, &conversation, &mid).await;
+    assert_eq!(turn["status"], "failed", "{turn}");
+    assert_eq!(turn["error_code"], "empty_reply");
 }

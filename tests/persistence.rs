@@ -24,6 +24,7 @@ async fn reboot(db: &Database) -> Router {
         files_path: common::files_dir(),
         cookie_secure: false,
         rate_limit: RateLimitConfig::unlimited(),
+        chat_limit: Default::default(),
         exam_presence: Default::default(),
         db_up: Default::default(),
         ai: None,
@@ -571,4 +572,190 @@ async fn legacy_exams_backfill_to_published() {
     assert_eq!(res.body["draft"], false);
     let listed = send(&app, "GET", "/exams", Some(&student), None).await;
     assert_eq!(common::items(&listed.body).len(), 1);
+}
+
+/// A chatbot thread and every turn in it die together: deleting the
+/// conversation cascades its `chat_message` rows in one transaction, so no
+/// orphan survives a reboot. And the thread is owner-scoped end to end — a
+/// second user reads neither the conversation nor its messages.
+#[tokio::test]
+async fn chat_thread_delete_cascades_and_stays_owner_scoped() {
+    use hezarfen_backend::domain::chat_message::{ChatContent, ChatMessage, MessageStatus};
+    use hezarfen_backend::domain::conversation::Conversation;
+    use hezarfen_backend::domain::user::UserId;
+
+    let (app, db) = common::app_and_db().await;
+    let owner_cookie = common::login(&app, "ali").await;
+    let other_cookie = common::login(&app, "ayse").await;
+    let owner = UserId::from_key(&me_id(&app, &owner_cookie).await);
+    let other = UserId::from_key(&me_id(&app, &other_cookie).await);
+
+    let conversation = Conversation::create(&owner, None, &db)
+        .await
+        .expect("create");
+    let id = conversation.get_id().clone();
+    let prompt = ChatMessage::append_user(
+        &id,
+        &owner,
+        ChatContent::try_new("selam").expect("content"),
+        &db,
+    )
+    .await
+    .expect("append user");
+    let reply = ChatMessage::append_pending_assistant(&id, &owner, &db)
+        .await
+        .expect("append assistant");
+    assert_eq!(reply.get_status(), MessageStatus::Pending);
+
+    let reply = ChatMessage::complete(
+        reply.get_id(),
+        ChatContent::try_new("aleykum selam").expect("content"),
+        false,
+        &db,
+    )
+    .await
+    .expect("complete");
+    assert_eq!(reply.get_status(), MessageStatus::Complete);
+    assert_eq!(reply.get_content().as_str(), "aleykum selam");
+    assert!(reply.get_completed_at().is_some());
+    assert_eq!(
+        ChatMessage::list_for_conversation(&id, &db)
+            .await
+            .expect("thread")
+            .len(),
+        2
+    );
+
+    // The other user sees nothing of it, by conversation or by message.
+    assert!(
+        Conversation::read_for(&id, &other, &db)
+            .await
+            .expect("cross-user conversation")
+            .is_none()
+    );
+    assert!(
+        ChatMessage::read_for(prompt.get_id(), &other, &db)
+            .await
+            .expect("cross-user message")
+            .is_none()
+    );
+    assert_eq!(
+        Conversation::count_for_user(&other, &db)
+            .await
+            .expect("count"),
+        0
+    );
+    assert_eq!(
+        Conversation::count_for_user(&owner, &db)
+            .await
+            .expect("count"),
+        1
+    );
+
+    conversation.delete(&db).await.expect("delete");
+    assert!(
+        Conversation::read_for(&id, &owner, &db)
+            .await
+            .expect("deleted conversation")
+            .is_none()
+    );
+    assert_eq!(
+        Conversation::list_for_user(&owner, &db)
+            .await
+            .unwrap()
+            .len(),
+        0
+    );
+    // Not just the thread's own view: no `chat_message` row is left anywhere.
+    let mut left = db
+        .query("SELECT VALUE id FROM chat_message")
+        .await
+        .expect("sweep")
+        .check()
+        .expect("sweep check");
+    assert!(
+        left.take::<Vec<surrealdb::types::RecordId>>(0)
+            .expect("ids")
+            .is_empty()
+    );
+}
+
+/// Chat turns written before the clipped-answer flag existed (2026-07-23)
+/// backfill to `truncated = false` on the next boot: an old volume's answers
+/// read back as whole, which is exactly how they were shown at the time.
+#[tokio::test]
+async fn legacy_chat_turns_backfill_to_untruncated() {
+    use hezarfen_backend::domain::chat_message::{ChatContent, ChatMessage};
+    use hezarfen_backend::domain::conversation::Conversation;
+    use hezarfen_backend::domain::user::UserId;
+
+    let (app, db) = common::app_and_db().await;
+    let creds = json!({ "username": "ali", "password": "secret1" });
+    assert_eq!(
+        send(&app, "POST", "/auth/register", None, Some(creds.clone()))
+            .await
+            .status,
+        StatusCode::CREATED
+    );
+    let cookie = send(&app, "POST", "/auth/login", None, Some(creds.clone()))
+        .await
+        .cookie
+        .unwrap();
+    let owner = UserId::from_key(&me_id(&app, &cookie).await);
+
+    let conversation = Conversation::create(&owner, None, &db)
+        .await
+        .expect("create");
+    let id = conversation.get_id().clone();
+    ChatMessage::append_user(
+        &id,
+        &owner,
+        ChatContent::try_new("selam").expect("content"),
+        &db,
+    )
+    .await
+    .expect("append user");
+    let reply = ChatMessage::append_pending_assistant(&id, &owner, &db)
+        .await
+        .expect("append assistant");
+    ChatMessage::complete(
+        reply.get_id(),
+        ChatContent::try_new("aleykum selam").expect("content"),
+        false,
+        &db,
+    )
+    .await
+    .expect("complete");
+
+    // Strip the column the way a pre-flag binary's schema would have left it.
+    db.query(
+        "REMOVE FIELD IF EXISTS truncated ON TABLE chat_message;
+         UPDATE chat_message SET truncated = NONE;",
+    )
+    .await
+    .expect("strip truncated")
+    .check()
+    .expect("strip truncated check");
+
+    // Second boot: the backfill stamps the legacy rows, and the thread reads
+    // back through the API instead of failing to deserialize.
+    let app = reboot(&db).await;
+    let cookie = send(&app, "POST", "/auth/login", None, Some(creds))
+        .await
+        .cookie
+        .unwrap();
+    let res = send(
+        &app,
+        "GET",
+        &format!("/chat/conversations/{}/messages", id.key()),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let turns = common::items(&res.body);
+    assert_eq!(turns.len(), 2, "{}", res.body);
+    for turn in turns {
+        assert_eq!(turn["truncated"], false, "{turn}");
+    }
 }

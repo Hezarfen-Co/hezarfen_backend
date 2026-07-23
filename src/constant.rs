@@ -271,6 +271,52 @@ pub const AI_DEFAULT_CONCURRENT_PER_WORKER: usize = 8;
 pub const AI_IDLE_TIMEOUT_SECS: u64 = 30;
 pub const AI_KEEPALIVE_SECS: u64 = 10;
 
+/// The capability an AI service declares to answer chatbot turns. The bridge
+/// routes a chat request to any worker carrying it; with none registered the
+/// chat endpoints report the service as unavailable.
+pub const AI_CHAT_CAPABILITY: &str = "chat.reply";
+
+/// Hard ceiling on one chat message's characters — the newtype bound, above
+/// which no school setting can reach. Sized for a pasted question with its
+/// working, well under [`AI_MAX_FRAME_BYTES`] once history rides along.
+pub const MAX_CHAT_MESSAGE_LEN: usize = 8_000;
+
+/// The school-adjustable per-message character cap (`max_chat_message_len` in
+/// settings): its default and the inclusive range a manager may set. The
+/// ceiling is [`MAX_CHAT_MESSAGE_LEN`] — a longer prompt costs the AI service
+/// context it needs for the history.
+pub const DEFAULT_MAX_CHAT_MESSAGE_LEN: i64 = 4_000;
+pub const MIN_MAX_CHAT_MESSAGE_LEN: i64 = 100;
+pub const MAX_MAX_CHAT_MESSAGE_LEN: i64 = MAX_CHAT_MESSAGE_LEN as i64;
+
+/// How many prior user/assistant turns of a conversation are replayed to the
+/// AI service as context (`chat_history_turns` in settings): its default and
+/// the inclusive range a manager may set. Every turn is re-sent on every
+/// request, so the ceiling bounds both the frame size and the inference cost.
+pub const DEFAULT_CHAT_HISTORY_TURNS: i64 = 10;
+pub const MIN_CHAT_HISTORY_TURNS: i64 = 1;
+pub const MAX_CHAT_HISTORY_TURNS: i64 = 50;
+
+/// How many conversations one user may keep (`max_chat_conversations` in
+/// settings): its default and the inclusive range a manager may set. Reached,
+/// the user deletes an old conversation before starting a new one — the cap is
+/// storage protection, not a usage quota.
+pub const DEFAULT_MAX_CHAT_CONVERSATIONS: i64 = 50;
+pub const MIN_MAX_CHAT_CONVERSATIONS: i64 = 1;
+pub const MAX_MAX_CHAT_CONVERSATIONS: i64 = 500;
+
+/// How often the chat stream re-reads a `pending` assistant message while it
+/// waits for the answer. The reply lands in the database from whichever task
+/// owns the bridge stream, so the reader polls rather than sharing state.
+pub const CHAT_STREAM_POLL_MS: u64 = 200;
+
+/// How long an assistant message may sit `pending` before a reader gives up on
+/// it and reports it failed. Comfortably past
+/// [`AI_DEFAULT_REQUEST_TIMEOUT_SECS`] (which `AI_REQUEST_TIMEOUT_SECS` may
+/// raise), because the answering task normally stamps the failure itself —
+/// this only catches the row whose task died with the process.
+pub const CHAT_PENDING_STALE_SECS: i64 = 300;
+
 /// How long a dialling AI service has to complete its `Hello`/`Welcome`
 /// exchange before the connection is dropped. Short: the handshake is one
 /// frame each way, and an unauthenticated connection must not be able to

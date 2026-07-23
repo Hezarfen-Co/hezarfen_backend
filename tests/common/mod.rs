@@ -47,6 +47,7 @@ pub async fn app_and_db() -> (Router, Database) {
         // Off, so suites hammering the API never trip a limit; the dedicated
         // `rate_limit` test binary opts into tight configs on purpose.
         rate_limit: RateLimitConfig::unlimited(),
+        chat_limit: Default::default(),
         exam_presence: Default::default(),
         db_up: Default::default(),
         ai: None,
