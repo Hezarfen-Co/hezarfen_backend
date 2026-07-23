@@ -7,6 +7,10 @@ use crate::rate_limit::RateLimitConfig;
 pub const DEFAULT_AUTH_RATE_LIMIT: u32 = 10;
 /// Default requests-per-minute-per-IP across the whole API.
 pub const DEFAULT_API_RATE_LIMIT: u32 = 300;
+/// Default chatbot messages per minute *per user*. Sits far above a human
+/// typing while still blunting a scripted fan-out at the AI service behind the
+/// bridge — which is the cost this tier rations, not this process.
+pub const DEFAULT_CHAT_RATE_LIMIT: u32 = 20;
 
 /// Runtime configuration, sourced from environment variables (see `.env.example`).
 #[derive(Clone, Debug)]
@@ -28,6 +32,11 @@ pub struct Config {
     /// Per-IP request limits (`RATE_LIMIT_AUTH_PER_MINUTE`,
     /// `RATE_LIMIT_API_PER_MINUTE`, `TRUST_PROXY`). `0` disables a tier.
     pub rate_limit: RateLimitConfig,
+    /// Chatbot messages one user may send per minute
+    /// (`RATE_LIMIT_CHAT_PER_MINUTE`). `0` disables the tier. Kept out of
+    /// [`RateLimitConfig`], which is the per-IP middleware bundle: this tier is
+    /// keyed by user and is enforced inside the handler.
+    pub chat_per_minute: u32,
     /// Startup admin seed (`ADMIN_USERNAME` + `ADMIN_PASSWORD`). When both are
     /// set, an admin account with these credentials is created at boot if the
     /// username doesn't exist yet. Blank values count as unset.
@@ -73,6 +82,10 @@ impl Config {
                 ),
                 trust_proxy: parse_flag(env::var("TRUST_PROXY").ok()),
             },
+            chat_per_minute: parse_limit(
+                env::var("RATE_LIMIT_CHAT_PER_MINUTE").ok(),
+                DEFAULT_CHAT_RATE_LIMIT,
+            ),
             admin_username: parse_optional(env::var("ADMIN_USERNAME").ok()),
             admin_password: parse_optional(env::var("ADMIN_PASSWORD").ok()),
             ai_quic_addr: parse_optional(env::var("AI_QUIC_ADDR").ok()),

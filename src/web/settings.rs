@@ -65,6 +65,15 @@ struct SettingsResponse {
     /// Per-file size limit for note uploads, in bytes.
     #[schema(example = 5_242_880)]
     max_file_bytes: i64,
+    /// How many prior turns of a conversation the chatbot is given as context.
+    #[schema(example = 10)]
+    chat_history_turns: i64,
+    /// How many chatbot conversations one user may keep.
+    #[schema(example = 50)]
+    max_chat_conversations: i64,
+    /// Character limit on one chat message.
+    #[schema(example = 4000)]
+    max_chat_message_len: i64,
 }
 
 impl SettingsResponse {
@@ -88,6 +97,9 @@ impl SettingsResponse {
                 })
                 .collect(),
             max_file_bytes: settings.get_max_file_bytes(),
+            chat_history_turns: settings.get_chat_history_turns(),
+            max_chat_conversations: settings.get_max_chat_conversations(),
+            max_chat_message_len: settings.get_max_chat_message_len(),
         }
     }
 }
@@ -107,6 +119,18 @@ struct UpdateSettings {
     /// `1024` (1 KiB) – `26214400` (25 MiB). The ceiling is a server hard cap.
     #[schema(example = 5_242_880)]
     max_file_bytes: Option<i64>,
+    /// How many prior turns of a conversation the chatbot is given as context,
+    /// `1`–`50`. Every turn is re-sent on every reply, so this costs tokens.
+    #[schema(example = 10)]
+    chat_history_turns: Option<i64>,
+    /// How many chatbot conversations one user may keep, `1`–`500`. At the cap
+    /// the user deletes an old conversation before starting a new one.
+    #[schema(example = 50)]
+    max_chat_conversations: Option<i64>,
+    /// Character limit on one chat message, `100`–`8000`. The ceiling is a
+    /// server hard cap.
+    #[schema(example = 4000)]
+    max_chat_message_len: Option<i64>,
 }
 
 /// The school's current policy. Any authenticated user — clients need it to
@@ -139,7 +163,8 @@ async fn get_settings(
 /// marks cannot be dropped from the list (409) — those marks would silently
 /// re-weight to 1; an unmarked kind leaves freely, and an exam whose kind is
 /// gone counts with weight 1 until the kind returns. `max_file_bytes` likewise
-/// applies at upload time only — already-stored files keep their size.
+/// applies at upload time only — already-stored files keep their size, and the
+/// chatbot knobs apply to the next chat request only.
 #[utoipa::path(
     patch,
     path = "/",
@@ -148,7 +173,7 @@ async fn get_settings(
     request_body = UpdateSettings,
     responses(
         (status = 200, description = "Updated policy", body = SettingsResponse),
-        (status = 400, description = "Invalid lists, bands, or file limit", body = ErrorResponse),
+        (status = 400, description = "Invalid lists, bands, file limit, or chat limits", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 409, description = "A removed exam kind still has graded exams, or concurrent edits kept changing the settings mid-save", body = ErrorResponse),
@@ -207,12 +232,22 @@ async fn update_settings(
                 .collect::<Result<Vec<_>, _>>()?,
             None => current.get_grade_bands().to_vec(),
         };
-        let max_file_bytes = req
-            .max_file_bytes
-            .unwrap_or_else(|| current.get_max_file_bytes());
+        // Merge over the snapshot's resolved values: an omitted field keeps
+        // whatever the row (or the default behind an unset field) reads as.
+        let mut params = current.params();
+        params.exam_kinds = exam_kinds;
+        params.attendance_statuses = attendance_statuses;
+        params.grade_bands = grade_bands;
+        params.max_file_bytes = req.max_file_bytes.unwrap_or(params.max_file_bytes);
+        params.chat_history_turns = req.chat_history_turns.unwrap_or(params.chat_history_turns);
+        params.max_chat_conversations = req
+            .max_chat_conversations
+            .unwrap_or(params.max_chat_conversations);
+        params.max_chat_message_len = req
+            .max_chat_message_len
+            .unwrap_or(params.max_chat_message_len);
 
-        let settings =
-            Settings::try_new(exam_kinds, attendance_statuses, grade_bands, max_file_bytes)?;
+        let settings = Settings::try_new(params)?;
         if let Some(saved) = settings.save_if_unchanged(&current, &st.db).await? {
             return Ok(Json(SettingsResponse::new(&saved)));
         }

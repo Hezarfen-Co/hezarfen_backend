@@ -4,6 +4,8 @@
 
 pub mod answer_image;
 pub mod attendance;
+pub mod chat_message;
+pub mod conversation;
 pub mod course;
 pub mod course_session;
 pub mod enrollment;

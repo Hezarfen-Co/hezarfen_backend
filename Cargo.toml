@@ -11,8 +11,9 @@ disallowed_types = "deny"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-# IntervalStream for the live exam-monitor SSE tick.
-tokio-stream = "0.1"
+# IntervalStream for the live exam-monitor SSE tick; "sync" adds
+# ReceiverStream, which carries the chatbot's SSE events.
+tokio-stream = { version = "0.1", features = ["sync"] }
 # "ws" backs the live exam room (WebSocket at /exams/{id}/attempt/ws);
 # "multipart" backs note file uploads (POST /notes/{id}/files).
 axum = { version = "0.8", features = ["ws", "multipart"] }

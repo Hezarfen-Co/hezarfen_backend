@@ -12,6 +12,7 @@
 //! the answer on stream 9. Connection setup happens once, not per request.
 //!
 //! * [`protocol`] — frames on the wire
+//! * [`chat`] — the JSON payloads carried for the `chat.reply` capability
 //! * [`server`] — the listener, handshake, and [`server::AiBridge::dispatch`]
 //! * [`registry`] — who is connected and who gets the next request
 //! * [`tls`] — the listener's certificate
@@ -19,12 +20,14 @@
 //! Nothing here is wired into a route yet: this is the transport, and the
 //! individual AI features land on top of it.
 
+pub mod chat;
 pub mod error;
 pub mod protocol;
 pub mod registry;
 pub mod server;
 pub mod tls;
 
+pub use chat::{ChatReplyPayload, ChatRequestPayload, ChatRole, ChatTurn};
 pub use error::AiError;
 pub use registry::{AiRegistry, WorkerSnapshot};
 pub use server::{AiBridge, BridgeConfig};

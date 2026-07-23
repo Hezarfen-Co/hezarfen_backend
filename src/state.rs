@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::ai::AiBridge;
 use crate::database::Database;
-use crate::rate_limit::RateLimitConfig;
+use crate::rate_limit::{RateLimitConfig, UserRateLimiter};
 
 /// Shared application state handed to every handler.
 #[derive(Clone)]
@@ -21,6 +21,11 @@ pub struct AppState {
     /// Per-IP request limits (from [`crate::config::Config::rate_limit`]).
     /// Read once by [`crate::build_router`] when the limiters are built.
     pub rate_limit: RateLimitConfig,
+    /// Per-user chatbot limit (see [`UserRateLimiter`], built from
+    /// [`crate::config::Config::chat_per_minute`]). Not middleware: the
+    /// caller is only known after `CurrentUser` has run, so handlers call it
+    /// themselves.
+    pub chat_limit: UserRateLimiter,
     /// Who is inside which exam room right now (see [`ExamPresence`]).
     pub exam_presence: ExamPresence,
     /// Whether the database socket answered its last ping (see [`DbHealth`]).

@@ -9,11 +9,13 @@ use common::{
     app_and_db, create_course, create_exam, create_exam_with, create_homework, create_session,
     create_subject, enroll, id_of, login, login_as, me_id, mem_app, send, set_role, unenroll,
 };
+use hezarfen_backend::domain::chat_message::ChatMessage;
+use hezarfen_backend::domain::conversation::ConversationId;
 use hezarfen_backend::domain::exam::ExamId;
 use hezarfen_backend::domain::exam_attempt::ExamAttempt;
 use hezarfen_backend::domain::session::Session;
 use hezarfen_backend::domain::timestamp::Timestamp;
-use hezarfen_backend::domain::user::{Password, User, Username};
+use hezarfen_backend::domain::user::{Password, User, UserId, Username};
 use hezarfen_backend::state::AppState;
 use hezarfen_backend::{build_router, database};
 use serde_json::json;
@@ -5222,6 +5224,7 @@ async fn session_cookie_secure_attribute_follows_config() {
         files_path: common::files_dir(),
         cookie_secure: true,
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
+        chat_limit: Default::default(),
         exam_presence: Default::default(),
         db_up: Default::default(),
         ai: None,
@@ -5260,6 +5263,7 @@ async fn db_down_refuses_before_touching_the_database() {
         files_path: common::files_dir(),
         cookie_secure: false,
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
+        chat_limit: Default::default(),
         exam_presence: Default::default(),
         db_up: db_up.clone(),
         ai: None,
@@ -14427,4 +14431,910 @@ async fn exam_kind_removal_blocks_while_marks_exist() {
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     assert_eq!(res.body["exam_kinds"].as_array().unwrap().len(), 1);
     assert_eq!(res.body["exam_kinds"][0]["weight"], 5);
+}
+
+// --- chatbot relay -------------------------------------------------------
+//
+// What the `POST` itself decides: the receipt, the availability gate, the
+// limits, and who may see a thread. The bridge round trip and the answer that
+// comes back are `ai_bridge.rs`'s job — the fake service dialled in here
+// completes the handshake and then stays quiet on purpose, so nothing in this
+// file depends on an answer arriving.
+
+use hezarfen_backend::ai::protocol::{Greeting, Hello, read_frame, write_frame};
+use hezarfen_backend::ai::{AiBridge, BridgeConfig};
+use hezarfen_backend::constant::{AI_ALPN, AI_CHAT_CAPABILITY, AI_PROTOCOL};
+use hezarfen_backend::database::Database;
+
+const CHAT_TOKEN: &str = "integration-ai-token";
+
+/// A bridge with one registered — but silent — `chat.reply` service. Holding
+/// it keeps the registration alive: the control stream's closure is a goodbye.
+struct ChatBridge {
+    bridge: AiBridge,
+    _endpoint: quinn::Endpoint,
+    _conn: quinn::Connection,
+    _control: (quinn::SendStream, quinn::RecvStream),
+}
+
+async fn chat_bridge() -> ChatBridge {
+    let bridge = AiBridge::bind(BridgeConfig {
+        addr: "127.0.0.1:0".parse().unwrap(),
+        token: CHAT_TOKEN.to_string(),
+        cert_path: None,
+        key_path: None,
+        request_timeout: std::time::Duration::from_secs(5),
+    })
+    .await
+    .expect("bridge binds on an ephemeral port");
+
+    hezarfen_backend::ai::tls::install_crypto_provider();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(bridge.certificate()).expect("pin the leaf");
+    let mut tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![AI_ALPN.to_vec()];
+    let config = quinn::ClientConfig::new(std::sync::Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("QUIC-usable TLS"),
+    ));
+    let mut endpoint =
+        quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("client bind");
+    endpoint.set_default_client_config(config);
+    let conn = endpoint
+        .connect(bridge.local_addr().unwrap(), "localhost")
+        .expect("dial")
+        .await
+        .expect("QUIC handshake");
+
+    let (mut send_stream, mut recv_stream) = conn.open_bi().await.expect("control stream");
+    write_frame(
+        &mut send_stream,
+        &Hello {
+            protocol: AI_PROTOCOL.to_string(),
+            service: "fake-chat".to_string(),
+            capabilities: vec![AI_CHAT_CAPABILITY.to_string()],
+            token: CHAT_TOKEN.to_string(),
+            max_concurrent: None,
+        },
+    )
+    .await
+    .expect("send Hello");
+    let greeting: Greeting = read_frame(&mut recv_stream).await.expect("read Greeting");
+    assert!(matches!(greeting, Greeting::Welcome { .. }), "{greeting:?}");
+
+    // Registration completes after the welcome is on the wire, so wait for it
+    // rather than racing it.
+    for _ in 0..300 {
+        if bridge.has_capability(AI_CHAT_CAPABILITY) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        bridge.has_capability(AI_CHAT_CAPABILITY),
+        "service never registered"
+    );
+
+    ChatBridge {
+        bridge,
+        _endpoint: endpoint,
+        _conn: conn,
+        _control: (send_stream, recv_stream),
+    }
+}
+
+/// A router whose AI bridge is `ai`, plus a handle to its database.
+async fn chat_app(ai: Option<AiBridge>) -> (axum::Router, Database) {
+    chat_app_limited(ai, Default::default()).await
+}
+
+/// The same, with an explicit per-user chat tier — what
+/// `RATE_LIMIT_CHAT_PER_MINUTE` configures in production.
+async fn chat_app_limited(
+    ai: Option<AiBridge>,
+    chat_limit: hezarfen_backend::rate_limit::UserRateLimiter,
+) -> (axum::Router, Database) {
+    let db = database::init_mem().await.expect("in-memory db");
+    let app = build_router(AppState {
+        db: db.clone(),
+        files_path: common::files_dir(),
+        cookie_secure: false,
+        rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
+        chat_limit,
+        exam_presence: Default::default(),
+        db_up: Default::default(),
+        ai,
+    });
+    (app, db)
+}
+
+/// How many `conversation` and `chat_message` rows exist, anywhere.
+async fn chat_rows(db: &Database) -> (usize, usize) {
+    let mut res = db
+        .query("SELECT VALUE id FROM conversation; SELECT VALUE id FROM chat_message;")
+        .await
+        .expect("count query")
+        .check()
+        .expect("count check");
+    let conversations: Vec<surrealdb::types::RecordId> = res.take(0).expect("conversation ids");
+    let messages: Vec<surrealdb::types::RecordId> = res.take(1).expect("chat_message ids");
+    (conversations.len(), messages.len())
+}
+
+/// Open a thread (asserts 201) and return its id.
+async fn new_thread(app: &axum::Router, cookie: &str) -> String {
+    let res = send(
+        app,
+        "POST",
+        "/chat/conversations",
+        Some(cookie),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    id_of(&res.body)
+}
+
+async fn post_turn(
+    app: &axum::Router,
+    cookie: &str,
+    conversation: &str,
+    content: &str,
+) -> common::Res {
+    send(
+        app,
+        "POST",
+        &format!("/chat/conversations/{conversation}/messages"),
+        Some(cookie),
+        Some(json!({ "content": content })),
+    )
+    .await
+}
+
+/// Open the SSE stream without draining it — a `pending` turn's stream stays
+/// open, so reading its body here would hang.
+async fn open_stream(
+    app: &axum::Router,
+    cookie: &str,
+    conversation: &str,
+    mid: &str,
+) -> StatusCode {
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/chat/conversations/{conversation}/messages/{mid}/stream"
+        ))
+        .header("cookie", cookie)
+        .body(Body::empty())
+        .unwrap();
+    app.clone().oneshot(request).await.unwrap().status()
+}
+
+#[tokio::test]
+async fn chat_send_is_accepted_with_a_reserved_assistant_row() {
+    let ai = chat_bridge().await;
+    let (app, db) = chat_app(Some(ai.bridge.clone())).await;
+    let cookie = login(&app, "ali").await;
+
+    let res = send(
+        &app,
+        "POST",
+        "/chat/conversations",
+        Some(&cookie),
+        Some(json!({ "title": "Fizik" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    assert_eq!(res.body["title"], "Fizik");
+    assert!(res.body["created_at"].is_i64(), "{}", res.body);
+    assert!(res.body["updated_at"].is_i64(), "{}", res.body);
+    let conversation = id_of(&res.body);
+
+    // The receipt: the reserved row's id and nothing else. The answer is not
+    // here — it is being fetched.
+    let res = post_turn(&app, &cookie, &conversation, "ikinci yasa nedir?").await;
+    assert_eq!(res.status, StatusCode::ACCEPTED, "{}", res.body);
+    assert_eq!(res.body["status"], "pending");
+    let mid = res.body["message_id"].as_str().expect("message_id");
+    assert!(!mid.is_empty());
+    assert_eq!(
+        res.body.as_object().expect("object body").len(),
+        2,
+        "{}",
+        res.body
+    );
+
+    // Both rows are already durable, and the reserved one reads back empty.
+    assert_eq!(chat_rows(&db).await, (1, 2));
+    let res = send(
+        &app,
+        "GET",
+        &format!("/chat/conversations/{conversation}/messages/{mid}"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["conversation_id"], conversation);
+    assert_eq!(res.body["role"], "assistant");
+    assert_eq!(res.body["status"], "pending");
+    assert_eq!(res.body["content"], "");
+    assert!(res.body["error_code"].is_null(), "{}", res.body);
+    assert!(res.body["completed_at"].is_null(), "{}", res.body);
+    assert!(res.body["created_at"].is_i64(), "{}", res.body);
+
+    // The thread holds the question and its reserved answer, in that order —
+    // the two rows one POST writes share a millisecond, so this is the id
+    // tie-break of the route's `ORDER BY` doing its job.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/chat/conversations/{conversation}/messages"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let turns = common::items(&res.body);
+    assert_eq!(turns.len(), 2, "{}", res.body);
+    assert_eq!(turns[0]["role"], "user", "{}", res.body);
+    assert_eq!(turns[0]["content"], "ikinci yasa nedir?", "{}", res.body);
+    assert_eq!(turns[1]["role"], "assistant", "{}", res.body);
+    assert_eq!(turns[1]["id"], mid, "{}", res.body);
+}
+
+#[tokio::test]
+async fn chat_send_without_a_service_is_503_and_writes_nothing() {
+    // Both ways the gate can say no: no bridge on this deployment at all, and
+    // a bridge with nothing declaring `chat.reply`. Neither may leave a user
+    // turn stranded next to a pending row nothing could ever answer.
+    let idle = AiBridge::bind(BridgeConfig {
+        addr: "127.0.0.1:0".parse().unwrap(),
+        token: CHAT_TOKEN.to_string(),
+        cert_path: None,
+        key_path: None,
+        request_timeout: std::time::Duration::from_secs(5),
+    })
+    .await
+    .expect("bridge binds");
+
+    for ai in [None, Some(idle)] {
+        let (app, db) = chat_app(ai).await;
+        let cookie = login(&app, "ali").await;
+        let conversation = new_thread(&app, &cookie).await;
+
+        let res = post_turn(&app, &cookie, &conversation, "bir soru").await;
+        assert_eq!(res.status, StatusCode::SERVICE_UNAVAILABLE, "{}", res.body);
+        assert!(
+            res.body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("AI"),
+            "{}",
+            res.body
+        );
+        // The thread exists (it was created), but the turn left no trace: no
+        // user message, no pending assistant row.
+        assert_eq!(chat_rows(&db).await, (1, 0), "a refused turn wrote rows");
+    }
+}
+
+#[tokio::test]
+async fn chat_lists_are_paged() {
+    let ai = chat_bridge().await;
+    let (app, _db) = chat_app(Some(ai.bridge.clone())).await;
+    let cookie = login(&app, "ali").await;
+
+    // Three threads, and three turns (six rows) inside the first.
+    let mut threads = Vec::new();
+    for _ in 0..3 {
+        threads.push(new_thread(&app, &cookie).await);
+    }
+    for n in 0..3 {
+        let res = post_turn(&app, &cookie, &threads[0], &format!("soru {n}")).await;
+        assert_eq!(res.status, StatusCode::ACCEPTED, "{}", res.body);
+    }
+
+    // Both routes answer the same envelope, and the pages partition the whole
+    // list. Order is compared element for element: the id tie-break makes it
+    // deterministic even for the two rows one POST writes in a millisecond.
+    for (uri, expected) in [
+        ("/chat/conversations".to_string(), 3),
+        (format!("/chat/conversations/{}/messages", threads[0]), 6),
+    ] {
+        let res = send(
+            &app,
+            "GET",
+            &format!("{uri}?limit=2&offset=0"),
+            Some(&cookie),
+            None,
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+        assert_eq!(common::total(&res.body), expected, "{}", res.body);
+        assert_eq!(res.body["limit"], 2, "{}", res.body);
+        assert_eq!(res.body["offset"], 0, "{}", res.body);
+        let mut ids: Vec<String> = common::items(&res.body).iter().map(id_of).collect();
+        assert_eq!(ids.len(), 2);
+
+        let res = send(
+            &app,
+            "GET",
+            &format!("{uri}?limit=99&offset=2"),
+            Some(&cookie),
+            None,
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+        assert_eq!(common::total(&res.body), expected, "{}", res.body);
+        assert_eq!(res.body["offset"], 2, "{}", res.body);
+        ids.extend(common::items(&res.body).iter().map(id_of));
+
+        // Paging is a window on one stable order, not a reshuffle: the pages
+        // concatenated must reproduce the unpaged list exactly.
+        let res = send(&app, "GET", &uri, Some(&cookie), None).await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+        let whole: Vec<String> = common::items(&res.body).iter().map(id_of).collect();
+        assert_eq!(ids, whole, "the pages must reproduce {uri} in order");
+
+        let mut unique = ids.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len() as i64,
+            expected,
+            "the pages must partition {uri}, not overlap or skip"
+        );
+
+        // Past the end is an empty page, not an error.
+        let res = send(
+            &app,
+            "GET",
+            &format!("{uri}?limit=5&offset=999"),
+            Some(&cookie),
+            None,
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+        assert!(common::items(&res.body).is_empty(), "{}", res.body);
+        assert_eq!(common::total(&res.body), expected, "{}", res.body);
+    }
+}
+
+#[tokio::test]
+async fn chat_threads_are_invisible_to_everyone_else() {
+    // Nobody reads someone else's thread — not a teacher, not an admin. A
+    // foreign id is a 404, never a 403: its existence is not leaked either.
+    let ai = chat_bridge().await;
+    let (app, db) = chat_app(Some(ai.bridge.clone())).await;
+    let ali = login(&app, "ali").await;
+    let conversation = new_thread(&app, &ali).await;
+    let res = post_turn(&app, &ali, &conversation, "bir soru").await;
+    assert_eq!(res.status, StatusCode::ACCEPTED, "{}", res.body);
+    let mid = res.body["message_id"].as_str().unwrap().to_string();
+
+    for (name, role) in [
+        ("veli", "student"),
+        ("hoca", "teacher"),
+        ("patron", "admin"),
+    ] {
+        let other = login_as(&app, &db, name, role).await;
+        for (method, uri) in [
+            (
+                "GET",
+                format!("/chat/conversations/{conversation}/messages"),
+            ),
+            (
+                "GET",
+                format!("/chat/conversations/{conversation}/messages/{mid}"),
+            ),
+            (
+                "GET",
+                format!("/chat/conversations/{conversation}/messages/{mid}/stream"),
+            ),
+            ("DELETE", format!("/chat/conversations/{conversation}")),
+            ("PATCH", format!("/chat/conversations/{conversation}")),
+            (
+                "POST",
+                format!("/chat/conversations/{conversation}/messages"),
+            ),
+        ] {
+            let body = match method {
+                "POST" => Some(json!({ "content": "sızıntı" })),
+                "PATCH" => Some(json!({ "title": "benim artık" })),
+                _ => None,
+            };
+            let res = send(&app, method, &uri, Some(&other), body).await;
+            assert_eq!(res.status, StatusCode::NOT_FOUND, "{name} {method} {uri}");
+        }
+        // Nor does someone else's thread show up in their own list.
+        let res = send(&app, "GET", "/chat/conversations", Some(&other), None).await;
+        assert!(common::items(&res.body).is_empty(), "{}", res.body);
+    }
+
+    // And the owner still has everything, untouched.
+    assert_eq!(chat_rows(&db).await, (1, 2));
+    let res = send(&app, "GET", "/chat/conversations", Some(&ali), None).await;
+    assert_eq!(common::items(&res.body).len(), 1, "{}", res.body);
+}
+
+#[tokio::test]
+async fn chat_thread_count_is_capped_by_the_school() {
+    let (app, db) = chat_app(None).await;
+    let manager = login_as(&app, &db, "mudur", "manager").await;
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&manager),
+        Some(json!({ "max_chat_conversations": 1 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    let ali = login(&app, "ali").await;
+    let first = new_thread(&app, &ali).await;
+    let res = send(
+        &app,
+        "POST",
+        "/chat/conversations",
+        Some(&ali),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+
+    // The cap is storage protection, per user: another user is unaffected, and
+    // deleting a thread frees the slot.
+    let veli = login(&app, "veli").await;
+    let _ = new_thread(&app, &veli).await;
+
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/chat/conversations/{first}"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    let _ = new_thread(&app, &ali).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_thread_creation_never_passes_the_cap() {
+    // The sequential test above cannot see this: count-then-create is only a
+    // cap if something serializes the two, and the database's transactions do
+    // not serialize a count against concurrent inserts. Sixteen simultaneous
+    // creators against a cap of five must still leave five rows.
+    const CAP: usize = 5;
+    const RACERS: usize = 16;
+
+    let (app, db) = chat_app(None).await;
+    let manager = login_as(&app, &db, "mudur", "manager").await;
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&manager),
+        Some(json!({ "max_chat_conversations": CAP })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let ali = login(&app, "ali").await;
+
+    // A barrier, so every request is inside the check-then-write window at
+    // once rather than trickling in.
+    let gate = std::sync::Arc::new(tokio::sync::Barrier::new(RACERS));
+    let racers: Vec<_> = (0..RACERS)
+        .map(|_| {
+            let (app, cookie, gate) = (app.clone(), ali.clone(), gate.clone());
+            tokio::spawn(async move {
+                gate.wait().await;
+                send(
+                    &app,
+                    "POST",
+                    "/chat/conversations",
+                    Some(&cookie),
+                    Some(json!({})),
+                )
+                .await
+                .status
+            })
+        })
+        .collect();
+
+    let mut created = 0;
+    for racer in racers {
+        match racer.await.expect("no panic in a racer") {
+            StatusCode::CREATED => created += 1,
+            StatusCode::CONFLICT => {}
+            other => panic!("unexpected {other}"),
+        }
+    }
+    assert_eq!(created, CAP, "the cap was over-admitted");
+    assert_eq!(
+        chat_rows(&db).await.0,
+        CAP,
+        "rows past the cap were written"
+    );
+}
+
+#[tokio::test]
+async fn chat_turn_stamps_thread_activity() {
+    // The `updated_at` bump is best-effort (a failure must never strand the
+    // pending row it follows) — but it still has to happen.
+    let ai = chat_bridge().await;
+    let (app, _db) = chat_app(Some(ai.bridge.clone())).await;
+    let ali = login(&app, "ali").await;
+    let conversation = new_thread(&app, &ali).await;
+    let before = send(&app, "GET", "/chat/conversations", Some(&ali), None).await;
+    let opened = common::items(&before.body)[0]["updated_at"]
+        .as_i64()
+        .unwrap();
+
+    // The stamp is in whole milliseconds; make sure the clock has moved.
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let res = post_turn(&app, &ali, &conversation, "bir soru").await;
+    assert_eq!(res.status, StatusCode::ACCEPTED, "{}", res.body);
+
+    let after = send(&app, "GET", "/chat/conversations", Some(&ali), None).await;
+    let stamped = common::items(&after.body)[0]["updated_at"]
+        .as_i64()
+        .unwrap();
+    assert!(stamped > opened, "{stamped} !> {opened}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_stream_stops_polling_when_the_client_hangs_up() {
+    // A `pending` turn sends nothing, so nothing used to notice a vanished
+    // client: the poll task kept re-reading the row every 200ms for the whole
+    // 300-second staleness window, and `/stream` is not rate-limited. Dropping
+    // the response body is exactly what axum does when a connection dies.
+    // No bridge here: the pending row is written straight to the database, so
+    // the only task this runtime gains is the stream's own poll loop and the
+    // count below is not drowned in the QUIC service's task churn.
+    let (app, db) = chat_app(None).await;
+    let ali = login(&app, "ali").await;
+    let conversation = new_thread(&app, &ali).await;
+    let me = send(&app, "GET", "/auth/me", Some(&ali), None).await;
+    let user = UserId::from_key(me.body["id"].as_str().unwrap());
+    let pending =
+        ChatMessage::append_pending_assistant(&ConversationId::from_key(&conversation), &user, &db)
+            .await
+            .expect("reserve an assistant row");
+    let mid = pending.get_id().key().to_string();
+
+    // The witness is the runtime's task count, so it is read only once the
+    // setup's short-lived database tasks have drained — otherwise one of those
+    // finishing mid-measurement looks like the stream's own task.
+    let metrics = tokio::runtime::Handle::current().metrics();
+    let mut before = metrics.num_alive_tasks();
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let now = metrics.num_alive_tasks();
+        if now == before {
+            break;
+        }
+        before = now;
+    }
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/chat/conversations/{conversation}/messages/{mid}/stream"
+        ))
+        .header("cookie", &ali)
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        metrics.num_alive_tasks() > before,
+        "the stream's poll task should be running"
+    );
+
+    drop(response);
+    for _ in 0..20 {
+        if metrics.num_alive_tasks() <= before {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the stream kept polling after its client hung up");
+}
+
+#[tokio::test]
+async fn chat_content_is_required_and_capped_by_the_school() {
+    let ai = chat_bridge().await;
+    let (app, db) = chat_app(Some(ai.bridge.clone())).await;
+    let manager = login_as(&app, &db, "mudur", "manager").await;
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&manager),
+        Some(json!({ "max_chat_message_len": 100 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    let ali = login(&app, "ali").await;
+    let conversation = new_thread(&app, &ali).await;
+
+    for empty in ["", "   ", "\n\t"] {
+        let res = post_turn(&app, &ali, &conversation, empty).await;
+        assert_eq!(res.status, StatusCode::BAD_REQUEST, "{empty:?} accepted");
+    }
+    // Counted in characters, not bytes: 101 multi-byte characters is 101.
+    let res = post_turn(&app, &ali, &conversation, &"é".repeat(101)).await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+    // Nothing rejected was written.
+    assert_eq!(chat_rows(&db).await, (1, 0));
+
+    let res = post_turn(&app, &ali, &conversation, &"é".repeat(100)).await;
+    assert_eq!(res.status, StatusCode::ACCEPTED, "{}", res.body);
+}
+
+#[tokio::test]
+async fn chat_rate_limit_refuses_before_anything_is_written() {
+    // 20 messages a minute per user (the documented tier). The limiter is
+    // charged first, so the refused turn leaves no row behind — and no other
+    // user inherits the window.
+    let ai = chat_bridge().await;
+    let (app, db) = chat_app(Some(ai.bridge.clone())).await;
+    let ali = login(&app, "ali").await;
+    let conversation = new_thread(&app, &ali).await;
+
+    for n in 1..=20 {
+        let res = post_turn(&app, &ali, &conversation, &format!("soru {n}")).await;
+        assert_eq!(res.status, StatusCode::ACCEPTED, "turn {n}: {}", res.body);
+    }
+    let before = chat_rows(&db).await;
+    assert_eq!(before, (1, 40));
+
+    let (status, headers, _) = common::send_raw(
+        &app,
+        "POST",
+        &format!("/chat/conversations/{conversation}/messages"),
+        Some(&ali),
+        Some("application/json"),
+        json!({ "content": "yirmi birinci" })
+            .to_string()
+            .into_bytes(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    let retry_after = headers
+        .get("retry-after")
+        .expect("Retry-After tells the client when to come back")
+        .to_str()
+        .unwrap()
+        .parse::<u64>()
+        .expect("whole seconds");
+    assert!((1..=60).contains(&retry_after), "{retry_after}");
+    assert_eq!(chat_rows(&db).await, before, "a refused turn wrote rows");
+
+    let veli = login(&app, "veli").await;
+    let other = new_thread(&app, &veli).await;
+    let res = post_turn(&app, &veli, &other, "benim ilk sorum").await;
+    assert_eq!(res.status, StatusCode::ACCEPTED, "{}", res.body);
+}
+
+#[tokio::test]
+async fn every_role_may_chat_parents_included() {
+    // Deliberate, not an oversight: the chatbot is a `CurrentUser` route for
+    // every role the school has, parents among them.
+    let ai = chat_bridge().await;
+    let (app, db) = chat_app(Some(ai.bridge.clone())).await;
+
+    for (name, role) in [
+        ("veli", "parent"),
+        ("ogrenci", "student"),
+        ("hoca", "teacher"),
+        ("mudur", "manager"),
+        ("patron", "admin"),
+    ] {
+        let cookie = login_as(&app, &db, name, role).await;
+        let conversation = new_thread(&app, &cookie).await;
+
+        let res = post_turn(&app, &cookie, &conversation, "bir soru").await;
+        assert_eq!(res.status, StatusCode::ACCEPTED, "{role}: {}", res.body);
+        let mid = res.body["message_id"].as_str().unwrap().to_string();
+
+        let res = send(
+            &app,
+            "GET",
+            &format!("/chat/conversations/{conversation}/messages/{mid}"),
+            Some(&cookie),
+            None,
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{role}: {}", res.body);
+
+        let res = send(
+            &app,
+            "GET",
+            &format!("/chat/conversations/{conversation}/messages"),
+            Some(&cookie),
+            None,
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{role}: {}", res.body);
+        assert_eq!(common::items(&res.body).len(), 2, "{role}: {}", res.body);
+
+        assert_eq!(
+            open_stream(&app, &cookie, &conversation, &mid).await,
+            StatusCode::OK,
+            "{role} may open the stream"
+        );
+
+        let res = send(&app, "GET", "/chat/conversations", Some(&cookie), None).await;
+        assert_eq!(res.status, StatusCode::OK, "{role}: {}", res.body);
+        assert_eq!(common::items(&res.body).len(), 1, "{role}: {}", res.body);
+
+        let res = send(
+            &app,
+            "DELETE",
+            &format!("/chat/conversations/{conversation}"),
+            Some(&cookie),
+            None,
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::NO_CONTENT, "{role}: {}", res.body);
+    }
+    // Every thread deleted, every turn cascaded with it.
+    assert_eq!(chat_rows(&db).await, (0, 0));
+}
+
+#[tokio::test]
+async fn chat_thread_can_be_renamed_and_cleared() {
+    // Renaming is how a user files a thread, so it counts as activity and the
+    // thread moves to the top of the list. Nothing renames a thread by itself:
+    // there is no auto-titling from the first message.
+    let (app, _db) = chat_app(None).await;
+    let ali = login(&app, "ali").await;
+    let first = new_thread(&app, &ali).await;
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let second = new_thread(&app, &ali).await;
+
+    let listed = send(&app, "GET", "/chat/conversations", Some(&ali), None).await;
+    let items = common::items(&listed.body);
+    assert_eq!(id_of(&items[0]), second, "newest activity first");
+    let before = items[1]["updated_at"].as_i64().expect("updated_at");
+    assert!(items[1]["title"].is_null(), "{}", listed.body);
+
+    // The stamp is in whole milliseconds; make sure the clock has moved.
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/chat/conversations/{first}"),
+        Some(&ali),
+        Some(json!({ "title": "  Fizik ödevi  " })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["title"], "Fizik ödevi", "trimmed, not stored raw");
+    assert_eq!(id_of(&res.body), first);
+    let stamped = res.body["updated_at"].as_i64().expect("updated_at");
+    assert!(stamped > before, "{stamped} !> {before}");
+
+    // The rename is durable and re-sorted the list.
+    let listed = send(&app, "GET", "/chat/conversations", Some(&ali), None).await;
+    let items = common::items(&listed.body);
+    assert_eq!(id_of(&items[0]), first, "the renamed thread is now first");
+    assert_eq!(items[0]["title"], "Fizik ödevi");
+
+    // `null` — and a blank string — clear the name back to untitled.
+    for clearing in [json!({ "title": null }), json!({ "title": "   " })] {
+        let res = send(
+            &app,
+            "PATCH",
+            &format!("/chat/conversations/{first}"),
+            Some(&ali),
+            Some(clearing.clone()),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{clearing}: {}", res.body);
+        assert!(res.body["title"].is_null(), "{clearing}: {}", res.body);
+
+        // Restore a name so the next iteration has something to clear.
+        send(
+            &app,
+            "PATCH",
+            &format!("/chat/conversations/{first}"),
+            Some(&ali),
+            Some(json!({ "title": "geri" })),
+        )
+        .await;
+    }
+
+    // Too long is a 400, and the stored name is untouched.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/chat/conversations/{first}"),
+        Some(&ali),
+        Some(json!({ "title": "é".repeat(201) })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/chat/conversations/{first}"),
+        Some(&ali),
+        Some(json!({ "title": "é".repeat(200) })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    // A thread that never existed is the same 404 a foreign one gets.
+    let res = send(
+        &app,
+        "PATCH",
+        "/chat/conversations/nosuchthread",
+        Some(&ali),
+        Some(json!({ "title": "hayalet" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND, "{}", res.body);
+    // And `second` was never touched by any of it.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/chat/conversations/{second}/messages"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+}
+
+#[tokio::test]
+async fn chat_rate_limit_tier_is_configurable_and_zero_disables_it() {
+    // `RATE_LIMIT_CHAT_PER_MINUTE`, the third tier, behaves like the two IP
+    // ones: the configured number is honoured exactly and `0` switches it off.
+    // No bridge is needed — the limiter is charged before the availability
+    // gate, so a metered turn answers 503 and only the refused one answers 429.
+    use hezarfen_backend::rate_limit::UserRateLimiter;
+
+    let (app, _db) = chat_app_limited(None, UserRateLimiter::per_user_minute(3)).await;
+    let ali = login(&app, "ali").await;
+    let conversation = new_thread(&app, &ali).await;
+    for n in 1..=3 {
+        let res = post_turn(&app, &ali, &conversation, &format!("soru {n}")).await;
+        assert_eq!(
+            res.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "turn {n} was inside the budget: {}",
+            res.body
+        );
+    }
+    let res = post_turn(&app, &ali, &conversation, "dorduncu").await;
+    assert_eq!(res.status, StatusCode::TOO_MANY_REQUESTS, "{}", res.body);
+    // Per user, still: a second caller starts with a full budget.
+    let veli = login(&app, "veli").await;
+    let other = new_thread(&app, &veli).await;
+    assert_eq!(
+        post_turn(&app, &veli, &other, "benim ilk sorum")
+            .await
+            .status,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+
+    // `0` disables the tier: well past the shipped default, nothing is refused.
+    let (app, _db) = chat_app_limited(None, UserRateLimiter::per_user_minute(0)).await;
+    let ali = login(&app, "ali").await;
+    let conversation = new_thread(&app, &ali).await;
+    for n in 1..=40 {
+        let res = post_turn(&app, &ali, &conversation, &format!("soru {n}")).await;
+        assert_eq!(
+            res.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "turn {n} was rate-limited with the tier off: {}",
+            res.body
+        );
+    }
 }

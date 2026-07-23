@@ -3,6 +3,7 @@ use hezarfen_backend::ai::{AiBridge, BridgeConfig};
 use hezarfen_backend::config::Config;
 use hezarfen_backend::database::Database;
 use hezarfen_backend::domain::user::{Password, User, Username};
+use hezarfen_backend::rate_limit::UserRateLimiter;
 use hezarfen_backend::state::{AppState, DbHealth};
 use hezarfen_backend::{build_router, database};
 
@@ -30,6 +31,7 @@ async fn main() -> anyhow::Result<()> {
         files_path: cfg.files_path.clone().into(),
         cookie_secure: cfg.cookie_secure,
         rate_limit: cfg.rate_limit.clone(),
+        chat_limit: UserRateLimiter::per_user_minute(cfg.chat_per_minute),
         exam_presence: Default::default(),
         db_up,
         ai,

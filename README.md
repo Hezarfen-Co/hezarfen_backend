@@ -74,8 +74,8 @@ the worked steps, both editable by the solution's author anytime; pending
 questions show only to their asker and to teacher+, and approval freezes the
 content so nothing unmoderated ever reaches the pool.
 School-varying policy is data, not code: exam kinds (each with its weight in
-course averages), attendance statuses, grade-display bands, and the note-file
-size limit live in an editable **settings** singleton, and academic **terms**
+course averages), attendance statuses, grade-display bands, the note-file
+size limit, and the chatbot's limits live in an editable **settings** singleton, and academic **terms**
 are plain rows courses can link to (see "Per-school policy"). Each account
 also carries its own **UI preferences** — theme (`light`/`dark`) and language
 (`tr`/`en`) — self-managed, admin-editable for anyone, `null` until chosen so
@@ -86,6 +86,14 @@ register the capabilities they serve, and each request rides its own QUIC
 stream on that one connection — no correlation ids, no head-of-line blocking.
 The bridge's certificate is published at `GET /ai/certificate` so a service can
 pin it before dialling (see "AI bridge (QUIC)").
+The first thing riding that bridge is the **chatbot**: every signed-in user
+(`parent` included) keeps private conversations with an AI service, free-form —
+no rule tables, no canned answers, the backend only owns auth, limits,
+persistence and the payload format. Sending is asynchronous because an
+inference outlives a request: the turn plus an empty `pending` answer are
+written *first*, the call goes out after, so a reload never loses an answer;
+the client then polls the message or reads it off an SSE stream (see
+"Chatbot").
 
 Every field is a validated newtype (`Username(String)`, `NoteTitle(String)`, …)
 constructed only after its restrictions pass — invalid input can't be
@@ -216,6 +224,13 @@ and every route — Swagger included — shares a generous catch-all
 (`RATE_LIMIT_API_PER_MINUTE`, default 300). Exceeding either answers `429` with
 a `Retry-After` header (seconds). Set a limit to `0` to disable that tier —
 useful for load tests.
+
+Sending a chatbot message adds a third tier, and it is keyed by **user id**,
+not by IP (`RATE_LIMIT_CHAT_PER_MINUTE`, default 20), because an inference
+costs the school real money and a shared-IP classroom must not spend one
+student's budget on another's. `0` disables it like the other two. It is
+charged before anything is written, so a `429` leaves no trace (see
+"Chatbot").
 
 Behind a reverse proxy every connection carries the proxy's address, so also
 set `TRUST_PROXY=true` to key clients by the rightmost `X-Forwarded-For` entry
@@ -541,13 +556,21 @@ their existing shapes: the student exam-room reads
 | GET    | `/pomodoro/{user}`               | teacher* | A user's pomodoro log, same shape · paged; *or a `parent` linked to `{user}` |
 | GET    | `/attendance/me`                 | student | Own attendance report: events + sessions + per-course tallies |
 | GET    | `/attendance/{user}`             | teacher* | A user's attendance report, narrowed to the caller's courses (manager+: full); *or a `parent` linked to `{user}` — full |
-| GET    | `/settings`                      | student | The school's policy: `exam_kinds` (`{name, weight}` each), `attendance_statuses`, `grade_bands`, `max_file_bytes` |
-| PATCH  | `/settings`                      | manager | Replace any subset of the fields (lists wholesale); concurrent edits merge, never silently revert each other; `409` when a removed exam kind still has graded exams (see "Per-school policy") |
+| GET    | `/settings`                      | student | The school's policy: `exam_kinds` (`{name, weight}` each), `attendance_statuses`, `grade_bands`, `max_file_bytes`, `chat_history_turns`, `max_chat_conversations`, `max_chat_message_len` |
+| PATCH  | `/settings`                      | manager | Replace any subset of the fields (lists wholesale); concurrent edits merge, never silently revert each other; `400` on "Invalid lists, bands, file limit, or chat limits"; `409` when a removed exam kind still has graded exams (see "Per-school policy") |
 | POST   | `/terms`                         | manager | `{name, starts_at, ends_at}` — past dates allowed (calendar backfill) |
 | GET    | `/terms`                         | student | List terms, newest first · paged |
 | GET    | `/terms/{id}`                    | student | Get one term                    |
 | PATCH  | `/terms/{id}`                    | manager | Edit a term (the merged range must stay ordered) |
 | DELETE | `/terms/{id}`                    | manager | Delete a term — `409` while any course still links to it |
+| POST   | `/chat/conversations`            | student | `{title?}` — start a chatbot conversation (every role incl. `parent`, always private to its owner); `409` at `max_chat_conversations` |
+| GET    | `/chat/conversations`            | student | The caller's conversations, newest activity first · paged |
+| PATCH  | `/chat/conversations/{id}`       | student | `{title}` — rename own conversation (`null` or blank clears it back to untitled); counts as activity, so the thread moves to the top. Nothing auto-titles a thread |
+| DELETE | `/chat/conversations/{id}`       | student | Delete own conversation and every message in it (someone else's is a `404`, never a `403`) |
+| GET    | `/chat/conversations/{id}/messages` | student | The conversation's turns, oldest first — user and assistant rows alike · paged |
+| POST   | `/chat/conversations/{id}/messages` | student | `{content}` (≤ `max_chat_message_len`) — send a turn; `202 {message_id, status: "pending"}`, the answer is fetched after (`503` when no AI service offers `chat.reply` — nothing is written; `429` + `Retry-After` on the send tier) |
+| GET    | `/chat/conversations/{id}/messages/{mid}` | student | Poll one turn: `pending` until the answer lands, then `complete` + `content` or `failed` + `error_code` |
+| GET    | `/chat/conversations/{id}/messages/{mid}/stream` | student | **SSE** on the same row: `delta` chunks then one `done` — or one `error` — and close; an already-finished answer replays (see "Chatbot") |
 
 `status` must be one of the school's attendance statuses (`GET /settings`);
 the core four `present | absent | late | excused` always exist, plus whatever
@@ -702,7 +725,7 @@ ULID.
 
 Every school runs differently; the parts that vary are data, not code. One
 editable `settings` singleton (`GET /settings` for any signed-in user,
-`PATCH /settings` for manager+) carries four knobs:
+`PATCH /settings` for manager+) carries seven knobs:
 
 - **`exam_kinds`** — the accepted `kind` values for new exams, each an
   object `{name, weight}`. The weight (`1`–`100`) is how many times an exam
@@ -730,6 +753,18 @@ editable `settings` singleton (`GET /settings` for any signed-in user,
   exam question images alike), in bytes: `1024` (1 KiB) to `26214400` (25 MiB;
   a server hard cap — uploads buffer in memory), default `5242880` (5 MiB).
   Checked at upload time only: lowering it never touches already-stored files.
+- **`chat_history_turns`** — how many prior **messages** of a conversation the
+  chatbot is given as context, `1`–`50` (default `10`). The unit is messages,
+  not exchanges: a question and its answer are two, so the default remembers
+  five question/answer pairs. Every one of them is re-sent on every reply, so
+  the number is both what the bot remembers and what each answer costs.
+- **`max_chat_conversations`** — how many chatbot conversations one user may
+  keep, `1`–`500` (default `50`); at the cap the user deletes an old one
+  first. Storage protection, not a usage quota — that is the per-minute
+  message limit.
+- **`max_chat_message_len`** — character limit on one chat message,
+  `100`–`8000` (default `4000`); the ceiling is a server hard cap, because
+  the message and its history must fit one bridge frame.
 
 A `PATCH` replaces only the fields it carries, each wholesale, and validation
 is all-or-nothing. Concurrent edits are safe: each save applies only if the
@@ -1376,6 +1411,156 @@ only as trustworthy as that HTTP hop. On an untrusted network set
 `AI_TLS_CERT`/`AI_TLS_KEY` to a real certificate and distribute it out of band
 — the endpoint then simply serves that, stable across restarts.
 
+## Chatbot
+
+Every signed-in user — `parent` included — keeps private conversations with an
+AI service. The backend is a **relay**: it owns auth, the limits, the thread,
+the payload format, and the last look at the answer before anyone sees it; the
+words are the service's. There are deliberately **no rule, intent or
+canned-answer tables** — the conversation is free-form, and a school that wants
+different behaviour changes its AI service, not this backend. A thread is
+private to its owner: no teacher, no admin, nobody reads someone else's, and
+another user's conversation is a `404`, never a `403`.
+
+### Sending is two-phase, and that is the point
+
+`POST /chat/conversations/{id}/messages` answers `202 {message_id, status:
+"pending"}` instead of the answer, because an inference outlives a normal
+request (and the request-timeout layer that guards every handler). Before the
+AI is even called, two rows are written: the user's turn, and an **empty
+`pending` assistant row** — `message_id` is that row. That order is the whole
+design: a reload, a dropped connection, a closed laptop can no longer lose an
+answer, because the place it will land already exists and the answering task
+outlives the HTTP request.
+
+The client then reads that row either way it likes:
+
+- **poll** `GET /chat/conversations/{id}/messages/{mid}` — `pending` until it
+  settles, then `complete` with `content` or `failed` with `error_code`;
+- **stream** `GET /chat/conversations/{id}/messages/{mid}/stream` — the same
+  row over Server-Sent Events.
+
+Both read the same row, so they can never disagree, in any state.
+
+### The SSE stream
+
+```
+event: delta
+data: {"text":"Newton'un ikinci yasası "}
+
+event: delta
+data: {"text":"kuvvet ile ivme arasındaki …"}
+
+event: done
+data: {"message":{ …the message DTO… }}
+```
+
+One to eight `delta` events, then exactly one `done` carrying the finished
+message; or, if the turn failed, a single `error` event
+(`{"code":"timed_out","message":"…"}`) and nothing else. Then the stream
+closes. A stream opened *after* the answer already landed still emits
+`delta`s and a `done` — the replay is deliberate, so a client that connects
+late (or reconnects) never hangs waiting for events that already happened.
+
+**The deltas are sliced by the backend from the finished answer.** `hab/1` is
+unary — the service returns the whole reply text, not tokens — so today the
+chunking is cosmetic pacing, not real streaming. The event shape exists now so
+that the day a service streams, it becomes a drop-in change behind an
+unchanged frontend.
+
+### The message DTO
+
+```json
+{ "id": "01J8…", "conversation_id": "01J8…", "role": "assistant",
+  "status": "complete", "content": "…", "truncated": false, "error_code": null,
+  "created_at": 1761820800000, "completed_at": 1761820803120 }
+```
+
+`role` is `user` or `assistant`; `status` is `pending`, `complete`, or
+`failed` (a user turn is always `complete`). `content` is empty while pending,
+`error_code` is set only when failed, `completed_at` is `null` until the turn
+settles. `truncated` is `true` when `content` is only the first part of what
+the assistant answered — the rest was over `max_chat_message_len` and was cut;
+it is always `false` for a user turn and for a failed one. Show it: a clipped
+answer that looks whole is worse than one the reader knows is clipped. The same
+DTO is what the SSE `done` event carries, so the streaming and polling reads
+agree about `truncated` exactly as they do about every other field.
+
+### Status codes
+
+| code | when |
+| --- | --- |
+| `202` | the turn was accepted; the answer is on its way |
+| `400` | empty message, or longer than the school's `max_chat_message_len` |
+| `404` | no such conversation or message — or not the caller's |
+| `409` | already at `max_chat_conversations`; delete a thread first |
+| `429` | over `RATE_LIMIT_CHAT_PER_MINUTE` messages/minute for this **user**; see `Retry-After` |
+| `503` | no connected service offers `chat.reply` — **nothing was written**, retry later |
+
+The `503` ordering matters: the bridge is checked before the rows exist, so an
+unavailable service leaves no dead `pending` row behind, and the rate limit is
+charged before that, so a refused turn leaves no trace at all.
+
+### A turn always settles
+
+Once the two rows exist the answer never stays `pending` forever, through
+three independent mechanisms:
+
+- the answering task stamps `complete` or `failed` itself — the normal path;
+- a reader **projects** a `pending` row older than 300 seconds as
+  `failed`/`timed_out` (a read-time projection, not a write — the row is left
+  for the task that may still own it);
+- a **boot sweep** flips every leftover `pending` to `failed`/`interrupted`,
+  which is what a process death mid-inference looks like.
+
+Two more verdicts come from inspecting the answer: an **empty** reply is
+reported as `failed`/`empty_reply` (a blank bubble is indistinguishable from a
+bug), and an **over-long** one is truncated to `max_chat_message_len` — a
+clipped answer still helps, a discarded one does not — with `truncated: true`
+on the stored turn, so the clip is never passed off as the whole answer.
+
+`error_code` values a client may see: `unavailable` (no worker, or the bridge
+is off), `busy`, `timed_out`, `transport`, `protocol`, `bad_reply` (the
+service's payload did not parse), `empty_reply`, `service_error`,
+`interrupted`, `not_found`, `internal` — **or a code the AI service itself
+returned**, verbatim. Treat it as an open set: branch on the ones you handle,
+fall back to the human-readable text for the rest.
+
+### The `chat.reply` capability (for AI-service authors)
+
+A chat service declares `chat.reply` in its `Hello` (see "AI bridge (QUIC)").
+Requests then arrive as ordinary `hab/1` `Request` frames whose `payload` is:
+
+```json
+{ "message": "and the second law?",
+  "history": [ {"role":"user","content":"what is the first law?"},
+               {"role":"assistant","content":"an object at rest …"} ] }
+```
+
+`history` is **oldest first** (index 0 is furthest back), optional (absent or
+`[]` = a fresh conversation), and **excludes** the new message — that one is
+`message`. It carries the last `chat_history_turns` **settled messages** —
+entries, not exchanges: the default `10` is five question/answer pairs, and
+`history` is exactly that many entries long whenever the thread holds enough
+of them. Only settled turns count: a failed answer is skipped and the window
+reaches further back for a usable one, rather than coming up short. All of it
+is re-sent on every request, which is why the service may be stateless: it can
+restart, scale out, or be replaced mid-conversation without losing context.
+
+The answer is a `Response::Ok` whose payload is:
+
+```json
+{ "text": "the complete reply, not chunked, not partial" }
+```
+
+Failures reuse the existing `Response::Err {code, message}` — one failure
+shape on the bridge for every capability — and that `code` reaches the client
+as the message's `error_code`.
+
+**Unknown extra keys are ignored on both sides, on purpose.** A service may
+add fields (a model name, token counts) and a future backend may send more
+context without either end having to be redeployed in lockstep.
+
 ## Layout
 
 ```
@@ -1387,7 +1572,7 @@ src/
   validate.rs      field validators (used by every newtype's try_new)
   error.rs         ValidationError + AppError -> HTTP responses
   database.rs      SurrealDB server connect (ws) + SCHEMAFULL migration
-  rate_limit.rs    fixed-window per-IP limiter (both tiers) + middleware
+  rate_limit.rs    fixed-window limiter: per-IP tiers + middleware, per-user chat tier
   state.rs         AppState { db, files_path, cookie_secure, rate_limit, ai }
   ai/              QUIC bridge to the out-of-process AI services
                    (see "AI bridge (QUIC)"; the HTTP half is web/ai.rs)
@@ -1396,6 +1581,7 @@ src/
     registry.rs    connected workers, capability routing, least-inflight leases
     tls.rs         listener certificate (PEM or self-signed) + fingerprint
     error.rs       AiError
+    chat.rs        the `chat.reply` payload contract (ChatRequestPayload/ChatReplyPayload)
   domain/          validated newtypes + entities (derive SurrealValue),
                    each owning its persistence
     user.rs        UserId · Username · Password · PasswordHash · User (has role)
@@ -1433,6 +1619,11 @@ src/
     subject.rs     SubjectId · SubjectName · SubjectDescription · Subject (course curriculum)
     term.rs        TermId · TermName · Term (school term window)
     settings.rs    ExamKindDef · GradeBand · Settings (per-school policy)
+    conversation.rs ConversationId · ConversationTitle · Conversation (one
+                   chatbot thread, private to its owner)
+    chat_message.rs ChatMessageId · ChatContent · MessageRole · MessageStatus ·
+                   ChatMessage (one turn; the assistant row is written
+                   `pending` before the AI call and settled after)
     pomodoro.rs    PomodoroSessionId · PomodoroSession (student focus log)
     pool_question.rs PoolQuestionId · PoolQuestionTitle · PoolQuestionBody ·
                    PoolQuestion (student-asked question; teacher-approved into
@@ -1458,7 +1649,7 @@ src/
     page.rs        PageParams · Page<T> (shared pagination)
     auth.rs  users.rs  notes.rs  messages.rs  events.rs  courses.rs  subjects.rs
     sessions.rs  exams.rs  homework.rs  questions.rs  marks.rs  work.rs
-    pomodoro.rs  attendance.rs  settings.rs  terms.rs  ai.rs
+    pomodoro.rs  attendance.rs  settings.rs  terms.rs  ai.rs  chat.rs
 ```
 
 Tests: `cargo test` — unit (in-source), integration (`tower::oneshot` + in-memory
