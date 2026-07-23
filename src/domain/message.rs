@@ -38,7 +38,7 @@ pub enum Folder {
 
 impl Folder {
     /// Folders a sender may file their side into (`Sent` is their home).
-    pub const SENDER: [Folder; 2] = [Folder::Sent, Folder::Trash];
+    pub const SENDER: [Folder; 3] = [Folder::Sent, Folder::Archive, Folder::Trash];
     /// Folders a recipient may file their side into (`Inbox` is their home).
     pub const RECIPIENT: [Folder; 3] = [Folder::Inbox, Folder::Archive, Folder::Trash];
 
@@ -268,11 +268,12 @@ impl Message {
         created.ok_or_else(|| AppError::Internal("failed to create message".into()))
     }
 
-    /// One folder view for `user`, newest first. `inbox`/`archive` are
-    /// recipient-side, `sent` is sender-side, `trash` is the union of both
-    /// sides' trashed copies. `read` narrows to that flag state (`false` on
-    /// the inbox is the unread view; on `sent`, receipts pending) — the
-    /// folder condition is parenthesized because trash's is an OR.
+    /// One folder view for `user`, newest first. `inbox` is recipient-side,
+    /// `sent` is sender-side, and `archive`/`trash` are each the union of both
+    /// sides' filed copies (either party may archive or trash their own copy).
+    /// `read` narrows to that flag state (`false` on the inbox is the unread
+    /// view; on `sent`, receipts pending) — the folder condition is
+    /// parenthesized because `archive`'s and `trash`'s are ORs.
     pub async fn list_folder(
         user: &UserId,
         folder: Folder,
@@ -281,6 +282,10 @@ impl Message {
     ) -> Result<Vec<Message>, AppError> {
         let condition = match folder {
             Folder::Sent => "sender = $usr AND sender_folder = 'sent'",
+            Folder::Archive => {
+                "(recipient = $usr AND recipient_folder = 'archive') \
+                 OR (sender = $usr AND sender_folder = 'archive')"
+            }
             Folder::Trash => {
                 "(recipient = $usr AND recipient_folder = 'trash') \
                  OR (sender = $usr AND sender_folder = 'trash')"
@@ -456,7 +461,10 @@ mod tests {
         assert!(Folder::try_new("spam").is_err());
         assert_eq!(Folder::home(true), Folder::Sent);
         assert_eq!(Folder::home(false), Folder::Inbox);
-        assert!(!Folder::allowed_for(true).contains(&Folder::Archive));
+        // Both sides may archive their own copy; neither may reach the inbox
+        // that isn't theirs — the sender's home is `sent`, not `inbox`.
+        assert!(Folder::allowed_for(true).contains(&Folder::Archive));
         assert!(Folder::allowed_for(false).contains(&Folder::Archive));
+        assert!(!Folder::allowed_for(true).contains(&Folder::Inbox));
     }
 }

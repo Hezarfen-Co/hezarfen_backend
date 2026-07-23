@@ -45,8 +45,8 @@ struct UpdateMessage {
     /// Mark read (`true`) or unread (`false`). Recipient only.
     read: Option<bool>,
     /// Move the caller's copy: a recipient may file into `inbox`, `archive`,
-    /// or `trash`; a sender into `sent` or `trash`. Restoring is moving back
-    /// to the copy's `previous_folder`.
+    /// or `trash`; a sender into `sent`, `archive`, or `trash`. Restoring is
+    /// moving back to the copy's `previous_folder`.
     #[schema(example = "archive")]
     folder: Option<String>,
 }
