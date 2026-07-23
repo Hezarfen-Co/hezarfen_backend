@@ -447,7 +447,7 @@ their existing shapes: the student exam-room reads
 | DELETE | `/notes/{id}/files/{file_id}`    | student | Delete one file                 |
 | POST   | `/messages`                      | student | `{recipient_id, subject, body?, label?}` — send to any user (every role incl. `parent`; not yourself); `label` is a free-text badge tag |
 | GET    | `/messages`                      | student | `?folder=inbox\|sent\|archive\|trash` (default `inbox`) `&read=` — the caller's folder, newest first; `?folder=inbox&read=false&limit=1` → `total` is the unread badge · paged |
-| PATCH  | `/messages/{id}`                 | student | `{read?, folder?}` — read flag (recipient only) and/or move **own copy** (recipient: `inbox`/`archive`/`trash`; sender: `sent`/`trash`) |
+| PATCH  | `/messages/{id}`                 | student | `{read?, folder?}` — read flag (recipient only) and/or move **own copy** (recipient: `inbox`/`archive`/`trash`; sender: `sent`/`archive`/`trash`) |
 | DELETE | `/messages/{id}`                 | student | Permanently delete **own copy** — only from the trash (`409` elsewhere); the row vanishes once both sides deleted |
 | POST   | `/events`                        | teacher | `{title, description?, audience?, starts_at?, ends_at?}` — `audience` defaults to school-wide |
 | GET    | `/events`                        | student | List all events · paged         |
@@ -810,7 +810,7 @@ user — student to teacher, parent to teacher, teacher to student; only
 messaging yourself is refused. A single stored message serves both parties,
 but each **owns their copy independently**: the recipient's moves through
 `inbox` → `archive`/`trash` and carries the `read` flag (the sender sees it
-as a read receipt); the sender's moves through `sent` → `trash`. Filing or
+as a read receipt); the sender's moves through `sent` → `archive`/`trash`. Filing or
 deleting your copy never changes the other side's view.
 
 Every copy remembers where it was filed from, so it can go back there. Moving
