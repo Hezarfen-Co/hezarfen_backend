@@ -12,6 +12,8 @@ use utoipa_axum::routes;
 use crate::constant::{MAX_MAX_FILE_BYTES, UPLOAD_BODY_OVERHEAD_BYTES};
 use crate::database::Database;
 use crate::domain::answer_image::AnswerImage;
+use crate::domain::bank_question::{BankQuestion, BankQuestionId};
+use crate::domain::bank_question_image::BankQuestionImage;
 use crate::domain::course::Course;
 use crate::domain::enrollment::Enrollment;
 use crate::domain::exam::{
@@ -33,6 +35,7 @@ use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
 
+use super::bank_questions::BankQuestionResponse;
 use super::courses::{can_manage_course, can_view_course, visible_courses};
 use super::subjects::subject_in_course;
 use super::{
@@ -76,6 +79,8 @@ pub fn routes() -> OpenApiRouter<AppState> {
         .routes(routes!(exam_live))
         .routes(routes!(create_question, list_questions))
         .routes(routes!(update_question, delete_question))
+        .routes(routes!(question_from_bank))
+        .routes(routes!(question_to_bank))
         .routes(routes!(attempt_questions))
         .routes(routes!(save_answer))
         .routes(routes!(attempt_answers))
@@ -1427,6 +1432,8 @@ struct QuestionResponse {
     image: Option<ImageMetaResponse>,
     /// Per-option pictures, aligned with `choices` (`choice` questions only).
     choice_images: Option<Vec<Option<ImageMetaResponse>>>,
+    /// The bank template this question was instantiated from, if any.
+    source_bank: Option<String>,
 }
 
 impl QuestionResponse {
@@ -1444,6 +1451,7 @@ impl QuestionResponse {
             correct: question.get_correct(),
             image: image_meta(images, None),
             choice_images: choice_image_metas(question, images),
+            source_bank: question.get_source_bank().map(|b| b.key().to_string()),
         }
     }
 }
@@ -1729,6 +1737,227 @@ async fn delete_question(
         remove_blob(&st.files_path, image.get_file()).await;
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---- question bank bridge ---------------------------------------------------
+// Two copy funnels between an exam's questions and the school-wide bank
+// (`web/bank_questions`): instantiate a template into this exam, or save one of
+// this exam's questions back into the bank. Both COPY the row and every image
+// blob to fresh ids/files — the source side is never touched or shared.
+
+#[derive(Deserialize, ToSchema)]
+struct InstantiateFromBank {
+    /// The subject to file the new question under — one of the exam's course's
+    /// subjects (the same-course rule the bank row itself is exempt from).
+    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    subject_id: String,
+}
+
+/// Instantiate a bank template into this exam as a fresh question. Requires
+/// teacher+ and management rights over the exam's course. `subject_id` must
+/// name one of the course's subjects — the template's own subject is origin
+/// metadata and does not carry over. The template (and its blobs) stay
+/// untouched; a full copy — text, points, spec, illustration, and option
+/// pictures — lands under a new question id. Locked once attempts exist.
+#[utoipa::path(
+    post,
+    path = "/{id}/questions/from-bank/{bid}",
+    tag = "exams",
+    security(("session_cookie" = [])),
+    params(
+        ("id" = String, Path, description = "Exam id"),
+        ("bid" = String, Path, description = "Bank question id"),
+    ),
+    request_body = InstantiateFromBank,
+    responses(
+        (status = 201, description = "Question created from the template", body = QuestionResponse),
+        (status = 400, description = "Unknown subject, or one from another course", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 404, description = "No such exam, or no such bank template", body = ErrorResponse),
+        (status = 409, description = "Attempts have started — questions are frozen", body = ErrorResponse),
+    ),
+)]
+async fn question_from_bank(
+    State(st): State<AppState>,
+    RequireTeacher(user): RequireTeacher,
+    Path((id, bid)): Path<(String, String)>,
+    Json(req): Json<InstantiateFromBank>,
+) -> Result<(StatusCode, Json<QuestionResponse>), AppError> {
+    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let course = course_of(&exam, &st.db).await?;
+    if !can_manage_course(&course, &user) {
+        return Err(AppError::Forbidden(
+            "only the course creator, an assigned teacher, or a manager/admin can author questions",
+        ));
+    }
+    // Writer lease of [`EXAM_LOCK`]: the freeze gate, the subject check, and the
+    // create are one unit — same reasoning as `create_question`.
+    let _guard = EXAM_LOCK.write().await;
+    ensure_questions_editable(exam.get_id(), &st.db).await?;
+    let subject = subject_in_course(&req.subject_id, course.get_id(), &st.db).await?;
+
+    let template = BankQuestion::read(&BankQuestionId::from_key(&bid), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let question = ExamQuestion::create_from_bank(
+        exam.get_id(),
+        subject,
+        template.get_text().clone(),
+        template.get_points(),
+        template.spec(),
+        template.get_id().clone(),
+        &st.db,
+    )
+    .await?;
+
+    // Copy each of the template's image blobs to a fresh file under the new
+    // question + same slot (file before row, via `store_image`). A missing
+    // source blob is server-side damage, surfaced as a 500 — not silently lost.
+    // The copy is all-or-nothing: any mid-loop failure rolls back the fresh
+    // question row (its cascade drops the copied image rows) and the blobs
+    // written so far, leaving the source and destination untouched.
+    let sources = BankQuestionImage::list_for_question(template.get_id(), &st.db).await?;
+    let mut copied: Vec<String> = Vec::new();
+    for source in &sources {
+        let step = async {
+            let bytes = tokio::fs::read(blob_path(&st.files_path, source.get_file()))
+                .await
+                .map_err(|err| {
+                    AppError::Internal(format!(
+                        "missing blob for bank image {}: {err}",
+                        source.get_file()
+                    ))
+                })?;
+            store_image(
+                &st,
+                &exam,
+                &question,
+                source.get_slot(),
+                source.get_content_type().clone(),
+                &bytes,
+            )
+            .await
+        };
+        match step.await {
+            Ok(image) => copied.push(image.get_file().to_string()),
+            Err(err) => {
+                for file in &copied {
+                    remove_blob(&st.files_path, file).await;
+                }
+                let _ = question.delete(&st.db).await;
+                return Err(err);
+            }
+        }
+    }
+    let images = QuestionImage::list_for_question(question.get_id(), &st.db).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(QuestionResponse::new(&question, &images)),
+    ))
+}
+
+/// Save one of this exam's questions into the school-wide bank as a reusable
+/// template. Requires teacher+ and management rights over the exam's course.
+/// The caller becomes the template's owner; the question's subject rides along
+/// as origin metadata. A full copy — text, points, spec, illustration, and
+/// option pictures — lands under a new bank id; the exam question is untouched.
+/// The origin exam is recorded on the template as `source_exam`.
+#[utoipa::path(
+    post,
+    path = "/{id}/questions/{qid}/to-bank",
+    tag = "exams",
+    security(("session_cookie" = [])),
+    params(
+        ("id" = String, Path, description = "Exam id"),
+        ("qid" = String, Path, description = "Question id"),
+    ),
+    responses(
+        (status = 201, description = "Template saved to the bank", body = BankQuestionResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 404, description = "No such exam, or no such question in it", body = ErrorResponse),
+    ),
+)]
+async fn question_to_bank(
+    State(st): State<AppState>,
+    RequireTeacher(user): RequireTeacher,
+    Path((id, qid)): Path<(String, String)>,
+) -> Result<(StatusCode, Json<BankQuestionResponse>), AppError> {
+    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let course = course_of(&exam, &st.db).await?;
+    if !can_manage_course(&course, &user) {
+        return Err(AppError::Forbidden(
+            "only the course creator, an assigned teacher, or a manager/admin can save questions to the bank",
+        ));
+    }
+    // Reader lease of [`BANK_LOCK`] across the question read and the insert: the
+    // template adopts the question's subject, and a re-tag/delete of this
+    // question could otherwise let that subject's delete-guard slip between the
+    // read and our insert (its `any_for_subject` check runs under BANK_LOCK's
+    // writer lease, so holding the reader lease forces it to see our new row).
+    let _bank_guard = super::bank_questions::BANK_LOCK.read().await;
+    let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
+
+    // `create_from_exam` mints its own id and insert (the funnel), fed the
+    // question's fields plus the origin exam it was saved off.
+    let template = BankQuestion::create_from_exam(
+        user.get_id().clone(),
+        question.get_subject().clone(),
+        question.get_text().clone(),
+        question.get_points(),
+        question.spec(),
+        exam.get_id().clone(),
+        &st.db,
+    )
+    .await?;
+
+    // Copy every image blob (illustration + option pictures) to a fresh file
+    // under the new bank row + same slot (file before row). All-or-nothing: a
+    // mid-loop failure rolls back the fresh bank row (cascade drops the copied
+    // image rows) and the blobs written so far; the source exam question stays
+    // untouched.
+    let sources = QuestionImage::list_for_question(question.get_id(), &st.db).await?;
+    let mut copied: Vec<String> = Vec::new();
+    for source in &sources {
+        let step = async {
+            let bytes = tokio::fs::read(blob_path(&st.files_path, source.get_file()))
+                .await
+                .map_err(|err| {
+                    AppError::Internal(format!(
+                        "missing blob for question image {}: {err}",
+                        source.get_file()
+                    ))
+                })?;
+            super::bank_questions::store_image(
+                &st,
+                template.get_id(),
+                source.get_slot(),
+                source.get_content_type().clone(),
+                &bytes,
+            )
+            .await
+        };
+        match step.await {
+            Ok(image) => copied.push(image.get_file().to_string()),
+            Err(err) => {
+                for file in &copied {
+                    remove_blob(&st.files_path, file).await;
+                }
+                let _ = template.delete(&st.db).await;
+                return Err(err);
+            }
+        }
+    }
+    let images = BankQuestionImage::list_for_question(template.get_id(), &st.db).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(BankQuestionResponse::new(&template, &images)),
+    ))
 }
 
 // ---- question images ----------------------------------------------------------

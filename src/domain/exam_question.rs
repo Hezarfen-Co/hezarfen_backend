@@ -5,6 +5,7 @@ use crate::constant::{
     MAX_CHOICE_TEXT_LEN, MAX_QUESTION_CHOICES, MAX_QUESTION_TEXT_LEN, MIN_QUESTION_CHOICES,
 };
 use crate::database::{Database, EXAM_QUESTION_TABLE};
+use crate::domain::bank_question::BankQuestionId;
 use crate::domain::exam::ExamId;
 use crate::domain::subject::SubjectId;
 use crate::error::{AppError, ValidationError};
@@ -158,6 +159,12 @@ impl QuestionSpec {
     pub fn get_kind(&self) -> &QuestionKind {
         &self.kind
     }
+
+    /// The validated fields, consumed — for a writer in another module (the
+    /// question bank) that stores the same three columns.
+    pub fn into_parts(self) -> (QuestionKind, Option<Vec<ChoiceText>>, Option<i64>) {
+        (self.kind, self.choices, self.correct)
+    }
 }
 
 /// One question of an exam. Order within the exam is the id's ULID order
@@ -175,6 +182,8 @@ pub struct ExamQuestion {
     points: QuestionPoints,
     choices: Option<Vec<ChoiceText>>,
     correct: Option<i64>,
+    /// The bank template this question was instantiated from, if any.
+    source_bank: Option<BankQuestionId>,
 }
 
 impl ExamQuestion {
@@ -210,6 +219,10 @@ impl ExamQuestion {
         self.correct
     }
 
+    pub fn get_source_bank(&self) -> Option<&BankQuestionId> {
+        self.source_bank.as_ref()
+    }
+
     /// The stored kind-dependent fields as the validated bundle (for
     /// merge-on-update). Bypasses `try_new`: the fields were written through a
     /// `QuestionSpec`, so the invariants already hold.
@@ -229,6 +242,33 @@ impl ExamQuestion {
         spec: QuestionSpec,
         db: &Database,
     ) -> Result<ExamQuestion, AppError> {
+        Self::insert(exam, subject, text, points, spec, None, db).await
+    }
+
+    /// Like [`Self::create`], but records the bank template this question was
+    /// instantiated from (`POST …/questions/from-bank/{bid}`).
+    pub async fn create_from_bank(
+        exam: &ExamId,
+        subject: SubjectId,
+        text: QuestionText,
+        points: QuestionPoints,
+        spec: QuestionSpec,
+        source: BankQuestionId,
+        db: &Database,
+    ) -> Result<ExamQuestion, AppError> {
+        Self::insert(exam, subject, text, points, spec, Some(source), db).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn insert(
+        exam: &ExamId,
+        subject: SubjectId,
+        text: QuestionText,
+        points: QuestionPoints,
+        spec: QuestionSpec,
+        source_bank: Option<BankQuestionId>,
+        db: &Database,
+    ) -> Result<ExamQuestion, AppError> {
         let question = ExamQuestion {
             id: ExamQuestionId::generate(),
             exam: exam.clone(),
@@ -238,6 +278,7 @@ impl ExamQuestion {
             kind: spec.kind,
             choices: spec.choices,
             correct: spec.correct,
+            source_bank,
         };
         let created: Option<ExamQuestion> =
             db.create(question.id.record()).content(question).await?;
@@ -320,6 +361,7 @@ impl ExamQuestion {
             kind: spec.kind,
             choices: spec.choices,
             correct: spec.correct,
+            source_bank: None,
         }
     }
 }

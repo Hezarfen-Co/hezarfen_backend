@@ -38,6 +38,8 @@ pub const EXAM_QUESTION_TABLE: &str = "exam_question";
 pub const QUESTION_IMAGE_TABLE: &str = "question_image";
 pub const EXAM_ANSWER_TABLE: &str = "exam_answer";
 pub const ANSWER_IMAGE_TABLE: &str = "answer_image";
+pub const BANK_QUESTION_TABLE: &str = "bank_question";
+pub const BANK_QUESTION_IMAGE_TABLE: &str = "bank_question_image";
 pub const COURSE_TABLE: &str = "course";
 pub const ENROLLMENT_TABLE: &str = "enrollment";
 pub const PARENT_LINK_TABLE: &str = "parent_link";
@@ -274,6 +276,7 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS choices ON exam_question TYPE option<array<string>>;
     DEFINE FIELD IF NOT EXISTS correct ON exam_question TYPE option<int>;
     DEFINE FIELD IF NOT EXISTS subject ON exam_question TYPE record<subject>;
+    DEFINE FIELD IF NOT EXISTS source_bank ON exam_question TYPE option<record<bank_question>>;
     DEFINE INDEX IF NOT EXISTS exam_question_exam ON exam_question FIELDS exam;
     DEFINE INDEX IF NOT EXISTS exam_question_subject ON exam_question FIELDS subject;
 
@@ -286,6 +289,27 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS size ON question_image TYPE int;
     DEFINE INDEX IF NOT EXISTS question_image_exam ON question_image FIELDS exam;
     DEFINE INDEX IF NOT EXISTS question_image_question ON question_image FIELDS question;
+
+    DEFINE TABLE IF NOT EXISTS bank_question SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS owner ON bank_question TYPE record<user>;
+    DEFINE FIELD IF NOT EXISTS subject ON bank_question TYPE record<subject>;
+    DEFINE FIELD IF NOT EXISTS text ON bank_question TYPE string;
+    DEFINE FIELD IF NOT EXISTS kind ON bank_question TYPE string;
+    DEFINE FIELD IF NOT EXISTS points ON bank_question TYPE int;
+    DEFINE FIELD IF NOT EXISTS choices ON bank_question TYPE option<array<string>>;
+    DEFINE FIELD IF NOT EXISTS correct ON bank_question TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS source_exam ON bank_question TYPE option<record<exam>>;
+    DEFINE FIELD IF NOT EXISTS created_at ON bank_question TYPE int READONLY;
+    DEFINE INDEX IF NOT EXISTS bank_question_owner ON bank_question FIELDS owner;
+    DEFINE INDEX IF NOT EXISTS bank_question_subject ON bank_question FIELDS subject;
+
+    DEFINE TABLE IF NOT EXISTS bank_question_image SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS bank_question ON bank_question_image TYPE record<bank_question>;
+    DEFINE FIELD IF NOT EXISTS slot ON bank_question_image TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS file ON bank_question_image TYPE string;
+    DEFINE FIELD IF NOT EXISTS content_type ON bank_question_image TYPE string;
+    DEFINE FIELD IF NOT EXISTS size ON bank_question_image TYPE int;
+    DEFINE INDEX IF NOT EXISTS bank_question_image_question ON bank_question_image FIELDS bank_question;
 
     DEFINE TABLE IF NOT EXISTS exam_answer SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS exam ON exam_answer TYPE record<exam>;
