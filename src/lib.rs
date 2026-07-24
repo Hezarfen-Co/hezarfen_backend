@@ -132,6 +132,10 @@ pub fn build_router(state: AppState) -> Router {
     router
         .merge(SwaggerUi::new("/swagger").url("/api-docs/openapi.json", api))
         .with_state(state)
+        // Conditional-GET: revalidatable `ETag` on 200 JSON GETs, `304` on a
+        // matching `If-None-Match`. Innermost, so it sees the handler's own
+        // response (mutations and errors pass straight through untouched).
+        .layer(middleware::from_fn(web::etag::etag))
         .layer(middleware::from_fn(move |req: Request, next: Next| {
             let health = db_up.clone();
             async move { db_guard(health, req, next).await }
