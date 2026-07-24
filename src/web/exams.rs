@@ -82,6 +82,7 @@ pub fn routes() -> OpenApiRouter<AppState> {
         .routes(routes!(student_attempts))
         .routes(routes!(student_attempt_answers))
         .routes(routes!(student_marks_history))
+        .routes(routes!(review_questions))
         .routes(routes!(review_attempts))
         .routes(routes!(review_attempt_answers))
         // The image routes get their own HTTP body cap, like the note-file
@@ -1563,8 +1564,20 @@ async fn list_questions(
             "only the course creator, an assigned teacher, or a manager/admin can read the question list",
         ));
     }
-    let questions = ExamQuestion::list_for_exam(exam.get_id(), &st.db).await?;
-    let images = images_by_question(exam.get_id(), &st.db).await?;
+    Ok(Json(question_page(&exam, limit, offset, &st.db).await?))
+}
+
+/// The paged answer-key list (`correct` included) shared by the teacher
+/// `list_questions` read and the student `review_questions` read — the two
+/// differ only in the access wall they run first.
+async fn question_page(
+    exam: &Exam,
+    limit: Option<i64>,
+    offset: i64,
+    db: &Database,
+) -> Result<Page<QuestionResponse>, AppError> {
+    let questions = ExamQuestion::list_for_exam(exam.get_id(), db).await?;
+    let images = images_by_question(exam.get_id(), db).await?;
     let total = questions.len() as i64;
     let items = paginate(&questions, limit, offset)
         .iter()
@@ -1577,7 +1590,7 @@ async fn list_questions(
             )
         })
         .collect();
-    Ok(Json(Page::new(items, total, limit, offset)))
+    Ok(Page::new(items, total, limit, offset))
 }
 
 /// Edit a question. Requires teacher+ and management rights over the exam's
@@ -3012,6 +3025,35 @@ async fn review_attempts(
     seqs.sort_unstable();
     seqs.dedup();
     Ok(Json(seqs))
+}
+
+/// The exam's full question list, `correct` indexes included — the answer key
+/// the caller reviews their own sheet against. Same review gate as the other
+/// self-review reads; revealing `correct` is the point (the gate already proves
+/// the caller was marked). Paged via `?limit=&offset=`.
+#[utoipa::path(
+    get,
+    path = "/{id}/review/questions",
+    tag = "exams",
+    security(("session_cookie" = [])),
+    params(("id" = String, Path, description = "Exam id"), PageParams),
+    responses(
+        (status = 200, description = "A page of the exam's questions with `correct` (all of them when unpaged)", body = Page<QuestionResponse>),
+        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Review not enabled for this exam", body = ErrorResponse),
+        (status = 404, description = "Exam not found, still a draft, or the caller has no mark on it", body = ErrorResponse),
+    ),
+)]
+async fn review_questions(
+    State(st): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    Path(id): Path<String>,
+    Query(page): Query<PageParams>,
+) -> Result<Json<Page<QuestionResponse>>, AppError> {
+    let (limit, offset) = page.resolve()?;
+    let exam = reviewable_exam(&st, &user, &id).await?;
+    Ok(Json(question_page(&exam, limit, offset, &st.db).await?))
 }
 
 /// One of the caller's own sittings, judged — the `seq`th attempt's answers,
