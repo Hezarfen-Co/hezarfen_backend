@@ -140,6 +140,9 @@ struct CreateExamInCourse {
     /// Whether a student who left the exam room may come back in and keep
     /// answering. Defaults to `true`; editable live while the exam runs.
     allow_rejoin: Option<bool>,
+    /// Whether students may review their graded attempt once results are out.
+    /// Defaults to `false`; editable live.
+    allow_review: Option<bool>,
     /// Save as a work-in-progress draft: visible only to the course's
     /// managers, not sittable, not gradable, until published via
     /// `PATCH /exams/{id}` with `draft: false`. Defaults to `false`.
@@ -834,6 +837,7 @@ async fn create_exam_in_course(
         schedule,
         max_attempts,
         req.allow_rejoin.unwrap_or(true),
+        req.allow_review.unwrap_or(false),
         req.draft.unwrap_or(false),
         &st.db,
     )

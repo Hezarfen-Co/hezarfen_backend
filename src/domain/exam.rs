@@ -274,6 +274,7 @@ pub struct Exam {
     // migration (limit 1, rejoin open), so reads never see them missing.
     max_attempts: ExamAttemptLimit,
     allow_rejoin: bool,
+    allow_review: bool,
     // Work-in-progress marker: a draft is visible only to its course's
     // managers, cannot be sat, and cannot be graded. Rows predating the
     // column are backfilled published (`false`).
@@ -331,6 +332,12 @@ impl Exam {
         self.allow_rejoin
     }
 
+    /// Whether students may review their graded attempt once results are out.
+    /// The teacher can flip this live.
+    pub fn get_allow_review(&self) -> bool {
+        self.allow_review
+    }
+
     /// Whether the exam is still being prepared — hidden from students, not
     /// sittable, not gradable, until published.
     pub fn is_draft(&self) -> bool {
@@ -366,6 +373,7 @@ impl Exam {
         schedule: ExamSchedule,
         max_attempts: ExamAttemptLimit,
         allow_rejoin: bool,
+        allow_review: bool,
         draft: bool,
         db: &Database,
     ) -> Result<Exam, AppError> {
@@ -382,6 +390,7 @@ impl Exam {
             duration_ms: schedule.duration_ms,
             max_attempts,
             allow_rejoin,
+            allow_review,
             draft,
         };
         let created: Option<Exam> = db.create(exam.id.record()).content(exam).await?;
@@ -441,6 +450,7 @@ impl Exam {
         schedule: ExamSchedule,
         max_attempts: ExamAttemptLimit,
         allow_rejoin: bool,
+        allow_review: bool,
         draft: bool,
         db: &Database,
     ) -> Result<Exam, AppError> {
@@ -453,6 +463,7 @@ impl Exam {
         self.duration_ms = schedule.duration_ms;
         self.max_attempts = max_attempts;
         self.allow_rejoin = allow_rejoin;
+        self.allow_review = allow_review;
         self.draft = draft;
         let updated: Option<Exam> = db.update(self.id.record()).content(self).await?;
         updated.ok_or(AppError::NotFound)

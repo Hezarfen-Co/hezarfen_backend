@@ -341,6 +341,9 @@ pub struct ExamResponse {
     /// Whether a student who left the exam room may come back in and keep
     /// answering. Teachers can flip this live.
     pub allow_rejoin: bool,
+    /// Whether students may review their graded attempt once results are out.
+    /// Teachers can flip this live.
+    pub allow_review: bool,
     /// Still being prepared: visible only to the course's managers, not
     /// sittable, not gradable. Publish by `PATCH`ing `draft: false`.
     pub draft: bool,
@@ -361,6 +364,7 @@ impl ExamResponse {
             duration_ms: exam.get_duration_ms().map(|d| d.as_millis()),
             max_attempts: exam.get_max_attempts().as_i64(),
             allow_rejoin: exam.get_allow_rejoin(),
+            allow_review: exam.get_allow_review(),
             draft: exam.is_draft(),
         }
     }
