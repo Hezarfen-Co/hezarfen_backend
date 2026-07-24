@@ -7,6 +7,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::database::Database;
+use crate::domain::bank_question::BankQuestion;
 use crate::domain::course::{Course, CourseId};
 use crate::domain::exam_question::ExamQuestion;
 use crate::domain::homework::Homework;
@@ -15,6 +16,7 @@ use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
 
 use super::courses::{can_manage_course, can_view_course};
+use super::bank_questions::BANK_LOCK;
 use super::exams::EXAM_LOCK;
 use super::homework::HOMEWORK_LOCK;
 use super::{CurrentUser, RequireTeacher, SubjectResponse};
@@ -51,6 +53,21 @@ pub(crate) async fn subject_in_course(
             reason: "subject belongs to a different course",
         }));
     }
+    Ok(subject.get_id().clone())
+}
+
+/// Turn a request-supplied subject id into a validated reference, checking only
+/// that the subject exists — no course tie. For the question bank, whose subject
+/// is cross-course origin metadata: the same-course rule applies at instantiate
+/// time, not here. An unknown subject is a `400` naming the field.
+pub(crate) async fn subject_must_exist(id: &str, db: &Database) -> Result<SubjectId, AppError> {
+    let subject =
+        Subject::read(&SubjectId::from_key(id), db)
+            .await?
+            .ok_or(AppError::Validation(ValidationError::Invalid {
+                field: "subject_id",
+                reason: "subject does not exist",
+            }))?;
     Ok(subject.get_id().clone())
 }
 
@@ -141,9 +158,9 @@ async fn update_subject(
 }
 
 /// Delete a subject. Requires teacher+ and management rights over its course.
-/// Refused with a 409 while any exam question or homework still references it —
-/// re-tag or delete those first, so nothing is left pointing at a subject that
-/// no longer exists.
+/// Refused with a 409 while any exam question, homework, or bank question still
+/// references it — re-tag or delete those first, so nothing is left pointing at
+/// a subject that no longer exists.
 #[utoipa::path(
     delete,
     path = "/{id}",
@@ -155,7 +172,7 @@ async fn update_subject(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "Exam questions or homework still reference this subject", body = ErrorResponse),
+        (status = 409, description = "Exam questions, homework, or bank questions still reference this subject", body = ErrorResponse),
     ),
 )]
 async fn delete_subject(
@@ -188,6 +205,18 @@ async fn delete_subject(
     if Homework::any_for_subject(subject.get_id(), &st.db).await? {
         return Err(AppError::Conflict(
             "homework still references this subject — re-tag or delete it first",
+        ));
+    }
+    // Bank templates carry this subject as origin metadata; a deleted subject
+    // would leave them pointing at nothing. Writer lease of [`BANK_LOCK`], the
+    // bank twin of the two guards above: bank create/update validate their
+    // subject and insert under the reader lease, so the no-templates check and
+    // the delete can't straddle a template that just adopted this subject. Held
+    // last; the order is EXAM_LOCK, then HOMEWORK_LOCK, then BANK_LOCK.
+    let _bank_guard = BANK_LOCK.write().await;
+    if BankQuestion::any_for_subject(subject.get_id(), &st.db).await? {
+        return Err(AppError::Conflict(
+            "bank questions still reference this subject — re-tag or delete them first",
         ));
     }
     subject.delete(&st.db).await?;

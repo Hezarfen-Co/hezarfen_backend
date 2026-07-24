@@ -6,6 +6,8 @@ pub mod answer_image;
 pub mod appointment;
 pub mod appointment_slot;
 pub mod attendance;
+pub mod bank_question;
+pub mod bank_question_image;
 pub mod chatbot_message;
 pub mod chatbot_thread;
 pub mod course;

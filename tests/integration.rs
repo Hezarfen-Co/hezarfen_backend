@@ -10626,6 +10626,17 @@ async fn image_blob_keys(db: &hezarfen_backend::database::Database) -> Vec<Strin
     result.take::<Vec<String>>(0).unwrap()
 }
 
+/// Every stored bank-question-image blob name, straight from the table.
+async fn bank_image_blob_keys(db: &hezarfen_backend::database::Database) -> Vec<String> {
+    let mut result = db
+        .query("SELECT VALUE file FROM bank_question_image")
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    result.take::<Vec<String>>(0).unwrap()
+}
+
 /// Every stored answer-image (student drawing) blob name, straight from the table.
 async fn answer_image_blob_keys(db: &hezarfen_backend::database::Database) -> Vec<String> {
     let mut result = db
@@ -16670,4 +16681,730 @@ async fn self_review_is_own_scoped_between_students() {
     .await;
     assert_eq!(sheet.body["answers"][0]["text"], "cicero", "A sees her own answer");
     assert_ne!(sheet.body["answers"][0]["text"], "cato", "never B's answer");
+}
+
+// --- question bank -----------------------------------------------------------
+
+#[tokio::test]
+async fn bank_question_create_get_list_and_instantiate() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "bank_t", "teacher").await;
+    let course = create_course(&app, &teacher, "algebra").await;
+    let subject = create_subject(&app, &teacher, &course, "linear").await;
+
+    // Create a template — subject is origin metadata, not held to a course.
+    let res = send(
+        &app,
+        "POST",
+        "/bank-questions",
+        Some(&teacher),
+        Some(json!({ "subject_id": subject, "text": "2 + 2?", "kind": "choice",
+                     "points": 10, "choices": ["3", "4", "5"], "correct": 1 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    assert_eq!(res.body["kind"], "choice");
+    assert_eq!(res.body["correct"], 1);
+    assert_eq!(res.body["subject"], subject);
+    let bid = id_of(&res.body);
+
+    // School-wide read + list.
+    let res = send(&app, "GET", &format!("/bank-questions/{bid}"), Some(&teacher), None).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["text"], "2 + 2?");
+    let res = send(&app, "GET", "/bank-questions", Some(&teacher), None).await;
+    assert_eq!(common::items(&res.body).len(), 1);
+
+    // `?subject=` matches, and a foreign id excludes.
+    let res = send(&app, "GET", &format!("/bank-questions?subject={subject}"), Some(&teacher), None).await;
+    assert_eq!(common::items(&res.body).len(), 1);
+    let res = send(&app, "GET", "/bank-questions?subject=nope", Some(&teacher), None).await;
+    assert_eq!(common::items(&res.body).len(), 0);
+
+    // Instantiate into an exam under one of the course's subjects.
+    let now = Timestamp::now().as_millis();
+    let exam = scheduled_exam(
+        &app,
+        &teacher,
+        &course,
+        json!({ "title": "midterm", "kind": "final", "mode": "sync",
+                "starts_at": now - 1_000, "ends_at": now + 600_000 }),
+    )
+    .await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/questions/from-bank/{bid}"),
+        Some(&teacher),
+        Some(json!({ "subject_id": subject })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    assert_eq!(res.body["exam"], exam);
+    assert_eq!(res.body["subject"], subject);
+    assert_eq!(res.body["correct"], 1);
+    assert_eq!(res.body["choices"][1], "4");
+
+    // The copy is independent — the template still stands.
+    let res = send(&app, "GET", &format!("/bank-questions/{bid}"), Some(&teacher), None).await;
+    assert_eq!(res.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn bank_question_owner_gate_cross_course_and_freeze() {
+    let (app, db) = app_and_db().await;
+    let owner = login_as(&app, &db, "bank_o", "teacher").await;
+    let other = login_as(&app, &db, "bank_x", "teacher").await;
+    let admin = login_as(&app, &db, "bank_a", "admin").await;
+
+    let course = create_course(&app, &owner, "geo").await;
+    let subject = create_subject(&app, &owner, &course, "angles").await;
+    let res = send(
+        &app,
+        "POST",
+        "/bank-questions",
+        Some(&owner),
+        Some(json!({ "subject_id": subject, "text": "q", "kind": "text", "points": 5 })),
+    )
+    .await;
+    let bid = id_of(&res.body);
+
+    // A non-owner teacher reads it, but may not edit or delete.
+    let res = send(&app, "GET", &format!("/bank-questions/{bid}"), Some(&other), None).await;
+    assert_eq!(res.status, StatusCode::OK);
+    let res = send(&app, "PATCH", &format!("/bank-questions/{bid}"), Some(&other), Some(json!({ "points": 7 }))).await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+    let res = send(&app, "DELETE", &format!("/bank-questions/{bid}"), Some(&other), None).await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    // Admin bypasses ownership.
+    let res = send(&app, "PATCH", &format!("/bank-questions/{bid}"), Some(&admin), Some(json!({ "points": 7 }))).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["points"], 7);
+
+    // Instantiate with a subject from ANOTHER course is a 400.
+    let course2 = create_course(&app, &owner, "chem").await;
+    let subject2 = create_subject(&app, &owner, &course2, "bonds").await;
+    let now = Timestamp::now().as_millis();
+    let exam = scheduled_exam(
+        &app,
+        &owner,
+        &course,
+        json!({ "title": "t", "kind": "final", "mode": "sync",
+                "starts_at": now - 1_000, "ends_at": now + 600_000 }),
+    )
+    .await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/questions/from-bank/{bid}"),
+        Some(&owner),
+        Some(json!({ "subject_id": subject2 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+
+    // Once a student sits the exam, instantiate freezes (409).
+    let student = login(&app, "sinem").await;
+    let student_id = me_id(&app, &student).await;
+    enroll(&app, &owner, &course, &student_id).await;
+    let res = send(&app, "POST", &format!("/exams/{exam}/attempt"), Some(&student), None).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/questions/from-bank/{bid}"),
+        Some(&owner),
+        Some(json!({ "subject_id": subject })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+}
+
+#[tokio::test]
+async fn exam_question_saves_to_bank() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "s2b_t", "teacher").await;
+    let course = create_course(&app, &teacher, "phys").await;
+    let subject = create_subject(&app, &teacher, &course, "kinematics").await;
+    let exam = create_exam(&app, &teacher, &course, "final", "final").await;
+    let qid = create_question(
+        &app,
+        &teacher,
+        &exam,
+        &subject,
+        json!({ "text": "v=?", "kind": "choice", "points": 10, "choices": ["a", "b"], "correct": 0 }),
+    )
+    .await;
+
+    let res = send(&app, "POST", &format!("/exams/{exam}/questions/{qid}/to-bank"), Some(&teacher), None).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    assert_eq!(res.body["text"], "v=?");
+    assert_eq!(res.body["correct"], 0);
+    assert_eq!(res.body["subject"], subject);
+    assert_eq!(res.body["owner"], me_id(&app, &teacher).await);
+    let bid = id_of(&res.body);
+
+    // It now lives in the school-wide bank.
+    let res = send(&app, "GET", &format!("/bank-questions/{bid}"), Some(&teacher), None).await;
+    assert_eq!(res.status, StatusCode::OK);
+}
+
+/// Instantiating a bank template copies its image blobs to fresh files under the
+/// new exam question, byte-for-byte, and leaves the source template's images
+/// untouched.
+#[tokio::test]
+async fn bank_instantiate_copies_images() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "bimg_t", "teacher").await;
+    let course = create_course(&app, &teacher, "geo1").await;
+    let subject = create_subject(&app, &teacher, &course, "maps1").await;
+
+    // A choice template with an illustration and one option picture.
+    let res = send(
+        &app,
+        "POST",
+        "/bank-questions",
+        Some(&teacher),
+        Some(json!({ "subject_id": subject, "text": "Which city?", "kind": "choice",
+                     "points": 10, "choices": ["Ankara", "İzmir"], "correct": 0 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let bid = id_of(&res.body);
+
+    let illus = b"bank-illustration".as_slice();
+    let choice = b"bank-choice-pic".as_slice();
+    let (status, _) =
+        post_image(&app, &teacher, &format!("/bank-questions/{bid}/image"), "image/png", illus).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = post_image(
+        &app,
+        &teacher,
+        &format!("/bank-questions/{bid}/choices/0/image"),
+        "image/webp",
+        choice,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let src_bank_keys = bank_image_blob_keys(&db).await;
+    assert_eq!(src_bank_keys.len(), 2);
+
+    // Instantiate into an exam.
+    let exam = create_exam(&app, &teacher, &course, "midterm", "final").await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/questions/from-bank/{bid}"),
+        Some(&teacher),
+        Some(json!({ "subject_id": subject })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let qid = id_of(&res.body);
+
+    // Both images retrievable on the new exam question, bytes equal to source.
+    let (status, _, bytes) = common::send_raw(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/questions/{qid}/image"),
+        Some(&teacher),
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, illus);
+    let (status, _, bytes) = common::send_raw(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/questions/{qid}/choices/0/image"),
+        Some(&teacher),
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, choice);
+
+    // Copies are fresh files — new keys, none shared with the bank.
+    let exam_keys = image_blob_keys(&db).await;
+    assert_eq!(exam_keys.len(), 2);
+    for k in &exam_keys {
+        assert!(!src_bank_keys.contains(k), "copied blob reused a source file");
+    }
+
+    // Source bank images untouched — still 200 with the same bytes and keys.
+    let (status, _, bytes) = common::send_raw(
+        &app,
+        "GET",
+        &format!("/bank-questions/{bid}/image"),
+        Some(&teacher),
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, illus);
+    let (status, _, bytes) = common::send_raw(
+        &app,
+        "GET",
+        &format!("/bank-questions/{bid}/choices/0/image"),
+        Some(&teacher),
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, choice);
+    assert_eq!(bank_image_blob_keys(&db).await, src_bank_keys, "source keys changed");
+}
+
+/// Saving an exam question to the bank copies its image blobs to fresh files
+/// under the new template, byte-for-byte, source exam images untouched.
+#[tokio::test]
+async fn bank_save_copies_images() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "simg_t", "teacher").await;
+    let course = create_course(&app, &teacher, "phys1").await;
+    let subject = create_subject(&app, &teacher, &course, "kin1").await;
+    let exam = create_exam(&app, &teacher, &course, "final", "final").await;
+    let qid = create_question(
+        &app,
+        &teacher,
+        &exam,
+        &subject,
+        json!({ "text": "v=?", "kind": "choice", "points": 10, "choices": ["a", "b"], "correct": 0 }),
+    )
+    .await;
+
+    let illus = b"exam-illustration".as_slice();
+    let choice = b"exam-choice-pic".as_slice();
+    let (status, _) = post_image(
+        &app,
+        &teacher,
+        &format!("/exams/{exam}/questions/{qid}/image"),
+        "image/png",
+        illus,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = post_image(
+        &app,
+        &teacher,
+        &format!("/exams/{exam}/questions/{qid}/choices/0/image"),
+        "image/jpeg",
+        choice,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let src_exam_keys = image_blob_keys(&db).await;
+    assert_eq!(src_exam_keys.len(), 2);
+
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/questions/{qid}/to-bank"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let bid = id_of(&res.body);
+
+    // The new bank question carries both images, bytes equal.
+    let (status, _, bytes) = common::send_raw(
+        &app,
+        "GET",
+        &format!("/bank-questions/{bid}/image"),
+        Some(&teacher),
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, illus);
+    let (status, _, bytes) = common::send_raw(
+        &app,
+        "GET",
+        &format!("/bank-questions/{bid}/choices/0/image"),
+        Some(&teacher),
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, choice);
+
+    // Fresh keys; source exam images untouched.
+    let bank_keys = bank_image_blob_keys(&db).await;
+    assert_eq!(bank_keys.len(), 2);
+    for k in &bank_keys {
+        assert!(!src_exam_keys.contains(k), "copied blob reused a source file");
+    }
+    assert_eq!(image_blob_keys(&db).await, src_exam_keys, "source keys changed");
+    let (status, _, bytes) = common::send_raw(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/questions/{qid}/image"),
+        Some(&teacher),
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, illus);
+}
+
+/// An image survives a full round trip: exam question -> bank -> a second exam,
+/// with the bytes intact at the far end.
+#[tokio::test]
+async fn bank_round_trip_preserves_image_bytes() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "rt_t", "teacher").await;
+    let course = create_course(&app, &teacher, "hist1").await;
+    let subject = create_subject(&app, &teacher, &course, "eras1").await;
+    let exam1 = create_exam(&app, &teacher, &course, "e1", "final").await;
+    let qid = create_question(
+        &app,
+        &teacher,
+        &exam1,
+        &subject,
+        json!({ "text": "When?", "kind": "text", "points": 10 }),
+    )
+    .await;
+    let pic = b"round-trip-illustration".as_slice();
+    let (status, _) = post_image(
+        &app,
+        &teacher,
+        &format!("/exams/{exam1}/questions/{qid}/image"),
+        "image/png",
+        pic,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Hop one: exam -> bank.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam1}/questions/{qid}/to-bank"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let bid = id_of(&res.body);
+
+    // Hop two: bank -> a second exam.
+    let exam2 = create_exam(&app, &teacher, &course, "e2", "final").await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam2}/questions/from-bank/{bid}"),
+        Some(&teacher),
+        Some(json!({ "subject_id": subject })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let qid2 = id_of(&res.body);
+
+    let (status, _, bytes) = common::send_raw(
+        &app,
+        "GET",
+        &format!("/exams/{exam2}/questions/{qid2}/image"),
+        Some(&teacher),
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, pic, "bytes drifted across the round trip");
+}
+
+/// Gap-1 guard: a missing source blob mid-copy is all-or-nothing — the
+/// instantiate 500s and leaves NO partial destination (no exam question row, no
+/// exam image rows), while the source template survives intact.
+#[tokio::test]
+async fn bank_instantiate_rolls_back_on_missing_source_blob() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "rb_t", "teacher").await;
+    let course = create_course(&app, &teacher, "geo2").await;
+    let subject = create_subject(&app, &teacher, &course, "maps2").await;
+
+    // Two images so the copy loop has multiple steps.
+    let res = send(
+        &app,
+        "POST",
+        "/bank-questions",
+        Some(&teacher),
+        Some(json!({ "subject_id": subject, "text": "q", "kind": "choice",
+                     "points": 10, "choices": ["a", "b"], "correct": 0 })),
+    )
+    .await;
+    let bid = id_of(&res.body);
+    let (status, _) =
+        post_image(&app, &teacher, &format!("/bank-questions/{bid}/image"), "image/png", b"illus").await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = post_image(
+        &app,
+        &teacher,
+        &format!("/bank-questions/{bid}/choices/0/image"),
+        "image/png",
+        b"opt",
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Corrupt the source on disk: delete one blob so the copy loop hits an
+    // unreadable source mid-flight.
+    let src_keys = bank_image_blob_keys(&db).await;
+    assert_eq!(src_keys.len(), 2);
+    tokio::fs::remove_file(common::files_dir().join(&src_keys[0]))
+        .await
+        .unwrap();
+
+    let exam = create_exam(&app, &teacher, &course, "midterm", "final").await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/questions/from-bank/{bid}"),
+        Some(&teacher),
+        Some(json!({ "subject_id": subject })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::INTERNAL_SERVER_ERROR, "{}", res.body);
+
+    // No partial destination: no question row, no exam image rows (isolated
+    // per-test DB is the race-safe source of truth; the shared parallel blob
+    // dir rules out an exact on-disk diff).
+    let res = send(&app, "GET", &format!("/exams/{exam}/questions"), Some(&teacher), None).await;
+    assert!(
+        common::items(&res.body).is_empty(),
+        "orphan question survived rollback"
+    );
+    assert!(
+        image_blob_keys(&db).await.is_empty(),
+        "orphan exam image rows survived rollback"
+    );
+
+    // Source intact: the template still reads, and its surviving blob is still
+    // on disk.
+    let res = send(&app, "GET", &format!("/bank-questions/{bid}"), Some(&teacher), None).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(bank_image_blob_keys(&db).await, src_keys, "source bank rows changed");
+    assert!(
+        common::files_dir().join(&src_keys[1]).exists(),
+        "surviving source blob vanished"
+    );
+}
+
+/// A bank template's subject is origin metadata, but it must still exist:
+/// create and update both 400 on an unknown subject id.
+#[tokio::test]
+async fn bank_rejects_unknown_subject() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "bsub_t", "teacher").await;
+    let course = create_course(&app, &teacher, "bsub_c").await;
+    let subject = create_subject(&app, &teacher, &course, "bsub_s").await;
+
+    // Create with a bogus subject id — 400, not a stored row.
+    let res = send(
+        &app,
+        "POST",
+        "/bank-questions",
+        Some(&teacher),
+        Some(json!({ "subject_id": "nope", "text": "q", "kind": "text", "points": 5 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+
+    // Create a real one, then PATCH its subject to a bogus id — also 400.
+    let res = send(
+        &app,
+        "POST",
+        "/bank-questions",
+        Some(&teacher),
+        Some(json!({ "subject_id": subject, "text": "q", "kind": "text", "points": 5 })),
+    )
+    .await;
+    let bid = id_of(&res.body);
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/bank-questions/{bid}"),
+        Some(&teacher),
+        Some(json!({ "subject_id": "nope" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+}
+
+/// A subject with bank templates referencing it can't be deleted (409) until
+/// those templates are gone — mirrors the exam-question / homework guard.
+#[tokio::test]
+async fn subject_delete_blocked_by_bank_question() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "bdel_t", "teacher").await;
+    let course = create_course(&app, &teacher, "bdel_c").await;
+    let subject = create_subject(&app, &teacher, &course, "bdel_s").await;
+
+    let res = send(
+        &app,
+        "POST",
+        "/bank-questions",
+        Some(&teacher),
+        Some(json!({ "subject_id": subject, "text": "q", "kind": "text", "points": 5 })),
+    )
+    .await;
+    let bid = id_of(&res.body);
+
+    // Guarded while the template stands.
+    let res = send(&app, "DELETE", &format!("/subjects/{subject}"), Some(&teacher), None).await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+
+    // Drop the template — the subject frees up.
+    let res = send(&app, "DELETE", &format!("/bank-questions/{bid}"), Some(&teacher), None).await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    let res = send(&app, "DELETE", &format!("/subjects/{subject}"), Some(&teacher), None).await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+}
+
+/// `?owner=me` (and an explicit owner id) narrows the school-wide bank to one
+/// owner's templates.
+#[tokio::test]
+async fn bank_owner_filter() {
+    let (app, db) = app_and_db().await;
+    let alice = login_as(&app, &db, "bown_a", "teacher").await;
+    let bob = login_as(&app, &db, "bown_b", "teacher").await;
+    let course = create_course(&app, &alice, "bown_c").await;
+    let subject = create_subject(&app, &alice, &course, "bown_s").await;
+
+    for who in [&alice, &bob] {
+        send(
+            &app,
+            "POST",
+            "/bank-questions",
+            Some(who),
+            Some(json!({ "subject_id": subject, "text": "q", "kind": "text", "points": 5 })),
+        )
+        .await;
+    }
+    let alice_id = me_id(&app, &alice).await;
+    let bob_id = me_id(&app, &bob).await;
+
+    // Whole bank has both.
+    let res = send(&app, "GET", "/bank-questions", Some(&alice), None).await;
+    assert_eq!(common::items(&res.body).len(), 2);
+
+    // `me` resolves to the caller.
+    let res = send(&app, "GET", "/bank-questions?owner=me", Some(&alice), None).await;
+    let items = common::items(&res.body);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["owner"], alice_id);
+
+    // An explicit id filters to that owner.
+    let res = send(&app, "GET", &format!("/bank-questions?owner={bob_id}"), Some(&alice), None).await;
+    let items = common::items(&res.body);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["owner"], bob_id);
+}
+
+/// A template's response carries its image metadata (illustration + per-choice
+/// slots) once images are uploaded — the same shape the exam side returns.
+#[tokio::test]
+async fn bank_response_carries_image_metas() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "bmeta_t", "teacher").await;
+    let course = create_course(&app, &teacher, "bmeta_c").await;
+    let subject = create_subject(&app, &teacher, &course, "bmeta_s").await;
+    let res = send(
+        &app,
+        "POST",
+        "/bank-questions",
+        Some(&teacher),
+        Some(json!({ "subject_id": subject, "text": "q", "kind": "choice",
+                     "points": 10, "choices": ["a", "b"], "correct": 0 })),
+    )
+    .await;
+    let bid = id_of(&res.body);
+
+    // No images yet: metas are null / all-empty.
+    assert!(res.body["image"].is_null());
+    assert_eq!(res.body["choice_images"], json!([null, null]));
+
+    let (status, _) =
+        post_image(&app, &teacher, &format!("/bank-questions/{bid}/image"), "image/png", b"illus").await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = post_image(
+        &app,
+        &teacher,
+        &format!("/bank-questions/{bid}/choices/0/image"),
+        "image/jpeg",
+        b"opt",
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let res = send(&app, "GET", &format!("/bank-questions/{bid}"), Some(&teacher), None).await;
+    assert_eq!(res.body["image"]["content_type"], "image/png");
+    assert_eq!(res.body["image"]["size"], 5);
+    assert_eq!(res.body["choice_images"][0]["content_type"], "image/jpeg");
+    assert!(res.body["choice_images"][1].is_null());
+
+    // The list carries them too (batched, not per-row).
+    let res = send(&app, "GET", "/bank-questions?owner=me", Some(&teacher), None).await;
+    let items = common::items(&res.body);
+    assert_eq!(items[0]["image"]["content_type"], "image/png");
+    assert_eq!(items[0]["choice_images"][0]["content_type"], "image/jpeg");
+}
+
+/// Provenance rides both directions: instantiate records `source_bank` on the
+/// new exam question; save-to-bank records `source_exam` on the new template.
+#[tokio::test]
+async fn bank_provenance_both_directions() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "bprov_t", "teacher").await;
+    let course = create_course(&app, &teacher, "bprov_c").await;
+    let subject = create_subject(&app, &teacher, &course, "bprov_s").await;
+
+    // Bank -> exam: source_bank is the template id.
+    let res = send(
+        &app,
+        "POST",
+        "/bank-questions",
+        Some(&teacher),
+        Some(json!({ "subject_id": subject, "text": "q", "kind": "text", "points": 5 })),
+    )
+    .await;
+    let bid = id_of(&res.body);
+    let exam = create_exam(&app, &teacher, &course, "midterm", "final").await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/questions/from-bank/{bid}"),
+        Some(&teacher),
+        Some(json!({ "subject_id": subject })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    assert_eq!(res.body["source_bank"], bid);
+
+    // A directly authored exam question has no source_bank.
+    let qid = create_question(
+        &app,
+        &teacher,
+        &exam,
+        &subject,
+        json!({ "text": "plain", "kind": "text", "points": 5 }),
+    )
+    .await;
+
+    // Exam -> bank: source_exam is the origin exam id.
+    let res = send(&app, "POST", &format!("/exams/{exam}/questions/{qid}/to-bank"), Some(&teacher), None).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    assert_eq!(res.body["source_exam"], exam);
+
+    // A directly authored template has no source_exam.
+    let res = send(&app, "GET", &format!("/bank-questions/{bid}"), Some(&teacher), None).await;
+    assert!(res.body["source_exam"].is_null());
 }

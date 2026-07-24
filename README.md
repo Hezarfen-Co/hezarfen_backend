@@ -47,7 +47,11 @@ governed by a teacher-controlled rejoin door. Writing an exam takes a while, so 
 when it's ready. Questions can carry **images**: any question may hold one
 illustration (a map above the prompt), and each option of a choice question
 may be a picture of its own (pick the right city off the map) — raster
-uploads capped by the same `max_file_bytes` policy as note files. Teachers
+uploads capped by the same `max_file_bytes` policy as note files. Good
+questions get reused, so a teacher+ can bank one in a school-wide **question
+bank** — detached templates (with their own images) that any teacher copies
+into a fresh exam question across years, editable and deletable only by
+whoever saved them. Teachers
 watch attendance, per-student remaining time,
 sittings, walk-outs, no-shows (`absent` once the window closes), submissions,
 and marks land live on a monitor endpoint (snapshot or SSE stream). Courses also hand out
@@ -305,6 +309,8 @@ course enrollments.
 | Ask into the school question pool        | student      | **Students only** (exact); born `pending` — visible to the asker + teacher+ only; the asker may attach/replace/remove one photo while pending |
 | Read the pool; offer / edit / withdraw own solutions | student | Every `approved` question is school-wide (parents stay out); a solution's author edits its body and photo anytime (solutions never freeze) and deletes it, teacher+ delete any |
 | Approve a pending pool question; delete any question or solution | teacher | Approval publishes school-wide and **freezes** the content; rejection = deletion — moderation never edits, so teacher+ cannot rewrite a solution |
+| Read the school **question bank**; save / instantiate bank questions | teacher | Every bank row is school-wide (reads + copy into an exam); saving one makes the caller its owner |
+| Edit / delete a bank question (and its images) | teacher | **Owner only** (admin bypass); bank rows carry no exam link, so they never freeze |
 | Read **own** attendance report           | student      |                                               |
 | Read another user's attendance report    | teacher      | Narrowed to the caller's managed courses; `manager`+ sees all; a `parent` sees a linked student's in full |
 | View **visible** courses/exams and a course's subjects; read **own** result, courses, mark report | student | Visible = enrolled (teachers: + created + assigned; `manager`+: all); exam **drafts** show only to the course's managers |
@@ -515,6 +521,8 @@ their existing shapes: the student exam-room reads
 | GET    | `/exams/{id}/questions`          | teacher | The full question list, `correct` included (course manager) · paged |
 | PATCH  | `/exams/{id}/questions/{qid}`    | teacher | Edit a question — the kind bundle revalidates as a unit (course manager; frozen once attempted) |
 | DELETE | `/exams/{id}/questions/{qid}`    | teacher | Delete a question + its answers (course manager; frozen once attempted) |
+| POST   | `/exams/{id}/questions/from-bank/{bid}` | teacher | Instantiate a **bank question** into this exam — copies it to a fresh exam-scoped question (new id, own images + answers; records the template in `source_bank`); body `{subject_id}` retags it against the course's subjects (`400` cross-course; course manager; `409` once attempted) |
+| POST   | `/exams/{id}/questions/{qid}/to-bank` | teacher | Save an existing exam question into the school **question bank** — copies it to a detached bank row (new id, own images; records the origin exam in `source_exam`); the source question is untouched (course manager) |
 | GET    | `/exams/{id}/attempt/questions`  | student | The sitting view: no `correct`, own answers embedded, image metadata included (requires enrollment + an attempt) |
 | POST   | `/exams/{id}/questions/{qid}/image` | teacher | Attach/replace the question's illustration: `multipart/form-data`, one `file` part — raster images only (`png`/`jpeg`/`webp`/`gif`), ≤ `max_file_bytes` (course manager; frozen once attempted) |
 | GET    | `/exams/{id}/questions/{qid}/image` | student | The illustration bytes (course manager anytime; students enrolled + attempt started) |
@@ -538,6 +546,17 @@ their existing shapes: the student exam-room reads
 | GET    | `/exams/{id}/review/attempts/{seq}/answers/{qid}/image` | student | The caller's **own** drawn-answer bytes for a sitting, inline (same review gate) |
 | GET    | `/exams/{id}/attempt/ws`         | student | **WebSocket** exam room (students only): state ticks, autosave, finish; entering clears `left_at`, leaving stamps it (see "Taking an exam") |
 | GET    | `/exams/{id}/live`               | teacher | Live monitor snapshot: roster × latest attempts × marks + per-student progress/`left_at`/`attempts_used` + counts; no-shows turn `absent` once the window closes (course manager); poll to keep a monitor current |
+| GET    | `/bank-questions`                | teacher | The school-wide question bank — `?subject=<id>` filters by origin subject, `?owner=<id>` (or `?owner=me`) by owner; reusable templates any teacher+ can read, each with its image metas (`image`, `choice_images`) · paged |
+| POST   | `/bank-questions`                | teacher | `{subject_id, text, kind, points, choices?, correct?}` — save a reusable question template into the bank (owner = caller; `subject_id` is origin metadata, but must exist — `400` otherwise) |
+| GET    | `/bank-questions/{bid}`          | teacher | Get one bank question, `correct` + image metas (`image`, `choice_images`) included (any teacher+) |
+| PATCH  | `/bank-questions/{bid}`          | teacher | Edit a bank question — the kind bundle revalidates as a unit (**owner only**, admin bypass; bank rows never freeze) |
+| DELETE | `/bank-questions/{bid}`          | teacher | Delete a bank question + its images (**owner only**, admin bypass) |
+| POST   | `/bank-questions/{bid}/image`    | teacher | Attach/replace the bank question's illustration: `multipart/form-data`, one `file` part — raster images only (`png`/`jpeg`/`webp`/`gif`), ≤ `max_file_bytes` (**owner only**, admin bypass) |
+| GET    | `/bank-questions/{bid}/image`    | teacher | The illustration bytes (any teacher+) |
+| DELETE | `/bank-questions/{bid}/image`    | teacher | Remove the illustration (**owner only**, admin bypass) |
+| POST   | `/bank-questions/{bid}/choices/{index}/image` | teacher | Attach/replace option `index`'s picture (`choice` questions; same form and limits as above; **owner only**, admin bypass) |
+| GET    | `/bank-questions/{bid}/choices/{index}/image` | teacher | The option picture's bytes (any teacher+) |
+| DELETE | `/bank-questions/{bid}/choices/{index}/image` | teacher | Remove one option picture (**owner only**, admin bypass) |
 | POST   | `/courses/{id}/homework`         | teacher | `{title, description?, subject_id, due_at, assigned?}` — assign homework tagged with a course subject, due in the future; `assigned` names an enrolled-student subset, ≤ 200 (omit/`[]` = the whole course) (course manager) |
 | GET    | `/courses/{id}/homework`         | student | List the course's homework, newest first (enrolled, creator, assigned teacher, or manager+; students see only what they're assigned) · paged |
 | GET    | `/homework`                      | student | The caller's cross-course homework: their courses' (manager+: all; students only what they're assigned) · paged |
@@ -1222,6 +1241,53 @@ The live monitor rides along: each roster row now carries `answered` and
 The student's own `GET /exams/{id}/attempt` echoes the same
 `answered`/`question_count` pair.
 
+## Question bank
+
+Writing good questions is slow, and the same one gets asked year after year, so
+the school keeps a reusable **question bank**. A bank question is an
+`ExamQuestion` cut loose from any exam: it has the same shape (`subject_id`,
+`text`, `kind`, `points`, and — for a `choice` — `choices` + `correct`), the
+same image slots (one illustration, plus a picture per option), and the same
+newtype validation, but it carries **no exam link**. Because nothing sits it,
+a bank row **never freezes** — its owner can edit or delete it forever.
+
+`POST /bank-questions` (teacher+) saves one, stamping the caller as its
+**owner**. `subject_id` is origin metadata, but it must **exist** — an unknown
+subject is a `400` (create and PATCH alike); the reverse guard holds too, so
+deleting a subject a template still references is a `409` (same as exam
+questions and homework). Reads are school-wide: `GET /bank-questions` lists the
+whole bank (paged, `?subject=<id>` narrows by origin subject, `?owner=<id>` — or
+`?owner=me` — by owner) and `GET /bank-questions/{bid}` fetches one with
+`correct` included — any teacher+ can browse and reuse what any colleague
+banked. Each response carries its **image metadata** — an `image` meta for the
+illustration and a `choice_images` array aligned with `choices` (per-slot
+`{content_type, size}`, `null` where a slot has no picture) — the same shape an
+exam question's response uses; the bytes still come from the image endpoints.
+Mutation is **owner-only** (an `admin` bypasses): `PATCH /bank-questions/{bid}`
+revalidates the kind bundle as a unit, `DELETE /bank-questions/{bid}` drops the
+row and its image blobs. The illustration and option pictures work exactly like
+an exam question's — `POST|GET|DELETE /bank-questions/{bid}/image` and
+`…/choices/{index}/image`, `multipart/form-data` with one `file` part, raster
+only (`png`/`jpeg`/`webp`/`gif`), ≤ `max_file_bytes` — reads school-wide,
+writes owner-only.
+
+The bank feeds exams by **copying**, never linking. `POST
+/exams/{id}/questions/from-bank/{bid}` instantiates a bank question into the
+exam: it mints a **fresh** exam-scoped question (new id, its own answer rows,
+its image blobs copied to new files), so later edits on either side never
+touch the other. The subject on the bank row is origin metadata only — the
+call takes its own `{subject_id}`, re-checked against the target course's
+subjects (`400` on a cross-course subject), and instantiating into an exam
+that already has attempts is a `409`, the same freeze that guards hand-authored
+questions. The instantiated question records the template it came from in
+`source_bank`. The reverse, `POST /exams/{id}/questions/{qid}/to-bank`, copies
+an existing exam question **into** the bank (new detached row, images copied to
+new files, owner = caller); the source question is left untouched, and the new
+template records the origin exam in `source_exam`. Both provenance fields are
+nullable — a hand-authored question or template carries `null` — and one-way
+metadata (the copies stay fully detached). All bank routes are course-agnostic
+and require teacher+.
+
 ## Homework
 
 A course hands out **homework**: `POST /courses/{id}/homework` with a title,
@@ -1782,6 +1848,10 @@ src/
                    metadata; bytes on disk under FILES_PATH)
     answer_image.rs AnswerImageId · AnswerImage (student answer-drawing
                    metadata; bytes on disk under FILES_PATH)
+    bank_question.rs BankQuestionId · BankQuestion (school-wide reusable
+                   question template, copied into exams; no exam FK)
+    bank_question_image.rs BankQuestionImageId · BankQuestionImage (bank
+                   question/choice picture metadata; bytes on disk under FILES_PATH)
     profile.rs     PersonName · Email · Phone · BirthDate (personal-info newtypes)
     preferences.rs Theme · Language (own UI preferences)
     message.rs     MessageId · MessageSubject · MessageBody · MessageLabel ·
@@ -1827,8 +1897,8 @@ src/
     page.rs        PageParams · Page<T> (shared pagination)
     auth.rs  users.rs  notes.rs  messages.rs  events.rs  appointments.rs
     courses.rs  subjects.rs  sessions.rs  exams.rs  homework.rs  questions.rs
-    marks.rs  work.rs  pomodoro.rs  attendance.rs  settings.rs  terms.rs
-    ai.rs  chatbot.rs
+    bank_questions.rs  marks.rs  work.rs  pomodoro.rs  attendance.rs
+    settings.rs  terms.rs  ai.rs  chatbot.rs
 ```
 
 Tests: `cargo test` — unit (in-source), integration (`tower::oneshot` + in-memory
