@@ -170,6 +170,11 @@ struct ExamResultResponse {
     exam: String,
     /// The graded student.
     user: PersonRef,
+    /// Which sitting this mark belongs to (1 = first attempt). Lets the grader
+    /// jump from a mark to that sitting's answer sheet
+    /// (`GET /exams/{id}/students/{user}/attempts/{seq}/answers`) — without it
+    /// a marked retake's answers are unreachable from the mark.
+    seq: i64,
     mark: i64,
     /// Who recorded the mark.
     graded_by: PersonRef,
@@ -181,6 +186,7 @@ impl ExamResultResponse {
             id: result.get_id().key().to_string(),
             exam: result.get_exam().key().to_string(),
             user: PersonRef::resolve(people, result.get_user()),
+            seq: result.get_seq(),
             mark: result.get_mark().as_i64(),
             graded_by: PersonRef::resolve(people, result.get_graded_by()),
         }
