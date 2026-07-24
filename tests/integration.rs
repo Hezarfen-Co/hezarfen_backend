@@ -15505,15 +15505,44 @@ async fn appointment_book_and_approve_holds_the_slot() {
 async fn rejecting_a_booking_frees_the_slot() {
     let (app, db) = app_and_db().await;
     let ali = login_as(&app, &db, "ali", "teacher").await;
+    let ali_id = me_id(&app, &ali).await;
     let veli = login(&app, "veli").await;
     let ayse = login(&app, "ayse").await;
     let now = Timestamp::now().as_millis();
     let slot = publish_slot(&app, &ali, now + HOUR_MS, now + 2 * HOUR_MS).await;
 
+    // A bodyless reject records the decider and no reason.
     let booking = book_ok(&app, &veli, &slot).await;
     let res = decide(&app, &ali, &booking, "reject").await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     assert_eq!(res.body["status"], "rejected");
+    assert_eq!(res.body["decided_by"]["id"], ali_id.as_str());
+    assert!(res.body["reject_reason"].is_null(), "no reason was given");
+
+    // A reject carrying a reason records both the decider and the reason, and
+    // an over-long reason is refused before the row changes.
+    let booking = book_ok(&app, &ayse, &slot).await;
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/appointments/{booking}/reject"),
+        Some(&ali),
+        Some(json!({ "reason": "x".repeat(2000) })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/appointments/{booking}/reject"),
+        Some(&ali),
+        Some(json!({ "reason": "Bu saatte müsait değilim" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["status"], "rejected");
+    assert_eq!(res.body["decided_by"]["id"], ali_id.as_str());
+    assert_eq!(res.body["reject_reason"], "Bu saatte müsait değilim");
 
     // Occupancy counts live rows only, so the next person may take it.
     let res = book_slot(&app, &ayse, &slot).await;
@@ -15682,6 +15711,7 @@ async fn declining_a_reschedule_cancels_the_booking() {
     let (app, db) = app_and_db().await;
     let ali = login_as(&app, &db, "ali", "teacher").await;
     let veli = login(&app, "veli").await;
+    let veli_id = me_id(&app, &veli).await;
     let ayse = login(&app, "ayse").await;
     let now = Timestamp::now().as_millis();
     let slot = publish_slot(&app, &ali, now + HOUR_MS, now + 2 * HOUR_MS).await;
@@ -15700,6 +15730,9 @@ async fn declining_a_reschedule_cancels_the_booking() {
     let res = decide(&app, &veli, &booking, "reschedule/decline").await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     assert_eq!(res.body["status"], "cancelled");
+    // The decliner is recorded as the canceller, with no reason.
+    assert_eq!(res.body["cancelled_by"]["id"], veli_id.as_str());
+    assert!(res.body["cancel_reason"].is_null());
     // The refused proposal stays readable on the cancelled row.
     assert_eq!(res.body["proposed_starts_at"], now + 3 * HOUR_MS);
 
@@ -15792,10 +15825,12 @@ async fn either_side_cancels_until_the_window_opens() {
     let (app, db) = app_and_db().await;
     let ali = login_as(&app, &db, "ali", "teacher").await;
     let veli = login(&app, "veli").await;
+    let veli_id = me_id(&app, &veli).await;
     let ayse = login(&app, "ayse").await;
     let now = Timestamp::now().as_millis();
 
-    // The requester's own call, on an approved meeting.
+    // The requester's own call, on an approved meeting. A bodyless cancel
+    // records the actor and no reason.
     let slot = publish_slot(&app, &ali, now + HOUR_MS, now + 2 * HOUR_MS).await;
     let booking = book_ok(&app, &veli, &slot).await;
     assert_eq!(
@@ -15805,6 +15840,33 @@ async fn either_side_cancels_until_the_window_opens() {
     let res = decide(&app, &veli, &booking, "cancel").await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     assert_eq!(res.body["status"], "cancelled");
+    assert_eq!(res.body["cancelled_by"]["id"], veli_id.as_str());
+    assert!(res.body["cancel_reason"].is_null(), "no reason was given");
+
+    // A cancel carrying a reason records both the actor and the reason, and an
+    // over-long reason is refused before the row changes.
+    let booking = book_ok(&app, &veli, &slot).await;
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/appointments/{booking}/cancel"),
+        Some(&veli),
+        Some(json!({ "reason": "x".repeat(2000) })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/appointments/{booking}/cancel"),
+        Some(&veli),
+        Some(json!({ "reason": "Rahatsızlandım" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["status"], "cancelled");
+    assert_eq!(res.body["cancelled_by"]["id"], veli_id.as_str());
+    assert_eq!(res.body["cancel_reason"], "Rahatsızlandım");
 
     // The slot's teacher may too.
     let booking = book_ok(&app, &ayse, &slot).await;

@@ -63,6 +63,22 @@ struct BookAppointment {
 }
 
 #[derive(Deserialize, ToSchema)]
+struct CancelRequest {
+    /// Optional free-text reason. Blank or absent records no reason; over-long
+    /// (past `MAX_APPOINTMENT_REASON_LEN`) answers `400`.
+    #[schema(example = "Rahatsızlandım, katılamayacağım")]
+    reason: Option<String>,
+}
+
+#[derive(Deserialize, ToSchema)]
+struct RejectRequest {
+    /// Optional free-text reason. Blank or absent records no reason; over-long
+    /// (past `MAX_APPOINTMENT_REASON_LEN`) answers `400`.
+    #[schema(example = "Bu saatte müsait değilim")]
+    reason: Option<String>,
+}
+
+#[derive(Deserialize, ToSchema)]
 struct Reschedule {
     /// Unix-millisecond timestamps. Must not be in the past.
     #[schema(example = 1_900_000_000_000_i64)]
@@ -126,6 +142,12 @@ struct AppointmentResponse {
     proposed_by: Option<PersonRef>,
     /// Who approved or rejected it; `null` while pending.
     decided_by: Option<PersonRef>,
+    /// Who called it off; `null` unless `status` is `cancelled`.
+    cancelled_by: Option<PersonRef>,
+    /// Optional free-text reason given when cancelling; `null` when none was.
+    cancel_reason: Option<String>,
+    /// Optional free-text reason given when rejecting; `null` when none was.
+    reject_reason: Option<String>,
     created_at: i64,
 }
 
@@ -153,6 +175,15 @@ impl AppointmentResponse {
             decided_by: appointment
                 .get_decided_by()
                 .map(|id| PersonRef::resolve(people, id)),
+            cancelled_by: appointment
+                .get_cancelled_by()
+                .map(|id| PersonRef::resolve(people, id)),
+            cancel_reason: appointment
+                .get_cancel_reason()
+                .map(|reason| reason.as_str().to_string()),
+            reject_reason: appointment
+                .get_reject_reason()
+                .map(|reason| reason.as_str().to_string()),
             created_at: appointment.get_created_at().as_millis(),
         }
     }
@@ -177,6 +208,7 @@ async fn appointment_responses(
         ids.extend(slot.as_ref().map(|slot| slot.get_teacher().clone()));
         ids.extend(row.get_proposed_by().cloned());
         ids.extend(row.get_decided_by().cloned());
+        ids.extend(row.get_cancelled_by().cloned());
     }
     let people = person_map(ids, db).await?;
     Ok(rows
@@ -551,8 +583,10 @@ async fn approve(
     tag = "appointments",
     security(("session_cookie" = [])),
     params(("id" = String, Path, description = "Appointment id")),
+    request_body(content = RejectRequest, description = "Optional rejection reason; the whole body may be omitted"),
     responses(
         (status = 200, description = "Rejected", body = AppointmentResponse),
+        (status = 400, description = "Reason is over-long", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the slot's teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
@@ -563,10 +597,17 @@ async fn reject(
     State(st): State<AppState>,
     RequireTeacher(user): RequireTeacher,
     Path(id): Path<String>,
+    body: Option<Json<RejectRequest>>,
 ) -> Result<Json<AppointmentResponse>, AppError> {
     let id = AppointmentId::from_key(&id);
     for_decision(&id, &user, &st.db).await?;
-    let appointment = Appointment::reject(&id, user.get_id(), &st.db).await?;
+    // A blank or absent reason records none; a present one is validated (400 if
+    // over-long) before it reaches the row.
+    let reason = match body.and_then(|Json(req)| req.reason) {
+        Some(reason) if !reason.trim().is_empty() => Some(AppointmentReason::try_new(&reason)?),
+        _ => None,
+    };
+    let appointment = Appointment::reject(&id, user.get_id(), reason, &st.db).await?;
     one_appointment(appointment, &st.db).await
 }
 
@@ -580,8 +621,10 @@ async fn reject(
     tag = "appointments",
     security(("session_cookie" = [])),
     params(("id" = String, Path, description = "Appointment id")),
+    request_body(content = CancelRequest, description = "Optional cancellation reason; the whole body may be omitted"),
     responses(
         (status = 200, description = "Cancelled", body = AppointmentResponse),
+        (status = 400, description = "Reason is over-long", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Neither the requester nor the slot's teacher", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
@@ -592,6 +635,7 @@ async fn cancel(
     State(st): State<AppState>,
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
+    body: Option<Json<CancelRequest>>,
 ) -> Result<Json<AppointmentResponse>, AppError> {
     let id = AppointmentId::from_key(&id);
     let appointment = Appointment::read(&id, &st.db)
@@ -605,10 +649,16 @@ async fn cancel(
             "only the requester or the slot's teacher can cancel this appointment",
         ));
     }
+    // A blank or absent reason records none; a present one is validated (400 if
+    // over-long) before it reaches the row.
+    let reason = match body.and_then(|Json(req)| req.reason) {
+        Some(reason) if !reason.trim().is_empty() => Some(AppointmentReason::try_new(&reason)?),
+        _ => None,
+    };
     // The started-window guard lives in `Appointment::cancel`, under the lock
     // and on a fresh read — a pre-lock copy of it here would only be a staler
     // second opinion, and `decline_reschedule` would still bypass it.
-    let appointment = Appointment::cancel(&id, &st.db).await?;
+    let appointment = Appointment::cancel(&id, user.get_id(), reason, &st.db).await?;
     one_appointment(appointment, &st.db).await
 }
 
@@ -719,7 +769,7 @@ async fn decline_reschedule(
     if appointment.get_proposed_starts_at().is_none() {
         return Err(AppError::Conflict("no time has been proposed"));
     }
-    let appointment = Appointment::cancel(&id, &st.db).await?;
+    let appointment = Appointment::cancel(&id, user.get_id(), None, &st.db).await?;
     one_appointment(appointment, &st.db).await
 }
 
