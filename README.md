@@ -532,6 +532,7 @@ their existing shapes: the student exam-room reads
 | GET    | `/exams/{id}/students/{user}/attempts/{seq}/answers` | teacher | One prior sitting's answer sheet: `is_correct` flags + suggested `auto_score` (course manager) |
 | GET    | `/exams/{id}/students/{user}/attempts/{seq}/answers/{qid}/image` | teacher | One prior sitting's drawn-answer bytes, inline (course manager) |
 | GET    | `/exams/{id}/students/{user}/marks` | teacher | A student's full per-sitting mark history, oldest first — the latest seq is the grade-of-record (course manager) |
+| GET    | `/exams/{id}/review/questions`   | student | The exam's question list **with `correct`** — the answer key the caller checks their own sheet against (same review gate) · paged |
 | GET    | `/exams/{id}/review/attempts`    | student | The caller's **own** sitting numbers (answers ⋃ marks), ascending — only when `allow_review` is on and the caller has been marked (`403`/`404` otherwise) |
 | GET    | `/exams/{id}/review/attempts/{seq}/answers` | student | One of the caller's **own** sittings, judged: `is_correct` flags + suggested `auto_score` (same review gate) |
 | GET    | `/exams/{id}/review/attempts/{seq}/answers/{qid}/image` | student | The caller's **own** drawn-answer bytes for a sitting, inline (same review gate) |

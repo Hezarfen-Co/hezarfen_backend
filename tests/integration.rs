@@ -16511,6 +16511,24 @@ async fn self_review_returns_own_seqs_and_per_sitting_answers() {
     assert_eq!(seq1.status, StatusCode::OK, "{}", seq1.body);
     assert_eq!(seq1.body["answers"][0]["text"], "mitochondria");
     assert_eq!(seq2.body["answers"][0]["text"], "chloroplast");
+
+    // The answer key: a marked student reads the questions with `correct`
+    // exposed (the whole point of review) — the same list the teacher sees.
+    let key = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/review/questions"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(key.status, StatusCode::OK, "{}", key.body);
+    assert_eq!(key.body["items"][0]["id"], question);
+    assert!(
+        key.body["items"][0].as_object().unwrap().contains_key("correct"),
+        "review/questions must expose `correct`: {}",
+        key.body
+    );
 }
 
 /// Own-scoped isolation: two graded students, review on. There is no `{user}`
