@@ -436,6 +436,9 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS proposed_ends_at ON appointment TYPE option<int>;
     DEFINE FIELD IF NOT EXISTS proposed_by ON appointment TYPE option<record<user>>;
     DEFINE FIELD IF NOT EXISTS decided_by ON appointment TYPE option<record<user>>;
+    DEFINE FIELD IF NOT EXISTS cancelled_by ON appointment TYPE option<record<user>>;
+    DEFINE FIELD IF NOT EXISTS cancel_reason ON appointment TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS reject_reason ON appointment TYPE option<string>;
     DEFINE FIELD IF NOT EXISTS created_at ON appointment TYPE int;
     DEFINE INDEX IF NOT EXISTS appointment_slot_ref ON appointment FIELDS slot;
     DEFINE INDEX IF NOT EXISTS appointment_requester ON appointment FIELDS requester;

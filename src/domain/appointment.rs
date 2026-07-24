@@ -153,6 +153,16 @@ pub struct Appointment {
     proposed_ends_at: Option<Timestamp>,
     proposed_by: Option<UserId>,
     decided_by: Option<UserId>,
+    /// Who called the meeting off, and why, once it is `cancelled`. Both
+    /// `#[surreal(default)]` so bookings written before cancellation records
+    /// existed still read back (they resolve to `None`).
+    #[surreal(default)]
+    cancelled_by: Option<UserId>,
+    #[surreal(default)]
+    cancel_reason: Option<AppointmentReason>,
+    /// Why the request was turned down; the rejecter is already on `decided_by`.
+    #[surreal(default)]
+    reject_reason: Option<AppointmentReason>,
     created_at: Timestamp,
 }
 
@@ -191,6 +201,18 @@ impl Appointment {
 
     pub fn get_decided_by(&self) -> Option<&UserId> {
         self.decided_by.as_ref()
+    }
+
+    pub fn get_cancelled_by(&self) -> Option<&UserId> {
+        self.cancelled_by.as_ref()
+    }
+
+    pub fn get_cancel_reason(&self) -> Option<&AppointmentReason> {
+        self.cancel_reason.as_ref()
+    }
+
+    pub fn get_reject_reason(&self) -> Option<&AppointmentReason> {
+        self.reject_reason.as_ref()
     }
 
     pub fn get_created_at(&self) -> Timestamp {
@@ -339,6 +361,9 @@ impl Appointment {
             proposed_ends_at: None,
             proposed_by: None,
             decided_by: None,
+            cancelled_by: None,
+            cancel_reason: None,
+            reject_reason: None,
             created_at: Timestamp::now(),
         };
         let created: Option<Appointment> = db
@@ -437,12 +462,14 @@ impl Appointment {
     pub async fn reject(
         id: &AppointmentId,
         decided_by: &UserId,
+        reason: Option<AppointmentReason>,
         db: &Database,
     ) -> Result<Appointment, AppError> {
         let _guard = APPOINTMENT_LOCK.lock().await;
         let mut appointment = Self::read_pending(id, db).await?;
         appointment.status = AppointmentStatus::Rejected;
         appointment.decided_by = Some(decided_by.clone());
+        appointment.reject_reason = reason;
         Self::save(appointment, db).await
     }
 
@@ -453,7 +480,12 @@ impl Appointment {
     /// began is history, not a plan. The guard lives here rather than in the
     /// handler so every caller inherits it: `decline_reschedule` cancels
     /// through this same door and used to slip past a handler-only check.
-    pub async fn cancel(id: &AppointmentId, db: &Database) -> Result<Appointment, AppError> {
+    pub async fn cancel(
+        id: &AppointmentId,
+        cancelled_by: &UserId,
+        reason: Option<AppointmentReason>,
+        db: &Database,
+    ) -> Result<Appointment, AppError> {
         let _guard = APPOINTMENT_LOCK.lock().await;
         let mut appointment = Self::read(id, db).await?.ok_or(AppError::NotFound)?;
         if !appointment.status.is_live() {
@@ -466,6 +498,8 @@ impl Appointment {
             return Err(AppError::Conflict("the appointment has already started"));
         }
         appointment.status = AppointmentStatus::Cancelled;
+        appointment.cancelled_by = Some(cancelled_by.clone());
+        appointment.cancel_reason = reason;
         Self::save(appointment, db).await
     }
 
@@ -730,7 +764,7 @@ mod tests {
             Err(AppError::Conflict(_))
         ));
 
-        Appointment::reject(first.get_id(), &teacher, &db)
+        Appointment::reject(first.get_id(), &teacher, None, &db)
             .await
             .unwrap();
         let second = Appointment::book(slot.get_id(), &UserId::from_key("s2"), reason(), &db)
