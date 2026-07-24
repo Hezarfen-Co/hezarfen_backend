@@ -15576,10 +15576,11 @@ async fn approval_refuses_a_teacher_double_booking() {
     let ayse = login(&app, "ayse").await;
     let now = Timestamp::now().as_millis();
 
-    // Two overlapping windows on the same calendar, one requester each: the
-    // request is fine (a wish), the second approval is not.
+    // A teacher can no longer publish two colliding slots, so the collision is
+    // reached the only way left: two non-overlapping slots, then a reschedule
+    // proposal that drags the second onto the first's just-approved window.
     let first = publish_slot(&app, &ali, now + HOUR_MS, now + 2 * HOUR_MS).await;
-    let second = publish_slot(&app, &ali, now + HOUR_MS + 600_000, now + 3 * HOUR_MS).await;
+    let second = publish_slot(&app, &ali, now + 3 * HOUR_MS, now + 4 * HOUR_MS).await;
     let one = book_ok(&app, &veli, &first).await;
     let two = book_ok(&app, &ayse, &second).await;
 
@@ -15587,7 +15588,12 @@ async fn approval_refuses_a_teacher_double_booking() {
         decide(&app, &ali, &one, "approve").await.status,
         StatusCode::OK
     );
-    let res = decide(&app, &ali, &two, "approve").await;
+    // Teacher counter-proposes a window overlapping the just-approved meeting;
+    // accepting it is approval at the proposed time, and that collision is what
+    // must be refused.
+    let res = propose(&app, &ali, &two, now + HOUR_MS + 600_000, now + 2 * HOUR_MS + 600_000).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = decide(&app, &ayse, &two, "reschedule/accept").await;
     assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
     // Refused, not half-applied: it is still pending and still decidable.
     let res = decide(&app, &ali, &two, "reject").await;
@@ -15616,8 +15622,11 @@ async fn approval_refuses_a_requester_double_booking() {
     let res = decide(&app, &mert, &two, "approve").await;
     assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
 
-    // Booking a fresh overlap once one is committed is refused up front.
-    let third = publish_slot(&app, &mert, now + HOUR_MS, now + 2 * HOUR_MS).await;
+    // Booking a fresh overlap once one is committed is refused up front. The
+    // slot comes from a third teacher: mert's calendar already holds `second`,
+    // which a same-teacher slot at this window would now overlap at publish.
+    let ahmet = login_as(&app, &db, "ahmet", "teacher").await;
+    let third = publish_slot(&app, &ahmet, now + HOUR_MS, now + 2 * HOUR_MS).await;
     let res = book_slot(&app, &veli, &third).await;
     assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
 }

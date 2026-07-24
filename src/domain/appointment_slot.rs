@@ -215,6 +215,31 @@ impl AppointmentSlot {
         created.ok_or_else(|| AppError::Internal("failed to create appointment slot".into()))
     }
 
+    /// Does the teacher already have a published slot whose window collides with
+    /// `[starts_at, ends_at)`? Half-open, so a slot ending exactly where the new
+    /// one starts is *not* a conflict — that is how a teacher's hour is carved
+    /// into back-to-back slots. Caller must hold [`APPOINTMENT_LOCK`] for the
+    /// answer to still be true by the time the insert lands.
+    async fn conflicts_existing(
+        teacher: &UserId,
+        starts_at: Timestamp,
+        ends_at: Timestamp,
+        db: &Database,
+    ) -> Result<bool, AppError> {
+        let mut result = db
+            .query(
+                "SELECT VALUE id FROM appointment_slot \
+                 WHERE teacher = $teacher AND starts_at < $ends AND ends_at > $starts \
+                 LIMIT 1",
+            )
+            .bind(("teacher", teacher.record()))
+            .bind(("starts", starts_at.as_millis()))
+            .bind(("ends", ends_at.as_millis()))
+            .await?
+            .check()?;
+        Ok(!result.take::<Vec<RecordId>>(0)?.is_empty())
+    }
+
     /// Publish one slot.
     pub async fn create(
         teacher: &UserId,
@@ -224,6 +249,14 @@ impl AppointmentSlot {
         db: &Database,
     ) -> Result<AppointmentSlot, AppError> {
         Self::check_window(starts_at, ends_at)?;
+        // Check-then-insert under the lock so a concurrent publish or booking
+        // can't slip a colliding window in between.
+        let _guard = APPOINTMENT_LOCK.lock().await;
+        if Self::conflicts_existing(teacher, starts_at, ends_at, db).await? {
+            return Err(AppError::ConflictOwned(
+                "this time overlaps a slot you have already published".into(),
+            ));
+        }
         Self::insert(
             AppointmentSlot {
                 id: AppointmentSlotId::generate(),
@@ -252,6 +285,28 @@ impl AppointmentSlot {
         db: &Database,
     ) -> Result<Vec<AppointmentSlot>, AppError> {
         let windows = Self::weekly_windows(starts_at, ends_at, until)?;
+        // Validate the whole batch before writing a single row: all-or-nothing,
+        // so a mid-series collision never leaves stray weeks behind. Held under
+        // the lock from first check through last insert, matching `create`.
+        let _guard = APPOINTMENT_LOCK.lock().await;
+        for (i, &(w_start, w_end)) in windows.iter().enumerate() {
+            // (a) against slots already in the database, and
+            if Self::conflicts_existing(teacher, w_start, w_end, db).await? {
+                return Err(AppError::ConflictOwned(
+                    "a repeated slot overlaps one you have already published".into(),
+                ));
+            }
+            // (b) against every earlier occurrence in this same batch — catches
+            // a duration longer than the weekly step overlapping itself.
+            if windows[..i]
+                .iter()
+                .any(|&(o_start, o_end)| Appointment::overlaps(w_start, w_end, o_start, o_end))
+            {
+                return Err(AppError::ConflictOwned(
+                    "the repeated slots overlap each other".into(),
+                ));
+            }
+        }
         let series = SlotSeries::generate();
         let now = Timestamp::now();
         let mut slots = Vec::with_capacity(windows.len());
@@ -509,5 +564,96 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(listed.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn overlapping_publish_is_refused_but_touching_is_allowed() {
+        let db = crate::database::init_mem().await.unwrap();
+        let teacher = UserId::from_key("t1");
+        AppointmentSlot::create(&teacher, at(1_000), at(2_000), None, &db)
+            .await
+            .unwrap();
+
+        // Overlaps the existing [1000,2000) → 409.
+        assert!(matches!(
+            AppointmentSlot::create(&teacher, at(1_500), at(2_500), None, &db).await,
+            Err(AppError::ConflictOwned(_))
+        ));
+        // Touching at the boundary (ends where the next starts) → allowed.
+        assert!(AppointmentSlot::create(&teacher, at(2_000), at(3_000), None, &db)
+            .await
+            .is_ok());
+        assert!(AppointmentSlot::create(&teacher, at(0), at(1_000), None, &db)
+            .await
+            .is_ok());
+        // A different teacher sharing the same window is fine.
+        let other = UserId::from_key("t2");
+        assert!(AppointmentSlot::create(&other, at(1_000), at(2_000), None, &db)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn weekly_publish_overlapping_an_existing_slot_writes_nothing() {
+        let db = crate::database::init_mem().await.unwrap();
+        let teacher = UserId::from_key("t1");
+        // A lone slot on the third week of the coming series.
+        AppointmentSlot::create(
+            &teacher,
+            at(1_000 + 2 * MILLIS_PER_WEEK),
+            at(2_000 + 2 * MILLIS_PER_WEEK),
+            None,
+            &db,
+        )
+        .await
+        .unwrap();
+
+        let before = AppointmentSlot::list_for_teacher(&teacher, &db)
+            .await
+            .unwrap()
+            .len();
+        assert!(matches!(
+            AppointmentSlot::publish_weekly(
+                &teacher,
+                at(1_000),
+                at(2_000),
+                None,
+                at(1_000 + 4 * MILLIS_PER_WEEK),
+                &db,
+            )
+            .await,
+            Err(AppError::ConflictOwned(_))
+        ));
+        // All-or-nothing: not one occurrence of the rejected series was written.
+        assert_eq!(
+            AppointmentSlot::list_for_teacher(&teacher, &db)
+                .await
+                .unwrap()
+                .len(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn weekly_publish_that_self_overlaps_is_refused() {
+        let db = crate::database::init_mem().await.unwrap();
+        let teacher = UserId::from_key("t1");
+        // A window longer than the weekly step collides with the next week.
+        assert!(matches!(
+            AppointmentSlot::publish_weekly(
+                &teacher,
+                at(0),
+                at(MILLIS_PER_WEEK + 1),
+                None,
+                at(MILLIS_PER_WEEK),
+                &db,
+            )
+            .await,
+            Err(AppError::ConflictOwned(_))
+        ));
+        assert!(AppointmentSlot::list_for_teacher(&teacher, &db)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }
