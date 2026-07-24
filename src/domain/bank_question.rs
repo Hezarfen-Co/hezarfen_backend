@@ -217,11 +217,19 @@ impl BankQuestion {
     /// Delete the template and cascade-remove its bank images, so none points
     /// at a missing template. Bank rows have no answers. The image *blobs* are
     /// the web layer's to remove — it collects their names before calling this.
+    ///
+    /// Exam questions saved from this template keep living: only their
+    /// `source_bank` provenance link is cleared, field-scoped (never a whole-row
+    /// save — the question isn't ours and may be edited concurrently), so the
+    /// bank page can't read a link to a template that no longer exists.
     pub async fn delete(self, db: &Database) -> Result<BankQuestion, AppError> {
-        db.query("DELETE bank_question_image WHERE bank_question = $b;")
-            .bind(("b", self.id.record()))
-            .await?
-            .check()?;
+        db.query(
+            "DELETE bank_question_image WHERE bank_question = $b;
+             UPDATE exam_question SET source_bank = NONE WHERE source_bank = $b;",
+        )
+        .bind(("b", self.id.record()))
+        .await?
+        .check()?;
         let deleted: Option<BankQuestion> = db.delete(self.id.record()).await?;
         deleted.ok_or(AppError::NotFound)
     }

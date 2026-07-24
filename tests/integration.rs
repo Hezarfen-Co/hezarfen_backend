@@ -17476,3 +17476,186 @@ async fn bank_provenance_both_directions() {
     let res = send(&app, "GET", &format!("/bank-questions/{bid}"), Some(&teacher), None).await;
     assert!(res.body["source_exam"].is_null());
 }
+
+/// Save-to-bank also links the *question* back at the template it produced, so
+/// a client can tell it was already banked. A repeat save is allowed and
+/// repoints the link at the newer template.
+#[tokio::test]
+async fn to_bank_links_the_question_at_the_new_template() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "bback_t", "teacher").await;
+    let course = create_course(&app, &teacher, "bback_c").await;
+    let subject = create_subject(&app, &teacher, &course, "bback_s").await;
+    let exam = create_exam(&app, &teacher, &course, "midterm", "final").await;
+    let qid = create_question(
+        &app,
+        &teacher,
+        &exam,
+        &subject,
+        json!({ "text": "plain", "kind": "text", "points": 5 }),
+    )
+    .await;
+
+    // Fresh question: no link yet.
+    let source_bank_of = |body: &serde_json::Value| -> serde_json::Value {
+        common::items(body)
+            .iter()
+            .find(|q| q["id"] == qid)
+            .expect("question in list")["source_bank"]
+            .clone()
+    };
+    let res = send(&app, "GET", &format!("/exams/{exam}/questions"), Some(&teacher), None).await;
+    assert!(source_bank_of(&res.body).is_null());
+
+    let res = send(&app, "POST", &format!("/exams/{exam}/questions/{qid}/to-bank"), Some(&teacher), None).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let first = id_of(&res.body);
+    let res = send(&app, "GET", &format!("/exams/{exam}/questions"), Some(&teacher), None).await;
+    assert_eq!(source_bank_of(&res.body), json!(first));
+
+    // Second save: still 201, a distinct template, and the link follows it.
+    let res = send(&app, "POST", &format!("/exams/{exam}/questions/{qid}/to-bank"), Some(&teacher), None).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let second = id_of(&res.body);
+    assert_ne!(first, second);
+    let res = send(&app, "GET", &format!("/exams/{exam}/questions"), Some(&teacher), None).await;
+    assert_eq!(source_bank_of(&res.body), json!(second));
+}
+
+/// The back-link is a field-scoped write. `question_to_bank` reads the question,
+/// then awaits a bank insert and the whole blob-copy loop before linking, holding
+/// no lock over `exam_question` — so a `PATCH` can land in that window. A
+/// whole-row save from the stale struct would silently revert it. Driven at the
+/// domain level: HTTP offers no way to interleave inside the handler.
+#[tokio::test]
+async fn linking_the_bank_source_does_not_clobber_a_concurrent_edit() {
+    use hezarfen_backend::domain::bank_question::BankQuestionId;
+    use hezarfen_backend::domain::exam_question::{ExamQuestion, ExamQuestionId};
+
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "bclob_t", "teacher").await;
+    let course = create_course(&app, &teacher, "bclob_c").await;
+    let subject = create_subject(&app, &teacher, &course, "bclob_s").await;
+    let exam = create_exam(&app, &teacher, &course, "midterm", "final").await;
+    let qid = create_question(
+        &app,
+        &teacher,
+        &exam,
+        &subject,
+        json!({ "text": "original", "kind": "text", "points": 5 }),
+    )
+    .await;
+    let res = send(
+        &app,
+        "POST",
+        "/bank-questions",
+        Some(&teacher),
+        Some(json!({ "subject_id": subject, "text": "q", "kind": "text", "points": 5 })),
+    )
+    .await;
+    let bid = id_of(&res.body);
+
+    // The handler's read, then someone else's edit lands mid-window.
+    let stale = ExamQuestion::read(&ExamQuestionId::from_key(&qid), &db)
+        .await
+        .unwrap()
+        .expect("question exists");
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/exams/{exam}/questions/{qid}"),
+        Some(&teacher),
+        Some(json!({ "text": "edited by someone else", "points": 9 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    stale
+        .link_source_bank(BankQuestionId::from_key(&bid), &db)
+        .await
+        .expect("link written");
+
+    // The edit survives and the link is set.
+    let res = send(&app, "GET", &format!("/exams/{exam}/questions"), Some(&teacher), None).await;
+    let question = common::items(&res.body)
+        .iter()
+        .find(|q| q["id"] == qid)
+        .expect("question in list")
+        .clone();
+    assert_eq!(question["text"], "edited by someone else");
+    assert_eq!(question["points"], 9);
+    assert_eq!(question["source_bank"], bid);
+}
+
+/// Deleting a bank template clears the provenance link on every exam question
+/// saved from it, instead of leaving `source_bank` pointing at a dead row.
+#[tokio::test]
+async fn deleting_a_template_clears_the_questions_source_bank() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "bdang_t", "teacher").await;
+    let course = create_course(&app, &teacher, "bdang_c").await;
+    let subject = create_subject(&app, &teacher, &course, "bdang_s").await;
+    let exam = create_exam(&app, &teacher, &course, "midterm", "final").await;
+    let qid = create_question(
+        &app,
+        &teacher,
+        &exam,
+        &subject,
+        json!({ "text": "plain", "kind": "text", "points": 5 }),
+    )
+    .await;
+
+    let res = send(&app, "POST", &format!("/exams/{exam}/questions/{qid}/to-bank"), Some(&teacher), None).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let bid = id_of(&res.body);
+
+    let source_bank_of = |body: &serde_json::Value| -> serde_json::Value {
+        common::items(body)
+            .iter()
+            .find(|q| q["id"] == qid)
+            .expect("question in list")["source_bank"]
+            .clone()
+    };
+    let res = send(&app, "GET", &format!("/exams/{exam}/questions"), Some(&teacher), None).await;
+    assert_eq!(source_bank_of(&res.body), json!(bid));
+
+    let res = send(&app, "DELETE", &format!("/bank-questions/{bid}"), Some(&teacher), None).await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+
+    // The question survives the template with no dangling link.
+    let res = send(&app, "GET", &format!("/exams/{exam}/questions"), Some(&teacher), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert!(source_bank_of(&res.body).is_null(), "{}", res.body);
+}
+
+/// The mirror: deleting the origin exam clears `source_exam` on the templates
+/// saved out of it — the template is a reusable library row and outlives the
+/// exam, but the bank page must not read a link to a dead exam.
+#[tokio::test]
+async fn deleting_an_exam_clears_the_templates_source_exam() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "edang_t", "teacher").await;
+    let course = create_course(&app, &teacher, "edang_c").await;
+    let subject = create_subject(&app, &teacher, &course, "edang_s").await;
+    let exam = create_exam(&app, &teacher, &course, "midterm", "final").await;
+    let qid = create_question(
+        &app,
+        &teacher,
+        &exam,
+        &subject,
+        json!({ "text": "plain", "kind": "text", "points": 5 }),
+    )
+    .await;
+
+    let res = send(&app, "POST", &format!("/exams/{exam}/questions/{qid}/to-bank"), Some(&teacher), None).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let bid = id_of(&res.body);
+    assert_eq!(res.body["source_exam"], exam);
+
+    let res = send(&app, "DELETE", &format!("/exams/{exam}"), Some(&teacher), None).await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+
+    let res = send(&app, "GET", &format!("/bank-questions/{bid}"), Some(&teacher), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert!(res.body["source_exam"].is_null(), "{}", res.body);
+}

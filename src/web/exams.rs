@@ -1863,8 +1863,10 @@ async fn question_from_bank(
 /// template. Requires teacher+ and management rights over the exam's course.
 /// The caller becomes the template's owner; the question's subject rides along
 /// as origin metadata. A full copy — text, points, spec, illustration, and
-/// option pictures — lands under a new bank id; the exam question is untouched.
-/// The origin exam is recorded on the template as `source_exam`.
+/// option pictures — lands under a new bank id. Provenance rides both ways: the
+/// origin exam is recorded on the template as `source_exam`, and the exam
+/// question's `source_bank` is pointed at the new template (a repeat save is
+/// allowed and repoints it at the newest one).
 #[utoipa::path(
     post,
     path = "/{id}/questions/{qid}/to-bank",
@@ -1953,6 +1955,24 @@ async fn question_to_bank(
             }
         }
     }
+    // Provenance back-link, so a client can tell this question was already
+    // banked: the question points at the template it was saved into, and a
+    // repeat save repoints it at the newest one (never blocked). Written only
+    // after the all-or-nothing copy above, so a rolled-back template can never
+    // leave a dangling link. A failure here is logged and swallowed rather than
+    // rolling the template back: the save is the user's actual work and a
+    // template silently vanishing over a metadata write is worse than a
+    // template with no back-link (the next save re-links it).
+    let question_key = question.get_id().key().to_string();
+    if let Err(err) = question
+        .link_source_bank(template.get_id().clone(), &st.db)
+        .await
+    {
+        tracing::warn!(
+            "saved question {question_key} to the bank but could not link it back: {err}"
+        );
+    }
+
     let images = BankQuestionImage::list_for_question(template.get_id(), &st.db).await?;
     Ok((
         StatusCode::CREATED,
