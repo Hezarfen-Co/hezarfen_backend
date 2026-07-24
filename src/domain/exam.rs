@@ -474,6 +474,10 @@ impl Exam {
     /// so a failure can't leave an emptied-out exam shell behind. The image
     /// *blobs* (question and answer) are the web layer's to remove — it collects
     /// their names before calling this.
+    ///
+    /// Bank templates saved out of this exam survive it — they are a separate,
+    /// reusable library — so only their `source_exam` provenance link is cleared,
+    /// in the same transaction, never left pointing at a dead exam.
     pub async fn delete(self, db: &Database) -> Result<Exam, AppError> {
         let mut result = db
             .query(
@@ -484,15 +488,16 @@ impl Exam {
                  DELETE answer_image WHERE exam = $ex;
                  DELETE question_image WHERE exam = $ex;
                  DELETE exam_question WHERE exam = $ex;
+                 UPDATE bank_question SET source_exam = NONE WHERE source_exam = $ex;
                  DELETE $ex RETURN BEFORE;
                  COMMIT TRANSACTION;",
             )
             .bind(("ex", self.id.record()))
             .await?
             .check()?;
-        // Statement slots count BEGIN and the child deletes: the exam's own
-        // DELETE is slot 7.
-        let deleted: Option<Exam> = result.take::<Vec<Exam>>(7)?.into_iter().next();
+        // Statement slots count BEGIN, the child deletes and the bank
+        // provenance clear: the exam's own DELETE is slot 8.
+        let deleted: Option<Exam> = result.take::<Vec<Exam>>(8)?.into_iter().next();
         deleted.ok_or(AppError::NotFound)
     }
 }

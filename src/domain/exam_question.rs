@@ -334,6 +334,34 @@ impl ExamQuestion {
         updated.ok_or(AppError::NotFound)
     }
 
+    /// Point the question at the bank template it was just saved into
+    /// (`POST …/questions/{qid}/to-bank`), the mirror of the `source_bank`
+    /// [`Self::create_from_bank`] writes on the other direction. Overwrites any
+    /// earlier link: repeat saves mint a new template and the newest one wins.
+    ///
+    /// Field-scoped write, unlike [`Self::update`]: the caller holds only
+    /// `BANK_LOCK` (which guards the bank, not `exam_question`) and awaits a
+    /// bank insert plus the whole blob-copy loop between reading this row and
+    /// linking it, so a concurrent `PATCH` of the question is entirely possible
+    /// in that window — a whole-row save would silently revert it.
+    pub async fn link_source_bank(
+        self,
+        source: BankQuestionId,
+        db: &Database,
+    ) -> Result<ExamQuestion, AppError> {
+        let mut result = db
+            .query("UPDATE $id SET source_bank = $bank RETURN AFTER")
+            .bind(("id", self.id.record()))
+            .bind(("bank", source.record()))
+            .await?
+            .check()?;
+        result
+            .take::<Vec<ExamQuestion>>(0)?
+            .into_iter()
+            .next()
+            .ok_or(AppError::NotFound)
+    }
+
     /// Delete the question and cascade-remove its answers and image rows, so
     /// neither can point at a missing question. The image *blobs* are the web
     /// layer's to remove — it collects their names before calling this.
