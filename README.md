@@ -1154,7 +1154,9 @@ for one of them (drawing bytes at
 `GET /exams/{id}/students/{user}/marks` is the full per-sitting mark history,
 oldest first. Grading (`POST /exams/{id}/results`) always lands on the current
 sitting, and the latest seq is the grade-of-record — the roster, report, and
-statistics reads all show it.
+statistics reads all show it. Every result payload carries its `seq`, so a mark
+links straight to that sitting's answer sheet — without it a marked retake's
+answers would be unreachable from the mark.
 
 **The exam room (WebSocket)** — `GET /exams/{id}/attempt/ws`, cookie-authed
 like everything else; REST above remains the full fallback. Gates run before
