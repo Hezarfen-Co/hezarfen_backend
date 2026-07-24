@@ -82,6 +82,8 @@ pub fn routes() -> OpenApiRouter<AppState> {
         .routes(routes!(student_attempts))
         .routes(routes!(student_attempt_answers))
         .routes(routes!(student_marks_history))
+        .routes(routes!(review_attempts))
+        .routes(routes!(review_attempt_answers))
         // The image routes get their own HTTP body cap, like the note-file
         // ones: the server-wide hard ceiling plus multipart framing headroom.
         .merge(
@@ -103,6 +105,7 @@ pub fn routes() -> OpenApiRouter<AppState> {
                 ))
                 .routes(routes!(get_student_answer_image))
                 .routes(routes!(student_attempt_answer_image))
+                .routes(routes!(review_attempt_answer_image))
                 .layer(DefaultBodyLimit::max(
                     MAX_MAX_FILE_BYTES as usize + UPLOAD_BODY_OVERHEAD_BYTES,
                 )),
@@ -148,6 +151,9 @@ struct UpdateExam {
     /// Whether students who left the exam room may come back in. Omit to
     /// keep. Editable live — the teacher's door handle for the running room.
     allow_rejoin: Option<bool>,
+    /// Whether students may review their graded attempt once results are out.
+    /// Omit to keep. Editable live.
+    allow_review: Option<bool>,
     /// `false` publishes a draft (students can now see and sit it); `true`
     /// pulls a published exam back into hiding — allowed only while nobody
     /// has attempted it and nothing is graded (`409` otherwise). Omit to keep.
@@ -402,6 +408,7 @@ async fn update_exam(
         None => exam.get_max_attempts(),
     };
     let allow_rejoin = req.allow_rejoin.unwrap_or_else(|| exam.get_allow_rejoin());
+    let allow_review = req.allow_review.unwrap_or_else(|| exam.get_allow_review());
     let draft = req.draft.unwrap_or_else(|| exam.is_draft());
 
     // Switching sync <-> async <-> open (or back to unscheduled) would
@@ -440,6 +447,7 @@ async fn update_exam(
             schedule,
             max_attempts,
             allow_rejoin,
+            allow_review,
             draft,
             &st.db,
         )
@@ -2947,4 +2955,123 @@ async fn student_marks_history(
             .map(|r| ExamResultResponse::new(r, &people))
             .collect(),
     ))
+}
+
+// ---- student self-review ----------------------------------------------------
+// The mirror of the teacher history reads above, but own-scoped: no `{user}`
+// path param, so the target is always the caller — a student can never reach
+// another student's sheet. Opens only once the teacher enables review AND has
+// marked this student (an ExamResult row proves it).
+
+/// The exam plus the per-student review gate the three self-review reads share.
+/// 404 if the exam is missing or still a draft, 403 if review is off for it, and
+/// 404 until the caller has a mark on it (nothing to review yet).
+async fn reviewable_exam(st: &AppState, user: &User, id: &str) -> Result<Exam, AppError> {
+    let exam = Exam::read(&ExamId::from_key(id), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if exam.is_draft() {
+        return Err(AppError::NotFound);
+    }
+    if !exam.get_allow_review() {
+        return Err(AppError::Forbidden("review not enabled for this exam"));
+    }
+    ExamResult::read_for_user(exam.get_id(), user.get_id(), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(exam)
+}
+
+/// The caller's own sitting numbers at an exam — every seq that carries answers
+/// or a mark, ascending. Own-scoped review view; opens once the teacher enables
+/// review and has marked the caller.
+#[utoipa::path(
+    get,
+    path = "/{id}/review/attempts",
+    tag = "exams",
+    security(("session_cookie" = [])),
+    params(("id" = String, Path, description = "Exam id")),
+    responses(
+        (status = 200, description = "The caller's own sitting numbers, ascending", body = [i64]),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Review not enabled for this exam", body = ErrorResponse),
+        (status = 404, description = "Exam not found, still a draft, or the caller has no mark on it", body = ErrorResponse),
+    ),
+)]
+async fn review_attempts(
+    State(st): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<i64>>, AppError> {
+    let exam = reviewable_exam(&st, &user, &id).await?;
+    let target = user.get_id().clone();
+    let mut seqs = ExamAnswer::list_seqs_for_user(exam.get_id(), &target, &st.db).await?;
+    for result in ExamResult::list_all_for_exam_user(exam.get_id(), &target, &st.db).await? {
+        seqs.push(result.get_seq());
+    }
+    seqs.sort_unstable();
+    seqs.dedup();
+    Ok(Json(seqs))
+}
+
+/// One of the caller's own sittings, judged — the `seq`th attempt's answers,
+/// drawing refs, correctness flags, and auto-score suggestion. Own-scoped
+/// review view.
+#[utoipa::path(
+    get,
+    path = "/{id}/review/attempts/{seq}/answers",
+    tag = "exams",
+    security(("session_cookie" = [])),
+    params(
+        ("id" = String, Path, description = "Exam id"),
+        ("seq" = i64, Path, description = "Sitting number (1, 2, …)"),
+    ),
+    responses(
+        (status = 200, description = "That sitting's answers, judged", body = AttemptAnswersResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Review not enabled for this exam", body = ErrorResponse),
+        (status = 404, description = "Exam not found, still a draft, or the caller has no mark on it", body = ErrorResponse),
+    ),
+)]
+async fn review_attempt_answers(
+    State(st): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    Path((id, seq)): Path<(String, i64)>,
+) -> Result<Json<AttemptAnswersResponse>, AppError> {
+    let exam = reviewable_exam(&st, &user, &id).await?;
+    Ok(Json(
+        answer_sheet(&exam, user.get_id(), seq, &st.db).await?,
+    ))
+}
+
+/// The caller's own drawn-answer bytes for one of their sittings — the
+/// seq-scoped, own-scoped mirror of the grader's drawing read.
+#[utoipa::path(
+    get,
+    path = "/{id}/review/attempts/{seq}/answers/{qid}/image",
+    tag = "exams",
+    security(("session_cookie" = [])),
+    params(
+        ("id" = String, Path, description = "Exam id"),
+        ("seq" = i64, Path, description = "Sitting number (1, 2, …)"),
+        ("qid" = String, Path, description = "Question id"),
+    ),
+    responses(
+        (status = 200, description = "The caller's drawing bytes", content_type = "image/*"),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Review not enabled for this exam", body = ErrorResponse),
+        (status = 404, description = "No such exam/question/drawing, a draft, or the caller has no mark on it", body = ErrorResponse),
+    ),
+)]
+async fn review_attempt_answer_image(
+    State(st): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    Path((id, seq, qid)): Path<(String, i64, String)>,
+) -> Result<Response, AppError> {
+    let exam = reviewable_exam(&st, &user, &id).await?;
+    let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
+    let image = AnswerImage::read(question.get_id(), user.get_id(), seq, &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    super::serve_inline_blob(&st.files_path, image.get_file(), image.get_content_type()).await
 }

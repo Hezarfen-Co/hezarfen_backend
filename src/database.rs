@@ -252,6 +252,7 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS duration_ms ON exam TYPE option<int>;
     DEFINE FIELD IF NOT EXISTS max_attempts ON exam TYPE int DEFAULT 1;
     DEFINE FIELD IF NOT EXISTS allow_rejoin ON exam TYPE bool DEFAULT true;
+    DEFINE FIELD IF NOT EXISTS allow_review ON exam TYPE bool DEFAULT false;
     DEFINE FIELD IF NOT EXISTS draft ON exam TYPE bool DEFAULT false;
     DEFINE INDEX IF NOT EXISTS exam_course ON exam FIELDS course;
 
@@ -457,6 +458,9 @@ const BACKFILL: &str = "
     -- Exams predate the draft flag (2026-07-19): everything already out there
     -- was live for its course, so it stays published.
     UPDATE exam SET draft = false WHERE draft = NONE;
+
+    -- Exams predate the review toggle (2026-07-24): default it closed (opt-in).
+    UPDATE exam SET allow_review = false WHERE allow_review = NONE;
 
     UPDATE event SET audience = { kind: 'school' } WHERE audience = NONE OR audience = {};
 

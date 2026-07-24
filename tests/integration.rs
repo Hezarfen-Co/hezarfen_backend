@@ -16300,3 +16300,294 @@ async fn attempt_history_endpoints_are_teacher_walled() {
         assert_eq!(res.status, StatusCode::FORBIDDEN, "{uri}");
     }
 }
+
+// --- student self-review (own-scoped, allow_review + a mark gate it) ---------
+
+/// Sit, answer, teacher grades — but with `allow_review` left at its default
+/// (false), the student's own review read is refused: 403, "review not enabled".
+#[tokio::test]
+async fn self_review_is_forbidden_until_the_teacher_enables_it() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "rev_off_t", "teacher").await;
+    let student = login(&app, "rev_off_s").await;
+    let student_id = me_id(&app, &student).await;
+
+    let course = create_course(&app, &teacher, "physics").await;
+    enroll(&app, &teacher, &course, &student_id).await;
+    let exam = scheduled_exam(
+        &app,
+        &teacher,
+        &course,
+        json!({ "title": "kinematics", "kind": "quiz", "mode": "open" }),
+    )
+    .await;
+
+    send(&app, "POST", &format!("/exams/{exam}/attempt"), Some(&student), None).await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/results"),
+        Some(&teacher),
+        Some(json!({ "mark": 55, "user_id": student_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    let res = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/review/attempts"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+}
+
+/// `allow_review` on, but the student has no mark yet — nothing to review, so
+/// the gate 404s rather than leaking an empty (or in-progress) sheet.
+#[tokio::test]
+async fn self_review_is_not_found_until_a_mark_exists() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "rev_ungraded_t", "teacher").await;
+    let student = login(&app, "rev_ungraded_s").await;
+    let student_id = me_id(&app, &student).await;
+
+    let course = create_course(&app, &teacher, "chemistry").await;
+    enroll(&app, &teacher, &course, &student_id).await;
+    let exam = scheduled_exam(
+        &app,
+        &teacher,
+        &course,
+        json!({ "title": "moles", "kind": "quiz", "mode": "open", "allow_review": true }),
+    )
+    .await;
+
+    // Sat, but never graded — no ExamResult row.
+    send(&app, "POST", &format!("/exams/{exam}/attempt"), Some(&student), None).await;
+
+    let res = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/review/attempts"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND, "{}", res.body);
+}
+
+/// A draft exam is invisible to students even with review on and a mark in hand:
+/// the draft check comes first, so every self-review read is a flat 404.
+#[tokio::test]
+async fn self_review_of_a_draft_exam_is_not_found() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "rev_draft_t", "teacher").await;
+    let student = login(&app, "rev_draft_s").await;
+    let student_id = me_id(&app, &student).await;
+
+    let course = create_course(&app, &teacher, "geography").await;
+    enroll(&app, &teacher, &course, &student_id).await;
+    let exam = scheduled_exam(
+        &app,
+        &teacher,
+        &course,
+        json!({
+            "title": "maps", "kind": "quiz", "mode": "open",
+            "allow_review": true, "draft": true,
+        }),
+    )
+    .await;
+
+    for uri in [
+        format!("/exams/{exam}/review/attempts"),
+        format!("/exams/{exam}/review/attempts/1/answers"),
+    ] {
+        let res = send(&app, "GET", &uri, Some(&student), None).await;
+        assert_eq!(res.status, StatusCode::NOT_FOUND, "{uri}: {}", res.body);
+    }
+}
+
+/// The happy path across retakes: review on, both sittings graded, and the
+/// student reads their own seqs `[1, 2]` plus each sitting's own answer text —
+/// seq 1 was not overwritten by the retake.
+#[tokio::test]
+async fn self_review_returns_own_seqs_and_per_sitting_answers() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "rev_ok_t", "teacher").await;
+    let student = login(&app, "rev_ok_s").await;
+    let student_id = me_id(&app, &student).await;
+
+    let course = create_course(&app, &teacher, "biology").await;
+    let subject = create_subject(&app, &teacher, &course, "cells").await;
+    enroll(&app, &teacher, &course, &student_id).await;
+    let exam = scheduled_exam(
+        &app,
+        &teacher,
+        &course,
+        json!({
+            "title": "cell quiz", "kind": "quiz", "mode": "open",
+            "max_attempts": 2, "allow_review": true,
+        }),
+    )
+    .await;
+    let question = create_question(
+        &app,
+        &teacher,
+        &exam,
+        &subject,
+        json!({ "text": "Name an organelle.", "kind": "text", "points": 10 }),
+    )
+    .await;
+    let results_uri = format!("/exams/{exam}/results");
+
+    // Seq 1: answer, grade, finish.
+    send(&app, "POST", &format!("/exams/{exam}/attempt"), Some(&student), None).await;
+    send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt/answers"),
+        Some(&student),
+        Some(json!({ "question_id": question, "text": "mitochondria" })),
+    )
+    .await;
+    send(
+        &app,
+        "POST",
+        &results_uri,
+        Some(&teacher),
+        Some(json!({ "mark": 40, "user_id": student_id })),
+    )
+    .await;
+    send(&app, "POST", &format!("/exams/{exam}/attempt/finish"), Some(&student), None).await;
+    // Seq 2: retake, answer differently, grade.
+    send(&app, "POST", &format!("/exams/{exam}/attempt"), Some(&student), None).await;
+    send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt/answers"),
+        Some(&student),
+        Some(json!({ "question_id": question, "text": "chloroplast" })),
+    )
+    .await;
+    send(
+        &app,
+        "POST",
+        &results_uri,
+        Some(&teacher),
+        Some(json!({ "mark": 90, "user_id": student_id })),
+    )
+    .await;
+
+    // Own seqs, ascending.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/review/attempts"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body, json!([1, 2]));
+
+    // Each sitting keeps its own answer text.
+    let seq1 = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/review/attempts/1/answers"),
+        Some(&student),
+        None,
+    )
+    .await;
+    let seq2 = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/review/attempts/2/answers"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(seq1.status, StatusCode::OK, "{}", seq1.body);
+    assert_eq!(seq1.body["answers"][0]["text"], "mitochondria");
+    assert_eq!(seq2.body["answers"][0]["text"], "chloroplast");
+}
+
+/// Own-scoped isolation: two graded students, review on. There is no `{user}`
+/// path param, so student A's token resolves to A — A sees A's own seqs and
+/// answer text, never B's, even though both are graded on the same exam.
+#[tokio::test]
+async fn self_review_is_own_scoped_between_students() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "rev_iso_t", "teacher").await;
+    let alice = login(&app, "rev_iso_a").await;
+    let alice_id = me_id(&app, &alice).await;
+    let bob = login(&app, "rev_iso_b").await;
+    let bob_id = me_id(&app, &bob).await;
+
+    let course = create_course(&app, &teacher, "history").await;
+    let subject = create_subject(&app, &teacher, &course, "rome").await;
+    enroll(&app, &teacher, &course, &alice_id).await;
+    enroll(&app, &teacher, &course, &bob_id).await;
+    let exam = scheduled_exam(
+        &app,
+        &teacher,
+        &course,
+        json!({ "title": "quiz", "kind": "quiz", "mode": "open", "allow_review": true }),
+    )
+    .await;
+    let question = create_question(
+        &app,
+        &teacher,
+        &exam,
+        &subject,
+        json!({ "text": "Name a consul.", "kind": "text", "points": 10 }),
+    )
+    .await;
+    let results_uri = format!("/exams/{exam}/results");
+
+    for (who, id, text, mark) in [
+        (&alice, &alice_id, "cicero", 70),
+        (&bob, &bob_id, "cato", 30),
+    ] {
+        send(&app, "POST", &format!("/exams/{exam}/attempt"), Some(who), None).await;
+        send(
+            &app,
+            "POST",
+            &format!("/exams/{exam}/attempt/answers"),
+            Some(who),
+            Some(json!({ "question_id": question, "text": text })),
+        )
+        .await;
+        send(
+            &app,
+            "POST",
+            &results_uri,
+            Some(&teacher),
+            Some(json!({ "mark": mark, "user_id": id })),
+        )
+        .await;
+    }
+
+    // Alice's token sees only Alice's data — one seq, her own answer.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/review/attempts"),
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body, json!([1]));
+    let sheet = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/review/attempts/1/answers"),
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(sheet.body["answers"][0]["text"], "cicero", "A sees her own answer");
+    assert_ne!(sheet.body["answers"][0]["text"], "cato", "never B's answer");
+}
