@@ -10,6 +10,7 @@ pub mod auth;
 pub mod bank_questions;
 pub mod chatbot;
 pub mod courses;
+pub mod etag;
 pub mod events;
 pub mod exam_ws;
 pub mod exams;
