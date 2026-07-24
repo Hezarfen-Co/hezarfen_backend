@@ -626,7 +626,7 @@ async fn reject(
         (status = 200, description = "Cancelled", body = AppointmentResponse),
         (status = 400, description = "Reason is over-long", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Neither the requester nor the slot's teacher", body = ErrorResponse),
+        (status = 403, description = "Not the requester", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
         (status = 409, description = "Already settled, or the appointment has already started", body = ErrorResponse),
     ),
@@ -641,12 +641,11 @@ async fn cancel(
     let appointment = Appointment::read(&id, &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    let slot = AppointmentSlot::read(appointment.get_slot(), &st.db)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    if appointment.get_requester() != user.get_id() && !can_manage(&slot, &user) {
+    // Only the requester (student/parent) may cancel. Teachers/managers end a
+    // booking by rejecting (while pending) or rescheduling — never cancelling.
+    if appointment.get_requester() != user.get_id() {
         return Err(AppError::Forbidden(
-            "only the requester or the slot's teacher can cancel this appointment",
+            "only the requester can cancel this appointment",
         ));
     }
     // A blank or absent reason records none; a present one is validated (400 if

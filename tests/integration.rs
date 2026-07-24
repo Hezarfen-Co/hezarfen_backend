@@ -15831,8 +15831,10 @@ async fn accepting_a_reschedule_re_runs_the_overlap_guard() {
     );
 }
 
+/// Only the requester (student/parent) may cancel a booking — not the slot's
+/// teacher, not an unrelated student. Deciders reject or reschedule instead.
 #[tokio::test]
-async fn either_side_cancels_until_the_window_opens() {
+async fn only_the_requester_cancels() {
     let (app, db) = app_and_db().await;
     let ali = login_as(&app, &db, "ali", "teacher").await;
     let veli = login(&app, "veli").await;
@@ -15879,21 +15881,78 @@ async fn either_side_cancels_until_the_window_opens() {
     assert_eq!(res.body["cancelled_by"]["id"], veli_id.as_str());
     assert_eq!(res.body["cancel_reason"], "Rahatsızlandım");
 
-    // The slot's teacher may too.
+    // The slot's teacher may NOT cancel — cancelling is the requester's lever;
+    // a decider ends a booking by rejecting (pending) or rescheduling.
     let booking = book_ok(&app, &ayse, &slot).await;
     let res = decide(&app, &ali, &booking, "cancel").await;
-    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-    assert_eq!(res.body["status"], "cancelled");
-    // An outsider may not, and a settled booking cannot be cancelled twice.
-    let booking = book_ok(&app, &veli, &slot).await;
-    let res = decide(&app, &ayse, &booking, "cancel").await;
-    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "owner-teacher: {}", res.body);
+    // An unrelated student may not either.
+    let res = decide(&app, &veli, &booking, "cancel").await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "outsider: {}", res.body);
+    // The requester can, and a settled booking cannot be cancelled twice.
     assert_eq!(
-        decide(&app, &veli, &booking, "cancel").await.status,
+        decide(&app, &ayse, &booking, "cancel").await.status,
         StatusCode::OK
     );
-    let res = decide(&app, &veli, &booking, "cancel").await;
+    let res = decide(&app, &ayse, &booking, "cancel").await;
     assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+}
+
+/// A student is not a decider: rejecting a booking is a teacher/manager call,
+/// so the requester calling `reject` on their own booking is refused.
+#[tokio::test]
+async fn student_cannot_reject_a_booking() {
+    let (app, db) = app_and_db().await;
+    let ali = login_as(&app, &db, "ali", "teacher").await;
+    let veli = login(&app, "veli").await;
+    let now = Timestamp::now().as_millis();
+    let slot = publish_slot(&app, &ali, now + HOUR_MS, now + 2 * HOUR_MS).await;
+    let booking = book_ok(&app, &veli, &slot).await;
+
+    let res = decide(&app, &veli, &booking, "reject").await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+}
+
+/// A slot-owning teacher may not *cancel* a booking — rejecting (pending) or
+/// rescheduling is their lever; cancelling belongs to the requester alone.
+#[tokio::test]
+async fn teacher_cannot_cancel_a_booking() {
+    let (app, db) = app_and_db().await;
+    let ali = login_as(&app, &db, "ali", "teacher").await;
+    let veli = login(&app, "veli").await;
+    let now = Timestamp::now().as_millis();
+
+    // Pending booking: owner-teacher cancel is refused (the booking stays live).
+    let slot = publish_slot(&app, &ali, now + HOUR_MS, now + 2 * HOUR_MS).await;
+    let booking = book_ok(&app, &veli, &slot).await;
+    let res = decide(&app, &ali, &booking, "cancel").await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "pending: {}", res.body);
+
+    // Approved booking on a fresh slot: same refusal.
+    let slot2 = publish_slot(&app, &ali, now + 3 * HOUR_MS, now + 4 * HOUR_MS).await;
+    let booking = book_ok(&app, &veli, &slot2).await;
+    assert_eq!(
+        decide(&app, &ali, &booking, "approve").await.status,
+        StatusCode::OK
+    );
+    let res = decide(&app, &ali, &booking, "cancel").await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "approved: {}", res.body);
+}
+
+/// A manager who is not the requester also cannot cancel — no oversight override
+/// exists; only the requester (student/parent) cancels.
+#[tokio::test]
+async fn manager_cannot_cancel_a_booking() {
+    let (app, db) = app_and_db().await;
+    let ali = login_as(&app, &db, "ali", "teacher").await;
+    let mgr = login_as(&app, &db, "mgr", "manager").await;
+    let veli = login(&app, "veli").await;
+    let now = Timestamp::now().as_millis();
+    let slot = publish_slot(&app, &ali, now + HOUR_MS, now + 2 * HOUR_MS).await;
+    let booking = book_ok(&app, &veli, &slot).await;
+
+    let res = decide(&app, &mgr, &booking, "cancel").await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "manager: {}", res.body);
 }
 
 #[tokio::test]
