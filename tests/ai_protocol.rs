@@ -792,7 +792,7 @@ async fn a_late_answer_after_the_deadline_is_not_delivered() {
     await_workers(&bridge, 1).await;
 
     let call = dispatch(&bridge, "ocr.extract", json!(null));
-    let (request, _, mut send, _r) = raw::take_request(&service.conn).await;
+    let (request, _, send, _r) = raw::take_request(&service.conn).await;
     assert_eq!(
         request["deadline_ms"], 250,
         "the service was told the deadline"
