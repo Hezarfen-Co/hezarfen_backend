@@ -14,7 +14,11 @@
 //! - `{"type":"pong"}`
 //! - `{"type":"finished", finished_at}` then Close — submitted (here or elsewhere)
 //! - `{"type":"expired"}` then Close — the deadline passed mid-session
-//! - `{"type":"error", message}` — bad JSON, unknown type, validation, deadline
+//! - `{"type":"error", message, question_id?}` — bad JSON, unknown type,
+//!   validation, deadline. `question_id` is present only when the failure
+//!   belongs to that one `answer` (its payload or its question); absent means
+//!   the failure is connection- or sitting-level, so every save in flight is
+//!   equally refused
 //!
 //! client → server
 //! - `{"type":"answer", question_id, selected? | text?}` (`selected` = choice id)
@@ -368,9 +372,14 @@ async fn handle_message(
             // like `save_answer_checked` — and dropped before the socket
             // sends, so a slow client never stalls a writer.
             let guard = EXAM_LOCK.read().await;
+            // Tracks how far the gates got: only once the sitting resolved can
+            // a failure possibly be about this one question rather than about
+            // the room. See [`error_frame_for`].
+            let mut in_save = false;
             let saved = match Exam::read(exam_id, db).await {
                 Ok(Some(exam)) => match writable_room_attempt(&exam, attempt_id, user, db).await {
                     Ok(attempt) => {
+                        in_save = true;
                         save_answer_in(&exam, &attempt, &question_id, selected, text, db).await
                     }
                     Err(err) => Err(err),
@@ -394,7 +403,14 @@ async fn handle_message(
                     // right away rather than waiting out the tick.
                     push_state(socket, exam_id, attempt_id, db).await
                 }
-                Err(err) => send(socket, error_frame(&err)).await,
+                Err(err) => {
+                    let attributed = in_save && attributable(&err);
+                    send(
+                        socket,
+                        error_frame_for(&err, attributed.then_some(question_id.as_str())),
+                    )
+                    .await
+                }
             }
         }
         ClientMessage::Finish => {
@@ -426,9 +442,34 @@ async fn handle_message(
     }
 }
 
+/// Whether a failure raised *inside* the save (past the exam and sitting
+/// gates) is about the answered question alone, so the client can fail that
+/// one save instead of every save in flight.
+///
+/// Only the two question-shaped failures qualify: [`AppError::Validation`]
+/// (the payload doesn't fit the question — wrong kind, unknown choice, too
+/// long) and [`AppError::NotFound`] (no such question in this exam). Every
+/// other variant from the save path is about the sitter or the sitting —
+/// `Unauthorized`/`Forbidden` (promoted out of `student`, unenrolled),
+/// `Conflict` (walked out with rejoin closed) — and dooms the next save just
+/// as much as this one, so it stays unattributed and keeps fail-everything.
+/// Db/Internal stay unattributed too: a database that just failed is not a
+/// per-question fact, and over-reporting there is the safe side.
+fn attributable(err: &AppError) -> bool {
+    matches!(err, AppError::Validation(_) | AppError::NotFound)
+}
+
 /// The public words for an error — the same strings the HTTP layer would use,
 /// with internals logged, never sent.
 fn error_frame(err: &AppError) -> Value {
+    error_frame_for(err, None)
+}
+
+/// [`error_frame`] plus the optional blame: `question_id` when the failure
+/// belongs to one `answer` message. Absent keeps its original meaning — an
+/// unattributed failure — so a client that ignores the field behaves exactly
+/// as before.
+fn error_frame_for(err: &AppError, question: Option<&str>) -> Value {
     let message = match err {
         AppError::Validation(err) => err.to_string(),
         AppError::NotFound => "not found".to_string(),
@@ -451,5 +492,8 @@ fn error_frame(err: &AppError) -> Value {
             "internal server error".to_string()
         }
     };
-    json!({ "type": "error", "message": message })
+    match question {
+        Some(question) => json!({ "type": "error", "message": message, "question_id": question }),
+        None => json!({ "type": "error", "message": message }),
+    }
 }

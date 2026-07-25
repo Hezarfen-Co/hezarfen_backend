@@ -9,6 +9,7 @@ use crate::database::{Database, USER_TABLE};
 use crate::domain::preferences::{Language, Theme};
 use crate::domain::profile::{BirthDate, Email, PersonName, Phone};
 use crate::domain::role::Role;
+use crate::domain::text_fold::{fold, fold_sql};
 use crate::error::{AppError, ValidationError};
 use crate::validate::{validate_password, validate_username};
 
@@ -301,7 +302,9 @@ impl User {
         Ok(result.take::<Vec<User>>(0)?)
     }
 
-    /// Case-insensitive fragment search over username, name, and surname —
+    /// Case- and diacritic-insensitive fragment search over username, name,
+    /// and surname. Needle and columns both go through
+    /// [`crate::domain::text_fold`], so `ilker` finds `İLKER` and back —
     /// backs the user pickers. `role` narrows to one role (e.g. only students
     /// for an enroll picker); `None` searches everyone. A blank `query`
     /// matches everyone, so blank + `role` is a role-scoped listing. Returns
@@ -313,14 +316,16 @@ impl User {
         role: Option<Role>,
         db: &Database,
     ) -> Result<Vec<User>, AppError> {
-        let needle = query.trim().to_lowercase();
+        let needle = fold(query.trim());
+        let text_clause = format!(
+            "({} CONTAINS $q OR {} CONTAINS $q OR {} CONTAINS $q)",
+            fold_sql("username"),
+            fold_sql("name ?? ''"),
+            fold_sql("surname ?? ''"),
+        );
         let mut clauses = Vec::new();
         if !needle.is_empty() {
-            clauses.push(
-                "(string::lowercase(username) CONTAINS $q \
-                  OR string::lowercase(name ?? '') CONTAINS $q \
-                  OR string::lowercase(surname ?? '') CONTAINS $q)",
-            );
+            clauses.push(text_clause.as_str());
         }
         if role.is_some() {
             clauses.push("role = $role");
