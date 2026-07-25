@@ -110,9 +110,25 @@ async fn register_validates_input() {
     assert_eq!(res.body["role"], "student");
     assert!(res.body.get("password_hash").is_none());
 
-    // Duplicate username -> 409.
-    let res = send(&app, "POST", "/auth/register", None, Some(ok)).await;
-    assert_eq!(res.status, StatusCode::CONFLICT);
+    // A duplicate answers 201 like any other register (the "taken" reply is
+    // deliberately indistinguishable — see tests/auth_enumeration.rs), but the
+    // write is still rejected: the original password keeps working and the
+    // second one never becomes valid.
+    let dup = json!({ "username": "bob", "password": "hijack1" });
+    let res = send(&app, "POST", "/auth/register", None, Some(dup.clone())).await;
+    assert_eq!(res.status, StatusCode::CREATED);
+    let res = send(&app, "POST", "/auth/login", None, Some(ok)).await;
+    assert_eq!(
+        res.status,
+        StatusCode::OK,
+        "original password stopped working"
+    );
+    let res = send(&app, "POST", "/auth/login", None, Some(dup)).await;
+    assert_eq!(
+        res.status,
+        StatusCode::UNAUTHORIZED,
+        "the duplicate register overwrote the account"
+    );
 }
 
 #[tokio::test]
@@ -4773,7 +4789,7 @@ async fn expired_session_is_unauthorized_before_any_purge() {
 /// (trimmed) at construction and at login lookup.
 #[tokio::test]
 async fn padded_usernames_are_canonicalized_not_distinct_accounts() {
-    let app = mem_app().await;
+    let (app, db) = app_and_db().await;
 
     let res = send(
         &app,
@@ -4785,20 +4801,66 @@ async fn padded_usernames_are_canonicalized_not_distinct_accounts() {
     .await;
     assert_eq!(res.status, StatusCode::CREATED);
 
-    // Padding must not mint a lookalike account.
+    // Padding must not mint a lookalike account. Register answers 201 either way
+    // (username enumeration is denied, see tests/auth_enumeration.rs), so the
+    // collision is observed through the account itself: each spoof asks for a
+    // different password, and none of them may take effect.
     for spoof in ["ali ", " ali", "  ali  "] {
         let res = send(
             &app,
             "POST",
             "/auth/register",
             None,
-            Some(json!({ "username": spoof, "password": "secret1" })),
+            Some(json!({ "username": spoof, "password": "spoof1" })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED, "{spoof:?}");
+    }
+
+    // One row, not four — the padded forms collided with the canonical name.
+    let rows: Vec<User> = db
+        .query("SELECT * FROM user WHERE username = 'ali'")
+        .await
+        .unwrap()
+        .check()
+        .unwrap()
+        .take(0)
+        .unwrap();
+    assert_eq!(rows.len(), 1, "padding minted a lookalike account");
+    let all: Vec<User> = db
+        .query("SELECT * FROM user")
+        .await
+        .unwrap()
+        .check()
+        .unwrap()
+        .take(0)
+        .unwrap();
+    assert_eq!(all.len(), 1, "unexpected extra user rows");
+
+    // That one account still belongs to the first registration, and every
+    // spelling of the name resolves to it.
+    for attempt in ["ali", "ali ", " ali", "  ali  "] {
+        let res = send(
+            &app,
+            "POST",
+            "/auth/login",
+            None,
+            Some(json!({ "username": attempt, "password": "secret1" })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "login as {attempt:?}");
+        let res = send(
+            &app,
+            "POST",
+            "/auth/login",
+            None,
+            Some(json!({ "username": attempt, "password": "spoof1" })),
         )
         .await;
         assert_eq!(
             res.status,
-            StatusCode::CONFLICT,
-            "{spoof:?} must collide with \"ali\""
+            StatusCode::UNAUTHORIZED,
+            "a padded register overwrote \"ali\" (as {attempt:?})"
         );
     }
 
@@ -5099,8 +5161,9 @@ async fn promotion_via_role_endpoint_sweeps_enrollments() {
 /// Regression: `User::create` pre-checks the username and then inserts, so two
 /// concurrent registrations of the same name could both pass the check; the
 /// loser then hit the unique index and surfaced as a raw 500. A lost race must
-/// report the same 409 as the sequential duplicate, and exactly one account may
-/// exist afterwards.
+/// answer the same uniform 201 as the winner (the "taken" reply is deliberately
+/// indistinguishable), exactly one account may exist afterwards, and the
+/// winner's password must be the one that works.
 #[tokio::test]
 async fn concurrent_duplicate_registrations_conflict_not_500() {
     let (app, db) = app_and_db().await;
@@ -5121,15 +5184,14 @@ async fn concurrent_duplicate_registrations_conflict_not_500() {
         }));
     }
 
-    let mut created = 0;
     for h in handles {
-        match h.await.unwrap() {
-            StatusCode::CREATED => created += 1,
-            StatusCode::CONFLICT => {}
-            other => panic!("unexpected status {other} — a lost race must be a 409, not a 500"),
-        }
+        let status = h.await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "a lost race must answer 201 like the winner, not a 500"
+        );
     }
-    assert_eq!(created, 1, "exactly one registration wins");
 
     // Exactly one row exists for the name.
     let users: Vec<hezarfen_backend::domain::user::User> = db
@@ -5144,6 +5206,40 @@ async fn concurrent_duplicate_registrations_conflict_not_500() {
         users.len(),
         1,
         "exactly one user row for the duplicated name"
+    );
+
+    // And the winner's credentials survived the pile-up: a further duplicate
+    // asking for a different password does not replace them.
+    let res = send(
+        &app,
+        "POST",
+        "/auth/register",
+        None,
+        Some(json!({ "username": "dup", "password": "hijack1" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED);
+    let res = send(
+        &app,
+        "POST",
+        "/auth/login",
+        None,
+        Some(json!({ "username": "dup", "password": "secret1" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "the winning password broke");
+    let res = send(
+        &app,
+        "POST",
+        "/auth/login",
+        None,
+        Some(json!({ "username": "dup", "password": "hijack1" })),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::UNAUTHORIZED,
+        "a duplicate register overwrote the account"
     );
 }
 
