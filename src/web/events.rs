@@ -11,7 +11,9 @@ use utoipa_axum::routes;
 use crate::database::Database;
 use crate::domain::attendance::{Attendance, AttendanceStatus};
 use crate::domain::course::{Course, CourseId};
-use crate::domain::event::{Event, EventAudience, EventDescription, EventId, EventTitle};
+use crate::domain::event::{
+    EVENT_LOCK, Event, EventAudience, EventDescription, EventId, EventTitle,
+};
 use crate::domain::registration::Registration;
 use crate::domain::role::Role;
 use crate::domain::settings::Settings;
@@ -335,6 +337,22 @@ async fn update_event(
     Path(id): Path<String>,
     Json(req): Json<UpdateEvent>,
 ) -> Result<Json<EventResponse>, AppError> {
+    // The schedule columns are nullable, so they keep the outer/inner
+    // distinction: a provided value sets the field, an explicit `null` clears
+    // it, and an omitted one is left alone.
+    let starts_at = req
+        .starts_at
+        .map(|update| update.map(Timestamp::from_millis));
+    let ends_at = req.ends_at.map(|update| update.map(Timestamp::from_millis));
+    // Only the range check needs the stored row, and only it can race: it
+    // validates an arriving end against the other end as stored, so the read,
+    // the check and the write are held together under [`EVENT_LOCK`]. A PATCH
+    // that moves neither end pays nothing.
+    let _guard = match (starts_at, ends_at) {
+        (None, None) => None,
+        _ => Some(EVENT_LOCK.lock().await),
+    };
+
     let event = Event::read(&EventId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -359,14 +377,8 @@ async fn update_event(
         Some(audience) => Some(audience.into_domain(&st.db).await?),
         None => None,
     };
-    // The schedule columns are nullable, so they keep the outer/inner
-    // distinction: a provided value sets the field, an explicit `null` clears
-    // it, and an omitted one is left alone. Only set values are held to the
-    // no-past rule — a kept time of an event already underway may be past.
-    let starts_at = req
-        .starts_at
-        .map(|update| update.map(Timestamp::from_millis));
-    let ends_at = req.ends_at.map(|update| update.map(Timestamp::from_millis));
+    // Only set schedule values are held to the no-past rule — a kept time of
+    // an event already underway may be past.
     if let Some(starts_at) = starts_at {
         check_not_past("starts_at", starts_at)?;
     }

@@ -1,4 +1,5 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
+use tokio::sync::Mutex;
 use ulid::Ulid;
 
 use crate::database::{Database, WORK_ENTRY_TABLE};
@@ -6,6 +7,20 @@ use crate::domain::field_update::FieldUpdate;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
+
+/// Serializes a stint correction's ordering check against the write it guards,
+/// exactly as `TERM_LOCK` does for terms: `check_in <= check_out` is a
+/// cross-field check, so a correction of one instant validates against the
+/// *stored* other one — two such corrections, each fine on its own snapshot,
+/// would otherwise commit an inverted stint between them. Check-in/check-out
+/// themselves stay lock-free (they are atomic single-row writes), and a PATCH
+/// carrying neither instant checks nothing cross-field.
+///
+/// Lock order: this is a leaf — the only path that takes it (`PATCH
+/// /work/entries/{id}`) takes no other lock, and no path holding another lock
+/// takes this one, so it cannot sit in a cycle. Should a future path need
+/// both, take the other lock first and this one innermost.
+pub(crate) static WORK_ENTRY_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct WorkEntryId(RecordId);

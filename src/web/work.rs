@@ -8,7 +8,7 @@ use utoipa_axum::routes;
 
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
-use crate::domain::work_entry::{WorkEntry, WorkEntryId};
+use crate::domain::work_entry::{WORK_ENTRY_LOCK, WorkEntry, WorkEntryId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
 
@@ -198,6 +198,17 @@ async fn update_entry(
     Path(id): Path<String>,
     Json(req): Json<UpdateWorkEntry>,
 ) -> Result<Json<WorkEntryResponse>, AppError> {
+    let check_in = req.check_in.map(Timestamp::from_millis);
+    let check_out = req.check_out.map(Timestamp::from_millis);
+    // Only the ordering check needs the stored row, and only it can race: it
+    // validates an arriving instant against the other one as stored, so the
+    // read, the check and the write are held together under
+    // [`WORK_ENTRY_LOCK`]. A PATCH carrying neither instant pays nothing.
+    let _guard = match (check_in, check_out) {
+        (None, None) => None,
+        _ => Some(WORK_ENTRY_LOCK.lock().await),
+    };
+
     let entry = WorkEntry::read(&WorkEntryId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -207,8 +218,6 @@ async fn update_entry(
         ));
     };
 
-    let check_in = req.check_in.map(Timestamp::from_millis);
-    let check_out = req.check_out.map(Timestamp::from_millis);
     // The side the correction left out is only *read* for the ordering check —
     // it is never written back, so a concurrent correction of it survives.
     if check_out.unwrap_or(current_out) < check_in.unwrap_or_else(|| entry.get_check_in()) {
