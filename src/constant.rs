@@ -207,6 +207,15 @@ pub const DB_CONNECT_BACKOFF_MAX_SECS: u64 = 5;
 /// (`GET /exams/{id}/attempt/ws`).
 pub const EXAM_WS_TICK_SECS: u64 = 2;
 
+/// Ceiling on a `question_id` arriving on the exam-room WebSocket. The field is
+/// a record key — a 26-char ULID in every real payload — not free text, so this
+/// is generous by a factor of two and change. The cap exists because the
+/// per-question error frame *echoes* the id back: axum's default WebSocket
+/// frame limit is 64 MiB, so without it a client can make its own room reflect
+/// that whole payload. Rejected before any database work, and unattributed — an
+/// unusable id names no question, so nothing of it is sent back.
+pub const MAX_QUESTION_ID_LEN: usize = 64;
+
 /// The only accepted question kinds. `choice`: pick one of the listed
 /// choices, auto-scorable. `text`: free text, judged by the grader.
 pub const QUESTION_KINDS: [&str; 2] = ["choice", "text"];

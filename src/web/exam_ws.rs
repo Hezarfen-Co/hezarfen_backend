@@ -55,7 +55,7 @@ use axum::response::Response;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::constant::EXAM_WS_TICK_SECS;
+use crate::constant::{EXAM_WS_TICK_SECS, MAX_QUESTION_ID_LEN};
 use crate::database::Database;
 use crate::domain::exam::{Exam, ExamId};
 use crate::domain::exam_answer::ExamAnswer;
@@ -65,6 +65,7 @@ use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 use crate::state::AppState;
+use crate::validate::validate_required;
 use crate::web::CurrentUser;
 use crate::web::exams::{
     EXAM_LOCK, check_rejoin, ensure_enrolled, ensure_sittable, ensure_student, save_answer_in,
@@ -365,6 +366,11 @@ async fn handle_message(
             selected,
             text,
         } => {
+            // Cap the key before it can be echoed — see [`MAX_QUESTION_ID_LEN`].
+            if let Err(err) = validate_required("question_id", &question_id, MAX_QUESTION_ID_LEN) {
+                let frame = error_frame(&AppError::Validation(err));
+                return send(socket, frame).await;
+            }
             // Re-read the exam so the save is judged against the *current*
             // schedule, exactly like the REST path it shares — but write into
             // the room's own sitting, never whatever is latest. Reader lease
