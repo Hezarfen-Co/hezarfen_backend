@@ -12,6 +12,7 @@ use ulid::Ulid;
 
 use crate::constant::MAX_TERM_NAME_LEN;
 use crate::database::{Database, TERM_TABLE};
+use crate::domain::field_update::FieldUpdate;
 use crate::domain::timestamp::Timestamp;
 use crate::error::{AppError, ValidationError};
 use crate::validate::validate_required;
@@ -20,6 +21,13 @@ use crate::validate::validate_required;
 /// the course writes that assign a term, so a course can't land on a term that
 /// is already on its way out. Course writes take it only when they actually
 /// link a term.
+///
+/// A PATCH that moves either end of the range takes it too: `starts_at <=
+/// ends_at` is a cross-field check, so a partial PATCH validates the value it
+/// carries against the *stored* other end — two such PATCHes, each fine on its
+/// own, would otherwise commit an inverted range between them. Holding this
+/// across read-check-write serializes them; name-only PATCHes check nothing
+/// cross-field and stay lock-free.
 ///
 /// Lock order: no path ever holds this and `ENROLL_LOCK` at the same time — the
 /// course writes that take this one touch no roster, and the course delete that
@@ -121,29 +129,23 @@ impl Term {
         Ok(result.take::<Vec<Term>>(0)?)
     }
 
-    /// Field-scoped: the handler reads the term, then awaits validation before
-    /// saving with no lock held ([`TERM_LOCK`] guards the delete's link check,
-    /// not this), so the save states its own three columns instead of replaying
-    /// a whole stale row.
+    /// Write only the fields the PATCH carried — `None` means the request
+    /// omitted it, so the column is left alone rather than re-stated from the
+    /// snapshot this struct was read into. All three columns are non-nullable,
+    /// so "absent" and "null" both correctly mean "keep".
     pub async fn update(
         self,
-        name: TermName,
-        starts_at: Timestamp,
-        ends_at: Timestamp,
+        name: Option<TermName>,
+        starts_at: Option<Timestamp>,
+        ends_at: Option<Timestamp>,
         db: &Database,
     ) -> Result<Term, AppError> {
-        let mut result = db
-            .query(
-                "UPDATE $id SET name = $name, starts_at = $starts_at,
-                 ends_at = $ends_at RETURN AFTER",
-            )
-            .bind(("id", self.id.record()))
-            .bind(("name", name))
-            .bind(("starts_at", starts_at))
-            .bind(("ends_at", ends_at))
-            .await?
-            .check()?;
-        result.take::<Vec<Term>>(0)?.into_iter().next().ok_or(AppError::NotFound)
+        FieldUpdate::new(self.id.record())
+            .set("name", name)
+            .set("starts_at", starts_at)
+            .set("ends_at", ends_at)
+            .run::<Term>(db)
+            .await
     }
 
     /// True iff any course still links to this term — the delete guard.

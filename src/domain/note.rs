@@ -3,6 +3,7 @@ use ulid::Ulid;
 
 use crate::constant::{MAX_NOTE_CONTENT_LEN, MAX_NOTE_TITLE_LEN};
 use crate::database::{Database, NOTE_TABLE};
+use crate::domain::field_update::FieldUpdate;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 use crate::validate::{validate_optional, validate_required};
@@ -115,23 +116,23 @@ impl Note {
         Ok(result.take::<Vec<Note>>(0)?)
     }
 
-    /// Field-scoped, mirroring [`crate::domain::subject::Subject::update`]: no
-    /// lock spans the handler's read and this write, so only the two columns
-    /// the request actually carries are written.
+    /// Request-scoped: no lock spans the handler's read and this write, so an
+    /// omitted field (`None`) is not written at all. Passing the snapshot's
+    /// value back instead would revert a concurrent edit of that field —
+    /// scoping the `SET` alone does not prevent that, the values have to come
+    /// from the request. Neither column is nullable, so plain `Option` per
+    /// field says everything there is to say.
     pub async fn update(
         self,
-        title: NoteTitle,
-        content: NoteContent,
+        title: Option<NoteTitle>,
+        content: Option<NoteContent>,
         db: &Database,
     ) -> Result<Note, AppError> {
-        let mut result = db
-            .query("UPDATE $id SET title = $title, content = $content RETURN AFTER")
-            .bind(("id", self.id.record()))
-            .bind(("title", title))
-            .bind(("content", content))
-            .await?
-            .check()?;
-        result.take::<Vec<Note>>(0)?.into_iter().next().ok_or(AppError::NotFound)
+        FieldUpdate::new(self.id.record())
+            .set("title", title)
+            .set("content", content)
+            .run::<Note>(db)
+            .await
     }
 
     /// Delete the note and cascade-remove its attachment rows. Blob files on

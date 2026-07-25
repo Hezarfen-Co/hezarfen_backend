@@ -16,6 +16,7 @@ use ulid::Ulid;
 use crate::constant::{MAX_HOMEWORK_DESCRIPTION_LEN, MAX_HOMEWORK_TITLE_LEN};
 use crate::database::{Database, HOMEWORK_TABLE};
 use crate::domain::course::CourseId;
+use crate::domain::field_update::FieldUpdate;
 use crate::domain::subject::SubjectId;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
@@ -255,36 +256,37 @@ impl Homework {
     }
 
     /// Re-tag, re-title, re-describe, re-schedule, or re-scope the homework.
-    /// Field-scoped, so `course`, `created_by`, and `created_at` are never in
-    /// the write at all — no `READONLY` column is re-sent, and nothing the
-    /// request didn't name can be carried back from a stale read. The web layer
-    /// has already re-checked the new `due_at` against now and the new
-    /// `subject` against the course, and refused a narrowing that would orphan
-    /// a submission.
+    /// Request-scoped: every parameter is `Option`, `None` meaning the PATCH
+    /// did not carry that field, so it is not written at all. Handing the
+    /// snapshot's value back instead would revert a concurrent edit of that
+    /// field — scoping the `SET` alone does not prevent that, the *values* must
+    /// come from the request. `course`, `created_by`, and `created_at` are
+    /// `READONLY` and never appear in the write.
+    ///
+    /// `description` and `assigned` are nullable columns, so they take a
+    /// *double* option: outer `None` = absent (keep), `Some(None)` = write
+    /// `NONE` (clear the description / widen back to the whole course). The web
+    /// layer has already re-checked a new `due_at` against now, a new `subject`
+    /// against the course, and refused a narrowing that would orphan work.
     pub async fn update(
         self,
-        subject: &SubjectId,
-        title: HomeworkTitle,
-        description: Option<HomeworkDescription>,
-        due_at: Timestamp,
-        assigned: Option<Vec<UserId>>,
+        subject: Option<SubjectId>,
+        title: Option<HomeworkTitle>,
+        description: Option<Option<HomeworkDescription>>,
+        due_at: Option<Timestamp>,
+        assigned: Option<Option<Vec<UserId>>>,
         db: &Database,
     ) -> Result<Homework, AppError> {
-        let assigned = assigned.map(|users| users.iter().map(UserId::record).collect::<Vec<_>>());
-        let mut result = db
-            .query(
-                "UPDATE $id SET subject = $subject, title = $title, description = $description,
-                 due_at = $due_at, assigned = $assigned RETURN AFTER",
-            )
-            .bind(("id", self.id.record()))
-            .bind(("subject", subject.record()))
-            .bind(("title", title))
-            .bind(("description", description))
-            .bind(("due_at", due_at))
-            .bind(("assigned", assigned))
-            .await?
-            .check()?;
-        result.take::<Vec<Homework>>(0)?.into_iter().next().ok_or(AppError::NotFound)
+        let assigned = assigned
+            .map(|subset| subset.map(|users| users.iter().map(UserId::record).collect::<Vec<_>>()));
+        FieldUpdate::new(self.id.record())
+            .set("subject", subject.map(|subject| subject.record()))
+            .set("title", title)
+            .set("description", description)
+            .set("due_at", due_at)
+            .set("assigned", assigned)
+            .run::<Homework>(db)
+            .await
     }
 
     /// Delete the homework and cascade its submissions, their files, and its

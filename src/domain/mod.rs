@@ -19,6 +19,7 @@ pub mod exam_answer;
 pub mod exam_attempt;
 pub mod exam_question;
 pub mod exam_result;
+pub mod field_update;
 pub mod homework;
 pub mod homework_file;
 pub mod homework_result;

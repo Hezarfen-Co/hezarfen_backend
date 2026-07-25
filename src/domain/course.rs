@@ -3,6 +3,7 @@ use ulid::Ulid;
 
 use crate::constant::{MAX_COURSE_DESCRIPTION_LEN, MAX_COURSE_TITLE_LEN};
 use crate::database::{COURSE_TABLE, Database};
+use crate::domain::field_update::FieldUpdate;
 use crate::domain::term::TermId;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
@@ -227,35 +228,33 @@ impl Course {
         Ok(result.take::<Vec<Course>>(0)?)
     }
 
-    /// Field-scoped: `teachers` is written by [`Self::assign_teacher`],
+    /// Request-scoped: `teachers` is written by [`Self::assign_teacher`],
     /// [`Self::unassign_teacher`] and the demotion sweep, and nothing guards
     /// the course row across the handler's read and this write (its `TERM_LOCK`
     /// window guards the *term* it links, and the assign path takes no lock at
-    /// all) — a whole-row save would revert an assignment that landed in
-    /// between.
+    /// all) — so a field the request omitted (`None`) is not written at all.
+    /// Sending the snapshot's value back instead would revert a concurrent
+    /// edit of that field; scoping the `SET` alone does not stop that, the
+    /// values have to come from the request. `term` and `capacity` are
+    /// nullable, so they take the outer/inner `Option<Option<_>>`: `None` =
+    /// omitted (keep), `Some(None)` = clear.
     pub async fn update(
         self,
-        title: CourseTitle,
-        description: CourseDescription,
-        kind: CourseKind,
-        term: Option<TermId>,
-        capacity: Option<i64>,
+        title: Option<CourseTitle>,
+        description: Option<CourseDescription>,
+        kind: Option<CourseKind>,
+        term: Option<Option<TermId>>,
+        capacity: Option<Option<i64>>,
         db: &Database,
     ) -> Result<Course, AppError> {
-        let mut result = db
-            .query(
-                "UPDATE $id SET title = $title, description = $description, kind = $kind,
-                 term = $term, capacity = $capacity RETURN AFTER",
-            )
-            .bind(("id", self.id.record()))
-            .bind(("title", title))
-            .bind(("description", description))
-            .bind(("kind", kind))
-            .bind(("term", term.map(|term| term.record())))
-            .bind(("capacity", capacity))
-            .await?
-            .check()?;
-        result.take::<Vec<Course>>(0)?.into_iter().next().ok_or(AppError::NotFound)
+        FieldUpdate::new(self.id.record())
+            .set("title", title)
+            .set("description", description)
+            .set("kind", kind)
+            .set("term", term.map(|term| term.map(|term| term.record())))
+            .set("capacity", capacity)
+            .run::<Course>(db)
+            .await
     }
 
     /// Assign `teacher` to run this course, or return the course untouched if

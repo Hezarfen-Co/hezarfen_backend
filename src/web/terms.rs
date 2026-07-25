@@ -187,23 +187,24 @@ async fn update_term(
     Path(id): Path<String>,
     Json(req): Json<UpdateTerm>,
 ) -> Result<Json<TermResponse>, AppError> {
+    let name = req.name.as_deref().map(TermName::try_new).transpose()?;
+    let starts_at = req.starts_at.map(Timestamp::from_millis);
+    let ends_at = req.ends_at.map(Timestamp::from_millis);
+
+    // Only the range check needs the stored row, and only it can race: it
+    // validates an arriving end against the other end as stored, so the read,
+    // the check and the write are held together under [`TERM_LOCK`].
+    let _guard = match (starts_at, ends_at) {
+        (None, None) => None,
+        _ => Some(TERM_LOCK.lock().await),
+    };
     let term = Term::read(&TermId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-
-    let name = match req.name {
-        Some(ref name) => TermName::try_new(name)?,
-        None => term.get_name().clone(),
-    };
-    let starts_at = req
-        .starts_at
-        .map(Timestamp::from_millis)
-        .unwrap_or_else(|| term.get_starts_at());
-    let ends_at = req
-        .ends_at
-        .map(Timestamp::from_millis)
-        .unwrap_or_else(|| term.get_ends_at());
-    check_time_range(Some(starts_at), Some(ends_at))?;
+    check_time_range(
+        Some(starts_at.unwrap_or_else(|| term.get_starts_at())),
+        Some(ends_at.unwrap_or_else(|| term.get_ends_at())),
+    )?;
 
     let updated = term.update(name, starts_at, ends_at, &st.db).await?;
     Ok(Json(TermResponse::new(&updated)))
