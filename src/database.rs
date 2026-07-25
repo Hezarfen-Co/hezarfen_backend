@@ -273,17 +273,34 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS text ON exam_question TYPE string;
     DEFINE FIELD IF NOT EXISTS kind ON exam_question TYPE string;
     DEFINE FIELD IF NOT EXISTS points ON exam_question TYPE int;
-    DEFINE FIELD IF NOT EXISTS choices ON exam_question TYPE option<array<string>>;
-    DEFINE FIELD IF NOT EXISTS correct ON exam_question TYPE option<int>;
+    -- OVERWRITE, not IF NOT EXISTS: these columns changed type when choices
+    -- gained stable ids (`array<string>`/`int` -> `array<object>`/`string`),
+    -- and IF NOT EXISTS would leave an existing database on the old types.
+    DEFINE FIELD OVERWRITE choices ON exam_question TYPE option<array<object>>;
+    -- SCHEMAFULL rejects any nested key it wasn't told about, so the choice
+    -- object's own fields are declared too (same shape as `settings.exam_kinds`).
+    DEFINE FIELD OVERWRITE choices.*.id ON exam_question TYPE string;
+    DEFINE FIELD OVERWRITE choices.*.text ON exam_question TYPE string;
+    DEFINE FIELD OVERWRITE correct ON exam_question TYPE option<string>;
     DEFINE FIELD IF NOT EXISTS subject ON exam_question TYPE record<subject>;
-    DEFINE FIELD IF NOT EXISTS source_bank ON exam_question TYPE option<record<bank_question>>;
+    -- Provenance, one column per direction: `from_bank` is the template this
+    -- question was inserted from, `banked_as` the template most recently minted
+    -- by saving it into the bank. They replace the single `source_bank`, which
+    -- both directions wrote — so a question inserted from the bank read as
+    -- already-saved. OVERWRITE (not IF NOT EXISTS): the old column has to
+    -- actually go on an existing database, or SCHEMAFULL keeps accepting it
+    -- while the struct no longer writes it.
+    DEFINE FIELD OVERWRITE from_bank ON exam_question TYPE option<record<bank_question>>;
+    DEFINE FIELD OVERWRITE banked_as ON exam_question TYPE option<record<bank_question>>;
+    REMOVE FIELD IF EXISTS source_bank ON TABLE exam_question;
     DEFINE INDEX IF NOT EXISTS exam_question_exam ON exam_question FIELDS exam;
     DEFINE INDEX IF NOT EXISTS exam_question_subject ON exam_question FIELDS subject;
 
     DEFINE TABLE IF NOT EXISTS question_image SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS exam ON question_image TYPE record<exam>;
     DEFINE FIELD IF NOT EXISTS question ON question_image TYPE record<exam_question>;
-    DEFINE FIELD IF NOT EXISTS slot ON question_image TYPE option<int>;
+    -- OVERWRITE: `slot` is now the choice's id, not its position.
+    DEFINE FIELD OVERWRITE slot ON question_image TYPE option<string>;
     DEFINE FIELD IF NOT EXISTS file ON question_image TYPE string;
     DEFINE FIELD IF NOT EXISTS content_type ON question_image TYPE string;
     DEFINE FIELD IF NOT EXISTS size ON question_image TYPE int;
@@ -292,20 +309,35 @@ const MIGRATION: &str = "
 
     DEFINE TABLE IF NOT EXISTS bank_question SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS owner ON bank_question TYPE record<user>;
-    DEFINE FIELD IF NOT EXISTS subject ON bank_question TYPE record<subject>;
+    -- OVERWRITE, not IF NOT EXISTS: the field started life as a required
+    -- `record<subject>` and has to actually change type on an existing database,
+    -- otherwise the subject-delete cascade (`SET subject = NONE`) is rejected.
+    DEFINE FIELD OVERWRITE subject ON bank_question TYPE option<record<subject>>;
     DEFINE FIELD IF NOT EXISTS text ON bank_question TYPE string;
     DEFINE FIELD IF NOT EXISTS kind ON bank_question TYPE string;
     DEFINE FIELD IF NOT EXISTS points ON bank_question TYPE int;
-    DEFINE FIELD IF NOT EXISTS choices ON bank_question TYPE option<array<string>>;
-    DEFINE FIELD IF NOT EXISTS correct ON bank_question TYPE option<int>;
+    -- OVERWRITE, not IF NOT EXISTS: these columns changed type when choices
+    -- gained stable ids (`array<string>`/`int` -> `array<object>`/`string`),
+    -- and IF NOT EXISTS would leave an existing database on the old types.
+    DEFINE FIELD OVERWRITE choices ON bank_question TYPE option<array<object>>;
+    -- SCHEMAFULL rejects any nested key it wasn't told about, so the choice
+    -- object's own fields are declared too (same shape as `settings.exam_kinds`).
+    DEFINE FIELD OVERWRITE choices.*.id ON bank_question TYPE string;
+    DEFINE FIELD OVERWRITE choices.*.text ON bank_question TYPE string;
+    DEFINE FIELD OVERWRITE correct ON bank_question TYPE option<string>;
     DEFINE FIELD IF NOT EXISTS source_exam ON bank_question TYPE option<record<exam>>;
+    -- 'private' | 'school'. DEFAULT so a row that predates the field (or any
+    -- partial write) can never come out published: the answer key stays the
+    -- owner's until they publish it.
+    DEFINE FIELD IF NOT EXISTS visibility ON bank_question TYPE string DEFAULT 'private';
     DEFINE FIELD IF NOT EXISTS created_at ON bank_question TYPE int READONLY;
     DEFINE INDEX IF NOT EXISTS bank_question_owner ON bank_question FIELDS owner;
     DEFINE INDEX IF NOT EXISTS bank_question_subject ON bank_question FIELDS subject;
 
     DEFINE TABLE IF NOT EXISTS bank_question_image SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS bank_question ON bank_question_image TYPE record<bank_question>;
-    DEFINE FIELD IF NOT EXISTS slot ON bank_question_image TYPE option<int>;
+    -- OVERWRITE: `slot` is now the choice's id, not its position.
+    DEFINE FIELD OVERWRITE slot ON bank_question_image TYPE option<string>;
     DEFINE FIELD IF NOT EXISTS file ON bank_question_image TYPE string;
     DEFINE FIELD IF NOT EXISTS content_type ON bank_question_image TYPE string;
     DEFINE FIELD IF NOT EXISTS size ON bank_question_image TYPE int;
@@ -315,7 +347,8 @@ const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS exam ON exam_answer TYPE record<exam>;
     DEFINE FIELD IF NOT EXISTS question ON exam_answer TYPE record<exam_question>;
     DEFINE FIELD IF NOT EXISTS user ON exam_answer TYPE record<user>;
-    DEFINE FIELD IF NOT EXISTS selected ON exam_answer TYPE option<int>;
+    -- OVERWRITE: `selected` now names the picked option by id.
+    DEFINE FIELD OVERWRITE selected ON exam_answer TYPE option<string>;
     DEFINE FIELD IF NOT EXISTS text ON exam_answer TYPE option<string>;
     DEFINE FIELD IF NOT EXISTS updated_at ON exam_answer TYPE int;
     -- `seq` numbers the sitting an answer belongs to (1, 2, …), mirroring

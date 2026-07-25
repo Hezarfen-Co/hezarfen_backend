@@ -7,7 +7,6 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::database::Database;
-use crate::domain::bank_question::BankQuestion;
 use crate::domain::course::{Course, CourseId};
 use crate::domain::exam_question::ExamQuestion;
 use crate::domain::homework::Homework;
@@ -158,9 +157,15 @@ async fn update_subject(
 }
 
 /// Delete a subject. Requires teacher+ and management rights over its course.
-/// Refused with a 409 while any exam question, homework, or bank question still
-/// references it — re-tag or delete those first, so nothing is left pointing at
-/// a subject that no longer exists.
+/// Refused with a 409 while any exam question or homework still references it —
+/// re-tag or delete those first, so nothing is left pointing at a subject that
+/// no longer exists.
+///
+/// Bank templates are the exception: their `subject` is optional origin
+/// metadata, so the delete simply clears it on every template that carried it
+/// instead of refusing. Blocking there was unresolvable (only a template's
+/// owner may re-tag it, so a manager could not clear their own 409) and leaked
+/// the existence of other teachers' private templates.
 #[utoipa::path(
     delete,
     path = "/{id}",
@@ -172,7 +177,7 @@ async fn update_subject(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "Exam questions, homework, or bank questions still reference this subject", body = ErrorResponse),
+        (status = 409, description = "Exam questions or homework still reference this subject", body = ErrorResponse),
     ),
 )]
 async fn delete_subject(
@@ -207,18 +212,14 @@ async fn delete_subject(
             "homework still references this subject — re-tag or delete it first",
         ));
     }
-    // Bank templates carry this subject as origin metadata; a deleted subject
-    // would leave them pointing at nothing. Writer lease of [`BANK_LOCK`], the
-    // bank twin of the two guards above: bank create/update validate their
-    // subject and insert under the reader lease, so the no-templates check and
-    // the delete can't straddle a template that just adopted this subject. Held
-    // last; the order is EXAM_LOCK, then HOMEWORK_LOCK, then BANK_LOCK.
+    // Bank templates carry this subject as optional origin metadata, so they
+    // don't block: `Subject::delete` clears it off them in the delete's own
+    // transaction. Writer lease of [`BANK_LOCK`] all the same — bank
+    // create/update validate their subject and write under the reader lease, so
+    // without it a template could adopt this subject *after* the cascade ran
+    // and outlive it. Held last; the order is EXAM_LOCK, then HOMEWORK_LOCK,
+    // then BANK_LOCK.
     let _bank_guard = BANK_LOCK.write().await;
-    if BankQuestion::any_for_subject(subject.get_id(), &st.db).await? {
-        return Err(AppError::Conflict(
-            "bank questions still reference this subject — re-tag or delete them first",
-        ));
-    }
     subject.delete(&st.db).await?;
     Ok(StatusCode::NO_CONTENT)
 }

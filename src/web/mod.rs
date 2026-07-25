@@ -50,6 +50,7 @@ use utoipa::ToSchema;
 
 use crate::constant::{QUESTION_IMAGE_CONTENT_TYPES, SCHEDULE_PAST_GRACE_MS};
 use crate::database::Database;
+use crate::domain::exam_question::{Choice, ChoiceInput};
 use crate::domain::note_file::FileContentType;
 use crate::domain::parent_link::ParentLink;
 use crate::domain::role::Role;
@@ -267,6 +268,49 @@ pub(crate) async fn read_upload(
         content_type,
         data,
     })
+}
+
+/// One option of a choice question as a client sends it — the wire form of
+/// [`crate::domain::exam_question::ChoiceInput`], shared by the exam-question
+/// and bank-template routes.
+///
+/// `id` is the option's key within the payload: send back the `id` the server
+/// returned to keep that option (and its picture) across an edit, or any fresh
+/// string to introduce a new one. The server mints the stored id either way, so
+/// nothing a client sends here ever reaches storage.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub(crate) struct ChoiceBody {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[schema(example = "42")]
+    pub text: String,
+}
+
+impl ChoiceBody {
+    pub(crate) fn into_input(self) -> ChoiceInput {
+        ChoiceInput {
+            id: self.id,
+            text: self.text,
+        }
+    }
+
+    /// The whole submitted list, or `None` when the field was omitted/cleared.
+    pub(crate) fn into_inputs(choices: Option<Vec<Self>>) -> Option<Vec<ChoiceInput>> {
+        choices.map(|list| list.into_iter().map(Self::into_input).collect())
+    }
+
+    /// The stored choices as a payload that re-submits them unchanged — how a
+    /// PATCH that omits `choices` keeps every option's identity.
+    pub(crate) fn from_stored(choices: Option<&[Choice]>) -> Option<Vec<ChoiceInput>> {
+        choices.map(|list| {
+            list.iter()
+                .map(|choice| ChoiceInput {
+                    id: Some(choice.get_id().as_str().to_string()),
+                    text: choice.get_text().as_str().to_string(),
+                })
+                .collect()
+        })
+    }
 }
 
 /// Distinguishes an *absent* PATCH field from an explicit `null`: absent never

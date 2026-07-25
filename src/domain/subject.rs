@@ -108,6 +108,21 @@ impl Subject {
         Ok(db.select(id.record()).await?)
     }
 
+    /// Several subjects in one query — the bulk half of a list endpoint that
+    /// names each row's subject (a read per row would be an N+1).
+    pub async fn list_by_ids(ids: &[&SubjectId], db: &Database) -> Result<Vec<Subject>, AppError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let records: Vec<RecordId> = ids.iter().map(|id| id.record()).collect();
+        let mut result = db
+            .query("SELECT * FROM subject WHERE id IN $ids")
+            .bind(("ids", records))
+            .await?
+            .check()?;
+        Ok(result.take::<Vec<Subject>>(0)?)
+    }
+
     /// The course's subjects in curriculum order (ULID ids sort by creation).
     pub async fn list_for_course(
         course: &CourseId,
@@ -127,14 +142,45 @@ impl Subject {
         description: SubjectDescription,
         db: &Database,
     ) -> Result<Subject, AppError> {
-        self.name = name;
-        self.description = description;
-        let updated: Option<Subject> = db.update(self.id.record()).content(self).await?;
-        updated.ok_or(AppError::NotFound)
+        // Field-scoped: the handler holds no lock across its read and this
+        // write, so a whole-row save would revert a concurrent edit of the
+        // other field.
+        let mut result = db
+            .query("UPDATE $id SET name = $name, description = $description RETURN AFTER")
+            .bind(("id", self.id.record()))
+            .bind(("name", name))
+            .bind(("description", description))
+            .await?
+            .check()?;
+        result.take::<Vec<Subject>>(0)?.into_iter().next().ok_or(AppError::NotFound)
     }
 
+    /// Delete the subject and clear it off every bank template that carried it
+    /// as origin metadata — one transaction, so a template can't be left
+    /// pointing at a subject that no longer exists.
+    ///
+    /// Exam questions and homework are *not* cascaded: their `subject` is a
+    /// required field the web layer refuses to orphan (both still block the
+    /// delete with a 409). The bank's is optional metadata, and blocking on it
+    /// was a dead end — only the template's owner may re-tag it, so a manager
+    /// could never clear their own 409, and a private template raising it
+    /// leaked its existence.
     pub async fn delete(self, db: &Database) -> Result<Subject, AppError> {
-        let deleted: Option<Subject> = db.delete(self.id.record()).await?;
+        let mut result = db
+            .query(
+                "BEGIN TRANSACTION;
+                 UPDATE bank_question SET subject = NONE WHERE subject = $sub;
+                 LET $before = (DELETE $sub RETURN BEFORE);
+                 RETURN $before;
+                 COMMIT TRANSACTION;",
+            )
+            .bind(("sub", self.id.record()))
+            .await?
+            .check()?;
+        // Read through the trailing `RETURN`, not a counted slot — see
+        // [`crate::domain::exam::Exam::delete`].
+        let slot = result.num_statements().saturating_sub(2);
+        let deleted: Option<Subject> = result.take::<Vec<Subject>>(slot)?.into_iter().next();
         deleted.ok_or(AppError::NotFound)
     }
 }

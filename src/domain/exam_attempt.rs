@@ -210,10 +210,25 @@ impl ExamAttempt {
 
     /// Stamp the submission time. The caller has already checked the deadline
     /// and that the attempt isn't finished.
-    pub async fn finish(mut self, db: &Database) -> Result<ExamAttempt, AppError> {
-        self.finished_at = Some(Timestamp::now());
-        let updated: Option<ExamAttempt> = db.update(self.id.record()).content(self).await?;
-        updated.ok_or(AppError::NotFound)
+    ///
+    /// Writes *only* `finished_at`, for the mirror image of
+    /// [`ExamAttempt::set_left`]'s reason: the submit path reads the attempt,
+    /// then awaits its deadline and already-finished checks before writing, and
+    /// the exam room stamps or clears `left_at` on the same row from a socket.
+    /// A whole-row write from the pre-read snapshot would carry its stale
+    /// `left_at` back over that stamp, erasing the recorded walk-out.
+    pub async fn finish(self, db: &Database) -> Result<ExamAttempt, AppError> {
+        let mut result = db
+            .query("UPDATE $id SET finished_at = $at RETURN AFTER")
+            .bind(("id", self.id.record()))
+            .bind(("at", Some(Timestamp::now())))
+            .await?
+            .check()?;
+        result
+            .take::<Vec<ExamAttempt>>(0)?
+            .into_iter()
+            .next()
+            .ok_or(AppError::NotFound)
     }
 
     /// Stamp (or clear) the walked-out marker. The exam room sets it when the
@@ -316,7 +331,15 @@ mod tests {
         ExamAttemptLimit, ExamDescription, ExamKind, ExamMode, ExamSchedule, ExamTitle,
     };
     use crate::domain::exam_answer::ExamAnswer;
-    use crate::domain::exam_question::{ExamQuestion, QuestionKind, QuestionPoints, QuestionSpec};
+    use crate::domain::exam_question::{
+        ChoiceInput, ExamQuestion, QuestionKind, QuestionPoints, QuestionSpec,
+    };
+
+    /// The id of the question's second option — what these tests used to write
+    /// as the index `1`.
+    fn second_choice(question: &ExamQuestion) -> String {
+        question.get_choices().unwrap()[1].get_id().as_str().to_string()
+    }
     use crate::domain::settings::Settings;
 
     /// An open exam with retakes allowed, plus one choice question — enough
@@ -343,8 +366,12 @@ mod tests {
         .unwrap();
         let spec = QuestionSpec::try_new(
             QuestionKind::try_new("choice").unwrap(),
-            Some(vec!["5".into(), "6".into()]),
-            Some(1),
+            Some(vec![
+                ChoiceInput { id: Some("a".into()), text: "5".into() },
+                ChoiceInput { id: Some("b".into()), text: "6".into() },
+            ]),
+            Some("b".into()),
+            &[],
         )
         .unwrap();
         let question = ExamQuestion::create(
@@ -373,7 +400,7 @@ mod tests {
         let (first, created) = ExamAttempt::start(&exam, &user, &db).await.unwrap();
         assert!(created);
         assert_eq!(first.get_seq(), 1);
-        ExamAnswer::save(&question, &user, 1, Some(1), None, &db)
+        ExamAnswer::save(&question, &user, 1, Some(second_choice(&question)), None, &db)
             .await
             .unwrap();
         first.finish(&db).await.unwrap();
@@ -407,7 +434,7 @@ mod tests {
         let (winner, created) = ExamAttempt::start(&exam, &user, &db).await.unwrap();
         assert!(created);
         assert_eq!(winner.get_seq(), 2);
-        ExamAnswer::save(&question, &user, 2, Some(1), None, &db)
+        ExamAnswer::save(&question, &user, 2, Some(second_choice(&question)), None, &db)
             .await
             .unwrap();
 
@@ -439,6 +466,49 @@ mod tests {
         let (resumed, created) = ExamAttempt::start(&exam, &user, &db).await.unwrap();
         assert!(!created);
         assert_eq!(resumed.get_seq(), 2);
+    }
+
+    #[tokio::test]
+    async fn submitting_never_reverts_a_walk_out_that_raced_it() {
+        let db = init_mem().await.unwrap();
+        let (exam, _question) = open_exam_with_question(&db, 1).await;
+        let user = student();
+
+        let (attempt, _) = ExamAttempt::start(&exam, &user, &db).await.unwrap();
+
+        // The REST submit path reads the attempt, then checks the deadline and
+        // the already-finished guard — several awaits before it writes.
+        let stale = ExamAttempt::read(attempt.get_id(), &db)
+            .await
+            .unwrap()
+            .expect("attempt exists");
+        assert!(stale.get_left_at().is_none());
+
+        // In that gap the exam room's teardown stamps the walk-out (or a join
+        // clears it) — a field-scoped write to the same row.
+        ExamAttempt::read(attempt.get_id(), &db)
+            .await
+            .unwrap()
+            .expect("attempt exists")
+            .set_left(Some(Timestamp::now()), &db)
+            .await
+            .unwrap();
+
+        // The submit now writes from its stale snapshot. It owns `finished_at`
+        // and nothing else: carrying the snapshot's blank `left_at` back over
+        // the fresh stamp erases the recorded walk-out.
+        let finished = stale.finish(&db).await.unwrap();
+        assert!(finished.get_finished_at().is_some());
+
+        let after = ExamAttempt::read(attempt.get_id(), &db)
+            .await
+            .unwrap()
+            .expect("attempt still exists");
+        assert!(
+            after.get_left_at().is_some(),
+            "submitting must not revert a walk-out stamp that raced it"
+        );
+        assert!(after.get_finished_at().is_some(), "the submission stands");
     }
 
     #[tokio::test]

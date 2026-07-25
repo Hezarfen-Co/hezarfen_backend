@@ -465,6 +465,7 @@ impl Exam {
         self.allow_rejoin = allow_rejoin;
         self.allow_review = allow_review;
         self.draft = draft;
+        // whole-row-save-ok: the only caller takes EXAM_LOCK.write() before the row read (web/exams.rs:354)
         let updated: Option<Exam> = db.update(self.id.record()).content(self).await?;
         updated.ok_or(AppError::NotFound)
     }
@@ -489,15 +490,22 @@ impl Exam {
                  DELETE question_image WHERE exam = $ex;
                  DELETE exam_question WHERE exam = $ex;
                  UPDATE bank_question SET source_exam = NONE WHERE source_exam = $ex;
-                 DELETE $ex RETURN BEFORE;
+                 LET $before = (DELETE $ex RETURN BEFORE);
+                 RETURN $before;
                  COMMIT TRANSACTION;",
             )
             .bind(("ex", self.id.record()))
             .await?
             .check()?;
-        // Statement slots count BEGIN, the child deletes and the bank
-        // provenance clear: the exam's own DELETE is slot 8.
-        let deleted: Option<Exam> = result.take::<Vec<Exam>>(8)?.into_iter().next();
+        // The deleted row comes back through the transaction's trailing
+        // `RETURN`, never a hand-counted slot: the old `take(8)` turned a
+        // successful delete into a 404 the moment a cascade statement was
+        // inserted above it (it already had to be bumped once). `RETURN` is
+        // always the last statement before `COMMIT`, so its slot is derived
+        // from the statement count and every insertion above it shifts it
+        // along. `num_statements` counts BEGIN and COMMIT too, hence -2.
+        let slot = result.num_statements().saturating_sub(2);
+        let deleted: Option<Exam> = result.take::<Vec<Exam>>(slot)?.into_iter().next();
         deleted.ok_or(AppError::NotFound)
     }
 }
@@ -612,3 +620,4 @@ mod tests {
         assert!(ExamSchedule::try_new(mode("async"), at(3), at(2), dur).is_err());
     }
 }
+

@@ -350,12 +350,14 @@ async fn legacy_subjectless_questions_are_destroyed_on_boot() {
         Some(&cookie),
         Some(
             json!({ "subject_id": subject_id, "text": "2 + 2?", "kind": "choice",
-                     "points": 10, "choices": ["3", "4"], "correct": 1 }),
+                     "points": 10, "choices": [{"id": "c0", "text": "3"}, {"id": "c1", "text": "4"}], "correct": "c1" }),
         ),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
     let question_id = common::id_of(&res.body);
+    // Choice ids are minted server-side, so the answer names one off the response.
+    let picked = res.body["choices"][1]["id"].as_str().expect("choice id").to_string();
     let res = send(
         &app,
         "POST",
@@ -370,7 +372,7 @@ async fn legacy_subjectless_questions_are_destroyed_on_boot() {
         "POST",
         &format!("/exams/{exam_id}/attempt/answers"),
         Some(&student_cookie),
-        Some(json!({ "question_id": question_id, "selected": 1 })),
+        Some(json!({ "question_id": question_id, "selected": picked })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);

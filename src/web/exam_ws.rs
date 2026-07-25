@@ -17,7 +17,7 @@
 //! - `{"type":"error", message}` — bad JSON, unknown type, validation, deadline
 //!
 //! client → server
-//! - `{"type":"answer", question_id, selected? | text?}`
+//! - `{"type":"answer", question_id, selected? | text?}` (`selected` = choice id)
 //! - `{"type":"finish"}`
 //! - `{"type":"ping"}`
 //!
@@ -89,7 +89,7 @@ enum ClientMessage {
     Answer {
         question_id: String,
         #[serde(default)]
-        selected: Option<i64>,
+        selected: Option<String>,
         #[serde(default)]
         text: Option<String>,
     },

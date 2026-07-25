@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1cbabc252057de3029f0cd3a1c557f98551848dcbaedcd44b03c331f0ed27ec5 # shrinks to stored_n = 6, submitted = [(Other(""), "a"), (Stored(0), "a")], correct = Some(Null)

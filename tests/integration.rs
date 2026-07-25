@@ -4965,7 +4965,7 @@ async fn promotion_out_of_student_freezes_the_seat() {
         "POST",
         &format!("/exams/{exam}/attempt/answers"),
         Some(&student),
-        Some(json!({ "question_id": "nope", "selected": 0 })),
+        Some(json!({ "question_id": "nope", "selected": "c0" })),
     )
     .await;
     assert_eq!(
@@ -6610,15 +6610,16 @@ async fn open_exams_sit_anytime_and_retakes_respect_the_limit() {
                 "mode": "open", "max_attempts": 2 }),
     )
     .await;
-    let question = create_question(
+    let question_body = create_question_body(
         &app,
         &teacher,
         &exam,
         &subject,
         json!({ "text": "2 + 2?", "kind": "choice", "points": 10,
-                "choices": ["3", "4"], "correct": 1 }),
+                "choices": [{"id": "c0", "text": "3"}, {"id": "c1", "text": "4"}], "correct": "c1" }),
     )
     .await;
+    let question = id_of(&question_body);
 
     // First sitting starts right away — no window to wait for — and runs
     // without a deadline: it can only end by submission.
@@ -6644,7 +6645,7 @@ async fn open_exams_sit_anytime_and_retakes_respect_the_limit() {
         "POST",
         &format!("/exams/{exam}/attempt/answers"),
         Some(&student),
-        Some(json!({ "question_id": question, "selected": 1 })),
+        Some(json!({ "question_id": question, "selected": choice_of(&question_body, 1) })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
@@ -7086,7 +7087,7 @@ async fn subject_delete_blocks_while_questions_reference_it() {
     let tagged = create_subject(&app, &teacher, &course, "antiquity").await;
     let spare = create_subject(&app, &teacher, &course, "middle ages").await;
     let exam = create_exam(&app, &teacher, &course, "final", "final").await;
-    let question = create_question(
+    let question_body = create_question_body(
         &app,
         &teacher,
         &exam,
@@ -7094,6 +7095,7 @@ async fn subject_delete_blocks_while_questions_reference_it() {
         json!({ "text": "When?", "kind": "text", "points": 10 }),
     )
     .await;
+    let question = id_of(&question_body);
 
     // Referenced: the delete is a conflict, and the subject survives.
     let res = send(
@@ -7175,8 +7177,21 @@ async fn create_question(
     cookie: &str,
     exam: &str,
     subject: &str,
-    mut body: serde_json::Value,
+    body: serde_json::Value,
 ) -> String {
+    id_of(&create_question_body(app, cookie, exam, subject, body).await)
+}
+
+/// Like [`create_question`], but hands back the whole response: choice ids are
+/// minted by the server, so a test that answers a question — or pictures one of
+/// its options — has to read them off the response rather than count positions.
+async fn create_question_body(
+    app: &axum::Router,
+    cookie: &str,
+    exam: &str,
+    subject: &str,
+    mut body: serde_json::Value,
+) -> serde_json::Value {
     body["subject_id"] = json!(subject);
     let res = send(
         app,
@@ -7192,7 +7207,16 @@ async fn create_question(
         "create question: {}",
         res.body
     );
-    id_of(&res.body)
+    res.body
+}
+
+/// The minted id of the option at `index` of a question (or bank template)
+/// response — what these tests used to write as a bare choice index.
+fn choice_of(question: &serde_json::Value, index: usize) -> String {
+    question["choices"][index]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("choice {index} of {question}"))
+        .to_string()
 }
 
 /// A course with an open sync window, one subject, and one enrolled student —
@@ -7236,7 +7260,7 @@ async fn question_crud_validation_and_rbac() {
         Some(&teacher),
         Some(
             json!({ "subject_id": subject, "text": "2 + 2?", "kind": "choice", "points": 10,
-                     "choices": ["3", "4", "5"], "correct": 1 }),
+                     "choices": [{"id": "c0", "text": "3"}, {"id": "c1", "text": "4"}, {"id": "c2", "text": "5"}], "correct": "c1" }),
         ),
     )
     .await;
@@ -7245,8 +7269,8 @@ async fn question_crud_validation_and_rbac() {
     assert_eq!(res.body["subject"], subject);
     assert_eq!(res.body["kind"], "choice");
     assert_eq!(res.body["points"], 10);
-    assert_eq!(res.body["choices"][1], "4");
-    assert_eq!(res.body["correct"], 1);
+    assert_eq!(res.body["choices"][1]["text"], "4");
+    assert_eq!(res.body["correct"], res.body["choices"][1]["id"]);
     let choice_q = id_of(&res.body);
 
     // A text question carries neither choices nor correct.
@@ -7298,40 +7322,51 @@ async fn question_crud_validation_and_rbac() {
         ),
         (
             "choice without choices",
-            json!({ "text": "x", "kind": "choice", "points": 1, "correct": 0 }),
+            json!({ "text": "x", "kind": "choice", "points": 1, "correct": "c0" }),
         ),
         (
             "choice without correct",
-            json!({ "text": "x", "kind": "choice", "points": 1, "choices": ["a", "b"] }),
+            json!({ "text": "x", "kind": "choice", "points": 1, "choices": [{"id": "c0", "text": "a"}, {"id": "c1", "text": "b"}] }),
         ),
         (
-            "correct out of range",
-            json!({ "text": "x", "kind": "choice", "points": 1, "choices": ["a", "b"], "correct": 2 }),
+            "correct names no submitted choice",
+            json!({ "text": "x", "kind": "choice", "points": 1, "choices": [{"id": "c0", "text": "a"}, {"id": "c1", "text": "b"}], "correct": "c2" }),
         ),
         (
-            "negative correct",
-            json!({ "text": "x", "kind": "choice", "points": 1, "choices": ["a", "b"], "correct": -1 }),
+            "correct is blank",
+            json!({ "text": "x", "kind": "choice", "points": 1, "choices": [{"id": "c0", "text": "a"}, {"id": "c1", "text": "b"}], "correct": "" }),
+        ),
+        (
+            // Two options under one key: the payload can't say which one
+            // `correct` (or a picture) means, so it is refused outright.
+            "duplicate choice id in one payload",
+            json!({ "text": "x", "kind": "choice", "points": 1, "choices": [{"id": "c0", "text": "a"}, {"id": "c0", "text": "b"}], "correct": "c0" }),
+        ),
+        (
+            // An option with no key cannot be named by `correct`.
+            "correct names an unkeyed option",
+            json!({ "text": "x", "kind": "choice", "points": 1, "choices": [{"text": "a"}, {"text": "b"}], "correct": "c0" }),
         ),
         (
             "one choice",
-            json!({ "text": "x", "kind": "choice", "points": 1, "choices": ["a"], "correct": 0 }),
+            json!({ "text": "x", "kind": "choice", "points": 1, "choices": [{"id": "c0", "text": "a"}], "correct": "c0" }),
         ),
         (
             "eleven choices",
             json!({ "text": "x", "kind": "choice", "points": 1,
-                                   "choices": ["a","b","c","d","e","f","g","h","i","j","k"], "correct": 0 }),
+                                   "choices": [{"id": "c0", "text": "a"}, {"id": "c1", "text": "b"}, {"id": "c2", "text": "c"}, {"id": "c3", "text": "d"}, {"id": "c4", "text": "e"}, {"id": "c5", "text": "f"}, {"id": "c6", "text": "g"}, {"id": "c7", "text": "h"}, {"id": "c8", "text": "i"}, {"id": "c9", "text": "j"}, {"id": "c10", "text": "k"}], "correct": "c0" }),
         ),
         (
             "blank choice",
-            json!({ "text": "x", "kind": "choice", "points": 1, "choices": ["a", " "], "correct": 0 }),
+            json!({ "text": "x", "kind": "choice", "points": 1, "choices": [{"id": "c0", "text": "a"}, {"id": "c1", "text": " "}], "correct": "c0" }),
         ),
         (
             "text with choices",
-            json!({ "text": "x", "kind": "text", "points": 1, "choices": ["a", "b"] }),
+            json!({ "text": "x", "kind": "text", "points": 1, "choices": [{"id": "c0", "text": "a"}, {"id": "c1", "text": "b"}] }),
         ),
         (
             "text with correct",
-            json!({ "text": "x", "kind": "text", "points": 1, "correct": 0 }),
+            json!({ "text": "x", "kind": "text", "points": 1, "correct": "c0" }),
         ),
     ] {
         let mut body = body;
@@ -7410,7 +7445,7 @@ async fn question_crud_validation_and_rbac() {
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     assert_eq!(res.body["points"], 15);
-    assert_eq!(res.body["correct"], 1, "kind bundle kept");
+    assert_eq!(res.body["correct"], res.body["choices"][1]["id"], "kind bundle kept");
     assert_eq!(res.body["subject"], subject, "subject kept by omission");
 
     // Re-tagging stays inside the course: another of its subjects is fine, a
@@ -7468,7 +7503,7 @@ async fn question_crud_validation_and_rbac() {
         "PATCH",
         &format!("/exams/{exam}/questions/{choice_q}"),
         Some(&teacher),
-        Some(json!({ "kind": "choice", "choices": ["yes", "no"], "correct": 0 })),
+        Some(json!({ "kind": "choice", "choices": [{"id": "c0", "text": "yes"}, {"id": "c1", "text": "no"}], "correct": "c0" })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
@@ -7546,15 +7581,16 @@ async fn questions_freeze_once_attempts_start() {
     let student_id = me_id(&app, &student).await;
     let (_course, exam, subject) =
         open_exam_with_student(&app, &teacher, &student_id, "algo").await;
-    let question = create_question(
+    let question_body = create_question_body(
         &app,
         &teacher,
         &exam,
         &subject,
         json!({ "text": "2 + 2?", "kind": "choice", "points": 10,
-                "choices": ["3", "4"], "correct": 1 }),
+                "choices": [{"id": "c0", "text": "3"}, {"id": "c1", "text": "4"}], "correct": "c1" }),
     )
     .await;
+    let question = id_of(&question_body);
 
     let res = send(
         &app,
@@ -7603,15 +7639,16 @@ async fn student_question_view_hides_correct_and_embeds_answers() {
     let student = login(&app, "sona").await;
     let student_id = me_id(&app, &student).await;
     let (_course, exam, subject) = open_exam_with_student(&app, &teacher, &student_id, "art").await;
-    let choice_q = create_question(
+    let choice_q_body = create_question_body(
         &app,
         &teacher,
         &exam,
         &subject,
         json!({ "text": "2 + 2?", "kind": "choice", "points": 10,
-                "choices": ["3", "4"], "correct": 1 }),
+                "choices": [{"id": "c0", "text": "3"}, {"id": "c1", "text": "4"}], "correct": "c1" }),
     )
     .await;
+    let choice_q = id_of(&choice_q_body);
     create_question(
         &app,
         &teacher,
@@ -7641,7 +7678,7 @@ async fn student_question_view_hides_correct_and_embeds_answers() {
     let questions = res.body.as_array().expect("questions");
     assert_eq!(questions.len(), 2);
     assert_eq!(questions[0]["kind"], "choice");
-    assert_eq!(questions[0]["choices"][1], "4");
+    assert_eq!(questions[0]["choices"][1]["text"], "4");
     for question in questions {
         assert!(
             question.as_object().unwrap().get("correct").is_none(),
@@ -7656,17 +7693,17 @@ async fn student_question_view_hides_correct_and_embeds_answers() {
         "POST",
         &format!("/exams/{exam}/attempt/answers"),
         Some(&student),
-        Some(json!({ "question_id": choice_q, "selected": 0 })),
+        Some(json!({ "question_id": choice_q, "selected": choice_of(&choice_q_body, 0) })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     assert_eq!(res.body["question"], choice_q);
-    assert_eq!(res.body["selected"], 0);
+    assert_eq!(res.body["selected"], choice_of(&choice_q_body, 0));
     let saved_at = res.body["updated_at"].as_i64().expect("updated_at");
 
     let res = send(&app, "GET", &uri, Some(&student), None).await;
     let questions = res.body.as_array().expect("questions");
-    assert_eq!(questions[0]["answer"]["selected"], 0);
+    assert_eq!(questions[0]["answer"]["selected"], choice_of(&choice_q_body, 0));
     assert_eq!(questions[0]["answer"]["updated_at"], saved_at);
     assert!(questions[1]["answer"].is_null());
 }
@@ -7678,16 +7715,17 @@ async fn answer_saves_gate_on_attempt_state_and_kind() {
     let student = login(&app, "arda").await;
     let student_id = me_id(&app, &student).await;
     let (course, exam, subject) = open_exam_with_student(&app, &teacher, &student_id, "phys").await;
-    let choice_q = create_question(
+    let choice_q_body = create_question_body(
         &app,
         &teacher,
         &exam,
         &subject,
         json!({ "text": "2 + 2?", "kind": "choice", "points": 10,
-                "choices": ["3", "4", "5"], "correct": 1 }),
+                "choices": [{"id": "c0", "text": "3"}, {"id": "c1", "text": "4"}, {"id": "c2", "text": "5"}], "correct": "c1" }),
     )
     .await;
-    let text_q = create_question(
+    let choice_q = id_of(&choice_q_body);
+    let text_q_body = create_question_body(
         &app,
         &teacher,
         &exam,
@@ -7695,6 +7733,7 @@ async fn answer_saves_gate_on_attempt_state_and_kind() {
         json!({ "text": "Explain.", "kind": "text", "points": 20 }),
     )
     .await;
+    let text_q = id_of(&text_q_body);
     let answers_uri = format!("/exams/{exam}/attempt/answers");
 
     // Saving needs an attempt (404 before start).
@@ -7703,7 +7742,7 @@ async fn answer_saves_gate_on_attempt_state_and_kind() {
         "POST",
         &answers_uri,
         Some(&student),
-        Some(json!({ "question_id": choice_q, "selected": 0 })),
+        Some(json!({ "question_id": choice_q, "selected": choice_of(&choice_q_body, 0) })),
     )
     .await;
     assert_eq!(res.status, StatusCode::NOT_FOUND, "attempt first");
@@ -7723,7 +7762,7 @@ async fn answer_saves_gate_on_attempt_state_and_kind() {
         "POST",
         &answers_uri,
         Some(&student),
-        Some(json!({ "question_id": choice_q, "selected": 0 })),
+        Some(json!({ "question_id": choice_q, "selected": choice_of(&choice_q_body, 0) })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
@@ -7734,11 +7773,11 @@ async fn answer_saves_gate_on_attempt_state_and_kind() {
         "POST",
         &answers_uri,
         Some(&student),
-        Some(json!({ "question_id": choice_q, "selected": 2 })),
+        Some(json!({ "question_id": choice_q, "selected": choice_of(&choice_q_body, 2) })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-    assert_eq!(res.body["selected"], 2);
+    assert_eq!(res.body["selected"], choice_of(&choice_q_body, 2));
     assert!(
         res.body["updated_at"].as_i64().expect("updated_at") > first_saved_at,
         "a re-save moves updated_at forward"
@@ -7774,20 +7813,16 @@ async fn answer_saves_gate_on_attempt_state_and_kind() {
         ),
         (
             "both fields",
-            json!({ "question_id": choice_q, "selected": 1, "text": "4" }),
+            json!({ "question_id": choice_q, "selected": choice_of(&choice_q_body, 1), "text": "4" }),
         ),
         (
-            "selected out of range",
-            json!({ "question_id": choice_q, "selected": 3 }),
-        ),
-        (
-            "negative selected",
-            json!({ "question_id": choice_q, "selected": -1 }),
+            "selected names no choice of this question",
+            json!({ "question_id": choice_q, "selected": "01NOTACHOICEOFTHISQUEST" }),
         ),
         ("nothing to save", json!({ "question_id": choice_q })),
         (
             "selected on a text question",
-            json!({ "question_id": text_q, "selected": 0 }),
+            json!({ "question_id": text_q, "selected": choice_of(&choice_q_body, 0) }),
         ),
         (
             "oversized text",
@@ -7804,26 +7839,27 @@ async fn answer_saves_gate_on_attempt_state_and_kind() {
         "POST",
         &answers_uri,
         Some(&student),
-        Some(json!({ "question_id": "missing", "selected": 0 })),
+        Some(json!({ "question_id": "missing", "selected": "c0" })),
     )
     .await;
     assert_eq!(res.status, StatusCode::NOT_FOUND);
     let foreign_exam = create_exam(&app, &teacher, &course, "other", "quiz").await;
-    let foreign_q = create_question(
+    let foreign_q_body = create_question_body(
         &app,
         &teacher,
         &foreign_exam,
         &subject,
         json!({ "text": "not yours", "kind": "choice", "points": 1,
-                "choices": ["a", "b"], "correct": 0 }),
+                "choices": [{"id": "c0", "text": "a"}, {"id": "c1", "text": "b"}], "correct": "c0" }),
     )
     .await;
+    let foreign_q = id_of(&foreign_q_body);
     let res = send(
         &app,
         "POST",
         &answers_uri,
         Some(&student),
-        Some(json!({ "question_id": foreign_q, "selected": 0 })),
+        Some(json!({ "question_id": foreign_q, "selected": choice_of(&foreign_q_body, 0) })),
     )
     .await;
     assert_eq!(
@@ -7848,7 +7884,7 @@ async fn answer_saves_gate_on_attempt_state_and_kind() {
         "POST",
         &answers_uri,
         Some(&student),
-        Some(json!({ "question_id": choice_q, "selected": 1 })),
+        Some(json!({ "question_id": choice_q, "selected": choice_of(&choice_q_body, 1) })),
     )
     .await;
     assert_eq!(
@@ -7873,7 +7909,7 @@ async fn answer_saves_gate_on_attempt_state_and_kind() {
         "review after submit: {}",
         res.body
     );
-    assert_eq!(res.body[0]["answer"]["selected"], 2);
+    assert_eq!(res.body[0]["answer"]["selected"], choice_of(&choice_q_body, 2));
     assert_eq!(res.body[1]["answer"]["text"], "because");
 }
 
@@ -7884,15 +7920,16 @@ async fn unenrollment_cuts_the_sittings_reads_and_writes() {
     let student = login(&app, "cansu").await;
     let student_id = me_id(&app, &student).await;
     let (course, exam, subject) = open_exam_with_student(&app, &teacher, &student_id, "chem").await;
-    let question = create_question(
+    let question_body = create_question_body(
         &app,
         &teacher,
         &exam,
         &subject,
         json!({ "text": "2 + 2?", "kind": "choice", "points": 10,
-                "choices": ["3", "4"], "correct": 1 }),
+                "choices": [{"id": "c0", "text": "3"}, {"id": "c1", "text": "4"}], "correct": "c1" }),
     )
     .await;
+    let question = id_of(&question_body);
 
     // Enrolled: start the attempt, read the questions, save an answer.
     let res = send(
@@ -7918,7 +7955,7 @@ async fn unenrollment_cuts_the_sittings_reads_and_writes() {
         "POST",
         &format!("/exams/{exam}/attempt/answers"),
         Some(&student),
-        Some(json!({ "question_id": question, "selected": 1 })),
+        Some(json!({ "question_id": question, "selected": choice_of(&question_body, 1) })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
@@ -7955,7 +7992,7 @@ async fn unenrollment_cuts_the_sittings_reads_and_writes() {
         "POST",
         &format!("/exams/{exam}/attempt/answers"),
         Some(&student),
-        Some(json!({ "question_id": question, "selected": 0 })),
+        Some(json!({ "question_id": question, "selected": choice_of(&question_body, 0) })),
     )
     .await;
     assert_eq!(
@@ -8015,15 +8052,16 @@ async fn answer_saves_stop_at_the_deadline() {
                 "mode": "sync", "starts_at": now - 1_000, "ends_at": now + 1_500 }),
     )
     .await;
-    let question = create_question(
+    let question_body = create_question_body(
         &app,
         &teacher,
         &exam,
         &subject,
         json!({ "text": "quick", "kind": "choice", "points": 1,
-                "choices": ["a", "b"], "correct": 0 }),
+                "choices": [{"id": "c0", "text": "a"}, {"id": "c1", "text": "b"}], "correct": "c0" }),
     )
     .await;
+    let question = id_of(&question_body);
     let res = send(
         &app,
         "POST",
@@ -8038,7 +8076,7 @@ async fn answer_saves_stop_at_the_deadline() {
         "POST",
         &format!("/exams/{exam}/attempt/answers"),
         Some(&student),
-        Some(json!({ "question_id": question, "selected": 0 })),
+        Some(json!({ "question_id": question, "selected": choice_of(&question_body, 0) })),
     )
     .await;
     assert_eq!(
@@ -8055,7 +8093,7 @@ async fn answer_saves_stop_at_the_deadline() {
         "POST",
         &format!("/exams/{exam}/attempt/answers"),
         Some(&student),
-        Some(json!({ "question_id": question, "selected": 1 })),
+        Some(json!({ "question_id": question, "selected": choice_of(&question_body, 1) })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CONFLICT, "expired: {}", res.body);
@@ -8070,7 +8108,7 @@ async fn answer_saves_stop_at_the_deadline() {
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-    assert_eq!(res.body["answers"][0]["selected"], 0);
+    assert_eq!(res.body["answers"][0]["selected"], choice_of(&question_body, 0));
 }
 
 #[tokio::test]
@@ -8081,24 +8119,26 @@ async fn teacher_answer_sheet_judges_choices_and_suggests_a_score() {
     let student_id = me_id(&app, &student).await;
     let (_course, exam, subject) =
         open_exam_with_student(&app, &teacher, &student_id, "chem").await;
-    let q1 = create_question(
+    let q1_body = create_question_body(
         &app,
         &teacher,
         &exam,
         &subject,
         json!({ "text": "2 + 2?", "kind": "choice", "points": 10,
-                "choices": ["3", "4"], "correct": 1 }),
+                "choices": [{"id": "c0", "text": "3"}, {"id": "c1", "text": "4"}], "correct": "c1" }),
     )
     .await;
-    let q2 = create_question(
+    let q1 = id_of(&q1_body);
+    let q2_body = create_question_body(
         &app,
         &teacher,
         &exam,
         &subject,
         json!({ "text": "3 + 3?", "kind": "choice", "points": 20,
-                "choices": ["6", "7"], "correct": 0 }),
+                "choices": [{"id": "c0", "text": "6"}, {"id": "c1", "text": "7"}], "correct": "c0" }),
     )
     .await;
+    let q2 = id_of(&q2_body);
     let q3 = create_question(
         &app,
         &teacher,
@@ -8123,8 +8163,8 @@ async fn teacher_answer_sheet_judges_choices_and_suggests_a_score() {
     .await;
     assert_eq!(res.status, StatusCode::CREATED);
     for body in [
-        json!({ "question_id": q1, "selected": 1 }), // right
-        json!({ "question_id": q2, "selected": 1 }), // wrong
+        json!({ "question_id": q1, "selected": choice_of(&q1_body, 1) }), // right
+        json!({ "question_id": q2, "selected": choice_of(&q2_body, 1) }), // wrong
         json!({ "question_id": q3, "text": "entropy grows" }),
     ] {
         let res = send(
@@ -8174,15 +8214,16 @@ async fn live_monitor_tracks_answer_progress() {
     let bora_id = me_id(&app, &bora).await;
     let (course, exam, subject) = open_exam_with_student(&app, &teacher, &ayla_id, "stats").await;
     enroll(&app, &teacher, &course, &bora_id).await;
-    let question = create_question(
+    let question_body = create_question_body(
         &app,
         &teacher,
         &exam,
         &subject,
         json!({ "text": "2 + 2?", "kind": "choice", "points": 10,
-                "choices": ["3", "4"], "correct": 1 }),
+                "choices": [{"id": "c0", "text": "3"}, {"id": "c1", "text": "4"}], "correct": "c1" }),
     )
     .await;
+    let question = id_of(&question_body);
     create_question(
         &app,
         &teacher,
@@ -8210,7 +8251,7 @@ async fn live_monitor_tracks_answer_progress() {
         "POST",
         &format!("/exams/{exam}/attempt/answers"),
         Some(&ayla),
-        Some(json!({ "question_id": question, "selected": 1 })),
+        Some(json!({ "question_id": question, "selected": choice_of(&question_body, 1) })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK);
@@ -8246,16 +8287,17 @@ async fn questions_and_answers_cascade_with_deletes() {
     let student = login(&app, "cem").await;
     let student_id = me_id(&app, &student).await;
     let (course, exam, subject) = open_exam_with_student(&app, &teacher, &student_id, "geo2").await;
-    let q1 = create_question(
+    let q1_body = create_question_body(
         &app,
         &teacher,
         &exam,
         &subject,
         json!({ "text": "2 + 2?", "kind": "choice", "points": 10,
-                "choices": ["3", "4"], "correct": 1 }),
+                "choices": [{"id": "c0", "text": "3"}, {"id": "c1", "text": "4"}], "correct": "c1" }),
     )
     .await;
-    let q2 = create_question(
+    let q1 = id_of(&q1_body);
+    let q2_body = create_question_body(
         &app,
         &teacher,
         &exam,
@@ -8263,6 +8305,7 @@ async fn questions_and_answers_cascade_with_deletes() {
         json!({ "text": "Explain.", "kind": "text", "points": 20 }),
     )
     .await;
+    let q2 = id_of(&q2_body);
     let res = send(
         &app,
         "POST",
@@ -8273,7 +8316,7 @@ async fn questions_and_answers_cascade_with_deletes() {
     .await;
     assert_eq!(res.status, StatusCode::CREATED);
     for body in [
-        json!({ "question_id": q1, "selected": 1 }),
+        json!({ "question_id": q1, "selected": choice_of(&q1_body, 1) }),
         json!({ "question_id": q2, "text": "so" }),
     ] {
         let res = send(
@@ -8361,15 +8404,16 @@ async fn questions_and_answers_cascade_with_deletes() {
                 "mode": "sync", "starts_at": now - 1_000, "ends_at": now + 600_000 }),
     )
     .await;
-    let q = create_question(
+    let q_body = create_question_body(
         &app,
         &teacher,
         &exam2,
         &subject,
         json!({ "text": "2 + 2?", "kind": "choice", "points": 10,
-                "choices": ["3", "4"], "correct": 1 }),
+                "choices": [{"id": "c0", "text": "3"}, {"id": "c1", "text": "4"}], "correct": "c1" }),
     )
     .await;
+    let q = id_of(&q_body);
     let res = send(
         &app,
         "POST",
@@ -8384,7 +8428,7 @@ async fn questions_and_answers_cascade_with_deletes() {
         "POST",
         &format!("/exams/{exam2}/attempt/answers"),
         Some(&student),
-        Some(json!({ "question_id": q, "selected": 1 })),
+        Some(json!({ "question_id": q, "selected": choice_of(&q_body, 1) })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK);
@@ -8431,15 +8475,16 @@ async fn question_patch_revalidates_the_stale_kind_bundle() {
     let course = create_course(&app, &teacher, "sets").await;
     let subject = create_subject(&app, &teacher, &course, "unions").await;
     let exam = create_exam(&app, &teacher, &course, "final", "final").await;
-    let question = create_question(
+    let question_body = create_question_body(
         &app,
         &teacher,
         &exam,
         &subject,
         json!({ "text": "pick", "kind": "choice", "points": 10,
-                "choices": ["a", "b", "c"], "correct": 2 }),
+                "choices": [{"id": "c0", "text": "a"}, {"id": "c1", "text": "b"}, {"id": "c2", "text": "c"}], "correct": "c2" }),
     )
     .await;
+    let question = id_of(&question_body);
     let uri = format!("/exams/{exam}/questions/{question}");
 
     // Shrinking the options while keeping the old `correct` would leave it
@@ -8449,7 +8494,7 @@ async fn question_patch_revalidates_the_stale_kind_bundle() {
         "PATCH",
         &uri,
         Some(&teacher),
-        Some(json!({ "choices": ["a", "b"] })),
+        Some(json!({ "choices": [{"id": "c0", "text": "a"}, {"id": "c1", "text": "b"}] })),
     )
     .await;
     assert_eq!(
@@ -8465,11 +8510,11 @@ async fn question_patch_revalidates_the_stale_kind_bundle() {
         "PATCH",
         &uri,
         Some(&teacher),
-        Some(json!({ "choices": ["a", "b"], "correct": 1 })),
+        Some(json!({ "choices": [{"id": "c0", "text": "a"}, {"id": "c1", "text": "b"}], "correct": "c1" })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-    assert_eq!(res.body["correct"], 1);
+    assert_eq!(res.body["correct"], res.body["choices"][1]["id"]);
 
     // A lone out-of-range `correct` against the kept choices is caught too.
     let res = send(
@@ -8477,7 +8522,7 @@ async fn question_patch_revalidates_the_stale_kind_bundle() {
         "PATCH",
         &uri,
         Some(&teacher),
-        Some(json!({ "correct": 5 })),
+        Some(json!({ "correct": "c5" })),
     )
     .await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
@@ -8509,7 +8554,7 @@ async fn question_patch_revalidates_the_stale_kind_bundle() {
             .len(),
         2
     );
-    assert_eq!(common::items(&res.body)[0]["correct"], 1);
+    assert_eq!(common::items(&res.body)[0]["correct"], common::items(&res.body)[0]["choices"][1]["id"]);
 }
 
 #[tokio::test]
@@ -8523,15 +8568,16 @@ async fn question_authoring_follows_course_management() {
 
     // A manager+ authors questions in anyone's course, like every other
     // course-management write.
-    let question = create_question(
+    let question_body = create_question_body(
         &app,
         &boss,
         &exam,
         &subject,
         json!({ "text": "pick", "kind": "choice", "points": 10,
-                "choices": ["a", "b"], "correct": 0 }),
+                "choices": [{"id": "c0", "text": "a"}, {"id": "c1", "text": "b"}], "correct": "c0" }),
     )
     .await;
+    let question = id_of(&question_body);
     let res = send(
         &app,
         "PATCH",
@@ -8560,15 +8606,16 @@ async fn concurrent_answer_saves_never_collide() {
     let student_id = me_id(&app, &student).await;
     let (_course, exam, subject) =
         open_exam_with_student(&app, &teacher, &student_id, "race").await;
-    let question = create_question(
+    let question_body = create_question_body(
         &app,
         &teacher,
         &exam,
         &subject,
         json!({ "text": "pick", "kind": "choice", "points": 10,
-                "choices": ["a", "b", "c"], "correct": 0 }),
+                "choices": [{"id": "c0", "text": "a"}, {"id": "c1", "text": "b"}, {"id": "c2", "text": "c"}], "correct": "c0" }),
     )
     .await;
+    let question = id_of(&question_body);
     let res = send(
         &app,
         "POST",
@@ -8586,7 +8633,7 @@ async fn concurrent_answer_saves_never_collide() {
         let app = app.clone();
         let student = student.clone();
         let uri = format!("/exams/{exam}/attempt/answers");
-        let body = json!({ "question_id": question, "selected": i % 3 });
+        let body = json!({ "question_id": question, "selected": choice_of(&question_body, (i % 3) as usize) });
         handles.push(tokio::spawn(async move {
             send(&app, "POST", &uri, Some(&student), Some(body))
                 .await
@@ -10670,15 +10717,16 @@ async fn question_images_author_serve_and_cascade() {
         json!({ "title": "map quiz", "kind": "quiz", "mode": "open" }),
     )
     .await;
-    let question = create_question(
+    let question_body = create_question_body(
         &app,
         &teacher,
         &exam,
         &subject,
         json!({ "text": "Which city is marked?", "kind": "choice", "points": 10,
-                "choices": ["Ankara", "İzmir"], "correct": 0 }),
+                "choices": [{"id": "c0", "text": "Ankara"}, {"id": "c1", "text": "İzmir"}], "correct": "c0" }),
     )
     .await;
+    let question = id_of(&question_body);
     let essay = create_question(
         &app,
         &teacher,
@@ -10715,7 +10763,7 @@ async fn question_images_author_serve_and_cascade() {
     let (status, _) = post_image(
         &app,
         &teacher,
-        &format!("/exams/{exam}/questions/{essay}/choices/0/image"),
+        &format!("/exams/{exam}/questions/{essay}/choices/{}/image", choice_of(&question_body, 0)),
         "image/png",
         b"x",
     )
@@ -10728,15 +10776,18 @@ async fn question_images_author_serve_and_cascade() {
     let (status, _) = post_image(
         &app,
         &teacher,
-        &format!("/exams/{exam}/questions/{question}/choices/2/image"),
+        &format!("/exams/{exam}/questions/{question}/choices/01NOTACHOICEOFTHISQUEST/image"),
         "image/png",
         b"x",
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "slot must index a choice");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "slot must name a choice");
 
     // Option picture on choice 1, and the author view carries all the metas.
-    let choice_image = format!("/exams/{exam}/questions/{question}/choices/1/image");
+    let choice_image = format!(
+        "/exams/{exam}/questions/{question}/choices/{}/image",
+        choice_of(&question_body, 1)
+    );
     let (status, _) = post_image(&app, &teacher, &choice_image, "image/webp", b"webp-choice").await;
     assert_eq!(status, StatusCode::CREATED);
     let res = send(
@@ -10874,7 +10925,7 @@ async fn student_answer_images_serve_and_cascade() {
         json!({ "title": "cell quiz", "kind": "quiz", "mode": "open", "max_attempts": 2 }),
     )
     .await;
-    let question = create_question(
+    let question_body = create_question_body(
         &app,
         &teacher,
         &exam,
@@ -10882,6 +10933,7 @@ async fn student_answer_images_serve_and_cascade() {
         json!({ "text": "Draw a cell.", "kind": "text", "points": 10 }),
     )
     .await;
+    let question = id_of(&question_body);
 
     let own = format!("/exams/{exam}/attempt/answers/{question}/image");
     let png = b"png-drawing".as_slice();
@@ -11087,7 +11139,7 @@ async fn answer_image_surfaces_for_a_drawing_only_answer() {
         json!({ "title": "sketch", "kind": "quiz", "mode": "open" }),
     )
     .await;
-    let question = create_question(
+    let question_body = create_question_body(
         &app,
         &teacher,
         &exam,
@@ -11095,6 +11147,7 @@ async fn answer_image_surfaces_for_a_drawing_only_answer() {
         json!({ "text": "Draw a triangle.", "kind": "text", "points": 5 }),
     )
     .await;
+    let question = id_of(&question_body);
 
     // Sit, then upload a drawing WITHOUT ever saving a text answer.
     let res = send(
@@ -11161,10 +11214,13 @@ async fn answer_image_surfaces_for_a_drawing_only_answer() {
     );
 }
 
-/// The authoring edits that reshape a question also groom its images: a
-/// replaced `choices` list drops the option pictures (the illustration
-/// stays), an explicit image DELETE removes row + blob, and deleting the
-/// question sweeps the rest.
+/// The authoring edits that reshape a question also groom its images — and
+/// **only** the pictures of options that are actually gone. Reordering the list
+/// and deleting one option leaves every surviving option's picture attached to
+/// *that option*, and leaves `correct` naming the option the author marked.
+/// This is the behaviour stable choice ids exist for: the images used to be
+/// keyed by position, so any edit that carried a `choices` key wiped all of
+/// them.
 #[tokio::test]
 async fn question_image_edits_follow_the_choices() {
     let (app, db) = app_and_db().await;
@@ -11178,20 +11234,28 @@ async fn question_image_edits_follow_the_choices() {
         json!({ "title": "eras", "kind": "quiz", "mode": "open" }),
     )
     .await;
-    let question = create_question(
+    let question_body = create_question_body(
         &app,
         &teacher,
         &exam,
         &subject,
         json!({ "text": "Pick the era.", "kind": "choice", "points": 5,
-                "choices": ["Bronze", "Iron"], "correct": 1 }),
+                "choices": [{"id": "c0", "text": "Stone"}, {"id": "c1", "text": "Bronze"},
+                            {"id": "c2", "text": "Iron"}], "correct": "c2" }),
     )
     .await;
+    let question = id_of(&question_body);
+    let (stone, bronze, iron) = (
+        choice_of(&question_body, 0),
+        choice_of(&question_body, 1),
+        choice_of(&question_body, 2),
+    );
     let base = format!("/exams/{exam}/questions/{question}");
     for (path, bytes) in [
         (format!("{base}/image"), b"illustration".as_slice()),
-        (format!("{base}/choices/0/image"), b"bronze".as_slice()),
-        (format!("{base}/choices/1/image"), b"iron".as_slice()),
+        (format!("{base}/choices/{stone}/image"), b"stone".as_slice()),
+        (format!("{base}/choices/{bronze}/image"), b"bronze".as_slice()),
+        (format!("{base}/choices/{iron}/image"), b"iron".as_slice()),
     ] {
         let (status, body) = post_image(&app, &teacher, &path, "image/png", bytes).await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
@@ -11208,40 +11272,91 @@ async fn question_image_edits_follow_the_choices() {
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     assert!(res.body["image"].is_object());
-    assert!(res.body["choice_images"][0].is_object());
-    assert!(res.body["choice_images"][1].is_object());
+    for slot in 0..3 {
+        assert!(res.body["choice_images"][slot].is_object());
+    }
+    assert_eq!(res.body["correct"], iron, "the answer key must not move");
 
-    // Replacing the choices drops the option pictures, keeps the illustration.
+    // The edit this whole remodel exists for: reorder the list (Iron first),
+    // rename one option, and drop Bronze entirely.
     let keys_before = image_blob_keys(&db).await;
     let res = send(
         &app,
         "PATCH",
         &base,
         Some(&teacher),
-        Some(json!({ "choices": ["Stone", "Bronze", "Iron"], "correct": 2 })),
+        Some(json!({ "choices": [
+            {"id": iron, "text": "Iron Age"},
+            {"id": stone, "text": "Stone"},
+        ], "correct": iron })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    // The surviving options kept their identities, in their new order…
+    assert_eq!(res.body["choices"][0]["id"], iron);
+    assert_eq!(res.body["choices"][0]["text"], "Iron Age");
+    assert_eq!(res.body["choices"][1]["id"], stone);
+    // …the answer key still names the option the author marked, though it moved
+    // from position 2 to position 0…
+    assert_eq!(res.body["correct"], iron, "correct must follow its option");
+    // …and each survivor kept *its own* picture, illustration included.
     assert!(res.body["image"].is_object(), "illustration must survive");
-    assert_eq!(
-        res.body["choice_images"],
-        json!([null, null, null]),
-        "option pictures must not follow a replaced list"
+    assert!(
+        res.body["choice_images"][0].is_object(),
+        "Iron kept its picture across the reorder"
     );
+    assert!(
+        res.body["choice_images"][1].is_object(),
+        "Stone kept its picture across the reorder"
+    );
+
+    // Exactly one blob went: the removed option's.
     let keys_after = image_blob_keys(&db).await;
-    assert_eq!(keys_after.len(), 1);
-    for dropped in keys_before.iter().filter(|k| !keys_after.contains(k)) {
+    assert_eq!(
+        keys_after.len(),
+        3,
+        "illustration + two surviving option pictures"
+    );
+    let dropped: Vec<_> = keys_before
+        .iter()
+        .filter(|k| !keys_after.contains(k))
+        .collect();
+    assert_eq!(dropped.len(), 1, "only the removed option's blob may go");
+    for key in dropped {
         assert!(
-            !common::files_dir().join(dropped).exists(),
+            !common::files_dir().join(key).exists(),
             "dropped option blob lingers"
         );
     }
 
+    // The remaining wipe path, now opt-in: a list of all-new options (no id
+    // matches a stored one) is a genuinely new set, so every option picture
+    // goes — and the illustration still stays.
+    let res = send(
+        &app,
+        "PATCH",
+        &base,
+        Some(&teacher),
+        Some(json!({ "choices": [{"id": "fresh-a", "text": "Iron"}, {"id": "fresh-b", "text": "Stone"}],
+                     "correct": "fresh-a" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_ne!(res.body["choices"][0]["id"], iron, "a new option, not Iron");
+    assert_eq!(
+        res.body["choice_images"],
+        json!([null, null]),
+        "an all-new option list keeps no pictures"
+    );
+    assert!(res.body["image"].is_object(), "illustration must survive");
+    assert_eq!(image_blob_keys(&db).await.len(), 1);
+
     // Explicit image DELETE: 204 once, 404 after, blob gone.
+    let fresh = choice_of(&res.body, 0);
     let (status, _) = post_image(
         &app,
         &teacher,
-        &format!("{base}/choices/0/image"),
+        &format!("{base}/choices/{fresh}/image"),
         "image/gif",
         b"gif",
     )
@@ -11250,7 +11365,7 @@ async fn question_image_edits_follow_the_choices() {
     let res = send(
         &app,
         "DELETE",
-        &format!("{base}/choices/0/image"),
+        &format!("{base}/choices/{fresh}/image"),
         Some(&teacher),
         None,
     )
@@ -11259,7 +11374,7 @@ async fn question_image_edits_follow_the_choices() {
     let res = send(
         &app,
         "DELETE",
-        &format!("{base}/choices/0/image"),
+        &format!("{base}/choices/{fresh}/image"),
         Some(&teacher),
         None,
     )
@@ -12712,7 +12827,7 @@ async fn answer_image_round_trip_keeps_the_stroke_text_chunk_intact() {
         json!({ "title": "sketch quiz", "kind": "quiz", "mode": "open" }),
     )
     .await;
-    let question = create_question(
+    let question_body = create_question_body(
         &app,
         &teacher,
         &exam,
@@ -12720,6 +12835,7 @@ async fn answer_image_round_trip_keeps_the_stroke_text_chunk_intact() {
         json!({ "text": "Draw a triangle.", "kind": "text", "points": 10 }),
     )
     .await;
+    let question = id_of(&question_body);
     let res = send(
         &app,
         "POST",
@@ -16255,7 +16371,7 @@ async fn attempt_history_preserves_each_prior_sitting() {
         json!({ "title": "cell quiz", "kind": "quiz", "mode": "open", "max_attempts": 2 }),
     )
     .await;
-    let question = create_question(
+    let question_body = create_question_body(
         &app,
         &teacher,
         &exam,
@@ -16263,6 +16379,7 @@ async fn attempt_history_preserves_each_prior_sitting() {
         json!({ "text": "Name an organelle.", "kind": "text", "points": 10 }),
     )
     .await;
+    let question = id_of(&question_body);
     let own_image = format!("/exams/{exam}/attempt/answers/{question}/image");
 
     // Seq 1: answer, draw, finish.
@@ -16572,7 +16689,7 @@ async fn self_review_returns_own_seqs_and_per_sitting_answers() {
         }),
     )
     .await;
-    let question = create_question(
+    let question_body = create_question_body(
         &app,
         &teacher,
         &exam,
@@ -16580,6 +16697,7 @@ async fn self_review_returns_own_seqs_and_per_sitting_answers() {
         json!({ "text": "Name an organelle.", "kind": "text", "points": 10 }),
     )
     .await;
+    let question = id_of(&question_body);
     let results_uri = format!("/exams/{exam}/results");
 
     // Seq 1: answer, grade, finish.
@@ -16695,7 +16813,7 @@ async fn self_review_is_own_scoped_between_students() {
         json!({ "title": "quiz", "kind": "quiz", "mode": "open", "allow_review": true }),
     )
     .await;
-    let question = create_question(
+    let question_body = create_question_body(
         &app,
         &teacher,
         &exam,
@@ -16703,6 +16821,7 @@ async fn self_review_is_own_scoped_between_students() {
         json!({ "text": "Name a consul.", "kind": "text", "points": 10 }),
     )
     .await;
+    let question = id_of(&question_body);
     let results_uri = format!("/exams/{exam}/results");
 
     for (who, id, text, mark) in [
@@ -16767,12 +16886,12 @@ async fn bank_question_create_get_list_and_instantiate() {
         "/bank-questions",
         Some(&teacher),
         Some(json!({ "subject_id": subject, "text": "2 + 2?", "kind": "choice",
-                     "points": 10, "choices": ["3", "4", "5"], "correct": 1 })),
+                     "points": 10, "choices": [{"id": "c0", "text": "3"}, {"id": "c1", "text": "4"}, {"id": "c2", "text": "5"}], "correct": "c1" })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
     assert_eq!(res.body["kind"], "choice");
-    assert_eq!(res.body["correct"], 1);
+    assert_eq!(res.body["correct"], res.body["choices"][1]["id"]);
     assert_eq!(res.body["subject"], subject);
     let bid = id_of(&res.body);
 
@@ -16810,12 +16929,339 @@ async fn bank_question_create_get_list_and_instantiate() {
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
     assert_eq!(res.body["exam"], exam);
     assert_eq!(res.body["subject"], subject);
-    assert_eq!(res.body["correct"], 1);
-    assert_eq!(res.body["choices"][1], "4");
+    assert_eq!(res.body["correct"], res.body["choices"][1]["id"]);
+    assert_eq!(res.body["choices"][1]["text"], "4");
 
     // The copy is independent — the template still stands.
     let res = send(&app, "GET", &format!("/bank-questions/{bid}"), Some(&teacher), None).await;
     assert_eq!(res.status, StatusCode::OK);
+}
+
+/// The bank list pages in SQL: newest first, every row reachable by offset,
+/// `total` counting the matches rather than the page, and `?q=` filtering
+/// server-side. Regression for the whole-table-then-slice version, which hid
+/// template #101 onward from a client asking for `limit=100`.
+#[tokio::test]
+async fn bank_question_list_pages_filters_and_names() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "bank_p", "teacher").await;
+    let other = login_as(&app, &db, "bank_p2", "teacher").await;
+    let course = create_course(&app, &teacher, "algebra").await;
+    let subject = create_subject(&app, &teacher, &course, "linear").await;
+    let other_subject = create_subject(&app, &teacher, &course, "quadratic").await;
+
+    // 120 templates — more than the clients' `limit=100`.
+    for i in 0..120 {
+        let res = send(
+            &app,
+            "POST",
+            "/bank-questions",
+            Some(&teacher),
+            Some(json!({ "subject_id": subject, "text": format!("template {i:03}"),
+                         "kind": "text", "points": 1 })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    }
+    // A foreign owner + subject, to prove the filters actually narrow.
+    let res = send(
+        &app,
+        "POST",
+        "/bank-questions",
+        Some(&other),
+        Some(json!({ "subject_id": other_subject, "text": "someone else's",
+                     "kind": "text", "points": 1 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    // Published, so it shows up in the first teacher's paging assertions below;
+    // a private one would (correctly) be invisible to them.
+    let foreign = id_of(&res.body);
+    let res = send(&app, "PATCH", &format!("/bank-questions/{foreign}"), Some(&other), Some(json!({ "visibility": "school" }))).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    // Page 1: newest first, full window, honest total.
+    let res = send(&app, "GET", "/bank-questions?limit=100", Some(&teacher), None).await;
+    assert_eq!(common::items(&res.body).len(), 100);
+    assert_eq!(res.body["total"], 121);
+    assert_eq!(common::items(&res.body)[0]["text"], "someone else's");
+    assert_eq!(common::items(&res.body)[1]["text"], "template 119");
+    // The names are joined on, not left for the client to look up per row.
+    assert_eq!(common::items(&res.body)[1]["subject_name"], "linear");
+    assert_eq!(common::items(&res.body)[1]["owner_name"], "bank_p");
+
+    // Item #101 onward is reachable — the bug was that it never was.
+    let res = send(
+        &app,
+        "GET",
+        "/bank-questions?limit=100&offset=100",
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(common::items(&res.body).len(), 21);
+    assert_eq!(res.body["total"], 121);
+    assert_eq!(common::items(&res.body)[0]["text"], "template 020");
+    assert_eq!(common::items(&res.body)[20]["text"], "template 000");
+
+    // `?q=` filters server-side: "template 005" sits on page 2 unfiltered, but
+    // leads page 1 once filtered — and matches case-insensitively.
+    let res = send(
+        &app,
+        "GET",
+        "/bank-questions?limit=100&q=TEMPLATE%20005",
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.body["total"], 1);
+    assert_eq!(common::items(&res.body).len(), 1);
+    assert_eq!(common::items(&res.body)[0]["text"], "template 005");
+    // A blank `q` is no filter at all.
+    let res = send(&app, "GET", "/bank-questions?q=", Some(&teacher), None).await;
+    assert_eq!(res.body["total"], 121);
+
+    // `owner=me` + `subject=` combine, and still page.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/bank-questions?owner=me&subject={subject}&limit=100&offset=100"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.body["total"], 120);
+    assert_eq!(common::items(&res.body).len(), 20);
+    assert_eq!(common::items(&res.body)[0]["text"], "template 019");
+    // The other teacher's `me` is their own single template.
+    let res = send(&app, "GET", "/bank-questions?owner=me", Some(&other), None).await;
+    assert_eq!(res.body["total"], 1);
+    assert_eq!(common::items(&res.body)[0]["owner_name"], "bank_p2");
+    // Owner and subject that never co-occur → an empty page, total 0.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/bank-questions?owner=me&subject={other_subject}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.body["total"], 0);
+    assert!(common::items(&res.body).is_empty());
+}
+
+/// `?visibility=` is a real SQL filter (so the client never has to fetch the
+/// bank unpaged and window it in memory — the very bug the SQL paging fixed),
+/// and it narrows the caller's view without ever widening it.
+#[tokio::test]
+async fn bank_question_list_filters_by_visibility() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "bank_v", "teacher").await;
+    let other = login_as(&app, &db, "bank_v2", "teacher").await;
+    let course = create_course(&app, &teacher, "biology").await;
+    let subject = create_subject(&app, &teacher, &course, "cells").await;
+    let other_subject = create_subject(&app, &teacher, &course, "genes").await;
+
+    // Mine: 3 drafts on `subject`, 2 published on `other_subject`.
+    let mut published = Vec::new();
+    for i in 0..5 {
+        let on = if i < 3 { &subject } else { &other_subject };
+        let res = send(
+            &app,
+            "POST",
+            "/bank-questions",
+            Some(&teacher),
+            Some(json!({ "subject_id": on, "text": format!("mine {i}"),
+                         "kind": "text", "points": 1 })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+        if i >= 3 {
+            published.push(id_of(&res.body));
+        }
+    }
+    for bid in &published {
+        let res = send(
+            &app,
+            "PATCH",
+            &format!("/bank-questions/{bid}"),
+            Some(&teacher),
+            Some(json!({ "visibility": "school" })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    }
+    // The other teacher keeps one private template — nobody else may ever see
+    // it, whatever they pass in `?visibility=`.
+    let res = send(
+        &app,
+        "POST",
+        "/bank-questions",
+        Some(&other),
+        Some(json!({ "subject_id": subject, "text": "their secret",
+                     "kind": "text", "points": 1 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+
+    // `private` = my drafts; `total` honours the filter, not the whole bank.
+    let res = send(
+        &app,
+        "GET",
+        "/bank-questions?visibility=private",
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.body["total"], 3, "{}", res.body);
+    assert_eq!(common::items(&res.body).len(), 3);
+    assert_eq!(common::items(&res.body)[0]["text"], "mine 2");
+    // `school` = the published shelf — and NOT the other teacher's private row.
+    let res = send(
+        &app,
+        "GET",
+        "/bank-questions?visibility=school",
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.body["total"], 2, "{}", res.body);
+    let texts: Vec<&str> = common::items(&res.body)
+        .iter()
+        .map(|item| item["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(texts, ["mine 4", "mine 3"]);
+    assert!(!texts.contains(&"their secret"));
+    // The stranger's `private` view is empty: the filter can't widen the gate.
+    let res = send(
+        &app,
+        "GET",
+        "/bank-questions?visibility=private",
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert!(
+        !common::items(&res.body)
+            .iter()
+            .any(|item| item["text"] == "their secret")
+    );
+    let res = send(
+        &app,
+        "GET",
+        "/bank-questions?visibility=private",
+        Some(&other),
+        None,
+    )
+    .await;
+    assert_eq!(res.body["total"], 1, "{}", res.body);
+    assert_eq!(common::items(&res.body)[0]["text"], "their secret");
+
+    // Composes with `q`, `subject`, `owner`, and with paging.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/bank-questions?visibility=private&subject={subject}&owner=me&q=MINE%201"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.body["total"], 1, "{}", res.body);
+    assert_eq!(common::items(&res.body)[0]["text"], "mine 1");
+    // Right owner and subject, wrong shelf → nothing.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/bank-questions?visibility=school&subject={subject}&owner=me"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.body["total"], 0, "{}", res.body);
+    assert!(common::items(&res.body).is_empty());
+    // Paging windows the filtered set, and `total` stays the filtered total.
+    let res = send(
+        &app,
+        "GET",
+        "/bank-questions?visibility=private&limit=2&offset=2",
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.body["total"], 3, "{}", res.body);
+    assert_eq!(common::items(&res.body).len(), 1);
+    assert_eq!(common::items(&res.body)[0]["text"], "mine 0");
+
+    // An unknown shelf is a 400, worded like the other param errors.
+    let res = send(
+        &app,
+        "GET",
+        "/bank-questions?visibility=public",
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+    assert!(
+        res.body["error"]
+            .as_str()
+            .unwrap()
+            .contains("must be private or school"),
+        "{}",
+        res.body
+    );
+}
+
+/// The app is EN/TR, so `?q=` must fold Turkish casing: `İ` lowercases to
+/// `i` + U+0307 in both Rust and SurrealQL, which used to make `istanbul` and
+/// `İSTANBUL` two disjoint searches — a teacher typing lowercase got an empty
+/// bank.
+#[tokio::test]
+async fn bank_question_search_folds_turkish_casing() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "bank_tr", "teacher").await;
+    let course = create_course(&app, &teacher, "cografya").await;
+    let subject = create_subject(&app, &teacher, &course, "iller").await;
+    for text in ["İSTANBUL kaç ilçedir?", "istanbul boğazı nerededir?"] {
+        let res = send(
+            &app,
+            "POST",
+            "/bank-questions",
+            Some(&teacher),
+            Some(json!({ "subject_id": subject, "text": text,
+                         "kind": "text", "points": 1 })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    }
+
+    // Lowercase needle finds the uppercase row, and every casing finds both.
+    for needle in ["istanbul", "%C4%B0STANBUL", "%C4%B1stanbul", "ISTANBUL"] {
+        let res = send(
+            &app,
+            "GET",
+            &format!("/bank-questions?q={needle}"),
+            Some(&teacher),
+            None,
+        )
+        .await;
+        assert_eq!(res.body["total"], 2, "needle {needle} missed: {}", res.body);
+    }
+    // Diacritics fold too, in both directions.
+    for needle in ["ilce", "il%C3%A7e", "bogaz", "bo%C4%9Faz"] {
+        let res = send(
+            &app,
+            "GET",
+            &format!("/bank-questions?q={needle}"),
+            Some(&teacher),
+            None,
+        )
+        .await;
+        assert_eq!(res.body["total"], 1, "needle {needle} missed: {}", res.body);
+    }
+    // Folding widens the match, it does not match everything.
+    let res = send(&app, "GET", "/bank-questions?q=ankara", Some(&teacher), None).await;
+    assert_eq!(res.body["total"], 0);
 }
 
 #[tokio::test]
@@ -16836,6 +17282,10 @@ async fn bank_question_owner_gate_cross_course_and_freeze() {
     )
     .await;
     let bid = id_of(&res.body);
+    // Published, so this test is about the *owner* gate alone — the visibility
+    // gate (404 while private) has its own test below.
+    let res = send(&app, "PATCH", &format!("/bank-questions/{bid}"), Some(&owner), Some(json!({ "visibility": "school" }))).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
 
     // A non-owner teacher reads it, but may not edit or delete.
     let res = send(&app, "GET", &format!("/bank-questions/{bid}"), Some(&other), None).await;
@@ -16888,6 +17338,208 @@ async fn bank_question_owner_gate_cross_course_and_freeze() {
     assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
 }
 
+/// A bank template carries `correct` — the answer key — so it is `private`
+/// until its owner publishes it. Regression for the one-click answer-key
+/// broadcast: saving a live exam's question to the bank used to hand the key
+/// (and the pictures) to every teacher in the school, permanently and silently.
+///
+/// Every read path is checked from a second teacher's seat, and each one must
+/// answer **404, not 403** — a 403 confirms the template exists.
+#[tokio::test]
+async fn bank_private_template_is_invisible_until_published() {
+    let (app, db) = app_and_db().await;
+    let owner = login_as(&app, &db, "bvis_o", "teacher").await;
+    let other = login_as(&app, &db, "bvis_x", "teacher").await;
+    let course = create_course(&app, &owner, "bio").await;
+    let subject = create_subject(&app, &owner, &course, "cells").await;
+
+    // Two templates; only the second is ever published.
+    let res = send(
+        &app,
+        "POST",
+        "/bank-questions",
+        Some(&owner),
+        Some(json!({ "subject_id": subject, "text": "Which organelle?", "kind": "choice",
+                     "points": 10, "choices": [{"id": "c0", "text": "nucleus"}, {"id": "c1", "text": "ribosome"}], "correct": "c0" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    // New templates are born private — nothing has to opt in to be safe.
+    assert_eq!(res.body["visibility"], "private");
+    let secret = id_of(&res.body);
+    let opt = choice_of(&res.body, 0);
+    let res = send(
+        &app,
+        "POST",
+        "/bank-questions",
+        Some(&owner),
+        Some(json!({ "subject_id": subject, "text": "shared later", "kind": "text", "points": 1 })),
+    )
+    .await;
+    let shared = id_of(&res.body);
+
+    let illus = b"private-illustration".as_slice();
+    let pic = b"private-choice-pic".as_slice();
+    let (status, _) =
+        post_image(&app, &owner, &format!("/bank-questions/{secret}/image"), "image/png", illus).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = post_image(
+        &app,
+        &owner,
+        &format!("/bank-questions/{secret}/choices/{opt}/image"),
+        "image/webp",
+        pic,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // The other teacher's own exam, to attempt an instantiate from.
+    let course2 = create_course(&app, &other, "bio2").await;
+    let subject2 = create_subject(&app, &other, &course2, "cells2").await;
+    let exam2 = create_exam(&app, &other, &course2, "quiz", "final").await;
+    let owner_id = me_id(&app, &owner).await;
+
+    // --- the stranger sees nothing, and is told nothing ---
+    let res = send(&app, "GET", "/bank-questions", Some(&other), None).await;
+    assert!(common::items(&res.body).is_empty());
+    assert_eq!(res.body["total"], 0, "total must count only visible templates");
+    let res = send(&app, "GET", &format!("/bank-questions/{secret}"), Some(&other), None).await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND, "{}", res.body);
+    let (status, _, _) = common::send_raw(
+        &app,
+        "GET",
+        &format!("/bank-questions/{secret}/image"),
+        Some(&other),
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _, _) = common::send_raw(
+        &app,
+        "GET",
+        &format!("/bank-questions/{secret}/choices/{opt}/image"),
+        Some(&other),
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam2}/questions/from-bank/{secret}"),
+        Some(&other),
+        Some(json!({ "subject_id": subject2 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND, "{}", res.body);
+    // Not even by asking for the owner's templates by name.
+    let res = send(&app, "GET", &format!("/bank-questions?owner={owner_id}"), Some(&other), None).await;
+    assert_eq!(res.body["total"], 0);
+
+    // --- the owner still has full use of their own template ---
+    let res = send(&app, "GET", "/bank-questions", Some(&owner), None).await;
+    assert_eq!(res.body["total"], 2);
+    let res = send(&app, "GET", &format!("/bank-questions/{secret}"), Some(&owner), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["correct"], res.body["choices"][0]["id"]);
+    let (status, _, bytes) = common::send_raw(
+        &app,
+        "GET",
+        &format!("/bank-questions/{secret}/image"),
+        Some(&owner),
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!((status, bytes.as_slice()), (StatusCode::OK, illus));
+    let (status, _, bytes) = common::send_raw(
+        &app,
+        "GET",
+        &format!("/bank-questions/{secret}/choices/{opt}/image"),
+        Some(&owner),
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!((status, bytes.as_slice()), (StatusCode::OK, pic));
+    let exam = create_exam(&app, &owner, &course, "midterm", "final").await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/questions/from-bank/{secret}"),
+        Some(&owner),
+        Some(json!({ "subject_id": subject })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+
+    // --- publishing one template opens exactly that one ---
+    let res = send(&app, "PATCH", &format!("/bank-questions/{shared}"), Some(&owner), Some(json!({ "visibility": "school" }))).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["visibility"], "school");
+    let res = send(&app, "GET", "/bank-questions", Some(&other), None).await;
+    assert_eq!(res.body["total"], 1, "the private one must still be hidden");
+    assert_eq!(common::items(&res.body)[0]["id"], shared);
+    let res = send(&app, "GET", &format!("/bank-questions/{shared}"), Some(&other), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam2}/questions/from-bank/{shared}"),
+        Some(&other),
+        Some(json!({ "subject_id": subject2 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    // The still-private one stays shut on every path.
+    let res = send(&app, "GET", &format!("/bank-questions/{secret}"), Some(&other), None).await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam2}/questions/from-bank/{secret}"),
+        Some(&other),
+        Some(json!({ "subject_id": subject2 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND, "{}", res.body);
+    // Unpublishing closes it again.
+    let res = send(&app, "PATCH", &format!("/bank-questions/{shared}"), Some(&owner), Some(json!({ "visibility": "private" }))).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(&app, "GET", &format!("/bank-questions/{shared}"), Some(&other), None).await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+    // A bogus value is a 400, not a silent publish.
+    let res = send(&app, "PATCH", &format!("/bank-questions/{shared}"), Some(&owner), Some(json!({ "visibility": "public" }))).await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+}
+
+/// Admins see private templates: they already read every exam's `correct` via
+/// course management, and they may already delete any template.
+#[tokio::test]
+async fn bank_private_template_is_visible_to_admins() {
+    let (app, db) = app_and_db().await;
+    let owner = login_as(&app, &db, "badm_o", "teacher").await;
+    let admin = login_as(&app, &db, "badm_a", "admin").await;
+    let course = create_course(&app, &owner, "hist").await;
+    let subject = create_subject(&app, &owner, &course, "ottoman").await;
+    let res = send(
+        &app,
+        "POST",
+        "/bank-questions",
+        Some(&owner),
+        Some(json!({ "subject_id": subject, "text": "when?", "kind": "text", "points": 1 })),
+    )
+    .await;
+    let bid = id_of(&res.body);
+
+    let res = send(&app, "GET", &format!("/bank-questions/{bid}"), Some(&admin), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(&app, "GET", "/bank-questions", Some(&admin), None).await;
+    assert_eq!(res.body["total"], 1);
+}
+
 #[tokio::test]
 async fn exam_question_saves_to_bank() {
     let (app, db) = app_and_db().await;
@@ -16900,19 +17552,22 @@ async fn exam_question_saves_to_bank() {
         &teacher,
         &exam,
         &subject,
-        json!({ "text": "v=?", "kind": "choice", "points": 10, "choices": ["a", "b"], "correct": 0 }),
+        json!({ "text": "v=?", "kind": "choice", "points": 10, "choices": [{"id": "c0", "text": "a"}, {"id": "c1", "text": "b"}], "correct": "c0" }),
     )
     .await;
 
     let res = send(&app, "POST", &format!("/exams/{exam}/questions/{qid}/to-bank"), Some(&teacher), None).await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
     assert_eq!(res.body["text"], "v=?");
-    assert_eq!(res.body["correct"], 0);
+    assert_eq!(res.body["correct"], res.body["choices"][0]["id"]);
     assert_eq!(res.body["subject"], subject);
     assert_eq!(res.body["owner"], me_id(&app, &teacher).await);
+    // The one-click broadcast that was: the saved key stays the teacher's until
+    // they publish it.
+    assert_eq!(res.body["visibility"], "private");
     let bid = id_of(&res.body);
 
-    // It now lives in the school-wide bank.
+    // It now lives in their bank.
     let res = send(&app, "GET", &format!("/bank-questions/{bid}"), Some(&teacher), None).await;
     assert_eq!(res.status, StatusCode::OK);
 }
@@ -16934,11 +17589,12 @@ async fn bank_instantiate_copies_images() {
         "/bank-questions",
         Some(&teacher),
         Some(json!({ "subject_id": subject, "text": "Which city?", "kind": "choice",
-                     "points": 10, "choices": ["Ankara", "İzmir"], "correct": 0 })),
+                     "points": 10, "choices": [{"id": "c0", "text": "Ankara"}, {"id": "c1", "text": "İzmir"}], "correct": "c0" })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
     let bid = id_of(&res.body);
+    let opt = choice_of(&res.body, 0);
 
     let illus = b"bank-illustration".as_slice();
     let choice = b"bank-choice-pic".as_slice();
@@ -16948,7 +17604,7 @@ async fn bank_instantiate_copies_images() {
     let (status, _) = post_image(
         &app,
         &teacher,
-        &format!("/bank-questions/{bid}/choices/0/image"),
+        &format!("/bank-questions/{bid}/choices/{opt}/image"),
         "image/webp",
         choice,
     )
@@ -16985,7 +17641,7 @@ async fn bank_instantiate_copies_images() {
     let (status, _, bytes) = common::send_raw(
         &app,
         "GET",
-        &format!("/exams/{exam}/questions/{qid}/choices/0/image"),
+        &format!("/exams/{exam}/questions/{qid}/choices/{opt}/image"),
         Some(&teacher),
         None,
         Vec::new(),
@@ -17016,7 +17672,7 @@ async fn bank_instantiate_copies_images() {
     let (status, _, bytes) = common::send_raw(
         &app,
         "GET",
-        &format!("/bank-questions/{bid}/choices/0/image"),
+        &format!("/bank-questions/{bid}/choices/{opt}/image"),
         Some(&teacher),
         None,
         Vec::new(),
@@ -17036,14 +17692,16 @@ async fn bank_save_copies_images() {
     let course = create_course(&app, &teacher, "phys1").await;
     let subject = create_subject(&app, &teacher, &course, "kin1").await;
     let exam = create_exam(&app, &teacher, &course, "final", "final").await;
-    let qid = create_question(
+    let qid_body = create_question_body(
         &app,
         &teacher,
         &exam,
         &subject,
-        json!({ "text": "v=?", "kind": "choice", "points": 10, "choices": ["a", "b"], "correct": 0 }),
+        json!({ "text": "v=?", "kind": "choice", "points": 10, "choices": [{"id": "c0", "text": "a"}, {"id": "c1", "text": "b"}], "correct": "c0" }),
     )
     .await;
+    let qid = id_of(&qid_body);
+    let opt = choice_of(&qid_body, 0);
 
     let illus = b"exam-illustration".as_slice();
     let choice = b"exam-choice-pic".as_slice();
@@ -17059,7 +17717,7 @@ async fn bank_save_copies_images() {
     let (status, _) = post_image(
         &app,
         &teacher,
-        &format!("/exams/{exam}/questions/{qid}/choices/0/image"),
+        &format!("/exams/{exam}/questions/{qid}/choices/{opt}/image"),
         "image/jpeg",
         choice,
     )
@@ -17078,6 +17736,7 @@ async fn bank_save_copies_images() {
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
     let bid = id_of(&res.body);
+    let opt = choice_of(&res.body, 0);
 
     // The new bank question carries both images, bytes equal.
     let (status, _, bytes) = common::send_raw(
@@ -17094,7 +17753,7 @@ async fn bank_save_copies_images() {
     let (status, _, bytes) = common::send_raw(
         &app,
         "GET",
-        &format!("/bank-questions/{bid}/choices/0/image"),
+        &format!("/bank-questions/{bid}/choices/{opt}/image"),
         Some(&teacher),
         None,
         Vec::new(),
@@ -17206,17 +17865,18 @@ async fn bank_instantiate_rolls_back_on_missing_source_blob() {
         "/bank-questions",
         Some(&teacher),
         Some(json!({ "subject_id": subject, "text": "q", "kind": "choice",
-                     "points": 10, "choices": ["a", "b"], "correct": 0 })),
+                     "points": 10, "choices": [{"id": "c0", "text": "a"}, {"id": "c1", "text": "b"}], "correct": "c0" })),
     )
     .await;
     let bid = id_of(&res.body);
+    let opt = choice_of(&res.body, 0);
     let (status, _) =
         post_image(&app, &teacher, &format!("/bank-questions/{bid}/image"), "image/png", b"illus").await;
     assert_eq!(status, StatusCode::CREATED);
     let (status, _) = post_image(
         &app,
         &teacher,
-        &format!("/bank-questions/{bid}/choices/0/image"),
+        &format!("/bank-questions/{bid}/choices/{opt}/image"),
         "image/png",
         b"opt",
     )
@@ -17307,38 +17967,72 @@ async fn bank_rejects_unknown_subject() {
     assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
 }
 
-/// A subject with bank templates referencing it can't be deleted (409) until
-/// those templates are gone — mirrors the exam-question / homework guard.
+/// Deleting a subject clears it off the bank templates that carried it as
+/// origin metadata, instead of being refused. Blocking would have been a dead
+/// end (only a template's owner may re-tag it, so a manager could not clear
+/// their own 409) and an existence oracle for other teachers' private
+/// templates — hence the cascade.
 #[tokio::test]
-async fn subject_delete_blocked_by_bank_question() {
+async fn subject_delete_clears_the_bank_templates_subject() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "bdel_t", "teacher").await;
+    let manager = login_as(&app, &db, "bdel_m", "manager").await;
     let course = create_course(&app, &teacher, "bdel_c").await;
     let subject = create_subject(&app, &teacher, &course, "bdel_s").await;
+    let other = create_subject(&app, &teacher, &course, "bdel_s2").await;
 
+    let mut ids = Vec::new();
+    for subject_id in [&subject, &other] {
+        let res = send(
+            &app,
+            "POST",
+            "/bank-questions",
+            Some(&teacher),
+            Some(json!({ "subject_id": subject_id, "text": "q", "kind": "text", "points": 5 })),
+        )
+        .await;
+        ids.push(id_of(&res.body));
+    }
+    let (bid, kept) = (&ids[0], &ids[1]);
+
+    // The manager owns none of these templates, yet the delete goes through.
+    let res = send(&app, "DELETE", &format!("/subjects/{subject}"), Some(&manager), None).await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+
+    // The template survives with a cleared origin; the other one is untouched.
+    let res = send(&app, "GET", &format!("/bank-questions/{bid}"), Some(&teacher), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["subject"], serde_json::Value::Null);
+    assert_eq!(res.body["text"], "q");
+    let res = send(&app, "GET", &format!("/bank-questions/{kept}"), Some(&teacher), None).await;
+    assert_eq!(res.body["subject"], json!(other));
+
+    // The list join renders the cleared one with an empty subject name.
+    let res = send(&app, "GET", "/bank-questions", Some(&teacher), None).await;
+    let cleared = common::items(&res.body)
+        .iter()
+        .find(|q| q["id"] == *bid)
+        .expect("template in list")
+        .clone();
+    assert_eq!(cleared["subject"], serde_json::Value::Null);
+    assert_eq!(cleared["subject_name"], "");
+
+    // A cleared template still edits: PATCH without `subject_id` keeps it null.
     let res = send(
         &app,
-        "POST",
-        "/bank-questions",
+        "PATCH",
+        &format!("/bank-questions/{bid}"),
         Some(&teacher),
-        Some(json!({ "subject_id": subject, "text": "q", "kind": "text", "points": 5 })),
+        Some(json!({ "text": "still editable" })),
     )
     .await;
-    let bid = id_of(&res.body);
-
-    // Guarded while the template stands.
-    let res = send(&app, "DELETE", &format!("/subjects/{subject}"), Some(&teacher), None).await;
-    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
-
-    // Drop the template — the subject frees up.
-    let res = send(&app, "DELETE", &format!("/bank-questions/{bid}"), Some(&teacher), None).await;
-    assert_eq!(res.status, StatusCode::NO_CONTENT);
-    let res = send(&app, "DELETE", &format!("/subjects/{subject}"), Some(&teacher), None).await;
-    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["subject"], serde_json::Value::Null);
+    assert_eq!(res.body["text"], "still editable");
 }
 
-/// `?owner=me` (and an explicit owner id) narrows the school-wide bank to one
-/// owner's templates.
+/// `?owner=me` (and an explicit owner id) narrows the bank to one owner's
+/// templates — on top of the visibility gate, never around it.
 #[tokio::test]
 async fn bank_owner_filter() {
     let (app, db) = app_and_db().await;
@@ -17348,7 +18042,7 @@ async fn bank_owner_filter() {
     let subject = create_subject(&app, &alice, &course, "bown_s").await;
 
     for who in [&alice, &bob] {
-        send(
+        let res = send(
             &app,
             "POST",
             "/bank-questions",
@@ -17356,6 +18050,10 @@ async fn bank_owner_filter() {
             Some(json!({ "subject_id": subject, "text": "q", "kind": "text", "points": 5 })),
         )
         .await;
+        // Published, so this test is about the owner filter, not visibility.
+        let bid = id_of(&res.body);
+        let res = send(&app, "PATCH", &format!("/bank-questions/{bid}"), Some(who), Some(json!({ "visibility": "school" }))).await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     }
     let alice_id = me_id(&app, &alice).await;
     let bob_id = me_id(&app, &bob).await;
@@ -17391,10 +18089,11 @@ async fn bank_response_carries_image_metas() {
         "/bank-questions",
         Some(&teacher),
         Some(json!({ "subject_id": subject, "text": "q", "kind": "choice",
-                     "points": 10, "choices": ["a", "b"], "correct": 0 })),
+                     "points": 10, "choices": [{"id": "c0", "text": "a"}, {"id": "c1", "text": "b"}], "correct": "c0" })),
     )
     .await;
     let bid = id_of(&res.body);
+    let opt = choice_of(&res.body, 0);
 
     // No images yet: metas are null / all-empty.
     assert!(res.body["image"].is_null());
@@ -17406,7 +18105,7 @@ async fn bank_response_carries_image_metas() {
     let (status, _) = post_image(
         &app,
         &teacher,
-        &format!("/bank-questions/{bid}/choices/0/image"),
+        &format!("/bank-questions/{bid}/choices/{opt}/image"),
         "image/jpeg",
         b"opt",
     )
@@ -17426,8 +18125,11 @@ async fn bank_response_carries_image_metas() {
     assert_eq!(items[0]["choice_images"][0]["content_type"], "image/jpeg");
 }
 
-/// Provenance rides both directions: instantiate records `source_bank` on the
-/// new exam question; save-to-bank records `source_exam` on the new template.
+/// Provenance rides both directions, one column per direction: instantiate
+/// records `from_bank` on the new exam question (and leaves `banked_as` null —
+/// coming *from* the bank is not being saved *to* it); save-to-bank records
+/// `source_exam` on the new template and `banked_as` on the question, without
+/// touching `from_bank`.
 #[tokio::test]
 async fn bank_provenance_both_directions() {
     let (app, db) = app_and_db().await;
@@ -17435,7 +18137,7 @@ async fn bank_provenance_both_directions() {
     let course = create_course(&app, &teacher, "bprov_c").await;
     let subject = create_subject(&app, &teacher, &course, "bprov_s").await;
 
-    // Bank -> exam: source_bank is the template id.
+    // Bank -> exam: from_bank is the template id, banked_as stays null.
     let res = send(
         &app,
         "POST",
@@ -17455,9 +18157,32 @@ async fn bank_provenance_both_directions() {
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
-    assert_eq!(res.body["source_bank"], bid);
+    assert_eq!(res.body["from_bank"], bid);
+    // The lie the split fixes: an inserted question must not read as banked.
+    assert!(res.body["banked_as"].is_null(), "{}", res.body);
+    let inserted = id_of(&res.body);
 
-    // A directly authored exam question has no source_bank.
+    // Saving that inserted question sets banked_as and leaves from_bank alone.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/questions/{inserted}/to-bank"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let template = id_of(&res.body);
+    let res = send(&app, "GET", &format!("/exams/{exam}/questions"), Some(&teacher), None).await;
+    let question = common::items(&res.body)
+        .iter()
+        .find(|q| q["id"] == inserted)
+        .expect("question in list")
+        .clone();
+    assert_eq!(question["from_bank"], bid, "{question}");
+    assert_eq!(question["banked_as"], template, "{question}");
+
+    // A directly authored exam question has neither link.
     let qid = create_question(
         &app,
         &teacher,
@@ -17497,21 +18222,21 @@ async fn to_bank_links_the_question_at_the_new_template() {
     .await;
 
     // Fresh question: no link yet.
-    let source_bank_of = |body: &serde_json::Value| -> serde_json::Value {
+    let banked_as_of = |body: &serde_json::Value| -> serde_json::Value {
         common::items(body)
             .iter()
             .find(|q| q["id"] == qid)
-            .expect("question in list")["source_bank"]
+            .expect("question in list")["banked_as"]
             .clone()
     };
     let res = send(&app, "GET", &format!("/exams/{exam}/questions"), Some(&teacher), None).await;
-    assert!(source_bank_of(&res.body).is_null());
+    assert!(banked_as_of(&res.body).is_null());
 
     let res = send(&app, "POST", &format!("/exams/{exam}/questions/{qid}/to-bank"), Some(&teacher), None).await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
     let first = id_of(&res.body);
     let res = send(&app, "GET", &format!("/exams/{exam}/questions"), Some(&teacher), None).await;
-    assert_eq!(source_bank_of(&res.body), json!(first));
+    assert_eq!(banked_as_of(&res.body), json!(first));
 
     // Second save: still 201, a distinct template, and the link follows it.
     let res = send(&app, "POST", &format!("/exams/{exam}/questions/{qid}/to-bank"), Some(&teacher), None).await;
@@ -17519,7 +18244,7 @@ async fn to_bank_links_the_question_at_the_new_template() {
     let second = id_of(&res.body);
     assert_ne!(first, second);
     let res = send(&app, "GET", &format!("/exams/{exam}/questions"), Some(&teacher), None).await;
-    assert_eq!(source_bank_of(&res.body), json!(second));
+    assert_eq!(banked_as_of(&res.body), json!(second));
 }
 
 /// The back-link is a field-scoped write. `question_to_bank` reads the question,
@@ -17528,7 +18253,7 @@ async fn to_bank_links_the_question_at_the_new_template() {
 /// whole-row save from the stale struct would silently revert it. Driven at the
 /// domain level: HTTP offers no way to interleave inside the handler.
 #[tokio::test]
-async fn linking_the_bank_source_does_not_clobber_a_concurrent_edit() {
+async fn linking_the_banked_template_does_not_clobber_a_concurrent_edit() {
     use hezarfen_backend::domain::bank_question::BankQuestionId;
     use hezarfen_backend::domain::exam_question::{ExamQuestion, ExamQuestionId};
 
@@ -17571,7 +18296,7 @@ async fn linking_the_bank_source_does_not_clobber_a_concurrent_edit() {
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
 
     stale
-        .link_source_bank(BankQuestionId::from_key(&bid), &db)
+        .link_banked_as(BankQuestionId::from_key(&bid), &db)
         .await
         .expect("link written");
 
@@ -17584,19 +18309,87 @@ async fn linking_the_bank_source_does_not_clobber_a_concurrent_edit() {
         .clone();
     assert_eq!(question["text"], "edited by someone else");
     assert_eq!(question["points"], 9);
-    assert_eq!(question["source_bank"], bid);
+    assert_eq!(question["banked_as"], bid);
 }
 
-/// Deleting a bank template clears the provenance link on every exam question
-/// saved from it, instead of leaving `source_bank` pointing at a dead row.
+/// A bank PATCH writes only the fields it was given: the handler reads the
+/// template, then awaits an ownership check, a subject lookup and (on a choice
+/// replace) an image sweep, so another write can land in that window — here the
+/// exam-delete cascade clearing `source_exam`, a field the PATCH never sets.
+/// A whole-row save from the stale struct would resurrect the dead exam link.
 #[tokio::test]
-async fn deleting_a_template_clears_the_questions_source_bank() {
+async fn a_bank_patch_does_not_clobber_a_concurrent_write() {
+    use hezarfen_backend::domain::bank_question::{BankQuestion, BankQuestionId, BankVisibility};
+    use hezarfen_backend::domain::exam_question::{
+        QuestionKind, QuestionPoints, QuestionSpec, QuestionText,
+    };
+
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "bpatch_t", "teacher").await;
+    let course = create_course(&app, &teacher, "bpatch_c").await;
+    let subject = create_subject(&app, &teacher, &course, "bpatch_s").await;
+    let exam = create_exam(&app, &teacher, &course, "midterm", "final").await;
+    let qid = create_question(
+        &app,
+        &teacher,
+        &exam,
+        &subject,
+        json!({ "text": "original", "kind": "text", "points": 5 }),
+    )
+    .await;
+    let res = send(&app, "POST", &format!("/exams/{exam}/questions/{qid}/to-bank"), Some(&teacher), None).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let bid = id_of(&res.body);
+    assert_eq!(res.body["source_exam"], json!(exam));
+
+    // The handler's read, then the exam delete lands mid-window and clears the
+    // template's `source_exam`.
+    let stale = BankQuestion::read(&BankQuestionId::from_key(&bid), &db)
+        .await
+        .unwrap()
+        .expect("template exists");
+    assert!(stale.get_source_exam().is_some());
+    let res = send(&app, "DELETE", &format!("/exams/{exam}"), Some(&teacher), None).await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+
+    // The stale struct writes its own fields only.
+    let updated = stale
+        .update(
+            None,
+            QuestionText::try_new("edited").unwrap(),
+            QuestionPoints::try_new(7).unwrap(),
+            QuestionSpec::try_new(QuestionKind::try_new("text").unwrap(), None, None, &[]).unwrap(),
+            BankVisibility::try_new(BankVisibility::SCHOOL).unwrap(),
+            &db,
+        )
+        .await
+        .expect("update written");
+    assert_eq!(updated.get_text().as_str(), "edited");
+    assert!(updated.get_source_exam().is_none(), "the dead exam link came back");
+
+    // The edit landed and the cleared provenance stayed cleared.
+    let res = send(&app, "GET", &format!("/bank-questions/{bid}"), Some(&teacher), None).await;
+    assert_eq!(res.body["source_exam"], serde_json::Value::Null);
+    assert_eq!(res.body["subject"], serde_json::Value::Null);
+    assert_eq!(res.body["text"], "edited");
+    assert_eq!(res.body["points"], 7);
+    assert_eq!(res.body["visibility"], "school");
+}
+
+/// Deleting a bank template clears *both* provenance links that can point at
+/// it — `from_bank` on the questions instantiated from it and `banked_as` on
+/// the question it was saved out of — instead of leaving either pointing at a
+/// dead row.
+#[tokio::test]
+async fn deleting_a_template_clears_both_question_links() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "bdang_t", "teacher").await;
     let course = create_course(&app, &teacher, "bdang_c").await;
     let subject = create_subject(&app, &teacher, &course, "bdang_s").await;
     let exam = create_exam(&app, &teacher, &course, "midterm", "final").await;
-    let qid = create_question(
+
+    // Question A: authored here, then saved to the bank -> banked_as = saved.
+    let authored = create_question(
         &app,
         &teacher,
         &exam,
@@ -17604,28 +18397,52 @@ async fn deleting_a_template_clears_the_questions_source_bank() {
         json!({ "text": "plain", "kind": "text", "points": 5 }),
     )
     .await;
-
-    let res = send(&app, "POST", &format!("/exams/{exam}/questions/{qid}/to-bank"), Some(&teacher), None).await;
+    let res = send(&app, "POST", &format!("/exams/{exam}/questions/{authored}/to-bank"), Some(&teacher), None).await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
-    let bid = id_of(&res.body);
+    let saved = id_of(&res.body);
 
-    let source_bank_of = |body: &serde_json::Value| -> serde_json::Value {
+    // Question B: instantiated from a separate template -> from_bank = origin.
+    let res = send(
+        &app,
+        "POST",
+        "/bank-questions",
+        Some(&teacher),
+        Some(json!({ "subject_id": subject, "text": "t", "kind": "text", "points": 5 })),
+    )
+    .await;
+    let origin = id_of(&res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/questions/from-bank/{origin}"),
+        Some(&teacher),
+        Some(json!({ "subject_id": subject })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let inserted = id_of(&res.body);
+
+    let link_of = |body: &serde_json::Value, qid: &str, field: &str| -> serde_json::Value {
         common::items(body)
             .iter()
             .find(|q| q["id"] == qid)
-            .expect("question in list")["source_bank"]
+            .expect("question in list")[field]
             .clone()
     };
     let res = send(&app, "GET", &format!("/exams/{exam}/questions"), Some(&teacher), None).await;
-    assert_eq!(source_bank_of(&res.body), json!(bid));
+    assert_eq!(link_of(&res.body, &authored, "banked_as"), json!(saved));
+    assert_eq!(link_of(&res.body, &inserted, "from_bank"), json!(origin));
 
-    let res = send(&app, "DELETE", &format!("/bank-questions/{bid}"), Some(&teacher), None).await;
-    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    for bid in [&saved, &origin] {
+        let res = send(&app, "DELETE", &format!("/bank-questions/{bid}"), Some(&teacher), None).await;
+        assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    }
 
-    // The question survives the template with no dangling link.
+    // Both questions survive their templates with no dangling link.
     let res = send(&app, "GET", &format!("/exams/{exam}/questions"), Some(&teacher), None).await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-    assert!(source_bank_of(&res.body).is_null(), "{}", res.body);
+    assert!(link_of(&res.body, &authored, "banked_as").is_null(), "{}", res.body);
+    assert!(link_of(&res.body, &inserted, "from_bank").is_null(), "{}", res.body);
 }
 
 /// The mirror: deleting the origin exam clears `source_exam` on the templates
@@ -17658,4 +18475,332 @@ async fn deleting_an_exam_clears_the_templates_source_exam() {
     let res = send(&app, "GET", &format!("/bank-questions/{bid}"), Some(&teacher), None).await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     assert!(res.body["source_exam"].is_null(), "{}", res.body);
+}
+
+/// `used_count` on the bank list: how many exam questions were copied out of
+/// each template. It is the divergence surface made visible — every one of
+/// those copies is detached, so an edit here never reaches them. Joined once
+/// for the whole page (one grouped query), list-only exactly like
+/// `subject_name`/`owner_name`.
+#[tokio::test]
+async fn bank_list_counts_the_copies_made_from_each_template() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "buse_t", "teacher").await;
+    let course = create_course(&app, &teacher, "buse_c").await;
+    let subject = create_subject(&app, &teacher, &course, "buse_s").await;
+
+    let template = |text: &'static str| {
+        send(
+            &app,
+            "POST",
+            "/bank-questions",
+            Some(&teacher),
+            Some(json!({ "subject_id": subject, "text": text, "kind": "text", "points": 4 })),
+        )
+    };
+    let used = id_of(&template("reused").await.body);
+    let unused = id_of(&template("never used").await.body);
+
+    // Two exams, three copies: twice out of `used` in one exam, once in the other.
+    let mut exams = Vec::new();
+    for title in ["one", "two"] {
+        exams.push(create_exam(&app, &teacher, &course, title, "final").await);
+    }
+    for (exam, times) in [(&exams[0], 2), (&exams[1], 1)] {
+        for _ in 0..times {
+            let res = send(
+                &app,
+                "POST",
+                &format!("/exams/{exam}/questions/from-bank/{used}"),
+                Some(&teacher),
+                Some(json!({ "subject_id": subject })),
+            )
+            .await;
+            assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+        }
+    }
+    // A hand-authored question in the same exam has no template and must not
+    // be tallied against one.
+    create_question(
+        &app,
+        &teacher,
+        &exams[0],
+        &subject,
+        json!({ "text": "mine alone", "kind": "text", "points": 1 }),
+    )
+    .await;
+
+    let res = send(&app, "GET", "/bank-questions?limit=100", Some(&teacher), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let counts: std::collections::HashMap<String, i64> = common::items(&res.body)
+        .iter()
+        .map(|item| (id_of(item), item["used_count"].as_i64().unwrap()))
+        .collect();
+    assert_eq!(counts.get(&used).copied(), Some(3), "{}", res.body);
+    assert_eq!(counts.get(&unused).copied(), Some(0), "{}", res.body);
+
+    // Deleting a copy takes it back off the tally (its `from_bank` goes with it).
+    let res = send(
+        &app,
+        "GET",
+        &format!("/exams/{}/questions", exams[1]),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    let qid = id_of(&common::items(&res.body)[0]);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/exams/{}/questions/{qid}", exams[1]),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    let res = send(&app, "GET", "/bank-questions?limit=100", Some(&teacher), None).await;
+    let after = common::items(&res.body)
+        .iter()
+        .find(|item| id_of(item) == used)
+        .cloned()
+        .unwrap();
+    assert_eq!(after["used_count"], 2, "{}", res.body);
+
+    // List-only, like the other joined fields: the single-template GET says 0.
+    let res = send(&app, "GET", &format!("/bank-questions/{used}"), Some(&teacher), None).await;
+    assert_eq!(res.body["used_count"], 0, "{}", res.body);
+}
+
+/// The escape hatch out of the divergence trap: re-copy a template's *current*
+/// content over the exam question that was instantiated from it.
+///
+/// Choice ids come from the template — the same funnel the original insert
+/// used — so pictures land back on the right options and a stale option's
+/// picture goes with it. A student's recorded `selected` can never be stranded
+/// by that: the route dies on `ensure_questions_editable` (409) the moment any
+/// attempt exists, and answers only exist under attempts.
+#[tokio::test]
+async fn refreshing_a_question_recopies_its_template() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "bref_t", "teacher").await;
+    let manager = login_as(&app, &db, "bref_m", "manager").await;
+    let course = create_course(&app, &teacher, "bref_c").await;
+    let subject = create_subject(&app, &teacher, &course, "bref_s").await;
+
+    // A template with an illustration and a picture on its first option.
+    let res = send(
+        &app,
+        "POST",
+        "/bank-questions",
+        Some(&teacher),
+        Some(json!({ "subject_id": subject, "text": "capitol of France?", "kind": "choice",
+                     "points": 5, "choices": [{"id": "a", "text": "Paris"}, {"id": "b", "text": "Lyon"}],
+                     "correct": "a" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let bid = id_of(&res.body);
+    let keep_choice = choice_of(&res.body, 0);
+    let drop_choice = choice_of(&res.body, 1);
+    let (status, _) = post_image(
+        &app,
+        &teacher,
+        &format!("/bank-questions/{bid}/image"),
+        "image/png",
+        b"old-illustration",
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = post_image(
+        &app,
+        &teacher,
+        &format!("/bank-questions/{bid}/choices/{drop_choice}/image"),
+        "image/png",
+        b"lyon-picture",
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let exam = create_exam(&app, &teacher, &course, "midterm", "final").await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/questions/from-bank/{bid}"),
+        Some(&teacher),
+        Some(json!({ "subject_id": subject })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let qid = id_of(&res.body);
+
+    // The exam copy drifts (a local edit), and the template is fixed and
+    // reshaped: the typo goes, "Lyon" is replaced by a new option (a new id),
+    // points change, and the illustration is replaced.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/exams/{exam}/questions/{qid}"),
+        Some(&teacher),
+        Some(json!({ "text": "local edit that will be lost", "points": 99 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/bank-questions/{bid}"),
+        Some(&teacher),
+        Some(json!({ "text": "capital of France?", "points": 7,
+                     "choices": [{"id": keep_choice, "text": "Paris"}, {"id": "new", "text": "Marseille"}],
+                     "correct": keep_choice })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let fresh_choice = choice_of(&res.body, 1);
+    assert_ne!(fresh_choice, drop_choice, "the replaced option is a new id");
+    let (status, _) = post_image(
+        &app,
+        &teacher,
+        &format!("/bank-questions/{bid}/image"),
+        "image/png",
+        b"new-illustration",
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // A template the caller cannot see is a 404 on this route too — never a
+    // 403, which would confirm it exists. (A manager may manage the course but
+    // is not the template's owner, and the template is private.)
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/questions/{qid}/refresh-from-bank"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND, "{}", res.body);
+
+    // The refresh itself: content, points, choices (ids and all), and correct
+    // come back from the template; the local edit is gone.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/questions/{qid}/refresh-from-bank"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["id"], qid, "the question keeps its id");
+    assert_eq!(res.body["text"], "capital of France?");
+    assert_eq!(res.body["points"], 7);
+    assert_eq!(res.body["subject"], subject, "the exam-side subject stays");
+    assert_eq!(res.body["from_bank"], bid, "provenance survives");
+    assert_eq!(choice_of(&res.body, 0), keep_choice, "template choice ids adopted");
+    assert_eq!(choice_of(&res.body, 1), fresh_choice);
+    assert_eq!(res.body["choices"][1]["text"], "Marseille");
+    assert_eq!(res.body["correct"], keep_choice);
+    // Pictures match the template: the new illustration landed, and the
+    // dropped option's picture is gone rather than orphaned on a stale slot.
+    assert_eq!(res.body["image"]["content_type"], "image/png", "{}", res.body);
+    assert!(res.body["choice_images"][0].is_null(), "{}", res.body);
+    assert!(res.body["choice_images"][1].is_null(), "{}", res.body);
+    let (status, _, bytes) = common::send_raw(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/questions/{qid}/image"),
+        Some(&teacher),
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, b"new-illustration", "the blob was re-copied, not kept");
+    // No orphan blob rows left behind by the dropped option.
+    assert_eq!(image_blob_keys(&db).await.len(), 1);
+
+    // A hand-authored question has nothing to refresh from — 400, not a 404
+    // that would read as "your exam is gone".
+    let plain = create_question(
+        &app,
+        &teacher,
+        &exam,
+        &subject,
+        json!({ "text": "mine alone", "kind": "text", "points": 1 }),
+    )
+    .await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/questions/{plain}/refresh-from-bank"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+
+    // Once a student sits an exam, its questions freeze — the refresh answers
+    // to the same guard as every other question mutation.
+    let now = Timestamp::now().as_millis();
+    let live = scheduled_exam(
+        &app,
+        &teacher,
+        &course,
+        json!({ "title": "live", "kind": "final", "mode": "sync",
+                "starts_at": now - 1_000, "ends_at": now + 600_000 }),
+    )
+    .await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{live}/questions/from-bank/{bid}"),
+        Some(&teacher),
+        Some(json!({ "subject_id": subject })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let live_qid = id_of(&res.body);
+    let student = login(&app, "bref_s").await;
+    let student_id = me_id(&app, &student).await;
+    enroll(&app, &teacher, &course, &student_id).await;
+    let res = send(&app, "POST", &format!("/exams/{live}/attempt"), Some(&student), None).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{live}/questions/{live_qid}/refresh-from-bank"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+
+    // Deleting the template clears `from_bank`, so the copy has nothing left to
+    // refresh from — the action stops existing rather than half-working.
+    let res = send(&app, "DELETE", &format!("/bank-questions/{bid}"), Some(&teacher), None).await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/questions"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    let refreshed = common::items(&res.body)
+        .iter()
+        .find(|item| id_of(item) == qid)
+        .cloned()
+        .unwrap();
+    assert!(refreshed["from_bank"].is_null(), "{}", res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/questions/{qid}/refresh-from-bank"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
 }
