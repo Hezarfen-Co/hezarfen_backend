@@ -473,8 +473,12 @@ impl Appointment {
         Self::save(appointment, db).await
     }
 
-    /// Call the meeting off. Legal from either side and from either live
-    /// state, so an approved meeting can still be dropped; the slot frees up.
+    /// Call the meeting off. Legal from either live state, so an approved
+    /// meeting can still be dropped; the slot frees up. The web layer opens
+    /// this to the **requester only** — a teacher's way out is `reject` while
+    /// the booking is pending, or `reschedule` (back to `pending`) then
+    /// `reject` for an approved one — and `decline_reschedule`, the other
+    /// caller, is the requester's too.
     ///
     /// Refused (409) once the *effective* window has opened — a meeting that
     /// began is history, not a plan. The guard lives here rather than in the
