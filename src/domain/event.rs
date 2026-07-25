@@ -1,6 +1,7 @@
 // `Value` looks unused but is load-bearing: the `SurrealValue` derive on the
 // tagged `EventAudience` enum expands to code that names `Value` unqualified.
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue, Value};
+use tokio::sync::Mutex;
 use ulid::Ulid;
 
 use crate::constant::{MAX_EVENT_DESCRIPTION_LEN, MAX_EVENT_TITLE_LEN};
@@ -14,6 +15,20 @@ use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ValidationError};
 use crate::validate::{validate_optional, validate_required};
+
+/// Serializes the schedule-range check against the write it guards, exactly as
+/// `TERM_LOCK` does for terms: `starts_at <= ends_at` is a cross-field check,
+/// so a partial PATCH validates the end it carries against the *stored* other
+/// end — two such PATCHes, each fine on its own snapshot, would otherwise
+/// commit an inverted range between them. A PATCH that moves neither end
+/// checks nothing cross-field and stays lock-free.
+///
+/// Lock order: this is a leaf — the only path that takes it (`PATCH
+/// /events/{id}`) takes no other lock, and no path that holds `REGISTER_LOCK`,
+/// `ENROLL_LOCK`, `TERM_LOCK`, `EXAM_LOCK` or any other takes this one, so it
+/// cannot sit in a cycle. Should a future path need both, take the other lock
+/// first and this one innermost.
+pub(crate) static EVENT_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct EventId(RecordId);

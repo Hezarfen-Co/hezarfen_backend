@@ -129,3 +129,63 @@ async fn range_check_still_sees_the_stored_other_side() {
         "check_out before the stored check_in"
     );
 }
+
+/// Each instant moved *just inside* the other is valid on its own snapshot, so
+/// two concurrent one-sided corrections can each pass their check against the
+/// stored row and still commit an inverted stint between them. Whatever each
+/// request returns (200/400/409 are all fine), the stored pair must stay
+/// ordered.
+#[tokio::test]
+async fn concurrent_range_patches_never_invert_the_stored_stint() {
+    let (app, db) = app_and_db().await;
+    let who = login_as(&app, &db, "mudur5", "manager").await;
+
+    let base = 1_000_000_000_000_i64;
+    let end = base + 3_600_000;
+
+    for round in 0..20 {
+        let id = closed_entry(&app, &who).await;
+        let uri = format!("/work/entries/{id}");
+        // The server stamps both instants milliseconds apart; widen the stint
+        // first so the racing corrections have room to invert it.
+        let widened = send(
+            &app,
+            "PATCH",
+            &uri,
+            Some(&who),
+            Some(json!({ "check_in": base, "check_out": end })),
+        )
+        .await;
+        assert_eq!(widened.status, StatusCode::OK, "round {round} widen");
+
+        // Each alone is valid: check_in lands before the stored check_out, and
+        // check_out after the stored check_in.
+        let (a, b) = tokio::join!(
+            send(
+                &app,
+                "PATCH",
+                &uri,
+                Some(&who),
+                Some(json!({ "check_in": end - 1000 })),
+            ),
+            send(
+                &app,
+                "PATCH",
+                &uri,
+                Some(&who),
+                Some(json!({ "check_out": base + 1000 })),
+            ),
+        );
+
+        let after = entry(&app, &who, &id).await;
+        let final_in = after["check_in"].as_i64().expect("check_in");
+        let final_out = after["check_out"].as_i64().expect("check_out");
+        assert!(
+            final_in <= final_out,
+            "round {round}: stored inverted stint check_in={final_in} \
+             check_out={final_out} (statuses {} {})",
+            a.status,
+            b.status
+        );
+    }
+}

@@ -125,3 +125,58 @@ async fn range_check_still_sees_the_stored_other_side() {
         "ends_at before stored starts_at"
     );
 }
+
+/// Each end moved *just inside* the other is valid on its own snapshot, so two
+/// concurrent one-ended PATCHes can each pass their check against the stored
+/// row and still commit an inverted range between them. Whatever each request
+/// returns (200/400/409 are all fine), the stored pair must stay ordered.
+#[tokio::test]
+async fn concurrent_range_patches_never_invert_the_stored_row() {
+    let (app, db) = app_and_db().await;
+    let who = login_as(&app, &db, "range", "teacher").await;
+    let starts = 1_900_000_000_000_i64;
+    let ends = starts + 3_600_000;
+
+    for round in 0..20 {
+        let created = send(
+            &app,
+            "POST",
+            "/events",
+            Some(&who),
+            Some(json!({ "title": "timed", "starts_at": starts, "ends_at": ends })),
+        )
+        .await;
+        assert_eq!(created.status, StatusCode::CREATED, "round {round} create");
+        let uri = format!("/events/{}", id_of(&created.body));
+
+        // Each alone is valid: starts_at lands before the stored ends_at, and
+        // ends_at lands after the stored starts_at.
+        let (a, b) = tokio::join!(
+            send(
+                &app,
+                "PATCH",
+                &uri,
+                Some(&who),
+                Some(json!({ "starts_at": ends - 1000 })),
+            ),
+            send(
+                &app,
+                "PATCH",
+                &uri,
+                Some(&who),
+                Some(json!({ "ends_at": starts + 1000 })),
+            ),
+        );
+
+        let after = send(&app, "GET", &uri, Some(&who), None).await.body;
+        let stored_starts = after["starts_at"].as_i64().expect("starts_at");
+        let stored_ends = after["ends_at"].as_i64().expect("ends_at");
+        assert!(
+            stored_starts <= stored_ends,
+            "round {round}: stored inverted range starts_at={stored_starts} \
+             ends_at={stored_ends} (statuses {} {})",
+            a.status,
+            b.status
+        );
+    }
+}
