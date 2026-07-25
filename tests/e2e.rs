@@ -508,6 +508,9 @@ struct ExamRoom {
     subject_id: String,
     exam_id: String,
     question_id: String,
+    /// The fixture question's minted choice ids, in list order — what the
+    /// tests below used to write as the indexes 0 and 1.
+    choice_ids: Vec<String>,
 }
 
 async fn exam_room_fixture(window_ms: i64) -> ExamRoom {
@@ -583,7 +586,7 @@ async fn exam_room_fixture(window_ms: i64) -> ExamRoom {
         .post(format!("{base}/exams/{exam_id}/questions"))
         .json(
             &json!({ "subject_id": subject_id, "text": "2 + 2?", "kind": "choice",
-                       "points": 10, "choices": ["3", "4"], "correct": 1 }),
+                       "points": 10, "choices": [{"id": "a", "text": "3"}, {"id": "b", "text": "4"}], "correct": "b" }),
         )
         .send()
         .await
@@ -592,6 +595,7 @@ async fn exam_room_fixture(window_ms: i64) -> ExamRoom {
         .await
         .unwrap();
     let question_id = question["id"].as_str().unwrap().to_string();
+    let choice_ids = choice_ids(&question);
     let cookie = raw_session_cookie(&base, "veli").await;
     ExamRoom {
         base,
@@ -604,7 +608,18 @@ async fn exam_room_fixture(window_ms: i64) -> ExamRoom {
         subject_id,
         exam_id,
         question_id,
+        choice_ids,
     }
+}
+
+/// The minted ids of a question response's options, in list order.
+fn choice_ids(question: &Value) -> Vec<String> {
+    question["choices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|choice| choice["id"].as_str().unwrap().to_string())
+        .collect()
 }
 
 /// The student exam room over a real TCP WebSocket: connect with the session
@@ -667,7 +682,7 @@ async fn exam_room_websocket_round_trip() {
     // Autosave: answer -> saved ack -> a state showing the progress.
     ws_send(
         &mut ws,
-        json!({ "type": "answer", "question_id": question_id, "selected": 1 }),
+        json!({ "type": "answer", "question_id": question_id, "selected": room.choice_ids[1] }),
     )
     .await;
     let saved = ws_frame_of_type(&mut ws, "saved").await;
@@ -848,7 +863,7 @@ async fn exam_room_promotion_mid_exam_closes_the_sheet() {
     // While the sitter is a student the sheet is open — save one answer.
     ws_send(
         &mut ws,
-        json!({ "type": "answer", "question_id": question_id, "selected": 1 }),
+        json!({ "type": "answer", "question_id": question_id, "selected": room.choice_ids[1] }),
     )
     .await;
     ws_frame_of_type(&mut ws, "saved").await;
@@ -859,7 +874,7 @@ async fn exam_room_promotion_mid_exam_closes_the_sheet() {
     // The very next save is refused over the same socket...
     ws_send(
         &mut ws,
-        json!({ "type": "answer", "question_id": question_id, "selected": 0 }),
+        json!({ "type": "answer", "question_id": question_id, "selected": room.choice_ids[0] }),
     )
     .await;
     let error = ws_frame_of_type(&mut ws, "error").await;
@@ -871,7 +886,7 @@ async fn exam_room_promotion_mid_exam_closes_the_sheet() {
     // ... and over REST — the two paths share the wall.
     let res = student
         .post(format!("{base}/exams/{exam_id}/attempt/answers"))
-        .json(&json!({ "question_id": question_id, "selected": 0 }))
+        .json(&json!({ "question_id": question_id, "selected": room.choice_ids[0] }))
         .send()
         .await
         .unwrap();
@@ -889,13 +904,13 @@ async fn exam_room_promotion_mid_exam_closes_the_sheet() {
         .await
         .unwrap();
     assert_eq!(sheet["answers"].as_array().unwrap().len(), 1);
-    assert_eq!(sheet["answers"][0]["selected"], 1);
+    assert_eq!(sheet["answers"][0]["selected"], room.choice_ids[1]);
 
     // Demoted back, the same socket writes again — no reconnect required.
     promote(db, "veli", "student").await;
     ws_send(
         &mut ws,
-        json!({ "type": "answer", "question_id": question_id, "selected": 0 }),
+        json!({ "type": "answer", "question_id": question_id, "selected": room.choice_ids[0] }),
     )
     .await;
     ws_frame_of_type(&mut ws, "saved").await;
@@ -967,7 +982,7 @@ async fn exam_room_expires_mid_session() {
     // One answer lands inside the window.
     ws_send(
         &mut ws,
-        json!({ "type": "answer", "question_id": room.question_id, "selected": 1 }),
+        json!({ "type": "answer", "question_id": room.question_id, "selected": room.choice_ids[1] }),
     )
     .await;
     ws_frame_of_type(&mut ws, "saved").await;
@@ -987,7 +1002,7 @@ async fn exam_room_expires_mid_session() {
             "{}/exams/{}/attempt/answers",
             room.base, room.exam_id
         ))
-        .json(&json!({ "question_id": room.question_id, "selected": 0 }))
+        .json(&json!({ "question_id": room.question_id, "selected": room.choice_ids[0] }))
         .send()
         .await
         .unwrap();
@@ -1015,7 +1030,7 @@ async fn exam_room_expires_mid_session() {
         .json()
         .await
         .unwrap();
-    assert_eq!(sheet["answers"][0]["selected"], 1);
+    assert_eq!(sheet["answers"][0]["selected"], room.choice_ids[1]);
     assert_eq!(sheet["auto_score"]["earned"], 10);
 }
 
@@ -1088,7 +1103,7 @@ async fn exam_room_rejoin_door_is_the_teachers_call() {
             "{}/exams/{}/attempt/answers",
             room.base, room.exam_id
         ))
-        .json(&json!({ "question_id": room.question_id, "selected": 1 }))
+        .json(&json!({ "question_id": room.question_id, "selected": room.choice_ids[1] }))
         .send()
         .await
         .unwrap();
@@ -1121,7 +1136,7 @@ async fn exam_room_rejoin_door_is_the_teachers_call() {
     );
     ws_send(
         &mut ws,
-        json!({ "type": "answer", "question_id": room.question_id, "selected": 1 }),
+        json!({ "type": "answer", "question_id": room.question_id, "selected": room.choice_ids[1] }),
     )
     .await;
     ws_frame_of_type(&mut ws, "saved").await;
@@ -1136,7 +1151,7 @@ async fn exam_room_rejoin_door_is_the_teachers_call() {
             "{}/exams/{}/attempt/answers",
             room.base, room.exam_id
         ))
-        .json(&json!({ "question_id": room.question_id, "selected": 0 }))
+        .json(&json!({ "question_id": room.question_id, "selected": room.choice_ids[0] }))
         .send()
         .await
         .unwrap();
@@ -1193,7 +1208,7 @@ async fn exam_room_close_after_a_retake_leaves_the_new_sitting_alone() {
         .post(format!("{}/exams/{exam_id}/questions", room.base))
         .json(
             &json!({ "subject_id": room.subject_id, "text": "3 + 3?", "kind": "choice",
-                       "points": 5, "choices": ["5", "6"], "correct": 1 }),
+                       "points": 5, "choices": [{"id": "a", "text": "5"}, {"id": "b", "text": "6"}], "correct": "b" }),
         )
         .send()
         .await
@@ -1202,6 +1217,7 @@ async fn exam_room_close_after_a_retake_leaves_the_new_sitting_alone() {
         .await
         .unwrap();
     let question_id = question["id"].as_str().unwrap().to_string();
+    let opts = choice_ids(&question);
 
     // Sit sitting #1 and open its room.
     let res = room
@@ -1259,7 +1275,7 @@ async fn exam_room_close_after_a_retake_leaves_the_new_sitting_alone() {
     let res = room
         .student
         .post(format!("{}/exams/{exam_id}/attempt/answers", room.base))
-        .json(&json!({ "question_id": question_id, "selected": 1 }))
+        .json(&json!({ "question_id": question_id, "selected": opts[1] }))
         .send()
         .await
         .unwrap();
@@ -1299,7 +1315,7 @@ async fn exam_room_messages_bind_to_their_own_sitting() {
         .post(format!("{}/exams/{exam_id}/questions", room.base))
         .json(
             &json!({ "subject_id": room.subject_id, "text": "3 + 3?", "kind": "choice",
-                       "points": 5, "choices": ["5", "6"], "correct": 1 }),
+                       "points": 5, "choices": [{"id": "a", "text": "5"}, {"id": "b", "text": "6"}], "correct": "b" }),
         )
         .send()
         .await
@@ -1308,6 +1324,7 @@ async fn exam_room_messages_bind_to_their_own_sitting() {
         .await
         .unwrap();
     let question_id = question["id"].as_str().unwrap().to_string();
+    let opts = choice_ids(&question);
 
     // Sit sitting #1 and open its room.
     let res = room
@@ -1346,7 +1363,7 @@ async fn exam_room_messages_bind_to_their_own_sitting() {
     // blank sheet of sitting #2.
     ws_send(
         &mut ws,
-        json!({ "type": "answer", "question_id": question_id, "selected": 1 }),
+        json!({ "type": "answer", "question_id": question_id, "selected": opts[1] }),
     )
     .await;
     let error = ws_frame_of_type(&mut ws, "error").await;
@@ -1432,7 +1449,7 @@ async fn exam_room_second_tab_keeps_the_student_present() {
             "{}/exams/{}/attempt/answers",
             room.base, room.exam_id
         ))
-        .json(&json!({ "question_id": room.question_id, "selected": 1 }))
+        .json(&json!({ "question_id": room.question_id, "selected": room.choice_ids[1] }))
         .send()
         .await
         .unwrap();
@@ -1452,7 +1469,7 @@ async fn exam_room_second_tab_keeps_the_student_present() {
             "{}/exams/{}/attempt/answers",
             room.base, room.exam_id
         ))
-        .json(&json!({ "question_id": room.question_id, "selected": 0 }))
+        .json(&json!({ "question_id": room.question_id, "selected": room.choice_ids[0] }))
         .send()
         .await
         .unwrap();
@@ -1486,7 +1503,7 @@ async fn exam_room_open_mode_runs_untimed_and_retakes() {
         .post(format!("{}/exams/{exam_id}/questions", room.base))
         .json(
             &json!({ "subject_id": room.subject_id, "text": "3 + 3?", "kind": "choice",
-                       "points": 5, "choices": ["5", "6"], "correct": 1 }),
+                       "points": 5, "choices": [{"id": "a", "text": "5"}, {"id": "b", "text": "6"}], "correct": "b" }),
         )
         .send()
         .await
@@ -1495,6 +1512,7 @@ async fn exam_room_open_mode_runs_untimed_and_retakes() {
         .await
         .unwrap();
     let question_id = question["id"].as_str().unwrap().to_string();
+    let opts = choice_ids(&question);
 
     let res = room
         .student
@@ -1515,7 +1533,7 @@ async fn exam_room_open_mode_runs_untimed_and_retakes() {
 
     ws_send(
         &mut ws,
-        json!({ "type": "answer", "question_id": question_id, "selected": 1 }),
+        json!({ "type": "answer", "question_id": question_id, "selected": opts[1] }),
     )
     .await;
     ws_frame_of_type(&mut ws, "saved").await;

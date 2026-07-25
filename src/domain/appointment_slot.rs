@@ -9,14 +9,12 @@
 //! time. Cancelling one week is then a plain row delete, and the whole series
 //! is still addressable through its id.
 
-use std::sync::{LazyLock, Mutex};
-
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-use ulid::{Generator, Ulid};
 
 use crate::constant::{MAX_APPOINTMENT_NOTE_LEN, MAX_SLOT_OCCURRENCES};
 use crate::database::{APPOINTMENT_SLOT_TABLE, Database};
 use crate::domain::appointment::{APPOINTMENT_LOCK, Appointment};
+use crate::domain::monotonic_id::next_ulid;
 use crate::domain::timestamp::{MILLIS_PER_DAY, Timestamp};
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
@@ -25,23 +23,10 @@ use crate::validate::validate_optional;
 /// One week, the only recurrence step this backend expands.
 const MILLIS_PER_WEEK: i64 = 7 * MILLIS_PER_DAY;
 
-/// Mints slot ids in write order. `Ulid::new()`'s random low bits sort
-/// arbitrarily among ids minted in the same millisecond, and a recurring
-/// publish writes its whole expansion inside one — which would scramble the
-/// `id` tie-break of the `ORDER BY starts_at, id` listings.
-static IDS: LazyLock<Mutex<Generator>> = LazyLock::new(|| Mutex::new(Generator::new()));
-
-fn next_ulid() -> Ulid {
-    let mut ids = IDS.lock().expect("slot id generator poisoned");
-    // The only error is exhausting the random bits *within* one millisecond
-    // (2^80 ids deep); it clears itself as the clock ticks, so retry rather
-    // than fall back to a random id and silently reintroduce the defect.
-    loop {
-        if let Ok(ulid) = ids.generate() {
-            break ulid;
-        }
-    }
-}
+// Slot ids come from [`crate::domain::monotonic_id`]: a recurring publish
+// writes its whole expansion inside one millisecond, which random ULID low
+// bits would scramble against the `id` tie-break of the `ORDER BY starts_at,
+// id` listings.
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct AppointmentSlotId(RecordId);

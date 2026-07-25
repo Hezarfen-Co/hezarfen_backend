@@ -3,7 +3,7 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use crate::constant::MAX_ANSWER_TEXT_LEN;
 use crate::database::{Database, EXAM_ANSWER_TABLE};
 use crate::domain::exam::ExamId;
-use crate::domain::exam_question::{ExamQuestion, ExamQuestionId};
+use crate::domain::exam_question::{ChoiceId, ExamQuestion, ExamQuestionId};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
@@ -68,7 +68,7 @@ pub struct ExamAnswer {
     question: ExamQuestionId,
     user: UserId,
     seq: i64,
-    selected: Option<i64>,
+    selected: Option<ChoiceId>,
     text: Option<AnswerText>,
     updated_at: Timestamp,
 }
@@ -95,8 +95,8 @@ impl ExamAnswer {
         self.seq
     }
 
-    pub fn get_selected(&self) -> Option<i64> {
-        self.selected
+    pub fn get_selected(&self) -> Option<&ChoiceId> {
+        self.selected.as_ref()
     }
 
     pub fn get_text(&self) -> Option<&AnswerText> {
@@ -111,13 +111,13 @@ impl ExamAnswer {
     /// text question — correctness is the grader's call, not the machine's.
     pub fn is_correct(&self, question: &ExamQuestion) -> Option<bool> {
         let correct = question.get_correct()?;
-        Some(self.selected == Some(correct))
+        Some(self.selected.as_ref() == Some(correct))
     }
 
     /// Save (or overwrite) `user`'s answer to `question` for sitting `seq` —
     /// the one write path, shared by the REST handler and the WebSocket room.
     /// The payload must match the question's kind: a choice question takes
-    /// `selected` (indexing one of its choices), a text question takes `text`.
+    /// `selected` (the id of one of its choices), a text question takes `text`.
     /// The caller has already checked that the attempt is in progress. Keyed
     /// by `seq`, so a retake's save is a new row, not an overwrite of an
     /// earlier sitting's answer.
@@ -125,7 +125,7 @@ impl ExamAnswer {
         question: &ExamQuestion,
         user: &UserId,
         seq: i64,
-        selected: Option<i64>,
+        selected: Option<String>,
         text: Option<String>,
         db: &Database,
     ) -> Result<ExamAnswer, AppError> {
@@ -142,14 +142,17 @@ impl ExamAnswer {
                 let Some(selected) = selected else {
                     return Err(invalid("selected", "required for a choice question"));
                 };
-                let count = question.get_choices().map_or(0, <[_]>::len);
-                if !(0..count as i64).contains(&selected) {
-                    return Err(invalid(
-                        "selected",
-                        "must index one of the question's choices",
-                    ));
-                }
-                (Some(selected), None)
+                // Membership, not a range: `selected` names an option by its
+                // stable id, so a reorder of the list can never repoint it.
+                let picked = question
+                    .get_choices()
+                    .unwrap_or_default()
+                    .iter()
+                    .find(|choice| choice.get_id().as_str() == selected)
+                    .ok_or_else(|| {
+                        invalid("selected", "must name one of the question's choices")
+                    })?;
+                (Some(picked.get_id().clone()), None)
             }
             _ => {
                 if selected.is_some() {
@@ -297,13 +300,23 @@ pub fn auto_score(questions: &[ExamQuestion], answers: &[ExamAnswer]) -> (i64, i
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::exam_question::{QuestionKind, QuestionSpec};
+    use crate::domain::exam_question::{ChoiceInput, QuestionKind, QuestionSpec};
 
-    fn choice_question(exam: &ExamId, points: i64, correct: i64) -> ExamQuestion {
+    /// A three-option question whose `correct` is the option at `correct`.
+    /// Positions are a *test* convenience only — the ids are minted, and every
+    /// assertion below goes through `choice_id`.
+    fn choice_question(exam: &ExamId, points: i64, correct: usize) -> ExamQuestion {
+        let labels = ["a", "b", "c"];
         let spec = QuestionSpec::try_new(
             QuestionKind::try_new("choice").unwrap(),
-            Some(vec!["a".into(), "b".into(), "c".into()]),
-            Some(correct),
+            Some(
+                labels
+                    .iter()
+                    .map(|l| ChoiceInput { id: Some((*l).into()), text: (*l).into() })
+                    .collect(),
+            ),
+            Some(labels[correct].into()),
+            &[],
         )
         .unwrap();
         ExamQuestion::test_new(exam, "pick one", points, spec)
@@ -311,21 +324,27 @@ mod tests {
 
     fn text_question(exam: &ExamId, points: i64) -> ExamQuestion {
         let spec =
-            QuestionSpec::try_new(QuestionKind::try_new("text").unwrap(), None, None).unwrap();
+            QuestionSpec::try_new(QuestionKind::try_new("text").unwrap(), None, None, &[]).unwrap();
         ExamQuestion::test_new(exam, "explain", points, spec)
     }
 
-    fn answer(question: &ExamQuestion, user: &UserId, selected: Option<i64>) -> ExamAnswer {
+    /// The minted id of the question's option at `index`.
+    fn choice_id(question: &ExamQuestion, index: usize) -> ChoiceId {
+        question.get_choices().unwrap()[index].get_id().clone()
+    }
+
+    fn answer(question: &ExamQuestion, user: &UserId, selected: Option<usize>) -> ExamAnswer {
+        let selected = selected.map(|index| choice_id(question, index));
         ExamAnswer {
             id: ExamAnswerId::composite(question.get_id(), user, 1),
             exam: question.get_exam().clone(),
             question: question.get_id().clone(),
             user: user.clone(),
             seq: 1,
-            selected,
             text: selected
                 .is_none()
                 .then(|| AnswerText::try_new("essay").unwrap()),
+            selected,
             updated_at: Timestamp::from_millis(1),
         }
     }

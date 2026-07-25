@@ -1,5 +1,6 @@
 //! An image pinned to a bank question — the question's own illustration
-//! (`slot = NONE`) or one choice's picture (`slot = i`, choice questions only).
+//! (`slot = NONE`) or one choice's picture (`slot` = that choice's stable id,
+//! choice questions only).
 //! A structural copy of [`crate::domain::question_image`] with the exam FK
 //! dropped: a bank template belongs to no exam, and its owner is reachable
 //! through the `bank_question` row. The row carries metadata; the bytes live
@@ -14,6 +15,7 @@ use ulid::Ulid;
 
 use crate::database::{BANK_QUESTION_IMAGE_TABLE, Database};
 use crate::domain::bank_question::BankQuestionId;
+use crate::domain::exam_question::ChoiceId;
 use crate::domain::note_file::FileContentType;
 use crate::error::AppError;
 
@@ -22,12 +24,15 @@ pub struct BankQuestionImageId(RecordId);
 
 impl BankQuestionImageId {
     /// The one id a (question, slot) pair can have: `{bid}_q` for the
-    /// question's own image, `{bid}_{i}` for choice `i` — uniqueness per slot
-    /// needs no index this way.
-    pub fn for_slot(question: &BankQuestionId, slot: Option<i64>) -> Self {
+    /// question's own image, `{bid}_{choice id}` for one option's picture —
+    /// uniqueness per slot needs no index this way. Keyed by the option's
+    /// *stable id*, so reordering the choice list moves no picture.
+    pub fn for_slot(question: &BankQuestionId, slot: Option<&ChoiceId>) -> Self {
+        // `_` is not in Crockford base32 and a ULID is never `"q"`, so
+        // `{qid}_{cid}` and `{qid}_q` can never collide.
         let suffix = match slot {
-            None => "q".to_string(),
-            Some(index) => index.to_string(),
+            None => "q",
+            Some(id) => id.as_str(),
         };
         Self(RecordId::new(
             BANK_QUESTION_IMAGE_TABLE,
@@ -51,8 +56,9 @@ impl BankQuestionImageId {
 pub struct BankQuestionImage {
     id: BankQuestionImageId,
     bank_question: BankQuestionId,
-    /// `NONE` = the question's illustration; `i` = the picture of choice `i`.
-    slot: Option<i64>,
+    /// `NONE` = the question's illustration; otherwise the id of the option
+    /// this picture belongs to.
+    slot: Option<ChoiceId>,
     /// The blob's on-disk name — a fresh ULID every upload.
     file: String,
     content_type: FileContentType,
@@ -65,14 +71,14 @@ impl BankQuestionImage {
     /// [`Self::upsert`] — so a stored row always points at a real blob.
     pub fn new(
         question: &BankQuestionId,
-        slot: Option<i64>,
+        slot: Option<&ChoiceId>,
         content_type: FileContentType,
         size: i64,
     ) -> Self {
         Self {
             id: BankQuestionImageId::for_slot(question, slot),
             bank_question: question.clone(),
-            slot,
+            slot: slot.cloned(),
             file: Ulid::new().to_string(),
             content_type,
             size,
@@ -83,8 +89,8 @@ impl BankQuestionImage {
         &self.bank_question
     }
 
-    pub fn get_slot(&self) -> Option<i64> {
-        self.slot
+    pub fn get_slot(&self) -> Option<&ChoiceId> {
+        self.slot.as_ref()
     }
 
     pub fn get_file(&self) -> &str {
@@ -102,13 +108,14 @@ impl BankQuestionImage {
     /// Create or replace the slot's image row — the deterministic id makes
     /// this the whole "one image per slot" story.
     pub async fn upsert(self, db: &Database) -> Result<BankQuestionImage, AppError> {
+        // whole-row-save-ok: self is built in place, never read back, and the slot id is deterministic
         let written: Option<BankQuestionImage> = db.upsert(self.id.record()).content(self).await?;
         written.ok_or_else(|| AppError::Internal("failed to store bank question image".into()))
     }
 
     pub async fn read_slot(
         question: &BankQuestionId,
-        slot: Option<i64>,
+        slot: Option<&ChoiceId>,
         db: &Database,
     ) -> Result<Option<BankQuestionImage>, AppError> {
         Ok(db
@@ -128,27 +135,46 @@ impl BankQuestionImage {
         Ok(result.take::<Vec<BankQuestionImage>>(0)?)
     }
 
-    /// Every bank image row, school-wide — for bucketing onto a whole template
-    /// list in one query (the bank list is itself school-wide).
-    pub async fn list_all(db: &Database) -> Result<Vec<BankQuestionImage>, AppError> {
+    /// The image rows of several templates in one query — for bucketing onto a
+    /// listing's *page* (never the whole table: the bank spans the school).
+    pub async fn list_for_questions(
+        questions: &[&BankQuestionId],
+        db: &Database,
+    ) -> Result<Vec<BankQuestionImage>, AppError> {
+        if questions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let records: Vec<RecordId> = questions.iter().map(|q| q.record()).collect();
         let mut result = db
-            .query("SELECT * FROM bank_question_image")
+            .query("SELECT * FROM bank_question_image WHERE bank_question IN $ids")
+            .bind(("ids", records))
             .await?
             .check()?;
         Ok(result.take::<Vec<BankQuestionImage>>(0)?)
     }
 
-    /// Drop every *choice* image of the question (the question's own
-    /// illustration stays), returning the removed rows so the caller can take
-    /// their blobs off disk. Runs when a PATCH replaces the choice list — the
-    /// old pictures belong to the old options.
-    pub async fn delete_choices_for(
+    /// Drop the option pictures whose choice is gone — every choice image of
+    /// the question whose `slot` is *not* in `keep` (the question's own
+    /// illustration always stays), returning the removed rows so the caller can
+    /// take their blobs off disk.
+    ///
+    /// This is what makes an edit non-destructive: a PATCH that reorders,
+    /// renames, or drops options passes the surviving choice ids as `keep`, so
+    /// only the pictures of genuinely removed options go. `keep = &[]` (a text
+    /// question, or an all-new choice list) still clears the lot.
+    pub async fn delete_choices_not_in(
         question: &BankQuestionId,
+        keep: &[ChoiceId],
         db: &Database,
     ) -> Result<Vec<BankQuestionImage>, AppError> {
+        let keep: Vec<String> = keep.iter().map(|id| id.as_str().to_string()).collect();
         let mut result = db
-            .query("DELETE bank_question_image WHERE bank_question = $b AND slot != NONE RETURN BEFORE")
+            .query(
+                "DELETE bank_question_image \
+                 WHERE bank_question = $b AND slot != NONE AND slot NOT IN $keep RETURN BEFORE",
+            )
             .bind(("b", question.record()))
+            .bind(("keep", keep))
             .await?
             .check()?;
         Ok(result.take::<Vec<BankQuestionImage>>(0)?)
@@ -163,25 +189,49 @@ impl BankQuestionImage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::exam_question::{ChoiceInput, QuestionKind, QuestionSpec};
 
     fn png() -> FileContentType {
         FileContentType::try_new("image/png").unwrap()
     }
 
+    fn choice_ids() -> Vec<ChoiceId> {
+        QuestionSpec::try_new(
+            QuestionKind::try_new("choice").unwrap(),
+            Some(
+                ["a", "b", "c"]
+                    .iter()
+                    .map(|l| ChoiceInput { id: Some((*l).into()), text: (*l).into() })
+                    .collect(),
+            ),
+            Some("a".into()),
+            &[],
+        )
+        .unwrap()
+        .into_parts()
+        .1
+        .unwrap()
+        .iter()
+        .map(|c| c.get_id().clone())
+        .collect()
+    }
+
     #[tokio::test]
-    async fn for_slot_keys_by_question_and_slot() {
+    async fn for_slot_keys_by_question_and_choice_id() {
         let question = BankQuestionId::from_key("abc");
+        let ids = choice_ids();
         assert_eq!(
             BankQuestionImageId::for_slot(&question, None).key(),
             "abc_q"
         );
         assert_eq!(
-            BankQuestionImageId::for_slot(&question, Some(0)).key(),
-            "abc_0"
+            BankQuestionImageId::for_slot(&question, Some(&ids[0])).key(),
+            format!("abc_{}", ids[0].as_str())
         );
-        assert_eq!(
-            BankQuestionImageId::for_slot(&question, Some(3)).key(),
-            "abc_3"
+        // Distinct options never share a row.
+        assert_ne!(
+            BankQuestionImageId::for_slot(&question, Some(&ids[0])),
+            BankQuestionImageId::for_slot(&question, Some(&ids[1]))
         );
     }
 
@@ -207,18 +257,54 @@ mod tests {
         assert_eq!(rows[0].get_size(), 5);
     }
 
+    /// The bank half of the non-destructive edit: keeping an option keeps its
+    /// picture, and only a removed option's picture goes.
     #[tokio::test]
-    async fn choice_wipe_spares_the_question_image() {
+    async fn only_the_dropped_options_lose_their_pictures() {
         let db = crate::database::init_mem().await.unwrap();
         let question = BankQuestionId::generate();
-        for slot in [None, Some(0), Some(1)] {
-            BankQuestionImage::new(&question, slot, png(), 1)
+        let ids = choice_ids();
+        BankQuestionImage::new(&question, None, png(), 1)
+            .upsert(&db)
+            .await
+            .unwrap();
+        for id in &ids {
+            BankQuestionImage::new(&question, Some(id), png(), 1)
                 .upsert(&db)
                 .await
                 .unwrap();
         }
 
-        let dropped = BankQuestionImage::delete_choices_for(&question, &db)
+        let keep = vec![ids[0].clone(), ids[1].clone()];
+        let dropped = BankQuestionImage::delete_choices_not_in(&question, &keep, &db)
+            .await
+            .unwrap();
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].get_slot(), Some(&ids[2]));
+
+        let left = BankQuestionImage::list_for_question(&question, &db)
+            .await
+            .unwrap();
+        assert_eq!(left.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn an_empty_keep_set_clears_every_option_picture() {
+        let db = crate::database::init_mem().await.unwrap();
+        let question = BankQuestionId::generate();
+        let ids = choice_ids();
+        BankQuestionImage::new(&question, None, png(), 1)
+            .upsert(&db)
+            .await
+            .unwrap();
+        for id in &ids[..2] {
+            BankQuestionImage::new(&question, Some(id), png(), 1)
+                .upsert(&db)
+                .await
+                .unwrap();
+        }
+
+        let dropped = BankQuestionImage::delete_choices_not_in(&question, &[], &db)
             .await
             .unwrap();
         assert_eq!(dropped.len(), 2);

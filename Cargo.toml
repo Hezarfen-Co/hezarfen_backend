@@ -51,3 +51,4 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "coo
 tempfile = "3"
 tokio-tungstenite = "0.30.0"
 futures-util = "0.3.32"
+proptest = "1.11.0"

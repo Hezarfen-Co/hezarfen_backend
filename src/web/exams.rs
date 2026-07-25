@@ -23,7 +23,8 @@ use crate::domain::exam::{
 use crate::domain::exam_answer::{ExamAnswer, auto_score};
 use crate::domain::exam_attempt::{AttemptStatus, ExamAttempt};
 use crate::domain::exam_question::{
-    ExamQuestion, ExamQuestionId, QuestionKind, QuestionPoints, QuestionSpec, QuestionText,
+    Choice, ChoiceId, ExamQuestion, ExamQuestionId, QuestionKind, QuestionPoints, QuestionSpec,
+    QuestionText,
 };
 use crate::domain::exam_result::{ExamResult, Mark};
 use crate::domain::note_file::FileContentType;
@@ -39,9 +40,9 @@ use super::bank_questions::BankQuestionResponse;
 use super::courses::{can_manage_course, can_view_course, visible_courses};
 use super::subjects::subject_in_course;
 use super::{
-    CurrentUser, ExamResponse, Page, PageParams, PersonRef, RequireTeacher, UploadFileForm,
-    blob_path, check_not_past, image_content_type, paginate, person_map, read_upload, remove_blob,
-    set_or_clear,
+    ChoiceBody, CurrentUser, ExamResponse, Page, PageParams, PersonRef, RequireTeacher,
+    UploadFileForm, blob_path, check_not_past, image_content_type, paginate, person_map,
+    read_upload, remove_blob, set_or_clear,
 };
 
 /// Serializes the exam subsystem's cross-record check-then-writes, which
@@ -81,6 +82,7 @@ pub fn routes() -> OpenApiRouter<AppState> {
         .routes(routes!(update_question, delete_question))
         .routes(routes!(question_from_bank))
         .routes(routes!(question_to_bank))
+        .routes(routes!(question_refresh_from_bank))
         .routes(routes!(attempt_questions))
         .routes(routes!(save_answer))
         .routes(routes!(attempt_answers))
@@ -1316,11 +1318,13 @@ struct CreateQuestion {
     #[schema(example = 10)]
     points: i64,
     /// The options of a `choice` question (2–10 of them); omit for `text`.
-    choices: Option<Vec<String>>,
-    /// Zero-based index of the right option; required for `choice`, absent
-    /// for `text`.
-    #[schema(example = 1)]
-    correct: Option<i64>,
+    /// Each carries an `id` naming it within this payload — the server mints
+    /// the stored ids and returns them.
+    choices: Option<Vec<ChoiceBody>>,
+    /// The `id` of the right option, as sent in `choices`; required for
+    /// `choice`, absent for `text`.
+    #[schema(example = "b")]
+    correct: Option<String>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -1336,19 +1340,22 @@ struct UpdateQuestion {
     /// when moving to `text`.
     kind: Option<String>,
     /// Omit to keep the stored options; send `null` to drop them (text
-    /// questions only). Replacing or clearing the list also drops every
-    /// option picture — the old images belong to the old options.
+    /// questions only). Send each option back with the `id` it was returned
+    /// with to keep it — its picture rides along. Only options whose id is
+    /// absent from the new list lose their picture, so reordering, renaming,
+    /// and deleting one option leave the rest untouched.
     #[serde(default, deserialize_with = "set_or_clear")]
-    #[schema(value_type = Option<Vec<String>>)]
-    choices: Option<Option<Vec<String>>>,
-    /// Omit to keep; `null` to clear (text questions only).
+    #[schema(value_type = Option<Vec<ChoiceBody>>)]
+    choices: Option<Option<Vec<ChoiceBody>>>,
+    /// The `id` of the right option. Omit to keep; `null` to clear (text
+    /// questions only).
     #[serde(default, deserialize_with = "set_or_clear")]
-    #[schema(value_type = Option<i64>)]
-    correct: Option<Option<i64>>,
+    #[schema(value_type = Option<String>)]
+    correct: Option<Option<String>>,
 }
 
 /// A stored question image's metadata; the bytes come from the image
-/// endpoints (`GET .../image`, `GET .../choices/{index}/image`).
+/// endpoints (`GET .../image`, `GET .../choices/{choice_id}/image`).
 #[derive(Serialize, ToSchema)]
 struct ImageMetaResponse {
     /// MIME type as declared on upload (always one of the raster allowlist).
@@ -1376,22 +1383,26 @@ impl ImageMetaResponse {
 }
 
 /// The question's slot out of its image rows.
-fn image_meta(images: &[QuestionImage], slot: Option<i64>) -> Option<ImageMetaResponse> {
+fn image_meta(images: &[QuestionImage], slot: Option<&ChoiceId>) -> Option<ImageMetaResponse> {
     images
         .iter()
         .find(|image| image.get_slot() == slot)
         .map(ImageMetaResponse::new)
 }
 
-/// The per-choice metas, aligned index-for-index with `choices` (`None`
+/// The per-choice metas, aligned position-for-position with `choices` (`None`
 /// entries = that option has no picture); `None` whole for text questions.
+/// A response-only projection: the pictures are *stored* against choice ids, so
+/// this alignment is rebuilt from the current list on every read and can never
+/// go stale.
 fn choice_image_metas(
     question: &ExamQuestion,
     images: &[QuestionImage],
 ) -> Option<Vec<Option<ImageMetaResponse>>> {
     question.get_choices().map(|choices| {
-        (0..choices.len() as i64)
-            .map(|index| image_meta(images, Some(index)))
+        choices
+            .iter()
+            .map(|choice| image_meta(images, Some(choice.get_id())))
             .collect()
     })
 }
@@ -1412,7 +1423,31 @@ async fn images_by_question(
     Ok(buckets)
 }
 
-/// A question as its author sees it — including the `correct` index. Never
+/// One option on the wire: its stable id and its text. Carries **no** answer
+/// key — `correct` is a sibling field on the question, and only on the
+/// author-facing DTO, so a student response cannot contain one by construction.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct ChoiceResponse {
+    /// Send this back in a PATCH to keep the option (and its picture).
+    id: String,
+    text: String,
+}
+
+impl ChoiceResponse {
+    pub(crate) fn list(choices: Option<&[Choice]>) -> Option<Vec<Self>> {
+        choices.map(|choices| {
+            choices
+                .iter()
+                .map(|choice| Self {
+                    id: choice.get_id().as_str().to_string(),
+                    text: choice.get_text().as_str().to_string(),
+                })
+                .collect()
+        })
+    }
+}
+
+/// A question as its author sees it — including the `correct` option. Never
 /// serialized to students; they get [`AttemptQuestionResponse`].
 #[derive(Serialize, ToSchema)]
 struct QuestionResponse {
@@ -1425,15 +1460,21 @@ struct QuestionResponse {
     #[schema(example = "choice")]
     kind: String,
     points: i64,
-    choices: Option<Vec<String>>,
-    /// Zero-based index of the right option (`choice` questions only).
-    correct: Option<i64>,
+    /// The options with their stable ids (`choice` questions only).
+    choices: Option<Vec<ChoiceResponse>>,
+    /// The id of the right option (`choice` questions only).
+    correct: Option<String>,
     /// The question's illustration, if one was uploaded (any kind).
     image: Option<ImageMetaResponse>,
     /// Per-option pictures, aligned with `choices` (`choice` questions only).
     choice_images: Option<Vec<Option<ImageMetaResponse>>>,
-    /// The bank template this question was instantiated from, if any.
-    source_bank: Option<String>,
+    /// The bank template this question was created from, if it was added out of
+    /// the bank (`GET /bank-questions/{id}`).
+    from_bank: Option<String>,
+    /// The bank template most recently created by saving this question into the
+    /// bank, if any — set only by `POST …/questions/{qid}/to-bank`. Null on a
+    /// question that came *from* the bank and was never saved back.
+    banked_as: Option<String>,
 }
 
 impl QuestionResponse {
@@ -1445,13 +1486,14 @@ impl QuestionResponse {
             text: question.get_text().as_str().to_string(),
             kind: question.get_kind().as_str().to_string(),
             points: question.get_points().as_i64(),
-            choices: question
-                .get_choices()
-                .map(|choices| choices.iter().map(|c| c.as_str().to_string()).collect()),
-            correct: question.get_correct(),
+            choices: ChoiceResponse::list(question.get_choices()),
+            correct: question
+                .get_correct()
+                .map(|id| id.as_str().to_string()),
             image: image_meta(images, None),
             choice_images: choice_image_metas(question, images),
-            source_bank: question.get_source_bank().map(|b| b.key().to_string()),
+            from_bank: question.get_from_bank().map(|b| b.key().to_string()),
+            banked_as: question.get_banked_as().map(|b| b.key().to_string()),
         }
     }
 }
@@ -1481,6 +1523,26 @@ async fn question_of_exam(
         return Err(AppError::NotFound);
     }
     Ok(question)
+}
+
+/// The question's option named by `choice_id` — a 400 for a text question or an
+/// id the question doesn't have, so an option picture can only ever be
+/// addressed through an option that exists.
+fn choice_slot(question: &ExamQuestion, choice_id: &str) -> Result<ChoiceId, AppError> {
+    let Some(choices) = question.get_choices() else {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "choice_id",
+            reason: "only choice questions take option pictures",
+        }));
+    };
+    choices
+        .iter()
+        .find(|choice| choice.get_id().as_str() == choice_id)
+        .map(|choice| choice.get_id().clone())
+        .ok_or(AppError::Validation(ValidationError::Invalid {
+            field: "choice_id",
+            reason: "must name one of the choices",
+        }))
 }
 
 /// Add a question to an exam. Requires teacher+ and management rights over the
@@ -1528,7 +1590,14 @@ async fn create_question(
     let subject = subject_in_course(&req.subject_id, course.get_id(), &st.db).await?;
     let text = QuestionText::try_new(&req.text)?;
     let points = QuestionPoints::try_new(req.points)?;
-    let spec = QuestionSpec::try_new(QuestionKind::try_new(&req.kind)?, req.choices, req.correct)?;
+    // No stored choices to match against on create, so every option is new and
+    // every id is minted here.
+    let spec = QuestionSpec::try_new(
+        QuestionKind::try_new(&req.kind)?,
+        ChoiceBody::into_inputs(req.choices),
+        req.correct,
+        &[],
+    )?;
     let question = ExamQuestion::create(exam.get_id(), subject, text, points, spec, &st.db).await?;
     // A question is born imageless — uploads come after, against its id.
     Ok((
@@ -1664,27 +1733,32 @@ async fn update_question(
         Some(ref kind) => QuestionKind::try_new(kind)?,
         None => question.get_kind().clone(),
     };
-    let choices_replaced = req.choices.is_some();
+    // Omitting `choices` re-submits the stored options *with their ids*, so a
+    // text-only edit keeps every identity (and every picture) untouched.
     let choices = match req.choices {
-        Some(update) => update,
-        None => question
-            .get_choices()
-            .map(|choices| choices.iter().map(|c| c.as_str().to_string()).collect()),
+        Some(update) => ChoiceBody::into_inputs(update),
+        None => ChoiceBody::from_stored(question.get_choices()),
     };
     let correct = match req.correct {
         Some(update) => update,
-        None => question.get_correct(),
+        None => question.get_correct().map(|id| id.as_str().to_string()),
     };
-    let spec = QuestionSpec::try_new(kind, choices, correct)?;
+    let stored: Vec<Choice> = question.get_choices().unwrap_or_default().to_vec();
+    let spec = QuestionSpec::try_new(kind, choices, correct, &stored)?;
 
     let updated = question.update(subject, text, points, spec, &st.db).await?;
-    // A replaced (or cleared) choice list orphans the old options' pictures —
-    // drop them all; the question's own illustration stays. Uploads re-attach
-    // against the new list.
-    if choices_replaced {
-        for image in QuestionImage::delete_choices_for(updated.get_id(), &st.db).await? {
-            remove_blob(&st.files_path, image.get_file()).await;
-        }
+    // Only the options that are actually *gone* lose their pictures: keyed by
+    // choice id, an option that survives the edit keeps its image no matter
+    // where it moved in the list. (This used to wipe every option picture
+    // whenever the request so much as carried a `choices` key.)
+    let keep: Vec<ChoiceId> = updated
+        .get_choices()
+        .unwrap_or_default()
+        .iter()
+        .map(|choice| choice.get_id().clone())
+        .collect();
+    for image in QuestionImage::delete_choices_not_in(updated.get_id(), &keep, &st.db).await? {
+        remove_blob(&st.files_path, image.get_file()).await;
     }
     let images = QuestionImage::list_for_question(updated.get_id(), &st.db).await?;
     Ok(Json(QuestionResponse::new(&updated, &images)))
@@ -1754,7 +1828,9 @@ struct InstantiateFromBank {
 }
 
 /// Instantiate a bank template into this exam as a fresh question. Requires
-/// teacher+ and management rights over the exam's course. `subject_id` must
+/// teacher+, management rights over the exam's course, and a template the
+/// caller may see (their own, or one published to the school) — anything else
+/// is a 404. `subject_id` must
 /// name one of the course's subjects — the template's own subject is origin
 /// metadata and does not carry over. The template (and its blobs) stay
 /// untouched; a full copy — text, points, spec, illustration, and option
@@ -1774,7 +1850,7 @@ struct InstantiateFromBank {
         (status = 400, description = "Unknown subject, or one from another course", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
-        (status = 404, description = "No such exam, or no such bank template", body = ErrorResponse),
+        (status = 404, description = "No such exam, or no bank template the caller may see", body = ErrorResponse),
         (status = 409, description = "Attempts have started — questions are frozen", body = ErrorResponse),
     ),
 )]
@@ -1802,6 +1878,12 @@ async fn question_from_bank(
     let template = BankQuestion::read(&BankQuestionId::from_key(&bid), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
+    // A template the caller may not see is a 404, exactly as it is on the bank's
+    // own routes — instantiating is a read of `correct`, and a 403 here would
+    // confirm that someone else's private template exists under that id.
+    if !super::bank_questions::can_see(&template, &user) {
+        return Err(AppError::NotFound);
+    }
     let question = ExamQuestion::create_from_bank(
         exam.get_id(),
         subject,
@@ -1859,14 +1941,159 @@ async fn question_from_bank(
     ))
 }
 
+/// Re-copy a bank template's *current* content over the exam question that was
+/// instantiated from it — the escape hatch for the divergence a deep copy
+/// creates: fixing a typo in the template does not reach the copies, so this is
+/// how a copy is brought back in line, explicitly and per question. Requires
+/// teacher+, management rights over the exam's course, and a template the
+/// caller may still see.
+///
+/// Replaces text, points, kind, choices, `correct`, the illustration, and the
+/// option pictures with the template's; the question keeps its own id, its
+/// exam, its `subject` (exam-course-scoped — the template's subject is
+/// unrelated metadata) and its provenance links. Anything edited on the exam
+/// copy since it was inserted is overwritten.
+///
+/// **Choice ids come from the template**, exactly as
+/// [`question_from_bank`] mints them — the copy adopts the template's ids, so
+/// its option pictures key off the same slots the template's do, and a
+/// re-copy after a template edit re-lands the right picture on the right
+/// option. A recorded `selected` can never be stranded by that: the freeze
+/// below refuses the whole route once *any* attempt exists, and an
+/// `exam_answer` only exists under an attempt — so at refresh time no answer
+/// points at any choice id at all.
+///
+/// - No `from_bank` (never came from the bank, or its template was deleted and
+///   the cascade cleared the link) → `400`; there is nothing to refresh from.
+/// - Template gone or not visible to the caller → `404`, never a 403.
+/// - Any attempt started → `409`, the same `ensure_questions_editable` freeze
+///   every other question mutation answers to.
+#[utoipa::path(
+    post,
+    path = "/{id}/questions/{qid}/refresh-from-bank",
+    tag = "exams",
+    security(("session_cookie" = [])),
+    params(
+        ("id" = String, Path, description = "Exam id"),
+        ("qid" = String, Path, description = "Question id"),
+    ),
+    responses(
+        (status = 200, description = "Question refreshed from its template", body = QuestionResponse),
+        (status = 400, description = "The question did not come from the bank", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 404, description = "No such exam, no such question in it, or no bank template the caller may see", body = ErrorResponse),
+        (status = 409, description = "Attempts have started — questions are frozen", body = ErrorResponse),
+    ),
+)]
+async fn question_refresh_from_bank(
+    State(st): State<AppState>,
+    RequireTeacher(user): RequireTeacher,
+    Path((id, qid)): Path<(String, String)>,
+) -> Result<Json<QuestionResponse>, AppError> {
+    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let course = course_of(&exam, &st.db).await?;
+    if !can_manage_course(&course, &user) {
+        return Err(AppError::Forbidden(
+            "only the course creator, an assigned teacher, or a manager/admin can edit questions",
+        ));
+    }
+    // Writer lease of [`EXAM_LOCK`]: the freeze gate, the read, and the
+    // overwrite are one unit — same reasoning as `update_question`, which this
+    // is a canned variant of.
+    let _guard = EXAM_LOCK.write().await;
+    ensure_questions_editable(exam.get_id(), &st.db).await?;
+    let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
+
+    let Some(source) = question.get_from_bank().cloned() else {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "question",
+            reason: "this question did not come from a bank template",
+        }));
+    };
+    let template = BankQuestion::read(&source, &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if !super::bank_questions::can_see(&template, &user) {
+        return Err(AppError::NotFound);
+    }
+
+    // Every source blob is read up front, *before* anything is written: a
+    // missing one is server-side damage and must surface as a 500 with the
+    // question untouched, since a half-applied refresh has no old content left
+    // to roll back to. Bounded — at most one illustration plus ten option
+    // pictures, each under the school's file cap.
+    let sources = BankQuestionImage::list_for_question(template.get_id(), &st.db).await?;
+    let mut incoming: Vec<(&BankQuestionImage, Vec<u8>)> = Vec::with_capacity(sources.len());
+    for source in &sources {
+        let bytes = tokio::fs::read(blob_path(&st.files_path, source.get_file()))
+            .await
+            .map_err(|err| {
+                AppError::Internal(format!(
+                    "missing blob for bank image {}: {err}",
+                    source.get_file()
+                ))
+            })?;
+        incoming.push((source, bytes));
+    }
+
+    // The question's own subject stays: it is checked against the exam's
+    // course, and the template's is origin metadata from anywhere in school.
+    let subject = question.get_subject().clone();
+    // `spec()` hands over the template's stored choices *with their ids* rather
+    // than re-minting any — the same funnel `question_from_bank` uses.
+    let updated = question
+        .update(
+            subject,
+            template.get_text().clone(),
+            template.get_points(),
+            template.spec(),
+            &st.db,
+        )
+        .await?;
+
+    // Make the pictures match the template exactly: drop every slot the
+    // template has no picture for (including the illustration, and every option
+    // that is gone after the re-copy), then write the template's over the rest.
+    // `store_image` upserts per slot, so a slot both sides have is replaced.
+    let incoming_slots: Vec<Option<&ChoiceId>> =
+        incoming.iter().map(|(image, _)| image.get_slot()).collect();
+    for stale in QuestionImage::list_for_question(updated.get_id(), &st.db).await? {
+        if incoming_slots.contains(&stale.get_slot()) {
+            continue;
+        }
+        let file = stale.get_file().to_string();
+        stale.delete(&st.db).await?;
+        remove_blob(&st.files_path, &file).await;
+    }
+    for (source, bytes) in &incoming {
+        store_image(
+            &st,
+            &exam,
+            &updated,
+            source.get_slot(),
+            source.get_content_type().clone(),
+            bytes,
+        )
+        .await?;
+    }
+
+    let images = QuestionImage::list_for_question(updated.get_id(), &st.db).await?;
+    Ok(Json(QuestionResponse::new(&updated, &images)))
+}
+
 /// Save one of this exam's questions into the school-wide bank as a reusable
 /// template. Requires teacher+ and management rights over the exam's course.
 /// The caller becomes the template's owner; the question's subject rides along
 /// as origin metadata. A full copy — text, points, spec, illustration, and
 /// option pictures — lands under a new bank id. Provenance rides both ways: the
 /// origin exam is recorded on the template as `source_exam`, and the exam
-/// question's `source_bank` is pointed at the new template (a repeat save is
-/// allowed and repoints it at the newest one).
+/// question's `banked_as` is pointed at the new template (a repeat save is
+/// allowed and repoints it at the newest one). `from_bank` is left alone — it
+/// records the other direction and a save never changes where a question came
+/// from.
 #[utoipa::path(
     post,
     path = "/{id}/questions/{qid}/to-bank",
@@ -1898,10 +2125,10 @@ async fn question_to_bank(
         ));
     }
     // Reader lease of [`BANK_LOCK`] across the question read and the insert: the
-    // template adopts the question's subject, and a re-tag/delete of this
-    // question could otherwise let that subject's delete-guard slip between the
-    // read and our insert (its `any_for_subject` check runs under BANK_LOCK's
-    // writer lease, so holding the reader lease forces it to see our new row).
+    // template adopts the question's subject, so without it a subject delete
+    // could slip between the two and leave the fresh template pointing at a
+    // subject its cascade had already swept (that cascade runs under BANK_LOCK's
+    // writer lease, so holding the reader lease orders us either side of it).
     let _bank_guard = super::bank_questions::BANK_LOCK.read().await;
     let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
 
@@ -1964,8 +2191,20 @@ async fn question_to_bank(
     // template silently vanishing over a metadata write is worse than a
     // template with no back-link (the next save re-links it).
     let question_key = question.get_id().key().to_string();
+    // The bank lease has done its job (the template is inserted, its subject
+    // pinned); hand it back *before* taking the exam one, so this handler never
+    // holds both — the subject delete goes EXAM_LOCK then BANK_LOCK, and taking
+    // them the other way round here would be a deadlock.
+    drop(_bank_guard);
+    // Reader lease of [`EXAM_LOCK`] around the back-link, the one write this
+    // handler makes to `exam_question`. `ExamQuestion::update` is a whole-row
+    // save taken under `EXAM_LOCK.write()`; without this lease the link could
+    // land between that handler's read and its write, and the pre-link snapshot
+    // would be written straight back over it — the provenance silently lost.
+    // Held around the link alone, never across the blob copy above.
+    let _exam_guard = EXAM_LOCK.read().await;
     if let Err(err) = question
-        .link_source_bank(template.get_id().clone(), &st.db)
+        .link_banked_as(template.get_id().clone(), &st.db)
         .await
     {
         tracing::warn!(
@@ -2031,7 +2270,7 @@ async fn store_image(
     st: &AppState,
     exam: &Exam,
     question: &ExamQuestion,
-    slot: Option<i64>,
+    slot: Option<&ChoiceId>,
     content_type: FileContentType,
     data: &[u8],
 ) -> Result<QuestionImage, AppError> {
@@ -2192,18 +2431,18 @@ async fn delete_question_image(
 /// drops all its option pictures — re-upload against the new list.
 #[utoipa::path(
     post,
-    path = "/{id}/questions/{qid}/choices/{index}/image",
+    path = "/{id}/questions/{qid}/choices/{choice_id}/image",
     tag = "exams",
     security(("session_cookie" = [])),
     params(
         ("id" = String, Path, description = "Exam id"),
         ("qid" = String, Path, description = "Question id"),
-        ("index" = i64, Path, description = "Zero-based choice index"),
+        ("choice_id" = String, Path, description = "Choice id, as returned in the question's `choices`"),
     ),
     request_body(content = UploadFileForm, content_type = "multipart/form-data"),
     responses(
         (status = 201, description = "Image stored", body = ImageMetaResponse),
-        (status = 400, description = "Missing file field, empty file, a content type outside the image allowlist, a text question, or an index past the choices", body = ErrorResponse),
+        (status = 400, description = "Missing file field, empty file, a content type outside the image allowlist, a text question, or an unknown choice id", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "No such exam, or no such question in it", body = ErrorResponse),
@@ -2214,7 +2453,7 @@ async fn delete_question_image(
 async fn upload_choice_image(
     State(st): State<AppState>,
     RequireTeacher(user): RequireTeacher,
-    Path((id, qid, index)): Path<(String, String, i64)>,
+    Path((id, qid, choice_id)): Path<(String, String, String)>,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<ImageMetaResponse>), AppError> {
     let exam = image_managed_exam(&st, &user, &id).await?;
@@ -2224,40 +2463,21 @@ async fn upload_choice_image(
     let _guard = EXAM_LOCK.write().await;
     ensure_questions_editable(exam.get_id(), &st.db).await?;
     let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
-    let Some(choices) = question.get_choices() else {
-        return Err(AppError::Validation(ValidationError::Invalid {
-            field: "index",
-            reason: "only choice questions take option pictures",
-        }));
-    };
-    if !(0..choices.len() as i64).contains(&index) {
-        return Err(AppError::Validation(ValidationError::Invalid {
-            field: "index",
-            reason: "must index one of the choices",
-        }));
-    }
-    let stored = store_image(
-        &st,
-        &exam,
-        &question,
-        Some(index),
-        content_type,
-        &upload.data,
-    )
-    .await?;
+    let slot = choice_slot(&question, &choice_id)?;
+    let stored = store_image(&st, &exam, &question, Some(&slot), content_type, &upload.data).await?;
     Ok((StatusCode::CREATED, Json(ImageMetaResponse::new(&stored))))
 }
 
 /// One option's picture bytes. Same access wall as the question-image read.
 #[utoipa::path(
     get,
-    path = "/{id}/questions/{qid}/choices/{index}/image",
+    path = "/{id}/questions/{qid}/choices/{choice_id}/image",
     tag = "exams",
     security(("session_cookie" = [])),
     params(
         ("id" = String, Path, description = "Exam id"),
         ("qid" = String, Path, description = "Question id"),
-        ("index" = i64, Path, description = "Zero-based choice index"),
+        ("choice_id" = String, Path, description = "Choice id"),
     ),
     responses(
         (status = 200, description = "The image bytes", content_type = "image/*"),
@@ -2269,14 +2489,15 @@ async fn upload_choice_image(
 async fn get_choice_image(
     State(st): State<AppState>,
     CurrentUser(user): CurrentUser,
-    Path((id, qid, index)): Path<(String, String, i64)>,
+    Path((id, qid, choice_id)): Path<(String, String, String)>,
 ) -> Result<Response, AppError> {
     let exam = Exam::read(&ExamId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
     ensure_question_content_visible(&st, &exam, &user).await?;
     let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
-    let image = QuestionImage::read_slot(question.get_id(), Some(index), &st.db)
+    let slot = choice_slot(&question, &choice_id)?;
+    let image = QuestionImage::read_slot(question.get_id(), Some(&slot), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
     serve_image(&st, &image).await
@@ -2286,13 +2507,13 @@ async fn get_choice_image(
 /// the exam's course; frozen once attempts exist.
 #[utoipa::path(
     delete,
-    path = "/{id}/questions/{qid}/choices/{index}/image",
+    path = "/{id}/questions/{qid}/choices/{choice_id}/image",
     tag = "exams",
     security(("session_cookie" = [])),
     params(
         ("id" = String, Path, description = "Exam id"),
         ("qid" = String, Path, description = "Question id"),
-        ("index" = i64, Path, description = "Zero-based choice index"),
+        ("choice_id" = String, Path, description = "Choice id"),
     ),
     responses(
         (status = 204, description = "Deleted"),
@@ -2305,13 +2526,14 @@ async fn get_choice_image(
 async fn delete_choice_image(
     State(st): State<AppState>,
     RequireTeacher(user): RequireTeacher,
-    Path((id, qid, index)): Path<(String, String, i64)>,
+    Path((id, qid, choice_id)): Path<(String, String, String)>,
 ) -> Result<StatusCode, AppError> {
     let exam = image_managed_exam(&st, &user, &id).await?;
     let _guard = EXAM_LOCK.write().await;
     ensure_questions_editable(exam.get_id(), &st.db).await?;
     let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
-    let image = QuestionImage::read_slot(question.get_id(), Some(index), &st.db)
+    let slot = choice_slot(&question, &choice_id)?;
+    let image = QuestionImage::read_slot(question.get_id(), Some(&slot), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
     let image = image.delete(&st.db).await?;
@@ -2327,8 +2549,8 @@ async fn delete_choice_image(
 /// A student's own saved answer, embedded in their question view.
 #[derive(Serialize, ToSchema)]
 struct AnswerStateResponse {
-    /// The picked option's zero-based index (`choice` questions).
-    selected: Option<i64>,
+    /// The picked option's id (`choice` questions).
+    selected: Option<String>,
     /// The typed answer (`text` questions).
     text: Option<String>,
     /// When this answer was last saved, UTC unix-milliseconds.
@@ -2341,7 +2563,7 @@ struct AnswerStateResponse {
 impl AnswerStateResponse {
     fn new(answer: &ExamAnswer, answer_image: Option<ImageMetaResponse>) -> Self {
         Self {
-            selected: answer.get_selected(),
+            selected: answer.get_selected().map(|id| id.as_str().to_string()),
             text: answer.get_text().map(|t| t.as_str().to_string()),
             updated_at: answer.get_updated_at().as_millis(),
             answer_image,
@@ -2361,12 +2583,15 @@ struct AttemptQuestionResponse {
     #[schema(example = "choice")]
     kind: String,
     points: i64,
-    choices: Option<Vec<String>>,
+    /// The options with their ids — and deliberately *not* `correct`: this DTO
+    /// leaks no answer key because it has no field to carry one, and
+    /// `ChoiceResponse` carries none either.
+    choices: Option<Vec<ChoiceResponse>>,
     /// The question's illustration, if any — bytes at
     /// `GET /exams/{id}/questions/{qid}/image`.
     image: Option<ImageMetaResponse>,
     /// Per-option pictures aligned with `choices`, if any — bytes at
-    /// `GET /exams/{id}/questions/{qid}/choices/{index}/image`.
+    /// `GET /exams/{id}/questions/{qid}/choices/{choice_id}/image`.
     choice_images: Option<Vec<Option<ImageMetaResponse>>>,
     /// The caller's saved answer; `null` while unanswered.
     answer: Option<AnswerStateResponse>,
@@ -2376,8 +2601,8 @@ struct AttemptQuestionResponse {
 struct SaveAnswer {
     /// The question being answered.
     question_id: String,
-    /// The picked option's zero-based index — required for `choice` questions.
-    selected: Option<i64>,
+    /// The picked option's `id` — required for `choice` questions.
+    selected: Option<String>,
     /// The typed answer — required for `text` questions (empty clears the draft).
     text: Option<String>,
 }
@@ -2385,7 +2610,8 @@ struct SaveAnswer {
 #[derive(Serialize, ToSchema)]
 struct AnswerSavedResponse {
     question: String,
-    selected: Option<i64>,
+    /// The picked option's id.
+    selected: Option<String>,
     text: Option<String>,
     /// Save instant by the server clock, UTC unix-milliseconds.
     updated_at: i64,
@@ -2432,7 +2658,7 @@ pub(crate) async fn save_answer_checked(
     exam: &Exam,
     user: &UserId,
     question_id: &str,
-    selected: Option<i64>,
+    selected: Option<String>,
     text: Option<String>,
     db: &Database,
 ) -> Result<ExamAnswer, AppError> {
@@ -2452,7 +2678,7 @@ pub(crate) async fn save_answer_in(
     exam: &Exam,
     attempt: &ExamAttempt,
     question_id: &str,
-    selected: Option<i64>,
+    selected: Option<String>,
     text: Option<String>,
     db: &Database,
 ) -> Result<ExamAnswer, AppError> {
@@ -2580,9 +2806,7 @@ async fn attempt_questions(
                     text: question.get_text().as_str().to_string(),
                     kind: question.get_kind().as_str().to_string(),
                     points: question.get_points().as_i64(),
-                    choices: question
-                        .get_choices()
-                        .map(|choices| choices.iter().map(|c| c.as_str().to_string()).collect()),
+                    choices: ChoiceResponse::list(question.get_choices()),
                     image: image_meta(question_images, None),
                     choice_images: choice_image_metas(question, question_images),
                     answer: answers.get(question.get_id().key()).map(|answer| {
@@ -2643,7 +2867,7 @@ async fn save_answer(
     .await?;
     Ok(Json(AnswerSavedResponse {
         question: answer.get_question().key().to_string(),
-        selected: answer.get_selected(),
+        selected: answer.get_selected().map(|id| id.as_str().to_string()),
         text: answer.get_text().map(|t| t.as_str().to_string()),
         updated_at: answer.get_updated_at().as_millis(),
     }))
@@ -2727,7 +2951,7 @@ async fn answer_sheet(
             .iter()
             .map(|answer| StudentAnswerResponse {
                 question: answer.get_question().key().to_string(),
-                selected: answer.get_selected(),
+                selected: answer.get_selected().map(|id| id.as_str().to_string()),
                 text: answer.get_text().map(|t| t.as_str().to_string()),
                 updated_at: answer.get_updated_at().as_millis(),
                 is_correct: by_question
@@ -2746,7 +2970,8 @@ async fn answer_sheet(
 #[derive(Serialize, ToSchema)]
 struct StudentAnswerResponse {
     question: String,
-    selected: Option<i64>,
+    /// The picked option's id.
+    selected: Option<String>,
     text: Option<String>,
     /// When the answer was last saved, UTC unix-milliseconds.
     updated_at: i64,
