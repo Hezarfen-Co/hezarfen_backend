@@ -716,6 +716,21 @@ async fn exam_room_websocket_round_trip() {
     let error = ws_frame_of_type(&mut ws, "error").await;
     assert_eq!(error["question_id"], "nosuchquestion", "{error}");
 
+    // An over-long `question_id` dies at the door and is *not* reflected. The
+    // error frame echoes the field it blames, and axum accepts frames up to
+    // 64 MiB, so an uncapped echo is a self-inflicted amplifier — uncapped,
+    // this arrives back with all 70 000 characters attached.
+    ws_send(
+        &mut ws,
+        json!({ "type": "answer", "question_id": "x".repeat(70_000), "text": "x" }),
+    )
+    .await;
+    let error = ws_frame_of_type(&mut ws, "error").await;
+    let message = error["message"].as_str().unwrap();
+    assert!(message.contains("question_id"), "{error}");
+    assert!(message.len() < 200, "the id itself is never quoted back");
+    assert!(error.get("question_id").is_none(), "{error}");
+
     // Junk and unknown message types too — the room shrugs and stays up.
     // These are frame-level, not save-level: no question to blame, so the
     // client keeps failing everything in flight.
@@ -982,9 +997,14 @@ async fn exam_room_deadline_moves_with_a_live_extension() {
 /// `expired`, closes, and everything saved in time survives for grading.
 #[tokio::test]
 async fn exam_room_expires_mid_session() {
-    // The window closes ~2.6 s in — enough to connect and save, gone by the
-    // second tick. Real time: expiry is judged by the server clock.
-    let room = exam_room_fixture(2_600).await;
+    // A generous window while the room is set up. Keying the deadline off
+    // *fixture* time (this used to ask for 2.6 s) made the whole fixture race
+    // it — five HTTP calls plus a `raw_session_cookie` login, and argon2 is
+    // deliberately expensive, so on a loaded run the setup alone outran the
+    // window and the attempt POST below hit an already-closed exam (409).
+    // Nothing here cares *when* the window closes, only that it closes with the
+    // room open — so close it deliberately, further down, once it is.
+    let room = exam_room_fixture(600_000).await;
     let res = room
         .student
         .post(format!("{}/exams/{}/attempt", room.base, room.exam_id))
@@ -1006,6 +1026,28 @@ async fn exam_room_expires_mid_session() {
     )
     .await;
     ws_frame_of_type(&mut ws, "saved").await;
+
+    // Now bring the deadline in, from a *fresh* server clock — the room re-reads
+    // the schedule every tick, the same live-schedule path
+    // `exam_room_deadline_moves_with_a_live_extension` covers, in the other
+    // direction. Setup latency is behind us, so the only wait left is one tick.
+    let now: Value = room
+        .teacher
+        .get(format!("{}/time", room.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let res = room
+        .teacher
+        .patch(format!("{}/exams/{}", room.base, room.exam_id))
+        .json(&json!({ "ends_at": now["now"].as_i64().unwrap() + 1_000 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
 
     // A tick notices the deadline: `expired`, then the room closes.
     ws_frame_of_type(&mut ws, "expired").await;
