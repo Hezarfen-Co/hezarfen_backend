@@ -124,8 +124,9 @@ impl AudienceDto {
 
 #[derive(Deserialize, ToSchema)]
 struct CreateEvent {
-    #[schema(example = "Sprint demo")]
+    #[schema(max_length = 200, example = "Sprint demo")]
     title: String,
+    #[schema(max_length = 2000)]
     description: Option<String>,
     /// Who the event is for (its expected-attendee roster). Omit for a
     /// school-wide event.
@@ -138,7 +139,9 @@ struct CreateEvent {
 
 #[derive(Deserialize, ToSchema)]
 struct UpdateEvent {
+    #[schema(max_length = 200)]
     title: Option<String>,
+    #[schema(max_length = 2000)]
     description: Option<String>,
     /// Replaces the audience wholesale when present; omit to keep the current
     /// one. Attendance rows for people the change drops out of the roster stay
@@ -160,7 +163,7 @@ struct UpdateEvent {
 struct MarkAttendance {
     /// One of the school's attendance statuses (`GET /settings`; the core
     /// four are `present`, `absent`, `late`, `excused`).
-    #[schema(example = "present")]
+    #[schema(max_length = 50, example = "present")]
     status: String,
     /// Target user id — must be in the event's audience. Defaults to the
     /// caller when omitted.

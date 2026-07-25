@@ -86,6 +86,15 @@ struct Bucket {
     count: u32,
 }
 
+impl<K> RateLimiter<K> {
+    /// Requests allowed per window, `0` meaning the tier is off. Read by
+    /// `GET /limits` so a client learns its own budget instead of discovering
+    /// it by getting a `429`.
+    pub fn max_per_window(&self) -> u32 {
+        self.max
+    }
+}
+
 /// The per-user tier, keyed by user record key instead of client IP. Lives in
 /// [`crate::state::AppState`] and is called from inside a handler, after
 /// `CurrentUser` has identified the caller.

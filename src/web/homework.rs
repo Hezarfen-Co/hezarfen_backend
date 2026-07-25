@@ -239,10 +239,11 @@ async fn get_homework(
 #[derive(Deserialize, ToSchema)]
 struct UpdateHomework {
     /// Re-title. Omit to keep the current title.
+    #[schema(max_length = 200)]
     title: Option<String>,
     /// Re-describe. Omit to keep; send `null` (or `""`) to clear.
     #[serde(default, deserialize_with = "set_or_clear")]
-    #[schema(value_type = Option<String>)]
+    #[schema(value_type = Option<String>, max_length = 2_000)]
     description: Option<Option<String>>,
     /// New due date, UTC unix-milliseconds. Omit to keep; a newly set value
     /// must not be in the past (a kept one may already be past).
@@ -256,7 +257,7 @@ struct UpdateHomework {
     /// / `null` for the whole course. Omit to keep. Narrowing is refused (409)
     /// while it would orphan a student who already submitted or was graded.
     #[serde(default, deserialize_with = "set_or_clear")]
-    #[schema(value_type = Option<Vec<String>>)]
+    #[schema(value_type = Option<Vec<String>>, max_items = 200)]
     assigned: Option<Option<Vec<String>>>,
 }
 
@@ -564,7 +565,10 @@ struct SubmitHomework {
     /// replaces any previous text, and omitting it (or sending `""`) clears it.
     /// Files are managed separately via `.../submission/files` and are never
     /// touched here.
-    #[schema(example = "Answers to questions 1–4 are in the attached photo.")]
+    #[schema(
+        example = "Answers to questions 1–4 are in the attached photo.",
+        max_length = 5_000
+    )]
     text: Option<String>,
 }
 
@@ -951,6 +955,7 @@ struct GradeHomework {
     status: String,
     /// An optional 0–100 mark on top of the status; omit to grade on status
     /// alone.
+    #[schema(minimum = 0, maximum = 100)]
     mark: Option<i64>,
 }
 

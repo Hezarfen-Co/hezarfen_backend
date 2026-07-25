@@ -49,12 +49,14 @@ struct SetRole {
 /// current value, an empty string clears it, anything else is validated and set.
 #[derive(Deserialize, ToSchema)]
 struct UpdateProfile {
-    #[schema(example = "Ada")]
+    #[schema(example = "Ada", max_length = 100)]
     name: Option<String>,
-    #[schema(example = "Lovelace")]
+    #[schema(example = "Lovelace", max_length = 100)]
     surname: Option<String>,
-    #[schema(example = "ada@example.com")]
+    #[schema(example = "ada@example.com", max_length = 254)]
     email: Option<String>,
+    /// Any punctuation and spacing; it is the digit count that must land in
+    /// `7`–`15`, so no character-length bound applies.
     #[schema(example = "+90 555 123 45 67")]
     phone: Option<String>,
     /// Birth date in `YYYY-MM-DD` form.

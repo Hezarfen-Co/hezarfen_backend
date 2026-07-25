@@ -56,8 +56,9 @@ pub fn routes() -> OpenApiRouter<AppState> {
 
 #[derive(Deserialize, ToSchema)]
 struct CreateCourse {
-    #[schema(example = "Algebra")]
+    #[schema(max_length = 200, example = "Algebra")]
     title: String,
+    #[schema(max_length = 2000)]
     description: Option<String>,
     /// `course` (a regular class — the default), `study` (a supervised study
     /// session — etüt), or `club` (a student club — kulüp). Behaviorally
@@ -73,7 +74,9 @@ struct CreateCourse {
 
 #[derive(Deserialize, ToSchema)]
 struct UpdateCourse {
+    #[schema(max_length = 200)]
     title: Option<String>,
+    #[schema(max_length = 2000)]
     description: Option<String>,
     /// `course`, `study` (etüt), or `club` (kulüp). Omit to keep the current
     /// kind.
@@ -108,14 +111,15 @@ struct AssignTeacher {
 
 #[derive(Deserialize, ToSchema)]
 struct CreateExamInCourse {
-    #[schema(example = "Midterm")]
+    #[schema(max_length = 200, example = "Midterm")]
     title: String,
+    #[schema(max_length = 2000)]
     description: Option<String>,
     /// The assessment form — one of the school's exam kinds (`GET /settings`;
     /// defaults: `homework`, `quiz`, `midterm`, `final`, `project`, `oral`).
     /// The kind's settings-configured weight decides how heavily the exam
     /// counts into the course average.
-    #[schema(example = "midterm")]
+    #[schema(max_length = 50, example = "midterm")]
     kind: String,
     /// `sync` (one fixed window for everyone), `async` (each student starts
     /// inside the window and gets `duration_ms`), or `open` (no window — sit
@@ -131,11 +135,11 @@ struct CreateExamInCourse {
     ends_at: Option<i64>,
     /// Per-attempt time budget, milliseconds — required for `async`, optional
     /// for `open` (omit for unlimited time), forbidden for `sync`.
-    #[schema(example = 5_400_000_i64)]
+    #[schema(minimum = 60_000, maximum = 86_400_000, example = 5_400_000_i64)]
     duration_ms: Option<i64>,
     /// How many attempts each student gets, `1`–`100`, or `0` for unlimited.
     /// Defaults to `1` — the classic single sitting.
-    #[schema(example = 1)]
+    #[schema(minimum = 0, maximum = 100, example = 1)]
     max_attempts: Option<i64>,
     /// Whether a student who left the exam room may come back in and keep
     /// answering. Defaults to `true`; editable live while the exam runs.
@@ -893,8 +897,9 @@ async fn list_course_exams(
 
 #[derive(Deserialize, ToSchema)]
 struct CreateSubject {
-    #[schema(example = "Limits and continuity")]
+    #[schema(max_length = 200, example = "Limits and continuity")]
     name: String,
+    #[schema(max_length = 2000)]
     description: Option<String>,
 }
 
@@ -987,8 +992,9 @@ async fn list_course_subjects(
 
 #[derive(Deserialize, ToSchema)]
 struct CreateHomework {
-    #[schema(example = "Read chapter 3 and answer Q1-Q5")]
+    #[schema(max_length = 200, example = "Read chapter 3 and answer Q1-Q5")]
     title: String,
+    #[schema(max_length = 2000)]
     description: Option<String>,
     /// The course subject this homework belongs to
     /// (`GET /courses/{id}/subjects`). Required — every homework is tagged with
@@ -1002,6 +1008,7 @@ struct CreateHomework {
     /// The students this homework is for: a list of enrolled student ids. Omit,
     /// send `null`, or send `[]` to assign the whole enrolled course (whoever is
     /// enrolled when they submit); a subset caps at 200 named students.
+    #[schema(max_items = 200)]
     assigned: Option<Vec<String>>,
 }
 
@@ -1120,7 +1127,7 @@ async fn list_course_homework(
 #[derive(Deserialize, ToSchema)]
 struct CreateSessionInCourse {
     /// What the lesson covers. Optional.
-    #[schema(example = "Limits and continuity")]
+    #[schema(max_length = 200, example = "Limits and continuity")]
     topic: Option<String>,
     /// Who teaches the session. Defaults to the caller; must hold the
     /// `teacher` role or higher.

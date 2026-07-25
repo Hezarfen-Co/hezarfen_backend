@@ -26,7 +26,9 @@ pub fn routes() -> OpenApiRouter<AppState> {
 
 #[derive(Deserialize, ToSchema)]
 struct UpdateSubject {
+    #[schema(max_length = 200)]
     name: Option<String>,
+    #[schema(max_length = 2000)]
     description: Option<String>,
 }
 

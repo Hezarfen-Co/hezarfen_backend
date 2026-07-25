@@ -94,17 +94,18 @@ struct CreateBankQuestion {
     /// template is instantiated.
     #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
     subject_id: String,
-    #[schema(example = "What is 2 + 2?")]
+    #[schema(example = "What is 2 + 2?", max_length = 2000)]
     text: String,
     /// `choice` or `text`.
     #[schema(example = "choice")]
     kind: String,
     /// This template's default point value, `1`–`100`.
-    #[schema(example = 10)]
+    #[schema(example = 10, minimum = 1, maximum = 100)]
     points: i64,
     /// The options of a `choice` question (2–10 of them); omit for `text`.
     /// Each carries an `id` naming it within this payload — the server mints
     /// the stored ids and returns them.
+    #[schema(min_items = 2, max_items = 10)]
     choices: Option<Vec<ChoiceBody>>,
     /// The `id` of the right option, as sent in `choices`; required for
     /// `choice`, absent for `text`.
@@ -117,7 +118,9 @@ struct UpdateBankQuestion {
     /// Re-tag the template's origin subject. Omit to keep the current one
     /// (which is `null` if that subject has since been deleted).
     subject_id: Option<String>,
+    #[schema(max_length = 2000)]
     text: Option<String>,
+    #[schema(minimum = 1, maximum = 100)]
     points: Option<i64>,
     /// `choice` or `text`. Switching kinds needs the other fields to follow:
     /// send `choices` + `correct` when moving to `choice`, explicit `null`s
@@ -128,7 +131,7 @@ struct UpdateBankQuestion {
     /// with to keep it — its picture rides along. Only options whose id is
     /// absent from the new list lose their picture.
     #[serde(default, deserialize_with = "set_or_clear")]
-    #[schema(value_type = Option<Vec<ChoiceBody>>)]
+    #[schema(value_type = Option<Vec<ChoiceBody>>, min_items = 2, max_items = 10)]
     choices: Option<Option<Vec<ChoiceBody>>>,
     /// The `id` of the right option. Omit to keep; `null` to clear (text
     /// questions only).

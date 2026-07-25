@@ -22,7 +22,7 @@ pub fn routes() -> OpenApiRouter<AppState> {
 
 #[derive(Deserialize, ToSchema)]
 struct CreateTerm {
-    #[schema(example = "2026 Fall")]
+    #[schema(example = "2026 Fall", max_length = 100)]
     name: String,
     /// Term start, UTC unix-milliseconds. May lie in the past — a school
     /// adopting the app mid-year backfills its calendar legitimately.
@@ -35,6 +35,7 @@ struct CreateTerm {
 
 #[derive(Deserialize, ToSchema)]
 struct UpdateTerm {
+    #[schema(max_length = 100)]
     name: Option<String>,
     starts_at: Option<i64>,
     ends_at: Option<i64>,

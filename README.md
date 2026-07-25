@@ -112,7 +112,11 @@ the client then polls the message or reads it off an SSE stream (see
 
 Every field is a validated newtype (`Username(String)`, `NoteTitle(String)`, …)
 constructed only after its restrictions pass — invalid input can't be
-represented. Those same types derive `surrealdb::types::SurrealValue`, so one
+represented. Those restrictions are published rather than left to be guessed:
+**`GET /limits`** (no auth) serves every fixed bound and closed value set the
+API enforces, read straight from the constants the newtypes use, so a frontend
+validates against the server's own rules instead of a hand-kept copy (see
+"Validation limits"). Those same types derive `surrealdb::types::SurrealValue`, so one
 typed value flows from HTTP request into the `SCHEMAFULL` database. Record ids
 are ULIDs (time-sortable).
 
@@ -239,6 +243,113 @@ Timezones and clock differences cannot corrupt data, by construction:
   and past/future checks instead of trusting the device clock.
 
 Keep the single server's clock NTP-synced; that's the only clock that matters.
+
+## Validation limits
+
+Every fixed bound the API enforces is published at `GET /limits` (no auth), so
+a client never has to hard-code a copy that drifts the day a constant moves.
+The handler reads `src/constant.rs` directly — a changed constant changes the
+response in the same commit.
+
+```json
+{
+  "user":          { "min_username_len": 3, "max_username_len": 32,
+                     "username_separators": [".", "_", "-"],
+                     "reserved_usernames": ["admin", "…"],
+                     "min_password_len": 6, "max_password_len": 128,
+                     "max_name_len": 100, "max_email_len": 254,
+                     "min_phone_digits": 7, "max_phone_digits": 15,
+                     "roles": ["parent", "student", "teacher", "manager", "admin"],
+                     "themes": ["light", "dark"], "languages": ["tr", "en"],
+                     "session_duration_days": 7 },
+  "note":          { "max_title_len": 200, "max_content_len": 10000, "max_files": 10 },
+  "file":          { "max_name_len": 255, "max_content_type_len": 100,
+                     "min_max_file_bytes": 1024, "max_max_file_bytes": 26214400,
+                     "default_max_file_bytes": 5242880,
+                     "image_content_types": ["image/png", "image/jpeg", "image/webp", "image/gif"] },
+  "message":       { "max_subject_len": 200, "max_body_len": 10000, "max_label_len": 50 },
+  "event":         { "max_title_len": 200, "max_description_len": 2000 },
+  "course":        { "kinds": ["course", "study", "club"], "max_title_len": 200, "…": 0 },
+  "exam":          { "modes": ["sync", "async", "open"],
+                     "question_kinds": ["choice", "text"],
+                     "min_duration_ms": 60000, "max_duration_ms": 86400000,
+                     "max_attempts": 100, "unlimited_attempts": 0,
+                     "min_mark": 0, "max_mark": 100, "…": 0 },
+  "homework":      { "statuses": ["done", "incomplete", "missing"],
+                     "max_files_per_submission": 10, "max_assigned": 200, "…": 0 },
+  "question_pool": { "max_title_len": 200, "max_body_len": 10000, "max_solution_body_len": 10000 },
+  "appointment":   { "max_note_len": 500, "max_reason_len": 1000, "max_slot_occurrences": 52 },
+  "chatbot":       { "max_message_len": 8000, "max_thread_title_len": 200,
+                     "min_max_message_len": 100, "…": 0 },
+  "settings":      { "max_list_len": 20, "max_item_len": 50,
+                     "min_exam_kind_weight": 1, "max_exam_kind_weight": 100,
+                     "max_grade_bands": 20, "max_grade_label_len": 20,
+                     "required_attendance_statuses": ["present", "absent", "late", "excused"] },
+  "request":       { "max_page_limit": 500, "schedule_past_grace_ms": 60000,
+                     "request_timeout_secs": 30 },
+  "rate":          { "window_secs": 60, "auth_per_minute": 10,
+                     "api_per_minute": 300, "chatbot_per_minute": 20 }
+}
+```
+
+The `rate` group is the one part that is **not** compile-time: those tiers are
+environment-tunable, so the endpoint serves *this* server's live values (read
+from its running limiters), not the shipped defaults. `0` means the tier is
+off. A client should read its budget here rather than discovering it by
+collecting a `429`.
+
+### Two surfaces, one source
+
+The bounds are published twice, on purpose, because clients consume them two
+different ways:
+
+| Surface | Shape | Use it when |
+|---------|-------|-------------|
+| `GET /limits` | One JSON document, grouped by resource, closed value sets included | Runtime fetch. No codegen step, survives a deploy skew, and carries things OpenAPI holds awkwardly (`reserved_usernames`, `image_content_types`) |
+| `/api-docs/openapi.json` | Per-field `maxLength` / `minLength` / `minimum` / `maximum` / `maxItems` on the request schemas | Build-time codegen — `openapi-typescript`, `orval`, and friends turn these into types *and* validators automatically |
+
+Both are generated from the same `src/constant.rs`, and **neither is allowed to
+drift from it**, which is enforced rather than asked for:
+
+- `tests/limits_completeness.rs` parses every `pub const` out of `constant.rs`
+  and fails unless each one is either referenced by `src/web/limits.rs` or
+  listed as a deliberate exclusion *with a reason*. A new constant breaks the
+  suite until someone decides, consciously, whether clients need it.
+- `tests/spec_bounds.rs` builds the OpenAPI document, reads all 104 published
+  bounds back out of the emitted JSON, and asserts each equals its constant.
+  This exists because utoipa's `#[schema(max_length = …)]` accepts a **literal
+  only** — a `const` there does not compile — so the annotations are
+  unavoidably a second copy of each number. The test is what makes that copy
+  safe. It also pins the `limit` query parameter's `maximum` to
+  `MAX_PAGE_LIMIT`, a duplication `constant.rs` previously only *asked* a human
+  to maintain.
+- A third check in `limits_completeness.rs` refuses to let a validation bound
+  be declared **outside** `constant.rs` at all. Without it a limit can hide in
+  a domain module and reach neither surface — which is exactly where
+  `MAX_CHATBOT_THREAD_TITLE_LEN` was found sitting, private and unpublished.
+
+Notes:
+
+- **No auth.** The registration and login forms need the username and password
+  bounds before a session exists, and none of these are secrets — they are the
+  same rules a `400` already spells out in prose.
+- **Answers during a database outage.** `/limits` touches no row, so it is
+  exempt from the guard that answers `503` while the database reconnects — a
+  frontend booting against a degraded backend is exactly when it needs the
+  contract. Every route that does read the database still refuses.
+- **Fetch once.** The values are compile-time constants, so the response only
+  changes with a deploy. Cache it for the session; the `ETag`/`304` path makes
+  a revalidation cheap if you'd rather re-check.
+- **`/limits` is not `/settings`.** School-adjustable policy — the exam kinds
+  and their weights, the attendance statuses, the grade bands, the live
+  `max_file_bytes` and chatbot knobs — is on `GET /settings` and changes when a
+  manager edits it. What `/limits` carries for those knobs is the fixed range a
+  manager may set them *within* (`min_`/`max_`/`default_` prefixes), plus the
+  attendance statuses no school may remove.
+- **Closed value sets ride along.** `roles`, `themes`, `languages`, course
+  `kinds`, exam `modes`, `question_kinds`, homework `statuses`, and the
+  uploadable `image_content_types` are the exact accepted spellings — build
+  pickers from these rather than from a literal list.
 
 ## Rate limiting
 
@@ -449,6 +560,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/health`                        | no      | Liveness check                  |
 | GET    | `/`                              | no      | Same as `/health`               |
 | GET    | `/time`                          | no      | Server clock: `{now}` UTC unix-millis (frontend sync) |
+| GET    | `/limits`                        | no      | Every fixed validation bound, grouped by resource — see Validation limits |
 | GET    | `/swagger`                       | no      | Interactive API docs (Swagger UI) |
 | GET    | `/api-docs/openapi.json`         | no      | Raw OpenAPI 3 spec              |
 | GET    | `/ai/certificate`                | no      | The AI bridge's certificate (PEM + sha256) for a service to pin; `404` when the bridge is off |
@@ -1987,6 +2099,7 @@ src/
     courses.rs  subjects.rs  sessions.rs  exams.rs  homework.rs  questions.rs
     bank_questions.rs  marks.rs  work.rs  pomodoro.rs  attendance.rs
     settings.rs  terms.rs  ai.rs  chatbot.rs
+    limits.rs      GET /limits: every constant.rs bound served as JSON
 ```
 
 Tests: `cargo test` — unit (in-source), integration (`tower::oneshot` + in-memory

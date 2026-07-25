@@ -36,6 +36,7 @@ pub fn routes() -> OpenApiRouter<AppState> {
 
 #[derive(Deserialize, ToSchema)]
 struct UpdateSession {
+    #[schema(max_length = 200)]
     topic: Option<String>,
     /// Reassign the session's teacher. Omit to keep; must be teacher+.
     teacher_id: Option<String>,
@@ -53,7 +54,7 @@ struct UpdateSession {
 struct MarkRollCall {
     /// One of the school's attendance statuses (`GET /settings`; the core
     /// four are `present`, `absent`, `late`, `excused`).
-    #[schema(example = "present")]
+    #[schema(max_length = 50, example = "present")]
     status: String,
     /// Whose roll-call state to record: an enrolled student, or the session's
     /// teacher (the latter requires manager+).

@@ -136,7 +136,9 @@ pub fn routes() -> OpenApiRouter<AppState> {
 
 #[derive(Deserialize, ToSchema)]
 struct UpdateExam {
+    #[schema(max_length = 200)]
     title: Option<String>,
+    #[schema(max_length = 2000)]
     description: Option<String>,
     /// The assessment form — one of the school's exam kinds (`GET /settings`).
     /// Changing it re-weights the exam: the course average uses the kind's
@@ -164,11 +166,12 @@ struct UpdateExam {
     /// to keep; `null` to clear. Changing it mid-exam moves every running
     /// attempt's deadline.
     #[serde(default, deserialize_with = "set_or_clear")]
-    #[schema(value_type = Option<i64>)]
+    #[schema(value_type = Option<i64>, minimum = 60000, maximum = 86400000)]
     duration_ms: Option<Option<i64>>,
     /// Attempt limit: `1`–`100`, or `0` for unlimited. Omit to keep. Editable
     /// live — raising it grants retakes on the spot; lowering it only blocks
     /// future starts.
+    #[schema(minimum = 0, maximum = 100)]
     max_attempts: Option<i64>,
     /// Whether students who left the exam room may come back in. Omit to
     /// keep. Editable live — the teacher's door handle for the running room.
@@ -185,7 +188,7 @@ struct UpdateExam {
 #[derive(Deserialize, ToSchema)]
 struct GradeResult {
     /// The mark to record, `0`–`100`.
-    #[schema(example = 85)]
+    #[schema(example = 85, minimum = 0, maximum = 100)]
     mark: i64,
     /// The student being graded.
     #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
@@ -1332,17 +1335,18 @@ struct CreateQuestion {
     #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
     subject_id: String,
     /// The question itself.
-    #[schema(example = "What is 2 + 2?")]
+    #[schema(example = "What is 2 + 2?", max_length = 2000)]
     text: String,
     /// `choice` or `text`.
     #[schema(example = "choice")]
     kind: String,
     /// This question's share of the auto-score, `1`–`100`.
-    #[schema(example = 10)]
+    #[schema(example = 10, minimum = 1, maximum = 100)]
     points: i64,
     /// The options of a `choice` question (2–10 of them); omit for `text`.
     /// Each carries an `id` naming it within this payload — the server mints
     /// the stored ids and returns them.
+    #[schema(min_items = 2, max_items = 10)]
     choices: Option<Vec<ChoiceBody>>,
     /// The `id` of the right option, as sent in `choices`; required for
     /// `choice`, absent for `text`.
@@ -1356,7 +1360,9 @@ struct UpdateQuestion {
     /// keep the current one — a question always has a subject, so there is no
     /// clearing it.
     subject_id: Option<String>,
+    #[schema(max_length = 2000)]
     text: Option<String>,
+    #[schema(minimum = 1, maximum = 100)]
     points: Option<i64>,
     /// `choice` or `text`. Switching kinds needs the other fields to follow:
     /// send `choices` + `correct` when moving to `choice`, explicit `null`s
@@ -1368,7 +1374,7 @@ struct UpdateQuestion {
     /// absent from the new list lose their picture, so reordering, renaming,
     /// and deleting one option leave the rest untouched.
     #[serde(default, deserialize_with = "set_or_clear")]
-    #[schema(value_type = Option<Vec<ChoiceBody>>)]
+    #[schema(value_type = Option<Vec<ChoiceBody>>, min_items = 2, max_items = 10)]
     choices: Option<Option<Vec<ChoiceBody>>>,
     /// The `id` of the right option. Omit to keep; `null` to clear (text
     /// questions only).
@@ -2635,6 +2641,7 @@ struct SaveAnswer {
     /// The picked option's `id` — required for `choice` questions.
     selected: Option<String>,
     /// The typed answer — required for `text` questions (empty clears the draft).
+    #[schema(max_length = 10000)]
     text: Option<String>,
 }
 
@@ -3218,7 +3225,7 @@ async fn delete_answer_image(
     // as answered. A typed answer keeps its row.
     if let Some(answer) = ExamAnswer::read(question.get_id(), user.get_id(), seq, &st.db).await? {
         let blank = answer.get_selected().is_none()
-            && answer.get_text().map_or(true, |t| t.as_str().is_empty());
+            && answer.get_text().is_none_or(|t| t.as_str().is_empty());
         if blank {
             ExamAnswer::delete(question.get_id(), user.get_id(), seq, &st.db).await?;
         }

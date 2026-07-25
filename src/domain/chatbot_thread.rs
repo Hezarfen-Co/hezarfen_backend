@@ -7,6 +7,7 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use tokio::sync::Mutex;
 use ulid::Ulid;
 
+use crate::constant::MAX_CHATBOT_THREAD_TITLE_LEN;
 use crate::database::{CHATBOT_THREAD_TABLE, Database};
 use crate::domain::settings::Settings;
 use crate::domain::timestamp::Timestamp;
@@ -19,11 +20,6 @@ use crate::validate::validate_required;
 /// transactions don't serialize cross-record counts against concurrent
 /// inserts. Same reasoning, and the same shape, as `ENROLL_LOCK`.
 static CHATBOT_THREAD_LOCK: Mutex<()> = Mutex::const_new(());
-
-/// Bound on a thread's display name. Local to this module because
-/// `constant.rs` is another task's file; move it there with the rest of the
-/// chat limits when they are next touched.
-const MAX_CHATBOT_THREAD_TITLE_LEN: usize = 200;
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct ChatbotThreadId(RecordId);
