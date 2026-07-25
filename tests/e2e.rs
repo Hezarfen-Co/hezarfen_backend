@@ -688,13 +688,13 @@ async fn exam_room_websocket_round_trip() {
     let saved = ws_frame_of_type(&mut ws, "saved").await;
     assert_eq!(saved["question_id"], question_id.as_str());
     assert!(saved["updated_at"].as_i64().is_some());
-    // No `seq` was sent, so no `seq` comes back — not even a null. Clients
+    // No `client_seq` was sent, so no `client_seq` comes back — not even a null. Clients
     // that predate the field see exactly the frames they always saw.
-    assert!(saved.get("seq").is_none(), "{saved}");
+    assert!(saved.get("client_seq").is_none(), "{saved}");
     let state = ws_frame_of_type(&mut ws, "state").await;
     assert_eq!(state["answered"], 1, "{state}");
 
-    // With a `seq`, the ack carries it back verbatim: `question_id` alone
+    // With a `client_seq`, the ack carries it back verbatim: `question_id` alone
     // cannot settle a send, since a re-save after a timeout leaves two of them
     // outstanding for the same question. The server assigns it no meaning —
     // a repeat of an already-used value is saved and echoed like any other.
@@ -702,11 +702,11 @@ async fn exam_room_websocket_round_trip() {
         ws_send(
             &mut ws,
             json!({ "type": "answer", "question_id": question_id,
-                    "selected": room.choice_ids[1], "seq": 7 }),
+                    "selected": room.choice_ids[1], "client_seq": 7 }),
         )
         .await;
         let saved = ws_frame_of_type(&mut ws, "saved").await;
-        assert_eq!(saved["seq"], 7, "{saved}");
+        assert_eq!(saved["client_seq"], 7, "{saved}");
         assert_eq!(saved["question_id"], question_id.as_str());
         ws_frame_of_type(&mut ws, "state").await;
     }
@@ -715,23 +715,23 @@ async fn exam_room_websocket_round_trip() {
     // fail the exact send, even when the error names no question.
     ws_send(
         &mut ws,
-        json!({ "type": "answer", "question_id": "x".repeat(70_000), "text": "x", "seq": 8 }),
+        json!({ "type": "answer", "question_id": "x".repeat(70_000), "text": "x", "client_seq": 8 }),
     )
     .await;
     let error = ws_frame_of_type(&mut ws, "error").await;
-    assert_eq!(error["seq"], 8, "{error}");
+    assert_eq!(error["client_seq"], 8, "{error}");
     assert!(error.get("question_id").is_none(), "{error}");
-    // ... and `seq` rides alongside the blame when there is one.
+    // ... and `client_seq` rides alongside the blame when there is one.
     ws_send(
         &mut ws,
-        json!({ "type": "answer", "question_id": question_id, "text": "4", "seq": 9 }),
+        json!({ "type": "answer", "question_id": question_id, "text": "4", "client_seq": 9 }),
     )
     .await;
     let error = ws_frame_of_type(&mut ws, "error").await;
-    assert_eq!(error["seq"], 9, "{error}");
+    assert_eq!(error["client_seq"], 9, "{error}");
     assert_eq!(error["question_id"], question_id.as_str(), "{error}");
 
-    // `seq` is legal only because it is a declared field: everything else on
+    // `client_seq` is legal only because it is a declared field: everything else on
     // an `answer` is still refused outright.
     ws_send(
         &mut ws,
@@ -744,7 +744,7 @@ async fn exam_room_websocket_round_trip() {
         error["message"].as_str().unwrap().contains("unrecognized"),
         "{error}"
     );
-    assert!(error.get("seq").is_none(), "{error}");
+    assert!(error.get("client_seq").is_none(), "{error}");
 
     // A payload that doesn't fit the question is an error frame, not a close.
     ws_send(

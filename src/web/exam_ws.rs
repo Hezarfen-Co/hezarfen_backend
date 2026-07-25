@@ -10,25 +10,25 @@
 //! server → client
 //! - `{"type":"state", status, attempt, deadline, remaining_ms, now, answered, question_count}`
 //!   on connect, every [`EXAM_WS_TICK_SECS`], and after each save
-//! - `{"type":"saved", question_id, updated_at, seq?}` — an answer landed
+//! - `{"type":"saved", question_id, updated_at, client_seq?}` — an answer landed
 //! - `{"type":"pong"}`
 //! - `{"type":"finished", finished_at}` then Close — submitted (here or elsewhere)
 //! - `{"type":"expired"}` then Close — the deadline passed mid-session
-//! - `{"type":"error", message, question_id?, seq?}` — bad JSON, unknown type,
+//! - `{"type":"error", message, question_id?, client_seq?}` — bad JSON, unknown type,
 //!   validation, deadline. `question_id` is present only when the failure
 //!   belongs to that one `answer` (its payload or its question); absent means
 //!   the failure is connection- or sitting-level, so every save in flight is
 //!   equally refused
 //!
-//! `seq` on either reply is whatever the `answer` sent, echoed verbatim: the
+//! `client_seq` on either reply is whatever the `answer` sent, echoed verbatim: the
 //! server never reads it, never dedupes on it, and omits the key entirely when
 //! the request omitted it. `question_id` cannot serve as the correlation id —
 //! a re-save of the same question after a timeout leaves two sends
 //! outstanding for it.
 //!
 //! client → server
-//! - `{"type":"answer", question_id, selected? | text?, seq?}` (`selected` =
-//!   choice id, `seq` = the client's own correlation id)
+//! - `{"type":"answer", question_id, selected? | text?, client_seq?}` (`selected` =
+//!   choice id, `client_seq` = the client's own correlation id)
 //! - `{"type":"finish"}`
 //! - `{"type":"ping"}`
 //!
@@ -110,7 +110,7 @@ enum ClientMessage {
         /// has two sends outstanding, and the first reply would otherwise
         /// settle the second.
         #[serde(default)]
-        seq: Option<u64>,
+        client_seq: Option<u64>,
     },
     Finish,
     Ping,
@@ -379,11 +379,11 @@ async fn handle_message(
             question_id,
             selected,
             text,
-            seq,
+            client_seq,
         } => {
             // Cap the key before it can be echoed — see [`MAX_QUESTION_ID_LEN`].
             if let Err(err) = validate_required("question_id", &question_id, MAX_QUESTION_ID_LEN) {
-                let frame = error_frame_for(&AppError::Validation(err), None, seq);
+                let frame = error_frame_for(&AppError::Validation(err), None, client_seq);
                 return send(socket, frame).await;
             }
             // Re-read the exam so the save is judged against the *current*
@@ -416,7 +416,7 @@ async fn handle_message(
                         "question_id": answer.get_question().key(),
                         "updated_at": answer.get_updated_at().as_millis(),
                     });
-                    with_seq(&mut frame, seq);
+                    with_client_seq(&mut frame, client_seq);
                     send(socket, frame).await?;
                     // Progress changed — refresh the countdown/answered state
                     // right away rather than waiting out the tick.
@@ -426,7 +426,11 @@ async fn handle_message(
                     let attributed = in_save && attributable(&err);
                     send(
                         socket,
-                        error_frame_for(&err, attributed.then_some(question_id.as_str()), seq),
+                        error_frame_for(
+                            &err,
+                            attributed.then_some(question_id.as_str()),
+                            client_seq,
+                        ),
                     )
                     .await
                 }
@@ -485,21 +489,21 @@ fn error_frame(err: &AppError) -> Value {
 }
 
 /// Attach the request's correlation id, if it sent one. Omitted stays omitted
-/// — never `null` — so a client that sends no `seq` sees byte-identical
+/// — never `null` — so a client that sends no `client_seq` sees byte-identical
 /// frames.
-fn with_seq(frame: &mut Value, seq: Option<u64>) {
-    if let Some(seq) = seq {
-        frame["seq"] = json!(seq);
+fn with_client_seq(frame: &mut Value, client_seq: Option<u64>) {
+    if let Some(client_seq) = client_seq {
+        frame["client_seq"] = json!(client_seq);
     }
 }
 
 /// [`error_frame`] plus the optional blame: `question_id` when the failure
-/// belongs to one `answer` message, and `seq` whenever the `answer` carried
+/// belongs to one `answer` message, and `client_seq` whenever the `answer` carried
 /// one — the two are independent, so an unattributable failure is still
 /// matchable to the send that caused it. Absent keeps its original meaning —
 /// an unattributed failure — so a client that ignores the fields behaves
 /// exactly as before.
-fn error_frame_for(err: &AppError, question: Option<&str>, seq: Option<u64>) -> Value {
+fn error_frame_for(err: &AppError, question: Option<&str>, client_seq: Option<u64>) -> Value {
     let message = match err {
         AppError::Validation(err) => err.to_string(),
         AppError::NotFound => "not found".to_string(),
@@ -526,6 +530,6 @@ fn error_frame_for(err: &AppError, question: Option<&str>, seq: Option<u64>) -> 
     if let Some(question) = question {
         frame["question_id"] = json!(question);
     }
-    with_seq(&mut frame, seq);
+    with_client_seq(&mut frame, client_seq);
     frame
 }
