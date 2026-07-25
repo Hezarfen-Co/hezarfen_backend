@@ -264,11 +264,7 @@ impl Course {
     /// so a whole-row save from either side would revert the other. The
     /// `array::distinct` keeps the assignment idempotent even when two requests
     /// name the same teacher at once (the early return only sees a stale row).
-    pub async fn assign_teacher(
-        self,
-        teacher: &UserId,
-        db: &Database,
-    ) -> Result<Course, AppError> {
+    pub async fn assign_teacher(self, teacher: &UserId, db: &Database) -> Result<Course, AppError> {
         if self.is_assigned(teacher) {
             return Ok(self);
         }
@@ -281,7 +277,11 @@ impl Course {
             .bind(("usr", teacher.record()))
             .await?
             .check()?;
-        result.take::<Vec<Course>>(0)?.into_iter().next().ok_or(AppError::NotFound)
+        result
+            .take::<Vec<Course>>(0)?
+            .into_iter()
+            .next()
+            .ok_or(AppError::NotFound)
     }
 
     /// Drop `teacher` from this course. `None` when they weren't assigned, so
@@ -303,7 +303,11 @@ impl Course {
             .await?
             .check()?;
         Ok(Some(
-            result.take::<Vec<Course>>(0)?.into_iter().next().ok_or(AppError::NotFound)?,
+            result
+                .take::<Vec<Course>>(0)?
+                .into_iter()
+                .next()
+                .ok_or(AppError::NotFound)?,
         ))
     }
 

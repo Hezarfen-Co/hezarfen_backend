@@ -15,11 +15,11 @@ use surrealdb::types::{RecordId, SurrealValue};
 
 use crate::constant::{
     DEFAULT_ATTENDANCE_STATUSES, DEFAULT_CHATBOT_HISTORY_TURNS, DEFAULT_EXAM_KINDS,
-    DEFAULT_MAX_CHATBOT_THREADS, DEFAULT_MAX_CHATBOT_MESSAGE_LEN, DEFAULT_MAX_FILE_BYTES,
-    MAX_CHATBOT_HISTORY_TURNS, MAX_EXAM_KIND_WEIGHT, MAX_GRADE_BANDS, MAX_GRADE_LABEL_LEN, MAX_MARK,
-    MAX_MAX_CHATBOT_THREADS, MAX_MAX_CHATBOT_MESSAGE_LEN, MAX_MAX_FILE_BYTES,
+    DEFAULT_MAX_CHATBOT_MESSAGE_LEN, DEFAULT_MAX_CHATBOT_THREADS, DEFAULT_MAX_FILE_BYTES,
+    MAX_CHATBOT_HISTORY_TURNS, MAX_EXAM_KIND_WEIGHT, MAX_GRADE_BANDS, MAX_GRADE_LABEL_LEN,
+    MAX_MARK, MAX_MAX_CHATBOT_MESSAGE_LEN, MAX_MAX_CHATBOT_THREADS, MAX_MAX_FILE_BYTES,
     MAX_SETTINGS_ITEM_LEN, MAX_SETTINGS_LIST_LEN, MIN_CHATBOT_HISTORY_TURNS, MIN_EXAM_KIND_WEIGHT,
-    MIN_MARK, MIN_MAX_CHATBOT_THREADS, MIN_MAX_CHATBOT_MESSAGE_LEN, MIN_MAX_FILE_BYTES,
+    MIN_MARK, MIN_MAX_CHATBOT_MESSAGE_LEN, MIN_MAX_CHATBOT_THREADS, MIN_MAX_FILE_BYTES,
 };
 use crate::database::{Database, SETTINGS_TABLE};
 use crate::domain::text_fold;
@@ -704,7 +704,10 @@ mod tests {
         Settings::defaults().save(&db).await.unwrap();
         let loaded = Settings::load(&db).await.unwrap();
         assert_eq!(loaded.get_max_file_bytes(), DEFAULT_MAX_FILE_BYTES);
-        assert_eq!(loaded.get_chatbot_history_turns(), DEFAULT_CHATBOT_HISTORY_TURNS);
+        assert_eq!(
+            loaded.get_chatbot_history_turns(),
+            DEFAULT_CHATBOT_HISTORY_TURNS
+        );
         assert_eq!(
             loaded.get_max_chatbot_threads(),
             DEFAULT_MAX_CHATBOT_THREADS

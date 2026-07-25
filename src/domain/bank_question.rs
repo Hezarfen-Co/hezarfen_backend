@@ -191,7 +191,11 @@ impl BankQuestion {
     /// hold — and a round-trip through `try_new` would mint *new* choice ids,
     /// detaching the copy's `correct` and option pictures from its choices.
     pub fn spec(&self) -> QuestionSpec {
-        QuestionSpec::from_stored(self.kind.clone(), self.choices.clone(), self.correct.clone())
+        QuestionSpec::from_stored(
+            self.kind.clone(),
+            self.choices.clone(),
+            self.correct.clone(),
+        )
     }
 
     pub async fn create(
@@ -248,7 +252,10 @@ impl BankQuestion {
         created.ok_or_else(|| AppError::Internal("failed to create bank question".into()))
     }
 
-    pub async fn read(id: &BankQuestionId, db: &Database) -> Result<Option<BankQuestion>, AppError> {
+    pub async fn read(
+        id: &BankQuestionId,
+        db: &Database,
+    ) -> Result<Option<BankQuestion>, AppError> {
         Ok(db.select(id.record()).await?)
     }
 
@@ -481,8 +488,14 @@ mod tests {
         QuestionSpec::try_new(
             QuestionKind::try_new("choice").unwrap(),
             Some(vec![
-                ChoiceInput { id: Some("a".into()), text: "yes".into() },
-                ChoiceInput { id: Some("b".into()), text: "no".into() },
+                ChoiceInput {
+                    id: Some("a".into()),
+                    text: "yes".into(),
+                },
+                ChoiceInput {
+                    id: Some("b".into()),
+                    text: "no".into(),
+                },
             ]),
             Some("b".into()),
             &[],
@@ -672,7 +685,10 @@ mod tests {
 
         // One statement, so a page costs one round trip — a `;` here would mean
         // the per-row N+1 crept back in.
-        assert!(!USAGE_COUNTS_SQL.contains(';'), "usage_counts must be one statement");
+        assert!(
+            !USAGE_COUNTS_SQL.contains(';'),
+            "usage_counts must be one statement"
+        );
 
         let db = crate::database::init_mem().await.unwrap();
         let owner = UserId::generate();
@@ -725,15 +741,26 @@ mod tests {
         let counts = BankQuestion::usage_counts(&ids, &db).await.unwrap();
         assert_eq!(counts.get(used_twice.get_id().key()).copied(), Some(2));
         assert_eq!(counts.get(used_once.get_id().key()).copied(), Some(1));
-        assert_eq!(counts.get(unused.get_id().key()), None, "unused stays absent");
+        assert_eq!(
+            counts.get(unused.get_id().key()),
+            None,
+            "unused stays absent"
+        );
         assert_eq!(counts.len(), 2);
 
         // A template outside the page is never counted into it.
-        let narrow = BankQuestion::usage_counts(&[used_once.get_id()], &db).await.unwrap();
+        let narrow = BankQuestion::usage_counts(&[used_once.get_id()], &db)
+            .await
+            .unwrap();
         assert_eq!(narrow.len(), 1);
         assert_eq!(narrow.get(used_once.get_id().key()).copied(), Some(1));
         // An empty page asks nothing at all.
-        assert!(BankQuestion::usage_counts(&[], &db).await.unwrap().is_empty());
+        assert!(
+            BankQuestion::usage_counts(&[], &db)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -796,15 +823,24 @@ mod tests {
             .unwrap();
         assert_eq!(tail[0].get_text().as_str(), "question 0");
         // Text filter runs in SQL, case-insensitively, and narrows `total`.
-        let (hits, total) = BankQuestion::list(None, None, None, None, Some("QUESTION 3"), None, 0, &db)
-            .await
-            .unwrap();
-        assert_eq!((hits.len(), total), (1, 1));
-        // Owner filter with nobody's templates.
-        let (none, total) =
-            BankQuestion::list(None, Some(&UserId::generate()), None, None, None, None, 0, &db)
+        let (hits, total) =
+            BankQuestion::list(None, None, None, None, Some("QUESTION 3"), None, 0, &db)
                 .await
                 .unwrap();
+        assert_eq!((hits.len(), total), (1, 1));
+        // Owner filter with nobody's templates.
+        let (none, total) = BankQuestion::list(
+            None,
+            Some(&UserId::generate()),
+            None,
+            None,
+            None,
+            None,
+            0,
+            &db,
+        )
+        .await
+        .unwrap();
         assert!(none.is_empty());
         assert_eq!(total, 0);
     }
@@ -823,15 +859,24 @@ mod tests {
         )
         .await
         .unwrap();
-        for needle in ["istanbul", "İSTANBUL", "İstanbul", "ıstanbul", "ilçe", "ILCE"] {
-            let (hits, total) = BankQuestion::list(None, None, None, None, Some(needle), None, 0, &db)
-                .await
-                .unwrap();
+        for needle in [
+            "istanbul",
+            "İSTANBUL",
+            "İstanbul",
+            "ıstanbul",
+            "ilçe",
+            "ILCE",
+        ] {
+            let (hits, total) =
+                BankQuestion::list(None, None, None, None, Some(needle), None, 0, &db)
+                    .await
+                    .unwrap();
             assert_eq!((hits.len(), total), (1, 1), "needle {needle} missed");
         }
-        let (miss, total) = BankQuestion::list(None, None, None, None, Some("ankara"), None, 0, &db)
-            .await
-            .unwrap();
+        let (miss, total) =
+            BankQuestion::list(None, None, None, None, Some("ankara"), None, 0, &db)
+                .await
+                .unwrap();
         assert!(miss.is_empty());
         assert_eq!(total, 0);
     }

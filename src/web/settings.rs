@@ -239,7 +239,9 @@ async fn update_settings(
         params.attendance_statuses = attendance_statuses;
         params.grade_bands = grade_bands;
         params.max_file_bytes = req.max_file_bytes.unwrap_or(params.max_file_bytes);
-        params.chatbot_history_turns = req.chatbot_history_turns.unwrap_or(params.chatbot_history_turns);
+        params.chatbot_history_turns = req
+            .chatbot_history_turns
+            .unwrap_or(params.chatbot_history_turns);
         params.max_chatbot_threads = req
             .max_chatbot_threads
             .unwrap_or(params.max_chatbot_threads);

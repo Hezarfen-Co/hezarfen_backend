@@ -357,7 +357,10 @@ async fn legacy_subjectless_questions_are_destroyed_on_boot() {
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
     let question_id = common::id_of(&res.body);
     // Choice ids are minted server-side, so the answer names one off the response.
-    let picked = res.body["choices"][1]["id"].as_str().expect("choice id").to_string();
+    let picked = res.body["choices"][1]["id"]
+        .as_str()
+        .expect("choice id")
+        .to_string();
     let res = send(
         &app,
         "POST",
@@ -748,14 +751,26 @@ async fn attempt_history_survives_remigration() {
         );
     }
     set_role(&db, "ali", "teacher").await;
-    let teacher = send(&app, "POST", "/auth/login", None, Some(teacher_creds.clone()))
-        .await
-        .cookie
-        .unwrap();
-    let student = send(&app, "POST", "/auth/login", None, Some(student_creds.clone()))
-        .await
-        .cookie
-        .unwrap();
+    let teacher = send(
+        &app,
+        "POST",
+        "/auth/login",
+        None,
+        Some(teacher_creds.clone()),
+    )
+    .await
+    .cookie
+    .unwrap();
+    let student = send(
+        &app,
+        "POST",
+        "/auth/login",
+        None,
+        Some(student_creds.clone()),
+    )
+    .await
+    .cookie
+    .unwrap();
     let student_id = me_id(&app, &student).await;
 
     let course = create_course(&app, &teacher, "biology").await;
@@ -786,9 +801,15 @@ async fn attempt_history_survives_remigration() {
     // Two sittings: distinct answer text + distinct mark on each.
     for (text, mark) in [("mitochondria", 40), ("chloroplast", 90)] {
         assert_eq!(
-            send(&app, "POST", &format!("/exams/{exam}/attempt"), Some(&student), None)
-                .await
-                .status,
+            send(
+                &app,
+                "POST",
+                &format!("/exams/{exam}/attempt"),
+                Some(&student),
+                None
+            )
+            .await
+            .status,
             StatusCode::CREATED
         );
         let res = send(
@@ -809,7 +830,14 @@ async fn attempt_history_survives_remigration() {
         )
         .await;
         assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-        send(&app, "POST", &format!("/exams/{exam}/attempt/finish"), Some(&student), None).await;
+        send(
+            &app,
+            "POST",
+            &format!("/exams/{exam}/attempt/finish"),
+            Some(&student),
+            None,
+        )
+        .await;
     }
 
     // Second boot: migration re-applied over the two sittings' live rows.
@@ -859,9 +887,24 @@ async fn attempt_history_survives_remigration() {
         .iter()
         .map(|r| r["mark"].as_i64().unwrap())
         .collect();
-    assert_eq!(marks, vec![40, 90], "both sittings' marks durable, oldest first");
-    let res = send(&app, "GET", &format!("/exams/{exam}/results"), Some(&teacher), None).await;
-    assert_eq!(common::items(&res.body)[0]["mark"], 90, "seq 2 is grade-of-record");
+    assert_eq!(
+        marks,
+        vec![40, 90],
+        "both sittings' marks durable, oldest first"
+    );
+    let res = send(
+        &app,
+        "GET",
+        &format!("/exams/{exam}/results"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(
+        common::items(&res.body)[0]["mark"],
+        90,
+        "seq 2 is grade-of-record"
+    );
 }
 
 /// A chatbot thread and every turn in it die together: deleting the

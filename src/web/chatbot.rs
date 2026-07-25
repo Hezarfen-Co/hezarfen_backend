@@ -85,9 +85,7 @@ impl ChatbotThreadResponse {
     fn new(thread: &ChatbotThread) -> Self {
         Self {
             id: thread.get_id().key().to_string(),
-            title: thread
-                .get_title()
-                .map(|title| title.as_str().to_string()),
+            title: thread.get_title().map(|title| title.as_str().to_string()),
             created_at: thread.get_created_at().as_millis(),
             updated_at: thread.get_updated_at().as_millis(),
         }
@@ -232,11 +230,7 @@ async fn delete_thread(
 
 /// Read a thread the caller owns, or `404`. A foreign id is indistinguishable
 /// from a missing one.
-async fn own_thread(
-    id: &str,
-    user: &UserId,
-    db: &Database,
-) -> Result<ChatbotThread, AppError> {
+async fn own_thread(id: &str, user: &UserId, db: &Database) -> Result<ChatbotThread, AppError> {
     ChatbotThread::read_for(&ChatbotThreadId::from_key(id), user, db)
         .await?
         .ok_or(AppError::NotFound)
@@ -406,13 +400,9 @@ async fn send_message(
         return Ok(unavailable("no AI service is connected right now"));
     }
 
-    let prompt = ChatbotMessage::append_user(
-        thread.get_id(),
-        user.get_id(),
-        content.clone(),
-        &st.db,
-    )
-    .await?;
+    let prompt =
+        ChatbotMessage::append_user(thread.get_id(), user.get_id(), content.clone(), &st.db)
+            .await?;
     let answer =
         ChatbotMessage::append_pending_assistant(thread.get_id(), user.get_id(), &st.db).await?;
     // Never fatal: both rows are already written, and failing here would strand

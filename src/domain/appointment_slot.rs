@@ -565,17 +565,23 @@ mod tests {
             Err(AppError::ConflictOwned(_))
         ));
         // Touching at the boundary (ends where the next starts) → allowed.
-        assert!(AppointmentSlot::create(&teacher, at(2_000), at(3_000), None, &db)
-            .await
-            .is_ok());
-        assert!(AppointmentSlot::create(&teacher, at(0), at(1_000), None, &db)
-            .await
-            .is_ok());
+        assert!(
+            AppointmentSlot::create(&teacher, at(2_000), at(3_000), None, &db)
+                .await
+                .is_ok()
+        );
+        assert!(
+            AppointmentSlot::create(&teacher, at(0), at(1_000), None, &db)
+                .await
+                .is_ok()
+        );
         // A different teacher sharing the same window is fine.
         let other = UserId::from_key("t2");
-        assert!(AppointmentSlot::create(&other, at(1_000), at(2_000), None, &db)
-            .await
-            .is_ok());
+        assert!(
+            AppointmentSlot::create(&other, at(1_000), at(2_000), None, &db)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -636,9 +642,11 @@ mod tests {
             .await,
             Err(AppError::ConflictOwned(_))
         ));
-        assert!(AppointmentSlot::list_for_teacher(&teacher, &db)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            AppointmentSlot::list_for_teacher(&teacher, &db)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

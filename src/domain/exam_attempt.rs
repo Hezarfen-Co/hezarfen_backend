@@ -338,7 +338,10 @@ mod tests {
     /// The id of the question's second option — what these tests used to write
     /// as the index `1`.
     fn second_choice(question: &ExamQuestion) -> String {
-        question.get_choices().unwrap()[1].get_id().as_str().to_string()
+        question.get_choices().unwrap()[1]
+            .get_id()
+            .as_str()
+            .to_string()
     }
     use crate::domain::settings::Settings;
 
@@ -367,8 +370,14 @@ mod tests {
         let spec = QuestionSpec::try_new(
             QuestionKind::try_new("choice").unwrap(),
             Some(vec![
-                ChoiceInput { id: Some("a".into()), text: "5".into() },
-                ChoiceInput { id: Some("b".into()), text: "6".into() },
+                ChoiceInput {
+                    id: Some("a".into()),
+                    text: "5".into(),
+                },
+                ChoiceInput {
+                    id: Some("b".into()),
+                    text: "6".into(),
+                },
             ]),
             Some("b".into()),
             &[],
@@ -400,9 +409,16 @@ mod tests {
         let (first, created) = ExamAttempt::start(&exam, &user, &db).await.unwrap();
         assert!(created);
         assert_eq!(first.get_seq(), 1);
-        ExamAnswer::save(&question, &user, 1, Some(second_choice(&question)), None, &db)
-            .await
-            .unwrap();
+        ExamAnswer::save(
+            &question,
+            &user,
+            1,
+            Some(second_choice(&question)),
+            None,
+            &db,
+        )
+        .await
+        .unwrap();
         first.finish(&db).await.unwrap();
 
         // The retake lands as sitting #2 without touching sitting #1's answers.
@@ -434,9 +450,16 @@ mod tests {
         let (winner, created) = ExamAttempt::start(&exam, &user, &db).await.unwrap();
         assert!(created);
         assert_eq!(winner.get_seq(), 2);
-        ExamAnswer::save(&question, &user, 2, Some(second_choice(&question)), None, &db)
-            .await
-            .unwrap();
+        ExamAnswer::save(
+            &question,
+            &user,
+            2,
+            Some(second_choice(&question)),
+            None,
+            &db,
+        )
+        .await
+        .unwrap();
 
         // A stale double-start races on the same seq and loses to the
         // composite id: the duplicate create is rejected, and with no wipe in

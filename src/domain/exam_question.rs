@@ -340,7 +340,11 @@ impl ExamQuestion {
     /// The stored kind-dependent fields as the validated bundle (for
     /// merge-on-update, and for copying into the bank).
     pub fn spec(&self) -> QuestionSpec {
-        QuestionSpec::from_stored(self.kind.clone(), self.choices.clone(), self.correct.clone())
+        QuestionSpec::from_stored(
+            self.kind.clone(),
+            self.choices.clone(),
+            self.correct.clone(),
+        )
     }
 
     pub async fn create(
@@ -535,7 +539,10 @@ mod tests {
         ])
     }
 
-    fn spec(choices: Option<Vec<ChoiceInput>>, correct: Option<&str>) -> Result<QuestionSpec, ValidationError> {
+    fn spec(
+        choices: Option<Vec<ChoiceInput>>,
+        correct: Option<&str>,
+    ) -> Result<QuestionSpec, ValidationError> {
         QuestionSpec::try_new(kind("choice"), choices, correct.map(str::to_string), &[])
     }
 
@@ -593,8 +600,14 @@ mod tests {
         // An unlabelled option cannot be marked correct — there is nothing to
         // name it by until the server's minted id comes back in the response.
         let unlabelled = Some(vec![
-            ChoiceInput { id: None, text: "yes".into() },
-            ChoiceInput { id: None, text: "no".into() },
+            ChoiceInput {
+                id: None,
+                text: "yes".into(),
+            },
+            ChoiceInput {
+                id: None,
+                text: "no".into(),
+            },
         ]);
         assert!(spec(unlabelled, Some("a")).is_err());
     }
@@ -615,7 +628,11 @@ mod tests {
     /// option's identity, so reordering and deleting move nothing.
     #[tokio::test]
     async fn existing_ids_are_preserved_across_an_edit() {
-        let stored = spec(two_choices(), Some("a")).unwrap().into_parts().1.unwrap();
+        let stored = spec(two_choices(), Some("a"))
+            .unwrap()
+            .into_parts()
+            .1
+            .unwrap();
         let (first, second) = (stored[0].get_id().clone(), stored[1].get_id().clone());
 
         // Resubmit reordered, renaming the first option's text, and marking the
@@ -623,8 +640,14 @@ mod tests {
         let edited = QuestionSpec::try_new(
             kind("choice"),
             Some(vec![
-                ChoiceInput { id: Some(second.as_str().into()), text: "no".into() },
-                ChoiceInput { id: Some(first.as_str().into()), text: "YES".into() },
+                ChoiceInput {
+                    id: Some(second.as_str().into()),
+                    text: "no".into(),
+                },
+                ChoiceInput {
+                    id: Some(first.as_str().into()),
+                    text: "YES".into(),
+                },
             ]),
             Some(second.as_str().into()),
             &stored,
@@ -641,8 +664,14 @@ mod tests {
     #[tokio::test]
     async fn spec_rejects_a_duplicate_choice_id() {
         let dupes = Some(vec![
-            ChoiceInput { id: Some("a".into()), text: "yes".into() },
-            ChoiceInput { id: Some("a".into()), text: "no".into() },
+            ChoiceInput {
+                id: Some("a".into()),
+                text: "yes".into(),
+            },
+            ChoiceInput {
+                id: Some("a".into()),
+                text: "no".into(),
+            },
         ]);
         assert!(spec(dupes, Some("a")).is_err());
     }
@@ -652,7 +681,10 @@ mod tests {
         let n = |count: usize| {
             Some(
                 (0..count)
-                    .map(|i| ChoiceInput { id: Some(i.to_string()), text: "option".into() })
+                    .map(|i| ChoiceInput {
+                        id: Some(i.to_string()),
+                        text: "option".into(),
+                    })
                     .collect::<Vec<_>>(),
             )
         };
@@ -676,7 +708,10 @@ mod tests {
         /// `try_new` on create, so the ids are real minted ULIDs.
         fn stored_set(n: usize) -> Vec<Choice> {
             let inputs = (0..n)
-                .map(|i| ChoiceInput { id: Some(format!("s{i}")), text: format!("stored {i}") })
+                .map(|i| ChoiceInput {
+                    id: Some(format!("s{i}")),
+                    text: format!("stored {i}"),
+                })
                 .collect();
             QuestionSpec::try_new(kind("choice"), Some(inputs), Some("s0".into()), &[])
                 .unwrap()
@@ -806,8 +841,14 @@ mod tests {
     async fn spec_rejects_blank_or_oversized_choices() {
         let with = |text: String| {
             Some(vec![
-                ChoiceInput { id: Some("a".into()), text: "yes".into() },
-                ChoiceInput { id: Some("b".into()), text },
+                ChoiceInput {
+                    id: Some("a".into()),
+                    text: "yes".into(),
+                },
+                ChoiceInput {
+                    id: Some("b".into()),
+                    text,
+                },
             ])
         };
         assert!(spec(with("  ".into()), Some("a")).is_err());

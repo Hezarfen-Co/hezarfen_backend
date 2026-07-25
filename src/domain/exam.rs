@@ -620,4 +620,3 @@ mod tests {
         assert!(ExamSchedule::try_new(mode("async"), at(3), at(2), dur).is_err());
     }
 }
-
