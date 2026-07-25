@@ -18,7 +18,7 @@ use crate::domain::exam_question::{
 };
 use crate::domain::monotonic_id::next_ulid;
 use crate::domain::subject::SubjectId;
-use crate::domain::text_fold::{fold, fold_sql};
+use crate::domain::text_fold::{search_fold, search_fold_sql};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
@@ -295,7 +295,7 @@ impl BankQuestion {
         offset: i64,
         db: &Database,
     ) -> Result<(Vec<BankQuestion>, i64), AppError> {
-        let needle = q.map(|q| fold(q.trim())).filter(|q| !q.is_empty());
+        let needle = q.map(|q| search_fold(q.trim())).filter(|q| !q.is_empty());
         let mut clauses = Vec::new();
         if visible_to.is_some() {
             clauses.push("(visibility = 'school' OR owner = $viewer)");
@@ -309,7 +309,7 @@ impl BankQuestion {
         if subject.is_some() {
             clauses.push("subject = $subject");
         }
-        let text_clause = format!("{} CONTAINS $q", fold_sql("text"));
+        let text_clause = format!("{} CONTAINS $q", search_fold_sql("text"));
         if needle.is_some() {
             clauses.push(text_clause.as_str());
         }

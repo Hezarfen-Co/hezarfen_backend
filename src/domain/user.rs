@@ -9,7 +9,7 @@ use crate::database::{Database, USER_TABLE};
 use crate::domain::preferences::{Language, Theme};
 use crate::domain::profile::{BirthDate, Email, PersonName, Phone};
 use crate::domain::role::Role;
-use crate::domain::text_fold::{fold, fold_sql};
+use crate::domain::text_fold::{search_fold, search_fold_sql};
 use crate::error::{AppError, ValidationError};
 use crate::validate::{validate_password, validate_username};
 
@@ -341,12 +341,12 @@ impl User {
         role: Option<Role>,
         db: &Database,
     ) -> Result<Vec<User>, AppError> {
-        let needle = fold(query.trim());
+        let needle = search_fold(query.trim());
         let text_clause = format!(
             "({} CONTAINS $q OR {} CONTAINS $q OR {} CONTAINS $q)",
-            fold_sql("username"),
-            fold_sql("name ?? ''"),
-            fold_sql("surname ?? ''"),
+            search_fold_sql("username"),
+            search_fold_sql("name ?? ''"),
+            search_fold_sql("surname ?? ''"),
         );
         let mut clauses = Vec::new();
         if !needle.is_empty() {

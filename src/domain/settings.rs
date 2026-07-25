@@ -439,8 +439,9 @@ fn validate_list(field: &'static str, values: Vec<String>) -> Result<Vec<String>
     }
     // `to_lowercase` is locale-invariant — `İZİN` lowercases to `i̇zin` (with a
     // leftover combining dot) and would slip past `izin` as a distinct entry.
-    // Same folding as search uses, so the whole app agrees on "the same word".
-    let mut folded: Vec<String> = trimmed.iter().map(|v| text_fold::fold(v)).collect();
+    // The *identity* fold, not search's: search deliberately collapses `ü`→`u`,
+    // which would make a school unable to have both `tur` and `tür`.
+    let mut folded: Vec<String> = trimmed.iter().map(|v| text_fold::case_fold_tr(v)).collect();
     folded.sort_unstable();
     folded.dedup();
     if folded.len() != trimmed.len() {
@@ -557,6 +558,32 @@ mod tests {
                 ..params()
             })
             .is_err()
+        );
+    }
+
+    /// Dedup folds *case*, not letters. The search fold collapses `ü`→`u`, so
+    /// using it here made genuinely distinct Turkish words un-listable: a
+    /// school could not have both a `tur` and a `tür`.
+    #[tokio::test]
+    async fn distinct_turkish_words_are_not_duplicates() {
+        let with_kinds = |exam_kinds| {
+            Settings::try_new(SettingsParams {
+                exam_kinds,
+                ..params()
+            })
+        };
+        assert!(with_kinds(kinds(&["tur", "tür"])).is_ok());
+        assert!(with_kinds(kinds(&["kir", "kır"])).is_ok());
+        // A true case variant of one of them is still a duplicate.
+        assert!(with_kinds(kinds(&["tür", "TÜR"])).is_err());
+        assert!(with_kinds(kinds(&["kır", "KIR"])).is_err());
+        // Same on the other guarded list.
+        assert!(
+            Settings::try_new(SettingsParams {
+                attendance_statuses: statuses_with(&["tur", "tür"]),
+                ..params()
+            })
+            .is_ok()
         );
     }
 
