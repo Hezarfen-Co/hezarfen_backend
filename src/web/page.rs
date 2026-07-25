@@ -55,6 +55,73 @@ impl PageParams {
     }
 }
 
+/// A row that carries a schedule window, so [`WindowParams`] can filter and
+/// order it. Both ends are optional unix milliseconds; `order_key` is the row
+/// id key, used only to break ties so paging stays stable.
+pub trait Scheduled {
+    fn starts_at_ms(&self) -> Option<i64>;
+    fn ends_at_ms(&self) -> Option<i64>;
+    fn order_key(&self) -> &str;
+}
+
+/// The optional `?starts_after=&ends_after=` schedule window on a list of
+/// scheduled rows. Both are unix milliseconds and independent (AND-ed when
+/// both are given). Omit both and the list is untouched — same order, same
+/// total as an unfiltered call.
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct WindowParams {
+    /// Keep only rows starting strictly after this unix-millisecond instant.
+    /// Rows without a `starts_at` are dropped.
+    #[param(minimum = 0, example = 1_760_000_000_000_i64)]
+    pub starts_after: Option<i64>,
+    /// Keep only rows whose window has not finished by this unix-millisecond
+    /// instant: `ends_at > value`, falling back to `starts_at > value` when
+    /// `ends_at` is null. Rows with no schedule at all are dropped.
+    #[param(minimum = 0, example = 1_760_000_000_000_i64)]
+    pub ends_after: Option<i64>,
+}
+
+impl WindowParams {
+    /// Apply the window to an already-visibility-filtered list. With neither
+    /// parameter the list is returned untouched; with either, schedule-less
+    /// rows are dropped and the survivors are sorted ascending by `starts_at`
+    /// (falling back to `ends_at`), ties broken by id. A negative value is a
+    /// `400` naming the field.
+    pub fn apply<T: Scheduled>(&self, mut items: Vec<T>) -> Result<Vec<T>, AppError> {
+        for (field, value) in [
+            ("starts_after", self.starts_after),
+            ("ends_after", self.ends_after),
+        ] {
+            if value.is_some_and(|value| value < 0) {
+                return Err(AppError::Validation(ValidationError::Invalid {
+                    field,
+                    reason: "must not be negative",
+                }));
+            }
+        }
+        if self.starts_after.is_none() && self.ends_after.is_none() {
+            return Ok(items);
+        }
+        items.retain(|item| {
+            let starts = item.starts_at_ms();
+            let ends = item.ends_at_ms();
+            self.starts_after.is_none_or(|after| starts > Some(after))
+                && self
+                    .ends_after
+                    .is_none_or(|after| ends.or(starts) > Some(after))
+        });
+        // Every survivor has at least one end, so the fallback never yields
+        // `None` — but sort defensively rather than unwrapping.
+        items.sort_by(|a, b| {
+            let key = |item: &T| item.starts_at_ms().or_else(|| item.ends_at_ms());
+            key(a)
+                .cmp(&key(b))
+                .then_with(|| a.order_key().cmp(b.order_key()))
+        });
+        Ok(items)
+    }
+}
+
 /// One page of a list: the `items`, the full `total` (row count before the
 /// window), and the `limit`/`offset` that produced it. `limit` is `null` when
 /// the caller asked for every row.
@@ -120,6 +187,82 @@ mod tests {
         assert!(params(Some(MAX_PAGE_LIMIT + 1), None).resolve().is_err());
         assert!(params(Some(-5), None).resolve().is_err());
         assert!(params(None, Some(-1)).resolve().is_err());
+    }
+
+    struct Row(&'static str, Option<i64>, Option<i64>);
+
+    impl Scheduled for Row {
+        fn starts_at_ms(&self) -> Option<i64> {
+            self.1
+        }
+        fn ends_at_ms(&self) -> Option<i64> {
+            self.2
+        }
+        fn order_key(&self) -> &str {
+            self.0
+        }
+    }
+
+    fn rows() -> Vec<Row> {
+        vec![
+            Row("none", None, None),
+            Row("running", Some(10), Some(40)),
+            Row("later", Some(30), None),
+            Row("ending", None, Some(20)),
+            Row("tie", Some(30), Some(50)),
+        ]
+    }
+
+    fn keys(window: WindowParams) -> Vec<&'static str> {
+        window
+            .apply(rows())
+            .unwrap()
+            .iter()
+            .map(|row| row.0)
+            .collect()
+    }
+
+    fn window(starts_after: Option<i64>, ends_after: Option<i64>) -> WindowParams {
+        WindowParams {
+            starts_after,
+            ends_after,
+        }
+    }
+
+    #[test]
+    fn window_absent_leaves_the_list_untouched() {
+        assert_eq!(
+            keys(window(None, None)),
+            ["none", "running", "later", "ending", "tie"]
+        );
+    }
+
+    #[test]
+    fn ends_after_keeps_unfinished_rows_and_falls_back_to_starts_at() {
+        // `ending` has no start (kept on ends_at), `later` no end (kept on the
+        // starts_at fallback), `none` has neither and always drops. Ascending
+        // by starts_at ?? ends_at, ties broken by key.
+        assert_eq!(
+            keys(window(None, Some(15))),
+            ["running", "ending", "later", "tie"]
+        );
+        // At 25, `ending` (ends 20) is over; `running` (ends 40) is not.
+        assert_eq!(keys(window(None, Some(25))), ["running", "later", "tie"]);
+    }
+
+    #[test]
+    fn starts_after_excludes_started_and_start_less_rows() {
+        assert_eq!(keys(window(Some(25), None)), ["later", "tie"]);
+        // AND-ed with ends_after: `tie` ends at 50, while `later` has no end
+        // and its starts_at fallback (30) is already behind 45.
+        assert_eq!(keys(window(Some(25), Some(45))), ["tie"]);
+        assert!(keys(window(Some(60), None)).is_empty());
+    }
+
+    #[test]
+    fn window_rejects_negative_values() {
+        assert!(window(Some(-1), None).apply(rows()).is_err());
+        assert!(window(None, Some(-1)).apply(rows()).is_err());
     }
 
     #[test]

@@ -431,6 +431,19 @@ their existing shapes: the student exam-room reads
 `/exams/{id}/attempt/questions` and `/attempt/answers`, the `/marks` and
 `/attendance` report objects, the `/exams/{id}/live` monitor, and `/settings`.
 
+**Schedule window (`GET /events`, `GET /exams`).** Both lists additionally
+accept `?starts_after=` and `?ends_after=`, UTC unix-millis, both optional and
+independent (AND-ed when both are sent). `ends_after=T` keeps rows whose window
+has not finished — `ends_at > T`, falling back to `starts_at > T` when `ends_at`
+is `null`; `starts_after=T` keeps rows with `starts_at > T`. A row with no
+schedule at all (an event without times, an exam with no `mode` or in `open`
+mode) is excluded by either parameter. Supplying either one flips the order to
+**ascending by schedule** (`starts_at`, falling back to `ends_at`; ties by id),
+so `?ends_after=<now>&limit=20` gives the twenty *soonest* rows instead of the
+twenty newest-created — with neither parameter the list is byte-for-byte the
+newest-first list it always was. `total` is the count after visibility *and*
+window filtering, before paging; negative values are a `400` naming the field.
+
 | Method | Path                             | Auth    | Description                     |
 |--------|----------------------------------|---------|---------------------------------|
 | GET    | `/health`                        | no      | Liveness check                  |
@@ -469,7 +482,7 @@ their existing shapes: the student exam-room reads
 | PATCH  | `/messages/{id}`                 | student | `{read?, folder?}` — read flag (recipient only) and/or move **own copy** (recipient: `inbox`/`archive`/`trash`; sender: `sent`/`archive`/`trash`) |
 | DELETE | `/messages/{id}`                 | student | Permanently delete **own copy** — only from the trash (`409` elsewhere); the row vanishes once both sides deleted |
 | POST   | `/events`                        | teacher | `{title, description?, audience?, starts_at?, ends_at?}` — `audience` defaults to school-wide |
-| GET    | `/events`                        | student | List all events · paged         |
+| GET    | `/events`                        | student | List all events · paged · `?starts_after=&ends_after=` window (soonest first) |
 | GET    | `/events/{id}`                   | student | Get event                       |
 | PATCH  | `/events/{id}`                   | teacher | Edit event (creator, or manager+ for any); a sent `audience` replaces the old one wholesale |
 | DELETE | `/events/{id}`                   | teacher | Delete event (creator, or manager+ for any) |
@@ -517,7 +530,7 @@ their existing shapes: the student exam-room reads
 | DELETE | `/sessions/{id}/attendance/{user}` | teacher | Remove a roll-call row (same rights as marking) |
 | POST   | `/courses/{id}/exams`            | teacher | `{title, description?, kind, mode?, starts_at?, ends_at?, duration_ms?, max_attempts?, allow_rejoin?, allow_review?, draft?}` — add an exam (course manager); its weight comes from the kind; `draft: true` keeps it hidden while it's written |
 | GET    | `/courses/{id}/exams`            | student | List the course's exams (enrolled, creator, assigned teacher, or manager+; drafts appear to course managers only) · paged |
-| GET    | `/exams`                         | student | The caller's visible exams: their courses' (manager+: all; drafts of managed courses only) · paged |
+| GET    | `/exams`                         | student | The caller's visible exams: their courses' (manager+: all; drafts of managed courses only) · paged · `?starts_after=&ends_after=` window (soonest first) |
 | GET    | `/exams/{id}`                    | student | Get exam (enrolled, creator, or manager+; a draft is a `404` for everyone but its course's managers) |
 | PATCH  | `/exams/{id}`                    | teacher | Edit exam incl. `kind` (re-weights it), schedule, `max_attempts`, `allow_rejoin`, `allow_review`, `draft` (course manager; `course` immutable, `mode` frozen once attempted, re-drafting frozen once attempts/results exist — the rest stays live) |
 | DELETE | `/exams/{id}`                    | teacher | Delete exam + its results, attempts, questions, answers, and question + answer images (course manager) |
