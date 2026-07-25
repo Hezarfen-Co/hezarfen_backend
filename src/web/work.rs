@@ -207,15 +207,11 @@ async fn update_entry(
         ));
     };
 
-    let check_in = req
-        .check_in
-        .map(Timestamp::from_millis)
-        .unwrap_or_else(|| entry.get_check_in());
-    let check_out = req
-        .check_out
-        .map(Timestamp::from_millis)
-        .unwrap_or(current_out);
-    if check_out < check_in {
+    let check_in = req.check_in.map(Timestamp::from_millis);
+    let check_out = req.check_out.map(Timestamp::from_millis);
+    // The side the correction left out is only *read* for the ordering check —
+    // it is never written back, so a concurrent correction of it survives.
+    if check_out.unwrap_or(current_out) < check_in.unwrap_or_else(|| entry.get_check_in()) {
         return Err(AppError::Validation(ValidationError::Invalid {
             field: "check_out",
             reason: "must be at or after check_in",

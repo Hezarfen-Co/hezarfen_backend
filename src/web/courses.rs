@@ -428,37 +428,32 @@ async fn update_course(
         ));
     }
 
-    let title = match req.title {
-        Some(ref title) => CourseTitle::try_new(title)?,
-        None => course.get_title().clone(),
-    };
-    let description = match req.description {
-        Some(ref description) => CourseDescription::try_new(description)?,
-        None => course.get_description().clone(),
-    };
-    let kind = match req.kind {
-        Some(ref kind) => CourseKind::try_new(kind)?,
-        None => course.get_kind().clone(),
-    };
+    // Only what the request actually carried is validated and written — an
+    // omitted field stays `None` so the save never re-sends this snapshot's
+    // value over a concurrent PATCH of that field.
+    let title = req.title.as_deref().map(CourseTitle::try_new).transpose()?;
+    let description = req
+        .description
+        .as_deref()
+        .map(CourseDescription::try_new)
+        .transpose()?;
+    let kind = req.kind.as_deref().map(CourseKind::try_new).transpose()?;
     // Same [`TERM_LOCK`] window as create — held over the lookup and the save
     // whenever this PATCH links a term (clearing or omitting needs no guard).
     let _term_guard = match req.term_id {
         Some(Some(_)) => Some(TERM_LOCK.lock().await),
         _ => None,
     };
+    // Both columns are nullable, so both stay clearable: omitted is `None`
+    // (keep), an explicit `null` is `Some(None)` (write `NONE`).
     let term = match req.term_id {
         // Explicit `null` clears the link; a value must name a real term.
-        Some(update) => resolve_term(update.as_deref(), &st.db).await?,
-        None => course.get_term().cloned(),
+        Some(ref update) => Some(resolve_term(update.as_deref(), &st.db).await?),
+        None => None,
     };
-    let capacity = match req.capacity {
-        // Explicit `null` lifts the cap; a value must be positive.
-        Some(update) => {
-            check_capacity(update)?;
-            update
-        }
-        None => course.get_capacity(),
-    };
+    // Explicit `null` lifts the cap; a value must be positive.
+    check_capacity(req.capacity.flatten())?;
+    let capacity = req.capacity;
 
     let updated = course
         .update(title, description, kind, term, capacity, &st.db)

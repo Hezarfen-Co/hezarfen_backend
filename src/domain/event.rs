@@ -7,6 +7,7 @@ use crate::constant::{MAX_EVENT_DESCRIPTION_LEN, MAX_EVENT_TITLE_LEN};
 use crate::database::{Database, EVENT_TABLE};
 use crate::domain::course::CourseId;
 use crate::domain::enrollment::Enrollment;
+use crate::domain::field_update::FieldUpdate;
 use crate::domain::registration::Registration;
 use crate::domain::role::Role;
 use crate::domain::timestamp::Timestamp;
@@ -249,32 +250,30 @@ impl Event {
         Ok(result.take::<Vec<Event>>(0)?)
     }
 
-    /// Field-scoped: the handler reads the event, then awaits the clock and a
-    /// course lookup before saving, holding no lock — a whole-row save would
-    /// carry the stale `creator` and every other column back over the row.
+    /// Request-scoped: the handler reads the event, then awaits the clock and a
+    /// course lookup before saving, holding no lock, so an omitted field
+    /// (`None`) is not written at all. Passing the snapshot's value back
+    /// instead would revert a concurrent edit of that field — scoping the `SET`
+    /// alone does not prevent that, the values have to come from the request.
+    /// The schedule columns are nullable, so they take the outer/inner
+    /// `Option<Option<_>>`: `None` = omitted (keep), `Some(None)` = clear.
     pub async fn update(
         self,
-        title: EventTitle,
-        description: EventDescription,
-        audience: EventAudience,
-        starts_at: Option<Timestamp>,
-        ends_at: Option<Timestamp>,
+        title: Option<EventTitle>,
+        description: Option<EventDescription>,
+        audience: Option<EventAudience>,
+        starts_at: Option<Option<Timestamp>>,
+        ends_at: Option<Option<Timestamp>>,
         db: &Database,
     ) -> Result<Event, AppError> {
-        let mut result = db
-            .query(
-                "UPDATE $id SET title = $title, description = $description,
-                 audience = $audience, starts_at = $starts_at, ends_at = $ends_at RETURN AFTER",
-            )
-            .bind(("id", self.id.record()))
-            .bind(("title", title))
-            .bind(("description", description))
-            .bind(("audience", audience))
-            .bind(("starts_at", starts_at))
-            .bind(("ends_at", ends_at))
-            .await?
-            .check()?;
-        result.take::<Vec<Event>>(0)?.into_iter().next().ok_or(AppError::NotFound)
+        FieldUpdate::new(self.id.record())
+            .set("title", title)
+            .set("description", description)
+            .set("audience", audience)
+            .set("starts_at", starts_at)
+            .set("ends_at", ends_at)
+            .run::<Event>(db)
+            .await
     }
 
     /// Delete the event and cascade-remove its attendance and signup rows.

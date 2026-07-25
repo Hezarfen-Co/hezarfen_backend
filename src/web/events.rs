@@ -344,38 +344,42 @@ async fn update_event(
         ));
     }
 
-    let title = match req.title {
-        Some(ref title) => EventTitle::try_new(title)?,
-        None => event.get_title().clone(),
-    };
-    let description = match req.description {
-        Some(ref description) => EventDescription::try_new(description)?,
-        None => event.get_description().clone(),
-    };
+    // Only what the request carried: an omitted field stays `None` and is
+    // never written, so a concurrent PATCH of another field survives. (A JSON
+    // `null` deserializes to `None` for title/description/audience too —
+    // those columns are not nullable, so "omitted" and "null" both mean
+    // "keep".)
+    let title = req.title.as_deref().map(EventTitle::try_new).transpose()?;
+    let description = req
+        .description
+        .as_deref()
+        .map(EventDescription::try_new)
+        .transpose()?;
     let audience = match req.audience {
-        Some(audience) => audience.into_domain(&st.db).await?,
-        None => event.get_audience().clone(),
+        Some(audience) => Some(audience.into_domain(&st.db).await?),
+        None => None,
     };
-    // A provided value sets the field, an explicit `null` clears it, and an
-    // omitted one keeps the current value. Only set values are held to the
+    // The schedule columns are nullable, so they keep the outer/inner
+    // distinction: a provided value sets the field, an explicit `null` clears
+    // it, and an omitted one is left alone. Only set values are held to the
     // no-past rule — a kept time of an event already underway may be past.
-    let starts_at = match req.starts_at {
-        Some(update) => {
-            let starts_at = update.map(Timestamp::from_millis);
-            check_not_past("starts_at", starts_at)?;
-            starts_at
-        }
-        None => event.get_starts_at(),
-    };
-    let ends_at = match req.ends_at {
-        Some(update) => {
-            let ends_at = update.map(Timestamp::from_millis);
-            check_not_past("ends_at", ends_at)?;
-            ends_at
-        }
-        None => event.get_ends_at(),
-    };
-    check_time_range(starts_at, ends_at)?;
+    let starts_at = req
+        .starts_at
+        .map(|update| update.map(Timestamp::from_millis));
+    let ends_at = req.ends_at.map(|update| update.map(Timestamp::from_millis));
+    if let Some(starts_at) = starts_at {
+        check_not_past("starts_at", starts_at)?;
+    }
+    if let Some(ends_at) = ends_at {
+        check_not_past("ends_at", ends_at)?;
+    }
+    // The range CHECK needs both ends: whichever the request omitted comes
+    // from the stored row. Read for the check only — the omitted side is
+    // never written back.
+    check_time_range(
+        starts_at.unwrap_or_else(|| event.get_starts_at()),
+        ends_at.unwrap_or_else(|| event.get_ends_at()),
+    )?;
 
     let updated = event
         .update(title, description, audience, starts_at, ends_at, &st.db)

@@ -391,6 +391,38 @@ async fn note_content_defaults_to_empty() {
     assert_eq!(res.body["content"], "");
 }
 
+/// Regression: two partial PATCHes touching *different* fields must both
+/// survive. The handler used to fill the field a request omitted from the
+/// snapshot it had read, so the writer that landed second reverted the other
+/// one's field — a field-scoped `SET` does not help while the value bound to
+/// it comes from a stale read. Raced repeatedly: a single round only loses the
+/// update on the interleaving where both handlers read before either writes.
+#[tokio::test]
+async fn concurrent_partial_note_patches_keep_both_fields() {
+    let app = mem_app().await;
+    let ali = login(&app, "ali").await;
+
+    for round in 0..20 {
+        let note = create_note(&app, &ali, "old title").await;
+        let uri = format!("/notes/{note}");
+        let title_patch = json!({ "title": "new title" });
+        let content_patch = json!({ "content": "new body" });
+        let (a, b) = tokio::join!(
+            send(&app, "PATCH", &uri, Some(&ali), Some(title_patch)),
+            send(&app, "PATCH", &uri, Some(&ali), Some(content_patch)),
+        );
+        assert_eq!(a.status, StatusCode::OK, "round {round} title patch");
+        assert_eq!(b.status, StatusCode::OK, "round {round} content patch");
+
+        let after = send(&app, "GET", &uri, Some(&ali), None).await.body;
+        assert_eq!(after["title"], "new title", "round {round}: title reverted");
+        assert_eq!(
+            after["content"], "new body",
+            "round {round}: content reverted"
+        );
+    }
+}
+
 #[tokio::test]
 async fn note_validation_and_missing_ids() {
     let app = mem_app().await;
@@ -18914,9 +18946,9 @@ async fn a_course_patch_does_not_clobber_a_concurrent_teacher_assignment() {
 
     let updated = stale
         .update(
-            CourseTitle::try_new("renamed").unwrap(),
-            CourseDescription::try_new("").unwrap(),
-            CourseKind::course(),
+            Some(CourseTitle::try_new("renamed").unwrap()),
+            Some(CourseDescription::try_new("").unwrap()),
+            Some(CourseKind::course()),
             None,
             None,
             &db,

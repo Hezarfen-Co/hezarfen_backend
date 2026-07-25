@@ -301,38 +301,41 @@ async fn update_homework(
     // also pins the subject re-tag against a concurrent subject delete.
     let _guard = HOMEWORK_LOCK.write().await;
 
-    let title = match req.title {
-        Some(ref title) => HomeworkTitle::try_new(title)?,
-        None => homework.get_title().clone(),
-    };
-    let description = match req.description {
-        Some(Some(ref text)) => description_or_none(text)?,
-        Some(None) => None,
-        None => homework.get_description().cloned(),
-    };
-    let due_at = match req.due_at {
-        Some(millis) => {
-            let due_at = Timestamp::from_millis(millis);
-            check_not_past("due_at", Some(due_at))?;
-            due_at
-        }
-        None => homework.get_due_at(),
-    };
+    // Only what the request carried: an omitted field stays `None` and is never
+    // written, so a concurrent PATCH of another field survives. The two
+    // nullable columns keep their double option — `Some(None)` still clears.
+    let title = req
+        .title
+        .as_deref()
+        .map(HomeworkTitle::try_new)
+        .transpose()?;
+    // `null` and `""` both mean "clear" here, as they always have.
+    let description = req
+        .description
+        .map(|text| description_or_none(text.as_deref().unwrap_or("")))
+        .transpose()?;
+    let due_at = req.due_at.map(Timestamp::from_millis);
+    // A kept (absent) due date may already be past; a newly set one may not be.
+    check_not_past("due_at", due_at)?;
     let subject = match req.subject_id {
-        Some(ref subject_id) => subject_in_course(subject_id, course.get_id(), &st.db).await?,
-        None => homework.get_subject().clone(),
+        Some(ref subject_id) => Some(subject_in_course(subject_id, course.get_id(), &st.db).await?),
+        None => None,
     };
+    // The orphan guard runs on exactly the requests that re-scope the audience.
+    // An absent `assigned` writes nothing, so the stored subset is untouched and
+    // no narrowing can happen behind the guard's back — which the old "carry the
+    // snapshot back" branch could do, re-narrowing over a concurrent widening.
     let assigned = match req.assigned {
         Some(assigned) => {
             let resolved = resolve_assigned(assigned, course.get_id(), &st.db).await?;
             ensure_no_orphans(&homework, resolved.as_deref(), &st.db).await?;
-            resolved
+            Some(resolved)
         }
-        None => homework.get_assigned().map(<[UserId]>::to_vec),
+        None => None,
     };
 
     let updated = homework
-        .update(&subject, title, description, due_at, assigned, &st.db)
+        .update(subject, title, description, due_at, assigned, &st.db)
         .await?;
     Ok(Json(HomeworkResponse::new(&updated)))
 }

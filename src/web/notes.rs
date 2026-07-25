@@ -174,14 +174,16 @@ async fn update(
         .await?
         .ok_or(AppError::NotFound)?;
 
-    let title = match req.title {
-        Some(ref title) => NoteTitle::try_new(title)?,
-        None => note.get_title().clone(),
-    };
-    let content = match req.content {
-        Some(ref content) => NoteContent::try_new(content)?,
-        None => note.get_content().clone(),
-    };
+    // Only what the request carried: an omitted field stays `None` and is
+    // never written, so a concurrent PATCH of the other field survives. (A
+    // JSON `null` deserializes to `None` too — neither column is nullable, so
+    // "omitted" and "null" both mean "keep it".)
+    let title = req.title.as_deref().map(NoteTitle::try_new).transpose()?;
+    let content = req
+        .content
+        .as_deref()
+        .map(NoteContent::try_new)
+        .transpose()?;
 
     let updated = note.update(title, content, &st.db).await?;
     Ok(Json(NoteResponse::new(&updated)))

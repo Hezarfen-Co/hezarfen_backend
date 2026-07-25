@@ -2,6 +2,7 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use ulid::Ulid;
 
 use crate::database::{Database, WORK_ENTRY_TABLE};
+use crate::domain::field_update::FieldUpdate;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
@@ -157,23 +158,22 @@ impl WorkEntry {
 
     /// Persist corrected instants (manager fix-ups on closed entries; the web
     /// layer validates ordering and rejects open entries).
-    /// Field-scoped: the stint's `user` is never part of a correction, so it is
-    /// left out of the write rather than replayed from a struct the handler
-    /// read before its validation awaits.
+    /// `None` = the correction left that instant out, so it is not written at
+    /// all — the stint's `user` and `check_in`/`check_out` stamps are never
+    /// replayed from a struct the handler read before its validation awaits.
+    /// `check_out` is never cleared here: an open stint is refused upstream, so
+    /// "absent" and "null" both mean keep.
     pub async fn update(
         self,
-        check_in: Timestamp,
-        check_out: Timestamp,
+        check_in: Option<Timestamp>,
+        check_out: Option<Timestamp>,
         db: &Database,
     ) -> Result<WorkEntry, AppError> {
-        let mut result = db
-            .query("UPDATE $id SET check_in = $check_in, check_out = $check_out RETURN AFTER")
-            .bind(("id", self.id.record()))
-            .bind(("check_in", check_in))
-            .bind(("check_out", check_out))
-            .await?
-            .check()?;
-        result.take::<Vec<WorkEntry>>(0)?.into_iter().next().ok_or(AppError::NotFound)
+        FieldUpdate::new(self.id.record())
+            .set("check_in", check_in)
+            .set("check_out", check_out)
+            .run::<WorkEntry>(db)
+            .await
     }
 
     pub async fn remove(id: &WorkEntryId, db: &Database) -> Result<Option<WorkEntry>, AppError> {
