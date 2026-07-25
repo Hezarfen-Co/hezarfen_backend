@@ -137,7 +137,7 @@ impl Subject {
     }
 
     pub async fn update(
-        mut self,
+        self,
         name: SubjectName,
         description: SubjectDescription,
         db: &Database,

@@ -9803,6 +9803,79 @@ async fn search_rejects_a_blank_query() {
     assert_eq!(res.status, StatusCode::BAD_REQUEST);
 }
 
+/// The app is EN/TR, so the user picker must fold Turkish casing: `İ` (U+0130)
+/// lowercases to `i` + U+0307 in both Rust and SurrealQL, which used to make
+/// `ilker` and `İLKER` two disjoint searches — a teacher typing lowercase got
+/// an empty picker. Same defect, same fix as the bank-question search.
+#[tokio::test]
+async fn user_search_folds_turkish_casing() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "teacher", "teacher").await;
+
+    let ilker = login(&app, "ilker_a").await;
+    let res = send(
+        &app,
+        "PATCH",
+        "/users/me",
+        Some(&ilker),
+        Some(json!({ "name": "İLKER", "surname": "ÇAĞLAR" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    let ilknur = login(&app, "ilknur_b").await;
+    let res = send(
+        &app,
+        "PATCH",
+        "/users/me",
+        Some(&ilknur),
+        Some(json!({ "name": "ilknur", "surname": "Işık" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    // Every casing of the shared `ilk` prefix finds both, in both directions:
+    // `ilk`, `İLK`, `ılk`, `ILK`.
+    for needle in ["ilk", "%C4%B0LK", "%C4%B1lk", "ILK"] {
+        let res = send(
+            &app,
+            "GET",
+            &format!("/users/search?q={needle}"),
+            Some(&teacher),
+            None,
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+        let hits = common::items(&res.body);
+        assert_eq!(hits.len(), 2, "needle {needle} missed: {hits:?}");
+    }
+
+    // Diacritics fold on the surname too, both ways (`ÇAĞLAR` ↔ `caglar`,
+    // `Işık` ↔ `isik`).
+    for (needle, username) in [
+        ("caglar", "ilker_a"),
+        ("%C3%A7a%C4%9Flar", "ilker_a"),
+        ("isik", "ilknur_b"),
+        ("I%C5%9F%C4%B1k", "ilknur_b"),
+    ] {
+        let res = send(
+            &app,
+            "GET",
+            &format!("/users/search?q={needle}"),
+            Some(&teacher),
+            None,
+        )
+        .await;
+        let hits = common::items(&res.body);
+        assert_eq!(hits.len(), 1, "needle {needle} missed: {hits:?}");
+        assert_eq!(hits[0]["username"], username);
+    }
+
+    // Folding widens the match, it does not match everything.
+    let res = send(&app, "GET", "/users/search?q=zeynep", Some(&teacher), None).await;
+    assert_eq!(common::items(&res.body).len(), 0);
+}
+
 // --- courses: catalog dedup -------------------------------------------------
 
 /// A user who both created a course (while staff) and is enrolled in it (after

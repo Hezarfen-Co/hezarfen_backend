@@ -702,20 +702,37 @@ async fn exam_room_websocket_round_trip() {
         error["message"].as_str().unwrap().contains("selected"),
         "{error}"
     );
+    // ... and it names the question it belongs to, so a client with several
+    // saves in flight fails only this one.
+    assert_eq!(error["question_id"], question_id.as_str(), "{error}");
+
+    // A question that isn't in this exam is attributable too — that one save
+    // is doomed, the others aren't.
+    ws_send(
+        &mut ws,
+        json!({ "type": "answer", "question_id": "nosuchquestion", "text": "x" }),
+    )
+    .await;
+    let error = ws_frame_of_type(&mut ws, "error").await;
+    assert_eq!(error["question_id"], "nosuchquestion", "{error}");
 
     // Junk and unknown message types too — the room shrugs and stays up.
+    // These are frame-level, not save-level: no question to blame, so the
+    // client keeps failing everything in flight.
     ws.send(Message::Text("not json".into())).await.unwrap();
     let error = ws_frame_of_type(&mut ws, "error").await;
     assert!(
         error["message"].as_str().unwrap().contains("unrecognized"),
         "{error}"
     );
+    assert!(error.get("question_id").is_none(), "{error}");
     ws_send(&mut ws, json!({ "type": "selfdestruct" })).await;
     let error = ws_frame_of_type(&mut ws, "error").await;
     assert!(
         error["message"].as_str().unwrap().contains("unrecognized"),
         "{error}"
     );
+    assert!(error.get("question_id").is_none(), "{error}");
     ws_send(&mut ws, json!({ "type": "ping" })).await;
     ws_frame_of_type(&mut ws, "pong").await;
 
@@ -882,6 +899,9 @@ async fn exam_room_promotion_mid_exam_closes_the_sheet() {
         error["message"].as_str().unwrap().contains("only students"),
         "{error}"
     );
+    // Sitter-level, not question-level: the sheet is closed for every question,
+    // so the frame blames none of them and the client fails everything.
+    assert!(error.get("question_id").is_none(), "{error}");
 
     // ... and over REST — the two paths share the wall.
     let res = student
@@ -1371,6 +1391,9 @@ async fn exam_room_messages_bind_to_their_own_sitting() {
         error["message"].as_str().unwrap().contains("sitting"),
         "{error}"
     );
+    // The room's sitting is over — that's not this question's fault, so no
+    // blame is attached and the client fails every pending save.
+    assert!(error.get("question_id").is_none(), "{error}");
 
     // A finish through the stale room must be refused — not submit sitting #2.
     ws_send(&mut ws, json!({ "type": "finish" })).await;
