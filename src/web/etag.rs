@@ -108,9 +108,11 @@ fn compute_etag(bytes: &[u8]) -> String {
     format!("\"{:016x}\"", hasher.finish())
 }
 
-/// Strong `If-None-Match` compare: `*` matches anything, otherwise the (comma-
-/// separated) candidate list must contain our exact quoted tag. A weak
-/// validator `W/"…"` never equals our strong tag, so it correctly misses.
+/// `If-None-Match` compare: `*` matches anything, otherwise the (comma-
+/// separated) candidate list must contain our tag. RFC 9110 §13.1.2 mandates the
+/// *weak* comparison function here, so the `W/` prefix is stripped from both
+/// sides and only the opaque quoted strings are compared — an intermediary that
+/// weakens our ETag (nginx does this when it gzips) must still get its `304`.
 fn matches(if_none_match: Option<&HeaderValue>, tag: &str) -> bool {
     let Some(value) = if_none_match.and_then(|v| v.to_str().ok()) else {
         return false;
@@ -120,5 +122,36 @@ fn matches(if_none_match: Option<&HeaderValue>, tag: &str) -> bool {
         || value
             .split(',')
             .map(str::trim)
-            .any(|candidate| candidate == tag)
+            .any(|candidate| opaque(candidate) == opaque(tag))
+}
+
+/// The opaque part of a validator — the quoted string without any weak prefix.
+fn opaque(validator: &str) -> &str {
+    validator.strip_prefix("W/").unwrap_or(validator)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::matches;
+    use axum::http::HeaderValue;
+
+    fn m(header: &str, tag: &str) -> bool {
+        matches(Some(&HeaderValue::from_str(header).unwrap()), tag)
+    }
+
+    #[test]
+    fn weak_comparison_is_symmetric() {
+        // Both directions and both-weak: the opaque strings decide (RFC 9110
+        // §13.1.2), never the `W/` prefix.
+        assert!(m("W/\"abc\"", "\"abc\""), "weak candidate vs strong tag");
+        assert!(m("\"abc\"", "W/\"abc\""), "strong candidate vs weak tag");
+        assert!(m("W/\"abc\"", "W/\"abc\""), "both weak");
+        assert!(m("\"abc\"", "\"abc\""), "both strong");
+        // A different opaque string still misses, weak prefix or not.
+        assert!(!m("W/\"abd\"", "\"abc\""));
+        // List membership and `*` keep working through the strip.
+        assert!(m("\"x\", W/\"abc\"", "\"abc\""));
+        assert!(m("*", "\"abc\""));
+        assert!(!m("garbage,,,\"", "\"abc\""));
+    }
 }
