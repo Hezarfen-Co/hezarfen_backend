@@ -15,6 +15,7 @@ pub mod events;
 pub mod exam_ws;
 pub mod exams;
 pub mod homework;
+pub mod limits;
 pub mod marks;
 pub mod messages;
 pub mod notes;
@@ -282,7 +283,7 @@ pub(crate) async fn read_upload(
 pub(crate) struct ChoiceBody {
     #[serde(default)]
     pub id: Option<String>,
-    #[schema(example = "42")]
+    #[schema(example = "42", max_length = 500)]
     pub text: String,
 }
 

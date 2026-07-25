@@ -47,6 +47,123 @@ async fn time_serves_server_clock_without_auth() {
 }
 
 #[tokio::test]
+async fn limits_publishes_the_bounds_the_api_actually_enforces() {
+    let app = mem_app().await;
+
+    let res = send(&app, "GET", "/limits", None, None).await;
+    assert_eq!(res.status, StatusCode::OK);
+
+    // Every group is present — a frontend reads one document, not thirteen.
+    for group in [
+        "user",
+        "note",
+        "file",
+        "message",
+        "event",
+        "course",
+        "exam",
+        "homework",
+        "question_pool",
+        "appointment",
+        "chatbot",
+        "settings",
+        "request",
+    ] {
+        assert!(res.body[group].is_object(), "missing group: {group}");
+    }
+
+    // The published value must equal the one the constants carry — the whole
+    // point is that the frontend stops keeping its own copy.
+    assert_eq!(
+        res.body["user"]["max_username_len"],
+        json!(hezarfen_backend::constant::MAX_USERNAME_LEN)
+    );
+    assert_eq!(res.body["exam"]["modes"], json!(["sync", "async", "open"]));
+    assert_eq!(
+        res.body["user"]["roles"],
+        json!(["parent", "student", "teacher", "manager", "admin"])
+    );
+
+    // The request budgets a caller is actually held to, read live off this
+    // server rather than from a constant — a client should learn its budget
+    // here, not by collecting a 429.
+    assert!(res.body["rate"]["auth_per_minute"].is_number());
+    assert!(res.body["rate"]["api_per_minute"].is_number());
+    assert!(res.body["rate"]["chatbot_per_minute"].is_number());
+    assert_eq!(res.body["rate"]["window_secs"], json!(60));
+
+    // Structural sanity over EVERY published pair, which is what a spot-check
+    // of a few named fields cannot give: any `min_x` must not exceed its
+    // `max_x`. This is what catches a mapping that wired a floor to a ceiling
+    // — the one mistake a "does the constant appear?" check cannot see.
+    let groups = res.body.as_object().expect("limits is an object");
+    let mut checked = 0;
+    for (group, fields) in groups {
+        let fields = fields.as_object().expect("each group is an object");
+        for (key, value) in fields {
+            let Some(bare) = key.strip_prefix("min_") else {
+                continue;
+            };
+            let Some(max) = fields.get(&format!("max_{bare}")) else {
+                continue;
+            };
+            let (min, max) = (
+                value.as_i64().expect("min is an integer"),
+                max.as_i64().expect("max is an integer"),
+            );
+            assert!(
+                min <= max,
+                "{group}.{key} ({min}) exceeds its maximum ({max}) — the pair is inverted"
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked >= 10,
+        "only {checked} min/max pairs were checked — the pairing broke, not the values"
+    );
+
+    // …and the endpoint that enforces it must agree: one over the published
+    // maximum is refused. This is what catches a constant moving without the
+    // limits response, or the reverse.
+    let max = res.body["user"]["max_username_len"]
+        .as_u64()
+        .expect("max_username_len is an integer") as usize;
+    let too_long = json!({ "username": "a".repeat(max + 1), "password": "secret1" });
+    let res = send(&app, "POST", "/auth/register", None, Some(too_long)).await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn limits_still_answers_while_the_database_is_down() {
+    // A frontend booting against a backend whose database is reconnecting is
+    // precisely when it needs the validation contract. `/limits` touches no
+    // row, so the outage guard must let it through — otherwise the client
+    // falls back to the hard-coded copy this endpoint exists to remove.
+    let db_up = hezarfen_backend::state::DbHealth::default();
+    let app = build_router(AppState {
+        db: database::init_mem().await.expect("in-memory db"),
+        files_path: tempfile::tempdir().expect("files dir").keep(),
+        cookie_secure: false,
+        rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
+        chatbot_limit: Default::default(),
+        exam_presence: Default::default(),
+        db_up: db_up.clone(),
+        ai: None,
+    });
+    db_up.set(false);
+
+    let res = send(&app, "GET", "/limits", None, None).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert!(res.body["user"]["max_username_len"].is_number());
+
+    // Everything that does touch the database still refuses, so the exemption
+    // is scoped to the one static route and has not disarmed the guard.
+    let res = send(&app, "GET", "/settings", None, None).await;
+    assert_eq!(res.status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
 async fn register_validates_input() {
     let app = mem_app().await;
 

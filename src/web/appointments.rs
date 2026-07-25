@@ -43,6 +43,7 @@ struct PublishSlots {
     starts_at: i64,
     ends_at: i64,
     /// Free-text hint shown to requesters ("office hours", "veli görüşmesi").
+    #[schema(max_length = 500)]
     note: Option<String>,
     /// Repeat the same window every week up to and including `until`.
     #[serde(default)]
@@ -58,7 +59,7 @@ struct BookAppointment {
     #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
     slot: String,
     /// Why you want the meeting — required, the teacher decides on it.
-    #[schema(example = "Ders notlarını konuşmak istiyorum")]
+    #[schema(max_length = 1000, example = "Ders notlarını konuşmak istiyorum")]
     reason: String,
 }
 
@@ -66,7 +67,7 @@ struct BookAppointment {
 struct CancelRequest {
     /// Optional free-text reason. Blank or absent records no reason; over-long
     /// (past `MAX_APPOINTMENT_REASON_LEN`) answers `400`.
-    #[schema(example = "Rahatsızlandım, katılamayacağım")]
+    #[schema(max_length = 1000, example = "Rahatsızlandım, katılamayacağım")]
     reason: Option<String>,
 }
 
@@ -74,7 +75,7 @@ struct CancelRequest {
 struct RejectRequest {
     /// Optional free-text reason. Blank or absent records no reason; over-long
     /// (past `MAX_APPOINTMENT_REASON_LEN`) answers `400`.
-    #[schema(example = "Bu saatte müsait değilim")]
+    #[schema(max_length = 1000, example = "Bu saatte müsait değilim")]
     reason: Option<String>,
 }
 

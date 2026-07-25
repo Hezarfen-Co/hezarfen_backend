@@ -30,13 +30,13 @@ struct SendMessage {
     /// The receiving user's id (find people via `GET /users/search`).
     #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
     recipient_id: String,
-    #[schema(example = "About today's study session")]
+    #[schema(example = "About today's study session", max_length = 200)]
     subject: String,
-    #[schema(example = "I may be 10 minutes late.")]
+    #[schema(example = "I may be 10 minutes late.", max_length = 10000)]
     body: Option<String>,
     /// Optional free-text tag the UI shows as a badge ("Etüt", "Sınav", …).
     /// Blank counts as absent.
-    #[schema(example = "Etüt")]
+    #[schema(example = "Etüt", max_length = 50)]
     label: Option<String>,
 }
 

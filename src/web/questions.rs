@@ -95,15 +95,15 @@ async fn question_or_404(st: &AppState, id: &str) -> Result<PoolQuestion, AppErr
 
 #[derive(Deserialize, ToSchema)]
 struct AskQuestion {
-    #[schema(example = "Bu integrali çözemedim")]
+    #[schema(example = "Bu integrali çözemedim", max_length = 200)]
     title: String,
-    #[schema(example = "∫x·eˣ dx nasıl adım adım çözülür?")]
+    #[schema(example = "∫x·eˣ dx nasıl adım adım çözülür?", max_length = 10000)]
     body: String,
 }
 
 #[derive(Deserialize, ToSchema)]
 struct OfferSolution {
-    #[schema(example = "Kısmi integrasyon: u = x, dv = eˣ dx …")]
+    #[schema(example = "Kısmi integrasyon: u = x, dv = eˣ dx …", max_length = 10000)]
     body: String,
 }
 

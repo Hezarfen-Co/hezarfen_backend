@@ -38,15 +38,17 @@ pub fn routes() -> OpenApiRouter<AppState> {
 
 #[derive(Deserialize, ToSchema)]
 struct CreateNote {
-    #[schema(example = "Groceries")]
+    #[schema(example = "Groceries", max_length = 200)]
     title: String,
-    #[schema(example = "milk, eggs")]
+    #[schema(example = "milk, eggs", max_length = 10000)]
     content: Option<String>,
 }
 
 #[derive(Deserialize, ToSchema)]
 struct UpdateNote {
+    #[schema(max_length = 200)]
     title: Option<String>,
+    #[schema(max_length = 10000)]
     content: Option<String>,
 }
 

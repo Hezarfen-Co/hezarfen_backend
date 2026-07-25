@@ -63,7 +63,7 @@ const MIN_CHUNK_CHARS: usize = 24;
 struct CreateChatbotThread {
     /// Optional thread name, up to 200 characters. Blank counts as absent —
     /// an untitled thread is normal (the UI labels it from its first turn).
-    #[schema(example = "Fizik ödevi")]
+    #[schema(max_length = 200, example = "Fizik ödevi")]
     title: Option<String>,
 }
 
@@ -164,7 +164,7 @@ async fn list_threads(
 struct RenameChatbotThread {
     /// The new name, up to 200 characters. `null` — or blank — clears it back
     /// to untitled, the same rule the create route applies.
-    #[schema(example = "Fizik ödevi")]
+    #[schema(max_length = 200, example = "Fizik ödevi")]
     title: Option<String>,
 }
 
@@ -240,9 +240,13 @@ async fn own_thread(id: &str, user: &UserId, db: &Database) -> Result<ChatbotThr
 
 #[derive(Deserialize, ToSchema)]
 struct SendChatbotMessage {
-    /// What to ask. Required, and capped by the school's
-    /// `max_chatbot_message_len` (`GET /settings`).
-    #[schema(example = "Newton'un ikinci yasasını açıklar mısın?")]
+    /// What to ask. Required. `maxLength` here is the server's hard ceiling;
+    /// the live cap is the school's `max_chatbot_message_len` (`GET /settings`),
+    /// which is always at or below it.
+    #[schema(
+        example = "Newton'un ikinci yasasını açıklar mısın?",
+        max_length = 8_000
+    )]
     content: String,
 }
 

@@ -307,6 +307,10 @@ pub const DEFAULT_MAX_CHATBOT_MESSAGE_LEN: i64 = 4_000;
 pub const MIN_MAX_CHATBOT_MESSAGE_LEN: i64 = 100;
 pub const MAX_MAX_CHATBOT_MESSAGE_LEN: i64 = MAX_CHATBOT_MESSAGE_LEN as i64;
 
+/// Bound on a chat thread's display name. A thread is named by hand or not at
+/// all — nothing auto-titles one — so this only has to fit a line a user typed.
+pub const MAX_CHATBOT_THREAD_TITLE_LEN: usize = 200;
+
 /// How many prior user/assistant turns of a thread are replayed to the
 /// AI service as context (`chatbot_history_turns` in settings): its default and
 /// the inclusive range a manager may set. Every turn is re-sent on every

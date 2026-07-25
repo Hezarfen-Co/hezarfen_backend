@@ -39,9 +39,9 @@ pub fn routes(rate_limit: &RateLimitConfig) -> OpenApiRouter<AppState> {
 
 #[derive(Deserialize, ToSchema)]
 struct Credentials {
-    #[schema(example = "ada")]
+    #[schema(example = "ada", min_length = 3, max_length = 32)]
     username: String,
-    #[schema(example = "correct horse battery")]
+    #[schema(example = "correct horse battery", min_length = 6, max_length = 128)]
     password: String,
 }
 

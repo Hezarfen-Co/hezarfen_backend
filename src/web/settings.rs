@@ -23,11 +23,11 @@ pub fn routes() -> OpenApiRouter<AppState> {
 #[derive(Serialize, Deserialize, ToSchema)]
 struct ExamKindDto {
     /// The `kind` value exams carry, 1–50 characters.
-    #[schema(example = "midterm")]
+    #[schema(example = "midterm", max_length = 50)]
     name: String,
     /// The kind's weight in the course average, `1`–`100`. Editing it
     /// re-weights every exam of this kind at once.
-    #[schema(example = 2)]
+    #[schema(example = 2, minimum = 1, maximum = 100)]
     weight: i64,
 }
 
@@ -36,10 +36,10 @@ struct ExamKindDto {
 #[derive(Serialize, Deserialize, ToSchema)]
 struct GradeBandDto {
     /// Lowest mark of the band, `0`–`100`. One band must start at `0`.
-    #[schema(example = 85)]
+    #[schema(example = 85, minimum = 0, maximum = 100)]
     min: i64,
     /// What that range shows as, 1–20 characters (`"AA"`, `"5"`, `"pass"`).
-    #[schema(example = "AA")]
+    #[schema(example = "AA", max_length = 20)]
     label: String,
 }
 
@@ -108,28 +108,32 @@ impl SettingsResponse {
 struct UpdateSettings {
     /// Replaces the whole list when present: 1–20 entries with unique names,
     /// each name 1–50 characters, each weight `1`–`100`.
+    #[schema(max_items = 20)]
     exam_kinds: Option<Vec<ExamKindDto>>,
     /// Replaces the whole list when present; must keep `present`, `absent`,
-    /// `late`, `excused` (the attendance rate is defined over them).
+    /// `late`, `excused` (the attendance rate is defined over them). Each entry
+    /// is 1–50 characters.
+    #[schema(max_items = 20)]
     attendance_statuses: Option<Vec<String>>,
     /// Replaces the whole set when present. `[]` clears the bands (numeric-only
     /// marks); otherwise mins are unique and one band must start at `0`.
+    #[schema(max_items = 20)]
     grade_bands: Option<Vec<GradeBandDto>>,
     /// Per-file size limit for note uploads, in bytes:
     /// `1024` (1 KiB) – `26214400` (25 MiB). The ceiling is a server hard cap.
-    #[schema(example = 5_242_880)]
+    #[schema(example = 5_242_880, minimum = 1_024, maximum = 26_214_400)]
     max_file_bytes: Option<i64>,
     /// How many prior turns of a thread the chatbot is given as context,
     /// `1`–`50`. Every turn is re-sent on every reply, so this costs tokens.
-    #[schema(example = 10)]
+    #[schema(example = 10, minimum = 1, maximum = 50)]
     chatbot_history_turns: Option<i64>,
     /// How many chatbot threads one user may keep, `1`–`500`. At the cap
     /// the user deletes an old thread before starting a new one.
-    #[schema(example = 50)]
+    #[schema(example = 50, minimum = 1, maximum = 500)]
     max_chatbot_threads: Option<i64>,
     /// Character limit on one chat message, `100`–`8000`. The ceiling is a
     /// server hard cap.
-    #[schema(example = 4000)]
+    #[schema(example = 4000, minimum = 100, maximum = 8_000)]
     max_chatbot_message_len: Option<i64>,
 }
 
