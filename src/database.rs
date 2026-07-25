@@ -61,6 +61,25 @@ pub const CHAT_MESSAGE_TABLE: &str = "chatbot_message";
 pub const APPOINTMENT_SLOT_TABLE: &str = "appointment_slot";
 pub const APPOINTMENT_TABLE: &str = "appointment";
 
+/// Repairs that must run *before* the DDL batch, because the DDL is what makes
+/// them impossible.
+///
+/// `MIGRATION` retires `exam_question.source_bank` with `REMOVE FIELD`, and
+/// once the column is gone SCHEMAFULL rejects every write to a row that still
+/// stores it ("Found field 'source_bank', but no such field exists") — an
+/// UNSET included. So the value has to go while its definition is still
+/// standing. Runs as its own query for the usual reason (see `MIGRATION`).
+///
+/// The table-exists guard is load-bearing: on a fresh database `MIGRATION` has
+/// not run yet, and an UPDATE against an undefined table is an error, not an
+/// empty result. On a database that has the table but never had the column the
+/// `WHERE` simply matches nothing.
+const PRE_REPAIR: &str = "
+    IF 'exam_question' IN object::keys((INFO FOR DB).tables) {
+        UPDATE exam_question UNSET source_bank WHERE source_bank != NONE
+    };
+";
+
 /// SCHEMAFULL schema: every column is typed, references use `record<..>`.
 /// Idempotent — safe to run on every boot: `IF NOT EXISTS` guards the
 /// definitions and `REMOVE ... IF EXISTS` retires schema (like the
@@ -562,6 +581,56 @@ const BACKFILL: &str = "
     -- `user.role = NONE`, which is also != 'student' — those rows go too.
     DELETE enrollment WHERE user.role != 'student';
 
+    -- Choices gained stable ids (2026-07-24): `choices` held bare strings and
+    -- `correct`/`selected`/`slot` held the option's *position*. The DDL above
+    -- retypes those columns, which leaves every old-shaped row readable but
+    -- unwritable ('Expected `none | array<object>` but found `[..]`'), so this
+    -- conversion is repair, not cosmetics.
+    --
+    -- Ids are minted in array order, so the id at position i *is* the id for
+    -- old index i — that identity is what keeps a stored answer, and an option
+    -- picture, pointing at the option the student actually saw. Hence the
+    -- dependent rows are remapped inside the loop that mints `$new`, against
+    -- that same array: once the ids are stored the positions are still
+    -- recoverable, but nothing guarantees a later pass would look them up the
+    -- same way. `WHERE choices[0] != NONE AND type::is_string(choices[0])`
+    -- matches only unconverted rows, so a second boot re-mints nothing; an
+    -- empty or absent `choices` needs no conversion at all. A question-level
+    -- picture (`slot = NONE`) is not an index and is left alone.
+    --
+    -- Runs *before* every other backfill that writes these rows (the `seq`
+    -- stamps below): a write coerces the whole record, so touching a row for
+    -- any reason fails while its choices are still positional. For the same
+    -- reason the answer's remap stamps `seq` itself — the two legacy gaps sit
+    -- on the same row, and a write that fixes only one of them is rejected for
+    -- the other. `seq ?? 1` leaves an already-numbered sitting alone (DEFAULT
+    -- fills a CREATE, not an UPDATE of a row that predates the column).
+    FOR $q IN ((SELECT id, choices, correct FROM exam_question
+        WHERE choices[0] != NONE AND type::is_string(choices[0])) ?? []) {
+        LET $new = $q.choices.map(|$c| { id: rand::ulid(), text: $c });
+        UPDATE $q.id SET choices = $new,
+            correct = IF $q.correct = NONE { NONE } ELSE { $new[$q.correct].id };
+        FOR $img IN ((SELECT id, slot FROM question_image
+            WHERE question = $q.id AND type::is_int(slot)) ?? []) {
+            UPDATE $img.id SET slot = $new[$img.slot].id;
+        };
+        FOR $ans IN ((SELECT id, selected FROM exam_answer
+            WHERE question = $q.id AND type::is_int(selected)) ?? []) {
+            UPDATE $ans.id SET selected = $new[$ans.selected].id, seq = seq ?? 1;
+        };
+    };
+
+    FOR $q IN ((SELECT id, choices, correct FROM bank_question
+        WHERE choices[0] != NONE AND type::is_string(choices[0])) ?? []) {
+        LET $new = $q.choices.map(|$c| { id: rand::ulid(), text: $c });
+        UPDATE $q.id SET choices = $new,
+            correct = IF $q.correct = NONE { NONE } ELSE { $new[$q.correct].id };
+        FOR $img IN ((SELECT id, slot FROM bank_question_image
+            WHERE bank_question = $q.id AND type::is_int(slot)) ?? []) {
+            UPDATE $img.id SET slot = $new[$img.slot].id;
+        };
+    };
+
     -- Per-attempt history (2026-07-24): answers, drawings, and marks written
     -- before retakes stopped wiping belong to the student's first sitting.
     -- They already use the bare (seq==1) record key, so only the denormalized
@@ -624,6 +693,7 @@ pub async fn init_mem() -> Result<Database, AppError> {
 /// Apply the schema + backfills. Idempotent — `init` runs it on every boot,
 /// and tests re-run it on a live handle to simulate a second boot.
 pub async fn migrate(db: &Surreal<Any>) -> Result<(), AppError> {
+    db.query(PRE_REPAIR).await?.check()?;
     db.query(MIGRATION).await?.check()?;
     db.query(BACKFILL).await?.check()?;
     Ok(())
@@ -664,5 +734,125 @@ mod tests {
         assert_eq!(interrupted["status"], "failed");
         assert_eq!(interrupted["error_code"], "interrupted");
         assert!(interrupted["completed_at"].as_i64().unwrap() > 0);
+    }
+
+    /// A row written before choices had ids survives the retyped columns: it is
+    /// converted, it is writable again, and its stored *position* still names
+    /// the same option — a wrong remap here silently regrades exams.
+    #[tokio::test]
+    async fn boot_converts_positional_choices_and_keeps_the_same_option() {
+        let db = super::init_mem().await.unwrap();
+        // Roll the columns back to their pre-2026-07-24 shapes and write the
+        // kind of row an older binary left behind, `source_bank` included.
+        db.query(
+            "REMOVE FIELD IF EXISTS choices[*].id ON TABLE exam_question;
+             REMOVE FIELD IF EXISTS choices[*].text ON TABLE exam_question;
+             REMOVE FIELD IF EXISTS choices[*].id ON TABLE bank_question;
+             REMOVE FIELD IF EXISTS choices[*].text ON TABLE bank_question;
+             DEFINE FIELD OVERWRITE choices ON exam_question TYPE option<array<string>>;
+             DEFINE FIELD OVERWRITE correct ON exam_question TYPE option<int>;
+             DEFINE FIELD OVERWRITE source_bank ON exam_question TYPE option<string>;
+             DEFINE FIELD OVERWRITE slot ON question_image TYPE option<int>;
+             DEFINE FIELD OVERWRITE selected ON exam_answer TYPE option<int>;
+             DEFINE FIELD OVERWRITE choices ON bank_question TYPE option<array<string>>;
+             DEFINE FIELD OVERWRITE correct ON bank_question TYPE option<int>;
+             DEFINE FIELD OVERWRITE slot ON bank_question_image TYPE option<int>;",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+        db.query(
+            "CREATE user:u SET username = 'u', password_hash = 'x';
+             CREATE exam_question:q SET exam = exam:e, text = 'q', kind = 'multiple',
+                 points = 5, subject = subject:s, choices = ['3', '4', '5'], correct = 1,
+                 source_bank = 'bank_question:b';
+             CREATE question_image:i SET exam = exam:e, question = exam_question:q, slot = 2,
+                 file = 'f', content_type = 'image/png', size = 1;
+             CREATE question_image:whole SET exam = exam:e, question = exam_question:q,
+                 file = 'w', content_type = 'image/png', size = 1;
+             CREATE exam_answer:a SET exam = exam:e, question = exam_question:q, user = user:u,
+                 selected = 2, updated_at = 1;
+             CREATE bank_question:b SET owner = user:u, text = 'b', kind = 'multiple',
+                 points = 3, choices = ['a', 'b'], correct = 0, created_at = 1;
+             CREATE bank_question_image:bi SET bank_question = bank_question:b, slot = 1,
+                 file = 'bf', content_type = 'image/png', size = 1;",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+        super::migrate(&db).await.unwrap();
+
+        let mut res = db
+            .query(
+                "SELECT choices, correct FROM ONLY exam_question:q;
+                 SELECT VALUE slot FROM ONLY question_image:i;
+                 SELECT VALUE slot FROM ONLY question_image:whole;
+                 SELECT VALUE selected FROM ONLY exam_answer:a;
+                 SELECT choices, correct FROM ONLY bank_question:b;
+                 SELECT VALUE slot FROM ONLY bank_question_image:bi;",
+            )
+            .await
+            .unwrap();
+        let q: Option<serde_json::Value> = res.take(0).unwrap();
+        let q = q.unwrap();
+        let img_slot: Option<String> = res.take(1).unwrap();
+        let whole_slot: Option<String> = res.take(2).unwrap();
+        let selected: Option<String> = res.take(3).unwrap();
+        let bank: Option<serde_json::Value> = res.take(4).unwrap();
+        let bank = bank.unwrap();
+        let bank_slot: Option<String> = res.take(5).unwrap();
+
+        let ids: Vec<&str> = q["choices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            q["choices"][0]["text"], "3",
+            "option order (and so the meaning of every stored index) is preserved"
+        );
+        assert_eq!(q["correct"], ids[1], "correct was index 1");
+        assert_eq!(
+            img_slot.as_deref(),
+            Some(ids[2]),
+            "option picture was slot 2"
+        );
+        assert_eq!(selected.as_deref(), Some(ids[2]), "the answer was index 2");
+        assert_eq!(whole_slot, None, "a question-level picture has no index");
+        let bank_ids: Vec<&str> = bank["choices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(bank["correct"], bank_ids[0]);
+        assert_eq!(bank_slot.as_deref(), Some(bank_ids[1]));
+
+        // Writable again — every one of these failed coercion before the
+        // backfill existed, and `source_bank` outlived its own column.
+        db.query(
+            "UPDATE exam_question:q SET points = 7;
+             UPDATE question_image:i SET size = 2;
+             UPDATE exam_answer:a SET updated_at = 2;
+             UPDATE bank_question:b SET points = 4;
+             UPDATE bank_question_image:bi SET size = 2;",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+        // A second boot re-mints nothing.
+        super::migrate(&db).await.unwrap();
+        let mut res = db
+            .query("SELECT VALUE choices.map(|$c| $c.id) FROM ONLY exam_question:q")
+            .await
+            .unwrap();
+        let again: Vec<String> = res.take(0).unwrap();
+        assert_eq!(again, ids, "conversion is idempotent");
     }
 }
