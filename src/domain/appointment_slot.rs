@@ -225,6 +225,36 @@ impl AppointmentSlot {
         Ok(!result.take::<Vec<RecordId>>(0)?.is_empty())
     }
 
+    /// Every window this teacher already published that intersects the envelope
+    /// `[from, to)`. One read for a whole batch: a stored row that overlaps *any*
+    /// window in the batch necessarily overlaps the envelope spanning them all,
+    /// so filtering the envelope and comparing in memory is exactly the
+    /// per-window [`conflicts_existing`](Self::conflicts_existing) check,
+    /// hoisted out of the loop — which is what keeps [`APPOINTMENT_LOCK`] down
+    /// to two round trips instead of one per occurrence.
+    async fn windows_in_span(
+        teacher: &UserId,
+        from: Timestamp,
+        to: Timestamp,
+        db: &Database,
+    ) -> Result<Vec<(Timestamp, Timestamp)>, AppError> {
+        let mut result = db
+            .query(
+                "SELECT * FROM appointment_slot \
+                 WHERE teacher = $teacher AND starts_at < $to AND ends_at > $from",
+            )
+            .bind(("teacher", teacher.record()))
+            .bind(("from", from.as_millis()))
+            .bind(("to", to.as_millis()))
+            .await?
+            .check()?;
+        Ok(result
+            .take::<Vec<AppointmentSlot>>(0)?
+            .into_iter()
+            .map(|slot| (slot.starts_at, slot.ends_at))
+            .collect())
+    }
+
     /// Publish one slot.
     pub async fn create(
         teacher: &UserId,
@@ -272,11 +302,17 @@ impl AppointmentSlot {
         let windows = Self::weekly_windows(starts_at, ends_at, until)?;
         // Validate the whole batch before writing a single row: all-or-nothing,
         // so a mid-series collision never leaves stray weeks behind. Held under
-        // the lock from first check through last insert, matching `create`.
+        // the lock from the check through the write, matching `create`.
         let _guard = APPOINTMENT_LOCK.lock().await;
+        // (a) against the slots already in the database. `weekly_windows` walks
+        // forward, so the first and last occurrence bound every one of them.
+        let (first, last) = (windows[0], windows[windows.len() - 1]);
+        let published = Self::windows_in_span(teacher, first.0, last.1, db).await?;
         for (i, &(w_start, w_end)) in windows.iter().enumerate() {
-            // (a) against slots already in the database, and
-            if Self::conflicts_existing(teacher, w_start, w_end, db).await? {
+            if published
+                .iter()
+                .any(|&(p_start, p_end)| Appointment::overlaps(w_start, w_end, p_start, p_end))
+            {
                 return Err(AppError::ConflictOwned(
                     "a repeated slot overlaps one you have already published".into(),
                 ));
@@ -294,25 +330,45 @@ impl AppointmentSlot {
         }
         let series = SlotSeries::generate();
         let now = Timestamp::now();
-        let mut slots = Vec::with_capacity(windows.len());
-        for (starts_at, ends_at) in windows {
-            slots.push(
-                Self::insert(
-                    AppointmentSlot {
-                        id: AppointmentSlotId::generate(),
-                        teacher: teacher.clone(),
-                        starts_at,
-                        ends_at,
-                        note: note.clone(),
-                        series: Some(series.clone()),
-                        created_at: now,
-                    },
-                    db,
-                )
-                .await?,
-            );
+        let rows: Vec<AppointmentSlot> = windows
+            .iter()
+            .map(|&(starts_at, ends_at)| AppointmentSlot {
+                id: AppointmentSlotId::generate(),
+                teacher: teacher.clone(),
+                starts_at,
+                ends_at,
+                note: note.clone(),
+                series: Some(series.clone()),
+                created_at: now,
+            })
+            .collect();
+        // One statement, therefore one transaction: SurrealDB rolls the whole
+        // `INSERT` back on any error. The row-by-row loop this replaces did not
+        // — a database error at week 7 of 10 answered 500 with six stray weeks
+        // already published, a half-series nobody asked for. It is also a single
+        // round trip, so the lock is now held for two queries whatever the
+        // occurrence count, instead of 1 + N (up to 52) sequential ones.
+        //
+        // No `BEGIN`/`COMMIT` wrapper: those consume result slots in this
+        // version, and a lone statement is already atomic — the explicit form
+        // would buy nothing but an off-by-one waiting to happen.
+        let mut result = db
+            .query("INSERT INTO appointment_slot $rows")
+            .bind(("rows", rows))
+            .await?
+            .check()?;
+        let mut created = result.take::<Vec<AppointmentSlot>>(0)?;
+        if created.len() != windows.len() {
+            return Err(AppError::Internal(format!(
+                "published {} of {} appointment slots",
+                created.len(),
+                windows.len()
+            )));
         }
-        Ok(slots)
+        // `INSERT` makes no promise about the order it echoes rows back in, and
+        // the response is rendered as the published calendar.
+        created.sort_by_key(|slot| slot.starts_at.as_millis());
+        Ok(created)
     }
 
     pub async fn read(
@@ -622,6 +678,50 @@ mod tests {
                 .unwrap()
                 .len(),
             before
+        );
+    }
+
+    /// The existing-slot check is one envelope-wide read instead of a query per
+    /// occurrence, so the edges of that envelope are what could go wrong: a
+    /// clash on the *last* week must still be caught, and a slot merely touching
+    /// the batch's boundaries must still be allowed.
+    #[tokio::test]
+    async fn the_batch_wide_conflict_read_still_sees_the_last_week_and_lets_touching_through() {
+        let db = crate::database::init_mem().await.unwrap();
+        let teacher = UserId::from_key("t1");
+        let last = 1_000 + 4 * MILLIS_PER_WEEK;
+        // Touching both ends of the envelope: ends where the first occurrence
+        // starts, and starts where the last one ends.
+        AppointmentSlot::create(&teacher, at(0), at(1_000), None, &db)
+            .await
+            .unwrap();
+        AppointmentSlot::create(&teacher, at(last + 1_000), at(last + 2_000), None, &db)
+            .await
+            .unwrap();
+        assert_eq!(
+            AppointmentSlot::publish_weekly(&teacher, at(1_000), at(2_000), None, at(last), &db)
+                .await
+                .unwrap()
+                .len(),
+            5
+        );
+
+        // One millisecond into the last occurrence → the whole publish is 409.
+        let db = crate::database::init_mem().await.unwrap();
+        AppointmentSlot::create(&teacher, at(last + 999), at(last + 3_000), None, &db)
+            .await
+            .unwrap();
+        assert!(matches!(
+            AppointmentSlot::publish_weekly(&teacher, at(1_000), at(2_000), None, at(last), &db)
+                .await,
+            Err(AppError::ConflictOwned(_))
+        ));
+        assert_eq!(
+            AppointmentSlot::list_for_teacher(&teacher, &db)
+                .await
+                .unwrap()
+                .len(),
+            1
         );
     }
 
