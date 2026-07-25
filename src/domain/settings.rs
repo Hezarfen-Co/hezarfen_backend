@@ -22,6 +22,7 @@ use crate::constant::{
     MIN_MARK, MIN_MAX_CHATBOT_THREADS, MIN_MAX_CHATBOT_MESSAGE_LEN, MIN_MAX_FILE_BYTES,
 };
 use crate::database::{Database, SETTINGS_TABLE};
+use crate::domain::text_fold;
 use crate::error::{AppError, ValidationError};
 
 /// The singleton's fixed key: one school per deployment, one settings row.
@@ -177,7 +178,7 @@ impl Settings {
     }
 
     /// Validate a full policy. List entries are trimmed; kinds and statuses
-    /// must be non-empty, unique (case-insensitive), and bounded; the four
+    /// must be non-empty, unique (folded: case- and Turkish-insensitive), and bounded; the four
     /// core attendance statuses can never be removed (the attendance rate's
     /// semantics are defined over them). Bands may be empty (numeric-only
     /// display), otherwise their mins are unique and one band must start at 0
@@ -344,6 +345,7 @@ impl Settings {
     /// unconditionally — last write wins. Prefer [`Self::save_if_unchanged`]
     /// wherever the new policy was merged from a loaded snapshot.
     pub async fn save(self, db: &Database) -> Result<Settings, AppError> {
+        // whole-row-save-ok: test-only seeding; every production write merges from a loaded snapshot and goes through save_if_unchanged
         let saved: Option<Settings> = db.upsert(Self::record_id()).content(self).await?;
         saved.ok_or_else(|| AppError::Internal("failed to save settings".into()))
     }
@@ -435,13 +437,17 @@ fn validate_list(field: &'static str, values: Vec<String>) -> Result<Vec<String>
         }
         trimmed.push(value.to_string());
     }
-    let mut folded: Vec<String> = trimmed.iter().map(|v| v.to_lowercase()).collect();
+    // `to_lowercase` is locale-invariant — `İZİN` lowercases to `i̇zin` (with a
+    // leftover combining dot) and would slip past `izin` as a distinct entry.
+    // Same folding as search uses, so the whole app agrees on "the same word".
+    let mut folded: Vec<String> = trimmed.iter().map(|v| text_fold::fold(v)).collect();
     folded.sort_unstable();
     folded.dedup();
     if folded.len() != trimmed.len() {
         return Err(ValidationError::Invalid {
             field,
-            reason: "entries must be unique (case-insensitive)",
+            reason: "two entries are the same word apart from upper/lower case \
+                     or Turkish letters — keep only one of them",
         });
     }
     Ok(trimmed)
@@ -525,6 +531,33 @@ mod tests {
             .map(|i| ExamKindDef::try_new(&format!("kind{i}"), 1).unwrap())
             .collect();
         assert!(with_kinds(too_many).is_err());
+    }
+
+    /// Rust's `to_lowercase` is locale-invariant: `İZİN` becomes `i̇zin` (with a
+    /// combining dot above), which never equals `izin`, so both spellings of
+    /// the same word used to land in one list. Teachers type these by hand in
+    /// Turkish, which is exactly when it happens.
+    #[tokio::test]
+    async fn turkish_casing_is_a_duplicate() {
+        let with_kinds = |exam_kinds| {
+            Settings::try_new(SettingsParams {
+                exam_kinds,
+                ..params()
+            })
+        };
+        assert!(with_kinds(kinds(&["İZİN", "izin"])).is_err());
+        assert!(with_kinds(kinds(&["SINAV", "sınav"])).is_err());
+        // Plain English duplicates still die, genuinely distinct entries live.
+        assert!(with_kinds(kinds(&["Lab", "LAB"])).is_err());
+        assert!(with_kinds(kinds(&["izin", "sınav", "lab"])).is_ok());
+        // Same rule on the other guarded list.
+        assert!(
+            Settings::try_new(SettingsParams {
+                attendance_statuses: statuses_with(&["İZİN", "izin"]),
+                ..params()
+            })
+            .is_err()
+        );
     }
 
     #[tokio::test]
