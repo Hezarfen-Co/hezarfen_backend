@@ -76,48 +76,45 @@ struct UpdatePreferences {
     language: Option<String>,
 }
 
-/// Resolve one patched field: absent keeps the current value, `""` clears it,
-/// anything else must parse into the domain newtype.
-fn merge_field<T: Clone>(
-    current: Option<&T>,
+/// Resolve one patched field into what the save should write: absent (or
+/// `null`) is `None` — the column is not written at all, so a concurrent PATCH
+/// of it survives; `""` is `Some(None)`, an explicit clear; anything else must
+/// parse into the domain newtype, exactly as a create would.
+fn merge_field<T>(
     patch: Option<&str>,
     parse: impl Fn(&str) -> Result<T, ValidationError>,
-) -> Result<Option<T>, ValidationError> {
+) -> Result<Option<Option<T>>, ValidationError> {
     match patch {
-        None => Ok(current.cloned()),
-        Some("") => Ok(None),
-        Some(value) => Ok(Some(parse(value)?)),
+        None => Ok(None),
+        Some("") => Ok(Some(None)),
+        Some(value) => Ok(Some(Some(parse(value)?))),
     }
 }
 
-/// Merge `req` over `user`'s current info and persist. Shared by the
-/// self-service and admin profile endpoints — they differ only in whose row
-/// they load and who may call them.
+/// Validate and persist exactly the info fields `req` carried — nothing is
+/// merged from `user`'s snapshot, so a concurrent PATCH of another field is not
+/// reverted. Shared by the self-service and admin profile endpoints — they
+/// differ only in whose row they load and who may call them.
 async fn apply_profile(
     user: User,
     req: &UpdateProfile,
     db: &Database,
 ) -> Result<UserResponse, AppError> {
-    let name = merge_field(user.get_name(), req.name.as_deref(), |v| {
-        PersonName::try_new("name", v)
-    })?;
-    let surname = merge_field(user.get_surname(), req.surname.as_deref(), |v| {
+    let name = merge_field(req.name.as_deref(), |v| PersonName::try_new("name", v))?;
+    let surname = merge_field(req.surname.as_deref(), |v| {
         PersonName::try_new("surname", v)
     })?;
-    let email = merge_field(user.get_email(), req.email.as_deref(), Email::try_new)?;
-    let phone = merge_field(user.get_phone(), req.phone.as_deref(), Phone::try_new)?;
-    let birth_date = merge_field(
-        user.get_birth_date(),
-        req.birth_date.as_deref(),
-        BirthDate::try_new,
-    )?;
+    let email = merge_field(req.email.as_deref(), Email::try_new)?;
+    let phone = merge_field(req.phone.as_deref(), Phone::try_new)?;
+    let birth_date = merge_field(req.birth_date.as_deref(), BirthDate::try_new)?;
     let updated = user
         .set_profile(name, surname, email, phone, birth_date, db)
         .await?;
     Ok(UserResponse::new(&updated))
 }
 
-/// Merge `req` over `user`'s current preferences and persist. Shared by the
+/// Validate and persist exactly the preference fields `req` carried — same
+/// no-merge reasoning as [`apply_profile`]. Shared by the
 /// self-service and admin preference endpoints — they differ only in whose row
 /// they load and who may call them.
 async fn apply_preferences(
@@ -125,14 +122,8 @@ async fn apply_preferences(
     req: &UpdatePreferences,
     db: &Database,
 ) -> Result<UserResponse, AppError> {
-    let theme = merge_field(user.get_theme().as_ref(), req.theme.as_deref(), |v| {
-        Theme::try_from_str(v)
-    })?;
-    let language = merge_field(
-        user.get_language().as_ref(),
-        req.language.as_deref(),
-        Language::try_from_str,
-    )?;
+    let theme = merge_field(req.theme.as_deref(), Theme::try_from_str)?;
+    let language = merge_field(req.language.as_deref(), Language::try_from_str)?;
     let updated = user.set_preferences(theme, language, db).await?;
     Ok(UserResponse::new(&updated))
 }
