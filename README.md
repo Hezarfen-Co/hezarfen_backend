@@ -83,9 +83,11 @@ slots (one-off, or repeating weekly up to an `until` date as a series that
 deletes as one), and students and parents book a slot with a reason — the
 booking lands `pending` until the teacher approves it, rejects it, or
 counter-proposes another time (which sends it back to `pending` for the
-requester to accept or decline); either side may cancel until the meeting
-starts, one live booking holds a slot, and no approved meeting may overlap
-another for the teacher or the requester (see "Appointments").
+requester to accept or decline); the **requester** may cancel until the meeting
+starts — a teacher ends a booking by rejecting it, or by counter-proposing and
+then rejecting an approved one — one live booking holds a slot, a teacher's own
+published windows may not overlap each other, and no approved meeting may
+overlap another for the teacher or the requester (see "Appointments").
 School-varying policy is data, not code: exam kinds (each with its weight in
 course averages), attendance statuses, grade-display bands, the note-file
 size limit, and the chatbot's limits live in an editable **settings** singleton, and academic **terms**
@@ -188,6 +190,16 @@ column names a role requires a valid session; the ones marked `no` (`/health`,
 the docs pages, `register` / `login` / `logout`) don't (`logout` is idempotent —
 it clears the session if one is present). Set `COOKIE_SECURE=true` when serving
 behind TLS to add the cookie's `Secure` attribute.
+
+**Register never reveals whether a username is taken.** `POST /auth/register`
+answers `201` either way, with a body shaped exactly like a fresh
+registration's — same status, same fields, and a throwaway `id` that resolves
+to no row. This is deliberate: the route is unauthenticated, so a `409` (or a
+faster reply) would let anyone enumerate the school's users. The password is
+hashed *before* the availability check so both outcomes cost the same ~33ms.
+The accepted cost: a caller who collides with an existing account gets no
+distinct error and simply cannot log in with that password — they pick another
+name. Do not "fix" this back to a `409`.
 
 ## Time policy
 
@@ -427,7 +439,7 @@ their existing shapes: the student exam-room reads
 | GET    | `/swagger`                       | no      | Interactive API docs (Swagger UI) |
 | GET    | `/api-docs/openapi.json`         | no      | Raw OpenAPI 3 spec              |
 | GET    | `/ai/certificate`                | no      | The AI bridge's certificate (PEM + sha256) for a service to pin; `404` when the bridge is off |
-| POST   | `/auth/register`                 | no      | `{username, password}` (new users are `student`) |
+| POST   | `/auth/register`                 | no      | `{username, password}` (new users are `student`); always `201`, even if the name was taken — see Auth model |
 | POST   | `/auth/login`                    | no      | `{username, password}` -> cookie|
 | POST   | `/auth/logout`                   | no      | Clear session (no-op if none)   |
 | GET    | `/auth/me`                       | student | Current user (incl. `role` and personal info) |
@@ -467,7 +479,7 @@ their existing shapes: the student exam-room reads
 | DELETE | `/events/{id}/attendance/{user}` | teacher | Remove a user's attendance      |
 | POST   | `/events/{id}/register`          | teacher | `{user_id?}` — seat a **student** (or yourself when omitted) on a registration event's signup list; idempotent, `409` once full or started |
 | DELETE | `/events/{id}/register/{user}`   | teacher | Free a seat (same self-or-student rule); `409` once the event started |
-| POST   | `/appointments/slots`            | teacher | `{starts_at, ends_at, note?, repeat_weekly?, until?}` — publish availability on **own** calendar; always answers an **array** (one element for a one-off, one per weekly occurrence, ≤ 52, sharing a `series`); `400` if a weekly shift would run off the end of time |
+| POST   | `/appointments/slots`            | teacher | `{starts_at, ends_at, note?, repeat_weekly?, until?}` — publish availability on **own** calendar; always answers an **array** (one element for a one-off, one per weekly occurrence, ≤ 52, sharing a `series`); `400` if a weekly shift would run off the end of time; `409` if the window overlaps one the caller already published (half-open, so back-to-back is fine) — a weekly publish is all-or-nothing |
 | GET    | `/appointments/slots`            | student | Teacher+: own calendar (past included). Everyone else: the bookable calendar — future slots only, demoted teachers' slots left out · paged |
 | DELETE | `/appointments/slots/{id}`       | teacher | Withdraw one slot (its teacher, or manager+); `409` while a pending/approved booking sits on it |
 | DELETE | `/appointments/slots/series/{series}` | teacher | Withdraw a whole recurring publish (same rights); `409` if **any** occurrence has a live booking |
@@ -475,7 +487,7 @@ their existing shapes: the student exam-room reads
 | GET    | `/appointments`                  | student | Teacher+: bookings on own slots (the request inbox). Everyone else: own requests · paged |
 | PATCH  | `/appointments/{id}/approve`     | teacher | Confirm a pending booking (slot's teacher, or manager+); `409` when settled, when the effective window has already started, or when the time collides with another approved meeting of either side |
 | PATCH  | `/appointments/{id}/reject`      | teacher | Turn it down (same rights); the slot frees up |
-| PATCH  | `/appointments/{id}/cancel`      | student | Call it off — the requester or the slot's teacher (manager+ too); `409` once settled or the meeting has started |
+| PATCH  | `/appointments/{id}/cancel`      | student | `{reason?}` — call it off; **the requester only** (`403` for anyone else, the slot's teacher and manager+ included — they reject, or reschedule then reject); `409` once settled or the meeting has started |
 | PATCH  | `/appointments/{id}/reschedule`  | teacher | `{starts_at, ends_at}` — counter-propose another time (same rights); the booking goes back to `pending`; `409` if the proposed window has already started |
 | PATCH  | `/appointments/{id}/reschedule/accept` | student | Requester only: approval at the proposed time (the overlap guard runs again) |
 | PATCH  | `/appointments/{id}/reschedule/decline` | student | Requester only: refuse the proposal — this **cancels** the booking, so the cancel deadline applies (`409` once the meeting's window has started) |
@@ -523,13 +535,14 @@ their existing shapes: the student exam-room reads
 | DELETE | `/exams/{id}/questions/{qid}`    | teacher | Delete a question + its answers (course manager; frozen once attempted) |
 | POST   | `/exams/{id}/questions/from-bank/{bid}` | teacher | Instantiate a **bank question** into this exam — copies it to a fresh exam-scoped question (new id, own images + answers; records the template in `source_bank`); body `{subject_id}` retags it against the course's subjects (`400` cross-course; course manager; `409` once attempted) |
 | POST   | `/exams/{id}/questions/{qid}/to-bank` | teacher | Save an existing exam question into the school **question bank** — copies it to a detached bank row (new id, own images; records the origin exam in `source_exam`); the source question is untouched (course manager) |
+| POST   | `/exams/{id}/questions/{qid}/refresh-from-bank` | teacher | Re-copy the template's **current** content over this question — text, points, kind, choices (with the template's choice ids), `correct`, illustration and option pictures; keeps the question's own id, exam, `subject` and provenance links, and overwrites any local edit. `400` if it never came from the bank (or the template is gone), `404` if the template is not visible to the caller, `409` once attempts exist (course manager) |
 | GET    | `/exams/{id}/attempt/questions`  | student | The sitting view: no `correct`, own answers embedded, image metadata included (requires enrollment + an attempt) |
 | POST   | `/exams/{id}/questions/{qid}/image` | teacher | Attach/replace the question's illustration: `multipart/form-data`, one `file` part — raster images only (`png`/`jpeg`/`webp`/`gif`), ≤ `max_file_bytes` (course manager; frozen once attempted) |
 | GET    | `/exams/{id}/questions/{qid}/image` | student | The illustration bytes (course manager anytime; students enrolled + attempt started) |
 | DELETE | `/exams/{id}/questions/{qid}/image` | teacher | Remove the illustration (course manager; frozen once attempted) |
-| POST   | `/exams/{id}/questions/{qid}/choices/{index}/image` | teacher | Attach/replace option `index`'s picture (`choice` questions; same form and limits as above) |
-| GET    | `/exams/{id}/questions/{qid}/choices/{index}/image` | student | The option picture's bytes (same access as the illustration) |
-| DELETE | `/exams/{id}/questions/{qid}/choices/{index}/image` | teacher | Remove one option picture (course manager; frozen once attempted) |
+| POST   | `/exams/{id}/questions/{qid}/choices/{choice_id}/image` | teacher | Attach/replace one option's picture, keyed by the `id` carried on that choice (`choice` questions; same form and limits as above) |
+| GET    | `/exams/{id}/questions/{qid}/choices/{choice_id}/image` | student | The option picture's bytes (same access as the illustration) |
+| DELETE | `/exams/{id}/questions/{qid}/choices/{choice_id}/image` | teacher | Remove one option picture (course manager; frozen once attempted) |
 | POST   | `/exams/{id}/attempt/answers`    | student | `{question_id, selected? \| text?}` — autosave one answer while a student, enrolled, and `in_progress` (and not locked out by a closed rejoin door) |
 | GET    | `/exams/{id}/attempts/{user}/answers` | teacher | A student's answer sheet: `is_correct` flags + suggested `auto_score` (course manager) |
 | POST   | `/exams/{id}/attempt/answers/{qid}/image` | student | Attach/replace the caller's drawn answer to a question: `multipart/form-data`, one `file` part — raster images only (`png`/`jpeg`/`webp`/`gif`), ≤ `max_file_bytes` (own in-progress attempt; students only, enrolled, rejoin door open) |
@@ -554,9 +567,9 @@ their existing shapes: the student exam-room reads
 | POST   | `/bank-questions/{bid}/image`    | teacher | Attach/replace the bank question's illustration: `multipart/form-data`, one `file` part — raster images only (`png`/`jpeg`/`webp`/`gif`), ≤ `max_file_bytes` (**owner only**, admin bypass) |
 | GET    | `/bank-questions/{bid}/image`    | teacher | The illustration bytes (any teacher+) |
 | DELETE | `/bank-questions/{bid}/image`    | teacher | Remove the illustration (**owner only**, admin bypass) |
-| POST   | `/bank-questions/{bid}/choices/{index}/image` | teacher | Attach/replace option `index`'s picture (`choice` questions; same form and limits as above; **owner only**, admin bypass) |
-| GET    | `/bank-questions/{bid}/choices/{index}/image` | teacher | The option picture's bytes (any teacher+) |
-| DELETE | `/bank-questions/{bid}/choices/{index}/image` | teacher | Remove one option picture (**owner only**, admin bypass) |
+| POST   | `/bank-questions/{bid}/choices/{choice_id}/image` | teacher | Attach/replace one option's picture, keyed by the `id` carried on that choice (`choice` questions; same form and limits as above; **owner only**, admin bypass) |
+| GET    | `/bank-questions/{bid}/choices/{choice_id}/image` | teacher | The option picture's bytes (any teacher+) |
+| DELETE | `/bank-questions/{bid}/choices/{choice_id}/image` | teacher | Remove one option picture (**owner only**, admin bypass) |
 | POST   | `/courses/{id}/homework`         | teacher | `{title, description?, subject_id, due_at, assigned?}` — assign homework tagged with a course subject, due in the future; `assigned` names an enrolled-student subset, ≤ 200 (omit/`[]` = the whole course) (course manager) |
 | GET    | `/courses/{id}/homework`         | student | List the course's homework, newest first (enrolled, creator, assigned teacher, or manager+; students see only what they're assigned) · paged |
 | GET    | `/homework`                      | student | The caller's cross-course homework: their courses' (manager+: all; students only what they're assigned) · paged |
@@ -698,9 +711,7 @@ digits plus non-consecutive interior `.`, `_`, `-` separators, starting and
 ending with a letter or digit (3–32 chars). Staff-looking names (`admin`,
 `administrator`, `root`, `support`, `system`, `moderator`, `staff`) are
 rejected at `/auth/register` only — the `ADMIN_USERNAME` bootstrap may still
-seed them. A duplicate username on register is a `409`; that this reveals the
-name is taken is a deliberate tradeoff (usernames are public handles here,
-unlike emails).
+seed them.
 UI preferences (`theme`: `light`/`dark`, `language`: `tr`/`en`) ride on the
 same account row and come back on every user response (`/auth/me` included).
 `PATCH /users/me/preferences` (or the admin `PATCH /users/{id}/preferences`)
@@ -722,7 +733,11 @@ A slot is a window on one teacher's calendar: `starts_at`/`ends_at` (unix
 milliseconds, `starts_at` strictly before `ends_at`, neither in the past — the
 usual 60-second grace) plus an optional `note` (≤ 500 chars) shown to
 requesters ("office hours", "veli görüşmesi"). Windows are **half-open**, so
-10:00–10:30 and 10:30–11:00 are two slots, not a collision. `POST
+10:00–10:30 and 10:30–11:00 are two slots, not a collision. A window that *does*
+overlap one the same teacher has already published is refused with a `409` — the
+guard is **per-teacher** (two teachers may hold office hours at the same hour)
+and boundary-touching windows are legal by that same half-open rule, which is
+how an hour gets carved into back-to-back slots. `POST
 /appointments/slots` publishes on the caller's *own* calendar (managers and
 admins included — the calendar always belongs to whoever posted) and **always
 answers an array**: one element for a one-off, one per occurrence for a
@@ -736,7 +751,12 @@ a `400`, as is `repeat_weekly` without `until` — and so is a window sitting so
 far ahead that shifting it by a week would run off the end of representable
 time (the shift is checked, never wrapped: a wrapped end would land *before*
 its start, and an inverted window can never overlap anything, which would
-quietly disable the double-booking guard). Delete one occurrence with
+quietly disable the double-booking guard). A recurring publish is
+**all-or-nothing**: every occurrence is checked — against the slots already
+stored *and* against the earlier occurrences of the same batch, which a window
+longer than a week overlaps itself — before a single row is written, so a
+mid-series collision answers `409` and leaves no stray weeks behind. Delete one
+occurrence with
 `DELETE /appointments/slots/{id}`, the whole publish with `DELETE
 /appointments/slots/series/{series}`.
 
@@ -775,8 +795,13 @@ decisions:
 - `PATCH /{id}/approve` — the slot's teacher (or manager+) confirms. Refused
   (`409`) when the effective window has already started.
 - `PATCH /{id}/reject` — turns it down; the slot frees up.
-- `PATCH /{id}/cancel` — either side, the requester or the teacher, from
-  either live state. Refused (`409`) once the meeting's window has started: a
+- `PATCH /{id}/cancel` — **the requester only**, from either live state.
+  Anyone else is a `403`, the slot's teacher and a manager/admin included (the
+  guard compares ids, not roles). A teacher ends a booking by **rejecting** it
+  while it is `pending`, and an approved one by counter-proposing another time
+  (`/reschedule`, which sends it back to `pending`) and then rejecting it — or
+  simply by rescheduling to a time that works. Refused (`409`) once the
+  meeting's window has started: a
   meeting that already began is history, not a plan. The guard sits in the
   domain's `cancel` itself, under the appointment lock and on a fresh read, so
   every way of cancelling — the decline below included — inherits it.
@@ -799,6 +824,20 @@ decisions:
   refused proposal still on it — book another slot instead. Declining *is* a
   cancel, so it answers to the cancel deadline too (`409` once the effective
   window has started).
+
+**Who settled it, and why.** Every settled booking carries its own audit trail
+on the row: `decided_by` (who approved or rejected — cleared again by a
+counter-proposal), `cancelled_by` (who called it off, stamped by `cancel` and by
+a declined counter-proposal), plus the optional free text that came with the
+decision — `reject_reason` on `PATCH /{id}/reject` and `cancel_reason` on
+`PATCH /{id}/cancel` and `/reschedule/decline`. Both reasons are optional: the
+whole body may be omitted, a blank one records nothing (`null`), and a present
+one is validated like the booking's own reason (≤ 1000 chars, `400` past that)
+before it reaches the row. They are **not public**: bookings are only ever
+rendered to the person who requested them and to the slot's teacher (a
+manager/admin acting on one by id sees the response to their own call), so
+"couldn't make it, sorry" goes no further than the two people it concerns. Rows
+written before these fields existed simply read back `null`.
 
 A booking's effective window is the accepted counter-proposal when there is
 one and the slot's own window otherwise; that is what `starts_at`/`ends_at` on
@@ -1106,7 +1145,7 @@ and images.
 **Question images**: any question may carry one **illustration** (`POST
 /exams/{id}/questions/{qid}/image` — the map the prompt asks about, on
 `choice` and `text` questions alike), and each option of a `choice` question
-may carry a **picture** of its own (`POST .../choices/{index}/image` — so
+may carry a **picture** of its own (`POST .../choices/{choice_id}/image` — so
 the options themselves can be images: four map crops, pick the right one).
 Uploads are `multipart/form-data` with a single `file` part, capped by the
 school's `max_file_bytes`; the declared content type must be `image/png`,
@@ -1267,7 +1306,7 @@ Mutation is **owner-only** (an `admin` bypasses): `PATCH /bank-questions/{bid}`
 revalidates the kind bundle as a unit, `DELETE /bank-questions/{bid}` drops the
 row and its image blobs. The illustration and option pictures work exactly like
 an exam question's — `POST|GET|DELETE /bank-questions/{bid}/image` and
-`…/choices/{index}/image`, `multipart/form-data` with one `file` part, raster
+`…/choices/{choice_id}/image`, `multipart/form-data` with one `file` part, raster
 only (`png`/`jpeg`/`webp`/`gif`), ≤ `max_file_bytes` — reads school-wide,
 writes owner-only.
 
@@ -1287,6 +1326,20 @@ template records the origin exam in `source_exam`. Both provenance fields are
 nullable — a hand-authored question or template carries `null` — and one-way
 metadata (the copies stay fully detached). All bank routes are course-agnostic
 and require teacher+.
+
+Copying means a template edit never reaches the copies, so there is one escape
+hatch for that divergence: `POST /exams/{id}/questions/{qid}/refresh-from-bank`
+re-copies the template's *current* content over one exam question — text,
+points, kind, choices (adopting the **template's** choice ids, so the option
+pictures re-land on the right options), `correct`, the illustration and the
+option pictures. The question keeps its own id, its exam, its `subject` (the
+template's is unrelated origin metadata) and its provenance links; anything
+edited on the copy is overwritten, deliberately. A question with no
+`source_bank` — hand-authored, or its template deleted — is a `400`, a template
+the caller may not see is a `404` (never a 403), and the usual freeze applies:
+once any attempt exists, `409`. Every source blob is read before anything is
+written, so a missing blob is a `500` with the question untouched rather than a
+half-applied refresh.
 
 ## Homework
 
@@ -1824,6 +1877,12 @@ src/
                    each owning its persistence
     user.rs        UserId · Username · Password · PasswordHash · User (has role)
     role.rs        Role enum (student < teacher < manager < admin), at_least()
+    field_update.rs FieldUpdate: one UPDATE ... SET built from only the fields a
+                   PATCH actually carried (an omitted field is never written)
+    monotonic_id.rs next_ulid: ids that sort in write order — one process-wide
+                   Generator, so same-millisecond rows never scramble
+    text_fold.rs   case- and diacritic-insensitive folding for search, shared by
+                   the Rust needle and the SurrealQL column (Turkish İ/ı, ü, ö…)
     session.rs     SessionId · SessionToken · Session (7-day expiry)
     timestamp.rs   Timestamp (unix-millisecond instant)
     note.rs        NoteId · NoteTitle · NoteContent · Note
@@ -1895,6 +1954,8 @@ src/
     dto.rs         shared UserResponse · CourseResponse · ExamResponse · SessionResponse schemas
     exam_ws.rs     the student exam-room WebSocket (state ticks, autosave, finish)
     page.rs        PageParams · Page<T> (shared pagination)
+    etag.rs        conditional-GET middleware: ETag over a 200 JSON body,
+                   If-None-Match → 304 (GET only; SSE and blobs pass through)
     auth.rs  users.rs  notes.rs  messages.rs  events.rs  appointments.rs
     courses.rs  subjects.rs  sessions.rs  exams.rs  homework.rs  questions.rs
     bank_questions.rs  marks.rs  work.rs  pomodoro.rs  attendance.rs

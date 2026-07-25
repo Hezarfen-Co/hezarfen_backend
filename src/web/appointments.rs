@@ -142,11 +142,15 @@ struct AppointmentResponse {
     proposed_by: Option<PersonRef>,
     /// Who approved or rejected it; `null` while pending.
     decided_by: Option<PersonRef>,
-    /// Who called it off; `null` unless `status` is `cancelled`.
+    /// Who called it off — the requester, or a requester declining a
+    /// counter-proposal; `null` unless `status` is `cancelled`.
     cancelled_by: Option<PersonRef>,
-    /// Optional free-text reason given when cancelling; `null` when none was.
+    /// Optional free-text reason given when cancelling; `null` when none was
+    /// (a blank one records nothing). Bookings are only ever rendered to the
+    /// requester and to the slot's teacher, so this audit trail goes no wider.
     cancel_reason: Option<String>,
     /// Optional free-text reason given when rejecting; `null` when none was.
+    /// The rejecter is on `decided_by`. Same audience as `cancel_reason`.
     reject_reason: Option<String>,
     created_at: i64,
 }
@@ -268,6 +272,14 @@ async fn for_decision(
 /// all sharing a `series` id — each occurrence is then independently bookable
 /// and independently deletable. The response is always an array: one element
 /// for a one-off publish, one per occurrence for a weekly one.
+///
+/// A window may not overlap another the *same teacher* has already published
+/// (`409`). The comparison is half-open, so 10:00–10:30 and 10:30–11:00 are two
+/// slots and not a collision — that is how an hour is carved into back-to-back
+/// slots. A weekly publish is all-or-nothing: it is validated in full (against
+/// stored slots *and* against its own earlier occurrences, which a window longer
+/// than a week collides with) before a single row is written, so a mid-series
+/// collision leaves no stray weeks behind.
 #[utoipa::path(
     post,
     path = "/slots",
@@ -279,6 +291,7 @@ async fn for_decision(
         (status = 400, description = "Invalid note, time range, times in the past, `until` missing with `repeat_weekly`, more than 52 occurrences, or a window too far ahead to shift by a week", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
+        (status = 409, description = "The window overlaps one the caller has already published, or (weekly) two occurrences overlap each other — the whole publish is refused, nothing is written", body = ErrorResponse),
     ),
 )]
 async fn publish_slots(
@@ -611,9 +624,13 @@ async fn reject(
     one_appointment(appointment, &st.db).await
 }
 
-/// Call a meeting off. Either side may — the requester or the slot's teacher
-/// (managers/admins too) — and from either live state, so an approved meeting
-/// can still be dropped and the slot freed. Refused (`409`) once the meeting's
+/// Call a meeting off. **The requester only** — the person who asked for it —
+/// from either live state, so an approved meeting can still be dropped and the
+/// slot freed. Anyone else is a `403`, the slot's teacher and a manager/admin
+/// included (the guard compares ids, not roles): a teacher ends a booking by
+/// **rejecting** it while it is `pending`, and an already-approved one by
+/// counter-proposing another time (`PATCH /{id}/reschedule` — which sends it
+/// back to `pending`) and then rejecting it. Refused (`409`) once the meeting's
 /// window has started: a meeting that already began is history, not a plan.
 #[utoipa::path(
     patch,
