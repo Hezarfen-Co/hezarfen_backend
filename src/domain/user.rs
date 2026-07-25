@@ -65,7 +65,9 @@ impl Password {
         Ok(Self(value.to_string()))
     }
 
-    pub fn hash(&self) -> Result<PasswordHash, AppError> {
+    /// Private on purpose: argon2 must never run on an async worker. Callers
+    /// outside this module go through [`Password::hash_async`].
+    fn hash(&self) -> Result<PasswordHash, AppError> {
         let mut salt_bytes = [0u8; 16];
         getrandom::fill(&mut salt_bytes).map_err(|e| AppError::Internal(format!("rng: {e}")))?;
         let salt = SaltString::encode_b64(&salt_bytes)
@@ -74,6 +76,17 @@ impl Password {
             .hash_password(self.0.as_bytes(), &salt)?
             .to_string();
         Ok(PasswordHash(hash))
+    }
+
+    /// [`Password::hash`] moved onto the blocking pool. argon2 is deliberately
+    /// CPU-expensive, so hashing on an async worker starves the runtime: under
+    /// load a registration burst pushes requests past `REQUEST_TIMEOUT_SECS`
+    /// and they come back as 503. Every request path must use this, not `hash`.
+    pub async fn hash_async(&self) -> Result<PasswordHash, AppError> {
+        let plain = self.0.clone();
+        tokio::task::spawn_blocking(move || Password(plain).hash())
+            .await
+            .map_err(|e| AppError::Internal(format!("hash task: {e}")))?
     }
 }
 
@@ -102,7 +115,8 @@ impl PasswordHash {
         &self.0
     }
 
-    pub fn verify(&self, password: &Password) -> bool {
+    /// Private on purpose — see [`Password::hash`]. Use [`PasswordHash::verify_async`].
+    fn verify(&self, password: &Password) -> bool {
         match argon2::password_hash::PasswordHash::new(&self.0) {
             Ok(parsed) => Argon2::default()
                 .verify_password(password.0.as_bytes(), &parsed)
@@ -111,12 +125,23 @@ impl PasswordHash {
         }
     }
 
-    /// Run a throwaway verification against the decoy hash. Login calls this when
-    /// the username is unknown, so a missing user costs the same argon2 time as a
-    /// real (wrong-password) check — otherwise the faster reply would let an
-    /// attacker enumerate valid usernames by timing.
-    pub fn verify_decoy(password: &Password) {
-        let _ = decoy_hash().verify(password);
+    /// [`PasswordHash::verify`] on the blocking pool — see [`Password::hash_async`].
+    pub async fn verify_async(&self, password: &Password) -> bool {
+        let hash = self.0.clone();
+        let plain = password.0.clone();
+        tokio::task::spawn_blocking(move || PasswordHash(hash).verify(&Password(plain)))
+            .await
+            .unwrap_or(false)
+    }
+
+    /// Run a throwaway verification against the decoy hash, on the blocking pool
+    /// (see [`Password::hash_async`]; the one-time decoy hash happens there too).
+    /// Login calls this when the username is unknown, so a missing user costs the
+    /// same argon2 time as a real (wrong-password) check — otherwise the faster
+    /// reply would let an attacker enumerate valid usernames by timing.
+    pub async fn verify_decoy_async(password: &Password) {
+        let plain = password.0.clone();
+        let _ = tokio::task::spawn_blocking(move || decoy_hash().verify(&Password(plain))).await;
     }
 }
 
@@ -255,7 +280,7 @@ impl User {
                 Ok(())
             }
             None => {
-                let created = Self::create(username, password.hash()?, db).await?;
+                let created = Self::create(username, password.hash_async().await?, db).await?;
                 let admin = created.set_role(Role::Admin, db).await?;
                 tracing::info!(username = admin.username.as_str(), "seeded admin account");
                 Ok(())
