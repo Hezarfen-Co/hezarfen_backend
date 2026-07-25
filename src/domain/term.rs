@@ -121,18 +121,29 @@ impl Term {
         Ok(result.take::<Vec<Term>>(0)?)
     }
 
+    /// Field-scoped: the handler reads the term, then awaits validation before
+    /// saving with no lock held ([`TERM_LOCK`] guards the delete's link check,
+    /// not this), so the save states its own three columns instead of replaying
+    /// a whole stale row.
     pub async fn update(
-        mut self,
+        self,
         name: TermName,
         starts_at: Timestamp,
         ends_at: Timestamp,
         db: &Database,
     ) -> Result<Term, AppError> {
-        self.name = name;
-        self.starts_at = starts_at;
-        self.ends_at = ends_at;
-        let updated: Option<Term> = db.update(self.id.record()).content(self).await?;
-        updated.ok_or(AppError::NotFound)
+        let mut result = db
+            .query(
+                "UPDATE $id SET name = $name, starts_at = $starts_at,
+                 ends_at = $ends_at RETURN AFTER",
+            )
+            .bind(("id", self.id.record()))
+            .bind(("name", name))
+            .bind(("starts_at", starts_at))
+            .bind(("ends_at", ends_at))
+            .await?
+            .check()?;
+        result.take::<Vec<Term>>(0)?.into_iter().next().ok_or(AppError::NotFound)
     }
 
     /// True iff any course still links to this term — the delete guard.

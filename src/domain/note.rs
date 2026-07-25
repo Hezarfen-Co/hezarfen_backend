@@ -115,16 +115,23 @@ impl Note {
         Ok(result.take::<Vec<Note>>(0)?)
     }
 
+    /// Field-scoped, mirroring [`crate::domain::subject::Subject::update`]: no
+    /// lock spans the handler's read and this write, so only the two columns
+    /// the request actually carries are written.
     pub async fn update(
-        mut self,
+        self,
         title: NoteTitle,
         content: NoteContent,
         db: &Database,
     ) -> Result<Note, AppError> {
-        self.title = title;
-        self.content = content;
-        let updated: Option<Note> = db.update(self.id.record()).content(self).await?;
-        updated.ok_or(AppError::NotFound)
+        let mut result = db
+            .query("UPDATE $id SET title = $title, content = $content RETURN AFTER")
+            .bind(("id", self.id.record()))
+            .bind(("title", title))
+            .bind(("content", content))
+            .await?
+            .check()?;
+        result.take::<Vec<Note>>(0)?.into_iter().next().ok_or(AppError::NotFound)
     }
 
     /// Delete the note and cascade-remove its attachment rows. Blob files on

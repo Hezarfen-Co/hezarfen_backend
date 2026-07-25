@@ -158,6 +158,7 @@ impl PoolQuestion {
     }
 
     pub async fn insert(self, db: &Database) -> Result<PoolQuestion, AppError> {
+        // whole-row-save-ok: create of a fresh ULID row built in place by `new` — there is no prior row to clobber
         let created: Option<PoolQuestion> = db.create(self.id.record()).content(self).await?;
         created.ok_or_else(|| AppError::Internal("failed to create pool question".into()))
     }

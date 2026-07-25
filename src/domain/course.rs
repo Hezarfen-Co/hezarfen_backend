@@ -227,8 +227,14 @@ impl Course {
         Ok(result.take::<Vec<Course>>(0)?)
     }
 
+    /// Field-scoped: `teachers` is written by [`Self::assign_teacher`],
+    /// [`Self::unassign_teacher`] and the demotion sweep, and nothing guards
+    /// the course row across the handler's read and this write (its `TERM_LOCK`
+    /// window guards the *term* it links, and the assign path takes no lock at
+    /// all) — a whole-row save would revert an assignment that landed in
+    /// between.
     pub async fn update(
-        mut self,
+        self,
         title: CourseTitle,
         description: CourseDescription,
         kind: CourseKind,
@@ -236,43 +242,70 @@ impl Course {
         capacity: Option<i64>,
         db: &Database,
     ) -> Result<Course, AppError> {
-        self.title = title;
-        self.description = description;
-        self.kind = kind;
-        self.term = term;
-        self.capacity = capacity;
-        let updated: Option<Course> = db.update(self.id.record()).content(self).await?;
-        updated.ok_or(AppError::NotFound)
+        let mut result = db
+            .query(
+                "UPDATE $id SET title = $title, description = $description, kind = $kind,
+                 term = $term, capacity = $capacity RETURN AFTER",
+            )
+            .bind(("id", self.id.record()))
+            .bind(("title", title))
+            .bind(("description", description))
+            .bind(("kind", kind))
+            .bind(("term", term.map(|term| term.record())))
+            .bind(("capacity", capacity))
+            .await?
+            .check()?;
+        result.take::<Vec<Course>>(0)?.into_iter().next().ok_or(AppError::NotFound)
     }
 
     /// Assign `teacher` to run this course, or return the course untouched if
     /// they already run it — assignment is idempotent, like enrollment.
+    /// Field-scoped, and the new list is folded server-side out of the *stored*
+    /// one: a course PATCH awaits a term lookup between its read and its write,
+    /// so a whole-row save from either side would revert the other. The
+    /// `array::distinct` keeps the assignment idempotent even when two requests
+    /// name the same teacher at once (the early return only sees a stale row).
     pub async fn assign_teacher(
-        mut self,
+        self,
         teacher: &UserId,
         db: &Database,
     ) -> Result<Course, AppError> {
         if self.is_assigned(teacher) {
             return Ok(self);
         }
-        self.teachers.push(teacher.clone());
-        let updated: Option<Course> = db.update(self.id.record()).content(self).await?;
-        updated.ok_or(AppError::NotFound)
+        let mut result = db
+            .query(
+                "UPDATE $id SET teachers = array::distinct(array::append(teachers, $usr))
+                 RETURN AFTER",
+            )
+            .bind(("id", self.id.record()))
+            .bind(("usr", teacher.record()))
+            .await?
+            .check()?;
+        result.take::<Vec<Course>>(0)?.into_iter().next().ok_or(AppError::NotFound)
     }
 
     /// Drop `teacher` from this course. `None` when they weren't assigned, so
     /// the web layer can answer 404 instead of pretending it removed someone.
     pub async fn unassign_teacher(
-        mut self,
+        self,
         teacher: &UserId,
         db: &Database,
     ) -> Result<Option<Course>, AppError> {
         if !self.is_assigned(teacher) {
             return Ok(None);
         }
-        self.teachers.retain(|assigned| assigned != teacher);
-        let updated: Option<Course> = db.update(self.id.record()).content(self).await?;
-        updated.map(Some).ok_or(AppError::NotFound)
+        // Same field-scoped story as [`Self::assign_teacher`]; `-=` drops the
+        // one link off the stored list without touching the course's own text.
+        let mut result = db
+            .query("UPDATE $id SET teachers -= $usr RETURN AFTER")
+            .bind(("id", self.id.record()))
+            .bind(("usr", teacher.record()))
+            .await?
+            .check()?;
+        Ok(Some(
+            result.take::<Vec<Course>>(0)?.into_iter().next().ok_or(AppError::NotFound)?,
+        ))
     }
 
     /// Strip `user` from every course they were assigned to — the sweep for a

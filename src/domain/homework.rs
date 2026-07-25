@@ -255,13 +255,14 @@ impl Homework {
     }
 
     /// Re-tag, re-title, re-describe, re-schedule, or re-scope the homework.
-    /// `course`, `created_by`, and `created_at` are untouched — the write
-    /// re-sends them unchanged, which the `READONLY` schema permits (only a
-    /// *changed* readonly value is refused). The web layer has already
-    /// re-checked the new `due_at` against now and the new `subject` against
-    /// the course, and refused a narrowing that would orphan a submission.
+    /// Field-scoped, so `course`, `created_by`, and `created_at` are never in
+    /// the write at all — no `READONLY` column is re-sent, and nothing the
+    /// request didn't name can be carried back from a stale read. The web layer
+    /// has already re-checked the new `due_at` against now and the new
+    /// `subject` against the course, and refused a narrowing that would orphan
+    /// a submission.
     pub async fn update(
-        mut self,
+        self,
         subject: &SubjectId,
         title: HomeworkTitle,
         description: Option<HomeworkDescription>,
@@ -269,13 +270,21 @@ impl Homework {
         assigned: Option<Vec<UserId>>,
         db: &Database,
     ) -> Result<Homework, AppError> {
-        self.subject = subject.clone();
-        self.title = title;
-        self.description = description;
-        self.due_at = due_at;
-        self.assigned = assigned;
-        let updated: Option<Homework> = db.update(self.id.record()).content(self).await?;
-        updated.ok_or(AppError::NotFound)
+        let assigned = assigned.map(|users| users.iter().map(UserId::record).collect::<Vec<_>>());
+        let mut result = db
+            .query(
+                "UPDATE $id SET subject = $subject, title = $title, description = $description,
+                 due_at = $due_at, assigned = $assigned RETURN AFTER",
+            )
+            .bind(("id", self.id.record()))
+            .bind(("subject", subject.record()))
+            .bind(("title", title))
+            .bind(("description", description))
+            .bind(("due_at", due_at))
+            .bind(("assigned", assigned))
+            .await?
+            .check()?;
+        result.take::<Vec<Homework>>(0)?.into_iter().next().ok_or(AppError::NotFound)
     }
 
     /// Delete the homework and cascade its submissions, their files, and its

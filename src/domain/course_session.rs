@@ -134,20 +134,30 @@ impl CourseSession {
         Ok(result.take::<Vec<CourseSession>>(0)?)
     }
 
+    /// Field-scoped, like every other save in this codebase: the handler holds
+    /// no lock across its read and this write, so a whole-row save would carry
+    /// the whole stale row back over anything that landed in between.
     pub async fn update(
-        mut self,
+        self,
         teacher: UserId,
         topic: SessionTopic,
         starts_at: Timestamp,
         ends_at: Option<Timestamp>,
         db: &Database,
     ) -> Result<CourseSession, AppError> {
-        self.teacher = teacher;
-        self.topic = topic;
-        self.starts_at = starts_at;
-        self.ends_at = ends_at;
-        let updated: Option<CourseSession> = db.update(self.id.record()).content(self).await?;
-        updated.ok_or(AppError::NotFound)
+        let mut result = db
+            .query(
+                "UPDATE $id SET teacher = $teacher, topic = $topic,
+                 starts_at = $starts_at, ends_at = $ends_at RETURN AFTER",
+            )
+            .bind(("id", self.id.record()))
+            .bind(("teacher", teacher.record()))
+            .bind(("topic", topic))
+            .bind(("starts_at", starts_at))
+            .bind(("ends_at", ends_at))
+            .await?
+            .check()?;
+        result.take::<Vec<CourseSession>>(0)?.into_iter().next().ok_or(AppError::NotFound)
     }
 
     /// Delete the session and cascade-remove its roll-call rows.
