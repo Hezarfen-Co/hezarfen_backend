@@ -1546,7 +1546,7 @@ fn choice_slot(question: &ExamQuestion, choice_id: &str) -> Result<ChoiceId, App
 /// Add a question to an exam. Requires teacher+ and management rights over the
 /// exam's course. `subject_id` must name one of the course's subjects
 /// (`GET /courses/{id}/subjects`) — every question belongs to a subject.
-/// `choice` questions carry 2–10 `choices` plus the `correct` index; `text`
+/// `choice` questions carry 2–10 `choices` plus `correct` naming one of them by id; `text`
 /// questions carry neither. Locked once attempts exist.
 #[utoipa::path(
     post,
@@ -1604,7 +1604,7 @@ async fn create_question(
     ))
 }
 
-/// The exam's question list, `correct` indexes included — the answer key,
+/// The exam's question list, `correct` choice ids included — the answer key,
 /// paged via `?limit=&offset=` (omit `limit` for the whole list). Requires
 /// teacher+ and management rights over the exam's course. Students read
 /// questions through `GET /exams/{id}/attempt/questions`. Returns a
@@ -2424,9 +2424,11 @@ async fn delete_question_image(
 
 /// Attach (or replace) one option's picture on a `choice` question — so the
 /// options themselves can be images (four map crops, pick the right one).
-/// Same form, limits, and rights as the question-image upload; `index` is the
-/// option's zero-based position. Replacing the question's `choices` list
-/// drops all its option pictures — re-upload against the new list.
+/// Same form, limits, and rights as the question-image upload; `choice_id` is
+/// the `id` carried on that choice, as returned in the question's `choices`
+/// (not a position — an unknown id is a `400`). Replacing the question's
+/// `choices` list drops all its option pictures — re-upload against the new
+/// list.
 #[utoipa::path(
     post,
     path = "/{id}/questions/{qid}/choices/{choice_id}/image",
@@ -2577,7 +2579,7 @@ impl AnswerStateResponse {
     }
 }
 
-/// A question as the sitting student sees it: no `correct` index, their own
+/// A question as the sitting student sees it: no `correct` choice id, their own
 /// saved answer embedded.
 #[derive(Serialize, ToSchema)]
 struct AttemptQuestionResponse {
@@ -3507,7 +3509,7 @@ async fn review_attempts(
     Ok(Json(seqs))
 }
 
-/// The exam's full question list, `correct` indexes included — the answer key
+/// The exam's full question list, `correct` choice ids included — the answer key
 /// the caller reviews their own sheet against. Same review gate as the other
 /// self-review reads; revealing `correct` is the point (the gate already proves
 /// the caller was marked). Paged via `?limit=&offset=`.
