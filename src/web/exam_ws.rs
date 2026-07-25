@@ -10,18 +10,25 @@
 //! server → client
 //! - `{"type":"state", status, attempt, deadline, remaining_ms, now, answered, question_count}`
 //!   on connect, every [`EXAM_WS_TICK_SECS`], and after each save
-//! - `{"type":"saved", question_id, updated_at}` — an answer landed
+//! - `{"type":"saved", question_id, updated_at, seq?}` — an answer landed
 //! - `{"type":"pong"}`
 //! - `{"type":"finished", finished_at}` then Close — submitted (here or elsewhere)
 //! - `{"type":"expired"}` then Close — the deadline passed mid-session
-//! - `{"type":"error", message, question_id?}` — bad JSON, unknown type,
+//! - `{"type":"error", message, question_id?, seq?}` — bad JSON, unknown type,
 //!   validation, deadline. `question_id` is present only when the failure
 //!   belongs to that one `answer` (its payload or its question); absent means
 //!   the failure is connection- or sitting-level, so every save in flight is
 //!   equally refused
 //!
+//! `seq` on either reply is whatever the `answer` sent, echoed verbatim: the
+//! server never reads it, never dedupes on it, and omits the key entirely when
+//! the request omitted it. `question_id` cannot serve as the correlation id —
+//! a re-save of the same question after a timeout leaves two sends
+//! outstanding for it.
+//!
 //! client → server
-//! - `{"type":"answer", question_id, selected? | text?}` (`selected` = choice id)
+//! - `{"type":"answer", question_id, selected? | text?, seq?}` (`selected` =
+//!   choice id, `seq` = the client's own correlation id)
 //! - `{"type":"finish"}`
 //! - `{"type":"ping"}`
 //!
@@ -97,6 +104,13 @@ enum ClientMessage {
         selected: Option<String>,
         #[serde(default)]
         text: Option<String>,
+        /// The client's own correlation id, echoed verbatim on this message's
+        /// `saved` or `error` and never read by the server. `question_id` is
+        /// not an identity — a re-save of the same question after a timeout
+        /// has two sends outstanding, and the first reply would otherwise
+        /// settle the second.
+        #[serde(default)]
+        seq: Option<u64>,
     },
     Finish,
     Ping,
@@ -365,10 +379,11 @@ async fn handle_message(
             question_id,
             selected,
             text,
+            seq,
         } => {
             // Cap the key before it can be echoed — see [`MAX_QUESTION_ID_LEN`].
             if let Err(err) = validate_required("question_id", &question_id, MAX_QUESTION_ID_LEN) {
-                let frame = error_frame(&AppError::Validation(err));
+                let frame = error_frame_for(&AppError::Validation(err), None, seq);
                 return send(socket, frame).await;
             }
             // Re-read the exam so the save is judged against the *current*
@@ -396,15 +411,13 @@ async fn handle_message(
             drop(guard);
             match saved {
                 Ok(answer) => {
-                    send(
-                        socket,
-                        json!({
-                            "type": "saved",
-                            "question_id": answer.get_question().key(),
-                            "updated_at": answer.get_updated_at().as_millis(),
-                        }),
-                    )
-                    .await?;
+                    let mut frame = json!({
+                        "type": "saved",
+                        "question_id": answer.get_question().key(),
+                        "updated_at": answer.get_updated_at().as_millis(),
+                    });
+                    with_seq(&mut frame, seq);
+                    send(socket, frame).await?;
                     // Progress changed — refresh the countdown/answered state
                     // right away rather than waiting out the tick.
                     push_state(socket, exam_id, attempt_id, db).await
@@ -413,7 +426,7 @@ async fn handle_message(
                     let attributed = in_save && attributable(&err);
                     send(
                         socket,
-                        error_frame_for(&err, attributed.then_some(question_id.as_str())),
+                        error_frame_for(&err, attributed.then_some(question_id.as_str()), seq),
                     )
                     .await
                 }
@@ -468,14 +481,25 @@ fn attributable(err: &AppError) -> bool {
 /// The public words for an error — the same strings the HTTP layer would use,
 /// with internals logged, never sent.
 fn error_frame(err: &AppError) -> Value {
-    error_frame_for(err, None)
+    error_frame_for(err, None, None)
+}
+
+/// Attach the request's correlation id, if it sent one. Omitted stays omitted
+/// — never `null` — so a client that sends no `seq` sees byte-identical
+/// frames.
+fn with_seq(frame: &mut Value, seq: Option<u64>) {
+    if let Some(seq) = seq {
+        frame["seq"] = json!(seq);
+    }
 }
 
 /// [`error_frame`] plus the optional blame: `question_id` when the failure
-/// belongs to one `answer` message. Absent keeps its original meaning — an
-/// unattributed failure — so a client that ignores the field behaves exactly
-/// as before.
-fn error_frame_for(err: &AppError, question: Option<&str>) -> Value {
+/// belongs to one `answer` message, and `seq` whenever the `answer` carried
+/// one — the two are independent, so an unattributable failure is still
+/// matchable to the send that caused it. Absent keeps its original meaning —
+/// an unattributed failure — so a client that ignores the fields behaves
+/// exactly as before.
+fn error_frame_for(err: &AppError, question: Option<&str>, seq: Option<u64>) -> Value {
     let message = match err {
         AppError::Validation(err) => err.to_string(),
         AppError::NotFound => "not found".to_string(),
@@ -498,8 +522,10 @@ fn error_frame_for(err: &AppError, question: Option<&str>) -> Value {
             "internal server error".to_string()
         }
     };
-    match question {
-        Some(question) => json!({ "type": "error", "message": message, "question_id": question }),
-        None => json!({ "type": "error", "message": message }),
+    let mut frame = json!({ "type": "error", "message": message });
+    if let Some(question) = question {
+        frame["question_id"] = json!(question);
     }
+    with_seq(&mut frame, seq);
+    frame
 }
