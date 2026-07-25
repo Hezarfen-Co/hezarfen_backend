@@ -1,13 +1,29 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
+use tokio::sync::Mutex;
 use ulid::Ulid;
 
 use crate::constant::MAX_SESSION_TOPIC_LEN;
 use crate::database::{COURSE_SESSION_TABLE, Database};
 use crate::domain::course::CourseId;
+use crate::domain::field_update::FieldUpdate;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 use crate::validate::validate_optional;
+
+/// Serializes a lesson's time-range check against the write it guards, exactly
+/// as [`crate::domain::event::EVENT_LOCK`] does for events: `starts_at <=
+/// ends_at` is a cross-field check, so a PATCH carrying one end validates it
+/// against the *stored* other end — two such PATCHes, each fine on its own
+/// snapshot, would otherwise commit an inverted lesson between them. A PATCH
+/// that moves neither end checks nothing cross-field and stays lock-free.
+///
+/// Lock order: this is a leaf — the only path that takes it (`PATCH
+/// /sessions/{id}`) takes no other lock, and no path holding `EXAM_LOCK`,
+/// `BANK_LOCK`, `HOMEWORK_LOCK`, `ENROLL_LOCK` or any other takes this one, so
+/// it cannot sit in a cycle. Should a future path need both, take the other
+/// lock first and this one innermost.
+pub(crate) static SESSION_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct CourseSessionId(RecordId);
@@ -134,34 +150,28 @@ impl CourseSession {
         Ok(result.take::<Vec<CourseSession>>(0)?)
     }
 
-    /// Field-scoped, like every other save in this codebase: the handler holds
-    /// no lock across its read and this write, so a whole-row save would carry
-    /// the whole stale row back over anything that landed in between.
+    /// Request-scoped: the handler holds no lock across its read and this write
+    /// unless a schedule end arrives ([`SESSION_LOCK`]), so a field the request
+    /// omitted (`None`) is not written at all. Re-sending the snapshot's value
+    /// instead would revert a concurrent PATCH of that field — scoping the
+    /// `SET` alone does not stop that, the values have to come from the
+    /// request. `ends_at` is nullable, so it takes the outer/inner
+    /// `Option<Option<_>>`: `None` = omitted (keep), `Some(None)` = clear.
     pub async fn update(
         self,
-        teacher: UserId,
-        topic: SessionTopic,
-        starts_at: Timestamp,
-        ends_at: Option<Timestamp>,
+        teacher: Option<UserId>,
+        topic: Option<SessionTopic>,
+        starts_at: Option<Timestamp>,
+        ends_at: Option<Option<Timestamp>>,
         db: &Database,
     ) -> Result<CourseSession, AppError> {
-        let mut result = db
-            .query(
-                "UPDATE $id SET teacher = $teacher, topic = $topic,
-                 starts_at = $starts_at, ends_at = $ends_at RETURN AFTER",
-            )
-            .bind(("id", self.id.record()))
-            .bind(("teacher", teacher.record()))
-            .bind(("topic", topic))
-            .bind(("starts_at", starts_at))
-            .bind(("ends_at", ends_at))
-            .await?
-            .check()?;
-        result
-            .take::<Vec<CourseSession>>(0)?
-            .into_iter()
-            .next()
-            .ok_or(AppError::NotFound)
+        FieldUpdate::new(self.id.record())
+            .set("teacher", teacher.map(|teacher| teacher.record()))
+            .set("topic", topic)
+            .set("starts_at", starts_at)
+            .set("ends_at", ends_at)
+            .run::<CourseSession>(db)
+            .await
     }
 
     /// Delete the session and cascade-remove its roll-call rows.

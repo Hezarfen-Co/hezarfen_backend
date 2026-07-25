@@ -11,7 +11,7 @@ use utoipa_axum::routes;
 use crate::database::Database;
 use crate::domain::attendance::AttendanceStatus;
 use crate::domain::course::Course;
-use crate::domain::course_session::{CourseSession, CourseSessionId, SessionTopic};
+use crate::domain::course_session::{CourseSession, CourseSessionId, SESSION_LOCK, SessionTopic};
 use crate::domain::enrollment::Enrollment;
 use crate::domain::role::Role;
 use crate::domain::session_attendance::SessionAttendance;
@@ -186,6 +186,25 @@ async fn update_session(
     Path(id): Path<String>,
     Json(req): Json<UpdateSession>,
 ) -> Result<Json<SessionResponse>, AppError> {
+    // Only values this request sets are held to the no-past rule — a kept
+    // `starts_at` of a lesson already underway is legitimately past. A provided
+    // `ends_at` sets the field, an explicit `null` clears it, an omitted one is
+    // left alone.
+    let starts_at = req.starts_at.map(Timestamp::from_millis);
+    check_not_past("starts_at", starts_at)?;
+    let ends_at = req.ends_at.map(|update| update.map(Timestamp::from_millis));
+    if let Some(ends_at) = ends_at {
+        check_not_past("ends_at", ends_at)?;
+    }
+    // Only the range check needs the stored row, and only it can race: it
+    // validates an arriving end against the other end as stored, so the read,
+    // the check and the write are held together under [`SESSION_LOCK`]. A PATCH
+    // that moves neither end pays nothing.
+    let _guard = match (starts_at, ends_at) {
+        (None, None) => None,
+        _ => Some(SESSION_LOCK.lock().await),
+    };
+
     let (session, course) = session_with_course(&id, &st.db).await?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
@@ -193,38 +212,26 @@ async fn update_session(
         ));
     }
 
-    let topic = match req.topic {
-        Some(ref topic) => SessionTopic::try_new(topic)?,
-        None => session.get_topic().clone(),
-    };
+    let topic = req
+        .topic
+        .as_deref()
+        .map(SessionTopic::try_new)
+        .transpose()?;
     let teacher = match req.teacher_id {
-        Some(ref key) => resolve_session_teacher(Some(key), &user, &st.db)
-            .await?
-            .get_id()
-            .clone(),
-        None => session.get_teacher().clone(),
+        Some(ref key) => Some(
+            resolve_session_teacher(Some(key), &user, &st.db)
+                .await?
+                .get_id()
+                .clone(),
+        ),
+        None => None,
     };
-    // Only values this request sets are held to the no-past rule — a kept
-    // `starts_at` of a lesson already underway is legitimately past.
-    let starts_at = match req.starts_at {
-        Some(millis) => {
-            let starts_at = Timestamp::from_millis(millis);
-            check_not_past("starts_at", Some(starts_at))?;
-            starts_at
-        }
-        None => session.get_starts_at(),
-    };
-    // A provided value sets the field, an explicit `null` clears it, and an
-    // omitted one keeps the current value.
-    let ends_at = match req.ends_at {
-        Some(update) => {
-            let ends_at = update.map(Timestamp::from_millis);
-            check_not_past("ends_at", ends_at)?;
-            ends_at
-        }
-        None => session.get_ends_at(),
-    };
-    check_time_range(Some(starts_at), ends_at)?;
+    // The end this request left out is only *read* for the range check — it is
+    // never written back, so a concurrent move of it survives.
+    check_time_range(
+        Some(starts_at.unwrap_or_else(|| session.get_starts_at())),
+        ends_at.unwrap_or_else(|| session.get_ends_at()),
+    )?;
 
     let updated = session
         .update(teacher, topic, starts_at, ends_at, &st.db)

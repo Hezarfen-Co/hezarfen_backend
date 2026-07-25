@@ -1,9 +1,10 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-use ulid::Ulid;
 
 use crate::constant::{MAX_SUBJECT_DESCRIPTION_LEN, MAX_SUBJECT_NAME_LEN};
 use crate::database::{Database, SUBJECT_TABLE};
 use crate::domain::course::CourseId;
+use crate::domain::field_update::FieldUpdate;
+use crate::domain::monotonic_id::next_ulid;
 use crate::error::{AppError, ValidationError};
 use crate::validate::{validate_optional, validate_required};
 
@@ -11,8 +12,12 @@ use crate::validate::{validate_optional, validate_required};
 pub struct SubjectId(RecordId);
 
 impl SubjectId {
+    /// Minted from the process-wide monotonic generator, not `Ulid::new()`: the
+    /// id *is* the curriculum's order ([`Subject::list_for_course`] sorts
+    /// `id ASC`), and a random low half scrambles a burst of saves that lands
+    /// inside one millisecond.
     pub fn generate() -> Self {
-        Self(RecordId::new(SUBJECT_TABLE, Ulid::new().to_string()))
+        Self(RecordId::new(SUBJECT_TABLE, next_ulid().to_string()))
     }
 
     pub fn from_key(key: &str) -> Self {
@@ -136,27 +141,23 @@ impl Subject {
         Ok(result.take::<Vec<Subject>>(0)?)
     }
 
+    /// Request-scoped: no lock spans the handler's read and this write, so an
+    /// omitted field (`None`) is not written at all. Passing the snapshot's
+    /// value back instead would revert a concurrent edit of that field —
+    /// scoping the `SET` alone does not prevent that, the values have to come
+    /// from the request. Neither column is nullable, so plain `Option` per
+    /// field says everything there is to say.
     pub async fn update(
         self,
-        name: SubjectName,
-        description: SubjectDescription,
+        name: Option<SubjectName>,
+        description: Option<SubjectDescription>,
         db: &Database,
     ) -> Result<Subject, AppError> {
-        // Field-scoped: the handler holds no lock across its read and this
-        // write, so a whole-row save would revert a concurrent edit of the
-        // other field.
-        let mut result = db
-            .query("UPDATE $id SET name = $name, description = $description RETURN AFTER")
-            .bind(("id", self.id.record()))
-            .bind(("name", name))
-            .bind(("description", description))
-            .await?
-            .check()?;
-        result
-            .take::<Vec<Subject>>(0)?
-            .into_iter()
-            .next()
-            .ok_or(AppError::NotFound)
+        FieldUpdate::new(self.id.record())
+            .set("name", name)
+            .set("description", description)
+            .run::<Subject>(db)
+            .await
     }
 
     /// Delete the subject and clear it off every bank template that carried it
@@ -192,6 +193,21 @@ impl Subject {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A teacher entering a curriculum gets it back in the order they typed it:
+    /// `list_for_course` sorts `id ASC`, so the ids minted inside one
+    /// millisecond have to sort in mint order. Revert `generate` to
+    /// `Ulid::new()` and this fails — the low 80 bits are redrawn per id, so a
+    /// same-tick burst comes out shuffled.
+    #[tokio::test]
+    async fn ids_sort_in_creation_order() {
+        let ids: Vec<String> = (0..500)
+            .map(|_| SubjectId::generate().key().to_string())
+            .collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted);
+    }
 
     #[tokio::test]
     async fn name_is_required() {

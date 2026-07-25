@@ -47,8 +47,11 @@ use super::{
 };
 
 /// Serializes bank writes that adopt a `subject` against a concurrent subject
-/// delete. Bank create/update take the reader lease across their
-/// subject-exists check and the write; the subject delete takes the writer
+/// delete. Bank create takes the reader lease across its
+/// subject-exists check and the write; the *update* takes the writer lease
+/// instead, because it is a read-modify-write of the whole template, so its row
+/// read must be serialized against another update and not merely against the
+/// delete cascade; the subject delete takes the writer
 /// lease across the cascade that clears `subject` off every template, so a
 /// template can't land on a subject that vanished mid-flight (it would outlive
 /// the sweep) — the bank twin of the
@@ -419,7 +422,7 @@ pub(crate) async fn store_image(
 /// Add a template to the bank. Requires teacher+. `subject_id` is origin
 /// metadata (any subject — the same-course rule lives at instantiate time),
 /// so it need only exist (an unknown subject is a `400`). `choice` templates
-/// carry 2–10 `choices` plus the `correct` index; `text` templates carry
+/// carry 2–10 `choices` plus `correct` naming one of them by id; `text` templates carry
 /// neither. The caller becomes the owner.
 #[utoipa::path(
     post,
@@ -628,11 +631,21 @@ async fn update_question(
     Path(bid): Path<String>,
     Json(req): Json<UpdateBankQuestion>,
 ) -> Result<Json<BankQuestionResponse>, AppError> {
+    // *Writer* lease of [`BANK_LOCK`], taken before the row is read: this is a
+    // read-modify-write, not a per-field write. Omitted fields are refilled from
+    // the snapshot below, and the kind/choices/correct trio genuinely has to be
+    // (a text-only edit re-submits the stored options *with their ids* so every
+    // choice keeps its picture), so the read, the merge and the write must be
+    // one unit or a concurrent PATCH of another field is silently reverted. The
+    // reader lease this used to take was both shared *and* acquired after the
+    // read, so it serialized nothing; it only ever covered the subject-exists
+    // check against a subject delete, which the writer lease still covers.
+    // Exclusive means bank writes queue behind each other — they are rare
+    // teacher edits, and the per-field alternative cannot express the
+    // choice-identity merge. Still the only lock this path takes, so the
+    // documented EXAM → BANK order is unaffected.
+    let _guard = BANK_LOCK.write().await;
     let question = owned_question(&st, &user, &bid).await?;
-
-    // Reader lease of [`BANK_LOCK`] across the exists-check and the update, so a
-    // re-tag to a subject that's being deleted can't straddle the delete-guard.
-    let _guard = BANK_LOCK.read().await;
     // Omitted keeps the stored subject — which may already be `None`, cleared
     // by that subject's delete.
     let subject = match req.subject_id {
@@ -818,8 +831,9 @@ async fn delete_question_image(
 
 /// Attach (or replace) one option's picture on a `choice` template. Owner only
 /// (admins aside). Same form, limits, and rules as the illustration upload;
-/// `index` is the option's zero-based position. Replacing the `choices` list
-/// drops all its option pictures.
+/// `choice_id` is the `id` carried on that choice, as returned in the
+/// template's `choices` (not a position — an unknown id is a `400`). Replacing
+/// the `choices` list drops all its option pictures.
 #[utoipa::path(
     post,
     path = "/{bid}/choices/{choice_id}/image",

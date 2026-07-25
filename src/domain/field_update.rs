@@ -4,8 +4,8 @@
 //! WHY: a handler reads the row, then writes. Filling a field the request
 //! omitted from that snapshot re-sends a value the client never gave, so a
 //! concurrent PATCH of the *other* field that landed in between is silently
-//! reverted — the same lost update the whole-row-save gate bans, just spelled
-//! field by field. Scoping the `SET` is not enough; the *values* must come
+//! reverted — the same lost update a whole-row `.content(self)` save causes,
+//! just spelled field by field. Scoping the `SET` is not enough; the *values* must come
 //! from the request, so an absent field is never written at all.
 //!
 //! Callers therefore take `Option<T>` per field (`None` = absent, keep) and

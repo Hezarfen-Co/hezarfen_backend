@@ -143,14 +143,15 @@ async fn update_subject(
         ));
     }
 
-    let name = match req.name {
-        Some(ref name) => SubjectName::try_new(name)?,
-        None => subject.get_name().clone(),
-    };
-    let description = match req.description {
-        Some(ref description) => SubjectDescription::try_new(description)?,
-        None => subject.get_description().clone(),
-    };
+    // Only what the request actually carried is validated and written — an
+    // omitted field stays `None` so the save never re-sends this snapshot's
+    // value over a concurrent PATCH of the other field.
+    let name = req.name.as_deref().map(SubjectName::try_new).transpose()?;
+    let description = req
+        .description
+        .as_deref()
+        .map(SubjectDescription::try_new)
+        .transpose()?;
 
     let updated = subject.update(name, description, &st.db).await?;
     Ok(Json(SubjectResponse::new(&updated)))
