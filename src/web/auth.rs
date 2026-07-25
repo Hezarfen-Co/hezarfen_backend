@@ -72,7 +72,7 @@ async fn register(
         }
         .into());
     }
-    let password_hash = Password::try_new(&req.password)?.hash()?;
+    let password_hash = Password::try_new(&req.password)?.hash_async().await?;
     let user = User::create(username, password_hash, &st.db).await?;
     Ok((StatusCode::CREATED, Json(UserResponse::new(&user))))
 }
@@ -98,13 +98,20 @@ async fn login(
     // Usernames are stored trimmed (see `Username::try_new`); trim the lookup
     // the same way so a padded login attempt matches the canonical name.
     let user = match User::find_by_username(req.username.trim(), &st.db).await? {
-        Some(user) if user.get_password_hash().verify(&password) => user,
-        Some(_) => return Err(AppError::Unauthorized),
+        // Verification is `.await`ed so argon2 runs on the blocking pool instead
+        // of stalling an async worker; that rules out a match guard, which
+        // cannot await.
+        Some(user) => {
+            if !user.get_password_hash().verify_async(&password).await {
+                return Err(AppError::Unauthorized);
+            }
+            user
+        }
         None => {
             // No such user. Still do the argon2 work against a decoy so the reply
             // takes as long as a real (wrong-password) check — otherwise the
             // timing difference leaks which usernames exist.
-            PasswordHash::verify_decoy(&password);
+            PasswordHash::verify_decoy_async(&password).await;
             return Err(AppError::Unauthorized);
         }
     };
