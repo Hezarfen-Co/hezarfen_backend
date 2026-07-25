@@ -40,10 +40,24 @@ use super::bank_questions::BankQuestionResponse;
 use super::courses::{can_manage_course, can_view_course, visible_courses};
 use super::subjects::subject_in_course;
 use super::{
-    ChoiceBody, CurrentUser, ExamResponse, Page, PageParams, PersonRef, RequireTeacher,
-    UploadFileForm, blob_path, check_not_past, image_content_type, paginate, person_map,
-    read_upload, remove_blob, set_or_clear,
+    ChoiceBody, CurrentUser, ExamResponse, Page, PageParams, PersonRef, RequireTeacher, Scheduled,
+    UploadFileForm, WindowParams, blob_path, check_not_past, image_content_type, paginate,
+    person_map, read_upload, remove_blob, set_or_clear,
 };
+
+impl Scheduled for Exam {
+    fn starts_at_ms(&self) -> Option<i64> {
+        self.get_starts_at().map(|at| at.as_millis())
+    }
+
+    fn ends_at_ms(&self) -> Option<i64> {
+        self.get_ends_at().map(|at| at.as_millis())
+    }
+
+    fn order_key(&self) -> &str {
+        self.get_id().key()
+    }
+}
 
 /// Serializes the exam subsystem's cross-record check-then-writes, which
 /// `BEGIN…COMMIT` cannot (write skew) — same reasoning as `REGISTER_LOCK`.
@@ -234,21 +248,29 @@ async fn course_of(exam: &Exam, db: &Database) -> Result<Course, AppError> {
 /// people's drafts (a draft shows only to its course's managers). Paged via
 /// `?limit=&offset=` (omit `limit` for the full list); returns a
 /// `{items, total, limit, offset}` envelope.
+///
+/// The optional `?starts_after=&ends_after=` schedule window (unix
+/// milliseconds) applies *after* the visibility and draft filtering, narrows
+/// the list to upcoming/unfinished exams and flips the order to ascending by
+/// schedule — so `?ends_after=<now>&limit=20` returns the twenty *soonest*
+/// exams rather than the twenty newest-created. Exams without a window
+/// (no `mode`, or `open`) are excluded by either parameter.
 #[utoipa::path(
     get,
     path = "/",
     tag = "exams",
     security(("session_cookie" = [])),
-    params(PageParams),
+    params(WindowParams, PageParams),
     responses(
         (status = 200, description = "A page of the caller's visible exams (all of them when unpaged)", body = Page<ExamResponse>),
-        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
+        (status = 400, description = "Invalid window, limit, or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
     ),
 )]
 async fn list_exams(
     State(st): State<AppState>,
     CurrentUser(user): CurrentUser,
+    Query(window): Query<WindowParams>,
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<ExamResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
@@ -268,6 +290,7 @@ async fn list_exams(
         exams.retain(|exam| !exam.is_draft() || managed.contains(&exam.get_course().key()));
         exams
     };
+    let exams = window.apply(exams)?;
     let total = exams.len() as i64;
     let items = paginate(&exams, limit, offset)
         .iter()

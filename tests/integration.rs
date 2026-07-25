@@ -19735,3 +19735,172 @@ async fn staffing_a_course_does_not_clobber_a_concurrent_edit() {
     assert_eq!(res.body["capacity"], 9);
     assert_eq!(res.body["teachers"].as_array().unwrap().len(), 0);
 }
+
+// --- schedule-window list filters ----------------------------------------
+
+/// Titles of a list envelope, in response order.
+fn titles(body: &serde_json::Value) -> Vec<String> {
+    common::items(body)
+        .iter()
+        .map(|item| item["title"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn events_schedule_window_filters_and_orders() {
+    let (app, db) = app_and_db().await;
+    let ali = login_as(&app, &db, "ali", "teacher").await;
+    let now = Timestamp::now().as_millis();
+
+    // Four events, created oldest-id first: one with no schedule at all, one
+    // already running (inside the 60s backdating grace), one starting later
+    // with no end, and one that only carries an end.
+    for body in [
+        json!({ "title": "no-schedule", "description": "" }),
+        json!({ "title": "running", "starts_at": now - 30_000, "ends_at": now + 600_000 }),
+        json!({ "title": "later", "starts_at": now + 900_000 }),
+        json!({ "title": "ending", "ends_at": now + 300_000 }),
+    ] {
+        let res = send(&app, "POST", "/events", Some(&ali), Some(body)).await;
+        assert_eq!(res.status, StatusCode::CREATED);
+    }
+
+    // No window params: unchanged behaviour — every row, newest-created first.
+    let all = send(&app, "GET", "/events", Some(&ali), None).await;
+    assert_eq!(common::total(&all.body), 4);
+    assert_eq!(
+        titles(&all.body),
+        ["ending", "later", "running", "no-schedule"]
+    );
+
+    // ends_after: keeps unfinished rows (running on ends_at, later on the
+    // starts_at fallback), drops the schedule-less one, ascending by schedule.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/events?ends_after={now}"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 3);
+    assert_eq!(titles(&res.body), ["running", "ending", "later"]);
+
+    // Past the running event's end: only the pure-end row and the fallback row.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/events?ends_after={}", now + 700_000),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(titles(&res.body), ["later"]);
+
+    // starts_after excludes the already-started row and every start-less row.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/events?starts_after={now}"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 1);
+    assert_eq!(titles(&res.body), ["later"]);
+
+    // total is the filtered, pre-pagination count; the page is the soonest.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/events?ends_after={now}&limit=1"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 3);
+    assert_eq!(titles(&res.body), ["running"]);
+
+    // Invalid values are a 400 naming the field.
+    for query in ["starts_after=-1", "ends_after=-1", "ends_after=soon"] {
+        let res = send(&app, "GET", &format!("/events?{query}"), Some(&ali), None).await;
+        assert_eq!(res.status, StatusCode::BAD_REQUEST, "{query}");
+    }
+}
+
+#[tokio::test]
+async fn exams_schedule_window_applies_after_visibility_and_drafts() {
+    let (app, db) = app_and_db().await;
+    let ali = login_as(&app, &db, "ali", "teacher").await;
+    let ayse = login_as(&app, &db, "ayse", "student").await;
+    let now = Timestamp::now().as_millis();
+
+    let course = create_course(&app, &ali, "math").await;
+    let other = create_course(&app, &ali, "hidden").await;
+    enroll(&app, &ali, &course, &me_id(&app, &ayse).await).await;
+
+    // Windowed exams in the student's course, plus a draft, an open-mode exam
+    // (no window at all), and one in a course they cannot see.
+    for (course, body) in [
+        (
+            &course,
+            json!({ "title": "soon", "kind": "quiz", "mode": "sync",
+                          "starts_at": now + 600_000, "ends_at": now + 900_000 }),
+        ),
+        (
+            &course,
+            json!({ "title": "late", "kind": "quiz", "mode": "sync",
+                          "starts_at": now + 1_800_000, "ends_at": now + 2_400_000 }),
+        ),
+        (
+            &course,
+            json!({ "title": "draft", "kind": "quiz", "mode": "sync", "draft": true,
+                          "starts_at": now + 60_000, "ends_at": now + 120_000 }),
+        ),
+        (
+            &course,
+            json!({ "title": "open", "kind": "quiz", "mode": "open" }),
+        ),
+        (
+            &other,
+            json!({ "title": "unseen", "kind": "quiz", "mode": "sync",
+                         "starts_at": now + 60_000, "ends_at": now + 120_000 }),
+        ),
+    ] {
+        let res = create_exam_with(&app, &ali, course, body).await;
+        assert_eq!(res.status, StatusCode::CREATED, "{:?}", res.body);
+    }
+
+    // Unfiltered: the student sees their course's non-draft exams only.
+    let all = send(&app, "GET", "/exams", Some(&ayse), None).await;
+    assert_eq!(common::total(&all.body), 3);
+    assert_eq!(titles(&all.body), ["open", "late", "soon"]);
+
+    // Windowed: the draft and the other course stay invisible (the window runs
+    // after visibility), the window-less open exam drops out, soonest first.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/exams?ends_after={now}"),
+        Some(&ayse),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 2);
+    assert_eq!(titles(&res.body), ["soon", "late"]);
+
+    // The teacher's own draft is windowed like any other exam of theirs.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/exams?starts_after={now}&limit=2"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 4);
+    assert_eq!(titles(&res.body), ["draft", "unseen"]);
+
+    let res = send(&app, "GET", "/exams?starts_after=-1", Some(&ayse), None).await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+}

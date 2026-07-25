@@ -36,7 +36,7 @@ pub use dto::{
     UserResponse, course_people, person_map,
 };
 pub use extractor::{CurrentUser, RequireAdmin, RequireManager, RequireStudent, RequireTeacher};
-pub use page::{Page, PageParams, paginate};
+pub use page::{Page, PageParams, Scheduled, WindowParams, paginate};
 
 use std::path::{Path as FsPath, PathBuf};
 

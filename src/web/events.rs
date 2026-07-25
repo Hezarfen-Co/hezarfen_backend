@@ -23,9 +23,23 @@ use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
 
 use super::{
-    CurrentUser, Page, PageParams, PersonRef, RequireTeacher, check_not_past, check_time_range,
-    paginate, person_map, set_or_clear,
+    CurrentUser, Page, PageParams, PersonRef, RequireTeacher, Scheduled, WindowParams,
+    check_not_past, check_time_range, paginate, person_map, set_or_clear,
 };
+
+impl Scheduled for Event {
+    fn starts_at_ms(&self) -> Option<i64> {
+        self.get_starts_at().map(|at| at.as_millis())
+    }
+
+    fn ends_at_ms(&self) -> Option<i64> {
+        self.get_ends_at().map(|at| at.as_millis())
+    }
+
+    fn order_key(&self) -> &str {
+        self.get_id().key()
+    }
+}
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -259,25 +273,32 @@ async fn create_event(
 
 /// List all events, newest first. Paged via `?limit=&offset=` (omit `limit`
 /// for every event); returns a `{items, total, limit, offset}` envelope.
+///
+/// The optional `?starts_after=&ends_after=` schedule window (unix
+/// milliseconds) narrows the list to upcoming/unfinished events and flips the
+/// order to ascending by schedule, so `?ends_after=<now>&limit=20` returns the
+/// twenty *soonest* events rather than the twenty newest-created. Events with
+/// no schedule are excluded by either parameter.
 #[utoipa::path(
     get,
     path = "/",
     tag = "events",
     security(("session_cookie" = [])),
-    params(PageParams),
+    params(WindowParams, PageParams),
     responses(
         (status = 200, description = "A page of events (all of them when unpaged)", body = Page<EventResponse>),
-        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
+        (status = 400, description = "Invalid window, limit, or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
     ),
 )]
 async fn list_events(
     State(st): State<AppState>,
     _user: CurrentUser,
+    Query(window): Query<WindowParams>,
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<EventResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let events = Event::list_all(&st.db).await?;
+    let events = window.apply(Event::list_all(&st.db).await?)?;
     let total = events.len() as i64;
     let items = paginate(&events, limit, offset)
         .iter()
