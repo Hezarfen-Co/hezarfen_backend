@@ -78,6 +78,29 @@ async fn matching_if_none_match_gets_304_empty() {
     assert!(!body.is_empty());
 }
 
+/// RFC 9110 §13.1.2: `If-None-Match` uses the *weak* comparison function, so a
+/// weakened copy of our own tag — what a gzipping reverse proxy sends back —
+/// must still revalidate to a `304`.
+#[tokio::test]
+async fn weak_if_none_match_gets_304_empty() {
+    let app = mem_app().await;
+    let (_, headers, _) = get(&app, "/health", None).await;
+    let etag = headers.get("etag").unwrap().to_str().unwrap().to_string();
+
+    let (status, _, body) = get(&app, "/health", Some(&format!("W/{etag}"))).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_MODIFIED,
+        "W/ prefix must not defeat the match"
+    );
+    assert!(body.is_empty(), "a 304 carries no body");
+
+    // A weakened *different* tag is still a miss.
+    let (status, _, body) = get(&app, "/health", Some("W/\"deadbeef\"")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.is_empty());
+}
+
 #[tokio::test]
 async fn handler_cache_control_is_not_overwritten() {
     async fn handler() -> impl IntoResponse {
