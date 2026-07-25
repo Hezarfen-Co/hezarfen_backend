@@ -18877,3 +18877,122 @@ async fn refreshing_a_question_recopies_its_template() {
     .await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
 }
+
+/// A course PATCH is a field-scoped write. The handler reads the course, then
+/// awaits a term lookup (and its `TERM_LOCK`) before saving, holding nothing
+/// over the course row itself — so a manager's teacher assignment can land in
+/// that window. A whole-row save from the stale struct would silently revert
+/// the staffing. Driven at the domain level: HTTP offers no way to interleave
+/// inside the handler.
+#[tokio::test]
+async fn a_course_patch_does_not_clobber_a_concurrent_teacher_assignment() {
+    use hezarfen_backend::domain::course::{
+        Course, CourseDescription, CourseId, CourseKind, CourseTitle,
+    };
+
+    let (app, db) = app_and_db().await;
+    let owner = login_as(&app, &db, "cclob_o", "teacher").await;
+    let helper = login_as(&app, &db, "cclob_h", "teacher").await;
+    let boss = login_as(&app, &db, "cclob_m", "manager").await;
+    let helper_id = me_id(&app, &helper).await;
+    let course = create_course(&app, &owner, "cclob_c").await;
+
+    // The handler's read, then the assignment lands mid-window.
+    let stale = Course::read(&CourseId::from_key(&course), &db)
+        .await
+        .unwrap()
+        .expect("course exists");
+    let res = send(
+        &app,
+        "POST",
+        &format!("/courses/{course}/teachers"),
+        Some(&boss),
+        Some(json!({ "user_id": helper_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    let updated = stale
+        .update(
+            CourseTitle::try_new("renamed").unwrap(),
+            CourseDescription::try_new("").unwrap(),
+            CourseKind::course(),
+            None,
+            None,
+            &db,
+        )
+        .await
+        .expect("update written");
+    assert_eq!(updated.get_teachers().len(), 1, "the assignment was reverted");
+
+    // The rename landed and the assigned teacher stayed assigned.
+    let res = send(&app, "GET", &format!("/courses/{course}"), Some(&owner), None).await;
+    assert_eq!(res.body["title"], "renamed");
+    assert_eq!(res.body["teachers"][0]["username"], "cclob_h");
+}
+
+/// The mirror image: staffing writes only `teachers`. `assign_teacher` reads
+/// the course, then awaits the target user's row (a role check) before saving,
+/// so a course PATCH can land in between — and a whole-row save would revert
+/// the rename. `unassign_teacher` gets the same field-scoped treatment.
+#[tokio::test]
+async fn staffing_a_course_does_not_clobber_a_concurrent_edit() {
+    use hezarfen_backend::domain::course::{Course, CourseId};
+    use hezarfen_backend::domain::user::UserId;
+
+    let (app, db) = app_and_db().await;
+    let owner = login_as(&app, &db, "cstaff_o", "teacher").await;
+    let helper = login_as(&app, &db, "cstaff_h", "teacher").await;
+    let helper_id = me_id(&app, &helper).await;
+    let course = create_course(&app, &owner, "cstaff_c").await;
+
+    // The handler's read, then someone else's edit lands mid-window.
+    let stale = Course::read(&CourseId::from_key(&course), &db)
+        .await
+        .unwrap()
+        .expect("course exists");
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/courses/{course}"),
+        Some(&owner),
+        Some(json!({ "title": "edited by someone else", "capacity": 9 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    let assigned = stale
+        .assign_teacher(&UserId::from_key(&helper_id), &db)
+        .await
+        .expect("assignment written");
+    assert_eq!(assigned.get_title().as_str(), "edited by someone else");
+    assert_eq!(assigned.get_capacity(), Some(9));
+    assert_eq!(assigned.get_teachers().len(), 1);
+
+    // Unassigning from a struct read before another edit is just as safe.
+    let stale = Course::read(&CourseId::from_key(&course), &db)
+        .await
+        .unwrap()
+        .expect("course exists");
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/courses/{course}"),
+        Some(&owner),
+        Some(json!({ "title": "edited again" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let dropped = stale
+        .unassign_teacher(&UserId::from_key(&helper_id), &db)
+        .await
+        .expect("unassignment written")
+        .expect("teacher was assigned");
+    assert_eq!(dropped.get_title().as_str(), "edited again");
+    assert!(dropped.get_teachers().is_empty());
+
+    let res = send(&app, "GET", &format!("/courses/{course}"), Some(&owner), None).await;
+    assert_eq!(res.body["title"], "edited again");
+    assert_eq!(res.body["capacity"], 9);
+    assert_eq!(res.body["teachers"].as_array().unwrap().len(), 0);
+}

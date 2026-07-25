@@ -157,16 +157,23 @@ impl WorkEntry {
 
     /// Persist corrected instants (manager fix-ups on closed entries; the web
     /// layer validates ordering and rejects open entries).
+    /// Field-scoped: the stint's `user` is never part of a correction, so it is
+    /// left out of the write rather than replayed from a struct the handler
+    /// read before its validation awaits.
     pub async fn update(
-        mut self,
+        self,
         check_in: Timestamp,
         check_out: Timestamp,
         db: &Database,
     ) -> Result<WorkEntry, AppError> {
-        self.check_in = check_in;
-        self.check_out = Some(check_out);
-        let updated: Option<WorkEntry> = db.update(self.id.record()).content(self).await?;
-        updated.ok_or(AppError::NotFound)
+        let mut result = db
+            .query("UPDATE $id SET check_in = $check_in, check_out = $check_out RETURN AFTER")
+            .bind(("id", self.id.record()))
+            .bind(("check_in", check_in))
+            .bind(("check_out", check_out))
+            .await?
+            .check()?;
+        result.take::<Vec<WorkEntry>>(0)?.into_iter().next().ok_or(AppError::NotFound)
     }
 
     pub async fn remove(id: &WorkEntryId, db: &Database) -> Result<Option<WorkEntry>, AppError> {

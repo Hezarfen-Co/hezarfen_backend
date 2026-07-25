@@ -168,6 +168,7 @@ impl NoteFile {
                 "the note already holds the maximum of 10 files — delete one first",
             ));
         }
+        // whole-row-save-ok: create of a fresh ULID row built in place by `new` — there is no prior row to clobber
         let created: Option<NoteFile> = db.create(self.id.record()).content(self).await?;
         created.ok_or_else(|| AppError::Internal("failed to create note file".into()))
     }

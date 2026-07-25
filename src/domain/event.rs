@@ -249,8 +249,11 @@ impl Event {
         Ok(result.take::<Vec<Event>>(0)?)
     }
 
+    /// Field-scoped: the handler reads the event, then awaits the clock and a
+    /// course lookup before saving, holding no lock — a whole-row save would
+    /// carry the stale `creator` and every other column back over the row.
     pub async fn update(
-        mut self,
+        self,
         title: EventTitle,
         description: EventDescription,
         audience: EventAudience,
@@ -258,13 +261,20 @@ impl Event {
         ends_at: Option<Timestamp>,
         db: &Database,
     ) -> Result<Event, AppError> {
-        self.title = title;
-        self.description = description;
-        self.audience = audience;
-        self.starts_at = starts_at;
-        self.ends_at = ends_at;
-        let updated: Option<Event> = db.update(self.id.record()).content(self).await?;
-        updated.ok_or(AppError::NotFound)
+        let mut result = db
+            .query(
+                "UPDATE $id SET title = $title, description = $description,
+                 audience = $audience, starts_at = $starts_at, ends_at = $ends_at RETURN AFTER",
+            )
+            .bind(("id", self.id.record()))
+            .bind(("title", title))
+            .bind(("description", description))
+            .bind(("audience", audience))
+            .bind(("starts_at", starts_at))
+            .bind(("ends_at", ends_at))
+            .await?
+            .check()?;
+        result.take::<Vec<Event>>(0)?.into_iter().next().ok_or(AppError::NotFound)
     }
 
     /// Delete the event and cascade-remove its attendance and signup rows.

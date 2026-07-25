@@ -127,6 +127,7 @@ impl Solution {
     }
 
     pub async fn insert(self, db: &Database) -> Result<Solution, AppError> {
+        // whole-row-save-ok: create of a fresh ULID row built in place by `new` — there is no prior row to clobber
         let created: Option<Solution> = db.create(self.id.record()).content(self).await?;
         created.ok_or_else(|| AppError::Internal("failed to create solution".into()))
     }

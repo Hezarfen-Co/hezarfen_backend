@@ -131,6 +131,7 @@ impl HomeworkFile {
                 "the submission already holds the maximum of 10 files — delete one first",
             ));
         }
+        // whole-row-save-ok: create of a fresh ULID row built in place by `new` — there is no prior row to clobber
         let created: Option<HomeworkFile> = db.create(self.id.record()).content(self).await?;
         created.ok_or_else(|| AppError::Internal("failed to create homework file".into()))
     }

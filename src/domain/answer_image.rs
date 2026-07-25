@@ -123,6 +123,7 @@ impl AnswerImage {
     /// deterministic id makes this the whole "one drawing per student per
     /// question" story.
     pub async fn upsert(self, db: &Database) -> Result<AnswerImage, AppError> {
+        // whole-row-save-ok: self is built in place from the request, never read back, and the (question, user, seq) id is deterministic — replacing the row *is* the operation
         let written: Option<AnswerImage> = db.upsert(self.id.record()).content(self).await?;
         written.ok_or_else(|| AppError::Internal("failed to store answer image".into()))
     }
