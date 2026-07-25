@@ -57,6 +57,21 @@ impl Username {
     }
 }
 
+/// Bounds how many argon2 hashes run at once. `spawn_blocking` is unbounded —
+/// tokio grows the blocking pool to 512 threads — and argon2's default `m_cost`
+/// is 19 MiB, so an un-capped login flood claims gigabytes (measured: ~17 MB
+/// per in-flight hash) and gets the whole process OOM-killed. A permit turns
+/// that into queueing: latency instead of memory. `nproc * 2` keeps every core
+/// busy while a hash waits on memory bandwidth, with a floor of 2 permits so a
+/// single-core box still makes progress.
+fn argon2_permits() -> &'static tokio::sync::Semaphore {
+    static PERMITS: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+    PERMITS.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
+        tokio::sync::Semaphore::new(cores * 2)
+    })
+}
+
 /// A validated plaintext password. Never stored — only hashed or verified.
 pub struct Password(String);
 
@@ -85,6 +100,10 @@ impl Password {
     /// and they come back as 503. Every request path must use this, not `hash`.
     pub async fn hash_async(&self) -> Result<PasswordHash, AppError> {
         let plain = self.0.clone();
+        let _permit = argon2_permits()
+            .acquire()
+            .await
+            .map_err(|e| AppError::Internal(format!("hash permit: {e}")))?;
         tokio::task::spawn_blocking(move || Password(plain).hash())
             .await
             .map_err(|e| AppError::Internal(format!("hash task: {e}")))?
@@ -130,6 +149,12 @@ impl PasswordHash {
     pub async fn verify_async(&self, password: &Password) -> bool {
         let hash = self.0.clone();
         let plain = password.0.clone();
+        // A closed semaphore can't happen (it is `'static` and never closed), but
+        // if it ever did this must fail like a pool panic does — 401, never a
+        // status an attacker could tell apart from the unknown-user branch.
+        let Ok(_permit) = argon2_permits().acquire().await else {
+            return false;
+        };
         tokio::task::spawn_blocking(move || PasswordHash(hash).verify(&Password(plain)))
             .await
             .unwrap_or(false)
@@ -142,7 +167,24 @@ impl PasswordHash {
     /// reply would let an attacker enumerate valid usernames by timing.
     pub async fn verify_decoy_async(password: &Password) {
         let plain = password.0.clone();
+        // Same permit as the real check, so both login branches queue alike.
+        let Ok(_permit) = argon2_permits().acquire().await else {
+            return;
+        };
         let _ = tokio::task::spawn_blocking(move || decoy_hash().verify(&Password(plain))).await;
+    }
+
+    /// Compute the decoy hash at startup, off the async runtime. Without this the
+    /// process's first unknown-username login pays hash + verify while a
+    /// wrong-password login pays only verify — a one-shot timing tell. The
+    /// `OnceLock` still initialises inside a blocking context, just earlier, and
+    /// the task is detached so boot never waits on it.
+    pub fn prewarm_decoy() {
+        // No permit: one hash at boot, and taking one here could only delay the
+        // seed's own hash.
+        tokio::task::spawn_blocking(|| {
+            decoy_hash();
+        });
     }
 }
 

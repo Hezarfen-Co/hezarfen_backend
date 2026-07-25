@@ -18,6 +18,9 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = Config::from_env();
     let db = database::init(&cfg).await?;
+    // Hash the login decoy now, so the first unknown-username login is not the
+    // one request that pays for it (see `PasswordHash::prewarm_decoy`).
+    hezarfen_backend::domain::user::PasswordHash::prewarm_decoy();
     seed_admin(&cfg, &db).await?;
     let db_up = DbHealth::default();
     keepalive(db.clone(), db_up.clone());

@@ -10,8 +10,9 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::constant::{RESERVED_USERNAMES, SESSION_DURATION_DAYS};
+use crate::domain::role::Role;
 use crate::domain::session::Session;
-use crate::domain::user::{Password, PasswordHash, User, Username};
+use crate::domain::user::{Password, PasswordHash, User, UserId, Username};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::state::AppState;
@@ -45,15 +46,21 @@ struct Credentials {
 }
 
 /// Register a new user account.
+///
+/// Answers `201` whether or not the username was free: a distinguishable
+/// "already taken" reply lets anyone unauthenticated enumerate every account in
+/// the school, which would make the constant-cost decoy on the login path
+/// pointless. A taken username is *not* re-created or overwritten — only the
+/// reply is uniform. The UX cost (a typo-collision looks like success until the
+/// user tries to log in) is deliberate.
 #[utoipa::path(
     post,
     path = "/register",
     tag = "auth",
     request_body = Credentials,
     responses(
-        (status = 201, description = "Account created", body = UserResponse),
+        (status = 201, description = "Account created, or the username was already taken — deliberately indistinguishable", body = UserResponse),
         (status = 400, description = "Invalid username or password", body = ErrorResponse),
-        (status = 409, description = "Username already taken", body = ErrorResponse),
         (status = 429, description = "Too many attempts from this address; see Retry-After", body = ErrorResponse),
     ),
 )]
@@ -72,9 +79,38 @@ async fn register(
         }
         .into());
     }
+    // Hash BEFORE the availability check inside `User::create`, never after: the
+    // ~33ms of argon2 is what makes both outcomes cost the same, so a taken
+    // username can't be spotted by a fast reply. The only work the taken path
+    // skips is the insert itself, orders of magnitude below hashing.
     let password_hash = Password::try_new(&req.password)?.hash_async().await?;
-    let user = User::create(username, password_hash, &st.db).await?;
-    Ok((StatusCode::CREATED, Json(UserResponse::new(&user))))
+    match User::create(username.clone(), password_hash, &st.db).await {
+        Ok(user) => Ok((StatusCode::CREATED, Json(UserResponse::new(&user)))),
+        // Taken. Log the real reason server-side and hand back a response shaped
+        // exactly like a fresh registration's — same status, same fields. The id
+        // is a throwaway that matches no row; nothing unauthenticated can
+        // resolve it, and telling the two apart is the whole thing we're denying.
+        Err(AppError::Conflict(_)) => {
+            tracing::info!("register: username already taken, answering 201");
+            Ok((
+                StatusCode::CREATED,
+                Json(UserResponse {
+                    id: UserId::generate().key().to_string(),
+                    username: username.as_str().to_string(),
+                    // Every fresh account starts as a student (`User::create`).
+                    role: Role::Student.into(),
+                    name: None,
+                    surname: None,
+                    email: None,
+                    phone: None,
+                    birth_date: None,
+                    theme: None,
+                    language: None,
+                }),
+            ))
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// Log in with username + password. Sets a `session` cookie on success.
