@@ -152,7 +152,11 @@ impl Subject {
             .bind(("description", description))
             .await?
             .check()?;
-        result.take::<Vec<Subject>>(0)?.into_iter().next().ok_or(AppError::NotFound)
+        result
+            .take::<Vec<Subject>>(0)?
+            .into_iter()
+            .next()
+            .ok_or(AppError::NotFound)
     }
 
     /// Delete the subject and clear it off every bank template that carried it

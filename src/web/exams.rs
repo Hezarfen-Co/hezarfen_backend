@@ -1487,9 +1487,7 @@ impl QuestionResponse {
             kind: question.get_kind().as_str().to_string(),
             points: question.get_points().as_i64(),
             choices: ChoiceResponse::list(question.get_choices()),
-            correct: question
-                .get_correct()
-                .map(|id| id.as_str().to_string()),
+            correct: question.get_correct().map(|id| id.as_str().to_string()),
             image: image_meta(images, None),
             choice_images: choice_image_metas(question, images),
             from_bank: question.get_from_bank().map(|b| b.key().to_string()),
@@ -2464,7 +2462,15 @@ async fn upload_choice_image(
     ensure_questions_editable(exam.get_id(), &st.db).await?;
     let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
     let slot = choice_slot(&question, &choice_id)?;
-    let stored = store_image(&st, &exam, &question, Some(&slot), content_type, &upload.data).await?;
+    let stored = store_image(
+        &st,
+        &exam,
+        &question,
+        Some(&slot),
+        content_type,
+        &upload.data,
+    )
+    .await?;
     Ok((StatusCode::CREATED, Json(ImageMetaResponse::new(&stored))))
 }
 
@@ -3555,9 +3561,7 @@ async fn review_attempt_answers(
     Path((id, seq)): Path<(String, i64)>,
 ) -> Result<Json<AttemptAnswersResponse>, AppError> {
     let exam = reviewable_exam(&st, &user, &id).await?;
-    Ok(Json(
-        answer_sheet(&exam, user.get_id(), seq, &st.db).await?,
-    ))
+    Ok(Json(answer_sheet(&exam, user.get_id(), seq, &st.db).await?))
 }
 
 /// The caller's own drawn-answer bytes for one of their sittings — the

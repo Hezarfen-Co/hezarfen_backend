@@ -213,7 +213,8 @@ impl ChatbotMessage {
     }
 
     async fn insert(message: ChatbotMessage, db: &Database) -> Result<ChatbotMessage, AppError> {
-        let created: Option<ChatbotMessage> = db.create(message.id.record()).content(message).await?;
+        let created: Option<ChatbotMessage> =
+            db.create(message.id.record()).content(message).await?;
         created.ok_or_else(|| AppError::Internal("failed to create chat message".into()))
     }
 
@@ -469,9 +470,7 @@ mod tests {
                 .unwrap();
         }
 
-        let whole = ChatbotMessage::list_for_thread(&thread, &db)
-            .await
-            .unwrap();
+        let whole = ChatbotMessage::list_for_thread(&thread, &db).await.unwrap();
         let tail = ChatbotMessage::list_tail(&thread, TURNS * 2, &db)
             .await
             .unwrap();

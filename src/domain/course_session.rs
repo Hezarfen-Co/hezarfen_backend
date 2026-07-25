@@ -157,7 +157,11 @@ impl CourseSession {
             .bind(("ends_at", ends_at))
             .await?
             .check()?;
-        result.take::<Vec<CourseSession>>(0)?.into_iter().next().ok_or(AppError::NotFound)
+        result
+            .take::<Vec<CourseSession>>(0)?
+            .into_iter()
+            .next()
+            .ok_or(AppError::NotFound)
     }
 
     /// Delete the session and cascade-remove its roll-call rows.

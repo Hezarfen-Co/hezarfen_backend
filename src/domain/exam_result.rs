@@ -300,15 +300,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            history.iter().map(|r| r.get_mark().as_i64()).collect::<Vec<_>>(),
+            history
+                .iter()
+                .map(|r| r.get_mark().as_i64())
+                .collect::<Vec<_>>(),
             vec![40, 90]
         );
 
         // Deleting the pair removes every sitting.
         ExamResult::remove(&exam, &user, &db).await.unwrap();
-        assert!(ExamResult::list_all_for_exam_user(&exam, &user, &db)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            ExamResult::list_all_for_exam_user(&exam, &user, &db)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

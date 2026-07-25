@@ -76,10 +76,9 @@ pub async fn etag(request: Request, next: Next) -> Response {
     // inert. `private`: these are per-user authenticated responses. But if the
     // handler set its own directive, it knows best — leave it untouched.
     if !parts.headers.contains_key(CACHE_CONTROL) {
-        parts.headers.insert(
-            CACHE_CONTROL,
-            HeaderValue::from_static("private, no-cache"),
-        );
+        parts
+            .headers
+            .insert(CACHE_CONTROL, HeaderValue::from_static("private, no-cache"));
     }
 
     if matches(if_none_match.as_ref(), &tag) {
@@ -117,5 +116,9 @@ fn matches(if_none_match: Option<&HeaderValue>, tag: &str) -> bool {
         return false;
     };
     let value = value.trim();
-    value == "*" || value.split(',').map(str::trim).any(|candidate| candidate == tag)
+    value == "*"
+        || value
+            .split(',')
+            .map(str::trim)
+            .any(|candidate| candidate == tag)
 }

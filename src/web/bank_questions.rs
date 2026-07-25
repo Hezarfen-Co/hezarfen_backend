@@ -39,8 +39,8 @@ use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
 
 use super::dto::person_map;
-use super::subjects::subject_must_exist;
 use super::exams::ChoiceResponse;
+use super::subjects::subject_must_exist;
 use super::{
     ChoiceBody, Page, PageParams, RequireTeacher, UploadFileForm, blob_path, image_content_type,
     read_upload, remove_blob, serve_inline_blob, set_or_clear,
@@ -530,7 +530,10 @@ async fn list_questions(
     let buckets = bank_images_by_question(&ids, &st.db).await?;
     // One grouped query for the whole page — never a count per row.
     let used = BankQuestion::usage_counts(&ids, &st.db).await?;
-    let subject_ids: Vec<&SubjectId> = questions.iter().filter_map(BankQuestion::get_subject).collect();
+    let subject_ids: Vec<&SubjectId> = questions
+        .iter()
+        .filter_map(BankQuestion::get_subject)
+        .collect();
     let subject_names: HashMap<String, String> = Subject::list_by_ids(&subject_ids, &st.db)
         .await?
         .iter()

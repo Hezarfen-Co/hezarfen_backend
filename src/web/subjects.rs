@@ -14,8 +14,8 @@ use crate::domain::subject::{Subject, SubjectDescription, SubjectId, SubjectName
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
 
-use super::courses::{can_manage_course, can_view_course};
 use super::bank_questions::BANK_LOCK;
+use super::courses::{can_manage_course, can_view_course};
 use super::exams::EXAM_LOCK;
 use super::homework::HOMEWORK_LOCK;
 use super::{CurrentUser, RequireTeacher, SubjectResponse};

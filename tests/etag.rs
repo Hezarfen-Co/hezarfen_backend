@@ -93,7 +93,10 @@ async fn handler_cache_control_is_not_overwritten() {
     let (status, headers, _) = get(&app, "/x", None).await;
     assert_eq!(status, StatusCode::OK);
     // We still add our validator...
-    assert!(headers.get("etag").is_some(), "no handler ETag, so we set one");
+    assert!(
+        headers.get("etag").is_some(),
+        "no handler ETag, so we set one"
+    );
     // ...but the handler's own directive wins.
     assert_eq!(headers.get("cache-control").unwrap(), "public, max-age=60");
 }

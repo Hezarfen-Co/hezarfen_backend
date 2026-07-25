@@ -217,7 +217,10 @@ mod tests {
             Some(
                 ["a", "b", "c"]
                     .iter()
-                    .map(|l| ChoiceInput { id: Some((*l).into()), text: (*l).into() })
+                    .map(|l| ChoiceInput {
+                        id: Some((*l).into()),
+                        text: (*l).into(),
+                    })
                     .collect(),
             ),
             Some("a".into()),
@@ -312,9 +315,24 @@ mod tests {
             .unwrap();
         // The question illustration plus the two surviving option pictures.
         assert_eq!(left.len(), 3);
-        assert!(QuestionImage::read_slot(&question, Some(&ids[0]), &db).await.unwrap().is_some());
-        assert!(QuestionImage::read_slot(&question, Some(&ids[2]), &db).await.unwrap().is_some());
-        assert!(QuestionImage::read_slot(&question, None, &db).await.unwrap().is_some());
+        assert!(
+            QuestionImage::read_slot(&question, Some(&ids[0]), &db)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            QuestionImage::read_slot(&question, Some(&ids[2]), &db)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            QuestionImage::read_slot(&question, None, &db)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]

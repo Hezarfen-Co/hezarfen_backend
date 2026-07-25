@@ -201,7 +201,10 @@ mod tests {
             Some(
                 ["a", "b", "c"]
                     .iter()
-                    .map(|l| ChoiceInput { id: Some((*l).into()), text: (*l).into() })
+                    .map(|l| ChoiceInput {
+                        id: Some((*l).into()),
+                        text: (*l).into(),
+                    })
                     .collect(),
             ),
             Some("a".into()),

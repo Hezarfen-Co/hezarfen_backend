@@ -312,7 +312,10 @@ mod tests {
             Some(
                 labels
                     .iter()
-                    .map(|l| ChoiceInput { id: Some((*l).into()), text: (*l).into() })
+                    .map(|l| ChoiceInput {
+                        id: Some((*l).into()),
+                        text: (*l).into(),
+                    })
                     .collect(),
             ),
             Some(labels[correct].into()),

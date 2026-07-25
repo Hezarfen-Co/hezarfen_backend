@@ -108,10 +108,7 @@ impl ChatbotThread {
             created_at: now,
             updated_at: now,
         };
-        let created: Option<ChatbotThread> = db
-            .create(thread.id.record())
-            .content(thread)
-            .await?;
+        let created: Option<ChatbotThread> = db.create(thread.id.record()).content(thread).await?;
         created.ok_or_else(|| AppError::Internal("failed to create thread".into()))
     }
 
@@ -227,7 +224,8 @@ impl ChatbotThread {
             .await?
             .check()?;
         // BEGIN is slot 0; the thread's own DELETE is slot 2.
-        let deleted: Option<ChatbotThread> = result.take::<Vec<ChatbotThread>>(2)?.into_iter().next();
+        let deleted: Option<ChatbotThread> =
+            result.take::<Vec<ChatbotThread>>(2)?.into_iter().next();
         deleted.ok_or(AppError::NotFound)
     }
 }

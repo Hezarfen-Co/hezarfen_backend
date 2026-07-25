@@ -1841,9 +1841,7 @@ async fn chat_stream_and_poll_agree_that_an_answer_was_truncated() {
 
     // The same row, read the other way: identical verdict, field for field.
     let polled: Value = ali
-        .get(format!(
-            "{base}/chatbot/threads/{thread}/messages/{mid}"
-        ))
+        .get(format!("{base}/chatbot/threads/{thread}/messages/{mid}"))
         .send()
         .await
         .unwrap()
@@ -1915,9 +1913,7 @@ async fn chat_stream_replays_an_answer_that_already_landed() {
     let mut settled = Value::Null;
     for _ in 0..500 {
         let turn: Value = ali
-            .get(format!(
-                "{base}/chatbot/threads/{thread}/messages/{mid}"
-            ))
+            .get(format!("{base}/chatbot/threads/{thread}/messages/{mid}"))
             .send()
             .await
             .unwrap()
