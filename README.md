@@ -1247,13 +1247,26 @@ frames:
 | direction | frame |
 |-----------|-------|
 | server →  | `{"type":"state", status, attempt, deadline, remaining_ms, now, answered, question_count}` on connect, every ~2 s, and after each save |
-| client →  | `{"type":"answer", "question_id":"…", "selected":1}` or `{"type":"answer", "question_id":"…", "text":"…"}` |
-| server →  | `{"type":"saved", question_id, updated_at}` — the autosave ack |
+| client →  | `{"type":"answer", "question_id":"…", "selected":1}` or `{"type":"answer", "question_id":"…", "text":"…"}`, optionally `+ "seq":7` |
+| server →  | `{"type":"saved", question_id, updated_at, seq?}` — the autosave ack |
 | client →  | `{"type":"finish"}` — submit the attempt |
 | server →  | `{"type":"finished", finished_at}`, then Close |
 | server →  | `{"type":"expired"}`, then Close — a tick noticed the deadline |
 | client →  | `{"type":"ping"}` → server `{"type":"pong"}` |
-| server →  | `{"type":"error", message}` — bad JSON, wrong kind, deadline, … |
+| server →  | `{"type":"error", message, question_id?, seq?}` — bad JSON, wrong kind, deadline, … |
+
+An `answer` may carry a `seq`: any number the client picks, echoed verbatim on
+that message's `saved` or `error` and on nothing else. The server never reads
+it — no uniqueness, no ordering, no dedupe, all the client's business — and
+omits the key entirely when the request omitted it, so leaving it out keeps
+today's frames byte for byte. It exists because `question_id` is not an
+identity: save a question, time out, save it again, and two sends are
+outstanding for the same id — the first reply would settle the second and the
+UI would claim "Saved" for an answer the server never took. `question_id` on
+an `error` is the separate, orthogonal question: whether the failure belongs
+to that one question (payload or question) or to the room, in which case every
+save in flight is equally refused. An error can carry `seq` without
+`question_id`.
 
 Every tick and every save re-read the exam, so a mid-exam `ends_at` extension
 moves the room's countdown on the next tick, and no stale socket can write
@@ -1281,10 +1294,11 @@ const ws = new WebSocket(`${BASE.replace("http", "ws")}/exams/${id}/attempt/ws`)
 ws.onmessage = (e) => {
   const m = JSON.parse(e.data);
   if (m.type === "state") renderCountdown(m.remaining_ms, m.answered, m.question_count);
-  if (m.type === "saved") markSaved(m.question_id);
+  if (m.type === "saved") settle(m.seq, m.question_id);
 };
+let seq = 0;
 const save = (question_id, selected) =>
-  ws.send(JSON.stringify({ type: "answer", question_id, selected }));
+  ws.send(JSON.stringify({ type: "answer", question_id, selected, seq: ++seq }));
 ```
 
 The live monitor rides along: each roster row now carries `answered` and
