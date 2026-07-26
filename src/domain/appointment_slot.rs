@@ -459,12 +459,10 @@ impl AppointmentSlot {
     /// [`APPOINTMENT_LOCK`]: the live-booking check is only meaningful while
     /// no booking can be written.
     async fn delete_locked(ids: &[AppointmentSlotId], db: &Database) -> Result<(), AppError> {
-        for id in ids {
-            if Appointment::has_live_booking(id, db).await? {
-                return Err(AppError::Conflict(
-                    "the slot has a pending or approved booking",
-                ));
-            }
+        if Appointment::any_live_booking(ids, db).await? {
+            return Err(AppError::Conflict(
+                "the slot has a pending or approved booking",
+            ));
         }
         let records: Vec<RecordId> = ids.iter().map(|id| id.record()).collect();
         let mut result = db
