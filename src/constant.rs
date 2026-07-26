@@ -195,6 +195,16 @@ pub const MAX_LEDGER_NOTE_LEN: usize = 500;
 /// a meal — one week. The knob itself is optional: absent means no cutoff.
 pub const MAX_MEAL_CANCEL_CUTOFF_MINUTES: i64 = 7 * 24 * 60;
 
+/// Inclusive ceiling for a meal slot's `serving_minute` — minutes past
+/// midnight on the menu's date, so `0` = 00:00 and `1439` = 23:59. The cutoff
+/// above counts back from that instant.
+///
+/// **The clock is UTC.** This backend deliberately stores no school timezone
+/// (rejected feature), so staff enter the serving time in UTC: a UTC+3 school
+/// types `540` (09:00) to mean noon locally. Optional per slot — a slot
+/// without one keeps the old behaviour, midnight UTC of the menu's date.
+pub const MAX_MEAL_SERVING_MINUTE: i64 = 24 * 60 - 1;
+
 /// The only accepted course kinds. `course`: a regular class (ders). `study`:
 /// a supervised study session (etüt). Behaviorally identical — the kind is a
 /// label for the UI, everything else (enrollment, exams, sessions, marks)
@@ -965,6 +975,12 @@ pub const MIGRATION: &str = "
     -- fine, which is why the food program needs no BACKFILL anywhere.
     DEFINE FIELD IF NOT EXISTS meal_slots ON settings TYPE option<array<object>>;
     DEFINE FIELD IF NOT EXISTS meal_slots.*.name ON settings TYPE string;
+    -- Minutes past midnight UTC at which the slot is served (2026-07-26).
+    -- `option<int>` for the same reason the list itself is: slots written
+    -- before the field existed simply have no key, and read back as NONE ->
+    -- the booking cutoff falls back to midnight UTC, its old meaning. No
+    -- BACKFILL, and no DEFAULT — see the note above.
+    DEFINE FIELD IF NOT EXISTS meal_slots.*.serving_minute ON settings TYPE option<int>;
     DEFINE FIELD IF NOT EXISTS dietary_tags ON settings TYPE option<array<string>>;
     DEFINE FIELD IF NOT EXISTS meal_cancel_cutoff_minutes ON settings TYPE option<int>;
 

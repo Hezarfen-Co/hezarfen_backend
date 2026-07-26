@@ -19,9 +19,9 @@ use crate::constant::{
     DEFAULT_MAX_FILE_BYTES, DEFAULT_MEAL_SLOTS, MAX_CHATBOT_HISTORY_TURNS, MAX_EXAM_KIND_WEIGHT,
     MAX_GRADE_BANDS, MAX_GRADE_LABEL_LEN, MAX_MARK, MAX_MAX_CHATBOT_MESSAGE_LEN,
     MAX_MAX_CHATBOT_THREADS, MAX_MAX_FILE_BYTES, MAX_MEAL_CANCEL_CUTOFF_MINUTES,
-    MAX_SETTINGS_ITEM_LEN, MAX_SETTINGS_LIST_LEN, MIN_CHATBOT_HISTORY_TURNS, MIN_EXAM_KIND_WEIGHT,
-    MIN_MARK, MIN_MAX_CHATBOT_MESSAGE_LEN, MIN_MAX_CHATBOT_THREADS, MIN_MAX_FILE_BYTES,
-    SETTINGS_KEY, SETTINGS_TABLE,
+    MAX_MEAL_SERVING_MINUTE, MAX_SETTINGS_ITEM_LEN, MAX_SETTINGS_LIST_LEN,
+    MIN_CHATBOT_HISTORY_TURNS, MIN_EXAM_KIND_WEIGHT, MIN_MARK, MIN_MAX_CHATBOT_MESSAGE_LEN,
+    MIN_MAX_CHATBOT_THREADS, MIN_MAX_FILE_BYTES, SETTINGS_KEY, SETTINGS_TABLE,
 };
 use crate::database::Database;
 use crate::domain::text_fold;
@@ -70,14 +70,22 @@ impl ExamKindDef {
 /// One meal slot the school serves (`"lunch"`, `"snack"`, …). A published menu
 /// snapshots the slot's *name* as text, so retiring a slot never rewrites a
 /// past menu — same contract exam kinds have with exams. An object, not a bare
-/// string, so a slot can grow a serving window later without a migration.
+/// string, which is what let the serving time land here without a migration.
+///
+/// `serving_minute` is minutes past midnight **UTC** on the menu's date, and
+/// it is what the booking/cancel cutoff counts back from. The backend stores
+/// no school timezone (deliberately), so staff enter UTC: a UTC+3 school sets
+/// `540` (09:00) for a meal served at noon locally. `None` — every slot
+/// written before the field existed — falls back to midnight UTC, the old
+/// behaviour.
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct MealSlotDef {
     name: String,
+    serving_minute: Option<i64>,
 }
 
 impl MealSlotDef {
-    pub fn try_new(name: &str) -> Result<Self, ValidationError> {
+    pub fn try_new(name: &str, serving_minute: Option<i64>) -> Result<Self, ValidationError> {
         let name = name.trim();
         if name.is_empty() || name.chars().count() > MAX_SETTINGS_ITEM_LEN {
             return Err(ValidationError::Invalid {
@@ -85,13 +93,28 @@ impl MealSlotDef {
                 reason: "slot names must be 1 to 50 characters",
             });
         }
+        if let Some(minute) = serving_minute {
+            in_range(
+                "meal_slots",
+                minute,
+                0..=MAX_MEAL_SERVING_MINUTE,
+                "serving minutes must be between 0 (00:00 UTC) and 1439 (23:59 UTC)",
+            )?;
+        }
         Ok(Self {
             name: name.to_string(),
+            serving_minute,
         })
     }
 
     pub fn get_name(&self) -> &str {
         &self.name
+    }
+
+    /// Minutes past midnight UTC at which this slot is served; `None` = unset,
+    /// so the cutoff counts back from midnight UTC instead.
+    pub fn get_serving_minute(&self) -> Option<i64> {
+        self.serving_minute
     }
 }
 
@@ -411,6 +434,9 @@ impl Settings {
             DEFAULT_MEAL_SLOTS
                 .map(|name| MealSlotDef {
                     name: name.to_string(),
+                    // No built-in serving time: the shipped defaults keep the
+                    // midnight-UTC cutoff until a school sets real hours.
+                    serving_minute: None,
                 })
                 .to_vec()
         })
@@ -468,6 +494,18 @@ impl Settings {
     /// state when no row exists yet (`load` reported the defaults, so the
     /// defaults are what the caller merged over), then the guarded update
     /// applies `self` only if the row (still) equals `expected`.
+    ///
+    /// **`meal_slots` is compared through a projection, and it has to be.**
+    /// SurrealDB *drops* an object key whose value is `NONE` on write, while
+    /// the `SurrealValue` derive always emits `serving_minute: NONE` for a
+    /// slot without one — so `{name: 'lunch'} = {name: 'lunch', serving_minute:
+    /// NONE}` is **false** and a plain equality guard would never match again
+    /// for any school with a serving-time-less slot (which is every school
+    /// until it sets one): every `PATCH /settings` would 409 forever. Rebuilding
+    /// both sides as full objects normalizes the shapes. The NONE-ness of the
+    /// column itself is compared separately, so "never set" stays distinguishable
+    /// from "explicitly empty". Top-level optional columns need none of this:
+    /// a missing field reads as `NONE`, and `NONE = NONE` holds.
     pub async fn save_if_unchanged(
         self,
         expected: &Settings,
@@ -485,7 +523,11 @@ impl Settings {
                        AND chatbot_history_turns = $ct
                        AND max_chatbot_threads = $cc
                        AND max_chatbot_message_len = $cl
-                       AND meal_slots = $ms
+                       AND (meal_slots = NONE) = $ms_unset
+                       AND (meal_slots ?? []).map(|$s| {
+                               name: $s.name,
+                               serving_minute: $s.serving_minute
+                           }) = ($ms ?? [])
                        AND dietary_tags = $dt
                        AND meal_cancel_cutoff_minutes = $mc;
                  COMMIT TRANSACTION;",
@@ -500,6 +542,7 @@ impl Settings {
             .bind(("ct", expected.chatbot_history_turns))
             .bind(("cc", expected.max_chatbot_threads))
             .bind(("cl", expected.max_chatbot_message_len))
+            .bind(("ms_unset", expected.meal_slots.is_none()))
             .bind(("ms", expected.meal_slots.clone()))
             .bind(("dt", expected.dietary_tags.clone()))
             .bind(("mc", expected.meal_cancel_cutoff_minutes))

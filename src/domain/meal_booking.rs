@@ -24,7 +24,8 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use crate::constant::MEAL_BOOKING_TABLE;
 use crate::database::Database;
 use crate::domain::meal_ledger::{LedgerAmount, MealLedger};
-use crate::domain::menu::{MENU_LOCK, Menu, MenuDate, MenuId};
+use crate::domain::menu::{MENU_LOCK, Menu, MenuDate, MenuId, MenuSlot};
+use crate::domain::settings::{MealSlotDef, Settings};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
@@ -157,18 +158,18 @@ impl MealBooking {
     /// line. The price is `None` when the menu is free, and that `None` is
     /// stored, so a dish added later never bills a seat retroactively.
     ///
-    /// `cutoff_minutes` is the school's one meal cutoff (`None` = none): once
-    /// the meal's day is that close, the seat is fixed either way.
+    /// `cutoff` is the school's one meal deadline (see [`MealCutoff`]): once
+    /// serving time is that close, the seat is fixed either way.
     pub async fn book(
         menu: &MenuId,
         student: &UserId,
         booked_by: &UserId,
-        cutoff_minutes: Option<i64>,
+        cutoff: &MealCutoff,
         db: &Database,
     ) -> Result<MealBooking, AppError> {
         let _guard = MENU_LOCK.lock().await;
         let fresh = Menu::read(menu, db).await?.ok_or(AppError::NotFound)?;
-        check_cutoff(fresh.get_date(), cutoff_minutes)?;
+        check_cutoff(fresh.get_date(), fresh.get_slot(), cutoff)?;
         // Before the seat: an unchargeable menu (dishes summing past the cap)
         // must refuse the booking outright, never leave a booked-but-unbilled
         // row behind.
@@ -233,7 +234,7 @@ impl MealBooking {
     /// the meal has since closed would strand the money exactly as before.
     pub async fn cancel(
         self,
-        cutoff_minutes: Option<i64>,
+        cutoff: &MealCutoff,
         recorded_by: &UserId,
         db: &Database,
     ) -> Result<MealBooking, AppError> {
@@ -246,7 +247,7 @@ impl MealBooking {
         let menu = Menu::read(&fresh.menu, db)
             .await?
             .ok_or(AppError::NotFound)?;
-        check_cutoff(menu.get_date(), cutoff_minutes)?;
+        check_cutoff(menu.get_date(), menu.get_slot(), cutoff)?;
         let cancelled = MealBooking {
             status: MealBookingStatus::Cancelled,
             cancelled_at: Some(Timestamp::now()),
@@ -334,28 +335,66 @@ impl MealBooking {
     }
 }
 
-/// The meal's day as an instant: **midnight UTC starting that day**. `date` is
-/// text with no timezone (see [`MenuDate`]), and the backend stores no school
-/// timezone, so the start of the UTC day is the only instant derivable from it.
-/// A school wanting "two hours before lunch" sets the cutoff relative to that.
-// ponytail: exact — needs a school timezone + a per-slot serving time, neither
-// of which the settings singleton carries yet.
-fn day_starts_at(date: &MenuDate) -> Option<Timestamp> {
+/// The school's meal deadline policy, resolved once per request: how many
+/// minutes ahead booking and cancelling close, plus the slot list the serving
+/// times live on. Built from [`Settings`] by the web layer and handed down, so
+/// the domain never reaches for the singleton mid-lock.
+///
+/// The slots are read **live**, not snapshotted onto the menu, and that is
+/// deliberate: `meal_cancel_cutoff_minutes` is already read live, so freezing
+/// the other half of the same deadline would make one policy edit apply and
+/// its twin not. A kitchen that moves lunch an hour later wants today's menus
+/// to move with it; the menu still snapshots the slot *name*, which is what
+/// keeps a retired slot's history readable.
+#[derive(Debug, Clone, Default)]
+pub struct MealCutoff {
+    minutes: Option<i64>,
+    slots: Vec<MealSlotDef>,
+}
+
+impl MealCutoff {
+    pub fn from_settings(settings: &Settings) -> Self {
+        Self {
+            minutes: settings.get_meal_cancel_cutoff_minutes(),
+            slots: settings.get_meal_slots(),
+        }
+    }
+
+    /// Minutes past midnight UTC at which `slot` is served, or `None` when the
+    /// school set none (or dropped the slot after a menu snapshotted its name).
+    fn serving_minute(&self, slot: &MenuSlot) -> Option<i64> {
+        self.slots
+            .iter()
+            .find(|def| def.get_name() == slot.as_str())
+            .and_then(MealSlotDef::get_serving_minute)
+    }
+}
+
+/// The instant the meal is served: midnight UTC of `date` plus the slot's
+/// `serving_minute`. `date` is text with no timezone (see [`MenuDate`]) and the
+/// backend deliberately stores no school timezone, so the serving time is UTC
+/// too — a UTC+3 school enters 09:00 for a noon lunch. A slot with no serving
+/// time falls back to midnight UTC, exactly what every booking used before the
+/// field existed; refusing the booking instead would take the canteen offline
+/// on an upgrade.
+fn served_at(date: &MenuDate, serving_minute: Option<i64>) -> Option<Timestamp> {
     let day = chrono::NaiveDate::parse_from_str(date.as_str(), "%Y-%m-%d").ok()?;
     Some(Timestamp::from_millis(
-        day.and_hms_opt(0, 0, 0)?.and_utc().timestamp_millis(),
+        day.and_hms_opt(0, 0, 0)?.and_utc().timestamp_millis()
+            + serving_minute.unwrap_or(0).saturating_mul(60_000),
     ))
 }
 
-/// Booking and cancelling both close `cutoff_minutes` before the meal's day
-/// starts. `None` = the school set no cutoff, so neither ever closes.
-fn check_cutoff(date: &MenuDate, cutoff_minutes: Option<i64>) -> Result<(), AppError> {
-    let (Some(cutoff), Some(start)) = (cutoff_minutes, day_starts_at(date)) else {
+/// Booking and cancelling both close `cutoff.minutes` before the meal is
+/// served. `None` = the school set no cutoff, so neither ever closes.
+fn check_cutoff(date: &MenuDate, slot: &MenuSlot, cutoff: &MealCutoff) -> Result<(), AppError> {
+    let serving = served_at(date, cutoff.serving_minute(slot));
+    let (Some(minutes), Some(serving)) = (cutoff.minutes, serving) else {
         return Ok(());
     };
-    let deadline = start
+    let deadline = serving
         .as_millis()
-        .saturating_sub(cutoff.saturating_mul(60_000));
+        .saturating_sub(minutes.saturating_mul(60_000));
     if Timestamp::now().as_millis() >= deadline {
         return Err(AppError::Conflict("the menu's booking cutoff has passed"));
     }
@@ -381,21 +420,45 @@ mod tests {
         }
     }
 
+    fn cutoff(minutes: Option<i64>, serving_minute: Option<i64>) -> MealCutoff {
+        MealCutoff {
+            minutes,
+            slots: vec![MealSlotDef::try_new("lunch", serving_minute).unwrap()],
+        }
+    }
+
+    fn lunch() -> MenuSlot {
+        MenuSlot::try_new("lunch", &[MealSlotDef::try_new("lunch", None).unwrap()]).unwrap()
+    }
+
     #[test]
     fn cutoff_closes_only_within_the_window() {
         let far = MenuDate::try_new("2999-01-01").unwrap();
         let past = MenuDate::try_new("2000-01-01").unwrap();
         // No cutoff configured: nothing ever closes, not even a past day.
-        assert!(check_cutoff(&past, None).is_ok());
+        assert!(check_cutoff(&past, &lunch(), &cutoff(None, Some(720))).is_ok());
         // A day far ahead is open; one long gone is shut.
-        assert!(check_cutoff(&far, Some(60)).is_ok());
-        assert!(check_cutoff(&past, Some(60)).is_err());
-        // The cutoff is measured back from midnight UTC of the meal's day.
+        assert!(check_cutoff(&far, &lunch(), &cutoff(Some(60), Some(720))).is_ok());
+        assert!(check_cutoff(&past, &lunch(), &cutoff(Some(60), Some(720))).is_err());
+    }
+
+    /// The instant the deadline counts back from: midnight UTC of the day plus
+    /// the slot's serving minute, and midnight itself when the slot has none.
+    #[test]
+    fn serving_instant_offsets_midnight_utc() {
+        let day = MenuDate::try_new("1970-01-02").unwrap();
+        assert_eq!(served_at(&day, None).unwrap().as_millis(), 86_400_000);
         assert_eq!(
-            day_starts_at(&MenuDate::try_new("1970-01-02").unwrap())
-                .unwrap()
-                .as_millis(),
-            86_400_000
+            served_at(&day, Some(12 * 60)).unwrap().as_millis(),
+            86_400_000 + 12 * 60 * 60_000
         );
+        // A slot the school no longer lists (renamed or retired after the
+        // menu snapshotted its name) resolves to no serving time, i.e. the
+        // midnight fallback rather than a refusal.
+        assert_eq!(
+            cutoff(Some(60), Some(720)).serving_minute(&lunch()),
+            Some(720)
+        );
+        assert_eq!(MealCutoff::default().serving_minute(&lunch()), None);
     }
 }

@@ -578,6 +578,13 @@ fn expectations() -> Vec<(&'static str, &'static str, &'static str, i64)> {
             "maxLength",
             MAX_SETTINGS_ITEM_LEN as i64,
         ),
+        ("MealSlotDto", "serving_minute", "minimum", 0),
+        (
+            "MealSlotDto",
+            "serving_minute",
+            "maximum",
+            MAX_MEAL_SERVING_MINUTE,
+        ),
         (
             "UpdateSettings",
             "meal_slots",

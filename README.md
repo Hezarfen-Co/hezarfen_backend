@@ -240,6 +240,11 @@ Timezones and clock differences cannot corrupt data, by construction:
   the writer's wall, not an instant: validation accepts up to UTC-tomorrow,
   since a client ahead of UTC (up to UTC+14) legitimately writes a date the
   server's UTC calendar hasn't reached yet.
+- **Times-of-day are UTC too, and staff enter them that way.** A meal slot's
+  `serving_minute` (minutes past midnight, `0`–`1439`) is the one clock-face
+  value a school types in, and it is read as UTC on the menu's `date` — there
+  is deliberately **no school-timezone setting** (a rejected feature), so a
+  UTC+3 school enters `540` (09:00 UTC) for a meal served at noon locally.
 - **Nothing schedules in the past.** A request-supplied schedule instant — an
   exam window, a lesson's `starts_at`/`ends_at`, an event time — must not lie
   before the server's now, on create and on every `PATCH` that sets it: a
@@ -1181,7 +1186,8 @@ The school publishes **one menu per calendar day and meal slot** (`POST
 - **`slot` is a snapshot**, not a link into settings. It must be one of the
   school's `meal_slots` (`GET /settings`) *when the menu is written*, and it
   is stored as text — so retiring a slot later never rewrites a menu already
-  published under it. The mirror of that rule lives in settings: a slot any
+  published under it. The slot's `serving_minute` is *not* snapshotted: the
+  booking cutoff resolves it live from the current list. The mirror of that rule lives in settings: a slot any
   menu was published for cannot be removed from the list (`409`), same
   contract exam kinds have with graded exams.
 
@@ -1256,12 +1262,25 @@ teacher or manager ordering a child's lunch is a `403`.
   otherwise all pass the count. The whole check-then-write runs under the same
   lock a menu publish takes, and the cap is re-read inside it.
 - **One cutoff closes both ends.** Within the school's
-  `meal_cancel_cutoff_minutes` of the meal's day, neither a new booking nor a
-  cancellation lands (`409`) — the kitchen's headcount has to settle at some
-  point. `null` (the default) means no cutoff at all. The cutoff is measured
-  back from **midnight UTC starting the meal's day**: `date` carries no
-  timezone and the backend stores no school timezone, so that is the only
-  instant derivable from it.
+  `meal_cancel_cutoff_minutes` of the meal's serving time, neither a new
+  booking nor a cancellation lands (`409`) — the kitchen's headcount has to
+  settle at some point. `null` (the default) means no cutoff at all. The
+  cutoff is measured back from the menu's `date` **plus the slot's
+  `serving_minute`** (`GET /settings`), so a two-hour cutoff on a lunch served
+  at `720` closes at 10:00 UTC that morning, not at 22:00 the night before.
+  **That minute is UTC**: `date` carries no timezone and the backend stores no
+  school timezone — deliberately, it is a rejected feature — so a UTC+3 school
+  enters `540` (09:00 UTC) for a meal served at noon locally. A slot with no
+  `serving_minute` falls back to **midnight UTC starting the meal's day**, the
+  behaviour every booking had before the field existed; the booking is never
+  refused for want of a serving time.
+- **The serving time is read live, not snapshotted onto the menu.** The cutoff
+  minutes are already read live, so freezing the other half of the same
+  deadline would make one policy edit apply and its twin not; a kitchen that
+  moves lunch an hour later wants today's menus to move with it. The menu
+  still snapshots the slot *name* (that is what keeps a retired slot's history
+  readable), so a menu whose slot has since left the list simply has no
+  serving time and falls back to midnight UTC.
 - A menu somebody still holds a seat on **cannot be unpublished** (`409`) —
   cancel the bookings first, so nothing is left pointing at a deleted meal.
 
