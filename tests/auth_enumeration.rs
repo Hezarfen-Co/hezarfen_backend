@@ -43,7 +43,7 @@ async fn duplicate_register_is_indistinguishable_from_a_fresh_one() {
     assert_eq!(dup.status, StatusCode::CREATED);
 
     // Structurally identical: same keys, and every value either the echoed
-    // username or the same default. Only `id` may differ (it is a ULID).
+    // username or the same default.
     let dup_obj = dup.body.as_object().expect("dup body object");
     let fresh_obj = fresh.body.as_object().expect("fresh body object");
     assert_eq!(
@@ -52,17 +52,18 @@ async fn duplicate_register_is_indistinguishable_from_a_fresh_one() {
         "field set leaks existence"
     );
     for (key, value) in dup_obj {
-        if key == "id" || key == "username" {
+        if key == "username" {
             continue;
         }
         assert_eq!(value, &fresh_obj[key], "field {key} leaks existence");
     }
     assert_eq!(dup_obj["username"], "ada");
     assert_eq!(dup_obj["role"], "student");
-    assert_eq!(
-        dup_obj["id"].as_str().map(str::len),
-        fresh_obj["id"].as_str().map(str::len),
-        "id shape leaks existence"
+    // No id at all: the taken path has no row to name, so returning one would
+    // hand the client an id that resolves to nothing.
+    assert!(
+        !dup_obj.contains_key("id"),
+        "register must not return an id: {dup_obj:?}"
     );
     assert!(dup.cookie.is_none() && fresh.cookie.is_none());
 
@@ -106,4 +107,38 @@ async fn duplicate_register_is_indistinguishable_from_a_fresh_one() {
         "duplicate register created a second row: {names:?}"
     );
     assert_eq!(names.len(), 2, "unexpected user rows: {names:?}");
+}
+
+/// The invariant the response type exists to hold: for one and the same
+/// username, the taken reply and the fresh reply are the *identical* JSON
+/// value — not merely the same key set. Any per-path field (an id, a profile
+/// echo, a flag) reintroduced into one arm and not the other fails here.
+#[tokio::test]
+async fn the_taken_body_equals_the_fresh_body_for_the_same_username() {
+    let (app, _db) = app_and_db().await;
+
+    let fresh = send(
+        &app,
+        "POST",
+        "/auth/register",
+        None,
+        Some(json!({ "username": "ada", "password": "secret1" })),
+    )
+    .await;
+    let taken = send(
+        &app,
+        "POST",
+        "/auth/register",
+        None,
+        Some(json!({ "username": "ada", "password": "another1" })),
+    )
+    .await;
+
+    assert_eq!(fresh.status, StatusCode::CREATED);
+    assert_eq!(taken.status, StatusCode::CREATED);
+    assert_eq!(
+        taken.body, fresh.body,
+        "the two register paths returned different bodies — that is an \
+         enumeration oracle"
+    );
 }

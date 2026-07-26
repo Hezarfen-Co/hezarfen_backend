@@ -4,19 +4,20 @@ use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum_extra::extract::CookieJar;
 use axum_extra::extract::cookie::{Cookie, SameSite};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::constant::{RESERVED_USERNAMES, SESSION_DURATION_DAYS};
-use crate::domain::role::Role;
+use crate::domain::role::Role as DomainRole;
 use crate::domain::session::Session;
-use crate::domain::user::{Password, PasswordHash, User, UserId, Username};
+use crate::domain::user::{Password, PasswordHash, User, Username};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::state::AppState;
 
+use super::dto::Role;
 use super::{CurrentUser, UserResponse};
 
 pub fn routes(rate_limit: &RateLimitConfig) -> OpenApiRouter<AppState> {
@@ -45,6 +46,19 @@ struct Credentials {
     password: String,
 }
 
+/// What `POST /auth/register` answers with — deliberately *not* [`UserResponse`].
+/// It carries only what is true of both outcomes (created, and already-taken):
+/// the echoed username and the role every fresh account gets. No `id`, because
+/// the taken path has no row to name and a fabricated one would be a lie the
+/// client stores; no profile fields, because a fresh account has none. Anything
+/// added here must hold for both paths, or the reply starts leaking existence.
+#[derive(Serialize, ToSchema)]
+struct RegisterResponse {
+    #[schema(example = "ada")]
+    username: String,
+    role: Role,
+}
+
 /// Register a new user account.
 ///
 /// Answers `201` whether or not the username was free: a distinguishable
@@ -52,14 +66,16 @@ struct Credentials {
 /// the school, which would make the constant-cost decoy on the login path
 /// pointless. A taken username is *not* re-created or overwritten — only the
 /// reply is uniform. The UX cost (a typo-collision looks like success until the
-/// user tries to log in) is deliberate.
+/// user tries to log in) is deliberate. Both outcomes return the *same*
+/// [`RegisterResponse`] value, built once before the branch — there is no
+/// per-path body that could drift apart.
 #[utoipa::path(
     post,
     path = "/register",
     tag = "auth",
     request_body = Credentials,
     responses(
-        (status = 201, description = "Account created, or the username was already taken — deliberately indistinguishable", body = UserResponse),
+        (status = 201, description = "Account created, or the username was already taken — deliberately indistinguishable. Carries no `id`: on the taken path there is no row to name, so log in to learn who you are", body = RegisterResponse),
         (status = 400, description = "Invalid username or password", body = ErrorResponse),
         (status = 429, description = "Too many attempts from this address; see Retry-After", body = ErrorResponse),
     ),
@@ -67,7 +83,7 @@ struct Credentials {
 async fn register(
     State(st): State<AppState>,
     Json(req): Json<Credentials>,
-) -> Result<(StatusCode, Json<UserResponse>), AppError> {
+) -> Result<(StatusCode, Json<RegisterResponse>), AppError> {
     let username = Username::try_new(&req.username)?;
     // Registration-level policy, not a `Username` invariant: these names read
     // as staff and invite impersonation, but the `ADMIN_USERNAME` bootstrap
@@ -84,33 +100,25 @@ async fn register(
     // username can't be spotted by a fast reply. The only work the taken path
     // skips is the insert itself, orders of magnitude below hashing.
     let password_hash = Password::try_new(&req.password)?.hash_async().await?;
-    match User::create(username.clone(), password_hash, &st.db).await {
-        Ok(user) => Ok((StatusCode::CREATED, Json(UserResponse::new(&user)))),
-        // Taken. Log the real reason server-side and hand back a response shaped
-        // exactly like a fresh registration's — same status, same fields. The id
-        // is a throwaway that matches no row; nothing unauthenticated can
-        // resolve it, and telling the two apart is the whole thing we're denying.
+    // Built once, before the branch: the created and the taken path answer with
+    // the very same value, so they cannot be told apart by construction rather
+    // than by keeping two field lists in sync. Every fresh account starts as a
+    // student (`User::create`), so this holds whichever way the insert goes.
+    let body = RegisterResponse {
+        username: username.as_str().to_string(),
+        role: DomainRole::Student.into(),
+    };
+    match User::create(username, password_hash, &st.db).await {
+        Ok(_) => {}
+        // Taken. Log the real reason server-side; the caller gets the same 201
+        // and the same body, because telling the two apart is the whole thing
+        // we're denying. The account is not re-created or overwritten.
         Err(AppError::Conflict(_)) => {
             tracing::info!("register: username already taken, answering 201");
-            Ok((
-                StatusCode::CREATED,
-                Json(UserResponse {
-                    id: UserId::generate().key().to_string(),
-                    username: username.as_str().to_string(),
-                    // Every fresh account starts as a student (`User::create`).
-                    role: Role::Student.into(),
-                    name: None,
-                    surname: None,
-                    email: None,
-                    phone: None,
-                    birth_date: None,
-                    theme: None,
-                    language: None,
-                }),
-            ))
         }
-        Err(err) => Err(err),
+        Err(err) => return Err(err),
     }
+    Ok((StatusCode::CREATED, Json(body)))
 }
 
 /// Log in with username + password. Sets a `session` cookie on success.
