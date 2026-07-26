@@ -20,7 +20,7 @@ use crate::constant::MAX_DISHES_PER_MENU;
 use crate::database::Database;
 use crate::domain::dietary_profile::{DietaryNote, DietaryProfile, DietaryTags, conflicts};
 use crate::domain::meal_attendance::{MealAttendance, MealAttendanceStatus};
-use crate::domain::meal_booking::{MealBooking, MealBookingId};
+use crate::domain::meal_booking::{MealBooking, MealBookingId, MealCutoff};
 use crate::domain::meal_ledger::{LedgerAmount, LedgerMethod, LedgerNote, MealLedger};
 use crate::domain::menu::{MENU_LOCK, Menu, MenuDate, MenuId, MenuSlot, validate_capacity};
 use crate::domain::menu_dish::{
@@ -739,9 +739,12 @@ async fn booking_responses(
         .collect())
 }
 
-/// The school's one meal cutoff, applied to booking and cancelling alike.
-async fn cutoff_minutes(db: &Database) -> Result<Option<i64>, AppError> {
-    Ok(Settings::load(db).await?.get_meal_cancel_cutoff_minutes())
+/// The school's one meal deadline, applied to booking and cancelling alike:
+/// the cutoff minutes plus the slot serving times they count back from. Read
+/// live on every call, so a serving time corrected today moves the deadline of
+/// menus already published for it.
+async fn meal_cutoff(db: &Database) -> Result<MealCutoff, AppError> {
+    Ok(MealCutoff::from_settings(&Settings::load(db).await?))
 }
 
 /// Whose seat is this? A student books only for themselves; a parent only for
@@ -818,13 +821,13 @@ async fn book_meal(
     Json(req): Json<BookMeal>,
 ) -> Result<(StatusCode, Json<BookingResponse>), AppError> {
     let student = booking_target(&user, req.student_id.as_deref(), &st.db).await?;
-    let cutoff = cutoff_minutes(&st.db).await?;
+    let cutoff = meal_cutoff(&st.db).await?;
     let menu = MenuId::from_key(&id);
     // Price, seat and charge all land together under `MENU_LOCK`, keyed by
     // (seat, attempt) — a double-click books one seat and bills it once, and a
     // dish cannot slip in between the price snapshot and the row it is frozen
     // onto.
-    let booking = MealBooking::book(&menu, &student, user.get_id(), cutoff, &st.db).await?;
+    let booking = MealBooking::book(&menu, &student, user.get_id(), &cutoff, &st.db).await?;
     let items = booking_responses(std::slice::from_ref(&booking), &st.db).await?;
     Ok((
         StatusCode::CREATED,
@@ -943,10 +946,10 @@ async fn cancel_booking(
     if &target != booking.get_student() {
         return Err(AppError::Forbidden("not your booking"));
     }
-    let cutoff = cutoff_minutes(&st.db).await?;
+    let cutoff = meal_cutoff(&st.db).await?;
     // Flips the row and appends the reversal for that attempt's charge
     // together, under the same lock booking uses; the charge itself stays.
-    let cancelled = booking.cancel(cutoff, user.get_id(), &st.db).await?;
+    let cancelled = booking.cancel(&cutoff, user.get_id(), &st.db).await?;
     let items = booking_responses(std::slice::from_ref(&cancelled), &st.db).await?;
     Ok(Json(
         items.into_iter().next().expect("one booking in, one out"),

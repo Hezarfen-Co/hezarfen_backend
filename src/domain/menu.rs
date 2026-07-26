@@ -313,7 +313,7 @@ mod tests {
 
     #[test]
     fn slot_must_be_one_the_school_serves() {
-        let allowed = vec![MealSlotDef::try_new("lunch").unwrap()];
+        let allowed = vec![MealSlotDef::try_new("lunch", None).unwrap()];
         assert!(MenuSlot::try_new("lunch", &allowed).is_ok());
         assert!(MenuSlot::try_new("brunch", &allowed).is_err());
         assert!(MenuSlot::try_new("lunch", &[]).is_err());

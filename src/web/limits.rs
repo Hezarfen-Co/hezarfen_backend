@@ -204,6 +204,10 @@ struct MealLimits {
     /// Ceiling on the `/settings` knob that closes booking (and cancelling)
     /// ahead of a meal, minutes; the live value is on `GET /settings`.
     max_cancel_cutoff_minutes: i64,
+    /// Ceiling on a meal slot's `serving_minute` — minutes past midnight
+    /// **UTC** on the menu's date, which is what the cutoff counts back from.
+    /// `1439` = 23:59 UTC. There is no school timezone: staff enter UTC.
+    max_serving_minute: i64,
     /// The only accepted booking `status` values.
     #[schema(example = json!(["booked", "cancelled"]))]
     booking_statuses: Vec<&'static str>,
@@ -408,6 +412,7 @@ impl LimitsResponse {
                 max_ledger_method_len: MAX_LEDGER_METHOD_LEN,
                 max_ledger_note_len: MAX_LEDGER_NOTE_LEN,
                 max_cancel_cutoff_minutes: MAX_MEAL_CANCEL_CUTOFF_MINUTES,
+                max_serving_minute: MAX_MEAL_SERVING_MINUTE,
                 booking_statuses: MEAL_BOOKING_STATUSES.to_vec(),
                 attendance_statuses: MEAL_ATTENDANCE_STATUSES.to_vec(),
                 ledger_kinds: MEAL_LEDGER_KINDS.to_vec(),

@@ -39,6 +39,16 @@ struct MealSlotDto {
     /// The `slot` value menus carry, 1–50 characters.
     #[schema(example = "lunch", max_length = 50)]
     name: String,
+    /// When the slot is served, as minutes past midnight **UTC** on the menu's
+    /// date (`0`–`1439`; `720` = 12:00 UTC). `meal_cancel_cutoff_minutes`
+    /// counts back from this instant.
+    ///
+    /// **The clock is UTC, not local time** — this API stores no school
+    /// timezone, so a UTC+3 school enters `540` (09:00 UTC) for a meal served
+    /// at noon locally. `null` = unset, and then the cutoff counts back from
+    /// midnight UTC of the menu's date, the pre-serving-time behaviour.
+    #[schema(example = 720, minimum = 0, maximum = 1_439)]
+    serving_minute: Option<i64>,
 }
 
 /// One grade-display band: marks at or above `min` (and below the next band's
@@ -84,15 +94,20 @@ struct SettingsResponse {
     /// Character limit on one chat message.
     #[schema(example = 4000)]
     max_chatbot_message_len: i64,
-    /// Meal slots menus may be published for. Empty = the school runs no meal
-    /// program.
-    #[schema(example = json!([{"name": "breakfast"}, {"name": "lunch"}, {"name": "snack"}]))]
+    /// Meal slots menus may be published for, each with the UTC minute it is
+    /// served at (`null` = unset → the cutoff counts back from midnight UTC).
+    /// Empty = the school runs no meal program.
+    #[schema(example = json!([
+        {"name": "breakfast", "serving_minute": 300},
+        {"name": "lunch", "serving_minute": 720},
+        {"name": "snack", "serving_minute": null},
+    ]))]
     meal_slots: Vec<MealSlotDto>,
     /// Dietary tags a dish and a student's profile may carry.
     #[schema(example = json!(["vegetarian", "vegan", "gluten_free"]))]
     dietary_tags: Vec<String>,
-    /// How many minutes before a meal booking and cancelling close.
-    /// `null` = no cutoff.
+    /// How many minutes before a slot's `serving_minute` booking and
+    /// cancelling close. `null` = no cutoff.
     #[schema(example = 120)]
     meal_cancel_cutoff_minutes: Option<i64>,
 }
@@ -126,6 +141,7 @@ impl SettingsResponse {
                 .iter()
                 .map(|slot| MealSlotDto {
                     name: slot.get_name().to_string(),
+                    serving_minute: slot.get_serving_minute(),
                 })
                 .collect(),
             dietary_tags: settings.get_dietary_tags(),
@@ -166,16 +182,20 @@ struct UpdateSettings {
     #[schema(example = 4000, minimum = 100, maximum = 8_000)]
     max_chatbot_message_len: Option<i64>,
     /// Replaces the whole list when present: at most 20 entries with unique
-    /// names, each 1–50 characters. `[]` switches the meal program off. A slot
-    /// a menu was already published for cannot be removed (409).
+    /// names, each 1–50 characters, each with an optional `serving_minute`
+    /// (minutes past midnight **UTC**, `0`–`1439`) the booking cutoff counts
+    /// back from. `[]` switches the meal program off. A slot a menu was already
+    /// published for cannot be removed (409); its serving time may be edited
+    /// freely and applies live, to menus already published for it too.
     #[schema(max_items = 20)]
     meal_slots: Option<Vec<MealSlotDto>>,
     /// Replaces the whole list when present: at most 20 unique entries, each
     /// 1–50 characters. `[]` means the school tracks no dietary tags.
     #[schema(max_items = 20)]
     dietary_tags: Option<Vec<String>>,
-    /// Minutes before a meal at which booking *and* cancelling close,
-    /// `0`–`10080` (one week). Omit to keep the current value; send `null` for
+    /// Minutes before a slot's `serving_minute` at which booking *and*
+    /// cancelling close, `0`–`10080` (one week). A slot with no serving time
+    /// is measured from midnight UTC of the menu's date instead. Omit to keep the current value; send `null` for
     /// no cutoff at all.
     #[serde(default, deserialize_with = "set_or_clear")]
     #[schema(value_type = Option<i64>, example = 120, minimum = 0, maximum = 10_080)]
@@ -287,7 +307,7 @@ async fn update_settings(
         let meal_slots = match &req.meal_slots {
             Some(slots) => slots
                 .iter()
-                .map(|slot| MealSlotDef::try_new(&slot.name))
+                .map(|slot| MealSlotDef::try_new(&slot.name, slot.serving_minute))
                 .collect::<Result<Vec<_>, _>>()?,
             None => current.get_meal_slots(),
         };

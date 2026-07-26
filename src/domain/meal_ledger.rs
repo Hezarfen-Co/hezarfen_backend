@@ -42,7 +42,7 @@
 
 use std::sync::LazyLock;
 
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
+use surrealdb::types::{AlreadyExistsError, RecordId, RecordIdKey, SurrealValue};
 use ulid::Generator;
 
 use crate::constant::{
@@ -106,6 +106,17 @@ impl MealLedgerId {
     pub fn key(&self) -> &str {
         key_of(&self.0)
     }
+}
+
+/// Did this `CREATE` fail *only* because the row is already there? Matched on
+/// the SDK's typed `AlreadyExists`/`Record` detail — never on the message text
+/// and never on "any database error", because swallowing a real fault in money
+/// code would be far worse than the 500 it saves.
+fn is_duplicate_record(error: &surrealdb::Error) -> bool {
+    matches!(
+        error.already_exists_details(),
+        Some(AlreadyExistsError::Record { .. })
+    )
 }
 
 /// The bare key of a record id — how every id leaves this API.
@@ -261,12 +272,20 @@ impl MealLedger {
     /// [`MealLedgerId::for_attempt`]) an idempotence key: replaying the same
     /// append is a no-op, never a second line and never an edit of the first.
     /// The point read is on the id itself, so unlike a scan it cannot miss a
-    /// row a concurrent writer just made.
+    /// row a concurrent writer just made — but it is only a fast path. The
+    /// guarantee is `CREATE`'s own: on an existing id it *errors* and leaves
+    /// the row untouched, so the writer that lost the race reads back the
+    /// winner's line instead of failing the request with a 500.
     async fn append(row: MealLedger, db: &Database) -> Result<MealLedger, AppError> {
         if let Some(existing) = Self::read(&row.id, db).await? {
             return Ok(existing);
         }
-        let created: Option<MealLedger> = db.create(row.id.record()).content(row).await?;
+        let id = row.id.clone();
+        let created: Option<MealLedger> = match db.create(id.record()).content(row).await {
+            Ok(created) => created,
+            Err(e) if is_duplicate_record(&e) => Self::read(&id, db).await?,
+            Err(e) => return Err(e.into()),
+        };
         created.ok_or_else(|| AppError::Internal("failed to write the ledger line".into()))
     }
 

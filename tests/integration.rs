@@ -10982,7 +10982,13 @@ async fn settings_round_trip_the_food_program_knobs() {
     let res = send(&app, "GET", "/settings", Some(&manager), None).await;
     assert_eq!(
         res.body["meal_slots"],
-        json!([{"name": "breakfast"}, {"name": "lunch"}, {"name": "snack"}])
+        json!([
+            {"name": "breakfast", "serving_minute": null},
+            {"name": "lunch", "serving_minute": null},
+            {"name": "snack", "serving_minute": null},
+        ]),
+        "the shipped defaults carry no serving time, so the cutoff keeps its \
+         midnight-UTC meaning until a school sets real hours"
     );
     assert_eq!(
         res.body["dietary_tags"],
@@ -11015,7 +11021,10 @@ async fn settings_round_trip_the_food_program_knobs() {
         "/settings",
         Some(&manager),
         Some(json!({
-            "meal_slots": [{"name": "lunch"}, {"name": "  snack "}],
+            "meal_slots": [
+                {"name": "lunch", "serving_minute": 720},
+                {"name": "  snack "},
+            ],
             "dietary_tags": ["vegan"],
             "meal_cancel_cutoff_minutes": 120,
         })),
@@ -11024,7 +11033,11 @@ async fn settings_round_trip_the_food_program_knobs() {
     assert_eq!(res.status, StatusCode::OK);
     assert_eq!(
         res.body["meal_slots"],
-        json!([{"name": "lunch"}, {"name": "snack"}])
+        json!([
+            {"name": "lunch", "serving_minute": 720},
+            {"name": "snack", "serving_minute": null},
+        ]),
+        "slots round-trip with and without a serving time"
     );
     assert_eq!(res.body["dietary_tags"], json!(["vegan"]));
     assert_eq!(res.body["meal_cancel_cutoff_minutes"], 120);
@@ -11062,6 +11075,8 @@ async fn settings_round_trip_the_food_program_knobs() {
         json!({ "meal_cancel_cutoff_minutes": -1 }),
         json!({ "meal_slots": [{"name": "   "}] }),
         json!({ "meal_slots": [{"name": "Lunch"}, {"name": "lunch"}] }),
+        json!({ "meal_slots": [{"name": "lunch", "serving_minute": 1440}] }),
+        json!({ "meal_slots": [{"name": "lunch", "serving_minute": -1}] }),
         json!({ "dietary_tags": ["vegan", "VEGAN"] }),
     ] {
         let res = send(
@@ -11105,7 +11120,10 @@ async fn settings_round_trip_the_food_program_knobs() {
     assert_eq!(res.status, StatusCode::OK);
     assert_eq!(
         res.body["meal_slots"],
-        json!([{"name": "lunch"}, {"name": "dinner"}])
+        json!([
+            {"name": "lunch", "serving_minute": null},
+            {"name": "dinner", "serving_minute": null},
+        ])
     );
 }
 
@@ -20700,6 +20718,80 @@ async fn concurrent_meal_bookings_never_exceed_the_capacity() {
     assert_eq!(common::total(&res.body), 3, "and only three rows exist");
 }
 
+/// Two appends of one ledger id must both succeed: the id is the idempotence
+/// key, so the loser reads back the winner's line instead of surfacing the
+/// duplicate-key error as a 500. Driven at the domain level on purpose — every
+/// HTTP path into the ledger runs under `MENU_LOCK`, which serializes the two
+/// writers before they can ever collide.
+#[tokio::test]
+async fn concurrent_ledger_appends_of_one_id_write_one_line_not_a_500() {
+    use hezarfen_backend::domain::meal_booking::{MealBooking, MealBookingId};
+    use hezarfen_backend::domain::meal_ledger::MealLedger;
+
+    let (app, db) = app_and_db().await;
+    let mgr = login_as(&app, &db, "ledger_race_mgr", "manager").await;
+    let ali = login(&app, "ledger_race_ali").await;
+
+    let res = send(
+        &app,
+        "POST",
+        "/meals/menus",
+        Some(&mgr),
+        Some(json!({ "date": "2026-09-15", "slot": "lunch" })),
+    )
+    .await;
+    let menu = id_of(&res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/dishes"),
+        Some(&mgr),
+        Some(json!({ "name": "Pilav", "price_minor": 1000 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED);
+
+    // The seat charges 1000; its reversal line does not exist yet, so both
+    // racers below derive the same unwritten id.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/bookings"),
+        Some(&ali),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let booking = MealBooking::read(&MealBookingId::from_key(&id_of(&res.body)), &db)
+        .await
+        .expect("read the booking")
+        .expect("the booking exists");
+    let student = booking.get_student().clone();
+    assert_eq!(
+        MealLedger::balance_of(&student, &db).await.unwrap(),
+        -1000,
+        "the seat was charged once"
+    );
+
+    let (first, second) = tokio::join!(
+        MealLedger::reverse_booking(&booking, &student, &db),
+        MealLedger::reverse_booking(&booking, &student, &db),
+    );
+    assert!(first.is_ok(), "the winner appended: {first:?}");
+    assert!(
+        second.is_ok(),
+        "the loser must read back the winner's line, not fail: {second:?}"
+    );
+
+    let lines = MealLedger::list_for_student(&student, &db).await.unwrap();
+    assert_eq!(lines.len(), 2, "one charge and exactly one reversal");
+    assert_eq!(
+        MealLedger::balance_of(&student, &db).await.unwrap(),
+        0,
+        "the money moved back exactly once"
+    );
+}
+
 /// One knob closes both ends: past the school's `meal_cancel_cutoff_minutes`
 /// neither a new booking nor a cancellation lands.
 #[tokio::test]
@@ -20779,6 +20871,137 @@ async fn meal_cutoff_closes_booking_and_cancelling_alike() {
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+}
+
+/// The cutoff counts back from the slot's **serving time**, not from midnight.
+/// The discriminating case: a menu on tomorrow's date whose lunch is served at
+/// 23:59 UTC, with a cutoff wide enough that *midnight* of that date is already
+/// inside it. Under the old midnight rule the seat is shut; measured from the
+/// serving time it is open for another ~24 hours. Then, with no serving time on
+/// the slot, the very same menu falls back to midnight and shuts — the upgrade
+/// path for every slot written before the field existed.
+#[tokio::test]
+async fn meal_cutoff_counts_back_from_the_slots_serving_time() {
+    let (app, db) = app_and_db().await;
+    let mgr = login_as(&app, &db, "serve_mgr", "manager").await;
+    let ali = login(&app, "serve_ali").await;
+
+    // Tomorrow UTC, so midnight of the menu's date is 0–1440 minutes ahead.
+    let now = Timestamp::now().as_millis();
+    let tomorrow = Timestamp::today_utc() + chrono::Days::new(1);
+    let midnight = tomorrow
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis();
+    // Five minutes wider than the gap to midnight: the midnight deadline is
+    // now in the past, while the 23:59 serving deadline is ~24 hours out.
+    let cutoff = (midnight - now).div_euclid(60_000) + 5;
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&mgr),
+        Some(json!({
+            "meal_slots": [{ "name": "lunch", "serving_minute": 1439 }],
+            "meal_cancel_cutoff_minutes": cutoff,
+        })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    let res = send(
+        &app,
+        "POST",
+        "/meals/menus",
+        Some(&mgr),
+        Some(json!({ "date": tomorrow.to_string(), "slot": "lunch" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let menu = id_of(&res.body);
+
+    let res = send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/bookings"),
+        Some(&ali),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::CREATED,
+        "measured from 23:59 the seat is still open; the midnight rule would \
+         have refused it: {}",
+        res.body
+    );
+    let booking = id_of(&res.body);
+
+    // Drop the serving time from the same slot: the deadline snaps back to
+    // midnight of the menu's date, which the cutoff already covers. The slot
+    // list is read live, so the menu published under it moves with it.
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&mgr),
+        Some(json!({ "meal_slots": [{ "name": "lunch" }] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(
+        res.body["meal_slots"],
+        json!([{ "name": "lunch", "serving_minute": null }]),
+        "{}",
+        res.body
+    );
+
+    let veli = login(&app, "serve_veli").await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/bookings"),
+        Some(&veli),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::CONFLICT,
+        "with no serving time the cutoff falls back to midnight UTC: {}",
+        res.body
+    );
+    // Cancelling is closed by the same fallback deadline...
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/meals/bookings/{booking}"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+
+    // ...and re-serving lunch at 23:59 opens both ends again.
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&mgr),
+        Some(json!({ "meal_slots": [{ "name": "lunch", "serving_minute": 1439 }] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/meals/bookings/{booking}"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
 }
 
 /// Who may take a seat: the student it is for, or a parent holding a link to

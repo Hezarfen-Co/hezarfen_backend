@@ -1092,3 +1092,88 @@ async fn legacy_chat_turns_backfill_to_untruncated() {
         assert_eq!(turn["truncated"], false, "{turn}");
     }
 }
+
+/// A settings singleton whose `meal_slots` predate `serving_minute` — the live
+/// podman volume's shape — still reads, and still **saves**. The trap is the
+/// compare-and-set in `save_if_unchanged`: it re-binds the loaded slot list as
+/// the expected value, so if a slot object without the key round-tripped to one
+/// *with* `serving_minute: NONE`, the guard would never match again and every
+/// `PATCH /settings` would 409 forever on an upgraded database.
+#[tokio::test]
+async fn settings_slots_without_a_serving_minute_still_patch() {
+    let (app, db) = common::app_and_db().await;
+
+    let creds = json!({ "username": "boss", "password": "secret1" });
+    send(&app, "POST", "/auth/register", None, Some(creds.clone())).await;
+    set_role(&db, "boss", "manager").await;
+    let cookie = send(&app, "POST", "/auth/login", None, Some(creds.clone()))
+        .await
+        .cookie
+        .unwrap();
+
+    // Materialize the singleton, then age its slots into the pre-serving-time
+    // shape: objects carrying nothing but a name.
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&cookie),
+        Some(json!({ "meal_slots": [{ "name": "lunch", "serving_minute": 720 }] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    db.query("UPDATE settings:school SET meal_slots = [{ name: 'lunch' }];")
+        .await
+        .expect("age slots")
+        .check()
+        .expect("age slots check");
+
+    // Second boot over that row: it reads back, with the field simply absent.
+    let app = reboot(&db).await;
+    let cookie = send(&app, "POST", "/auth/login", None, Some(creds))
+        .await
+        .cookie
+        .unwrap();
+    let res = send(&app, "GET", "/settings", Some(&cookie), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["meal_slots"][0]["name"], "lunch", "{}", res.body);
+    assert!(
+        res.body["meal_slots"][0]["serving_minute"].is_null(),
+        "{}",
+        res.body
+    );
+
+    // And a PATCH of an unrelated knob still lands: the CAS matched the aged
+    // row. This is the assertion that would have caught a `DEFAULT []` column.
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&cookie),
+        Some(json!({ "max_file_bytes": 2048 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["max_file_bytes"], 2048, "{}", res.body);
+    assert!(
+        res.body["meal_slots"][0]["serving_minute"].is_null(),
+        "{}",
+        res.body
+    );
+
+    // Setting the serving time on that legacy slot round-trips too.
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&cookie),
+        Some(json!({ "meal_slots": [{ "name": "lunch", "serving_minute": 615 }] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(
+        res.body["meal_slots"][0]["serving_minute"], 615,
+        "{}",
+        res.body
+    );
+}
