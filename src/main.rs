@@ -1,7 +1,6 @@
 use anyhow::Context;
 use hezarfen_backend::config::Config;
 use hezarfen_backend::database::Database;
-use hezarfen_backend::domain::user::{Password, User, Username};
 use hezarfen_backend::rate_limit::UserRateLimiter;
 use hezarfen_backend::state::{AppState, DbHealth};
 use hezarfen_backend::{build_router, database};
@@ -17,11 +16,12 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cfg = Config::from_env();
-    let db = database::init(&cfg).await?;
     // Hash the login decoy now, so the first unknown-username login is not the
     // one request that pays for it (see `PasswordHash::prewarm_decoy`).
     hezarfen_backend::domain::user::PasswordHash::prewarm_decoy();
-    seed_admin(&cfg, &db).await?;
+    // Schema *and* the admin seed: both are boot work that must happen once
+    // across overlapping processes, so both live behind the boot election.
+    let db = database::init(&cfg).await?;
     let db_up = DbHealth::default();
     keepalive(db.clone(), db_up.clone());
     tokio::fs::create_dir_all(&cfg.files_path)
@@ -92,24 +92,6 @@ fn keepalive(db: Database, health: DbHealth) {
             }
         }
     });
-}
-
-/// Apply the `ADMIN_USERNAME` / `ADMIN_PASSWORD` bootstrap, if configured.
-/// Both-or-neither: half a credential pair is a deployment mistake, so it
-/// aborts startup rather than silently running without the seed.
-async fn seed_admin(cfg: &Config, db: &Database) -> anyhow::Result<()> {
-    match (&cfg.admin_username, &cfg.admin_password) {
-        (Some(username), Some(password)) => {
-            let username = Username::try_new(username).context("invalid ADMIN_USERNAME")?;
-            let password = Password::try_new(password).context("invalid ADMIN_PASSWORD")?;
-            User::ensure_admin(username, password, db)
-                .await
-                .context("failed to seed the admin account")?;
-            Ok(())
-        }
-        (None, None) => Ok(()),
-        _ => anyhow::bail!("ADMIN_USERNAME and ADMIN_PASSWORD must be set together"),
-    }
 }
 
 /// Resolve on SIGINT (Ctrl-C) or SIGTERM. As PID 1 in a container the process

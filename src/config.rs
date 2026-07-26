@@ -1,8 +1,8 @@
 use std::env;
 
 use crate::constant::{
-    AI_DEFAULT_REQUEST_TIMEOUT_SECS, DEFAULT_API_RATE_LIMIT, DEFAULT_AUTH_RATE_LIMIT,
-    DEFAULT_CHATBOT_RATE_LIMIT,
+    AI_DEFAULT_REQUEST_TIMEOUT_SECS, AI_MAX_REQUEST_TIMEOUT_SECS, DEFAULT_API_RATE_LIMIT,
+    DEFAULT_AUTH_RATE_LIMIT, DEFAULT_CHATBOT_RATE_LIMIT,
 };
 use crate::rate_limit::RateLimitConfig;
 
@@ -105,14 +105,34 @@ fn parse_limit(value: Option<String>, default: u32) -> u32 {
     value.and_then(|v| v.trim().parse().ok()).unwrap_or(default)
 }
 
-/// Parse a timeout in seconds. Unlike a rate limit, `0` is *not* honoured —
-/// a zero deadline would fail every AI request instantly, which is never what
-/// an operator means — so it falls back with the rest of the garbage.
+/// Parse the AI request deadline in seconds. Unlike a rate limit, `0` is *not*
+/// honoured — a zero deadline would fail every AI request instantly, which is
+/// never what an operator means — so it falls back with the rest of the
+/// garbage.
+///
+/// The ceiling is the load-bearing part, and it is enforced here because here
+/// is the only place the number enters the process. A deadline above
+/// [`AI_MAX_REQUEST_TIMEOUT_SECS`] lets one dispatch outlive
+/// `CHATBOT_CLAIM_RECLAIM_SECS`, and the chat claim queue then hands the same
+/// turn to a second worker while the first is still answering it — two
+/// inferences for one reply. Clamping at the boundary is what makes that
+/// unreachable *by configuration*, instead of true only for the default.
 fn parse_timeout(value: Option<String>, default: u64) -> u64 {
-    value
+    let asked = value
         .and_then(|v| v.trim().parse().ok())
         .filter(|n| *n > 0)
-        .unwrap_or(default)
+        .unwrap_or(default);
+    if asked > AI_MAX_REQUEST_TIMEOUT_SECS {
+        // Loud: the operator asked for something they are not getting, and the
+        // reason (a queue horizon) is not one they could guess from the name.
+        tracing::warn!(
+            "AI_REQUEST_TIMEOUT_SECS={asked} is above the {AI_MAX_REQUEST_TIMEOUT_SECS}s ceiling \
+             the chat claim queue allows (a longer inference would be reclaimed and re-dispatched \
+             mid-flight) — using {AI_MAX_REQUEST_TIMEOUT_SECS}s"
+        );
+        return AI_MAX_REQUEST_TIMEOUT_SECS;
+    }
+    asked
 }
 
 /// Parse the `PORT` value, falling back to 8080 when unset or unparseable.
@@ -134,6 +154,9 @@ fn parse_flag(value: Option<String>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{parse_flag, parse_limit, parse_port, parse_timeout};
+    use crate::constant::{
+        AI_DEFAULT_REQUEST_TIMEOUT_SECS, AI_MAX_REQUEST_TIMEOUT_SECS, CHATBOT_CLAIM_RECLAIM_SECS,
+    };
 
     #[tokio::test]
     async fn timeout_falls_back_on_absent_garbage_and_zero() {
@@ -141,7 +164,34 @@ mod tests {
         assert_eq!(parse_timeout(Some("nope".into()), 30), 30);
         // A zero deadline would time out every AI call before it started.
         assert_eq!(parse_timeout(Some("0".into()), 30), 30);
-        assert_eq!(parse_timeout(Some(" 120 ".into()), 30), 120);
+        // Whitespace is trimmed; the ceiling has its own test below.
+        assert_eq!(parse_timeout(Some(" 45 ".into()), 30), 45);
+    }
+
+    #[tokio::test]
+    async fn a_configured_timeout_can_never_outlive_the_chat_claim_horizon() {
+        // The one double-dispatch an operator could still reach: nothing used
+        // to stop `AI_REQUEST_TIMEOUT_SECS=120`, and a dispatch outliving
+        // `CHATBOT_CLAIM_RECLAIM_SECS` has its turn reclaimed and re-sent while
+        // the first inference is still running — the model answers one turn
+        // twice. The relationship, not a literal, is what is asserted: raising
+        // one of the two numbers without the other cannot pass this.
+        for asked in ["91", "120", "600", "18446744073709551615"] {
+            let got = parse_timeout(Some(asked.into()), AI_DEFAULT_REQUEST_TIMEOUT_SECS);
+            assert!(
+                (got as i64) < CHATBOT_CLAIM_RECLAIM_SECS,
+                "AI_REQUEST_TIMEOUT_SECS={asked} was honoured as {got}s, at or past the \
+                 {CHATBOT_CLAIM_RECLAIM_SECS}s reclaim horizon"
+            );
+            assert_eq!(got, AI_MAX_REQUEST_TIMEOUT_SECS, "clamped to the ceiling");
+        }
+        // Everything under the ceiling — the default included — is honoured
+        // verbatim: this is a ceiling, not a fixed deadline.
+        assert_eq!(parse_timeout(Some("45".into()), 30), 45);
+        assert_eq!(
+            parse_timeout(None, AI_DEFAULT_REQUEST_TIMEOUT_SECS),
+            AI_DEFAULT_REQUEST_TIMEOUT_SECS
+        );
     }
 
     #[tokio::test]
