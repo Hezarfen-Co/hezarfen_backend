@@ -306,6 +306,34 @@ impl Appointment {
         Ok(!result.take::<Vec<Appointment>>(0)?.is_empty())
     }
 
+    /// Same question as [`has_live_booking`](Self::has_live_booking) asked of a
+    /// whole series at once: does *any* of `slots` still hold an occupied
+    /// booking? One round-trip, because a weekly publish is up to 52 slots and
+    /// the caller asks while holding the lock. Caller must hold
+    /// [`APPOINTMENT_LOCK`], for the same reason: the answer is only meaningful
+    /// while no booking can be written.
+    ///
+    /// No slots, no bookings — answered without a query, since an empty `IN`
+    /// list is a needless round-trip and must never read as "occupied".
+    pub async fn any_live_booking(
+        slots: &[AppointmentSlotId],
+        db: &Database,
+    ) -> Result<bool, AppError> {
+        if slots.is_empty() {
+            return Ok(false);
+        }
+        let records: Vec<RecordId> = slots.iter().map(AppointmentSlotId::record).collect();
+        let mut result = db
+            .query(
+                "SELECT * FROM appointment WHERE slot IN $slots \
+                 AND status IN ['pending', 'approved'] LIMIT 1",
+            )
+            .bind(("slots", records))
+            .await?
+            .check()?;
+        Ok(!result.take::<Vec<Appointment>>(0)?.is_empty())
+    }
+
     /// Request `slot`. Lands `pending`: publishing availability is not consent
     /// to a specific person and topic.
     ///
