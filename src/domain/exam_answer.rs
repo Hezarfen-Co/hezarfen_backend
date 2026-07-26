@@ -1,7 +1,7 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
-use crate::constant::MAX_ANSWER_TEXT_LEN;
-use crate::database::{Database, EXAM_ANSWER_TABLE};
+use crate::constant::{EXAM_ANSWER_TABLE, MAX_ANSWER_TEXT_LEN};
+use crate::database::Database;
 use crate::domain::exam::ExamId;
 use crate::domain::exam_question::{ChoiceId, ExamQuestion, ExamQuestionId};
 use crate::domain::timestamp::Timestamp;

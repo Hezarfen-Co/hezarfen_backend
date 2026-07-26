@@ -1,8 +1,10 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use ulid::Ulid;
 
-use crate::constant::{MAX_EXAM_DESCRIPTION_LEN, MAX_EXAM_TITLE_LEN, UNLIMITED_EXAM_ATTEMPTS};
-use crate::database::{Database, EXAM_TABLE};
+use crate::constant::{
+    EXAM_TABLE, MAX_EXAM_DESCRIPTION_LEN, MAX_EXAM_TITLE_LEN, UNLIMITED_EXAM_ATTEMPTS,
+};
+use crate::database::Database;
 use crate::domain::course::CourseId;
 use crate::domain::settings::ExamKindDef;
 use crate::domain::timestamp::Timestamp;

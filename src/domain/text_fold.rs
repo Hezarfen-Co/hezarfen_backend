@@ -18,29 +18,14 @@
 //! makes the search work in both directions (`istanbul` ↔ `İSTANBUL`,
 //! `ıgdır` ↔ `Iğdır`).
 
-/// Replacements applied *after* lowercasing, in order. One table, two
-/// consumers ([`search_fold`] and [`search_fold_sql`]): the needle and the
-/// column are folded by the same rules by construction, which is the whole
-/// point.
-const REPLACEMENTS: &[(&str, &str)] = &[
-    ("\u{307}", ""), // combining dot above, left behind by İ → i̇
-    ("ı", "i"),
-    ("ş", "s"),
-    ("ğ", "g"),
-    ("ç", "c"),
-    ("ö", "o"),
-    ("ü", "u"),
-    ("â", "a"),
-    ("î", "i"),
-    ("û", "u"),
-];
+use crate::constant::TEXT_FOLD_REPLACEMENTS;
 
 /// Fold a search needle (or any Rust-side string) for comparison. **Search
 /// only** — this is lossy, `tür` and `tur` both fold to `tur`. For "is this
 /// the same word?" use [`case_fold_tr`].
 pub fn search_fold(text: &str) -> String {
     let mut folded = text.to_lowercase();
-    for (from, to) in REPLACEMENTS {
+    for (from, to) in TEXT_FOLD_REPLACEMENTS {
         folded = folded.replace(from, to);
     }
     folded
@@ -51,7 +36,7 @@ pub fn search_fold(text: &str) -> String {
 /// input.
 pub fn search_fold_sql(column: &str) -> String {
     let mut expr = format!("string::lowercase({column})");
-    for (from, to) in REPLACEMENTS {
+    for (from, to) in TEXT_FOLD_REPLACEMENTS {
         expr = format!("string::replace({expr}, '{from}', '{to}')");
     }
     expr
@@ -91,6 +76,29 @@ mod tests {
         assert_eq!(search_fold("Iğdır"), "igdir");
         assert_eq!(search_fold("ÇÖZÜM"), "cozum");
         assert_eq!(search_fold("Şekil"), "sekil");
+    }
+
+    /// Circumflexed vowels fold too. Pinned because they are the tail of the
+    /// table and a silent truncation of it still passes every other test here.
+    #[test]
+    fn folds_circumflexed_vowels() {
+        assert_eq!(search_fold("Kâğıt"), "kagit");
+        assert_eq!(search_fold("HÂLÂ"), "hala");
+        assert_eq!(search_fold("Îmân"), "iman");
+        assert_eq!(search_fold("sükûn"), "sukun");
+    }
+
+    /// `search_fold` and `search_fold_sql` are one table, two consumers — the
+    /// SQL must emit a `string::replace` for every rule, or the column and the
+    /// needle drift apart and a search silently stops matching.
+    #[test]
+    fn sql_covers_every_replacement() {
+        let sql = search_fold_sql("name");
+        assert_eq!(
+            sql.matches("string::replace").count(),
+            TEXT_FOLD_REPLACEMENTS.len(),
+            "one string::replace per rule"
+        );
     }
 
     /// The identity fold folds case (Turkish rules) and *nothing else* — the

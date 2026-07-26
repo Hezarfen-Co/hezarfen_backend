@@ -9,8 +9,10 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use tokio::sync::Mutex;
 use ulid::Ulid;
 
-use crate::constant::{MAX_FILE_CONTENT_TYPE_LEN, MAX_FILE_NAME_LEN, MAX_NOTE_FILES};
-use crate::database::{Database, NOTE_FILE_TABLE};
+use crate::constant::{
+    MAX_FILE_CONTENT_TYPE_LEN, MAX_FILE_NAME_LEN, MAX_NOTE_FILES, NOTE_FILE_TABLE,
+};
+use crate::database::Database;
 use crate::domain::note::NoteId;
 use crate::error::{AppError, ValidationError};
 

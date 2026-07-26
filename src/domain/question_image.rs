@@ -12,7 +12,8 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use ulid::Ulid;
 
-use crate::database::{Database, QUESTION_IMAGE_TABLE};
+use crate::constant::QUESTION_IMAGE_TABLE;
+use crate::database::Database;
 use crate::domain::course::CourseId;
 use crate::domain::exam::ExamId;
 use crate::domain::exam_question::{ChoiceId, ExamQuestionId};

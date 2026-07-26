@@ -14,8 +14,8 @@
 
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
-use crate::constant::MAX_HOMEWORK_TEXT_LEN;
-use crate::database::{Database, HOMEWORK_SUBMISSION_TABLE};
+use crate::constant::{HOMEWORK_SUBMISSION_TABLE, MAX_HOMEWORK_TEXT_LEN};
+use crate::database::Database;
 use crate::domain::homework::HomeworkId;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;

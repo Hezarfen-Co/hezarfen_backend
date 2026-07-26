@@ -13,22 +13,16 @@ use std::sync::{LazyLock, Mutex};
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use ulid::{Generator, Ulid};
 
-use crate::constant::{CHATBOT_PENDING_STALE_SECS, MAX_CHATBOT_MESSAGE_LEN};
-use crate::database::{CHAT_MESSAGE_TABLE, Database};
+use crate::constant::{
+    CHAT_MESSAGE_TABLE, CHATBOT_PENDING_STALE_SECS, MAX_CHATBOT_MESSAGE_LEN, MAX_ERROR_CODE_LEN,
+    STALE_ERROR_CODE,
+};
+use crate::database::Database;
 use crate::domain::chatbot_thread::ChatbotThreadId;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 use crate::validate::validate_required;
-
-/// The `error_code` a stale `pending` row presents as. Distinct from the boot
-/// sweep's `interrupted`: this one was never repaired, only projected.
-pub const STALE_ERROR_CODE: &str = "timed_out";
-
-/// Ceiling on a stored `error_code`. Codes are short slugs, but one arrives
-/// from an out-of-process AI service — a trust boundary — so it is trimmed
-/// rather than trusted.
-const MAX_ERROR_CODE_LEN: usize = 64;
 
 /// Mints message ids in write order. Unlike `Ulid::new()`, whose 80 random
 /// low bits sort arbitrarily among ids minted in the same millisecond, this

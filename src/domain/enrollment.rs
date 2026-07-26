@@ -1,7 +1,8 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use tokio::sync::Mutex;
 
-use crate::database::{Database, ENROLLMENT_TABLE};
+use crate::constant::ENROLLMENT_TABLE;
+use crate::database::Database;
 use crate::domain::course::{Course, CourseId};
 use crate::domain::user::UserId;
 use crate::error::AppError;

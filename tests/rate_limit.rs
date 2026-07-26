@@ -420,7 +420,7 @@ async fn a_limit_of_fifty_admits_exactly_fifty_requests() {
 /// endpoints cheap (no argon2 runs for a body-less request).
 #[tokio::test]
 async fn every_route_enforces_the_shipped_limit_plus_one() {
-    use hezarfen_backend::config::{DEFAULT_API_RATE_LIMIT, DEFAULT_AUTH_RATE_LIMIT};
+    use hezarfen_backend::constant::{DEFAULT_API_RATE_LIMIT, DEFAULT_AUTH_RATE_LIMIT};
 
     let app = app_with(RateLimitConfig {
         auth_per_minute: DEFAULT_AUTH_RATE_LIMIT,

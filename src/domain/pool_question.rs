@@ -13,21 +13,17 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use ulid::Ulid;
 
-use crate::constant::{MAX_POOL_QUESTION_BODY_LEN, MAX_POOL_QUESTION_TITLE_LEN};
-use crate::database::{Database, POOL_QUESTION_TABLE};
+use crate::constant::{
+    MAX_POOL_QUESTION_BODY_LEN, MAX_POOL_QUESTION_TITLE_LEN, POOL_QUESTION_TABLE, STATUS_APPROVED,
+    STATUS_PENDING,
+};
+use crate::database::Database;
 use crate::domain::note_file::FileContentType;
 use crate::domain::solution::Solution;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 use crate::validate::validate_required;
-
-/// The two lifecycle states. `pending`: awaiting teacher+ approval, visible
-/// only to the asker and to teacher+. `approved`: in the pool, school-wide.
-/// Rejection is not a state — a teacher+ simply deletes the question.
-pub const STATUS_PENDING: &str = "pending";
-pub const STATUS_APPROVED: &str = "approved";
-pub const POOL_QUESTION_STATUSES: [&str; 2] = [STATUS_PENDING, STATUS_APPROVED];
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct PoolQuestionId(RecordId);

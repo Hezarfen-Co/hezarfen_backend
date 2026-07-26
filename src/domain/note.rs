@@ -1,8 +1,8 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use ulid::Ulid;
 
-use crate::constant::{MAX_NOTE_CONTENT_LEN, MAX_NOTE_TITLE_LEN};
-use crate::database::{Database, NOTE_TABLE};
+use crate::constant::{MAX_NOTE_CONTENT_LEN, MAX_NOTE_TITLE_LEN, NOTE_TABLE};
+use crate::database::Database;
 use crate::domain::field_update::FieldUpdate;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};

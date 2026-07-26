@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
-use crate::database::{Database, EXAM_RESULT_TABLE};
+use crate::constant::EXAM_RESULT_TABLE;
+use crate::database::Database;
 use crate::domain::course::CourseId;
 use crate::domain::exam::ExamId;
 use crate::domain::user::UserId;

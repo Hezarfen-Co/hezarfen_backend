@@ -19,8 +19,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::constant::*;
-use crate::domain::preferences::{Language, Theme};
-use crate::domain::role::Role;
+use crate::constant::{LANGUAGES, ROLES, THEMES};
 use crate::state::AppState;
 
 pub fn routes() -> OpenApiRouter<AppState> {
@@ -281,12 +280,9 @@ impl LimitsResponse {
                 max_email_len: MAX_EMAIL_LEN,
                 min_phone_digits: MIN_PHONE_DIGITS,
                 max_phone_digits: MAX_PHONE_DIGITS,
-                roles: Role::ALL.iter().map(|role| role.as_str()).collect(),
-                themes: Theme::ALL.iter().map(|theme| theme.as_str()).collect(),
-                languages: Language::ALL
-                    .iter()
-                    .map(|language| language.as_str())
-                    .collect(),
+                roles: ROLES.iter().map(|role| role.as_str()).collect(),
+                themes: THEMES.iter().map(|theme| theme.as_str()).collect(),
+                languages: LANGUAGES.iter().map(|language| language.as_str()).collect(),
                 session_duration_days: SESSION_DURATION_DAYS,
             },
             note: NoteLimits {

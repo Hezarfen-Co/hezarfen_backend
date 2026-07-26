@@ -9,6 +9,7 @@ use common::{
     app_and_db, create_course, create_exam, create_exam_with, create_homework, create_session,
     create_subject, enroll, id_of, login, login_as, me_id, mem_app, send, set_role, unenroll,
 };
+use hezarfen_backend::constant::BANK_VISIBILITY_SCHOOL;
 use hezarfen_backend::domain::chatbot_message::ChatbotMessage;
 use hezarfen_backend::domain::chatbot_thread::ChatbotThreadId;
 use hezarfen_backend::domain::exam::ExamId;
@@ -19157,7 +19158,7 @@ async fn a_bank_patch_does_not_clobber_a_concurrent_write() {
             QuestionText::try_new("edited").unwrap(),
             QuestionPoints::try_new(7).unwrap(),
             QuestionSpec::try_new(QuestionKind::try_new("text").unwrap(), None, None, &[]).unwrap(),
-            BankVisibility::try_new(BankVisibility::SCHOOL).unwrap(),
+            BankVisibility::try_new(BANK_VISIBILITY_SCHOOL).unwrap(),
             &db,
         )
         .await

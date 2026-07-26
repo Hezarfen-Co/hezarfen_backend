@@ -5,7 +5,8 @@ use argon2::{Argon2, PasswordHasher, PasswordVerifier};
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use ulid::Ulid;
 
-use crate::database::{Database, USER_TABLE};
+use crate::constant::{DECOY_PASSWORD, USER_TABLE};
+use crate::database::Database;
 use crate::domain::field_update::FieldUpdate;
 use crate::domain::preferences::{Language, Theme};
 use crate::domain::profile::{BirthDate, Email, PersonName, Phone};
@@ -113,10 +114,6 @@ impl Password {
 /// An argon2 PHC hash, safe to persist.
 #[derive(Debug, Clone, SurrealValue)]
 pub struct PasswordHash(String);
-
-/// A fixed password whose hash is the login decoy (see [`PasswordHash::verify_decoy`]).
-/// Not a secret — it never matches a real account.
-const DECOY_PASSWORD: &str = "decoy-password-not-a-secret";
 
 /// A process-wide decoy hash, computed once on first use. Verifying against it
 /// performs the full argon2 work while matching no real account.

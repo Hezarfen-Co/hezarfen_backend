@@ -1,7 +1,8 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use ulid::Ulid;
 
-use crate::database::{Database, POMODORO_SESSION_TABLE};
+use crate::constant::POMODORO_SESSION_TABLE;
+use crate::database::Database;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;

@@ -9,8 +9,11 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use ulid::Ulid;
 
-use crate::constant::{MAX_MESSAGE_BODY_LEN, MAX_MESSAGE_LABEL_LEN, MAX_MESSAGE_SUBJECT_LEN};
-use crate::database::{Database, MESSAGE_TABLE};
+use crate::constant::{
+    MAX_MESSAGE_BODY_LEN, MAX_MESSAGE_LABEL_LEN, MAX_MESSAGE_SUBJECT_LEN, MESSAGE_TABLE,
+    RECIPIENT_FOLDERS, SENDER_FOLDERS,
+};
+use crate::database::Database;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
@@ -37,11 +40,6 @@ pub enum Folder {
 }
 
 impl Folder {
-    /// Folders a sender may file their side into (`Sent` is their home).
-    pub const SENDER: [Folder; 3] = [Folder::Sent, Folder::Archive, Folder::Trash];
-    /// Folders a recipient may file their side into (`Inbox` is their home).
-    pub const RECIPIENT: [Folder; 3] = [Folder::Inbox, Folder::Archive, Folder::Trash];
-
     /// The storage/wire form. Must stay in lockstep with `rename_all`.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -80,9 +78,9 @@ impl Folder {
     /// The folders a side may move its copy to.
     pub fn allowed_for(is_sender: bool) -> &'static [Folder] {
         if is_sender {
-            &Folder::SENDER
+            &SENDER_FOLDERS
         } else {
-            &Folder::RECIPIENT
+            &RECIPIENT_FOLDERS
         }
     }
 

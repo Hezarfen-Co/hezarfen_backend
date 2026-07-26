@@ -28,10 +28,7 @@ use axum::http::{HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
 
-/// Bodies larger than this are streamed through without buffering — JSON pages
-/// sit far below it, so the cap only bounds worst-case memory. A response whose
-/// `Content-Length` exceeds it (or is absent, i.e. a stream) skips the feature.
-const MAX_BODY: u64 = 1 << 20; // 1 MiB
+use crate::constant::MAX_ETAG_BODY_BYTES;
 
 /// Add an `ETag` + revalidation headers to `200` JSON `GET`s, and short-circuit
 /// a matching `If-None-Match` to a bodyless `304`.
@@ -57,12 +54,12 @@ pub async fn etag(request: Request, next: Next) -> Response {
     // (`Content-Length` isn't a header yet here — hyper writes it downstream —
     // so the size hint is the pre-buffer measurement.)
     match response.body().size_hint().upper() {
-        Some(len) if len <= MAX_BODY => {}
+        Some(len) if len <= MAX_ETAG_BODY_BYTES => {}
         _ => return response,
     }
 
     let (mut parts, body) = response.into_parts();
-    let Ok(bytes) = axum::body::to_bytes(body, MAX_BODY as usize).await else {
+    let Ok(bytes) = axum::body::to_bytes(body, MAX_ETAG_BODY_BYTES as usize).await else {
         // Unreachable given the Content-Length check above; a truncated body is
         // worse than a missed cache, so fail closed on the empty-parts path.
         return Response::from_parts(parts, Body::empty());

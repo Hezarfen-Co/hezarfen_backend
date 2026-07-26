@@ -11,7 +11,10 @@ use std::collections::HashMap;
 
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
-use crate::database::{BANK_QUESTION_TABLE, Database};
+use crate::constant::{
+    BANK_QUESTION_TABLE, BANK_VISIBILITY_PRIVATE, BANK_VISIBILITY_SCHOOL, USAGE_COUNTS_SQL,
+};
+use crate::database::Database;
 use crate::domain::exam::ExamId;
 use crate::domain::exam_question::{
     Choice, ChoiceId, QuestionKind, QuestionPoints, QuestionSpec, QuestionText,
@@ -36,16 +39,13 @@ pub struct BankVisibility(String);
 
 impl Default for BankVisibility {
     fn default() -> Self {
-        Self(Self::PRIVATE.to_string())
+        Self(BANK_VISIBILITY_PRIVATE.to_string())
     }
 }
 
 impl BankVisibility {
-    pub const PRIVATE: &'static str = "private";
-    pub const SCHOOL: &'static str = "school";
-
     pub fn try_new(value: &str) -> Result<Self, ValidationError> {
-        if value != Self::PRIVATE && value != Self::SCHOOL {
+        if value != BANK_VISIBILITY_PRIVATE && value != BANK_VISIBILITY_SCHOOL {
             return Err(ValidationError::Invalid {
                 field: "visibility",
                 reason: "must be private or school",
@@ -60,19 +60,12 @@ impl BankVisibility {
 
     /// Whether the template is published to the whole school.
     pub fn is_school(&self) -> bool {
-        self.0 == Self::SCHOOL
+        self.0 == BANK_VISIBILITY_SCHOOL
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct BankQuestionId(RecordId);
-
-/// The whole of [`BankQuestion::usage_counts`]: **one** statement (no `;`),
-/// so a page of templates costs one round trip no matter how long it is. Named
-/// so a test can assert that, since a per-row `count()` is exactly the N+1 this
-/// page was cleaned of once.
-const USAGE_COUNTS_SQL: &str =
-    "SELECT from_bank, count() AS n FROM exam_question WHERE from_bank IN $ids GROUP BY from_bank";
 
 /// One `GROUP BY from_bank` row of [`BankQuestion::usage_counts`].
 #[derive(SurrealValue)]
@@ -522,7 +515,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(question.get_visibility().as_str(), BankVisibility::PRIVATE);
+        assert_eq!(question.get_visibility().as_str(), BANK_VISIBILITY_PRIVATE);
 
         let mut stored = question.into_value();
         let Value::Object(ref mut map) = stored else {
@@ -530,7 +523,7 @@ mod tests {
         };
         assert!(map.remove("visibility").is_some());
         let old = BankQuestion::from_value(stored).unwrap();
-        assert_eq!(old.get_visibility().as_str(), BankVisibility::PRIVATE);
+        assert_eq!(old.get_visibility().as_str(), BANK_VISIBILITY_PRIVATE);
         assert!(!old.get_visibility().is_school());
     }
 
@@ -568,7 +561,7 @@ mod tests {
                 QuestionText::try_new("shared").unwrap(),
                 QuestionPoints::try_new(1).unwrap(),
                 spec(),
-                BankVisibility::try_new(BankVisibility::SCHOOL).unwrap(),
+                BankVisibility::try_new(BANK_VISIBILITY_SCHOOL).unwrap(),
                 &db,
             )
             .await
@@ -595,7 +588,7 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!((items.len(), total), (1, 1));
-        assert_eq!(private.get_visibility().as_str(), BankVisibility::PRIVATE);
+        assert_eq!(private.get_visibility().as_str(), BANK_VISIBILITY_PRIVATE);
     }
 
     /// The `visibility` filter ANDs onto the security gate, so it narrows and
@@ -625,13 +618,13 @@ mod tests {
                 QuestionText::try_new("shared").unwrap(),
                 QuestionPoints::try_new(1).unwrap(),
                 spec(),
-                BankVisibility::try_new(BankVisibility::SCHOOL).unwrap(),
+                BankVisibility::try_new(BANK_VISIBILITY_SCHOOL).unwrap(),
                 &db,
             )
             .await
             .unwrap();
-        let private = BankVisibility::try_new(BankVisibility::PRIVATE).unwrap();
-        let school = BankVisibility::try_new(BankVisibility::SCHOOL).unwrap();
+        let private = BankVisibility::try_new(BANK_VISIBILITY_PRIVATE).unwrap();
+        let school = BankVisibility::try_new(BANK_VISIBILITY_SCHOOL).unwrap();
 
         // Owner: `private` = their drafts, `school` = the published one.
         let (items, total) =
