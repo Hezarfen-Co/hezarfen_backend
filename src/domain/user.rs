@@ -257,6 +257,21 @@ impl User {
         password_hash: PasswordHash,
         db: &Database,
     ) -> Result<User, AppError> {
+        Self::create_with_role(username, password_hash, Role::Student, db).await
+    }
+
+    /// The one row-minting path. `role` is written *with* the row rather than
+    /// patched on afterwards, which is what makes the admin seed atomic: a
+    /// create-then-promote pair can be interrupted between its halves (a SIGKILL,
+    /// or a cancelled future), and the row left behind is an ordinary student
+    /// account that [`User::ensure_admin`] must then refuse to touch — a
+    /// deployment with no admin and no way for a later boot to repair it.
+    async fn create_with_role(
+        username: Username,
+        password_hash: PasswordHash,
+        role: Role,
+        db: &Database,
+    ) -> Result<User, AppError> {
         if Self::find_by_username(username.as_str(), db)
             .await?
             .is_some()
@@ -267,7 +282,7 @@ impl User {
             id: UserId::generate(),
             username,
             password_hash,
-            role: Role::Student,
+            role,
             name: None,
             surname: None,
             email: None,
@@ -320,8 +335,16 @@ impl User {
                 Ok(())
             }
             None => {
-                let created = Self::create(username, password.hash_async().await?, db).await?;
-                let admin = created.set_role(Role::Admin, db).await?;
+                // One statement, admin from birth. Never create-then-promote:
+                // an interruption between those two writes leaves a student row
+                // holding ADMIN_USERNAME, which the `Some(_)` arm above then
+                // refuses to promote — forever, on every subsequent boot. There
+                // is no marker that could tell such a row apart from a stranger
+                // who registered the name first, so the hole cannot be healed
+                // later; it has to be impossible to open.
+                let admin =
+                    Self::create_with_role(username, password.hash_async().await?, Role::Admin, db)
+                        .await?;
                 tracing::info!(username = admin.username.as_str(), "seeded admin account");
                 Ok(())
             }

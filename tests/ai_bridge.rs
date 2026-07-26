@@ -1162,6 +1162,227 @@ async fn a_blank_chat_answer_fails_as_empty_reply() {
     assert_eq!(turn["error_code"], "empty_reply");
 }
 
+// ----------------------------------------------------------- claim queue --
+//
+// A pending assistant row is a durable job, not an in-process task. These
+// prove the three things that buys: a turn nobody could answer yet is answered
+// when a worker appears, a claim whose owner died is taken back, and a turn is
+// dispatched exactly once no matter how many replicas are watching the queue.
+
+use hezarfen_backend::constant::{CHATBOT_CLAIM_POLL_MS, CHATBOT_CLAIM_RECLAIM_SECS};
+use hezarfen_backend::domain::chatbot_message::{ChatContent, ChatbotMessage};
+use hezarfen_backend::domain::chatbot_thread::ChatbotThreadId;
+use hezarfen_backend::domain::user::UserId;
+
+/// Write one turn's two rows straight to the queue, bypassing the POST — what
+/// a replica that has since died would have left behind. Returns the reserved
+/// assistant row's key.
+async fn queue_turn(app: &Router, db: &Database, cookie: &str, thread: &str, text: &str) -> String {
+    let me = common::send(app, "GET", "/auth/me", Some(cookie), None).await;
+    let user = UserId::from_key(me.body["id"].as_str().expect("own id"));
+    let thread = ChatbotThreadId::from_key(thread);
+    ChatbotMessage::append_user(&thread, &user, ChatContent::try_new(text).unwrap(), db)
+        .await
+        .expect("the user's turn");
+    ChatbotMessage::append_pending_assistant(&thread, &user, db)
+        .await
+        .expect("the reserved answer")
+        .get_id()
+        .key()
+        .to_string()
+}
+
+/// A turn nobody has claimed, held by `claimant` since `age_secs` ago.
+async fn stamp_claim(db: &Database, mid: &str, claimant: &str, age_secs: i64) {
+    db.query(
+        "UPDATE $id SET claimed_by = $who, claimed_at = time::unix(time::now()) * 1000 - $age",
+    )
+    .bind(("id", RecordId::new("chatbot_message", mid.to_string())))
+    .bind(("who", claimant.to_string()))
+    .bind(("age", age_secs * 1_000))
+    .await
+    .expect("stamp a claim")
+    .check()
+    .expect("stamp a claim");
+}
+
+async fn status_of(app: &Router, cookie: &str, thread: &str, mid: &str) -> String {
+    let res = common::send(
+        app,
+        "GET",
+        &format!("/chatbot/threads/{thread}/messages/{mid}"),
+        Some(cookie),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    res.body["status"].as_str().expect("status").to_string()
+}
+
+#[tokio::test]
+async fn a_turn_written_with_no_worker_is_answered_once_one_appears() {
+    // The failure this queue removes: the row used to be answered by a task
+    // spawned inside the POST, so a turn that outlived its process — or was
+    // written while nothing could serve it — settled `failed` at the staleness
+    // horizon and never got an answer at all.
+    let bridge = bridge().await;
+    let (app, db) = chat_app(&bridge).await;
+    let (cookie, thread) = chat_user(&app, "ali").await;
+
+    // Nothing is connected, so the gate refuses the POST outright…
+    let res = common::send(
+        &app,
+        "POST",
+        &format!("/chatbot/threads/{thread}/messages"),
+        Some(&cookie),
+        Some(json!({ "content": "kimse yokken" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::SERVICE_UNAVAILABLE, "{}", res.body);
+
+    // …but a row already on the queue (written by a replica that has since
+    // gone) must still be picked up.
+    let mid = queue_turn(&app, &db, &cookie, &thread, "kimse yokken").await;
+    let _service = connect_service(
+        &bridge,
+        hello("tutor", &[AI_CHAT_CAPABILITY]),
+        Behaviour::Reply("geç gelen cevap".into()),
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+
+    let turn = settled(&app, &cookie, &thread, &mid).await;
+    assert_eq!(turn["status"], "complete", "{turn}");
+    assert_eq!(turn["content"], "geç gelen cevap");
+}
+
+#[tokio::test]
+async fn a_claim_left_by_a_dead_replica_is_taken_back() {
+    let bridge = bridge().await;
+    let service = connect_service(
+        &bridge,
+        hello("tutor", &[AI_CHAT_CAPABILITY]),
+        Behaviour::Reply("devraldım".into()),
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (app, db) = chat_app(&bridge).await;
+    let (cookie, thread) = chat_user(&app, "ali").await;
+
+    // A claim a peer took moments ago is respected: that peer is presumably
+    // still waiting on its inference, and answering alongside it would run the
+    // model twice for one reply.
+    let live = queue_turn(&app, &db, &cookie, &thread, "başkası bakıyor").await;
+    stamp_claim(&db, &live, "a-live-peer", 1).await;
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_millis(CHATBOT_CLAIM_POLL_MS)).await;
+    }
+    assert_eq!(
+        status_of(&app, &cookie, &thread, &live).await,
+        "pending",
+        "a live peer's claim was stolen"
+    );
+    assert!(service.seen().is_empty(), "{:?}", service.seen());
+
+    // The same claim, past the reclaim horizon, is a claimant that died. The
+    // turn goes back on the queue rather than waiting out its staleness
+    // window with nobody answering it.
+    stamp_claim(&db, &live, "a-dead-peer", CHATBOT_CLAIM_RECLAIM_SECS + 1).await;
+    let turn = settled(&app, &cookie, &thread, &live).await;
+    assert_eq!(turn["status"], "complete", "{turn}");
+    assert_eq!(turn["content"], "devraldım");
+    assert_eq!(service.seen().len(), 1, "{:?}", service.seen());
+}
+
+#[tokio::test]
+async fn a_claimed_turn_is_dispatched_exactly_once() {
+    // The claim is what stops the poll loop from re-sending a turn every tick
+    // while the first inference is still running. A silent service holds the
+    // stream open, so every extra dispatch would show up in `seen()`.
+    let bridge = bridge_with_timeout(Duration::from_secs(30)).await;
+    let service = connect_service(
+        &bridge,
+        hello("tutor", &[AI_CHAT_CAPABILITY]),
+        Behaviour::Silent,
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (app, _db) = chat_app(&bridge).await;
+    let (cookie, thread) = chat_user(&app, "ali").await;
+
+    let mid = ask(&app, &cookie, &thread, "uzun sürecek bir soru").await;
+    await_inflight(&bridge, 1).await;
+    // Ten poll ticks with the answer still outstanding.
+    tokio::time::sleep(Duration::from_millis(CHATBOT_CLAIM_POLL_MS * 10)).await;
+    assert_eq!(
+        service.seen().len(),
+        1,
+        "one turn, one dispatch: {:?}",
+        service.seen()
+    );
+    assert_eq!(status_of(&app, &cookie, &thread, &mid).await, "pending");
+}
+
+#[tokio::test]
+async fn a_replica_with_no_worker_accepts_a_turn_its_peer_answers() {
+    // Two replicas, one database, and the worker dialled into exactly one of
+    // them. The other has nothing to dispatch with — its own registry says so
+    // — yet it must still accept the turn, because the `ai_worker` gate can
+    // see its peer. And exactly one of the two answers it.
+    let db = hezarfen_backend::database::init_mem()
+        .await
+        .expect("mem db");
+    let quiet = bridge().await;
+    let serving = bridge().await;
+    let app_quiet = replica(&quiet, &db);
+    let app_serving = replica(&serving, &db);
+
+    let service = connect_service(
+        &serving,
+        hello("tutor", &[AI_CHAT_CAPABILITY]),
+        Behaviour::Reply("komşudan cevap".into()),
+    )
+    .await;
+    await_workers(&serving, 1).await;
+    assert!(!quiet.has_capability(AI_CHAT_CAPABILITY), "no local worker");
+    // The gate is heartbeated, so give the serving replica's first beat time
+    // to publish its worker before asking the replica that holds none.
+    for _ in 0..300 {
+        if hezarfen_backend::ai::presence::serves(&db, AI_CHAT_CAPABILITY).await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let (cookie, thread) = chat_user(&app_quiet, "ali").await;
+    let mid = ask(&app_quiet, &cookie, &thread, "komşuya soru").await;
+    let turn = settled(&app_quiet, &cookie, &thread, &mid).await;
+    assert_eq!(turn["status"], "complete", "{turn}");
+    assert_eq!(turn["content"], "komşudan cevap");
+    assert_eq!(service.seen().len(), 1, "{:?}", service.seen());
+    // The answer is one row, so the peer that accepted the turn reads exactly
+    // what the peer that answered it wrote.
+    assert_eq!(
+        status_of(&app_serving, &cookie, &thread, &mid).await,
+        "complete"
+    );
+}
+
+/// A second process against the same database: its own bridge, its own claim
+/// loop, one shared queue.
+fn replica(bridge: &AiBridge, db: &Database) -> Router {
+    hezarfen_backend::build_router(hezarfen_backend::state::AppState {
+        db: db.clone(),
+        files_path: common::files_dir(),
+        cookie_secure: false,
+        rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
+        chatbot_limit: Default::default(),
+        exam_presence: Default::default(),
+        db_up: Default::default(),
+        ai: Some(bridge.clone()),
+    })
+}
+
 // ------------------------------------------------------------- boot wiring --
 //
 // `ai::start_bridge` is the seam between deployment config and the listener.

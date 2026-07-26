@@ -7,10 +7,16 @@
 //!
 //! Sending is asynchronous by design. `POST .../messages` writes the user's
 //! turn plus an empty `pending` assistant row and answers `202` immediately;
-//! the bridge round trip happens in a spawned task, because an inference can
-//! outlast the request-timeout layer that guards every HTTP handler. The client
-//! then either polls `GET .../messages/{mid}` or opens its SSE stream — both
-//! read the same row, so they can never disagree.
+//! an inference can outlast the request-timeout layer that guards every HTTP
+//! handler, so nothing is awaited on the request path. The client then either
+//! polls `GET .../messages/{mid}` or opens its SSE stream — both read the same
+//! row, so they can never disagree.
+//!
+//! The pending row *is* the job. It used to be answered by a `tokio::spawn`
+//! from the POST, which meant a restart orphaned every turn in flight; since
+//! 2026-07-27 it is claimed off the database by [`spawn_claim_loop`], so the
+//! turn is answered by whichever process holds a `chat.reply` worker — the one
+//! that accepted it, a peer replica, or the one that comes up after a restart.
 
 use std::time::Duration;
 
@@ -29,9 +35,10 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::ai::chat::{ChatReplyPayload, ChatRequestPayload, ChatRole, ChatTurn};
-use crate::ai::{AiBridge, AiError};
+use crate::ai::{AiBridge, AiError, presence};
 use crate::constant::{
-    AI_CHAT_CAPABILITY, CHAT_STREAM_POLL_MS, MAX_CHATBOT_MESSAGE_LEN, MIN_CHUNK_CHARS, REPLY_CHUNKS,
+    AI_CHAT_CAPABILITY, CHAT_STREAM_POLL_MS, CHATBOT_CLAIM_POLL_MS, MAX_CHATBOT_MESSAGE_LEN,
+    MIN_CHUNK_CHARS, REPLY_CHUNKS,
 };
 use crate::database::Database;
 use crate::domain::chatbot_message::{
@@ -345,12 +352,17 @@ async fn list_messages(
 /// answer itself lands later, in the reserved assistant row.
 ///
 /// Order matters and is deliberate: the per-user rate limit is charged
-/// *before* anything is written, so a refused turn leaves no trace; the AI
-/// bridge is checked for a `chat.reply` worker *before* the rows exist, so an
-/// unavailable service produces a `503` and no dead pending row. Once the rows
-/// are written the turn always settles — the answering task stamps
-/// `complete`/`failed`, a reader projects a long-stale `pending` as failed, and
-/// the boot sweep repairs whatever a process death left behind.
+/// *before* anything is written, so a refused turn leaves no trace;
+/// availability is checked *before* the rows exist, so an unavailable service
+/// produces a `503` and no dead pending row.
+///
+/// The pending row is a claimed job, not an in-process task: whichever backend
+/// process holds a `chat.reply` worker picks it up (within ~200ms) and answers
+/// it, so a restart no longer strands the turn — and a process with no worker
+/// of its own still accepts turns its peers can answer. The turn always
+/// settles: the claiming process stamps `complete`/`failed`, a claim its owner
+/// never finishes is retried, a reader projects a long-stale `pending` as
+/// failed, and the boot sweep repairs the rest.
 #[utoipa::path(
     post,
     path = "/threads/{id}/messages",
@@ -389,21 +401,32 @@ async fn send_message(
     }
     let content = ChatContent::try_new(&req.content)?;
 
-    // The 503 gate, and the only place it is evaluated. `has_capability` is
-    // documented racy — that is fine here: it never guards a write, it only
-    // spares the user a thread full of rows nothing could ever answer.
-    let Some(bridge) = st.ai.clone() else {
+    // The 503 gate, and the only place it is evaluated. Two questions, asked
+    // cheapest first, and neither of them guards a write — the gate only
+    // spares the user a thread full of rows nothing could ever answer:
+    //
+    //   1. can *this* replica answer? — the in-process registry, which owns
+    //      the sockets. Authoritative and free, so it is asked first, which is
+    //      also why a single-replica deployment pays no round trip here.
+    //   2. can any *other* replica? — the heartbeated `ai_worker` table, which
+    //      may lag reality by a heartbeat in either direction. A yes here is
+    //      not a promise that this process can do anything: the turn is
+    //      written and a peer's claim loop picks it up.
+    //
+    // Neither answer decides who dispatches. That is the claim loop's own
+    // registry, every time (see `crate::ai::presence`).
+    let Some(bridge) = st.ai.as_ref() else {
         return Ok(unavailable(
             "the AI service is not enabled on this deployment",
         ));
     };
-    if !bridge.has_capability(AI_CHAT_CAPABILITY) {
+    if !bridge.has_capability(AI_CHAT_CAPABILITY)
+        && !presence::serves(&st.db, AI_CHAT_CAPABILITY).await
+    {
         return Ok(unavailable("no AI service is connected right now"));
     }
 
-    let prompt =
-        ChatbotMessage::append_user(thread.get_id(), user.get_id(), content.clone(), &st.db)
-            .await?;
+    ChatbotMessage::append_user(thread.get_id(), user.get_id(), content, &st.db).await?;
     let answer =
         ChatbotMessage::append_pending_assistant(thread.get_id(), user.get_id(), &st.db).await?;
     // Never fatal: both rows are already written, and failing here would strand
@@ -417,17 +440,11 @@ async fn send_message(
         );
     }
 
-    // Never awaited inline: the bridge round trip can outlast the request
-    // timeout that guards every handler, and the POST must return now.
-    tokio::spawn(answer_turn(
-        bridge,
-        st.db.clone(),
-        thread.get_id().clone(),
-        [prompt.get_id().clone(), answer.get_id().clone()],
-        content.as_str().to_string(),
-        settings.get_chatbot_history_turns().max(0) as usize,
-        reply_cap,
-    ));
+    // Nothing is dispatched here, deliberately. The pending row *is* the job:
+    // a claim loop — this replica's or a peer's — takes it within one
+    // `CHATBOT_CLAIM_POLL_MS` tick and answers it. An in-process
+    // `tokio::spawn` could not survive the restart that orphans the turn,
+    // which is the whole failure this queue removes.
 
     Ok((
         StatusCode::ACCEPTED,
@@ -457,31 +474,112 @@ fn unavailable(message: &str) -> Response {
         .into_response()
 }
 
-/// Fetch one answer and settle its row. Runs detached from the request.
+/// This replica's share of the chat work queue.
+///
+/// One task per process, started by [`crate::build_router`] when a bridge is
+/// configured. Every [`CHATBOT_CLAIM_POLL_MS`] it asks *its own* registry
+/// whether it can serve `chat.reply` and, if so, claims a small batch of
+/// unanswered turns and dispatches them.
+///
+/// The registry is the only thing consulted, never the `ai_worker` gate: the
+/// gate can say a peer has a worker, and claiming on that word would park the
+/// turn here for a whole reclaim horizon with no socket to send it down (see
+/// [`crate::ai::presence`]).
+///
+/// ponytail: no shutdown handle — the loop runs for the life of the process,
+/// which is the life of the bridge, and it is idle (one registry read per
+/// tick, no query) whenever this replica holds no chat worker. Give it a
+/// `CancellationToken` the day the bridge itself becomes restartable.
+pub fn spawn_claim_loop(bridge: AiBridge, db: Database) {
+    // Any unique string. It is only ever compared for equality and read in a
+    // log line: a claim identifies the *process*, and a claim nobody renews
+    // expires by age rather than by anyone recognising the claimant.
+    let me = ulid::Ulid::new().to_string();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(CHATBOT_CLAIM_POLL_MS));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            // The DISPATCHER's answer, and the gate that matters here.
+            if !bridge.has_capability(AI_CHAT_CAPABILITY) {
+                continue;
+            }
+            let claimed = match ChatbotMessage::claim_pending(&me, &db).await {
+                Ok(claimed) => claimed,
+                Err(err) => {
+                    tracing::warn!("could not claim chat turns: {err}");
+                    continue;
+                }
+            };
+            if claimed.is_empty() {
+                continue;
+            }
+            // Read once per batch, not per turn. Unlike the old in-process
+            // spawn this is the policy live when the turn is *answered* rather
+            // than when it was accepted — unavoidable once the answering
+            // process may not be the accepting one, and the window is one poll
+            // tick wide in the normal case.
+            let settings = match Settings::load(&db).await {
+                Ok(settings) => settings,
+                Err(err) => {
+                    tracing::warn!("could not load settings for a claimed chat turn: {err}");
+                    continue;
+                }
+            };
+            let reply_cap = content_cap(&settings);
+            let history_turns = settings.get_chatbot_history_turns().max(0) as usize;
+            for answer in claimed {
+                // One task per turn: the bridge round trip can take tens of
+                // seconds and must not hold up the next poll.
+                tokio::spawn(answer_turn(
+                    bridge.clone(),
+                    db.clone(),
+                    answer,
+                    history_turns,
+                    reply_cap,
+                ));
+            }
+        }
+    });
+}
+
+/// Fetch one claimed turn's answer and settle its row.
 ///
 /// Every path settles: a row left `pending` would show as a spinner forever.
-/// The settings snapshot is passed in rather than re-read — the whole turn is
-/// then judged by the policy that was live when it was accepted, and a manager
-/// editing the limits mid-flight cannot make the answer be measured by a rule
-/// the prompt never saw (it also saves a database round trip per turn).
-#[allow(clippy::too_many_arguments)]
 async fn answer_turn(
     bridge: AiBridge,
     db: Database,
-    thread: ChatbotThreadId,
-    // The two rows this turn just wrote; both are excluded from the history.
-    fresh: [ChatbotMessageId; 2],
-    prompt: String,
+    answer: ChatbotMessage,
     history_turns: usize,
     reply_cap: usize,
 ) {
-    let answer_id = fresh[1].clone();
+    let answer_id = answer.get_id().clone();
+    let thread = answer.get_thread_id().clone();
+    // The question this reserved row was written next to. Recovered from the
+    // thread rather than carried in memory, because the process that accepted
+    // the turn may no longer exist.
+    let prompt = match answer.prompt_for(&db).await {
+        Ok(Some(prompt)) => prompt,
+        Ok(None) => {
+            // A reserved answer with no question before it. Only reachable if
+            // the user row was deleted out from under it; there is nothing to
+            // ask, so settle rather than re-claim it every reclaim horizon.
+            tracing::warn!("chat answer {} has no prompt to send", answer_id.key());
+            let _ = ChatbotMessage::fail(&answer_id, "internal", &db).await;
+            return;
+        }
+        Err(err) => {
+            tracing::warn!("could not read the prompt for {}: {err}", answer_id.key());
+            return;
+        }
+    };
+    let fresh = [prompt.get_id().clone(), answer_id.clone()];
     let settled = match fetch_reply(
         &bridge,
         &db,
         &thread,
         &fresh,
-        prompt,
+        prompt.get_content().as_str().to_string(),
         history_turns,
         reply_cap,
     )

@@ -371,6 +371,56 @@ pub const AI_KEEPALIVE_SECS: u64 = 10;
 /// chat endpoints report the service as unavailable.
 pub const AI_CHAT_CAPABILITY: &str = "chat.reply";
 
+// --- AI worker presence: the GATE, never the dispatcher -----------------
+//
+// Read `crate::ai::presence` before touching anything below. In one line: the
+// `ai_worker` table answers "could *anything, anywhere* serve this
+// capability?" so a POST on a replica holding no worker can still be accepted
+// (a peer's claim loop will answer it). It is a heartbeated cache of other
+// processes' sockets and it is allowed to be wrong in both directions. The
+// in-process `ai::registry::Registry` is the dispatcher and the only thing
+// that may decide who actually answers.
+
+/// The heartbeated presence table. One row per connected worker, written by
+/// whichever replica owns that worker's QUIC connection.
+pub const AI_WORKER_TABLE: &str = "ai_worker";
+
+/// How often a replica restamps `seen_at` for the workers it holds, and how
+/// long a row is believed without a restamp. The lease is a comfortable
+/// multiple of the beat (three), so a single missed heartbeat never hides a
+/// live worker, and it matches [`AI_IDLE_TIMEOUT_SECS`] — the window in which
+/// the transport itself notices a dead service — so a replica that dies
+/// outright leaves a phantom for no longer than a service that dies outright.
+pub const AI_WORKER_HEARTBEAT_SECS: u64 = 10;
+pub const AI_WORKER_LEASE_SECS: i64 = 30;
+
+/// Write (or restamp) one worker's row. `UPSERT` rather than `CREATE`: the
+/// heartbeat replays the whole live set every beat, which is what heals a row
+/// lost to a database blip or written before the presence table was attached.
+pub const AI_WORKER_ANNOUNCE: &str = "
+    UPSERT $id CONTENT { service: $service, capabilities: $capabilities,
+        seen_at: time::unix(time::now()) * 1000 };
+";
+
+/// Drop a worker whose connection closed. Immediate — the gate should not
+/// hold a door open for a service that has already said goodbye.
+pub const AI_WORKER_WITHDRAW: &str = "DELETE $id;";
+
+/// Forget workers nobody has restamped within the lease: the replica holding
+/// them died without deregistering. Any replica's heartbeat may run it — the
+/// rows are keyed by worker, not by owner.
+pub const AI_WORKER_SWEEP: &str = "
+    DELETE ai_worker WHERE seen_at < time::unix(time::now()) * 1000 - $lease_ms;
+";
+
+/// The gate read. Age-filtered in the query, not by the sweep, so a phantom
+/// row is inert the moment it is stale rather than when someone gets round to
+/// deleting it.
+pub const AI_WORKER_SERVES: &str = "
+    SELECT VALUE id FROM ai_worker WHERE $capability IN capabilities
+        AND seen_at >= time::unix(time::now()) * 1000 - $lease_ms LIMIT 1;
+";
+
 /// Hard ceiling on one chat message's characters — the newtype bound, above
 /// which no school setting can reach. Sized for a pasted question with its
 /// working, well under [`AI_MAX_FRAME_BYTES`] once history rides along.
@@ -415,6 +465,93 @@ pub const CHAT_STREAM_POLL_MS: u64 = 200;
 /// raise), because the answering task normally stamps the failure itself —
 /// this only catches the row whose task died with the process.
 pub const CHATBOT_PENDING_STALE_SECS: i64 = 300;
+
+// --- the chat claim queue ----------------------------------------------
+
+/// How often a replica looks for an unanswered turn, and how many it takes in
+/// one sweep. The poll is what replaces the in-process `tokio::spawn` a POST
+/// used to do, so it is the answer's added latency floor — matched to
+/// [`CHAT_STREAM_POLL_MS`], the cadence the client already waits at, so a turn
+/// is never claimed slower than its own reader refreshes. The batch is small
+/// on purpose: a claim is a promise to dispatch now, and dispatching more at
+/// once than a worker's `max_concurrent` would only turn the surplus into
+/// `busy` failures.
+pub const CHATBOT_CLAIM_POLL_MS: u64 = 200;
+pub const CHATBOT_CLAIM_BATCH: i64 = 4;
+
+/// How long a claim is believed before another replica may take the turn back.
+///
+/// Sized between the two horizons it sits between, and both bounds bite (see
+/// `the_claim_horizon_sits_between_the_inference_and_the_stale_window`):
+///
+/// * **Above the AI request timeout** ([`AI_DEFAULT_REQUEST_TIMEOUT_SECS`],
+///   30s), with room to spare, because a reclaim that fires while the first
+///   claimer is still waiting on a legitimate inference makes two services
+///   answer the same turn — twice the cost for one reply (the second is then
+///   discarded by the `status = 'pending'` gate on the settle, so it is waste,
+///   not corruption). Three times the default leaves margin for the settle
+///   write and for a moderately raised `AI_REQUEST_TIMEOUT_SECS`.
+/// * **Below [`CHATBOT_PENDING_STALE_SECS`]** (300s), because a turn is only
+///   claimable inside that window; a reclaim horizon at or above it would
+///   never fire before the turn stopped being worth answering, making the
+///   dead-claimer retry dead code. At 90s a turn survives two lost claimers
+///   and still gets answered.
+pub const CHATBOT_CLAIM_RECLAIM_SECS: i64 = 90;
+
+/// The largest per-request AI deadline a deployment may configure
+/// (`AI_REQUEST_TIMEOUT_SECS`). Anything above it is clamped down to it at
+/// startup, loudly — see [`crate::config`].
+///
+/// Not a taste limit; it is the claim queue's arithmetic, and the bound the
+/// doc above only *asserted* before. A dispatch allowed to outlive
+/// [`CHATBOT_CLAIM_RECLAIM_SECS`] has its turn reclaimed and re-sent while the
+/// first inference is still legitimately running, so the model runs twice for
+/// one reply. (The settle's `status = 'pending'` gate still admits only one
+/// answer, so it is waste rather than corruption — but a worker with side
+/// effects makes it worse than waste.) Nothing but the parser stood between an
+/// operator and that: `AI_REQUEST_TIMEOUT_SECS=120` used to be honoured
+/// verbatim.
+///
+/// Clamped rather than refused, because a slow model is a legitimate thing to
+/// own and a boot that dies over it helps nobody — and because the ceiling is
+/// real either way: a reply that arrives after
+/// [`CHATBOT_PENDING_STALE_SECS`] is discarded by the read-time projection, so
+/// no deadline near it was ever going to produce an answer a user sees. A
+/// school that genuinely needs longer raises the horizon and the staleness
+/// window together, and the ordering tests police the result.
+///
+/// Two thirds of the horizon, derived and never hand-kept: raising the horizon
+/// raises this with it, so the two numbers cannot drift apart. The remaining
+/// third is the room the reply needs to arrive, be capped and be stamped
+/// before anyone may reclaim the turn.
+pub const AI_MAX_REQUEST_TIMEOUT_SECS: u64 = CHATBOT_CLAIM_RECLAIM_SECS as u64 * 2 / 3;
+
+/// Take up to [`CHATBOT_CLAIM_BATCH`] unanswered turns for this replica.
+///
+/// Two statements because SurrealDB has no `LIMIT` on `UPDATE`: the first
+/// picks candidates, the second claims them. The pick is advisory — a peer may
+/// take a row in between — so the `UPDATE` repeats the *whole* guard, and
+/// per-record `UPDATE ... WHERE` is atomic, so a row claimed by a rival simply
+/// does not come back in `RETURN AFTER`. Nothing here consults `ai_worker`:
+/// the caller has already asked its own registry whether it can answer.
+///
+/// The guard, term by term: only a reserved assistant row (`pending`), only
+/// one young enough that somebody is still waiting for it (`$stale_ms` — past
+/// that a reader already shows it failed, so answering it would resurrect a
+/// turn the user was told was lost), and only one that is unclaimed *or* whose
+/// claimer has gone quiet past `$reclaim_ms`. Both disjuncts are required: a
+/// row whose claimer died must be retried, not left forever.
+pub const CHATBOT_CLAIM: &str = "
+    LET $ids = (SELECT VALUE id FROM chatbot_message
+        WHERE status = 'pending' AND role = 'assistant'
+            AND created_at >= time::unix(time::now()) * 1000 - $stale_ms
+            AND (claimed_by = NONE OR claimed_at < time::unix(time::now()) * 1000 - $reclaim_ms)
+        ORDER BY created_at ASC, id ASC LIMIT $batch);
+    UPDATE $ids SET claimed_by = $me, claimed_at = time::unix(time::now()) * 1000
+        WHERE status = 'pending'
+            AND (claimed_by = NONE OR claimed_at < time::unix(time::now()) * 1000 - $reclaim_ms)
+        RETURN AFTER;
+";
 
 /// How long a dialling AI service has to complete its `Hello`/`Welcome`
 /// exchange before the connection is dropped. Short: the handshake is one
@@ -582,6 +719,87 @@ pub const MEAL_BOOKING_TABLE: &str = "meal_booking";
 pub const MEAL_ATTENDANCE_TABLE: &str = "meal_attendance";
 pub const MEAL_LEDGER_TABLE: &str = "meal_ledger";
 
+// --- boot leader election ----------------------------------------------
+
+/// The lock row every booting process races for (see
+/// [`crate::database::boot_once`]). Its own table, and the only SCHEMALESS one
+/// in the database: the lock has to be claimable *before* the SCHEMAFULL batch
+/// that defines every other table has run, so a lock whose own schema needed
+/// migrating could not guard the migration. `IF NOT EXISTS` makes the
+/// definition safe for all N processes to issue.
+pub const MIGRATION_LOCK_TABLE: &str = "migration_lock";
+pub const MIGRATION_LOCK_DDL: &str = "DEFINE TABLE IF NOT EXISTS migration_lock SCHEMALESS;";
+
+/// Claim the lock. A deterministic id is the whole mechanism: SurrealDB v3
+/// answers a `CREATE` on an existing id with "already exists" rather than
+/// overwriting it, so of N concurrent processes exactly one gets an `Ok`.
+/// Returns the holder like the takeover does, so one caller reads both.
+pub const MIGRATION_LOCK_CLAIM: &str = "
+    CREATE migration_lock:boot SET holder = $me, claimed_at = time::unix(time::now()) * 1000,
+        applied_at = NONE, applies = 0 RETURN VALUE holder;
+";
+
+/// What a loser needs to know, decided by the *database's* clock — never the
+/// process's, since two replicas' clocks disagree and the lease horizon is the
+/// one thing a wrong clock could turn into a concurrent migration.
+///
+/// `applied` means "applied *this* binary's schema": a stamp carries the
+/// fingerprint of the DDL that produced it, and a peer's stamp with any other
+/// fingerprint is no evidence about the schema this process is about to write
+/// (see [`crate::database::migration_fingerprint`]).
+pub const MIGRATION_LOCK_STATE: &str = "
+    SELECT holder, applied_at != NONE AND (fingerprint ?? '') = $fingerprint AS applied,
+        claimed_at >= time::unix(time::now()) * 1000 - $lease_ms AS live
+        FROM ONLY migration_lock:boot;
+";
+
+/// Take the lock off a holder that cannot be relied on: one that has gone
+/// silent past the lease horizon (killed mid-migration), or one that finished
+/// with a *different* schema than ours — a stamp is the last thing a leader
+/// writes, so a foreign fingerprint means nobody is in the DDL right now and
+/// this binary's own migration still has to run.
+///
+/// Per-record `UPDATE ... WHERE` is atomic, so a second taker re-reads the
+/// freshly bumped `claimed_at` and is refused (empty result). Clears
+/// `applied_at` and `fingerprint`: the previous generation's stamp says nothing
+/// about this one's schema.
+pub const MIGRATION_LOCK_TAKEOVER: &str = "
+    UPDATE migration_lock:boot SET holder = $me, claimed_at = time::unix(time::now()) * 1000,
+        applied_at = NONE, fingerprint = NONE
+        WHERE claimed_at < time::unix(time::now()) * 1000 - $lease_ms
+            OR (applied_at != NONE AND (fingerprint ?? '') != $fingerprint)
+        RETURN VALUE holder;
+";
+
+/// Renew the lease while the migration runs, and stamp it done afterwards.
+/// Both are `holder`-guarded and both report the holder back, so a leader that
+/// was declared dead and replaced not only stops being able to write the lock —
+/// it finds out (an empty result), which is the only way it can learn that a
+/// peer is now applying the same DDL underneath it.
+pub const MIGRATION_LOCK_HEARTBEAT: &str = "
+    UPDATE migration_lock:boot SET claimed_at = time::unix(time::now()) * 1000
+        WHERE holder = $me RETURN VALUE holder;
+";
+pub const MIGRATION_LOCK_STAMP: &str = "
+    UPDATE migration_lock:boot SET applied_at = time::unix(time::now()) * 1000, applies += 1,
+        fingerprint = $fingerprint
+        WHERE holder = $me RETURN VALUE holder;
+";
+
+/// How long a lock may go unrenewed before a peer may take it over. Must stay
+/// a comfortable multiple of `MIGRATION_LOCK_HEARTBEAT_SECS`: it is the number
+/// of missed beats that separates "the leader was killed" from "the leader is
+/// slow", and mistaking the second for the first runs two migrations at once.
+pub const MIGRATION_LOCK_LEASE_SECS: i64 = 30;
+pub const MIGRATION_LOCK_HEARTBEAT_SECS: u64 = 5;
+
+/// How long a non-leader waits for the leader's `applied_at` before failing the
+/// boot, and how often it looks. Bounded because a boot that hangs forever is
+/// indistinguishable from a hung database; loud because the alternative —
+/// serving on a schema nobody confirmed — is worse.
+pub const MIGRATION_LOCK_WAIT_SECS: u64 = 180;
+pub const MIGRATION_LOCK_POLL_MS: u64 = 200;
+
 // --- schema migration SQL ----------------------------------------------
 
 /// Repairs that must run *before* the DDL batch, because the DDL is what makes
@@ -686,8 +904,26 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS error_code ON chatbot_message TYPE option<string>;
     DEFINE FIELD IF NOT EXISTS created_at ON chatbot_message TYPE int READONLY;
     DEFINE FIELD IF NOT EXISTS completed_at ON chatbot_message TYPE option<int>;
+    -- The claim (2026-07-27): which replica's claim loop owes this turn an
+    -- answer, and when it said so. Absent = nobody has taken it yet; a claim
+    -- older than CHATBOT_CLAIM_RECLAIM_SECS is a dead claimer and the turn is
+    -- taken back (see `CHATBOT_CLAIM`).
+    DEFINE FIELD IF NOT EXISTS claimed_by ON chatbot_message TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS claimed_at ON chatbot_message TYPE option<int>;
     DEFINE INDEX IF NOT EXISTS chatbot_message_thread_created ON chatbot_message FIELDS thread_id, created_at;
     DEFINE INDEX IF NOT EXISTS chatbot_message_user ON chatbot_message FIELDS user_id;
+    -- The claim loop's sweep: every poll asks for pending rows by age.
+    DEFINE INDEX IF NOT EXISTS chatbot_message_status_created ON chatbot_message FIELDS status, created_at;
+
+    -- Which AI workers are connected to *any* replica (2026-07-27). The GATE
+    -- and nothing else: a row only says a socket existed somewhere at
+    -- `seen_at`, so it may spare a user a 503 but must never pick who answers
+    -- — that is the in-process registry's call. Heartbeated by the replica
+    -- owning the connection; a stale row is ignored by the read and swept.
+    DEFINE TABLE IF NOT EXISTS ai_worker SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS service ON ai_worker TYPE string;
+    DEFINE FIELD IF NOT EXISTS capabilities ON ai_worker TYPE array<string>;
+    DEFINE FIELD IF NOT EXISTS seen_at ON ai_worker TYPE int;
 
     DEFINE TABLE IF NOT EXISTS event SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS creator ON event TYPE record<user>;
@@ -1190,17 +1426,33 @@ pub const BACKFILL: &str = "
     -- which is what they were presented as all along.
     UPDATE chatbot_message SET truncated = false WHERE truncated = NONE;
 
-    -- An assistant turn is answered by an in-process task, so a restart usually
-    -- leaves its row `pending` with nobody left to complete it. Only rows past
-    -- the stale horizon ($stale_ms, from `CHATBOT_PENDING_STALE_SECS`) are
-    -- certainly abandoned though: a young one may still be being answered on the
-    -- other side of the AI bridge, and a deploy must not shoot down a turn
-    -- dispatched seconds ago. Nothing is lost by waiting — a reader already
-    -- presents an over-age `pending` row as failed, and the next boot sweeps for
-    -- real whatever crossed the horizon in the meantime.
+    -- An assistant turn is answered by a claim loop in some replica's process,
+    -- so a restart can leave its row `pending` with nobody left to complete it.
+    -- Only rows past the stale horizon ($stale_ms, from
+    -- `CHATBOT_PENDING_STALE_SECS`) are certainly abandoned though: a young one
+    -- may still be being answered on the other side of the AI bridge, and a
+    -- deploy must not shoot down a turn dispatched seconds ago. Nothing is lost
+    -- by waiting — a reader already presents an over-age `pending` row as
+    -- failed, and the next boot sweeps for real whatever crossed the horizon in
+    -- the meantime.
+    --
+    -- Claim-aware since 2026-07-27, because the sweep is no longer school-wide
+    -- truth: under N replicas the row may belong to a *live peer's* claim loop,
+    -- and failing it here would shoot down another process's in-flight turn.
+    -- So a claim restamped within the window is left alone. Both disjuncts
+    -- matter — `claimed_by = NONE` alone would strand every row whose claimer
+    -- died, which is the one case the sweep exists for.
+    --
+    -- The claim age is measured against $stale_ms rather than
+    -- CHATBOT_CLAIM_RECLAIM_SECS only because the boot binds one horizon (see
+    -- `database::migration_binds`); erring long is the safe direction — the
+    -- cost is that a row claimed just before it aged out waits one more boot
+    -- for its durable stamp, while readers have shown it failed all along.
     UPDATE chatbot_message SET status = 'failed', error_code = 'interrupted',
         completed_at = time::unix(time::now()) * 1000
-        WHERE status = 'pending' AND created_at < time::unix(time::now()) * 1000 - $stale_ms;
+        WHERE status = 'pending' AND created_at < time::unix(time::now()) * 1000 - $stale_ms
+            AND (claimed_by = NONE
+                 OR claimed_at < time::unix(time::now()) * 1000 - $stale_ms);
 
     -- Promotion out of student now deletes the user's enrollments (2026-07-18);
     -- this sweeps rows promoted before that fix. A deleted user reads as
@@ -1265,3 +1517,12 @@ pub const BACKFILL: &str = "
     UPDATE answer_image SET seq = 1 WHERE seq = NONE;
     UPDATE exam_result SET seq = 1 WHERE seq = NONE;
 ";
+
+/// The migration batches, in the order a boot applies them — and the *only*
+/// list of them. [`crate::database::migrate`] runs exactly these and
+/// [`crate::database::migration_fingerprint`] hashes exactly these, so a fourth
+/// batch cannot be executed without changing the fingerprint that decides
+/// whether a peer's schema is ours. They stay three separate queries: statements
+/// in one batch see the schema as it stood when the batch started (see
+/// `MIGRATION`).
+pub const MIGRATION_BATCHES: [&str; 3] = [PRE_REPAIR, MIGRATION, BACKFILL];

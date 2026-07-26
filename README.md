@@ -2183,23 +2183,39 @@ agree about `truncated` exactly as they do about every other field.
 | `404` | no such thread or message — or not the caller's |
 | `409` | already at `max_chatbot_threads`; delete a thread first |
 | `429` | over `RATE_LIMIT_CHATBOT_PER_MINUTE` messages/minute for this **user**; see `Retry-After` |
-| `503` | no connected service offers `chat.reply` — **nothing was written**, retry later |
+| `503` | no service anywhere in the deployment offers `chat.reply` — **nothing was written**, retry later |
 
-The `503` ordering matters: the bridge is checked before the rows exist, so an
-unavailable service leaves no dead `pending` row behind, and the rate limit is
-charged before that, so a refused turn leaves no trace at all.
+The `503` ordering matters: availability is checked before the rows exist, so
+an unavailable service leaves no dead `pending` row behind, and the rate limit
+is charged before that, so a refused turn leaves no trace at all. The check
+asks two questions — is a `chat.reply` worker connected to *this* backend
+process, and failing that, is one connected to any other — so a deployment
+running several backends accepts a turn as long as one of them can answer it.
+
+### A turn is a claimed job
+
+The `pending` assistant row *is* the work item. Backend processes poll it: a
+process holding a `chat.reply` worker claims an unanswered turn, dispatches it
+over its own connection, and stamps the result. That is why a `202` is a real
+promise — a backend restart no longer strands the turn it had just accepted,
+and a turn accepted by a process with no worker of its own is answered by one
+that has. The cost is up to ~200 ms before the request leaves for the service.
+A claim whose owner disappears is taken back after 90 seconds.
 
 ### A turn always settles
 
 Once the two rows exist the answer never stays `pending` forever, through
 three independent mechanisms:
 
-- the answering task stamps `complete` or `failed` itself — the normal path;
+- the process that claimed the turn stamps `complete` or `failed` — the normal
+  path, and a claim its owner never finishes is retried by another;
 - a reader **projects** a `pending` row older than 300 seconds as
   `failed`/`timed_out` (a read-time projection, not a write — the row is left
   for the task that may still own it);
-- a **boot sweep** flips every leftover `pending` to `failed`/`interrupted`,
-  which is what a process death mid-inference looks like.
+- a **boot sweep** flips every leftover `pending` past the 300-second horizon
+  to `failed`/`interrupted`, which is what a process death mid-inference looks
+  like. It leaves rows another process has claimed recently alone, so a
+  restarting backend cannot shoot down a turn its peer is answering.
 
 Two more verdicts come from inspecting the answer: an **empty** reply is
 reported as `failed`/`empty_reply` (a blank bubble is indistinguishable from a
