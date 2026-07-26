@@ -208,14 +208,19 @@ it clears the session if one is present). Set `COOKIE_SECURE=true` when serving
 behind TLS to add the cookie's `Secure` attribute.
 
 **Register never reveals whether a username is taken.** `POST /auth/register`
-answers `201` either way, with a body shaped exactly like a fresh
-registration's — same status, same fields, and a throwaway `id` that resolves
-to no row. This is deliberate: the route is unauthenticated, so a `409` (or a
+answers `201` either way with the *same* body — `{username, role}`, the echoed
+name and the `student` role every fresh account gets. Both outcomes return one
+value built before the insert is even attempted, so they are byte-identical by
+construction. This is deliberate: the route is unauthenticated, so a `409` (or a
 faster reply) would let anyone enumerate the school's users. The password is
 hashed *before* the availability check so both outcomes cost the same ~33ms.
-The accepted cost: a caller who collides with an existing account gets no
-distinct error and simply cannot log in with that password — they pick another
-name. Do not "fix" this back to a `409`.
+
+The reply carries **no `id`**: on the taken path there is no row to name, and a
+fabricated one would leave the client holding an id that matches nothing. Log
+in and read `GET /auth/me` to learn who you are. The accepted cost: a caller who
+collides with an existing account gets no distinct error and simply cannot log
+in with that password — they pick another name. Do not "fix" this back to a
+`409`, and do not add an `id` back.
 
 ## Time policy
 
@@ -581,7 +586,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/swagger`                       | no      | Interactive API docs (Swagger UI) |
 | GET    | `/api-docs/openapi.json`         | no      | Raw OpenAPI 3 spec              |
 | GET    | `/ai/certificate`                | no      | The AI bridge's certificate (PEM + sha256) for a service to pin; `404` when the bridge is off |
-| POST   | `/auth/register`                 | no      | `{username, password}` (new users are `student`); always `201`, even if the name was taken — see Auth model |
+| POST   | `/auth/register`                 | no      | `{username, password}` -> `{username, role}` (no `id`; new users are `student`); always `201`, even if the name was taken — see Auth model |
 | POST   | `/auth/login`                    | no      | `{username, password}` -> cookie|
 | POST   | `/auth/logout`                   | no      | Clear session (no-op if none)   |
 | GET    | `/auth/me`                       | student | Current user (incl. `role` and personal info) |
