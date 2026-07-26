@@ -149,6 +149,52 @@ pub const MAX_APPOINTMENT_REASON_LEN: usize = 1_000;
 /// (a decade out) is refused instead of writing thousands of rows.
 pub const MAX_SLOT_OCCURRENCES: usize = 52;
 
+/// The default meal slots; schools replace the list via `PATCH /settings`, and
+/// a published menu snapshots the slot it was written for, so retiring a slot
+/// never rewrites history.
+pub const DEFAULT_MEAL_SLOTS: [&str; 3] = ["breakfast", "lunch", "snack"];
+
+/// The default dietary tags. A student's profile and a dish both carry tags
+/// from this school-editable list, which is how "this dish is safe for them"
+/// is answered without the backend knowing any nutrition.
+pub const DEFAULT_DIETARY_TAGS: [&str; 5] = [
+    "vegetarian",
+    "vegan",
+    "gluten_free",
+    "lactose_free",
+    "nut_allergy",
+];
+
+/// Bounds on one menu and the dishes hanging off it.
+pub const MAX_DISH_NAME_LEN: usize = 100;
+pub const MAX_DISH_DESCRIPTION_LEN: usize = 500;
+pub const MAX_DISHES_PER_MENU: usize = 50;
+pub const MAX_DISH_TAGS: usize = 10;
+
+/// How many students one menu may seat. Absent capacity means uncapped, the
+/// same shape a course's `capacity` uses.
+pub const MAX_MENU_CAPACITY: i64 = 10_000;
+
+/// Bounds on a student's dietary profile: one row per student, so the tag list
+/// is the whole payload plus a free-text note for the kitchen.
+pub const MAX_DIETARY_TAGS: usize = 10;
+pub const MAX_DIETARY_NOTE_LEN: usize = 500;
+
+/// Money is **minor units** (kuruş) as `i64` everywhere — never a decimal and
+/// never a float. `MAX_DISH_PRICE_MINOR` caps one dish (10 000 ₺);
+/// `MAX_LEDGER_AMOUNT_MINOR` caps one ledger line (100 000 ₺), which is wide
+/// enough for a term's prepayment.
+pub const MAX_DISH_PRICE_MINOR: i64 = 1_000_000;
+pub const MAX_LEDGER_AMOUNT_MINOR: i64 = 10_000_000;
+
+/// Bounds on the free-text a ledger line carries: how the money moved, and why.
+pub const MAX_LEDGER_METHOD_LEN: usize = 50;
+pub const MAX_LEDGER_NOTE_LEN: usize = 500;
+
+/// Ceiling on the settings knob that closes booking (and cancelling) ahead of
+/// a meal — one week. The knob itself is optional: absent means no cutoff.
+pub const MAX_MEAL_CANCEL_CUTOFF_MINUTES: i64 = 7 * 24 * 60;
+
 /// The only accepted course kinds. `course`: a regular class (ders). `study`:
 /// a supervised study session (etüt). Behaviorally identical — the kind is a
 /// label for the UI, everything else (enrollment, exams, sessions, marks)
@@ -168,6 +214,23 @@ pub const EXAM_MODES: [&str; 3] = ["sync", "async", "open"];
 /// missing (unsubmitted past due). The `HomeworkStatus` newtype enforces the
 /// set; the DDL carries no ASSERT (repo convention), exactly like `EXAM_MODES`.
 pub const HOMEWORK_STATUSES: [&str; 3] = ["done", "incomplete", "missing"];
+
+/// The only accepted meal-booking states. A cancel flips the status and stamps
+/// `cancelled_at` instead of deleting the row, so a seat freed after the cutoff
+/// is still auditable against the ledger line it charged.
+pub const MEAL_BOOKING_STATUSES: [&str; 2] = ["booked", "cancelled"];
+
+/// The only accepted meal-attendance states — did the student actually eat.
+/// Deliberately *not* the school's `attendance_statuses`: a canteen line has no
+/// "late" or "excused", and mixing the two would let a school edit one meaning
+/// while changing the other.
+pub const MEAL_ATTENDANCE_STATUSES: [&str; 2] = ["served", "missed"];
+
+/// The only accepted ledger kinds. `charge`: a booking billed the student.
+/// `credit`: money in (a payment, or an opening balance). `reversal`: a charge
+/// undone — the ledger is append-only, so a cancelled booking writes a new
+/// opposing line rather than editing or deleting the charge.
+pub const MEAL_LEDGER_KINDS: [&str; 3] = ["charge", "credit", "reversal"];
 
 /// Inclusive bounds for an exam's per-attempt duration, milliseconds
 /// (1 minute to 24 hours). Required for `async`, optional for `open`.
@@ -502,6 +565,12 @@ pub const CHATBOT_THREAD_TABLE: &str = "chatbot_thread";
 pub const CHAT_MESSAGE_TABLE: &str = "chatbot_message";
 pub const APPOINTMENT_SLOT_TABLE: &str = "appointment_slot";
 pub const APPOINTMENT_TABLE: &str = "appointment";
+pub const MENU_TABLE: &str = "menu";
+pub const MENU_DISH_TABLE: &str = "menu_dish";
+pub const DIETARY_PROFILE_TABLE: &str = "dietary_profile";
+pub const MEAL_BOOKING_TABLE: &str = "meal_booking";
+pub const MEAL_ATTENDANCE_TABLE: &str = "meal_attendance";
+pub const MEAL_LEDGER_TABLE: &str = "meal_ledger";
 
 // --- schema migration SQL ----------------------------------------------
 
@@ -884,6 +953,20 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS chatbot_history_turns ON settings TYPE option<int>;
     DEFINE FIELD IF NOT EXISTS max_chatbot_threads ON settings TYPE option<int>;
     DEFINE FIELD IF NOT EXISTS max_chatbot_message_len ON settings TYPE option<int>;
+    -- Food program (2026-07-26). `meal_slots` mirrors the `exam_kinds` shape —
+    -- a named list a menu snapshots from — and `dietary_tags` mirrors
+    -- `attendance_statuses`. `meal_cancel_cutoff_minutes` is ONE knob for both
+    -- the booking and the cancel deadline; absent means no cutoff at all. All
+    -- three are `option<>`, exactly like `max_file_bytes`: NOT `DEFAULT []`.
+    -- `DEFAULT` fires on create only, and `PATCH /settings` writes the whole
+    -- row with `UPDATE ... CONTENT`, so a required-with-default field a writer
+    -- omits coerces to NONE and fails every settings write until the domain
+    -- struct carries it. `option<>` also means the existing singleton reads
+    -- fine, which is why the food program needs no BACKFILL anywhere.
+    DEFINE FIELD IF NOT EXISTS meal_slots ON settings TYPE option<array<object>>;
+    DEFINE FIELD IF NOT EXISTS meal_slots.*.name ON settings TYPE string;
+    DEFINE FIELD IF NOT EXISTS dietary_tags ON settings TYPE option<array<string>>;
+    DEFINE FIELD IF NOT EXISTS meal_cancel_cutoff_minutes ON settings TYPE option<int>;
 
     -- Homework (greenfield, 2026-07-22): a teacher assigns per course, students
     -- submit files + optional text, a teacher grades a status + optional mark.
@@ -963,6 +1046,83 @@ pub const MIGRATION: &str = "
     DEFINE INDEX IF NOT EXISTS appointment_slot_ref ON appointment FIELDS slot;
     DEFINE INDEX IF NOT EXISTS appointment_requester ON appointment FIELDS requester;
     DEFINE INDEX IF NOT EXISTS appointment_status ON appointment FIELDS status;
+
+    -- Food program (greenfield, 2026-07-26): a published menu per day+slot,
+    -- dishes on it, a dietary profile per student, bookings against a menu's
+    -- capacity, who actually ate, and the money that moved. `date` is a
+    -- calendar day as `YYYY-MM-DD` text, not a timestamp: the unique index is
+    -- an equality test and a midnight-in-millis day is only unique for one
+    -- timezone. `slot` is snapshotted text, not a link, so retiring a slot in
+    -- settings never rewrites a past menu. Stamps stay `int` millis like the
+    -- rest of the schema. No BACKFILL: all six tables are new.
+    DEFINE TABLE IF NOT EXISTS menu SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS date ON menu TYPE string READONLY;
+    DEFINE FIELD IF NOT EXISTS slot ON menu TYPE string READONLY;
+    DEFINE FIELD IF NOT EXISTS capacity ON menu TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS created_by ON menu TYPE record<user> READONLY;
+    DEFINE FIELD IF NOT EXISTS created_at ON menu TYPE int READONLY;
+    DEFINE INDEX IF NOT EXISTS menu_date_slot ON menu FIELDS date, slot UNIQUE;
+
+    DEFINE TABLE IF NOT EXISTS menu_dish SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS menu ON menu_dish TYPE record<menu> READONLY;
+    DEFINE FIELD IF NOT EXISTS name ON menu_dish TYPE string;
+    DEFINE FIELD IF NOT EXISTS description ON menu_dish TYPE option<string>;
+    -- Money is minor units (kuruş) as an integer, everywhere. Never decimal.
+    DEFINE FIELD IF NOT EXISTS price_minor ON menu_dish TYPE int;
+    DEFINE FIELD IF NOT EXISTS tags ON menu_dish TYPE array<string> DEFAULT [];
+    DEFINE FIELD IF NOT EXISTS tags[*] ON menu_dish TYPE string;
+    DEFINE FIELD IF NOT EXISTS created_at ON menu_dish TYPE int READONLY;
+    DEFINE INDEX IF NOT EXISTS menu_dish_menu ON menu_dish FIELDS menu;
+
+    DEFINE TABLE IF NOT EXISTS dietary_profile SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS student ON dietary_profile TYPE record<user> READONLY;
+    DEFINE FIELD IF NOT EXISTS tags ON dietary_profile TYPE array<string> DEFAULT [];
+    DEFINE FIELD IF NOT EXISTS tags[*] ON dietary_profile TYPE string;
+    DEFINE FIELD IF NOT EXISTS note ON dietary_profile TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS updated_by ON dietary_profile TYPE record<user>;
+    DEFINE FIELD IF NOT EXISTS updated_at ON dietary_profile TYPE int;
+    DEFINE INDEX IF NOT EXISTS dietary_profile_student ON dietary_profile FIELDS student UNIQUE;
+
+    -- A cancel flips `status` and stamps `cancelled_at`; the row stays so the
+    -- freed seat is still auditable against the ledger line it charged.
+    DEFINE TABLE IF NOT EXISTS meal_booking SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS menu ON meal_booking TYPE record<menu> READONLY;
+    DEFINE FIELD IF NOT EXISTS student ON meal_booking TYPE record<user> READONLY;
+    DEFINE FIELD IF NOT EXISTS booked_by ON meal_booking TYPE record<user> READONLY;
+    DEFINE FIELD IF NOT EXISTS status ON meal_booking TYPE string DEFAULT 'booked';
+    -- How many times this seat has been taken, and what it cost when the
+    -- *current* attempt took it (NONE = the menu was free then). Together they
+    -- key the attempt's ledger lines, which is what makes billing idempotent
+    -- by identity rather than by scanning for an outstanding charge.
+    DEFINE FIELD IF NOT EXISTS attempt ON meal_booking TYPE int DEFAULT 1;
+    DEFINE FIELD IF NOT EXISTS price_minor ON meal_booking TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS cancelled_at ON meal_booking TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS created_at ON meal_booking TYPE int READONLY;
+    DEFINE INDEX IF NOT EXISTS meal_booking_menu ON meal_booking FIELDS menu;
+    DEFINE INDEX IF NOT EXISTS meal_booking_student ON meal_booking FIELDS student;
+
+    DEFINE TABLE IF NOT EXISTS meal_attendance SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS menu ON meal_attendance TYPE record<menu> READONLY;
+    DEFINE FIELD IF NOT EXISTS student ON meal_attendance TYPE record<user> READONLY;
+    DEFINE FIELD IF NOT EXISTS status ON meal_attendance TYPE string;
+    DEFINE FIELD IF NOT EXISTS marked_by ON meal_attendance TYPE record<user>;
+    DEFINE FIELD IF NOT EXISTS marked_at ON meal_attendance TYPE int;
+    DEFINE INDEX IF NOT EXISTS meal_attendance_menu_student ON meal_attendance FIELDS menu, student UNIQUE;
+
+    -- APPEND-ONLY by design: a mistake is corrected with an opposing
+    -- `reversal` line, never by editing or deleting one. Hence every field is
+    -- READONLY. `source` is untyped on purpose — a charge points at the
+    -- booking that caused it, a reversal at the line it undoes.
+    DEFINE TABLE IF NOT EXISTS meal_ledger SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS student ON meal_ledger TYPE record<user> READONLY;
+    DEFINE FIELD IF NOT EXISTS kind ON meal_ledger TYPE string READONLY;
+    DEFINE FIELD IF NOT EXISTS amount_minor ON meal_ledger TYPE int READONLY;
+    DEFINE FIELD IF NOT EXISTS source ON meal_ledger TYPE option<record> READONLY;
+    DEFINE FIELD IF NOT EXISTS method ON meal_ledger TYPE option<string> READONLY;
+    DEFINE FIELD IF NOT EXISTS note ON meal_ledger TYPE option<string> READONLY;
+    DEFINE FIELD IF NOT EXISTS recorded_by ON meal_ledger TYPE record<user> READONLY;
+    DEFINE FIELD IF NOT EXISTS created_at ON meal_ledger TYPE int READONLY;
+    DEFINE INDEX IF NOT EXISTS meal_ledger_student ON meal_ledger FIELDS student;
 ";
 
 /// Data backfills for rows written by older binaries. Runs *after* (and apart

@@ -10969,6 +10969,146 @@ async fn settings_accept_admin_edits_trim_entries_and_noop_on_empty_patch() {
     );
 }
 
+/// The food-program knobs are `option<…>` columns, and every settings save
+/// rewrites the whole row — so a PATCH that never mentions them must still
+/// round-trip them. (A `DEFAULT []` column plus a struct that dropped the field
+/// aborts the transaction with a coercion error instead.)
+#[tokio::test]
+async fn settings_round_trip_the_food_program_knobs() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "meal.manager", "manager").await;
+
+    // Unset columns read as the built-in seeds; an absent cutoff is no cutoff.
+    let res = send(&app, "GET", "/settings", Some(&manager), None).await;
+    assert_eq!(
+        res.body["meal_slots"],
+        json!([{"name": "breakfast"}, {"name": "lunch"}, {"name": "snack"}])
+    );
+    assert_eq!(
+        res.body["dietary_tags"],
+        json!([
+            "vegetarian",
+            "vegan",
+            "gluten_free",
+            "lactose_free",
+            "nut_allergy"
+        ])
+    );
+    assert_eq!(res.body["meal_cancel_cutoff_minutes"], json!(null));
+
+    // A PATCH of an unrelated field still writes the whole row.
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&manager),
+        Some(json!({ "max_file_bytes": 4096 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["meal_slots"].as_array().unwrap().len(), 3);
+
+    // All three set at once; slot names arrive trimmed.
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&manager),
+        Some(json!({
+            "meal_slots": [{"name": "lunch"}, {"name": "  snack "}],
+            "dietary_tags": ["vegan"],
+            "meal_cancel_cutoff_minutes": 120,
+        })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(
+        res.body["meal_slots"],
+        json!([{"name": "lunch"}, {"name": "snack"}])
+    );
+    assert_eq!(res.body["dietary_tags"], json!(["vegan"]));
+    assert_eq!(res.body["meal_cancel_cutoff_minutes"], 120);
+
+    // A later PATCH that omits them keeps them — now over a row that really
+    // carries the columns.
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&manager),
+        Some(json!({ "chatbot_history_turns": 3 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["meal_slots"].as_array().unwrap().len(), 2);
+    assert_eq!(res.body["meal_cancel_cutoff_minutes"], 120);
+
+    // `null` clears the cutoff (no cutoff at all); the lists stay.
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&manager),
+        Some(json!({ "meal_cancel_cutoff_minutes": null })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["meal_cancel_cutoff_minutes"], json!(null));
+    assert_eq!(res.body["meal_slots"].as_array().unwrap().len(), 2);
+
+    // Bounds hold on the way in.
+    for body in [
+        json!({ "meal_cancel_cutoff_minutes": 10_081 }),
+        json!({ "meal_cancel_cutoff_minutes": -1 }),
+        json!({ "meal_slots": [{"name": "   "}] }),
+        json!({ "meal_slots": [{"name": "Lunch"}, {"name": "lunch"}] }),
+        json!({ "dietary_tags": ["vegan", "VEGAN"] }),
+    ] {
+        let res = send(
+            &app,
+            "PATCH",
+            "/settings",
+            Some(&manager),
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::BAD_REQUEST, "should reject {body}");
+    }
+
+    // A published menu pins the slot it snapshotted: dropping it is a 409.
+    db.query(
+        "CREATE menu SET date = '2026-07-27', slot = 'lunch',
+             created_by = (SELECT VALUE id FROM user LIMIT 1)[0], created_at = 0",
+    )
+    .await
+    .unwrap()
+    .check()
+    .unwrap();
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&manager),
+        Some(json!({ "meal_slots": [{"name": "snack"}] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT);
+    // Keeping it is fine; an unused slot still leaves freely.
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&manager),
+        Some(json!({ "meal_slots": [{"name": "lunch"}, {"name": "dinner"}] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(
+        res.body["meal_slots"],
+        json!([{"name": "lunch"}, {"name": "dinner"}])
+    );
+}
+
 // --- question images ---------------------------------------------------------
 
 /// POST `bytes` as a multipart image upload to `path`; returns (status, json).
@@ -20021,4 +20161,1989 @@ async fn exams_schedule_window_applies_after_visibility_and_drafts() {
 
     let res = send(&app, "GET", "/exams?starts_after=-1", Some(&ayse), None).await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST);
+}
+
+// --- meals: menus and dishes ---------------------------------------------
+
+/// The whole published side, end to end: publish, list, patch the cap, add and
+/// edit and drop a dish, and the unique day+slot rule.
+#[tokio::test]
+async fn menus_and_dishes_round_trip() {
+    let (app, db) = app_and_db().await;
+    let mgr = login_as(&app, &db, "meal_mgr", "manager").await;
+
+    let res = send(
+        &app,
+        "POST",
+        "/meals/menus",
+        Some(&mgr),
+        Some(json!({ "date": "2026-09-14", "slot": "lunch", "capacity": 120 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED);
+    let menu = id_of(&res.body);
+    assert_eq!(res.body["slot"], "lunch");
+    assert_eq!(res.body["capacity"], 120);
+    assert_eq!(res.body["created_by"]["username"], "meal_mgr");
+
+    // A second menu for the same day and slot is the UNIQUE rule, as a 409 —
+    // never a 500 out of the index.
+    let res = send(
+        &app,
+        "POST",
+        "/meals/menus",
+        Some(&mgr),
+        Some(json!({ "date": "2026-09-14", "slot": "lunch" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT);
+
+    // Same day, another slot is a different meal and lands fine.
+    let res = send(
+        &app,
+        "POST",
+        "/meals/menus",
+        Some(&mgr),
+        Some(json!({ "date": "2026-09-14", "slot": "breakfast" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED);
+
+    // Dishes: money is minor units, tags come from the school's list.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/dishes"),
+        Some(&mgr),
+        Some(json!({
+            "name": "Mercimek çorbası",
+            "description": "  ",
+            "price_minor": 4550,
+            "tags": ["vegetarian", "vegetarian"],
+        })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED);
+    let dish = id_of(&res.body);
+    assert_eq!(res.body["price_minor"], 4550);
+    // A whitespace-only description is the absence of one, and repeated tags
+    // collapse.
+    assert_eq!(res.body["description"], json!(null));
+    assert_eq!(res.body["tags"], json!(["vegetarian"]));
+
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/meals/dishes/{dish}"),
+        Some(&mgr),
+        Some(json!({ "price_minor": 5000, "description": "günlük" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["price_minor"], 5000);
+    assert_eq!(res.body["description"], "günlük");
+    assert_eq!(res.body["name"], "Mercimek çorbası");
+
+    // The menu read carries its dishes, and `null` clears the cap.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/meals/menus/{menu}"),
+        Some(&mgr),
+        Some(json!({ "capacity": null })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["capacity"], json!(null));
+    assert_eq!(res.body["dishes"].as_array().expect("dishes").len(), 1);
+
+    // Any authenticated user reads; the range filter is inclusive.
+    let student = login(&app, "meal_student").await;
+    let res = send(
+        &app,
+        "GET",
+        "/meals/menus?from=2026-09-14&to=2026-09-14",
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(common::total(&res.body), 2);
+    let res = send(
+        &app,
+        "GET",
+        "/meals/menus?from=2026-09-15",
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 0);
+
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/meals/dishes/{dish}"),
+        Some(&mgr),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/meals/menus/{menu}"),
+        Some(&mgr),
+        None,
+    )
+    .await;
+    assert_eq!(res.body["dishes"], json!([]));
+
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/meals/menus/{menu}"),
+        Some(&mgr),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/meals/menus/{menu}"),
+        Some(&mgr),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+}
+
+/// Publishing is manager+, and both school-editable lists are enforced: a slot
+/// nobody serves and a tag nobody defined are 400s, not stored strings.
+#[tokio::test]
+async fn menu_writes_are_manager_only_and_validate_against_settings() {
+    let (app, db) = app_and_db().await;
+    let mgr = login_as(&app, &db, "meal_mgr2", "manager").await;
+    let teacher = login_as(&app, &db, "meal_teacher", "teacher").await;
+
+    let body = json!({ "date": "2026-09-15", "slot": "lunch" });
+    let res = send(
+        &app,
+        "POST",
+        "/meals/menus",
+        Some(&teacher),
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+
+    // A slot outside the school's `meal_slots` never reaches the column.
+    let res = send(
+        &app,
+        "POST",
+        "/meals/menus",
+        Some(&mgr),
+        Some(json!({ "date": "2026-09-15", "slot": "brunch" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+
+    // Neither does a malformed day.
+    let res = send(
+        &app,
+        "POST",
+        "/meals/menus",
+        Some(&mgr),
+        Some(json!({ "date": "2026-9-15", "slot": "lunch" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+
+    let res = send(&app, "POST", "/meals/menus", Some(&mgr), Some(body)).await;
+    assert_eq!(res.status, StatusCode::CREATED);
+    let menu = id_of(&res.body);
+
+    let res = send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/dishes"),
+        Some(&teacher),
+        Some(json!({ "name": "Pilav", "price_minor": 1000 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+
+    // A tag outside the school's `dietary_tags` is a 400, on create...
+    let res = send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/dishes"),
+        Some(&mgr),
+        Some(json!({ "name": "Pilav", "price_minor": 1000, "tags": ["halal"] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+
+    // ...and on patch, and negative money never lands either.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/dishes"),
+        Some(&mgr),
+        Some(json!({ "name": "Pilav", "price_minor": 1000 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED);
+    let dish = id_of(&res.body);
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/meals/dishes/{dish}"),
+        Some(&mgr),
+        Some(json!({ "tags": ["halal"] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/meals/dishes/{dish}"),
+        Some(&mgr),
+        Some(json!({ "price_minor": -1 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+}
+
+// --- meals: bookings ------------------------------------------------------
+
+/// A seat, end to end: book, see it on both listings, cancel it (the row stays,
+/// flipped), re-book the same seat, and the menu-delete guard in between.
+#[tokio::test]
+async fn meal_bookings_round_trip() {
+    let (app, db) = app_and_db().await;
+    let mgr = login_as(&app, &db, "booking_mgr", "manager").await;
+    let ali = login(&app, "booking_ali").await;
+
+    let res = send(
+        &app,
+        "POST",
+        "/meals/menus",
+        Some(&mgr),
+        Some(json!({ "date": "2026-09-14", "slot": "lunch", "capacity": 2 })),
+    )
+    .await;
+    let menu = id_of(&res.body);
+
+    let res = send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/bookings"),
+        Some(&ali),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let booking = id_of(&res.body);
+    assert_eq!(res.body["status"], "booked");
+    assert_eq!(res.body["student"]["username"], "booking_ali");
+    assert_eq!(res.body["booked_by"]["username"], "booking_ali");
+    assert_eq!(res.body["cancelled_at"], json!(null));
+
+    // Booking twice is the same seat, not a second one — the composite id.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/bookings"),
+        Some(&ali),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED);
+    assert_eq!(id_of(&res.body), booking);
+
+    let res = send(&app, "GET", "/meals/bookings/me", Some(&ali), None).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(common::total(&res.body), 1);
+    assert_eq!(res.body["items"][0]["id"], json!(booking));
+
+    // The kitchen's list is manager+; nobody else's `/me` shows the seat.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/meals/menus/{menu}/bookings"),
+        Some(&mgr),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 1);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/meals/menus/{menu}/bookings"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    let res = send(&app, "GET", "/meals/bookings/me", Some(&mgr), None).await;
+    assert_eq!(common::total(&res.body), 0);
+
+    // A menu somebody still holds a seat on cannot be unpublished.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/meals/menus/{menu}"),
+        Some(&mgr),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+
+    // Cancelling flips the row, it never deletes it.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/meals/bookings/{booking}"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["status"], "cancelled");
+    let stamp = res.body["cancelled_at"].as_i64().expect("stamped");
+    assert!(stamp > 0);
+    // Cancelling again is idempotent — a `200` with the row as it stands, so a
+    // cancel interrupted before its refund can be recovered by repeating it.
+    // The stamp is not re-written: the seat was freed once.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/meals/bookings/{booking}"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["status"], "cancelled");
+    assert_eq!(res.body["cancelled_at"], stamp);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/meals/menus/{menu}/bookings"),
+        Some(&mgr),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 1, "the cancelled row survives");
+
+    // Re-booking is the same row flipped back — one seat, never two.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/bookings"),
+        Some(&ali),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    assert_eq!(id_of(&res.body), booking);
+    assert_eq!(res.body["status"], "booked");
+    assert_eq!(res.body["cancelled_at"], json!(null));
+    let res = send(
+        &app,
+        "GET",
+        &format!("/meals/menus/{menu}/bookings"),
+        Some(&mgr),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 1);
+
+    // Cancelled, the menu is free to go.
+    send(
+        &app,
+        "DELETE",
+        &format!("/meals/bookings/{booking}"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/meals/menus/{menu}"),
+        Some(&mgr),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+}
+
+/// The cap refuses the seat that would overflow it, and a cancel genuinely
+/// gives that seat back.
+#[tokio::test]
+async fn meal_booking_capacity_caps_and_a_cancel_frees_a_seat() {
+    let (app, db) = app_and_db().await;
+    let mgr = login_as(&app, &db, "cap_mgr", "manager").await;
+    let res = send(
+        &app,
+        "POST",
+        "/meals/menus",
+        Some(&mgr),
+        Some(json!({ "date": "2026-09-14", "slot": "lunch", "capacity": 2 })),
+    )
+    .await;
+    let menu = id_of(&res.body);
+
+    let students: Vec<String> = {
+        let mut cookies = Vec::new();
+        for i in 0..3 {
+            cookies.push(login(&app, &format!("cap_student{i}")).await);
+        }
+        cookies
+    };
+    let book = |who: String| {
+        let app = app.clone();
+        let menu = menu.clone();
+        async move {
+            send(
+                &app,
+                "POST",
+                &format!("/meals/menus/{menu}/bookings"),
+                Some(&who),
+                Some(json!({})),
+            )
+            .await
+        }
+    };
+
+    let first = book(students[0].clone()).await;
+    assert_eq!(first.status, StatusCode::CREATED);
+    assert_eq!(book(students[1].clone()).await.status, StatusCode::CREATED);
+    assert_eq!(book(students[2].clone()).await.status, StatusCode::CONFLICT);
+
+    // Cancelling frees the seat — a cancelled row must not count.
+    let booking = id_of(&first.body);
+    send(
+        &app,
+        "DELETE",
+        &format!("/meals/bookings/{booking}"),
+        Some(&students[0]),
+        None,
+    )
+    .await;
+    assert_eq!(book(students[2].clone()).await.status, StatusCode::CREATED);
+    // …and the freed seat is gone again, so the first student cannot return.
+    assert_eq!(book(students[0].clone()).await.status, StatusCode::CONFLICT);
+}
+
+/// The cap is a count-then-write pair, which SurrealDB does not serialize:
+/// under a stampede it must still admit exactly `capacity` seats, and the
+/// losers must get a 409 rather than a 500. Mirrors
+/// `concurrent_duplicate_registrations_conflict_not_500`.
+#[tokio::test]
+async fn concurrent_meal_bookings_never_exceed_the_capacity() {
+    let (app, db) = app_and_db().await;
+    let mgr = login_as(&app, &db, "race_mgr", "manager").await;
+    let res = send(
+        &app,
+        "POST",
+        "/meals/menus",
+        Some(&mgr),
+        Some(json!({ "date": "2026-09-14", "slot": "lunch", "capacity": 3 })),
+    )
+    .await;
+    let menu = id_of(&res.body);
+
+    let mut students = Vec::new();
+    for i in 0..24 {
+        students.push(login(&app, &format!("race_student{i}")).await);
+    }
+
+    let mut handles = Vec::new();
+    for cookie in students {
+        let app = app.clone();
+        let menu = menu.clone();
+        handles.push(tokio::spawn(async move {
+            send(
+                &app,
+                "POST",
+                &format!("/meals/menus/{menu}/bookings"),
+                Some(&cookie),
+                Some(json!({})),
+            )
+            .await
+            .status
+        }));
+    }
+
+    let mut booked = 0;
+    for h in handles {
+        let status = h.await.unwrap();
+        assert!(
+            status == StatusCode::CREATED || status == StatusCode::CONFLICT,
+            "a lost race must be a 409, never a 500: {status}"
+        );
+        booked += i32::from(status == StatusCode::CREATED);
+    }
+    assert_eq!(booked, 3, "exactly the capacity was admitted");
+
+    let res = send(
+        &app,
+        "GET",
+        &format!("/meals/menus/{menu}/bookings"),
+        Some(&mgr),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 3, "and only three rows exist");
+}
+
+/// One knob closes both ends: past the school's `meal_cancel_cutoff_minutes`
+/// neither a new booking nor a cancellation lands.
+#[tokio::test]
+async fn meal_cutoff_closes_booking_and_cancelling_alike() {
+    let (app, db) = app_and_db().await;
+    let mgr = login_as(&app, &db, "cutoff_mgr", "manager").await;
+    let ali = login(&app, "cutoff_ali").await;
+
+    // No cutoff configured yet, so a menu whose day is long gone still books.
+    let res = send(
+        &app,
+        "POST",
+        "/meals/menus",
+        Some(&mgr),
+        Some(json!({ "date": "2020-01-06", "slot": "lunch" })),
+    )
+    .await;
+    let menu = id_of(&res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/bookings"),
+        Some(&ali),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let booking = id_of(&res.body);
+
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&mgr),
+        Some(json!({ "meal_cancel_cutoff_minutes": 60 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    // Both ends now refuse: the meal is settled.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/meals/bookings/{booking}"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+    let veli = login(&app, "cutoff_veli").await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/bookings"),
+        Some(&veli),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+
+    // A meal far enough ahead is untouched by the same cutoff.
+    let res = send(
+        &app,
+        "POST",
+        "/meals/menus",
+        Some(&mgr),
+        Some(json!({ "date": "2099-01-06", "slot": "lunch" })),
+    )
+    .await;
+    let later = id_of(&res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{later}/bookings"),
+        Some(&ali),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+}
+
+/// Who may take a seat: the student it is for, or a parent holding a link to
+/// them. Nobody else — a teacher does not order lunch for a child.
+#[tokio::test]
+async fn meal_bookings_are_student_or_linked_parent_only() {
+    let (app, db) = app_and_db().await;
+    let admin = login_as(&app, &db, "boss", "admin").await;
+    let mgr = login_as(&app, &db, "kin_mgr", "manager").await;
+    let teacher = login_as(&app, &db, "kin_teacher", "teacher").await;
+    let mom = login_as(&app, &db, "kin_mom", "parent").await;
+    let mom_id = me_id(&app, &mom).await;
+    let ali = login(&app, "kin_ali").await;
+    let ali_id = me_id(&app, &ali).await;
+    let veli = login(&app, "kin_veli").await;
+    let veli_id = me_id(&app, &veli).await;
+
+    let res = send(
+        &app,
+        "POST",
+        &format!("/users/{mom_id}/students"),
+        Some(&admin),
+        Some(json!({ "user_id": ali_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    let res = send(
+        &app,
+        "POST",
+        "/meals/menus",
+        Some(&mgr),
+        Some(json!({ "date": "2026-09-14", "slot": "lunch" })),
+    )
+    .await;
+    let menu = id_of(&res.body);
+    let path = format!("/meals/menus/{menu}/bookings");
+
+    // The parent books for their own child.
+    let res = send(
+        &app,
+        "POST",
+        &path,
+        Some(&mom),
+        Some(json!({ "student_id": ali_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    assert_eq!(res.body["student"]["username"], "kin_ali");
+    assert_eq!(res.body["booked_by"]["username"], "kin_mom");
+    let booking = id_of(&res.body);
+    // …and sees it on their own list, though the seat is not theirs.
+    let res = send(&app, "GET", "/meals/bookings/me", Some(&mom), None).await;
+    assert_eq!(common::total(&res.body), 1);
+
+    // Never for someone else's child, and never without naming one.
+    let res = send(
+        &app,
+        "POST",
+        &path,
+        Some(&mom),
+        Some(json!({ "student_id": veli_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+    let res = send(&app, "POST", &path, Some(&mom), Some(json!({}))).await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+
+    // Staff do not order for children through this route.
+    let res = send(
+        &app,
+        "POST",
+        &path,
+        Some(&teacher),
+        Some(json!({ "student_id": ali_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+    let res = send(
+        &app,
+        "POST",
+        &path,
+        Some(&mgr),
+        Some(json!({ "student_id": ali_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+
+    // A student books only for themselves, and cancels only their own.
+    let res = send(
+        &app,
+        "POST",
+        &path,
+        Some(&veli),
+        Some(json!({ "student_id": ali_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/meals/bookings/{booking}"),
+        Some(&veli),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+
+    // The linked parent may give the seat back.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/meals/bookings/{booking}"),
+        Some(&mom),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["status"], "cancelled");
+}
+
+// --- meals: the ledger ----------------------------------------------------
+
+/// The money, end to end: booking charges the menu's price *snapshot*, editing
+/// a dish afterwards never moves that charge, cancelling appends a reversal
+/// (leaving the charge standing — the append-only proof), and re-booking bills
+/// the new price.
+#[tokio::test]
+async fn meal_booking_charges_a_price_snapshot_and_a_cancel_reverses_it() {
+    let (app, db) = app_and_db().await;
+    let mgr = login_as(&app, &db, "money_mgr", "manager").await;
+    let ali = login(&app, "money_ali").await;
+    let ali_id = me_id(&app, &ali).await;
+
+    let res = send(
+        &app,
+        "POST",
+        "/meals/menus",
+        Some(&mgr),
+        Some(json!({ "date": "2026-09-14", "slot": "lunch" })),
+    )
+    .await;
+    let menu = id_of(&res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/dishes"),
+        Some(&mgr),
+        Some(json!({ "name": "Çorba", "price_minor": 4_500 })),
+    )
+    .await;
+    let dish = id_of(&res.body);
+    send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/dishes"),
+        Some(&mgr),
+        Some(json!({ "name": "Pilav", "price_minor": 2_000 })),
+    )
+    .await;
+
+    // A fresh student owes nothing.
+    let res = send(&app, "GET", "/meals/balance/me", Some(&ali), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["balance_minor"], 0);
+
+    // Booking charges the sum of the dishes — negative means "owes".
+    let res = send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/bookings"),
+        Some(&ali),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let booking = id_of(&res.body);
+    let res = send(&app, "GET", "/meals/balance/me", Some(&ali), None).await;
+    assert_eq!(res.body["balance_minor"], -6_500);
+
+    // Booking again is the same seat, so it must not bill twice.
+    send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/bookings"),
+        Some(&ali),
+        Some(json!({})),
+    )
+    .await;
+    let res = send(&app, "GET", "/meals/balance/me", Some(&ali), None).await;
+    assert_eq!(res.body["balance_minor"], -6_500, "one seat, one charge");
+
+    // A price edit is not retroactive: what the student owes is what the menu
+    // cost the day they booked.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/meals/dishes/{dish}"),
+        Some(&mgr),
+        Some(json!({ "price_minor": 9_900 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(&app, "GET", "/meals/balance/me", Some(&ali), None).await;
+    assert_eq!(res.body["balance_minor"], -6_500, "the snapshot is frozen");
+
+    // Cancelling appends a reversal; the charge row stays right where it was.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/meals/bookings/{booking}"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(&app, "GET", "/meals/balance/me", Some(&ali), None).await;
+    assert_eq!(res.body["balance_minor"], 0);
+
+    let res = send(
+        &app,
+        "GET",
+        &format!("/meals/ledger/{ali_id}"),
+        Some(&mgr),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(common::total(&res.body), 2, "both lines survive the cancel");
+    let lines = res.body["items"].as_array().unwrap().clone();
+    // Newest first: the reversal, then the charge it points at.
+    assert_eq!(lines[0]["kind"], "reversal");
+    assert_eq!(lines[0]["amount_minor"], 6_500);
+    assert_eq!(lines[1]["kind"], "charge");
+    assert_eq!(lines[1]["amount_minor"], 6_500);
+    assert_eq!(lines[1]["source"], json!(booking));
+    assert_eq!(lines[0]["source"], lines[1]["id"]);
+
+    // Re-booking is a fresh charge, at the *new* price.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/bookings"),
+        Some(&ali),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let res = send(&app, "GET", "/meals/balance/me", Some(&ali), None).await;
+    assert_eq!(res.body["balance_minor"], -11_900);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/meals/ledger/{ali_id}"),
+        Some(&mgr),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 3);
+}
+
+/// Recording cash is admin-only — a manager runs the kitchen, not the till.
+#[tokio::test]
+async fn meal_credits_are_admin_only_and_raise_the_balance() {
+    let (app, db) = app_and_db().await;
+    let admin = login_as(&app, &db, "till_admin", "admin").await;
+    let mgr = login_as(&app, &db, "till_mgr", "manager").await;
+    let ali = login(&app, "till_ali").await;
+    let ali_id = me_id(&app, &ali).await;
+
+    let body = json!({ "student_id": ali_id, "amount_minor": 25_000, "method": "cash" });
+    let res = send(
+        &app,
+        "POST",
+        "/meals/credits",
+        Some(&mgr),
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+    let res = send(
+        &app,
+        "POST",
+        "/meals/credits",
+        Some(&ali),
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+
+    let res = send(&app, "POST", "/meals/credits", Some(&admin), Some(body)).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    assert_eq!(res.body["kind"], "credit");
+    assert_eq!(res.body["amount_minor"], 25_000);
+    assert_eq!(res.body["method"], "cash");
+    assert_eq!(res.body["note"], json!(null));
+    assert_eq!(res.body["source"], json!(null));
+    assert_eq!(res.body["recorded_by"]["username"], "till_admin");
+
+    let res = send(&app, "GET", "/meals/balance/me", Some(&ali), None).await;
+    assert_eq!(res.body["balance_minor"], 25_000);
+
+    // The amount is bounded and positive; the target must be a student.
+    for bad in [
+        json!({ "student_id": ali_id, "amount_minor": 0 }),
+        json!({ "student_id": ali_id, "amount_minor": -100 }),
+        json!({ "student_id": ali_id, "amount_minor": 10_000_001 }),
+    ] {
+        let res = send(&app, "POST", "/meals/credits", Some(&admin), Some(bad)).await;
+        assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+    }
+    let mgr_id = me_id(&app, &mgr).await;
+    let res = send(
+        &app,
+        "POST",
+        "/meals/credits",
+        Some(&admin),
+        Some(json!({ "student_id": mgr_id, "amount_minor": 100 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+    // …and the failed writes left the balance exactly where it was.
+    let res = send(&app, "GET", "/meals/balance/me", Some(&ali), None).await;
+    assert_eq!(res.body["balance_minor"], 25_000);
+}
+
+/// Whose money a caller may read: their own, their linked child's, or — as
+/// teacher+ — anyone's. Never another family's.
+#[tokio::test]
+async fn meal_balance_reads_follow_the_observer_gate() {
+    let (app, db) = app_and_db().await;
+    let admin = login_as(&app, &db, "wallet_boss", "admin").await;
+    let teacher = login_as(&app, &db, "wallet_teacher", "teacher").await;
+    let mom = login_as(&app, &db, "wallet_mom", "parent").await;
+    let mom_id = me_id(&app, &mom).await;
+    let ali = login(&app, "wallet_ali").await;
+    let ali_id = me_id(&app, &ali).await;
+    let veli = login(&app, "wallet_veli").await;
+    let veli_id = me_id(&app, &veli).await;
+
+    let res = send(
+        &app,
+        "POST",
+        &format!("/users/{mom_id}/students"),
+        Some(&admin),
+        Some(json!({ "user_id": ali_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    // The linked parent reads their child's balance and statement.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/meals/balance/{ali_id}"),
+        Some(&mom),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["student"]["username"], "wallet_ali");
+    let res = send(
+        &app,
+        "GET",
+        &format!("/meals/ledger/{ali_id}"),
+        Some(&mom),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    // Someone else's child is a 403, on both routes.
+    for path in [
+        format!("/meals/balance/{veli_id}"),
+        format!("/meals/ledger/{veli_id}"),
+    ] {
+        let res = send(&app, "GET", &path, Some(&mom), None).await;
+        assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+    }
+
+    // A student reads their own money, never a classmate's.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/meals/balance/{ali_id}"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/meals/balance/{ali_id}"),
+        Some(&veli),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+
+    // Teacher+ reads any student's.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/meals/balance/{ali_id}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+}
+
+// --- meals: attendance ----------------------------------------------------
+
+/// Marking who ate is reporting, never billing: a booked no-show still owes the
+/// full price, and a walk-in served without a booking owes nothing. Also covers
+/// the composite id (re-marking flips the row) and the teacher+ gate.
+#[tokio::test]
+async fn meal_attendance_never_moves_money() {
+    let (app, db) = app_and_db().await;
+    let mgr = login_as(&app, &db, "ate_mgr", "manager").await;
+    let teacher = login_as(&app, &db, "ate_teacher", "teacher").await;
+    let ali = login(&app, "ate_ali").await;
+    let ali_id = me_id(&app, &ali).await;
+    let veli = login(&app, "ate_veli").await;
+    let veli_id = me_id(&app, &veli).await;
+
+    let res = send(
+        &app,
+        "POST",
+        "/meals/menus",
+        Some(&mgr),
+        Some(json!({ "date": "2026-09-14", "slot": "lunch" })),
+    )
+    .await;
+    let menu = id_of(&res.body);
+    send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/dishes"),
+        Some(&mgr),
+        Some(json!({ "name": "Çorba", "price_minor": 4_500 })),
+    )
+    .await;
+
+    // Ali books (and is charged); Veli never books.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/bookings"),
+        Some(&ali),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let res = send(&app, "GET", "/meals/balance/me", Some(&ali), None).await;
+    assert_eq!(res.body["balance_minor"], -4_500);
+
+    let path = format!("/meals/menus/{menu}/attendance");
+
+    // Served shows up on the menu's list.
+    let res = send(
+        &app,
+        "POST",
+        &path,
+        Some(&teacher),
+        Some(json!({ "student_id": ali_id, "status": "served" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let mark = id_of(&res.body);
+    assert_eq!(res.body["status"], "served");
+    assert_eq!(res.body["student"]["username"], "ate_ali");
+    assert_eq!(res.body["marked_by"]["username"], "ate_teacher");
+    assert_eq!(res.body["menu_id"], json!(menu));
+    let res = send(&app, "GET", &path, Some(&teacher), None).await;
+    assert_eq!(common::total(&res.body), 1);
+    assert_eq!(res.body["items"][0]["id"], json!(mark));
+
+    // Re-marking the same student flips the row — one row per (menu, student).
+    let res = send(
+        &app,
+        "POST",
+        &path,
+        Some(&teacher),
+        Some(json!({ "student_id": ali_id, "status": "missed" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(id_of(&res.body), mark);
+    assert_eq!(res.body["status"], "missed");
+    let res = send(&app, "GET", &path, Some(&teacher), None).await;
+    assert_eq!(
+        common::total(&res.body),
+        1,
+        "the mark was flipped, not doubled"
+    );
+
+    // THE BILLING-ISOLATION PROOF: the no-show still owes the whole price, and
+    // his statement grew no reversal line. The kitchen bought the food.
+    let res = send(&app, "GET", "/meals/balance/me", Some(&ali), None).await;
+    assert_eq!(
+        res.body["balance_minor"], -4_500,
+        "attendance must never move money"
+    );
+    let res = send(
+        &app,
+        "GET",
+        &format!("/meals/ledger/{ali_id}"),
+        Some(&mgr),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 1, "only the booking's charge");
+    assert_eq!(res.body["items"][0]["kind"], "charge");
+
+    // A walk-in with no booking is recordable — and still not charged.
+    let res = send(
+        &app,
+        "POST",
+        &path,
+        Some(&teacher),
+        Some(json!({ "student_id": veli_id, "status": "served" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(&app, "GET", "/meals/balance/me", Some(&veli), None).await;
+    assert_eq!(res.body["balance_minor"], 0, "a walk-in is never billed");
+
+    // Students never mark, not even themselves, and never read the list.
+    let res = send(
+        &app,
+        "POST",
+        &path,
+        Some(&ali),
+        Some(json!({ "student_id": ali_id, "status": "served" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+    let res = send(&app, "GET", &path, Some(&ali), None).await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+
+    // Bad inputs: a roll-call status is not a canteen status, and the menu and
+    // the student both have to exist.
+    let res = send(
+        &app,
+        "POST",
+        &path,
+        Some(&teacher),
+        Some(json!({ "student_id": ali_id, "status": "excused" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+    let res = send(
+        &app,
+        "POST",
+        &path,
+        Some(&teacher),
+        Some(json!({ "student_id": "nobody", "status": "served" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+    let res = send(
+        &app,
+        "POST",
+        "/meals/menus/missing/attendance",
+        Some(&teacher),
+        Some(json!({ "student_id": ali_id, "status": "served" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND, "{}", res.body);
+}
+
+/// The per-student report: a lexical `?from=&to=` window over the menu's day,
+/// readable by teacher+ or a linked parent and by nobody else.
+#[tokio::test]
+async fn meal_attendance_report_is_ranged_and_gated() {
+    let (app, db) = app_and_db().await;
+    let admin = login_as(&app, &db, "ate_boss", "admin").await;
+    let mgr = login_as(&app, &db, "range_mgr", "manager").await;
+    let teacher = login_as(&app, &db, "range_teacher", "teacher").await;
+    let mom = login_as(&app, &db, "range_mom", "parent").await;
+    let mom_id = me_id(&app, &mom).await;
+    let ali = login(&app, "range_ali").await;
+    let ali_id = me_id(&app, &ali).await;
+    let veli = login(&app, "range_veli").await;
+    let veli_id = me_id(&app, &veli).await;
+
+    let res = send(
+        &app,
+        "POST",
+        &format!("/users/{mom_id}/students"),
+        Some(&admin),
+        Some(json!({ "user_id": ali_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    // Three days, one mark each for Ali.
+    for date in ["2026-09-01", "2026-09-15", "2026-09-30"] {
+        let res = send(
+            &app,
+            "POST",
+            "/meals/menus",
+            Some(&mgr),
+            Some(json!({ "date": date, "slot": "lunch" })),
+        )
+        .await;
+        let menu = id_of(&res.body);
+        let res = send(
+            &app,
+            "POST",
+            &format!("/meals/menus/{menu}/attendance"),
+            Some(&teacher),
+            Some(json!({ "student_id": ali_id, "status": "served" })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    }
+
+    // Unbounded, then each bound, then both — the window is the menu's day.
+    for (query, expected) in [
+        ("", 3),
+        ("?from=2026-09-15", 2),
+        ("?to=2026-09-15", 2),
+        ("?from=2026-09-10&to=2026-09-20", 1),
+        ("?from=2026-10-01", 0),
+    ] {
+        let res = send(
+            &app,
+            "GET",
+            &format!("/meals/attendance/{ali_id}{query}"),
+            Some(&teacher),
+            None,
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+        assert_eq!(common::total(&res.body), expected, "range {query}");
+    }
+
+    // A malformed bound is a 400, never a silently ignored filter.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/meals/attendance/{ali_id}?from=2026-9-1"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+
+    // The linked parent reads her child's report; another child's is a 403,
+    // and a classmate never reads it at all.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/meals/attendance/{ali_id}"),
+        Some(&mom),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(common::total(&res.body), 3);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/meals/attendance/{veli_id}"),
+        Some(&mom),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/meals/attendance/{ali_id}"),
+        Some(&veli),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+}
+
+/// The dietary profile and the `conflicts` it produces on a menu read: the
+/// school writes it, everyone in the reading gate sees it, and the overlap is
+/// computed against the *caller's* own tags.
+#[tokio::test]
+async fn dietary_profile_drives_menu_conflicts() {
+    let (app, db) = app_and_db().await;
+    let admin = login_as(&app, &db, "diet_boss", "admin").await;
+    let mgr = login_as(&app, &db, "diet_mgr", "manager").await;
+    let teacher = login_as(&app, &db, "diet_teacher", "teacher").await;
+    let mom = login_as(&app, &db, "diet_mom", "parent").await;
+    let mom_id = me_id(&app, &mom).await;
+    let other_mom = login_as(&app, &db, "diet_aunt", "parent").await;
+    let ali = login(&app, "diet_ali").await;
+    let ali_id = me_id(&app, &ali).await;
+    let veli = login(&app, "diet_veli").await;
+    let veli_id = me_id(&app, &veli).await;
+
+    let res = send(
+        &app,
+        "POST",
+        &format!("/users/{mom_id}/students"),
+        Some(&admin),
+        Some(json!({ "user_id": ali_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    // No profile yet: empty, never a 404.
+    let res = send(&app, "GET", "/meals/profiles/me", Some(&ali), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["tags"], json!([]));
+    assert_eq!(res.body["note"], json!(null));
+    assert_eq!(res.body["updated_at"], json!(null));
+
+    // A student does not write their own allergen list, and neither does a
+    // teacher — this is a manager+ safety record.
+    for actor in [&ali, &teacher] {
+        let res = send(
+            &app,
+            "PATCH",
+            &format!("/meals/profiles/{ali_id}"),
+            Some(actor),
+            Some(json!({ "tags": ["nut_allergy"] })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+    }
+
+    // A tag outside the school's list is a 400, never a stored string.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/meals/profiles/{ali_id}"),
+        Some(&mgr),
+        Some(json!({ "tags": ["halal"] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/meals/profiles/{ali_id}"),
+        Some(&mgr),
+        Some(json!({ "tags": ["nut_allergy", "nut_allergy"], "note": "  EpiPen  " })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["tags"], json!(["nut_allergy"]));
+    assert_eq!(res.body["note"], "EpiPen");
+    assert_eq!(res.body["updated_by"]["username"], "diet_mgr");
+
+    // The student reads it back at `/me`; a second PATCH edits the same row.
+    let res = send(&app, "GET", "/meals/profiles/me", Some(&ali), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["tags"], json!(["nut_allergy"]));
+    assert_eq!(res.body["student"]["username"], "diet_ali");
+
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/meals/profiles/{ali_id}"),
+        Some(&mgr),
+        Some(json!({ "note": null })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["note"], json!(null));
+    assert_eq!(res.body["tags"], json!(["nut_allergy"]), "tags kept");
+
+    // The linked parent reads her child's; an unlinked one does not.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/meals/profiles/{ali_id}"),
+        Some(&mom),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["tags"], json!(["nut_allergy"]));
+    let res = send(
+        &app,
+        "GET",
+        &format!("/meals/profiles/{ali_id}"),
+        Some(&other_mom),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+
+    // A profile is a student's thing — a teacher never carries one.
+    let teacher_id = me_id(&app, &teacher).await;
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/meals/profiles/{teacher_id}"),
+        Some(&mgr),
+        Some(json!({ "tags": ["vegan"] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+
+    // One menu, two dishes: one Ali must avoid, one he must not.
+    let res = send(
+        &app,
+        "POST",
+        "/meals/menus",
+        Some(&mgr),
+        Some(json!({ "date": "2026-10-05", "slot": "lunch" })),
+    )
+    .await;
+    let menu = id_of(&res.body);
+    for (name, tags) in [
+        ("Fıstıklı baklava", json!(["nut_allergy", "vegetarian"])),
+        ("Pilav", json!(["vegan"])),
+    ] {
+        let res = send(
+            &app,
+            "POST",
+            &format!("/meals/menus/{menu}/dishes"),
+            Some(&mgr),
+            Some(json!({ "name": name, "price_minor": 1000, "tags": tags })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    }
+
+    // Ali sees his own conflict on the one dish, and nothing on the other.
+    for path in [format!("/meals/menus/{menu}"), "/meals/menus".to_string()] {
+        let res = send(&app, "GET", &path, Some(&ali), None).await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+        let menu_body = if path == "/meals/menus" {
+            res.body["items"][0].clone()
+        } else {
+            res.body.clone()
+        };
+        assert_eq!(
+            menu_body["dishes"][0]["conflicts"],
+            json!(["nut_allergy"]),
+            "{path}: the tag Ali holds, and only it"
+        );
+        assert_eq!(menu_body["dishes"][1]["conflicts"], json!([]), "{path}");
+    }
+
+    // A student with no profile, and a manager (who never has one), both read
+    // empty conflicts — that is correct, not a bug.
+    for actor in [&veli, &mgr] {
+        let res = send(
+            &app,
+            "GET",
+            &format!("/meals/menus/{menu}"),
+            Some(actor),
+            None,
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+        assert_eq!(res.body["dishes"][0]["conflicts"], json!([]));
+        assert_eq!(res.body["dishes"][1]["conflicts"], json!([]));
+    }
+
+    // Cleanup 1: a student reads their OWN meal-attendance history, like they
+    // already read their own balance and statement.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/attendance"),
+        Some(&teacher),
+        Some(json!({ "student_id": veli_id, "status": "served" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/meals/attendance/{veli_id}"),
+        Some(&veli),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(common::total(&res.body), 1);
+}
+
+// --- meals: money under concurrency and stale grants ----------------------
+
+/// Publish a lunch menu carrying one dish at `price`; returns (menu id,
+/// student cookie). Every money-race test below needs the same three rows.
+async fn priced_menu(tag: &str, price: i64) -> (axum::Router, String, String) {
+    let (app, db) = app_and_db().await;
+    let mgr = login_as(&app, &db, &format!("{tag}_mgr"), "manager").await;
+    let stu = login(&app, &format!("{tag}_stu")).await;
+    let res = send(
+        &app,
+        "POST",
+        "/meals/menus",
+        Some(&mgr),
+        Some(json!({ "date": "2026-09-14", "slot": "lunch" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let menu = id_of(&res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/dishes"),
+        Some(&mgr),
+        Some(json!({ "name": "Pilav", "price_minor": price })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    (app, menu, stu)
+}
+
+/// The sequential "booking twice bills once" test cannot see this: idempotence
+/// that rests on a "is there already a charge?" scan is no idempotence at all,
+/// since eight simultaneous POSTs of one seat all read "not yet" and all
+/// append. One seat must mean one charge, so the ledger line is keyed by
+/// (booking, attempt) and written under the same lock as the seat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_bookings_of_one_seat_bill_it_once() {
+    let (app, menu, stu) = priced_menu("race", 5_000).await;
+
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let app = app.clone();
+        let stu = stu.clone();
+        let menu = menu.clone();
+        tasks.push(tokio::spawn(async move {
+            send(
+                &app,
+                "POST",
+                &format!("/meals/menus/{menu}/bookings"),
+                Some(&stu),
+                Some(json!({})),
+            )
+            .await
+        }));
+    }
+    for task in tasks {
+        let res = task.await.unwrap();
+        assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    }
+
+    let res = send(&app, "GET", "/meals/bookings/me", Some(&stu), None).await;
+    assert_eq!(common::total(&res.body), 1, "one seat: {}", res.body);
+    let res = send(&app, "GET", "/meals/balance/me", Some(&stu), None).await;
+    assert_eq!(
+        res.body["balance_minor"], -5_000,
+        "one seat, one charge: {}",
+        res.body
+    );
+}
+
+/// A repeat POST racing the cancel. A cancel that reverses whatever charge it
+/// can find, off a booking row read before the lock, can flip the seat to
+/// `cancelled` while the charge of a newer attempt stands — the student owes
+/// for a seat they do not hold. Keying the reversal to the attempt, and
+/// re-reading the row inside the lock, is what closes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_cancelled_seat_never_keeps_its_charge() {
+    let (app, menu, stu) = priced_menu("race2", 3_000).await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/bookings"),
+        Some(&stu),
+        Some(json!({})),
+    )
+    .await;
+    let booking = id_of(&res.body);
+
+    for round in 0..20 {
+        let book = {
+            let (app, stu, menu) = (app.clone(), stu.clone(), menu.clone());
+            tokio::spawn(async move {
+                send(
+                    &app,
+                    "POST",
+                    &format!("/meals/menus/{menu}/bookings"),
+                    Some(&stu),
+                    Some(json!({})),
+                )
+                .await
+            })
+        };
+        let cancel = {
+            let (app, stu, booking) = (app.clone(), stu.clone(), booking.clone());
+            tokio::spawn(async move {
+                send(
+                    &app,
+                    "DELETE",
+                    &format!("/meals/bookings/{booking}"),
+                    Some(&stu),
+                    None,
+                )
+                .await
+            })
+        };
+        book.await.unwrap();
+        cancel.await.unwrap();
+        // Settle the seat into `cancelled`, then the money must be back.
+        send(
+            &app,
+            "DELETE",
+            &format!("/meals/bookings/{booking}"),
+            Some(&stu),
+            None,
+        )
+        .await;
+        let res = send(&app, "GET", "/meals/bookings/me", Some(&stu), None).await;
+        assert_eq!(
+            common::items(&res.body)[0]["status"],
+            "cancelled",
+            "round {round}: {}",
+            res.body
+        );
+        let res = send(&app, "GET", "/meals/balance/me", Some(&stu), None).await;
+        assert_eq!(
+            res.body["balance_minor"], 0,
+            "round {round}: a cancelled seat still owes: {}",
+            res.body
+        );
+    }
+}
+
+/// "Was free" is a recorded fact, not the absence of a charge. A seat taken
+/// off a dishless menu writes no ledger line; if that were all the code knew,
+/// a dish added afterwards would make the next POST of the *same held seat*
+/// look unbilled and charge it — a price the student never agreed to.
+#[tokio::test]
+async fn a_repeat_post_never_bills_a_seat_that_was_free_when_taken() {
+    let (app, db) = app_and_db().await;
+    let mgr = login_as(&app, &db, "free_mgr", "manager").await;
+    let stu = login(&app, "free_stu").await;
+    let res = send(
+        &app,
+        "POST",
+        "/meals/menus",
+        Some(&mgr),
+        Some(json!({ "date": "2026-09-14", "slot": "lunch" })),
+    )
+    .await;
+    let menu = id_of(&res.body);
+
+    // The seat is taken while the menu carries no dishes at all.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/bookings"),
+        Some(&stu),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let res = send(&app, "GET", "/meals/balance/me", Some(&stu), None).await;
+    assert_eq!(res.body["balance_minor"], 0, "a free menu bills nothing");
+
+    // The kitchen prices the menu afterwards.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/dishes"),
+        Some(&mgr),
+        Some(json!({ "name": "Pilav", "price_minor": 9_000 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+
+    // A refresh re-POSTs the seat the student already holds.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/bookings"),
+        Some(&stu),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let res = send(&app, "GET", "/meals/balance/me", Some(&stu), None).await;
+    assert_eq!(
+        res.body["balance_minor"], 0,
+        "a repeat POST on a held seat moves no money: {}",
+        res.body
+    );
+
+    // Cancelling and taking the seat again *is* a fresh attempt, at the price
+    // the menu carries now — that is the same rule, not an exception to it.
+    let res = send(&app, "GET", "/meals/bookings/me", Some(&stu), None).await;
+    let booking = common::items(&res.body)[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    send(
+        &app,
+        "DELETE",
+        &format!("/meals/bookings/{booking}"),
+        Some(&stu),
+        None,
+    )
+    .await;
+    send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/bookings"),
+        Some(&stu),
+        Some(json!({})),
+    )
+    .await;
+    let res = send(&app, "GET", "/meals/balance/me", Some(&stu), None).await;
+    assert_eq!(res.body["balance_minor"], -9_000, "{}", res.body);
+}
+
+/// A revoked parent link must go inert everywhere, `booked_by` included: the
+/// seats a parent paid for stay visible while the link lives, and vanish with
+/// it. The leak this catches was a *live* one — the unlinked parent kept
+/// watching the child's row, seeing a cancellation made after the unlink.
+#[tokio::test]
+async fn an_unlinked_parent_loses_the_live_view_of_a_childs_bookings() {
+    let (app, db) = app_and_db().await;
+    let admin = login_as(&app, &db, "lv_boss", "admin").await;
+    let mgr = login_as(&app, &db, "lv_mgr", "manager").await;
+    let mom = login_as(&app, &db, "lv_mom", "parent").await;
+    let mom_id = me_id(&app, &mom).await;
+    let kid = login(&app, "lv_kid").await;
+    let kid_id = me_id(&app, &kid).await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/users/{mom_id}/students"),
+        Some(&admin),
+        Some(json!({ "user_id": kid_id })),
+    )
+    .await;
+    assert!(res.status.is_success(), "link: {}", res.body);
+    let res = send(
+        &app,
+        "POST",
+        "/meals/menus",
+        Some(&mgr),
+        Some(json!({ "date": "2027-08-01", "slot": "lunch" })),
+    )
+    .await;
+    let menu = id_of(&res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/bookings"),
+        Some(&mom),
+        Some(json!({ "student_id": kid_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let booking = id_of(&res.body);
+
+    // While the link lives, mom sees the seat she booked.
+    let res = send(&app, "GET", "/meals/bookings/me", Some(&mom), None).await;
+    assert_eq!(common::total(&res.body), 1, "{}", res.body);
+
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/users/{mom_id}/students/{kid_id}"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert!(res.status.is_success(), "unlink: {}", res.body);
+
+    // The kid cancels *after* the link is gone — mom must not see that.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/meals/bookings/{booking}"),
+        Some(&kid),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(&app, "GET", "/meals/bookings/me", Some(&mom), None).await;
+    assert_eq!(
+        common::total(&res.body),
+        0,
+        "an unlinked parent still reads the child's seat: {}",
+        res.body
+    );
+    // The child's own view is untouched.
+    let res = send(&app, "GET", "/meals/bookings/me", Some(&kid), None).await;
+    assert_eq!(common::total(&res.body), 1, "{}", res.body);
+}
+
+/// A cancel is two writes — the status flip, then the reversal — and axum drops
+/// the handler future when the client goes away (tab closed, proxy timeout). A
+/// drop landing between them freed the seat and left the charge standing, and
+/// while an already-cancelled row was a `409` **no route on the API could ever
+/// append the missing reversal**: the student stayed billed for a meal they had
+/// given back, and re-booking billed them a second time. So the cancel is
+/// idempotent — repeating it replays the reversal, keyed by (seat, attempt), so
+/// it heals the gap exactly once.
+#[tokio::test]
+async fn a_cancel_cut_short_mid_flight_is_healed_by_repeating_it() {
+    let (app, menu, stu) = priced_menu("cutshort", 3_000).await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/bookings"),
+        Some(&stu),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let booking = id_of(&res.body);
+    let res = send(&app, "GET", "/meals/balance/me", Some(&stu), None).await;
+    assert_eq!(res.body["balance_minor"], -3_000, "{}", res.body);
+
+    // The DELETE, polled just far enough to flip the row, then dropped.
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/meals/bookings/{booking}"))
+        .header("cookie", &stu)
+        .body(Body::empty())
+        .unwrap();
+    let mut fut = Box::pin(app.clone().oneshot(req));
+    for _ in 0..7 {
+        assert!(
+            futures_util::poll!(fut.as_mut()).is_pending(),
+            "the cancel finished before it could be interrupted"
+        );
+        tokio::task::yield_now().await;
+    }
+    drop(fut);
+
+    // Repeating the cancel is the documented recovery: a `200`, not a `409`.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/meals/bookings/{booking}"),
+        Some(&stu),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["status"], "cancelled", "{}", res.body);
+    let res = send(&app, "GET", "/meals/balance/me", Some(&stu), None).await;
+    assert_eq!(
+        res.body["balance_minor"], 0,
+        "still billed for a cancelled seat: {}",
+        res.body
+    );
+
+    // And a third cancel refunds nothing extra — the reversal is keyed, not
+    // counted — while a re-book is one fresh charge, not a doubled one.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/meals/bookings/{booking}"),
+        Some(&stu),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(&app, "GET", "/meals/balance/me", Some(&stu), None).await;
+    assert_eq!(res.body["balance_minor"], 0, "{}", res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/bookings"),
+        Some(&stu),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let res = send(&app, "GET", "/meals/balance/me", Some(&stu), None).await;
+    assert_eq!(
+        res.body["balance_minor"], -3_000,
+        "one meal, one charge: {}",
+        res.body
+    );
+}
+
+/// A dish must never land on a menu that is already gone. `add_dish` reading
+/// the menu *before* `MENU_LOCK` left a window: `DELETE /menus/{id}` ran its
+/// cascade in the gap, the create landed after it, and the row survived
+/// pointing at a menu the API 404s. Unreachable, but real orphaned data — so
+/// the read moved inside the lock, the way `MealBooking::book` does it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_dish_never_lands_on_a_deleted_menu() {
+    let (app, db) = app_and_db().await;
+    let mgr = login_as(&app, &db, "orphan_mgr", "manager").await;
+    for round in 0..40 {
+        let res = send(
+            &app,
+            "POST",
+            "/meals/menus",
+            Some(&mgr),
+            Some(json!({ "date": format!("2027-10-{:02}", round % 28 + 1), "slot": "lunch" })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+        let menu = id_of(&res.body);
+
+        let add = {
+            let (app, menu, mgr) = (app.clone(), menu.clone(), mgr.clone());
+            tokio::spawn(async move {
+                send(
+                    &app,
+                    "POST",
+                    &format!("/meals/menus/{menu}/dishes"),
+                    Some(&mgr),
+                    Some(json!({ "name": "Pilav", "price_minor": 1 })),
+                )
+                .await
+            })
+        };
+        let remove = {
+            let (app, menu, mgr) = (app.clone(), menu.clone(), mgr.clone());
+            tokio::spawn(async move {
+                send(
+                    &app,
+                    "DELETE",
+                    &format!("/meals/menus/{menu}"),
+                    Some(&mgr),
+                    None,
+                )
+                .await
+            })
+        };
+        add.await.unwrap();
+        remove.await.unwrap();
+
+        let gone = send(
+            &app,
+            "GET",
+            &format!("/meals/menus/{menu}"),
+            Some(&mgr),
+            None,
+        )
+        .await
+        .status
+            == StatusCode::NOT_FOUND;
+        if gone {
+            let mut res = db
+                .query("SELECT VALUE id FROM menu_dish WHERE menu = $menu")
+                .bind((
+                    "menu",
+                    surrealdb::types::RecordId::new("menu", menu.clone()),
+                ))
+                .await
+                .unwrap();
+            let left: Vec<surrealdb::types::RecordId> = res.take(0).unwrap();
+            assert!(
+                left.is_empty(),
+                "round {round}: a dish outlived its menu: {left:?}"
+            );
+        }
+        send(
+            &app,
+            "DELETE",
+            &format!("/meals/menus/{menu}"),
+            Some(&mgr),
+            None,
+        )
+        .await;
+    }
 }

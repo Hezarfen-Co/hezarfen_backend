@@ -14,10 +14,11 @@
 use surrealdb::types::{RecordId, SurrealValue};
 
 use crate::constant::{
-    DEFAULT_ATTENDANCE_STATUSES, DEFAULT_CHATBOT_HISTORY_TURNS, DEFAULT_EXAM_KINDS,
-    DEFAULT_MAX_CHATBOT_MESSAGE_LEN, DEFAULT_MAX_CHATBOT_THREADS, DEFAULT_MAX_FILE_BYTES,
-    MAX_CHATBOT_HISTORY_TURNS, MAX_EXAM_KIND_WEIGHT, MAX_GRADE_BANDS, MAX_GRADE_LABEL_LEN,
-    MAX_MARK, MAX_MAX_CHATBOT_MESSAGE_LEN, MAX_MAX_CHATBOT_THREADS, MAX_MAX_FILE_BYTES,
+    DEFAULT_ATTENDANCE_STATUSES, DEFAULT_CHATBOT_HISTORY_TURNS, DEFAULT_DIETARY_TAGS,
+    DEFAULT_EXAM_KINDS, DEFAULT_MAX_CHATBOT_MESSAGE_LEN, DEFAULT_MAX_CHATBOT_THREADS,
+    DEFAULT_MAX_FILE_BYTES, DEFAULT_MEAL_SLOTS, MAX_CHATBOT_HISTORY_TURNS, MAX_EXAM_KIND_WEIGHT,
+    MAX_GRADE_BANDS, MAX_GRADE_LABEL_LEN, MAX_MARK, MAX_MAX_CHATBOT_MESSAGE_LEN,
+    MAX_MAX_CHATBOT_THREADS, MAX_MAX_FILE_BYTES, MAX_MEAL_CANCEL_CUTOFF_MINUTES,
     MAX_SETTINGS_ITEM_LEN, MAX_SETTINGS_LIST_LEN, MIN_CHATBOT_HISTORY_TURNS, MIN_EXAM_KIND_WEIGHT,
     MIN_MARK, MIN_MAX_CHATBOT_MESSAGE_LEN, MIN_MAX_CHATBOT_THREADS, MIN_MAX_FILE_BYTES,
     SETTINGS_KEY, SETTINGS_TABLE,
@@ -63,6 +64,34 @@ impl ExamKindDef {
 
     pub fn get_weight(&self) -> i64 {
         self.weight
+    }
+}
+
+/// One meal slot the school serves (`"lunch"`, `"snack"`, …). A published menu
+/// snapshots the slot's *name* as text, so retiring a slot never rewrites a
+/// past menu — same contract exam kinds have with exams. An object, not a bare
+/// string, so a slot can grow a serving window later without a migration.
+#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+pub struct MealSlotDef {
+    name: String,
+}
+
+impl MealSlotDef {
+    pub fn try_new(name: &str) -> Result<Self, ValidationError> {
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > MAX_SETTINGS_ITEM_LEN {
+            return Err(ValidationError::Invalid {
+                field: "meal_slots",
+                reason: "slot names must be 1 to 50 characters",
+            });
+        }
+        Ok(Self {
+            name: name.to_string(),
+        })
+    }
+
+    pub fn get_name(&self) -> &str {
+        &self.name
     }
 }
 
@@ -120,6 +149,16 @@ pub struct Settings {
     chatbot_history_turns: Option<i64>,
     max_chatbot_threads: Option<i64>,
     max_chatbot_message_len: Option<i64>,
+    /// Food-program knobs. `None`-while-unset exactly like `max_file_bytes` —
+    /// the columns are `option<…>`, never `DEFAULT []`: `save_if_unchanged`
+    /// writes the whole row, so a field this struct did not carry would coerce
+    /// to `NONE` and abort the transaction.
+    meal_slots: Option<Vec<MealSlotDef>>,
+    dietary_tags: Option<Vec<String>>,
+    /// Minutes before a meal at which booking *and* cancelling close. One knob
+    /// for both deadlines; `None` = no cutoff at all, which is also what an
+    /// unset column reads as.
+    meal_cancel_cutoff_minutes: Option<i64>,
 }
 
 /// Everything [`Settings::try_new`] validates, in one struct — the knobs
@@ -134,6 +173,10 @@ pub struct SettingsParams {
     pub chatbot_history_turns: i64,
     pub max_chatbot_threads: i64,
     pub max_chatbot_message_len: i64,
+    pub meal_slots: Vec<MealSlotDef>,
+    pub dietary_tags: Vec<String>,
+    /// `None` = no booking/cancel cutoff.
+    pub meal_cancel_cutoff_minutes: Option<i64>,
 }
 
 impl Settings {
@@ -158,6 +201,9 @@ impl Settings {
             chatbot_history_turns: None,
             max_chatbot_threads: None,
             max_chatbot_message_len: None,
+            meal_slots: None,
+            dietary_tags: None,
+            meal_cancel_cutoff_minutes: None,
         }
     }
 
@@ -172,6 +218,9 @@ impl Settings {
             chatbot_history_turns: self.get_chatbot_history_turns(),
             max_chatbot_threads: self.get_max_chatbot_threads(),
             max_chatbot_message_len: self.get_max_chatbot_message_len(),
+            meal_slots: self.get_meal_slots(),
+            dietary_tags: self.get_dietary_tags(),
+            meal_cancel_cutoff_minutes: self.meal_cancel_cutoff_minutes,
         }
     }
 
@@ -192,6 +241,9 @@ impl Settings {
             chatbot_history_turns,
             max_chatbot_threads,
             max_chatbot_message_len,
+            meal_slots,
+            dietary_tags,
+            meal_cancel_cutoff_minutes,
         } = params;
         in_range(
             "max_file_bytes",
@@ -260,6 +312,32 @@ impl Settings {
         let mut grade_bands = grade_bands;
         grade_bands.sort_by_key(|band| std::cmp::Reverse(band.get_min()));
 
+        // The food lists follow the same list rules as the kinds and statuses
+        // above, with one difference: empty is legal on both. A school that
+        // runs no canteen has no slots and no dietary tags, and refusing that
+        // would force it to keep a list it never uses.
+        let slot_names: Vec<String> = meal_slots
+            .iter()
+            .map(|slot| slot.get_name().to_string())
+            .collect();
+        if !slot_names.is_empty() {
+            validate_list("meal_slots", slot_names)?;
+        }
+        let dietary_tags = if dietary_tags.is_empty() {
+            dietary_tags
+        } else {
+            validate_list("dietary_tags", dietary_tags)?
+        };
+        // One knob for both deadlines: 0 = closes exactly at serving time.
+        if let Some(minutes) = meal_cancel_cutoff_minutes {
+            in_range(
+                "meal_cancel_cutoff_minutes",
+                minutes,
+                0..=MAX_MEAL_CANCEL_CUTOFF_MINUTES,
+                "must be between 0 and 10080 (one week) minutes",
+            )?;
+        }
+
         Ok(Self {
             id: Self::record_id(),
             exam_kinds,
@@ -269,6 +347,9 @@ impl Settings {
             chatbot_history_turns: Some(chatbot_history_turns),
             max_chatbot_threads: Some(max_chatbot_threads),
             max_chatbot_message_len: Some(max_chatbot_message_len),
+            meal_slots: Some(meal_slots),
+            dietary_tags: Some(dietary_tags),
+            meal_cancel_cutoff_minutes,
         })
     }
 
@@ -320,6 +401,33 @@ impl Settings {
     pub fn get_max_chatbot_message_len(&self) -> i64 {
         self.max_chatbot_message_len
             .unwrap_or(DEFAULT_MAX_CHATBOT_MESSAGE_LEN)
+    }
+
+    /// The meal slots the school serves; the built-in list while it never set
+    /// one (including rows saved before the field existed). An explicitly
+    /// stored empty list stays empty — that is "no meal program", not "unset".
+    pub fn get_meal_slots(&self) -> Vec<MealSlotDef> {
+        self.meal_slots.clone().unwrap_or_else(|| {
+            DEFAULT_MEAL_SLOTS
+                .map(|name| MealSlotDef {
+                    name: name.to_string(),
+                })
+                .to_vec()
+        })
+    }
+
+    /// The dietary tags a dish and a student's profile may carry; the built-in
+    /// list while the school never set one.
+    pub fn get_dietary_tags(&self) -> Vec<String> {
+        self.dietary_tags
+            .clone()
+            .unwrap_or_else(|| DEFAULT_DIETARY_TAGS.map(String::from).to_vec())
+    }
+
+    /// Minutes before a meal at which booking and cancelling close; `None` =
+    /// no cutoff, the default while the school never set one.
+    pub fn get_meal_cancel_cutoff_minutes(&self) -> Option<i64> {
+        self.meal_cancel_cutoff_minutes
     }
 
     /// The label of the band `mark` falls into: the band with the greatest
@@ -376,7 +484,10 @@ impl Settings {
                        AND max_file_bytes = $mf
                        AND chatbot_history_turns = $ct
                        AND max_chatbot_threads = $cc
-                       AND max_chatbot_message_len = $cl;
+                       AND max_chatbot_message_len = $cl
+                       AND meal_slots = $ms
+                       AND dietary_tags = $dt
+                       AND meal_cancel_cutoff_minutes = $mc;
                  COMMIT TRANSACTION;",
             )
             .bind(("expected", expected.clone()))
@@ -389,6 +500,9 @@ impl Settings {
             .bind(("ct", expected.chatbot_history_turns))
             .bind(("cc", expected.max_chatbot_threads))
             .bind(("cl", expected.max_chatbot_message_len))
+            .bind(("ms", expected.meal_slots.clone()))
+            .bind(("dt", expected.dietary_tags.clone()))
+            .bind(("mc", expected.meal_cancel_cutoff_minutes))
             .await?
             .check()?;
         // Statement slots count BEGIN too: the guarded UPDATE is slot 2. An

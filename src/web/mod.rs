@@ -17,6 +17,7 @@ pub mod exams;
 pub mod homework;
 pub mod limits;
 pub mod marks;
+pub mod meals;
 pub mod messages;
 pub mod notes;
 pub mod pomodoro;

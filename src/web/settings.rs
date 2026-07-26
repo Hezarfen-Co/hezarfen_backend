@@ -7,12 +7,13 @@ use utoipa_axum::routes;
 
 use crate::constant::SETTINGS_UPDATE_RETRIES;
 use crate::domain::exam_result::ExamResult;
-use crate::domain::settings::{ExamKindDef, GradeBand, Settings};
+use crate::domain::menu::{MENU_LOCK, Menu};
+use crate::domain::settings::{ExamKindDef, GradeBand, MealSlotDef, Settings};
 use crate::error::{AppError, ErrorResponse};
 use crate::state::AppState;
 
 use super::exams::EXAM_LOCK;
-use super::{CurrentUser, RequireManager};
+use super::{CurrentUser, RequireManager, set_or_clear};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new().routes(routes!(get_settings, update_settings))
@@ -29,6 +30,15 @@ struct ExamKindDto {
     /// re-weights every exam of this kind at once.
     #[schema(example = 2, minimum = 1, maximum = 100)]
     weight: i64,
+}
+
+/// One meal slot the school serves. A published menu snapshots this name, so
+/// renaming or retiring a slot never rewrites a past menu.
+#[derive(Serialize, Deserialize, ToSchema)]
+struct MealSlotDto {
+    /// The `slot` value menus carry, 1–50 characters.
+    #[schema(example = "lunch", max_length = 50)]
+    name: String,
 }
 
 /// One grade-display band: marks at or above `min` (and below the next band's
@@ -74,6 +84,17 @@ struct SettingsResponse {
     /// Character limit on one chat message.
     #[schema(example = 4000)]
     max_chatbot_message_len: i64,
+    /// Meal slots menus may be published for. Empty = the school runs no meal
+    /// program.
+    #[schema(example = json!([{"name": "breakfast"}, {"name": "lunch"}, {"name": "snack"}]))]
+    meal_slots: Vec<MealSlotDto>,
+    /// Dietary tags a dish and a student's profile may carry.
+    #[schema(example = json!(["vegetarian", "vegan", "gluten_free"]))]
+    dietary_tags: Vec<String>,
+    /// How many minutes before a meal booking and cancelling close.
+    /// `null` = no cutoff.
+    #[schema(example = 120)]
+    meal_cancel_cutoff_minutes: Option<i64>,
 }
 
 impl SettingsResponse {
@@ -100,6 +121,15 @@ impl SettingsResponse {
             chatbot_history_turns: settings.get_chatbot_history_turns(),
             max_chatbot_threads: settings.get_max_chatbot_threads(),
             max_chatbot_message_len: settings.get_max_chatbot_message_len(),
+            meal_slots: settings
+                .get_meal_slots()
+                .iter()
+                .map(|slot| MealSlotDto {
+                    name: slot.get_name().to_string(),
+                })
+                .collect(),
+            dietary_tags: settings.get_dietary_tags(),
+            meal_cancel_cutoff_minutes: settings.get_meal_cancel_cutoff_minutes(),
         }
     }
 }
@@ -135,6 +165,21 @@ struct UpdateSettings {
     /// server hard cap.
     #[schema(example = 4000, minimum = 100, maximum = 8_000)]
     max_chatbot_message_len: Option<i64>,
+    /// Replaces the whole list when present: at most 20 entries with unique
+    /// names, each 1–50 characters. `[]` switches the meal program off. A slot
+    /// a menu was already published for cannot be removed (409).
+    #[schema(max_items = 20)]
+    meal_slots: Option<Vec<MealSlotDto>>,
+    /// Replaces the whole list when present: at most 20 unique entries, each
+    /// 1–50 characters. `[]` means the school tracks no dietary tags.
+    #[schema(max_items = 20)]
+    dietary_tags: Option<Vec<String>>,
+    /// Minutes before a meal at which booking *and* cancelling close,
+    /// `0`–`10080` (one week). Omit to keep the current value; send `null` for
+    /// no cutoff at all.
+    #[serde(default, deserialize_with = "set_or_clear")]
+    #[schema(value_type = Option<i64>, example = 120, minimum = 0, maximum = 10_080)]
+    meal_cancel_cutoff_minutes: Option<Option<i64>>,
 }
 
 /// The school's current policy. Any authenticated user — clients need it to
@@ -168,7 +213,9 @@ async fn get_settings(
 /// re-weight to 1; an unmarked kind leaves freely, and an exam whose kind is
 /// gone counts with weight 1 until the kind returns. `max_file_bytes` likewise
 /// applies at upload time only — already-stored files keep their size, and the
-/// chatbot knobs apply to the next chat request only.
+/// chatbot knobs apply to the next chat request only. `meal_slots` follows the
+/// exam-kind rule: a slot a menu was already published for cannot be dropped
+/// (409), because the menu snapshotted its name.
 #[utoipa::path(
     patch,
     path = "/",
@@ -180,7 +227,7 @@ async fn get_settings(
         (status = 400, description = "Invalid lists, bands, file limit, or chat limits", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
-        (status = 409, description = "A removed exam kind still has graded exams, or concurrent edits kept changing the settings mid-save", body = ErrorResponse),
+        (status = 409, description = "A removed exam kind still has graded exams, a removed meal slot still has published menus, or concurrent edits kept changing the settings mid-save", body = ErrorResponse),
     ),
 )]
 async fn update_settings(
@@ -197,6 +244,14 @@ async fn update_settings(
     // can't land the first mark of a kind that is being dropped mid-flight.
     let _guard = match req.exam_kinds {
         Some(_) => Some(EXAM_LOCK.write().await),
+        None => None,
+    };
+    // Same shape for the slot list: the "was a menu ever published for it?"
+    // check and the save are one unit, so a publish cannot land on a slot that
+    // is being dropped mid-flight. Taken after EXAM_LOCK; nothing under
+    // MENU_LOCK ever takes EXAM_LOCK, so the pair cannot deadlock.
+    let _menu_guard = match req.meal_slots {
+        Some(_) => Some(MENU_LOCK.lock().await),
         None => None,
     };
     for _ in 0..SETTINGS_UPDATE_RETRIES {
@@ -221,6 +276,29 @@ async fn update_settings(
             if ExamResult::any_for_kind(gone.get_name(), &st.db).await? {
                 return Err(AppError::ConflictOwned(format!(
                     "exams of kind '{}' are already graded — the kind cannot be removed",
+                    gone.get_name()
+                )));
+            }
+        }
+        // Same shape for meal slots: a slot a menu was already published for
+        // cannot leave the list — the menu snapshotted the name as text, and a
+        // slot no longer offered would leave that menu unreachable from the
+        // school's own list.
+        let meal_slots = match &req.meal_slots {
+            Some(slots) => slots
+                .iter()
+                .map(|slot| MealSlotDef::try_new(&slot.name))
+                .collect::<Result<Vec<_>, _>>()?,
+            None => current.get_meal_slots(),
+        };
+        for gone in current.get_meal_slots().iter().filter(|slot| {
+            !meal_slots
+                .iter()
+                .any(|new| new.get_name() == slot.get_name())
+        }) {
+            if Menu::any_for_slot(gone.get_name(), &st.db).await? {
+                return Err(AppError::ConflictOwned(format!(
+                    "menus are already published for the '{}' slot — it cannot be removed",
                     gone.get_name()
                 )));
             }
@@ -252,6 +330,15 @@ async fn update_settings(
         params.max_chatbot_message_len = req
             .max_chatbot_message_len
             .unwrap_or(params.max_chatbot_message_len);
+        params.meal_slots = meal_slots;
+        params.dietary_tags = req
+            .dietary_tags
+            .clone()
+            .unwrap_or_else(|| current.get_dietary_tags());
+        // Double option: absent keeps the knob, `null` clears it (no cutoff).
+        params.meal_cancel_cutoff_minutes = req
+            .meal_cancel_cutoff_minutes
+            .unwrap_or(params.meal_cancel_cutoff_minutes);
 
         let settings = Settings::try_new(params)?;
         if let Some(saved) = settings.save_if_unchanged(&current, &st.db).await? {

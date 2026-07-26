@@ -177,6 +177,45 @@ struct AppointmentLimits {
     max_slot_occurrences: usize,
 }
 
+/// The food program: menus and their dishes, dietary profiles, bookings and
+/// the meal ledger. The school's own lists (`meal_slots`, `dietary_tags`) and
+/// its booking cutoff are on `GET /settings`; what stands here is the fixed
+/// range those must stay inside.
+#[derive(Serialize, ToSchema)]
+struct MealLimits {
+    max_dish_name_len: usize,
+    max_dish_description_len: usize,
+    /// How many dishes one menu may list.
+    max_dishes_per_menu: usize,
+    /// Dietary tags one dish may carry.
+    max_dish_tags: usize,
+    /// Upper bound for a menu's optional `capacity`; absent = uncapped.
+    max_menu_capacity: i64,
+    /// Dietary tags one student's profile may carry, and its kitchen note.
+    max_dietary_tags: usize,
+    max_dietary_note_len: usize,
+    /// Money is **minor units** (kuruş) as an integer everywhere — never a
+    /// decimal, never a float. These cap one dish and one ledger line.
+    max_dish_price_minor: i64,
+    max_ledger_amount_minor: i64,
+    /// How the money moved, and why.
+    max_ledger_method_len: usize,
+    max_ledger_note_len: usize,
+    /// Ceiling on the `/settings` knob that closes booking (and cancelling)
+    /// ahead of a meal, minutes; the live value is on `GET /settings`.
+    max_cancel_cutoff_minutes: i64,
+    /// The only accepted booking `status` values.
+    #[schema(example = json!(["booked", "cancelled"]))]
+    booking_statuses: Vec<&'static str>,
+    /// The only accepted meal-attendance `status` values — deliberately not
+    /// the school's lesson attendance statuses.
+    #[schema(example = json!(["served", "missed"]))]
+    attendance_statuses: Vec<&'static str>,
+    /// The only accepted ledger `kind` values.
+    #[schema(example = json!(["charge", "credit", "reversal"]))]
+    ledger_kinds: Vec<&'static str>,
+}
+
 /// The AI chatbot. Each range bounds the matching `/settings` knob; the live
 /// values are on `GET /settings`.
 #[derive(Serialize, ToSchema)]
@@ -260,6 +299,7 @@ struct LimitsResponse {
     homework: HomeworkLimits,
     question_pool: QuestionPoolLimits,
     appointment: AppointmentLimits,
+    meal: MealLimits,
     chatbot: ChatbotLimits,
     settings: SettingsLimits,
     request: RequestLimits,
@@ -354,6 +394,23 @@ impl LimitsResponse {
                 max_note_len: MAX_APPOINTMENT_NOTE_LEN,
                 max_reason_len: MAX_APPOINTMENT_REASON_LEN,
                 max_slot_occurrences: MAX_SLOT_OCCURRENCES,
+            },
+            meal: MealLimits {
+                max_dish_name_len: MAX_DISH_NAME_LEN,
+                max_dish_description_len: MAX_DISH_DESCRIPTION_LEN,
+                max_dishes_per_menu: MAX_DISHES_PER_MENU,
+                max_dish_tags: MAX_DISH_TAGS,
+                max_menu_capacity: MAX_MENU_CAPACITY,
+                max_dietary_tags: MAX_DIETARY_TAGS,
+                max_dietary_note_len: MAX_DIETARY_NOTE_LEN,
+                max_dish_price_minor: MAX_DISH_PRICE_MINOR,
+                max_ledger_amount_minor: MAX_LEDGER_AMOUNT_MINOR,
+                max_ledger_method_len: MAX_LEDGER_METHOD_LEN,
+                max_ledger_note_len: MAX_LEDGER_NOTE_LEN,
+                max_cancel_cutoff_minutes: MAX_MEAL_CANCEL_CUTOFF_MINUTES,
+                booking_statuses: MEAL_BOOKING_STATUSES.to_vec(),
+                attendance_statuses: MEAL_ATTENDANCE_STATUSES.to_vec(),
+                ledger_kinds: MEAL_LEDGER_KINDS.to_vec(),
             },
             chatbot: ChatbotLimits {
                 max_message_len: MAX_CHATBOT_MESSAGE_LEN,

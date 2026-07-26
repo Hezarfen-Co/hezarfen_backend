@@ -78,6 +78,14 @@ const EXCLUDED: &[(&str, &str)] = &[
         "DEFAULT_EXAM_KINDS",
         "settings seed; the live list is on GET /settings",
     ),
+    (
+        "DEFAULT_MEAL_SLOTS",
+        "settings seed; the live list is on GET /settings",
+    ),
+    (
+        "DEFAULT_DIETARY_TAGS",
+        "settings seed; the live list is on GET /settings",
+    ),
     // Schema and query text. `constant.rs` is the single home for every
     // constant, so the migration batches live there too — a client never sees
     // a byte of SurrealQL.
