@@ -109,6 +109,18 @@ inference outlives a request: the turn plus an empty `pending` answer are
 written *first*, the call goes out after, so a reload never loses an answer;
 the client then polls the message or reads it off an SSE stream (see
 "Chatbot").
+The school's **food program** is published here too: a manager puts up one
+**menu** per calendar day and meal slot (`date` as `YYYY-MM-DD` text, `slot`
+drawn from the school's `meal_slots`, unique per pair), lists its **dishes**
+with dietary tags from the school's own list, and prices them in **minor
+units** (kuruş) as integers — this API never speaks decimals or floats about
+money. A student's own **dietary profile** is tagged from that same list
+(manager-written — an allergen list is a school record, not a self-service
+preference), so every dish a menu read returns names the tags it `conflicts`
+with for whoever is reading. Every authenticated user reads what is being
+served; students (or their parents) book a seat, and every seat writes a line into an
+**append-only** meal ledger whose balance is derived and never stored (see
+"Food program: menus, dishes, bookings & the ledger").
 
 Every field is a validated newtype (`Username(String)`, `NoteTitle(String)`, …)
 constructed only after its restrictions pass — invalid input can't be
@@ -748,6 +760,28 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/terms/{id}`                    | student | Get one term                    |
 | PATCH  | `/terms/{id}`                    | manager | Edit a term (the merged range must stay ordered) |
 | DELETE | `/terms/{id}`                    | manager | Delete a term — `409` while any course still links to it |
+| POST   | `/meals/menus`                   | manager | `{date, slot, capacity?}` — publish a menu; `date` is `YYYY-MM-DD` text, `slot` must be one of the school's `meal_slots`; `409` when that day+slot is already published |
+| GET    | `/meals/menus`                   | student | List menus with their dishes, newest day first · `?from=&to=` inclusive `YYYY-MM-DD` range · paged |
+| GET    | `/meals/menus/{id}`              | student | One menu with its dishes |
+| PATCH  | `/meals/menus/{id}`              | manager | `{capacity}` — the only mutable field (`null` = uncapped); `date` and `slot` are immutable |
+| DELETE | `/meals/menus/{id}`              | manager | Unpublish a menu; its dishes go with it; `409` while anyone still holds a seat |
+| POST   | `/meals/menus/{id}/dishes`       | manager | `{name, description?, price_minor, tags?}` — add a dish (≤ 50 per menu, `409` at the cap); `tags` must come from the school's `dietary_tags` |
+| PATCH  | `/meals/dishes/{did}`            | manager | Edit a dish (`tags` replaces the list, `"description": null` clears it) |
+| DELETE | `/meals/dishes/{did}`            | manager | Remove a dish from its menu |
+| GET    | `/meals/profiles/me`             | student | The caller's own dietary profile (empty when the school recorded none) |
+| GET    | `/meals/profiles/{user}`         | student | One student's dietary profile; own id always, otherwise teacher+ or a parent link |
+| PATCH  | `/meals/profiles/{user}`         | manager | `{tags?, note?}` — record what a student may not eat (`tags` replaces the list, `"note": null` clears it); **manager+**, a student never edits their own |
+| POST   | `/meals/menus/{id}/bookings`     | student | `{student_id?}` — take a seat; a student books for themselves, a parent for a linked student; `409` when the menu is full or its cutoff has passed |
+| GET    | `/meals/bookings/me`             | student | The caller's own bookings (seats held for them + for a parent, their currently linked children's), newest first · paged |
+| GET    | `/meals/menus/{id}/bookings`     | manager | Every booking on one menu, cancelled ones included · paged |
+| DELETE | `/meals/bookings/{bid}`          | student | Cancel a booking (status flip, the row stays); idempotent — cancelling again is a `200` that replays the refund; `409` past the cutoff |
+| POST   | `/meals/menus/{id}/attendance`   | teacher | `{student_id, status}` — mark who was served (`served`/`missed`); one row per (menu, student), re-marking flips it; **moves no money** |
+| GET    | `/meals/menus/{id}/attendance`   | teacher | Who ate off one menu · paged |
+| GET    | `/meals/attendance/{user}`       | student | One student's meal-attendance history · `?from=&to=` inclusive `YYYY-MM-DD` range over the menu's day · paged · own id always, otherwise teacher+ or a parent link |
+| GET    | `/meals/balance/me`              | student | The caller's meal balance, minor units (negative = owes) |
+| GET    | `/meals/balance/{user}`          | student | One student's balance; own id always, otherwise teacher+ or a parent link |
+| GET    | `/meals/ledger/{user}`           | student | That student's statement — every charge, credit, reversal — newest first · paged · same gate |
+| POST   | `/meals/credits`                 | admin   | `{student_id, amount_minor, method?, note?}` — record money received; **admin only**, appends a `credit` line |
 | POST   | `/chatbot/threads`            | student | `{title?}` — start a chatbot thread (every role incl. `parent`, always private to its owner); `409` at `max_chatbot_threads` |
 | GET    | `/chatbot/threads`            | student | The caller's threads, newest activity first · paged |
 | PATCH  | `/chatbot/threads/{id}`       | student | `{title}` — rename own thread (`null` or blank clears it back to untitled); counts as activity, so the thread moves to the top. Nothing auto-titles a thread |
@@ -1116,6 +1150,8 @@ the later write silently reverting the earlier one. Editing a list never
 rewrites history: an exam keeps its retired kind, a roll-call row keeps its
 retired status — only **new writes** are held to the current lists.
 
+The kitchen is data too: a manager publishes a **menu** per calendar day and meal slot, with its dishes, their dietary tags, and prices in minor units; booking a seat charges that price as a snapshot and an admin records the cash that comes back in (see "Food program: menus, dishes, bookings & the ledger").
+
 Academic structure is data too. **Terms** (`/terms`) model whatever calendar
 the school runs — semester, trimester, quarter systems are just rows with a
 name and a date range. Courses may link to one via `term_id` (nullable), and
@@ -1131,6 +1167,204 @@ validation bounds, and the UTC time policy are invariants, not preferences
 "manager"). Deployment knobs (ports, rate limits, admin seed, CORS) remain
 environment variables — the model is **one school per deployment**, which
 keeps every school's data physically isolated.
+
+## Food program: menus, dishes, bookings, attendance & the ledger
+
+The school publishes **one menu per calendar day and meal slot** (`POST
+/meals/menus`). Two shapes there are deliberate:
+
+- **`date` is text**, `YYYY-MM-DD`, not a timestamp. "One menu per day and
+  slot" is an equality test on the school's own day, and a midnight-in-millis
+  day is only unique for one timezone. Fixed-width and zero-padded, so the
+  text sorts chronologically — which is what the inclusive `?from=&to=` range
+  filter and the newest-day-first ordering are built on.
+- **`slot` is a snapshot**, not a link into settings. It must be one of the
+  school's `meal_slots` (`GET /settings`) *when the menu is written*, and it
+  is stored as text — so retiring a slot later never rewrites a menu already
+  published under it. The mirror of that rule lives in settings: a slot any
+  menu was published for cannot be removed from the list (`409`), same
+  contract exam kinds have with graded exams.
+
+The day+slot pair is unique: a second publish for the same meal answers `409`
+— edit the first one instead. Only `capacity` is patchable (`null` = uncapped)
+— `date` and `slot` are immutable, because a menu on another day is another
+menu.
+
+**Dishes** hang off a menu (`POST /meals/menus/{id}/dishes`, at most 50, then
+`PATCH`/`DELETE /meals/dishes/{did}`). Each carries a name, an optional
+description (blank or `null` clears it), dietary `tags` drawn from the
+school's `dietary_tags` list — an unknown tag is a `400`, never a stored
+string — and a `price_minor`.
+
+### Dietary profiles and conflicts
+
+A student carries a **dietary profile**: a list of tags plus a free-text note
+for the kitchen, one row per student (the record key *is* the student's id).
+The tags come from the *same* `dietary_tags` list a dish is tagged from —
+there is deliberately no second vocabulary, because one shared list is exactly
+what makes "is this dish a problem for this student" answerable as a set
+intersection, without the backend knowing any nutrition.
+
+Writing it is **manager+** (`PATCH /meals/profiles/{user}`, first write
+creates the row). A student does *not* edit their own allergen list: it is a
+safety record the school keeps on their behalf, and a mistyped — or quietly
+removed — allergy would otherwise reach the kitchen with the school's
+authority behind it. Reading is `GET /meals/profiles/me`, or
+`GET /meals/profiles/{user}` under the usual per-student gate (own id always,
+otherwise teacher+ or a parent link). A student who was never recorded reads
+back as an *empty* profile rather than a `404` — "nothing known" is an answer.
+
+Every dish a menu read returns therefore carries a **`conflicts`** list: the
+intersection of that dish's `tags` with the **calling user's** profile tags.
+It is empty when the two do not overlap, and empty for every reader without a
+profile — a manager reading a menu sees `conflicts: []`, which is correct and
+not a bug (the field answers "may *I* eat this", and there is no "conflicts
+for student X" parameter). The caller's profile is loaded **once per request**,
+not per dish, so the menu list stays at its fixed query count no matter how
+many menus or dishes the page holds.
+
+**Money is minor units** (kuruş) as an integer, at every layer: `4550` is
+45,50 ₺. This API never speaks decimals or floats about money, so no rounding
+is ever introduced by transport or by a client's JSON number parser.
+
+Reads are open to every authenticated user — a student has to see what is
+being served — and every write is manager+. Deleting a menu takes its dishes
+with it: a dish has no meaning apart from the menu it was published on.
+
+**Bookings** are seats on a published menu (`POST
+/meals/menus/{id}/bookings`). One row per (menu, student), keyed by a
+deterministic composite id, so booking twice is the same seat and never a
+second one. A **student books only for themselves**; a **parent books for a
+student they hold a link to** — the one write a `parent_link` authorises, since
+paying for lunch is a parent's job. Nobody else books through this route: a
+teacher or manager ordering a child's lunch is a `403`.
+
+- **Cancelling is a status flip, not a delete** (`DELETE
+  /meals/bookings/{bid}` answers `200` with the flipped row): the row survives
+  as `cancelled` with a `cancelled_at` stamp, so a freed seat stays auditable
+  against the money it moved. Only `booked` rows count against `capacity`,
+  which is what genuinely frees the seat — and re-booking is the same row
+  flipped back. The call is **idempotent**: cancelling an already-cancelled
+  seat answers `200` with the row as it stands *and replays the refund*, so a
+  cancel cut short between the flip and the reversal (the tab closed, a proxy
+  timed out) is recovered by sending it again. Refusing it as a `409` — as it
+  once did — made that state permanent: no route could append the missing
+  reversal, and the student stayed billed for a seat they no longer held.
+- **The capacity check is serialized in-process.** Counting rows and then
+  writing one is write-skew: SurrealDB does not conflict-check a cross-record
+  count against a concurrent insert, so 24 students racing for 3 seats would
+  otherwise all pass the count. The whole check-then-write runs under the same
+  lock a menu publish takes, and the cap is re-read inside it.
+- **One cutoff closes both ends.** Within the school's
+  `meal_cancel_cutoff_minutes` of the meal's day, neither a new booking nor a
+  cancellation lands (`409`) — the kitchen's headcount has to settle at some
+  point. `null` (the default) means no cutoff at all. The cutoff is measured
+  back from **midnight UTC starting the meal's day**: `date` carries no
+  timezone and the backend stores no school timezone, so that is the only
+  instant derivable from it.
+- A menu somebody still holds a seat on **cannot be unpublished** (`409`) —
+  cancel the bookings first, so nothing is left pointing at a deleted meal.
+
+`GET /meals/bookings/me` is the caller's own list: the seats held *for* them
+plus, for a parent, the seats held for every student they **currently** hold a
+link to — so a parent's list is their children's meals. The links are re-read
+on every call rather than trusted from the booking's `booked_by` stamp: an
+unlinked parent stops seeing the child's seats at once, including the ones
+they booked and paid for themselves, exactly like every other parent read. `GET /meals/menus/{id}/bookings` is the kitchen's list for
+one menu (manager+), cancelled rows included so the changes are visible.
+
+### Meal attendance
+
+Whoever stands at the canteen door records who actually ate:
+`POST /meals/menus/{id}/attendance` with `{student_id, status}`, teacher+ (a
+student never marks, not even themselves). The status is the fixed pair
+`served` / `missed` — deliberately **not** the school's editable
+`attendance_statuses`, since a canteen line has no "late" or "excused", and one
+list meaning two things would let a school change one by editing the other.
+One row per (menu, student) keyed by a composite id, so a correction re-marks
+the same row instead of stacking a second one.
+
+**Attendance has zero billing effect.** Booking is the sole charge trigger, so
+a student who booked and did not eat still pays — the kitchen bought the food.
+There is no no-show penalty, no refund-on-missed, and no auto-reversal:
+nothing under `meal_attendance` writes to the ledger. A walk-in with no live
+booking *can* be marked `served` (the record is operationally true) and is
+likewise not charged for it — charging there would be a ledger write. The
+target only has to *exist*: a canteen also feeds staff, so any user may be
+marked, not only a student. A mark is a record of what happened, not a check
+of who was entitled, and since it moves no money it costs nobody anything.
+
+`GET /meals/menus/{id}/attendance` is the per-menu list (teacher+), and
+`GET /meals/attendance/{user}` is one student's history, narrowable with
+`?from=&to=` — inclusive `YYYY-MM-DD` bounds compared against the *menu's*
+day, a lexical compare that is chronological for that format. Same gate as the
+balance and the ledger: the caller's own id always passes, anyone else's needs
+teacher+ or a `parent_link` to that student.
+
+### The ledger
+
+The money is an **append-only ledger** (`meal_ledger`): one line per `charge`,
+`credit`, or `reversal`, every field `READONLY`, and **no code path anywhere
+that updates or deletes one**. A ledger line that can be edited or dropped
+silently rewrites a student's financial history with no trace of the rewrite —
+this is the one genuinely irreversible part of the food program, so a mistake
+is corrected by appending the opposing line, which leaves both the mistake and
+the correction visible.
+
+**No balance is stored, anywhere.** It is always derived:
+
+```text
+balance = SUM(credit) + SUM(reversal) - SUM(charge)
+```
+
+in **minor units** (kuruş) as an `i64` — no float, no decimal, at any layer.
+A *negative* balance means the student owes the school; a positive one is
+money on account. Amounts are stored positive; the sign lives in the `kind`.
+
+- **Booking is what charges, at a price snapshot.** The menu's dishes are
+  summed the moment the seat is taken and that number is frozen onto the
+  charge. Editing a dish's price afterwards moves no existing charge — what a
+  student owes is what the menu cost the day they booked. The price is
+  snapshotted *before* the seat is given, so a menu that cannot be charged
+  refuses the booking rather than leaving a booked-but-unbilled row (`400`,
+  when the dishes sum past 10 000 000). A free menu writes no line at all —
+  but the booking row records that it *was* free, so "free when taken" is
+  never confused with "not billed yet": pricing the menu afterwards leaves
+  every seat already taken on it free.
+- **Charge and reversal are keyed by `(booking, attempt)`.** The seat and its
+  money move together under one in-process lock, and the ledger id is derived
+  from the seat plus how many times it has been taken — so eight simultaneous
+  `POST`s of one seat write one charge, a retried cancel refunds once, and a
+  write that failed halfway heals when the request is repeated. Booking the
+  same seat twice bills once because the *identity* is the same, never
+  because a scan happened to see the first charge in time.
+- **Cancelling appends a `reversal`** for the charge's exact amount, with
+  `source` pointing at the charge it undoes. The charge row itself stays. A
+  cancel past the cutoff is already a `409`, so a reversal only ever follows a
+  legal cancel — and repeating a cancel replays the reversal, which is what
+  makes the refund recoverable rather than a one-shot the network can lose.
+  Re-booking afterwards is a **fresh** charge at the then-current price.
+- **The price snapshot is taken under the booking lock**, and dish
+  create/edit/delete take that same lock. Taken outside it, a dish added
+  between the sum and the seat would be frozen onto the row as "the menu was
+  free then" — and nothing heals it, since a seat already held is returned
+  as-is, never re-priced.
+- **A no-show still pays.** Meal attendance has zero billing effect — nothing
+  in the ledger reads or writes it. The seat was reserved and the food was
+  cooked; there is no no-show penalty and no no-show refund.
+- **`POST /meals/credits` is admin-only**, not manager: writing down cash
+  received is the highest-trust action in the app. It appends a `credit` for a
+  student with a positive `amount_minor` (≤ 10 000 000), an optional `method`
+  ("cash", "havale", …) and `note`, and records the admin as `recorded_by`.
+  There is no payment gateway and no card data, ever. An over-credit is
+  corrected with a compensating line, never a fix-up.
+
+`GET /meals/balance/me` is the caller's own balance. `GET
+/meals/balance/{user}` and `GET /meals/ledger/{user}` (paged, newest line
+first) read a student's: your own id always passes, anyone else's needs
+teacher+ or a `parent_link` to that student. A charge's `source` is the
+booking id it came from, a reversal's is the charge line it reverses, and a
+credit has none.
 
 ## Exam modes, attempts, retakes, rejoin & live monitoring
 
@@ -2058,6 +2292,21 @@ src/
     registration.rs RegistrationId · Registration (a seat on a registration event's signup list)
     subject.rs     SubjectId · SubjectName · SubjectDescription · Subject (course curriculum)
     term.rs        TermId · TermName · Term (school term window)
+    menu.rs        MenuId · MenuDate · MenuSlot · Menu (one published menu per
+                   calendar day + meal slot; slot snapshotted as text)
+    menu_dish.rs   MenuDishId · DishName · DishDescription · DishPrice ·
+                   DishTags · MenuDish (a dish on a menu; price in minor units)
+    dietary_profile.rs DietaryProfileId · DietaryTags · DietaryNote ·
+                   DietaryProfile (what one student may not eat; keyed by the
+                   student, tagged from the same `dietary_tags` list a dish is)
+    meal_booking.rs MealBookingId · MealBookingStatus · MealBooking (one seat
+                   per (menu, student); a cancel flips the status, never deletes)
+    meal_attendance.rs MealAttendanceId · MealAttendanceStatus · MealAttendance
+                   (who actually ate; one row per (menu, student), reporting
+                   only — it never touches the ledger)
+    meal_ledger.rs MealLedgerId · MealLedgerKind · LedgerAmount · LedgerMethod ·
+                   LedgerNote · MealLedger (append-only money; the balance is
+                   always the fold, never a stored field)
     settings.rs    ExamKindDef · GradeBand · Settings (per-school policy)
     chatbot_thread.rs ChatbotThreadId · ChatbotThreadTitle · ChatbotThread (one
                    chatbot thread, private to its owner)
@@ -2098,7 +2347,7 @@ src/
     auth.rs  users.rs  notes.rs  messages.rs  events.rs  appointments.rs
     courses.rs  subjects.rs  sessions.rs  exams.rs  homework.rs  questions.rs
     bank_questions.rs  marks.rs  work.rs  pomodoro.rs  attendance.rs
-    settings.rs  terms.rs  ai.rs  chatbot.rs
+    settings.rs  terms.rs  meals.rs  ai.rs  chatbot.rs
     limits.rs      GET /limits: every constant.rs bound served as JSON
 ```
 

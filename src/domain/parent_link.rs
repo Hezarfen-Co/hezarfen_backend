@@ -32,9 +32,11 @@ impl ParentLinkId {
     }
 }
 
-/// A parent account's tie to one student it may observe. Purely a read grant:
-/// it gates the parent's access to the student's reports (marks, attendance,
-/// pomodoro) and nothing else — a parent never writes through it.
+/// A parent account's tie to one student it may observe. Almost entirely a
+/// read grant: it gates the parent's access to the student's reports (marks,
+/// attendance, pomodoro). The single write it authorizes is the food program —
+/// a parent books and cancels a linked child's meals, since paying for lunch
+/// is a parent's job and a small child cannot do it themselves.
 #[derive(Debug, Clone, SurrealValue)]
 pub struct ParentLink {
     id: ParentLinkId,
