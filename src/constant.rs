@@ -1190,11 +1190,17 @@ pub const BACKFILL: &str = "
     -- which is what they were presented as all along.
     UPDATE chatbot_message SET truncated = false WHERE truncated = NONE;
 
-    -- An assistant turn is answered by an in-process task, so a restart leaves
-    -- its row `pending` with nobody left to complete it: fail it at boot rather
-    -- than let a reader wait out `CHATBOT_PENDING_STALE_SECS` on every load.
+    -- An assistant turn is answered by an in-process task, so a restart usually
+    -- leaves its row `pending` with nobody left to complete it. Only rows past
+    -- the stale horizon ($stale_ms, from `CHATBOT_PENDING_STALE_SECS`) are
+    -- certainly abandoned though: a young one may still be being answered on the
+    -- other side of the AI bridge, and a deploy must not shoot down a turn
+    -- dispatched seconds ago. Nothing is lost by waiting — a reader already
+    -- presents an over-age `pending` row as failed, and the next boot sweeps for
+    -- real whatever crossed the horizon in the meantime.
     UPDATE chatbot_message SET status = 'failed', error_code = 'interrupted',
-        completed_at = time::unix(time::now()) * 1000 WHERE status = 'pending';
+        completed_at = time::unix(time::now()) * 1000
+        WHERE status = 'pending' AND created_at < time::unix(time::now()) * 1000 - $stale_ms;
 
     -- Promotion out of student now deletes the user's enrollments (2026-07-18);
     -- this sweeps rows promoted before that fix. A deleted user reads as

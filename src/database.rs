@@ -5,7 +5,7 @@ use surrealdb::engine::any::Any;
 use surrealdb::opt::auth::Root;
 
 use crate::config::Config;
-use crate::constant::{BACKFILL, MIGRATION, PRE_REPAIR};
+use crate::constant::{BACKFILL, CHATBOT_PENDING_STALE_SECS, MIGRATION, PRE_REPAIR};
 use crate::error::AppError;
 
 /// The shared database handle.
@@ -79,7 +79,12 @@ pub async fn init_mem() -> Result<Database, AppError> {
 pub async fn migrate(db: &Surreal<Any>) -> Result<(), AppError> {
     db.query(PRE_REPAIR).await?.check()?;
     db.query(MIGRATION).await?.check()?;
-    db.query(BACKFILL).await?.check()?;
+    // Bound, not baked into the SQL string: a `const` cannot be interpolated
+    // into another `const`, and a hand-copied 300000 would drift silently.
+    db.query(BACKFILL)
+        .bind(("stale_ms", CHATBOT_PENDING_STALE_SECS * 1_000))
+        .await?
+        .check()?;
     Ok(())
 }
 
@@ -118,6 +123,49 @@ mod tests {
         assert_eq!(interrupted["status"], "failed");
         assert_eq!(interrupted["error_code"], "interrupted");
         assert!(interrupted["completed_at"].as_i64().unwrap() > 0);
+    }
+
+    /// The other half of the sweep: a restart seconds after a dispatch must not
+    /// kill the turn — the answering task may still be alive on the other side
+    /// of the bridge, and the row is not yet past the stale horizon.
+    #[tokio::test]
+    async fn boot_spares_a_chatbot_message_pending_since_just_now() {
+        let db = super::init_mem().await.unwrap();
+        db.query(
+            "CREATE user:u SET username = 'u', password_hash = 'x';
+             CREATE chatbot_thread:c SET user_id = user:u, created_at = 1, updated_at = 1;
+             CREATE chatbot_message:fresh SET thread_id = chatbot_thread:c, user_id = user:u,
+                 role = 'assistant', content = '', status = 'pending',
+                 created_at = time::unix(time::now()) * 1000 - 2000;
+             CREATE chatbot_message:old SET thread_id = chatbot_thread:c, user_id = user:u,
+                 role = 'assistant', content = '', status = 'pending',
+                 created_at = time::unix(time::now()) * 1000
+                     - ($stale + 1) * 1000;",
+        )
+        .bind(("stale", crate::constant::CHATBOT_PENDING_STALE_SECS))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+        super::migrate(&db).await.unwrap();
+
+        let mut res = db
+            .query(
+                "SELECT status, error_code FROM ONLY chatbot_message:fresh;
+                 SELECT VALUE status FROM ONLY chatbot_message:old;",
+            )
+            .await
+            .unwrap();
+        let fresh: Option<serde_json::Value> = res.take(0).unwrap();
+        let fresh = fresh.unwrap();
+        let old: Option<String> = res.take(1).unwrap();
+        assert_eq!(
+            fresh["status"], "pending",
+            "a two-second-old turn is still being answered"
+        );
+        assert_eq!(fresh["error_code"], serde_json::Value::Null);
+        assert_eq!(old.as_deref(), Some("failed"), "past the horizon it goes");
     }
 
     /// A row written before choices had ids survives the retyped columns: it is
