@@ -2,8 +2,8 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use tokio::sync::Mutex;
 use ulid::Ulid;
 
-use crate::constant::MAX_SESSION_TOPIC_LEN;
-use crate::database::{COURSE_SESSION_TABLE, Database};
+use crate::constant::{COURSE_SESSION_TABLE, MAX_SESSION_TOPIC_LEN};
+use crate::database::Database;
 use crate::domain::course::CourseId;
 use crate::domain::field_update::FieldUpdate;
 use crate::domain::timestamp::Timestamp;

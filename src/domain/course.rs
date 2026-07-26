@@ -1,8 +1,8 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use ulid::Ulid;
 
-use crate::constant::{MAX_COURSE_DESCRIPTION_LEN, MAX_COURSE_TITLE_LEN};
-use crate::database::{COURSE_TABLE, Database};
+use crate::constant::{COURSE_TABLE, MAX_COURSE_DESCRIPTION_LEN, MAX_COURSE_TITLE_LEN};
+use crate::database::Database;
 use crate::domain::field_update::FieldUpdate;
 use crate::domain::term::TermId;
 use crate::domain::user::UserId;

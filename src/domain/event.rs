@@ -4,8 +4,8 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue, Value};
 use tokio::sync::Mutex;
 use ulid::Ulid;
 
-use crate::constant::{MAX_EVENT_DESCRIPTION_LEN, MAX_EVENT_TITLE_LEN};
-use crate::database::{Database, EVENT_TABLE};
+use crate::constant::{EVENT_TABLE, MAX_EVENT_DESCRIPTION_LEN, MAX_EVENT_TITLE_LEN};
+use crate::database::Database;
 use crate::domain::course::CourseId;
 use crate::domain::enrollment::Enrollment;
 use crate::domain::field_update::FieldUpdate;

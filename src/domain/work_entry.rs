@@ -2,7 +2,8 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use tokio::sync::Mutex;
 use ulid::Ulid;
 
-use crate::database::{Database, WORK_ENTRY_TABLE};
+use crate::constant::WORK_ENTRY_TABLE;
+use crate::database::Database;
 use crate::domain::field_update::FieldUpdate;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;

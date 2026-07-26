@@ -11,17 +11,16 @@
 
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
-use crate::constant::{MAX_APPOINTMENT_NOTE_LEN, MAX_SLOT_OCCURRENCES};
-use crate::database::{APPOINTMENT_SLOT_TABLE, Database};
+use crate::constant::{
+    APPOINTMENT_SLOT_TABLE, MAX_APPOINTMENT_NOTE_LEN, MAX_SLOT_OCCURRENCES, MILLIS_PER_WEEK,
+};
+use crate::database::Database;
 use crate::domain::appointment::{APPOINTMENT_LOCK, Appointment};
 use crate::domain::monotonic_id::next_ulid;
-use crate::domain::timestamp::{MILLIS_PER_DAY, Timestamp};
+use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 use crate::validate::validate_optional;
-
-/// One week, the only recurrence step this backend expands.
-const MILLIS_PER_WEEK: i64 = 7 * MILLIS_PER_DAY;
 
 // Slot ids come from [`crate::domain::monotonic_id`]: a recurring publish
 // writes its whole expansion inside one millisecond, which random ULID low
@@ -483,6 +482,7 @@ impl AppointmentSlot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constant::MILLIS_PER_DAY;
 
     fn at(millis: i64) -> Timestamp {
         Timestamp::from_millis(millis)

@@ -13,7 +13,8 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use ulid::Ulid;
 
-use crate::database::{BANK_QUESTION_IMAGE_TABLE, Database};
+use crate::constant::BANK_QUESTION_IMAGE_TABLE;
+use crate::database::Database;
 use crate::domain::bank_question::BankQuestionId;
 use crate::domain::exam_question::ChoiceId;
 use crate::domain::note_file::FileContentType;

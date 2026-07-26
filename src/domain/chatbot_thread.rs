@@ -7,8 +7,8 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use tokio::sync::Mutex;
 use ulid::Ulid;
 
-use crate::constant::MAX_CHATBOT_THREAD_TITLE_LEN;
-use crate::database::{CHATBOT_THREAD_TABLE, Database};
+use crate::constant::{CHATBOT_THREAD_TABLE, MAX_CHATBOT_THREAD_TITLE_LEN};
+use crate::database::Database;
 use crate::domain::settings::Settings;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;

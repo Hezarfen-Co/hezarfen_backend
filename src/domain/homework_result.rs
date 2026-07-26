@@ -13,7 +13,8 @@
 
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
-use crate::database::{Database, HOMEWORK_RESULT_TABLE};
+use crate::constant::HOMEWORK_RESULT_TABLE;
+use crate::database::Database;
 use crate::domain::course::CourseId;
 use crate::domain::exam_result::Mark;
 use crate::domain::homework::HomeworkId;

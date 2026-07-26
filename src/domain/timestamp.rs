@@ -13,11 +13,11 @@
 
 use surrealdb::types::SurrealValue;
 
+use crate::constant::MILLIS_PER_DAY;
+
 /// A unix-millisecond instant (UTC by construction). Stored as an `int`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, SurrealValue)]
 pub struct Timestamp(i64);
-
-pub const MILLIS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
 
 impl Timestamp {
     /// The sole wall-clock read. Everything else derives from this.

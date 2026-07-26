@@ -38,11 +38,8 @@ use axum::response::Response;
 // window arithmetic below testable without sleeping.
 use tokio::time::Instant;
 
+use crate::constant::PURGE_AT;
 use crate::error::AppError;
-
-/// Once the bucket map holds this many distinct client IPs, expired entries are
-/// swept out on the next check. Keeps memory bounded without a reaper task.
-const PURGE_AT: usize = 10_000;
 
 /// Per-IP rate-limit knobs, sourced from the environment (see `.env.example`) and
 /// carried in [`crate::state::AppState`]. A `0` limit disables that tier.
@@ -104,7 +101,7 @@ impl Default for UserRateLimiter {
     /// The chatbot tier at its shipped default, for tests and any caller that
     /// has no [`crate::config::Config`] to hand.
     fn default() -> Self {
-        Self::per_user_minute(crate::config::DEFAULT_CHATBOT_RATE_LIMIT)
+        Self::per_user_minute(crate::constant::DEFAULT_CHATBOT_RATE_LIMIT)
     }
 }
 
@@ -298,7 +295,7 @@ mod tests {
     /// an off-by-one in either direction.
     #[tokio::test(start_paused = true)]
     async fn boundary_is_exact_at_production_scale_limits() {
-        use crate::config::{DEFAULT_API_RATE_LIMIT, DEFAULT_AUTH_RATE_LIMIT};
+        use crate::constant::{DEFAULT_API_RATE_LIMIT, DEFAULT_AUTH_RATE_LIMIT};
 
         for max in [1, DEFAULT_AUTH_RATE_LIMIT, 50, DEFAULT_API_RATE_LIMIT] {
             let limiter = RateLimiter::per_minute(max, false);
@@ -355,7 +352,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn users_get_independent_windows_that_reset() {
         let limiter = UserRateLimiter::default();
-        for _ in 0..crate::config::DEFAULT_CHATBOT_RATE_LIMIT {
+        for _ in 0..crate::constant::DEFAULT_CHATBOT_RATE_LIMIT {
             assert!(limiter.enforce_user("user:a").is_ok());
         }
         assert!(matches!(

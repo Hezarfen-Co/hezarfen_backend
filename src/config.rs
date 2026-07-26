@@ -1,16 +1,10 @@
 use std::env;
 
-use crate::constant::AI_DEFAULT_REQUEST_TIMEOUT_SECS;
+use crate::constant::{
+    AI_DEFAULT_REQUEST_TIMEOUT_SECS, DEFAULT_API_RATE_LIMIT, DEFAULT_AUTH_RATE_LIMIT,
+    DEFAULT_CHATBOT_RATE_LIMIT,
+};
 use crate::rate_limit::RateLimitConfig;
-
-/// Default requests-per-minute-per-IP for `/auth/login` + `/auth/register`.
-pub const DEFAULT_AUTH_RATE_LIMIT: u32 = 10;
-/// Default requests-per-minute-per-IP across the whole API.
-pub const DEFAULT_API_RATE_LIMIT: u32 = 300;
-/// Default chatbot messages per minute *per user*. Sits far above a human
-/// typing while still blunting a scripted fan-out at the AI service behind the
-/// bridge — which is the cost this tier rations, not this process.
-pub const DEFAULT_CHATBOT_RATE_LIMIT: u32 = 20;
 
 /// Runtime configuration, sourced from environment variables (see `.env.example`).
 #[derive(Clone, Debug)]

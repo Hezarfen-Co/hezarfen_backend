@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use ulid::Ulid;
 
-use crate::constant::MAX_SOLUTION_BODY_LEN;
-use crate::database::{Database, SOLUTION_TABLE};
+use crate::constant::{MAX_SOLUTION_BODY_LEN, SOLUTION_TABLE};
+use crate::database::Database;
 use crate::domain::note_file::FileContentType;
 use crate::domain::pool_question::PoolQuestionId;
 use crate::domain::timestamp::Timestamp;

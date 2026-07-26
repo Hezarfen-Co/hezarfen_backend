@@ -1,6 +1,7 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
-use crate::database::{Database, PARENT_LINK_TABLE};
+use crate::constant::PARENT_LINK_TABLE;
+use crate::database::Database;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 

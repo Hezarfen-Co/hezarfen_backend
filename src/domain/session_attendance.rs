@@ -1,6 +1,7 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
-use crate::database::{Database, SESSION_ATTENDANCE_TABLE};
+use crate::constant::SESSION_ATTENDANCE_TABLE;
+use crate::database::Database;
 use crate::domain::attendance::AttendanceStatus;
 use crate::domain::course::CourseId;
 use crate::domain::course_session::{CourseSession, CourseSessionId};

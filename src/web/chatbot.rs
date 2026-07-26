@@ -30,7 +30,9 @@ use utoipa_axum::routes;
 
 use crate::ai::chat::{ChatReplyPayload, ChatRequestPayload, ChatRole, ChatTurn};
 use crate::ai::{AiBridge, AiError};
-use crate::constant::{AI_CHAT_CAPABILITY, CHAT_STREAM_POLL_MS, MAX_CHATBOT_MESSAGE_LEN};
+use crate::constant::{
+    AI_CHAT_CAPABILITY, CHAT_STREAM_POLL_MS, MAX_CHATBOT_MESSAGE_LEN, MIN_CHUNK_CHARS, REPLY_CHUNKS,
+};
 use crate::database::Database;
 use crate::domain::chatbot_message::{
     ChatContent, ChatbotMessage, ChatbotMessageId, MessageRole, MessageStatus,
@@ -51,11 +53,6 @@ pub fn routes() -> OpenApiRouter<AppState> {
         .routes(routes!(read_message))
         .routes(routes!(stream_message))
 }
-
-/// How many `delta` events a completed answer is cut into, and the shortest
-/// chunk worth emitting (see [`slice_reply`]).
-const REPLY_CHUNKS: usize = 8;
-const MIN_CHUNK_CHARS: usize = 24;
 
 // ---- threads ----------------------------------------------------------
 

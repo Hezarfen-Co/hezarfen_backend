@@ -21,8 +21,8 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use tokio::sync::Mutex;
 use ulid::Generator;
 
-use crate::constant::MAX_APPOINTMENT_REASON_LEN;
-use crate::database::{APPOINTMENT_TABLE, Database};
+use crate::constant::{APPOINTMENT_TABLE, MAX_APPOINTMENT_REASON_LEN};
+use crate::database::Database;
 use crate::domain::appointment_slot::{AppointmentSlot, AppointmentSlotId};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;

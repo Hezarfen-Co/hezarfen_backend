@@ -20,13 +20,11 @@ use crate::constant::{
     MAX_MARK, MAX_MAX_CHATBOT_MESSAGE_LEN, MAX_MAX_CHATBOT_THREADS, MAX_MAX_FILE_BYTES,
     MAX_SETTINGS_ITEM_LEN, MAX_SETTINGS_LIST_LEN, MIN_CHATBOT_HISTORY_TURNS, MIN_EXAM_KIND_WEIGHT,
     MIN_MARK, MIN_MAX_CHATBOT_MESSAGE_LEN, MIN_MAX_CHATBOT_THREADS, MIN_MAX_FILE_BYTES,
+    SETTINGS_KEY, SETTINGS_TABLE,
 };
-use crate::database::{Database, SETTINGS_TABLE};
+use crate::database::Database;
 use crate::domain::text_fold;
 use crate::error::{AppError, ValidationError};
-
-/// The singleton's fixed key: one school per deployment, one settings row.
-const SETTINGS_KEY: &str = "school";
 
 /// One exam kind the school runs (`"midterm"`, `"oral"`, …) with its weight:
 /// how many times an exam of that kind counts into its course's average.

@@ -1,6 +1,7 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
-use crate::database::{ATTENDANCE_TABLE, Database};
+use crate::constant::ATTENDANCE_TABLE;
+use crate::database::Database;
 use crate::domain::event::EventId;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};

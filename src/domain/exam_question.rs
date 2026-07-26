@@ -2,9 +2,10 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use ulid::Ulid;
 
 use crate::constant::{
-    MAX_CHOICE_TEXT_LEN, MAX_QUESTION_CHOICES, MAX_QUESTION_TEXT_LEN, MIN_QUESTION_CHOICES,
+    EXAM_QUESTION_TABLE, MAX_CHOICE_TEXT_LEN, MAX_QUESTION_CHOICES, MAX_QUESTION_TEXT_LEN,
+    MIN_QUESTION_CHOICES,
 };
-use crate::database::{Database, EXAM_QUESTION_TABLE};
+use crate::database::Database;
 use crate::domain::bank_question::BankQuestionId;
 use crate::domain::exam::ExamId;
 use crate::domain::monotonic_id::next_ulid;

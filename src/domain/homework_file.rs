@@ -12,8 +12,8 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use tokio::sync::Mutex;
 use ulid::Ulid;
 
-use crate::constant::MAX_HOMEWORK_FILES_PER_SUBMISSION;
-use crate::database::{Database, HOMEWORK_FILE_TABLE};
+use crate::constant::{HOMEWORK_FILE_TABLE, MAX_HOMEWORK_FILES_PER_SUBMISSION};
+use crate::database::Database;
 use crate::domain::course::CourseId;
 use crate::domain::homework::HomeworkId;
 use crate::domain::homework_submission::HomeworkSubmissionId;

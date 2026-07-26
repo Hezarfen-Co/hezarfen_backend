@@ -1,6 +1,7 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
-use crate::database::{Database, EXAM_ATTEMPT_TABLE};
+use crate::constant::EXAM_ATTEMPT_TABLE;
+use crate::database::Database;
 use crate::domain::exam::Exam;
 use crate::domain::exam::ExamId;
 use crate::domain::timestamp::Timestamp;

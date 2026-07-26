@@ -10,8 +10,8 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use tokio::sync::Mutex;
 use ulid::Ulid;
 
-use crate::constant::MAX_TERM_NAME_LEN;
-use crate::database::{Database, TERM_TABLE};
+use crate::constant::{MAX_TERM_NAME_LEN, TERM_TABLE};
+use crate::database::Database;
 use crate::domain::field_update::FieldUpdate;
 use crate::domain::timestamp::Timestamp;
 use crate::error::{AppError, ValidationError};

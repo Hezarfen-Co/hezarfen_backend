@@ -78,7 +78,74 @@ const EXCLUDED: &[(&str, &str)] = &[
         "DEFAULT_EXAM_KINDS",
         "settings seed; the live list is on GET /settings",
     ),
+    // Schema and query text. `constant.rs` is the single home for every
+    // constant, so the migration batches live there too — a client never sees
+    // a byte of SurrealQL.
+    ("PRE_REPAIR", "pre-DDL data repair batch"),
+    ("MIGRATION", "SCHEMAFULL DDL batch"),
+    ("BACKFILL", "post-DDL data backfill batch"),
+    ("USAGE_COUNTS_SQL", "one-statement bank usage-count query"),
+    // Storage-side keys and literals. Each names a row, a column value or a
+    // fold rule the server writes; none is a number a client is held to.
+    ("SETTINGS_KEY", "the settings singleton's record key"),
+    (
+        "DECOY_PASSWORD",
+        "login-decoy input, never a real credential",
+    ),
+    ("STALE_ERROR_CODE", "error_code a stuck answer projects as"),
+    ("TEXT_FOLD_REPLACEMENTS", "server-side search folding table"),
+    // Accepted-value lists that stay off /limits deliberately: unlike roles,
+    // themes and languages (which the endpoint does publish), these are read
+    // back from the resource itself — a question carries its status, a message
+    // its folder — so a client never has to know the set up front.
+    ("STATUS_PENDING", "pool-question lifecycle state"),
+    ("STATUS_APPROVED", "pool-question lifecycle state"),
+    ("POOL_QUESTION_STATUSES", "pool-question lifecycle states"),
+    ("BANK_VISIBILITY_PRIVATE", "bank-question visibility value"),
+    ("BANK_VISIBILITY_SCHOOL", "bank-question visibility value"),
+    ("SENDER_FOLDERS", "folders a sender may file into"),
+    ("RECIPIENT_FOLDERS", "folders a recipient may file into"),
+    // Client-facing, but deliberately not compile-time contracts: these are
+    // per-deployment defaults an operator overrides by environment variable.
+    // `GET /limits` publishes the running server's ACTUAL tiers (from
+    // AppState) in its `rate` group, which is strictly better than publishing
+    // a default a deployment may not use.
+    (
+        "DEFAULT_AUTH_RATE_LIMIT",
+        "env-tunable; live value served in /limits `rate`",
+    ),
+    (
+        "DEFAULT_API_RATE_LIMIT",
+        "env-tunable; live value served in /limits `rate`",
+    ),
+    (
+        "DEFAULT_CHATBOT_RATE_LIMIT",
+        "env-tunable; live value served in /limits `rate`",
+    ),
+    ("MILLIS_PER_DAY", "unit conversion, not a limit"),
+    ("MILLIS_PER_WEEK", "unit conversion, not a limit"),
+    (
+        "MAX_ETAG_BODY_BYTES",
+        "ETag middleware's own buffering ceiling",
+    ),
+    ("PURGE_AT", "rate-limiter bucket eviction threshold"),
+    (
+        "MAX_ERROR_CODE_LEN",
+        "bounds a code the SERVER writes from an AI service's reply; no client sends it",
+    ),
+    ("REPLY_CHUNKS", "how the SSE stream slices an answer"),
+    ("MIN_CHUNK_CHARS", "how the SSE stream slices an answer"),
 ];
+
+/// A `*_TABLE` constant is a SurrealDB table name, not a bound. Listing all 37
+/// by hand would bury the deliberate exclusions above in boilerplate, so the
+/// whole shape is excused once — the naming convention *is* the decision.
+fn is_storage_identifier(name: &str) -> bool {
+    name.ends_with("_TABLE")
+        && !["MAX_", "MIN_", "DEFAULT_"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+}
 
 /// Every `pub const` declared in `src/constant.rs`.
 fn declared_constants(source: &str) -> BTreeSet<String> {
@@ -119,7 +186,11 @@ fn every_constant_is_published_or_deliberately_excluded() {
     let excluded: BTreeSet<&str> = EXCLUDED.iter().map(|(name, _)| *name).collect();
     let missing: Vec<&String> = declared
         .iter()
-        .filter(|name| !excluded.contains(name.as_str()) && !references(&limits, name))
+        .filter(|name| {
+            !excluded.contains(name.as_str())
+                && !is_storage_identifier(name)
+                && !references(&limits, name)
+        })
         .collect();
 
     assert!(
@@ -138,35 +209,12 @@ fn every_constant_is_published_or_deliberately_excluded() {
 /// Constants outside `constant.rs` that the sweep below may ignore — either
 /// because they are not a client-facing bound at all, or because they are
 /// published by a route that reads the *live* value instead of the constant.
-const NOT_A_CLIENT_BOUND: &[(&str, &str)] = &[
-    // Client-facing, but deliberately not compile-time constants: these are
-    // per-deployment defaults an operator overrides by environment variable,
-    // so `constant.rs` is the wrong home for them. `GET /limits` publishes the
-    // running server's ACTUAL tiers (from AppState) in its `rate` group, which
-    // is strictly better than publishing the default a deployment may not use.
-    (
-        "DEFAULT_AUTH_RATE_LIMIT",
-        "env-tunable; live value served in /limits `rate`",
-    ),
-    (
-        "DEFAULT_API_RATE_LIMIT",
-        "env-tunable; live value served in /limits `rate`",
-    ),
-    (
-        "DEFAULT_CHATBOT_RATE_LIMIT",
-        "env-tunable; live value served in /limits `rate`",
-    ),
-    ("MILLIS_PER_DAY", "unit conversion, not a limit"),
-    ("MILLIS_PER_WEEK", "unit conversion, not a limit"),
-    ("MAX_BODY", "ETag middleware's own buffering ceiling"),
-    ("PURGE_AT", "rate-limiter bucket eviction threshold"),
-    (
-        "MAX_ERROR_CODE_LEN",
-        "bounds a code the SERVER writes from an AI service's reply; no client sends it",
-    ),
-    ("REPLY_CHUNKS", "how the SSE stream slices an answer"),
-    ("MIN_CHUNK_CHARS", "how the SSE stream slices an answer"),
-];
+///
+/// Empty since the consolidation that made `constant.rs` the only home for any
+/// constant: every former entry now lives there and is excused (or published)
+/// through `EXCLUDED` above instead. A new name here is a claim that a bound
+/// belongs somewhere else, which needs an argument.
+const NOT_A_CLIENT_BOUND: &[(&str, &str)] = &[];
 
 #[test]
 fn validation_bounds_live_in_constant_rs() {
@@ -195,7 +243,7 @@ fn validation_bounds_live_in_constant_rs() {
             for line in source.lines() {
                 let trimmed = line.trim_start();
                 // Only `const NAME: <numeric> = <digit>` — a bound. Arrays of
-                // accepted values (`Role::ALL`) and string constants are not.
+                // accepted values (`ROLES`) and string constants are not.
                 let Some(rest) = trimmed
                     .strip_prefix("pub const ")
                     .or_else(|| trimmed.strip_prefix("const "))

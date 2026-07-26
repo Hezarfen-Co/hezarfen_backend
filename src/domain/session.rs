@@ -1,8 +1,8 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use ulid::Ulid;
 
-use crate::constant::SESSION_DURATION_DAYS;
-use crate::database::{Database, SESSION_TABLE};
+use crate::constant::{SESSION_DURATION_DAYS, SESSION_TABLE};
+use crate::database::Database;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;

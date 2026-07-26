@@ -5,6 +5,7 @@
 
 use surrealdb::types::SurrealValue;
 
+use crate::constant::{LANGUAGES, THEMES};
 use crate::error::ValidationError;
 
 /// The frontend color scheme.
@@ -20,8 +21,6 @@ pub enum Theme {
 }
 
 impl Theme {
-    pub const ALL: [Theme; 2] = [Theme::Light, Theme::Dark];
-
     /// The wire/storage form. Must stay in lockstep with `rename_all = "lowercase"`.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -32,7 +31,7 @@ impl Theme {
 
     /// Parse a wire string into a theme — the inverse of [`Theme::as_str`].
     pub fn try_from_str(value: &str) -> Result<Self, ValidationError> {
-        Self::ALL
+        THEMES
             .into_iter()
             .find(|theme| theme.as_str() == value)
             .ok_or(ValidationError::Invalid {
@@ -52,8 +51,6 @@ pub enum Language {
 }
 
 impl Language {
-    pub const ALL: [Language; 2] = [Language::Tr, Language::En];
-
     /// The wire/storage form. Must stay in lockstep with `rename_all = "lowercase"`.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -64,7 +61,7 @@ impl Language {
 
     /// Parse a wire string into a language — the inverse of [`Language::as_str`].
     pub fn try_from_str(value: &str) -> Result<Self, ValidationError> {
-        Self::ALL
+        LANGUAGES
             .into_iter()
             .find(|language| language.as_str() == value)
             .ok_or(ValidationError::Invalid {
@@ -81,7 +78,7 @@ mod tests {
 
     #[tokio::test]
     async fn theme_str_round_trips() {
-        for theme in Theme::ALL {
+        for theme in THEMES {
             assert_eq!(Theme::try_from_str(theme.as_str()).unwrap(), theme);
         }
         assert!(Theme::try_from_str("solarized").is_err());
@@ -91,7 +88,7 @@ mod tests {
 
     #[tokio::test]
     async fn language_str_round_trips() {
-        for language in Language::ALL {
+        for language in LANGUAGES {
             assert_eq!(Language::try_from_str(language.as_str()).unwrap(), language);
         }
         assert!(Language::try_from_str("turkish").is_err());
@@ -103,12 +100,12 @@ mod tests {
     async fn surreal_values_are_plain_strings() {
         // `untagged` keeps the stored value a bare string so the `option<string>`
         // columns accept it. Guard that the encoding never regresses.
-        for theme in Theme::ALL {
+        for theme in THEMES {
             let value = theme.into_value();
             assert_eq!(value, Value::String(theme.as_str().to_string()));
             assert_eq!(Theme::from_value(value).unwrap(), theme);
         }
-        for language in Language::ALL {
+        for language in LANGUAGES {
             let value = language.into_value();
             assert_eq!(value, Value::String(language.as_str().to_string()));
             assert_eq!(Language::from_value(value).unwrap(), language);
