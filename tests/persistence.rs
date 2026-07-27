@@ -10,6 +10,7 @@ use axum::Router;
 use axum::http::StatusCode;
 use common::{create_course, create_exam, create_subject, enroll, me_id, send, set_role};
 use hezarfen_backend::database::Database;
+use hezarfen_backend::domain::timestamp::Timestamp;
 use hezarfen_backend::rate_limit::RateLimitConfig;
 use hezarfen_backend::state::AppState;
 use hezarfen_backend::{build_router, database};
@@ -1263,4 +1264,343 @@ async fn cap_counters_are_seeded_from_the_rows_that_predate_them() {
     assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
     let up = common::upload_file(&app, &ali, &note, "eleventh.txt", "", b"x").await;
     assert_eq!(up.status, StatusCode::CONFLICT, "{}", up.body);
+}
+
+/// The appointment slot's counter is the odd one out: it seeds from the
+/// bookings that are still *live*, because a rejected or cancelled one gave the
+/// slot back long before the column existed (2026-07-27). A slot aged into the
+/// pre-counter shape must come back taken if someone is still waiting on it,
+/// and free if nobody is — a flat recount of its rows would get the second case
+/// wrong and lock a free slot out of the calendar for good.
+#[tokio::test]
+async fn slot_occupancy_is_seeded_from_the_bookings_that_are_still_live() {
+    let (app, db) = common::app_and_db().await;
+    let teacher = common::login_as(&app, &db, "teacher", "teacher").await;
+    let veli = common::login(&app, "veli").await;
+    let ayse = common::login(&app, "ayse").await;
+    let now = hezarfen_backend::domain::timestamp::Timestamp::now().as_millis();
+    let hour = 3_600_000;
+
+    async fn publish(app: &Router, who: &str, starts_at: i64) -> String {
+        let res = send(
+            app,
+            "POST",
+            "/appointments/slots",
+            Some(who),
+            Some(json!({ "starts_at": starts_at, "ends_at": starts_at + 3_600_000 })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+        common::id_of(&res.body[0])
+    }
+    async fn book(app: &Router, who: &str, slot: &str) -> common::Res {
+        send(
+            app,
+            "POST",
+            "/appointments",
+            Some(who),
+            Some(json!({ "slot": slot, "reason": "görüşme" })),
+        )
+        .await
+    }
+
+    let taken = publish(&app, &teacher, now + hour).await;
+    let freed = publish(&app, &teacher, now + 3 * hour).await;
+    let held = common::id_of(&book(&app, &veli, &taken).await.body);
+    let gone = common::id_of(&book(&app, &veli, &freed).await.body);
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/appointments/{gone}/reject"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    // Age both slots into the pre-counter shape.
+    db.query("UPDATE appointment_slot UNSET occupied;")
+        .await
+        .expect("age the rows")
+        .check()
+        .expect("age the rows");
+
+    let app = reboot(&db).await;
+
+    // The still-pending booking keeps its slot; the rejected one's slot is free.
+    let res = book(&app, &ayse, &taken).await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+    let res = book(&app, &ayse, &freed).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+
+    // And the seeded seat is still a seat, not a stuck flag: cancelling the
+    // held booking hands it back.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/appointments/{held}/cancel"),
+        Some(&veli),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = book(&app, &ayse, &taken).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+}
+
+/// A submission graded before the freeze moved into the database (2026-07-27)
+/// carries no `graded_by_result` stamp, and an absent stamp is exactly what the
+/// student's writes now take as "still open" — so without the backfill an
+/// upgrade would quietly unfreeze every already-graded submission. The backfill
+/// stamps each one from the grade it already has; graded-but-never-submitted
+/// work has no row to stamp and must stay that way (the report reads
+/// `submitted`/`missing` straight off its absence).
+#[tokio::test]
+async fn graded_submissions_are_stamped_by_the_backfill() {
+    let (app, db) = common::app_and_db().await;
+    let teacher = common::login_as(&app, &db, "teacher", "teacher").await;
+    let ali = common::login(&app, "ali").await;
+    let veli = common::login(&app, "veli").await;
+    let (ali_id, veli_id) = (me_id(&app, &ali).await, me_id(&app, &veli).await);
+    let course = create_course(&app, &teacher, "math").await;
+    let subject = create_subject(&app, &teacher, &course, "algebra").await;
+    enroll(&app, &teacher, &course, &ali_id).await;
+    enroll(&app, &teacher, &course, &veli_id).await;
+    let due_at = Timestamp::now().as_millis() + 86_400_000;
+    let hw = common::create_homework(&app, &teacher, &course, &subject, "essay", due_at).await;
+
+    // Ali hands in and is graded; Veli never hands in and is graded `missing`.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/homework/{hw}/submission"),
+        Some(&ali),
+        Some(json!({ "text": "version A" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    for (user, status) in [(&ali_id, "done"), (&veli_id, "missing")] {
+        let res = send(
+            &app,
+            "POST",
+            &format!("/homework/{hw}/results"),
+            Some(&teacher),
+            Some(json!({ "user": user, "status": status })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    }
+
+    // Age the row into the pre-stamp shape.
+    db.query("UPDATE homework_submission UNSET graded_by_result;")
+        .await
+        .expect("age the row")
+        .check()
+        .expect("age the row");
+    let app = reboot(&db).await;
+
+    let mut stamps = db
+        .query("SELECT VALUE graded_by_result FROM homework_submission; SELECT VALUE id FROM homework_submission;")
+        .await
+        .expect("read stamps")
+        .check()
+        .expect("read stamps");
+    let stamped = stamps
+        .take::<Vec<surrealdb::types::RecordId>>(0)
+        .expect("graded_by_result");
+    let rows = stamps
+        .take::<Vec<surrealdb::types::RecordId>>(1)
+        .expect("submission ids");
+    assert_eq!(rows.len(), 1, "grading absent work must not conjure a row");
+    assert_eq!(
+        stamped.len(),
+        1,
+        "the surviving submission must come back stamped by its grade"
+    );
+    assert_eq!(
+        format!("{:?}", stamped[0].key),
+        format!("{:?}", rows[0].key),
+        "the stamp must name the grade of that very (homework, user) pair"
+    );
+    assert_eq!(
+        stamped[0].table.to_string(),
+        "homework_result",
+        "the stamp must point at the grade table"
+    );
+
+    // And the freeze bites again, which an unstamped row would not have done.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/homework/{hw}/submission"),
+        Some(&ali),
+        Some(json!({ "text": "version B" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+    // Veli, graded but never submitted, still reports as not-submitted.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/homework/{hw}/submission"),
+        Some(&veli),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND, "{}", res.body);
+}
+
+/// A menu written before the seat counter existed (2026-07-27) carries none,
+/// which reads as zero — an uncapped menu for every seat already sold. The
+/// backfill seeds it from the bookings that are still *held*: a cancelled one
+/// gave its seat back long before the column existed, so counting rows flatly
+/// would lock out a seat nobody holds.
+#[tokio::test]
+async fn menu_seats_are_seeded_from_the_bookings_that_are_still_held() {
+    let (app, db) = common::app_and_db().await;
+    let mgr = common::login_as(&app, &db, "seat_mgr", "manager").await;
+    let ali = common::login(&app, "seat_ali").await;
+    let veli = common::login(&app, "seat_veli").await;
+    let ayse = common::login(&app, "seat_ayse").await;
+
+    let res = send(
+        &app,
+        "POST",
+        "/meals/menus",
+        Some(&mgr),
+        Some(json!({ "date": "2026-09-14", "slot": "lunch", "capacity": 2 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let menu = common::id_of(&res.body);
+
+    let book = async |who: &str| {
+        send(
+            &app,
+            "POST",
+            &format!("/meals/menus/{menu}/bookings"),
+            Some(who),
+            Some(json!({})),
+        )
+        .await
+    };
+    let held = book(&ali).await;
+    assert_eq!(held.status, StatusCode::CREATED, "{}", held.body);
+    let given_back = common::id_of(&book(&veli).await.body);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/meals/bookings/{given_back}"),
+        Some(&veli),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    // Age the menu into the pre-counter shape.
+    db.query("UPDATE menu UNSET seats_booked;")
+        .await
+        .expect("age the row")
+        .check()
+        .expect("age the row");
+
+    // Same database, so the router above keeps serving; what matters is that
+    // the migration ran again over the aged row.
+    let _ = reboot(&db).await;
+
+    let mut counted = db
+        .query("SELECT VALUE seats_booked FROM menu")
+        .await
+        .expect("counter read")
+        .check()
+        .expect("counter read");
+    assert_eq!(
+        counted.take::<Vec<i64>>(0).expect("counter column"),
+        vec![1],
+        "only the seat still held may be counted back"
+    );
+
+    // The seeded counter is a real cap, not a decoration: one seat is left.
+    assert_eq!(book(&ayse).await.status, StatusCode::CREATED);
+    assert_eq!(book(&veli).await.status, StatusCode::CONFLICT);
+}
+
+/// A subject written before its two reference counters existed (2026-07-27)
+/// carries neither, and an absent counter reads as zero — which is exactly
+/// "nothing points at me", so the delete guard would wave through a subject
+/// half the school's questions are tagged with. The backfill counts the rows
+/// that actually point at each subject, once.
+///
+/// The bite is the last assertion: seed the counters wrong (or not at all) and
+/// the delete comes back `204` instead of `409`.
+#[tokio::test]
+async fn subject_reference_counts_are_seeded_from_the_rows_that_predate_them() {
+    let (app, db) = common::app_and_db().await;
+    let teacher = common::login_as(&app, &db, "seed_t", "teacher").await;
+    let course = create_course(&app, &teacher, "biology").await;
+    let tagged = create_subject(&app, &teacher, &course, "cells").await;
+    let untouched = create_subject(&app, &teacher, &course, "genes").await;
+    let exam = create_exam(&app, &teacher, &course, "quiz", "quiz").await;
+    for text in ["what?", "why?"] {
+        let res = send(
+            &app,
+            "POST",
+            &format!("/exams/{exam}/questions"),
+            Some(&teacher),
+            Some(json!({
+                "text": text,
+                "kind": "text",
+                "points": 1,
+                "subject_id": tagged,
+            })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    }
+    let due = Timestamp::now().as_millis() + 86_400_000;
+    common::create_homework(&app, &teacher, &course, &tagged, "mitosis", due).await;
+
+    // Age both subjects into the pre-counter shape.
+    db.query("UPDATE subject UNSET exam_question_count, homework_count;")
+        .await
+        .expect("age the rows")
+        .check()
+        .expect("age the rows");
+
+    let app = reboot(&db).await;
+
+    let mut counted = db
+        .query(
+            "SELECT VALUE [exam_question_count ?? 0, homework_count ?? 0] \
+             FROM subject ORDER BY id ASC",
+        )
+        .await
+        .expect("counter read")
+        .check()
+        .expect("counter read");
+    assert_eq!(
+        counted.take::<Vec<Vec<i64>>>(0).expect("counter columns"),
+        vec![vec![2, 1], vec![0, 0]],
+        "each subject must be seeded from the rows that point at it"
+    );
+
+    // The seeded counters are the delete guard itself, not a decoration.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/subjects/{tagged}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/subjects/{untouched}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
 }

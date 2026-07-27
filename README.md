@@ -675,9 +675,9 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/courses/{id}/exams`            | student | List the course's exams (enrolled, creator, assigned teacher, or manager+; drafts appear to course managers only) · paged |
 | GET    | `/exams`                         | student | The caller's visible exams: their courses' (manager+: all; drafts of managed courses only) · paged · `?starts_after=&ends_after=` window (soonest first) |
 | GET    | `/exams/{id}`                    | student | Get exam (enrolled, creator, or manager+; a draft is a `404` for everyone but its course's managers) |
-| PATCH  | `/exams/{id}`                    | teacher | Edit exam incl. `kind` (re-weights it), schedule, `max_attempts`, `allow_rejoin`, `allow_review`, `draft` (course manager; `course` immutable, `mode` frozen once attempted, re-drafting frozen once attempts/results exist — the rest stays live; concurrent edits merge, never silently revert each other) |
+| PATCH  | `/exams/{id}`                    | teacher | Edit exam incl. `kind` (re-weights it), schedule, `max_attempts`, `allow_rejoin`, `allow_review`, `draft` (course manager; `course` immutable, `kind` and `mode` frozen once marks/attempts exist, re-drafting frozen once attempts/results exist — the rest stays live; concurrent edits merge, never silently revert each other) |
 | DELETE | `/exams/{id}`                    | teacher | Delete exam + its results, attempts, questions, answers, and question + answer images (course manager) |
-| POST   | `/exams/{id}/results`            | teacher | `{mark, user_id}` — grade an **enrolled student** (upsert; course manager; students only; drafts can't be graded, `409`) |
+| POST   | `/exams/{id}/results`            | teacher | `{mark, user_id}` — grade an **enrolled student** (upsert; course manager; students only; drafts, and exams whose kind the school has removed, can't be graded, `409`) |
 | GET    | `/exams/{id}/results`            | teacher | List every result for the exam (course manager) · paged |
 | GET    | `/exams/{id}/result`             | student | The caller's **own** result (`404` until graded) |
 | DELETE | `/exams/{id}/results/{user}`     | teacher | Remove a student's result (course manager) |
@@ -773,7 +773,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/attendance/me`                 | student | Own attendance report: events + sessions + per-course tallies |
 | GET    | `/attendance/{user}`             | teacher* | A user's attendance report, narrowed to the caller's courses (manager+: full); *or a `parent` linked to `{user}` — full |
 | GET    | `/settings`                      | student | The school's policy: `exam_kinds` (`{name, weight}` each), `attendance_statuses`, `grade_bands`, `max_file_bytes`, `chatbot_history_turns`, `max_chatbot_threads`, `max_chatbot_message_len` |
-| PATCH  | `/settings`                      | manager | Replace any subset of the fields (lists wholesale); concurrent edits merge, never silently revert each other; `400` on "Invalid lists, bands, file limit, or chat limits"; `409` when a removed exam kind still has graded exams (see "Per-school policy") |
+| PATCH  | `/settings`                      | manager | Replace any subset of the fields (lists wholesale); concurrent edits merge, never silently revert each other; `400` on "Invalid lists, bands, file limit, or chat limits"; `409` when a removed exam kind still has graded exams, or a removed meal slot still has published menus (see "Per-school policy") |
 | POST   | `/terms`                         | manager | `{name, starts_at, ends_at}` — past dates allowed (calendar backfill) |
 | GET    | `/terms`                         | student | List terms, newest first · paged |
 | GET    | `/terms/{id}`                    | student | Get one term                    |
@@ -790,7 +790,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/meals/profiles/me`             | student | The caller's own dietary profile (empty when the school recorded none) |
 | GET    | `/meals/profiles/{user}`         | student | One student's dietary profile; own id always, otherwise teacher+ or a parent link |
 | PATCH  | `/meals/profiles/{user}`         | manager | `{tags?, note?}` — record what a student may not eat (`tags` replaces the list, `"note": null` clears it); **manager+**, a student never edits their own |
-| POST   | `/meals/menus/{id}/bookings`     | student | `{student_id?}` — take a seat; a student books for themselves, a parent for a linked student; `409` when the menu is full or its cutoff has passed |
+| POST   | `/meals/menus/{id}/bookings`     | student | `{student_id?}` — take a seat; a student books for themselves, a parent for a linked student; `409` when the menu is full, its cutoff has passed, or the menu was edited so often mid-booking that the price could not be pinned |
 | GET    | `/meals/bookings/me`             | student | The caller's own bookings (seats held for them + for a parent, their currently linked children's), newest first · paged |
 | GET    | `/meals/menus/{id}/bookings`     | manager | Every booking on one menu, cancelled ones included · paged |
 | DELETE | `/meals/bookings/{bid}`          | student | Cancel a booking (status flip, the row stays); idempotent — cancelling again is a `200` that replays the refund; `409` past the cutoff |
@@ -967,7 +967,9 @@ particular person and a particular topic, so approve/reject still applies.
 
 A booking is `pending`, `approved`, `rejected`, or `cancelled`. The first two
 are **live** and hold the slot; rejecting or cancelling frees it for someone
-else immediately (occupancy is counted live, never stored as a flag). The
+else immediately (the slot carries an `occupied` counter, taken by a booking
+and handed back in the same transaction as the reject or cancel that settles
+it, so the guard holds across replicas). The
 decisions:
 
 - `PATCH /{id}/approve` — the slot's teacher (or manager+) confirms. Refused
@@ -981,7 +983,7 @@ decisions:
   simply by rescheduling to a time that works. Refused (`409`) once the
   meeting's window has started: a
   meeting that already began is history, not a plan. The guard sits in the
-  domain's `cancel` itself, under the appointment lock and on a fresh read, so
+  domain's `cancel` itself, on a fresh read compared-and-set into the row, so
   every way of cancelling — the decline below included — inherits it.
 - `PATCH /{id}/reschedule` (`{starts_at, ends_at}`) — the teacher
   **counter-proposes**. The times land on the *same* row as
@@ -1132,7 +1134,12 @@ editable `settings` singleton (`GET /settings` for any signed-in user,
   re-weights every exam of that kind at once. For the same reason a kind
   whose exams already carry marks cannot be removed from the list (`409`):
   those marks would silently re-weight. An unmarked kind leaves freely, and
-  an exam keeping a since-removed kind counts with weight `1`.
+  an exam keeping a since-removed kind counts with weight `1` — but it can no
+  longer be graded (`409`) until the school offers that kind again, which is
+  what keeps "a marked kind cannot be removed" true from both ends. The same
+  rule pointed at one exam: an exam that already carries marks keeps its
+  `kind` (`PATCH /exams/{id}` answers `409`), because re-pointing it would
+  re-weight those marks just as silently.
 - **`attendance_statuses`** — what attendance marking accepts. The core four
   (`present`, `absent`, `late`, `excused`) are mandatory because the
   attendance rate is defined over them (`(present+late) /
@@ -1167,7 +1174,8 @@ policy still matches the snapshot it merged from (retrying over the fresh row
 otherwise), so two managers patching different fields both land instead of
 the later write silently reverting the earlier one. Editing a list never
 rewrites history: an exam keeps its retired kind, a roll-call row keeps its
-retired status — only **new writes** are held to the current lists.
+retired status — only **new writes** are held to the current lists (which is
+why grading an exam whose kind has left the list is refused).
 
 The kitchen is data too: a manager publishes a **menu** per calendar day and meal slot, with its dishes, their dietary tags, and prices in minor units; booking a seat charges that price as a snapshot and an admin records the cash that comes back in (see "Food program: menus, dishes, bookings & the ledger").
 
@@ -1698,9 +1706,12 @@ a bank row **never freezes** — its owner can edit or delete it forever.
 
 `POST /bank-questions` (teacher+) saves one, stamping the caller as its
 **owner**. `subject_id` is origin metadata, but it must **exist** — an unknown
-subject is a `400` (create and PATCH alike); the reverse guard holds too, so
-deleting a subject a template still references is a `409` (same as exam
-questions and homework). Reads are school-wide: `GET /bank-questions` lists the
+subject is a `400` (create and PATCH alike). The reverse guard does **not**
+hold here, unlike exam questions and homework: a template never blocks a
+subject delete, which simply clears `subject` off every template that carried
+it (only a template's owner may re-tag it, so a `409` would be one a manager
+could never clear — and a private template raising it would leak its
+existence). Reads are school-wide: `GET /bank-questions` lists the
 whole bank (paged, `?subject=<id>` narrows by origin subject, `?owner=<id>` — or
 `?owner=me` — by owner) and `GET /bank-questions/{bid}` fetches one with
 `correct` included — any teacher+ can browse and reuse what any colleague
@@ -2274,6 +2285,47 @@ as the message's `error_code`.
 add fields (a model name, token counts) and a future backend may send more
 context without either end having to be redeployed in lockstep.
 
+## Concurrency model
+
+The backend runs as more than one replica against one database, so every
+invariant is guarded where all replicas can see it. Three tiers:
+
+1. **Single-row conditional writes** — compare-and-set (`save_if_unchanged`),
+   `UPDATE … WHERE`, stored counters (`domain::cap`), leases. These hold
+   *across replicas*: the database decides the winner, the loser retries or
+   gets a 409.
+2. **In-transaction `IF … THROW` gates** — the check runs inside the same
+   statement as the write it authorizes, so it is atomic with it. Used where
+   the rule reads the row being written (state machines, delete guards).
+   "Is anything still attached?" is answered the same way, by a counter on the
+   row being deleted rather than a `SELECT` over the children: a course is
+   deletable while its `enrollment_count` is zero, a term while its
+   `course_count` is (courses claim that reference *before* they write the
+   link, and give it back when the link moves or the course is deleted).
+   Where the child also carries a deterministic id — one enrollment per
+   (course, user), one registration per (event, user) — the seat and the row
+   are claimed in one transaction (`cap::claim_and_create`), so a duplicate
+   `CREATE` rolls its own seat back instead of costing a stranger their place.
+3. **Two accepted races**, reviewed and deliberately left open:
+   - *Attempt-seq late save* — a save racing a retake can stamp an answer onto
+     the just-terminal previous sitting. Damage: one history row; the grade of
+     record (latest `seq`) is never touched.
+   - *Approved-overlap* — two replicas approving in the same instant can
+     double-book a teacher. Damage: one overlapping half-hour, visible to both
+     parties, fixable by cancelling either side.
+
+In-process locks that remain do so for reasons a database write cannot serve:
+`PRESENCE_LOCK` guards in-process socket state, `CLAIM_LOCK` keeps one
+counter writer per process (the `WHERE` clause is the cap — the lock only
+tames the retry loop, and keeps the tests' in-memory engine deterministic),
+`APPOINTMENT_LOCK` still collapses the common within-replica overlap case.
+
+Deployment contract: a release that adds or renames a stored counter must
+restart *all* replicas together (`podman compose down` + `up`), never rolling.
+An old binary writes rows without touching the new counters, the `= NONE`
+backfill guard (correctly) refuses to re-seed, and the resulting permanent
+under-count lets a guard approve exactly what it exists to refuse.
+
 ## Layout
 
 ```
@@ -2310,7 +2362,9 @@ src/
     cap.rs         claim()/release(): the cross-replica count caps — an atomic
                    `UPDATE parent SET n += 1 WHERE n < cap` on a counter column
                    of the parent row, replacing the per-process mutexes that
-                   only held while one instance owned the database
+                   only held while one instance owned the database;
+                   claim_and_create() commits that seat and the child row in
+                   one transaction, for children with a deterministic id
     text_fold.rs   case- and diacritic-insensitive folding for search, shared by
                    the Rust needle and the SurrealQL column (Turkish İ/ı, ü, ö…)
     session.rs     SessionId · SessionToken · Session (7-day expiry)
@@ -2374,8 +2428,9 @@ src/
                    AppointmentSlot (a teacher's published availability; a
                    recurring publish is expanded into rows sharing a series id)
     appointment.rs AppointmentId · AppointmentStatus · AppointmentReason ·
-                   Appointment (a booking on a slot; occupancy and overlap are
-                   derived under APPOINTMENT_LOCK, never stored)
+                   Appointment (a booking on a slot; occupancy is the slot's
+                   stored `occupied` cap-1 counter, overlap is derived under
+                   APPOINTMENT_LOCK)
     pomodoro.rs    PomodoroSessionId · PomodoroSession (student focus log)
     pool_question.rs PoolQuestionId · PoolQuestionTitle · PoolQuestionBody ·
                    PoolQuestion (student-asked question; teacher-approved into

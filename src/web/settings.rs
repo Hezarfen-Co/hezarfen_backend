@@ -5,14 +5,17 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use surrealdb::types::RecordId;
+
 use crate::constant::CAS_UPDATE_RETRIES;
-use crate::domain::exam_result::ExamResult;
-use crate::domain::menu::{MENU_LOCK, Menu};
+use crate::database::Database;
+use crate::domain::cap;
+use crate::domain::exam_result::kind_ref;
+use crate::domain::menu::slot_ref;
 use crate::domain::settings::{ExamKindDef, GradeBand, MealSlotDef, Settings};
 use crate::error::{AppError, ErrorResponse};
 use crate::state::AppState;
 
-use super::exams::EXAM_LOCK;
 use super::{CurrentUser, RequireManager, set_or_clear};
 
 pub fn routes() -> OpenApiRouter<AppState> {
@@ -231,7 +234,8 @@ async fn get_settings(
 /// every exam of that kind. For that reason a kind whose exams already carry
 /// marks cannot be dropped from the list (409) — those marks would silently
 /// re-weight to 1; an unmarked kind leaves freely, and an exam whose kind is
-/// gone counts with weight 1 until the kind returns. `max_file_bytes` likewise
+/// gone counts with weight 1 but cannot be graded (409) until the kind
+/// returns — the other end of the same rule. `max_file_bytes` likewise
 /// applies at upload time only — already-stored files keep their size, and the
 /// chatbot knobs apply to the next chat request only. `meal_slots` follows the
 /// exam-kind rule: a slot a menu was already published for cannot be dropped
@@ -259,21 +263,6 @@ async fn update_settings(
     // otherwise a concurrent PATCH of a *different* field would be silently
     // reverted by whichever whole-row write lands second. A refused save
     // reloads and re-merges, so both edits land.
-    // Writer lease of [`EXAM_LOCK`] while the kind list is being replaced: the
-    // no-marks check below and the save are one unit, so a grade (a reader)
-    // can't land the first mark of a kind that is being dropped mid-flight.
-    let _guard = match req.exam_kinds {
-        Some(_) => Some(EXAM_LOCK.write().await),
-        None => None,
-    };
-    // Same shape for the slot list: the "was a menu ever published for it?"
-    // check and the save are one unit, so a publish cannot land on a slot that
-    // is being dropped mid-flight. Taken after EXAM_LOCK; nothing under
-    // MENU_LOCK ever takes EXAM_LOCK, so the pair cannot deadlock.
-    let _menu_guard = match req.meal_slots {
-        Some(_) => Some(MENU_LOCK.lock().await),
-        None => None,
-    };
     for _ in 0..CAS_UPDATE_RETRIES {
         let current = Settings::load(&st.db).await?;
 
@@ -284,26 +273,6 @@ async fn update_settings(
                 .collect::<Result<Vec<_>, _>>()?,
             None => current.get_exam_kinds().to_vec(),
         };
-        // A kind that graded exams still count under cannot leave the list —
-        // weights are read live, so dropping it would silently re-weight every
-        // mark of that kind. Re-checked on every retry: the snapshot it is
-        // diffed against is the one the save is conditioned on.
-        for gone in current.get_exam_kinds().iter().filter(|kind| {
-            !exam_kinds
-                .iter()
-                .any(|new| new.get_name() == kind.get_name())
-        }) {
-            if ExamResult::any_for_kind(gone.get_name(), &st.db).await? {
-                return Err(AppError::ConflictOwned(format!(
-                    "exams of kind '{}' are already graded — the kind cannot be removed",
-                    gone.get_name()
-                )));
-            }
-        }
-        // Same shape for meal slots: a slot a menu was already published for
-        // cannot leave the list — the menu snapshotted the name as text, and a
-        // slot no longer offered would leave that menu unreachable from the
-        // school's own list.
         let meal_slots = match &req.meal_slots {
             Some(slots) => slots
                 .iter()
@@ -311,18 +280,6 @@ async fn update_settings(
                 .collect::<Result<Vec<_>, _>>()?,
             None => current.get_meal_slots(),
         };
-        for gone in current.get_meal_slots().iter().filter(|slot| {
-            !meal_slots
-                .iter()
-                .any(|new| new.get_name() == slot.get_name())
-        }) {
-            if Menu::any_for_slot(gone.get_name(), &st.db).await? {
-                return Err(AppError::ConflictOwned(format!(
-                    "menus are already published for the '{}' slot — it cannot be removed",
-                    gone.get_name()
-                )));
-            }
-        }
         let attendance_statuses = req
             .attendance_statuses
             .clone()
@@ -334,6 +291,13 @@ async fn update_settings(
                 .collect::<Result<Vec<_>, _>>()?,
             None => current.get_grade_bands().to_vec(),
         };
+        // The name lists as they stand and as they would stand, for the removal
+        // guards below — a list edit is judged by which names it drops.
+        let was_kinds = kind_names(current.get_exam_kinds());
+        let now_kinds = kind_names(&exam_kinds);
+        let was_slots = slot_names(&current.get_meal_slots());
+        let now_slots = slot_names(&meal_slots);
+
         // Merge over the snapshot's resolved values: an omitted field keeps
         // whatever the row (or the default behind an unset field) reads as.
         let mut params = current.params();
@@ -361,11 +325,105 @@ async fn update_settings(
             .unwrap_or(params.meal_cancel_cutoff_minutes);
 
         let settings = Settings::try_new(params)?;
-        if let Some(saved) = settings.save_if_unchanged(&current, &st.db).await? {
-            return Ok(Json(SettingsResponse::new(&saved)));
+
+        // The removal guards. A name leaves a list by being *retired* on its
+        // reference counter — one conditional write on one record, which lands
+        // only while nothing references the name and refuses every claim from
+        // that instant on. That is the whole guard: the check and the removal
+        // used to be a cross-table count and a save held together by a
+        // process-wide lock, which the second replica walked straight through.
+        //
+        // Retired before the save, never after: the other order leaves a window
+        // in which a mark lands under a kind the settings no longer list. A save
+        // that then does not land undoes them (`restore`) before the next try.
+        let mut retired: Vec<RecordId> = Vec::new();
+        let mut refused = None;
+        for gone in missing(&was_kinds, &now_kinds) {
+            let counter = kind_ref(&gone);
+            if !cap::retire(&counter, &st.db).await? {
+                refused = Some(AppError::ConflictOwned(format!(
+                    "exams of kind '{gone}' are already graded — the kind cannot be removed"
+                )));
+                break;
+            }
+            retired.push(counter);
+        }
+        // Same shape for meal slots: a slot a menu was already published for
+        // cannot leave the list — the menu snapshotted the name as text, and a
+        // slot no longer offered would leave that menu unreachable from the
+        // school's own list.
+        if refused.is_none() {
+            for gone in missing(&was_slots, &now_slots) {
+                let counter = slot_ref(&gone);
+                if !cap::retire(&counter, &st.db).await? {
+                    refused = Some(AppError::ConflictOwned(format!(
+                        "menus are already published for the '{gone}' slot — it cannot be removed"
+                    )));
+                    break;
+                }
+                retired.push(counter);
+            }
+        }
+        if let Some(refused) = refused {
+            restore(&retired, &st.db).await?;
+            return Err(refused);
+        }
+        // A name re-entering a list is back in service: its counter still
+        // carries the retirement from the edit that dropped it, and a mark (or
+        // a menu) under a kind the school offers again must not be refused.
+        for back in missing(&now_kinds, &was_kinds) {
+            cap::unretire(&kind_ref(&back), &st.db).await?;
+        }
+        for back in missing(&now_slots, &was_slots) {
+            cap::unretire(&slot_ref(&back), &st.db).await?;
+        }
+
+        match settings.save_if_unchanged(&current, &st.db).await {
+            Ok(Some(saved)) => return Ok(Json(SettingsResponse::new(&saved))),
+            // The row moved under the snapshot these guards were judged against:
+            // put the names back and re-merge, or the next attempt would decide
+            // against a list nobody asked for.
+            Ok(None) => restore(&retired, &st.db).await?,
+            Err(err) => {
+                restore(&retired, &st.db).await?;
+                return Err(err);
+            }
         }
     }
     Err(AppError::Conflict(
         "the settings kept changing underneath this update — try again",
     ))
+}
+
+fn kind_names(kinds: &[ExamKindDef]) -> Vec<String> {
+    kinds
+        .iter()
+        .map(|kind| kind.get_name().to_string())
+        .collect()
+}
+
+fn slot_names(slots: &[MealSlotDef]) -> Vec<String> {
+    slots
+        .iter()
+        .map(|slot| slot.get_name().to_string())
+        .collect()
+}
+
+/// The names `before` carries that `after` does not — a list edit's removals,
+/// or its additions with the arguments swapped.
+fn missing(before: &[String], after: &[String]) -> Vec<String> {
+    before
+        .iter()
+        .filter(|name| !after.contains(name))
+        .cloned()
+        .collect()
+}
+
+/// Put back every name this attempt retired: the edit that would have removed
+/// them did not land, so they are still names the school offers.
+async fn restore(names: &[RecordId], db: &Database) -> Result<(), AppError> {
+    for name in names {
+        cap::unretire(name, db).await?;
+    }
+    Ok(())
 }

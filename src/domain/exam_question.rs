@@ -3,10 +3,11 @@ use ulid::Ulid;
 
 use crate::constant::{
     EXAM_QUESTION_TABLE, MAX_CHOICE_TEXT_LEN, MAX_QUESTION_CHOICES, MAX_QUESTION_TEXT_LEN,
-    MIN_QUESTION_CHOICES,
+    MIN_QUESTION_CHOICES, SUBJECT_QUESTION_COUNT_FIELD,
 };
 use crate::database::Database;
 use crate::domain::bank_question::BankQuestionId;
+use crate::domain::cap;
 use crate::domain::exam::ExamId;
 use crate::domain::exam_attempt::ExamAttempt;
 use crate::domain::monotonic_id::next_ulid;
@@ -393,6 +394,20 @@ impl ExamQuestion {
         from_bank: Option<BankQuestionId>,
         db: &Database,
     ) -> Result<ExamQuestion, AppError> {
+        // Take the subject's reference before the row exists, exactly as a cap
+        // is claimed before the child it caps ([`cap::claim`], here uncapped):
+        // the subject delete is conditioned on that counter reading zero, so
+        // the two contend on the subject record and a question can no longer
+        // land on a subject another replica is deleting. A miss means the
+        // subject is already gone — the same 400 the web layer's pre-flight
+        // check answers with.
+        let counted = subject.record();
+        if !cap::claim(&counted, SUBJECT_QUESTION_COUNT_FIELD, cap::UNLIMITED, db).await? {
+            return Err(AppError::Validation(ValidationError::Invalid {
+                field: "subject_id",
+                reason: "subject does not exist",
+            }));
+        }
         let question = ExamQuestion {
             id: ExamQuestionId::generate(),
             exam: exam.clone(),
@@ -409,18 +424,28 @@ impl ExamQuestion {
         // The freeze gate rides in the same transaction as the insert: a
         // question cannot appear under an exam somebody has already started,
         // whichever replica the two requests hit.
-        let mut result = db
-            .query(ExamAttempt::unfrozen("CREATE $id CONTENT $question;"))
-            .bind(("freeze_exam", exam.record()))
-            .bind(("id", question.id.record()))
-            .bind(("question", question))
-            .await?;
-        ExamAttempt::frozen_check(&mut result)?;
-        result
-            .take::<Vec<ExamQuestion>>(ExamAttempt::FROZEN_SLOT)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| AppError::Internal("failed to create exam question".into()))
+        let inserted = async {
+            let mut result = db
+                .query(ExamAttempt::unfrozen("CREATE $id CONTENT $question;"))
+                .bind(("freeze_exam", exam.record()))
+                .bind(("id", question.id.record()))
+                .bind(("question", question))
+                .await?;
+            ExamAttempt::frozen_check(&mut result)?;
+            result
+                .take::<Vec<ExamQuestion>>(ExamAttempt::FROZEN_SLOT)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| AppError::Internal("failed to create exam question".into()))
+        }
+        .await;
+        if inserted.is_err() {
+            // The row never landed (a frozen exam, most often), so the
+            // reference it took goes straight back — otherwise the subject
+            // would be undeletable for a question that does not exist.
+            cap::release(&counted, SUBJECT_QUESTION_COUNT_FIELD, db).await?;
+        }
+        inserted
     }
 
     pub async fn read(
@@ -443,17 +468,6 @@ impl ExamQuestion {
             .await
     }
 
-    /// Whether any question anywhere references `subject` — the gate that
-    /// blocks deleting a subject still in use.
-    pub async fn any_for_subject(subject: &SubjectId, db: &Database) -> Result<bool, AppError> {
-        let mut result = db
-            .query("SELECT VALUE id FROM exam_question WHERE subject = $subject LIMIT 1")
-            .bind(("subject", subject.record()))
-            .await?
-            .check()?;
-        Ok(!result.take::<Vec<RecordId>>(0)?.is_empty())
-    }
-
     /// Write the editable fields, refused outright once the exam has an
     /// attempt — the freeze gate is part of this transaction, not a check the
     /// caller made a moment earlier under a lock.
@@ -472,26 +486,49 @@ impl ExamQuestion {
         spec: QuestionSpec,
         db: &Database,
     ) -> Result<ExamQuestion, AppError> {
-        let mut result = db
-            .query(ExamAttempt::unfrozen(
-                "UPDATE $id SET subject = $subject, text = $text, points = $points,
-                 kind = $kind, choices = $choices, correct = $correct RETURN AFTER;",
-            ))
-            .bind(("freeze_exam", self.exam.record()))
-            .bind(("id", self.id.record()))
-            .bind(("subject", subject.record()))
-            .bind(("text", text))
-            .bind(("points", points))
-            .bind(("kind", spec.kind))
-            .bind(("choices", spec.choices))
-            .bind(("correct", spec.correct))
-            .await?;
-        ExamAttempt::frozen_check(&mut result)?;
-        result
-            .take::<Vec<ExamQuestion>>(ExamAttempt::FROZEN_SLOT)?
-            .into_iter()
-            .next()
-            .ok_or(AppError::NotFound)
+        // A re-tag moves a reference: the new subject is claimed *before* the
+        // write and the old one released only once it lands, so at no instant
+        // is either subject under-counted — the direction that would let one be
+        // deleted while this question still points at it. Both counters staying
+        // put is the ordinary case (`subject` omitted from the PATCH), and it
+        // costs nothing.
+        let retag = (subject != self.subject).then(|| (subject.record(), self.subject.record()));
+        if let Some((next, _)) = &retag
+            && !cap::claim(next, SUBJECT_QUESTION_COUNT_FIELD, cap::UNLIMITED, db).await?
+        {
+            return Err(AppError::Validation(ValidationError::Invalid {
+                field: "subject_id",
+                reason: "subject does not exist",
+            }));
+        }
+        let written = async {
+            let mut result = db
+                .query(ExamAttempt::unfrozen(
+                    "UPDATE $id SET subject = $subject, text = $text, points = $points,
+                     kind = $kind, choices = $choices, correct = $correct RETURN AFTER;",
+                ))
+                .bind(("freeze_exam", self.exam.record()))
+                .bind(("id", self.id.record()))
+                .bind(("subject", subject.record()))
+                .bind(("text", text))
+                .bind(("points", points))
+                .bind(("kind", spec.kind))
+                .bind(("choices", spec.choices))
+                .bind(("correct", spec.correct))
+                .await?;
+            ExamAttempt::frozen_check(&mut result)?;
+            result
+                .take::<Vec<ExamQuestion>>(ExamAttempt::FROZEN_SLOT)?
+                .into_iter()
+                .next()
+                .ok_or(AppError::NotFound)
+        }
+        .await;
+        if let Some((next, previous)) = &retag {
+            let give_back = if written.is_ok() { previous } else { next };
+            cap::release(give_back, SUBJECT_QUESTION_COUNT_FIELD, db).await?;
+        }
+        written
     }
 
     /// Point the question's `banked_as` at the bank template it was just saved
@@ -538,15 +575,25 @@ impl ExamQuestion {
             .query(ExamAttempt::unfrozen(
                 "DELETE exam_answer WHERE question = $q;
                  DELETE question_image WHERE question = $q;
-                 DELETE $q RETURN BEFORE;",
+                 LET $gone = (DELETE $q RETURN BEFORE);
+                 FOR $sub IN ($gone.subject ?? []) {
+                     UPDATE $sub SET exam_question_count =
+                         math::max([(exam_question_count ?? 0) - 1, 0])
+                 };
+                 RETURN $gone;",
             ))
             .bind(("freeze_exam", self.exam.record()))
             .bind(("q", self.id.record()))
             .await?;
         ExamAttempt::frozen_check(&mut result)?;
-        // Two cascade statements ahead of the delete itself.
+        // The subject's reference is given back inside this same transaction,
+        // driven off what the delete actually removed — a question that wasn't
+        // there decrements nothing. Read through the trailing `RETURN` rather
+        // than a hand-counted slot, so inserting a cascade statement above can
+        // never turn a delete into a 404 (see [`crate::domain::exam::Exam`]).
+        let slot = result.num_statements().saturating_sub(2);
         result
-            .take::<Vec<ExamQuestion>>(ExamAttempt::FROZEN_SLOT + 2)?
+            .take::<Vec<ExamQuestion>>(slot)?
             .into_iter()
             .next()
             .ok_or(AppError::NotFound)

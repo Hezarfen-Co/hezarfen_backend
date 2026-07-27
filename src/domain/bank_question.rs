@@ -771,10 +771,25 @@ mod tests {
 
         let exam = ExamId::generate();
         let other_exam = ExamId::generate();
-        async fn instantiate(exam: &ExamId, source: &BankQuestion, db: &Database) {
+        // A real subject row: an exam question claims a reference on its
+        // subject, so a minted id it never wrote would be refused.
+        let subject = crate::domain::subject::Subject::create(
+            &crate::domain::course::CourseId::generate(),
+            crate::domain::subject::SubjectName::try_new("topic").unwrap(),
+            crate::domain::subject::SubjectDescription::try_new("").unwrap(),
+            &db,
+        )
+        .await
+        .unwrap();
+        async fn instantiate(
+            exam: &ExamId,
+            subject: &SubjectId,
+            source: &BankQuestion,
+            db: &Database,
+        ) {
             ExamQuestion::create_from_bank(
                 exam,
-                SubjectId::generate(),
+                subject.clone(),
                 source.get_text().clone(),
                 source.get_points(),
                 source.spec(),
@@ -785,13 +800,13 @@ mod tests {
             .unwrap();
         }
         // Two copies of the same template, in two different exams.
-        instantiate(&exam, &used_twice, &db).await;
-        instantiate(&other_exam, &used_twice, &db).await;
-        instantiate(&exam, &used_once, &db).await;
+        instantiate(&exam, subject.get_id(), &used_twice, &db).await;
+        instantiate(&other_exam, subject.get_id(), &used_twice, &db).await;
+        instantiate(&exam, subject.get_id(), &used_once, &db).await;
         // A hand-authored question has no `from_bank` and must not be tallied.
         ExamQuestion::create(
             &exam,
-            SubjectId::generate(),
+            subject.get_id().clone(),
             QuestionText::try_new("mine").unwrap(),
             QuestionPoints::try_new(1).unwrap(),
             spec(),

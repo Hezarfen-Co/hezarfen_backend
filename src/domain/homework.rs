@@ -13,8 +13,12 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use ulid::Ulid;
 
-use crate::constant::{HOMEWORK_TABLE, MAX_HOMEWORK_DESCRIPTION_LEN, MAX_HOMEWORK_TITLE_LEN};
+use crate::constant::{
+    HOMEWORK_TABLE, MAX_HOMEWORK_DESCRIPTION_LEN, MAX_HOMEWORK_TITLE_LEN,
+    SUBJECT_HOMEWORK_COUNT_FIELD,
+};
 use crate::database::Database;
+use crate::domain::cap;
 use crate::domain::course::CourseId;
 use crate::domain::field_update::FieldUpdate;
 use crate::domain::subject::SubjectId;
@@ -156,6 +160,20 @@ impl Homework {
         created_by: &UserId,
         db: &Database,
     ) -> Result<Homework, AppError> {
+        // Take the subject's reference before the row exists — the exam
+        // question's twin ([`crate::domain::exam_question::ExamQuestion`]): the
+        // subject delete is refused while this counter is non-zero, so the
+        // create and the delete contend on the subject record rather than on a
+        // cross-table count only one replica could see. A miss means the
+        // subject is already gone, which is the 400 the web layer's pre-flight
+        // check answers with.
+        let counted = subject.record();
+        if !cap::claim(&counted, SUBJECT_HOMEWORK_COUNT_FIELD, cap::UNLIMITED, db).await? {
+            return Err(AppError::Validation(ValidationError::Invalid {
+                field: "subject_id",
+                reason: "subject does not exist",
+            }));
+        }
         let homework = Homework {
             id: HomeworkId::generate(),
             course: course.clone(),
@@ -167,8 +185,20 @@ impl Homework {
             created_by: created_by.clone(),
             created_at: Timestamp::now(),
         };
-        let created: Option<Homework> = db.create(homework.id.record()).content(homework).await?;
-        created.ok_or_else(|| AppError::Internal("failed to create homework".into()))
+        let created: Result<Option<Homework>, AppError> = db
+            .create(homework.id.record())
+            .content(homework)
+            .await
+            .map_err(AppError::from);
+        match created {
+            Ok(Some(homework)) => Ok(homework),
+            other => {
+                // Nothing landed, so the reference goes straight back.
+                cap::release(&counted, SUBJECT_HOMEWORK_COUNT_FIELD, db).await?;
+                other?;
+                Err(AppError::Internal("failed to create homework".into()))
+            }
+        }
     }
 
     pub async fn read(id: &HomeworkId, db: &Database) -> Result<Option<Homework>, AppError> {
@@ -242,19 +272,6 @@ impl Homework {
         Ok(result.take::<Vec<Homework>>(0)?)
     }
 
-    /// Whether any homework still references `subject` — the subject delete
-    /// guard's question: a subject with homework can't be deleted until the
-    /// homework is re-tagged or removed. Mirrors
-    /// [`crate::domain::exam_question::ExamQuestion::any_for_subject`].
-    pub async fn any_for_subject(subject: &SubjectId, db: &Database) -> Result<bool, AppError> {
-        let mut result = db
-            .query("SELECT VALUE id FROM homework WHERE subject = $subject LIMIT 1")
-            .bind(("subject", subject.record()))
-            .await?
-            .check()?;
-        Ok(!result.take::<Vec<RecordId>>(0)?.is_empty())
-    }
-
     /// Re-tag, re-title, re-describe, re-schedule, or re-scope the homework.
     /// Request-scoped: every parameter is `Option`, `None` meaning the PATCH
     /// did not carry that field, so it is not written at all. Handing the
@@ -279,14 +296,35 @@ impl Homework {
     ) -> Result<Homework, AppError> {
         let assigned = assigned
             .map(|subset| subset.map(|users| users.iter().map(UserId::record).collect::<Vec<_>>()));
-        FieldUpdate::new(self.id.record())
+        // A re-tag moves a reference: claim the new subject before the write,
+        // release the old only after it lands, so neither is ever
+        // under-counted (the direction that would let a subject this homework
+        // points at be deleted). Same shape as the exam question's re-tag.
+        let retag = subject
+            .as_ref()
+            .filter(|next| **next != self.subject)
+            .map(|next| (next.record(), self.subject.record()));
+        if let Some((next, _)) = &retag
+            && !cap::claim(next, SUBJECT_HOMEWORK_COUNT_FIELD, cap::UNLIMITED, db).await?
+        {
+            return Err(AppError::Validation(ValidationError::Invalid {
+                field: "subject_id",
+                reason: "subject does not exist",
+            }));
+        }
+        let written = FieldUpdate::new(self.id.record())
             .set("subject", subject.map(|subject| subject.record()))
             .set("title", title)
             .set("description", description)
             .set("due_at", due_at)
             .set("assigned", assigned)
             .run::<Homework>(db)
-            .await
+            .await;
+        if let Some((next, previous)) = &retag {
+            let give_back = if written.is_ok() { previous } else { next };
+            cap::release(give_back, SUBJECT_HOMEWORK_COUNT_FIELD, db).await?;
+        }
+        written
     }
 
     /// Delete the homework and cascade its submissions, their files, and its
@@ -302,14 +340,21 @@ impl Homework {
                  DELETE homework_file WHERE submission IN (SELECT VALUE id FROM homework_submission WHERE homework = $hw);
                  DELETE homework_submission WHERE homework = $hw;
                  DELETE homework_result WHERE homework = $hw;
-                 DELETE $hw RETURN BEFORE;
+                 LET $gone = (DELETE $hw RETURN BEFORE);
+                 FOR $sub IN ($gone.subject ?? []) {
+                     UPDATE $sub SET homework_count = math::max([(homework_count ?? 0) - 1, 0])
+                 };
+                 RETURN $gone;
                  COMMIT TRANSACTION;",
             )
             .bind(("hw", self.id.record()))
             .await?
             .check()?;
-        // BEGIN is slot 0; the homework's own DELETE is slot 4.
-        let deleted: Option<Homework> = result.take::<Vec<Homework>>(4)?.into_iter().next();
+        // The subject's reference is given back in this same transaction, off
+        // what the delete actually removed. Read through the trailing `RETURN`,
+        // not a hand-counted slot — see [`crate::domain::exam::Exam::delete`].
+        let slot = result.num_statements().saturating_sub(2);
+        let deleted: Option<Homework> = result.take::<Vec<Homework>>(slot)?.into_iter().next();
         deleted.ok_or(AppError::NotFound)
     }
 }

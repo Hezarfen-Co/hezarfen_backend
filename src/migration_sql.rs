@@ -180,6 +180,9 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS name ON term TYPE string;
     DEFINE FIELD IF NOT EXISTS starts_at ON term TYPE int;
     DEFINE FIELD IF NOT EXISTS ends_at ON term TYPE int;
+    -- Courses still linking this term, the cross-replica delete guard (see
+    -- `crate::domain::cap`). Absent reads as zero, so no Rust struct needs it.
+    DEFINE FIELD IF NOT EXISTS course_count ON term TYPE option<int>;
 
     DEFINE TABLE IF NOT EXISTS course SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS creator ON course TYPE record<user>;
@@ -196,6 +199,11 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS course ON subject TYPE record<course>;
     DEFINE FIELD IF NOT EXISTS name ON subject TYPE string;
     DEFINE FIELD IF NOT EXISTS description ON subject TYPE string;
+    -- How many exam questions and how many homework still point here. The
+    -- delete is conditioned on both reading zero, which is what makes the
+    -- guard hold against a question created on another replica.
+    DEFINE FIELD IF NOT EXISTS exam_question_count ON subject TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS homework_count ON subject TYPE option<int>;
     DEFINE INDEX IF NOT EXISTS subject_course ON subject FIELDS course;
 
     DEFINE TABLE IF NOT EXISTS enrollment SCHEMAFULL;
@@ -258,6 +266,10 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS allow_rejoin ON exam TYPE bool DEFAULT true;
     DEFINE FIELD IF NOT EXISTS allow_review ON exam TYPE bool DEFAULT false;
     DEFINE FIELD IF NOT EXISTS draft ON exam TYPE bool DEFAULT false;
+    -- How many marks the exam carries (2026-07-27). A kind change is refused
+    -- against it, and the exam's own compare-and-set pins it, so a grade
+    -- landing mid-PATCH refuses that save instead of slipping past its gates.
+    DEFINE FIELD IF NOT EXISTS result_count ON exam TYPE option<int>;
     DEFINE INDEX IF NOT EXISTS exam_course ON exam FIELDS course;
 
     DEFINE TABLE IF NOT EXISTS exam_attempt SCHEMAFULL;
@@ -469,6 +481,13 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS submitted_at ON homework_submission TYPE int READONLY;
     DEFINE FIELD IF NOT EXISTS updated_at ON homework_submission TYPE int;
     DEFINE FIELD IF NOT EXISTS file_count ON homework_submission TYPE option<int>;
+    -- The grade that froze this submission, absent while it is still open. The
+    -- freeze used to be a cross-table read (does a homework_result exist?)
+    -- followed by a write here, which no lock can hold across replicas; the
+    -- stamp turns every submission edit into a conditional single-record write
+    -- (`WHERE graded_by_result = NONE`), the one guard that survives. Set by
+    -- grading, cleared by un-grading, never by the student.
+    DEFINE FIELD IF NOT EXISTS graded_by_result ON homework_submission TYPE option<record<homework_result>>;
     DEFINE INDEX IF NOT EXISTS homework_submission_homework ON homework_submission FIELDS homework;
 
     DEFINE TABLE IF NOT EXISTS homework_file SCHEMAFULL;
@@ -493,14 +512,17 @@ pub const MIGRATION: &str = "
     -- slots, a student or parent books one. `series` groups the occurrences a
     -- weekly repeat expanded into, so one cancel deletes one row and a series
     -- delete finds the rest. A booking's live/dead state is the `status`
-    -- string; occupancy is derived from it under the appointment lock rather
-    -- than stored, so a rejected or cancelled booking frees its slot again.
+    -- string; `occupied` is the cap-1 counter that says whether the slot is
+    -- taken (2026-07-27 — it used to be counted from the booking rows under a
+    -- process-local lock, which two replicas could each pass), decremented in
+    -- the same transaction as the reject/cancel that frees it.
     -- The `proposed_*` fields carry a teacher's counter-proposal on the same
-    -- row until the requester accepts. No BACKFILL: both tables are new.
+    -- row until the requester accepts.
     DEFINE TABLE IF NOT EXISTS appointment_slot SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS teacher ON appointment_slot TYPE record<user>;
     DEFINE FIELD IF NOT EXISTS starts_at ON appointment_slot TYPE int;
     DEFINE FIELD IF NOT EXISTS ends_at ON appointment_slot TYPE int;
+    DEFINE FIELD IF NOT EXISTS occupied ON appointment_slot TYPE option<int>;
     DEFINE FIELD IF NOT EXISTS note ON appointment_slot TYPE option<string>;
     DEFINE FIELD IF NOT EXISTS series ON appointment_slot TYPE option<string>;
     DEFINE FIELD IF NOT EXISTS created_at ON appointment_slot TYPE int;
@@ -536,6 +558,13 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS date ON menu TYPE string READONLY;
     DEFINE FIELD IF NOT EXISTS slot ON menu TYPE string READONLY;
     DEFINE FIELD IF NOT EXISTS capacity ON menu TYPE option<int>;
+    -- `seats_booked` is the seat cap's counter (see `domain::cap`) and
+    -- `version` the menu's revision: a booking claims its seat only while the
+    -- menu still stands at the revision it read the price at, so a dish
+    -- re-priced mid-booking cannot be billed as the old price. Both absent
+    -- means zero, which is what `(x ?? 0)` reads on a row written before them.
+    DEFINE FIELD IF NOT EXISTS seats_booked ON menu TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS version ON menu TYPE option<int>;
     DEFINE FIELD IF NOT EXISTS created_by ON menu TYPE record<user> READONLY;
     DEFINE FIELD IF NOT EXISTS created_at ON menu TYPE int READONLY;
     DEFINE INDEX IF NOT EXISTS menu_date_slot ON menu FIELDS date, slot UNIQUE;
@@ -600,6 +629,21 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS recorded_by ON meal_ledger TYPE record<user> READONLY;
     DEFINE FIELD IF NOT EXISTS created_at ON meal_ledger TYPE int READONLY;
     DEFINE INDEX IF NOT EXISTS meal_ledger_student ON meal_ledger FIELDS student;
+
+    -- Reference counters, one row per *name* the settings offer, keyed by the
+    -- name itself (2026-07-27). They are how 'a kind nothing is graded under
+    -- may be removed' survives a second replica: the guard used to be a
+    -- count-then-write across two tables under a process-wide lock, and the
+    -- database serializes neither half of that. Both columns are `option<…>`
+    -- so an absent row reads as zero references, in service — the counter is
+    -- created by the first claim, never seeded per name.
+    DEFINE TABLE IF NOT EXISTS kind_ref SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS count ON kind_ref TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS retired ON kind_ref TYPE option<bool>;
+
+    DEFINE TABLE IF NOT EXISTS slot_ref SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS count ON slot_ref TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS retired ON slot_ref TYPE option<bool>;
 ";
 
 /// Data backfills for rows written by older binaries. Runs *after* (and apart
@@ -742,6 +786,19 @@ pub const BACKFILL: &str = "
     UPDATE answer_image SET seq = 1 WHERE seq = NONE;
     UPDATE exam_result SET seq = 1 WHERE seq = NONE;
 
+    -- The homework freeze became cross-replica (2026-07-27): a grade that
+    -- predates the stamp column has to put it on the submission it already
+    -- froze, or that submission would read as open and be editable again.
+    -- Result and submission share the deterministic `{homework}_{user}` key, so
+    -- the owning row is addressed directly rather than searched for; an UPDATE
+    -- of a record that isn't there (graded absent work) is an empty no-op. The
+    -- `= NONE` guard keeps it one-time, for the same reason the counters below
+    -- are one-time — a peer replica is serving while this runs.
+    FOR $r IN ((SELECT VALUE id FROM homework_result) ?? []) {
+        UPDATE type::record('homework_submission', record::id($r))
+            SET graded_by_result = $r WHERE graded_by_result = NONE;
+    };
+
     -- Count caps became cross-replica (2026-07-27): the authority moved from a
     -- process-wide mutex to a counter column on the parent row, so every parent
     -- that predates the column is seeded from the children it actually has.
@@ -755,6 +812,14 @@ pub const BACKFILL: &str = "
         UPDATE $row.course SET enrollment_count = $row.n WHERE enrollment_count = NONE;
     };
     UPDATE course SET enrollment_count = 0 WHERE enrollment_count = NONE;
+
+    -- The one refcount among them: courses per term, not children per parent.
+    -- Same one-time `= NONE` guard, and `WHERE term != NONE` keeps the
+    -- unlinked courses out of the group (they would form a NONE bucket).
+    FOR $row IN ((SELECT term, count() AS n FROM course WHERE term != NONE GROUP BY term) ?? []) {
+        UPDATE $row.term SET course_count = $row.n WHERE course_count = NONE;
+    };
+    UPDATE term SET course_count = 0 WHERE course_count = NONE;
 
     FOR $row IN ((SELECT event, count() AS n FROM registration GROUP BY event) ?? []) {
         UPDATE $row.event SET registration_count = $row.n WHERE registration_count = NONE;
@@ -775,6 +840,71 @@ pub const BACKFILL: &str = "
         UPDATE $row.user_id SET chatbot_thread_count = $row.n WHERE chatbot_thread_count = NONE;
     };
     UPDATE user SET chatbot_thread_count = 0 WHERE chatbot_thread_count = NONE;
+
+    -- The appointment slot's counter is the odd one out: it counts only the
+    -- bookings that are still *live*, because a rejected or cancelled one gave
+    -- the slot back long before this column existed.
+    FOR $row IN ((SELECT slot, count() AS n FROM appointment
+        WHERE status IN ['pending', 'approved'] GROUP BY slot) ?? []) {
+        UPDATE $row.slot SET occupied = $row.n WHERE occupied = NONE;
+    };
+    UPDATE appointment_slot SET occupied = 0 WHERE occupied = NONE;
+
+    -- A menu's seats, counted from the bookings still *held* — a cancelled one
+    -- gave its seat back before this column existed, exactly like the slot
+    -- above. `version` gets no pass at all: absent already reads as revision
+    -- zero everywhere it is compared, so writing it would be a no-op that
+    -- touches every menu row.
+    FOR $row IN ((SELECT menu, count() AS n FROM meal_booking
+        WHERE status = 'booked' GROUP BY menu) ?? []) {
+        UPDATE $row.menu SET seats_booked = $row.n WHERE seats_booked = NONE;
+    };
+    UPDATE menu SET seats_booked = 0 WHERE seats_booked = NONE;
+
+    -- A subject's two reference counters, seeded from what actually points at
+    -- it. This must run *after* the legacy sweep above destroys the questions
+    -- that predate subjects, or a subject would be seeded with rows that are
+    -- about to vanish and could then never be deleted. No zero pass, for the
+    -- same reason `version` gets none: absent already reads as zero in the
+    -- delete's `(count ?? 0) = 0` guard, so writing it would touch every
+    -- subject row to say what it already says.
+    FOR $row IN ((SELECT subject, count() AS n FROM exam_question GROUP BY subject) ?? []) {
+        UPDATE $row.subject SET exam_question_count = $row.n WHERE exam_question_count = NONE;
+    };
+
+    FOR $row IN ((SELECT subject, count() AS n FROM homework GROUP BY subject) ?? []) {
+        UPDATE $row.subject SET homework_count = $row.n WHERE homework_count = NONE;
+    };
+
+    -- The settings guards became cross-replica the same way (2026-07-27): an
+    -- exam kind counts the marks written under it, a meal slot the menus
+    -- published for it, and a name is removable exactly while its counter reads
+    -- zero. Rows written before the counters existed are counted once here.
+    --
+    -- Same `= NONE` guard and the same reason as the caps above: a peer replica
+    -- may already be serving, and recomputing a counter it is incrementing
+    -- would hand back a reference that is still held. No zero pass either — an
+    -- absent counter already reads as zero, and a name nobody ever used needs
+    -- no row at all.
+    --
+    -- Marks predate the counter but so may their *kind*: an exam whose kind was
+    -- removed from the list long ago is counted too, which only ever refuses a
+    -- removal that already happened. `slot` is text on the menu, so its group
+    -- needs no join; `kind` lives on the exam, one hop from the mark.
+    FOR $row IN ((SELECT exam.kind AS kind, count() AS n FROM exam_result GROUP BY kind) ?? []) {
+        UPSERT type::record('kind_ref', $row.kind) SET count = $row.n WHERE count = NONE;
+    };
+
+    FOR $row IN ((SELECT slot, count() AS n FROM menu GROUP BY slot) ?? []) {
+        UPSERT type::record('slot_ref', $row.slot) SET count = $row.n WHERE count = NONE;
+    };
+
+    -- Same one-time seeding for the per-exam mark counter: an exam graded by an
+    -- older binary must read as graded, or its kind could be changed under the
+    -- marks it already carries.
+    FOR $row IN ((SELECT exam, count() AS n FROM exam_result GROUP BY exam) ?? []) {
+        UPDATE $row.exam SET result_count = $row.n WHERE result_count = NONE;
+    };
 ";
 
 /// The migration batches, in the order a boot applies them — and the *only*

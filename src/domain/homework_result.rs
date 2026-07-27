@@ -13,11 +13,12 @@
 
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
-use crate::constant::HOMEWORK_RESULT_TABLE;
+use crate::constant::{HOMEWORK_RESULT_TABLE, SUBMISSION_GRADED_FIELD, SUBMISSION_OPEN_GUARD};
 use crate::database::Database;
 use crate::domain::course::CourseId;
 use crate::domain::exam_result::Mark;
 use crate::domain::homework::HomeworkId;
+use crate::domain::homework_submission::HomeworkSubmissionId;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
@@ -119,6 +120,22 @@ impl HomeworkResult {
     /// UPSERT — concurrent grades for the same pair converge on one row instead
     /// of racing a unique index into a 500. Grading before the due date, or
     /// before any submission exists, is allowed (the caller's policy call).
+    ///
+    /// In the same transaction the grade *stamps* the student's submission
+    /// ([`crate::constant::SUBMISSION_GRADED_FIELD`]), which is what freezes it:
+    /// every student-side write to that row then fails its own
+    /// `graded_by_result = NONE` condition, with no cross-table read for a peer
+    /// replica to slip past. A submission that does not exist yet is left alone
+    /// — grading absent work must not conjure a hand-in (the report reads
+    /// `submitted`/`missing`/`late` straight off that row).
+    //
+    // ponytail: that one case keeps a residual race — a student's *first* hand-in
+    // committing between this grade and nothing-to-stamp lands unstamped, so a
+    // grade of never-submitted work can end up beside an editable submission.
+    // The web layer's pre-flight read still refuses it whenever the grade landed
+    // first, so only a genuine collision slips through. Closing it needs a row to
+    // stamp: either a tombstone submission every read path learns to ignore, or
+    // moving the freeze onto a per-(homework, user) record both sides own.
     pub async fn grade(
         homework: &HomeworkId,
         user: &UserId,
@@ -127,8 +144,10 @@ impl HomeworkResult {
         graded_by: &UserId,
         db: &Database,
     ) -> Result<HomeworkResult, AppError> {
+        let id = HomeworkResultId::composite(homework, user);
+        let submission = HomeworkSubmissionId::composite(homework, user);
         let result = HomeworkResult {
-            id: HomeworkResultId::composite(homework, user),
+            id: id.clone(),
             homework: homework.clone(),
             user: user.clone(),
             status,
@@ -136,8 +155,25 @@ impl HomeworkResult {
             graded_by: graded_by.clone(),
             created_at: Timestamp::now(),
         };
-        let saved: Option<HomeworkResult> = db.upsert(result.id.record()).content(result).await?;
-        saved.ok_or_else(|| AppError::Internal("failed to record homework result".into()))
+        let mut saved = db
+            .query(format!(
+                "BEGIN TRANSACTION;
+                 UPSERT $id CONTENT $row RETURN AFTER;
+                 UPDATE $sub SET {SUBMISSION_GRADED_FIELD} = $id \
+                     WHERE {SUBMISSION_OPEN_GUARD};
+                 COMMIT TRANSACTION;"
+            ))
+            .bind(("id", id.record()))
+            .bind(("sub", submission.record()))
+            .bind(("row", result.into_value()))
+            .await?
+            .check()?;
+        // BEGIN is slot 0; the result's UPSERT is slot 1, the stamp slot 2.
+        saved
+            .take::<Vec<HomeworkResult>>(1)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| AppError::Internal("failed to record homework result".into()))
     }
 
     /// `user`'s grade for `homework`, if graded.
@@ -186,19 +222,33 @@ impl HomeworkResult {
     }
 
     /// Un-grade (homework, user), returning the removed row (`None` if there
-    /// was none). Removing the grade unfreezes the student's submission.
+    /// was none). Removing the grade unfreezes the student's submission, so the
+    /// stamp [`grade`](Self::grade) left on it is cleared in the same
+    /// transaction — scoped to *this* grade's id, so it can never wipe a stamp a
+    /// concurrent re-grade has just written.
     pub async fn remove(
         homework: &HomeworkId,
         user: &UserId,
         db: &Database,
     ) -> Result<Option<HomeworkResult>, AppError> {
+        let id = HomeworkResultId::composite(homework, user);
         let mut result = db
-            .query("DELETE homework_result WHERE homework = $hw AND user = $usr RETURN BEFORE")
-            .bind(("hw", homework.record()))
-            .bind(("usr", user.record()))
+            .query(format!(
+                "BEGIN TRANSACTION;
+                 DELETE $id RETURN BEFORE;
+                 UPDATE $sub SET {SUBMISSION_GRADED_FIELD} = NONE \
+                     WHERE {SUBMISSION_GRADED_FIELD} = $id;
+                 COMMIT TRANSACTION;"
+            ))
+            .bind(("id", id.record()))
+            .bind((
+                "sub",
+                HomeworkSubmissionId::composite(homework, user).record(),
+            ))
             .await?
             .check()?;
-        Ok(result.take::<Vec<HomeworkResult>>(0)?.into_iter().next())
+        // BEGIN is slot 0; the grade's DELETE is slot 1, the unstamp slot 2.
+        Ok(result.take::<Vec<HomeworkResult>>(1)?.into_iter().next())
     }
 }
 

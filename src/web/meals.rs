@@ -242,7 +242,7 @@ async fn one_menu(
         (status = 400, description = "Malformed date, unknown slot, or out-of-range capacity", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
-        (status = 409, description = "A menu already exists for that date and slot", body = ErrorResponse),
+        (status = 409, description = "A menu already exists for that date and slot, or the slot was removed from the settings mid-request", body = ErrorResponse),
     ),
 )]
 async fn create_menu(
@@ -371,14 +371,8 @@ async fn delete_menu(
     let menu = Menu::read(&MenuId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    // [`MENU_LOCK`] holds the seat check and the delete together, so a booking
-    // cannot land on a menu that is already on its way out.
-    let _guard = MENU_LOCK.lock().await;
-    if MealBooking::any_live_for_menu(menu.get_id(), &st.db).await? {
-        return Err(AppError::Conflict(
-            "the menu still has live bookings — cancel them first",
-        ));
-    }
+    // The seat check rides in the delete's own `WHERE` (see `Menu::delete`), so
+    // a booking landing in another replica cannot slip between the two.
     menu.delete(&st.db).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -416,15 +410,15 @@ async fn add_dish(
         .flatten();
     let price = DishPrice::try_new(req.price_minor)?;
     let tags = DishTags::try_new(&req.tags, &Settings::load(&st.db).await?.get_dietary_tags())?;
-    // Dish writes take [`MENU_LOCK`] because a booking snapshots the menu's
-    // price under it: a dish landing mid-booking would be stored on the seat as
-    // "the menu was free", and a held seat is never re-priced. It also makes
-    // the dish cap a real cap — count-then-write is write-skew otherwise. The
-    // lock stays a leaf: nothing below here takes another.
+    // Dish writes take [`MENU_LOCK`] for the dish cap alone: count-then-write
+    // is write-skew, so the count and the insert have to be one step. The
+    // *price* no longer needs it — a dish write moves the menu's revision, and
+    // a booking claims its seat at the revision it priced itself against.
+    // The lock stays a leaf: nothing below here takes another.
     let _guard = MENU_LOCK.lock().await;
-    // The menu is read *inside* the lock, like `MealBooking::book` does: read
-    // before it, a `DELETE /menus/{id}` running in the gap takes its cascade
-    // with it and this dish lands on a menu that no longer exists.
+    // The menu is read *inside* the lock: read before it, a `DELETE /menus/{id}`
+    // running in the gap takes its cascade with it and this dish lands on a menu
+    // that no longer exists.
     let menu = Menu::read(&MenuId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -810,7 +804,7 @@ async fn booking_target(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not a student booking for themselves, nor a parent booking for a linked student", body = ErrorResponse),
         (status = 404, description = "No such menu", body = ErrorResponse),
-        (status = 409, description = "The menu is full, or its cutoff has passed", body = ErrorResponse),
+        (status = 409, description = "The menu is full, its cutoff has passed, or the menu kept being edited while the seat was being taken", body = ErrorResponse),
     ),
 )]
 async fn book_meal(
@@ -822,10 +816,10 @@ async fn book_meal(
     let student = booking_target(&user, req.student_id.as_deref(), &st.db).await?;
     let cutoff = meal_cutoff(&st.db).await?;
     let menu = MenuId::from_key(&id);
-    // Price, seat and charge all land together under `MENU_LOCK`, keyed by
-    // (seat, attempt) — a double-click books one seat and bills it once, and a
-    // dish cannot slip in between the price snapshot and the row it is frozen
-    // onto.
+    // Price, seat and charge land as one decision (see `MealBooking::book`),
+    // keyed by (seat, attempt) — a double-click books one seat and bills it
+    // once, and a dish landing between the price and the seat is refused by the
+    // claim rather than billed.
     let booking = MealBooking::book(&menu, &student, user.get_id(), &cutoff, &st.db).await?;
     let items = booking_responses(std::slice::from_ref(&booking), &st.db).await?;
     Ok((
@@ -927,7 +921,7 @@ async fn list_menu_bookings(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the booking's student, nor their parent", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "The cutoff has passed", body = ErrorResponse),
+        (status = 409, description = "The cutoff has passed, or the menu was too contended to free the seat", body = ErrorResponse),
     ),
 )]
 async fn cancel_booking(

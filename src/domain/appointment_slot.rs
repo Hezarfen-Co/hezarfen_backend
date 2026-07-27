@@ -1,8 +1,11 @@
 //! A teacher's published availability: "I am free here, book me". A slot is
-//! pure calendar — it carries no booking state at all. Whether it is taken is
-//! *derived* from its [`Appointment`] rows under [`APPOINTMENT_LOCK`], so a
-//! rejected or cancelled booking frees the slot again without any flag to
-//! reset (and without a UNIQUE index, which would keep a dead booking's seat).
+//! nearly pure calendar: the one piece of booking state it carries is the
+//! `occupied` counter (a [`cap`](crate::domain::cap) of one), taken when a
+//! booking is made and given back in the same transaction as the reject or
+//! cancel that settles it — so the slot frees itself again, and unlike a UNIQUE
+//! index it does not keep a dead booking's seat. Stored rather than counted
+//! from the [`Appointment`] rows because a conditional write on one row is the
+//! only guard that survives a second replica.
 //!
 //! A recurring publish is expanded into concrete rows here, at write time,
 //! sharing one `series` id — no recurrence rule is ever evaluated at read
@@ -430,11 +433,10 @@ impl AppointmentSlot {
     /// Settled bookings (rejected/cancelled) are history of a slot that is
     /// going away, so they cascade out with it, like [`Event::delete`]'s rows.
     ///
-    /// The occupancy read and the delete run under [`APPOINTMENT_LOCK`], so a
-    /// booking cannot land between them and outlive its slot.
+    /// The guard is the delete's own `WHERE`, so no booking can land between a
+    /// check and the row going away — in this replica or another.
     pub async fn delete(self, db: &Database) -> Result<AppointmentSlot, AppError> {
-        let _guard = APPOINTMENT_LOCK.lock().await;
-        Self::delete_locked(std::slice::from_ref(&self.id), db).await?;
+        Self::delete_free(std::slice::from_ref(&self.id), db).await?;
         Ok(self)
     }
 
@@ -445,33 +447,60 @@ impl AppointmentSlot {
         series: &SlotSeries,
         db: &Database,
     ) -> Result<Vec<AppointmentSlot>, AppError> {
-        let _guard = APPOINTMENT_LOCK.lock().await;
         let slots = Self::list_for_series(series, db).await?;
         if slots.is_empty() {
             return Err(AppError::NotFound);
         }
         let ids: Vec<AppointmentSlotId> = slots.iter().map(|slot| slot.id.clone()).collect();
-        Self::delete_locked(&ids, db).await?;
+        Self::delete_free(&ids, db).await?;
         Ok(slots)
     }
 
-    /// Shared body of both deletes. Caller must already hold
-    /// [`APPOINTMENT_LOCK`]: the live-booking check is only meaningful while
-    /// no booking can be written.
-    async fn delete_locked(ids: &[AppointmentSlotId], db: &Database) -> Result<(), AppError> {
-        if Appointment::any_live_booking(ids, db).await? {
+    /// Shared body of both deletes: drop every named slot, but only while its
+    /// `occupied` counter says nobody is waiting on it — the delete's own
+    /// `WHERE` is the guard, which is what makes it hold against a booking
+    /// landing in another replica (a separate read-then-delete could not).
+    ///
+    /// All-or-nothing across the whole list: if fewer rows go than were named,
+    /// the transaction is thrown away, so a series never loses its free weeks
+    /// and keeps the booked one. Whether that shortfall was a live booking or a
+    /// slot that no longer exists is read off what survived — the occupied rows
+    /// are still there, a vanished one is not — which is the 409/404 the caller
+    /// used to get from a separate check.
+    async fn delete_free(ids: &[AppointmentSlotId], db: &Database) -> Result<(), AppError> {
+        let records: Vec<RecordId> = ids.iter().map(|id| id.record()).collect();
+        let mut result = db
+            .query(
+                "BEGIN TRANSACTION;
+                 LET $gone = (DELETE $slots WHERE (occupied ?? 0) = 0 RETURN BEFORE);
+                 IF array::len($gone) != array::len($slots) {
+                     THROW IF array::len((SELECT VALUE id FROM appointment_slot
+                         WHERE id IN $slots)) > 0 { 'slot_occupied' } ELSE { 'slot_missing' }
+                 };
+                 DELETE appointment WHERE slot IN $slots;
+                 RETURN $gone;
+                 COMMIT TRANSACTION;",
+            )
+            .bind(("slots", records))
+            .await?;
+        // An aborted transaction errors every slot; only the THROW's own slot
+        // names the marker (the `Exam::update` treatment).
+        let mut errors = result.take_errors();
+        let thrown = |marker: &str| {
+            errors
+                .values()
+                .any(|error| error.to_string().contains(marker))
+        };
+        if thrown("slot_occupied") {
             return Err(AppError::Conflict(
                 "the slot has a pending or approved booking",
             ));
         }
-        let records: Vec<RecordId> = ids.iter().map(|id| id.record()).collect();
-        let mut result = db
-            .query("DELETE appointment WHERE slot IN $slots; DELETE $slots RETURN BEFORE;")
-            .bind(("slots", records))
-            .await?
-            .check()?;
-        if result.take::<Vec<AppointmentSlot>>(1)?.is_empty() {
+        if thrown("slot_missing") {
             return Err(AppError::NotFound);
+        }
+        if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+            return Err(error.into());
         }
         Ok(())
     }
@@ -480,7 +509,8 @@ impl AppointmentSlot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constant::MILLIS_PER_DAY;
+    use crate::constant::{MILLIS_PER_DAY, SLOT_OCCUPIED_FIELD};
+    use crate::domain::cap;
 
     fn at(millis: i64) -> Timestamp {
         Timestamp::from_millis(millis)
@@ -721,6 +751,65 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    /// The delete-vs-book race: a booking that lands in another replica between
+    /// this delete's read and its write must still keep the slot alive, so the
+    /// guard has to be the delete's own `WHERE` — here driven by taking the seat
+    /// the way that replica would, with no booking row to read.
+    ///
+    /// A series is all-or-nothing: one taken week refuses the whole publish,
+    /// and the free weeks must survive the refusal.
+    #[tokio::test]
+    async fn a_taken_slot_is_never_deleted_and_takes_its_series_with_it() {
+        let db = crate::database::init_mem().await.unwrap();
+        let teacher = UserId::from_key("t1");
+        let slots = AppointmentSlot::publish_weekly(
+            &teacher,
+            at(1_000),
+            at(2_000),
+            None,
+            at(1_000 + 2 * MILLIS_PER_WEEK),
+            &db,
+        )
+        .await
+        .unwrap();
+        let series = slots[0].get_series().cloned().unwrap();
+
+        // A free slot goes, and its series is deletable while every week is free.
+        assert!(slots[0].clone().delete(&db).await.is_ok());
+        // The seat on the middle week is taken — no booking row, exactly as a
+        // racing replica would leave it mid-flight.
+        assert!(
+            cap::claim(&slots[1].get_id().record(), SLOT_OCCUPIED_FIELD, 1, &db)
+                .await
+                .unwrap()
+        );
+        assert!(matches!(
+            slots[1].clone().delete(&db).await,
+            Err(AppError::Conflict(
+                "the slot has a pending or approved booking"
+            ))
+        ));
+        assert!(matches!(
+            AppointmentSlot::delete_series(&series, &db).await,
+            Err(AppError::Conflict(_))
+        ));
+        // Refused, not half-applied: the free third week is still published.
+        assert_eq!(
+            AppointmentSlot::list_for_series(&series, &db)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // A slot that is simply gone is a 404, not a 409 — the delete tells the
+        // two shortfalls apart by what survived it.
+        assert!(matches!(
+            slots[0].clone().delete(&db).await,
+            Err(AppError::NotFound)
+        ));
     }
 
     #[tokio::test]

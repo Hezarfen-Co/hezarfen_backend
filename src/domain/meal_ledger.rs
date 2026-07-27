@@ -46,9 +46,10 @@ use surrealdb::types::{AlreadyExistsError, RecordId, RecordIdKey, SurrealValue};
 use ulid::Generator;
 
 use crate::constant::{
-    MAX_LEDGER_AMOUNT_MINOR, MAX_LEDGER_METHOD_LEN, MAX_LEDGER_NOTE_LEN, MEAL_LEDGER_TABLE,
+    CAS_UPDATE_RETRIES, MAX_LEDGER_AMOUNT_MINOR, MAX_LEDGER_METHOD_LEN, MAX_LEDGER_NOTE_LEN,
+    MEAL_LEDGER_TABLE,
 };
-use crate::database::Database;
+use crate::database::{Database, lost_the_race};
 use crate::domain::meal_booking::{MealBooking, MealBookingId};
 use crate::domain::menu::MenuId;
 use crate::domain::menu_dish::MenuDish;
@@ -277,17 +278,31 @@ impl MealLedger {
     /// guarantee is `CREATE`'s own: on an existing id it *errors* and leaves
     /// the row untouched, so the writer that lost the race reads back the
     /// winner's line instead of failing the request with a 500.
+    ///
+    /// A *write conflict* is the same race decided one layer down — two
+    /// appends of one id arriving together are no longer serialized by a
+    /// process-wide lock, so the store aborts one as retryable instead of
+    /// answering it "already exists". Both are read back the same way, and a
+    /// conflict that turns out to have written nothing is simply tried again;
+    /// no path here can write a second line, since the id is the key.
     async fn append(row: MealLedger, db: &Database) -> Result<MealLedger, AppError> {
         if let Some(existing) = Self::read(&row.id, db).await? {
             return Ok(existing);
         }
         let id = row.id.clone();
-        let created: Option<MealLedger> = match db.create(id.record()).content(row).await {
-            Ok(created) => created,
-            Err(e) if is_duplicate_record(&e) => Self::read(&id, db).await?,
-            Err(e) => return Err(e.into()),
-        };
-        created.ok_or_else(|| AppError::Internal("failed to write the ledger line".into()))
+        for _ in 0..CAS_UPDATE_RETRIES {
+            match db.create(id.record()).content(row.clone()).await {
+                Ok(Some(created)) => return Ok(created),
+                Ok(None) => break,
+                Err(e) if is_duplicate_record(&e) || lost_the_race(&e) => {
+                    if let Some(existing) = Self::read(&id, db).await? {
+                        return Ok(existing);
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(AppError::Internal("failed to write the ledger line".into()))
     }
 
     pub async fn read(id: &MealLedgerId, db: &Database) -> Result<Option<MealLedger>, AppError> {
@@ -322,9 +337,8 @@ impl MealLedger {
     /// The price comes off the *booking row*, never off the menu as it stands
     /// now: a seat taken while the menu was free carries `None` forever, so
     /// "was free" is a recorded fact and a later dish never bills a seat
-    /// retroactively. Called under
-    /// [`MENU_LOCK`](crate::domain::menu::MENU_LOCK), from
-    /// [`MealBooking::book`] alone, so the seat and its money move together.
+    /// retroactively. Called from [`MealBooking::book`] alone, right after the seat
+    /// was claimed, so the seat and its money move together.
     ///
     /// Replaying it is free: the id is `(booking, attempt)`, so a duplicate
     /// `POST` writes nothing, and an attempt whose charge failed the first time

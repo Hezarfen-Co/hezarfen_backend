@@ -742,6 +742,11 @@ pub const DIETARY_PROFILE_TABLE: &str = "dietary_profile";
 pub const MEAL_BOOKING_TABLE: &str = "meal_booking";
 pub const MEAL_ATTENDANCE_TABLE: &str = "meal_attendance";
 pub const MEAL_LEDGER_TABLE: &str = "meal_ledger";
+/// One row per *name* the school's settings offer, keyed by the name itself:
+/// how many rows still reference it, and whether it has been retired out of the
+/// list (see the reference counters in [`crate::domain::cap`]).
+pub const KIND_REF_TABLE: &str = "kind_ref";
+pub const SLOT_REF_TABLE: &str = "slot_ref";
 
 // --- cross-replica cap counters ----------------------------------------
 
@@ -754,9 +759,55 @@ pub const MEAL_LEDGER_TABLE: &str = "meal_ledger";
 /// SCHEMAFULL refusing the write.
 pub const ENROLLMENT_COUNT_FIELD: &str = "enrollment_count";
 pub const REGISTRATION_COUNT_FIELD: &str = "registration_count";
+/// Not a cap — a refcount, and the whole of the term delete guard: how many
+/// courses link this term. A term may only be dropped at zero, and the count
+/// is claimed before a course's link is written, so the two decisions contend
+/// on the term row instead of on a cross-table `SELECT` no transaction orders.
+pub const COURSE_COUNT_FIELD: &str = "course_count";
 pub const NOTE_FILE_COUNT_FIELD: &str = "file_count";
 pub const SUBMISSION_FILE_COUNT_FIELD: &str = "file_count";
 pub const CHATBOT_THREAD_COUNT_FIELD: &str = "chatbot_thread_count";
+/// Cap 1, not N: an appointment slot holds at most one live booking, so this
+/// counter is really an "is it taken" flag kept in the shape every other cap
+/// uses (`claim`/`release`), which is what makes rejecting or cancelling a
+/// booking give the slot back.
+pub const SLOT_OCCUPIED_FIELD: &str = "occupied";
+/// Not caps either, and uncapped by design: how many exam questions and how
+/// many homework still point at a subject. A subject may be deleted exactly
+/// while both read zero, so the delete's own `WHERE` decides it — the
+/// cross-table "does anything reference this?" count it replaces served one
+/// replica only.
+pub const SUBJECT_QUESTION_COUNT_FIELD: &str = "exam_question_count";
+pub const SUBJECT_HOMEWORK_COUNT_FIELD: &str = "homework_count";
+/// How many marks an exam carries. Uncapped too, and the only counter its
+/// entity carries as a field: the exam's save is a whole-row `CONTENT` write,
+/// which would wipe a column the struct did not know about. That save pins it,
+/// which is what makes "this exam has no marks" — the gate a kind change is
+/// refused on — decided at write time rather than at read time.
+pub const EXAM_RESULT_COUNT_FIELD: &str = "result_count";
+/// The two columns of a reference-counter row (`kind_ref`, `slot_ref`): how
+/// many rows still point at the name, and whether it has left the school's
+/// list. Both `option<…>`, absent meaning zero references and in service.
+pub const REF_COUNT_FIELD: &str = "count";
+pub const REF_RETIRED_FIELD: &str = "retired";
+/// Seats held on one menu — the meal capacity cap.
+pub const MENU_SEAT_COUNT_FIELD: &str = "seats_booked";
+/// Not a cap: the menu's revision, bumped by every write that can change what
+/// a seat costs (a dish added, re-priced or removed, the capacity moved). A
+/// booking claims its seat only at the revision it read the price at, so the
+/// price frozen onto the row is one the menu really carried at that instant.
+pub const MENU_VERSION_FIELD: &str = "version";
+
+/// Not a cap either: the grade that froze a homework submission, absent while
+/// the submission is still open. Every student-side write to a submission (its
+/// text, its files) carries `graded_by_result = NONE` as a condition, so the
+/// "not graded yet" decision and the write it licenses are one conditional
+/// single-record write rather than a cross-table read a peer replica can
+/// outrun. Set by grading, cleared by un-grading, never by the student.
+pub const SUBMISSION_GRADED_FIELD: &str = "graded_by_result";
+/// The condition itself, spelled once: a submission is writable exactly while
+/// its grade stamp is absent.
+pub const SUBMISSION_OPEN_GUARD: &str = "graded_by_result = NONE";
 
 /// How hard a counter write tries before giving up, and the first backoff step
 /// it sleeps between attempts (doubling, plus jitter). Contention on one record

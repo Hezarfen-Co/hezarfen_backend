@@ -665,6 +665,14 @@ pub(crate) async fn save_answer_checked(
     // Reader lease of [`EXAM_LOCK`]: the writable gate and the upsert are
     // one unit, or a retake's wipe-and-create (a writer) slips in between
     // and this stale save lands on the fresh blank sheet.
+    //
+    // ponytail (accepted race, reviewed): the lease is process-local, so with
+    // more than one replica a save that started just before a retake can still
+    // stamp its answer onto the *old* seq, milliseconds after that sitting went
+    // terminal. Damage is confined to a history row — the grade of record is
+    // the latest seq, which the late write never touches. Closing it needs a
+    // `current_seq` claim on every answer save, the hottest path in the app;
+    // cost beats the damage, so it stays open on purpose.
     let _guard = EXAM_LOCK.read().await;
     let attempt = writable_attempt(exam, user, db).await?;
     save_answer_in(exam, &attempt, question_id, selected, text, db).await

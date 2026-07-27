@@ -1,7 +1,7 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
 use crate::constant::{REGISTRATION_COUNT_FIELD, REGISTRATION_TABLE};
-use crate::database::{Database, lost_the_race};
+use crate::database::Database;
 use crate::domain::cap;
 use crate::domain::event::{Event, EventId};
 use crate::domain::user::UserId;
@@ -83,45 +83,36 @@ impl Registration {
             .await?
             .ok_or(AppError::NotFound)?
             .registration_capacity()?;
-        let seats = event.record();
-        if !cap::claim(
-            &seats,
-            REGISTRATION_COUNT_FIELD,
-            capacity.unwrap_or(cap::UNLIMITED),
-            db,
-        )
-        .await?
-        {
-            return Err(AppError::Conflict("the event is full"));
-        }
         let registration = Registration {
             id: RegistrationId::composite(event, user),
             event: event.clone(),
             user: user.clone(),
             registered_by: registered_by.clone(),
         };
-        let created: Result<Option<Registration>, _> = db
-            .create(registration.id.record())
-            .content(registration)
-            .await;
-        match created {
-            Ok(Some(created)) => Ok(created),
-            Ok(None) => {
-                cap::release(&seats, REGISTRATION_COUNT_FIELD, db).await?;
-                Err(AppError::Internal("failed to register user".into()))
-            }
-            // A concurrent placement of the same pair got there first: give the
-            // seat back and hand its row over, the same no-op the early return
-            // above would have made.
-            Err(err) => {
-                cap::release(&seats, REGISTRATION_COUNT_FIELD, db).await?;
-                if !lost_the_race(&err) {
-                    return Err(err.into());
-                }
-                Self::read_for_user(event, user, db)
-                    .await?
-                    .ok_or_else(|| AppError::Internal("failed to register user".into()))
-            }
+        match cap::claim_and_create(
+            &event.record(),
+            REGISTRATION_COUNT_FIELD,
+            capacity.unwrap_or(cap::UNLIMITED),
+            &registration.id.record(),
+            &registration,
+            db,
+        )
+        .await?
+        {
+            cap::Claimed::Made(created) => Ok(created),
+            // A concurrent placement of the same pair got there first: hand its
+            // row over, the same no-op the early return above would have made,
+            // and with no seat spent either way.
+            cap::Claimed::Duplicate => Self::read_for_user(event, user, db)
+                .await?
+                .ok_or_else(|| AppError::Internal("failed to register user".into())),
+            // Full, or the event was deleted between the read and the claim —
+            // the conditional write matches nothing either way, and only this
+            // path pays for the read that tells them apart.
+            cap::Claimed::Full => match Event::read(event, db).await? {
+                Some(_) => Err(AppError::Conflict("the event is full")),
+                None => Err(AppError::NotFound),
+            },
         }
     }
 

@@ -13,12 +13,13 @@ use ulid::Ulid;
 
 use crate::constant::{
     HOMEWORK_FILE_TABLE, MAX_HOMEWORK_FILES_PER_SUBMISSION, SUBMISSION_FILE_COUNT_FIELD,
+    SUBMISSION_OPEN_GUARD,
 };
 use crate::database::Database;
 use crate::domain::cap;
 use crate::domain::course::CourseId;
 use crate::domain::homework::HomeworkId;
-use crate::domain::homework_submission::HomeworkSubmissionId;
+use crate::domain::homework_submission::{HomeworkSubmission, HomeworkSubmissionId};
 use crate::domain::note_file::{FileContentType, FileName};
 use crate::domain::timestamp::Timestamp;
 use crate::error::AppError;
@@ -58,6 +59,16 @@ pub struct HomeworkFile {
     size: i64,
     file: String,
     created_at: Timestamp,
+}
+
+/// What [`HomeworkFile::delete`]'s transaction reports: whether the submission
+/// was still open (`open` = 1, the gate bit) and the row it then removed. Two
+/// answers in one object because an empty `gone` alone cannot say whether the
+/// delete was refused or the file had simply vanished.
+#[derive(Debug, SurrealValue)]
+struct DeleteOutcome {
+    open: i64,
+    gone: Vec<HomeworkFile>,
 }
 
 impl HomeworkFile {
@@ -111,20 +122,27 @@ impl HomeworkFile {
     }
 
     /// Persist the row assembled by [`Self::new`], refusing once its submission
-    /// already holds [`MAX_HOMEWORK_FILES_PER_SUBMISSION`]. The slot is taken by
-    /// [`cap::claim`] on the submission row — a conditional single-record write,
-    /// the only guard that holds when the racing uploads are in two replicas,
-    /// the same story as `NoteFile::insert`.
-    pub async fn insert(self, db: &Database) -> Result<HomeworkFile, AppError> {
+    /// already holds [`MAX_HOMEWORK_FILES_PER_SUBMISSION`] (an `Err(Conflict)`)
+    /// or once a grade has frozen it (`Ok(None)`, so the web layer keeps its own
+    /// wording). Both are decided by one [`cap::claim_when`] on the submission
+    /// row — a conditional single-record write, the only guard that holds when
+    /// the racing writers are in two replicas, the same story as
+    /// `NoteFile::insert`. Which of the two conditions failed is read back
+    /// afterwards, off the losing path only, and only to pick the message.
+    pub async fn insert(self, db: &Database) -> Result<Option<HomeworkFile>, AppError> {
         let submission = self.submission.record();
-        if !cap::claim(
+        if !cap::claim_when(
             &submission,
             SUBMISSION_FILE_COUNT_FIELD,
             MAX_HOMEWORK_FILES_PER_SUBMISSION as i64,
+            SUBMISSION_OPEN_GUARD,
             db,
         )
         .await?
         {
+            if HomeworkSubmission::is_graded(&self.submission, db).await? {
+                return Ok(None);
+            }
             return Err(AppError::Conflict(
                 "the submission already holds the maximum of 10 files — delete one first",
             ));
@@ -133,7 +151,7 @@ impl HomeworkFile {
         let created: Result<Option<HomeworkFile>, _> =
             db.create(self.id.record()).content(self).await;
         match created {
-            Ok(Some(created)) => Ok(created),
+            Ok(Some(created)) => Ok(Some(created)),
             Ok(None) => {
                 cap::release(&submission, SUBMISSION_FILE_COUNT_FIELD, db).await?;
                 Err(AppError::Internal("failed to create homework file".into()))
@@ -242,23 +260,44 @@ impl HomeworkFile {
     /// Delete the row and give its slot back in the same transaction. The
     /// submission survives, so its counter has to be corrected; the cascades
     /// that delete the submission itself take the counter with it.
-    pub async fn delete(self, db: &Database) -> Result<HomeworkFile, AppError> {
+    ///
+    /// The gate is the first statement: a conditional write on the *submission*
+    /// row — the "last touched" re-stamp a file delete owes the late flag
+    /// anyway — carrying [`SUBMISSION_OPEN_GUARD`]. Nothing else in the
+    /// transaction runs unless it bit, so a grade landing concurrently either
+    /// stamps first (this delete is refused, `Ok(None)`) or stamps after (the
+    /// file was already gone when it graded). `Err(NotFound)` still means the
+    /// file row itself had vanished.
+    pub async fn delete(self, db: &Database) -> Result<Option<HomeworkFile>, AppError> {
         let mut result = db
-            .query(
+            .query(format!(
                 "BEGIN TRANSACTION;
-                 LET $gone = (DELETE $id RETURN BEFORE);
+                 LET $open = (UPDATE $sub SET updated_at = $now \
+                     WHERE {SUBMISSION_OPEN_GUARD} RETURN VALUE id);
+                 LET $gone = IF array::len($open) > 0 {{ (DELETE $id RETURN BEFORE) }} ELSE {{ [] }};
                  UPDATE $sub SET file_count = math::max([(file_count ?? 0) - array::len($gone), 0]);
-                 RETURN $gone;
-                 COMMIT TRANSACTION;",
-            )
+                 RETURN {{ open: array::len($open), gone: $gone }};
+                 COMMIT TRANSACTION;"
+            ))
             .bind(("id", self.id.record()))
             .bind(("sub", self.submission.record()))
+            .bind(("now", Timestamp::now()))
             .await?
             .check()?;
-        result
-            .take::<Vec<HomeworkFile>>(3)?
+        // BEGIN is slot 0, the two LETs slots 1-2 and the counter fix slot 3;
+        // the RETURN is slot 4.
+        let outcome: Option<DeleteOutcome> =
+            result.take::<Vec<DeleteOutcome>>(4)?.into_iter().next();
+        let outcome =
+            outcome.ok_or_else(|| AppError::Internal("failed to delete homework file".into()))?;
+        if outcome.open == 0 {
+            return Ok(None);
+        }
+        outcome
+            .gone
             .into_iter()
             .next()
+            .map(Some)
             .ok_or(AppError::NotFound)
     }
 }
@@ -286,6 +325,7 @@ mod tests {
         // A real submission row, so the GC join through it resolves.
         let submission = HomeworkSubmission::upsert(&homework, &user, None, &db)
             .await
+            .unwrap()
             .unwrap();
         let sub_a = submission.get_id().clone();
         let sub_b = HomeworkSubmissionId::composite(
@@ -293,7 +333,7 @@ mod tests {
             &UserId::from_key("01TESTUSERBBBBBBBBBBBBBBBB"),
         );
 
-        let stored = a_file(&sub_a).insert(&db).await.unwrap();
+        let stored = a_file(&sub_a).insert(&db).await.unwrap().unwrap();
         // Readable under its own submission, invisible under another.
         assert!(
             HomeworkFile::read_for(stored.get_id(), &sub_a, &db)
@@ -342,11 +382,61 @@ mod tests {
 
         // Fill to the cap, then the 11th is refused.
         for _ in 1..MAX_HOMEWORK_FILES_PER_SUBMISSION {
-            a_file(&sub_a).insert(&db).await.unwrap();
+            a_file(&sub_a).insert(&db).await.unwrap().unwrap();
         }
         assert!(matches!(
             a_file(&sub_a).insert(&db).await,
             Err(AppError::Conflict(_))
         ));
+    }
+
+    /// A graded submission takes no more files and gives none up — decided by
+    /// the same conditional write that claims the file slot, so no
+    /// `homework_result` read stands between the check and the write.
+    ///
+    /// Bite check: drop [`SUBMISSION_OPEN_GUARD`] from `insert`'s
+    /// [`cap::claim_when`] and the add below lands; drop it from `delete`'s gate
+    /// and the delete below succeeds.
+    #[tokio::test]
+    async fn a_grade_freezes_the_files_too() {
+        use crate::domain::homework_result::{HomeworkResult, HomeworkStatus};
+
+        let db = crate::database::init_mem().await.unwrap();
+        let homework = HomeworkId::from_key("01TESTHWAAAAAAAAAAAAAAAAAA");
+        let user = UserId::from_key("01TESTUSERAAAAAAAAAAAAAAAA");
+        let submission = HomeworkSubmission::upsert(&homework, &user, None, &db)
+            .await
+            .unwrap()
+            .unwrap();
+        let sub = submission.get_id().clone();
+        let stored = a_file(&sub).insert(&db).await.unwrap().unwrap();
+
+        HomeworkResult::grade(
+            &homework,
+            &user,
+            HomeworkStatus::try_new("done").unwrap(),
+            None,
+            &UserId::from_key("01TESTTEACHERAAAAAAAAAAAAA"),
+            &db,
+        )
+        .await
+        .unwrap();
+
+        // Neither adding nor removing an attachment: `None` is the freeze, and
+        // the cap's own `Err(Conflict)` stays distinct from it.
+        assert!(a_file(&sub).insert(&db).await.unwrap().is_none());
+        assert!(stored.clone().delete(&db).await.unwrap().is_none());
+        assert_eq!(
+            HomeworkFile::count_for_submission(&sub, &db).await.unwrap(),
+            1,
+            "the graded submission keeps exactly the files it was graded on"
+        );
+        // The refused add took no slot either, so un-grading gives back a
+        // submission with room, not one that silently lost nine.
+        HomeworkResult::remove(&homework, &user, &db).await.unwrap();
+        for _ in 1..MAX_HOMEWORK_FILES_PER_SUBMISSION {
+            a_file(&sub).insert(&db).await.unwrap().unwrap();
+        }
+        assert!(stored.delete(&db).await.unwrap().is_some());
     }
 }

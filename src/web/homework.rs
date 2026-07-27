@@ -44,15 +44,31 @@ use super::{
 
 /// Serializes the homework subsystem's cross-record check-then-writes, which
 /// `BEGIN…COMMIT` cannot (write skew) — the same reasoning as
-/// [`crate::web::exams::EXAM_LOCK`]. The class of bug: a submission stays
-/// editable only *until a result exists*, so the "no grade yet" read and the
-/// submission write that depends on it must not straddle a concurrent grade,
-/// and a homework delete must not race a submission landing under it. Read side
-/// (steps 3/4): the student's submission and file writes, held from the
-/// ungraded gate through the upsert, concurrent with each other. Write side:
-/// grade/ungrade (steps 3/4) and the homework-delete cascade here. Lock order,
-/// where both are taken: `HOMEWORK_LOCK` before the file-cap `Mutex`, never the
-/// reverse.
+/// [`crate::web::exams::EXAM_LOCK`]. It is a *within-replica* guard only, so
+/// the rule it can no longer be trusted with is the freeze: a graded submission
+/// used to stay unedited because the "no grade yet" read and the write it
+/// licensed sat under one lease, which two processes never shared. That rule
+/// moved into the database — grading stamps
+/// [`crate::constant::SUBMISSION_GRADED_FIELD`] on the submission row and every
+/// student-side write carries `graded_by_result = NONE` as its own condition.
+///
+/// What still leases it, honestly:
+/// - Write: the homework PATCH's orphan guard ([`update_homework`]), the
+///   homework-delete cascade ([`delete_homework`]), and grade/ungrade — which
+///   read the homework itself under the lease so a concurrent delete can't
+///   leave a result row under a vanished homework.
+/// - Read: the student's submission/file writes, which no longer gate the
+///   freeze but still must not land under a PATCH re-scoping the audience out
+///   from under them.
+///
+/// The subject rule has left: creating a homework and re-tagging one move the
+/// subject's reference counter, and the subject delete is refused while that
+/// counter is non-zero ([`crate::domain::subject::Subject::delete`]), so
+/// neither the create ([`super::courses`]) nor the outside writer the subject
+/// delete used to take is on this list any more.
+///
+/// Lock order, where both are taken: `HOMEWORK_LOCK` before the counter lock in
+/// [`crate::domain::cap`], never the reverse.
 // ponytail: global RwLock, shard per-homework if write latency ever matters.
 pub(crate) static HOMEWORK_LOCK: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
 
@@ -299,8 +315,9 @@ async fn update_homework(
     // Writer lease of [`HOMEWORK_LOCK`]: `ensure_no_orphans` below reads the
     // live submissions and results, and the row write depends on what it saw —
     // without the lease a submission (a reader) could land between the check
-    // and the write, orphaned by the narrowing that just missed it. The lease
-    // also pins the subject re-tag against a concurrent subject delete.
+    // and the write, orphaned by the narrowing that just missed it. The subject
+    // re-tag no longer needs it — it moves the two subjects' reference counters
+    // inside `Homework::update`.
     let _guard = HOMEWORK_LOCK.write().await;
 
     // Only what the request carried: an omitted field stays `None` and is never
@@ -609,10 +626,15 @@ async fn submit(
         Some(ref text) if !text.is_empty() => Some(SubmissionText::try_new(text)?),
         _ => None,
     };
-    // Reader lease of HOMEWORK_LOCK, held from the graded gate through the write:
-    // the "no grade yet" read and the upsert that depends on it are one unit, or
-    // a grade landing between them lets an edit slip onto a frozen submission.
+    // Reader lease of HOMEWORK_LOCK: no longer the freeze (that is the stamp on
+    // the row, below), but still the interlock against a PATCH re-scoping this
+    // homework's audience while the submission lands under it.
     let _guard = HOMEWORK_LOCK.read().await;
+    // The graded gate, twice over. This read answers the common case — graded
+    // minutes ago, and the student who never submitted has no row to carry the
+    // freeze; the upsert's own `WHERE` (the grade stamp on the row) is what
+    // holds when the grade lands *while* this request runs, in this replica or
+    // the other one.
     if HomeworkResult::read_for(homework.get_id(), user.get_id(), &st.db)
         .await?
         .is_some()
@@ -621,13 +643,18 @@ async fn submit(
             "this homework has been graded — ask the teacher to remove the grade before editing your submission",
         ));
     }
-    // 201-vs-200: a prior read under the lock is exact, where comparing the
-    // returned stamps would misreport a same-millisecond re-submit as a create.
+    // 201-vs-200: a prior read is exact, where comparing the returned stamps
+    // would misreport a same-millisecond re-submit as a create.
     let existed = HomeworkSubmission::read_for(homework.get_id(), user.get_id(), &st.db)
         .await?
         .is_some();
-    let submission =
-        HomeworkSubmission::upsert(homework.get_id(), user.get_id(), text, &st.db).await?;
+    let Some(submission) =
+        HomeworkSubmission::upsert(homework.get_id(), user.get_id(), text, &st.db).await?
+    else {
+        return Err(AppError::Conflict(
+            "this homework has been graded — ask the teacher to remove the grade before editing your submission",
+        ));
+    };
     let files = HomeworkFile::list_for_submission(submission.get_id(), &st.db).await?;
     let status = if existed {
         StatusCode::OK
@@ -705,6 +732,7 @@ async fn delete_submission(
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
     let homework = gate_own_submission(&id, &user, &st.db).await?;
+    // Reader lease as in `submit` — the audience interlock, not the freeze.
     let _guard = HOMEWORK_LOCK.read().await;
     if HomeworkResult::read_for(homework.get_id(), user.get_id(), &st.db)
         .await?
@@ -720,7 +748,13 @@ async fn delete_submission(
     // Collect blob names before the cascade (submission.delete wipes the file
     // rows in the same transaction), then unlink after the rows are gone.
     let files = HomeworkFile::list_for_submission(submission.get_id(), &st.db).await?;
-    submission.delete(&st.db).await?;
+    // The delete carries the freeze as its own condition, so a grade landing
+    // since the read above refuses it rather than wiping graded work.
+    if submission.delete(&st.db).await?.is_none() {
+        return Err(AppError::Conflict(
+            "this homework has been graded — ask the teacher to remove the grade before deleting your submission",
+        ));
+    }
     for file in &files {
         remove_blob(&st.files_path, file.get_file()).await;
     }
@@ -799,29 +833,33 @@ async fn upload_submission_file(
     let name = FileName::try_new(&upload.name.unwrap_or_default())?;
     let content_type = FileContentType::try_new(&upload.content_type.unwrap_or_default())?;
 
-    // Reader lease of HOMEWORK_LOCK, held from the graded gate through the write.
+    const GRADED: AppError = AppError::Conflict(
+        "this homework has been graded — ask the teacher to remove the grade before adding files",
+    );
+    // Reader lease as in `submit` — the audience interlock, not the freeze.
+    // Taken before the cap claim inside `insert`, never after (the lock order
+    // is HOMEWORK_LOCK, then the counter lock).
     let _guard = HOMEWORK_LOCK.read().await;
+    // The common-case gate; the freeze itself rides on the writes below.
     if HomeworkResult::read_for(homework.get_id(), user.get_id(), &st.db)
         .await?
         .is_some()
     {
-        return Err(AppError::Conflict(
-            "this homework has been graded — ask the teacher to remove the grade before adding files",
-        ));
+        return Err(GRADED);
     }
     // A submission row must exist to hang the file off; auto-create an empty one
     // for the photo-only case rather than force a separate text submit first.
-    let submission = match HomeworkSubmission::read_for(homework.get_id(), user.get_id(), &st.db)
-        .await?
-    {
-        Some(existing) => existing,
-        None => HomeworkSubmission::upsert(homework.get_id(), user.get_id(), None, &st.db).await?,
-    };
+    let submission =
+        match HomeworkSubmission::read_for(homework.get_id(), user.get_id(), &st.db).await? {
+            Some(existing) => existing,
+            None => HomeworkSubmission::upsert(homework.get_id(), user.get_id(), None, &st.db)
+                .await?
+                .ok_or(GRADED)?,
+        };
 
     // Blob first, row second — a stored row always points at a real blob. The
-    // 10-file cap is enforced inside `insert` under its own lock (order:
-    // HOMEWORK_LOCK then the cap Mutex, never reversed). Unlink the fresh blob if
-    // the row insert loses the cap race.
+    // 10-file cap and the freeze are one conditional write on the submission row
+    // inside `insert`. Unlink the fresh blob if the row insert loses either.
     let file = HomeworkFile::new(
         submission.get_id(),
         name,
@@ -833,10 +871,12 @@ async fn upload_submission_file(
         .await
         .map_err(|err| AppError::Internal(format!("failed to store the file blob: {err}")))?;
     let stored = match file.insert(&st.db).await {
-        Ok(stored) => stored,
-        Err(err) => {
+        Ok(Some(stored)) => stored,
+        // `None` is the freeze biting, an `Err` the file cap (or worse); either
+        // way the blob just written has no row and must go.
+        landed => {
             let _ = tokio::fs::remove_file(&path).await;
-            return Err(err);
+            return Err(landed.err().unwrap_or(GRADED));
         }
     };
     // A landed file moves the submission's "last touched" clock (the late flag).
@@ -923,24 +963,29 @@ async fn delete_submission_file(
     Path((id, fid)): Path<(String, String)>,
 ) -> Result<StatusCode, AppError> {
     let homework = gate_own_submission(&id, &user, &st.db).await?;
+    const GRADED: AppError = AppError::Conflict(
+        "this homework has been graded — ask the teacher to remove the grade before deleting files",
+    );
+    // Reader lease as in `submit` — the audience interlock, not the freeze.
     let _guard = HOMEWORK_LOCK.read().await;
     if HomeworkResult::read_for(homework.get_id(), user.get_id(), &st.db)
         .await?
         .is_some()
     {
-        return Err(AppError::Conflict(
-            "this homework has been graded — ask the teacher to remove the grade before deleting files",
-        ));
+        return Err(GRADED);
     }
     let submission = HomeworkSubmissionId::composite(homework.get_id(), user.get_id());
     let file = HomeworkFile::read_for(&HomeworkFileId::from_key(&fid), &submission, &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
     let blob = file.get_file().to_string();
-    file.delete(&st.db).await?;
+    // The delete's own transaction re-stamps the submission's "last touched"
+    // clock (the late flag) as its freeze gate, so a refused delete moves
+    // nothing and no separate touch is owed here.
+    if file.delete(&st.db).await?.is_none() {
+        return Err(GRADED);
+    }
     remove_blob(&st.files_path, &blob).await;
-    // A removed file moves the submission's "last touched" clock (the late flag).
-    HomeworkSubmission::touch(&submission, &st.db).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

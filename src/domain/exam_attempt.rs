@@ -438,9 +438,19 @@ mod tests {
             &[],
         )
         .unwrap();
+        // A real subject row, not a minted id: a question claims a reference on
+        // its subject and is refused if that subject does not exist.
+        let subject = crate::domain::subject::Subject::create(
+            &crate::domain::course::CourseId::generate(),
+            crate::domain::subject::SubjectName::try_new("topic").unwrap(),
+            crate::domain::subject::SubjectDescription::try_new("").unwrap(),
+            db,
+        )
+        .await
+        .unwrap();
         let question = ExamQuestion::create(
             exam.get_id(),
-            crate::domain::subject::SubjectId::generate(),
+            subject.get_id().clone(),
             crate::domain::exam_question::QuestionText::try_new("3 + 3?").unwrap(),
             QuestionPoints::try_new(5).unwrap(),
             spec,

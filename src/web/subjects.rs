@@ -8,16 +8,11 @@ use utoipa_axum::routes;
 
 use crate::database::Database;
 use crate::domain::course::{Course, CourseId};
-use crate::domain::exam_question::ExamQuestion;
-use crate::domain::homework::Homework;
 use crate::domain::subject::{Subject, SubjectDescription, SubjectId, SubjectName};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
 
-use super::bank_questions::BANK_LOCK;
 use super::courses::{can_manage_course, can_view_course};
-use super::exams::EXAM_LOCK;
-use super::homework::HOMEWORK_LOCK;
 use super::{CurrentUser, RequireTeacher, SubjectResponse};
 
 pub fn routes() -> OpenApiRouter<AppState> {
@@ -194,35 +189,11 @@ async fn delete_subject(
             "only the course creator, an assigned teacher, or a manager/admin can delete this subject",
         ));
     }
-    // Writer lease of [`EXAM_LOCK`]: the no-questions check and the delete
-    // are one unit, so a question create/update that just validated this
-    // subject can't land its row on a subject that vanished mid-flight.
-    let _guard = EXAM_LOCK.write().await;
-    if ExamQuestion::any_for_subject(subject.get_id(), &st.db).await? {
-        return Err(AppError::Conflict(
-            "exam questions still reference this subject — re-tag or delete them first",
-        ));
-    }
-    // The homework twin of the guard above, under [`HOMEWORK_LOCK`]'s writer
-    // lease: homework create validates its subject under the read side and the
-    // PATCH re-tag under the write side, so the no-homework check and the
-    // delete can't straddle a row that just adopted this subject. This is the
-    // only place both locks are held; the order is EXAM_LOCK, then
-    // HOMEWORK_LOCK.
-    let _homework_guard = HOMEWORK_LOCK.write().await;
-    if Homework::any_for_subject(subject.get_id(), &st.db).await? {
-        return Err(AppError::Conflict(
-            "homework still references this subject — re-tag or delete it first",
-        ));
-    }
-    // Bank templates carry this subject as optional origin metadata, so they
-    // don't block: `Subject::delete` clears it off them in the delete's own
-    // transaction. Writer lease of [`BANK_LOCK`] all the same — bank
-    // create/update validate their subject and write under the reader lease, so
-    // without it a template could adopt this subject *after* the cascade ran
-    // and outlive it. Held last; the order is EXAM_LOCK, then HOMEWORK_LOCK,
-    // then BANK_LOCK.
-    let _bank_guard = BANK_LOCK.write().await;
+    // No locks: the two checks *are* the delete's `WHERE`, decided against the
+    // subject's own reference counters inside one statement. This used to be
+    // three process-wide locks (the only site that held more than one) around
+    // two cross-table counts, which served one replica and let the other create
+    // a question on a subject being deleted.
     subject.delete(&st.db).await?;
     Ok(StatusCode::NO_CONTENT)
 }

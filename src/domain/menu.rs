@@ -10,14 +10,14 @@
 //! - **`slot` is a snapshot**, not a link into settings. Retiring a slot must
 //!   never rewrite a menu already published under it.
 
-use std::sync::LazyLock;
-
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use tokio::sync::Mutex;
-use ulid::Generator;
 
-use crate::constant::{MAX_MENU_CAPACITY, MENU_TABLE};
-use crate::database::Database;
+use crate::constant::{
+    MAX_MENU_CAPACITY, MENU_SEAT_COUNT_FIELD, MENU_TABLE, MENU_VERSION_FIELD, SLOT_REF_TABLE,
+};
+use crate::database::{Database, lost_the_race};
+use crate::domain::cap;
 use crate::domain::field_update::FieldUpdate;
 use crate::domain::menu_dish::MenuDish;
 use crate::domain::page::PagedList;
@@ -26,38 +26,46 @@ use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 
-/// Serializes "is there already a menu for this day and slot?" against the
-/// publish it authorizes — a count-then-write pair SurrealDB does not
-/// conflict-check, so the UNIQUE index would otherwise be the only thing
-/// standing between two racing publishes and a 500. Also held by the settings
-/// slot-removal guard, whose check ("was any menu published for this slot?")
-/// is the mirror image.
+/// Serializes what is left that counts rows against one menu: the dish cap
+/// (`MAX_DISHES_PER_MENU`, a count-then-write SurrealDB does not
+/// conflict-check). Publishing no longer needs it — the day+slot *is* the
+/// record id — and neither does a booking, a menu delete, or the settings
+/// slot-removal guard: those went to conditional single-record writes
+/// ([`crate::domain::cap`]), which hold across replicas as this lock cannot.
+//
+// ponytail: the dish cap is therefore still replica-local — two replicas can
+// each add the 50th dish. Closing it is another `cap` counter (`dish_count` on
+// the menu row) plus its backfill; the ceiling is 51 dishes on a menu, not
+// money or a seat, so it was not worth the column here.
 ///
-/// Lock order: `EXAM_LOCK` (taken by the same settings write) is always taken
-/// *before* this one; nothing here ever takes `EXAM_LOCK`, so the two cannot
-/// deadlock.
+/// A leaf: nothing held under it takes another lock.
 pub(crate) static MENU_LOCK: Mutex<()> = Mutex::const_new(());
 
-/// Mints menu ids in write order — `Ulid::new()`'s random low bits sort
-/// arbitrarily within one millisecond, which would scramble the `id` tie-break
-/// of the listings below.
-static IDS: LazyLock<std::sync::Mutex<Generator>> =
-    LazyLock::new(|| std::sync::Mutex::new(Generator::new()));
+/// The reference counter for one meal slot — how many menus are published under
+/// that name, and whether the school has retired it (see
+/// [`crate::domain::cap`]). The mirror of
+/// [`kind_ref`](crate::domain::exam_result::kind_ref) for exam kinds: the slot
+/// is snapshotted text on the menu, so this row is the only place the two
+/// tables' relationship is a single record two replicas can contend on.
+pub(crate) fn slot_ref(slot: &str) -> RecordId {
+    RecordId::new(SLOT_REF_TABLE, slot)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct MenuId(RecordId);
 
 impl MenuId {
-    pub fn generate() -> Self {
-        let mut ids = IDS.lock().expect("menu id generator poisoned");
-        // The only error is exhausting the random bits within one millisecond
-        // (2^80 ids deep); it clears itself as the clock ticks, so retry.
-        let ulid = loop {
-            if let Ok(ulid) = ids.generate() {
-                break ulid;
-            }
-        };
-        Self(RecordId::new(MENU_TABLE, ulid.to_string()))
+    /// The one id a menu for this day and slot can have. Deterministic on
+    /// purpose (the `EnrollmentId` trick): two replicas publishing the same
+    /// meal race on a single record instead of writing two rows, so the loser
+    /// is told "already exists" by the store and answered the same 409 the
+    /// pre-check gives. `date` is fixed-width `YYYY-MM-DD`, so the `_` joiner
+    /// cannot be read two ways however the school spells its slots.
+    pub fn for_slot(date: &MenuDate, slot: &MenuSlot) -> Self {
+        Self(RecordId::new(
+            MENU_TABLE,
+            format!("{}_{}", date.as_str(), slot.as_str()),
+        ))
     }
 
     pub fn from_key(key: &str) -> Self {
@@ -156,6 +164,12 @@ pub struct Menu {
     date: MenuDate,
     slot: MenuSlot,
     capacity: Option<i64>,
+    /// The menu's revision (see [`MENU_VERSION_FIELD`]). Absent on rows written
+    /// before the column existed, which reads as revision zero — the same thing
+    /// `(version ?? 0)` says in the claim's `WHERE`. The seat counter is
+    /// deliberately *not* here: it is the database's to own, and a whole-row
+    /// save must never carry a stale copy of it.
+    version: Option<i64>,
     created_by: UserId,
     created_at: Timestamp,
 }
@@ -177,6 +191,13 @@ impl Menu {
         self.capacity
     }
 
+    /// The revision a booking must still find on the row when it claims its
+    /// seat. Absent (a pre-column row) is revision zero, exactly as the `WHERE`
+    /// reads it.
+    pub fn get_version(&self) -> i64 {
+        self.version.unwrap_or(0)
+    }
+
     pub fn get_created_by(&self) -> &UserId {
         &self.created_by
     }
@@ -185,9 +206,14 @@ impl Menu {
         self.created_at
     }
 
-    /// Publish a menu. Refused (409) when the day+slot already carries one —
-    /// re-checked under [`MENU_LOCK`], so two racing publishes cannot both find
-    /// the day free and trip the UNIQUE index into a 500.
+    /// Publish a menu. Refused (409) when the day+slot already carries one.
+    ///
+    /// The day and slot *are* the record id ([`MenuId::for_slot`]), so the
+    /// refusal is decided by the store rather than by a check a peer replica can
+    /// outrun: two publishes of the same meal write one id, and the loser's
+    /// "already exists" becomes the same 409. The pre-check stays for the
+    /// ordinary case — and for menus published before ids were derived, whose
+    /// ULID key no new publish can collide with.
     pub async fn create(
         date: MenuDate,
         slot: MenuSlot,
@@ -195,22 +221,44 @@ impl Menu {
         created_by: &UserId,
         db: &Database,
     ) -> Result<Menu, AppError> {
-        let _guard = MENU_LOCK.lock().await;
+        let taken = AppError::Conflict("a menu is already published for that date and slot");
         if Self::find(&date, &slot, db).await?.is_some() {
-            return Err(AppError::Conflict(
-                "a menu is already published for that date and slot",
-            ));
+            return Err(taken);
+        }
+        // The menu takes a reference on its slot, which is what stops the slot
+        // being dropped from the settings while this menu (whose slot is only
+        // snapshotted text) still points at it. Claimed before the write and
+        // given back if the write does not land, exactly like a seat.
+        let counter = slot_ref(slot.as_str());
+        if !cap::claim_ref(&counter, 1, db).await? {
+            return Err(AppError::ConflictOwned(format!(
+                "the '{}' meal slot has been removed from the school's settings",
+                slot.as_str()
+            )));
         }
         let menu = Menu {
-            id: MenuId::generate(),
+            id: MenuId::for_slot(&date, &slot),
             date,
             slot,
             capacity,
+            version: Some(0),
             created_by: created_by.clone(),
             created_at: Timestamp::now(),
         };
-        let created: Option<Menu> = db.create(menu.id.record()).content(menu).await?;
-        created.ok_or_else(|| AppError::Internal("failed to publish the menu".into()))
+        match db.create(menu.id.record()).content(menu).await {
+            Ok(Some(created)) => Ok(created),
+            Ok(None) => {
+                cap::release_ref(&counter, 1, db).await?;
+                Err(AppError::Internal("failed to publish the menu".into()))
+            }
+            Err(err) => {
+                cap::release_ref(&counter, 1, db).await?;
+                match lost_the_race(&err) {
+                    true => Err(taken),
+                    false => Err(err.into()),
+                }
+            }
+        }
     }
 
     pub async fn read(id: &MenuId, db: &Database) -> Result<Option<Menu>, AppError> {
@@ -255,37 +303,57 @@ impl Menu {
     /// Only `capacity` is writable: `date` and `slot` are `READONLY` columns,
     /// because moving a published menu to another day is a different menu.
     /// `None` keeps the stored cap, `Some(None)` clears it back to uncapped.
+    ///
+    /// Moving the cap moves the revision first ([`cap::bump`]): a booking that
+    /// read the old cap must not claim its seat against it, or a shrink
+    /// over-admits by exactly the bookings in flight.
     pub async fn update(
         self,
         capacity: Option<Option<i64>>,
         db: &Database,
     ) -> Result<Menu, AppError> {
+        if capacity.is_some() {
+            cap::bump(&self.id.record(), MENU_VERSION_FIELD, db).await?;
+        }
         FieldUpdate::new(self.id.record())
             .set("capacity", capacity)
             .run::<Menu>(db)
             .await
     }
 
-    /// Whether any menu was ever published for this slot name — the guard
-    /// behind removing a slot from `meal_slots`, mirroring
-    /// [`ExamResult::any_for_kind`](crate::domain::exam_result::ExamResult::any_for_kind).
-    /// Menus snapshot the slot as text, so this is a plain string match.
-    /// Callers hold [`MENU_LOCK`] so a publish cannot slip in behind the check.
-    pub async fn any_for_slot(slot: &str, db: &Database) -> Result<bool, AppError> {
-        let mut result = db
-            .query("SELECT VALUE id FROM menu WHERE slot = $slot LIMIT 1")
-            .bind(("slot", slot.to_string()))
-            .await?
-            .check()?;
-        Ok(!result.take::<Vec<RecordId>>(0)?.is_empty())
-    }
-
     /// Delete the menu and the dishes on it — a dish has no meaning without
     /// its menu, and the `menu` link is `READONLY`, so it cannot be re-homed.
+    ///
+    /// Refused (409) while a seat is still held, and the *row itself* decides
+    /// that: the delete carries the seat counter in its `WHERE`, so a booking
+    /// landing in another replica at that instant either takes its seat before
+    /// the delete (which then finds a non-zero counter and refuses) or after it
+    /// (and finds no menu). A read-then-delete pair had a window where both
+    /// happened — a paid seat on a menu that no longer exists.
+    ///
+    /// The dishes go *after* the row: their cascade must not run for a delete
+    /// the counter refused.
     pub async fn delete(self, db: &Database) -> Result<Menu, AppError> {
+        let mut result = db
+            .query(format!(
+                "DELETE $id WHERE ({MENU_SEAT_COUNT_FIELD} ?? 0) = 0 RETURN BEFORE"
+            ))
+            .bind(("id", self.id.record()))
+            .await?
+            .check()?;
+        let Some(deleted) = result.take::<Vec<Menu>>(0)?.into_iter().next() else {
+            // Nothing back: either seats are held, or the menu is already gone.
+            return Err(match Self::read(&self.id, db).await? {
+                Some(_) => AppError::Conflict("the menu still has live bookings"),
+                None => AppError::NotFound,
+            });
+        };
         MenuDish::delete_for_menu(&self.id, db).await?;
-        let deleted: Option<Menu> = db.delete(self.id.record()).await?;
-        deleted.ok_or(AppError::NotFound)
+        // The slot gets its reference back — a slot no menu is published for
+        // any more may leave the settings again. After the delete, so a crash
+        // over-counts (refusing a removal) rather than under-counts.
+        cap::release_ref(&slot_ref(deleted.slot.as_str()), 1, db).await?;
+        Ok(deleted)
     }
 }
 
