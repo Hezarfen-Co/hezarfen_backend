@@ -12,9 +12,10 @@ use ulid::Generator;
 
 use crate::constant::{
     MAX_DISH_DESCRIPTION_LEN, MAX_DISH_NAME_LEN, MAX_DISH_PRICE_MINOR, MAX_DISH_TAGS,
-    MENU_DISH_TABLE,
+    MENU_DISH_TABLE, MENU_VERSION_FIELD,
 };
 use crate::database::Database;
+use crate::domain::cap;
 use crate::domain::field_update::FieldUpdate;
 use crate::domain::menu::MenuId;
 use crate::domain::timestamp::Timestamp;
@@ -185,6 +186,7 @@ impl MenuDish {
         self.created_at
     }
 
+    /// Add a dish. Moves the menu's revision *first* — see [`Self::bump_menu`].
     pub async fn create(
         menu: &MenuId,
         name: DishName,
@@ -202,8 +204,43 @@ impl MenuDish {
             tags,
             created_at: Timestamp::now(),
         };
-        let created: Option<MenuDish> = db.create(dish.id.record()).content(dish).await?;
-        created.ok_or_else(|| AppError::Internal("failed to add the dish".into()))
+        // The revision bump and the insert are one transaction, and the bump is
+        // what makes the menu's existence part of it: the `UPDATE` matches
+        // nothing once the menu row is deleted, and a delete racing this one
+        // touches the very key this transaction writes, so the two cannot both
+        // commit. Without that, a dish landing just after `DELETE /menus/{id}`
+        // removed the row but before its cascade ran outlived its menu.
+        let mut result = db
+            .query(format!(
+                "BEGIN TRANSACTION;
+                 LET $bumped = (UPDATE $menu SET {MENU_VERSION_FIELD} = \
+                     ({MENU_VERSION_FIELD} ?? 0) + 1 RETURN VALUE id);
+                 IF array::len($bumped) = 0 {{ THROW 'no_menu' }};
+                 CREATE $id CONTENT $dish;
+                 COMMIT TRANSACTION;"
+            ))
+            .bind(("menu", menu.record()))
+            .bind(("id", dish.id.record()))
+            .bind(("dish", dish))
+            .await?;
+        // An aborted transaction errors *every* slot, most with a generic "not
+        // executed" — only the THROW's own slot names the reason.
+        let mut errors = result.take_errors();
+        if errors
+            .values()
+            .any(|error| error.to_string().contains("no_menu"))
+        {
+            return Err(AppError::NotFound);
+        }
+        if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+            return Err(error.into());
+        }
+        // Slots count BEGIN, the LET and the IF: the CREATE is slot 3.
+        result
+            .take::<Vec<MenuDish>>(3)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| AppError::Internal("failed to add the dish".into()))
     }
 
     pub async fn read(id: &MenuDishId, db: &Database) -> Result<Option<MenuDish>, AppError> {
@@ -240,6 +277,19 @@ impl MenuDish {
         Ok(Self::list_for_menu(menu, db).await?.len())
     }
 
+    /// What a seat on this dish's menu costs changed, so the menu is now at a
+    /// new revision and any booking that priced itself against the old one has
+    /// to re-read. Called *before* the write, never after: bumped-and-not-written
+    /// costs a booking one retry, written-and-not-bumped bills a seat a price
+    /// the menu no longer carries.
+    ///
+    /// Deliberately on every dish write, not only the ones that move
+    /// `price_minor`: a re-tagged dish is cheap to re-read, and a rule that
+    /// applies to every write cannot be forgotten by the next field added here.
+    async fn bump_menu(menu: &MenuId, db: &Database) -> Result<(), AppError> {
+        cap::bump(&menu.record(), MENU_VERSION_FIELD, db).await
+    }
+
     /// Write only the fields the PATCH carried. `description` is nullable, so
     /// it takes the three-way shape: absent = keep, `Some(None)` = clear.
     pub async fn update(
@@ -250,6 +300,7 @@ impl MenuDish {
         tags: Option<DishTags>,
         db: &Database,
     ) -> Result<MenuDish, AppError> {
+        Self::bump_menu(&self.menu, db).await?;
         FieldUpdate::new(self.id.record())
             .set("name", name)
             .set("description", description)
@@ -260,6 +311,7 @@ impl MenuDish {
     }
 
     pub async fn delete(self, db: &Database) -> Result<MenuDish, AppError> {
+        Self::bump_menu(&self.menu, db).await?;
         let deleted: Option<MenuDish> = db.delete(self.id.record()).await?;
         deleted.ok_or(AppError::NotFound)
     }

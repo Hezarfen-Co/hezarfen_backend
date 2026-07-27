@@ -7,9 +7,10 @@ use surrealdb::types::SurrealValue;
 
 use crate::config::Config;
 use crate::constant::{
-    CHATBOT_PENDING_STALE_SECS, MIGRATION_LOCK_CLAIM, MIGRATION_LOCK_DDL, MIGRATION_LOCK_HEARTBEAT,
-    MIGRATION_LOCK_HEARTBEAT_SECS, MIGRATION_LOCK_LEASE_SECS, MIGRATION_LOCK_POLL_MS,
-    MIGRATION_LOCK_STAMP, MIGRATION_LOCK_STATE, MIGRATION_LOCK_TAKEOVER, MIGRATION_LOCK_WAIT_SECS,
+    CAS_UPDATE_RETRIES, CHATBOT_PENDING_STALE_SECS, MIGRATION_LOCK_CLAIM, MIGRATION_LOCK_DDL,
+    MIGRATION_LOCK_HEARTBEAT, MIGRATION_LOCK_HEARTBEAT_SECS, MIGRATION_LOCK_LEASE_SECS,
+    MIGRATION_LOCK_POLL_MS, MIGRATION_LOCK_STAMP, MIGRATION_LOCK_STATE, MIGRATION_LOCK_TAKEOVER,
+    MIGRATION_LOCK_WAIT_SECS,
 };
 use crate::domain::user::{Password, User, Username};
 use crate::error::AppError;
@@ -143,13 +144,24 @@ async fn boot_once(
         if claim(db, MIGRATION_LOCK_CLAIM, &me, lease_ms).await? {
             return leader_applies(db, &me, admin).await.map(|()| true);
         }
-        let state: Option<LockState> = db
+        let read = db
             .query(MIGRATION_LOCK_STATE)
             .bind(("lease_ms", lease_ms))
             .bind(("fingerprint", migration_fingerprint()))
-            .await?
-            .check()?
-            .take(0)?;
+            .await
+            .and_then(|response| response.check())
+            .and_then(|mut response| response.take::<Option<LockState>>(0));
+        let state = match read {
+            Ok(state) => state,
+            // The leader heartbeats this very row every few seconds and rivals
+            // take it over, so a read of it can be aborted as retryable — which
+            // is not an error about the lock, just "no answer this round". This
+            // poll loop, with its deadline, *is* the bounded retry the conflict
+            // asks for, so treat it like a missing row and look again. Retrying
+            // a `SELECT` is free of side effects by construction.
+            Err(err) if lost_the_race(&err) => None,
+            Err(err) => return Err(err.into()),
+        };
         match state {
             // A live lease, stamped with our own fingerprint: the exact schema
             // this process needs is in place, so stop waiting.
@@ -328,13 +340,34 @@ async fn leader_applies(
         lost = renew_lease(db, me) => return Err(lost),
     }
 
-    let mut response = db
-        .query(MIGRATION_LOCK_STAMP)
-        .bind(("me", me.to_string()))
-        .bind(("fingerprint", migration_fingerprint()))
-        .await?
-        .check()?;
-    let stamped: Vec<String> = response.take(0)?;
+    // The stamp is the one write in this path with nothing above it to retry
+    // it: waiters are polling the same row and taking it over, so the
+    // key-value layer can abort ours as retryable, and an escaping conflict
+    // fails a boot that had already migrated everything. Repeating it is safe
+    // despite `applies += 1` — a conflicted transaction commits nothing, and
+    // the statement's `holder` guard turns a *genuine* takeover into an empty
+    // result rather than a second count. Bounded, because a conflict that
+    // never clears is a real failure and must stay one.
+    let mut stamped: Vec<String> = Vec::new();
+    for attempt in 0..CAS_UPDATE_RETRIES {
+        let attempted = db
+            .query(MIGRATION_LOCK_STAMP)
+            .bind(("me", me.to_string()))
+            .bind(("fingerprint", migration_fingerprint()))
+            .await
+            .and_then(|response| response.check());
+        match attempted {
+            Ok(mut response) => {
+                stamped = response.take(0)?;
+                break;
+            }
+            Err(err) if lost_the_race(&err) && attempt + 1 < CAS_UPDATE_RETRIES => {
+                tracing::warn!("stamping the boot migration lock conflicted ({err}) — retrying");
+                tokio::time::sleep(std::time::Duration::from_millis(MIGRATION_LOCK_POLL_MS)).await;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
     if stamped.is_empty() {
         // The same verdict as a lost renewal, for the same reason — this is the
         // backstop for losing the lock in the window between the last renewal
@@ -522,6 +555,38 @@ mod tests {
                 .is_ok(),
             "the schema is in place once both boots return"
         );
+    }
+
+    /// The same race with enough processes in it to actually hit the
+    /// key-value layer's retryable aborts: eight boots contending for one lock
+    /// row collide on the losers' state read and the leader's stamp, which with
+    /// two boots surfaces only once in a few full-suite runs.
+    ///
+    /// What it asserts is deliberately narrow: no boot may fail with a
+    /// *retryable* conflict. A conflict is the layer asking to be asked again,
+    /// so one reaching the caller is always a missing retry — while the other
+    /// outcomes of a crowded election (a leader that loses its lease to a
+    /// taker) are documented behaviour, not bugs, and asserting against them
+    /// here would only make this flaky. Exactly-once stays the two-boot test's
+    /// job.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_crowd_of_boots_never_surfaces_a_retryable_conflict() {
+        let db = unmigrated().await;
+        let boots: Vec<_> = (0..8)
+            .map(|_| {
+                let db = db.clone();
+                tokio::spawn(async move { boot_once(&db, admin(), Duration::from_secs(30)).await })
+            })
+            .collect();
+        for boot in boots {
+            if let Err(err) = boot.await.unwrap() {
+                let message = err.to_string();
+                assert!(
+                    !message.contains("can be retried") && !message.contains("conflict"),
+                    "a retryable conflict escaped boot_once instead of being retried: {message}"
+                );
+            }
+        }
     }
 
     /// A leader killed mid-migration leaves its claim behind. Nothing may

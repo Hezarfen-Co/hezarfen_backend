@@ -1,14 +1,22 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use ulid::Ulid;
 
-use crate::constant::{COURSE_TABLE, MAX_COURSE_DESCRIPTION_LEN, MAX_COURSE_TITLE_LEN};
+use crate::constant::{
+    COURSE_COUNT_FIELD, COURSE_TABLE, ENROLLMENT_COUNT_FIELD, MAX_COURSE_DESCRIPTION_LEN,
+    MAX_COURSE_TITLE_LEN, REF_COUNT_FIELD,
+};
 use crate::database::Database;
+use crate::domain::cap;
 use crate::domain::field_update::FieldUpdate;
 use crate::domain::page::PagedList;
 use crate::domain::term::TermId;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 use crate::validate::{validate_course_kind, validate_optional, validate_required};
+
+/// The `THROW` marker the delete guard aborts with — a roster that is not
+/// empty, or a course row that is no longer there.
+const ROSTER_MARK: &str = "course_roster";
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct CourseId(RecordId);
@@ -153,6 +161,11 @@ impl Course {
         self.teachers.contains(user)
     }
 
+    /// Create the course, claiming a reference on the term it links (if any)
+    /// *before* the row is written: the claim is a conditional write on the
+    /// term row, so it fails when the term is already gone and it makes the
+    /// term undeletable the instant this link exists — across replicas, which
+    /// the mutex it replaced could not do inside one process.
     pub async fn create(
         creator: &UserId,
         title: CourseTitle,
@@ -162,18 +175,35 @@ impl Course {
         capacity: Option<i64>,
         db: &Database,
     ) -> Result<Course, AppError> {
+        if let Some(term) = &term {
+            claim_term(term, db).await?;
+        }
+        let claimed = term.clone();
         let course = Course {
             id: CourseId::generate(),
             creator: creator.clone(),
             teachers: Vec::new(),
+            term,
+            capacity,
             title,
             description,
             kind,
-            term,
-            capacity,
         };
-        let created: Option<Course> = db.create(course.id.record()).content(course).await?;
-        created.ok_or_else(|| AppError::Internal("failed to create course".into()))
+        let created: Result<Option<Course>, _> =
+            db.create(course.id.record()).content(course).await;
+        match created {
+            Ok(Some(created)) => Ok(created),
+            other => {
+                // The link never landed, so the reference has to go back.
+                if let Some(term) = &claimed {
+                    cap::release(&term.record(), COURSE_COUNT_FIELD, db).await?;
+                }
+                match other {
+                    Err(err) => Err(err.into()),
+                    _ => Err(AppError::Internal("failed to create course".into())),
+                }
+            }
+        }
     }
 
     pub async fn read(id: &CourseId, db: &Database) -> Result<Option<Course>, AppError> {
@@ -250,14 +280,43 @@ impl Course {
         capacity: Option<Option<i64>>,
         db: &Database,
     ) -> Result<Course, AppError> {
-        FieldUpdate::new(self.id.record())
+        // A term move is claim-then-write-then-release, in that order: the new
+        // term is made undeletable before the link points at it, and the old
+        // one is only let go once the link has actually moved off it. Doing it
+        // the other way round would open exactly the window this replaced.
+        let claimed = match &term {
+            Some(Some(new)) if Some(new) != self.term.as_ref() => {
+                claim_term(new, db).await?;
+                Some(new.clone())
+            }
+            _ => None,
+        };
+        let updated = FieldUpdate::new(self.id.record())
             .set("title", title)
             .set("description", description)
             .set("kind", kind)
             .set("term", term.map(|term| term.map(|term| term.record())))
             .set("capacity", capacity)
             .run::<Course>(db)
-            .await
+            .await;
+        match updated {
+            Ok(updated) => {
+                // The stored row is the authority on where the link ended up —
+                // a PATCH that carried no `term_id` leaves it untouched.
+                if let Some(old) = &self.term
+                    && updated.term.as_ref() != Some(old)
+                {
+                    cap::release(&old.record(), COURSE_COUNT_FIELD, db).await?;
+                }
+                Ok(updated)
+            }
+            Err(err) => {
+                if let Some(new) = &claimed {
+                    cap::release(&new.record(), COURSE_COUNT_FIELD, db).await?;
+                }
+                Err(err)
+            }
+        }
     }
 
     /// Assign `teacher` to run this course, or return the course untouched if
@@ -332,9 +391,36 @@ impl Course {
     /// leave an exam pointing at a deleted course. The image and
     /// homework-file *blobs* are the web layer's to remove — it collects
     /// their names before calling this.
-    pub async fn delete(self, db: &Database) -> Result<Course, AppError> {
-        db.query(
+    ///
+    /// The marks going with it give their exam kinds' references back, counted
+    /// per kind inside this same transaction — the mirror of `Exam::delete`.
+    /// Skipping it would leave every kind the course graded under counted
+    /// forever, and a counted kind can never leave the school's settings.
+    ///
+    /// `false` = refused, nothing was written: someone is still enrolled. The
+    /// roster is read off the course's own `enrollment_count`, so the check and
+    /// the delete are one conditional write on one record — an enroll racing
+    /// this either takes its seat first (and the delete is refused) or finds
+    /// the row gone (and is refused itself), in any replica. `Err(NotFound)`
+    /// keeps the answer a concurrent *delete* used to get.
+    pub async fn delete(self, db: &Database) -> Result<bool, AppError> {
+        let mut result = db
+            .query(format!(
             "BEGIN TRANSACTION;
+             LET $gone = (DELETE $course WHERE ({ENROLLMENT_COUNT_FIELD} ?? 0) = 0 RETURN BEFORE);
+             IF array::len($gone) = 0 {{ THROW '{ROSTER_MARK}' }};
+             FOR $row IN $gone {{
+                 IF $row.term != NONE {{
+                     UPDATE $row.term SET {COURSE_COUNT_FIELD} = \
+                         math::max([({COURSE_COUNT_FIELD} ?? 0) - 1, 0]);
+                 }};
+             }};
+             FOR $row IN ((SELECT exam.kind AS kind, count() AS n FROM exam_result
+                 WHERE exam IN (SELECT VALUE id FROM exam WHERE course = $course)
+                 GROUP BY kind) ?? []) {{
+                 UPDATE type::record('kind_ref', $row.kind) SET {REF_COUNT_FIELD} = \
+                     math::max([({REF_COUNT_FIELD} ?? 0) - $row.n, 0])
+             }};
              DELETE exam_result WHERE exam IN (SELECT VALUE id FROM exam WHERE course = $course);
              DELETE exam_attempt WHERE exam IN (SELECT VALUE id FROM exam WHERE course = $course);
              DELETE exam_answer WHERE exam IN (SELECT VALUE id FROM exam WHERE course = $course);
@@ -350,19 +436,171 @@ impl Course {
              DELETE subject WHERE course = $course;
              DELETE homework WHERE course = $course;
              DELETE exam WHERE course = $course;
-             COMMIT TRANSACTION;",
-        )
-        .bind(("course", self.id.record()))
-        .await?
-        .check()?;
-        let deleted: Option<Course> = db.delete(self.id.record()).await?;
-        deleted.ok_or(AppError::NotFound)
+             COMMIT TRANSACTION;"
+            ))
+            .bind(("course", self.id.record()))
+            .await?;
+        // An aborted transaction errors *every* slot, most with a generic "not
+        // executed" — only the THROW's own slot names the marker.
+        let mut errors = result.take_errors();
+        if errors
+            .values()
+            .any(|error| error.to_string().contains(ROSTER_MARK))
+        {
+            // Full stop or already gone: the guard cannot tell those apart, and
+            // only the refusal path pays for the extra read that can.
+            return match Self::read(&self.id, db).await? {
+                Some(_) => Ok(false),
+                None => Err(AppError::NotFound),
+            };
+        }
+        if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+            return Err(error.into());
+        }
+        Ok(true)
     }
+}
+
+/// Take a reference on `term` for a course about to link it. The conditional
+/// write doubles as the existence check: a term that a delete already removed
+/// matches nothing, and the caller answers exactly what the pre-flight lookup
+/// in `web::terms::resolve_term` would have.
+async fn claim_term(term: &TermId, db: &Database) -> Result<(), AppError> {
+    if cap::claim(&term.record(), COURSE_COUNT_FIELD, cap::UNLIMITED, db).await? {
+        return Ok(());
+    }
+    Err(AppError::Validation(ValidationError::Invalid {
+        field: "term_id",
+        reason: "term does not exist",
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn course_on(term: Option<TermId>, db: &Database) -> Course {
+        Course::create(
+            &UserId::from_key("teacher"),
+            CourseTitle::try_new("algebra").unwrap(),
+            CourseDescription::try_new("").unwrap(),
+            CourseKind::course(),
+            term,
+            None,
+            db,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// The bite test for the delete guard that replaced `ENROLL_LOCK`: the
+    /// roster check is now the `WHERE` on the delete itself, so only the guard
+    /// can refuse — and it must refuse having written nothing, cascade
+    /// included. A `>= 0` guard passes the roster branch and fails here.
+    #[tokio::test]
+    async fn a_course_with_a_roster_refuses_to_delete() {
+        use crate::domain::enrollment::Enrollment;
+
+        let db = crate::database::init_mem().await.unwrap();
+        let teacher = UserId::from_key("teacher");
+        let student = UserId::from_key("student");
+        let course = course_on(None, &db).await;
+        Enrollment::enroll(course.get_id(), &student, &teacher, &db)
+            .await
+            .unwrap();
+
+        assert!(
+            !course.clone().delete(&db).await.unwrap(),
+            "a non-empty roster must refuse the delete"
+        );
+        assert!(
+            Course::read(course.get_id(), &db).await.unwrap().is_some(),
+            "a refused delete may write nothing"
+        );
+        assert!(
+            Enrollment::read_for_user(course.get_id(), &student, &db)
+                .await
+                .unwrap()
+                .is_some(),
+            "…the cascade least of all"
+        );
+
+        Enrollment::remove(course.get_id(), &student, &db)
+            .await
+            .unwrap();
+        assert!(course.clone().delete(&db).await.unwrap());
+        assert!(Course::read(course.get_id(), &db).await.unwrap().is_none());
+
+        // The other half of the same guard: once the course row is gone the
+        // seat claim matches nothing, so a late enroll is a 404 rather than a
+        // roster row that outlived its course.
+        let late = Enrollment::enroll(course.get_id(), &student, &teacher, &db)
+            .await
+            .expect_err("enrolling into a deleted course must fail");
+        assert!(matches!(late, AppError::NotFound), "got {late:?}");
+    }
+
+    /// The bite test for the refcount that replaced `TERM_LOCK`: a term is
+    /// undeletable exactly while a course links it, and every way a link can
+    /// end — PATCH away, and the course's own delete — gives the reference
+    /// back. Dropping the release in `delete` leaves the term deletable never.
+    #[tokio::test]
+    async fn a_term_is_deletable_only_once_no_course_links_it() {
+        use crate::domain::term::{Term, TermName};
+
+        let db = crate::database::init_mem().await.unwrap();
+        let at = crate::domain::timestamp::Timestamp::from_millis;
+        let term = Term::create(TermName::try_new("2026").unwrap(), at(100), at(200), &db)
+            .await
+            .unwrap();
+
+        let linked = course_on(Some(term.get_id().clone()), &db).await;
+        let patched = course_on(Some(term.get_id().clone()), &db).await;
+        assert!(
+            !term.clone().delete(&db).await.unwrap(),
+            "two linked courses must refuse the delete"
+        );
+
+        patched
+            .update(None, None, None, Some(None), None, &db)
+            .await
+            .unwrap();
+        assert!(
+            !term.clone().delete(&db).await.unwrap(),
+            "one link is still one link"
+        );
+
+        assert!(linked.delete(&db).await.unwrap());
+        assert!(
+            term.clone().delete(&db).await.unwrap(),
+            "the last link gone, the term may go"
+        );
+        let again = term.delete(&db).await;
+        assert!(
+            matches!(again, Err(AppError::NotFound)),
+            "a second delete is a 404, not a refusal: {again:?}"
+        );
+    }
+
+    /// The claim doubles as the existence check the lock used to make safe:
+    /// a term that is already gone cannot be linked, with the same 400 the
+    /// web layer's pre-flight lookup gives.
+    #[tokio::test]
+    async fn a_course_cannot_link_a_term_that_is_gone() {
+        let db = crate::database::init_mem().await.unwrap();
+        let error = Course::create(
+            &UserId::from_key("teacher"),
+            CourseTitle::try_new("algebra").unwrap(),
+            CourseDescription::try_new("").unwrap(),
+            CourseKind::course(),
+            Some(TermId::from_key("gone")),
+            None,
+            &db,
+        )
+        .await
+        .expect_err("a missing term must not be linkable");
+        assert!(error.to_string().contains("term does not exist"));
+    }
 
     #[tokio::test]
     async fn title_is_required() {

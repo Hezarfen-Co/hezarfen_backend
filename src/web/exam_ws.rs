@@ -396,6 +396,13 @@ async fn handle_message(
             // of [`EXAM_LOCK`] from the gates through the upsert, exactly
             // like `save_answer_checked` — and dropped before the socket
             // sends, so a slow client never stalls a writer.
+            //
+            // ponytail (accepted race, reviewed): the lease is process-local,
+            // so across replicas a save already in flight can land on the
+            // room's sitting just after a retake made it terminal. It writes a
+            // history row for the old seq; the grade of record (latest seq) is
+            // untouched. The fix is a `current_seq` claim on every save — the
+            // hottest path here — so the cost beats the damage and it stays.
             let guard = EXAM_LOCK.read().await;
             // Tracks how far the gates got: only once the sitting resolved can
             // a failure possibly be about this one question rather than about

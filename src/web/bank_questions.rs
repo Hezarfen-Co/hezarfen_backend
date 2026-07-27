@@ -45,22 +45,19 @@ use super::{
     remove_blob, serve_inline_blob, set_or_clear, store_blob,
 };
 
-/// Serializes bank writes that adopt a `subject` against a concurrent subject
-/// delete — the one invariant left here, and a **replica-local** one: it orders
-/// requests inside one process, and there are two. Every lease is now a
-/// *reader* lease taken across a subject-exists check and the write that adopts
-/// it: bank create, bank update, and save-to-bank. (Update used to take the
-/// writer lease for its read-modify-write; that is a compare-and-set on the row
-/// itself now, which holds across replicas.) The subject delete takes the writer
-/// lease across the cascade that clears `subject` off every template, so a
-/// template can't land on a subject that vanished mid-flight (it would outlive
-/// the sweep) — the bank twin of the
-/// [`super::exams::EXAM_LOCK`]/[`super::homework::HOMEWORK_LOCK`] guards.
-/// Save-to-bank (`question_to_bank`) takes the same reader lease across its
-/// question read and insert: the source question can be re-tagged/deleted, so
-/// its subject isn't otherwise pinned. Held after EXAM_LOCK/HOMEWORK_LOCK in
-/// the delete path; bank writers take only this one, so no cycle.
-pub(crate) static BANK_LOCK: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+// There is no `BANK_LOCK` any more. It served exactly one pairing — a
+// subject-exists check here against the subject delete's cascade that clears
+// `subject` off every template — and that delete no longer takes any lock: it
+// is a conditional statement on the subject's own reference counters, which
+// bank templates deliberately do not hold (blocking on them was a dead end; see
+// [`crate::domain::subject::Subject::delete`]). With the writer gone the three
+// reader leases guarded nothing, and what they claimed to guard was already
+// open in production: the lock ordered one process, and the backend runs two.
+//
+// The race it leaves is the one the cascade already accepts — a template can
+// adopt a subject the same instant it is deleted and be left holding a dangling
+// id. Every read tolerates that: `subject_name` resolves to empty, exactly as
+// it does for the templates the cascade did clear.
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -435,9 +432,6 @@ async fn create_question(
     RequireTeacher(user): RequireTeacher,
     Json(req): Json<CreateBankQuestion>,
 ) -> Result<(StatusCode, Json<BankQuestionResponse>), AppError> {
-    // Reader lease of [`BANK_LOCK`]: the exists-check and the insert are one
-    // unit, so a subject delete can't slip between them (see the lock's doc).
-    let _guard = BANK_LOCK.read().await;
     // Origin metadata only — no course to check it against, but it must exist.
     let subject = subject_must_exist(&req.subject_id, &st.db).await?;
     let text = QuestionText::try_new(&req.text)?;
@@ -627,14 +621,6 @@ async fn update_question(
     Path(bid): Path<String>,
     Json(req): Json<UpdateBankQuestion>,
 ) -> Result<Json<BankQuestionResponse>, AppError> {
-    // Reader lease of [`BANK_LOCK`], exactly like the create path and for the
-    // one thing it buys: the subject-exists check below is paired with the
-    // subject delete that sweeps this table (that cascade takes the writer
-    // lease), so a template cannot be pinned to a subject on its way out. It is
-    // replica-local, like every lock here. The *writer* lease this used to take
-    // was aimed at the read-modify-write below, which it only serialized inside
-    // one process — that is now a compare-and-set on the row itself.
-    let _guard = BANK_LOCK.read().await;
     // Read, merge and write again while the row keeps moving underneath: the
     // guarded write refuses on a snapshot that has gone stale, so both edits
     // land instead of the later one reverting the earlier.

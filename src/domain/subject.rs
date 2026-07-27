@@ -166,23 +166,67 @@ impl Subject {
     /// pointing at a subject that no longer exists.
     ///
     /// Exam questions and homework are *not* cascaded: their `subject` is a
-    /// required field the web layer refuses to orphan (both still block the
-    /// delete with a 409). The bank's is optional metadata, and blocking on it
-    /// was a dead end — only the template's owner may re-tag it, so a manager
-    /// could never clear their own 409, and a private template raising it
-    /// leaked its existence.
+    /// required field that may not be orphaned, so either one still refuses the
+    /// delete with a 409. That refusal is the delete's own `WHERE`, read off the
+    /// two reference counters this row carries
+    /// ([`crate::constant::SUBJECT_QUESTION_COUNT_FIELD`] and its homework
+    /// twin), which is what makes it hold when the question is created on
+    /// another replica — the cross-table `SELECT … LIMIT 1` it replaces was a
+    /// count-then-delete no transaction serializes, pinned by three
+    /// process-wide locks that only ever served one process.
+    ///
+    /// Which of the two blocked is read off the counters *before* the delete,
+    /// purely to pick the message; the decision itself was already made by the
+    /// `WHERE`.
+    ///
+    /// The bank's subject is optional metadata, and blocking on it was a dead
+    /// end — only the template's owner may re-tag it, so a manager could never
+    /// clear their own 409, and a private template raising it leaked its
+    /// existence. Its cascade runs *after* the conditional delete, so a refused
+    /// delete leaves every template's subject where it was.
     pub async fn delete(self, db: &Database) -> Result<Subject, AppError> {
         let mut result = db
             .query(
                 "BEGIN TRANSACTION;
+                 LET $held = (SELECT exam_question_count AS q, homework_count AS h FROM $sub);
+                 LET $before = (DELETE $sub
+                     WHERE (exam_question_count ?? 0) = 0 AND (homework_count ?? 0) = 0
+                     RETURN BEFORE);
+                 IF array::len($before) = 0 {
+                     THROW IF array::len($held) = 0 { 'subject_missing' }
+                         ELSE IF ($held[0].q ?? 0) > 0 { 'subject_questions' }
+                         ELSE { 'subject_homework' }
+                 };
                  UPDATE bank_question SET subject = NONE WHERE subject = $sub;
-                 LET $before = (DELETE $sub RETURN BEFORE);
                  RETURN $before;
                  COMMIT TRANSACTION;",
             )
             .bind(("sub", self.id.record()))
-            .await?
-            .check()?;
+            .await?;
+        // An aborted transaction errors every slot; only the THROW's own slot
+        // names the marker (the [`crate::domain::appointment_slot`] treatment).
+        let mut errors = result.take_errors();
+        let thrown = |marker: &str| {
+            errors
+                .values()
+                .any(|error| error.to_string().contains(marker))
+        };
+        if thrown("subject_questions") {
+            return Err(AppError::Conflict(
+                "exam questions still reference this subject — re-tag or delete them first",
+            ));
+        }
+        if thrown("subject_homework") {
+            return Err(AppError::Conflict(
+                "homework still references this subject — re-tag or delete it first",
+            ));
+        }
+        if thrown("subject_missing") {
+            return Err(AppError::NotFound);
+        }
+        if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+            return Err(error.into());
+        }
         // Read through the trailing `RETURN`, not a counted slot — see
         // [`crate::domain::exam::Exam::delete`].
         let slot = result.num_statements().saturating_sub(2);

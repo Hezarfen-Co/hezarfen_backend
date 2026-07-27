@@ -7,7 +7,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::database::Database;
-use crate::domain::term::{TERM_LOCK, Term, TermId, TermName};
+use crate::domain::term::{Term, TermId, TermName};
 use crate::domain::timestamp::Timestamp;
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
@@ -229,14 +229,10 @@ async fn delete_term(
     let term = Term::read(&TermId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    // [`TERM_LOCK`] holds the link check and the delete together, so a course
-    // write that just resolved this term can't land its link on a dead row.
-    let _guard = TERM_LOCK.lock().await;
-    if Term::any_course(term.get_id(), &st.db).await? {
+    if !term.delete(&st.db).await? {
         return Err(AppError::Conflict(
             "courses are still linked to this term — unlink them first",
         ));
     }
-    term.delete(&st.db).await?;
     Ok(StatusCode::NO_CONTENT)
 }

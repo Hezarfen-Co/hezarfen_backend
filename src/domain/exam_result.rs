@@ -2,8 +2,11 @@ use std::collections::HashMap;
 
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
-use crate::constant::EXAM_RESULT_TABLE;
+use crate::constant::{
+    EXAM_RESULT_COUNT_FIELD, EXAM_RESULT_TABLE, KIND_REF_TABLE, REF_COUNT_FIELD,
+};
 use crate::database::Database;
+use crate::domain::cap;
 use crate::domain::course::CourseId;
 use crate::domain::exam::ExamId;
 use crate::domain::key;
@@ -15,6 +18,25 @@ use crate::validate::validate_mark;
 /// pre-flight gate and the in-transaction guard on the mark write.
 pub(crate) fn draft_error() -> AppError {
     AppError::Conflict("this exam is a draft — publish it before grading")
+}
+
+/// The reference counter for one exam kind — how many marks are written under
+/// that name, and whether the school has retired it (see
+/// [`crate::domain::cap`]). Keyed by the name itself: the kind is snapshotted
+/// text on the exam, and this row is what makes "a kind nothing is graded under
+/// may be removed" a decision two replicas can share.
+pub(crate) fn kind_ref(kind: &str) -> RecordId {
+    RecordId::new(KIND_REF_TABLE, kind)
+}
+
+/// The refusal a mark meets once its kind has left the school's list. The
+/// mirror of the settings-side 409: whichever of the two writes reaches the
+/// counter first, the other is told the name is no longer usable.
+pub(crate) fn retired_kind_error(kind: &str) -> AppError {
+    AppError::ConflictOwned(format!(
+        "the '{kind}' exam kind has been removed from the school's settings — \
+         add it back before grading this exam"
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
@@ -56,6 +78,14 @@ impl Mark {
     pub fn as_i64(&self) -> i64 {
         self.0
     }
+}
+
+/// What one mark write reports back: the stored row, and whether it replaced a
+/// mark that was already there.
+#[derive(Debug, Clone, SurrealValue)]
+struct Written {
+    existed: bool,
+    result: ExamResult,
 }
 
 #[derive(Debug, Clone, SurrealValue)]
@@ -155,14 +185,54 @@ impl ExamResult {
     /// converge on one row instead of racing the unique index into a 500.
     /// Grading a retake writes a fresh mark at the current seq and never touches
     /// prior sittings' marks; the latest seq is the grade-of-record.
+    ///
+    /// `kind` is the exam's kind, and this is where a mark takes its reference
+    /// on it — claimed *before* the write, given back when the write turns out
+    /// to have been an overwrite (one mark, one reference) or to have failed. A
+    /// kind the school has retired refuses the claim, which is the same
+    /// invariant the settings guard enforces from the other side, and the one
+    /// crash window left over-counts a kind (refusing a removal) rather than
+    /// letting a mark exist under a kind nothing counted.
+    ///
+    /// The exam's own `result_count` is claimed in the same breath, and it is
+    /// what a kind change is refused against: the exam PATCH pins that counter,
+    /// so a mark landing while it decides cannot slip past its gate and leave
+    /// itself counted under a kind its exam no longer carries.
     pub async fn grade(
         exam: &ExamId,
         user: &UserId,
         seq: i64,
         mark: Mark,
         graded_by: &UserId,
+        kind: &str,
         db: &Database,
     ) -> Result<ExamResult, AppError> {
+        let counter = kind_ref(kind);
+        if !cap::claim_ref(&counter, 1, db).await? {
+            return Err(retired_kind_error(kind));
+        }
+        cap::claim(&exam.record(), EXAM_RESULT_COUNT_FIELD, cap::UNLIMITED, db).await?;
+        let written = Self::write_mark(exam, user, seq, mark, graded_by, db).await;
+        match written {
+            // An overwrite is not a second mark: both counters go back, or a
+            // regrade would drift them upward and freeze the kind for good.
+            Ok(Written { existed: true, .. }) | Err(_) => {
+                cap::release_ref(&counter, 1, db).await?;
+                cap::release(&exam.record(), EXAM_RESULT_COUNT_FIELD, db).await?;
+            }
+            Ok(_) => {}
+        }
+        written.map(|written| written.result)
+    }
+
+    async fn write_mark(
+        exam: &ExamId,
+        user: &UserId,
+        seq: i64,
+        mark: Mark,
+        graded_by: &UserId,
+        db: &Database,
+    ) -> Result<Written, AppError> {
         let result = ExamResult {
             id: ExamResultId::composite(exam, user, seq),
             exam: exam.clone(),
@@ -176,11 +246,17 @@ impl ExamResult {
         // them, a mark and a re-draft racing each other can only ever leave one
         // of the two applied, whichever process either ran in. The caller's
         // pre-flight check answers the same 409 one round trip earlier.
+        // Whether the row was already there rides out of the transaction with
+        // the mark: the answer decides if this grade owes the kind a reference,
+        // and read anywhere else it would be a guess about a row two graders
+        // may be writing at once.
         let mut written = db
             .query(
                 "BEGIN TRANSACTION;
                  IF (SELECT VALUE draft FROM ONLY $exam) { THROW 'exam_draft' };
-                 UPSERT $id CONTENT $result RETURN AFTER;
+                 LET $before = (SELECT VALUE id FROM ONLY $id);
+                 LET $after = (UPSERT $id CONTENT $result RETURN AFTER);
+                 RETURN { existed: $before != NONE, result: $after[0] };
                  COMMIT TRANSACTION;",
             )
             .bind(("exam", exam.record()))
@@ -197,9 +273,12 @@ impl ExamResult {
         if let Some(error) = errors.drain().map(|(_, error)| error).next() {
             return Err(error.into());
         }
-        // BEGIN and the IF take a slot each.
+        // The trailing `RETURN` is always the last statement before `COMMIT`,
+        // so its slot follows the statement count instead of a hand-kept
+        // number — see `Exam::delete` for the bug the hand-kept one caused.
+        let slot = written.num_statements().saturating_sub(2);
         written
-            .take::<Vec<ExamResult>>(2)?
+            .take::<Vec<Written>>(slot)?
             .into_iter()
             .next()
             .ok_or_else(|| AppError::Internal("failed to record exam result".into()))
@@ -223,22 +302,6 @@ impl ExamResult {
             .await?
             .check()?;
         Ok(Self::latest_per_pair(result.take::<Vec<ExamResult>>(0)?))
-    }
-
-    /// True iff any exam of `kind` has produced a mark — the settings guard
-    /// against removing an exam kind that grades already depend on (weights are
-    /// read live from settings, so dropping the kind would silently re-weight
-    /// those marks).
-    pub async fn any_for_kind(kind: &str, db: &Database) -> Result<bool, AppError> {
-        let mut result = db
-            .query(
-                "SELECT VALUE id FROM exam_result
-                 WHERE exam IN (SELECT VALUE id FROM exam WHERE kind = $kind) LIMIT 1",
-            )
-            .bind(("kind", kind.to_string()))
-            .await?
-            .check()?;
-        Ok(!result.take::<Vec<RecordId>>(0)?.is_empty())
     }
 
     pub async fn list_for_exam(exam: &ExamId, db: &Database) -> Result<Vec<ExamResult>, AppError> {
@@ -269,18 +332,44 @@ impl ExamResult {
         Ok(result.take::<Vec<ExamResult>>(0)?)
     }
 
+    /// Delete every sitting's mark for one (exam, user) pair. `kind` is the
+    /// exam's: the marks give their references back, so a kind nothing is
+    /// graded under any more can leave the settings again.
     pub async fn remove(
         exam: &ExamId,
         user: &UserId,
+        kind: &str,
         db: &Database,
     ) -> Result<Option<ExamResult>, AppError> {
+        // Both counters go back *inside* the delete's own transaction, driven
+        // off the rows this statement actually deleted. Counted outside it, a
+        // cascade (exam or course delete) taking the same rows in the gap would
+        // release them a second time, and on a kind another exam still grades
+        // under, one release too many reads as one mark too few — a kind
+        // wrongly free to leave the settings.
         let mut result = db
-            .query("DELETE exam_result WHERE exam = $ex AND user = $usr RETURN BEFORE")
+            .query(format!(
+                "BEGIN TRANSACTION;
+                 LET $gone = (DELETE exam_result WHERE exam = $ex AND user = $usr RETURN BEFORE);
+                 IF array::len($gone) > 0 {{
+                     UPDATE type::record('kind_ref', $kind) SET {REF_COUNT_FIELD} =
+                         math::max([({REF_COUNT_FIELD} ?? 0) - array::len($gone), 0]);
+                     UPDATE $ex SET {EXAM_RESULT_COUNT_FIELD} =
+                         math::max([({EXAM_RESULT_COUNT_FIELD} ?? 0) - array::len($gone), 0]);
+                 }};
+                 RETURN $gone;
+                 COMMIT TRANSACTION;"
+            ))
             .bind(("ex", exam.record()))
             .bind(("usr", user.record()))
+            .bind(("kind", kind.to_string()))
             .await?
             .check()?;
-        Ok(result.take::<Vec<ExamResult>>(0)?.into_iter().next())
+        // `RETURN` is the last statement before `COMMIT`; its slot follows the
+        // statement count, as in `Exam::delete`.
+        let slot = result.num_statements().saturating_sub(2);
+        let removed = result.take::<Vec<ExamResult>>(slot)?;
+        Ok(removed.into_iter().next())
     }
 }
 
@@ -305,12 +394,28 @@ mod tests {
         let teacher = UserId::from_key("01TESTTEACHERAAAAAAAAAAAAA");
 
         // Grade sitting #1, then a retake as sitting #2 — two rows, not one.
-        ExamResult::grade(&exam, &user, 1, Mark::try_new(40).unwrap(), &teacher, &db)
-            .await
-            .unwrap();
-        let second = ExamResult::grade(&exam, &user, 2, Mark::try_new(90).unwrap(), &teacher, &db)
-            .await
-            .unwrap();
+        ExamResult::grade(
+            &exam,
+            &user,
+            1,
+            Mark::try_new(40).unwrap(),
+            &teacher,
+            "midterm",
+            &db,
+        )
+        .await
+        .unwrap();
+        let second = ExamResult::grade(
+            &exam,
+            &user,
+            2,
+            Mark::try_new(90).unwrap(),
+            &teacher,
+            "midterm",
+            &db,
+        )
+        .await
+        .unwrap();
         assert_eq!(second.get_seq(), 2);
 
         // Grade-of-record is the latest sitting's mark.
@@ -339,7 +444,9 @@ mod tests {
         );
 
         // Deleting the pair removes every sitting.
-        ExamResult::remove(&exam, &user, &db).await.unwrap();
+        ExamResult::remove(&exam, &user, "midterm", &db)
+            .await
+            .unwrap();
         assert!(
             ExamResult::list_all_for_exam_user(&exam, &user, &db)
                 .await

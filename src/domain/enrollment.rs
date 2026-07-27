@@ -1,23 +1,12 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-use tokio::sync::Mutex;
 
 use crate::constant::{ENROLLMENT_COUNT_FIELD, ENROLLMENT_TABLE};
-use crate::database::{Database, lost_the_race};
+use crate::database::Database;
 use crate::domain::cap;
 use crate::domain::course::{Course, CourseId};
 use crate::domain::page::PagedList;
 use crate::domain::user::UserId;
 use crate::error::AppError;
-
-/// Serializes the roster check of a course delete against a concurrent enroll,
-/// so a student can't join a course that is already on its way out.
-//
-// ponytail: process-local, so with two replicas the delete-vs-enroll window is
-// only narrowed, not closed — a student can still land on a course another
-// replica is deleting, and the cascade then leaves nothing behind but a 404 on
-// the next read. Closing it needs the same treatment the capacity cap got: a
-// deleting flag on the course row that the enroll's conditional UPDATE checks.
-pub(crate) static ENROLL_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct EnrollmentId(RecordId);
@@ -82,13 +71,15 @@ impl Enrollment {
     /// single-record conditional write, so the cap holds across replicas and
     /// against a concurrent capacity PATCH alike. An already enrolled user is
     /// returned as-is even when the roster is full, and never charged a seat.
+    /// The same claim is the delete guard's other half: it is refused outright
+    /// once the course row is gone, and while it holds a seat the course cannot
+    /// be deleted — so no roster row can outlive its course.
     pub async fn enroll(
         course: &CourseId,
         user: &UserId,
         enrolled_by: &UserId,
         db: &Database,
     ) -> Result<Enrollment, AppError> {
-        let _guard = ENROLL_LOCK.lock().await;
         if let Some(existing) = Self::read_for_user(course, user, db).await? {
             return Ok(existing);
         }
@@ -96,43 +87,39 @@ impl Enrollment {
             .await?
             .ok_or(AppError::NotFound)?
             .get_capacity();
-        let seats = course.record();
-        if !cap::claim(
-            &seats,
-            ENROLLMENT_COUNT_FIELD,
-            capacity.unwrap_or(cap::UNLIMITED),
-            db,
-        )
-        .await?
-        {
-            return Err(AppError::Conflict("the course is full"));
-        }
         let enrollment = Enrollment {
             id: EnrollmentId::composite(course, user),
             course: course.clone(),
             user: user.clone(),
             enrolled_by: enrolled_by.clone(),
         };
-        // CREATE, not UPSERT: a duplicate has to be *seen*, or the pair's second
-        // writer would silently keep the seat it claimed for a row that already
-        // existed and the counter would drift above the roster forever.
-        let saved: Result<Option<Enrollment>, _> =
-            db.create(enrollment.id.record()).content(enrollment).await;
-        match saved {
-            Ok(Some(saved)) => Ok(saved),
-            Ok(None) => {
-                cap::release(&seats, ENROLLMENT_COUNT_FIELD, db).await?;
-                Err(AppError::Internal("failed to enroll user".into()))
-            }
-            Err(err) => {
-                cap::release(&seats, ENROLLMENT_COUNT_FIELD, db).await?;
-                if !lost_the_race(&err) {
-                    return Err(err.into());
-                }
-                Self::read_for_user(course, user, db)
-                    .await?
-                    .ok_or_else(|| AppError::Internal("failed to enroll user".into()))
-            }
+        // CREATE, not UPSERT, and in the seat's own transaction: a duplicate has
+        // to be *seen*, or the pair's second writer would keep the seat it
+        // claimed for a row that already existed and the counter would drift
+        // above the roster forever.
+        match cap::claim_and_create(
+            &course.record(),
+            ENROLLMENT_COUNT_FIELD,
+            capacity.unwrap_or(cap::UNLIMITED),
+            &enrollment.id.record(),
+            &enrollment,
+            db,
+        )
+        .await?
+        {
+            cap::Claimed::Made(saved) => Ok(saved),
+            // Someone placed this pair first; their row is the answer, and no
+            // seat was spent finding that out.
+            cap::Claimed::Duplicate => Self::read_for_user(course, user, db)
+                .await?
+                .ok_or_else(|| AppError::Internal("failed to enroll user".into())),
+            // Full, or the course was deleted between the read and the claim —
+            // the conditional write matches nothing either way, and only this
+            // path pays for the read that tells them apart.
+            cap::Claimed::Full => match Course::read(course, db).await? {
+                Some(_) => Err(AppError::Conflict("the course is full")),
+                None => Err(AppError::NotFound),
+            },
         }
     }
 
@@ -149,16 +136,6 @@ impl Enrollment {
             .await?
             .check()?;
         Ok(result.take::<Vec<Enrollment>>(0)?.into_iter().next())
-    }
-
-    /// True iff anyone is still on the course's roster — the delete guard.
-    pub async fn any_for_course(course: &CourseId, db: &Database) -> Result<bool, AppError> {
-        let mut result = db
-            .query("SELECT VALUE id FROM enrollment WHERE course = $course LIMIT 1")
-            .bind(("course", course.record()))
-            .await?
-            .check()?;
-        Ok(!result.take::<Vec<RecordId>>(0)?.is_empty())
     }
 
     pub async fn list_for_course(

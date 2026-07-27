@@ -218,11 +218,10 @@ pub(crate) async fn create_question(
             "only the course creator, an assigned teacher, or a manager/admin can author questions",
         ));
     }
-    // Reader lease of [`EXAM_LOCK`], for the subject check alone: a subject
-    // delete (which takes the writer lease) must not invalidate a subject this
-    // just validated. Replica-local, like every lock here. The freeze gate no
-    // longer needs the lease — it rides inside the insert's own transaction.
-    let _guard = EXAM_LOCK.read().await;
+    // No lease: the subject check below is only a pre-flight for the message,
+    // and the insert takes the subject's reference counter in the same breath —
+    // a subject delete lands either wholly before it (400) or is refused. The
+    // freeze gate rides inside the insert's own transaction.
     ensure_questions_editable(exam.get_id(), &st.db).await?;
 
     let subject = subject_in_course(&req.subject_id, course.get_id(), &st.db).await?;
@@ -346,9 +345,8 @@ pub(crate) async fn update_question(
             "only the course creator, an assigned teacher, or a manager/admin can edit questions",
         ));
     }
-    // Reader lease of [`EXAM_LOCK`] for the subject check — see
-    // `create_question`. The freeze gate rides in the update's transaction.
-    let _guard = EXAM_LOCK.read().await;
+    // No lease — see `create_question`; a re-tag moves the subject's reference
+    // counter, and the freeze gate rides in the update's transaction.
     ensure_questions_editable(exam.get_id(), &st.db).await?;
     let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
 
@@ -504,9 +502,8 @@ pub(crate) async fn question_from_bank(
             "only the course creator, an assigned teacher, or a manager/admin can author questions",
         ));
     }
-    // Reader lease of [`EXAM_LOCK`] for the subject check — same reasoning as
-    // `create_question`. The freeze gate rides in the insert's transaction.
-    let _guard = EXAM_LOCK.read().await;
+    // No lease — same reasoning as `create_question`. The freeze gate rides in
+    // the insert's transaction.
     ensure_questions_editable(exam.get_id(), &st.db).await?;
     let subject = subject_in_course(&req.subject_id, course.get_id(), &st.db).await?;
 
@@ -758,12 +755,9 @@ pub(crate) async fn question_to_bank(
             "only the course creator, an assigned teacher, or a manager/admin can save questions to the bank",
         ));
     }
-    // Reader lease of [`BANK_LOCK`] across the question read and the insert: the
-    // template adopts the question's subject, so without it a subject delete
-    // could slip between the two and leave the fresh template pointing at a
-    // subject its cascade had already swept (that cascade runs under BANK_LOCK's
-    // writer lease, so holding the reader lease orders us either side of it).
-    let _bank_guard = crate::web::bank_questions::BANK_LOCK.read().await;
+    // No lease: `BANK_LOCK` is gone with the subject delete's writer lease, and
+    // a template left holding a deleted subject reads as an empty
+    // `subject_name` either way (see [`crate::web::bank_questions`]).
     let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
 
     // `create_from_exam` mints its own id and insert (the funnel), fed the
@@ -825,9 +819,6 @@ pub(crate) async fn question_to_bank(
     // template silently vanishing over a metadata write is worse than a
     // template with no back-link (the next save re-links it).
     let question_key = question.get_id().key().to_string();
-    // The bank lease has done its job (the template is inserted, its subject
-    // pinned); hand it back before the link write.
-    drop(_bank_guard);
     // No exam lease around the back-link any more, and none is needed: this is a
     // single-column `UPDATE`, and `ExamQuestion::update` no longer re-states
     // this column from a snapshot (it names the columns it writes), so a

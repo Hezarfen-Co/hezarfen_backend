@@ -12,7 +12,7 @@ use crate::database::Database;
 use crate::domain::answer_image::AnswerImage;
 use crate::domain::course::{Course, CourseDescription, CourseId, CourseKind, CourseTitle};
 use crate::domain::course_session::{CourseSession, SessionTopic};
-use crate::domain::enrollment::{ENROLL_LOCK, Enrollment};
+use crate::domain::enrollment::Enrollment;
 use crate::domain::exam::{
     Exam, ExamAttemptLimit, ExamDescription, ExamDuration, ExamKind, ExamMode, ExamSchedule,
     ExamTitle,
@@ -23,13 +23,12 @@ use crate::domain::question_image::QuestionImage;
 use crate::domain::role::Role;
 use crate::domain::settings::Settings;
 use crate::domain::subject::{Subject, SubjectDescription, SubjectName};
-use crate::domain::term::TERM_LOCK;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
 
-use super::homework::{HOMEWORK_LOCK, description_or_none, resolve_assigned};
+use super::homework::{description_or_none, resolve_assigned};
 use super::sessions::resolve_session_teacher;
 use super::subjects::subject_in_course;
 use super::terms::resolve_term;
@@ -274,13 +273,9 @@ async fn create_course(
         Some(ref kind) => CourseKind::try_new(kind)?,
         None => CourseKind::course(),
     };
-    // [`TERM_LOCK`] holds the term lookup and the save together, so the link
-    // can't be written onto a term a concurrent delete just cleared. Only a
-    // write that actually links a term needs it.
-    let _term_guard = match req.term_id {
-        Some(_) => Some(TERM_LOCK.lock().await),
-        None => None,
-    };
+    // Pre-flight only: [`Course::create`] claims a reference on the term before
+    // it writes the link, and a term deleted in between fails that claim with
+    // this very error — so an unknown id reads the same whichever side wins.
     let term = resolve_term(req.term_id.as_deref(), &st.db).await?;
     check_capacity(req.capacity)?;
     let course = Course::create(
@@ -441,12 +436,6 @@ async fn update_course(
         .map(CourseDescription::try_new)
         .transpose()?;
     let kind = req.kind.as_deref().map(CourseKind::try_new).transpose()?;
-    // Same [`TERM_LOCK`] window as create — held over the lookup and the save
-    // whenever this PATCH links a term (clearing or omitting needs no guard).
-    let _term_guard = match req.term_id {
-        Some(Some(_)) => Some(TERM_LOCK.lock().await),
-        _ => None,
-    };
     // Both columns are nullable, so both stay clearable: omitted is `None`
     // (keep), an explicit `null` is `Some(None)` (write `NONE`).
     let term = match req.term_id {
@@ -499,21 +488,18 @@ async fn delete_course(
             "only the course creator or a manager/admin can delete this course",
         ));
     }
-    // [`ENROLL_LOCK`] holds the roster check and the delete together, so an
-    // enroll that just passed its capacity check can't land its row on a
-    // course that vanished mid-flight.
-    let _guard = ENROLL_LOCK.lock().await;
-    if Enrollment::any_for_course(course.get_id(), &st.db).await? {
+    // Rows go first (the delete cascades them), blobs after — a crash in
+    // between strands at worst an unreachable blob. The keys are read before
+    // the delete because it takes their rows with it; a refused delete just
+    // drops them unused.
+    let image_files = QuestionImage::file_keys_for_course(course.get_id(), &st.db).await?;
+    let answer_image_files = AnswerImage::file_keys_for_course(course.get_id(), &st.db).await?;
+    let homework_files = HomeworkFile::file_keys_for_course(course.get_id(), &st.db).await?;
+    if !course.delete(&st.db).await? {
         return Err(AppError::Conflict(
             "students are still enrolled in this course — remove them first",
         ));
     }
-    // Rows go first (the delete cascades them), blobs after — a crash in
-    // between strands at worst an unreachable blob.
-    let image_files = QuestionImage::file_keys_for_course(course.get_id(), &st.db).await?;
-    let answer_image_files = AnswerImage::file_keys_for_course(course.get_id(), &st.db).await?;
-    let homework_files = HomeworkFile::file_keys_for_course(course.get_id(), &st.db).await?;
-    course.delete(&st.db).await?;
     for file in image_files
         .iter()
         .chain(&answer_image_files)
@@ -1048,11 +1034,9 @@ async fn create_homework_in_course(
     };
     let due_at = Timestamp::from_millis(req.due_at);
     check_not_past("due_at", Some(due_at))?;
-    // Reader lease of [`HOMEWORK_LOCK`], held from the subject check through
-    // the create: a subject delete (a writer, which checks for homework) can't
-    // vanish the subject between its validation here and the row landing with
-    // it.
-    let _guard = HOMEWORK_LOCK.read().await;
+    // No lease: the create takes the subject's reference counter in the same
+    // breath as the row, and the subject delete is refused while that counter
+    // is non-zero — so the check below is only a pre-flight for the message.
     let subject = subject_in_course(&req.subject_id, course.get_id(), &st.db).await?;
     let assigned = resolve_assigned(req.assigned, course.get_id(), &st.db).await?;
     let homework = Homework::create(

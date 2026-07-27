@@ -46,6 +46,12 @@ const EXCLUDED: &[(&str, &str)] = &[
         "internal backoff between cap counter retries",
     ),
     (
+        "SUBMISSION_OPEN_GUARD",
+        "SQL fragment: the condition every homework-submission write carries so \
+         a grade freezes it in the database; the client sees the freeze as a 409, \
+         never as a number",
+    ),
+    (
         "UPLOAD_BODY_OVERHEAD_BYTES",
         "multipart headroom over max_file_bytes; the client sizes against \
          max_file_bytes itself, which /limits does publish",

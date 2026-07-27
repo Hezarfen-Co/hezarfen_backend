@@ -78,19 +78,22 @@ impl Scheduled for Exam {
 ///
 /// Read side — the answer saves (REST and the exam room), from the
 /// writable-attempt gate through the upsert; the grade write (draft gate
-/// through the result upsert); the exam PATCH, whose mode/re-draft gates count
-/// attempts and results; and the three question writes that first check a
-/// subject belongs to the course. These stay concurrent with each other.
+/// through the result upsert); and the exam PATCH, whose mode/re-draft gates
+/// count attempts and results. These stay concurrent with each other.
 ///
-/// Write side — attempt starts (the max-attempts count and the retake's answer
-/// wipe) and the subject delete's cascade. So a save can never land on a sheet
-/// a retake just wiped, a mark can never land on an exam mid-flight into
-/// hiding, and a question can never adopt a subject being swept.
+/// Write side — attempt starts alone (the max-attempts count and the retake's
+/// answer wipe). So a save can never land on a sheet a retake just wiped, and a
+/// mark can never land on an exam mid-flight into hiding.
 ///
-/// The question freeze gate is *not* on this list any more: it rides inside
-/// each question/image write's own transaction
+/// Two rules have left this list. The question freeze gate rides inside each
+/// question/image write's own transaction
 /// ([`crate::domain::exam_attempt::ExamAttempt::unfrozen`]), and the exam PATCH
-/// no longer needs the writer lease because its save is a compare-and-set.
+/// no longer needs the writer lease because its save is a compare-and-set. The
+/// subject delete's cascade — the only writer outside attempt starts, paired
+/// with the question writes' subject check — is now a conditional statement on
+/// the subject's own reference counter
+/// ([`crate::domain::subject::Subject::delete`]), which every question create,
+/// re-tag and delete moves.
 // ponytail: global RwLock, shard per-exam if save latency ever matters.
 pub(crate) static EXAM_LOCK: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
 
@@ -162,7 +165,9 @@ struct UpdateExam {
     description: Option<String>,
     /// The assessment form — one of the school's exam kinds (`GET /settings`).
     /// Changing it re-weights the exam: the course average uses the kind's
-    /// settings-configured weight.
+    /// settings-configured weight. For that reason an exam that already carries
+    /// marks keeps its kind (`409`) — those marks would silently re-weight,
+    /// exactly what the settings' kind-removal guard refuses.
     kind: Option<String>,
     /// `sync`, `async`, or `open`. Omit to keep the current mode; send `null`
     /// to turn the exam back into an offline-graded one. Frozen once anyone
@@ -385,7 +390,7 @@ async fn get_exam(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "Mode change after attempts started, re-drafting an exam that has attempts or results, or the exam kept changing under concurrent edits", body = ErrorResponse),
+        (status = 409, description = "Mode change after attempts started, re-drafting an exam that has attempts or results, a kind change on an exam that already carries marks, or the exam kept changing under concurrent edits", body = ErrorResponse),
     ),
 )]
 async fn update_exam(
@@ -502,6 +507,19 @@ async fn update_exam(
             }
         }
 
+        // A graded exam keeps its kind. Moving it re-weights every mark it
+        // already carries — the same silent re-weighting the settings' removal
+        // guard refuses — and it would strand those marks' references on the
+        // kind they were counted under, freeing the kind the exam now claims to
+        // be. Marks are counted on the exam row, and the save below *pins* that
+        // counter, so a grade landing between this read and the write refuses
+        // the save (the loop then re-reads and answers the 409 below).
+        if kind.as_str() != exam.get_kind().as_str() && exam.get_result_count() > 0 {
+            return Err(AppError::Conflict(
+                "cannot change the kind of an exam that already has marks",
+            ));
+        }
+
         if let Some(updated) = exam
             .update_if_unchanged(
                 title,
@@ -594,7 +612,7 @@ async fn delete_exam(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin), or attempted to grade yourself", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
-        (status = 409, description = "The exam is a draft", body = ErrorResponse),
+        (status = 409, description = "The exam is a draft, or its kind has been removed from the school's settings", body = ErrorResponse),
     ),
 )]
 async fn grade(
@@ -669,7 +687,16 @@ async fn grade(
     let seq = ExamAttempt::read_latest_for_user(&exam_id, &target, &st.db)
         .await?
         .map_or(1, |a| a.get_seq());
-    let result = ExamResult::grade(&exam_id, &target, seq, mark, teacher.get_id(), &st.db).await?;
+    let result = ExamResult::grade(
+        &exam_id,
+        &target,
+        seq,
+        mark,
+        teacher.get_id(),
+        exam.get_kind().as_str(),
+        &st.db,
+    )
+    .await?;
     let people = PersonRef::map_of(&[&target_user, &teacher]);
     Ok(Json(ExamResultResponse::new(&result, &people)))
 }
@@ -790,7 +817,13 @@ async fn remove_result(
             "only the course creator, an assigned teacher, or a manager/admin can remove results",
         ));
     }
-    let removed = ExamResult::remove(exam.get_id(), &UserId::from_key(&target), &st.db).await?;
+    let removed = ExamResult::remove(
+        exam.get_id(),
+        &UserId::from_key(&target),
+        exam.get_kind().as_str(),
+        &st.db,
+    )
+    .await?;
     if removed.is_none() {
         return Err(AppError::NotFound);
     }

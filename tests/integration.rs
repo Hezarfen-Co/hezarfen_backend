@@ -3331,17 +3331,37 @@ async fn kind_weight_edits_reweight_reports_live() {
 
     // The PATCH above also retired `project` (allowed — no marks of that kind
     // existed yet; a graded kind can't leave at all, see
-    // `exam_kind_removal_blocks_while_marks_exist`). Its exam lives on and
-    // counts with weight 1.
+    // `exam_kind_removal_blocks_while_marks_exist`). Its exam lives on, but a
+    // retired kind takes no new marks: that is the other end of the same rule,
+    // and it is what keeps "a kind with marks cannot be removed" true however
+    // the two writes interleave.
+    let grade_project = async || {
+        send(
+            &app,
+            "POST",
+            &format!("/exams/{project}/results"),
+            Some(&teacher),
+            Some(json!({ "mark": 60, "user_id": alice_id })),
+        )
+        .await
+    };
+    assert_eq!(grade_project().await.status, StatusCode::CONFLICT);
+    // Offered again — at weight 1, so the exam counts exactly as an exam of a
+    // since-removed kind would have.
     let res = send(
         &app,
-        "POST",
-        &format!("/exams/{project}/results"),
-        Some(&teacher),
-        Some(json!({ "mark": 60, "user_id": alice_id })),
+        "PATCH",
+        "/settings",
+        Some(&manager),
+        Some(json!({ "exam_kinds": [
+            {"name": "quiz", "weight": 1},
+            {"name": "oral", "weight": 3},
+            {"name": "project", "weight": 1},
+        ]})),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(grade_project().await.status, StatusCode::OK);
     // (40 + 240 + 60) / 5 = 68.
     let report = send(&app, "GET", "/marks/me", Some(&alice), None).await;
     assert_eq!(report.body["courses"][0]["average"], 68.0);
@@ -4175,11 +4195,11 @@ async fn concurrent_enrolls_never_exceed_course_capacity() {
 /// be full forever. Stored state is the only witness: the embedded engine can
 /// tell two racers they both won, so the HTTP statuses prove nothing.
 //
-// ponytail: `ENROLL_LOCK` serializes the enrolls inside one process, so what
-// this actually drives is the already-enrolled early return; the `CREATE`-loser
-// release only runs when the two racers sit on different replicas. Both paths
-// are pinned by the same assertion below (counter == roster), which is the part
-// that matters.
+// Nothing serializes these any more: the seat and the row are claimed in one
+// transaction (`cap::claim_and_create`), so a racer that loses the id has its
+// own increment rolled back with the transaction and reads the winner's row
+// instead of being told the course is full. Both the early return and that
+// rollback are pinned by the assertion below (counter == roster).
 #[tokio::test]
 async fn concurrent_enrolls_of_one_pair_claim_one_seat() {
     let (app, db) = app_and_db().await;
@@ -4226,6 +4246,317 @@ async fn concurrent_enrolls_of_one_pair_claim_one_seat() {
         counted.take::<Vec<i64>>(0).expect("counter column"),
         vec![1],
         "one row on the roster must have cost exactly one seat"
+    );
+}
+
+/// The same stampede on a course with exactly one seat. Every racer enrolls the
+/// *same* student, so between them they owe one seat — but on a cap this tight
+/// the claim is the first thing to fail, and answering that with "the course is
+/// full" would refuse a student the enrollment that just succeeded on their
+/// behalf. So the pair's own row is looked for inside the claim's transaction,
+/// before the seat is blamed. Drop that gate and every loser here is a 409.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_enrolls_of_one_seat_never_refuse_their_own_winner() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "tight_teacher", "teacher").await;
+    let student = login(&app, "tight_student").await;
+    let student_id = me_id(&app, &student).await;
+    let res = send(
+        &app,
+        "POST",
+        "/courses",
+        Some(&teacher),
+        Some(json!({ "title": "one seat", "description": "", "capacity": 1 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let course = id_of(&res.body);
+    let uri = format!("/courses/{course}/enrollments");
+
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let (app, teacher, uri) = (app.clone(), teacher.clone(), uri.clone());
+        let body = json!({ "user_id": student_id });
+        tasks.push(tokio::spawn(async move {
+            send(&app, "POST", &uri, Some(&teacher), Some(body)).await
+        }));
+    }
+    for task in tasks {
+        let res = task.await.unwrap();
+        assert_eq!(
+            res.status,
+            StatusCode::OK,
+            "one student, one seat, no refusal: {}",
+            res.body
+        );
+    }
+
+    let roster = send(&app, "GET", &uri, Some(&teacher), None).await;
+    assert_eq!(common::total(&roster.body), 1, "one seat: {}", roster.body);
+    let mut counted = db
+        .query("SELECT VALUE enrollment_count FROM type::record('course', $c)")
+        .bind(("c", course.clone()))
+        .await
+        .expect("counter read")
+        .check()
+        .expect("counter read");
+    assert_eq!(
+        counted.take::<Vec<i64>>(0).expect("counter column"),
+        vec![1],
+        "and the seat it cost is the one seat the course has"
+    );
+}
+
+/// The two reference counters a subject carries — the whole basis of its
+/// delete guard — must equal the rows that actually point at it, through every
+/// writer: create, re-tag, delete, and the exam cascade. Nothing recomputes
+/// them, so a single missed decrement makes a subject undeletable forever.
+///
+/// This bites on the halves the HTTP status alone cannot see. Drop the
+/// release of the *old* subject from either re-tag and the counter drifts up:
+/// the last delete below comes back 409 instead of 204.
+#[tokio::test]
+async fn subject_reference_counts_track_every_writer() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "refc_t", "teacher").await;
+    let course = create_course(&app, &teacher, "physics").await;
+    let from = create_subject(&app, &teacher, &course, "optics").await;
+    let to = create_subject(&app, &teacher, &course, "waves").await;
+    let exam = create_exam(&app, &teacher, &course, "midterm", "midterm").await;
+    let due = Timestamp::now().as_millis() + 86_400_000;
+
+    let counts = async |subject: &str| -> (i64, i64) {
+        let mut result = db
+            .query(
+                "SELECT VALUE [exam_question_count ?? 0, homework_count ?? 0] \
+                 FROM type::record('subject', $s)",
+            )
+            .bind(("s", subject.to_string()))
+            .await
+            .expect("counter read")
+            .check()
+            .expect("counter read");
+        let pair = result
+            .take::<Vec<Vec<i64>>>(0)
+            .expect("counter columns")
+            .pop()
+            .expect("the subject row");
+        (pair[0], pair[1])
+    };
+
+    let question = create_question(
+        &app,
+        &teacher,
+        &exam,
+        &from,
+        json!({ "text": "How fast?", "kind": "text", "points": 10 }),
+    )
+    .await;
+    let cascaded = create_question(
+        &app,
+        &teacher,
+        &exam,
+        &from,
+        json!({ "text": "How bright?", "kind": "text", "points": 10 }),
+    )
+    .await;
+    let homework = create_homework(&app, &teacher, &course, &from, "lenses", due).await;
+    assert_eq!(counts(&from).await, (2, 1), "two questions and a homework");
+    assert_eq!(counts(&to).await, (0, 0), "the spare subject holds nothing");
+
+    // A re-tag moves a reference: both ends must move, not just the new one.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/exams/{exam}/questions/{question}"),
+        Some(&teacher),
+        Some(json!({ "subject_id": to })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/homework/{homework}"),
+        Some(&teacher),
+        Some(json!({ "subject_id": to })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(counts(&from).await, (1, 0), "both re-tags must have left");
+    assert_eq!(counts(&to).await, (1, 1), "and both must have arrived");
+
+    // A re-tag back to where it already is moves nothing.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/homework/{homework}"),
+        Some(&teacher),
+        Some(json!({ "subject_id": to })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(counts(&to).await, (1, 1), "a no-op re-tag is a no-op");
+
+    // Deleting the referencing rows gives every reference back — including the
+    // question the *exam* cascade takes with it, which the row delete never
+    // sees.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/homework/{homework}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/exams/{exam}/questions/{question}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    assert_eq!(counts(&to).await, (0, 0), "the new subject is free again");
+    assert_eq!(
+        counts(&from).await,
+        (1, 0),
+        "the cascaded question still holds"
+    );
+    assert!(!cascaded.is_empty());
+
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/exams/{exam}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    assert_eq!(counts(&from).await, (0, 0), "the exam cascade gave it back");
+
+    for subject in [&from, &to] {
+        let res = send(
+            &app,
+            "DELETE",
+            &format!("/subjects/{subject}"),
+            Some(&teacher),
+            None,
+        )
+        .await;
+        assert_eq!(
+            res.status,
+            StatusCode::NO_CONTENT,
+            "an unreferenced subject must delete: {}",
+            res.body
+        );
+    }
+}
+
+/// A subject delete racing question creates on the same subject. Exactly one
+/// outcome is legal, and it is decided by the delete's own `WHERE`: either the
+/// subject is gone and *no* question points at it, or it survived and its
+/// counter equals the questions that landed. Stored state is the only witness —
+/// the embedded engine can tell two racers they both won, so the statuses prove
+/// nothing.
+///
+/// The count-then-delete this replaced fails here: it reads "no questions",
+/// then deletes while a create that already passed its own subject check lands
+/// its row on the corpse.
+#[tokio::test]
+async fn a_subject_delete_racing_question_creates_leaves_no_orphan() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "race_t", "teacher").await;
+    let course = create_course(&app, &teacher, "chemistry").await;
+    let subject = create_subject(&app, &teacher, &course, "bonds").await;
+    let exam = create_exam(&app, &teacher, &course, "quiz", "quiz").await;
+    // One question already tagged before the race starts, so the delete is
+    // never legal: whichever way the interleaving falls, it must be refused.
+    create_question(
+        &app,
+        &teacher,
+        &exam,
+        &subject,
+        json!({ "text": "first", "kind": "text", "points": 1 }),
+    )
+    .await;
+
+    let mut handles = Vec::new();
+    for i in 0..8 {
+        let (app, teacher, exam, subject) =
+            (app.clone(), teacher.clone(), exam.clone(), subject.clone());
+        handles.push(tokio::spawn(async move {
+            let body = json!({
+                "text": format!("q{i}"),
+                "kind": "text",
+                "points": 1,
+                "subject_id": subject,
+            });
+            send(
+                &app,
+                "POST",
+                &format!("/exams/{exam}/questions"),
+                Some(&teacher),
+                Some(body),
+            )
+            .await
+            .status
+        }));
+    }
+    let killer = {
+        let (app, teacher, subject) = (app.clone(), teacher.clone(), subject.clone());
+        tokio::spawn(async move {
+            send(
+                &app,
+                "DELETE",
+                &format!("/subjects/{subject}"),
+                Some(&teacher),
+                None,
+            )
+            .await
+            .status
+        })
+    };
+    for handle in handles {
+        let status = handle.await.unwrap();
+        assert!(
+            status == StatusCode::CREATED || status == StatusCode::BAD_REQUEST,
+            "a create either lands or is told the subject is gone, got {status}"
+        );
+    }
+    let killed = killer.await.unwrap();
+
+    let mut result = db
+        .query("SELECT VALUE exam_question_count ?? 0 FROM type::record('subject', $s)")
+        .bind(("s", subject.clone()))
+        .await
+        .expect("counter read")
+        .check()
+        .expect("counter read");
+    let counter = result.take::<Vec<i64>>(0).expect("counter column");
+    let mut rows = db
+        .query("SELECT VALUE id FROM exam_question WHERE subject = type::record('subject', $s)")
+        .bind(("s", subject.clone()))
+        .await
+        .expect("row read")
+        .check()
+        .expect("row read");
+    let landed = rows
+        .take::<Vec<surrealdb::types::RecordId>>(0)
+        .expect("question rows")
+        .len() as i64;
+    assert_eq!(
+        killed,
+        StatusCode::CONFLICT,
+        "a subject a question already points at may never be deleted"
+    );
+    assert_eq!(
+        counter.first().copied(),
+        Some(landed),
+        "the subject must survive with its counter equal to the rows it guards"
     );
 }
 
@@ -11235,14 +11566,15 @@ async fn settings_round_trip_the_food_program_knobs() {
     }
 
     // A published menu pins the slot it snapshotted: dropping it is a 409.
-    db.query(
-        "CREATE menu SET date = '2026-07-27', slot = 'lunch',
-             created_by = (SELECT VALUE id FROM user LIMIT 1)[0], created_at = 0",
+    let menu = send(
+        &app,
+        "POST",
+        "/meals/menus",
+        Some(&manager),
+        Some(json!({ "date": "2026-07-27", "slot": "lunch" })),
     )
-    .await
-    .unwrap()
-    .check()
-    .unwrap();
+    .await;
+    assert_eq!(menu.status, StatusCode::CREATED, "{}", menu.body);
     let res = send(
         &app,
         "PATCH",
@@ -20939,6 +21271,63 @@ async fn concurrent_meal_bookings_never_exceed_the_capacity() {
     )
     .await;
     assert_eq!(common::total(&res.body), 3, "and only three rows exist");
+
+    // The rows are downstream of the counter, so assert the counter itself:
+    // it is what every replica's `WHERE` compares, and a drift here would open
+    // the cap on the next booking however tidy the listing looks.
+    let mut counted = db
+        .query("SELECT VALUE seats_booked FROM type::record('menu', $m)")
+        .bind(("m", menu.clone()))
+        .await
+        .expect("counter read")
+        .check()
+        .expect("counter read");
+    assert_eq!(
+        counted.take::<Vec<i64>>(0).expect("counter column"),
+        vec![3],
+        "the stored seat counter must agree with the seats handed out"
+    );
+}
+
+/// Publishing the same day+slot twice at once must be one menu and one 409 —
+/// never two rows and never a 500. The day and slot *are* the record id, so the
+/// racers collide on a single record inside the database rather than on a
+/// check-then-write pair, which is the only form that also holds when the two
+/// `POST`s land on different replicas.
+#[tokio::test]
+async fn concurrent_duplicate_menu_publishes_conflict_not_500() {
+    let (app, db) = app_and_db().await;
+    let mgr = login_as(&app, &db, "publish_race_mgr", "manager").await;
+
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let app = app.clone();
+        let mgr = mgr.clone();
+        handles.push(tokio::spawn(async move {
+            send(
+                &app,
+                "POST",
+                "/meals/menus",
+                Some(&mgr),
+                Some(json!({ "date": "2026-09-14", "slot": "lunch" })),
+            )
+            .await
+            .status
+        }));
+    }
+    let mut published = 0;
+    for h in handles {
+        let status = h.await.unwrap();
+        assert!(
+            status == StatusCode::CREATED || status == StatusCode::CONFLICT,
+            "a lost publish must be a 409, never a 500: {status}"
+        );
+        published += i32::from(status == StatusCode::CREATED);
+    }
+    assert_eq!(published, 1, "exactly one publish won");
+
+    let res = send(&app, "GET", "/meals/menus", Some(&mgr), None).await;
+    assert_eq!(common::total(&res.body), 1, "and exactly one menu exists");
 }
 
 /// Two appends of one ledger id must both succeed: the id is the idempotence
@@ -22181,6 +22570,68 @@ async fn concurrent_bookings_of_one_seat_bill_it_once() {
         res.body["balance_minor"], -5_000,
         "one seat, one charge: {}",
         res.body
+    );
+}
+
+/// The same stampede on a menu with exactly one seat. Every racer is the *same*
+/// student, so between them they owe one seat — but each claims before it can
+/// know another already placed the row, and the losers' claims are refused as
+/// "full". Answering that with a 409 would refuse a student the booking that
+/// just succeeded on their behalf, so a refused claim looks for this very seat
+/// before it blames the cap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_bookings_of_one_seat_never_refuse_their_own_winner() {
+    let (app, db) = app_and_db().await;
+    let mgr = login_as(&app, &db, "tight_mgr", "manager").await;
+    let stu = login(&app, "tight_stu").await;
+    let res = send(
+        &app,
+        "POST",
+        "/meals/menus",
+        Some(&mgr),
+        Some(json!({ "date": "2026-09-14", "slot": "lunch", "capacity": 1 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let menu = id_of(&res.body);
+
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let (app, stu, menu) = (app.clone(), stu.clone(), menu.clone());
+        tasks.push(tokio::spawn(async move {
+            send(
+                &app,
+                "POST",
+                &format!("/meals/menus/{menu}/bookings"),
+                Some(&stu),
+                Some(json!({})),
+            )
+            .await
+        }));
+    }
+    for task in tasks {
+        let res = task.await.unwrap();
+        assert_eq!(
+            res.status,
+            StatusCode::CREATED,
+            "one student, one seat, no refusal: {}",
+            res.body
+        );
+    }
+
+    let res = send(&app, "GET", "/meals/bookings/me", Some(&stu), None).await;
+    assert_eq!(common::total(&res.body), 1, "one seat: {}", res.body);
+    let mut counted = db
+        .query("SELECT VALUE seats_booked FROM type::record('menu', $m)")
+        .bind(("m", menu.clone()))
+        .await
+        .expect("counter read")
+        .check()
+        .expect("counter read");
+    assert_eq!(
+        counted.take::<Vec<i64>>(0).expect("counter column"),
+        vec![1],
+        "and the seat it cost is the one seat the menu has"
     );
 }
 

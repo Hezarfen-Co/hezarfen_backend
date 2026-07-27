@@ -290,11 +290,24 @@ pub struct Exam {
     // managers, cannot be sat, and cannot be graded. Rows predating the
     // column are backfilled published (`false`).
     draft: bool,
+    /// How many marks the exam carries — a cap-style counter ([`cap::claim`]
+    /// from the grade, decremented by every delete of a mark), absent meaning
+    /// zero. Unlike every other counter it is carried *in the struct*, because
+    /// the save below is a whole-row `CONTENT` write: a column this type did
+    /// not know about would be wiped by the next exam PATCH. Being in the row
+    /// is also what makes it useful — the save pins it, so a grade landing
+    /// mid-PATCH refuses the save instead of slipping past its gates.
+    result_count: Option<i64>,
 }
 
 impl Exam {
     pub fn get_id(&self) -> &ExamId {
         &self.id
+    }
+
+    /// The marks this exam carries, as the counter reads (absent = none yet).
+    pub fn get_result_count(&self) -> i64 {
+        self.result_count.unwrap_or(0)
     }
 
     pub fn get_creator(&self) -> &UserId {
@@ -403,6 +416,7 @@ impl Exam {
             allow_rejoin,
             allow_review,
             draft,
+            result_count: None,
         };
         let created: Option<Exam> = db.create(exam.id.record()).content(exam).await?;
         created.ok_or_else(|| AppError::Internal("failed to create exam".into()))
@@ -523,6 +537,7 @@ impl Exam {
                    AND allow_rejoin = $was_allow_rejoin
                    AND allow_review = $was_allow_review
                    AND draft = $was_draft
+                   AND (result_count ?? 0) = $was_results
                  RETURN AFTER;
                  COMMIT TRANSACTION;",
             )
@@ -539,6 +554,12 @@ impl Exam {
             .bind(("was_allow_rejoin", was.8))
             .bind(("was_allow_review", was.9))
             .bind(("was_draft", was.10))
+            // The mark counter is pinned like every other column this write
+            // replaces, and for a sharper reason: a grade increments it, so
+            // pinning it is what makes "this exam had no marks" — the gate the
+            // handler refuses a kind change on — true at *write* time and not
+            // merely at read time. A mark landing in between refuses the save.
+            .bind(("was_results", self.result_count.unwrap_or(0)))
             .bind(("new", self))
             .await?;
         // An aborted transaction errors every slot; only the THROW's names the
@@ -566,15 +587,35 @@ impl Exam {
     /// Bank templates saved out of this exam survive it — they are a separate,
     /// reusable library — so only their `source_exam` provenance link is cleared,
     /// in the same transaction, never left pointing at a dead exam.
+    ///
+    /// The questions about to be cascaded each hold a reference on their
+    /// subject, which is what keeps that subject from being deleted under them.
+    /// They are given back in this same transaction, counted per subject, so
+    /// deleting an exam frees its subjects for deletion and nothing else does.
+    /// The marks give their *kind* references back the same way, and it has to
+    /// be the same way: counted outside the transaction, a mark deleted by a
+    /// concurrent `remove_result` in the gap would be released twice — once by
+    /// each — which on a kind another exam still uses reads as one mark too
+    /// few, and that is a kind wrongly free to leave the settings.
     pub async fn delete(self, db: &Database) -> Result<Exam, AppError> {
         let mut result = db
             .query(
                 "BEGIN TRANSACTION;
+                 FOR $row IN ((SELECT exam.kind AS kind, count() AS n FROM exam_result
+                     WHERE exam = $ex GROUP BY kind) ?? []) {
+                     UPDATE type::record('kind_ref', $row.kind) SET count =
+                         math::max([(count ?? 0) - $row.n, 0])
+                 };
                  DELETE exam_result WHERE exam = $ex;
                  DELETE exam_attempt WHERE exam = $ex;
                  DELETE exam_answer WHERE exam = $ex;
                  DELETE answer_image WHERE exam = $ex;
                  DELETE question_image WHERE exam = $ex;
+                 FOR $row IN ((SELECT subject, count() AS n FROM exam_question
+                     WHERE exam = $ex GROUP BY subject) ?? []) {
+                     UPDATE $row.subject SET exam_question_count =
+                         math::max([(exam_question_count ?? 0) - $row.n, 0])
+                 };
                  DELETE exam_question WHERE exam = $ex;
                  UPDATE bank_question SET source_exam = NONE WHERE source_exam = $ex;
                  LET $before = (DELETE $ex RETURN BEFORE);
@@ -697,6 +738,7 @@ mod tests {
             1,
             Mark::try_new(80).unwrap(),
             &UserId::generate(),
+            exam.get_kind().as_str(),
             &db,
         )
         .await
