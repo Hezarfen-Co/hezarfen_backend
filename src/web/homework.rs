@@ -192,6 +192,7 @@ async fn list_homework(
         homework
     };
     let total = homework.len() as i64;
+    // Paged in the web layer: the audience filter above is per-row Rust.
     let items = paginate(&homework, limit, offset)
         .iter()
         .map(HomeworkResponse::new)
@@ -1201,8 +1202,9 @@ async fn list_homework_submissions(
     }
     let submissions = HomeworkSubmission::list_for_homework(homework.get_id(), &st.db).await?;
     let results = HomeworkResult::list_for_homework(homework.get_id(), &st.db).await?;
-    let enrolled: Vec<String> = Enrollment::list_for_course(course.get_id(), &st.db)
+    let enrolled: Vec<String> = Enrollment::list_for_course(course.get_id(), None, 0, &st.db)
         .await?
+        .0
         .iter()
         .map(|enrollment| enrollment.get_user().key().to_string())
         .collect();
@@ -1232,6 +1234,7 @@ async fn list_homework_submissions(
     let total = users.len() as i64;
     // Join the heavy parts (the file lists) onto the page alone.
     let mut items = Vec::new();
+    // Paged in the web layer: the audience is resolved in Rust.
     for user_key in paginate(&users, limit, offset) {
         let submission = match submissions
             .iter()
@@ -1325,7 +1328,7 @@ async fn homework_report(
         .ok_or(AppError::NotFound)?;
     // Only an exactly-teacher caller is narrowed to their managed courses;
     // manager+ and a linked parent read the full report (the marks idiom).
-    let mut courses = Course::list_enrolled(&target, &st.db).await?;
+    let (mut courses, _) = Course::list_enrolled(&target, None, 0, &st.db).await?;
     if caller.get_role() == Role::Teacher {
         courses.retain(|course| can_manage_course(course, &caller));
     }
@@ -1336,6 +1339,7 @@ async fn homework_report(
     let total = rows.len() as i64;
     // Join submissions and grades onto the page alone.
     let mut items = Vec::new();
+    // Paged in the web layer: the rows are gathered course by course.
     for homework in paginate(&rows, limit, offset) {
         let submission = HomeworkSubmission::read_for(homework.get_id(), &target, &st.db).await?;
         let result = HomeworkResult::read_for(homework.get_id(), &target, &st.db).await?;

@@ -11,7 +11,7 @@ use utoipa_axum::routes;
 use crate::database::Database;
 use crate::domain::attendance::AttendanceStatus;
 use crate::domain::course::Course;
-use crate::domain::course_session::{CourseSession, CourseSessionId, SESSION_LOCK, SessionTopic};
+use crate::domain::course_session::{CourseSession, CourseSessionId, SessionTopic};
 use crate::domain::enrollment::Enrollment;
 use crate::domain::role::Role;
 use crate::domain::session_attendance::SessionAttendance;
@@ -24,7 +24,7 @@ use crate::state::AppState;
 use super::courses::{can_manage_course, can_view_course};
 use super::{
     CurrentUser, Page, PageParams, PersonRef, RequireTeacher, SessionResponse, check_not_past,
-    check_time_range, paginate, person_map, set_or_clear,
+    check_time_range, person_map, set_or_clear,
 };
 
 pub fn routes() -> OpenApiRouter<AppState> {
@@ -197,15 +197,6 @@ async fn update_session(
     if let Some(ends_at) = ends_at {
         check_not_past("ends_at", ends_at)?;
     }
-    // Only the range check needs the stored row, and only it can race: it
-    // validates an arriving end against the other end as stored, so the read,
-    // the check and the write are held together under [`SESSION_LOCK`]. A PATCH
-    // that moves neither end pays nothing.
-    let _guard = match (starts_at, ends_at) {
-        (None, None) => None,
-        _ => Some(SESSION_LOCK.lock().await),
-    };
-
     let (session, course) = session_with_course(&id, &st.db).await?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
@@ -228,7 +219,8 @@ async fn update_session(
         None => None,
     };
     // The end this request left out is only *read* for the range check — it is
-    // never written back, so a concurrent move of it survives.
+    // never written back, so a concurrent move of it survives. Pre-flight only:
+    // `CourseSession::update` re-makes this check in the UPDATE's `WHERE`.
     check_time_range(
         Some(starts_at.unwrap_or_else(|| session.get_starts_at())),
         ends_at.unwrap_or_else(|| session.get_ends_at()),
@@ -383,10 +375,9 @@ async fn list_roll_call(
             "only the session's teacher or a course manager can list the roll call",
         ));
     }
-    let roster = SessionAttendance::list_for_session(session.get_id(), &st.db).await?;
-    let total = roster.len() as i64;
+    let (rows, total) =
+        SessionAttendance::list_for_session(session.get_id(), limit, offset, &st.db).await?;
     // Join people onto the page alone — the lookup shrinks with the window.
-    let rows = paginate(&roster, limit, offset);
     let people = person_map(
         rows.iter()
             .flat_map(|a| [a.get_user().clone(), a.get_marked_by().clone()]),

@@ -4108,6 +4108,127 @@ async fn concurrent_placements_never_exceed_capacity() {
     }
 }
 
+/// The course capacity cap is a counter column on the course row now, not a
+/// process mutex: `UPDATE ... SET n += 1 WHERE n < capacity` is atomic per
+/// record, so it holds whichever replica the racing enrolls land on. Removing
+/// that `WHERE` (or the claim entirely) puts a third student on a capacity-2
+/// course and fails this. The unenroll each round proves the seat comes back —
+/// without the decrement the course is permanently full by round two.
+#[tokio::test]
+async fn concurrent_enrolls_never_exceed_course_capacity() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "teacher", "teacher").await;
+    let mut students = Vec::new();
+    for name in ["ali", "veli", "ayse"] {
+        let cookie = login(&app, name).await;
+        let id = me_id(&app, &cookie).await;
+        students.push(id);
+    }
+    let res = send(
+        &app,
+        "POST",
+        "/courses",
+        Some(&teacher),
+        Some(json!({ "title": "small", "description": "", "capacity": 2 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let course = id_of(&res.body);
+    let uri = format!("/courses/{course}/enrollments");
+
+    for _round in 0..8 {
+        for id in &students {
+            let _ = send(&app, "DELETE", &format!("{uri}/{id}"), Some(&teacher), None).await;
+        }
+        let mut handles = Vec::new();
+        for id in &students {
+            let (app, teacher, uri) = (app.clone(), teacher.clone(), uri.clone());
+            let body = json!({ "user_id": id });
+            handles.push(tokio::spawn(async move {
+                send(&app, "POST", &uri, Some(&teacher), Some(body))
+                    .await
+                    .status
+            }));
+        }
+        for handle in handles {
+            let status = handle.await.unwrap();
+            assert!(
+                status == StatusCode::OK || status == StatusCode::CONFLICT,
+                "a lost capacity race must be a 409, got {status}"
+            );
+        }
+        let roster = send(&app, "GET", &uri, Some(&teacher), None).await;
+        assert!(
+            common::total(&roster.body) <= 2,
+            "capacity 2 must never over-admit, roster={}",
+            roster.body
+        );
+    }
+}
+
+/// The same (user, course) pair enrolled concurrently must cost exactly one
+/// seat: the row is idempotent by its composite id, so a second enroll that
+/// finds the pair already there returns it *without* claiming, and a `CREATE`
+/// that loses the id race releases the seat it claimed before reading the
+/// winner's row back. Either way the counter must equal the roster — a drift
+/// above it is permanent (nothing recomputes the counter), so the course would
+/// be full forever. Stored state is the only witness: the embedded engine can
+/// tell two racers they both won, so the HTTP statuses prove nothing.
+//
+// ponytail: `ENROLL_LOCK` serializes the enrolls inside one process, so what
+// this actually drives is the already-enrolled early return; the `CREATE`-loser
+// release only runs when the two racers sit on different replicas. Both paths
+// are pinned by the same assertion below (counter == roster), which is the part
+// that matters.
+#[tokio::test]
+async fn concurrent_enrolls_of_one_pair_claim_one_seat() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "teacher", "teacher").await;
+    let alice = login(&app, "alice").await;
+    let alice_id = me_id(&app, &alice).await;
+    let res = send(
+        &app,
+        "POST",
+        "/courses",
+        Some(&teacher),
+        Some(json!({ "title": "seats", "description": "", "capacity": 2 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let course = id_of(&res.body);
+    let uri = format!("/courses/{course}/enrollments");
+
+    let mut handles = Vec::new();
+    for _ in 0..16 {
+        let (app, teacher, uri) = (app.clone(), teacher.clone(), uri.clone());
+        let body = json!({ "user_id": alice_id });
+        handles.push(tokio::spawn(async move {
+            send(&app, "POST", &uri, Some(&teacher), Some(body))
+                .await
+                .status
+        }));
+    }
+    for handle in handles {
+        let status = handle.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "a same-pair enroll is idempotent");
+    }
+
+    let roster = send(&app, "GET", &uri, Some(&teacher), None).await;
+    assert_eq!(common::total(&roster.body), 1, "one pair, one row");
+    let mut counted = db
+        .query("SELECT VALUE enrollment_count FROM type::record('course', $c)")
+        .bind(("c", course.clone()))
+        .await
+        .expect("counter read")
+        .check()
+        .expect("counter read");
+    assert_eq!(
+        counted.take::<Vec<i64>>(0).expect("counter column"),
+        vec![1],
+        "one row on the roster must have cost exactly one seat"
+    );
+}
+
 /// The signup list freezes the moment the event starts — both directions.
 /// (The create-time no-past grace lets a just-started event exist, which is
 /// exactly a closed list.)
@@ -8589,9 +8710,10 @@ async fn questions_and_answers_cascade_with_deletes() {
     }
     let exam_id = ExamId::from_key(&exam);
     assert_eq!(
-        ExamQuestion::list_for_exam(&exam_id, &db)
+        ExamQuestion::list_for_exam(&exam_id, None, 0, &db)
             .await
             .unwrap()
+            .0
             .len(),
         2
     );
@@ -8603,20 +8725,40 @@ async fn questions_and_answers_cascade_with_deletes() {
         2
     );
 
-    // Deleting one question takes its answers with it — the API freezes
-    // question deletes once attempts exist, so exercise the domain cascade
-    // directly (it also runs under the exam/course cascades below).
-    let question = ExamQuestion::list_for_exam(&exam_id, &db)
+    // Deleting one question takes its answers with it. The freeze gate now
+    // lives inside `ExamQuestion::delete`'s own transaction (not in a lock the
+    // handler held), so the attempt has to go first for the cascade to be
+    // exercised at all — that refusal is asserted here before it is cleared.
+    let frozen = ExamQuestion::list_for_exam(&exam_id, None, 0, &db)
         .await
         .unwrap()
+        .0
+        .into_iter()
+        .next()
+        .unwrap();
+    assert!(
+        matches!(frozen.delete(&db).await, Err(err) if err.to_string().contains("after attempts")),
+        "the gate must refuse a question delete while an attempt exists"
+    );
+    db.query("DELETE exam_attempt WHERE exam = $ex")
+        .bind(("ex", exam_id.record()))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    let question = ExamQuestion::list_for_exam(&exam_id, None, 0, &db)
+        .await
+        .unwrap()
+        .0
         .into_iter()
         .next()
         .unwrap();
     question.delete(&db).await.unwrap();
     assert_eq!(
-        ExamQuestion::list_for_exam(&exam_id, &db)
+        ExamQuestion::list_for_exam(&exam_id, None, 0, &db)
             .await
             .unwrap()
+            .0
             .len(),
         1
     );
@@ -8640,9 +8782,10 @@ async fn questions_and_answers_cascade_with_deletes() {
     .await;
     assert_eq!(res.status, StatusCode::NO_CONTENT);
     assert!(
-        ExamQuestion::list_for_exam(&exam_id, &db)
+        ExamQuestion::list_for_exam(&exam_id, None, 0, &db)
             .await
             .unwrap()
+            .0
             .is_empty()
     );
     assert!(
@@ -8703,9 +8846,10 @@ async fn questions_and_answers_cascade_with_deletes() {
     assert_eq!(res.status, StatusCode::NO_CONTENT);
     let exam2_id = ExamId::from_key(&exam2);
     assert!(
-        ExamQuestion::list_for_exam(&exam2_id, &db)
+        ExamQuestion::list_for_exam(&exam2_id, None, 0, &db)
             .await
             .unwrap()
+            .0
             .is_empty()
     );
     assert!(
@@ -14222,6 +14366,84 @@ async fn homework_grading_gates_and_bounds() {
 }
 
 /// A stored grade freezes the submission — text, files, withdrawal — until
+/// The files-per-submission cap is the same counter guard as the note-file one,
+/// on the submission row. Nine seeded files plus four racers for the last slot:
+/// exactly one may win, and the delete must give the slot back or the next
+/// upload is refused forever.
+#[tokio::test]
+async fn concurrent_homework_uploads_never_exceed_the_file_cap() {
+    let (app, db) = app_and_db().await;
+    let w = hw_world(&app, &db).await;
+    let now = Timestamp::now().as_millis();
+    let hw = create_homework(
+        &app,
+        &w.teacher,
+        &w.course,
+        &w.subject,
+        "essay",
+        now + 3_600_000,
+    )
+    .await;
+    let res = submit_hw(&app, &w.ali, &hw, Some("v1")).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    for i in 0..9 {
+        let up = upload_hw_file(&app, &w.ali, &hw, &format!("f{i}.txt"), "text/plain", b"x").await;
+        assert_eq!(up.status, StatusCode::CREATED, "seed file {i}: {}", up.body);
+    }
+
+    let racers = tokio::join!(
+        upload_hw_file(&app, &w.ali, &hw, "r0.txt", "text/plain", b"x"),
+        upload_hw_file(&app, &w.ali, &hw, "r1.txt", "text/plain", b"x"),
+        upload_hw_file(&app, &w.ali, &hw, "r2.txt", "text/plain", b"x"),
+        upload_hw_file(&app, &w.ali, &hw, "r3.txt", "text/plain", b"x"),
+    );
+    let statuses = [
+        racers.0.status,
+        racers.1.status,
+        racers.2.status,
+        racers.3.status,
+    ];
+    for status in statuses {
+        assert!(
+            status == StatusCode::CREATED || status == StatusCode::CONFLICT,
+            "a lost cap race must be a 409, got {status}"
+        );
+    }
+    let list = send(
+        &app,
+        "GET",
+        &format!("/homework/{hw}/submission"),
+        Some(&w.ali),
+        None,
+    )
+    .await;
+    let files = list.body["files"].as_array().expect("files").clone();
+    assert_eq!(
+        files.len(),
+        10,
+        "the cap must hold exactly under concurrency, statuses={statuses:?}"
+    );
+
+    // A deleted file frees its slot again — the counter is not a ratchet.
+    let fid = files[0]["id"].as_str().expect("file id").to_string();
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/homework/{hw}/submission/files/{fid}"),
+        Some(&w.ali),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    let up = upload_hw_file(&app, &w.ali, &hw, "after.txt", "text/plain", b"x").await;
+    assert_eq!(
+        up.status,
+        StatusCode::CREATED,
+        "the freed slot must be reusable: {}",
+        up.body
+    );
+}
+
 /// the teacher removes it; and work never handed in can be graded `missing`,
 /// a verdict the student reads from `/result` despite having no submission.
 #[tokio::test]
@@ -19311,7 +19533,7 @@ async fn a_bank_patch_does_not_clobber_a_concurrent_write() {
 
     // The stale struct writes its own fields only.
     let updated = stale
-        .update(
+        .update_if_unchanged(
             None,
             QuestionText::try_new("edited").unwrap(),
             QuestionPoints::try_new(7).unwrap(),
@@ -19320,7 +19542,8 @@ async fn a_bank_patch_does_not_clobber_a_concurrent_write() {
             &db,
         )
         .await
-        .expect("update written");
+        .expect("update ran")
+        .expect("update written — the exam delete touched no compared column");
     assert_eq!(updated.get_text().as_str(), "edited");
     assert!(
         updated.get_source_exam().is_none(),
@@ -20783,7 +21006,9 @@ async fn concurrent_ledger_appends_of_one_id_write_one_line_not_a_500() {
         "the loser must read back the winner's line, not fail: {second:?}"
     );
 
-    let lines = MealLedger::list_for_student(&student, &db).await.unwrap();
+    let (lines, _) = MealLedger::list_for_student(&student, None, 0, &db)
+        .await
+        .unwrap();
     assert_eq!(lines.len(), 2, "one charge and exactly one reversal");
     assert_eq!(
         MealLedger::balance_of(&student, &db).await.unwrap(),

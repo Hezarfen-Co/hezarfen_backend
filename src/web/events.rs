@@ -11,9 +11,7 @@ use utoipa_axum::routes;
 use crate::database::Database;
 use crate::domain::attendance::{Attendance, AttendanceStatus};
 use crate::domain::course::{Course, CourseId};
-use crate::domain::event::{
-    EVENT_LOCK, Event, EventAudience, EventDescription, EventId, EventTitle,
-};
+use crate::domain::event::{Event, EventAudience, EventDescription, EventId, EventTitle};
 use crate::domain::registration::Registration;
 use crate::domain::role::Role;
 use crate::domain::settings::Settings;
@@ -303,6 +301,7 @@ async fn list_events(
     let (limit, offset) = page.resolve()?;
     let events = window.apply(Event::list_all(&st.db).await?)?;
     let total = events.len() as i64;
+    // Paged in the web layer: `WindowParams` filters and re-orders in Rust.
     let items = paginate(&events, limit, offset)
         .iter()
         .map(EventResponse::new)
@@ -368,15 +367,6 @@ async fn update_event(
         .starts_at
         .map(|update| update.map(Timestamp::from_millis));
     let ends_at = req.ends_at.map(|update| update.map(Timestamp::from_millis));
-    // Only the range check needs the stored row, and only it can race: it
-    // validates an arriving end against the other end as stored, so the read,
-    // the check and the write are held together under [`EVENT_LOCK`]. A PATCH
-    // that moves neither end pays nothing.
-    let _guard = match (starts_at, ends_at) {
-        (None, None) => None,
-        _ => Some(EVENT_LOCK.lock().await),
-    };
-
     let event = Event::read(&EventId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -411,7 +401,8 @@ async fn update_event(
     }
     // The range CHECK needs both ends: whichever the request omitted comes
     // from the stored row. Read for the check only — the omitted side is
-    // never written back.
+    // never written back. Pre-flight only: `Event::update` re-makes this check
+    // in the UPDATE's `WHERE`, so a concurrent move of the omitted end loses.
     check_time_range(
         starts_at.unwrap_or_else(|| event.get_starts_at()),
         ends_at.unwrap_or_else(|| event.get_ends_at()),
@@ -549,10 +540,8 @@ async fn list_attendance(
     Event::read(&event_id, &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    let roster = Attendance::list_for_event(&event_id, &st.db).await?;
-    let total = roster.len() as i64;
+    let (rows, total) = Attendance::list_for_event(&event_id, limit, offset, &st.db).await?;
     // Join people onto the page alone — the lookup shrinks with the window.
-    let rows = paginate(&roster, limit, offset);
     let people = person_map(
         rows.iter()
             .flat_map(|a| [a.get_user().clone(), a.get_marked_by().clone()]),
@@ -646,7 +635,7 @@ async fn roster(
     let mut members = event.get_audience().members(event.get_id(), &st.db).await?;
     // ULID keys sort by creation instant — a stable order keeps pages coherent.
     members.sort_by(|a, b| a.key().cmp(b.key()));
-    let marks = Attendance::list_for_event(&event_id, &st.db).await?;
+    let (marks, _) = Attendance::list_for_event(&event_id, None, 0, &st.db).await?;
     let by_user: HashMap<&str, &Attendance> = marks
         .iter()
         .map(|attendance| (attendance.get_user().key(), attendance))
@@ -654,6 +643,7 @@ async fn roster(
 
     let total = members.len() as i64;
     // Join people onto the page alone — the lookup shrinks with the window.
+    // Paged in the web layer: the audience is resolved in Rust.
     let window = paginate(&members, limit, offset);
     let ids = window.iter().cloned().chain(window.iter().filter_map(|m| {
         by_user

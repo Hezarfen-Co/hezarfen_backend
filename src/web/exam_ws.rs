@@ -88,8 +88,9 @@ use crate::web::exams::{
 /// so it never stamps. No ordering leaves a present student stamped as left —
 /// the reconnect-vs-teardown race that used to lock students out with
 /// `allow_rejoin` off (cleared at the door, stamped after, present forever
-/// refused). This backend is the database's only writer (single
-/// instance) — so one process-wide lock is sufficient, same as `REGISTER_LOCK`.
+/// refused). The count this pairs with lives in *this* process's memory
+/// ([`crate::state::ExamPresence`]), so process-wide is exactly the right
+/// scope: a peer replica counts its own sockets in its own map.
 // ponytail: global lock, per-attempt locks if room churn ever shows up in a
 // profile.
 static PRESENCE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -337,7 +338,10 @@ async fn state_frame(
         ExamAnswer::list_for_exam_user(exam.get_id(), attempt.get_user(), attempt.get_seq(), db)
             .await?
             .len();
-    let question_count = ExamQuestion::list_for_exam(exam.get_id(), db).await?.len();
+    let question_count = ExamQuestion::list_for_exam(exam.get_id(), None, 0, db)
+        .await?
+        .0
+        .len();
     let frame = json!({
         "type": "state",
         "status": status.as_str(),

@@ -952,9 +952,10 @@ async fn chat_thread_delete_cascades_and_stays_owner_scoped() {
     assert_eq!(reply.get_content().as_str(), "aleykum selam");
     assert!(reply.get_completed_at().is_some());
     assert_eq!(
-        ChatbotMessage::list_for_thread(&id, &db)
+        ChatbotMessage::list_for_thread(&id, None, 0, &db)
             .await
             .expect("thread")
+            .0
             .len(),
         2
     );
@@ -993,9 +994,10 @@ async fn chat_thread_delete_cascades_and_stays_owner_scoped() {
             .is_none()
     );
     assert_eq!(
-        ChatbotThread::list_for_user(&owner, &db)
+        ChatbotThread::list_for_user(&owner, None, 0, &db)
             .await
             .unwrap()
+            .0
             .len(),
         0
     );
@@ -1176,4 +1178,89 @@ async fn settings_slots_without_a_serving_minute_still_patch() {
         "{}",
         res.body
     );
+}
+
+/// Rows written before the cap counters existed (2026-07-27) carry no counter
+/// at all, and an absent counter reads as zero — which would hand a full course
+/// and a full note a clean slate. The backfill seeds each parent from the
+/// children it actually has, so the caps keep holding across the upgrade.
+#[tokio::test]
+async fn cap_counters_are_seeded_from_the_rows_that_predate_them() {
+    let (app, db) = common::app_and_db().await;
+    let teacher = common::login_as(&app, &db, "teacher", "teacher").await;
+    let ali = common::login(&app, "ali").await;
+    let veli = common::login(&app, "veli").await;
+    let ayse = common::login(&app, "ayse").await;
+    let (ali_id, veli_id, ayse_id) = (
+        me_id(&app, &ali).await,
+        me_id(&app, &veli).await,
+        me_id(&app, &ayse).await,
+    );
+
+    let res = send(
+        &app,
+        "POST",
+        "/courses",
+        Some(&teacher),
+        Some(json!({ "title": "small", "description": "", "capacity": 2 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let course = common::id_of(&res.body);
+    enroll(&app, &teacher, &course, &ali_id).await;
+    enroll(&app, &teacher, &course, &veli_id).await;
+
+    let res = send(
+        &app,
+        "POST",
+        "/notes",
+        Some(&ali),
+        Some(json!({ "title": "full", "content": "x" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let note = common::id_of(&res.body);
+    for i in 0..10 {
+        let up = common::upload_file(&app, &ali, &note, &format!("f{i}.txt"), "", b"x").await;
+        assert_eq!(up.status, StatusCode::CREATED, "seed file {i}");
+    }
+
+    // Age both parents into the pre-counter shape.
+    db.query("UPDATE course UNSET enrollment_count; UPDATE note UNSET file_count;")
+        .await
+        .expect("age the rows")
+        .check()
+        .expect("age the rows");
+
+    let app = reboot(&db).await;
+
+    let mut counters = db
+        .query("SELECT VALUE enrollment_count FROM course; SELECT VALUE file_count FROM note;")
+        .await
+        .expect("read counters")
+        .check()
+        .expect("read counters");
+    assert_eq!(
+        counters.take::<Vec<i64>>(0).expect("enrollment_count"),
+        vec![2],
+        "the course counter must be seeded from its roster"
+    );
+    assert_eq!(
+        counters.take::<Vec<i64>>(1).expect("file_count"),
+        vec![10],
+        "the note counter must be seeded from its files"
+    );
+
+    // And the caps still bite, which a zeroed counter would not have done.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/courses/{course}/enrollments"),
+        Some(&teacher),
+        Some(json!({ "user_id": ayse_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+    let up = common::upload_file(&app, &ali, &note, "eleventh.txt", "", b"x").await;
+    assert_eq!(up.status, StatusCode::CONFLICT, "{}", up.body);
 }

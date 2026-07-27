@@ -36,9 +36,14 @@ const EXCLUDED: &[(&str, &str)] = &[
         "DB_CONNECT_BACKOFF_MAX_SECS",
         "boot reconnect backoff ceiling",
     ),
+    ("CAS_UPDATE_RETRIES", "internal compare-and-set retry count"),
     (
-        "SETTINGS_UPDATE_RETRIES",
-        "internal compare-and-set retry count",
+        "CAP_WRITE_TRIES",
+        "internal retry count for a contended cap counter",
+    ),
+    (
+        "CAP_WRITE_BACKOFF_MS",
+        "internal backoff between cap counter retries",
     ),
     (
         "UPLOAD_BODY_OVERHEAD_BYTES",
@@ -114,9 +119,6 @@ const EXCLUDED: &[(&str, &str)] = &[
         "DEFAULT_DIETARY_TAGS",
         "settings seed; the live list is on GET /settings",
     ),
-    // Schema and query text. `constant.rs` is the single home for every
-    // constant, so the migration batches live there too — a client never sees
-    // a byte of SurrealQL.
     // The boot leader election. A client never sees the lock, and the timings
     // are startup mechanics between processes — publishing them would invite a
     // frontend to reason about a boot it cannot observe.
@@ -136,13 +138,9 @@ const EXCLUDED: &[(&str, &str)] = &[
         "how long a non-leader waits for the boot migration",
     ),
     ("MIGRATION_LOCK_POLL_MS", "boot lock poll cadence"),
-    (
-        "MIGRATION_BATCHES",
-        "the batch list the boot executes and fingerprints",
-    ),
-    ("PRE_REPAIR", "pre-DDL data repair batch"),
-    ("MIGRATION", "SCHEMAFULL DDL batch"),
-    ("BACKFILL", "post-DDL data backfill batch"),
+    // The three migration batches and their list moved to
+    // `src/migration_sql.rs` — they are SurrealQL text, not bounds, and the
+    // numeric sweep below still catches any bound that tries to follow them.
     ("USAGE_COUNTS_SQL", "one-statement bank usage-count query"),
     // Storage-side keys and literals. Each names a row, a column value or a
     // fold rule the server writes; none is a number a client is held to.
@@ -188,6 +186,18 @@ const EXCLUDED: &[(&str, &str)] = &[
         "ETag middleware's own buffering ceiling",
     ),
     ("PURGE_AT", "rate-limiter bucket eviction threshold"),
+    // How the tiers are kept fleet-wide. A client is held to the tier itself
+    // (published live in /limits `rate`), never to the cadence the replicas
+    // reconcile it at — publishing that would invite pacing against it.
+    (
+        "RATE_SYNC_INTERVAL_SECS",
+        "how often a replica reconciles its counters",
+    ),
+    ("RATE_SYNC_TIMEOUT_SECS", "deadline on one sync round"),
+    (
+        "RATE_SYNC_MAX_KEYS",
+        "client buckets one sync round carries",
+    ),
     (
         "MAX_ERROR_CODE_LEN",
         "bounds a code the SERVER writes from an AI service's reply; no client sends it",
@@ -196,11 +206,12 @@ const EXCLUDED: &[(&str, &str)] = &[
     ("MIN_CHUNK_CHARS", "how the SSE stream slices an answer"),
 ];
 
-/// A `*_TABLE` constant is a SurrealDB table name, not a bound. Listing all 37
-/// by hand would bury the deliberate exclusions above in boilerplate, so the
-/// whole shape is excused once — the naming convention *is* the decision.
+/// A `*_TABLE` constant is a SurrealDB table name and a `*_FIELD` one a column
+/// name, not a bound. Listing all 37 by hand would bury the deliberate
+/// exclusions above in boilerplate, so the whole shape is excused once — the
+/// naming convention *is* the decision.
 fn is_storage_identifier(name: &str) -> bool {
-    name.ends_with("_TABLE")
+    (name.ends_with("_TABLE") || name.ends_with("_FIELD"))
         && !["MAX_", "MIN_", "DEFAULT_"]
             .iter()
             .any(|prefix| name.starts_with(prefix))

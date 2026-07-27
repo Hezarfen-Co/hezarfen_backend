@@ -17,6 +17,7 @@ use crate::constant::BANK_QUESTION_IMAGE_TABLE;
 use crate::database::Database;
 use crate::domain::bank_question::BankQuestionId;
 use crate::domain::exam_question::ChoiceId;
+use crate::domain::key;
 use crate::domain::note_file::FileContentType;
 use crate::error::AppError;
 
@@ -24,20 +25,12 @@ use crate::error::AppError;
 pub struct BankQuestionImageId(RecordId);
 
 impl BankQuestionImageId {
-    /// The one id a (question, slot) pair can have: `{bid}_q` for the
-    /// question's own image, `{bid}_{choice id}` for one option's picture —
-    /// uniqueness per slot needs no index this way. Keyed by the option's
-    /// *stable id*, so reordering the choice list moves no picture.
+    /// The one id a (question, slot) pair can have — see [`key::slot`] for the
+    /// key shape and why the two forms can never collide.
     pub fn for_slot(question: &BankQuestionId, slot: Option<&ChoiceId>) -> Self {
-        // `_` is not in Crockford base32 and a ULID is never `"q"`, so
-        // `{qid}_{cid}` and `{qid}_q` can never collide.
-        let suffix = match slot {
-            None => "q",
-            Some(id) => id.as_str(),
-        };
         Self(RecordId::new(
             BANK_QUESTION_IMAGE_TABLE,
-            format!("{}_{suffix}", question.key()),
+            key::slot(question.key(), slot.map(|id| id.as_str())),
         ))
     }
 

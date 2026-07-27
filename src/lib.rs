@@ -4,6 +4,7 @@ pub mod constant;
 pub mod database;
 pub mod domain;
 pub mod error;
+pub mod migration_sql;
 pub mod rate_limit;
 pub mod state;
 pub mod validate;
@@ -103,7 +104,7 @@ pub fn build_router(state: AppState) -> Router {
         .routes(routes!(server_time))
         .merge(web::limits::routes())
         .nest("/ai", web::ai::routes())
-        .nest("/auth", web::auth::routes(&state.rate_limit))
+        .nest("/auth", web::auth::routes(&state))
         .nest("/chatbot", web::chatbot::routes())
         .nest("/users", web::users::routes())
         .nest("/notes", web::notes::routes())
@@ -133,6 +134,13 @@ pub fn build_router(state: AppState) -> Router {
         state.rate_limit.api_per_minute,
         state.rate_limit.trust_proxy,
     );
+    // Every tier's budget is fleet-wide, not per process (see
+    // [`rate_limit::RateLimiter::share`]). The chatbot tier is shared here too
+    // rather than in `main`, so it holds in every process that serves it.
+    api_limiter.share("api", state.db.clone(), state.db_up.clone());
+    state
+        .chatbot_limit
+        .share("chatbot", state.db.clone(), state.db_up.clone());
 
     let db_up = state.db_up.clone();
 

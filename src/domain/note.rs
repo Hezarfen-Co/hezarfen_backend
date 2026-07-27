@@ -4,6 +4,7 @@ use ulid::Ulid;
 use crate::constant::{MAX_NOTE_CONTENT_LEN, MAX_NOTE_TITLE_LEN, NOTE_TABLE};
 use crate::database::Database;
 use crate::domain::field_update::FieldUpdate;
+use crate::domain::page::PagedList;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 use crate::validate::{validate_optional, validate_required};
@@ -107,13 +108,16 @@ impl Note {
         Ok(note.filter(|note| &note.user == owner))
     }
 
-    pub async fn list_for(owner: &UserId, db: &Database) -> Result<Vec<Note>, AppError> {
-        let mut result = db
-            .query("SELECT * FROM note WHERE user = $usr ORDER BY id DESC")
-            .bind(("usr", owner.record()))
-            .await?
-            .check()?;
-        Ok(result.take::<Vec<Note>>(0)?)
+    pub async fn list_for(
+        owner: &UserId,
+        limit: Option<i64>,
+        offset: i64,
+        db: &Database,
+    ) -> Result<(Vec<Note>, i64), AppError> {
+        PagedList::new("note WHERE user = $usr", "ORDER BY id DESC")
+            .bind("usr", owner.record())
+            .run(limit, offset, db)
+            .await
     }
 
     /// Request-scoped: no lock spans the handler's read and this write, so an

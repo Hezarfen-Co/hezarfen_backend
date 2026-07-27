@@ -4,6 +4,7 @@ use ulid::Ulid;
 use crate::constant::{COURSE_TABLE, MAX_COURSE_DESCRIPTION_LEN, MAX_COURSE_TITLE_LEN};
 use crate::database::Database;
 use crate::domain::field_update::FieldUpdate;
+use crate::domain::page::PagedList;
 use crate::domain::term::TermId;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
@@ -189,17 +190,19 @@ impl Course {
 
     /// The courses `user` is enrolled in — the spine of `/courses/me` and the
     /// marks report.
-    pub async fn list_enrolled(user: &UserId, db: &Database) -> Result<Vec<Course>, AppError> {
-        let mut result = db
-            .query(
-                "SELECT * FROM course
-                 WHERE id IN (SELECT VALUE course FROM enrollment WHERE user = $usr)
-                 ORDER BY id DESC",
-            )
-            .bind(("usr", user.record()))
-            .await?
-            .check()?;
-        Ok(result.take::<Vec<Course>>(0)?)
+    pub async fn list_enrolled(
+        user: &UserId,
+        limit: Option<i64>,
+        offset: i64,
+        db: &Database,
+    ) -> Result<(Vec<Course>, i64), AppError> {
+        PagedList::new(
+            "course WHERE id IN (SELECT VALUE course FROM enrollment WHERE user = $usr)",
+            "ORDER BY id DESC",
+        )
+        .bind("usr", user.record())
+        .run(limit, offset, db)
+        .await
     }
 
     /// The courses `user` runs — the ones they created plus the ones a manager

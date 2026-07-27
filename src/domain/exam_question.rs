@@ -8,7 +8,9 @@ use crate::constant::{
 use crate::database::Database;
 use crate::domain::bank_question::BankQuestionId;
 use crate::domain::exam::ExamId;
+use crate::domain::exam_attempt::ExamAttempt;
 use crate::domain::monotonic_id::next_ulid;
+use crate::domain::page::PagedList;
 use crate::domain::subject::SubjectId;
 use crate::error::{AppError, ValidationError};
 use crate::validate::{validate_question_kind, validate_question_points, validate_required};
@@ -404,9 +406,21 @@ impl ExamQuestion {
             // An insert never banks anything: only a to-bank save writes this.
             banked_as: None,
         };
-        let created: Option<ExamQuestion> =
-            db.create(question.id.record()).content(question).await?;
-        created.ok_or_else(|| AppError::Internal("failed to create exam question".into()))
+        // The freeze gate rides in the same transaction as the insert: a
+        // question cannot appear under an exam somebody has already started,
+        // whichever replica the two requests hit.
+        let mut result = db
+            .query(ExamAttempt::unfrozen("CREATE $id CONTENT $question;"))
+            .bind(("freeze_exam", exam.record()))
+            .bind(("id", question.id.record()))
+            .bind(("question", question))
+            .await?;
+        ExamAttempt::frozen_check(&mut result)?;
+        result
+            .take::<Vec<ExamQuestion>>(ExamAttempt::FROZEN_SLOT)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| AppError::Internal("failed to create exam question".into()))
     }
 
     pub async fn read(
@@ -419,14 +433,14 @@ impl ExamQuestion {
     /// The exam's questions in presentation order (ULID ids sort by creation).
     pub async fn list_for_exam(
         exam: &ExamId,
+        limit: Option<i64>,
+        offset: i64,
         db: &Database,
-    ) -> Result<Vec<ExamQuestion>, AppError> {
-        let mut result = db
-            .query("SELECT * FROM exam_question WHERE exam = $ex ORDER BY id ASC")
-            .bind(("ex", exam.record()))
-            .await?
-            .check()?;
-        Ok(result.take::<Vec<ExamQuestion>>(0)?)
+    ) -> Result<(Vec<ExamQuestion>, i64), AppError> {
+        PagedList::new("exam_question WHERE exam = $ex", "ORDER BY id ASC")
+            .bind("ex", exam.record())
+            .run(limit, offset, db)
+            .await
     }
 
     /// Whether any question anywhere references `subject` — the gate that
@@ -440,23 +454,44 @@ impl ExamQuestion {
         Ok(!result.take::<Vec<RecordId>>(0)?.is_empty())
     }
 
+    /// Write the editable fields, refused outright once the exam has an
+    /// attempt — the freeze gate is part of this transaction, not a check the
+    /// caller made a moment earlier under a lock.
+    ///
+    /// Field-scoped, no longer a whole-row save. The row also carries
+    /// `from_bank`/`banked_as`, which [`Self::link_banked_as`] writes from a
+    /// *different* request: re-stating this snapshot's copy of them would
+    /// revert a to-bank save that landed in between. That is exactly what the
+    /// caller's `EXAM_LOCK.write()` used to order (inside one process), and
+    /// naming the columns removes the need for any ordering at all.
     pub async fn update(
-        mut self,
+        self,
         subject: SubjectId,
         text: QuestionText,
         points: QuestionPoints,
         spec: QuestionSpec,
         db: &Database,
     ) -> Result<ExamQuestion, AppError> {
-        self.subject = subject;
-        self.text = text;
-        self.points = points;
-        self.kind = spec.kind;
-        self.choices = spec.choices;
-        self.correct = spec.correct;
-        // whole-row-save-ok: callers hold EXAM_LOCK.write() across the read and this write
-        let updated: Option<ExamQuestion> = db.update(self.id.record()).content(self).await?;
-        updated.ok_or(AppError::NotFound)
+        let mut result = db
+            .query(ExamAttempt::unfrozen(
+                "UPDATE $id SET subject = $subject, text = $text, points = $points,
+                 kind = $kind, choices = $choices, correct = $correct RETURN AFTER;",
+            ))
+            .bind(("freeze_exam", self.exam.record()))
+            .bind(("id", self.id.record()))
+            .bind(("subject", subject.record()))
+            .bind(("text", text))
+            .bind(("points", points))
+            .bind(("kind", spec.kind))
+            .bind(("choices", spec.choices))
+            .bind(("correct", spec.correct))
+            .await?;
+        ExamAttempt::frozen_check(&mut result)?;
+        result
+            .take::<Vec<ExamQuestion>>(ExamAttempt::FROZEN_SLOT)?
+            .into_iter()
+            .next()
+            .ok_or(AppError::NotFound)
     }
 
     /// Point the question's `banked_as` at the bank template it was just saved
@@ -495,16 +530,26 @@ impl ExamQuestion {
     /// Delete the question and cascade-remove its answers and image rows, so
     /// neither can point at a missing question. The image *blobs* are the web
     /// layer's to remove — it collects their names before calling this.
+    /// Refused once the exam has an attempt, in the same transaction as the
+    /// delete — and the cascade now shares that transaction too, so a failure
+    /// mid-way can no longer strand answers whose question survived.
     pub async fn delete(self, db: &Database) -> Result<ExamQuestion, AppError> {
-        db.query(
-            "DELETE exam_answer WHERE question = $q;
-             DELETE question_image WHERE question = $q;",
-        )
-        .bind(("q", self.id.record()))
-        .await?
-        .check()?;
-        let deleted: Option<ExamQuestion> = db.delete(self.id.record()).await?;
-        deleted.ok_or(AppError::NotFound)
+        let mut result = db
+            .query(ExamAttempt::unfrozen(
+                "DELETE exam_answer WHERE question = $q;
+                 DELETE question_image WHERE question = $q;
+                 DELETE $q RETURN BEFORE;",
+            ))
+            .bind(("freeze_exam", self.exam.record()))
+            .bind(("q", self.id.record()))
+            .await?;
+        ExamAttempt::frozen_check(&mut result)?;
+        // Two cascade statements ahead of the delete itself.
+        result
+            .take::<Vec<ExamQuestion>>(ExamAttempt::FROZEN_SLOT + 2)?
+            .into_iter()
+            .next()
+            .ok_or(AppError::NotFound)
     }
 
     /// A question constructed without a database, for pure-function tests.

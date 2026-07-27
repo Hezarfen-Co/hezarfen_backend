@@ -95,7 +95,7 @@ async fn build_report(
     viewer: Option<&User>,
     db: &Database,
 ) -> Result<MarksReport, AppError> {
-    let mut courses = Course::list_enrolled(user, db).await?;
+    let (mut courses, _) = Course::list_enrolled(user, None, 0, db).await?;
     if let Some(viewer) = viewer {
         courses.retain(|course| can_manage_course(course, viewer));
     }

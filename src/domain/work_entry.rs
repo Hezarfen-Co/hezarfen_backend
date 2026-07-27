@@ -1,27 +1,23 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-use tokio::sync::Mutex;
 use ulid::Ulid;
 
 use crate::constant::WORK_ENTRY_TABLE;
 use crate::database::Database;
 use crate::domain::field_update::FieldUpdate;
+use crate::domain::page::PagedList;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
-use crate::error::AppError;
+use crate::error::{AppError, ValidationError};
 
-/// Serializes a stint correction's ordering check against the write it guards,
-/// exactly as `TERM_LOCK` does for terms: `check_in <= check_out` is a
-/// cross-field check, so a correction of one instant validates against the
-/// *stored* other one — two such corrections, each fine on its own snapshot,
-/// would otherwise commit an inverted stint between them. Check-in/check-out
-/// themselves stay lock-free (they are atomic single-row writes), and a PATCH
-/// carrying neither instant checks nothing cross-field.
-///
-/// Lock order: this is a leaf — the only path that takes it (`PATCH
-/// /work/entries/{id}`) takes no other lock, and no path holding another lock
-/// takes this one, so it cannot sit in a cycle. Should a future path need
-/// both, take the other lock first and this one innermost.
-pub(crate) static WORK_ENTRY_LOCK: Mutex<()> = Mutex::const_new(());
+/// The one spelling of "this stint is inverted", shared by the handler's
+/// pre-flight check and the write-time `WHERE` guard that re-makes it against
+/// the stored row.
+pub(crate) fn out_before_in_error() -> AppError {
+    AppError::Validation(ValidationError::Invalid {
+        field: "check_out",
+        reason: "must be at or after check_in",
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct WorkEntryId(RecordId);
@@ -163,13 +159,16 @@ impl WorkEntry {
     /// Every stint of `user`, newest first — the open one (if any) included.
     /// Ordered by `check_in`: the open entry's `open_` key doesn't sort with
     /// the ULIDs, so id order would misplace it.
-    pub async fn list_for_user(user: &UserId, db: &Database) -> Result<Vec<WorkEntry>, AppError> {
-        let mut result = db
-            .query("SELECT * FROM work_entry WHERE user = $usr ORDER BY check_in DESC")
-            .bind(("usr", user.record()))
-            .await?
-            .check()?;
-        Ok(result.take::<Vec<WorkEntry>>(0)?)
+    pub async fn list_for_user(
+        user: &UserId,
+        limit: Option<i64>,
+        offset: i64,
+        db: &Database,
+    ) -> Result<(Vec<WorkEntry>, i64), AppError> {
+        PagedList::new("work_entry WHERE user = $usr", "ORDER BY check_in DESC")
+            .bind("usr", user.record())
+            .run(limit, offset, db)
+            .await
     }
 
     /// Persist corrected instants (manager fix-ups on closed entries; the web
@@ -188,6 +187,10 @@ impl WorkEntry {
         FieldUpdate::new(self.id.record())
             .set("check_in", check_in)
             .set("check_out", check_out)
+            // Same race closer as the schedule ranges, with this table's own
+            // field names and message: a correction of one instant is only
+            // written while it still orders against the other as *stored*.
+            .ordered("check_in", "check_out", out_before_in_error())
             .run::<WorkEntry>(db)
             .await
     }
@@ -216,7 +219,7 @@ mod tests {
         // Second check-in must not create a second stint or reset the clock.
         let dup = WorkEntry::check_in(&user, &db).await;
         assert!(matches!(dup, Err(AppError::Conflict(_))));
-        let entries = WorkEntry::list_for_user(&user, &db).await.unwrap();
+        let (entries, _) = WorkEntry::list_for_user(&user, None, 0, &db).await.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].get_check_in(), open.get_check_in());
 
@@ -230,7 +233,7 @@ mod tests {
             Err(AppError::Conflict(_))
         ));
         WorkEntry::check_in(&user, &db).await.unwrap();
-        let entries = WorkEntry::list_for_user(&user, &db).await.unwrap();
+        let (entries, _) = WorkEntry::list_for_user(&user, None, 0, &db).await.unwrap();
         assert_eq!(entries.len(), 2);
     }
 }

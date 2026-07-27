@@ -1,5 +1,6 @@
 //! Rate limiting, hand-rolled on a fixed 60-second window — no extra crates,
-//! no background tasks. The counter is keyed generically: by client IP for the
+//! and nothing on the request path but a mutex (the one background task below
+//! only shares counters). The counter is keyed generically: by client IP for the
 //! middleware tiers below, by user id for the per-user chatbot tier
 //! ([`UserRateLimiter`]), which cannot be middleware because the caller is only
 //! known once `CurrentUser` has run.
@@ -23,6 +24,24 @@
 //! Fixed windows admit up to a 2× burst straddling a window boundary. That is
 //! an accepted trade-off for an implementation simple enough to read in one
 //! sitting; argon2 keeps each allowed login attempt expensive anyway.
+//!
+//! # Across replicas
+//!
+//! The counters above are per process, and the backend runs as two replicas —
+//! so a client hitting both got twice its budget. [`RateLimiter::share`] closes
+//! that: a background task folds each bucket's new admits into one shared row
+//! per tier + client + wall window (`rate_limit`, see
+//! [`crate::constant::RATE_LIMIT_TABLE`]) every
+//! [`crate::constant::RATE_SYNC_INTERVAL_SECS`], and the fleet-wide total that
+//! comes back caps what the local bucket admits for the rest of that window.
+//!
+//! Admission itself stays in memory and stays synchronous — no request ever
+//! waits on the database to be let in, and a database that is down or slow
+//! costs nothing but the sharing (the tiers fall back to their local budgets
+//! rather than failing anyone). The cost is a lag: within one interval a
+//! replica can spend up to its own full budget before the shared total tells
+//! it to stop, so the fleet's worst case is `replicas × max` for one interval
+//! and `max` from then on.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -33,13 +52,19 @@ use std::time::Duration;
 use axum::extract::{ConnectInfo, Request};
 use axum::middleware::Next;
 use axum::response::Response;
+use surrealdb::types::RecordId;
 // tokio's `Instant` wraps `std::time::Instant` in production but obeys
 // `tokio::time::pause`/`advance` under `start_paused` tests, which makes the
 // window arithmetic below testable without sleeping.
 use tokio::time::Instant;
 
-use crate::constant::PURGE_AT;
+use crate::constant::{
+    PURGE_AT, RATE_LIMIT_TABLE, RATE_SYNC_INTERVAL_SECS, RATE_SYNC_MAX_KEYS, RATE_SYNC_TIMEOUT_SECS,
+};
+use crate::database::Database;
+use crate::domain::timestamp::Timestamp;
 use crate::error::AppError;
+use crate::state::DbHealth;
 
 /// Per-IP rate-limit knobs, sourced from the environment (see `.env.example`) and
 /// carried in [`crate::state::AppState`]. A `0` limit disables that tier.
@@ -80,7 +105,40 @@ pub struct RateLimiter<K = IpAddr> {
 
 struct Bucket {
     window_start: Instant,
+    /// Requests this process admitted in the current local window.
     count: u32,
+    /// How many of `count` the sync task has already folded into the shared
+    /// row. Never above `count`, so `count - pushed` is what is still ours to
+    /// report.
+    pushed: u32,
+    /// The fleet-wide total the last sync read back — everyone's admits,
+    /// `pushed` included. Zero until a sync lands, which is what makes an
+    /// unshared limiter behave exactly like the local-only one it replaced.
+    remote: u32,
+    /// The wall window (`RATE_LIMIT_TABLE` row) `pushed`/`remote` describe.
+    /// The local window rolls per client while the shared one is aligned to the
+    /// clock, so this says which shared row those two numbers came from.
+    epoch: i64,
+}
+
+impl Bucket {
+    /// A fresh window: nothing admitted, nothing shared, nothing known.
+    fn opened_at(now: Instant) -> Self {
+        Self {
+            window_start: now,
+            count: 0,
+            pushed: 0,
+            remote: 0,
+            epoch: 0,
+        }
+    }
+
+    /// Requests the whole fleet has spent in this window as far as this process
+    /// can tell: what every replica had reported at the last sync, plus our own
+    /// admits since. Equals `count` until a sync lands.
+    fn spent(&self) -> u32 {
+        self.remote.saturating_add(self.count - self.pushed)
+    }
 }
 
 impl<K> RateLimiter<K> {
@@ -168,16 +226,15 @@ impl<K: Eq + Hash> RateLimiter<K> {
             buckets.retain(|_, b| now.duration_since(b.window_start) < self.window);
         }
 
-        let bucket = buckets.entry(key).or_insert(Bucket {
-            window_start: now,
-            count: 0,
-        });
+        let bucket = buckets.entry(key).or_insert_with(|| Bucket::opened_at(now));
         if now.duration_since(bucket.window_start) >= self.window {
-            bucket.window_start = now;
-            bucket.count = 0;
+            // A fresh window starts owing nothing and knowing nothing: keeping
+            // the old total would hold the client at a budget it no longer
+            // spent. The next sync re-reads what the fleet has spent since.
+            *bucket = Bucket::opened_at(now);
         }
 
-        if bucket.count < self.max {
+        if bucket.spent() < self.max {
             bucket.count += 1;
             Ok(())
         } else {
@@ -185,6 +242,196 @@ impl<K: Eq + Hash> RateLimiter<K> {
             Err((remaining.as_secs_f64().ceil() as u64).max(1))
         }
     }
+}
+
+/// One bucket's report, taken while the map was locked so the round can run
+/// its query without holding it. `counted` is the `count` the delta was read
+/// from — a request admitted mid-round bumps `count` past it and is simply
+/// carried into the next round.
+struct Pending<K> {
+    key: K,
+    delta: u32,
+    counted: u32,
+    window_start: Instant,
+}
+
+impl<K> RateLimiter<K>
+where
+    K: Eq + Hash + Clone + std::fmt::Display + Send + Sync + 'static,
+{
+    /// Make this tier's budget fleet-wide: every
+    /// [`RATE_SYNC_INTERVAL_SECS`] a background task reports what this replica
+    /// has admitted and reads back what everyone has, which caps further local
+    /// admits in the same window (see the module docs).
+    ///
+    /// `tier` names the counter's namespace in the shared table — two limiters
+    /// sharing a name share a budget, which is exactly what the two processes
+    /// running the same tier want and what `auth` and `api` must avoid.
+    ///
+    /// The task holds a *weak* reference to the buckets, so it stops with the
+    /// limiter rather than keeping a dropped one alive (test suites build
+    /// dozens).
+    pub fn share(&self, tier: &'static str, db: Database, db_up: DbHealth) {
+        if self.max == 0 {
+            // The tier is off: `check` records nothing, so there is nothing to
+            // share and no reason to hold a task or a table row.
+            return;
+        }
+        let buckets = Arc::downgrade(&self.buckets);
+        let window = self.window;
+        tokio::spawn(async move {
+            let mut swept = 0;
+            loop {
+                tokio::time::sleep(Duration::from_secs(RATE_SYNC_INTERVAL_SECS)).await;
+                let Some(buckets) = buckets.upgrade() else {
+                    return;
+                };
+                // Never queue work on a database that is down: the SDK parks a
+                // query instead of failing it, so this task would sit on a
+                // round for the whole outage and then apply a stale total.
+                if !db_up.is_up() {
+                    continue;
+                }
+                let epoch = current_epoch(window);
+                sync_once(tier, &buckets, window, epoch, &db).await;
+                // Piggybacked cleanup, once per window: rows for a window that
+                // has passed can never be read again.
+                if swept != epoch {
+                    swept = epoch;
+                    let sql = format!("DELETE {RATE_LIMIT_TABLE} WHERE window_start < $cutoff");
+                    if let Err(err) = with_deadline(db.query(sql).bind(("cutoff", epoch))).await {
+                        tracing::warn!(%err, "rate-limit sweep failed; retrying next window");
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Fold every live bucket's new admits into its shared row and take the
+/// fleet-wide total back.
+///
+/// One statement per bucket in one query, and each statement is its own
+/// transaction — so a statement that loses a write race fails alone. Its bucket
+/// simply keeps the delta unreported and the next round (2s later) carries it,
+/// which is why no retry loop is needed here: retrying the *query* would
+/// double-apply the statements that did land, since `hits` accumulates.
+async fn sync_once<K: Eq + Hash + Clone + std::fmt::Display>(
+    tier: &str,
+    buckets: &Mutex<HashMap<K, Bucket>>,
+    window: Duration,
+    epoch: i64,
+    db: &Database,
+) {
+    let now = Instant::now();
+    let pending: Vec<Pending<K>> = {
+        let mut guard = buckets.lock().expect("rate limiter mutex poisoned");
+        guard
+            .iter_mut()
+            .filter(|(_, b)| b.count > 0 && now.duration_since(b.window_start) < window)
+            .take(RATE_SYNC_MAX_KEYS)
+            .map(|(key, b)| {
+                if b.epoch != epoch {
+                    // The shared window rolled: the row this bucket is about to
+                    // write knows nothing of us, so the whole local count is
+                    // the delta and the previous total describes a dead row.
+                    b.epoch = epoch;
+                    b.pushed = 0;
+                    b.remote = 0;
+                }
+                Pending {
+                    key: key.clone(),
+                    delta: b.count - b.pushed,
+                    counted: b.count,
+                    window_start: b.window_start,
+                }
+            })
+            .collect()
+    };
+    if pending.is_empty() {
+        return;
+    }
+
+    let sql: String = (0..pending.len())
+        .map(|i| {
+            format!("UPSERT $id{i} SET hits = (hits ?? 0) + $delta{i}, window_start = $window RETURN VALUE hits;")
+        })
+        .collect();
+    let mut query = db.query(sql).bind(("window", epoch));
+    for (i, p) in pending.iter().enumerate() {
+        let id = RecordId::new(RATE_LIMIT_TABLE, row_key(tier, &p.key, epoch));
+        query = query
+            .bind((format!("id{i}"), id))
+            .bind((format!("delta{i}"), i64::from(p.delta)));
+    }
+    let mut response = match with_deadline(query).await {
+        Ok(response) => response,
+        Err(err) => {
+            tracing::warn!(%err, "rate-limit sync failed; counting locally until it recovers");
+            return;
+        }
+    };
+
+    let mut guard = buckets.lock().expect("rate limiter mutex poisoned");
+    for (i, p) in pending.iter().enumerate() {
+        // A statement that failed (a lost write race) leaves its bucket
+        // untouched: the delta stays unreported and the next round carries it.
+        let Ok(total) = response.take::<Vec<i64>>(i) else {
+            continue;
+        };
+        let (Some(total), Some(bucket)) = (total.first(), guard.get_mut(&p.key)) else {
+            continue;
+        };
+        // The window may have rolled while the query was in flight, in which
+        // case this total is about a bucket that no longer exists.
+        if bucket.epoch != epoch || bucket.window_start != p.window_start {
+            continue;
+        }
+        bucket.pushed = p.counted;
+        bucket.remote = (*total).clamp(0, u32::MAX.into()) as u32;
+    }
+}
+
+/// The wall-clock window a shared row is keyed by, aligned so every replica
+/// agrees on it — the local windows cannot be used for this, since each one
+/// starts whenever that client's first request happened to land.
+fn current_epoch(window: Duration) -> i64 {
+    let ms = i64::try_from(window.as_millis()).unwrap_or(i64::MAX).max(1);
+    Timestamp::now().as_millis().div_euclid(ms) * ms
+}
+
+/// The shared row's key: tier, client, window. The client part is hashed
+/// because it is a raw IP or user id — free of the `:` and `_` that would
+/// otherwise let one client's key collide with another's by construction.
+fn row_key<K: std::fmt::Display>(tier: &str, key: &K, epoch: i64) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(key.to_string().as_bytes());
+    format!("{tier}_{:x}_{epoch}", ByteSlice(&digest[..8]))
+}
+
+/// Lowercase hex of a byte slice, for [`row_key`].
+struct ByteSlice<'a>(&'a [u8]);
+
+impl std::fmt::LowerHex for ByteSlice<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
+    }
+}
+
+/// Run a sync query under a deadline. The liveness flag catches a *known*
+/// outage; this catches the socket that died between the last ping and now,
+/// which the SDK would otherwise park until the database returned — wedging
+/// the one task every tier's sharing depends on.
+async fn with_deadline<T>(
+    query: impl std::future::IntoFuture<Output = surrealdb::Result<T>>,
+) -> Result<T, AppError> {
+    tokio::time::timeout(
+        Duration::from_secs(RATE_SYNC_TIMEOUT_SECS),
+        query.into_future(),
+    )
+    .await
+    .map_err(|_| AppError::Internal("rate-limit sync timed out".into()))?
+    .map_err(AppError::from)
 }
 
 /// Resolve the client IP a request is billed against.

@@ -8,6 +8,7 @@ use ulid::Ulid;
 use crate::constant::{DECOY_PASSWORD, USER_TABLE};
 use crate::database::Database;
 use crate::domain::field_update::FieldUpdate;
+use crate::domain::page::PagedList;
 use crate::domain::preferences::{Language, Theme};
 use crate::domain::profile::{BirthDate, Email, PersonName, Phone};
 use crate::domain::role::Role;
@@ -355,12 +356,14 @@ impl User {
         Ok(db.select(id.record()).await?)
     }
 
-    pub async fn list_all(db: &Database) -> Result<Vec<User>, AppError> {
-        let mut result = db
-            .query("SELECT * FROM user ORDER BY id DESC")
-            .await?
-            .check()?;
-        Ok(result.take::<Vec<User>>(0)?)
+    pub async fn list_all(
+        limit: Option<i64>,
+        offset: i64,
+        db: &Database,
+    ) -> Result<(Vec<User>, i64), AppError> {
+        PagedList::new("user", "ORDER BY id DESC")
+            .run(limit, offset, db)
+            .await
     }
 
     /// Fetch the users behind `ids` in one query. Ids with no row are simply
@@ -402,8 +405,10 @@ impl User {
     pub async fn search(
         query: &str,
         role: Option<Role>,
+        limit: Option<i64>,
+        offset: i64,
         db: &Database,
-    ) -> Result<Vec<User>, AppError> {
+    ) -> Result<(Vec<User>, i64), AppError> {
         let needle = search_fold(query.trim());
         let text_clause = format!(
             "({} CONTAINS $q OR {} CONTAINS $q OR {} CONTAINS $q)",
@@ -423,16 +428,12 @@ impl User {
         } else {
             clauses.join(" AND ")
         };
-        let mut query = db
-            .query(format!(
-                "SELECT * FROM user WHERE {where_clause} ORDER BY username"
-            ))
-            .bind(("q", needle));
+        let mut list = PagedList::new(format!("user WHERE {where_clause}"), "ORDER BY username")
+            .bind("q", needle);
         if let Some(role) = role {
-            query = query.bind(("role", role));
+            list = list.bind("role", role);
         }
-        let mut result = query.await?.check()?;
-        Ok(result.take::<Vec<User>>(0)?)
+        list.run(limit, offset, db).await
     }
 
     /// Overwrite this user's role. The caller is responsible for authorizing it.

@@ -10,6 +10,15 @@ use crate::domain::settings::ExamKindDef;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
+
+/// The one spelling of the re-draft refusal, shared by the handler's
+/// pre-flight gate and the in-transaction guard that re-makes it at write
+/// time — a client cannot tell which of the two refused.
+pub(crate) fn redraft_error() -> AppError {
+    AppError::Conflict(
+        "cannot turn a published exam back into a draft after attempts or results exist",
+    )
+}
 use crate::validate::{
     validate_attempt_limit, validate_exam_duration, validate_exam_mode, validate_optional,
     validate_required,
@@ -444,7 +453,17 @@ impl Exam {
         clippy::too_many_arguments,
         reason = "mirrors the sibling entities' update(field, field, ..) shape"
     )]
-    pub async fn update(
+    /// Save the merged exam, but only while the row still reads as the
+    /// snapshot the caller merged over — `None` means a concurrent PATCH
+    /// landed in between and nothing was written: re-read, re-merge, retry.
+    ///
+    /// Every column this write replaces is in the guard, which is what makes
+    /// the whole-row `CONTENT` save safe without a lock held across the
+    /// handler's read: the compare-and-set refuses precisely when that save
+    /// would have reverted somebody. `course`/`creator` are not editable and
+    /// ride along unchanged. Same shape as
+    /// [`crate::domain::settings::Settings::save_if_unchanged`].
+    pub async fn update_if_unchanged(
         mut self,
         title: ExamTitle,
         description: ExamDescription,
@@ -455,7 +474,26 @@ impl Exam {
         allow_review: bool,
         draft: bool,
         db: &Database,
-    ) -> Result<Exam, AppError> {
+    ) -> Result<Option<Exam>, AppError> {
+        // Re-drafting hides an exam: it must be refused while any sitting or
+        // mark exists, and that check has to be *in this transaction*. Holding
+        // it under a lock outside would only order the two writers inside one
+        // process — and it did not even do that, since grading takes the reader
+        // lease this write does.
+        let redraft = draft && !self.draft;
+        let was = (
+            self.title.clone(),
+            self.description.clone(),
+            self.kind.clone(),
+            self.mode.clone(),
+            self.starts_at,
+            self.ends_at,
+            self.duration_ms,
+            self.max_attempts,
+            self.allow_rejoin,
+            self.allow_review,
+            self.draft,
+        );
         self.title = title;
         self.description = description;
         self.kind = kind;
@@ -467,9 +505,56 @@ impl Exam {
         self.allow_rejoin = allow_rejoin;
         self.allow_review = allow_review;
         self.draft = draft;
-        // whole-row-save-ok: the only caller takes EXAM_LOCK.write() before the row read (web/exams.rs:354)
-        let updated: Option<Exam> = db.update(self.id.record()).content(self).await?;
-        updated.ok_or(AppError::NotFound)
+        // whole-row-save-ok: the WHERE below pins every column this replaces to
+        // the caller's snapshot, so no concurrent write can be reverted
+        let mut result = db
+            .query(
+                "BEGIN TRANSACTION;
+                 IF $redraft AND (
+                     array::len((SELECT VALUE id FROM exam_attempt WHERE exam = $id LIMIT 1)) > 0
+                     OR array::len((SELECT VALUE id FROM exam_result WHERE exam = $id LIMIT 1)) > 0
+                 ) { THROW 'exam_redraft' };
+                 UPDATE $id CONTENT $new
+                 WHERE title = $was_title AND description = $was_description
+                   AND kind = $was_kind AND mode = $was_mode
+                   AND starts_at = $was_starts AND ends_at = $was_ends
+                   AND duration_ms = $was_duration
+                   AND max_attempts = $was_max_attempts
+                   AND allow_rejoin = $was_allow_rejoin
+                   AND allow_review = $was_allow_review
+                   AND draft = $was_draft
+                 RETURN AFTER;
+                 COMMIT TRANSACTION;",
+            )
+            .bind(("redraft", redraft))
+            .bind(("id", self.id.record()))
+            .bind(("was_title", was.0))
+            .bind(("was_description", was.1))
+            .bind(("was_kind", was.2))
+            .bind(("was_mode", was.3))
+            .bind(("was_starts", was.4))
+            .bind(("was_ends", was.5))
+            .bind(("was_duration", was.6))
+            .bind(("was_max_attempts", was.7))
+            .bind(("was_allow_rejoin", was.8))
+            .bind(("was_allow_review", was.9))
+            .bind(("was_draft", was.10))
+            .bind(("new", self))
+            .await?;
+        // An aborted transaction errors every slot; only the THROW's names the
+        // marker (the `frozen_check` treatment).
+        let mut errors = result.take_errors();
+        if errors
+            .values()
+            .any(|error| error.to_string().contains("exam_redraft"))
+        {
+            return Err(redraft_error());
+        }
+        if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+            return Err(error.into());
+        }
+        // BEGIN and the IF take a slot each.
+        Ok(result.take::<Vec<Exam>>(2)?.into_iter().next())
     }
 
     /// Delete the exam and cascade-remove its result, attempt, question,
@@ -515,6 +600,128 @@ impl Exam {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An unscheduled published exam, the minimum this file's write tests need.
+    async fn published(db: &Database) -> Exam {
+        let allowed: Vec<ExamKindDef> = crate::domain::settings::Settings::defaults()
+            .get_exam_kinds()
+            .to_vec();
+        Exam::create(
+            &UserId::generate(),
+            &CourseId::generate(),
+            ExamTitle::try_new("midterm").unwrap(),
+            ExamDescription::try_new("").unwrap(),
+            ExamKind::try_new("midterm", &allowed).unwrap(),
+            ExamSchedule::try_new(None, None, None, None).unwrap(),
+            ExamAttemptLimit::try_new(1).unwrap(),
+            true,
+            false,
+            false,
+            db,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn edit(exam: &Exam) -> (ExamTitle, ExamDescription, ExamKind, ExamSchedule) {
+        (
+            exam.get_title().clone(),
+            exam.get_description().clone(),
+            exam.get_kind().clone(),
+            ExamSchedule::try_new(None, None, None, None).unwrap(),
+        )
+    }
+
+    /// The bite test for the compare-and-set that replaced the writer lease on
+    /// `PATCH /exams/{id}`: a merge built on a snapshot the row has moved past
+    /// must be refused (the handler then re-reads and re-merges), never
+    /// written over somebody else's edit. Asserts the *stored* row.
+    #[tokio::test]
+    async fn a_merge_built_on_a_stale_snapshot_is_refused() {
+        let db = crate::database::init_mem().await.unwrap();
+        let stale = published(&db).await;
+        let (_, description, kind, schedule) = edit(&stale);
+        let landed = stale
+            .clone()
+            .update_if_unchanged(
+                ExamTitle::try_new("theirs").unwrap(),
+                description,
+                kind,
+                schedule,
+                ExamAttemptLimit::try_new(1).unwrap(),
+                true,
+                false,
+                false,
+                &db,
+            )
+            .await
+            .unwrap();
+        assert!(landed.is_some(), "the first write is on a fresh snapshot");
+
+        let (_, description, kind, schedule) = edit(&stale);
+        let refused = stale
+            .update_if_unchanged(
+                ExamTitle::try_new("mine").unwrap(),
+                description,
+                kind,
+                schedule,
+                ExamAttemptLimit::try_new(1).unwrap(),
+                true,
+                false,
+                false,
+                &db,
+            )
+            .await
+            .unwrap();
+        assert!(refused.is_none(), "a stale merge must not be written");
+        let stored = Exam::read(landed.unwrap().get_id(), &db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.get_title().as_str(), "theirs");
+    }
+
+    /// The bite test for the re-draft guard now living *inside* the update's
+    /// transaction: a mark that lands after the handler's pre-flight gate (the
+    /// grade path is a lock reader, exactly like this one) must still stop the
+    /// exam from being hidden.
+    #[tokio::test]
+    async fn re_drafting_is_refused_by_the_write_itself_once_a_mark_exists() {
+        use crate::domain::exam_result::{ExamResult, Mark};
+        let db = crate::database::init_mem().await.unwrap();
+        let exam = published(&db).await;
+        let student = UserId::generate();
+        ExamResult::grade(
+            exam.get_id(),
+            &student,
+            1,
+            Mark::try_new(80).unwrap(),
+            &UserId::generate(),
+            &db,
+        )
+        .await
+        .unwrap();
+
+        let (title, description, kind, schedule) = edit(&exam);
+        let refused = exam
+            .clone()
+            .update_if_unchanged(
+                title,
+                description,
+                kind,
+                schedule,
+                ExamAttemptLimit::try_new(1).unwrap(),
+                true,
+                false,
+                true,
+                &db,
+            )
+            .await
+            .expect_err("a graded exam cannot be re-drafted");
+        assert!(refused.to_string().contains("back into a draft"));
+        let stored = Exam::read(exam.get_id(), &db).await.unwrap().unwrap();
+        assert!(!stored.is_draft(), "nothing may have been written");
+    }
 
     #[tokio::test]
     async fn title_is_required() {

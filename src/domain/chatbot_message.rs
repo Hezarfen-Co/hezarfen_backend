@@ -21,6 +21,7 @@ use crate::constant::{
 };
 use crate::database::Database;
 use crate::domain::chatbot_thread::ChatbotThreadId;
+use crate::domain::page::PagedList;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
@@ -283,21 +284,21 @@ impl ChatbotMessage {
     /// history payload read in.
     pub async fn list_for_thread(
         thread: &ChatbotThreadId,
+        limit: Option<i64>,
+        offset: i64,
         db: &Database,
-    ) -> Result<Vec<ChatbotMessage>, AppError> {
-        let mut result = db
-            .query(
-                "SELECT * FROM chatbot_message WHERE thread_id = $conv \
-                 ORDER BY created_at ASC, id ASC",
-            )
-            .bind(("conv", thread.record()))
-            .await?
-            .check()?;
-        Ok(result
-            .take::<Vec<ChatbotMessage>>(0)?
-            .into_iter()
-            .map(ChatbotMessage::projected)
-            .collect())
+    ) -> Result<(Vec<ChatbotMessage>, i64), AppError> {
+        let (rows, total) = PagedList::new(
+            "chatbot_message WHERE thread_id = $conv",
+            "ORDER BY created_at ASC, id ASC",
+        )
+        .bind("conv", thread.record())
+        .run::<ChatbotMessage>(limit, offset, db)
+        .await?;
+        Ok((
+            rows.into_iter().map(ChatbotMessage::projected).collect(),
+            total,
+        ))
     }
 
     /// The last `limit` turns, still oldest-first — the tail replayed to the
@@ -549,7 +550,9 @@ mod tests {
                 .unwrap();
         }
 
-        let whole = ChatbotMessage::list_for_thread(&thread, &db).await.unwrap();
+        let (whole, _) = ChatbotMessage::list_for_thread(&thread, None, 0, &db)
+            .await
+            .unwrap();
         let tail = ChatbotMessage::list_tail(&thread, TURNS * 2, &db)
             .await
             .unwrap();

@@ -459,9 +459,10 @@ mod tests {
         assert_eq!(swept[0].get_id(), offered.get_id());
         assert!(PoolQuestion::read(q.get_id(), &db).await.unwrap().is_none());
         assert!(
-            Solution::list_for(q.get_id(), &db)
+            Solution::list_for(q.get_id(), None, 0, &db)
                 .await
                 .unwrap()
+                .0
                 .is_empty()
         );
 

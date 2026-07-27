@@ -3,6 +3,7 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use crate::constant::ATTENDANCE_TABLE;
 use crate::database::Database;
 use crate::domain::event::EventId;
+use crate::domain::page::PagedList;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 
@@ -113,14 +114,14 @@ impl Attendance {
 
     pub async fn list_for_event(
         event: &EventId,
+        limit: Option<i64>,
+        offset: i64,
         db: &Database,
-    ) -> Result<Vec<Attendance>, AppError> {
-        let mut result = db
-            .query("SELECT * FROM attendance WHERE event = $ev ORDER BY id DESC")
-            .bind(("ev", event.record()))
-            .await?
-            .check()?;
-        Ok(result.take::<Vec<Attendance>>(0)?)
+    ) -> Result<(Vec<Attendance>, i64), AppError> {
+        PagedList::new("attendance WHERE event = $ev", "ORDER BY id DESC")
+            .bind("ev", event.record())
+            .run(limit, offset, db)
+            .await
     }
 
     /// Every event-attendance row recorded for `user` — the events half of the

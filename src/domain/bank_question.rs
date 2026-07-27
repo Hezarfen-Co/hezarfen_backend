@@ -379,15 +379,22 @@ impl BankQuestion {
             .collect())
     }
 
-    /// Write the editable fields of the template.
+    /// Write the editable fields of the template, but only while the row still
+    /// reads as the snapshot `self` was loaded from — `None` means a concurrent
+    /// edit (or the subject-delete cascade that clears `subject`) landed inside
+    /// the handler's read-merge window, so nothing was written: reload,
+    /// re-merge, retry. This is a genuine read-modify-write — every editable
+    /// field is re-stated from the snapshot, and the kind/choices/correct trio
+    /// has to be (a text-only edit re-submits the stored options *with their
+    /// ids* so each keeps its picture) — so without the compare-and-set the
+    /// later writer silently reverts the earlier one. An in-process `RwLock`
+    /// only stopped that between requests of *one* replica.
     ///
-    /// Field-scoped, never a whole-row content-replace save: the handler reads
-    /// the row, then awaits an ownership check and a subject lookup before
-    /// getting here, so a concurrent PATCH (or the subject-delete cascade that
-    /// clears `subject`) can land inside that window — a whole-row save would
-    /// silently revert it. Same shape, same reason as
-    /// [`crate::domain::exam_question::ExamQuestion::link_banked_as`].
-    pub async fn update(
+    /// Every field the merge re-states is in the guard, which is the same list
+    /// the `SET` writes. `choices` is compared whole: its objects carry two
+    /// required string keys, so none is ever dropped for being `NONE` (the trap
+    /// [`crate::domain::settings::Settings::save_if_unchanged`] works around).
+    pub async fn update_if_unchanged(
         self,
         subject: Option<SubjectId>,
         text: QuestionText,
@@ -395,14 +402,26 @@ impl BankQuestion {
         spec: QuestionSpec,
         visibility: BankVisibility,
         db: &Database,
-    ) -> Result<BankQuestion, AppError> {
+    ) -> Result<Option<BankQuestion>, AppError> {
         let (kind, choices, correct) = spec.into_parts();
         let mut result = db
             .query(
                 "UPDATE $id SET subject = $subject, text = $text, points = $points,
                  kind = $kind, choices = $choices, correct = $correct,
-                 visibility = $visibility RETURN AFTER",
+                 visibility = $visibility
+                 WHERE subject = $was_subject AND text = $was_text
+                   AND points = $was_points AND kind = $was_kind
+                   AND choices = $was_choices AND correct = $was_correct
+                   AND visibility = $was_visibility
+                 RETURN AFTER",
             )
+            .bind(("was_subject", self.subject.clone().map(|s| s.record())))
+            .bind(("was_text", self.text.clone()))
+            .bind(("was_points", self.points))
+            .bind(("was_kind", self.kind.clone()))
+            .bind(("was_choices", self.choices.clone()))
+            .bind(("was_correct", self.correct.clone()))
+            .bind(("was_visibility", self.visibility.clone()))
             .bind(("id", self.id.record()))
             .bind(("subject", subject.map(|s| s.record())))
             .bind(("text", text))
@@ -413,11 +432,7 @@ impl BankQuestion {
             .bind(("visibility", visibility))
             .await?
             .check()?;
-        result
-            .take::<Vec<BankQuestion>>(0)?
-            .into_iter()
-            .next()
-            .ok_or(AppError::NotFound)
+        Ok(result.take::<Vec<BankQuestion>>(0)?.into_iter().next())
     }
 
     /// Delete the template and cascade-remove its bank images, so none points
@@ -556,7 +571,7 @@ mod tests {
         .unwrap();
         let subject = published.get_subject().cloned();
         published
-            .update(
+            .update_if_unchanged(
                 subject,
                 QuestionText::try_new("shared").unwrap(),
                 QuestionPoints::try_new(1).unwrap(),
@@ -591,6 +606,61 @@ mod tests {
         assert_eq!(private.get_visibility().as_str(), BANK_VISIBILITY_PRIVATE);
     }
 
+    /// The bite test for the compare-and-set that replaced the writer lease of
+    /// `BANK_LOCK` on the PATCH path: a merge built on a snapshot the row has
+    /// since moved past must be refused, not written — otherwise it reverts
+    /// whatever landed in between. Asserts the *stored* row, never a race
+    /// outcome: the in-memory engine can drop one of two concurrent writes and
+    /// still answer `Ok`.
+    #[tokio::test]
+    async fn a_merge_built_on_a_stale_snapshot_is_refused() {
+        let db = crate::database::init_mem().await.unwrap();
+        let owner = UserId::generate();
+        let stale = BankQuestion::create(
+            owner,
+            SubjectId::generate(),
+            QuestionText::try_new("first").unwrap(),
+            QuestionPoints::try_new(1).unwrap(),
+            spec(),
+            &db,
+        )
+        .await
+        .unwrap();
+        // Somebody else's edit lands on the row this snapshot came from.
+        let landed = stale
+            .clone()
+            .update_if_unchanged(
+                None,
+                QuestionText::try_new("theirs").unwrap(),
+                QuestionPoints::try_new(2).unwrap(),
+                spec(),
+                BankVisibility::try_new(BANK_VISIBILITY_PRIVATE).unwrap(),
+                &db,
+            )
+            .await
+            .unwrap();
+        assert!(landed.is_some(), "the first write is on a fresh snapshot");
+
+        let refused = stale
+            .update_if_unchanged(
+                None,
+                QuestionText::try_new("mine").unwrap(),
+                QuestionPoints::try_new(3).unwrap(),
+                spec(),
+                BankVisibility::try_new(BANK_VISIBILITY_PRIVATE).unwrap(),
+                &db,
+            )
+            .await
+            .unwrap();
+        assert!(refused.is_none(), "a stale merge must not be written");
+        let stored = BankQuestion::read(landed.unwrap().get_id(), &db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.get_text().as_str(), "theirs");
+        assert_eq!(stored.get_points().as_i64(), 2);
+    }
+
     /// The `visibility` filter ANDs onto the security gate, so it narrows and
     /// never widens: a stranger asking for `school` still can't see a private
     /// row, and `private` means "my own drafts" for everyone but an admin.
@@ -613,7 +683,7 @@ mod tests {
         let published = mine("shared").await.unwrap();
         let subject = published.get_subject().cloned();
         published
-            .update(
+            .update_if_unchanged(
                 subject,
                 QuestionText::try_new("shared").unwrap(),
                 QuestionPoints::try_new(1).unwrap(),

@@ -24,7 +24,7 @@ use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::constant::{MAX_MAX_FILE_BYTES, UPLOAD_BODY_OVERHEAD_BYTES};
+use crate::constant::{CAS_UPDATE_RETRIES, MAX_MAX_FILE_BYTES, UPLOAD_BODY_OVERHEAD_BYTES};
 use crate::domain::bank_question::{BankQuestion, BankQuestionId, BankVisibility};
 use crate::domain::bank_question_image::BankQuestionImage;
 use crate::domain::exam_question::{
@@ -32,7 +32,6 @@ use crate::domain::exam_question::{
 };
 use crate::domain::note_file::FileContentType;
 use crate::domain::role::Role;
-use crate::domain::settings::Settings;
 use crate::domain::subject::{Subject, SubjectId};
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
@@ -42,16 +41,17 @@ use super::dto::person_map;
 use super::exams::ChoiceResponse;
 use super::subjects::subject_must_exist;
 use super::{
-    ChoiceBody, Page, PageParams, RequireTeacher, UploadFileForm, blob_path, image_content_type,
-    read_upload, remove_blob, serve_inline_blob, set_or_clear,
+    ChoiceBody, ImageUpload, Page, PageParams, RequireTeacher, UploadFileForm, read_image_upload,
+    remove_blob, serve_inline_blob, set_or_clear, store_blob,
 };
 
 /// Serializes bank writes that adopt a `subject` against a concurrent subject
-/// delete. Bank create takes the reader lease across its
-/// subject-exists check and the write; the *update* takes the writer lease
-/// instead, because it is a read-modify-write of the whole template, so its row
-/// read must be serialized against another update and not merely against the
-/// delete cascade; the subject delete takes the writer
+/// delete — the one invariant left here, and a **replica-local** one: it orders
+/// requests inside one process, and there are two. Every lease is now a
+/// *reader* lease taken across a subject-exists check and the write that adopts
+/// it: bank create, bank update, and save-to-bank. (Update used to take the
+/// writer lease for its read-modify-write; that is a compare-and-set on the row
+/// itself now, which holds across replicas.) The subject delete takes the writer
 /// lease across the cascade that clears `subject` off every template, so a
 /// template can't land on a subject that vanished mid-flight (it would outlive
 /// the sweep) — the bank twin of the
@@ -113,7 +113,7 @@ struct CreateBankQuestion {
     correct: Option<String>,
 }
 
-#[derive(Deserialize, ToSchema)]
+#[derive(Clone, Deserialize, ToSchema)]
 struct UpdateBankQuestion {
     /// Re-tag the template's origin subject. Omit to keep the current one
     /// (which is `null` if that subject has since been deleted).
@@ -392,9 +392,9 @@ async fn owned_question(st: &AppState, user: &User, bid: &str) -> Result<BankQue
     Ok(question)
 }
 
-/// The whole bank-image write tail: new blob to disk, row UPSERT (the
-/// deterministic per-slot id makes it a replace), then the replaced blob off
-/// disk. A failed row write takes the fresh blob back out.
+/// The bank-image write tail: the slot's current row names the blob to retire,
+/// the UPSERT replaces it (the deterministic per-slot id makes it a replace),
+/// and [`store_blob`] owns the disk ordering.
 pub(crate) async fn store_image(
     st: &AppState,
     question: &BankQuestionId,
@@ -404,22 +404,12 @@ pub(crate) async fn store_image(
 ) -> Result<BankQuestionImage, AppError> {
     let replaced = BankQuestionImage::read_slot(question, slot, &st.db).await?;
     let image = BankQuestionImage::new(question, slot, content_type, data.len() as i64);
-    let path = blob_path(&st.files_path, image.get_file());
-    tokio::fs::write(&path, data)
-        .await
-        .map_err(|err| AppError::Internal(format!("failed to store the image blob: {err}")))?;
-    match image.upsert(&st.db).await {
-        Ok(stored) => {
-            if let Some(replaced) = replaced {
-                remove_blob(&st.files_path, replaced.get_file()).await;
-            }
-            Ok(stored)
-        }
-        Err(err) => {
-            let _ = tokio::fs::remove_file(&path).await;
-            Err(err)
-        }
-    }
+    let file = image.get_file().to_string();
+    store_blob(st, &file, data, || async {
+        let stored = image.upsert(&st.db).await?;
+        Ok((stored, replaced.map(|old| old.get_file().to_string())))
+    })
+    .await
 }
 
 /// Add a template to the bank. Requires teacher+. `subject_id` is origin
@@ -602,8 +592,10 @@ async fn get_question(
     Ok(Json(BankQuestionResponse::new(&question, &images)))
 }
 
-/// Edit a template. Owner only (admins aside — 403 otherwise). Omitted fields
-/// keep their value; `kind`/`choices`/`correct` are re-validated as a unit, so
+/// Edit a template. Owner only (admins aside — 403 otherwise). Concurrent edits
+/// of *different* fields merge instead of reverting each other (the save is
+/// conditioned on the snapshot it merged over, and re-merges when it loses).
+/// Omitted fields keep their value; `kind`/`choices`/`correct` are re-validated as a unit, so
 /// a kind switch must bring the matching fields along. Replacing or clearing
 /// `choices` drops the old options' pictures. Bank templates never freeze —
 /// they have no exam tie.
@@ -626,6 +618,7 @@ async fn get_question(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the template's owner (and not an admin)", body = ErrorResponse),
         (status = 404, description = "No such template", body = ErrorResponse),
+        (status = 409, description = "The template kept changing under concurrent edits — retry", body = ErrorResponse),
     ),
 )]
 async fn update_question(
@@ -634,62 +627,71 @@ async fn update_question(
     Path(bid): Path<String>,
     Json(req): Json<UpdateBankQuestion>,
 ) -> Result<Json<BankQuestionResponse>, AppError> {
-    // *Writer* lease of [`BANK_LOCK`], taken before the row is read: this is a
-    // read-modify-write, not a per-field write. Omitted fields are refilled from
-    // the snapshot below, and the kind/choices/correct trio genuinely has to be
-    // (a text-only edit re-submits the stored options *with their ids* so every
-    // choice keeps its picture), so the read, the merge and the write must be
-    // one unit or a concurrent PATCH of another field is silently reverted. The
-    // reader lease this used to take was both shared *and* acquired after the
-    // read, so it serialized nothing; it only ever covered the subject-exists
-    // check against a subject delete, which the writer lease still covers.
-    // Exclusive means bank writes queue behind each other — they are rare
-    // teacher edits, and the per-field alternative cannot express the
-    // choice-identity merge. Still the only lock this path takes, so the
-    // documented EXAM → BANK order is unaffected.
-    let _guard = BANK_LOCK.write().await;
-    let question = owned_question(&st, &user, &bid).await?;
-    // Omitted keeps the stored subject — which may already be `None`, cleared
-    // by that subject's delete.
-    let subject = match req.subject_id {
-        Some(ref subject_id) => Some(subject_must_exist(subject_id, &st.db).await?),
-        None => question.get_subject().cloned(),
-    };
-    let text = match req.text {
-        Some(ref text) => QuestionText::try_new(text)?,
-        None => question.get_text().clone(),
-    };
-    let points = match req.points {
-        Some(points) => QuestionPoints::try_new(points)?,
-        None => question.get_points(),
-    };
-    // Merge the kind-dependent fields (set / clear / keep per field), then
-    // re-validate them as a unit — a PATCH can't leave a half-question behind.
-    let kind = match req.kind {
-        Some(ref kind) => QuestionKind::try_new(kind)?,
-        None => question.get_kind().clone(),
-    };
-    // Omitting `choices` re-submits the stored options *with their ids*, so a
-    // text-only edit keeps every identity (and every picture) untouched.
-    let choices = match req.choices {
-        Some(update) => ChoiceBody::into_inputs(update),
-        None => ChoiceBody::from_stored(question.get_choices()),
-    };
-    let correct = match req.correct {
-        Some(update) => update,
-        None => question.get_correct().map(|id| id.as_str().to_string()),
-    };
-    let stored: Vec<Choice> = question.get_choices().unwrap_or_default().to_vec();
-    let spec = QuestionSpec::try_new(kind, choices, correct, &stored)?;
-    let visibility = match req.visibility {
-        Some(ref visibility) => BankVisibility::try_new(visibility)?,
-        None => question.get_visibility().clone(),
-    };
+    // Reader lease of [`BANK_LOCK`], exactly like the create path and for the
+    // one thing it buys: the subject-exists check below is paired with the
+    // subject delete that sweeps this table (that cascade takes the writer
+    // lease), so a template cannot be pinned to a subject on its way out. It is
+    // replica-local, like every lock here. The *writer* lease this used to take
+    // was aimed at the read-modify-write below, which it only serialized inside
+    // one process — that is now a compare-and-set on the row itself.
+    let _guard = BANK_LOCK.read().await;
+    // Read, merge and write again while the row keeps moving underneath: the
+    // guarded write refuses on a snapshot that has gone stale, so both edits
+    // land instead of the later one reverting the earlier.
+    let mut left = CAS_UPDATE_RETRIES;
+    let updated = loop {
+        let question = owned_question(&st, &user, &bid).await?;
+        // Omitted keeps the stored subject — which may already be `None`, cleared
+        // by that subject's delete.
+        let subject = match req.subject_id {
+            Some(ref subject_id) => Some(subject_must_exist(subject_id, &st.db).await?),
+            None => question.get_subject().cloned(),
+        };
+        let text = match req.text {
+            Some(ref text) => QuestionText::try_new(text)?,
+            None => question.get_text().clone(),
+        };
+        let points = match req.points {
+            Some(points) => QuestionPoints::try_new(points)?,
+            None => question.get_points(),
+        };
+        // Merge the kind-dependent fields (set / clear / keep per field), then
+        // re-validate them as a unit — a PATCH can't leave a half-question behind.
+        let kind = match req.kind {
+            Some(ref kind) => QuestionKind::try_new(kind)?,
+            None => question.get_kind().clone(),
+        };
+        // Omitting `choices` re-submits the stored options *with their ids*, so a
+        // text-only edit keeps every identity (and every picture) untouched.
+        let choices = match req.choices.clone() {
+            Some(update) => ChoiceBody::into_inputs(update),
+            None => ChoiceBody::from_stored(question.get_choices()),
+        };
+        let correct = match req.correct.clone() {
+            Some(update) => update,
+            None => question.get_correct().map(|id| id.as_str().to_string()),
+        };
+        let stored: Vec<Choice> = question.get_choices().unwrap_or_default().to_vec();
+        let spec = QuestionSpec::try_new(kind, choices, correct, &stored)?;
+        let visibility = match req.visibility {
+            Some(ref visibility) => BankVisibility::try_new(visibility)?,
+            None => question.get_visibility().clone(),
+        };
 
-    let bid = question.get_id().clone();
-    let updated = question
-        .update(subject, text, points, spec, visibility, &st.db)
-        .await?;
+        if let Some(updated) = question
+            .update_if_unchanged(subject, text, points, spec, visibility, &st.db)
+            .await?
+        {
+            break updated;
+        }
+        left -= 1;
+        if left == 0 {
+            return Err(AppError::Conflict(
+                "the template kept changing underneath this update — try again",
+            ));
+        }
+    };
+    let bid = updated.get_id().clone();
     // Only the options that are actually *gone* lose their pictures — an option
     // that survives the edit keeps its image wherever it moved in the list.
     let keep: Vec<ChoiceId> = updated
@@ -770,10 +772,8 @@ async fn upload_question_image(
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<BankImageMeta>), AppError> {
     let question = owned_question(&st, &user, &bid).await?;
-    let limit = Settings::load(&st.db).await?.get_max_file_bytes();
-    let upload = read_upload(&mut multipart, limit).await?;
-    let content_type = image_content_type(&upload.content_type.unwrap_or_default())?;
-    let stored = store_image(&st, question.get_id(), None, content_type, &upload.data).await?;
+    let ImageUpload { content_type, data } = read_image_upload(&st, &mut multipart).await?;
+    let stored = store_image(&st, question.get_id(), None, content_type, &data).await?;
     Ok((StatusCode::CREATED, Json(BankImageMeta::new(&stored))))
 }
 
@@ -864,17 +864,8 @@ async fn upload_choice_image(
 ) -> Result<(StatusCode, Json<BankImageMeta>), AppError> {
     let question = owned_question(&st, &user, &bid).await?;
     let slot = bank_choice_slot(&question, &choice_id)?;
-    let limit = Settings::load(&st.db).await?.get_max_file_bytes();
-    let upload = read_upload(&mut multipart, limit).await?;
-    let content_type = image_content_type(&upload.content_type.unwrap_or_default())?;
-    let stored = store_image(
-        &st,
-        question.get_id(),
-        Some(&slot),
-        content_type,
-        &upload.data,
-    )
-    .await?;
+    let ImageUpload { content_type, data } = read_image_upload(&st, &mut multipart).await?;
+    let stored = store_image(&st, question.get_id(), Some(&slot), content_type, &data).await?;
     Ok((StatusCode::CREATED, Json(BankImageMeta::new(&stored))))
 }
 

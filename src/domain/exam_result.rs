@@ -6,27 +6,27 @@ use crate::constant::EXAM_RESULT_TABLE;
 use crate::database::Database;
 use crate::domain::course::CourseId;
 use crate::domain::exam::ExamId;
+use crate::domain::key;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 use crate::validate::validate_mark;
+
+/// The one spelling of "this exam is hidden", shared by the grade handler's
+/// pre-flight gate and the in-transaction guard on the mark write.
+pub(crate) fn draft_error() -> AppError {
+    AppError::Conflict("this exam is a draft — publish it before grading")
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct ExamResultId(RecordId);
 
 impl ExamResultId {
     /// A deterministic id for the (exam, user, seq) triple — one mark row per
-    /// sitting. The same triple always maps to the same record id, so grading a
-    /// sitting is a single atomic UPSERT with no find-then-insert race. The
-    /// first sitting keeps the historical `{exam}_{user}` shape (marks written
-    /// before per-attempt history existed stay addressable unchanged); later
-    /// sittings append their number. ULID keys are alphanumeric, so `_` is an
-    /// unambiguous joiner.
+    /// sitting, so grading is a single atomic UPSERT with no find-then-insert
+    /// race. See [`key::sitting`] for the key shape and why the first sitting
+    /// stays bare.
     pub fn composite(exam: &ExamId, user: &UserId, seq: i64) -> Self {
-        let key = if seq == 1 {
-            format!("{}_{}", exam.key(), user.key())
-        } else {
-            format!("{}_{}_{}", exam.key(), user.key(), seq)
-        };
+        let key = key::sitting(exam.key(), user.key(), seq);
         Self(RecordId::new(EXAM_RESULT_TABLE, key))
     }
 
@@ -171,8 +171,38 @@ impl ExamResult {
             mark,
             graded_by: graded_by.clone(),
         };
-        let saved: Option<ExamResult> = db.upsert(result.id.record()).content(result).await?;
-        saved.ok_or_else(|| AppError::Internal("failed to record exam result".into()))
+        // The "not a draft" gate rides in the same transaction as the mark, the
+        // mirror of the re-draft gate on `Exam::update_if_unchanged`: between
+        // them, a mark and a re-draft racing each other can only ever leave one
+        // of the two applied, whichever process either ran in. The caller's
+        // pre-flight check answers the same 409 one round trip earlier.
+        let mut written = db
+            .query(
+                "BEGIN TRANSACTION;
+                 IF (SELECT VALUE draft FROM ONLY $exam) { THROW 'exam_draft' };
+                 UPSERT $id CONTENT $result RETURN AFTER;
+                 COMMIT TRANSACTION;",
+            )
+            .bind(("exam", exam.record()))
+            .bind(("id", result.id.record()))
+            .bind(("result", result))
+            .await?;
+        let mut errors = written.take_errors();
+        if errors
+            .values()
+            .any(|error| error.to_string().contains("exam_draft"))
+        {
+            return Err(draft_error());
+        }
+        if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+            return Err(error.into());
+        }
+        // BEGIN and the IF take a slot each.
+        written
+            .take::<Vec<ExamResult>>(2)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| AppError::Internal("failed to record exam result".into()))
     }
 
     /// The user's graded results restricted to one course's exams — the raw

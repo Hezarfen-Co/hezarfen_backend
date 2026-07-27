@@ -13,7 +13,8 @@ use ulid::Ulid;
 use crate::constant::{MAX_TERM_NAME_LEN, TERM_TABLE};
 use crate::database::Database;
 use crate::domain::field_update::FieldUpdate;
-use crate::domain::timestamp::Timestamp;
+use crate::domain::page::PagedList;
+use crate::domain::timestamp::{Timestamp, range_error};
 use crate::error::{AppError, ValidationError};
 use crate::validate::validate_required;
 
@@ -22,12 +23,12 @@ use crate::validate::validate_required;
 /// is already on its way out. Course writes take it only when they actually
 /// link a term.
 ///
-/// A PATCH that moves either end of the range takes it too: `starts_at <=
-/// ends_at` is a cross-field check, so a partial PATCH validates the value it
-/// carries against the *stored* other end — two such PATCHes, each fine on its
-/// own, would otherwise commit an inverted range between them. Holding this
-/// across read-check-write serializes them; name-only PATCHes check nothing
-/// cross-field and stay lock-free.
+/// Two leases remain, both cross-record and both replica-*local*: the delete
+/// guard in `web::terms::delete_term`, and the term lookup in
+/// `web::courses`' create/update. The range check a PATCH makes is no longer
+/// one of them — it is a `WHERE` on the update itself
+/// ([`crate::domain::field_update::FieldUpdate::ordered`]), which holds across
+/// replicas as this mutex never did.
 ///
 /// Lock order: no path ever holds this and `ENROLL_LOCK` at the same time — the
 /// course writes that take this one touch no roster, and the course delete that
@@ -121,12 +122,14 @@ impl Term {
     }
 
     /// Every term, newest first — the school calendar is small by nature.
-    pub async fn list_all(db: &Database) -> Result<Vec<Term>, AppError> {
-        let mut result = db
-            .query("SELECT * FROM term ORDER BY starts_at DESC")
-            .await?
-            .check()?;
-        Ok(result.take::<Vec<Term>>(0)?)
+    pub async fn list_all(
+        limit: Option<i64>,
+        offset: i64,
+        db: &Database,
+    ) -> Result<(Vec<Term>, i64), AppError> {
+        PagedList::new("term", "ORDER BY starts_at DESC")
+            .run(limit, offset, db)
+            .await
     }
 
     /// Write only the fields the PATCH carried — `None` means the request
@@ -144,6 +147,7 @@ impl Term {
             .set("name", name)
             .set("starts_at", starts_at)
             .set("ends_at", ends_at)
+            .ordered("starts_at", "ends_at", range_error())
             .run::<Term>(db)
             .await
     }
@@ -170,6 +174,36 @@ impl Term {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bite test for the `WHERE` guard that replaced `TERM_LOCK` on the
+    /// PATCH path: the handler's pre-flight check is not in play here, so only
+    /// the guard can refuse a moved end that inverts the range — and it must
+    /// refuse it with the same error, having written nothing.
+    #[tokio::test]
+    async fn a_moved_end_is_refused_against_the_stored_other_end() {
+        let db = crate::database::init_mem().await.unwrap();
+        let at = Timestamp::from_millis;
+        let term = Term::create(TermName::try_new("2026").unwrap(), at(100), at(200), &db)
+            .await
+            .unwrap();
+
+        let refused = term
+            .clone()
+            .update(None, None, Some(at(50)), &db)
+            .await
+            .expect_err("an end before the stored start must be refused");
+        assert!(refused.to_string().contains("at or after starts_at"));
+        let stored = Term::read(term.get_id(), &db).await.unwrap().unwrap();
+        assert_eq!(
+            stored.get_ends_at(),
+            at(200),
+            "nothing may have been written"
+        );
+
+        // A move that keeps the range ordered still lands, guard and all.
+        let moved = term.update(None, None, Some(at(300)), &db).await.unwrap();
+        assert_eq!(moved.get_ends_at(), at(300));
+    }
 
     #[tokio::test]
     async fn name_is_required_and_bounded() {

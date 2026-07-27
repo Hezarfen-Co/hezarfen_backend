@@ -20,12 +20,16 @@ use crate::state::AppState;
 use super::dto::Role;
 use super::{CurrentUser, UserResponse};
 
-pub fn routes(rate_limit: &RateLimitConfig) -> OpenApiRouter<AppState> {
+pub fn routes(state: &AppState) -> OpenApiRouter<AppState> {
     // Strict per-IP limit on the two credential endpoints only — the
     // brute-force and username-enumeration surface. `me` and `logout` stay
     // outside it: browser frontends poll `me` on every page load, and being
     // over the auth limit must never block an intentional logout.
+    let rate_limit: &RateLimitConfig = &state.rate_limit;
     let limiter = RateLimiter::per_minute(rate_limit.auth_per_minute, rate_limit.trust_proxy);
+    // One budget across replicas, not one per process — the tier only means
+    // something if a brute-forcer cannot get it twice by hitting both.
+    limiter.share("auth", state.db.clone(), state.db_up.clone());
     OpenApiRouter::new()
         .routes(routes!(register))
         .routes(routes!(login))

@@ -20,6 +20,7 @@ use crate::constant::{MAX_MENU_CAPACITY, MENU_TABLE};
 use crate::database::Database;
 use crate::domain::field_update::FieldUpdate;
 use crate::domain::menu_dish::MenuDish;
+use crate::domain::page::PagedList;
 use crate::domain::settings::MealSlotDef;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
@@ -237,19 +238,18 @@ impl Menu {
     pub async fn list(
         from: Option<&MenuDate>,
         to: Option<&MenuDate>,
+        limit: Option<i64>,
+        offset: i64,
         db: &Database,
-    ) -> Result<Vec<Menu>, AppError> {
-        let mut result = db
-            .query(
-                "SELECT * FROM menu \
-                 WHERE ($from = NONE OR date >= $from) AND ($to = NONE OR date <= $to) \
-                 ORDER BY date DESC, slot ASC, id DESC",
-            )
-            .bind(("from", from.map(|date| date.as_str().to_string())))
-            .bind(("to", to.map(|date| date.as_str().to_string())))
-            .await?
-            .check()?;
-        Ok(result.take::<Vec<Menu>>(0)?)
+    ) -> Result<(Vec<Menu>, i64), AppError> {
+        PagedList::new(
+            "menu WHERE ($from = NONE OR date >= $from) AND ($to = NONE OR date <= $to)",
+            "ORDER BY date DESC, slot ASC, id DESC",
+        )
+        .bind("from", from.map(|date| date.as_str().to_string()))
+        .bind("to", to.map(|date| date.as_str().to_string()))
+        .run(limit, offset, db)
+        .await
     }
 
     /// Only `capacity` is writable: `date` and `slot` are `READONLY` columns,

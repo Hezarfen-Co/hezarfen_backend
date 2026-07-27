@@ -35,7 +35,7 @@ use crate::state::AppState;
 
 use super::{
     CurrentUser, Page, PageParams, PersonRef, RequireAdmin, RequireManager, RequireTeacher,
-    paginate, person_map, set_or_clear,
+    person_map, set_or_clear,
 };
 
 pub fn routes() -> OpenApiRouter<AppState> {
@@ -283,10 +283,9 @@ async fn list_menus(
     let (limit, offset) = page.resolve()?;
     let from = range.from.as_deref().map(MenuDate::try_new).transpose()?;
     let to = range.to.as_deref().map(MenuDate::try_new).transpose()?;
-    let menus = Menu::list(from.as_ref(), to.as_ref(), &st.db).await?;
-    let total = menus.len() as i64;
+    let (menus, total) = Menu::list(from.as_ref(), to.as_ref(), limit, offset, &st.db).await?;
     // The dish/people join runs over the page alone, so it shrinks with it.
-    let items = menu_responses(paginate(&menus, limit, offset), user.get_id(), &st.db).await?;
+    let items = menu_responses(&menus, user.get_id(), &st.db).await?;
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 
@@ -870,9 +869,8 @@ async fn my_bookings(
                 .map(|link| link.get_student().clone()),
         );
     }
-    let rows = MealBooking::list_for_students(&students, &st.db).await?;
-    let total = rows.len() as i64;
-    let items = booking_responses(paginate(&rows, limit, offset), &st.db).await?;
+    let (rows, total) = MealBooking::list_for_students(&students, limit, offset, &st.db).await?;
+    let items = booking_responses(&rows, &st.db).await?;
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 
@@ -903,9 +901,8 @@ async fn list_menu_bookings(
     let menu = Menu::read(&MenuId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    let rows = MealBooking::list_for_menu(menu.get_id(), &st.db).await?;
-    let total = rows.len() as i64;
-    let items = booking_responses(paginate(&rows, limit, offset), &st.db).await?;
+    let (rows, total) = MealBooking::list_for_menu(menu.get_id(), limit, offset, &st.db).await?;
+    let items = booking_responses(&rows, &st.db).await?;
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 
@@ -1094,9 +1091,8 @@ async fn list_menu_attendance(
     let menu = Menu::read(&MenuId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    let rows = MealAttendance::list_for_menu(menu.get_id(), &st.db).await?;
-    let total = rows.len() as i64;
-    let items = attendance_responses(paginate(&rows, limit, offset), &st.db).await?;
+    let (rows, total) = MealAttendance::list_for_menu(menu.get_id(), limit, offset, &st.db).await?;
+    let items = attendance_responses(&rows, &st.db).await?;
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 
@@ -1129,10 +1125,16 @@ async fn user_attendance(
     ensure_can_read_student(&caller, &target, &st.db).await?;
     let from = range.from.as_deref().map(MenuDate::try_new).transpose()?;
     let to = range.to.as_deref().map(MenuDate::try_new).transpose()?;
-    let rows =
-        MealAttendance::list_for_student(&target, from.as_ref(), to.as_ref(), &st.db).await?;
-    let total = rows.len() as i64;
-    let items = attendance_responses(paginate(&rows, limit, offset), &st.db).await?;
+    let (rows, total) = MealAttendance::list_for_student(
+        &target,
+        from.as_ref(),
+        to.as_ref(),
+        limit,
+        offset,
+        &st.db,
+    )
+    .await?;
+    let items = attendance_responses(&rows, &st.db).await?;
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 
@@ -1296,9 +1298,8 @@ async fn user_ledger(
     let (limit, offset) = page.resolve()?;
     let target = UserId::from_key(&user);
     ensure_can_read_student(&caller, &target, &st.db).await?;
-    let rows = MealLedger::list_for_student(&target, &st.db).await?;
-    let total = rows.len() as i64;
-    let items = ledger_responses(paginate(&rows, limit, offset), &st.db).await?;
+    let (rows, total) = MealLedger::list_for_student(&target, limit, offset, &st.db).await?;
+    let items = ledger_responses(&rows, &st.db).await?;
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 

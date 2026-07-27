@@ -4,27 +4,30 @@ use crate::constant::EXAM_ATTEMPT_TABLE;
 use crate::database::Database;
 use crate::domain::exam::Exam;
 use crate::domain::exam::ExamId;
+use crate::domain::key;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
+
+/// The `THROW` marker the freeze gate aborts with, and the one 409 both it and
+/// the handler's pre-flight check answer with — a client cannot tell which of
+/// the two refused.
+const FROZEN_MARK: &str = "questions_frozen";
+
+pub(crate) fn frozen_error() -> AppError {
+    AppError::Conflict("cannot change questions after attempts have started")
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct ExamAttemptId(RecordId);
 
 impl ExamAttemptId {
-    /// A deterministic id for the (exam, user, seq) triple. The same triple
-    /// always maps to the same record id, so sitting `seq` exists at most once
-    /// by construction — a concurrent double "start" races on the same id and
-    /// exactly one create wins. The first sitting keeps the historical
-    /// `{exam}_{user}` shape (rows written before retakes existed stay
-    /// addressable); later sittings append their number. ULID keys are
-    /// alphanumeric, so `_` is an unambiguous joiner.
+    /// A deterministic id for the (exam, user, seq) triple, so sitting `seq`
+    /// exists at most once by construction — a concurrent double "start" races
+    /// on the same id and exactly one create wins. See [`key::sitting`] for the
+    /// key shape and why the first sitting stays bare.
     pub fn composite(exam: &ExamId, user: &UserId, seq: i64) -> Self {
-        let key = if seq == 1 {
-            format!("{}_{}", exam.key(), user.key())
-        } else {
-            format!("{}_{}_{}", exam.key(), user.key(), seq)
-        };
+        let key = key::sitting(exam.key(), user.key(), seq);
         Self(RecordId::new(EXAM_ATTEMPT_TABLE, key))
     }
 
@@ -309,6 +312,57 @@ impl ExamAttempt {
             .await?
             .check()?;
         Ok(result.take::<Vec<ExamAttempt>>(0)?)
+    }
+
+    /// Wrap `statements` in a transaction that refuses to run them at all once
+    /// `$freeze_exam` has an attempt — the freeze gate, made atomic with the
+    /// write it guards instead of merely preceding it. Callers bind
+    /// `freeze_exam` and read their own results from
+    /// [`Self::FROZEN_SLOT`] onwards (`BEGIN` and the `IF` take a slot each).
+    ///
+    /// This replaces a process-wide `EXAM_LOCK.write()` held across the check
+    /// and the write. That lock served one process; the gate serves the
+    /// database, so a question edit on replica A can no longer sail past an
+    /// attempt started on replica B.
+    //
+    // ponytail: the count and a concurrent `CREATE exam_attempt` are still not
+    // serialized against each other — SurrealDB does not conflict-check a
+    // cross-record count (the write skew `domain::cap` exists for), so an
+    // attempt landing in the same instant as an edit can still interleave
+    // either way. The mutex this replaces closed that inside one process only,
+    // and there are two, so nothing is lost. Closing it properly means the
+    // cap.rs shape: an attempt counter on the exam row, incremented by the
+    // attempt create, and the write conditioned on `count ?? 0 = 0`.
+    pub(crate) fn unfrozen(statements: &str) -> String {
+        format!(
+            "BEGIN TRANSACTION;
+             IF array::len((SELECT VALUE id FROM exam_attempt \
+             WHERE exam = $freeze_exam LIMIT 1)) > 0 {{ THROW '{FROZEN_MARK}' }};
+             {statements}
+             COMMIT TRANSACTION;"
+        )
+    }
+
+    /// The first slot a [`Self::unfrozen`] caller's own statements land in.
+    pub(crate) const FROZEN_SLOT: usize = 2;
+
+    /// Turn a gate abort into the 409 the pre-flight check answers with, so
+    /// losing the race and failing the check read identically to a client.
+    /// An aborted transaction errors *every* slot with a generic "not
+    /// executed" — only the `THROW`'s own slot names the marker, so every slot
+    /// is scanned.
+    pub(crate) fn frozen_check(result: &mut surrealdb::IndexedResults) -> Result<(), AppError> {
+        let mut errors = result.take_errors();
+        if errors
+            .values()
+            .any(|error| error.to_string().contains(FROZEN_MARK))
+        {
+            return Err(frozen_error());
+        }
+        match errors.drain().map(|(_, error)| error).next() {
+            Some(error) => Err(error.into()),
+            None => Ok(()),
+        }
     }
 
     /// Whether anyone has started this exam — the gate that freezes `mode`

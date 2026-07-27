@@ -25,6 +25,7 @@ use crate::constant::MEAL_BOOKING_TABLE;
 use crate::database::Database;
 use crate::domain::meal_ledger::{LedgerAmount, MealLedger};
 use crate::domain::menu::{MENU_LOCK, Menu, MenuDate, MenuId, MenuSlot};
+use crate::domain::page::PagedList;
 use crate::domain::settings::{MealSlotDef, Settings};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
@@ -266,16 +267,19 @@ impl MealBooking {
     }
 
     /// Every booking on a menu, cancelled ones included — the kitchen's list.
-    pub async fn list_for_menu(menu: &MenuId, db: &Database) -> Result<Vec<MealBooking>, AppError> {
-        let mut result = db
-            .query(
-                "SELECT * FROM meal_booking WHERE menu = $menu \
-                 ORDER BY created_at DESC, id DESC",
-            )
-            .bind(("menu", menu.record()))
-            .await?
-            .check()?;
-        Ok(result.take::<Vec<MealBooking>>(0)?)
+    pub async fn list_for_menu(
+        menu: &MenuId,
+        limit: Option<i64>,
+        offset: i64,
+        db: &Database,
+    ) -> Result<(Vec<MealBooking>, i64), AppError> {
+        PagedList::new(
+            "meal_booking WHERE menu = $menu",
+            "ORDER BY created_at DESC, id DESC",
+        )
+        .bind("menu", menu.record())
+        .run(limit, offset, db)
+        .await
     }
 
     /// The seats actually held — the capacity count.
@@ -318,20 +322,20 @@ impl MealBooking {
     /// dies with the link.
     pub async fn list_for_students(
         students: &[UserId],
+        limit: Option<i64>,
+        offset: i64,
         db: &Database,
-    ) -> Result<Vec<MealBooking>, AppError> {
-        let mut result = db
-            .query(
-                "SELECT * FROM meal_booking WHERE student IN $students \
-                 ORDER BY created_at DESC, id DESC",
-            )
-            .bind((
-                "students",
-                students.iter().map(UserId::record).collect::<Vec<_>>(),
-            ))
-            .await?
-            .check()?;
-        Ok(result.take::<Vec<MealBooking>>(0)?)
+    ) -> Result<(Vec<MealBooking>, i64), AppError> {
+        PagedList::new(
+            "meal_booking WHERE student IN $students",
+            "ORDER BY created_at DESC, id DESC",
+        )
+        .bind(
+            "students",
+            students.iter().map(UserId::record).collect::<Vec<_>>(),
+        )
+        .run(limit, offset, db)
+        .await
     }
 }
 

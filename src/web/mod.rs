@@ -31,6 +31,7 @@ pub mod work;
 
 mod dto;
 mod extractor;
+mod image;
 mod page;
 
 pub use dto::{
@@ -38,6 +39,7 @@ pub use dto::{
     UserResponse, course_people, person_map,
 };
 pub use extractor::{CurrentUser, RequireAdmin, RequireManager, RequireStudent, RequireTeacher};
+pub(crate) use image::{ImageUpload, read_image_upload, store_blob};
 pub use page::{Page, PageParams, Scheduled, WindowParams, paginate};
 
 use std::path::{Path as FsPath, PathBuf};
@@ -92,7 +94,10 @@ pub(crate) async fn ensure_can_observe(
 }
 
 /// If both ends are present, `ends_at` must not precede `starts_at`. Shared by
-/// everything that carries a time range (events, course sessions).
+/// everything that carries a time range (events, course sessions). The PATCH
+/// paths re-check this at write time via
+/// [`crate::domain::field_update::FieldUpdate::ordered`], which answers with the
+/// same error — this is the pre-flight, that is the race closer.
 pub(crate) fn check_time_range(
     starts_at: Option<Timestamp>,
     ends_at: Option<Timestamp>,
@@ -100,10 +105,7 @@ pub(crate) fn check_time_range(
     if let (Some(starts), Some(ends)) = (starts_at, ends_at)
         && ends < starts
     {
-        return Err(AppError::Validation(ValidationError::Invalid {
-            field: "ends_at",
-            reason: "must be at or after starts_at",
-        }));
+        return Err(crate::domain::timestamp::range_error());
     }
     Ok(())
 }

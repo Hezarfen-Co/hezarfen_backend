@@ -219,7 +219,7 @@ pub(crate) async fn visible_courses(user: &User, db: &Database) -> Result<Vec<Co
         return Course::list_all(db).await;
     }
     let mut courses = Course::list_for_teacher(user.get_id(), db).await?;
-    for course in Course::list_enrolled(user.get_id(), db).await? {
+    for course in Course::list_enrolled(user.get_id(), None, 0, db).await?.0 {
         if !courses
             .iter()
             .any(|known| known.get_id() == course.get_id())
@@ -325,6 +325,7 @@ async fn list_courses(
     let (limit, offset) = page.resolve()?;
     let courses = visible_courses(&user, &st.db).await?;
     let total = courses.len() as i64;
+    // Paged in the web layer: the visible set is a Rust union of two lists.
     let window = paginate(&courses, limit, offset);
     // Join creators onto the page alone — the lookup shrinks with the window.
     let people = person_map(window.iter().flat_map(course_people), &st.db).await?;
@@ -356,11 +357,9 @@ async fn my_courses(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<CourseResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let courses = Course::list_enrolled(user.get_id(), &st.db).await?;
-    let total = courses.len() as i64;
-    let window = paginate(&courses, limit, offset);
-    let people = person_map(window.iter().flat_map(course_people), &st.db).await?;
-    let items = window
+    let (courses, total) = Course::list_enrolled(user.get_id(), limit, offset, &st.db).await?;
+    let people = person_map(courses.iter().flat_map(course_people), &st.db).await?;
+    let items = courses
         .iter()
         .map(|course| CourseResponse::new(course, &people))
         .collect();
@@ -711,10 +710,8 @@ async fn list_roster(
             "only the course creator, an assigned teacher, or a manager/admin can list the roster",
         ));
     }
-    let enrollments = Enrollment::list_for_course(course.get_id(), &st.db).await?;
-    let total = enrollments.len() as i64;
+    let (rows, total) = Enrollment::list_for_course(course.get_id(), limit, offset, &st.db).await?;
     // Join people onto the page alone — the lookup shrinks with the window.
-    let rows = paginate(&enrollments, limit, offset);
     let people = person_map(
         rows.iter()
             .flat_map(|e| [e.get_user().clone(), e.get_enrolled_by().clone()]),
@@ -884,6 +881,7 @@ async fn list_course_exams(
         exams.retain(|exam| !exam.is_draft());
     }
     let total = exams.len() as i64;
+    // Paged in the web layer: the draft filter above is per-row Rust.
     let items = paginate(&exams, limit, offset)
         .iter()
         .map(ExamResponse::new)
@@ -976,12 +974,9 @@ async fn list_course_subjects(
             "only enrolled users, the course creator, an assigned teacher, or a manager/admin can view this course",
         ));
     }
-    let subjects = Subject::list_for_course(course.get_id(), &st.db).await?;
-    let total = subjects.len() as i64;
-    let items = paginate(&subjects, limit, offset)
-        .iter()
-        .map(SubjectResponse::new)
-        .collect();
+    let (subjects, total) =
+        Subject::list_for_course(course.get_id(), limit, offset, &st.db).await?;
+    let items = subjects.iter().map(SubjectResponse::new).collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 
@@ -1115,6 +1110,7 @@ async fn list_course_homework(
         homework.retain(|hw| hw.student_sees(user.get_id()));
     }
     let total = homework.len() as i64;
+    // Paged in the web layer: the audience filter above is per-row Rust.
     let items = paginate(&homework, limit, offset)
         .iter()
         .map(HomeworkResponse::new)
@@ -1230,10 +1226,9 @@ async fn list_course_sessions(
             "only enrolled users, the course creator, an assigned teacher, or a manager/admin can view this course",
         ));
     }
-    let sessions = CourseSession::list_for_course(course.get_id(), &st.db).await?;
-    let total = sessions.len() as i64;
+    let (rows, total) =
+        CourseSession::list_for_course(course.get_id(), limit, offset, &st.db).await?;
     // Join teachers onto the page alone — the lookup shrinks with the window.
-    let rows = paginate(&sessions, limit, offset);
     let people = person_map(rows.iter().map(|s| s.get_teacher().clone()), &st.db).await?;
     let items = rows
         .iter()

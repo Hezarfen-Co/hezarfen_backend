@@ -1,7 +1,6 @@
 // `Value` looks unused but is load-bearing: the `SurrealValue` derive on the
 // tagged `EventAudience` enum expands to code that names `Value` unqualified.
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue, Value};
-use tokio::sync::Mutex;
 use ulid::Ulid;
 
 use crate::constant::{EVENT_TABLE, MAX_EVENT_DESCRIPTION_LEN, MAX_EVENT_TITLE_LEN};
@@ -11,24 +10,10 @@ use crate::domain::enrollment::Enrollment;
 use crate::domain::field_update::FieldUpdate;
 use crate::domain::registration::Registration;
 use crate::domain::role::Role;
-use crate::domain::timestamp::Timestamp;
+use crate::domain::timestamp::{Timestamp, range_error};
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ValidationError};
 use crate::validate::{validate_optional, validate_required};
-
-/// Serializes the schedule-range check against the write it guards, exactly as
-/// `TERM_LOCK` does for terms: `starts_at <= ends_at` is a cross-field check,
-/// so a partial PATCH validates the end it carries against the *stored* other
-/// end — two such PATCHes, each fine on its own snapshot, would otherwise
-/// commit an inverted range between them. A PATCH that moves neither end
-/// checks nothing cross-field and stays lock-free.
-///
-/// Lock order: this is a leaf — the only path that takes it (`PATCH
-/// /events/{id}`) takes no other lock, and no path that holds `REGISTER_LOCK`,
-/// `ENROLL_LOCK`, `TERM_LOCK`, `EXAM_LOCK` or any other takes this one, so it
-/// cannot sit in a cycle. Should a future path need both, take the other lock
-/// first and this one innermost.
-pub(crate) static EVENT_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct EventId(RecordId);
@@ -140,8 +125,9 @@ impl EventAudience {
     /// are kept; the caller degrades their display like any stale reference.
     pub async fn members(&self, event: &EventId, db: &Database) -> Result<Vec<UserId>, AppError> {
         match self {
-            EventAudience::School => Ok(User::list_all(db)
+            EventAudience::School => Ok(User::list_all(None, 0, db)
                 .await?
+                .0
                 .iter()
                 .map(|user| user.get_id().clone())
                 .collect()),
@@ -150,11 +136,14 @@ impl EventAudience {
                 .iter()
                 .map(|user| user.get_id().clone())
                 .collect()),
-            EventAudience::Course { course } => Ok(Enrollment::list_for_course(course, db)
-                .await?
-                .iter()
-                .map(|enrollment| enrollment.get_user().clone())
-                .collect()),
+            EventAudience::Course { course } => {
+                Ok(Enrollment::list_for_course(course, None, 0, db)
+                    .await?
+                    .0
+                    .iter()
+                    .map(|enrollment| enrollment.get_user().clone())
+                    .collect())
+            }
             EventAudience::Registration { .. } => Ok(Registration::list_for_event(event, db)
                 .await?
                 .iter()
@@ -287,6 +276,7 @@ impl Event {
             .set("audience", audience)
             .set("starts_at", starts_at)
             .set("ends_at", ends_at)
+            .ordered("starts_at", "ends_at", range_error())
             .run::<Event>(db)
             .await
     }
