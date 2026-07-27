@@ -22,7 +22,6 @@ use crate::domain::pool_question::{
     PoolQuestion, PoolQuestionBody, PoolQuestionId, PoolQuestionTitle,
 };
 use crate::domain::role::Role;
-use crate::domain::settings::Settings;
 use crate::domain::solution::{Solution, SolutionBody, SolutionId};
 use crate::domain::user::User;
 use crate::error::{AppError, ErrorResponse, ValidationError};
@@ -30,8 +29,7 @@ use crate::state::AppState;
 
 use super::{
     CurrentUser, Page, PageParams, PersonRef, RequireStudent, RequireTeacher, UploadFileForm,
-    blob_path, image_content_type, paginate, person_map, read_upload, remove_blob,
-    serve_inline_blob,
+    paginate, person_map, read_image_upload, remove_blob, serve_inline_blob, store_blob,
 };
 
 pub fn routes() -> OpenApiRouter<AppState> {
@@ -319,6 +317,7 @@ async fn list_questions(
     }
 
     let total = questions.len() as i64;
+    // Paged in the web layer: the status filter above is per-row Rust.
     let items = question_responses(paginate(&questions, limit, offset), &st).await?;
     Ok(Json(Page::new(items, total, limit, offset)))
 }
@@ -476,42 +475,29 @@ async fn upload_image(
 ) -> Result<(StatusCode, Json<PoolImageMeta>), AppError> {
     let question = question_or_404(&st, &id).await?;
     ensure_asker_editable(&question, &user)?;
-    let limit = Settings::load(&st.db).await?.get_max_file_bytes();
-    let upload = read_upload(&mut multipart, limit).await?;
-    let content_type = image_content_type(&upload.content_type.unwrap_or_default())?;
+    let upload = read_image_upload(&st, &mut multipart).await?;
+    let size = upload.size();
 
-    // Blob first, row second — a stored row always points at a real blob.
     let file = ulid::Ulid::new().to_string();
-    let path = blob_path(&st.files_path, &file);
-    tokio::fs::write(&path, &upload.data)
-        .await
-        .map_err(|err| AppError::Internal(format!("failed to store the image blob: {err}")))?;
-    let size = upload.data.len() as i64;
-    match PoolQuestion::set_image(question.get_id(), &file, &content_type, size, &st.db).await {
-        // The guarded UPDATE found the question still pending: point-of-truth
-        // write done; the replaced blob (if any) comes off disk.
-        Ok(Some(before)) => {
-            if let Some(replaced) = before.get_image_file() {
-                remove_blob(&st.files_path, replaced).await;
-            }
-            Ok((
-                StatusCode::CREATED,
-                Json(PoolImageMeta {
-                    content_type: content_type.as_str().to_string(),
-                    size,
-                }),
-            ))
+    store_blob(&st, &file, &upload.data, || async {
+        match PoolQuestion::set_image(question.get_id(), &file, &upload.content_type, size, &st.db)
+            .await?
+        {
+            // The guarded UPDATE found the question still pending: point-of-truth
+            // write done; the replaced blob (if any) comes off disk.
+            Some(before) => Ok(((), before.get_image_file().map(str::to_string))),
+            // Approved or deleted mid-upload — the fresh blob is an orphan.
+            None => Err(AppError::Conflict("the question is no longer pending")),
         }
-        // Approved or deleted mid-upload — the fresh blob is an orphan.
-        Ok(None) => {
-            let _ = tokio::fs::remove_file(&path).await;
-            Err(AppError::Conflict("the question is no longer pending"))
-        }
-        Err(err) => {
-            let _ = tokio::fs::remove_file(&path).await;
-            Err(err)
-        }
-    }
+    })
+    .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(PoolImageMeta {
+            content_type: upload.content_type.as_str().to_string(),
+            size,
+        }),
+    ))
 }
 
 /// The question's photo bytes. Access follows the question itself: approved →
@@ -683,9 +669,8 @@ async fn list_solutions(
     let (limit, offset) = page.resolve()?;
     let question = question_or_404(&st, &id).await?;
     ensure_visible(&question, &user)?;
-    let solutions = Solution::list_for(question.get_id(), &st.db).await?;
-    let total = solutions.len() as i64;
-    let slice = paginate(&solutions, limit, offset);
+    let (solutions, total) = Solution::list_for(question.get_id(), limit, offset, &st.db).await?;
+    let slice = solutions.as_slice();
     let people = person_map(
         slice.iter().map(|solution| solution.get_author().clone()),
         &st.db,
@@ -812,41 +797,28 @@ async fn upload_solution_image(
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<PoolImageMeta>), AppError> {
     let solution = author_solution(&st, &user, &id, &sid).await?;
-    let limit = Settings::load(&st.db).await?.get_max_file_bytes();
-    let upload = read_upload(&mut multipart, limit).await?;
-    let content_type = image_content_type(&upload.content_type.unwrap_or_default())?;
+    let upload = read_image_upload(&st, &mut multipart).await?;
+    let size = upload.size();
 
-    // Blob first, row second — a stored row always points at a real blob.
     let file = ulid::Ulid::new().to_string();
-    let path = blob_path(&st.files_path, &file);
-    tokio::fs::write(&path, &upload.data)
-        .await
-        .map_err(|err| AppError::Internal(format!("failed to store the image blob: {err}")))?;
-    let size = upload.data.len() as i64;
-    match Solution::set_image(solution.get_id(), &file, &content_type, size, &st.db).await {
-        // Row write done; the replaced blob (if any) comes off disk.
-        Ok(Some(before)) => {
-            if let Some(replaced) = before.get_image_file() {
-                remove_blob(&st.files_path, replaced).await;
-            }
-            Ok((
-                StatusCode::CREATED,
-                Json(PoolImageMeta {
-                    content_type: content_type.as_str().to_string(),
-                    size,
-                }),
-            ))
+    store_blob(&st, &file, &upload.data, || async {
+        match Solution::set_image(solution.get_id(), &file, &upload.content_type, size, &st.db)
+            .await?
+        {
+            // Row write done; the replaced blob (if any) comes off disk.
+            Some(before) => Ok(((), before.get_image_file().map(str::to_string))),
+            // Deleted mid-upload — the fresh blob is an orphan.
+            None => Err(AppError::NotFound),
         }
-        // Deleted mid-upload — the fresh blob is an orphan.
-        Ok(None) => {
-            let _ = tokio::fs::remove_file(&path).await;
-            Err(AppError::NotFound)
-        }
-        Err(err) => {
-            let _ = tokio::fs::remove_file(&path).await;
-            Err(err)
-        }
-    }
+    })
+    .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(PoolImageMeta {
+            content_type: upload.content_type.as_str().to_string(),
+            size,
+        }),
+    ))
 }
 
 /// The solution photo's bytes. Access follows the question the solution

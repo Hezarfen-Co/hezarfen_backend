@@ -5,6 +5,7 @@ use crate::database::Database;
 use crate::domain::course::CourseId;
 use crate::domain::field_update::FieldUpdate;
 use crate::domain::monotonic_id::next_ulid;
+use crate::domain::page::PagedList;
 use crate::error::{AppError, ValidationError};
 use crate::validate::{validate_optional, validate_required};
 
@@ -131,14 +132,14 @@ impl Subject {
     /// The course's subjects in curriculum order (ULID ids sort by creation).
     pub async fn list_for_course(
         course: &CourseId,
+        limit: Option<i64>,
+        offset: i64,
         db: &Database,
-    ) -> Result<Vec<Subject>, AppError> {
-        let mut result = db
-            .query("SELECT * FROM subject WHERE course = $course ORDER BY id ASC")
-            .bind(("course", course.record()))
-            .await?
-            .check()?;
-        Ok(result.take::<Vec<Subject>>(0)?)
+    ) -> Result<(Vec<Subject>, i64), AppError> {
+        PagedList::new("subject WHERE course = $course", "ORDER BY id ASC")
+            .bind("course", course.record())
+            .run(limit, offset, db)
+            .await
     }
 
     /// Request-scoped: no lock spans the handler's read and this write, so an

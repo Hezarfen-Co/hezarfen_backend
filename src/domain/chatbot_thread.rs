@@ -4,22 +4,19 @@
 //! [`crate::domain::chatbot_message`], and deleting a thread cascades them.
 
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-use tokio::sync::Mutex;
 use ulid::Ulid;
 
-use crate::constant::{CHATBOT_THREAD_TABLE, MAX_CHATBOT_THREAD_TITLE_LEN};
+use crate::constant::{
+    CHATBOT_THREAD_COUNT_FIELD, CHATBOT_THREAD_TABLE, MAX_CHATBOT_THREAD_TITLE_LEN,
+};
 use crate::database::Database;
+use crate::domain::cap;
+use crate::domain::page::PagedList;
 use crate::domain::settings::Settings;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 use crate::validate::validate_required;
-
-/// Serializes thread creation so the `max_chatbot_threads` check (count,
-/// then write) can't over-admit under concurrency — the database's optimistic
-/// transactions don't serialize cross-record counts against concurrent
-/// inserts. Same reasoning, and the same shape, as `ENROLL_LOCK`.
-static CHATBOT_THREAD_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct ChatbotThreadId(RecordId);
@@ -109,37 +106,46 @@ impl ChatbotThread {
     }
 
     /// Start a thread unless `user` is already at the school's
-    /// `max_chatbot_threads`. The whole check-then-write runs under
-    /// [`CHATBOT_THREAD_LOCK`], and the cap is re-read inside it, since neither
-    /// the transaction model nor a caller-supplied number survives a concurrent
-    /// settings PATCH.
+    /// `max_chatbot_threads`. The slot is taken by [`cap::claim`] on the user
+    /// row — an atomic single-record write, so two replicas racing the same
+    /// user's last slot cannot both win, and the cap is read fresh so a
+    /// concurrent settings PATCH is respected.
     pub async fn create_capped(
         user: &UserId,
         title: Option<ChatbotThreadTitle>,
         db: &Database,
     ) -> Result<ChatbotThread, AppError> {
-        let _guard = CHATBOT_THREAD_LOCK.lock().await;
-        let cap = Settings::load(db).await?.get_max_chatbot_threads();
-        if Self::count_for_user(user, db).await? as i64 >= cap {
+        let limit = Settings::load(db).await?.get_max_chatbot_threads();
+        let owner = user.record();
+        if !cap::claim(&owner, CHATBOT_THREAD_COUNT_FIELD, limit, db).await? {
             return Err(AppError::Conflict(
                 "you have reached the school's limit on saved threads — delete one first",
             ));
         }
-        Self::create(user, title, db).await
+        match Self::create(user, title, db).await {
+            Ok(thread) => Ok(thread),
+            Err(err) => {
+                cap::release(&owner, CHATBOT_THREAD_COUNT_FIELD, db).await?;
+                Err(err)
+            }
+        }
     }
 
     /// A user's threads, most recently active first — the sort the
     /// `chatbot_thread_user_updated` index exists for.
     pub async fn list_for_user(
         user: &UserId,
+        limit: Option<i64>,
+        offset: i64,
         db: &Database,
-    ) -> Result<Vec<ChatbotThread>, AppError> {
-        let mut result = db
-            .query("SELECT * FROM chatbot_thread WHERE user_id = $usr ORDER BY updated_at DESC")
-            .bind(("usr", user.record()))
-            .await?
-            .check()?;
-        Ok(result.take::<Vec<ChatbotThread>>(0)?)
+    ) -> Result<(Vec<ChatbotThread>, i64), AppError> {
+        PagedList::new(
+            "chatbot_thread WHERE user_id = $usr",
+            "ORDER BY updated_at DESC",
+        )
+        .bind("usr", user.record())
+        .run(limit, offset, db)
+        .await
     }
 
     /// How many threads `user` keeps — the `max_chatbot_threads` cap check.
@@ -207,21 +213,24 @@ impl ChatbotThread {
     }
 
     /// Delete the thread and every turn in it — one transaction, so a crash
-    /// can't orphan messages under a vanished thread.
+    /// can't orphan messages under a vanished thread. The owner's slot comes
+    /// back in that same transaction, or the cap would ratchet shut.
     pub async fn delete(self, db: &Database) -> Result<ChatbotThread, AppError> {
         let mut result = db
             .query(
                 "BEGIN TRANSACTION;
                  DELETE chatbot_message WHERE thread_id = $conv;
-                 DELETE $conv RETURN BEFORE;
+                 LET $gone = (DELETE $conv RETURN BEFORE);
+                 UPDATE $usr SET chatbot_thread_count = math::max([(chatbot_thread_count ?? 0) - array::len($gone), 0]);
+                 RETURN $gone;
                  COMMIT TRANSACTION;",
             )
             .bind(("conv", self.id.record()))
+            .bind(("usr", self.user_id.record()))
             .await?
             .check()?;
-        // BEGIN is slot 0; the thread's own DELETE is slot 2.
         let deleted: Option<ChatbotThread> =
-            result.take::<Vec<ChatbotThread>>(2)?.into_iter().next();
+            result.take::<Vec<ChatbotThread>>(4)?.into_iter().next();
         deleted.ok_or(AppError::NotFound)
     }
 }

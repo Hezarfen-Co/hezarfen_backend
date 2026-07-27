@@ -182,12 +182,8 @@ async fn search_users(
     }
     .resolve()?;
     let role = req.role.as_deref().map(Role::try_from_str).transpose()?;
-    let users = User::search(&req.q, role, &st.db).await?;
-    let total = users.len() as i64;
-    let items = paginate(&users, limit, offset)
-        .iter()
-        .map(PersonRef::new)
-        .collect();
+    let (users, total) = User::search(&req.q, role, limit, offset, &st.db).await?;
+    let items = users.iter().map(PersonRef::new).collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 
@@ -214,12 +210,8 @@ async fn list_users(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<UserResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let users = User::list_all(&st.db).await?;
-    let total = users.len() as i64;
-    let items = paginate(&users, limit, offset)
-        .iter()
-        .map(UserResponse::new)
-        .collect();
+    let (users, total) = User::list_all(limit, offset, &st.db).await?;
+    let items = users.iter().map(UserResponse::new).collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 
@@ -445,6 +437,8 @@ async fn students_page(
     let mut students = User::list_by_ids(&ids, db).await?;
     students.sort_by(|a, b| a.get_username().as_str().cmp(b.get_username().as_str()));
     let total = students.len() as i64;
+    // Paged in the web layer: the rows come from a link table and are
+    // re-sorted by username in Rust.
     let items = paginate(&students, limit, offset)
         .iter()
         .map(PersonRef::new)

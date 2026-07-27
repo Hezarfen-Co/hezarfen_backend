@@ -5,6 +5,7 @@ use crate::database::Database;
 use crate::domain::attendance::AttendanceStatus;
 use crate::domain::course::CourseId;
 use crate::domain::course_session::{CourseSession, CourseSessionId};
+use crate::domain::page::PagedList;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 
@@ -100,14 +101,14 @@ impl SessionAttendance {
 
     pub async fn list_for_session(
         session: &CourseSessionId,
+        limit: Option<i64>,
+        offset: i64,
         db: &Database,
-    ) -> Result<Vec<SessionAttendance>, AppError> {
-        let mut result = db
-            .query("SELECT * FROM session_attendance WHERE session = $s ORDER BY id DESC")
-            .bind(("s", session.record()))
-            .await?
-            .check()?;
-        Ok(result.take::<Vec<SessionAttendance>>(0)?)
+    ) -> Result<(Vec<SessionAttendance>, i64), AppError> {
+        PagedList::new("session_attendance WHERE session = $s", "ORDER BY id DESC")
+            .bind("s", session.record())
+            .run(limit, offset, db)
+            .await
     }
 
     /// Every roll-call row ever recorded for `user` — the session half of the

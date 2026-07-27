@@ -386,6 +386,7 @@ async fn list_slots(
         (slots, people)
     };
     let total = slots.len() as i64;
+    // Paged in the web layer: slots of demoted teachers are dropped above.
     let items = paginate(&slots, limit, offset)
         .iter()
         .map(|slot| SlotResponse::new(slot, &people))
@@ -547,14 +548,13 @@ async fn list_appointments(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<AppointmentResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let rows = if user.get_role().at_least(Role::Teacher) {
-        Appointment::list_for_teacher(user.get_id(), &st.db).await?
+    let (rows, total) = if user.get_role().at_least(Role::Teacher) {
+        Appointment::list_for_teacher(user.get_id(), limit, offset, &st.db).await?
     } else {
-        Appointment::list_for_requester(user.get_id(), &st.db).await?
+        Appointment::list_for_requester(user.get_id(), limit, offset, &st.db).await?
     };
-    let total = rows.len() as i64;
     // Join slots and people onto the page alone — the lookup shrinks with it.
-    let items = appointment_responses(paginate(&rows, limit, offset), &st.db).await?;
+    let items = appointment_responses(&rows, &st.db).await?;
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 

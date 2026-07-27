@@ -390,6 +390,15 @@ student's budget on another's. `0` disables it like the other two. It is
 charged before anything is written, so a `429` leaves no trace (see
 "Chatbot").
 
+All three tiers are **fleet-wide, not per replica**. Admission stays in memory
+(no request ever waits on the database to be let in), and a background task in
+each replica folds its new admits into one shared `rate_limit` row per tier +
+client + minute every 2 seconds, then caps itself by the total that comes back.
+Two replicas therefore enforce one budget, with one caveat: within a single
+2-second interval a client that reaches both can spend up to the tier's budget
+on each before the shared total tightens them. If the database is down the
+tiers simply fall back to their own local budgets — nobody is refused for it.
+
 Behind a reverse proxy every connection carries the proxy's address, so also
 set `TRUST_PROXY=true` to key clients by the rightmost `X-Forwarded-For` entry
 (the one the proxy itself appends). Leave it off when clients reach the server
@@ -666,7 +675,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/courses/{id}/exams`            | student | List the course's exams (enrolled, creator, assigned teacher, or manager+; drafts appear to course managers only) · paged |
 | GET    | `/exams`                         | student | The caller's visible exams: their courses' (manager+: all; drafts of managed courses only) · paged · `?starts_after=&ends_after=` window (soonest first) |
 | GET    | `/exams/{id}`                    | student | Get exam (enrolled, creator, or manager+; a draft is a `404` for everyone but its course's managers) |
-| PATCH  | `/exams/{id}`                    | teacher | Edit exam incl. `kind` (re-weights it), schedule, `max_attempts`, `allow_rejoin`, `allow_review`, `draft` (course manager; `course` immutable, `mode` frozen once attempted, re-drafting frozen once attempts/results exist — the rest stays live) |
+| PATCH  | `/exams/{id}`                    | teacher | Edit exam incl. `kind` (re-weights it), schedule, `max_attempts`, `allow_rejoin`, `allow_review`, `draft` (course manager; `course` immutable, `mode` frozen once attempted, re-drafting frozen once attempts/results exist — the rest stays live; concurrent edits merge, never silently revert each other) |
 | DELETE | `/exams/{id}`                    | teacher | Delete exam + its results, attempts, questions, answers, and question + answer images (course manager) |
 | POST   | `/exams/{id}/results`            | teacher | `{mark, user_id}` — grade an **enrolled student** (upsert; course manager; students only; drafts can't be graded, `409`) |
 | GET    | `/exams/{id}/results`            | teacher | List every result for the exam (course manager) · paged |
@@ -709,7 +718,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/bank-questions`                | teacher | The school-wide question bank — `?subject=<id>` filters by origin subject, `?owner=<id>` (or `?owner=me`) by owner; reusable templates any teacher+ can read, each with its image metas (`image`, `choice_images`) · paged |
 | POST   | `/bank-questions`                | teacher | `{subject_id, text, kind, points, choices?, correct?}` — save a reusable question template into the bank (owner = caller; `subject_id` is origin metadata, but must exist — `400` otherwise) |
 | GET    | `/bank-questions/{bid}`          | teacher | Get one bank question, `correct` + image metas (`image`, `choice_images`) included (any teacher+) |
-| PATCH  | `/bank-questions/{bid}`          | teacher | Edit a bank question — the kind bundle revalidates as a unit (**owner only**, admin bypass; bank rows never freeze) |
+| PATCH  | `/bank-questions/{bid}`          | teacher | Edit a bank question — the kind bundle revalidates as a unit (**owner only**, admin bypass; bank rows never freeze; concurrent edits merge, never silently revert each other) |
 | DELETE | `/bank-questions/{bid}`          | teacher | Delete a bank question + its images (**owner only**, admin bypass) |
 | POST   | `/bank-questions/{bid}/image`    | teacher | Attach/replace the bank question's illustration: `multipart/form-data`, one `file` part — raster images only (`png`/`jpeg`/`webp`/`gif`), ≤ `max_file_bytes` (**owner only**, admin bypass) |
 | GET    | `/bank-questions/{bid}/image`    | teacher | The illustration bytes (any teacher+) |
@@ -2276,6 +2285,8 @@ src/
   validate.rs      field validators (used by every newtype's try_new)
   error.rs         ValidationError + AppError -> HTTP responses
   database.rs      SurrealDB server connect (ws) + SCHEMAFULL migration
+  migration_sql.rs the three boot batches as SurrealQL text (PRE_REPAIR,
+                   MIGRATION, BACKFILL) + MIGRATION_BATCHES, the only list of them
   rate_limit.rs    fixed-window limiter: per-IP tiers + middleware, per-user chat tier
   state.rs         AppState { db, files_path, cookie_secure, rate_limit, ai }
   ai/              QUIC bridge to the out-of-process AI services
@@ -2294,6 +2305,12 @@ src/
                    PATCH actually carried (an omitted field is never written)
     monotonic_id.rs next_ulid: ids that sort in write order — one process-wide
                    Generator, so same-millisecond rows never scramble
+    key.rs         sitting(): the deterministic per-sitting record key shared by
+                   attempts, answers, answer images and results (seq 1 stays bare)
+    cap.rs         claim()/release(): the cross-replica count caps — an atomic
+                   `UPDATE parent SET n += 1 WHERE n < cap` on a counter column
+                   of the parent row, replacing the per-process mutexes that
+                   only held while one instance owned the database
     text_fold.rs   case- and diacritic-insensitive folding for search, shared by
                    the Rust needle and the SurrealQL column (Turkish İ/ı, ü, ö…)
     session.rs     SessionId · SessionToken · Session (7-day expiry)
@@ -2393,7 +2410,8 @@ src/
 
 Tests: `cargo test` — unit (in-source), integration (`tower::oneshot` + in-memory
 db), rate-limit (both tiers, proxy-header and peer-address keying, shipped
-limits over every route), e2e (real TCP + reqwest cookie jar), persistence
+limits over every route, two "replicas" sharing one budget over one db), e2e
+(real TCP + reqwest cookie jar), persistence
 (tempfile file engine, including close + reopen), ai-bridge (real QUIC on
 loopback against a fake AI service), ai-protocol (the `hab/1` wire contract,
 driven by a client that shares no code with the backend).

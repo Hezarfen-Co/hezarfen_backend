@@ -12,7 +12,7 @@ use crate::domain::timestamp::Timestamp;
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
 
-use super::{CurrentUser, Page, PageParams, RequireManager, check_time_range, paginate};
+use super::{CurrentUser, Page, PageParams, RequireManager, check_time_range};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -132,12 +132,8 @@ async fn list_terms(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<TermResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let terms = Term::list_all(&st.db).await?;
-    let total = terms.len() as i64;
-    let items = paginate(&terms, limit, offset)
-        .iter()
-        .map(TermResponse::new)
-        .collect();
+    let (terms, total) = Term::list_all(limit, offset, &st.db).await?;
+    let items = terms.iter().map(TermResponse::new).collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 
@@ -192,16 +188,12 @@ async fn update_term(
     let starts_at = req.starts_at.map(Timestamp::from_millis);
     let ends_at = req.ends_at.map(Timestamp::from_millis);
 
-    // Only the range check needs the stored row, and only it can race: it
-    // validates an arriving end against the other end as stored, so the read,
-    // the check and the write are held together under [`TERM_LOCK`].
-    let _guard = match (starts_at, ends_at) {
-        (None, None) => None,
-        _ => Some(TERM_LOCK.lock().await),
-    };
     let term = Term::read(&TermId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
+    // Pre-flight only: the range check is re-made inside the UPDATE's `WHERE`
+    // (`Term::update`), so a concurrent move of the end this PATCH omits cannot
+    // slip an inverted range past this snapshot.
     check_time_range(
         Some(starts_at.unwrap_or_else(|| term.get_starts_at())),
         Some(ends_at.unwrap_or_else(|| term.get_ends_at())),

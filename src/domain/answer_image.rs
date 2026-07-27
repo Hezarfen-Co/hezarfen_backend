@@ -20,6 +20,7 @@ use crate::database::Database;
 use crate::domain::course::CourseId;
 use crate::domain::exam::ExamId;
 use crate::domain::exam_question::ExamQuestionId;
+use crate::domain::key;
 use crate::domain::note_file::FileContentType;
 use crate::domain::user::UserId;
 use crate::error::AppError;
@@ -28,19 +29,11 @@ use crate::error::AppError;
 pub struct AnswerImageId(RecordId);
 
 impl AnswerImageId {
-    /// The one id a (question, user, seq) triple can have — the same
-    /// deterministic shape as [`crate::domain::exam_attempt::ExamAttemptId::composite`],
-    /// so "one drawing per student per question per sitting" needs no index.
-    /// The first sitting keeps the historical `{question}_{user}` shape (rows
-    /// written before per-attempt history existed stay addressable); later
-    /// sittings append their number. ULID keys are alphanumeric, so `_` is an
-    /// unambiguous joiner.
+    /// The one id a (question, user, seq) triple can have, so "one drawing per
+    /// student per question per sitting" needs no index. See [`key::sitting`]
+    /// for the key shape and why the first sitting stays bare.
     pub fn composite(question: &ExamQuestionId, user: &UserId, seq: i64) -> Self {
-        let key = if seq == 1 {
-            format!("{}_{}", question.key(), user.key())
-        } else {
-            format!("{}_{}_{}", question.key(), user.key(), seq)
-        };
+        let key = key::sitting(question.key(), user.key(), seq);
         Self(RecordId::new(ANSWER_IMAGE_TABLE, key))
     }
 

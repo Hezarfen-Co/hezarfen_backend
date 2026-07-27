@@ -14,6 +14,17 @@
 use surrealdb::types::SurrealValue;
 
 use crate::constant::MILLIS_PER_DAY;
+use crate::error::{AppError, ValidationError};
+
+/// The one spelling of "this range is inverted", so the pre-flight check
+/// ([`crate::web::check_time_range`]) and the write-time `WHERE` guard that
+/// re-makes it against the stored row answer a client identically.
+pub(crate) fn range_error() -> AppError {
+    AppError::Validation(ValidationError::Invalid {
+        field: "ends_at",
+        reason: "must be at or after starts_at",
+    })
+}
 
 /// A unix-millisecond instant (UTC by construction). Stored as an `int`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, SurrealValue)]

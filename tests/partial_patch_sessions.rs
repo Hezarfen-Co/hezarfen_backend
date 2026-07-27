@@ -1,7 +1,8 @@
 //! Two concurrent partial PATCHes on the same session must not revert each
 //! other, and — since only the fields a request carried are written — the
 //! `starts_at`/`ends_at` pair must not be invertible by two one-ended PATCHes
-//! either (that is what `SESSION_LOCK` is for).
+//! either (that is what `FieldUpdate::ordered`'s in-statement range guard is
+//! for).
 
 mod common;
 

@@ -2,8 +2,8 @@
 //! for the meeting with a reason; the teacher approves, rejects, or
 //! counter-proposes another time.
 //!
-//! Two invariants live here, and both are guarded by [`APPOINTMENT_LOCK`]
-//! rather than by the database:
+//! Two *cross-record* invariants live here, and both are guarded by
+//! [`APPOINTMENT_LOCK`] rather than by the database:
 //!
 //! - **One live booking per slot.** Occupancy is counted from the rows, not
 //!   stored — so rejecting or cancelling frees the slot with nothing to reset.
@@ -12,8 +12,18 @@
 //!
 //! Both are count-then-write checks across records, which a `BEGIN…COMMIT`
 //! does not serialize in SurrealDB (write-skew: two racing bookings each see a
-//! free slot). This backend is the database's only writer, so one process-wide
-//! lock closes it, exactly as `REGISTER_LOCK` does for event seats.
+//! free slot).
+//!
+//! The *single-row* invariant — a decision must be written onto the state it
+//! was validated against — is **not** the lock's job, and never was: the lock
+//! is process-local, so two replicas each take their own copy of it and a
+//! whole-row save would silently drop the other's decision. That one is a
+//! compare-and-set ([`Appointment::save_if_unchanged`]), which holds across
+//! replicas. The lock stays for the two counts above, which no per-row
+//! conditional write can cover.
+// ponytail: with more than one replica those two counts are only
+// replica-local. Closing them needs a stored occupancy counter (`domain::cap`)
+// rather than a lock — deliberately not built here.
 
 use std::sync::LazyLock;
 
@@ -21,9 +31,10 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use tokio::sync::Mutex;
 use ulid::Generator;
 
-use crate::constant::{APPOINTMENT_TABLE, MAX_APPOINTMENT_REASON_LEN};
-use crate::database::Database;
+use crate::constant::{APPOINTMENT_TABLE, CAS_UPDATE_RETRIES, MAX_APPOINTMENT_REASON_LEN};
+use crate::database::{Database, lost_the_race};
 use crate::domain::appointment_slot::{AppointmentSlot, AppointmentSlotId};
+use crate::domain::page::PagedList;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
@@ -34,7 +45,7 @@ use crate::validate::validate_required;
 /// conflict-check a cross-record `count()` against a concurrent insert.
 ///
 /// Lock order: no path ever holds this together with `ENROLL_LOCK`,
-/// `TERM_LOCK`, `REGISTER_LOCK`, `EXAM_LOCK`, or `PRESENCE_LOCK` — appointments
+/// `TERM_LOCK`, `EXAM_LOCK`, or `PRESENCE_LOCK` — appointments
 /// touch no roster, term, event seat, or exam room, and none of those touch
 /// appointments — so they cannot deadlock. Should a future path ever need two,
 /// take this one *last*.
@@ -407,28 +418,34 @@ impl Appointment {
 
     pub async fn list_for_requester(
         requester: &UserId,
+        limit: Option<i64>,
+        offset: i64,
         db: &Database,
-    ) -> Result<Vec<Appointment>, AppError> {
-        let mut result = db
-            .query("SELECT * FROM appointment WHERE requester = $requester ORDER BY id DESC")
-            .bind(("requester", requester.record()))
-            .await?
-            .check()?;
-        Ok(result.take::<Vec<Appointment>>(0)?)
+    ) -> Result<(Vec<Appointment>, i64), AppError> {
+        PagedList::new(
+            "appointment WHERE requester = $requester",
+            "ORDER BY id DESC",
+        )
+        .bind("requester", requester.record())
+        .run(limit, offset, db)
+        .await
     }
 
     /// Every booking aimed at `teacher`, across all their slots — the teacher's
     /// request inbox.
     pub async fn list_for_teacher(
         teacher: &UserId,
+        limit: Option<i64>,
+        offset: i64,
         db: &Database,
-    ) -> Result<Vec<Appointment>, AppError> {
-        let mut result = db
-            .query("SELECT * FROM appointment WHERE slot.teacher = $teacher ORDER BY id DESC")
-            .bind(("teacher", teacher.record()))
-            .await?
-            .check()?;
-        Ok(result.take::<Vec<Appointment>>(0)?)
+    ) -> Result<(Vec<Appointment>, i64), AppError> {
+        PagedList::new(
+            "appointment WHERE slot.teacher = $teacher",
+            "ORDER BY id DESC",
+        )
+        .bind("teacher", teacher.record())
+        .run(limit, offset, db)
+        .await
     }
 
     pub async fn list_for_slot(
@@ -454,36 +471,42 @@ impl Appointment {
         db: &Database,
     ) -> Result<Appointment, AppError> {
         let _guard = APPOINTMENT_LOCK.lock().await;
-        let mut appointment = Self::read_pending(id, db).await?;
-        let slot = AppointmentSlot::read(&appointment.slot, db)
+        for _ in 0..CAS_UPDATE_RETRIES {
+            let expected = Self::read_pending(id, db).await?;
+            let slot = AppointmentSlot::read(&expected.slot, db)
+                .await?
+                .ok_or(AppError::NotFound)?;
+            let (starts_at, ends_at) = expected.window(&slot);
+            // The effective window — the proposal's when one stands — must still
+            // be ahead. Mutual agreement does not help: `cancel` refuses a
+            // meeting that started, so committing to a passed window would mint
+            // a booking nobody can ever undo. Refused, the row stays `pending`
+            // and the teacher can propose a time that can actually happen.
+            if starts_at.as_millis() <= Timestamp::now().as_millis() {
+                return Err(AppError::Conflict("that time has already started"));
+            }
+            if Self::conflicts(
+                slot.get_teacher(),
+                &expected.requester,
+                starts_at,
+                ends_at,
+                Some(id),
+                db,
+            )
             .await?
-            .ok_or(AppError::NotFound)?;
-        let (starts_at, ends_at) = appointment.window(&slot);
-        // The effective window — the proposal's when one stands — must still be
-        // ahead. Mutual agreement does not help: `cancel` refuses a meeting
-        // that started, so committing to a passed window would mint a booking
-        // nobody can ever undo. Refused, the row stays `pending` and the
-        // teacher can propose a time that can actually happen.
-        if starts_at.as_millis() <= Timestamp::now().as_millis() {
-            return Err(AppError::Conflict("that time has already started"));
+            {
+                return Err(AppError::Conflict(
+                    "that time collides with another approved appointment",
+                ));
+            }
+            let mut approved = expected.clone();
+            approved.status = AppointmentStatus::Approved;
+            approved.decided_by = Some(decided_by.clone());
+            if let Some(saved) = approved.save_if_unchanged(&expected, db).await? {
+                return Ok(saved);
+            }
         }
-        if Self::conflicts(
-            slot.get_teacher(),
-            &appointment.requester,
-            starts_at,
-            ends_at,
-            Some(id),
-            db,
-        )
-        .await?
-        {
-            return Err(AppError::Conflict(
-                "that time collides with another approved appointment",
-            ));
-        }
-        appointment.status = AppointmentStatus::Approved;
-        appointment.decided_by = Some(decided_by.clone());
-        Self::save(appointment, db).await
+        Err(contended())
     }
 
     /// Turn the request down. Frees the slot: occupancy counts live rows only.
@@ -494,11 +517,17 @@ impl Appointment {
         db: &Database,
     ) -> Result<Appointment, AppError> {
         let _guard = APPOINTMENT_LOCK.lock().await;
-        let mut appointment = Self::read_pending(id, db).await?;
-        appointment.status = AppointmentStatus::Rejected;
-        appointment.decided_by = Some(decided_by.clone());
-        appointment.reject_reason = reason;
-        Self::save(appointment, db).await
+        for _ in 0..CAS_UPDATE_RETRIES {
+            let expected = Self::read_pending(id, db).await?;
+            let mut rejected = expected.clone();
+            rejected.status = AppointmentStatus::Rejected;
+            rejected.decided_by = Some(decided_by.clone());
+            rejected.reject_reason = reason.clone();
+            if let Some(saved) = rejected.save_if_unchanged(&expected, db).await? {
+                return Ok(saved);
+            }
+        }
+        Err(contended())
     }
 
     /// Call the meeting off. Legal from either live state, so an approved
@@ -519,20 +548,26 @@ impl Appointment {
         db: &Database,
     ) -> Result<Appointment, AppError> {
         let _guard = APPOINTMENT_LOCK.lock().await;
-        let mut appointment = Self::read(id, db).await?.ok_or(AppError::NotFound)?;
-        if !appointment.status.is_live() {
-            return Err(AppError::Conflict("the appointment is already settled"));
+        for _ in 0..CAS_UPDATE_RETRIES {
+            let expected = Self::read(id, db).await?.ok_or(AppError::NotFound)?;
+            if !expected.status.is_live() {
+                return Err(AppError::Conflict("the appointment is already settled"));
+            }
+            let slot = AppointmentSlot::read(&expected.slot, db)
+                .await?
+                .ok_or(AppError::NotFound)?;
+            if expected.window(&slot).0.as_millis() <= Timestamp::now().as_millis() {
+                return Err(AppError::Conflict("the appointment has already started"));
+            }
+            let mut cancelled = expected.clone();
+            cancelled.status = AppointmentStatus::Cancelled;
+            cancelled.cancelled_by = Some(cancelled_by.clone());
+            cancelled.cancel_reason = reason.clone();
+            if let Some(saved) = cancelled.save_if_unchanged(&expected, db).await? {
+                return Ok(saved);
+            }
         }
-        let slot = AppointmentSlot::read(&appointment.slot, db)
-            .await?
-            .ok_or(AppError::NotFound)?;
-        if appointment.window(&slot).0.as_millis() <= Timestamp::now().as_millis() {
-            return Err(AppError::Conflict("the appointment has already started"));
-        }
-        appointment.status = AppointmentStatus::Cancelled;
-        appointment.cancelled_by = Some(cancelled_by.clone());
-        appointment.cancel_reason = reason;
-        Self::save(appointment, db).await
+        Err(contended())
     }
 
     /// Counter-propose another time on the same booking (no second row, so the
@@ -561,19 +596,25 @@ impl Appointment {
             .into());
         }
         let _guard = APPOINTMENT_LOCK.lock().await;
-        let mut appointment = Self::read(id, db).await?.ok_or(AppError::NotFound)?;
-        if !appointment.status.is_live() {
-            return Err(AppError::Conflict("the appointment is already settled"));
+        for _ in 0..CAS_UPDATE_RETRIES {
+            let expected = Self::read(id, db).await?.ok_or(AppError::NotFound)?;
+            if !expected.status.is_live() {
+                return Err(AppError::Conflict("the appointment is already settled"));
+            }
+            if starts_at.as_millis() <= Timestamp::now().as_millis() {
+                return Err(AppError::Conflict("that time has already started"));
+            }
+            let mut proposed = expected.clone();
+            proposed.status = AppointmentStatus::Pending;
+            proposed.decided_by = None;
+            proposed.proposed_starts_at = Some(starts_at);
+            proposed.proposed_ends_at = Some(ends_at);
+            proposed.proposed_by = Some(proposed_by.clone());
+            if let Some(saved) = proposed.save_if_unchanged(&expected, db).await? {
+                return Ok(saved);
+            }
         }
-        if starts_at.as_millis() <= Timestamp::now().as_millis() {
-            return Err(AppError::Conflict("that time has already started"));
-        }
-        appointment.status = AppointmentStatus::Pending;
-        appointment.decided_by = None;
-        appointment.proposed_starts_at = Some(starts_at);
-        appointment.proposed_ends_at = Some(ends_at);
-        appointment.proposed_by = Some(proposed_by.clone());
-        Self::save(appointment, db).await
+        Err(contended())
     }
 
     /// Accept the standing proposal — approval at the proposed time. The
@@ -603,13 +644,64 @@ impl Appointment {
         Ok(appointment)
     }
 
-    async fn save(appointment: Appointment, db: &Database) -> Result<Appointment, AppError> {
-        let updated: Option<Appointment> = db
-            .update(appointment.id.record())
-            .content(appointment)
-            .await?;
-        updated.ok_or(AppError::NotFound)
+    /// Write the decision only while the stored row still carries the state it
+    /// was validated against. `None` means it does not: another decision landed
+    /// between the read and the write, so reload, re-validate, and try again.
+    ///
+    /// Four columns discriminate every write, and `status` alone would not:
+    /// `propose` leaves a pending booking pending, so an approval built from a
+    /// snapshot taken *before* that proposal would sail through a status-only
+    /// guard and confirm the meeting at the old, superseded time. With the
+    /// proposed window and `decided_by` alongside it, every mutator moves at
+    /// least one of the four. The fields only a terminal transition writes
+    /// (`cancelled_by`, `cancel_reason`, `reject_reason`) need no compare of
+    /// their own: they always travel with a `status` change into a state no
+    /// later decision is allowed from. All four are top-level columns, so an
+    /// absent one reads back as `NONE` and `NONE = NONE` holds — the object-key
+    /// dropping that forces `settings` to compare a rebuilt projection cannot
+    /// bite here.
+    ///
+    /// A store-level write conflict is reported the same way as a miss: it
+    /// means a concurrent write committed on this row, which is exactly the
+    /// "reload and re-decide" case.
+    async fn save_if_unchanged(
+        self,
+        expected: &Appointment,
+        db: &Database,
+    ) -> Result<Option<Appointment>, AppError> {
+        let attempted = async {
+            let mut result = db
+                .query(
+                    "UPDATE $id CONTENT $new \
+                     WHERE status = $status \
+                       AND proposed_starts_at = $proposed_starts_at \
+                       AND proposed_ends_at = $proposed_ends_at \
+                       AND decided_by = $decided_by",
+                )
+                .bind(("id", expected.id.record()))
+                .bind(("status", expected.status))
+                .bind(("proposed_starts_at", expected.proposed_starts_at))
+                .bind(("proposed_ends_at", expected.proposed_ends_at))
+                .bind(("decided_by", expected.decided_by.clone()))
+                .bind(("new", self))
+                .await?
+                .check()?;
+            result.take::<Vec<Appointment>>(0)
+        }
+        .await;
+        match attempted {
+            Ok(rows) => Ok(rows.into_iter().next()),
+            Err(err) if lost_the_race(&err) => Ok(None),
+            Err(err) => Err(err.into()),
+        }
     }
+}
+
+/// Every retry lost the row to another decision. A 409 rather than a 500: the
+/// caller's request was refused, nothing was half-applied, and re-reading the
+/// booking shows what happened to it.
+fn contended() -> AppError {
+    AppError::Conflict("the appointment is being decided elsewhere")
 }
 
 #[cfg(test)]
@@ -749,13 +841,18 @@ mod tests {
         // And approval judges the effective window again, for a proposal whose
         // time simply passed while it stood: forced onto the row directly,
         // since `propose` no longer mints one.
-        let mut standing = Appointment::read(booking.get_id(), &db)
+        let current = Appointment::read(booking.get_id(), &db)
             .await
             .unwrap()
             .unwrap();
+        let mut standing = current.clone();
         standing.proposed_starts_at = Some(soon(-30_000));
         standing.proposed_ends_at = Some(soon(30_000));
-        Appointment::save(standing, &db).await.unwrap();
+        standing
+            .save_if_unchanged(&current, &db)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(matches!(
             Appointment::accept_proposal(booking.get_id(), &student, &db).await,
             Err(AppError::Conflict("that time has already started"))
@@ -771,6 +868,76 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(accepted.get_status(), AppointmentStatus::Approved);
+    }
+
+    /// The compare-and-set every decision writes through. `APPOINTMENT_LOCK` is
+    /// process-local, so with two replicas serving, nothing else stands between
+    /// an approval and a counter-proposal landing on the same booking — and the
+    /// interleaving that matters is the one a status-only guard would miss,
+    /// since `propose` leaves a pending booking pending.
+    ///
+    /// Deliberately sequential: the mem engine answers `Ok` to a write it then
+    /// drops, so a `join!` of two decisions proves nothing. This drives the
+    /// primitive itself with the exact snapshot a second replica would hold.
+    #[tokio::test]
+    async fn a_decision_built_on_a_stale_snapshot_never_lands() {
+        let db = crate::database::init_mem().await.unwrap();
+        let teacher = UserId::from_key("t1");
+        let student = UserId::from_key("s1");
+        let slot = AppointmentSlot::create(&teacher, soon(60_000), soon(120_000), None, &db)
+            .await
+            .unwrap();
+        let booking = Appointment::book(
+            slot.get_id(),
+            &student,
+            AppointmentReason::try_new("görüşme").unwrap(),
+            &db,
+        )
+        .await
+        .unwrap();
+
+        // Replica A counter-proposes. Replica B is still holding the snapshot
+        // it read before that — same id, same `pending` status.
+        let stale = booking.clone();
+        let (proposed_starts_at, proposed_ends_at) = (soon(180_000), soon(240_000));
+        Appointment::propose(
+            booking.get_id(),
+            proposed_starts_at,
+            proposed_ends_at,
+            &teacher,
+            &db,
+        )
+        .await
+        .unwrap();
+
+        let mut late = stale.clone();
+        late.status = AppointmentStatus::Approved;
+        late.decided_by = Some(teacher.clone());
+        assert!(late.save_if_unchanged(&stale, &db).await.unwrap().is_none());
+
+        // The proposal survived: the row was not confirmed at the slot's old
+        // window behind the requester's back.
+        let after = Appointment::read(booking.get_id(), &db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.get_status(), AppointmentStatus::Pending);
+        assert_eq!(after.get_proposed_starts_at(), Some(proposed_starts_at));
+        assert_eq!(after.get_proposed_ends_at(), Some(proposed_ends_at));
+        assert_eq!(after.get_decided_by(), None);
+
+        // And the same decision, re-validated against the row as it now
+        // stands, does land — a miss is a retry signal, not a wall.
+        let mut fresh = after.clone();
+        fresh.status = AppointmentStatus::Approved;
+        fresh.decided_by = Some(teacher.clone());
+        let saved = fresh
+            .save_if_unchanged(&after, &db)
+            .await
+            .unwrap()
+            .expect("a current snapshot must write");
+        assert_eq!(saved.get_status(), AppointmentStatus::Approved);
+        assert_eq!(saved.get_proposed_starts_at(), Some(proposed_starts_at));
     }
 
     /// Occupancy is derived, so a rejected booking must hand the slot back.

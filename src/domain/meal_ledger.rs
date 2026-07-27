@@ -52,6 +52,7 @@ use crate::database::Database;
 use crate::domain::meal_booking::{MealBooking, MealBookingId};
 use crate::domain::menu::MenuId;
 use crate::domain::menu_dish::MenuDish;
+use crate::domain::page::PagedList;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
@@ -436,17 +437,17 @@ impl MealLedger {
     /// A student's whole statement, newest first.
     pub async fn list_for_student(
         student: &UserId,
+        limit: Option<i64>,
+        offset: i64,
         db: &Database,
-    ) -> Result<Vec<MealLedger>, AppError> {
-        let mut result = db
-            .query(
-                "SELECT * FROM meal_ledger WHERE student = $student \
-                 ORDER BY created_at DESC, id DESC",
-            )
-            .bind(("student", student.record()))
-            .await?
-            .check()?;
-        Ok(result.take::<Vec<MealLedger>>(0)?)
+    ) -> Result<(Vec<MealLedger>, i64), AppError> {
+        PagedList::new(
+            "meal_ledger WHERE student = $student",
+            "ORDER BY created_at DESC, id DESC",
+        )
+        .bind("student", student.record())
+        .run(limit, offset, db)
+        .await
     }
 
     /// The derived balance: `credits + reversals - charges`, in minor units.
@@ -454,8 +455,9 @@ impl MealLedger {
     // ponytail: folds the student's lines in-process (a few hundred a year);
     // push it into a `math::sum` aggregate if a statement ever gets long.
     pub async fn balance_of(student: &UserId, db: &Database) -> Result<i64, AppError> {
-        Ok(Self::list_for_student(student, db)
+        Ok(Self::list_for_student(student, None, 0, db)
             .await?
+            .0
             .iter()
             .fold(0i64, |sum, line| {
                 sum + line.kind.sign() * line.amount_minor.as_minor()

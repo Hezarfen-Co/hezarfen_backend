@@ -780,26 +780,35 @@ fn expectations_cover_every_annotation() {
     ];
 
     let mut annotated = 0;
-    for entry in std::fs::read_dir(format!("{root}/src/web")).expect("read src/web") {
-        let path = entry.expect("dir entry").path();
-        if path.extension().is_none_or(|ext| ext != "rs") {
-            continue;
-        }
-        let source = std::fs::read_to_string(&path).expect("read source");
-        // Scan whole attributes, not lines: rustfmt wraps a long
-        // `#[schema(example = "…", max_length = 5_000)]` across several lines,
-        // and a line-based count silently misses the wrapped keyword.
-        //
-        // `#[param(...)]` bounds are query parameters, covered by
-        // `every_page_limit_param_matches_its_constant` instead.
-        for (at, _) in source.match_indices("#[schema(") {
-            let rest = &source[at..];
-            let end = rest.find(")]").map_or(rest.len(), |end| end + 2);
-            let attribute = &rest[..end];
-            annotated += keywords
-                .iter()
-                .filter(|kw| attribute.contains(&format!("{kw} = ")))
-                .count();
+    // Walk sub-directories too: a resource split into `web/<x>/` (exams) keeps
+    // its annotations, and a flat read_dir would silently stop counting them.
+    let mut dirs = vec![format!("{root}/src/web")];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read src/web") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                dirs.push(path.to_string_lossy().into_owned());
+                continue;
+            }
+            if path.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("read source");
+            // Scan whole attributes, not lines: rustfmt wraps a long
+            // `#[schema(example = "…", max_length = 5_000)]` across several lines,
+            // and a line-based count silently misses the wrapped keyword.
+            //
+            // `#[param(...)]` bounds are query parameters, covered by
+            // `every_page_limit_param_matches_its_constant` instead.
+            for (at, _) in source.match_indices("#[schema(") {
+                let rest = &source[at..];
+                let end = rest.find(")]").map_or(rest.len(), |end| end + 2);
+                let attribute = &rest[..end];
+                annotated += keywords
+                    .iter()
+                    .filter(|kw| attribute.contains(&format!("{kw} = ")))
+                    .count();
+            }
         }
     }
 
@@ -811,4 +820,46 @@ fn expectations_cover_every_annotation() {
          asserting it still matches its constant.",
         expectations().len()
     );
+}
+
+/// The three image-meta bodies — exam question images, bank template images,
+/// and pool question/solution photos — are hand-kept copies of one shape,
+/// `{content_type, size}`. The write half behind them is shared
+/// (`src/web/image.rs`), but the DTOs stay three types because their *names*
+/// are the published contract, so nothing but this comparison of the emitted
+/// JSON stops one of them from quietly growing a field the others lack.
+#[tokio::test]
+async fn the_image_meta_bodies_stay_the_same_shape() {
+    let spec = spec().await;
+    let schemas = &spec["components"]["schemas"];
+
+    // Field names with their JSON type, prose (description/example) stripped —
+    // the wording is allowed to differ per system, the shape is not.
+    let shape = |name: &str| -> Vec<String> {
+        let properties = schemas[name]["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{name} is not an object schema — was it renamed?"));
+        let mut fields: Vec<String> = properties
+            .iter()
+            .map(|(field, spec)| format!("{field}: {}/{}", spec["type"], spec["format"]))
+            .collect();
+        fields.sort();
+        let mut required: Vec<String> = schemas[name]["required"]
+            .as_array()
+            .map(|items| items.iter().map(|item| item.to_string()).collect())
+            .unwrap_or_default();
+        required.sort();
+        fields.push(format!("required: {required:?}"));
+        fields
+    };
+
+    let want = shape("ImageMetaResponse");
+    for other in ["BankImageMeta", "PoolImageMeta"] {
+        assert_eq!(
+            want,
+            shape(other),
+            "{other} has drifted from ImageMetaResponse — the image-meta bodies are \
+             copies of one shape and must be changed together"
+        );
+    }
 }

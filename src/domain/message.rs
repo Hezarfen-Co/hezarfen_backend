@@ -14,6 +14,7 @@ use crate::constant::{
     RECIPIENT_FOLDERS, SENDER_FOLDERS,
 };
 use crate::database::Database;
+use crate::domain::page::PagedList;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
@@ -276,8 +277,10 @@ impl Message {
         user: &UserId,
         folder: Folder,
         read: Option<bool>,
+        limit: Option<i64>,
+        offset: i64,
         db: &Database,
-    ) -> Result<Vec<Message>, AppError> {
+    ) -> Result<(Vec<Message>, i64), AppError> {
         let condition = match folder {
             Folder::Sent => "sender = $usr AND sender_folder = 'sent'",
             Folder::Archive => {
@@ -295,16 +298,15 @@ impl Message {
         } else {
             ""
         };
-        let mut result = db
-            .query(format!(
-                "SELECT * FROM message WHERE ({condition}){read_clause} ORDER BY id DESC"
-            ))
-            .bind(("usr", user.record()))
-            .bind(("folder", folder.as_str().to_string()))
-            .bind(("read", read.unwrap_or_default()))
-            .await?
-            .check()?;
-        Ok(result.take::<Vec<Message>>(0)?)
+        PagedList::new(
+            format!("message WHERE ({condition}){read_clause}"),
+            "ORDER BY id DESC",
+        )
+        .bind("usr", user.record())
+        .bind("folder", folder.as_str().to_string())
+        .bind("read", read.unwrap_or_default())
+        .run(limit, offset, db)
+        .await
     }
 
     /// Read a message only if `user` is its sender or recipient and their

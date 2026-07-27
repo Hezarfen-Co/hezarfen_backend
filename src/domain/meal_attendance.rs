@@ -20,6 +20,7 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use crate::constant::{MEAL_ATTENDANCE_STATUSES, MEAL_ATTENDANCE_TABLE};
 use crate::database::Database;
 use crate::domain::menu::{MenuDate, MenuId};
+use crate::domain::page::PagedList;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
@@ -131,17 +132,17 @@ impl MealAttendance {
     /// The kitchen's list for one menu.
     pub async fn list_for_menu(
         menu: &MenuId,
+        limit: Option<i64>,
+        offset: i64,
         db: &Database,
-    ) -> Result<Vec<MealAttendance>, AppError> {
-        let mut result = db
-            .query(
-                "SELECT * FROM meal_attendance WHERE menu = $menu \
-                 ORDER BY marked_at DESC, id DESC",
-            )
-            .bind(("menu", menu.record()))
-            .await?
-            .check()?;
-        Ok(result.take::<Vec<MealAttendance>>(0)?)
+    ) -> Result<(Vec<MealAttendance>, i64), AppError> {
+        PagedList::new(
+            "meal_attendance WHERE menu = $menu",
+            "ORDER BY marked_at DESC, id DESC",
+        )
+        .bind("menu", menu.record())
+        .run(limit, offset, db)
+        .await
     }
 
     /// One student's marks, newest first. `from`/`to` are inclusive
@@ -153,21 +154,21 @@ impl MealAttendance {
         student: &UserId,
         from: Option<&MenuDate>,
         to: Option<&MenuDate>,
+        limit: Option<i64>,
+        offset: i64,
         db: &Database,
-    ) -> Result<Vec<MealAttendance>, AppError> {
-        let mut result = db
-            .query(
-                "SELECT * FROM meal_attendance WHERE student = $usr \
-                 AND ($from = NONE OR menu.date >= $from) \
-                 AND ($to = NONE OR menu.date <= $to) \
-                 ORDER BY marked_at DESC, id DESC",
-            )
-            .bind(("usr", student.record()))
-            .bind(("from", from.map(|date| date.as_str().to_string())))
-            .bind(("to", to.map(|date| date.as_str().to_string())))
-            .await?
-            .check()?;
-        Ok(result.take::<Vec<MealAttendance>>(0)?)
+    ) -> Result<(Vec<MealAttendance>, i64), AppError> {
+        PagedList::new(
+            "meal_attendance WHERE student = $usr \
+             AND ($from = NONE OR menu.date >= $from) \
+             AND ($to = NONE OR menu.date <= $to)",
+            "ORDER BY marked_at DESC, id DESC",
+        )
+        .bind("usr", student.record())
+        .bind("from", from.map(|date| date.as_str().to_string()))
+        .bind("to", to.map(|date| date.as_str().to_string()))
+        .run(limit, offset, db)
+        .await
     }
 }
 

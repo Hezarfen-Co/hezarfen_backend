@@ -9,25 +9,19 @@
 //! upload, row before blob on delete); this module owns the rows.
 
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-use tokio::sync::Mutex;
 use ulid::Ulid;
 
-use crate::constant::{HOMEWORK_FILE_TABLE, MAX_HOMEWORK_FILES_PER_SUBMISSION};
+use crate::constant::{
+    HOMEWORK_FILE_TABLE, MAX_HOMEWORK_FILES_PER_SUBMISSION, SUBMISSION_FILE_COUNT_FIELD,
+};
 use crate::database::Database;
+use crate::domain::cap;
 use crate::domain::course::CourseId;
 use crate::domain::homework::HomeworkId;
 use crate::domain::homework_submission::HomeworkSubmissionId;
 use crate::domain::note_file::{FileContentType, FileName};
 use crate::domain::timestamp::Timestamp;
 use crate::error::AppError;
-
-/// Serializes the files-per-submission cap check against the insert (see
-/// [`HomeworkFile::insert`]). Its own lock, not note files' `FILE_CAP_LOCK`:
-/// the two caps are independent counts and must not needlessly contend on one
-/// mutex. This backend is the database's only writer, so one process-wide lock
-/// suffices.
-// ponytail: global lock, per-submission locks if uploads ever see real contention.
-static SUBMISSION_FILE_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct HomeworkFileId(RecordId);
@@ -117,23 +111,38 @@ impl HomeworkFile {
     }
 
     /// Persist the row assembled by [`Self::new`], refusing once its submission
-    /// already holds [`MAX_HOMEWORK_FILES_PER_SUBMISSION`]. The
-    /// count-then-create runs under [`SUBMISSION_FILE_LOCK`]: a `BEGIN…COMMIT`
-    /// can't enforce the cap because SurrealDB doesn't conflict-check a
-    /// cross-record count against a concurrent insert (write-skew), the same
-    /// story as `NoteFile::insert`.
+    /// already holds [`MAX_HOMEWORK_FILES_PER_SUBMISSION`]. The slot is taken by
+    /// [`cap::claim`] on the submission row — a conditional single-record write,
+    /// the only guard that holds when the racing uploads are in two replicas,
+    /// the same story as `NoteFile::insert`.
     pub async fn insert(self, db: &Database) -> Result<HomeworkFile, AppError> {
-        let _guard = SUBMISSION_FILE_LOCK.lock().await;
-        if Self::count_for_submission(&self.submission, db).await?
-            >= MAX_HOMEWORK_FILES_PER_SUBMISSION
+        let submission = self.submission.record();
+        if !cap::claim(
+            &submission,
+            SUBMISSION_FILE_COUNT_FIELD,
+            MAX_HOMEWORK_FILES_PER_SUBMISSION as i64,
+            db,
+        )
+        .await?
         {
             return Err(AppError::Conflict(
                 "the submission already holds the maximum of 10 files — delete one first",
             ));
         }
         // whole-row-save-ok: create of a fresh ULID row built in place by `new` — there is no prior row to clobber
-        let created: Option<HomeworkFile> = db.create(self.id.record()).content(self).await?;
-        created.ok_or_else(|| AppError::Internal("failed to create homework file".into()))
+        let created: Result<Option<HomeworkFile>, _> =
+            db.create(self.id.record()).content(self).await;
+        match created {
+            Ok(Some(created)) => Ok(created),
+            Ok(None) => {
+                cap::release(&submission, SUBMISSION_FILE_COUNT_FIELD, db).await?;
+                Err(AppError::Internal("failed to create homework file".into()))
+            }
+            Err(err) => {
+                cap::release(&submission, SUBMISSION_FILE_COUNT_FIELD, db).await?;
+                Err(err.into())
+            }
+        }
     }
 
     /// Read a file's row only if it belongs to `submission` — callers have
@@ -230,9 +239,27 @@ impl HomeworkFile {
         Ok(result.take::<Vec<String>>(0)?)
     }
 
+    /// Delete the row and give its slot back in the same transaction. The
+    /// submission survives, so its counter has to be corrected; the cascades
+    /// that delete the submission itself take the counter with it.
     pub async fn delete(self, db: &Database) -> Result<HomeworkFile, AppError> {
-        let deleted: Option<HomeworkFile> = db.delete(self.id.record()).await?;
-        deleted.ok_or(AppError::NotFound)
+        let mut result = db
+            .query(
+                "BEGIN TRANSACTION;
+                 LET $gone = (DELETE $id RETURN BEFORE);
+                 UPDATE $sub SET file_count = math::max([(file_count ?? 0) - array::len($gone), 0]);
+                 RETURN $gone;
+                 COMMIT TRANSACTION;",
+            )
+            .bind(("id", self.id.record()))
+            .bind(("sub", self.submission.record()))
+            .await?
+            .check()?;
+        result
+            .take::<Vec<HomeworkFile>>(3)?
+            .into_iter()
+            .next()
+            .ok_or(AppError::NotFound)
     }
 }
 

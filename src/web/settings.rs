@@ -5,7 +5,7 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::constant::SETTINGS_UPDATE_RETRIES;
+use crate::constant::CAS_UPDATE_RETRIES;
 use crate::domain::exam_result::ExamResult;
 use crate::domain::menu::{MENU_LOCK, Menu};
 use crate::domain::settings::{ExamKindDef, GradeBand, MealSlotDef, Settings};
@@ -274,7 +274,7 @@ async fn update_settings(
         Some(_) => Some(MENU_LOCK.lock().await),
         None => None,
     };
-    for _ in 0..SETTINGS_UPDATE_RETRIES {
+    for _ in 0..CAS_UPDATE_RETRIES {
         let current = Settings::load(&st.db).await?;
 
         let exam_kinds = match &req.exam_kinds {

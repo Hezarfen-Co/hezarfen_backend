@@ -16,7 +16,7 @@ use crate::error::{AppError, ErrorResponse};
 use crate::state::AppState;
 
 use super::{
-    Page, PageParams, RequireStudent, UploadFileForm, blob_path, paginate, read_upload, remove_blob,
+    Page, PageParams, RequireStudent, UploadFileForm, blob_path, read_upload, remove_blob,
 };
 
 pub fn routes() -> OpenApiRouter<AppState> {
@@ -116,12 +116,8 @@ async fn list(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<NoteResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let notes = Note::list_for(user.get_id(), &st.db).await?;
-    let total = notes.len() as i64;
-    let items = paginate(&notes, limit, offset)
-        .iter()
-        .map(NoteResponse::new)
-        .collect();
+    let (notes, total) = Note::list_for(user.get_id(), limit, offset, &st.db).await?;
+    let items = notes.iter().map(NoteResponse::new).collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 
@@ -216,7 +212,7 @@ async fn delete_one(
     // Rows go first (the note delete cascades them), blobs after: a crash in
     // between strands at worst an unreachable blob, never a row whose blob is
     // already gone.
-    let files = NoteFile::list_for(note.get_id(), &st.db).await?;
+    let (files, _) = NoteFile::list_for(note.get_id(), None, 0, &st.db).await?;
     note.delete(&st.db).await?;
     for file in &files {
         remove_blob(&st.files_path, file.get_id().key()).await;
@@ -331,12 +327,8 @@ async fn list_files(
     let note = Note::read_owned(&NoteId::from_key(&id), user.get_id(), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    let files = NoteFile::list_for(note.get_id(), &st.db).await?;
-    let total = files.len() as i64;
-    let items = paginate(&files, limit, offset)
-        .iter()
-        .map(NoteFileResponse::new)
-        .collect();
+    let (files, total) = NoteFile::list_for(note.get_id(), limit, offset, &st.db).await?;
+    let items = files.iter().map(NoteFileResponse::new).collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 

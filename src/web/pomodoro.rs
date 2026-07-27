@@ -92,6 +92,8 @@ impl PomodoroLog {
             })
             .sum();
         Self {
+            // Paged in the web layer: `total_focus_ms` folds the whole log, so the
+            // rows the page comes from are already all in hand.
             items: paginate(sessions, limit, offset)
                 .iter()
                 .map(PomodoroResponse::new)

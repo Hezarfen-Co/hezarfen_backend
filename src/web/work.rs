@@ -8,11 +8,11 @@ use utoipa_axum::routes;
 
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
-use crate::domain::work_entry::{WORK_ENTRY_LOCK, WorkEntry, WorkEntryId};
-use crate::error::{AppError, ErrorResponse, ValidationError};
+use crate::domain::work_entry::{WorkEntry, WorkEntryId, out_before_in_error};
+use crate::error::{AppError, ErrorResponse};
 use crate::state::AppState;
 
-use super::{Page, PageParams, RequireManager, RequireTeacher, paginate};
+use super::{Page, PageParams, RequireManager, RequireTeacher};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -127,12 +127,8 @@ async fn my_work(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<WorkEntryResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let entries = WorkEntry::list_for_user(user.get_id(), &st.db).await?;
-    let total = entries.len() as i64;
-    let items = paginate(&entries, limit, offset)
-        .iter()
-        .map(WorkEntryResponse::new)
-        .collect();
+    let (entries, total) = WorkEntry::list_for_user(user.get_id(), limit, offset, &st.db).await?;
+    let items = entries.iter().map(WorkEntryResponse::new).collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 
@@ -165,12 +161,8 @@ async fn user_work(
     User::read(&target, &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    let entries = WorkEntry::list_for_user(&target, &st.db).await?;
-    let total = entries.len() as i64;
-    let items = paginate(&entries, limit, offset)
-        .iter()
-        .map(WorkEntryResponse::new)
-        .collect();
+    let (entries, total) = WorkEntry::list_for_user(&target, limit, offset, &st.db).await?;
+    let items = entries.iter().map(WorkEntryResponse::new).collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 
@@ -200,15 +192,6 @@ async fn update_entry(
 ) -> Result<Json<WorkEntryResponse>, AppError> {
     let check_in = req.check_in.map(Timestamp::from_millis);
     let check_out = req.check_out.map(Timestamp::from_millis);
-    // Only the ordering check needs the stored row, and only it can race: it
-    // validates an arriving instant against the other one as stored, so the
-    // read, the check and the write are held together under
-    // [`WORK_ENTRY_LOCK`]. A PATCH carrying neither instant pays nothing.
-    let _guard = match (check_in, check_out) {
-        (None, None) => None,
-        _ => Some(WORK_ENTRY_LOCK.lock().await),
-    };
-
     let entry = WorkEntry::read(&WorkEntryId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -220,11 +203,9 @@ async fn update_entry(
 
     // The side the correction left out is only *read* for the ordering check —
     // it is never written back, so a concurrent correction of it survives.
+    // Pre-flight only: `WorkEntry::update` re-makes this in the UPDATE's `WHERE`.
     if check_out.unwrap_or(current_out) < check_in.unwrap_or_else(|| entry.get_check_in()) {
-        return Err(AppError::Validation(ValidationError::Invalid {
-            field: "check_out",
-            reason: "must be at or after check_in",
-        }));
+        return Err(out_before_in_error());
     }
 
     let updated = entry.update(check_in, check_out, &st.db).await?;

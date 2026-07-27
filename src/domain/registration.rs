@@ -1,20 +1,11 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-use tokio::sync::Mutex;
 
-use crate::constant::REGISTRATION_TABLE;
-use crate::database::Database;
+use crate::constant::{REGISTRATION_COUNT_FIELD, REGISTRATION_TABLE};
+use crate::database::{Database, lost_the_race};
+use crate::domain::cap;
 use crate::domain::event::{Event, EventId};
 use crate::domain::user::UserId;
 use crate::error::AppError;
-
-/// Serializes seat-taking. A `BEGIN…COMMIT` around the count can't do this:
-/// SurrealDB transactions don't conflict-check a cross-record `count()`
-/// against a concurrent insert (write-skew), so two racing registrations both
-/// saw a free seat and a full event over-admitted. This backend is the database's only
-/// writer (single instance) — so one process-wide lock is sufficient.
-// ponytail: global lock, per-event locks (or DB-side serialization) if
-// registration ever sees real contention.
-static REGISTER_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct RegistrationId(RecordId);
@@ -75,17 +66,16 @@ impl Registration {
     /// Register (idempotently) `user` onto `event`, refusing when a capacity
     /// cap is set and every seat is taken. Someone already listed gets their
     /// existing row back untouched — a true no-op that never counts against
-    /// the cap and never rewrites who placed them. The whole check-then-write
-    /// runs under [`REGISTER_LOCK`], and the gate + cap are re-derived from a
-    /// fresh event read under that lock, so neither a racing registration nor
-    /// a concurrent capacity/audience/schedule PATCH can over-admit.
+    /// the cap and never rewrites who placed them. The seat is taken by
+    /// [`cap::claim`] on the event row — an atomic single-record conditional
+    /// write, so neither a racing registration in another replica nor a
+    /// concurrent capacity/audience/schedule PATCH can over-admit.
     pub async fn register(
         event: &EventId,
         user: &UserId,
         registered_by: &UserId,
         db: &Database,
     ) -> Result<Registration, AppError> {
-        let _guard = REGISTER_LOCK.lock().await;
         if let Some(existing) = Self::read_for_user(event, user, db).await? {
             return Ok(existing);
         }
@@ -93,8 +83,14 @@ impl Registration {
             .await?
             .ok_or(AppError::NotFound)?
             .registration_capacity()?;
-        if let Some(capacity) = capacity
-            && Self::list_for_event(event, db).await?.len() as i64 >= capacity
+        let seats = event.record();
+        if !cap::claim(
+            &seats,
+            REGISTRATION_COUNT_FIELD,
+            capacity.unwrap_or(cap::UNLIMITED),
+            db,
+        )
+        .await?
         {
             return Err(AppError::Conflict("the event is full"));
         }
@@ -104,11 +100,29 @@ impl Registration {
             user: user.clone(),
             registered_by: registered_by.clone(),
         };
-        let created: Option<Registration> = db
+        let created: Result<Option<Registration>, _> = db
             .create(registration.id.record())
             .content(registration)
-            .await?;
-        created.ok_or_else(|| AppError::Internal("failed to register user".into()))
+            .await;
+        match created {
+            Ok(Some(created)) => Ok(created),
+            Ok(None) => {
+                cap::release(&seats, REGISTRATION_COUNT_FIELD, db).await?;
+                Err(AppError::Internal("failed to register user".into()))
+            }
+            // A concurrent placement of the same pair got there first: give the
+            // seat back and hand its row over, the same no-op the early return
+            // above would have made.
+            Err(err) => {
+                cap::release(&seats, REGISTRATION_COUNT_FIELD, db).await?;
+                if !lost_the_race(&err) {
+                    return Err(err.into());
+                }
+                Self::read_for_user(event, user, db)
+                    .await?
+                    .ok_or_else(|| AppError::Internal("failed to register user".into()))
+            }
+        }
     }
 
     /// Some(_) iff `user` holds a seat on `event` — the audience point check.
@@ -143,12 +157,19 @@ impl Registration {
         user: &UserId,
         db: &Database,
     ) -> Result<Option<Registration>, AppError> {
+        // The seat comes back in the same transaction as the row that held it.
         let mut result = db
-            .query("DELETE registration WHERE event = $ev AND user = $usr RETURN BEFORE")
+            .query(
+                "BEGIN TRANSACTION;
+                 LET $gone = (DELETE registration WHERE event = $ev AND user = $usr RETURN BEFORE);
+                 UPDATE $ev SET registration_count = math::max([(registration_count ?? 0) - array::len($gone), 0]);
+                 RETURN $gone;
+                 COMMIT TRANSACTION;",
+            )
             .bind(("ev", event.record()))
             .bind(("usr", user.record()))
             .await?
             .check()?;
-        Ok(result.take::<Vec<Registration>>(0)?.into_iter().next())
+        Ok(result.take::<Vec<Registration>>(3)?.into_iter().next())
     }
 }

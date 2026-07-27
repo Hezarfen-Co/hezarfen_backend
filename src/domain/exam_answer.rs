@@ -4,6 +4,7 @@ use crate::constant::{EXAM_ANSWER_TABLE, MAX_ANSWER_TEXT_LEN};
 use crate::database::Database;
 use crate::domain::exam::ExamId;
 use crate::domain::exam_question::{ChoiceId, ExamQuestion, ExamQuestionId};
+use crate::domain::key;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
@@ -13,20 +14,13 @@ use crate::validate::validate_optional;
 pub struct ExamAnswerId(RecordId);
 
 impl ExamAnswerId {
-    /// A deterministic id for the (question, user, seq) triple — the question
-    /// key is its own ULID, so the triple key is unambiguous. Saving is a
+    /// A deterministic id for the (question, user, seq) triple. Saving is a
     /// single atomic UPSERT keyed by seq: re-answering *within a sitting*
     /// overwrites its one row, but a retake's `seq` writes a new row, so every
-    /// sitting keeps its own answer history. The first sitting keeps the
-    /// historical `{question}_{user}` shape (rows written before history
-    /// existed stay addressable); later sittings append their number. ULID
-    /// keys are alphanumeric, so `_` is an unambiguous joiner.
+    /// sitting keeps its own answer history. See [`key::sitting`] for the key
+    /// shape and why the first sitting stays bare.
     pub fn composite(question: &ExamQuestionId, user: &UserId, seq: i64) -> Self {
-        let key = if seq == 1 {
-            format!("{}_{}", question.key(), user.key())
-        } else {
-            format!("{}_{}_{}", question.key(), user.key(), seq)
-        };
+        let key = key::sitting(question.key(), user.key(), seq);
         Self(RecordId::new(EXAM_ANSWER_TABLE, key))
     }
 

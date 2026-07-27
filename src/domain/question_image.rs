@@ -16,7 +16,9 @@ use crate::constant::QUESTION_IMAGE_TABLE;
 use crate::database::Database;
 use crate::domain::course::CourseId;
 use crate::domain::exam::ExamId;
+use crate::domain::exam_attempt::ExamAttempt;
 use crate::domain::exam_question::{ChoiceId, ExamQuestionId};
+use crate::domain::key;
 use crate::domain::note_file::FileContentType;
 use crate::error::AppError;
 
@@ -24,20 +26,12 @@ use crate::error::AppError;
 pub struct QuestionImageId(RecordId);
 
 impl QuestionImageId {
-    /// The one id a (question, slot) pair can have: `{qid}_q` for the
-    /// question's own image, `{qid}_{choice id}` for one option's picture —
-    /// uniqueness per slot needs no index this way. Keyed by the option's
-    /// *stable id*, so reordering the choice list moves no picture.
+    /// The one id a (question, slot) pair can have — see [`key::slot`] for the
+    /// key shape and why the two forms can never collide.
     pub fn for_slot(question: &ExamQuestionId, slot: Option<&ChoiceId>) -> Self {
-        // `_` is not in Crockford base32 and a ULID is never `"q"`, so
-        // `{qid}_{cid}` and `{qid}_q` can never collide.
-        let suffix = match slot {
-            None => "q",
-            Some(id) => id.as_str(),
-        };
         Self(RecordId::new(
             QUESTION_IMAGE_TABLE,
-            format!("{}_{suffix}", question.key()),
+            key::slot(question.key(), slot.map(|id| id.as_str())),
         ))
     }
 
@@ -110,11 +104,23 @@ impl QuestionImage {
     }
 
     /// Create or replace the slot's image row — the deterministic id makes
-    /// this the whole "one image per slot" story.
+    /// this the whole "one image per slot" story. Refused once the exam has an
+    /// attempt: pictures are part of the question, so they freeze with it, and
+    /// the gate is in this transaction rather than in a lock the caller held.
     pub async fn upsert(self, db: &Database) -> Result<QuestionImage, AppError> {
         // whole-row-save-ok: self is built in place, never read back, and the slot id is deterministic
-        let written: Option<QuestionImage> = db.upsert(self.id.record()).content(self).await?;
-        written.ok_or_else(|| AppError::Internal("failed to store question image".into()))
+        let mut result = db
+            .query(ExamAttempt::unfrozen("UPSERT $id CONTENT $image;"))
+            .bind(("freeze_exam", self.exam.record()))
+            .bind(("id", self.id.record()))
+            .bind(("image", self))
+            .await?;
+        ExamAttempt::frozen_check(&mut result)?;
+        result
+            .take::<Vec<QuestionImage>>(ExamAttempt::FROZEN_SLOT)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| AppError::Internal("failed to store question image".into()))
     }
 
     pub async fn read_slot(
@@ -196,9 +202,20 @@ impl QuestionImage {
         Ok(result.take::<Vec<String>>(0)?)
     }
 
+    /// Refused once the exam has an attempt, in the same transaction — same
+    /// gate, same reason as [`Self::upsert`].
     pub async fn delete(self, db: &Database) -> Result<QuestionImage, AppError> {
-        let deleted: Option<QuestionImage> = db.delete(self.id.record()).await?;
-        deleted.ok_or(AppError::NotFound)
+        let mut result = db
+            .query(ExamAttempt::unfrozen("DELETE $id RETURN BEFORE;"))
+            .bind(("freeze_exam", self.exam.record()))
+            .bind(("id", self.id.record()))
+            .await?;
+        ExamAttempt::frozen_check(&mut result)?;
+        result
+            .take::<Vec<QuestionImage>>(ExamAttempt::FROZEN_SLOT)?
+            .into_iter()
+            .next()
+            .ok_or(AppError::NotFound)
     }
 }
 

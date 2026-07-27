@@ -310,6 +310,146 @@ async fn concurrent_bursts_never_over_admit() {
     assert_eq!((ok, limited), (5, 15));
 }
 
+// --- shared across replicas --------------------------------------------
+//
+// Two `UserRateLimiter`s over one database stand in for two replicas: they are
+// separate processes' worth of in-memory buckets, sharing only the `rate_limit`
+// table. Time is paused, so a round of the sync task is driven by advancing
+// past `RATE_SYNC_INTERVAL_SECS` — and because the task blocks on the database
+// (not on time) mid-round, the short sleep afterwards cannot resolve until the
+// round has finished. Assertions are on admissions, never on which replica won
+// a race: the embedded engine can drop one of two concurrent writes and still
+// answer `Ok`.
+
+use hezarfen_backend::constant::RATE_SYNC_INTERVAL_SECS;
+use hezarfen_backend::database::Database;
+use hezarfen_backend::rate_limit::UserRateLimiter;
+use hezarfen_backend::state::DbHealth;
+use std::time::Duration;
+
+/// A migrated in-memory database, with the clock frozen only afterwards: the
+/// embedded engine has internal deadlines of its own and cannot start up under
+/// a paused clock ("Insert node failed after 5 attempts due to timeout").
+async fn shared_db() -> Database {
+    let db = database::init_mem().await.expect("in-memory db");
+    tokio::time::pause();
+    db
+}
+
+/// Let the sync task run one round: fire its timer, then hand it *real* time
+/// to finish in. The real time is not optional — a round waits on the database,
+/// and a paused clock auto-advances straight past a virtual sleep while it
+/// does, so the assertions would race the round they are about.
+async fn sync_round() {
+    // Let a freshly spawned task reach its `sleep` first: `advance` moves the
+    // clock *before* it yields, so a timer registered after it is registered
+    // against the new now and would sit out the whole round.
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(RATE_SYNC_INTERVAL_SECS)).await;
+    tokio::time::resume();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    tokio::time::pause();
+}
+
+/// Two "replicas" of one tier, sharing `db`.
+fn two_replicas(max: u32, db: &Database) -> (UserRateLimiter, UserRateLimiter, DbHealth) {
+    let health = DbHealth::default();
+    let (a, b) = (
+        UserRateLimiter::per_user_minute(max),
+        UserRateLimiter::per_user_minute(max),
+    );
+    a.share("test", db.clone(), health.clone());
+    b.share("test", db.clone(), health.clone());
+    (a, b, health)
+}
+
+/// How many of `tries` requests a limiter admits for `user`.
+fn admits(limiter: &UserRateLimiter, user: &str, tries: usize) -> usize {
+    (0..tries)
+        .filter(|_| limiter.enforce_user(user).is_ok())
+        .count()
+}
+
+#[tokio::test]
+async fn two_replicas_share_one_budget() {
+    let db = shared_db().await;
+    let (a, b, _health) = two_replicas(6, &db);
+
+    // Both replicas spend freely until their first sync — the accepted
+    // one-interval overshoot, and the whole reason the fleet needs the shared
+    // row at all.
+    let spent = admits(&a, "user:a", 6) + admits(&b, "user:a", 6);
+    assert_eq!(spent, 12, "each replica starts on its own local budget");
+
+    // From the first sync on, the fleet total is what binds: neither replica
+    // admits anything more in this window, whatever the interleaving was.
+    sync_round().await;
+    assert_eq!(
+        admits(&a, "user:a", 6) + admits(&b, "user:a", 6),
+        0,
+        "the shared budget is spent"
+    );
+
+    // And the shared row agrees with what was actually admitted.
+    let mut rows = db
+        .query("SELECT VALUE hits FROM rate_limit")
+        .await
+        .expect("read shared counters");
+    assert_eq!(rows.take::<Vec<i64>>(0).unwrap(), vec![spent as i64]);
+}
+
+#[tokio::test]
+async fn a_replica_that_never_admitted_still_learns_the_budget_is_gone() {
+    let db = shared_db().await;
+    let (a, b, _health) = two_replicas(4, &db);
+
+    // b spends one request, so it has a bucket to sync; a spends the rest.
+    assert_eq!(admits(&b, "user:a", 1), 1);
+    assert_eq!(admits(&a, "user:a", 3), 3);
+    sync_round().await;
+
+    assert_eq!(
+        admits(&b, "user:a", 3),
+        0,
+        "the fleet total, not b's own count, is the cap"
+    );
+    // Other users are untouched by a spent bucket.
+    assert_eq!(admits(&b, "user:b", 4), 4);
+}
+
+#[tokio::test]
+async fn a_down_database_leaves_each_replica_on_its_local_budget() {
+    let db = shared_db().await;
+    let (a, b, health) = two_replicas(3, &db);
+    health.set(false);
+
+    // Nothing is shared while the database is down — and nothing stalls: both
+    // replicas keep serving their own budgets at full speed.
+    for _ in 0..3 {
+        sync_round().await;
+        assert_eq!(admits(&a, "user:a", 1), 1);
+        assert_eq!(admits(&b, "user:a", 1), 1);
+    }
+    assert_eq!(admits(&a, "user:a", 1), 0, "the local budget still binds");
+    assert_eq!(admits(&b, "user:a", 1), 0);
+
+    // Nothing was written, so the row the sync would have made does not exist.
+    let mut rows = db
+        .query("SELECT VALUE hits FROM rate_limit")
+        .await
+        .expect("read shared counters");
+    assert_eq!(rows.take::<Vec<i64>>(0).unwrap(), Vec::<i64>::new());
+
+    // Recovery needs no restart: the next round shares again.
+    health.set(true);
+    sync_round().await;
+    let mut rows = db
+        .query("SELECT VALUE hits FROM rate_limit")
+        .await
+        .expect("read shared counters");
+    assert_eq!(rows.take::<Vec<i64>>(0).unwrap(), vec![6]);
+}
+
 /// Boot the app on a real TCP port, `ConnectInfo` wired exactly like `main`.
 async fn spawn_server(rate_limit: RateLimitConfig) -> String {
     let db = database::init_mem().await.expect("in-memory db");

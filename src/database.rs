@@ -7,13 +7,13 @@ use surrealdb::types::SurrealValue;
 
 use crate::config::Config;
 use crate::constant::{
-    CHATBOT_PENDING_STALE_SECS, MIGRATION_BATCHES, MIGRATION_LOCK_CLAIM, MIGRATION_LOCK_DDL,
-    MIGRATION_LOCK_HEARTBEAT, MIGRATION_LOCK_HEARTBEAT_SECS, MIGRATION_LOCK_LEASE_SECS,
-    MIGRATION_LOCK_POLL_MS, MIGRATION_LOCK_STAMP, MIGRATION_LOCK_STATE, MIGRATION_LOCK_TAKEOVER,
-    MIGRATION_LOCK_WAIT_SECS,
+    CHATBOT_PENDING_STALE_SECS, MIGRATION_LOCK_CLAIM, MIGRATION_LOCK_DDL, MIGRATION_LOCK_HEARTBEAT,
+    MIGRATION_LOCK_HEARTBEAT_SECS, MIGRATION_LOCK_LEASE_SECS, MIGRATION_LOCK_POLL_MS,
+    MIGRATION_LOCK_STAMP, MIGRATION_LOCK_STATE, MIGRATION_LOCK_TAKEOVER, MIGRATION_LOCK_WAIT_SECS,
 };
 use crate::domain::user::{Password, User, Username};
 use crate::error::AppError;
+use crate::migration_sql::MIGRATION_BATCHES;
 
 /// The shared database handle.
 ///
@@ -259,7 +259,7 @@ async fn claim(db: &Database, sql: &str, me: &str, lease_ms: i64) -> Result<bool
 /// WebSocket, where the SDK rebuilds them from the wire (`Error::from_parts`),
 /// and a server that omitted the typed details would otherwise turn a lost race
 /// into a failed boot. Widest known wordings, cheap, and belt-and-braces.
-fn lost_the_race(err: &surrealdb::Error) -> bool {
+pub(crate) fn lost_the_race(err: &surrealdb::Error) -> bool {
     use surrealdb::types::{ErrorDetails, QueryError};
     if err.is_already_exists()
         || matches!(
@@ -685,7 +685,7 @@ mod tests {
             }
             hex::encode(hasher.finalize())
         };
-        let batches: Vec<String> = crate::constant::MIGRATION_BATCHES
+        let batches: Vec<String> = crate::migration_sql::MIGRATION_BATCHES
             .iter()
             .map(|sql| (*sql).to_string())
             .collect();

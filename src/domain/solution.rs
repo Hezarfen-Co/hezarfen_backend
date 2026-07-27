@@ -15,6 +15,7 @@ use ulid::Ulid;
 use crate::constant::{MAX_SOLUTION_BODY_LEN, SOLUTION_TABLE};
 use crate::database::Database;
 use crate::domain::note_file::FileContentType;
+use crate::domain::page::PagedList;
 use crate::domain::pool_question::PoolQuestionId;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
@@ -149,14 +150,17 @@ impl Solution {
     /// are random within a millisecond, so same-ms order is arbitrary).
     pub async fn list_for(
         question: &PoolQuestionId,
+        limit: Option<i64>,
+        offset: i64,
         db: &Database,
-    ) -> Result<Vec<Solution>, AppError> {
-        let mut result = db
-            .query("SELECT * FROM solution WHERE question = $q ORDER BY offered_at ASC, id ASC")
-            .bind(("q", question.record()))
-            .await?
-            .check()?;
-        Ok(result.take::<Vec<Solution>>(0)?)
+    ) -> Result<(Vec<Solution>, i64), AppError> {
+        PagedList::new(
+            "solution WHERE question = $q",
+            "ORDER BY offered_at ASC, id ASC",
+        )
+        .bind("q", question.record())
+        .run(limit, offset, db)
+        .await
     }
 
     /// Per-question solution tallies for a page of questions, in one grouped
@@ -273,14 +277,15 @@ mod tests {
         second.offered_at = Timestamp::from_millis(2);
         let second = second.insert(&db).await.unwrap();
 
-        let listed = Solution::list_for(&question_a, &db).await.unwrap();
+        let (listed, _) = Solution::list_for(&question_a, None, 0, &db).await.unwrap();
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].get_id(), first.get_id());
         assert_eq!(listed[1].get_id(), second.get_id());
         assert!(
-            Solution::list_for(&question_b, &db)
+            Solution::list_for(&question_b, None, 0, &db)
                 .await
                 .unwrap()
+                .0
                 .is_empty()
         );
 
@@ -299,7 +304,14 @@ mod tests {
         );
 
         first.delete(&db).await.unwrap();
-        assert_eq!(Solution::list_for(&question_a, &db).await.unwrap().len(), 1);
+        assert_eq!(
+            Solution::list_for(&question_a, None, 0, &db)
+                .await
+                .unwrap()
+                .0
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

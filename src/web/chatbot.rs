@@ -50,7 +50,7 @@ use crate::domain::user::UserId;
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
 
-use super::{CurrentUser, Page, PageParams, paginate};
+use super::{CurrentUser, Page, PageParams};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -155,12 +155,9 @@ async fn list_threads(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<ChatbotThreadResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let threads = ChatbotThread::list_for_user(user.get_id(), &st.db).await?;
-    let total = threads.len() as i64;
-    let items = paginate(&threads, limit, offset)
-        .iter()
-        .map(ChatbotThreadResponse::new)
-        .collect();
+    let (threads, total) =
+        ChatbotThread::list_for_user(user.get_id(), limit, offset, &st.db).await?;
+    let items = threads.iter().map(ChatbotThreadResponse::new).collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 
@@ -339,12 +336,9 @@ async fn list_messages(
 ) -> Result<Json<Page<ChatbotMessageResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
     let thread = own_thread(&id, user.get_id(), &st.db).await?;
-    let messages = ChatbotMessage::list_for_thread(thread.get_id(), &st.db).await?;
-    let total = messages.len() as i64;
-    let items = paginate(&messages, limit, offset)
-        .iter()
-        .map(ChatbotMessageResponse::new)
-        .collect();
+    let (messages, total) =
+        ChatbotMessage::list_for_thread(thread.get_id(), limit, offset, &st.db).await?;
+    let items = messages.iter().map(ChatbotMessageResponse::new).collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 

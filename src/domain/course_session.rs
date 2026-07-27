@@ -1,29 +1,15 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-use tokio::sync::Mutex;
 use ulid::Ulid;
 
 use crate::constant::{COURSE_SESSION_TABLE, MAX_SESSION_TOPIC_LEN};
 use crate::database::Database;
 use crate::domain::course::CourseId;
 use crate::domain::field_update::FieldUpdate;
-use crate::domain::timestamp::Timestamp;
+use crate::domain::page::PagedList;
+use crate::domain::timestamp::{Timestamp, range_error};
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 use crate::validate::validate_optional;
-
-/// Serializes a lesson's time-range check against the write it guards, exactly
-/// as [`crate::domain::event::EVENT_LOCK`] does for events: `starts_at <=
-/// ends_at` is a cross-field check, so a PATCH carrying one end validates it
-/// against the *stored* other end — two such PATCHes, each fine on its own
-/// snapshot, would otherwise commit an inverted lesson between them. A PATCH
-/// that moves neither end checks nothing cross-field and stays lock-free.
-///
-/// Lock order: this is a leaf — the only path that takes it (`PATCH
-/// /sessions/{id}`) takes no other lock, and no path holding `EXAM_LOCK`,
-/// `BANK_LOCK`, `HOMEWORK_LOCK`, `ENROLL_LOCK` or any other takes this one, so
-/// it cannot sit in a cycle. Should a future path need both, take the other
-/// lock first and this one innermost.
-pub(crate) static SESSION_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct CourseSessionId(RecordId);
@@ -140,18 +126,21 @@ impl CourseSession {
     /// the row was created.
     pub async fn list_for_course(
         course: &CourseId,
+        limit: Option<i64>,
+        offset: i64,
         db: &Database,
-    ) -> Result<Vec<CourseSession>, AppError> {
-        let mut result = db
-            .query("SELECT * FROM course_session WHERE course = $course ORDER BY starts_at DESC")
-            .bind(("course", course.record()))
-            .await?
-            .check()?;
-        Ok(result.take::<Vec<CourseSession>>(0)?)
+    ) -> Result<(Vec<CourseSession>, i64), AppError> {
+        PagedList::new(
+            "course_session WHERE course = $course",
+            "ORDER BY starts_at DESC",
+        )
+        .bind("course", course.record())
+        .run(limit, offset, db)
+        .await
     }
 
-    /// Request-scoped: the handler holds no lock across its read and this write
-    /// unless a schedule end arrives ([`SESSION_LOCK`]), so a field the request
+    /// Request-scoped: the handler holds nothing across its read and this
+    /// write — the range check rides in the `WHERE` — so a field the request
     /// omitted (`None`) is not written at all. Re-sending the snapshot's value
     /// instead would revert a concurrent PATCH of that field — scoping the
     /// `SET` alone does not stop that, the values have to come from the
@@ -170,6 +159,7 @@ impl CourseSession {
             .set("topic", topic)
             .set("starts_at", starts_at)
             .set("ends_at", ends_at)
+            .ordered("starts_at", "ends_at", range_error())
             .run::<CourseSession>(db)
             .await
     }

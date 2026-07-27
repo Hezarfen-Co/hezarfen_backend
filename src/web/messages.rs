@@ -17,7 +17,7 @@ use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
 
 use super::dto::Role;
-use super::{CurrentUser, Page, PageParams, PersonRef, paginate};
+use super::{CurrentUser, Page, PageParams, PersonRef};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -240,11 +240,10 @@ async fn list(
         None => Folder::Inbox,
     };
 
-    let messages = Message::list_folder(user.get_id(), folder, filter.read, &st.db).await?;
-    let total = messages.len() as i64;
-    let slice = paginate(&messages, limit, offset);
-    let people = load_people(slice, &st.db).await?;
-    let items = slice
+    let (messages, total) =
+        Message::list_folder(user.get_id(), folder, filter.read, limit, offset, &st.db).await?;
+    let people = load_people(&messages, &st.db).await?;
+    let items = messages
         .iter()
         .map(|message| MessageResponse::new(message, user.get_id(), &people))
         .collect();

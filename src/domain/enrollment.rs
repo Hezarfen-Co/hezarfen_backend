@@ -1,17 +1,22 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use tokio::sync::Mutex;
 
-use crate::constant::ENROLLMENT_TABLE;
-use crate::database::Database;
+use crate::constant::{ENROLLMENT_COUNT_FIELD, ENROLLMENT_TABLE};
+use crate::database::{Database, lost_the_race};
+use crate::domain::cap;
 use crate::domain::course::{Course, CourseId};
+use crate::domain::page::PagedList;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 
-/// Serializes enrolls so the capacity check (count, then write) can't
-/// over-admit under concurrency — the database's optimistic transactions
-/// don't serialize cross-record counts against concurrent inserts.
-/// It also serializes the roster check of a course delete against a concurrent
-/// enroll, so a student can't join a course that is already on its way out.
+/// Serializes the roster check of a course delete against a concurrent enroll,
+/// so a student can't join a course that is already on its way out.
+//
+// ponytail: process-local, so with two replicas the delete-vs-enroll window is
+// only narrowed, not closed — a student can still land on a course another
+// replica is deleting, and the cascade then leaves nothing behind but a 404 on
+// the next read. Closing it needs the same treatment the capacity cap got: a
+// deleting flag on the course row that the enroll's conditional UPDATE checks.
 pub(crate) static ENROLL_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
@@ -69,14 +74,14 @@ impl Enrollment {
     }
 
     /// Enroll (idempotently) `user` into `course`. One row per (course, user),
-    /// keyed by a deterministic composite id so this is a single atomic UPSERT —
-    /// concurrent enrolls for the same pair converge on one row instead of
-    /// racing the unique index into a 500. When the course carries a capacity,
-    /// a full roster refuses new members (409) — the whole check-then-write
-    /// runs under [`ENROLL_LOCK`], and the cap is re-derived from a fresh
-    /// course read inside it, since neither the transaction model nor a
-    /// caller-supplied course survives a concurrent capacity PATCH. An already
-    /// enrolled user is returned as-is even when the roster is full.
+    /// keyed by a deterministic composite id, so concurrent enrolls of the same
+    /// pair converge on one row instead of racing the unique index into a 500:
+    /// the loser of the `CREATE` reads the winner's row back and returns it.
+    /// When the course carries a capacity, a full roster refuses new members
+    /// (409) — the seat is taken by [`cap::claim`] on the course row, an atomic
+    /// single-record conditional write, so the cap holds across replicas and
+    /// against a concurrent capacity PATCH alike. An already enrolled user is
+    /// returned as-is even when the roster is full, and never charged a seat.
     pub async fn enroll(
         course: &CourseId,
         user: &UserId,
@@ -91,8 +96,14 @@ impl Enrollment {
             .await?
             .ok_or(AppError::NotFound)?
             .get_capacity();
-        if let Some(capacity) = capacity
-            && Self::list_for_course(course, db).await?.len() as i64 >= capacity
+        let seats = course.record();
+        if !cap::claim(
+            &seats,
+            ENROLLMENT_COUNT_FIELD,
+            capacity.unwrap_or(cap::UNLIMITED),
+            db,
+        )
+        .await?
         {
             return Err(AppError::Conflict("the course is full"));
         }
@@ -102,11 +113,27 @@ impl Enrollment {
             user: user.clone(),
             enrolled_by: enrolled_by.clone(),
         };
-        let saved: Option<Enrollment> = db
-            .upsert(enrollment.id.record())
-            .content(enrollment)
-            .await?;
-        saved.ok_or_else(|| AppError::Internal("failed to enroll user".into()))
+        // CREATE, not UPSERT: a duplicate has to be *seen*, or the pair's second
+        // writer would silently keep the seat it claimed for a row that already
+        // existed and the counter would drift above the roster forever.
+        let saved: Result<Option<Enrollment>, _> =
+            db.create(enrollment.id.record()).content(enrollment).await;
+        match saved {
+            Ok(Some(saved)) => Ok(saved),
+            Ok(None) => {
+                cap::release(&seats, ENROLLMENT_COUNT_FIELD, db).await?;
+                Err(AppError::Internal("failed to enroll user".into()))
+            }
+            Err(err) => {
+                cap::release(&seats, ENROLLMENT_COUNT_FIELD, db).await?;
+                if !lost_the_race(&err) {
+                    return Err(err.into());
+                }
+                Self::read_for_user(course, user, db)
+                    .await?
+                    .ok_or_else(|| AppError::Internal("failed to enroll user".into()))
+            }
+        }
     }
 
     /// Some(_) iff `user` is enrolled in `course` — the grading gate.
@@ -136,23 +163,30 @@ impl Enrollment {
 
     pub async fn list_for_course(
         course: &CourseId,
+        limit: Option<i64>,
+        offset: i64,
         db: &Database,
-    ) -> Result<Vec<Enrollment>, AppError> {
-        let mut result = db
-            .query("SELECT * FROM enrollment WHERE course = $course ORDER BY id DESC")
-            .bind(("course", course.record()))
-            .await?
-            .check()?;
-        Ok(result.take::<Vec<Enrollment>>(0)?)
+    ) -> Result<(Vec<Enrollment>, i64), AppError> {
+        PagedList::new("enrollment WHERE course = $course", "ORDER BY id DESC")
+            .bind("course", course.record())
+            .run(limit, offset, db)
+            .await
     }
 
     /// Drop every enrollment `user` holds, across all courses. Only students
     /// enroll, so promotion out of `student` calls this to clear the rosters.
     pub async fn delete_for_user(user: &UserId, db: &Database) -> Result<(), AppError> {
-        db.query("DELETE enrollment WHERE user = $usr")
-            .bind(("usr", user.record()))
-            .await?
-            .check()?;
+        db.query(
+            "BEGIN TRANSACTION;
+             LET $gone = (DELETE enrollment WHERE user = $usr RETURN BEFORE);
+             FOR $row IN ($gone ?? []) {
+                 UPDATE $row.course SET enrollment_count = math::max([(enrollment_count ?? 0) - 1, 0]);
+             };
+             COMMIT TRANSACTION;",
+        )
+        .bind(("usr", user.record()))
+        .await?
+        .check()?;
         Ok(())
     }
 
@@ -161,12 +195,20 @@ impl Enrollment {
         user: &UserId,
         db: &Database,
     ) -> Result<Option<Enrollment>, AppError> {
+        // The seat comes back in the same transaction as the row that held it,
+        // so nothing but a lost transaction can drift the counter.
         let mut result = db
-            .query("DELETE enrollment WHERE course = $course AND user = $usr RETURN BEFORE")
+            .query(
+                "BEGIN TRANSACTION;
+                 LET $gone = (DELETE enrollment WHERE course = $course AND user = $usr RETURN BEFORE);
+                 UPDATE $course SET enrollment_count = math::max([(enrollment_count ?? 0) - array::len($gone), 0]);
+                 RETURN $gone;
+                 COMMIT TRANSACTION;",
+            )
             .bind(("course", course.record()))
             .bind(("usr", user.record()))
             .await?
             .check()?;
-        Ok(result.take::<Vec<Enrollment>>(0)?.into_iter().next())
+        Ok(result.take::<Vec<Enrollment>>(3)?.into_iter().next())
     }
 }
