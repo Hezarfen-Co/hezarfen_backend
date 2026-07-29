@@ -1604,3 +1604,94 @@ async fn subject_reference_counts_are_seeded_from_the_rows_that_predate_them() {
     .await;
     assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
 }
+
+/// A fee plan's installments are an `array<object>` on the plan row, and the
+/// charges it raised are frozen copies of them. A SCHEMAFULL re-migration
+/// rewrites every field definition it owns, so this is where a nested array
+/// would quietly come back as `NONE` or lose a key — the plan, the placement
+/// and the money all have to survive a second boot unchanged.
+#[tokio::test]
+async fn fee_plans_and_their_charges_survive_remigration() {
+    let (app, db) = common::app_and_db().await;
+    let manager_creds = json!({ "username": "ali", "password": "secret1" });
+    let student_creds = json!({ "username": "ayse", "password": "secret1" });
+    for creds in [&manager_creds, &student_creds] {
+        assert_eq!(
+            send(&app, "POST", "/auth/register", None, Some((*creds).clone()))
+                .await
+                .status,
+            StatusCode::CREATED
+        );
+    }
+    set_role(&db, "ali", "manager").await;
+    let manager = send(&app, "POST", "/auth/login", None, Some(manager_creds))
+        .await
+        .cookie
+        .unwrap();
+    let student = send(&app, "POST", "/auth/login", None, Some(student_creds))
+        .await
+        .cookie
+        .unwrap();
+    let student_id = me_id(&app, &student).await;
+
+    let res = send(
+        &app,
+        "POST",
+        "/payments/plans",
+        Some(&manager),
+        Some(json!({
+            "name": "2026-2027 Yearly",
+            "installments": [
+                { "amount_minor": 150_000, "due_at": 1_760_000_000_123_i64 },
+                { "amount_minor": 250_000, "due_at": 1_770_000_000_456_i64 },
+            ],
+        })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let plan = res.body["id"].as_str().unwrap().to_string();
+    let res = send(
+        &app,
+        "POST",
+        &format!("/payments/plans/{plan}/assignments"),
+        Some(&manager),
+        Some(json!({ "student_ids": [student_id] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    let app = reboot(&db).await;
+
+    let res = send(
+        &app,
+        "GET",
+        &format!("/payments/plans/{plan}"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["name"], "2026-2027 Yearly");
+    let installments = res.body["installments"].as_array().expect("installments");
+    assert_eq!(installments.len(), 2, "{}", res.body);
+    // Order and both keys of each entry, not merely the count.
+    assert_eq!(installments[0]["amount_minor"], 150_000);
+    assert_eq!(installments[0]["due_at"], 1_760_000_000_123_i64);
+    assert_eq!(installments[1]["amount_minor"], 250_000);
+    assert_eq!(installments[1]["due_at"], 1_770_000_000_456_i64);
+
+    let res = send(
+        &app,
+        "GET",
+        &format!("/payments/statement/{student_id}"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        res.body["balance_minor"], -400_000,
+        "the charges the placement raised are still owed"
+    );
+}

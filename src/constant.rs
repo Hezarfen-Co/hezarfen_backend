@@ -245,6 +245,27 @@ pub const MEAL_ATTENDANCE_STATUSES: [&str; 2] = ["served", "missed"];
 /// opposing line rather than editing or deleting the charge.
 pub const MEAL_LEDGER_KINDS: [&str; 3] = ["charge", "credit", "reversal"];
 
+/// The only accepted school-payment ledger kinds. `charge`: an installment the
+/// student owes, appended when a fee plan is assigned. `credit`: money in,
+/// against one named charge. `refund`: money paid back out, against one named
+/// credit. `reversal`: a mistaken `charge` or `refund` undone — the ledger is
+/// append-only, so the opposing line is appended rather than the line edited.
+/// A mistaken *credit* is corrected by a `refund`, which is why `reversal`
+/// never points at one.
+pub const PAYMENT_LEDGER_KINDS: [&str; 4] = ["charge", "credit", "reversal", "refund"];
+
+/// Bounds on a fee plan: its name, and how many installments it may carry.
+/// Sixty covers a monthly plan over five years — well past any school year,
+/// and low enough that one assignment cannot append a thousand ledger lines.
+pub const MAX_FEE_PLAN_NAME_LEN: usize = 120;
+pub const MAX_FEE_PLAN_INSTALLMENTS: usize = 60;
+
+/// How many students one `POST /payments/plans/{id}/assignments` may name.
+/// Bulk placement is a whole class at a time, not the whole school: each named
+/// student appends every installment of the plan, so this is what bounds one
+/// request's writes.
+pub const MAX_FEE_PLAN_ASSIGN_STUDENTS: usize = 200;
+
 /// Inclusive bounds for an exam's per-attempt duration, milliseconds
 /// (1 minute to 24 hours). Required for `async`, optional for `open`.
 pub const MIN_EXAM_DURATION_MS: i64 = 60 * 1000;
@@ -742,6 +763,9 @@ pub const DIETARY_PROFILE_TABLE: &str = "dietary_profile";
 pub const MEAL_BOOKING_TABLE: &str = "meal_booking";
 pub const MEAL_ATTENDANCE_TABLE: &str = "meal_attendance";
 pub const MEAL_LEDGER_TABLE: &str = "meal_ledger";
+pub const FEE_PLAN_TABLE: &str = "fee_plan";
+pub const FEE_PLAN_ASSIGNMENT_TABLE: &str = "fee_plan_assignment";
+pub const PAYMENT_LEDGER_TABLE: &str = "payment_ledger";
 /// One row per *name* the school's settings offer, keyed by the name itself:
 /// how many rows still reference it, and whether it has been retired out of the
 /// list (see the reference counters in [`crate::domain::cap`]).

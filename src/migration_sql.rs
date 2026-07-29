@@ -630,6 +630,50 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS created_at ON meal_ledger TYPE int READONLY;
     DEFINE INDEX IF NOT EXISTS meal_ledger_student ON meal_ledger FIELDS student;
 
+    -- A school fee plan: a name and its installments, each an amount and the
+    -- day it falls due. The installments are embedded (SCHEMAFULL, so the
+    -- object's own fields are declared too, same shape as `settings.exam_kinds`)
+    -- because a charge line copies the amount it was assigned at — child rows
+    -- would buy nothing. Neither field inside the object is optional: a NONE
+    -- value would be dropped from the stored object entirely.
+    DEFINE TABLE IF NOT EXISTS fee_plan SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS name ON fee_plan TYPE string;
+    DEFINE FIELD IF NOT EXISTS installments ON fee_plan TYPE array<object>;
+    DEFINE FIELD IF NOT EXISTS installments.*.amount_minor ON fee_plan TYPE int;
+    DEFINE FIELD IF NOT EXISTS installments.*.due_at ON fee_plan TYPE int;
+    DEFINE FIELD IF NOT EXISTS created_by ON fee_plan TYPE record<user> READONLY;
+    DEFINE FIELD IF NOT EXISTS created_at ON fee_plan TYPE int READONLY;
+
+    -- One plan on one student, keyed `<plan>_<student>`: assigning twice is the
+    -- same record id, so a replay writes nothing and an assignment cut short
+    -- half-way self-heals when it is repeated. Nothing here is ever edited.
+    DEFINE TABLE IF NOT EXISTS fee_plan_assignment SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS plan ON fee_plan_assignment TYPE record<fee_plan> READONLY;
+    DEFINE FIELD IF NOT EXISTS student ON fee_plan_assignment TYPE record<user> READONLY;
+    DEFINE FIELD IF NOT EXISTS assigned_by ON fee_plan_assignment TYPE record<user> READONLY;
+    DEFINE FIELD IF NOT EXISTS created_at ON fee_plan_assignment TYPE int READONLY;
+    DEFINE INDEX IF NOT EXISTS fee_plan_assignment_plan ON fee_plan_assignment FIELDS plan;
+    DEFINE INDEX IF NOT EXISTS fee_plan_assignment_student ON fee_plan_assignment FIELDS student;
+
+    -- School fees, APPEND-ONLY by design exactly like `meal_ledger`: a mistake
+    -- is corrected with an opposing line, never by editing or deleting one,
+    -- hence every field is READONLY. `source` is untyped on purpose — a charge
+    -- points at the `fee_plan_assignment` that raised it, a credit at the charge
+    -- it pays, a refund at the credit it returns, a reversal at the line it
+    -- undoes. `due_at` is set on charges alone.
+    DEFINE TABLE IF NOT EXISTS payment_ledger SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS student ON payment_ledger TYPE record<user> READONLY;
+    DEFINE FIELD IF NOT EXISTS kind ON payment_ledger TYPE string READONLY;
+    DEFINE FIELD IF NOT EXISTS amount_minor ON payment_ledger TYPE int READONLY;
+    DEFINE FIELD IF NOT EXISTS source ON payment_ledger TYPE option<record> READONLY;
+    DEFINE FIELD IF NOT EXISTS due_at ON payment_ledger TYPE option<int> READONLY;
+    DEFINE FIELD IF NOT EXISTS method ON payment_ledger TYPE option<string> READONLY;
+    DEFINE FIELD IF NOT EXISTS note ON payment_ledger TYPE option<string> READONLY;
+    DEFINE FIELD IF NOT EXISTS recorded_by ON payment_ledger TYPE record<user> READONLY;
+    DEFINE FIELD IF NOT EXISTS created_at ON payment_ledger TYPE int READONLY;
+    DEFINE INDEX IF NOT EXISTS payment_ledger_student ON payment_ledger FIELDS student;
+    DEFINE INDEX IF NOT EXISTS payment_ledger_source ON payment_ledger FIELDS source;
+
     -- Reference counters, one row per *name* the settings offer, keyed by the
     -- name itself (2026-07-27). They are how 'a kind nothing is graded under
     -- may be removed' survives a second replica: the guard used to be a

@@ -121,6 +121,15 @@ with for whoever is reading. Every authenticated user reads what is being
 served; students (or their parents) book a seat, and every seat writes a line into an
 **append-only** meal ledger whose balance is derived and never stored (see
 "Food program: menus, dishes, bookings & the ledger").
+School **fees** are tracked the same way, in a ledger of their own: a manager
+writes a **fee plan** (a name and 1–60 installments, each an amount in minor
+units and a due date that may sit in the past) and **assigns** it to students,
+which appends every installment as a `charge` at once — there is no scheduler,
+and "overdue" is derived at read time. Payments are recorded against one named
+charge, refunds against one named payment, and nothing is ever edited or
+deleted: a mistake is corrected by appending the opposing line. **There is no
+online payment integration and none is planned** — no gateway, no card data,
+`method` is free text. Teachers see no money at all (see "Payments").
 
 Every field is a validated newtype (`Username(String)`, `NoteTitle(String)`, …)
 constructed only after its restrictions pass — invalid input can't be
@@ -801,6 +810,21 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/meals/balance/{user}`          | student | One student's balance; own id always, otherwise teacher+ or a parent link |
 | GET    | `/meals/ledger/{user}`           | student | That student's statement — every charge, credit, reversal — newest first · paged · same gate |
 | POST   | `/meals/credits`                 | admin   | `{student_id, amount_minor, method?, note?}` — record money received; **admin only**, appends a `credit` line |
+| POST   | `/payments/plans`                | manager | `{name, installments}` — write a fee plan (1–60 installments, each `{amount_minor, due_at}`; `due_at` may be in the past); bills nobody |
+| GET    | `/payments/plans`                | manager | List fee plans, newest first · paged |
+| GET    | `/payments/plans/{id}`           | manager | One fee plan with its schedule |
+| PATCH  | `/payments/plans/{id}`           | manager | Edit a plan's `name` and/or `installments` (the schedule replaces wholesale); `409` once anyone is on the plan |
+| DELETE | `/payments/plans/{id}`           | manager | Delete a plan; `409` once anyone is on it — its charges name it |
+| POST   | `/payments/plans/{id}/assignments` | manager | `{student_ids}` (≤ 200) — place the plan on students, appending **every** installment as a `charge` at once; replay-safe, reported per student as `assigned` / `already_assigned` / `rejected` |
+| GET    | `/payments/plans/{id}/assignments` | manager | Who is on this plan, newest first · paged |
+| POST   | `/payments/credits`              | manager | `{charge_id, amount_minor, method?, note?}` — record money received against one named charge; partials are the norm, `409` past what the charge is worth (advisory) |
+| POST   | `/payments/refunds`              | manager | `{credit_id, amount_minor, method?, note?}` — hand money back against one named payment; partials allowed, capped by that credit |
+| POST   | `/payments/reversals`            | manager | `{line_id, note?}` — undo a `charge` or a `refund` for its exact amount (`400` on any other kind); idempotent, at most one reversal per line |
+| GET    | `/payments/ledger/{user}`        | student | One student's raw lines — charges, payments, refunds, reversals — newest first · paged · own id always, otherwise manager+ or a parent link (**a teacher gets a `403`**) |
+| GET    | `/payments/statement/me`         | student | The caller's own statement: a row per charge with what it collected, what went back out, what is still owed, and whether it is `overdue` |
+| GET    | `/payments/statement/{user}`     | student | One student's statement; same gate as the ledger |
+| GET    | `/payments/balance/me`           | student | The caller's fee balance, minor units (negative = owes the school) |
+| GET    | `/payments/balance/{user}`       | student | One student's fee balance; same gate as the ledger |
 | POST   | `/chatbot/threads`            | student | `{title?}` — start a chatbot thread (every role incl. `parent`, always private to its owner); `409` at `max_chatbot_threads` |
 | GET    | `/chatbot/threads`            | student | The caller's threads, newest activity first · paged |
 | PATCH  | `/chatbot/threads/{id}`       | student | `{title}` — rename own thread (`null` or blank clears it back to untitled); counts as activity, so the thread moves to the top. Nothing auto-titles a thread |
@@ -1406,6 +1430,124 @@ first) read a student's: your own id always passes, anyone else's needs
 teacher+ or a `parent_link` to that student. A charge's `source` is the
 booking id it came from, a reversal's is the charge line it reverses, and a
 credit has none.
+
+## Payments: fee plans, assignment & the fee ledger
+
+School fees live in their own tables (`fee_plan`, `fee_plan_assignment`,
+`payment_ledger`) and their own balance. **Meal money is separate** — two
+ledgers, two balances, and no route folds one into the other: what a family
+owes the canteen and what it owes the school are different debts, and mixing
+them would make either statement unreadable.
+
+Every write here is **manager+**. Reads are narrower than the other
+per-student reports: the student themselves, a parent holding a live link to
+them, or manager+ — **a teacher gets a `403` on every `/payments` route**,
+because what a family owes the school is not classroom information.
+
+### Fee plans and what turns them into money
+
+A **fee plan** (`POST /payments/plans`) is a name and 1 to 60 **installments**,
+each `{amount_minor, due_at}` — minor units (kuruş) as an integer, and unix
+milliseconds. `due_at` **may be in the past**: a school adopting the app
+mid-year assigns plans whose first installments were already due, so there is
+no future-date rule here.
+
+Writing a plan bills nobody. **Assigning it does** (`POST
+/payments/plans/{id}/assignments` with `{student_ids}`, at most 200 per call):
+that appends *every* installment as a `charge` line right away, each carrying
+its own due date. There is no scheduler, no nightly sweep, and nothing that
+wakes up when a date passes — the whole schedule is written once, and lateness
+is read off it.
+
+Assignment is **replay-safe by identity**: the assignment row is keyed
+(plan, student) and every charge it raises is keyed (plan, student,
+installment), so re-assigning bills nothing a second time (that student comes
+back `already_assigned`), and an assignment cut short after three of twelve
+charges landed completes itself when the call is simply repeated. Only
+students carry a fee record, so any other target comes back `rejected` — one
+bad id never loses the rest of the batch.
+
+A plan that has been assigned to anyone can no longer be edited or deleted
+(`409`). Its charges are frozen copies of the installments as they stood, so
+an edit would only make the plan and the money tell different stories — write
+a new plan instead.
+
+### The ledger
+
+The money is an **append-only ledger** (`payment_ledger`), exactly like the
+meal one: every field `READONLY`, and **no code path anywhere that updates or
+deletes a line**. A ledger line that can be edited or dropped silently
+rewrites a family's financial history with no trace of the rewrite, so a
+mistake is corrected by appending the **opposing line**, which leaves both the
+mistake and the correction visible.
+
+Four kinds, and the sign lives in the `kind` — amounts are always stored
+positive:
+
+| Kind       | Sign | What it records                                  | `source` points at |
+| ---------- | ---- | ------------------------------------------------ | ------------------ |
+| `charge`   | −1   | An installment billed by a plan assignment       | the assignment     |
+| `credit`   | +1   | Money received, against one named charge         | the charge paid    |
+| `reversal` | +1   | A `charge` or `refund` entered in error, undone  | the undone line    |
+| `refund`   | −1   | Money handed back, against one named payment     | the credit returned |
+
+**No balance is stored, anywhere.** It is always derived:
+
+```text
+balance = SUM(credit) + SUM(reversal) - SUM(charge) - SUM(refund)
+```
+
+in **minor units** (kuruş) as an `i64` — no float, no decimal, at any layer. A
+*negative* balance means the family owes the school; a positive one is money on
+account.
+
+- **A payment names the charge it settles.** `POST /payments/credits` takes
+  `{charge_id, amount_minor, method?, note?}`: allocation is *recorded*, never
+  inferred from a balance, so a statement can say which installment is still
+  open rather than only how much is outstanding. **Partial payments are the
+  norm** — several credits accumulate against one charge.
+- **A refund names the payment it returns.** `POST /payments/refunds` takes
+  `{credit_id, …}`, partials allowed, capped by what that credit was worth.
+  This is also the **only** way a mistaken credit is corrected: a credit is
+  never reversed, so money leaving the school is always spelled the one way.
+- **A reversal only undoes a `charge` or a `refund`**, for its exact amount and
+  nothing else (`400` on any other kind). It is keyed `<line>_r`, so a line has
+  at most one reversal however often the call is retried, and the reversed line
+  itself stays on the record beside it.
+- **A refund frees the charge's room.** The cap on a payment is folded over the
+  target's whole source subtree, so refunding a payment gives that charge its
+  room back and the charge **can be paid again** — and reversing that refund
+  takes the room back with it. Money that came back out is not money the school
+  still holds.
+- **The over-payment cap is advisory.** The `409` past a charge's or a credit's
+  worth is a cross-record fold taken under a process-local lock, and with two
+  replicas serving, two payments recorded in the same instant can together
+  overshoot. That is accepted deliberately: this is human data entry at an
+  office desk, not a concurrent machine load, the outcome is an over-paid
+  charge that is plainly visible in the statement, and it is undone by
+  appending a refund. Both lines are true records of money that really
+  arrived — refusing them would be the worse lie.
+- **There is no payment gateway and no card data, ever**, and none is planned:
+  nothing here talks to a bank, a PSP, or a card network. `method` is free text
+  ("cash", "havale", …) describing how money that already arrived was handed
+  over, and `note` is whatever the office needs to remember (a receipt number,
+  say).
+
+### Statements, balances and `overdue`
+
+`GET /payments/ledger/{user}` is the raw lines, newest first, paged.
+`GET /payments/statement/me` and `/payments/statement/{user}` are the
+**per-charge rollup**: one row per charge with its plan, the installment's
+amount and due date, what it collected, what went back out, what is still
+outstanding, whether the charge itself was reversed (such a charge owes
+nothing), and whether it is **`overdue`** — still owed, and its `due_at` has
+passed.
+
+All of that is folded from the raw lines **on every request and stored
+nowhere**, `overdue` included. There is no overdue flag, no sweep that sets
+one, and no stored rollup: a stored rollup is a second version of the truth,
+and the ledger is the first. `GET /payments/balance/me` and
+`/payments/balance/{user}` are the same fold reduced to one number.
 
 ## Exam modes, attempts, retakes, rejoin & live monitoring
 
@@ -2418,6 +2560,15 @@ src/
     meal_ledger.rs MealLedgerId · MealLedgerKind · LedgerAmount · LedgerMethod ·
                    LedgerNote · MealLedger (append-only money; the balance is
                    always the fold, never a stored field)
+    fee_plan.rs    FeePlanId · FeePlanName · Installment · FeePlan (a school fee
+                   plan; installments embedded on the row, past due dates legal)
+    fee_plan_assignment.rs FeePlanAssignmentId · FeePlanAssignment (one plan on
+                   one student, keyed `<plan>_<student>`; assigning appends
+                   every installment charge, a replay appends nothing)
+    payment_ledger.rs PaymentLedgerId · PaymentLedgerKind · PaymentLedger
+                   (append-only school fees: charge/credit/reversal/refund, a
+                   credit names its charge and a refund its credit; the balance
+                   is always the fold; over-payment cap is advisory)
     settings.rs    ExamKindDef · GradeBand · Settings (per-school policy)
     chatbot_thread.rs ChatbotThreadId · ChatbotThreadTitle · ChatbotThread (one
                    chatbot thread, private to its owner)
@@ -2459,7 +2610,7 @@ src/
     auth.rs  users.rs  notes.rs  messages.rs  events.rs  appointments.rs
     courses.rs  subjects.rs  sessions.rs  exams.rs  homework.rs  questions.rs
     bank_questions.rs  marks.rs  work.rs  pomodoro.rs  attendance.rs
-    settings.rs  terms.rs  meals.rs  ai.rs  chatbot.rs
+    settings.rs  terms.rs  meals.rs  payments.rs  ai.rs  chatbot.rs
     limits.rs      GET /limits: every constant.rs bound served as JSON
 ```
 
