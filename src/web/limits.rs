@@ -220,6 +220,21 @@ struct MealLimits {
     ledger_kinds: Vec<&'static str>,
 }
 
+/// School payments: fee plans, their assignment, and the payment ledger. Money
+/// is **minor units** (kuruş) as an integer, and one ledger line is capped by
+/// the same `max_ledger_amount_minor` the meal ledger publishes.
+#[derive(Serialize, ToSchema)]
+struct PaymentLimits {
+    max_plan_name_len: usize,
+    /// How many installments one fee plan may schedule.
+    max_plan_installments: usize,
+    /// How many students one bulk assignment may name.
+    max_assign_students: usize,
+    /// The only accepted payment-ledger `kind` values.
+    #[schema(example = json!(["charge", "credit", "reversal", "refund"]))]
+    ledger_kinds: Vec<&'static str>,
+}
+
 /// The AI chatbot. Each range bounds the matching `/settings` knob; the live
 /// values are on `GET /settings`.
 #[derive(Serialize, ToSchema)]
@@ -304,6 +319,7 @@ struct LimitsResponse {
     question_pool: QuestionPoolLimits,
     appointment: AppointmentLimits,
     meal: MealLimits,
+    payment: PaymentLimits,
     chatbot: ChatbotLimits,
     settings: SettingsLimits,
     request: RequestLimits,
@@ -416,6 +432,12 @@ impl LimitsResponse {
                 booking_statuses: MEAL_BOOKING_STATUSES.to_vec(),
                 attendance_statuses: MEAL_ATTENDANCE_STATUSES.to_vec(),
                 ledger_kinds: MEAL_LEDGER_KINDS.to_vec(),
+            },
+            payment: PaymentLimits {
+                max_plan_name_len: MAX_FEE_PLAN_NAME_LEN,
+                max_plan_installments: MAX_FEE_PLAN_INSTALLMENTS,
+                max_assign_students: MAX_FEE_PLAN_ASSIGN_STUDENTS,
+                ledger_kinds: PAYMENT_LEDGER_KINDS.to_vec(),
             },
             chatbot: ChatbotLimits {
                 max_message_len: MAX_CHATBOT_MESSAGE_LEN,

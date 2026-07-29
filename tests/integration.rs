@@ -9,7 +9,7 @@ use common::{
     app_and_db, create_course, create_exam, create_exam_with, create_homework, create_session,
     create_subject, enroll, id_of, login, login_as, me_id, mem_app, send, set_role, unenroll,
 };
-use hezarfen_backend::constant::BANK_VISIBILITY_SCHOOL;
+use hezarfen_backend::constant::{BANK_VISIBILITY_SCHOOL, MAX_FEE_PLAN_ASSIGN_STUDENTS};
 use hezarfen_backend::domain::chatbot_message::ChatbotMessage;
 use hezarfen_backend::domain::chatbot_thread::ChatbotThreadId;
 use hezarfen_backend::domain::exam::ExamId;
@@ -23045,4 +23045,696 @@ async fn a_dish_never_lands_on_a_deleted_menu() {
         )
         .await;
     }
+}
+
+// --- school payments -----------------------------------------------------
+
+/// Create a fee plan as `cookie` (asserts 201); returns its id. Installments
+/// are `(amount_minor, due_at)` pairs, billed in the order given.
+async fn create_plan(
+    app: &axum::Router,
+    cookie: &str,
+    name: &str,
+    installments: &[(i64, i64)],
+) -> String {
+    let body = json!({
+        "name": name,
+        "installments": installments
+            .iter()
+            .map(|(amount, due)| json!({ "amount_minor": amount, "due_at": due }))
+            .collect::<Vec<_>>(),
+    });
+    let res = send(app, "POST", "/payments/plans", Some(cookie), Some(body)).await;
+    assert_eq!(
+        res.status,
+        StatusCode::CREATED,
+        "create plan {name}: {}",
+        res.body
+    );
+    id_of(&res.body)
+}
+
+/// Place `students` on `plan` (no assertion — the per-student outcomes are
+/// what most of these tests are about).
+async fn assign_plan(
+    app: &axum::Router,
+    cookie: &str,
+    plan: &str,
+    students: &[&str],
+) -> common::Res {
+    send(
+        app,
+        "POST",
+        &format!("/payments/plans/{plan}/assignments"),
+        Some(cookie),
+        Some(json!({ "student_ids": students })),
+    )
+    .await
+}
+
+/// One student's ledger lines, newest first (asserts 200).
+async fn ledger_of(app: &axum::Router, cookie: &str, student: &str) -> Vec<serde_json::Value> {
+    let res = send(
+        app,
+        "GET",
+        &format!("/payments/ledger/{student}"),
+        Some(cookie),
+        None,
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::OK,
+        "ledger of {student}: {}",
+        res.body
+    );
+    common::items(&res.body).clone()
+}
+
+/// The id of the student's `charge` line worth exactly `amount_minor`.
+async fn charge_worth(app: &axum::Router, cookie: &str, student: &str, amount: i64) -> String {
+    let lines = ledger_of(app, cookie, student).await;
+    let line = lines
+        .iter()
+        .find(|line| line["kind"] == "charge" && line["amount_minor"] == amount)
+        .unwrap_or_else(|| panic!("no charge worth {amount} in {lines:?}"));
+    id_of(line)
+}
+
+/// Record money in against `charge` (no assertion).
+async fn pay(app: &axum::Router, cookie: &str, charge: &str, amount: i64) -> common::Res {
+    send(
+        app,
+        "POST",
+        "/payments/credits",
+        Some(cookie),
+        Some(json!({ "charge_id": charge, "amount_minor": amount })),
+    )
+    .await
+}
+
+/// Hand money back against `credit` (no assertion).
+async fn refund(app: &axum::Router, cookie: &str, credit: &str, amount: i64) -> common::Res {
+    send(
+        app,
+        "POST",
+        "/payments/refunds",
+        Some(cookie),
+        Some(json!({ "credit_id": credit, "amount_minor": amount })),
+    )
+    .await
+}
+
+/// Undo `line` (no assertion).
+async fn reverse(app: &axum::Router, cookie: &str, line: &str) -> common::Res {
+    send(
+        app,
+        "POST",
+        "/payments/reversals",
+        Some(cookie),
+        Some(json!({ "line_id": line })),
+    )
+    .await
+}
+
+/// Row count of `table`, straight from the database. The in-memory engine
+/// drops writes under concurrency and still answers `201`, so a response is
+/// never proof that a line landed — stored state is.
+async fn pay_row_count(db: &hezarfen_backend::database::Database, table: &str) -> usize {
+    let mut result = db
+        .query(format!("SELECT VALUE id FROM {table}"))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    result
+        .take::<Vec<surrealdb::types::RecordId>>(0)
+        .unwrap()
+        .len()
+}
+
+/// A manager, a student, and a plan the student is on — the starting point of
+/// every money test below. Returns `(manager cookie, student id, plan id)`.
+async fn billed_student(
+    app: &axum::Router,
+    db: &hezarfen_backend::database::Database,
+    installments: &[(i64, i64)],
+) -> (String, String, String) {
+    let mgr = login_as(app, db, "bursar", "manager").await;
+    let student = login(app, "ali").await;
+    let student_id = me_id(app, &student).await;
+    let plan = create_plan(app, &mgr, "Yearly", installments).await;
+    let res = assign_plan(app, &mgr, &plan, &[&student_id]).await;
+    assert_eq!(res.status, StatusCode::OK, "assign: {}", res.body);
+    (mgr, student_id, plan)
+}
+
+#[tokio::test]
+async fn fee_plans_are_manager_written_and_freeze_once_assigned() {
+    let (app, db) = app_and_db().await;
+    let mgr = login_as(&app, &db, "bursar", "manager").await;
+
+    let plan = create_plan(&app, &mgr, "Yearly", &[(10_000, 1_000), (20_000, 2_000)]).await;
+    let res = send(
+        &app,
+        "GET",
+        &format!("/payments/plans/{plan}"),
+        Some(&mgr),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["name"], "Yearly");
+    assert_eq!(res.body["installments"].as_array().unwrap().len(), 2);
+    assert_eq!(res.body["installments"][1]["amount_minor"], 20_000);
+
+    // Editing and deleting are both free while nobody is on the plan.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/payments/plans/{plan}"),
+        Some(&mgr),
+        Some(json!({ "name": "Yearly (revised)" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["name"], "Yearly (revised)");
+
+    let doomed = create_plan(&app, &mgr, "Scrapped", &[(500, 1_000)]).await;
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/payments/plans/{doomed}"),
+        Some(&mgr),
+        None,
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::NO_CONTENT,
+        "delete before assignment"
+    );
+
+    // One assignment freezes both: the charges are frozen copies, so an edit
+    // would only make the plan and the money disagree.
+    let student = login(&app, "ali").await;
+    let student_id = me_id(&app, &student).await;
+    let res = assign_plan(&app, &mgr, &plan, &[&student_id]).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/payments/plans/{plan}"),
+        Some(&mgr),
+        Some(json!({ "name": "Too late" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/payments/plans/{plan}"),
+        Some(&mgr),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+    // The refused edit changed nothing.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/payments/plans/{plan}"),
+        Some(&mgr),
+        None,
+    )
+    .await;
+    assert_eq!(res.body["name"], "Yearly (revised)");
+}
+
+#[tokio::test]
+async fn assigning_bills_every_installment_and_replays_without_billing_twice() {
+    let (app, db) = app_and_db().await;
+    let mgr = login_as(&app, &db, "bursar", "manager").await;
+    let ali = login(&app, "ali").await;
+    let ali_id = me_id(&app, &ali).await;
+    let veli = login(&app, "veli").await;
+    let veli_id = me_id(&app, &veli).await;
+
+    let plan = create_plan(
+        &app,
+        &mgr,
+        "Yearly",
+        &[(10_000, 1_000), (20_000, 2_000), (30_000, 3_000)],
+    )
+    .await;
+    let res = assign_plan(&app, &mgr, &plan, &[&ali_id, &veli_id]).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let outcomes = res.body.as_array().expect("one outcome per student");
+    assert_eq!(outcomes.len(), 2);
+    assert!(outcomes.iter().all(|o| o["status"] == "assigned"));
+
+    // 2 students × 3 installments, counted in the database — a 200 is not
+    // evidence that six lines landed.
+    assert_eq!(pay_row_count(&db, "payment_ledger").await, 6);
+    assert_eq!(pay_row_count(&db, "fee_plan_assignment").await, 2);
+
+    // The same call again: reported as a replay, and it bills nothing.
+    let res = assign_plan(&app, &mgr, &plan, &[&ali_id, &veli_id]).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert!(
+        res.body
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|o| o["status"] == "already_assigned"),
+        "{}",
+        res.body
+    );
+    assert_eq!(
+        pay_row_count(&db, "payment_ledger").await,
+        6,
+        "a replayed assignment must not append a second set of charges"
+    );
+    assert_eq!(pay_row_count(&db, "fee_plan_assignment").await, 2);
+}
+
+#[tokio::test]
+async fn partial_payments_accumulate_up_to_the_charge_and_no_further() {
+    let (app, db) = app_and_db().await;
+    let (mgr, student_id, _) = billed_student(&app, &db, &[(100, 1_000)]).await;
+    let charge = charge_worth(&app, &mgr, &student_id, 100).await;
+
+    assert_eq!(
+        pay(&app, &mgr, &charge, 40).await.status,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        pay(&app, &mgr, &charge, 60).await.status,
+        StatusCode::CREATED
+    );
+    let res = pay(&app, &mgr, &charge, 1).await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+
+    // The refused payment left no line behind: 1 charge + 2 credits.
+    assert_eq!(pay_row_count(&db, "payment_ledger").await, 3);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/payments/balance/{student_id}"),
+        Some(&mgr),
+        None,
+    )
+    .await;
+    assert_eq!(res.body["balance_minor"], 0, "paid in full");
+}
+
+#[tokio::test]
+async fn a_refund_frees_the_room_it_took_and_a_reversal_takes_it_back() {
+    let (app, db) = app_and_db().await;
+    let (mgr, student_id, _) = billed_student(&app, &db, &[(100, 1_000)]).await;
+    let charge = charge_worth(&app, &mgr, &student_id, 100).await;
+
+    let credit = pay(&app, &mgr, &charge, 100).await;
+    assert_eq!(credit.status, StatusCode::CREATED);
+    let credit_id = id_of(&credit.body);
+
+    let refunded = refund(&app, &mgr, &credit_id, 100).await;
+    assert_eq!(refunded.status, StatusCode::CREATED, "{}", refunded.body);
+    let refund_id = id_of(&refunded.body);
+
+    // Money handed back is money owed again, so the charge is payable again.
+    let again = pay(&app, &mgr, &charge, 100).await;
+    assert_eq!(
+        again.status,
+        StatusCode::CREATED,
+        "a refunded charge must be payable again: {}",
+        again.body
+    );
+
+    // Undoing the refund says the money never left — the room it freed is
+    // taken back, and a further payment is over-paying.
+    assert_eq!(
+        reverse(&app, &mgr, &refund_id).await.status,
+        StatusCode::CREATED
+    );
+    let res = pay(&app, &mgr, &charge, 1).await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+}
+
+#[tokio::test]
+async fn reversal_undoes_a_charge_once_and_refuses_a_payment() {
+    let (app, db) = app_and_db().await;
+    let (mgr, student_id, _) = billed_student(&app, &db, &[(100, 1_000)]).await;
+    let charge = charge_worth(&app, &mgr, &student_id, 100).await;
+
+    let first = reverse(&app, &mgr, &charge).await;
+    assert_eq!(first.status, StatusCode::CREATED, "{}", first.body);
+    // Keyed `<line>_r`, so a retry reverses the same line rather than again.
+    let replay = reverse(&app, &mgr, &charge).await;
+    assert_eq!(replay.status, StatusCode::CREATED, "{}", replay.body);
+    assert_eq!(id_of(&replay.body), id_of(&first.body));
+    assert_eq!(
+        pay_row_count(&db, "payment_ledger").await,
+        2,
+        "a replayed reversal must not append a second line"
+    );
+
+    // A mistaken payment is corrected with a refund, never a reversal.
+    let (mgr2, other_id, _) = {
+        let student = login(&app, "veli").await;
+        let other_id = me_id(&app, &student).await;
+        let plan = create_plan(&app, &mgr, "Second", &[(100, 1_000)]).await;
+        assign_plan(&app, &mgr, &plan, &[&other_id]).await;
+        (mgr.clone(), other_id, plan)
+    };
+    let other_charge = charge_worth(&app, &mgr2, &other_id, 100).await;
+    let credit = pay(&app, &mgr2, &other_charge, 100).await;
+    let credit_id = id_of(&credit.body);
+    let res = reverse(&app, &mgr2, &credit_id).await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+
+    let refunded = refund(&app, &mgr2, &credit_id, 100).await;
+    assert_eq!(refunded.status, StatusCode::CREATED);
+    let res = reverse(&app, &mgr2, &id_of(&refunded.body)).await;
+    assert_eq!(
+        res.status,
+        StatusCode::CREATED,
+        "a refund may be reversed: {}",
+        res.body
+    );
+}
+
+#[tokio::test]
+async fn the_statement_reports_overdue_and_its_rollup_matches_the_balance() {
+    let (app, db) = app_and_db().await;
+    let future = Timestamp::now().as_millis() + 30 * 24 * 60 * 60 * 1000;
+    // One installment already past due, one not.
+    let (mgr, student_id, _) = billed_student(&app, &db, &[(100, 1_000), (200, future)]).await;
+
+    let statement = |cookie: String, who: String| {
+        let app = app.clone();
+        async move {
+            let res = send(
+                &app,
+                "GET",
+                &format!("/payments/statement/{who}"),
+                Some(&cookie),
+                None,
+            )
+            .await;
+            assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+            res.body
+        }
+    };
+
+    let body = statement(mgr.clone(), student_id.clone()).await;
+    let row = |body: &serde_json::Value, amount: i64| {
+        body["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["amount_minor"] == amount)
+            .unwrap_or_else(|| panic!("no statement row worth {amount}"))
+            .clone()
+    };
+    let overdue = row(&body, 100);
+    assert_eq!(overdue["plan_name"], "Yearly");
+    assert_eq!(overdue["outstanding_minor"], 100);
+    assert_eq!(
+        overdue["overdue"], true,
+        "unpaid and its due date has passed"
+    );
+    assert_eq!(row(&body, 200)["overdue"], false, "not due yet");
+    assert_eq!(body["balance_minor"], -300);
+
+    // Pay the overdue one off, then hand a quarter of it back.
+    let charge = charge_worth(&app, &mgr, &student_id, 100).await;
+    let credit = pay(&app, &mgr, &charge, 100).await;
+    let body = statement(mgr.clone(), student_id.clone()).await;
+    let settled = row(&body, 100);
+    assert_eq!(settled["credited_minor"], 100);
+    assert_eq!(settled["outstanding_minor"], 0);
+    assert_eq!(settled["overdue"], false, "settled, however late it was");
+
+    assert_eq!(
+        refund(&app, &mgr, &id_of(&credit.body), 25).await.status,
+        StatusCode::CREATED
+    );
+    let body = statement(mgr.clone(), student_id.clone()).await;
+    let clawed_back = row(&body, 100);
+    assert_eq!(clawed_back["credited_minor"], 100);
+    assert_eq!(clawed_back["refunded_minor"], 25);
+    // 100 billed - 100 paid + 25 handed back, and owed again means overdue again.
+    assert_eq!(clawed_back["outstanding_minor"], 25);
+    assert_eq!(clawed_back["overdue"], true);
+    assert_eq!(body["balance_minor"], -225);
+
+    // The student's own statement is the same document, and the balance
+    // endpoint agrees with the fold behind it.
+    let student = send(
+        &app,
+        "POST",
+        "/auth/login",
+        None,
+        Some(json!({ "username": "ali", "password": "secret1" })),
+    )
+    .await
+    .cookie
+    .unwrap();
+    let own = send(&app, "GET", "/payments/statement/me", Some(&student), None).await;
+    assert_eq!(own.status, StatusCode::OK);
+    assert_eq!(own.body["balance_minor"], -225);
+    assert_eq!(own.body["entries"].as_array().unwrap().len(), 2);
+    let own = send(&app, "GET", "/payments/balance/me", Some(&student), None).await;
+    assert_eq!(own.body["balance_minor"], -225);
+}
+
+#[tokio::test]
+async fn payment_reads_are_self_parent_or_manager_and_writes_are_manager_only() {
+    let (app, db) = app_and_db().await;
+    let admin = login_as(&app, &db, "boss", "admin").await;
+    let teacher = login_as(&app, &db, "teacher", "teacher").await;
+    let parent = login_as(&app, &db, "mom", "parent").await;
+    let parent_id = me_id(&app, &parent).await;
+    let ali = login(&app, "ali").await;
+    let ali_id = me_id(&app, &ali).await;
+    let veli = login(&app, "veli").await;
+    let veli_id = me_id(&app, &veli).await;
+
+    // Mom is tied to Ali only.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/users/{parent_id}/students"),
+        Some(&admin),
+        Some(json!({ "user_id": ali_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    let plan = create_plan(&app, &admin, "Yearly", &[(100, 1_000)]).await;
+    assert_eq!(
+        assign_plan(&app, &admin, &plan, &[&ali_id, &veli_id])
+            .await
+            .status,
+        StatusCode::OK
+    );
+    let charge = charge_worth(&app, &admin, &ali_id, 100).await;
+
+    let reads = |who: &str| {
+        [
+            format!("/payments/ledger/{who}"),
+            format!("/payments/statement/{who}"),
+            format!("/payments/balance/{who}"),
+        ]
+    };
+    for uri in reads(&ali_id) {
+        // Own record, always.
+        assert_eq!(
+            send(&app, "GET", &uri, Some(&ali), None).await.status,
+            StatusCode::OK,
+            "{uri} as the student themselves"
+        );
+        // A live parent link, and manager+.
+        assert_eq!(
+            send(&app, "GET", &uri, Some(&parent), None).await.status,
+            StatusCode::OK,
+            "{uri} as the linked parent"
+        );
+        assert_eq!(
+            send(&app, "GET", &uri, Some(&admin), None).await.status,
+            StatusCode::OK,
+            "{uri} as an admin"
+        );
+        // Not a teacher: what a family owes the school is not classroom
+        // information, so this is narrower than every other per-student report.
+        assert_eq!(
+            send(&app, "GET", &uri, Some(&teacher), None).await.status,
+            StatusCode::FORBIDDEN,
+            "{uri} as a teacher"
+        );
+    }
+    for uri in reads(&veli_id) {
+        // Another student's record: not the student, not the unlinked parent.
+        assert_eq!(
+            send(&app, "GET", &uri, Some(&ali), None).await.status,
+            StatusCode::FORBIDDEN,
+            "{uri} as another student"
+        );
+        assert_eq!(
+            send(&app, "GET", &uri, Some(&parent), None).await.status,
+            StatusCode::FORBIDDEN,
+            "{uri} as a parent with no link to them"
+        );
+    }
+
+    // Writes — and the plan routes, which are money administration end to end.
+    for cookie in [&ali, &parent, &teacher] {
+        assert_eq!(
+            send(&app, "GET", "/payments/plans", Some(cookie), None)
+                .await
+                .status,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            send(
+                &app,
+                "POST",
+                "/payments/plans",
+                Some(cookie),
+                Some(
+                    json!({ "name": "Mine", "installments": [{ "amount_minor": 1, "due_at": 0 }] })
+                ),
+            )
+            .await
+            .status,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            assign_plan(&app, cookie, &plan, &[&ali_id]).await.status,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            pay(&app, cookie, &charge, 1).await.status,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            refund(&app, cookie, &charge, 1).await.status,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            reverse(&app, cookie, &charge).await.status,
+            StatusCode::FORBIDDEN
+        );
+    }
+    // Nothing above landed: one charge per student, and no other line.
+    assert_eq!(pay_row_count(&db, "payment_ledger").await, 2);
+}
+
+#[tokio::test]
+async fn payment_lists_page_through_the_envelope() {
+    let (app, db) = app_and_db().await;
+    let mgr = login_as(&app, &db, "bursar", "manager").await;
+    for n in 0..3 {
+        create_plan(&app, &mgr, &format!("Plan {n}"), &[(100, 1_000)]).await;
+    }
+    let plan = create_plan(&app, &mgr, "Shared", &[(100, 1_000), (200, 2_000)]).await;
+    let mut students = Vec::new();
+    for name in ["ali", "veli", "ayse"] {
+        let cookie = login(&app, name).await;
+        students.push(me_id(&app, &cookie).await);
+    }
+    let ids: Vec<&str> = students.iter().map(String::as_str).collect();
+    assert_eq!(
+        assign_plan(&app, &mgr, &plan, &ids).await.status,
+        StatusCode::OK
+    );
+
+    let res = send(
+        &app,
+        "GET",
+        "/payments/plans?limit=2&offset=0",
+        Some(&mgr),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 4);
+    assert_eq!(common::items(&res.body).len(), 2);
+    assert_eq!(res.body["limit"], 2);
+    assert_eq!(res.body["offset"], 0);
+
+    let res = send(
+        &app,
+        "GET",
+        &format!("/payments/plans/{plan}/assignments?limit=2&offset=2"),
+        Some(&mgr),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 3);
+    assert_eq!(
+        common::items(&res.body).len(),
+        1,
+        "tail returns the remainder"
+    );
+
+    let student = &students[0];
+    let res = send(
+        &app,
+        "GET",
+        &format!("/payments/ledger/{student}?limit=1&offset=0"),
+        Some(&mgr),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 2, "both installments were billed");
+    assert_eq!(common::items(&res.body).len(), 1);
+    // Unpaged is still the whole list.
+    assert_eq!(ledger_of(&app, &mgr, student).await.len(), 2);
+}
+
+#[tokio::test]
+async fn assignment_rejects_a_non_student_without_billing_anyone() {
+    let (app, db) = app_and_db().await;
+    let mgr = login_as(&app, &db, "bursar", "manager").await;
+    let teacher = login_as(&app, &db, "teacher", "teacher").await;
+    let teacher_id = me_id(&app, &teacher).await;
+    let ali = login(&app, "ali").await;
+    let ali_id = me_id(&app, &ali).await;
+
+    let plan = create_plan(&app, &mgr, "Yearly", &[(100, 1_000)]).await;
+    let res = assign_plan(&app, &mgr, &plan, &[&teacher_id, &ali_id]).await;
+    assert_eq!(
+        res.status,
+        StatusCode::OK,
+        "one bad id never loses the batch"
+    );
+    let outcomes = res.body.as_array().unwrap();
+    assert_eq!(outcomes[0]["student_id"], teacher_id.as_str());
+    assert_eq!(outcomes[0]["status"], "rejected");
+    assert_eq!(outcomes[0]["reason"], "no such student");
+    assert_eq!(outcomes[1]["status"], "assigned");
+
+    // Only the student was billed, and only the student was placed.
+    assert_eq!(pay_row_count(&db, "payment_ledger").await, 1);
+    assert_eq!(pay_row_count(&db, "fee_plan_assignment").await, 1);
+    assert!(ledger_of(&app, &mgr, &teacher_id).await.is_empty());
+}
+
+#[tokio::test]
+async fn bulk_assignment_is_capped_at_two_hundred_students() {
+    let (app, db) = app_and_db().await;
+    let mgr = login_as(&app, &db, "bursar", "manager").await;
+    let plan = create_plan(&app, &mgr, "Yearly", &[(100, 1_000)]).await;
+
+    let too_many: Vec<String> = (0..MAX_FEE_PLAN_ASSIGN_STUDENTS + 1)
+        .map(|n| format!("nobody{n}"))
+        .collect();
+    let ids: Vec<&str> = too_many.iter().map(String::as_str).collect();
+    let res = assign_plan(&app, &mgr, &plan, &ids).await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+    // Refused whole, not partly: nothing was written before the count check.
+    assert_eq!(pay_row_count(&db, "fee_plan_assignment").await, 0);
+    assert_eq!(pay_row_count(&db, "payment_ledger").await, 0);
 }

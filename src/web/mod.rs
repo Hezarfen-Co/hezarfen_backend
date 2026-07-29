@@ -20,6 +20,7 @@ pub mod marks;
 pub mod meals;
 pub mod messages;
 pub mod notes;
+pub mod payments;
 pub mod pomodoro;
 pub mod questions;
 pub mod sessions;
