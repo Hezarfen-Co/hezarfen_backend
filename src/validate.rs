@@ -3,10 +3,10 @@
 
 use crate::constant::{
     COURSE_KINDS, EXAM_MODES, HOMEWORK_STATUSES, MAX_EMAIL_LEN, MAX_EXAM_ATTEMPTS,
-    MAX_EXAM_DURATION_MS, MAX_MARK, MAX_PASSWORD_LEN, MAX_PHONE_DIGITS, MAX_QUESTION_POINTS,
-    MAX_USERNAME_LEN, MIN_EXAM_DURATION_MS, MIN_MARK, MIN_PASSWORD_LEN, MIN_PHONE_DIGITS,
-    MIN_QUESTION_POINTS, MIN_USERNAME_LEN, QUESTION_KINDS, UNLIMITED_EXAM_ATTEMPTS,
-    USERNAME_SEPARATORS,
+    MAX_EXAM_DURATION_MS, MAX_MARK, MAX_PASSWORD_LEN, MAX_PAYMENT_REQUEST_KEY_LEN,
+    MAX_PHONE_DIGITS, MAX_QUESTION_POINTS, MAX_USERNAME_LEN, MIN_EXAM_DURATION_MS, MIN_MARK,
+    MIN_PASSWORD_LEN, MIN_PHONE_DIGITS, MIN_QUESTION_POINTS, MIN_USERNAME_LEN, QUESTION_KINDS,
+    UNLIMITED_EXAM_ATTEMPTS, USERNAME_SEPARATORS,
 };
 use crate::error::ValidationError;
 
@@ -193,6 +193,32 @@ pub fn validate_phone(value: &str) -> Result<(), ValidationError> {
         return Err(ValidationError::Invalid {
             field: "phone",
             reason: "must contain 7 to 15 digits",
+        });
+    }
+    Ok(())
+}
+
+/// A client-chosen idempotence key. It is concatenated into a record id whose
+/// parts are joined by `_`, so the charset is an allowlist that **excludes the
+/// separator itself**: a key containing `_` could spell another id's grammar
+/// (a refund keyed `abc_r` would derive the id a reversal of that refund must
+/// own), and two different ids meeting is money landing on the wrong line.
+pub fn validate_request_key(value: &str) -> Result<(), ValidationError> {
+    let len = value.chars().count();
+    if len == 0 {
+        return Err(ValidationError::Empty("request_key"));
+    }
+    if len > MAX_PAYMENT_REQUEST_KEY_LEN {
+        return Err(ValidationError::TooLong {
+            field: "request_key",
+            max: MAX_PAYMENT_REQUEST_KEY_LEN,
+            got: len,
+        });
+    }
+    if !value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err(ValidationError::Invalid {
+            field: "request_key",
+            reason: "may contain only letters, digits and '-'",
         });
     }
     Ok(())
@@ -395,6 +421,25 @@ mod tests {
         assert!(validate_phone("1234567890123456").is_err()); // 16 digits, too many
         assert!(validate_phone("call-me-maybe").is_err()); // letters
         assert!(validate_phone("55+5123456").is_err()); // + only allowed in front
+    }
+
+    #[tokio::test]
+    async fn request_key_rules() {
+        assert!(validate_request_key("invoice-2026-114").is_ok());
+        assert!(validate_request_key(&"x".repeat(MAX_PAYMENT_REQUEST_KEY_LEN)).is_ok());
+        assert!(validate_request_key("").is_err());
+        assert!(validate_request_key(&"x".repeat(MAX_PAYMENT_REQUEST_KEY_LEN + 1)).is_err());
+        // `_` is the record-id separator, so a key carrying one could spell
+        // another line's id: `abc_r` under a refund is the id that refund's
+        // reversal must own, and `a_kr_b` under a charge is the id of a refund
+        // against that charge's `a`-keyed credit.
+        assert!(validate_request_key("abc_r").is_err());
+        assert!(validate_request_key("a_kr_b").is_err());
+        // Anything that could break — or alias — a record id.
+        assert!(validate_request_key("a b").is_err());
+        assert!(validate_request_key("a:b").is_err());
+        assert!(validate_request_key("a/b").is_err());
+        assert!(validate_request_key("naïve").is_err());
     }
 
     #[tokio::test]

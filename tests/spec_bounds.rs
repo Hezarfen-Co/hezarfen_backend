@@ -724,6 +724,13 @@ fn expectations() -> Vec<(&'static str, &'static str, &'static str, i64)> {
             "maxLength",
             MAX_LEDGER_NOTE_LEN as i64,
         ),
+        ("RecordPayment", "request_key", "minLength", 1),
+        (
+            "RecordPayment",
+            "request_key",
+            "maxLength",
+            MAX_PAYMENT_REQUEST_KEY_LEN as i64,
+        ),
         ("RecordRefund", "amount_minor", "minimum", 1),
         (
             "RecordRefund",
@@ -742,6 +749,13 @@ fn expectations() -> Vec<(&'static str, &'static str, &'static str, i64)> {
             "note",
             "maxLength",
             MAX_LEDGER_NOTE_LEN as i64,
+        ),
+        ("RecordRefund", "request_key", "minLength", 1),
+        (
+            "RecordRefund",
+            "request_key",
+            "maxLength",
+            MAX_PAYMENT_REQUEST_KEY_LEN as i64,
         ),
         (
             "RecordReversal",

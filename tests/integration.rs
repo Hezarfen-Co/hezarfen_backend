@@ -23145,6 +23145,42 @@ async fn refund(app: &axum::Router, cookie: &str, credit: &str, amount: i64) -> 
     .await
 }
 
+/// Record money in against `charge`, carrying a client idempotence key.
+async fn pay_keyed(
+    app: &axum::Router,
+    cookie: &str,
+    charge: &str,
+    amount: i64,
+    key: &str,
+) -> common::Res {
+    send(
+        app,
+        "POST",
+        "/payments/credits",
+        Some(cookie),
+        Some(json!({ "charge_id": charge, "amount_minor": amount, "request_key": key })),
+    )
+    .await
+}
+
+/// Hand money back against `credit`, carrying a client idempotence key.
+async fn refund_keyed(
+    app: &axum::Router,
+    cookie: &str,
+    credit: &str,
+    amount: i64,
+    key: &str,
+) -> common::Res {
+    send(
+        app,
+        "POST",
+        "/payments/refunds",
+        Some(cookie),
+        Some(json!({ "credit_id": credit, "amount_minor": amount, "request_key": key })),
+    )
+    .await
+}
+
 /// Undo `line` (no assertion).
 async fn reverse(app: &axum::Router, cookie: &str, line: &str) -> common::Res {
     send(
@@ -23450,7 +23486,7 @@ async fn the_statement_reports_overdue_and_its_rollup_matches_the_balance() {
 
     let body = statement(mgr.clone(), student_id.clone()).await;
     let row = |body: &serde_json::Value, amount: i64| {
-        body["entries"]
+        body["entries"]["items"]
             .as_array()
             .unwrap()
             .iter()
@@ -23505,7 +23541,7 @@ async fn the_statement_reports_overdue_and_its_rollup_matches_the_balance() {
     let own = send(&app, "GET", "/payments/statement/me", Some(&student), None).await;
     assert_eq!(own.status, StatusCode::OK);
     assert_eq!(own.body["balance_minor"], -225);
-    assert_eq!(own.body["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(own.body["entries"]["items"].as_array().unwrap().len(), 2);
     let own = send(&app, "GET", "/payments/balance/me", Some(&student), None).await;
     assert_eq!(own.body["balance_minor"], -225);
 }
@@ -23630,6 +23666,170 @@ async fn payment_reads_are_self_parent_or_manager_and_writes_are_manager_only() 
     }
     // Nothing above landed: one charge per student, and no other line.
     assert_eq!(pay_row_count(&db, "payment_ledger").await, 2);
+}
+
+/// A client retry after a network timeout must not charge a family twice. The
+/// key is what makes the retry the *same* line, so the interesting case is a
+/// payment that filled its charge exactly: the cap, consulted first, would
+/// refuse precisely the payment that landed.
+#[tokio::test]
+async fn a_replayed_request_key_returns_the_same_payment_instead_of_a_second_one() {
+    let (app, db) = app_and_db().await;
+    let (mgr, student_id, _) =
+        billed_student(&app, &db, &[(100, 1_000), (60, 2_000), (30, 3_000)]).await;
+    let charge = |amount| {
+        let app = app.clone();
+        let mgr = mgr.clone();
+        let student_id = student_id.clone();
+        async move { charge_worth(&app, &mgr, &student_id, amount).await }
+    };
+    let full = charge(100).await;
+
+    // This payment fills the charge to the penny.
+    let first = pay_keyed(&app, &mgr, &full, 100, "receipt-114").await;
+    assert_eq!(first.status, StatusCode::CREATED, "{}", first.body);
+    assert_eq!(pay_row_count(&db, "payment_ledger").await, 4);
+
+    let replay = pay_keyed(&app, &mgr, &full, 100, "receipt-114").await;
+    assert_eq!(
+        replay.status,
+        StatusCode::CREATED,
+        "a replay of a cap-filling payment must return the line, not a 409: {}",
+        replay.body
+    );
+    assert_eq!(id_of(&replay.body), id_of(&first.body));
+    assert_eq!(
+        pay_row_count(&db, "payment_ledger").await,
+        4,
+        "the replay must not append a second credit"
+    );
+
+    // The same key for different money is a client bug, not a replay.
+    let mismatch = pay_keyed(&app, &mgr, &full, 50, "receipt-114").await;
+    assert_eq!(mismatch.status, StatusCode::CONFLICT, "{}", mismatch.body);
+    assert_eq!(pay_row_count(&db, "payment_ledger").await, 4);
+
+    // Two different keys are two payments, and the cap still applies to them.
+    let sixty = charge(60).await;
+    let a = pay_keyed(&app, &mgr, &sixty, 30, "a").await;
+    let b = pay_keyed(&app, &mgr, &sixty, 30, "b").await;
+    assert_eq!(a.status, StatusCode::CREATED);
+    assert_eq!(b.status, StatusCode::CREATED, "{}", b.body);
+    assert_ne!(id_of(&a.body), id_of(&b.body));
+    assert_eq!(
+        pay_keyed(&app, &mgr, &sixty, 1, "c").await.status,
+        StatusCode::CONFLICT,
+        "a fresh key does not buy room the charge does not have"
+    );
+    assert_eq!(pay_row_count(&db, "payment_ledger").await, 6);
+
+    // No key: the old semantics stay exactly as they were — two identical
+    // posts are two payments, because a desk taking the same amount twice is.
+    let thirty = charge(30).await;
+    let one = pay(&app, &mgr, &thirty, 10).await;
+    let two = pay(&app, &mgr, &thirty, 10).await;
+    assert_eq!(one.status, StatusCode::CREATED);
+    assert_eq!(two.status, StatusCode::CREATED);
+    assert_ne!(id_of(&one.body), id_of(&two.body));
+    assert_eq!(pay_row_count(&db, "payment_ledger").await, 8);
+}
+
+#[tokio::test]
+async fn a_replayed_request_key_returns_the_same_refund_instead_of_a_second_one() {
+    let (app, db) = app_and_db().await;
+    let (mgr, student_id, _) = billed_student(&app, &db, &[(100, 1_000)]).await;
+    let charge = charge_worth(&app, &mgr, &student_id, 100).await;
+    let credit = pay(&app, &mgr, &charge, 100).await;
+    let credit_id = id_of(&credit.body);
+
+    let first = refund_keyed(&app, &mgr, &credit_id, 100, "back-1").await;
+    assert_eq!(first.status, StatusCode::CREATED, "{}", first.body);
+    assert_eq!(pay_row_count(&db, "payment_ledger").await, 3);
+
+    // The refund used the credit up, so the cap would refuse a second one —
+    // the replay must still answer with the line that exists.
+    let replay = refund_keyed(&app, &mgr, &credit_id, 100, "back-1").await;
+    assert_eq!(replay.status, StatusCode::CREATED, "{}", replay.body);
+    assert_eq!(id_of(&replay.body), id_of(&first.body));
+    assert_eq!(pay_row_count(&db, "payment_ledger").await, 3);
+
+    let mismatch = refund_keyed(&app, &mgr, &credit_id, 25, "back-1").await;
+    assert_eq!(mismatch.status, StatusCode::CONFLICT, "{}", mismatch.body);
+    assert_eq!(pay_row_count(&db, "payment_ledger").await, 3);
+
+    // The balance is what it was after the single refund: money out once.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/payments/balance/{student_id}"),
+        Some(&mgr),
+        None,
+    )
+    .await;
+    assert_eq!(res.body["balance_minor"], -100);
+}
+
+/// The statement pages its per-charge rows — but the money it reports is folded
+/// from every line, so `balance_minor` must not move between pages.
+#[tokio::test]
+async fn the_statement_pages_its_rows_without_moving_the_balance() {
+    let (app, db) = app_and_db().await;
+    let (mgr, student_id, _) =
+        billed_student(&app, &db, &[(100, 1_000), (60, 2_000), (30, 3_000)]).await;
+    let statement = |query: &str| {
+        let app = app.clone();
+        let uri = format!("/payments/statement/{student_id}{query}");
+        let mgr = mgr.clone();
+        async move {
+            let res = send(&app, "GET", &uri, Some(&mgr), None).await;
+            assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+            res.body
+        }
+    };
+
+    let all = statement("").await;
+    assert_eq!(all["entries"]["items"].as_array().unwrap().len(), 3);
+    assert_eq!(all["entries"]["total"], 3);
+    assert_eq!(all["balance_minor"], -190);
+
+    let head = statement("?limit=2&offset=0").await;
+    assert_eq!(head["entries"]["items"].as_array().unwrap().len(), 2);
+    assert_eq!(head["entries"]["total"], 3);
+    assert_eq!(head["entries"]["limit"], 2);
+    assert_eq!(head["entries"]["offset"], 0);
+    assert_eq!(head["balance_minor"], -190);
+
+    let tail = statement("?limit=2&offset=2").await;
+    assert_eq!(
+        tail["entries"]["items"].as_array().unwrap().len(),
+        1,
+        "the tail returns the remainder"
+    );
+    assert_eq!(tail["balance_minor"], -190, "every page folds every line");
+    // The window is a slice of one order, so the pages do not overlap.
+    let page_ids = |body: &serde_json::Value| {
+        body["entries"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["charge_id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    let mut seen = page_ids(&head);
+    seen.extend(page_ids(&tail));
+    seen.sort();
+    seen.dedup();
+    assert_eq!(seen.len(), 3, "two pages, three distinct charges");
+
+    let res = send(
+        &app,
+        "GET",
+        &format!("/payments/statement/{student_id}?limit=0"),
+        Some(&mgr),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
 }
 
 #[tokio::test]

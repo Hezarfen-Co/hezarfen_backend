@@ -40,6 +40,18 @@
 //!   self-heals when it is repeated. Money must never depend on a "has this
 //!   been billed yet?" scan: two concurrent requests can both read "not yet"
 //!   and both append.
+//! - **A payment or a refund is replayable when the client names it.** An
+//!   optional `request_key` keys the line `<target>_k_<key>` (or `_kr_` for a
+//!   refund), so a retry after a timeout derives the row the first attempt
+//!   wrote — same identity rule, no scan. The key is scoped by the line it
+//!   targets, so it never has to be globally unique. Without a key the id is a
+//!   fresh ulid and two identical calls are two payments, which is what a desk
+//!   taking the same amount twice really means. The **replay read happens
+//!   before the cap check** and inside [`PAYMENT_LOCK`]: the first attempt's
+//!   line is already inside what the cap folds, so checking the cap first would
+//!   refuse the very payment that landed. A key replayed with a *different*
+//!   amount or against a *different* line is a `409`, never the stored line —
+//!   returning it would hide a client bug behind a `201`.
 //!
 //! **The over-payment cap is ADVISORY (accepted race).** [`PaymentLedger::credit`]
 //! and [`PaymentLedger::refund`] refuse to take more than the line they target
@@ -60,6 +72,13 @@
 //! and both entries are true records of money that really arrived. A CAS
 //! counter row was rejected — refunding would have to decrement it, which is a
 //! stored derived balance by another name.
+//!
+//! The same replica boundary bounds the `request_key` mismatch `409`: it is a
+//! read-then-compare, so if two *first-time* posts of one key with different
+//! amounts land on two replicas at once, the loser is handed the winner's line
+//! as a `201` instead of the conflict. One line, one amount, no double charge —
+//! the guarantee that matters holds; only the "you reused a key" diagnostic is
+//! best-effort, and every retry after either has landed reports it correctly.
 
 use surrealdb::types::{AlreadyExistsError, RecordId, RecordIdKey, SurrealValue};
 use tokio::sync::Mutex;
@@ -121,12 +140,53 @@ impl PaymentLedgerId {
         ))
     }
 
+    /// The one line a `(target, request_key)` pair may ever have: `<target>_k_`
+    /// for a payment, `<target>_kr_` for a refund. Scoping the key by the line
+    /// it targets is what keeps one office's "receipt-114" from colliding with
+    /// another charge's, and the two markers keep the kinds apart the same way
+    /// `_c<n>` and `_r` do above.
+    ///
+    /// **The grammar parses uniquely because `_` joins the parts and cannot
+    /// appear inside one.** Every id here is `<ulid>_<ulid>_c<n>` optionally
+    /// followed by one `_k_<key>`, `_kr_<key>` or `_r` — plan and student keys
+    /// are ULIDs (`[0-9A-Z]` only) and a `request_key` is
+    /// [`crate::validate::validate_request_key`]'s `[A-Za-z0-9-]`, so no part
+    /// can spell a separator plus a marker. That is not decoration: a key of
+    /// `abc_r` on a refund would derive exactly the id that refund's *reversal*
+    /// must own, and the loser of that collision would be handed a line of the
+    /// wrong kind and the wrong amount, with the real reversal impossible
+    /// forever after. The ban on `_` in a key is what makes the collision
+    /// unconstructible; [`PaymentLedger::append`] re-checks the kind anyway.
+    pub fn for_request(target: &PaymentLedgerId, marker: &str, key: &PaymentRequestKey) -> Self {
+        Self(RecordId::new(
+            PAYMENT_LEDGER_TABLE,
+            format!("{}_{marker}_{}", target.key(), key.as_str()),
+        ))
+    }
+
     pub fn record(&self) -> RecordId {
         self.0.clone()
     }
 
     pub fn key(&self) -> &str {
         key_of(&self.0)
+    }
+}
+
+/// A client-chosen idempotence key for one payment or refund. Never stored as
+/// a column — it lives inside the line's record id, which is what makes a retry
+/// derive the row it already wrote instead of a second one.
+#[derive(Debug, Clone)]
+pub struct PaymentRequestKey(String);
+
+impl PaymentRequestKey {
+    pub fn try_new(value: &str) -> Result<Self, ValidationError> {
+        crate::validate::validate_request_key(value)?;
+        Ok(Self(value.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -260,9 +320,25 @@ impl PaymentLedger {
     /// "already exists". Both are read back the same way, and a conflict that
     /// turns out to have written nothing is simply tried again; no path here
     /// can write a second line, since the id is the key.
+    ///
+    /// Both read-backs check the stored line is the *kind* that was being
+    /// appended. Handing a caller someone else's row is only safe while every
+    /// id shape is unambiguous (see [`PaymentLedgerId::for_request`]); if a
+    /// future marker or a widened key charset ever let two shapes meet, this is
+    /// the check that turns silently-wrong money into a 500 instead. It should
+    /// be unreachable, and it is cheap enough to keep it that way.
     async fn append(row: PaymentLedger, db: &Database) -> Result<PaymentLedger, AppError> {
+        let same_kind = |existing: PaymentLedger| {
+            if existing.kind == row.kind {
+                Ok(existing)
+            } else {
+                Err(AppError::Internal(
+                    "a ledger id resolved to a line of another kind".into(),
+                ))
+            }
+        };
         if let Some(existing) = Self::read(&row.id, db).await? {
-            return Ok(existing);
+            return same_kind(existing);
         }
         let id = row.id.clone();
         for _ in 0..CAS_UPDATE_RETRIES {
@@ -271,7 +347,7 @@ impl PaymentLedger {
                 Ok(None) => break,
                 Err(e) if is_duplicate_record(&e) || lost_the_race(&e) => {
                     if let Some(existing) = Self::read(&id, db).await? {
-                        return Ok(existing);
+                        return same_kind(existing);
                     }
                 }
                 Err(e) => return Err(e.into()),
@@ -322,11 +398,17 @@ impl PaymentLedger {
     /// Money in, against one named `charge`. Partial payments are the norm, so
     /// a charge may collect several credits; together they may not exceed it
     /// (advisory — see the module doc's accepted race).
+    ///
+    /// With a `request_key` the line is keyed by it (see
+    /// [`PaymentLedgerId::for_request`]) and the call is retry-safe; without
+    /// one the id is a fresh ulid and two identical calls are two payments,
+    /// which is what a cash desk taking the same amount twice really means.
     pub async fn credit(
         charge: &PaymentLedger,
         amount_minor: LedgerAmount,
         method: Option<LedgerMethod>,
         note: Option<LedgerNote>,
+        request_key: Option<&PaymentRequestKey>,
         recorded_by: &UserId,
         db: &Database,
     ) -> Result<PaymentLedger, AppError> {
@@ -339,6 +421,7 @@ impl PaymentLedger {
             amount_minor,
             method,
             note,
+            request_key.map(|key| PaymentLedgerId::for_request(charge.get_id(), "k", key)),
             recorded_by,
             db,
         )
@@ -347,12 +430,14 @@ impl PaymentLedger {
 
     /// Money back out, against one named `credit` — how an over-payment or a
     /// payment recorded in error is returned. Partials allowed, and no more
-    /// than the credit was worth (advisory, same race).
+    /// than the credit was worth (advisory, same race). `request_key` makes it
+    /// retry-safe exactly as it does for [`PaymentLedger::credit`].
     pub async fn refund(
         credit: &PaymentLedger,
         amount_minor: LedgerAmount,
         method: Option<LedgerMethod>,
         note: Option<LedgerNote>,
+        request_key: Option<&PaymentRequestKey>,
         recorded_by: &UserId,
         db: &Database,
     ) -> Result<PaymentLedger, AppError> {
@@ -365,6 +450,7 @@ impl PaymentLedger {
             amount_minor,
             method,
             note,
+            request_key.map(|key| PaymentLedgerId::for_request(credit.get_id(), "kr", key)),
             recorded_by,
             db,
         )
@@ -374,6 +460,13 @@ impl PaymentLedger {
     /// The shared body of `credit` and `refund`: check the target is the kind
     /// this line may point at, then append under [`PAYMENT_LOCK`] while the
     /// target's existing children still sum below its amount.
+    ///
+    /// The replay read comes **before** the cap, and inside the lock: on a
+    /// retry the first attempt's line is already part of the subtree the cap
+    /// folds, so consulting the cap first would answer a payment that landed
+    /// with "already paid in full" — refusing precisely the request that
+    /// succeeded. Reading the id under the lock also keeps two simultaneous
+    /// retries from both walking into the cap check.
     #[allow(clippy::too_many_arguments)]
     async fn against(
         target: &PaymentLedger,
@@ -384,6 +477,7 @@ impl PaymentLedger {
         amount_minor: LedgerAmount,
         method: Option<LedgerMethod>,
         note: Option<LedgerNote>,
+        keyed: Option<PaymentLedgerId>,
         recorded_by: &UserId,
         db: &Database,
     ) -> Result<PaymentLedger, AppError> {
@@ -395,13 +489,29 @@ impl PaymentLedger {
             .into());
         }
         let _guard = PAYMENT_LOCK.lock().await;
+        if let Some(id) = &keyed
+            && let Some(existing) = Self::read(id, db).await?
+        {
+            // A replay is answered from the stored line — but only if it is the
+            // same money. The same key for a different amount or a different
+            // target is a client bug, and handing back the old line would hide
+            // it behind a `201`.
+            if existing.amount_minor.as_minor() != amount_minor.as_minor()
+                || existing.get_source_key() != Some(target.id.key())
+            {
+                return Err(AppError::Conflict(
+                    "this request_key was already used for a different amount or target",
+                ));
+            }
+            return Ok(existing);
+        }
         let taken = Self::applied_to(target, db).await?;
         if taken.saturating_add(amount_minor.as_minor()) > target.amount_minor.as_minor() {
             return Err(AppError::Conflict(over));
         }
         Self::append(
             PaymentLedger {
-                id: PaymentLedgerId::generate(),
+                id: keyed.unwrap_or_else(PaymentLedgerId::generate),
                 student: target.student.clone(),
                 kind,
                 amount_minor,
@@ -633,6 +743,30 @@ mod tests {
         );
     }
 
+    /// A `request_key` is only an idempotence key if it derives the same id
+    /// every time, and only *safe* if it is scoped by the line it targets and
+    /// tells a payment from a refund.
+    #[test]
+    fn a_request_key_is_scoped_by_its_target_and_its_kind() {
+        let charge = PaymentLedgerId::from_key("plan1_stu1_c1");
+        let other = PaymentLedgerId::from_key("plan1_stu1_c2");
+        let key = PaymentRequestKey::try_new("receipt-114").unwrap();
+        let credit = PaymentLedgerId::for_request(&charge, "k", &key);
+
+        assert_eq!(credit.key(), "plan1_stu1_c1_k_receipt-114");
+        assert_eq!(
+            PaymentLedgerId::for_request(&charge, "k", &key),
+            credit,
+            "a retry must derive the same id, or it pays twice"
+        );
+        assert_ne!(PaymentLedgerId::for_request(&other, "k", &key), credit);
+        assert_ne!(PaymentLedgerId::for_request(&charge, "kr", &key), credit);
+        assert_eq!(
+            PaymentLedgerId::for_request(&credit, "kr", &key).key(),
+            "plan1_stu1_c1_k_receipt-114_kr_receipt-114"
+        );
+    }
+
     /// Raise one charge of `amount` on a fresh student, and hand it back.
     #[cfg(test)]
     async fn one_charge(amount: i64, db: &Database) -> (PaymentLedger, UserId, UserId) {
@@ -661,6 +795,74 @@ mod tests {
         (lines.into_iter().next().unwrap(), student, manager)
     }
 
+    /// The collision the id grammar must not admit: with `_` legal in a key, a
+    /// refund keyed `abc_r` derived exactly `<refund>_r` — the id that refund's
+    /// own reversal must own — and whichever came second was handed the other's
+    /// line, of the wrong kind and the wrong amount, with the real reversal
+    /// impossible ever after. `_` is now illegal in a key, so the collision
+    /// cannot be constructed; the nearest legal key still works, and the
+    /// reversal still gets its own line.
+    #[tokio::test]
+    async fn a_keyed_refund_cannot_take_the_id_of_its_own_reversal() {
+        assert!(
+            PaymentRequestKey::try_new("abc_r").is_err(),
+            "the key that spelled a reversal's id must not parse"
+        );
+        let db = crate::database::init_mem().await.unwrap();
+        let (charge, _, manager) = one_charge(100, &db).await;
+        let key = PaymentRequestKey::try_new("abc-r").unwrap();
+        let credit = PaymentLedger::credit(
+            &charge,
+            LedgerAmount::try_new(100).unwrap(),
+            None,
+            None,
+            None,
+            &manager,
+            &db,
+        )
+        .await
+        .unwrap();
+        let refund = PaymentLedger::refund(
+            &credit,
+            LedgerAmount::try_new(100).unwrap(),
+            None,
+            None,
+            Some(&key),
+            &manager,
+            &db,
+        )
+        .await
+        .unwrap();
+        let reversal = PaymentLedger::reversal(&refund, None, &manager, &db)
+            .await
+            .unwrap();
+        assert_ne!(reversal.get_id(), refund.get_id());
+        assert_eq!(reversal.get_kind(), PaymentLedgerKind::Reversal);
+        assert_eq!(reversal.get_amount_minor().as_minor(), 100);
+
+        // And the last-ditch guard bites: an id that resolves to another kind
+        // is a 500, never that other line handed back as this one.
+        let intruder = PaymentLedger {
+            id: charge.get_id().clone(),
+            student: charge.student.clone(),
+            kind: PaymentLedgerKind::Credit,
+            amount_minor: LedgerAmount::try_new(1).unwrap(),
+            source: Some(charge.id.record()),
+            due_at: None,
+            method: None,
+            note: None,
+            recorded_by: manager.clone(),
+            created_at: Timestamp::now(),
+        };
+        assert!(
+            matches!(
+                PaymentLedger::append(intruder, &db).await,
+                Err(AppError::Internal(_))
+            ),
+            "a read-back of another kind must not pass for the appended line"
+        );
+    }
+
     /// The defect this fold replaced a plain sum for: a payment that was handed
     /// back frees the room it took, so the charge it paid can be paid again. It
     /// is the same charge, still owed — refusing the second payment would leave
@@ -673,6 +875,7 @@ mod tests {
             PaymentLedger::credit(
                 &charge,
                 LedgerAmount::try_new(amount).unwrap(),
+                None,
                 None,
                 None,
                 &manager,
@@ -690,6 +893,7 @@ mod tests {
         PaymentLedger::refund(
             &credit,
             LedgerAmount::try_new(100).unwrap(),
+            None,
             None,
             None,
             &manager,
@@ -723,6 +927,7 @@ mod tests {
             LedgerAmount::try_new(100).unwrap(),
             None,
             None,
+            None,
             &manager,
             &db,
         )
@@ -731,6 +936,7 @@ mod tests {
         let refund = PaymentLedger::refund(
             &credit,
             LedgerAmount::try_new(100).unwrap(),
+            None,
             None,
             None,
             &manager,
@@ -747,6 +953,7 @@ mod tests {
                 PaymentLedger::credit(
                     &charge,
                     LedgerAmount::try_new(100).unwrap(),
+                    None,
                     None,
                     None,
                     &manager,
@@ -797,6 +1004,7 @@ mod tests {
                 LedgerAmount::try_new(amount).unwrap(),
                 None,
                 None,
+                None,
                 &manager,
                 &db,
             )
@@ -816,6 +1024,7 @@ mod tests {
                 LedgerAmount::try_new(amount).unwrap(),
                 None,
                 None,
+                None,
                 &manager,
                 &db,
             )
@@ -833,6 +1042,7 @@ mod tests {
             PaymentLedger::credit(
                 &first,
                 LedgerAmount::try_new(1).unwrap(),
+                None,
                 None,
                 None,
                 &manager,

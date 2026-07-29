@@ -28,6 +28,7 @@ use crate::domain::fee_plan_assignment::FeePlanAssignment;
 use crate::domain::parent_link::ParentLink;
 use crate::domain::payment_ledger::{
     LedgerAmount, LedgerMethod, LedgerNote, PaymentLedger, PaymentLedgerId, PaymentLedgerKind,
+    PaymentRequestKey,
 };
 use crate::domain::role::Role;
 use crate::domain::timestamp::Timestamp;
@@ -35,7 +36,7 @@ use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
 
-use super::{CurrentUser, Page, PageParams, PersonRef, RequireManager, person_map};
+use super::{CurrentUser, Page, PageParams, PersonRef, RequireManager, paginate, person_map};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -549,6 +550,13 @@ struct RecordPayment {
     method: Option<String>,
     #[schema(max_length = 500, example = "receipt 2026-114")]
     note: Option<String>,
+    /// Optional client-chosen idempotence key, `[A-Za-z0-9-]` (no `_`: it is the
+    /// separator inside a ledger line's id). Send one and a
+    /// retry after a timeout returns the **same** line instead of recording the
+    /// money twice; omit it and two identical calls are two payments. The same
+    /// key sent with a different `amount_minor` or `charge_id` is a `409`.
+    #[schema(min_length = 1, max_length = 64, example = "receipt-2026-114")]
+    request_key: Option<String>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -563,6 +571,11 @@ struct RecordRefund {
     method: Option<String>,
     #[schema(max_length = 500)]
     note: Option<String>,
+    /// Optional client-chosen idempotence key, `[A-Za-z0-9-]` — the same
+    /// retry-safety a payment gets, keyed by the credit it returns. The same
+    /// key with a different `amount_minor` or `credit_id` is a `409`.
+    #[schema(min_length = 1, max_length = 64, example = "refund-2026-114")]
+    request_key: Option<String>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -581,10 +594,21 @@ fn note_of(raw: Option<&str>) -> Result<Option<LedgerNote>, AppError> {
     Ok(raw.map(LedgerNote::try_new).transpose()?.flatten())
 }
 
+fn request_key_of(raw: Option<&str>) -> Result<Option<PaymentRequestKey>, AppError> {
+    Ok(raw.map(PaymentRequestKey::try_new).transpose()?)
+}
+
 /// Record money received against one named charge. Allocation is recorded, not
 /// inferred: a payment always says which installment it settles. Partial
 /// payments accumulate; one that would take the charge past what it is worth is
 /// a `409`.
+///
+/// **Retry-safe on request** — send a `request_key` and a repeat of the call
+/// (a client retry after a network timeout) returns the line the first attempt
+/// wrote rather than recording the money a second time, even when that payment
+/// filled the charge exactly. The same key with a different `amount_minor` or
+/// `charge_id` is a `409`: that is a client bug, not a replay. Without a key
+/// two identical calls are two payments, as before.
 #[utoipa::path(
     post,
     path = "/credits",
@@ -597,7 +621,7 @@ fn note_of(raw: Option<&str>) -> Result<Option<LedgerNote>, AppError> {
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "No such ledger line", body = ErrorResponse),
-        (status = 409, description = "The charge is already paid in full", body = ErrorResponse),
+        (status = 409, description = "The charge is already paid in full, or the request_key was used for a different amount or charge", body = ErrorResponse),
     ),
 )]
 async fn record_payment(
@@ -611,6 +635,7 @@ async fn record_payment(
         LedgerAmount::try_new(req.amount_minor)?,
         method_of(req.method.as_deref())?,
         note_of(req.note.as_deref())?,
+        request_key_of(req.request_key.as_deref())?.as_ref(),
         manager.get_id(),
         &st.db,
     )
@@ -621,6 +646,10 @@ async fn record_payment(
 /// Hand money back, against one named payment — how an over-payment or a
 /// payment recorded in error is returned, and the only way a mistaken *credit*
 /// is corrected (a credit is never reversed). Capped by that credit's amount.
+///
+/// **Retry-safe on request** the same way a payment is: a `request_key` makes a
+/// repeat return the existing refund, and the same key with a different
+/// `amount_minor` or `credit_id` is a `409`.
 #[utoipa::path(
     post,
     path = "/refunds",
@@ -633,7 +662,7 @@ async fn record_payment(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "No such ledger line", body = ErrorResponse),
-        (status = 409, description = "The payment is already refunded in full", body = ErrorResponse),
+        (status = 409, description = "The payment is already refunded in full, or the request_key was used for a different amount or payment", body = ErrorResponse),
     ),
 )]
 async fn record_refund(
@@ -647,6 +676,7 @@ async fn record_refund(
         LedgerAmount::try_new(req.amount_minor)?,
         method_of(req.method.as_deref())?,
         note_of(req.note.as_deref())?,
+        request_key_of(req.request_key.as_deref())?.as_ref(),
         manager.get_id(),
         &st.db,
     )
@@ -782,8 +812,10 @@ struct StatementEntry {
 #[derive(Serialize, ToSchema)]
 struct StatementResponse {
     student: PersonRef,
-    /// One row per charge, newest first.
-    entries: Vec<StatementEntry>,
+    /// One row per charge, newest first, in the standard
+    /// `{items, total, limit, offset}` envelope. Paging windows these rows
+    /// only — `balance_minor` is folded from every line either way.
+    entries: Page<StatementEntry>,
     /// `credits + reversals - charges - refunds`, minor units. Negative means
     /// the family owes the school.
     #[schema(example = -100000)]
@@ -796,8 +828,14 @@ struct StatementResponse {
 /// what is still owed, and whether it is late — is computed from the raw lines
 /// at request time and stored nowhere: a stored rollup is a second version of
 /// the truth, and the ledger is the first.
+///
+/// `limit`/`offset` window the returned rows **after** the whole fold, never
+/// the lines it folds: a page of a statement must still report the same
+/// `balance_minor` (and the same overdue arithmetic) as every other page.
 async fn statement_response(
     student: &UserId,
+    limit: Option<i64>,
+    offset: i64,
     db: &Database,
 ) -> Result<Json<StatementResponse>, AppError> {
     let (lines, _) = PaymentLedger::list_for_student(student, None, 0, db).await?;
@@ -832,9 +870,16 @@ async fn statement_response(
     }
 
     let now = Timestamp::now().as_millis();
-    let entries = lines
+    // The window is taken over the charges, not over the lines: the rollup
+    // above (and the balance below) still reads every line, so a page reports
+    // exactly the arithmetic the unpaged document does.
+    let charges: Vec<&PaymentLedger> = lines
         .iter()
         .filter(|line| line.get_kind() == PaymentLedgerKind::Charge)
+        .collect();
+    let total = charges.len() as i64;
+    let entries: Vec<StatementEntry> = paginate(&charges, limit, offset)
+        .iter()
         .map(|charge| {
             let paid: Vec<&&PaymentLedger> = children
                 .get(charge.get_id().key())
@@ -885,40 +930,48 @@ async fn statement_response(
     let people = person_map(std::iter::once(student.clone()), db).await?;
     Ok(Json(StatementResponse {
         student: PersonRef::resolve(&people, student),
-        entries,
+        entries: Page::new(entries, total, limit, offset),
         balance_minor: PaymentLedger::balance_of(student, db).await?,
     }))
 }
 
-/// The caller's own statement.
+/// The caller's own statement. The per-charge rows are paged via
+/// `?limit=&offset=` (omit `limit` for all of them); `balance_minor` is the
+/// same on every page, because the fold behind it reads every line.
 #[utoipa::path(
     get,
     path = "/statement/me",
     tag = "payments",
     security(("session_cookie" = [])),
+    params(PageParams),
     responses(
         (status = 200, description = "The caller's statement", body = StatementResponse),
+        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
     ),
 )]
 async fn my_statement(
     State(st): State<AppState>,
     CurrentUser(user): CurrentUser,
+    Query(page): Query<PageParams>,
 ) -> Result<Json<StatementResponse>, AppError> {
-    statement_response(user.get_id(), &st.db).await
+    let (limit, offset) = page.resolve()?;
+    statement_response(user.get_id(), limit, offset, &st.db).await
 }
 
 /// One student's statement: a row per charge with what it collected, what went
 /// back out, what is still owed, and whether it is overdue. Own record always;
-/// otherwise manager+ or a parent link (a teacher gets a `403`).
+/// otherwise manager+ or a parent link (a teacher gets a `403`). The rows are
+/// paged via `?limit=&offset=`; `balance_minor` is the same on every page.
 #[utoipa::path(
     get,
     path = "/statement/{user}",
     tag = "payments",
     security(("session_cookie" = [])),
-    params(("user" = String, Path, description = "Student id")),
+    params(("user" = String, Path, description = "Student id"), PageParams),
     responses(
         (status = 200, description = "The student's statement", body = StatementResponse),
+        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher, or a parent link", body = ErrorResponse),
     ),
@@ -927,10 +980,12 @@ async fn user_statement(
     State(st): State<AppState>,
     CurrentUser(caller): CurrentUser,
     Path(user): Path<String>,
+    Query(page): Query<PageParams>,
 ) -> Result<Json<StatementResponse>, AppError> {
+    let (limit, offset) = page.resolve()?;
     let target = UserId::from_key(&user);
     ensure_can_read_payments(&caller, &target, &st.db).await?;
-    statement_response(&target, &st.db).await
+    statement_response(&target, limit, offset, &st.db).await
 }
 
 #[derive(Serialize, ToSchema)]
@@ -1048,6 +1103,7 @@ mod tests {
             LedgerAmount::try_new(6_000).unwrap(),
             None,
             None,
+            None,
             &manager,
             &db,
         )
@@ -1056,6 +1112,7 @@ mod tests {
         PaymentLedger::refund(
             &paid,
             LedgerAmount::try_new(1_000).unwrap(),
+            None,
             None,
             None,
             &manager,
@@ -1067,10 +1124,11 @@ mod tests {
             .await
             .unwrap();
 
-        let statement = statement_response(&student, &db).await.unwrap().0;
+        let statement = statement_response(&student, None, 0, &db).await.unwrap().0;
         let entry = |n: &str| {
             statement
                 .entries
+                .items
                 .iter()
                 .find(|entry| entry.charge_id.ends_with(n))
                 .expect("a row per charge")
