@@ -230,6 +230,9 @@ struct PaymentLimits {
     max_plan_installments: usize,
     /// How many students one bulk assignment may name.
     max_assign_students: usize,
+    /// Ceiling on the optional `request_key` that makes a credit or a refund
+    /// retry-safe; charset `[A-Za-z0-9-]` (no `_`), at least one character.
+    max_request_key_len: usize,
     /// The only accepted payment-ledger `kind` values.
     #[schema(example = json!(["charge", "credit", "reversal", "refund"]))]
     ledger_kinds: Vec<&'static str>,
@@ -437,6 +440,7 @@ impl LimitsResponse {
                 max_plan_name_len: MAX_FEE_PLAN_NAME_LEN,
                 max_plan_installments: MAX_FEE_PLAN_INSTALLMENTS,
                 max_assign_students: MAX_FEE_PLAN_ASSIGN_STUDENTS,
+                max_request_key_len: MAX_PAYMENT_REQUEST_KEY_LEN,
                 ledger_kinds: PAYMENT_LEDGER_KINDS.to_vec(),
             },
             chatbot: ChatbotLimits {

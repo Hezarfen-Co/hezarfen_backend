@@ -266,6 +266,13 @@ pub const MAX_FEE_PLAN_INSTALLMENTS: usize = 60;
 /// request's writes.
 pub const MAX_FEE_PLAN_ASSIGN_STUDENTS: usize = 200;
 
+/// Ceiling on the client-chosen `request_key` that makes a credit or a refund
+/// retry-safe: it becomes part of the ledger line's record id, so it is bounded
+/// and drawn from `[A-Za-z0-9-]` — `_` joins the parts of a ledger id, so a key
+/// carrying one could spell another line's id. Sixty-four characters take a
+/// UUID or a receipt number comfortably.
+pub const MAX_PAYMENT_REQUEST_KEY_LEN: usize = 64;
+
 /// Inclusive bounds for an exam's per-attempt duration, milliseconds
 /// (1 minute to 24 hours). Required for `async`, optional for `open`.
 pub const MIN_EXAM_DURATION_MS: i64 = 60 * 1000;

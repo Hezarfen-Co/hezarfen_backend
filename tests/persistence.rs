@@ -1689,7 +1689,7 @@ async fn fee_plans_and_their_charges_survive_remigration() {
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-    assert_eq!(res.body["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(res.body["entries"]["items"].as_array().unwrap().len(), 2);
     assert_eq!(
         res.body["balance_minor"], -400_000,
         "the charges the placement raised are still owed"

@@ -817,12 +817,12 @@ window filtering, before paging; negative values are a `400` naming the field.
 | DELETE | `/payments/plans/{id}`           | manager | Delete a plan; `409` once anyone is on it — its charges name it |
 | POST   | `/payments/plans/{id}/assignments` | manager | `{student_ids}` (≤ 200) — place the plan on students, appending **every** installment as a `charge` at once; replay-safe, reported per student as `assigned` / `already_assigned` / `rejected` |
 | GET    | `/payments/plans/{id}/assignments` | manager | Who is on this plan, newest first · paged |
-| POST   | `/payments/credits`              | manager | `{charge_id, amount_minor, method?, note?}` — record money received against one named charge; partials are the norm, `409` past what the charge is worth (advisory) |
-| POST   | `/payments/refunds`              | manager | `{credit_id, amount_minor, method?, note?}` — hand money back against one named payment; partials allowed, capped by that credit |
+| POST   | `/payments/credits`              | manager | `{charge_id, amount_minor, method?, note?, request_key?}` — record money received against one named charge; partials are the norm, `409` past what the charge is worth (advisory). A `request_key` makes the call retry-safe: a replay returns the same line, the same key for different money is a `409` |
+| POST   | `/payments/refunds`              | manager | `{credit_id, amount_minor, method?, note?, request_key?}` — hand money back against one named payment; partials allowed, capped by that credit; same `request_key` retry-safety |
 | POST   | `/payments/reversals`            | manager | `{line_id, note?}` — undo a `charge` or a `refund` for its exact amount (`400` on any other kind); idempotent, at most one reversal per line |
 | GET    | `/payments/ledger/{user}`        | student | One student's raw lines — charges, payments, refunds, reversals — newest first · paged · own id always, otherwise manager+ or a parent link (**a teacher gets a `403`**) |
-| GET    | `/payments/statement/me`         | student | The caller's own statement: a row per charge with what it collected, what went back out, what is still owed, and whether it is `overdue` |
-| GET    | `/payments/statement/{user}`     | student | One student's statement; same gate as the ledger |
+| GET    | `/payments/statement/me`         | student | The caller's own statement: a row per charge with what it collected, what went back out, what is still owed, and whether it is `overdue`. `?limit=&offset=` pages the rows (`entries` is the envelope); `balance_minor` is the same on every page |
+| GET    | `/payments/statement/{user}`     | student | One student's statement; same gate as the ledger, same row paging |
 | GET    | `/payments/balance/me`           | student | The caller's fee balance, minor units (negative = owes the school) |
 | GET    | `/payments/balance/{user}`       | student | One student's fee balance; same gate as the ledger |
 | POST   | `/chatbot/threads`            | student | `{title?}` — start a chatbot thread (every role incl. `parent`, always private to its owner); `409` at `max_chatbot_threads` |
@@ -1510,6 +1510,21 @@ account.
   `{credit_id, …}`, partials allowed, capped by what that credit was worth.
   This is also the **only** way a mistaken credit is corrected: a credit is
   never reversed, so money leaving the school is always spelled the one way.
+- **A retry is not a second payment — when the client says so.** Both routes
+  take an optional `request_key` (`[A-Za-z0-9-]`, 1 to 64 characters — `_` is
+  the separator inside a ledger id, so a key may not carry one). With
+  one, the line is keyed `<charge>_k_<key>` (a refund: `<credit>_kr_<key>`), so
+  a client retrying after a network timeout gets **the line the first attempt
+  wrote**, not a second charge on the family — idempotence by identity, the
+  same rule that keeps a replayed assignment from billing twice, never a "has
+  this been recorded yet?" scan two concurrent requests can both walk past. The
+  replay is answered **before** the over-payment cap is consulted, so a payment
+  that filled its charge to the penny still replays as itself instead of coming
+  back "already paid in full". Sending that key again with a **different**
+  `amount_minor` or a different target is a `409`, never the stored line: that
+  is a client bug, and a `201` would bury it. Omit the key and nothing changes
+  from before — two identical posts are two payments, which is exactly what a
+  desk taking the same amount twice means.
 - **A reversal only undoes a `charge` or a `refund`**, for its exact amount and
   nothing else (`400` on any other kind). It is keyed `<line>_r`, so a line has
   at most one reversal however often the call is retried, and the reversed line
@@ -1537,14 +1552,17 @@ account.
 
 `GET /payments/ledger/{user}` is the raw lines, newest first, paged.
 `GET /payments/statement/me` and `/payments/statement/{user}` are the
-**per-charge rollup**: one row per charge with its plan, the installment's
+**per-charge rollup** (its rows paged by the usual opt-in `?limit=&offset=`,
+in an `entries: {items, total, limit, offset}` envelope): one row per charge with its plan, the installment's
 amount and due date, what it collected, what went back out, what is still
 outstanding, whether the charge itself was reversed (such a charge owes
 nothing), and whether it is **`overdue`** — still owed, and its `due_at` has
 passed.
 
 All of that is folded from the raw lines **on every request and stored
-nowhere**, `overdue` included. There is no overdue flag, no sweep that sets
+nowhere**, `overdue` included. Paging windows the *returned rows* only, after
+that fold: `balance_minor` — and every row's own arithmetic — is identical on
+every page, because it is read from all of the student's lines either way. There is no overdue flag, no sweep that sets
 one, and no stored rollup: a stored rollup is a second version of the truth,
 and the ledger is the first. `GET /payments/balance/me` and
 `/payments/balance/{user}` are the same fold reduced to one number.
