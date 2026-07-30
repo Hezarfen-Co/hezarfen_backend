@@ -372,7 +372,7 @@ async fn delete_menu(
         .await?
         .ok_or(AppError::NotFound)?;
     // The seat check rides in the delete's own `WHERE` (see `Menu::delete`), so
-    // a booking landing in another replica cannot slip between the two.
+    // a concurrent booking cannot slip between the read and the delete.
     menu.delete(&st.db).await?;
     Ok(StatusCode::NO_CONTENT)
 }

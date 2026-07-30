@@ -14,7 +14,7 @@
 //!   conditional single-record write ([`cap`]). Counting the rows instead is
 //!   write-skew — SurrealDB does not conflict-check a cross-record count
 //!   against a concurrent insert — and a process-wide lock around that count
-//!   only holds inside one replica, which the school no longer runs one of.
+//!   is released around the very round trip the racing insert lands in.
 //!   Cancelling gives the seat back in the *same transaction* as the flip.
 //! - **The price is claimed, not just read.** The seat is taken at the menu
 //!   revision the price was read at, in the same transaction as the row
@@ -159,8 +159,8 @@ impl MealBooking {
     /// at, so a dish added, re-priced or removed in that gap loses the claim and
     /// the whole decision is made again on fresh figures. What is frozen onto
     /// the row is therefore always a price the menu genuinely carried at the
-    /// instant the seat was taken — the guarantee a lock could only give inside
-    /// one replica.
+    /// instant the seat was taken — a guarantee a lock around the read could
+    /// not give, since the price is read a round trip before the claim.
     ///
     /// The charge is appended after, keyed by (seat, attempt): eight concurrent
     /// `POST`s of one seat hold one seat and write one charge line. The price is

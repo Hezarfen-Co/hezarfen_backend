@@ -310,16 +310,20 @@ async fn concurrent_bursts_never_over_admit() {
     assert_eq!((ok, limited), (5, 15));
 }
 
-// --- shared across replicas --------------------------------------------
+// --- the window outlives the process ------------------------------------
 //
-// Two `UserRateLimiter`s over one database stand in for two replicas: they are
-// separate processes' worth of in-memory buckets, sharing only the `rate_limit`
-// table. Time is paused, so a round of the sync task is driven by advancing
-// past `RATE_SYNC_INTERVAL_SECS` — and because the task blocks on the database
-// (not on time) mid-round, the short sleep afterwards cannot resolve until the
-// round has finished. Assertions are on admissions, never on which replica won
-// a race: the embedded engine can drop one of two concurrent writes and still
-// answer `Ok`.
+// Two `UserRateLimiter`s over one database stand in for the process before and
+// after a restart: two separate sets of in-memory buckets sharing only the
+// `rate_limit` table, which is what stops a restart mid-window from handing
+// every client a fresh budget. Time is paused, so a round of the sync task is
+// driven by advancing past `RATE_SYNC_INTERVAL_SECS` — and because the task
+// blocks on the database (not on time) mid-round, the short sleep afterwards
+// cannot resolve until the round has finished. Assertions are on admissions,
+// never on which limiter won a race: the embedded engine can drop one of two
+// concurrent writes and still answer `Ok`.
+//
+// (The `replica` spelling below is historical — renaming test items is a code
+// change, not a doc one.)
 
 use hezarfen_backend::constant::RATE_SYNC_INTERVAL_SECS;
 use hezarfen_backend::database::Database;
@@ -351,7 +355,7 @@ async fn sync_round() {
     tokio::time::pause();
 }
 
-/// Two "replicas" of one tier, sharing `db`.
+/// Two limiters of one tier, sharing `db`.
 fn two_replicas(max: u32, db: &Database) -> (UserRateLimiter, UserRateLimiter, DbHealth) {
     let health = DbHealth::default();
     let (a, b) = (
@@ -375,13 +379,12 @@ async fn two_replicas_share_one_budget() {
     let db = shared_db().await;
     let (a, b, _health) = two_replicas(6, &db);
 
-    // Both replicas spend freely until their first sync — the accepted
-    // one-interval overshoot, and the whole reason the fleet needs the shared
-    // row at all.
+    // Each spends freely until its first sync — the accepted one-interval
+    // overshoot, and the whole reason the shared row exists at all.
     let spent = admits(&a, "user:a", 6) + admits(&b, "user:a", 6);
     assert_eq!(spent, 12, "each replica starts on its own local budget");
 
-    // From the first sync on, the fleet total is what binds: neither replica
+    // From the first sync on, the shared total is what binds: neither limiter
     // admits anything more in this window, whatever the interleaving was.
     sync_round().await;
     assert_eq!(
@@ -424,7 +427,7 @@ async fn a_down_database_leaves_each_replica_on_its_local_budget() {
     health.set(false);
 
     // Nothing is shared while the database is down — and nothing stalls: both
-    // replicas keep serving their own budgets at full speed.
+    // limiters keep serving their own budgets at full speed.
     for _ in 0..3 {
         sync_round().await;
         assert_eq!(admits(&a, "user:a", 1), 1);

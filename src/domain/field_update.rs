@@ -63,7 +63,8 @@ impl FieldUpdate {
     /// handler made against its snapshot is re-made by the database at write
     /// time, against the row as it is *then*: two PATCHes each moving one end,
     /// each fine on its own, cannot commit an inverted range between them. That
-    /// is what an in-process `Mutex` used to buy, and this holds across replicas.
+    /// is what an in-process `Mutex` used to buy, without a window between the
+    /// snapshot and the write for a concurrent request to slip into.
     ///
     /// Call it after the `.set()`s of both fields. A PATCH that moves neither
     /// end emits no guard at all (nothing to race), matching the lock window it

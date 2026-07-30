@@ -15,7 +15,6 @@
 //! * [`chat`] — the JSON payloads carried for the `chat.reply` capability
 //! * [`server`] — the listener, handshake, and [`server::AiBridge::dispatch`]
 //! * [`registry`] — who is connected here, and who gets the next request
-//! * [`presence`] — who is connected *anywhere*, for a cross-replica gate
 //! * [`tls`] — the listener's certificate
 //!
 //! The transport is generic; the features land on top of it. So far that is
@@ -23,7 +22,6 @@
 
 pub mod chat;
 pub mod error;
-pub mod presence;
 pub mod protocol;
 pub mod registry;
 pub mod server;

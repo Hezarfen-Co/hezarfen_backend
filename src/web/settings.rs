@@ -331,7 +331,7 @@ async fn update_settings(
         // only while nothing references the name and refuses every claim from
         // that instant on. That is the whole guard: the check and the removal
         // used to be a cross-table count and a save held together by a
-        // process-wide lock, which the second replica walked straight through.
+        // process-wide lock that was released around the round trip between them.
         //
         // Retired before the save, never after: the other order leaves a window
         // in which a mark lands under a kind the settings no longer list. A save

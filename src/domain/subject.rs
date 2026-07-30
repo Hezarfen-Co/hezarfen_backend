@@ -170,10 +170,10 @@ impl Subject {
     /// delete with a 409. That refusal is the delete's own `WHERE`, read off the
     /// two reference counters this row carries
     /// ([`crate::constant::SUBJECT_QUESTION_COUNT_FIELD`] and its homework
-    /// twin), which is what makes it hold when the question is created on
-    /// another replica — the cross-table `SELECT … LIMIT 1` it replaces was a
-    /// count-then-delete no transaction serializes, pinned by three
-    /// process-wide locks that only ever served one process.
+    /// twin), which is what makes it hold against a question created by a
+    /// request racing this one — the cross-table `SELECT … LIMIT 1` it replaces
+    /// was a count-then-delete no transaction serializes, pinned by three
+    /// process-wide locks that could not cover the round trip between them.
     ///
     /// Which of the two blocked is read off the counters *before* the delete,
     /// purely to pick the message; the decision itself was already made by the

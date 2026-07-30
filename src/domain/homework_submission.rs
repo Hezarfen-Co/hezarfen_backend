@@ -116,7 +116,7 @@ impl HomeworkSubmission {
     /// could let two concurrent first-submits pick different stamps and 500.
     ///
     /// The `WHERE` is the freeze: [`SUBMISSION_OPEN_GUARD`] makes "not graded
-    /// yet" a condition of this very write instead of a read the grading replica
+    /// yet" a condition of this very write instead of a read a concurrent grade
     /// can land behind. An absent row satisfies it (the stamp is `NONE` there
     /// too), so a first submit still creates.
     pub async fn upsert(
@@ -285,7 +285,7 @@ mod tests {
     /// The freeze, as stored state rather than as a race: the grade stamps the
     /// submission row, and from then on the submission's own writes fail their
     /// condition — no read of `homework_result` involved, which is what makes it
-    /// hold when the grader is in the other replica. Un-grading clears the stamp
+    /// hold when the grade lands mid-request. Un-grading clears the stamp
     /// and the row is writable again.
     ///
     /// Bite check: drop `WHERE graded_by_result = NONE` from

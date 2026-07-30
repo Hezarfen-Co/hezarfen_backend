@@ -408,14 +408,14 @@ student's budget on another's. `0` disables it like the other two. It is
 charged before anything is written, so a `429` leaves no trace (see
 "Chatbot").
 
-All three tiers are **fleet-wide, not per replica**. Admission stays in memory
-(no request ever waits on the database to be let in), and a background task in
-each replica folds its new admits into one shared `rate_limit` row per tier +
-client + minute every 2 seconds, then caps itself by the total that comes back.
-Two replicas therefore enforce one budget, with one caveat: within a single
-2-second interval a client that reaches both can spend up to the tier's budget
-on each before the shared total tightens them. If the database is down the
-tiers simply fall back to their own local budgets — nobody is refused for it.
+All three tiers admit from memory — no request ever waits on the database to be
+let in — but the window **outlives the process**. A background task folds each
+tier's new admits into one shared `rate_limit` row per tier + client + minute
+every 2 seconds, then caps the in-memory bucket by the total that comes back,
+so a restart mid-minute does not hand every client a fresh budget. One caveat:
+a just-started process can spend up to the tier's budget in the 2 seconds
+before its first fold tightens it. If the database is down the tiers simply
+fall back to their own local budgets — nobody is refused for it.
 
 Behind a reverse proxy every connection carries the proxy's address, so also
 set `TRUST_PROXY=true` to key clients by the rightmost `X-Forwarded-For` entry
@@ -1006,8 +1006,8 @@ A booking is `pending`, `approved`, `rejected`, or `cancelled`. The first two
 are **live** and hold the slot; rejecting or cancelling frees it for someone
 else immediately (the slot carries an `occupied` counter, taken by a booking
 and handed back in the same transaction as the reject or cancel that settles
-it, so the guard holds across replicas). The
-decisions:
+it, so the seat is decided by the database rather than by a count two
+concurrent bookings can both read as free). The decisions:
 
 - `PATCH /{id}/approve` — the slot's teacher (or manager+) confirms. Refused
   (`409`) when the effective window has already started.
@@ -1547,14 +1547,14 @@ account.
   room back and the charge **can be paid again** — and reversing that refund
   takes the room back with it. Money that came back out is not money the school
   still holds.
-- **The over-payment cap is advisory.** The `409` past a charge's or a credit's
-  worth is a cross-record fold taken under a process-local lock, and with two
-  replicas serving, two payments recorded in the same instant can together
-  overshoot. That is accepted deliberately: this is human data entry at an
-  office desk, not a concurrent machine load, the outcome is an over-paid
-  charge that is plainly visible in the statement, and it is undone by
-  appending a refund. Both lines are true records of money that really
-  arrived — refusing them would be the worse lie.
+- **The over-payment cap is not the database's.** The `409` past a charge's or
+  a credit's worth is a cross-record fold, which SurrealDB cannot enforce on
+  its own; it holds because the backend is one process and the fold, and the
+  append it authorizes, are taken under one lock. Should an over-payment ever
+  be recorded anyway it is not a crisis: this is human data entry at an office
+  desk, the outcome is an over-paid charge that is plainly visible in the
+  statement, and it is undone by appending a refund. Both lines are true
+  records of money that really arrived — refusing them would be the worse lie.
 - **There is no payment gateway and no card data, ever**, and none is planned:
   nothing here talks to a bank, a PSP, or a card network. `method` is free text
   ("cash", "havale", …) describing how money that already arrived was handed
@@ -2376,39 +2376,32 @@ agree about `truncated` exactly as they do about every other field.
 | `404` | no such thread or message — or not the caller's |
 | `409` | already at `max_chatbot_threads`; delete a thread first |
 | `429` | over `RATE_LIMIT_CHATBOT_PER_MINUTE` messages/minute for this **user**; see `Retry-After` |
-| `503` | no service anywhere in the deployment offers `chat.reply` — **nothing was written**, retry later |
+| `503` | no connected service offers `chat.reply` — **nothing was written**, retry later |
 
 The `503` ordering matters: availability is checked before the rows exist, so
 an unavailable service leaves no dead `pending` row behind, and the rate limit
-is charged before that, so a refused turn leaves no trace at all. The check
-asks two questions — is a `chat.reply` worker connected to *this* backend
-process, and failing that, is one connected to any other — so a deployment
-running several backends accepts a turn as long as one of them can answer it.
-
-### A turn is a claimed job
-
-The `pending` assistant row *is* the work item. Backend processes poll it: a
-process holding a `chat.reply` worker claims an unanswered turn, dispatches it
-over its own connection, and stamps the result. That is why a `202` is a real
-promise — a backend restart no longer strands the turn it had just accepted,
-and a turn accepted by a process with no worker of its own is answered by one
-that has. The cost is up to ~200 ms before the request leaves for the service.
-A claim whose owner disappears is taken back after 90 seconds.
+is charged before that, so a refused turn leaves no trace at all. The check is
+the backend's own worker registry, which owns the QUIC sockets and is therefore
+the whole truth about what can be answered.
 
 ### A turn always settles
 
 Once the two rows exist the answer never stays `pending` forever, through
 three independent mechanisms:
 
-- the process that claimed the turn stamps `complete` or `failed` — the normal
-  path, and a claim its owner never finishes is retried by another;
+- the task that owns the bridge round trip stamps `complete` or `failed` —
+  the normal path;
 - a reader **projects** a `pending` row older than 300 seconds as
   `failed`/`timed_out` (a read-time projection, not a write — the row is left
   for the task that may still own it);
 - a **boot sweep** flips every leftover `pending` past the 300-second horizon
   to `failed`/`interrupted`, which is what a process death mid-inference looks
-  like. It leaves rows another process has claimed recently alone, so a
-  restarting backend cannot shoot down a turn its peer is answering.
+  like. Younger rows are left alone, since one may still be in flight.
+
+A restart therefore loses a turn that was in flight: it settles
+`failed`/`interrupted` rather than being answered. Accepted — the backend is a
+single process with stop-the-world deploys, so there is no peer that could have
+taken it over.
 
 Two more verdicts come from inspecting the answer: an **empty** reply is
 reported as `failed`/`empty_reply` (a blank bubble is indistinguishable from a
@@ -2460,13 +2453,21 @@ context without either end having to be redeployed in lockstep.
 
 ## Concurrency model
 
-The backend runs as more than one replica against one database, so every
-invariant is guarded where all replicas can see it. Three tiers:
+The backend runs as **one process against one database**, and that buys less
+than it sounds like: every request is an async task, dozens are in flight at
+once, and each of them awaits the database in the middle of its work. So
+"read, decide, write" is never safe on its own — SurrealDB does not
+conflict-check a cross-record `count()` against a concurrent insert
+(write-skew), and that fires between two tasks in one process exactly as it
+would between two machines. The mutex-only design this replaced was already
+losing races at one process. Every invariant is therefore guarded where the
+database itself decides the winner. Three tiers:
 
 1. **Single-row conditional writes** — compare-and-set (`save_if_unchanged`),
-   `UPDATE … WHERE`, stored counters (`domain::cap`), leases. These hold
-   *across replicas*: the database decides the winner, the loser retries or
-   gets a 409.
+   `UPDATE … WHERE`, stored counters (`domain::cap`). A single-record write is
+   atomic, so of N concurrent tasks exactly the allowed number get a non-empty
+   result: the database decides the winner, the loser retries
+   (`CAS_UPDATE_RETRIES`) or gets a 409.
 2. **In-transaction `IF … THROW` gates** — the check runs inside the same
    statement as the write it authorizes, so it is atomic with it. Used where
    the rule reads the row being written (state machines, delete guards).
@@ -2480,24 +2481,32 @@ invariant is guarded where all replicas can see it. Three tiers:
    are claimed in one transaction (`cap::claim_and_create`), so a duplicate
    `CREATE` rolls its own seat back instead of costing a stranger their place.
 3. **Two accepted races**, reviewed and deliberately left open:
-   - *Attempt-seq late save* — a save racing a retake can stamp an answer onto
-     the just-terminal previous sitting. Damage: one history row; the grade of
-     record (latest `seq`) is never touched.
-   - *Approved-overlap* — two replicas approving in the same instant can
+   - *Attempt-seq late save* — an exam-room socket writes into the sitting it
+     joined with, a choice made before any lock is taken, so a save racing a
+     retake can stamp an answer onto the just-terminal previous sitting.
+     Damage: one history row; the grade of record (latest `seq`) is never
+     touched.
+   - *Approved-overlap* — two approvals landing in the same instant can
      double-book a teacher. Damage: one overlapping half-hour, visible to both
      parties, fixable by cancelling either side.
 
-In-process locks that remain do so for reasons a database write cannot serve:
-`PRESENCE_LOCK` guards in-process socket state, `CLAIM_LOCK` keeps one
-counter writer per process (the `WHERE` clause is the cap — the lock only
-tames the retry loop, and keeps the tests' in-memory engine deterministic),
-`APPOINTMENT_LOCK` still collapses the common within-replica overlap case.
+In-process locks remain, and they are a *second* line, never the guarantee:
+`PRESENCE_LOCK` guards in-process socket state (there is no row to conditional
+-write), `CLAIM_LOCK` keeps one counter writer at a time (the `WHERE` clause is
+the cap — the lock only tames the retry loop, and keeps the tests' in-memory
+engine deterministic), `APPOINTMENT_LOCK` collapses the common overlap case in
+front of a rule no single-record write can express. Removing one of them costs
+throughput or an accepted race; removing the conditional write behind it costs
+the invariant.
 
-Deployment contract: a release that adds or renames a stored counter must
-restart *all* replicas together (`podman compose down` + `up`), never rolling.
-An old binary writes rows without touching the new counters, the `= NONE`
-backfill guard (correctly) refuses to re-seed, and the resulting permanent
-under-count lets a guard approve exactly what it exists to refuse.
+Boot is unconditional: the schema batches, the backfills and the admin seed all
+run on every start, because exactly one process ever starts. Deployment is
+stop-the-world — `podman compose down` then `up`, never overlapping — and a
+release that adds or renames a stored counter *requires* it. An old binary
+writes rows without touching the new counter, the `= NONE` backfill guard
+(correctly) refuses to re-seed, and the resulting permanent under-count lets a
+guard approve exactly what it exists to refuse. In-flight work does not survive
+a restart either: a chatbot turn mid-inference settles `failed`/`interrupted`.
 
 ## Layout
 
@@ -2532,10 +2541,10 @@ src/
                    Generator, so same-millisecond rows never scramble
     key.rs         sitting(): the deterministic per-sitting record key shared by
                    attempts, answers, answer images and results (seq 1 stays bare)
-    cap.rs         claim()/release(): the cross-replica count caps — an atomic
-                   `UPDATE parent SET n += 1 WHERE n < cap` on a counter column
-                   of the parent row, replacing the per-process mutexes that
-                   only held while one instance owned the database;
+    cap.rs         claim()/release(): the count caps the database enforces — an
+                   atomic `UPDATE parent SET n += 1 WHERE n < cap` on a counter
+                   column of the parent row, replacing count-then-write mutexes
+                   that could not see a concurrent insert;
                    claim_and_create() commits that seat and the child row in
                    one transaction, for children with a deterministic id
     text_fold.rs   case- and diacritic-insensitive folding for search, shared by
@@ -2647,7 +2656,7 @@ src/
 
 Tests: `cargo test` — unit (in-source), integration (`tower::oneshot` + in-memory
 db), rate-limit (both tiers, proxy-header and peer-address keying, shipped
-limits over every route, two "replicas" sharing one budget over one db), e2e
+limits over every route, two limiters sharing one budget over one db), e2e
 (real TCP + reqwest cookie jar), persistence
 (tempfile file engine, including close + reopen), ai-bridge (real QUIC on
 loopback against a fake AI service), ai-protocol (the `hab/1` wire contract,

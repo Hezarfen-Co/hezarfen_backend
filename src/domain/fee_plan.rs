@@ -199,9 +199,9 @@ impl FeePlan {
 
     /// Has this plan ever been assigned? The 409 guard on edit and delete.
     ///
-    /// A scan, and deliberately so: it races an assign landing in the same
-    /// instant on the other replica, which can leave a plan edited *and*
-    /// assigned. Accepted — both versions of the plan were manager-approved,
+    /// A scan, and deliberately so: it races an assign landing in the gap
+    /// between this read and the edit it licenses, which can leave a plan edited
+    /// *and* assigned. Accepted — both versions of the plan were manager-approved,
     /// and the charges the assign raised are frozen copies either way, so no
     /// money moves behind anyone's back.
     pub async fn has_assignments(id: &FeePlanId, db: &Database) -> Result<bool, AppError> {

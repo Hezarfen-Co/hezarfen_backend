@@ -165,7 +165,7 @@ async fn marks_release_their_kind_when_they_are_deleted() {
 /// The claim's `WHERE`, the other half of the same race: once the kind is out
 /// of the list, a mark can no longer land under it. Whichever of the two
 /// writes reaches the counter first, the other is refused — which is what makes
-/// the pair safe with two replicas and no shared lock.
+/// the pair safe without a lock spanning both writes.
 #[tokio::test]
 async fn a_removed_kind_refuses_a_grade() {
     let school = school_with_kinds(&["lab", "quiz"]).await;

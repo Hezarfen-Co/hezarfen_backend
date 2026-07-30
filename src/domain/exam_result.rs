@@ -24,7 +24,8 @@ pub(crate) fn draft_error() -> AppError {
 /// that name, and whether the school has retired it (see
 /// [`crate::domain::cap`]). Keyed by the name itself: the kind is snapshotted
 /// text on the exam, and this row is what makes "a kind nothing is graded under
-/// may be removed" a decision two replicas can share.
+/// may be removed" a decision the database takes, not a count a concurrent mark
+/// can invalidate.
 pub(crate) fn kind_ref(kind: &str) -> RecordId {
     RecordId::new(KIND_REF_TABLE, kind)
 }

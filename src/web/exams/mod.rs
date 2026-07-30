@@ -71,10 +71,11 @@ impl Scheduled for Exam {
 
 /// Serializes the exam subsystem's cross-record check-then-writes, which
 /// `BEGIN…COMMIT` cannot (write skew) — the reasoning in [`crate::domain::cap`].
-/// **Replica-local**: it orders requests inside one process only, and the
-/// backend runs as two, so every invariant that could be moved into the
-/// database has been. What is left needs a cross-record read and a write held
-/// together, which no single statement expresses:
+/// It orders requests, but only around what it wraps — every invariant that
+/// could be moved into the database itself has been, so a gap between a read
+/// and its write is decided by the store. What is left here needs a
+/// cross-record read and a write held together, which no single statement
+/// expresses:
 ///
 /// Read side — the answer saves (REST and the exam room), from the
 /// writable-attempt gate through the upsert; the grade write (draft gate
@@ -402,11 +403,11 @@ async fn update_exam(
     // *Reader* lease of [`EXAM_LOCK`] for exactly one pairing: the mode gate
     // below reads `exam_attempt`, and an attempt start takes the *writer*
     // lease, so a first sitting still cannot land between that gate and the
-    // write — replica-locally, as it always did.
+    // write, as it always did.
     //
     // It buys nothing against grading, which is a reader too: the re-draft gate
     // is therefore enforced inside the update's own transaction
-    // (`Exam::update_if_unchanged`), where it holds across replicas. The gate
+    // (`Exam::update_if_unchanged`), where the store decides it. The gate
     // below stays as the pre-flight — same error, one round trip earlier.
     // Concurrent PATCHes of this exam no longer queue behind each other either:
     // the lost update they used to cause is refused by the compare-and-set.

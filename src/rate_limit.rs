@@ -25,23 +25,22 @@
 //! an accepted trade-off for an implementation simple enough to read in one
 //! sitting; argon2 keeps each allowed login attempt expensive anyway.
 //!
-//! # Across replicas
+//! # The shared window
 //!
-//! The counters above are per process, and the backend runs as two replicas —
-//! so a client hitting both got twice its budget. [`RateLimiter::share`] closes
-//! that: a background task folds each bucket's new admits into one shared row
-//! per tier + client + wall window (`rate_limit`, see
+//! The counters above are per process. [`RateLimiter::share`] also carries them
+//! through the process: a background task folds each bucket's new admits into
+//! one shared row per tier + client + wall window (`rate_limit`, see
 //! [`crate::constant::RATE_LIMIT_TABLE`]) every
-//! [`crate::constant::RATE_SYNC_INTERVAL_SECS`], and the fleet-wide total that
-//! comes back caps what the local bucket admits for the rest of that window.
+//! [`crate::constant::RATE_SYNC_INTERVAL_SECS`], and the stored total that
+//! comes back caps what the local bucket admits for the rest of that window —
+//! so a restart mid-window does not hand every client a fresh budget.
 //!
 //! Admission itself stays in memory and stays synchronous — no request ever
 //! waits on the database to be let in, and a database that is down or slow
 //! costs nothing but the sharing (the tiers fall back to their local budgets
-//! rather than failing anyone). The cost is a lag: within one interval a
-//! replica can spend up to its own full budget before the shared total tells
-//! it to stop, so the fleet's worst case is `replicas × max` for one interval
-//! and `max` from then on.
+//! rather than failing anyone). The cost is a lag: a process that has just
+//! started can spend up to its own full budget for one interval before the
+//! shared total tells it to stop.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -111,7 +110,7 @@ struct Bucket {
     /// row. Never above `count`, so `count - pushed` is what is still ours to
     /// report.
     pushed: u32,
-    /// The fleet-wide total the last sync read back — everyone's admits,
+    /// The stored total the last sync read back — every admit in this window,
     /// `pushed` included. Zero until a sync lands, which is what makes an
     /// unshared limiter behave exactly like the local-only one it replaced.
     remote: u32,
@@ -133,9 +132,9 @@ impl Bucket {
         }
     }
 
-    /// Requests the whole fleet has spent in this window as far as this process
-    /// can tell: what every replica had reported at the last sync, plus our own
-    /// admits since. Equals `count` until a sync lands.
+    /// Requests spent in this window as far as this process can tell: what the
+    /// shared row held at the last sync — this process's earlier life included —
+    /// plus our own admits since. Equals `count` until a sync lands.
     fn spent(&self) -> u32 {
         self.remote.saturating_add(self.count - self.pushed)
     }
@@ -259,9 +258,9 @@ impl<K> RateLimiter<K>
 where
     K: Eq + Hash + Clone + std::fmt::Display + Send + Sync + 'static,
 {
-    /// Make this tier's budget fleet-wide: every
-    /// [`RATE_SYNC_INTERVAL_SECS`] a background task reports what this replica
-    /// has admitted and reads back what everyone has, which caps further local
+    /// Make this tier's budget outlive the process: every
+    /// [`RATE_SYNC_INTERVAL_SECS`] a background task reports what this limiter
+    /// has admitted and reads back the window's total, which caps further local
     /// admits in the same window (see the module docs).
     ///
     /// `tier` names the counter's namespace in the shared table — two limiters
@@ -309,7 +308,7 @@ where
 }
 
 /// Fold every live bucket's new admits into its shared row and take the
-/// fleet-wide total back.
+/// window's total back.
 ///
 /// One statement per bucket in one query, and each statement is its own
 /// transaction — so a statement that loses a write race fails alone. Its bucket
@@ -392,9 +391,9 @@ async fn sync_once<K: Eq + Hash + Clone + std::fmt::Display>(
     }
 }
 
-/// The wall-clock window a shared row is keyed by, aligned so every replica
-/// agrees on it — the local windows cannot be used for this, since each one
-/// starts whenever that client's first request happened to land.
+/// The wall-clock window a shared row is keyed by, aligned so a restarted
+/// process lands on the same one — the local windows cannot be used for this,
+/// since each starts whenever that client's first request happened to land.
 fn current_epoch(window: Duration) -> i64 {
     let ms = i64::try_from(window.as_millis()).unwrap_or(i64::MAX).max(1);
     Timestamp::now().as_millis().div_euclid(ms) * ms

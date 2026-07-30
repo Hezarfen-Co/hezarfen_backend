@@ -44,11 +44,11 @@ use super::{
 
 /// Serializes the homework subsystem's cross-record check-then-writes, which
 /// `BEGIN…COMMIT` cannot (write skew) — the same reasoning as
-/// [`crate::web::exams::EXAM_LOCK`]. It is a *within-replica* guard only, so
-/// the rule it can no longer be trusted with is the freeze: a graded submission
-/// used to stay unedited because the "no grade yet" read and the write it
-/// licensed sat under one lease, which two processes never shared. That rule
-/// moved into the database — grading stamps
+/// [`crate::web::exams::EXAM_LOCK`]. It orders requests but cannot cover a
+/// round trip, so the rule it can no longer be trusted with is the freeze: a
+/// graded submission used to stay unedited because the "no grade yet" read and
+/// the write it licensed sat under one lease, with the database consulted in
+/// between. That rule moved into the database — grading stamps
 /// [`crate::constant::SUBMISSION_GRADED_FIELD`] on the submission row and every
 /// student-side write carries `graded_by_result = NONE` as its own condition.
 ///
@@ -633,8 +633,7 @@ async fn submit(
     // The graded gate, twice over. This read answers the common case — graded
     // minutes ago, and the student who never submitted has no row to carry the
     // freeze; the upsert's own `WHERE` (the grade stamp on the row) is what
-    // holds when the grade lands *while* this request runs, in this replica or
-    // the other one.
+    // holds when the grade lands *while* this request runs.
     if HomeworkResult::read_for(homework.get_id(), user.get_id(), &st.db)
         .await?
         .is_some()

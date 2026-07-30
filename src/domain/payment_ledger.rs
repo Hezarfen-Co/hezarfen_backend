@@ -53,7 +53,7 @@
 //!   amount or against a *different* line is a `409`, never the stored line —
 //!   returning it would hide a client bug behind a `201`.
 //!
-//! **The over-payment cap is ADVISORY (accepted race).** [`PaymentLedger::credit`]
+//! **The over-payment cap is the lock's, not the database's.** [`PaymentLedger::credit`]
 //! and [`PaymentLedger::refund`] refuse to take more than the line they target
 //! is worth, by folding that line's whole subtree under [`PAYMENT_LOCK`]. The
 //! fold, rather than a sum of the direct children, because money handed back
@@ -63,22 +63,26 @@
 //! landing between a payment's fold and its append would admit the payment
 //! against room it no longer has.
 //!
-//! That check is a count-then-write across rows, and SurrealDB does not conflict-check
-//! a cross-record read against a concurrent insert (the write-skew this repo has
-//! hit before), while the lock is *process-local* and **two replicas serve in
-//! production** — so two payments recorded in the same instant on different
-//! replicas can together overshoot a charge. Accepted deliberately: the outcome
-//! is an over-paid charge, visible in the statement and undone by a refund,
-//! and both entries are true records of money that really arrived. A CAS
-//! counter row was rejected — refunding would have to decrement it, which is a
-//! stored derived balance by another name.
+//! The lock is what makes that check mean anything, and it is load-bearing:
+//! the fold is a count-then-write across rows, and SurrealDB does not
+//! conflict-check a cross-record read against a concurrent insert (the
+//! write-skew this repo has hit before), so a fold left unserialized would let
+//! two payments both see room and both take it. Running as one process buys
+//! nothing on its own — two request tasks interleave across the fold's `await`
+//! exactly as two machines would. The cap therefore holds only for as long as
+//! *every* write that moves this arithmetic is taken under [`PAYMENT_LOCK`];
+//! a future append that skips it re-opens the hole silently, which is why the
+//! rule is stated here rather than left to be noticed. If an over-payment ever
+//! does land it is not a crisis — an over-paid charge is plainly visible in the
+//! statement and undone by appending a refund, and both entries are true
+//! records of money that really arrived. A CAS counter row was rejected —
+//! refunding would have to decrement it, which is a stored derived balance by
+//! another name.
 //!
-//! The same replica boundary bounds the `request_key` mismatch `409`: it is a
-//! read-then-compare, so if two *first-time* posts of one key with different
-//! amounts land on two replicas at once, the loser is handed the winner's line
-//! as a `201` instead of the conflict. One line, one amount, no double charge —
-//! the guarantee that matters holds; only the "you reused a key" diagnostic is
-//! best-effort, and every retry after either has landed reports it correctly.
+//! The `request_key` mismatch `409` rides on the same lock: it is a
+//! read-then-compare, and it is read *inside* the lock, so two first-time posts
+//! of one key with different amounts cannot both walk past it. One line, one
+//! amount, no double charge, and the "you reused a key" diagnostic is exact.
 
 use surrealdb::types::{AlreadyExistsError, RecordId, RecordIdKey, SurrealValue};
 use tokio::sync::Mutex;
@@ -97,11 +101,12 @@ use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 
-/// Serializes the advisory over-payment check, the append it authorizes, and
-/// every other append that changes the arithmetic that check does — nothing
-/// else. Process-local, hence the accepted cross-replica race the module doc
-/// records. Held across no other lock, and no other lock is taken while it is
-/// held.
+/// Serializes the over-payment check, the append it authorizes, and every
+/// other append that changes the arithmetic that check does — nothing else.
+/// It is the whole guarantee behind that cap, not a convenience: the fold it
+/// protects is a cross-record read the database will not conflict-check
+/// against a concurrent insert. Held across no other lock, and no other lock is
+/// taken while it is held.
 pub(crate) static PAYMENT_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
@@ -132,7 +137,7 @@ impl PaymentLedgerId {
     }
 
     /// The one reversal a line may ever have — a retried undo appends nothing
-    /// the second time, on this replica or any other.
+    /// the second time — the id decides that, not a scan.
     pub fn for_reversal(line: &PaymentLedgerId) -> Self {
         Self(RecordId::new(
             PAYMENT_LEDGER_TABLE,
@@ -569,7 +574,7 @@ impl PaymentLedger {
     /// subtree [`PaymentLedger::applied_to`] folds, so one landing between a
     /// concurrent payment's fold and its append would let that payment be
     /// admitted against room it no longer has. The lock is what makes the cap
-    /// exact within a replica, which is the promise this module's doc makes.
+    /// exact, which is the promise this module's doc makes.
     pub async fn reversal(
         line: &PaymentLedger,
         note: Option<LedgerNote>,

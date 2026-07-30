@@ -110,13 +110,11 @@ fn parse_limit(value: Option<String>, default: u32) -> u32 {
 /// never what an operator means — so it falls back with the rest of the
 /// garbage.
 ///
-/// The ceiling is the load-bearing part, and it is enforced here because here
-/// is the only place the number enters the process. A deadline above
-/// [`AI_MAX_REQUEST_TIMEOUT_SECS`] lets one dispatch outlive
-/// `CHATBOT_CLAIM_RECLAIM_SECS`, and the chat claim queue then hands the same
-/// turn to a second worker while the first is still answering it — two
-/// inferences for one reply. Clamping at the boundary is what makes that
-/// unreachable *by configuration*, instead of true only for the default.
+/// The ceiling is enforced here because here is the only place the number
+/// enters the process. A deadline above [`AI_MAX_REQUEST_TIMEOUT_SECS`] keeps
+/// a task and a worker slot busy past the point where the answer could still
+/// be shown to anyone (see that constant), so it is clamped rather than
+/// honoured.
 fn parse_timeout(value: Option<String>, default: u64) -> u64 {
     let asked = value
         .and_then(|v| v.trim().parse().ok())
@@ -127,8 +125,8 @@ fn parse_timeout(value: Option<String>, default: u64) -> u64 {
         // reason (a queue horizon) is not one they could guess from the name.
         tracing::warn!(
             "AI_REQUEST_TIMEOUT_SECS={asked} is above the {AI_MAX_REQUEST_TIMEOUT_SECS}s ceiling \
-             the chat claim queue allows (a longer inference would be reclaimed and re-dispatched \
-             mid-flight) — using {AI_MAX_REQUEST_TIMEOUT_SECS}s"
+             (a reply that late is discarded as stale before anyone sees it) — using \
+             {AI_MAX_REQUEST_TIMEOUT_SECS}s"
         );
         return AI_MAX_REQUEST_TIMEOUT_SECS;
     }
@@ -155,7 +153,7 @@ fn parse_flag(value: Option<String>) -> bool {
 mod tests {
     use super::{parse_flag, parse_limit, parse_port, parse_timeout};
     use crate::constant::{
-        AI_DEFAULT_REQUEST_TIMEOUT_SECS, AI_MAX_REQUEST_TIMEOUT_SECS, CHATBOT_CLAIM_RECLAIM_SECS,
+        AI_DEFAULT_REQUEST_TIMEOUT_SECS, AI_MAX_REQUEST_TIMEOUT_SECS, CHATBOT_PENDING_STALE_SECS,
     };
 
     #[tokio::test]
@@ -169,19 +167,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_configured_timeout_can_never_outlive_the_chat_claim_horizon() {
-        // The one double-dispatch an operator could still reach: nothing used
-        // to stop `AI_REQUEST_TIMEOUT_SECS=120`, and a dispatch outliving
-        // `CHATBOT_CLAIM_RECLAIM_SECS` has its turn reclaimed and re-sent while
-        // the first inference is still running — the model answers one turn
-        // twice. The relationship, not a literal, is what is asserted: raising
-        // one of the two numbers without the other cannot pass this.
-        for asked in ["91", "120", "600", "18446744073709551615"] {
+    async fn a_configured_timeout_is_clamped_below_the_stale_horizon() {
+        // Nothing used to stop `AI_REQUEST_TIMEOUT_SECS=600`, and a dispatch
+        // that outlives `CHATBOT_PENDING_STALE_SECS` holds a worker slot for an
+        // answer every reader has already been shown as failed. The
+        // relationship, not a literal, is what is asserted: raising the ceiling
+        // past the staleness window cannot pass this.
+        for asked in ["61", "120", "600", "18446744073709551615"] {
             let got = parse_timeout(Some(asked.into()), AI_DEFAULT_REQUEST_TIMEOUT_SECS);
             assert!(
-                (got as i64) < CHATBOT_CLAIM_RECLAIM_SECS,
+                (got as i64) < CHATBOT_PENDING_STALE_SECS,
                 "AI_REQUEST_TIMEOUT_SECS={asked} was honoured as {got}s, at or past the \
-                 {CHATBOT_CLAIM_RECLAIM_SECS}s reclaim horizon"
+                 {CHATBOT_PENDING_STALE_SECS}s staleness horizon"
             );
             assert_eq!(got, AI_MAX_REQUEST_TIMEOUT_SECS, "clamped to the ceiling");
         }

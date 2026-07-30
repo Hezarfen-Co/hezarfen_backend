@@ -387,8 +387,9 @@ impl BankQuestion {
     /// field is re-stated from the snapshot, and the kind/choices/correct trio
     /// has to be (a text-only edit re-submits the stored options *with their
     /// ids* so each keeps its picture) — so without the compare-and-set the
-    /// later writer silently reverts the earlier one. An in-process `RwLock`
-    /// only stopped that between requests of *one* replica.
+    /// later writer silently reverts the earlier one — and the window is a
+    /// database round trip wide, which is exactly how far apart two concurrent
+    /// requests to this one process can sit.
     ///
     /// Every field the merge re-states is in the guard, which is the same list
     /// the `SET` writes. `choices` is compared whole: its objects carry two

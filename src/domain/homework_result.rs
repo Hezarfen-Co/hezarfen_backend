@@ -124,9 +124,9 @@ impl HomeworkResult {
     /// In the same transaction the grade *stamps* the student's submission
     /// ([`crate::constant::SUBMISSION_GRADED_FIELD`]), which is what freezes it:
     /// every student-side write to that row then fails its own
-    /// `graded_by_result = NONE` condition, with no cross-table read for a peer
-    /// replica to slip past. A submission that does not exist yet is left alone
-    /// — grading absent work must not conjure a hand-in (the report reads
+    /// `graded_by_result = NONE` condition, with no cross-table read for a
+    /// concurrent write to slip past. A submission that does not exist yet is
+    /// left alone — grading absent work must not conjure a hand-in (the report reads
     /// `submitted`/`missing`/`late` straight off that row).
     //
     // ponytail: that one case keeps a residual race — a student's *first* hand-in

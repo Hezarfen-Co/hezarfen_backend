@@ -31,12 +31,13 @@ use crate::error::{AppError, ValidationError};
 /// conflict-check). Publishing no longer needs it — the day+slot *is* the
 /// record id — and neither does a booking, a menu delete, or the settings
 /// slot-removal guard: those went to conditional single-record writes
-/// ([`crate::domain::cap`]), which hold across replicas as this lock cannot.
+/// ([`crate::domain::cap`]), which the store decides as this lock cannot.
 //
-// ponytail: the dish cap is therefore still replica-local — two replicas can
-// each add the 50th dish. Closing it is another `cap` counter (`dish_count` on
-// the menu row) plus its backfill; the ceiling is 51 dishes on a menu, not
-// money or a seat, so it was not worth the column here.
+// ponytail: the dish cap therefore rests on this lock alone — a dish write
+// added without taking it reopens the count-then-write hole silently. Closing
+// it properly is another `cap` counter (`dish_count` on the menu row) plus its
+// backfill; the ceiling is 51 dishes on a menu, not money or a seat, so it was
+// not worth the column here.
 ///
 /// A leaf: nothing held under it takes another lock.
 pub(crate) static MENU_LOCK: Mutex<()> = Mutex::const_new(());
@@ -46,7 +47,7 @@ pub(crate) static MENU_LOCK: Mutex<()> = Mutex::const_new(());
 /// [`crate::domain::cap`]). The mirror of
 /// [`kind_ref`](crate::domain::exam_result::kind_ref) for exam kinds: the slot
 /// is snapshotted text on the menu, so this row is the only place the two
-/// tables' relationship is a single record two replicas can contend on.
+/// tables' relationship is a single record concurrent writes can contend on.
 pub(crate) fn slot_ref(slot: &str) -> RecordId {
     RecordId::new(SLOT_REF_TABLE, slot)
 }
@@ -56,7 +57,7 @@ pub struct MenuId(RecordId);
 
 impl MenuId {
     /// The one id a menu for this day and slot can have. Deterministic on
-    /// purpose (the `EnrollmentId` trick): two replicas publishing the same
+    /// purpose (the `EnrollmentId` trick): two requests publishing the same
     /// meal race on a single record instead of writing two rows, so the loser
     /// is told "already exists" by the store and answered the same 409 the
     /// pre-check gives. `date` is fixed-width `YYYY-MM-DD`, so the `_` joiner
@@ -209,8 +210,8 @@ impl Menu {
     /// Publish a menu. Refused (409) when the day+slot already carries one.
     ///
     /// The day and slot *are* the record id ([`MenuId::for_slot`]), so the
-    /// refusal is decided by the store rather than by a check a peer replica can
-    /// outrun: two publishes of the same meal write one id, and the loser's
+    /// refusal is decided by the store rather than by a check a concurrent
+    /// publish can outrun: two publishes of the same meal write one id, and the loser's
     /// "already exists" becomes the same 409. The pre-check stays for the
     /// ordinary case — and for menus published before ids were derived, whose
     /// ULID key no new publish can collide with.
@@ -326,7 +327,7 @@ impl Menu {
     ///
     /// Refused (409) while a seat is still held, and the *row itself* decides
     /// that: the delete carries the seat counter in its `WHERE`, so a booking
-    /// landing in another replica at that instant either takes its seat before
+    /// landing at that instant either takes its seat before
     /// the delete (which then finds a non-zero counter and refuses) or after it
     /// (and finds no menu). A read-then-delete pair had a window where both
     /// happened — a paid seat on a menu that no longer exists.
