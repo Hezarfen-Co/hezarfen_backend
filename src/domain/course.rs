@@ -5,7 +5,7 @@ use crate::constant::{
     COURSE_COUNT_FIELD, COURSE_TABLE, ENROLLMENT_COUNT_FIELD, MAX_COURSE_DESCRIPTION_LEN,
     MAX_COURSE_TITLE_LEN, REF_COUNT_FIELD,
 };
-use crate::database::Database;
+use crate::database::{Database, transaction_with_retry};
 use crate::domain::cap;
 use crate::domain::field_update::FieldUpdate;
 use crate::domain::page::PagedList;
@@ -404,8 +404,7 @@ impl Course {
     /// the row gone (and is refused itself). `Err(NotFound)`
     /// keeps the answer a concurrent *delete* used to get.
     pub async fn delete(self, db: &Database) -> Result<bool, AppError> {
-        let mut result = db
-            .query(format!(
+        let sql = format!(
             "BEGIN TRANSACTION;
              LET $gone = (DELETE $course WHERE ({ENROLLMENT_COUNT_FIELD} ?? 0) = 0 RETURN BEFORE);
              IF array::len($gone) = 0 {{ THROW '{ROSTER_MARK}' }};
@@ -437,12 +436,17 @@ impl Course {
              DELETE homework WHERE course = $course;
              DELETE exam WHERE course = $course;
              COMMIT TRANSACTION;"
-            ))
-            .bind(("course", self.id.record()))
-            .await?;
+        );
         // An aborted transaction errors *every* slot, most with a generic "not
-        // executed" — only the THROW's own slot names the marker.
-        let mut errors = result.take_errors();
+        // executed" — only the THROW's own slot names the marker, and a lost
+        // round is re-sent rather than reported (see [`transaction_with_retry`]).
+        let (_, mut errors) = transaction_with_retry(
+            db,
+            &sql,
+            &[("course".into(), self.id.record().into_value())],
+            &[ROSTER_MARK],
+        )
+        .await?;
         if errors
             .values()
             .any(|error| error.to_string().contains(ROSTER_MARK))
@@ -676,5 +680,104 @@ mod tests {
         let decoded = Course::from_value(Value::Object(object)).unwrap();
         assert!(decoded.get_teachers().is_empty());
         assert!(!decoded.is_assigned(&assigned));
+    }
+
+    /// MEASUREMENT — the one race test that actually measures the retry, and
+    /// the only one of the four that does. The other three (subject, term,
+    /// exam) are status-code guards; each says so on itself.
+    ///
+    /// `Course::delete` is one `BEGIN…COMMIT` whose guard reads
+    /// `enrollment_count` off the very record a concurrent enroll increments,
+    /// so the two contend by design, and its cascade is long enough that a
+    /// rival's write lands mid-transaction. Losing that round writes nothing,
+    /// which is what makes re-sending it the recovery. Without
+    /// [`crate::database::transaction_with_retry`] a lost round comes out as a
+    /// 500: mutation-tested by cutting that retry loop to one attempt, which
+    /// turns this test red at 1-2 of 20 rounds (3 runs in 5 — the window is
+    /// real but narrow, so a single green run under the mutation means nothing).
+    ///
+    /// A refusal (`Ok(false)`) or an `Err(NotFound)` is *correct* here and
+    /// must not fail this test: the only defect is `AppError::Db`.
+    ///
+    /// The rate is counted over the whole loop instead of asserted per round,
+    /// because a per-round `assert!` aborts at the first hit and would report
+    /// "1 of 1" for a bug the point of this test is to *quantify*.
+    ///
+    /// Multi-threaded and on a real server for the reasons spelled out on
+    /// [`crate::domain::fee_plan_assignment`]'s pair of race tests: the
+    /// current-thread runtime never interleaves the two, and the embedded
+    /// engine does not conflict-check concurrent writes to one record at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
+    async fn a_delete_racing_an_enroll_never_answers_500() {
+        use crate::domain::enrollment::Enrollment;
+        let (db, _serialized) = crate::database::init_test_server("course_delete_race").await;
+        let (mut delete_500, mut enroll_500, mut enrolled) = (0, 0, 0);
+        let (mut last_delete, mut last_enroll) = (String::new(), String::new());
+        for round in 0..20 {
+            let course = course_on(None, &db).await;
+
+            // A *burst* of enrolls, and a delete held back by a sweeping beat.
+            // Released together the delete is one statement while an enroll
+            // spends two round trips reading before it claims, so it wins every
+            // round and the guard is never contended at all (measured: 0/20
+            // seats placed). Six racers over a 0-3ms sweep put the single
+            // statement somewhere inside the counter writes instead.
+            let drop_it = {
+                let (course, db) = (course.clone(), db.clone());
+                let beat = std::time::Duration::from_millis(round % 4);
+                tokio::spawn(async move {
+                    tokio::time::sleep(beat).await;
+                    course.delete(&db).await
+                })
+            };
+            let joins: Vec<_> = (0..6)
+                .map(|seat| {
+                    let (id, db) = (course.get_id().clone(), db.clone());
+                    let student = UserId::from_key(&format!("stu{round}_{seat}"));
+                    tokio::spawn(async move {
+                        Enrollment::enroll(&id, &student, &UserId::from_key("mgr"), &db).await
+                    })
+                })
+                .collect();
+            let drop_it = drop_it.await.unwrap();
+            if matches!(drop_it, Err(AppError::Db(_))) {
+                delete_500 += 1;
+                last_delete = format!("{drop_it:?}");
+            }
+            for join in joins {
+                let join = join.await.unwrap();
+                if matches!(join, Err(AppError::Db(_))) {
+                    enroll_500 += 1;
+                    last_enroll = format!("{join:?}");
+                }
+            }
+            // Stored state, not the return values: a seat that landed is what
+            // the guard had to see.
+            if !Enrollment::list_for_course(course.get_id(), None, 0, &db)
+                .await
+                .unwrap()
+                .0
+                .is_empty()
+            {
+                enrolled += 1;
+            }
+        }
+        eprintln!(
+            "Course::delete raced: {delete_500}/20 delete 500s, {enroll_500} enroll 500s, \
+             {enrolled}/20 rounds with a seat placed"
+        );
+        assert!(
+            enrolled > 0,
+            "no round ever placed an enrollment, so the delete guard was never contended"
+        );
+        assert_eq!(
+            delete_500, 0,
+            "a raced delete must be refused, not 500: {delete_500}/20 rounds, last {last_delete}"
+        );
+        assert_eq!(
+            enroll_500, 0,
+            "a raced enroll must retry, not 500: {enroll_500}/20 rounds, last {last_enroll}"
+        );
     }
 }

@@ -4,7 +4,7 @@ use ulid::Ulid;
 use crate::constant::{
     EXAM_TABLE, MAX_EXAM_DESCRIPTION_LEN, MAX_EXAM_TITLE_LEN, UNLIMITED_EXAM_ATTEMPTS,
 };
-use crate::database::Database;
+use crate::database::{Database, transaction_with_retry};
 use crate::domain::course::CourseId;
 use crate::domain::settings::ExamKindDef;
 use crate::domain::timestamp::Timestamp;
@@ -598,9 +598,9 @@ impl Exam {
     /// each — which on a kind another exam still uses reads as one mark too
     /// few, and that is a kind wrongly free to leave the settings.
     pub async fn delete(self, db: &Database) -> Result<Exam, AppError> {
-        let mut result = db
-            .query(
-                "BEGIN TRANSACTION;
+        let (mut result, mut errors) = transaction_with_retry(
+            db,
+            "BEGIN TRANSACTION;
                  FOR $row IN ((SELECT exam.kind AS kind, count() AS n FROM exam_result
                      WHERE exam = $ex GROUP BY kind) ?? []) {
                      UPDATE type::record('kind_ref', $row.kind) SET count =
@@ -621,10 +621,17 @@ impl Exam {
                  LET $before = (DELETE $ex RETURN BEFORE);
                  RETURN $before;
                  COMMIT TRANSACTION;",
-            )
-            .bind(("ex", self.id.record()))
-            .await?
-            .check()?;
+            &[("ex".into(), self.id.record().into_value())],
+            // No THROW of its own: an unconditional cascade, so the only error
+            // worth telling apart is a lost round, and `check()` — which took
+            // the *first* error in the batch — could not. It reported a
+            // sibling's "not executed" and made a retryable round a 500.
+            &[],
+        )
+        .await?;
+        if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+            return Err(error.into());
+        }
         // The deleted row comes back through the transaction's trailing
         // `RETURN`, never a hand-counted slot: the old `take(8)` turned a
         // successful delete into a 404 the moment a cascade statement was
@@ -869,5 +876,119 @@ mod tests {
         // The window must be a real interval, whatever the mode.
         assert!(ExamSchedule::try_new(mode("sync"), at(2), at(2), None).is_err());
         assert!(ExamSchedule::try_new(mode("async"), at(3), at(2), dur).is_err());
+    }
+
+    /// GUARD, not a retry measurement — read the last paragraph before
+    /// trusting this test with the retry. See
+    /// [`crate::domain::course::Course::delete`]'s race test for why the rate is
+    /// counted rather than asserted per round.
+    ///
+    /// This site has no `THROW` marker at all: it ends `.check()?`, which
+    /// returns the *first* error in the batch, and an aborted transaction
+    /// errors every slot — most of them with a generic "not executed". So a
+    /// genuine conflict can be masked by a sibling, and either way there is no
+    /// [`crate::database::lost_the_race`] check and no retry.
+    ///
+    /// The racer is a mark: [`ExamResult::grade`] claims the exam's own
+    /// `result_count` (and the kind's reference) before writing, so it contends
+    /// with the `DELETE $ex` and with the kind_ref decrement inside the same
+    /// transaction. The two stored counters assert the delete landed *inside*
+    /// the burst rather than before or after it.
+    ///
+    /// It does not prove the retry either: measured at 0 conflicts in 100 raced
+    /// rounds, and green with
+    /// [`crate::database::transaction_with_retry`]'s loop cut to a single
+    /// attempt — the grades serialize behind `cap`'s claim lock, so they mostly
+    /// queue rather than collide. So this guards the status codes and the
+    /// cascade (marks either survive whole or are swept whole, never a 500).
+    /// The retry is measured on [`crate::domain::course::Course::delete`].
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
+    async fn a_delete_racing_a_mark_never_answers_500() {
+        use crate::domain::exam_result::{ExamResult, Mark};
+        let (db, _serialized) = crate::database::init_test_server("exam_delete_race").await;
+        let (mut delete_500, mut grade_500) = (0, 0);
+        let (mut marked, mut swept) = (0, 0);
+        let (mut last_delete, mut last_grade) = (String::new(), String::new());
+        for round in 0..20 {
+            let exam = published(&db).await;
+            let kind = exam.get_kind().as_str().to_string();
+
+            // A burst of marks and a delete held back by a sweeping beat: this
+            // site has no guard to lose to, so a single racer released with it
+            // simply finishes on one side of it. Same recipe as
+            // [`crate::domain::course::Course::delete`]'s race test.
+            let drop_it = {
+                let (exam, db) = (exam.clone(), db.clone());
+                // A wide sweep, not the 0-3ms the other three use: each grade
+                // takes two counter writes serialized behind `cap`'s claim
+                // lock, so the burst runs tens of milliseconds and a short beat
+                // always puts the delete in front of all six.
+                let beat = std::time::Duration::from_millis(round * 2);
+                tokio::spawn(async move {
+                    tokio::time::sleep(beat).await;
+                    exam.delete(&db).await
+                })
+            };
+            let marks: Vec<_> = (0..6)
+                .map(|seat| {
+                    let (id, db, kind) = (exam.get_id().clone(), db.clone(), kind.clone());
+                    let student = UserId::from_key(&format!("stu{round}_{seat}"));
+                    tokio::spawn(async move {
+                        ExamResult::grade(
+                            &id,
+                            &student,
+                            1,
+                            Mark::try_new(50).unwrap(),
+                            &UserId::from_key("teacher"),
+                            &kind,
+                            &db,
+                        )
+                        .await
+                    })
+                })
+                .collect();
+            let drop_it = drop_it.await.unwrap();
+            if matches!(drop_it, Err(AppError::Db(_))) {
+                delete_500 += 1;
+                last_delete = format!("{drop_it:?}");
+            }
+            for mark in marks {
+                let mark = mark.await.unwrap();
+                if matches!(mark, Err(AppError::Db(_))) {
+                    grade_500 += 1;
+                    last_grade = format!("{mark:?}");
+                }
+            }
+            // Stored state, and *both* outcomes are needed: marks surviving
+            // means the grades ran past the cascade, no marks left means the
+            // cascade ran past the grades. Seeing only one of the two is a run
+            // where the delete never landed inside the burst at all.
+            if ExamResult::list_for_exam(exam.get_id(), &db)
+                .await
+                .unwrap()
+                .is_empty()
+            {
+                swept += 1;
+            } else {
+                marked += 1;
+            }
+        }
+        eprintln!(
+            "Exam::delete raced: {delete_500}/20 delete 500s, {grade_500} grade 500s, \
+             {marked} rounds with marks left / {swept} swept"
+        );
+        assert!(
+            marked > 0 && swept > 0,
+            "the delete never landed inside the burst ({marked} left / {swept} swept)"
+        );
+        assert_eq!(
+            delete_500, 0,
+            "a raced delete must not 500: {delete_500}/20 rounds, last {last_delete}"
+        );
+        assert_eq!(
+            grade_500, 0,
+            "a raced grade must retry, not 500: {grade_500}/20 rounds, last {last_grade}"
+        );
     }
 }

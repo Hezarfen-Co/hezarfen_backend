@@ -319,7 +319,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn an_edit_racing_an_assign_leaves_the_plan_and_the_money_agreeing() {
-        let db = crate::database::init_test_server("edit_race").await;
+        let (db, _serialized) = crate::database::init_test_server("edit_race").await;
         let mut reached = 0;
         for round in 0..20 {
             let manager = UserId::from_key("mgr1");
@@ -424,7 +424,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn a_delete_racing_an_assign_never_orphans_an_assignment() {
-        let db = crate::database::init_test_server("delete_race").await;
+        let (db, _serialized) = crate::database::init_test_server("delete_race").await;
         let (mut deleted_first, mut assigned_first) = (0, 0);
         for round in 0..20 {
             let hold_back_the_assign = round % 2 == 0;
