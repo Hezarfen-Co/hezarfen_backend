@@ -52,3 +52,7 @@ tempfile = "3"
 tokio-tungstenite = "0.30.0"
 futures-util = "0.3.32"
 proptest = "1.11.0"
+# Compiles the pattern `GET /limits` publishes and runs it over the same inputs
+# the validator sees, so the published promise cannot drift from the accept set.
+# Already in the tree (tracing-subscriber's env-filter), so this costs no build.
+regex = "1"

@@ -136,6 +136,10 @@ pub struct UserResponse {
     /// client should fall back to the device language.
     #[schema(example = "tr")]
     pub language: Option<String>,
+    /// UI accent color as a 6-digit hex with a leading `#`, lowercase. `null` =
+    /// never chosen — the client should fall back to its default accent.
+    #[schema(example = "#fefae0")]
+    pub palette_color: Option<String>,
 }
 
 impl UserResponse {
@@ -151,6 +155,7 @@ impl UserResponse {
             birth_date: user.get_birth_date().map(|v| v.as_str().to_string()),
             theme: user.get_theme().map(|v| v.as_str().to_string()),
             language: user.get_language().map(|v| v.as_str().to_string()),
+            palette_color: user.get_palette_color().map(|v| v.as_str().to_string()),
         }
     }
 }

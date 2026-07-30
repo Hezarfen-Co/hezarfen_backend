@@ -92,9 +92,11 @@ School-varying policy is data, not code: exam kinds (each with its weight in
 course averages), attendance statuses, grade-display bands, the note-file
 size limit, and the chatbot's limits live in an editable **settings** singleton, and academic **terms**
 are plain rows courses can link to (see "Per-school policy"). Each account
-also carries its own **UI preferences** — theme (`light`/`dark`) and language
-(`tr`/`en`) — self-managed, admin-editable for anyone, `null` until chosen so
-the client can fall back to the device preference.
+also carries its own **UI preferences** — theme (`light`/`dark`), language
+(`tr`/`en`), and accent color (`palette_color`, a 6-digit hex like `#fefae0` —
+any hex, deliberately not a fixed palette) — self-managed, admin-editable for
+anyone, `null` until chosen so the client can fall back to the device
+preference (or, for the accent, its own default).
 The **AI features live in separate projects**, so the backend also opens a
 QUIC **AI bridge** (`AI_QUIC_ADDR`, off by default): AI services dial in,
 register the capabilities they serve, and each request rides its own QUIC
@@ -292,6 +294,7 @@ response in the same commit.
                      "min_phone_digits": 7, "max_phone_digits": 15,
                      "roles": ["parent", "student", "teacher", "manager", "admin"],
                      "themes": ["light", "dark"], "languages": ["tr", "en"],
+                     "palette_color_pattern": "^#[0-9a-fA-F]{6}$", "palette_color_len": 7,
                      "session_duration_days": 7 },
   "note":          { "max_title_len": 200, "max_content_len": 10000, "max_files": 10 },
   "file":          { "max_name_len": 255, "max_content_type_len": 100,
@@ -377,6 +380,12 @@ Notes:
   manager edits it. What `/limits` carries for those knobs is the fixed range a
   manager may set them *within* (`min_`/`max_`/`default_` prefixes), plus the
   attendance statuses no school may remove.
+- **Open sets travel as a pattern.** `palette_color` accepts any hex accent
+  color, so `/limits` publishes `palette_color_pattern` (a regular expression)
+  and `palette_color_len` instead of a value list — validate the shape, not
+  membership in a palette. The pattern describes what the server *accepts*, so
+  it matches either case; the stored (and returned) value is lowercased, which
+  is the one place a response may differ in case from the request.
 - **Closed value sets ride along.** `roles`, `themes`, `languages`, course
   `kinds`, exam `modes`, `question_kinds`, homework `statuses`, and the
   uploadable `image_content_types` are the exact accepted spellings — build
@@ -493,7 +502,7 @@ course enrollments.
 | Submit **own** homework (text + files); read own submission and grade | student | **Students only** — staff never submit; enrolled + in the audience; editable until graded; ≤ 10 files of any type, each ≤ `max_file_bytes`, always downloaded as attachments |
 | Read another user's homework report      | teacher      | Narrowed to the caller's managed courses; `manager`+ sees all; a `parent` sees a linked student's in full — statuses/marks/flags, never files |
 | Edit **own** personal info (name, surname, email, phone, birth date) | student | Every account carries the same optional info fields |
-| Edit **own** UI preferences (theme, language) | student | `null` until chosen — the client then follows the device preference |
+| Edit **own** UI preferences (theme, language, accent color) | student | `null` until chosen — the client then follows the device preference |
 | List **own** linked students             | parent       | Read-only: the list plus each student's mark/attendance/pomodoro/homework reports — a parent changes nothing, anywhere |
 | Read the school settings and the term list | student | Clients need them to render kind/status pickers, grades, and the calendar |
 | Edit school settings; create / edit / delete terms | manager | School policy (exam kinds, attendance statuses, grade bands, the note-file size limit) and the academic calendar are management's call |
@@ -609,7 +618,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | POST   | `/auth/logout`                   | no      | Clear session (no-op if none)   |
 | GET    | `/auth/me`                       | student | Current user (incl. `role` and personal info) |
 | PATCH  | `/users/me`                      | student | Update own personal info (see below) |
-| PATCH  | `/users/me/preferences`          | student | `{theme?, language?}` — own UI preferences (see below) |
+| PATCH  | `/users/me/preferences`          | student | `{theme?, language?, palette_color?}` — own UI preferences (see below) |
 | GET    | `/users/me/students`             | parent  | The caller's linked students (refs, sorted by username) · paged |
 | GET    | `/users/search`                  | teacher | `?q=<fragment>&role=<role?>` — find users by username/name fragment (pickers); refs only, no contact info · paged |
 | GET    | `/users`                         | admin   | List all users · paged          |
@@ -914,13 +923,17 @@ ending with a letter or digit (3–32 chars). Staff-looking names (`admin`,
 `administrator`, `root`, `support`, `system`, `moderator`, `staff`) are
 rejected at `/auth/register` only — the `ADMIN_USERNAME` bootstrap may still
 seed them.
-UI preferences (`theme`: `light`/`dark`, `language`: `tr`/`en`) ride on the
+UI preferences (`theme`: `light`/`dark`, `language`: `tr`/`en`,
+`palette_color`: an accent color as `#` plus exactly 6 hex digits) ride on the
 same account row and come back on every user response (`/auth/me` included).
 `PATCH /users/me/preferences` (or the admin `PATCH /users/{id}/preferences`)
 uses the same field semantics as the profile patch: omitted keeps, `""` clears
 back to `null` ("never chose" — the client then follows the device
-preference), anything else must be one of the listed values or the whole patch
-is a `400`.
+preference, or its own default accent), anything else must be valid or the
+whole patch is a `400`. `palette_color` is the one **open** set: any valid hex
+passes (mixed case in, stored and returned lowercase), so a new frontend
+palette needs no backend change — `/limits` publishes its pattern rather than a
+list of colors.
 
 ## Appointments
 
@@ -2556,7 +2569,7 @@ src/
     bank_question_image.rs BankQuestionImageId · BankQuestionImage (bank
                    question/choice picture metadata; bytes on disk under FILES_PATH)
     profile.rs     PersonName · Email · Phone · BirthDate (personal-info newtypes)
-    preferences.rs Theme · Language (own UI preferences)
+    preferences.rs Theme · Language · PaletteColor (own UI preferences)
     message.rs     MessageId · MessageSubject · MessageBody · MessageLabel ·
                    Message (per-copy folders: inbox/sent/archive/trash)
     parent_link.rs ParentLinkId · ParentLink (parent↔student tie = the parent's read grant)

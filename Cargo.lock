@@ -1800,6 +1800,7 @@ dependencies = [
  "proptest",
  "quinn",
  "rcgen",
+ "regex",
  "reqwest",
  "rustls",
  "rustls-pemfile",
