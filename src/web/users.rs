@@ -10,7 +10,7 @@ use crate::database::Database;
 use crate::domain::course::Course;
 use crate::domain::enrollment::Enrollment;
 use crate::domain::parent_link::ParentLink;
-use crate::domain::preferences::{Language, Theme};
+use crate::domain::preferences::{Language, PaletteColor, Theme};
 use crate::domain::profile::{BirthDate, Email, PersonName, Phone};
 use crate::domain::role::Role;
 use crate::domain::user::{User, UserId};
@@ -76,6 +76,10 @@ struct UpdatePreferences {
     /// `tr` or `en` (ISO 639-1).
     #[schema(example = "tr")]
     language: Option<String>,
+    /// Accent color as a 6-digit hex with a leading `#`; stored lowercase. Any
+    /// valid hex, not a fixed palette.
+    #[schema(example = "#fefae0")]
+    palette_color: Option<String>,
 }
 
 /// Resolve one patched field into what the save should write: absent (or
@@ -126,7 +130,10 @@ async fn apply_preferences(
 ) -> Result<UserResponse, AppError> {
     let theme = merge_field(req.theme.as_deref(), Theme::try_from_str)?;
     let language = merge_field(req.language.as_deref(), Language::try_from_str)?;
-    let updated = user.set_preferences(theme, language, db).await?;
+    let palette_color = merge_field(req.palette_color.as_deref(), PaletteColor::try_from_str)?;
+    let updated = user
+        .set_preferences(theme, language, palette_color, db)
+        .await?;
     Ok(UserResponse::new(&updated))
 }
 
@@ -238,8 +245,9 @@ async fn update_my_profile(
     Ok(Json(apply_profile(user, &req, &st.db).await?))
 }
 
-/// Update the caller's own UI preferences: `theme` (`light`/`dark`) and
-/// `language` (`tr`/`en`). Any authenticated role. Omitted fields stay as they
+/// Update the caller's own UI preferences: `theme` (`light`/`dark`),
+/// `language` (`tr`/`en`), and `palette_color` (accent color as `#rrggbb`).
+/// Any authenticated role. Omitted fields stay as they
 /// are; an empty string clears one back to "never chose" (the client then
 /// follows the device preference). Read them back on any user response, e.g.
 /// `GET /auth/me`.
@@ -251,7 +259,7 @@ async fn update_my_profile(
     request_body = UpdatePreferences,
     responses(
         (status = 200, description = "Updated user", body = UserResponse),
-        (status = 400, description = "Invalid theme or language", body = ErrorResponse),
+        (status = 400, description = "Invalid theme, language, or palette color", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
     ),
 )]
@@ -330,7 +338,7 @@ async fn update_user_profile(
     request_body = UpdatePreferences,
     responses(
         (status = 200, description = "Updated user", body = UserResponse),
-        (status = 400, description = "Invalid theme or language", body = ErrorResponse),
+        (status = 400, description = "Invalid theme, language, or palette color", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires admin role", body = ErrorResponse),
         (status = 404, description = "User not found", body = ErrorResponse),

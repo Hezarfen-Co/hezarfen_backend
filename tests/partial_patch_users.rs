@@ -55,7 +55,8 @@ async fn concurrent_preference_patches_keep_both_fields() {
         } else {
             ("light", "en")
         };
-        let (a, b) = tokio::join!(
+        let color = if round % 2 == 0 { "#283618" } else { "#fefae0" };
+        let (a, b, c) = tokio::join!(
             send(
                 &app,
                 "PATCH",
@@ -70,15 +71,27 @@ async fn concurrent_preference_patches_keep_both_fields() {
                 Some(&who),
                 Some(json!({ "language": language })),
             ),
+            send(
+                &app,
+                "PATCH",
+                "/users/me/preferences",
+                Some(&who),
+                Some(json!({ "palette_color": color })),
+            ),
         );
         assert_eq!(a.status, StatusCode::OK, "round {round} theme patch");
         assert_eq!(b.status, StatusCode::OK, "round {round} language patch");
+        assert_eq!(c.status, StatusCode::OK, "round {round} palette patch");
 
         let after = send(&app, "GET", "/auth/me", Some(&who), None).await.body;
         assert_eq!(after["theme"], theme, "round {round}: theme reverted");
         assert_eq!(
             after["language"], language,
             "round {round}: language reverted"
+        );
+        assert_eq!(
+            after["palette_color"], color,
+            "round {round}: palette_color reverted"
         );
     }
 }
@@ -156,5 +169,44 @@ async fn omitted_keeps_empty_clears_and_validation_still_bites() {
         bad_theme.status,
         StatusCode::BAD_REQUEST,
         "bad theme refused"
+    );
+
+    // The accent color joins them: set, cleared by `""`, refused when malformed
+    // — and never touching the other two preferences.
+    let set = send(
+        &app,
+        "PATCH",
+        "/users/me/preferences",
+        Some(&who),
+        Some(json!({ "theme": "dark", "palette_color": "#FEFAE0" })),
+    )
+    .await;
+    assert_eq!(set.status, StatusCode::OK, "{}", set.body);
+    assert_eq!(set.body["palette_color"], "#fefae0", "stored lowercase");
+
+    let cleared = send(
+        &app,
+        "PATCH",
+        "/users/me/preferences",
+        Some(&who),
+        Some(json!({ "palette_color": "" })),
+    )
+    .await;
+    assert_eq!(cleared.status, StatusCode::OK);
+    assert_eq!(cleared.body["palette_color"], json!(null));
+    assert_eq!(cleared.body["theme"], "dark", "theme lost to the clear");
+
+    let bad_color = send(
+        &app,
+        "PATCH",
+        "/users/me/preferences",
+        Some(&who),
+        Some(json!({ "palette_color": "#fff" })),
+    )
+    .await;
+    assert_eq!(
+        bad_color.status,
+        StatusCode::BAD_REQUEST,
+        "bad palette color refused"
     );
 }

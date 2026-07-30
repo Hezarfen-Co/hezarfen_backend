@@ -9,7 +9,7 @@ use crate::constant::{DECOY_PASSWORD, USER_TABLE};
 use crate::database::Database;
 use crate::domain::field_update::FieldUpdate;
 use crate::domain::page::PagedList;
-use crate::domain::preferences::{Language, Theme};
+use crate::domain::preferences::{Language, PaletteColor, Theme};
 use crate::domain::profile::{BirthDate, Email, PersonName, Phone};
 use crate::domain::role::Role;
 use crate::domain::text_fold::{search_fold, search_fold_sql};
@@ -204,6 +204,7 @@ pub struct User {
     // "never chose", which the frontend renders as the device preference.
     theme: Option<Theme>,
     language: Option<Language>,
+    palette_color: Option<PaletteColor>,
 }
 
 impl User {
@@ -251,6 +252,10 @@ impl User {
         self.language
     }
 
+    pub fn get_palette_color(&self) -> Option<&PaletteColor> {
+        self.palette_color.as_ref()
+    }
+
     /// Register a new account. New users always start as [`Role::Student`];
     /// elevation is a separate, admin-only action (see [`User::set_role`]).
     pub async fn create(
@@ -291,6 +296,7 @@ impl User {
             birth_date: None,
             theme: None,
             language: None,
+            palette_color: None,
         };
         let created: Result<Option<User>, surrealdb::Error> =
             db.create(user.id.record()).content(user.clone()).await;
@@ -497,11 +503,13 @@ impl User {
         self,
         theme: Option<Option<Theme>>,
         language: Option<Option<Language>>,
+        palette_color: Option<Option<PaletteColor>>,
         db: &Database,
     ) -> Result<User, AppError> {
         FieldUpdate::new(self.id.record())
             .set("theme", theme)
             .set("language", language)
+            .set("palette_color", palette_color)
             .run::<User>(db)
             .await
     }

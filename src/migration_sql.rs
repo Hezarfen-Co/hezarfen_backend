@@ -50,6 +50,7 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS birth_date ON user TYPE option<string>;
     DEFINE FIELD IF NOT EXISTS theme ON user TYPE option<string>;
     DEFINE FIELD IF NOT EXISTS language ON user TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS palette_color ON user TYPE option<string>;
     DEFINE FIELD IF NOT EXISTS chatbot_thread_count ON user TYPE option<int>;
     DEFINE INDEX IF NOT EXISTS user_username ON user FIELDS username UNIQUE;
 

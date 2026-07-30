@@ -52,6 +52,15 @@ struct UserLimits {
     /// Accepted `language` preference values (`null` clears it).
     #[schema(example = json!(["tr", "en"]))]
     languages: Vec<&'static str>,
+    /// Shape a `palette_color` preference must match, as a regular expression
+    /// (`null` clears it). Open on purpose — any hex accent color, not a fixed
+    /// palette — so this is a pattern, not a value list like `themes`. Matches
+    /// either case: the server normalizes the value to lowercase on store, so a
+    /// response may differ in case from what was sent.
+    #[schema(example = "^#[0-9a-fA-F]{6}$")]
+    palette_color_pattern: &'static str,
+    /// Length of a `palette_color`, `#` included.
+    palette_color_len: usize,
     /// How long a login session stays valid, days.
     session_duration_days: i64,
 }
@@ -346,6 +355,8 @@ impl LimitsResponse {
                 roles: ROLES.iter().map(|role| role.as_str()).collect(),
                 themes: THEMES.iter().map(|theme| theme.as_str()).collect(),
                 languages: LANGUAGES.iter().map(|language| language.as_str()).collect(),
+                palette_color_pattern: PALETTE_COLOR_PATTERN,
+                palette_color_len: PALETTE_COLOR_LEN,
                 session_duration_days: SESSION_DURATION_DAYS,
             },
             note: NoteLimits {

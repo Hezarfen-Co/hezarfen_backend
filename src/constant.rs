@@ -648,6 +648,21 @@ pub const THEMES: [Theme; 2] = [Theme::Light, Theme::Dark];
 
 pub const LANGUAGES: [Language; 2] = [Language::Tr, Language::En];
 
+/// A `palette_color` preference is `#` plus exactly six hex digits — the length
+/// of the whole string, `#` included.
+pub const PALETTE_COLOR_LEN: usize = 7;
+
+/// The shape a `palette_color` must match, as a regular expression. This
+/// describes what the server **accepts**, so it is case-insensitive — the value
+/// is normalized to lowercase on store, and a client that sent `#FEFAE0` reads
+/// `#fefae0` back. Publishing the lowercase-only form would have a client
+/// reject its own valid input.
+///
+/// Deliberately an open value set: any valid hex accent color, not a closed
+/// list of the frontend's palette, so a new palette entry needs no backend
+/// change.
+pub const PALETTE_COLOR_PATTERN: &str = "^#[0-9a-fA-F]{6}$";
+
 /// Folders a sender may file their side into (`Sent` is their home).
 pub const SENDER_FOLDERS: [Folder; 3] = [Folder::Sent, Folder::Archive, Folder::Trash];
 /// Folders a recipient may file their side into (`Inbox` is their home).

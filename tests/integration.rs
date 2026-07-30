@@ -80,6 +80,16 @@ async fn limits_publishes_the_bounds_the_api_actually_enforces() {
         json!(hezarfen_backend::constant::MAX_USERNAME_LEN)
     );
     assert_eq!(res.body["exam"]["modes"], json!(["sync", "async", "open"]));
+    // The accent color is published as a pattern, not a value list — it is an
+    // open set, so a client validates the shape instead of a fixed palette.
+    assert_eq!(
+        res.body["user"]["palette_color_pattern"],
+        json!(hezarfen_backend::constant::PALETTE_COLOR_PATTERN)
+    );
+    assert_eq!(
+        res.body["user"]["palette_color_len"],
+        json!(hezarfen_backend::constant::PALETTE_COLOR_LEN)
+    );
     assert_eq!(
         res.body["user"]["roles"],
         json!(["parent", "student", "teacher", "manager", "admin"])
@@ -5002,7 +5012,7 @@ async fn admin_reads_and_edits_any_profile_with_guards() {
     );
 }
 
-// --- users: UI preferences (theme, language) ------------------------------
+// --- users: UI preferences (theme, language, palette color) ------------------------------
 
 #[tokio::test]
 async fn preferences_start_null_and_update_via_me_preferences() {
@@ -5014,21 +5024,27 @@ async fn preferences_start_null_and_update_via_me_preferences() {
     assert_eq!(me.status, StatusCode::OK);
     assert!(me.body["theme"].is_null(), "theme should start null");
     assert!(me.body["language"].is_null(), "language should start null");
+    assert!(
+        me.body["palette_color"].is_null(),
+        "palette_color should start null"
+    );
 
-    // Set both through the self-service endpoint.
+    // Set all three through the self-service endpoint. Mixed-case hex is
+    // accepted and comes back lowercase.
     let res = send(
         &app,
         "PATCH",
         "/users/me/preferences",
         Some(&bob),
-        Some(json!({ "theme": "dark", "language": "tr" })),
+        Some(json!({ "theme": "dark", "language": "tr", "palette_color": "#FEFAE0" })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK);
     assert_eq!(res.body["theme"], "dark");
     assert_eq!(res.body["language"], "tr");
+    assert_eq!(res.body["palette_color"], "#fefae0");
 
-    // Partial patch: only the theme changes, the language survives.
+    // Partial patch: only the theme changes, the other two survive.
     let res = send(
         &app,
         "PATCH",
@@ -5040,8 +5056,23 @@ async fn preferences_start_null_and_update_via_me_preferences() {
     assert_eq!(res.status, StatusCode::OK);
     assert_eq!(res.body["theme"], "light");
     assert_eq!(res.body["language"], "tr");
+    assert_eq!(res.body["palette_color"], "#fefae0");
 
-    // Empty string clears back to "never chose"; the other stays.
+    // …and only the accent color changes, leaving theme and language alone.
+    let res = send(
+        &app,
+        "PATCH",
+        "/users/me/preferences",
+        Some(&bob),
+        Some(json!({ "palette_color": "#283618" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["palette_color"], "#283618");
+    assert_eq!(res.body["theme"], "light");
+    assert_eq!(res.body["language"], "tr");
+
+    // Empty string clears back to "never chose"; the others stay.
     let res = send(
         &app,
         "PATCH",
@@ -5053,10 +5084,24 @@ async fn preferences_start_null_and_update_via_me_preferences() {
     assert_eq!(res.status, StatusCode::OK);
     assert!(res.body["theme"].is_null());
     assert_eq!(res.body["language"], "tr");
+    assert_eq!(res.body["palette_color"], "#283618");
+
+    let res = send(
+        &app,
+        "PATCH",
+        "/users/me/preferences",
+        Some(&bob),
+        Some(json!({ "palette_color": "" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert!(res.body["palette_color"].is_null());
+    assert_eq!(res.body["language"], "tr");
 
     // The merged state is what /auth/me reports afterwards.
     let me = send(&app, "GET", "/auth/me", Some(&bob), None).await;
     assert!(me.body["theme"].is_null());
+    assert!(me.body["palette_color"].is_null());
     assert_eq!(me.body["language"], "tr");
 
     // No session -> 401.
@@ -5085,6 +5130,13 @@ async fn preferences_reject_invalid_values() {
         json!({ "language": "turkish" }),
         json!({ "language": "de" }),
         json!({ "theme": "dark", "language": "nope" }),
+        json!({ "palette_color": "fefae0" }),   // no leading #
+        json!({ "palette_color": "#fff" }),     // short form
+        json!({ "palette_color": "#gggggg" }),  // not hex
+        json!({ "palette_color": "#fefae0 " }), // untrimmed
+        json!({ "palette_color": "rebeccapurple" }),
+        // Mixed: a valid theme must not sneak through beside a bad color.
+        json!({ "theme": "dark", "palette_color": "#12345" }),
     ];
     for body in bad {
         let res = send(
@@ -5104,6 +5156,10 @@ async fn preferences_reject_invalid_values() {
     assert!(
         me.body["language"].is_null(),
         "language should still be null"
+    );
+    assert!(
+        me.body["palette_color"].is_null(),
+        "palette_color should still be null"
     );
 }
 
@@ -5135,12 +5191,55 @@ async fn admin_edits_any_preferences_with_guards() {
         "PATCH",
         &format!("/users/{alice_id}/preferences"),
         Some(&admin),
-        Some(json!({ "theme": "dark", "language": "en" })),
+        Some(json!({ "theme": "dark", "language": "en", "palette_color": "#FEFAE0" })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK);
     assert_eq!(res.body["theme"], "dark");
     assert_eq!(res.body["language"], "en");
+    assert_eq!(
+        res.body["palette_color"], "#fefae0",
+        "normalized on the admin path too"
+    );
+
+    // The admin route patches partially and clears by `""` exactly like the
+    // self-service one — one field at a time, the others untouched.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/users/{alice_id}/preferences"),
+        Some(&admin),
+        Some(json!({ "palette_color": "#283618" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["palette_color"], "#283618");
+    assert_eq!(res.body["theme"], "dark", "theme lost to the color patch");
+    assert_eq!(res.body["language"], "en");
+
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/users/{alice_id}/preferences"),
+        Some(&admin),
+        Some(json!({ "palette_color": "" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert!(res.body["palette_color"].is_null());
+    assert_eq!(res.body["theme"], "dark", "theme lost to the clear");
+    assert_eq!(res.body["language"], "en");
+
+    // Back to a set value, so the reads below cover it too.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/users/{alice_id}/preferences"),
+        Some(&admin),
+        Some(json!({ "palette_color": "#fefae0" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
 
     // Admin reads them on the single-user lookup; alice sees them on /auth/me.
     let one = send(
@@ -5153,9 +5252,11 @@ async fn admin_edits_any_preferences_with_guards() {
     .await;
     assert_eq!(one.body["theme"], "dark");
     assert_eq!(one.body["language"], "en");
+    assert_eq!(one.body["palette_color"], "#fefae0");
     let me = send(&app, "GET", "/auth/me", Some(&alice), None).await;
     assert_eq!(me.body["theme"], "dark");
     assert_eq!(me.body["language"], "en");
+    assert_eq!(me.body["palette_color"], "#fefae0");
 
     // Unknown id -> 404.
     assert_eq!(

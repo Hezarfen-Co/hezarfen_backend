@@ -1695,3 +1695,66 @@ async fn fee_plans_and_their_charges_survive_remigration() {
         "the charges the placement raised are still owed"
     );
 }
+
+/// A user row written before `palette_color` existed needs no backfill: the
+/// column is `option<string>`, so the absent key reads back as "never chose"
+/// and a later patch sets it in place. Adding an option column to a SCHEMAFULL
+/// table must not strand the rows already there.
+#[tokio::test]
+async fn a_user_row_without_palette_color_still_reads_and_patches() {
+    let (app, db) = common::app_and_db().await;
+    let ali = common::login(&app, "ali").await;
+
+    // Write the column first: a fresh row stores no key for a `None` option, so
+    // UNSET alone would be a no-op and this test would prove nothing.
+    let set = send(
+        &app,
+        "PATCH",
+        "/users/me/preferences",
+        Some(&ali),
+        Some(json!({ "palette_color": "#283618" })),
+    )
+    .await;
+    assert_eq!(set.status, StatusCode::OK, "{}", set.body);
+    let stored: Vec<String> = db
+        .query("SELECT VALUE palette_color FROM user WHERE palette_color != NONE;")
+        .await
+        .expect("read the column")
+        .check()
+        .expect("read the column")
+        .take(0)
+        .expect("read the column");
+    assert_eq!(
+        stored,
+        vec!["#283618"],
+        "the column must exist to be aged away"
+    );
+
+    // Now age the row into the pre-accent shape: the key goes away, exactly as
+    // on a row a binary without this column wrote.
+    db.query("UPDATE user UNSET palette_color;")
+        .await
+        .expect("age the row")
+        .check()
+        .expect("age the row");
+
+    let app = reboot(&db).await;
+
+    let me = send(&app, "GET", "/auth/me", Some(&ali), None).await;
+    assert_eq!(me.status, StatusCode::OK, "{}", me.body);
+    assert!(
+        me.body["palette_color"].is_null(),
+        "an aged row must read as never-chosen, not error"
+    );
+
+    let set = send(
+        &app,
+        "PATCH",
+        "/users/me/preferences",
+        Some(&ali),
+        Some(json!({ "palette_color": "#fefae0" })),
+    )
+    .await;
+    assert_eq!(set.status, StatusCode::OK, "{}", set.body);
+    assert_eq!(set.body["palette_color"], "#fefae0");
+}
