@@ -1485,6 +1485,27 @@ A plan that has been assigned to anyone can no longer be edited or deleted
 an edit would only make the plan and the money tell different stories — write
 a new plan instead.
 
+That freeze is a **counter on the plan row** (`assignment_count`), incremented
+in the *same transaction* as the assignment row it counts, and the edit and the
+delete are single-record conditional writes against it — the same shape as a
+term's `course_count`. It used to be a `SELECT` taken before the write, which a
+concurrent assign could land behind, leaving a plan edited *and* assigned, or
+deleted with a live assignment naming it. Now the two contend on one record: an
+assign either freezes the plan first (and the edit or delete is a `409`) or
+arrives after it (and bills the edited plan — the installments a first
+assignment charges are re-read from the *stored* plan at the instant it
+freezes, never from the copy the request first looked at). A plan deleted out
+from under a running batch is `rejected` for that student on, in the same
+per-student report as every other outcome — the students it already billed are
+never dropped from the answer. A `PATCH`
+carrying no field at all writes nothing, so it is not refused.
+
+Because an assignment is never removed, the counter is only ever claimed and
+never released: once assigned, a plan stays frozen for good. Plans written
+before the counter existed are seeded from their assignment rows at boot,
+before the server accepts a request — an absent counter reads as zero, and a
+zero would have re-opened every already-assigned plan on an existing volume.
+
 ### The ledger
 
 The money is an **append-only ledger** (`payment_ledger`), exactly like the
@@ -2475,9 +2496,13 @@ database itself decides the winner. Three tiers:
    row being deleted rather than a `SELECT` over the children: a course is
    deletable while its `enrollment_count` is zero, a term while its
    `course_count` is (courses claim that reference *before* they write the
-   link, and give it back when the link moves or the course is deleted).
+   link, and give it back when the link moves or the course is deleted). A fee
+   plan reads the same way — editable *and* deletable while its
+   `assignment_count` is zero, and frozen for good once it is not, since an
+   assignment is never taken back.
    Where the child also carries a deterministic id — one enrollment per
-   (course, user), one registration per (event, user) — the seat and the row
+   (course, user), one registration per (event, user), one fee-plan assignment
+   per (plan, student) — the seat and the row
    are claimed in one transaction (`cap::claim_and_create`), so a duplicate
    `CREATE` rolls its own seat back instead of costing a stranger their place.
 3. **Two accepted races**, reviewed and deliberately left open:

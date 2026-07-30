@@ -24,7 +24,7 @@
 
 use surrealdb::types::{RecordId, SurrealValue, Value};
 
-use crate::database::Database;
+use crate::database::{Database, write_with_retry};
 use crate::error::AppError;
 
 pub struct FieldUpdate {
@@ -34,6 +34,8 @@ pub struct FieldUpdate {
     bindings: Vec<(String, Value)>,
     /// `(low, high, refusal)` for [`FieldUpdate::ordered`].
     ordered: Option<(&'static str, &'static str, AppError)>,
+    /// `(condition, refusal)` for [`FieldUpdate::guard`].
+    guard: Option<(&'static str, AppError)>,
 }
 
 impl FieldUpdate {
@@ -43,6 +45,7 @@ impl FieldUpdate {
             assignments: Vec::new(),
             bindings: Vec::new(),
             ordered: None,
+            guard: None,
         }
     }
 
@@ -77,6 +80,23 @@ impl FieldUpdate {
         self
     }
 
+    /// Refuse the write unless `condition` — a predicate on this same row —
+    /// still holds at write time. The [`FieldUpdate::ordered`] guard for a
+    /// precondition that is not about a range: a handler that read "nothing
+    /// references this yet" re-asks the database at the instant it writes, so a
+    /// reference landing in between refuses the edit instead of being edited
+    /// out from under. `condition` is always an in-crate SQL literal, never
+    /// user input.
+    ///
+    /// A request that carries no field at all emits no `UPDATE`, so it is not
+    /// refused: it writes nothing, and reading the row back is a truthful
+    /// answer to a PATCH that asked for no change.
+    #[must_use]
+    pub fn guard(mut self, condition: &'static str, refused: AppError) -> Self {
+        self.guard = Some((condition, refused));
+        self
+    }
+
     /// Run the update and return the stored row. An empty request writes
     /// nothing at all and reads the row back unchanged.
     pub async fn run<T: SurrealValue>(mut self, db: &Database) -> Result<T, AppError> {
@@ -84,7 +104,7 @@ impl FieldUpdate {
             let row: Option<T> = db.select(self.id).await?;
             return row.ok_or(AppError::NotFound);
         }
-        let (guard, mut refused) = match self.ordered.take() {
+        let (ordered, mut refused) = match self.ordered.take() {
             // Both ends stored: name the bound variable for an end this request
             // set, the column for one it left alone.
             Some((low, high, err)) if self.is_set(low) || self.is_set(high) => {
@@ -98,26 +118,38 @@ impl FieldUpdate {
                 let low = side(low, self.is_set(low));
                 let high = side(high, self.is_set(high));
                 (
-                    format!(" WHERE ({low} = NONE OR {high} = NONE OR {low} <= {high})"),
+                    Some(format!(
+                        "({low} = NONE OR {high} = NONE OR {low} <= {high})"
+                    )),
                     Some(err),
                 )
             }
-            _ => (String::new(), None),
+            _ => (None, None),
+        };
+        // Both guards land on the one `UPDATE`, ANDed. No caller sets both, so
+        // the refusal is whichever one is there.
+        let (extra, extra_refused) = match self.guard.take() {
+            Some((condition, err)) => (Some(condition.to_string()), Some(err)),
+            None => (None, None),
+        };
+        refused = refused.or(extra_refused);
+        let conditions: Vec<String> = ordered.into_iter().chain(extra).collect();
+        let guard = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", conditions.join(" AND "))
         };
         let sets = self.assignments.join(", ");
-        let mut query = db
-            .query(format!("UPDATE $id SET {sets}{guard} RETURN AFTER"))
-            .bind(("id", self.id));
-        for (name, value) in self.bindings {
-            query = query.bind((name, value));
-        }
-        let mut result = query.await?.check()?;
+        let sql = format!("UPDATE $id SET {sets}{guard} RETURN AFTER");
+        self.bindings.push(("id".into(), self.id.into_value()));
+        // Retried on a write conflict: a guarded PATCH contends on the very row
+        // its guard reads, and the loser wrote nothing, so re-sending it is the
+        // recovery — see [`write_with_retry`].
+        let rows: Vec<T> = write_with_retry(db, &sql, &self.bindings).await?;
         // No row back means the guard bit (or, in the window after the handler's
         // read, the row was deleted — the guard cannot tell the two apart, and
         // reports the refusal it was given).
-        result
-            .take::<Vec<T>>(0)?
-            .into_iter()
+        rows.into_iter()
             .next()
             .ok_or_else(|| refused.take().unwrap_or(AppError::NotFound))
     }

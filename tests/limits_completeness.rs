@@ -52,6 +52,12 @@ const EXCLUDED: &[(&str, &str)] = &[
          never as a number",
     ),
     (
+        "FEE_PLAN_UNASSIGNED_GUARD",
+        "SQL fragment: the condition a fee plan's edit and delete carry so an \
+         assigned plan freezes in the database; the client sees the freeze as a \
+         409, never as a number",
+    ),
+    (
         "UPLOAD_BODY_OVERHEAD_BYTES",
         "multipart headroom over max_file_bytes; the client sizes against \
          max_file_bytes itself, which /limits does publish",

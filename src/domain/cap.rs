@@ -29,9 +29,8 @@
 use surrealdb::types::{RecordId, SurrealValue};
 use tokio::sync::Mutex;
 
-use crate::constant::{CAP_WRITE_BACKOFF_MS, CAP_WRITE_TRIES, REF_COUNT_FIELD, REF_RETIRED_FIELD};
-use crate::database::{Database, lost_the_race};
-use crate::domain::timestamp::Timestamp;
+use crate::constant::{CAP_WRITE_TRIES, REF_COUNT_FIELD, REF_RETIRED_FIELD};
+use crate::database::{Database, backoff, lost_the_race};
 use crate::error::AppError;
 
 /// One counter writer at a time, over every counter.
@@ -196,12 +195,17 @@ pub(crate) async fn claim_and_create<T: SurrealValue + Clone>(
         {
             return Ok(Claimed::Full);
         }
-        if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-            if !lost_the_race(&error) {
-                return Err(error.into());
-            }
-            last = Some(error);
+        // A conflict in *any* slot is the whole batch's verdict, and it is read
+        // before the arbitrary pick below: the siblings say only "not executed",
+        // which is the *consequence* of this abort and never a reason of its
+        // own. Picking one of those out of a `HashMap` — unordered, so it wins
+        // most rounds — retired a retryable round as a 500.
+        if errors.values().any(lost_the_race) {
+            last = errors.drain().map(|(_, error)| error).find(lost_the_race);
             continue;
+        }
+        if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+            return Err(error.into());
         }
         // Slots count BEGIN, two LETs and two IFs: the CREATE is slot 5.
         return result
@@ -214,18 +218,6 @@ pub(crate) async fn claim_and_create<T: SurrealValue + Clone>(
     Err(last
         .map(AppError::from)
         .unwrap_or_else(|| AppError::Internal("cap counter write never ran".into())))
-}
-
-/// Wait out one lost round. Exponential with jitter, because racers arrive in
-/// lockstep (one HTTP burst) and a fixed delay would just re-synchronize them.
-/// Attempt zero waits not at all.
-async fn backoff(attempt: usize) {
-    if attempt == 0 {
-        return;
-    }
-    let step = CAP_WRITE_BACKOFF_MS << (attempt - 1);
-    let jitter = Timestamp::now().as_millis().unsigned_abs() % step.max(1);
-    tokio::time::sleep(std::time::Duration::from_millis(step + jitter)).await;
 }
 
 /// Move `parent` to its next revision. A revision column is not a cap: it is

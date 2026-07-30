@@ -12,12 +12,14 @@
 //!
 //! Nothing is ever edited or deleted: unassigning is not a thing, because the
 //! charges are already history. A plan raised in error is undone by reversing
-//! its charges.
+//! its charges. That is also why the plan's assignment refcount is only ever
+//! claimed and never released — a plan, once assigned, stays frozen for good.
 
-use surrealdb::types::{AlreadyExistsError, RecordId, RecordIdKey, SurrealValue};
+use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
-use crate::constant::FEE_PLAN_ASSIGNMENT_TABLE;
-use crate::database::{Database, lost_the_race};
+use crate::constant::{FEE_PLAN_ASSIGNMENT_COUNT_FIELD, FEE_PLAN_ASSIGNMENT_TABLE};
+use crate::database::Database;
+use crate::domain::cap::{self, Claimed};
 use crate::domain::fee_plan::{FeePlan, FeePlanId};
 use crate::domain::page::PagedList;
 use crate::domain::payment_ledger::PaymentLedger;
@@ -90,6 +92,20 @@ impl FeePlanAssignment {
     /// whether it was *already* there, so the web layer can answer a replay
     /// honestly instead of pretending it just happened.
     ///
+    /// The row and the plan's assignment refcount are written in **one**
+    /// transaction ([`cap::claim_and_create`]): that increment is what makes the
+    /// plan un-editable and un-deletable, and it has to be indivisible from the
+    /// row it counts, or an edit could slip between the two. A plan the counter
+    /// cannot be claimed on is one a concurrent delete already removed, which is
+    /// the same `404` the handler's own lookup would have given.
+    ///
+    /// The installments are then re-read **from the stored plan**, not taken
+    /// from the caller's snapshot: the claim is the moment the plan freezes, and
+    /// an edit that landed between the handler's read and that claim is
+    /// legitimate. Billing the snapshot would raise charges from a schedule the
+    /// plan no longer shows — precisely the divergence the 409 exists to
+    /// prevent.
+    ///
     /// The charges are appended after the row, never before: each one is keyed
     /// by (assignment, installment number), so this loop is safe to re-enter
     /// from the top — which is exactly what a repeated assign does, and the
@@ -101,30 +117,35 @@ impl FeePlanAssignment {
         db: &Database,
     ) -> Result<(FeePlanAssignment, bool), AppError> {
         let id = FeePlanAssignmentId::composite(plan.get_id(), student);
-        let (assignment, existed) = match Self::read(&id, db).await? {
-            Some(existing) => (existing, true),
-            None => {
-                let row = FeePlanAssignment {
-                    id: id.clone(),
-                    plan: plan.get_id().clone(),
-                    student: student.clone(),
-                    assigned_by: assigned_by.clone(),
-                    created_at: Timestamp::now(),
-                };
-                match db.create(id.record()).content(row).await {
-                    Ok(Some(created)) => (created, false),
-                    // Someone assigned this pair first, or the write was
-                    // aborted as retryable — either way their row is the
-                    // answer, and the charges below are keyed the same, so
-                    // continuing here can only *complete* the billing.
-                    Ok(None) => (Self::require(&id, db).await?, true),
-                    Err(e) if is_duplicate_record(&e) || lost_the_race(&e) => {
-                        (Self::require(&id, db).await?, true)
-                    }
-                    Err(e) => return Err(e.into()),
-                }
-            }
+        let row = FeePlanAssignment {
+            id: id.clone(),
+            plan: plan.get_id().clone(),
+            student: student.clone(),
+            assigned_by: assigned_by.clone(),
+            created_at: Timestamp::now(),
         };
+        let claimed = cap::claim_and_create(
+            &plan.get_id().record(),
+            FEE_PLAN_ASSIGNMENT_COUNT_FIELD,
+            cap::UNLIMITED,
+            &id.record(),
+            &row,
+            db,
+        )
+        .await?;
+        let (assignment, existed) = match claimed {
+            Claimed::Made(created) => (created, false),
+            // Someone assigned this pair first — their row is the answer, and
+            // the charges below are keyed the same, so continuing here can only
+            // *complete* the billing. Their claim already counts this row.
+            Claimed::Duplicate => (Self::require(&id, db).await?, true),
+            // The counter is uncapped, so the only miss is a plan that is gone.
+            Claimed::Full => return Err(AppError::NotFound),
+        };
+        // Frozen as of the claim above: no edit can land past it any more.
+        let plan = FeePlan::read(plan.get_id(), db)
+            .await?
+            .ok_or_else(|| AppError::Internal("the assigned fee plan vanished".into()))?;
         for (index, installment) in plan.get_installments().iter().enumerate() {
             PaymentLedger::charge_for_installment(
                 &assignment,
@@ -170,8 +191,10 @@ impl FeePlanAssignment {
         .await
     }
 
-    /// Is anybody on this plan? Backs the edit/delete guard — see
-    /// [`FeePlan::has_assignments`] for the race it accepts.
+    /// Is anybody on this plan? A scan, and no longer a guard: the edit and
+    /// delete guards read the plan's own refcount, which no concurrent assign
+    /// can be behind. Kept because a *test* asserting the rows and the counter
+    /// agree is the only thing that would catch the counter drifting.
     pub async fn exists_for_plan(plan: &FeePlanId, db: &Database) -> Result<bool, AppError> {
         let mut result = db
             .query("SELECT VALUE id FROM fee_plan_assignment WHERE plan = $plan LIMIT 1")
@@ -196,15 +219,6 @@ impl FeePlanAssignment {
         .run(limit, offset, db)
         .await
     }
-}
-
-/// Did this `CREATE` fail *only* because the row is already there? Same typed
-/// match, and the same reasoning, as the ledger's.
-fn is_duplicate_record(error: &surrealdb::Error) -> bool {
-    matches!(
-        error.already_exists_details(),
-        Some(AlreadyExistsError::Record { .. })
-    )
 }
 
 #[cfg(test)]
@@ -273,6 +287,216 @@ mod tests {
             FeePlanAssignment::exists_for_plan(plan.get_id(), &db)
                 .await
                 .unwrap()
+        );
+    }
+
+    /// The race the refcount exists for: an edit and an assign, both licensed
+    /// by the same instant.
+    ///
+    /// "Neither lands" is *not* the invariant — the two are legal in one order
+    /// (edit, then assign the edited plan) and illegal in the other. What may
+    /// never happen is the money and the plan disagreeing: the charges raised
+    /// must be copies of the schedule the plan actually ends up carrying, and
+    /// once anybody is on the plan no further edit or delete may land at all.
+    ///
+    /// Asserted against the **stored** state, never against which call returned
+    /// `Ok`: a winner's word is not evidence about what the store kept.
+    /// The one thing the *returned* values are good for is the second
+    /// invariant: neither racer may answer 500. Losing a single-record round to
+    /// a rival is the ordinary way this guard works, and the loser's recovery is
+    /// to re-send, not to fail the request.
+    ///
+    /// Multi-threaded on purpose: on the single-threaded runtime the two tasks
+    /// interleave only at await points and the store never reports a conflict at
+    /// all, which is how a version of this test watched a 45-in-50 500 rate and
+    /// passed.
+    ///
+    /// Real server, and `#[ignore]`d rather than falling back to `init_mem`:
+    /// the embedded engine drops one of two concurrent writes to a record and
+    /// answers `Ok` to both, which fails this very assertion out of nowhere
+    /// (measured 2026-07-30: 2 runs in 36 on `memory` under host load, 0 in
+    /// 10 000 rounds on the server). See [`crate::database::init_test_server`].
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
+    async fn an_edit_racing_an_assign_leaves_the_plan_and_the_money_agreeing() {
+        let db = crate::database::init_test_server("edit_race").await;
+        let mut reached = 0;
+        for round in 0..20 {
+            let manager = UserId::from_key("mgr1");
+            let student = UserId::from_key(&format!("stu{round}"));
+            let plan = FeePlan::create(
+                FeePlanName::try_new("Yearly").unwrap(),
+                vec![Installment::new(
+                    LedgerAmount::try_new(100).unwrap(),
+                    Timestamp::from_millis(1_000),
+                )],
+                &manager,
+                &db,
+            )
+            .await
+            .unwrap();
+
+            let edit = {
+                let (plan, db) = (plan.clone(), db.clone());
+                tokio::spawn(async move {
+                    plan.update(
+                        None,
+                        Some(vec![Installment::new(
+                            LedgerAmount::try_new(999).unwrap(),
+                            Timestamp::from_millis(2_000),
+                        )]),
+                        &db,
+                    )
+                    .await
+                })
+            };
+            let assign = {
+                let (plan, db, manager, student) =
+                    (plan.clone(), db.clone(), manager.clone(), student.clone());
+                tokio::spawn(async move {
+                    FeePlanAssignment::assign(&plan, &student, &manager, &db).await
+                })
+            };
+            let (edit, assign) = (edit.await.unwrap(), assign.await.unwrap());
+            assert!(
+                !matches!(edit, Err(AppError::Db(_))),
+                "a raced edit must be refused, not 500: {edit:?}"
+            );
+            assert!(
+                !matches!(assign, Err(AppError::Db(_))),
+                "a raced assign must retry, not 500: {assign:?}"
+            );
+
+            let stored = FeePlan::read(plan.get_id(), &db).await.unwrap().unwrap();
+            let assigned = FeePlanAssignment::exists_for_plan(plan.get_id(), &db)
+                .await
+                .unwrap();
+            if assigned {
+                reached += 1;
+                // The counter is what refuses every later edit, so it has to
+                // agree with the rows it stands for.
+                let (lines, _) = PaymentLedger::list_for_student(&student, None, 0, &db)
+                    .await
+                    .unwrap();
+                assert_eq!(lines.len(), 1, "one installment, one charge");
+                assert_eq!(
+                    lines[0].get_amount_minor().as_minor(),
+                    stored.get_installments()[0].get_amount_minor().as_minor(),
+                    "the charge must be a copy of the plan as it now stands"
+                );
+                assert!(
+                    plan.clone().update(None, None, &db).await.is_ok(),
+                    "an empty PATCH writes nothing, so it is not refused"
+                );
+                assert!(
+                    matches!(
+                        plan.clone()
+                            .update(Some(FeePlanName::try_new("Nope").unwrap()), None, &db)
+                            .await,
+                        Err(AppError::Conflict(_))
+                    ),
+                    "an assigned plan stays frozen afterwards"
+                );
+                assert!(
+                    !plan.clone().delete(&db).await.unwrap(),
+                    "and it cannot be deleted either"
+                );
+            }
+        }
+        // Every assertion above sits behind "the assign landed", so a run where
+        // it never did asserts nothing at all — the failure this counter turns
+        // into a loud one.
+        assert!(reached > 0, "no round ever placed the assignment");
+    }
+
+    /// The other half, and here "never both" *is* the invariant: a delete and
+    /// an assign racing must never leave a live assignment — with the charges
+    /// it billed — pointing at a plan that is gone. Stored state again, and a
+    /// real server again, for the same reasons.
+    ///
+    /// Both orderings are forced, because the interesting one does not happen on
+    /// its own: with both racers released together the assign wins ~24 rounds in
+    /// 25, so a run that only ever saw that ordering never tested a delete
+    /// landing first at all. Half the rounds therefore hold the assign back by a
+    /// beat, and the two counters below fail the test if either ordering went
+    /// unseen. Neither racer may answer 500 here either — this is the pair that
+    /// contends hardest, both writing the plan record itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
+    async fn a_delete_racing_an_assign_never_orphans_an_assignment() {
+        let db = crate::database::init_test_server("delete_race").await;
+        let (mut deleted_first, mut assigned_first) = (0, 0);
+        for round in 0..20 {
+            let hold_back_the_assign = round % 2 == 0;
+            let manager = UserId::from_key("mgr1");
+            let student = UserId::from_key(&format!("stu{round}"));
+            let plan = FeePlan::create(
+                FeePlanName::try_new("Yearly").unwrap(),
+                vec![Installment::new(
+                    LedgerAmount::try_new(100).unwrap(),
+                    Timestamp::from_millis(1_000),
+                )],
+                &manager,
+                &db,
+            )
+            .await
+            .unwrap();
+
+            let head_start = std::time::Duration::from_millis(5);
+            let drop_it = {
+                let (plan, db) = (plan.clone(), db.clone());
+                tokio::spawn(async move {
+                    if !hold_back_the_assign {
+                        tokio::time::sleep(head_start).await;
+                    }
+                    plan.delete(&db).await
+                })
+            };
+            let assign = {
+                let (plan, db, manager, student) =
+                    (plan.clone(), db.clone(), manager.clone(), student.clone());
+                tokio::spawn(async move {
+                    if hold_back_the_assign {
+                        tokio::time::sleep(head_start).await;
+                    }
+                    FeePlanAssignment::assign(&plan, &student, &manager, &db).await
+                })
+            };
+            let (drop_it, assign) = (drop_it.await.unwrap(), assign.await.unwrap());
+            assert!(
+                !matches!(drop_it, Err(AppError::Db(_))),
+                "a raced delete must retry, not 500: {drop_it:?}"
+            );
+            assert!(
+                !matches!(assign, Err(AppError::Db(_))),
+                "a raced assign must retry, not 500: {assign:?}"
+            );
+
+            let gone = FeePlan::read(plan.get_id(), &db).await.unwrap().is_none();
+            let assigned = FeePlanAssignment::exists_for_plan(plan.get_id(), &db)
+                .await
+                .unwrap();
+            deleted_first += usize::from(gone);
+            assigned_first += usize::from(assigned);
+            assert!(
+                !(gone && assigned),
+                "an assignment may not outlive the plan it names"
+            );
+            let (lines, _) = PaymentLedger::list_for_student(&student, None, 0, &db)
+                .await
+                .unwrap();
+            assert!(
+                !(gone && !lines.is_empty()),
+                "and neither may the charges it raised"
+            );
+        }
+        // The premise, not a nicety: "never both" is trivially true in a run
+        // where one of the two never landed, so a run that only saw one
+        // ordering has proven nothing and says so.
+        assert!(deleted_first > 0, "no round ever let the delete land first");
+        assert!(
+            assigned_first > 0,
+            "no round ever let the assign land first"
         );
     }
 }

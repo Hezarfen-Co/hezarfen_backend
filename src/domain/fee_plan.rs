@@ -16,8 +16,10 @@
 
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
-use crate::constant::{FEE_PLAN_TABLE, MAX_FEE_PLAN_INSTALLMENTS, MAX_FEE_PLAN_NAME_LEN};
-use crate::database::Database;
+use crate::constant::{
+    FEE_PLAN_TABLE, FEE_PLAN_UNASSIGNED_GUARD, MAX_FEE_PLAN_INSTALLMENTS, MAX_FEE_PLAN_NAME_LEN,
+};
+use crate::database::{Database, write_with_retry};
 use crate::domain::field_update::FieldUpdate;
 use crate::domain::monotonic_id::next_ulid;
 use crate::domain::page::PagedList;
@@ -169,13 +171,19 @@ impl FeePlan {
 
     /// Write only the fields the PATCH carried — `None` means the request
     /// omitted it, so the column is left alone rather than re-stated from the
-    /// snapshot this struct was read into.
+    /// snapshot this struct was read into. `Err(Conflict)` = refused, nothing
+    /// was written: somebody is already on the plan.
     ///
     /// Editing a plan never moves money: charges are frozen copies of the
-    /// installments as they stood when the plan was assigned. The web layer
-    /// refuses the edit outright once [`FeePlan::has_assignments`] holds, so a
-    /// plan and the charges raised from it cannot drift apart in the first
-    /// place.
+    /// installments as they stood when the plan was assigned. That is exactly
+    /// why an assigned plan may not be edited at all — the plan and the charges
+    /// raised from it would tell different stories. The roster is the plan's own
+    /// [`crate::constant::FEE_PLAN_ASSIGNMENT_COUNT_FIELD`] refcount, claimed in the same
+    /// transaction as the assignment row, so the check and the write are one
+    /// conditional `UPDATE` on one record: an assign racing this either claims
+    /// first (and the edit is refused) or claims after (and bills the edited
+    /// plan, which it re-reads). A `SELECT`-then-write could be, and was,
+    /// stepped over in the gap between the two.
     pub async fn update(
         self,
         name: Option<FeePlanName>,
@@ -188,24 +196,38 @@ impl FeePlan {
         FieldUpdate::new(self.id.record())
             .set("name", name)
             .set("installments", installments)
+            .guard(
+                FEE_PLAN_UNASSIGNED_GUARD,
+                AppError::Conflict("an assigned plan cannot be edited"),
+            )
             .run::<FeePlan>(db)
             .await
     }
 
-    pub async fn delete(self, db: &Database) -> Result<(), AppError> {
-        let _: Option<FeePlan> = db.delete(self.id.record()).await?;
-        Ok(())
-    }
-
-    /// Has this plan ever been assigned? The 409 guard on edit and delete.
+    /// Delete the plan, but only while nobody is on it. `false` = refused,
+    /// nothing was written; `Err(NotFound)` keeps the answer a concurrent
+    /// *delete* gives. Same one-record guard as [`FeePlan::update`], and the
+    /// same reason — the charges an assignment raised name this plan, and a
+    /// school's financial history keeps its references.
     ///
-    /// A scan, and deliberately so: it races an assign landing in the gap
-    /// between this read and the edit it licenses, which can leave a plan edited
-    /// *and* assigned. Accepted — both versions of the plan were manager-approved,
-    /// and the charges the assign raised are frozen copies either way, so no
-    /// money moves behind anyone's back.
-    pub async fn has_assignments(id: &FeePlanId, db: &Database) -> Result<bool, AppError> {
-        crate::domain::fee_plan_assignment::FeePlanAssignment::exists_for_plan(id, db).await
+    /// Retried while the store answers "conflict, retry": the guard reads a
+    /// counter an assign *writes*, so the two contend on this one record by
+    /// design — and a delete that loses that round has written nothing, so
+    /// re-sending it is the whole of the recovery. Without the retry an
+    /// ordinary raced delete answers 500 instead of the 404 or 409 it owes.
+    pub async fn delete(self, db: &Database) -> Result<bool, AppError> {
+        let sql = format!("DELETE $plan WHERE {FEE_PLAN_UNASSIGNED_GUARD} RETURN BEFORE");
+        let deleted: Vec<FeePlan> =
+            write_with_retry(db, &sql, &[("plan".into(), self.id.record().into_value())]).await?;
+        if !deleted.is_empty() {
+            return Ok(true);
+        }
+        // Still assigned or already gone: the one statement cannot tell those
+        // apart, and only the refusal path pays for the read that can.
+        match Self::read(&self.id, db).await? {
+            Some(_) => Ok(false),
+            None => Err(AppError::NotFound),
+        }
     }
 }
 

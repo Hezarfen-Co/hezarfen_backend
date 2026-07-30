@@ -686,6 +686,19 @@ pub const REGISTRATION_COUNT_FIELD: &str = "registration_count";
 /// is claimed before a course's link is written, so the two decisions contend
 /// on the term row instead of on a cross-table `SELECT` no transaction orders.
 pub const COURSE_COUNT_FIELD: &str = "course_count";
+/// A refcount too, and the whole of the fee-plan edit *and* delete guard: how
+/// many students are on this plan. A plan may only be edited or deleted at
+/// zero, and the count is claimed in the same transaction as the assignment
+/// row, so a manager's edit and a concurrent assign contend on the plan row
+/// rather than on a `SELECT` the edit had already outrun. Nothing ever
+/// releases it — an assignment is never unassigned, because the charges it
+/// raised are history.
+pub const FEE_PLAN_ASSIGNMENT_COUNT_FIELD: &str = "assignment_count";
+/// The condition itself, spelled once: a plan is editable and deletable
+/// exactly while nobody is on it. The `??` is parenthesized on purpose —
+/// `count ?? 0 = 0` parses as `count ?? (0 = 0)`, which is truthy for *every*
+/// row and would license editing a plan a family is already being billed for.
+pub const FEE_PLAN_UNASSIGNED_GUARD: &str = "(assignment_count ?? 0) = 0";
 pub const NOTE_FILE_COUNT_FIELD: &str = "file_count";
 pub const SUBMISSION_FILE_COUNT_FIELD: &str = "file_count";
 pub const CHATBOT_THREAD_COUNT_FIELD: &str = "chatbot_thread_count";
