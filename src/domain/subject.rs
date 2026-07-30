@@ -1,7 +1,7 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
 use crate::constant::{MAX_SUBJECT_DESCRIPTION_LEN, MAX_SUBJECT_NAME_LEN, SUBJECT_TABLE};
-use crate::database::Database;
+use crate::database::{Database, transaction_with_retry};
 use crate::domain::course::CourseId;
 use crate::domain::field_update::FieldUpdate;
 use crate::domain::monotonic_id::next_ulid;
@@ -185,9 +185,9 @@ impl Subject {
     /// existence. Its cascade runs *after* the conditional delete, so a refused
     /// delete leaves every template's subject where it was.
     pub async fn delete(self, db: &Database) -> Result<Subject, AppError> {
-        let mut result = db
-            .query(
-                "BEGIN TRANSACTION;
+        let (mut result, mut errors) = transaction_with_retry(
+            db,
+            "BEGIN TRANSACTION;
                  LET $held = (SELECT exam_question_count AS q, homework_count AS h FROM $sub);
                  LET $before = (DELETE $sub
                      WHERE (exam_question_count ?? 0) = 0 AND (homework_count ?? 0) = 0
@@ -200,12 +200,13 @@ impl Subject {
                  UPDATE bank_question SET subject = NONE WHERE subject = $sub;
                  RETURN $before;
                  COMMIT TRANSACTION;",
-            )
-            .bind(("sub", self.id.record()))
-            .await?;
+            &[("sub".into(), self.id.record().into_value())],
+            &["subject_missing", "subject_questions", "subject_homework"],
+        )
+        .await?;
         // An aborted transaction errors every slot; only the THROW's own slot
-        // names the marker (the [`crate::domain::appointment_slot`] treatment).
-        let mut errors = result.take_errors();
+        // names the marker (the [`crate::domain::appointment_slot`] treatment),
+        // and a lost round is re-sent rather than reported.
         let thrown = |marker: &str| {
             errors
                 .values()
@@ -266,5 +267,149 @@ mod tests {
     async fn description_is_optional() {
         assert!(SubjectDescription::try_new("").is_ok());
         assert!(SubjectDescription::try_new(&"x".repeat(2_001)).is_err());
+    }
+
+    /// GUARD, not a retry measurement — read the last paragraph before
+    /// trusting this test with the retry. See
+    /// [`crate::domain::course::Course::delete`]'s race test for why the rate
+    /// is counted rather than asserted per round, and why this needs the real
+    /// server and a multi-threaded runtime.
+    ///
+    /// The racer is [`ExamQuestion::create`], which claims the subject's
+    /// question reference *before* it writes the row — a conditional write on
+    /// the same record the delete's `WHERE` reads. `Err(Conflict)` (still
+    /// referenced), `Err(NotFound)` and the claim's `Validation` miss are all
+    /// correct answers; only `AppError::Db` is the defect. What the two stored
+    /// counters below assert is that the sweep genuinely straddled the site:
+    /// some rounds the claims won, some rounds the delete did.
+    ///
+    /// What it does *not* prove is the retry. The 500 window here is the delete
+    /// passing its `WHERE` and then committing while a claim is in flight, and
+    /// this cascade is three statements long — measured at 0 conflicts in 100
+    /// raced rounds, and the whole test stays green with
+    /// [`crate::database::transaction_with_retry`]'s loop cut to a single
+    /// attempt. Widening the sweep, staggering the burst and doubling it to 12
+    /// racers all failed to open the window (they only move which side wins).
+    /// So this is a status-code-and-cascade guard: a raced delete answers 409 or
+    /// 404 and never 500, and a landed question survives it. The retry itself is
+    /// measured on [`crate::domain::course::Course::delete`], whose cascade is
+    /// long enough to lose a round (1-2 of 20, red under the same mutation).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
+    async fn a_delete_racing_a_question_never_answers_500() {
+        use crate::domain::exam::ExamId;
+        use crate::domain::exam_question::{
+            ExamQuestion, QuestionKind, QuestionPoints, QuestionSpec, QuestionText,
+        };
+        let (db, _serialized) = crate::database::init_test_server("subject_delete_race").await;
+        let (mut delete_500, mut question_500) = (0, 0);
+        let (mut landed, mut wiped) = (0, 0);
+        let (mut last_delete, mut last_question) = (String::new(), String::new());
+        for round in 0..20 {
+            let course = CourseId::generate();
+            let exam = ExamId::generate();
+            let subject = Subject::create(
+                &course,
+                SubjectName::try_new("Limits").unwrap(),
+                SubjectDescription::try_new("").unwrap(),
+                &db,
+            )
+            .await
+            .unwrap();
+
+            let separated = round % 4 == 0;
+            let drop_it = {
+                let (subject, db) = (subject.clone(), db.clone());
+                // One round in four holds the racers back by a clear 2ms so the
+                // delete wins outright: the sub-millisecond sweep alone leaves
+                // them ahead of it nearly every round (measured 20 to 0), and
+                // both counters below have to see a side. The other three keep
+                // the sub-ms beat, which is the only spacing that overlaps at
+                // all — a whole millisecond either way separates them.
+                let beat = if separated {
+                    std::time::Duration::ZERO
+                } else {
+                    std::time::Duration::from_micros(round * 53 % 300)
+                };
+                tokio::spawn(async move {
+                    tokio::time::sleep(beat).await;
+                    subject.delete(&db).await
+                })
+            };
+            let asks: Vec<_> = (0..6)
+                .map(|_| {
+                    let (id, db, exam) = (subject.get_id().clone(), db.clone(), exam.clone());
+                    let head_start = if separated {
+                        std::time::Duration::from_millis(2)
+                    } else {
+                        std::time::Duration::from_micros(round * 37 % 300)
+                    };
+                    tokio::spawn(async move {
+                        tokio::time::sleep(head_start).await;
+                        ExamQuestion::create(
+                            &exam,
+                            id,
+                            QuestionText::try_new("why").unwrap(),
+                            QuestionPoints::try_new(1).unwrap(),
+                            QuestionSpec::try_new(
+                                QuestionKind::try_new("text").unwrap(),
+                                None,
+                                None,
+                                &[],
+                            )
+                            .unwrap(),
+                            &db,
+                        )
+                        .await
+                    })
+                })
+                .collect();
+            let drop_it = drop_it.await.unwrap();
+            if matches!(drop_it, Err(AppError::Db(_))) {
+                delete_500 += 1;
+                last_delete = format!("{drop_it:?}");
+            }
+            for ask in asks {
+                let ask = ask.await.unwrap();
+                if matches!(ask, Err(AppError::Db(_))) {
+                    question_500 += 1;
+                    last_question = format!("{ask:?}");
+                }
+            }
+            // Stored state, and both sides are needed: a question landing means
+            // the claim beat the guard, the subject being gone means the delete
+            // did. Seeing only one is a run that never swept across the window.
+            if Subject::read(subject.get_id(), &db)
+                .await
+                .unwrap()
+                .is_none()
+            {
+                wiped += 1;
+            }
+            if !ExamQuestion::list_for_exam(&exam, None, 0, &db)
+                .await
+                .unwrap()
+                .0
+                .is_empty()
+            {
+                landed += 1;
+            }
+        }
+        eprintln!(
+            "Subject::delete raced: {delete_500}/20 delete 500s, {question_500} question 500s, \
+             {landed} rounds with a question landed / {wiped} wiped"
+        );
+        assert!(
+            landed > 0 && wiped > 0,
+            "the sweep never crossed the window ({landed} landed / {wiped} wiped)"
+        );
+        assert_eq!(
+            delete_500, 0,
+            "a raced delete must be refused, not 500: {delete_500}/20 rounds, last {last_delete}"
+        );
+        assert_eq!(
+            question_500, 0,
+            "a raced question create must retry, not 500: {question_500}/20 rounds, last {last_question}"
+        );
     }
 }

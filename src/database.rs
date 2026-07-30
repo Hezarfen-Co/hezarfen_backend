@@ -136,6 +136,75 @@ pub(crate) async fn write_with_retry<T: surrealdb::types::SurrealValue>(
         .unwrap_or_else(|| AppError::Internal("a guarded write never ran".into())))
 }
 
+/// Send one guarded `BEGIN…COMMIT` cascade, re-sending it while the store
+/// answers "conflict, retry", and hand back both the response and the errors
+/// drained off it.
+///
+/// [`write_with_retry`]'s story, for the cascades that cannot be one statement:
+/// the guard reads a column a rival writes, so the two contend on one record by
+/// design, and a lost round aborts the transaction having written *nothing* —
+/// which is what makes re-sending the whole of the recovery.
+///
+/// Both halves come back because the caller needs both and `take_errors`
+/// consumes: the response carries the result slots, and only the error map can
+/// tell a deliberate `THROW` from a lost round. `refusals` are the caller's
+/// `THROW` markers and they are matched *first* — a `THROW` is a decision, and
+/// it outranks a conflict. Everything after that ordering is why this exists:
+/// an aborted transaction errors *every* slot, and all but the failing one say
+/// a generic "not executed", which is the consequence of the abort and never a
+/// reason of its own. Picking one of those out of the unordered `HashMap` — or
+/// taking the first via `check()` — retired a retryable round as a 500, measured
+/// on `Course::delete` at 1-3 of 20 raced rounds.
+///
+/// [`write_with_retry`]'s restriction carries over, and a cascade makes it
+/// easier to trip: no statement inside may be able to answer "already exists",
+/// because that is the other thing [`lost_the_race`] matches and re-sending it
+/// would just fail the same way until the tries run out — turning a 409 into a
+/// 500, which is the exact defect this exists to prevent. So `UPDATE` and
+/// `DELETE`, and no `CREATE` and no write under a `UNIQUE` index anywhere in
+/// the batch. The four cascades on it today are clear on both counts.
+pub(crate) async fn transaction_with_retry(
+    db: &Database,
+    sql: &str,
+    bindings: &[(String, surrealdb::types::Value)],
+    refusals: &[&str],
+) -> Result<
+    (
+        surrealdb::IndexedResults,
+        std::collections::HashMap<usize, surrealdb::Error>,
+    ),
+    AppError,
+> {
+    let mut last = None;
+    for attempt in 0..CAP_WRITE_TRIES {
+        backoff(attempt).await;
+        let mut query = db.query(sql);
+        for (name, value) in bindings {
+            query = query.bind((name.clone(), value.clone()));
+        }
+        let mut result = match query.await {
+            Ok(result) => result,
+            Err(err) if lost_the_race(&err) => {
+                last = Some(err);
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
+        let mut errors = result.take_errors();
+        let refused = |error: &surrealdb::Error| {
+            let message = error.to_string();
+            refusals.iter().any(|marker| message.contains(marker))
+        };
+        if errors.values().any(refused) || !errors.values().any(lost_the_race) {
+            return Ok((result, errors));
+        }
+        last = errors.drain().map(|(_, error)| error).find(lost_the_race);
+    }
+    Err(last
+        .map(AppError::from)
+        .unwrap_or_else(|| AppError::Internal("a guarded cascade never ran".into())))
+}
+
 /// Wait out one lost round. Exponential with jitter, because racers arrive in
 /// lockstep (one HTTP burst) and a fixed delay would just re-synchronize them.
 /// Attempt zero waits not at all.
@@ -194,8 +263,23 @@ pub async fn init_mem() -> Result<Database, AppError> {
 /// Every caller is `#[ignore]`d, so a machine with no server prints them as
 /// `ignored` rather than passing: this is not a test that may quietly skip.
 /// `HEZARFEN_TEST_DB` overrides the address; the credentials are `compose.yaml`'s.
+///
+/// The guard handed back with the handle serializes these tests against each
+/// other and must be held for the whole test — hence the tuple, which cannot be
+/// forgotten the way a separate `lock()` line can. `cargo test -- --ignored`
+/// runs them in parallel, and while each has a namespace to itself they all
+/// burst against the *one* server: their beats are sub-millisecond, so a
+/// sibling's burst pushes a delete clean out of the window it is meant to land
+/// in (measured 4 runs in 4 at 3 of 6 failing their own "the race was reached"
+/// guard). Serialized, the plain documented command works.
 #[cfg(test)]
-pub(crate) async fn init_test_server(scratch: &str) -> Database {
+pub(crate) static RACE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+pub(crate) async fn init_test_server(
+    scratch: &str,
+) -> (Database, tokio::sync::MutexGuard<'static, ()>) {
+    let serialized = RACE_LOCK.lock().await;
     let url =
         std::env::var("HEZARFEN_TEST_DB").unwrap_or_else(|_| "ws://127.0.0.1:8000".to_string());
     let db = surrealdb::engine::any::connect(url.clone())
@@ -216,7 +300,7 @@ pub(crate) async fn init_test_server(scratch: &str) -> Database {
     db.use_ns(ns.clone()).use_db(ns).await.expect("scratch ns");
     let db = std::sync::Arc::new(db);
     migrate(&db).await.expect("migrate the scratch namespace");
-    db
+    (db, serialized)
 }
 
 /// Apply the schema + backfills. Idempotent — `init` runs it on every boot,

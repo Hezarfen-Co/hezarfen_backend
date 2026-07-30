@@ -10,7 +10,7 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use ulid::Ulid;
 
 use crate::constant::{COURSE_COUNT_FIELD, MAX_TERM_NAME_LEN, TERM_TABLE};
-use crate::database::Database;
+use crate::database::{Database, write_with_retry};
 use crate::domain::field_update::FieldUpdate;
 use crate::domain::page::PagedList;
 use crate::domain::timestamp::{Timestamp, range_error};
@@ -144,14 +144,13 @@ impl Term {
     /// refused itself, with the same 400 the lookup gives). `Err(NotFound)`
     /// keeps the answer a concurrent *delete* used to get.
     pub async fn delete(self, db: &Database) -> Result<bool, AppError> {
-        let mut result = db
-            .query(format!(
-                "DELETE $term WHERE ({COURSE_COUNT_FIELD} ?? 0) = 0 RETURN BEFORE"
-            ))
-            .bind(("term", self.id.record()))
-            .await?
-            .check()?;
-        if !result.take::<Vec<Term>>(0)?.is_empty() {
+        let sql = format!("DELETE $term WHERE ({COURSE_COUNT_FIELD} ?? 0) = 0 RETURN BEFORE");
+        // Through the retry, because the guard reads the very column a course
+        // create claims: a lost round writes nothing, and re-sending it is what
+        // keeps the answer the 404 or 409 it owes instead of a 500.
+        let gone: Vec<Term> =
+            write_with_retry(db, &sql, &[("term".into(), self.id.record().into_value())]).await?;
+        if !gone.is_empty() {
             return Ok(true);
         }
         // Still linked or already gone: the one statement cannot tell those
@@ -203,5 +202,133 @@ mod tests {
         assert!(TermName::try_new("").is_err());
         assert!(TermName::try_new("   ").is_err());
         assert!(TermName::try_new(&"x".repeat(101)).is_err());
+    }
+
+    /// GUARD, not a retry measurement — read the last paragraph before
+    /// trusting this test with the retry. See
+    /// [`crate::domain::course::Course::delete`]'s race test for why the rate is
+    /// counted rather than asserted per round.
+    ///
+    /// One conditional `DELETE … RETURN BEFORE` and a bare `.check()?`: no
+    /// transaction to abort, but also no [`crate::database::write_with_retry`],
+    /// which every other guarded single-statement write in the crate goes
+    /// through. A store answering "conflict, retry" therefore comes out as a
+    /// 500 instead of the 404 or 409 the request owes.
+    ///
+    /// The racer is [`crate::domain::course::Course::create`] against this
+    /// term: it claims `course_count` on the term row before it writes the
+    /// link, which is the same record and the same column the guard reads. Both
+    /// sides are swept across each other sub-millisecond, exactly as in
+    /// [`crate::domain::subject::Subject::delete`]'s race test — a whole
+    /// millisecond of head start on either side separates them completely, and
+    /// the counters below assert the sweep straddled the site rather than
+    /// landing on one side of it (it used to alternate on `round % 2` and score
+    /// an exact 10/10, i.e. no overlap at all).
+    ///
+    /// And like that test it does *not* prove the retry: this site is one
+    /// statement, so the window in which a conflict could reach
+    /// [`write_with_retry`] is a single round trip wide — measured at 0
+    /// conflicts in 100 raced rounds, green with the retry loop cut to a single
+    /// attempt. A status-code guard, then: a raced delete answers 409 or 404 and
+    /// never 500, and a course that got linked survives it. The retry is
+    /// measured on [`crate::domain::course::Course::delete`].
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
+    async fn a_delete_racing_a_course_create_never_answers_500() {
+        use crate::domain::course::{Course, CourseDescription, CourseKind, CourseTitle};
+        use crate::domain::user::UserId;
+        let (db, _serialized) = crate::database::init_test_server("term_delete_race").await;
+        let (mut delete_500, mut create_500) = (0, 0);
+        let (mut linked, mut wiped) = (0, 0);
+        let (mut last_delete, mut last_create) = (String::new(), String::new());
+        let at = Timestamp::from_millis;
+        for round in 0..20 {
+            let term = Term::create(TermName::try_new("2026").unwrap(), at(100), at(200), &db)
+                .await
+                .unwrap();
+
+            let separated = round % 4 == 0;
+            let drop_it = {
+                let (term, db) = (term.clone(), db.clone());
+                // One round in four holds the racers back by a clear 2ms so the
+                // delete wins outright: the sub-millisecond sweep alone leaves
+                // them ahead of it nearly every round (measured 20 to 0), and
+                // both counters below have to see a side. The other three keep
+                // the sub-ms beat, which is the only spacing that overlaps at
+                // all — a whole millisecond either way separates them.
+                let beat = if separated {
+                    std::time::Duration::ZERO
+                } else {
+                    std::time::Duration::from_micros(round * 53 % 300)
+                };
+                tokio::spawn(async move {
+                    tokio::time::sleep(beat).await;
+                    term.delete(&db).await
+                })
+            };
+            let makes: Vec<_> = (0..6)
+                .map(|_| {
+                    let (id, db) = (term.get_id().clone(), db.clone());
+                    let head_start = if separated {
+                        std::time::Duration::from_millis(2)
+                    } else {
+                        std::time::Duration::from_micros(round * 37 % 300)
+                    };
+                    tokio::spawn(async move {
+                        tokio::time::sleep(head_start).await;
+                        Course::create(
+                            &UserId::from_key("teacher"),
+                            CourseTitle::try_new("algebra").unwrap(),
+                            CourseDescription::try_new("").unwrap(),
+                            CourseKind::course(),
+                            Some(id),
+                            None,
+                            &db,
+                        )
+                        .await
+                    })
+                })
+                .collect();
+            let drop_it = drop_it.await.unwrap();
+            if matches!(drop_it, Err(AppError::Db(_))) {
+                delete_500 += 1;
+                last_delete = format!("{drop_it:?}");
+            }
+            // Stored state, both sides: a linked course means the claim beat the
+            // guard, a gone term means the delete did.
+            let mut landed = false;
+            for make in makes {
+                let make = make.await.unwrap();
+                if matches!(make, Err(AppError::Db(_))) {
+                    create_500 += 1;
+                    last_create = format!("{make:?}");
+                }
+                if let Ok(course) = &make
+                    && Course::read(course.get_id(), &db).await.unwrap().is_some()
+                {
+                    landed = true;
+                }
+            }
+            linked += usize::from(landed);
+            if Term::read(term.get_id(), &db).await.unwrap().is_none() {
+                wiped += 1;
+            }
+        }
+        eprintln!(
+            "Term::delete raced: {delete_500}/20 delete 500s, {create_500} create 500s, \
+             {linked} rounds with a course linked / {wiped} wiped"
+        );
+        assert!(
+            linked > 0 && wiped > 0,
+            "the sweep never crossed the window ({linked} linked / {wiped} wiped)"
+        );
+        assert_eq!(
+            delete_500, 0,
+            "a raced delete must be refused, not 500: {delete_500}/20 rounds, last {last_delete}"
+        );
+        assert_eq!(
+            create_500, 0,
+            "a raced course create must retry, not 500: {create_500}/20 rounds, last {last_create}"
+        );
     }
 }
