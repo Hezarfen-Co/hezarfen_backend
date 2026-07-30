@@ -247,6 +247,12 @@ async fn get_plan(
 /// been assigned to anyone: those charges are frozen copies of the installments
 /// as they stood, so editing afterwards would leave the plan and the money
 /// telling different stories. Write a new plan instead.
+///
+/// The refusal is decided by the database as the edit is written, not by a
+/// read taken before it, so an assign arriving at the same instant cannot end
+/// up on either side of the edit: it either freezes the plan first (and this is
+/// a `409`) or bills the edited schedule. A PATCH carrying no field at all
+/// writes nothing and returns the plan unchanged, assigned or not.
 #[utoipa::path(
     patch,
     path = "/plans/{id}",
@@ -270,7 +276,6 @@ async fn update_plan(
     Json(req): Json<UpdateFeePlan>,
 ) -> Result<Json<FeePlanResponse>, AppError> {
     let plan = require_plan(&id, &st.db).await?;
-    ensure_unassigned(plan.get_id(), "an assigned plan cannot be edited", &st.db).await?;
     let name = req.name.as_deref().map(FeePlanName::try_new).transpose()?;
     let installments = req.installments.map(InstallmentBody::list).transpose()?;
     let plan = plan.update(name, installments, &st.db).await?;
@@ -282,7 +287,9 @@ async fn update_plan(
 
 /// Delete a plan. Refused (`409`) once it has been assigned to anyone — the
 /// charges it raised name it, and a school's financial history keeps its
-/// references.
+/// references. Decided as the delete is written, the same way the edit is, so a
+/// simultaneous assign can never leave a live assignment pointing at a plan
+/// that is gone.
 #[utoipa::path(
     delete,
     path = "/plans/{id}",
@@ -303,22 +310,10 @@ async fn delete_plan(
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
     let plan = require_plan(&id, &st.db).await?;
-    ensure_unassigned(plan.get_id(), "an assigned plan cannot be deleted", &st.db).await?;
-    plan.delete(&st.db).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// The shared 409 guard behind editing and deleting a plan. A scan, and
-/// deliberately so — see [`FeePlan::has_assignments`] for the race it accepts.
-async fn ensure_unassigned(
-    plan: &FeePlanId,
-    reason: &'static str,
-    db: &Database,
-) -> Result<(), AppError> {
-    if FeePlan::has_assignments(plan, db).await? {
-        return Err(AppError::Conflict(reason));
+    if !plan.delete(&st.db).await? {
+        return Err(AppError::Conflict("an assigned plan cannot be deleted"));
     }
-    Ok(())
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ---- assignments ------------------------------------------------------------
@@ -361,6 +356,13 @@ struct FeePlanAssignmentResponse {
 /// Only students carry a fee record, so any other target is rejected. One bad
 /// id never loses the rest of the batch: the response reports each student
 /// separately.
+///
+/// Placing the first student **freezes** the plan: it can no longer be edited
+/// or deleted. The installments billed are read back from the stored plan at
+/// that instant, so an edit that landed a moment earlier is the one billed,
+/// never the version this request first looked at. A plan deleted while the
+/// batch is running is `rejected` from that student on — a per-student outcome
+/// like any other, so the students it already billed stay in the report.
 #[utoipa::path(
     post,
     path = "/plans/{id}/assignments",
@@ -398,9 +400,15 @@ async fn assign_plan(
             .await?
             .is_some_and(|user| user.get_role() == Role::Student);
         let (status, reason) = if is_student {
-            match FeePlanAssignment::assign(&plan, &student, manager.get_id(), &st.db).await? {
-                (_, true) => ("already_assigned", None),
-                (_, false) => ("assigned", None),
+            match FeePlanAssignment::assign(&plan, &student, manager.get_id(), &st.db).await {
+                Ok((_, true)) => ("already_assigned", None),
+                Ok((_, false)) => ("assigned", None),
+                // The plan was deleted mid-batch. That is a per-student outcome
+                // like any other, not a reason to throw away the report for the
+                // students this batch already billed — their charges are
+                // written and the caller has to be told about them.
+                Err(AppError::NotFound) => ("rejected", Some("no such plan")),
+                Err(err) => return Err(err),
             }
         } else {
             ("rejected", Some("no such student"))

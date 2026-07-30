@@ -5,7 +5,8 @@ use surrealdb::engine::any::Any;
 use surrealdb::opt::auth::Root;
 
 use crate::config::Config;
-use crate::constant::CHATBOT_PENDING_STALE_SECS;
+use crate::constant::{CAP_WRITE_BACKOFF_MS, CAP_WRITE_TRIES, CHATBOT_PENDING_STALE_SECS};
+use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{Password, User, Username};
 use crate::error::AppError;
 use crate::migration_sql::MIGRATION_BATCHES;
@@ -102,6 +103,51 @@ pub(crate) fn lost_the_race(err: &surrealdb::Error) -> bool {
     message.contains("already exists") || message.contains("can be retried")
 }
 
+/// Send one guarded single-statement write, re-sending it while the store
+/// answers "conflict, retry", and hand back the rows it returned.
+///
+/// The guard on such a statement reads a column a rival writes, so the two
+/// contend on one record *by design* — that contention is what makes the guard
+/// atomic. Losing a round writes nothing at all, which makes re-sending the
+/// whole of the recovery; without it an ordinary raced `PATCH` or `DELETE`
+/// answers 500 instead of the 404 or 409 it owes. Only for statements that
+/// cannot produce "already exists" (the other thing [`lost_the_race`] matches),
+/// so `UPDATE` and `DELETE` and not `CREATE`.
+pub(crate) async fn write_with_retry<T: surrealdb::types::SurrealValue>(
+    db: &Database,
+    sql: &str,
+    bindings: &[(String, surrealdb::types::Value)],
+) -> Result<Vec<T>, AppError> {
+    let mut last = None;
+    for attempt in 0..CAP_WRITE_TRIES {
+        backoff(attempt).await;
+        let mut query = db.query(sql);
+        for (name, value) in bindings {
+            query = query.bind((name.clone(), value.clone()));
+        }
+        match async { query.await?.check()?.take::<Vec<T>>(0) }.await {
+            Ok(rows) => return Ok(rows),
+            Err(err) if lost_the_race(&err) => last = Some(err),
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Err(last
+        .map(AppError::from)
+        .unwrap_or_else(|| AppError::Internal("a guarded write never ran".into())))
+}
+
+/// Wait out one lost round. Exponential with jitter, because racers arrive in
+/// lockstep (one HTTP burst) and a fixed delay would just re-synchronize them.
+/// Attempt zero waits not at all.
+pub(crate) async fn backoff(attempt: usize) {
+    if attempt == 0 {
+        return;
+    }
+    let step = CAP_WRITE_BACKOFF_MS << (attempt - 1);
+    let jitter = Timestamp::now().as_millis().unsigned_abs() % step.max(1);
+    tokio::time::sleep(std::time::Duration::from_millis(step + jitter)).await;
+}
+
 /// Dial the database, retrying until it answers.
 ///
 /// Never gives up, because giving up is worse than waiting: the database is
@@ -135,6 +181,42 @@ pub async fn init_mem() -> Result<Database, AppError> {
     db.use_ns("hezarfen").use_db("hezarfen").await?;
     migrate(&db).await?;
     Ok(std::sync::Arc::new(db))
+}
+
+/// A handle on a **real** SurrealDB server, in a scratch namespace of its own
+/// that is dropped and re-made on every call. For the tests whose subject is
+/// the store's own conflict detection, which [`init_mem`]'s embedded engine
+/// does not have: it drops one of two concurrent writes to a record and answers
+/// `Ok` to both (see [`crate::domain::cap`]), which *forges* the very
+/// integrity failure those tests exist to catch — measured 2026-07-30 at 2
+/// failed runs in 36 on `memory`, against 0 in 10 000 rounds here.
+///
+/// Every caller is `#[ignore]`d, so a machine with no server prints them as
+/// `ignored` rather than passing: this is not a test that may quietly skip.
+/// `HEZARFEN_TEST_DB` overrides the address; the credentials are `compose.yaml`'s.
+#[cfg(test)]
+pub(crate) async fn init_test_server(scratch: &str) -> Database {
+    let url =
+        std::env::var("HEZARFEN_TEST_DB").unwrap_or_else(|_| "ws://127.0.0.1:8000".to_string());
+    let db = surrealdb::engine::any::connect(url.clone())
+        .await
+        .unwrap_or_else(|err| panic!("no SurrealDB server at {url} ({err})"));
+    db.signin(Root {
+        username: "root".into(),
+        password: "root".into(),
+    })
+    .await
+    .expect("sign in to the test server");
+    let ns = format!("test_{scratch}");
+    db.query(format!("REMOVE NAMESPACE IF EXISTS {ns}"))
+        .await
+        .expect("clear the scratch namespace")
+        .check()
+        .expect("clear the scratch namespace");
+    db.use_ns(ns.clone()).use_db(ns).await.expect("scratch ns");
+    let db = std::sync::Arc::new(db);
+    migrate(&db).await.expect("migrate the scratch namespace");
+    db
 }
 
 /// Apply the schema + backfills. Idempotent — `init` runs it on every boot,
@@ -219,6 +301,78 @@ mod tests {
         assert_eq!(interrupted["status"], "failed");
         assert_eq!(interrupted["error_code"], "interrupted");
         assert!(interrupted["completed_at"].as_i64().unwrap() > 0);
+    }
+
+    /// Stale-data path for the 2026-07-30 fee-plan refcount. A dev volume
+    /// carries plans and assignments written before the counter column existed,
+    /// and an absent counter reads as **zero** — which is exactly the value
+    /// that licenses an edit and a delete. Unseeded, every already-assigned
+    /// plan on every existing volume would go editable and deletable again, so
+    /// the backfill is the whole of the stale-data story, not a nicety.
+    #[tokio::test]
+    async fn a_plan_assigned_before_the_counter_existed_is_still_refused() {
+        use crate::domain::fee_plan::{FeePlan, FeePlanId, FeePlanName};
+        use crate::error::AppError;
+
+        let db = super::init_mem().await.unwrap();
+        // The old shape: rows stating every column the older binary knew, and
+        // no `assignment_count` at all. `used` carries an assignment, `free`
+        // does not — a plan nobody is on must stay editable.
+        db.query(
+            "CREATE user:m SET username = 'm', password_hash = 'x';
+             CREATE user:s SET username = 's', password_hash = 'x';
+             CREATE fee_plan:used SET name = 'Yearly',
+                 installments = [{ amount_minor: 100, due_at: 1 }],
+                 created_by = user:m, created_at = 1;
+             CREATE fee_plan:free SET name = 'Unused',
+                 installments = [{ amount_minor: 100, due_at: 1 }],
+                 created_by = user:m, created_at = 1;
+             CREATE fee_plan_assignment:used_s SET plan = fee_plan:used,
+                 student = user:s, assigned_by = user:m, created_at = 1;",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+        // Twice: every boot runs the backfill, and a second pass must not
+        // double a counter it already seeded.
+        super::migrate(&db).await.unwrap();
+        super::migrate(&db).await.unwrap();
+
+        let mut counts = db
+            .query("SELECT VALUE assignment_count FROM fee_plan ORDER BY id")
+            .await
+            .unwrap();
+        let counts: Vec<Option<i64>> = counts.take(0).unwrap();
+        // `free` before `used` by id; the unused plan is deliberately left
+        // absent, which already reads as zero in the guard.
+        assert_eq!(counts, vec![None, Some(1)]);
+
+        // The load-bearing half: the seeded plan is frozen, and the untouched
+        // one is not.
+        let used = FeePlan::read(&FeePlanId::from_key("used"), &db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            used.clone()
+                .update(Some(FeePlanName::try_new("Edited").unwrap()), None, &db)
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        assert!(!used.delete(&db).await.unwrap());
+        let free = FeePlan::read(&FeePlanId::from_key("free"), &db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            free.clone()
+                .update(Some(FeePlanName::try_new("Edited").unwrap()), None, &db)
+                .await
+                .is_ok()
+        );
+        assert!(free.delete(&db).await.unwrap());
     }
 
     #[tokio::test]

@@ -651,6 +651,12 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS installments.*.due_at ON fee_plan TYPE int;
     DEFINE FIELD IF NOT EXISTS created_by ON fee_plan TYPE record<user> READONLY;
     DEFINE FIELD IF NOT EXISTS created_at ON fee_plan TYPE int READONLY;
+    -- How many students are on the plan. The edit and delete guards read it,
+    -- an assignment's own transaction increments it, and nothing decrements it
+    -- (assignments are never removed). `option<int>` and no DEFAULT, like every
+    -- other counter: no Rust struct carries it, so the plan's create must not
+    -- be expected to state it.
+    DEFINE FIELD IF NOT EXISTS assignment_count ON fee_plan TYPE option<int>;
 
     -- One plan on one student, keyed `<plan>_<student>`: assigning twice is the
     -- same record id, so a replay writes nothing and an assignment cut short
@@ -946,6 +952,26 @@ pub const BACKFILL: &str = "
     -- marks it already carries.
     FOR $row IN ((SELECT exam, count() AS n FROM exam_result GROUP BY exam) ?? []) {
         UPDATE $row.exam SET result_count = $row.n WHERE result_count = NONE;
+    };
+
+    -- The fee-plan guard became a refcount (2026-07-30): editing or deleting a
+    -- plan is now refused by `(assignment_count ?? 0) = 0` on the plan row
+    -- itself, instead of by a scan a concurrent assign could land behind.
+    --
+    -- This seeding is what keeps a *stale* volume safe: a plan written by an
+    -- older binary carries no counter, an absent counter reads as zero, and a
+    -- zero would make an already-assigned plan editable and deletable again —
+    -- the exact thing the 409 exists to prevent. Boot seeds it from the
+    -- assignment rows that actually exist, and `migrate` runs to completion
+    -- before the router is bound, so no request is ever served against the
+    -- unseeded shape. `= NONE` keeps it one-time, so a second boot recomputes
+    -- nothing.
+    --
+    -- No zero pass, for the same reason the subject counters get none: a plan
+    -- nobody is on has no assignment rows, and absent already reads as zero in
+    -- the guard — writing it would touch every plan row to say what it says.
+    FOR $row IN ((SELECT plan, count() AS n FROM fee_plan_assignment GROUP BY plan) ?? []) {
+        UPDATE $row.plan SET assignment_count = $row.n WHERE assignment_count = NONE;
     };
 ";
 
