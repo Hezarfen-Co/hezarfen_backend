@@ -27,8 +27,8 @@ pub fn routes(state: &AppState) -> OpenApiRouter<AppState> {
     // over the auth limit must never block an intentional logout.
     let rate_limit: &RateLimitConfig = &state.rate_limit;
     let limiter = RateLimiter::per_minute(rate_limit.auth_per_minute, rate_limit.trust_proxy);
-    // One budget across replicas, not one per process — the tier only means
-    // something if a brute-forcer cannot get it twice by hitting both.
+    // The budget survives a restart — the tier only means something if a
+    // brute-forcer cannot reset it by waiting out a deploy.
     limiter.share("auth", state.db.clone(), state.db_up.clone());
     OpenApiRouter::new()
         .routes(routes!(register))

@@ -68,8 +68,8 @@ impl Registration {
     /// existing row back untouched — a true no-op that never counts against
     /// the cap and never rewrites who placed them. The seat is taken by
     /// [`cap::claim`] on the event row — an atomic single-record conditional
-    /// write, so neither a racing registration in another replica nor a
-    /// concurrent capacity/audience/schedule PATCH can over-admit.
+    /// write, so neither a racing registration nor a concurrent
+    /// capacity/audience/schedule PATCH can over-admit.
     pub async fn register(
         event: &EventId,
         user: &UserId,

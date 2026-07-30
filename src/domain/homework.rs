@@ -164,7 +164,7 @@ impl Homework {
         // question's twin ([`crate::domain::exam_question::ExamQuestion`]): the
         // subject delete is refused while this counter is non-zero, so the
         // create and the delete contend on the subject record rather than on a
-        // cross-table count only one replica could see. A miss means the
+        // cross-table count neither of them sees the other move. A miss means the
         // subject is already gone, which is the 400 the web layer's pre-flight
         // check answers with.
         let counted = subject.record();

@@ -164,8 +164,8 @@ impl Course {
     /// Create the course, claiming a reference on the term it links (if any)
     /// *before* the row is written: the claim is a conditional write on the
     /// term row, so it fails when the term is already gone and it makes the
-    /// term undeletable the instant this link exists — across replicas, which
-    /// the mutex it replaced could not do inside one process.
+    /// term undeletable the instant this link exists, which the count-then-write
+    /// mutex it replaced could not do.
     pub async fn create(
         creator: &UserId,
         title: CourseTitle,
@@ -401,7 +401,7 @@ impl Course {
     /// roster is read off the course's own `enrollment_count`, so the check and
     /// the delete are one conditional write on one record — an enroll racing
     /// this either takes its seat first (and the delete is refused) or finds
-    /// the row gone (and is refused itself), in any replica. `Err(NotFound)`
+    /// the row gone (and is refused itself). `Err(NotFound)`
     /// keeps the answer a concurrent *delete* used to get.
     pub async fn delete(self, db: &Database) -> Result<bool, AppError> {
         let mut result = db

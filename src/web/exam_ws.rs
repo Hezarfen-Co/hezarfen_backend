@@ -90,7 +90,7 @@ use crate::web::exams::{
 /// `allow_rejoin` off (cleared at the door, stamped after, present forever
 /// refused). The count this pairs with lives in *this* process's memory
 /// ([`crate::state::ExamPresence`]), so process-wide is exactly the right
-/// scope: a peer replica counts its own sockets in its own map.
+/// scope: there is no room state anywhere else to serialize against.
 // ponytail: global lock, per-attempt locks if room churn ever shows up in a
 // profile.
 static PRESENCE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -397,12 +397,13 @@ async fn handle_message(
             // like `save_answer_checked` — and dropped before the socket
             // sends, so a slow client never stalls a writer.
             //
-            // ponytail (accepted race, reviewed): the lease is process-local,
-            // so across replicas a save already in flight can land on the
-            // room's sitting just after a retake made it terminal. It writes a
-            // history row for the old seq; the grade of record (latest seq) is
-            // untouched. The fix is a `current_seq` claim on every save — the
-            // hottest path here — so the cost beats the damage and it stays.
+            // ponytail (accepted race, reviewed): the room's sitting was
+            // chosen at join, before any lease, so no lock scope can help — a
+            // save can land on it just after a retake made it terminal. It
+            // writes a history row for the old seq; the grade of record (latest
+            // seq) is untouched. The fix is a `current_seq` claim on every save
+            // — the hottest path here — so the cost beats the damage and it
+            // stays.
             let guard = EXAM_LOCK.read().await;
             // Tracks how far the gates got: only once the sitting resolved can
             // a failure possibly be about this one question rather than about

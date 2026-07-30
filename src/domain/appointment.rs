@@ -8,26 +8,26 @@
 //!   [`cap`](crate::domain::cap) of one. Booking [`claim`](cap::claim)s it;
 //!   rejecting or cancelling gives it back in the *same transaction* as the
 //!   status flip, so the slot frees itself with nothing to sweep. Both are
-//!   single-record conditional writes, so this invariant holds across replicas.
+//!   single-record conditional writes, so the store decides it, not a lock.
 //! - **No double-booked person.** An approved meeting may not overlap another
 //!   approved meeting of the same teacher *or* of the same requester. That is a
 //!   count-then-write over *many* rows, which a `BEGIN…COMMIT` does not
 //!   serialize in SurrealDB (write-skew), so it stays under
-//!   [`APPOINTMENT_LOCK`] — and stays replica-local.
+//!   [`APPOINTMENT_LOCK`], which is the whole guarantee behind it.
 //!
 //! The *single-row* invariant — a decision must be written onto the state it
-//! was validated against — is **not** the lock's job, and never was: the lock
-//! is process-local, so two replicas each take their own copy of it and a
-//! whole-row save would silently drop the other's decision. That one is a
-//! compare-and-set ([`Appointment::save_if_unchanged`]), which holds across
-//! replicas.
+//! was validated against — is **not** the lock's job, and never was: a
+//! whole-row save built on a snapshot read before the lock was taken would
+//! silently drop whatever landed in between. That one is a compare-and-set
+//! ([`Appointment::save_if_unchanged`]), decided by the store.
 //!
-//! Overlap is a **documented accepted race** (reviewed, not an oversight):
-//! it is a predicate over *other* rows with no single row to key a counter or
-//! a CAS on, so across replicas two approvals decided in the same instant can
-//! both land. Damage is one double-booked half-hour, visible to both parties
-//! and fixable by cancelling either side — no money, no grade, no data loss.
-//! Closing it would need a lease row per teacher taken on every approval.
+//! Overlap therefore rests on the lock alone — it is a predicate over *other*
+//! rows, with no single row to key a counter or a CAS on. That holds while
+//! every approving write takes [`APPOINTMENT_LOCK`]; one that skips it puts two
+//! meetings in one half-hour, so the rule is stated here rather than left to be
+//! noticed. The damage if it ever happens is one double-booked half-hour,
+//! visible to both parties and fixable by cancelling either side — no money, no
+//! grade, no data loss.
 
 use std::sync::LazyLock;
 
@@ -51,13 +51,12 @@ use crate::validate::validate_required;
 /// "Is this teacher (or this requester) already committed at that time" is a
 /// predicate over other appointment rows, and SurrealDB does not conflict-check
 /// a cross-record read against a concurrent insert, so the check and its write
-/// have to be one atomic step *within this process*. Occupancy is no longer its
-/// business: that is the slot's `occupied` counter, a conditional single-record
-/// write that holds between replicas too.
+/// have to be one atomic step, and this lock is the only thing that makes them
+/// one. Occupancy is no longer its business: that is the slot's `occupied`
+/// counter, a conditional single-record write the store decides.
 ///
-/// Which leaves the accepted race the module doc records: this lock is
-/// process-local, so two replicas can each approve an overlapping meeting in
-/// the same instant. Visible to both parties, undone by cancelling either side.
+/// So this is load-bearing, not a convenience: an approval path that does not
+/// take it can double-book a teacher, as the module doc records.
 ///
 /// Lock order: taken *before* `cap`'s `CLAIM_LOCK` (booking claims a slot while
 /// holding this) and never the other way round. No path ever holds this
@@ -323,8 +322,8 @@ impl Appointment {
     /// already taken, or when the requester is already committed elsewhere at
     /// that time. The slot is taken by [`cap::claim`] on the slot row — a
     /// conditional single-record write, so two racing requests cannot both find
-    /// it free however many replicas they arrive at; the requester's own overlap
-    /// is the lock's part.
+    /// it free however they interleave; the requester's own overlap is the
+    /// lock's part.
     pub async fn book(
         slot: &AppointmentSlotId,
         requester: &UserId,
@@ -876,15 +875,15 @@ mod tests {
         assert_eq!(accepted.get_status(), AppointmentStatus::Approved);
     }
 
-    /// The compare-and-set every decision writes through. `APPOINTMENT_LOCK` is
-    /// process-local, so with two replicas serving, nothing else stands between
-    /// an approval and a counter-proposal landing on the same booking — and the
-    /// interleaving that matters is the one a status-only guard would miss,
-    /// since `propose` leaves a pending booking pending.
+    /// The compare-and-set every decision writes through — the guard against a
+    /// decision built on a snapshot that has since moved, which no lock taken
+    /// after the read can catch. The interleaving that matters is the one a
+    /// status-only guard would miss, since `propose` leaves a pending booking
+    /// pending.
     ///
     /// Deliberately sequential: the mem engine answers `Ok` to a write it then
     /// drops, so a `join!` of two decisions proves nothing. This drives the
-    /// primitive itself with the exact snapshot a second replica would hold.
+    /// primitive itself with the exact stale snapshot the race produces.
     #[tokio::test]
     async fn a_decision_built_on_a_stale_snapshot_never_lands() {
         let db = crate::database::init_mem().await.unwrap();
@@ -947,7 +946,7 @@ mod tests {
     }
 
     /// What the slot row itself says about being taken — the authority every
-    /// gate now reads, in any replica.
+    /// gate now reads.
     async fn occupied(slot: &AppointmentSlotId, db: &Database) -> i64 {
         let mut result = db
             .query("SELECT VALUE (occupied ?? 0) FROM $slot")
@@ -959,9 +958,9 @@ mod tests {
         result.take::<Vec<i64>>(0).unwrap()[0]
     }
 
-    /// The double-book race, as the *other replica* runs it: `APPOINTMENT_LOCK`
-    /// is process-local, so a second process's booking arrives at the database
-    /// with nothing between it and the slot but the claim's own `WHERE`. Driven
+    /// The double-book race with the lock taken out of the picture: a second
+    /// booking arrives at the database with nothing between it and the slot but
+    /// the claim's own `WHERE`, which is what must refuse it. Driven
     /// through [`cap::claim`] directly rather than through a `join!`, since the
     /// in-memory engine can drop one of two concurrent writes to a record and
     /// still answer `Ok` — this asks the primitive the exact question the race

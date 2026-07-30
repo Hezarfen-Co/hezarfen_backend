@@ -12,14 +12,12 @@ use serde_json::Value;
 use ulid::Ulid;
 
 use crate::ai::error::AiError;
-use crate::ai::presence;
 use crate::ai::protocol::{
     Greeting, Hello, RejectCode, Request, Response, protocol_matches, read_frame, write_frame,
 };
 use crate::ai::registry::{AiRegistry, WorkerSnapshot, clamp_concurrency};
 use crate::ai::tls;
 use crate::constant::{AI_HANDSHAKE_TIMEOUT_SECS, AI_PROTOCOL};
-use crate::database::Database;
 
 /// What the bridge needs to come up.
 #[derive(Clone, Debug)]
@@ -37,13 +35,6 @@ pub struct BridgeConfig {
 
 struct Inner {
     registry: AiRegistry,
-    /// The database, once [`AiBridge::attach_presence`] has handed it over —
-    /// used for the `ai_worker` gate and nothing else (see
-    /// [`crate::ai::presence`]). `OnceLock` because the bridge binds before the
-    /// router is built, so presence is wired *after* the listener is already
-    /// accepting: a worker may register before this is set, and the heartbeat
-    /// republishes the whole live set precisely so that one is not lost.
-    presence: std::sync::OnceLock<Database>,
     /// The leaf certificate this listener presents, kept so it can be shown to
     /// an operator (or pinned by an in-process client) without re-reading the
     /// PEM off disk.
@@ -86,7 +77,6 @@ impl AiBridge {
 
         let inner = Arc::new(Inner {
             registry: AiRegistry::default(),
-            presence: std::sync::OnceLock::new(),
             certificate: bridge_tls.leaf.clone(),
             token: config.token,
             request_timeout: config.request_timeout,
@@ -124,33 +114,13 @@ impl AiBridge {
         self.inner.registry.snapshot()
     }
 
-    /// Is anything connected *to this process* that can serve `capability`?
+    /// Is anything connected that can serve `capability`?
     ///
-    /// The DISPATCHER's answer, and the authoritative one: this registry owns
-    /// the sockets, so only it may decide that this replica can answer a job.
-    /// Racy in the harmless direction — a worker can vanish between the check
-    /// and the dispatch — so it still never guards a write. For "can *anyone*
-    /// serve it", which is a different and weaker question, see
-    /// [`crate::ai::presence::serves`].
+    /// This registry owns the sockets, so it is the whole truth about what the
+    /// backend can answer. Racy in the harmless direction — a worker can vanish
+    /// between the check and the dispatch — so it never guards a write.
     pub fn has_capability(&self, capability: &str) -> bool {
         self.inner.registry.has_capability(capability)
-    }
-
-    /// Hand the bridge the database, so the workers it holds become visible to
-    /// other replicas through the `ai_worker` gate. Returns whether this call
-    /// was the one that wired it — the caller uses that to start exactly one
-    /// claim loop per process.
-    ///
-    /// Idempotent by construction: a second call is a no-op and returns
-    /// `false`. Nothing here is required for the bridge to work; a deployment
-    /// that never attaches presence simply keeps the single-process behaviour,
-    /// where the in-process registry is the whole truth.
-    pub fn attach_presence(&self, db: Database) -> bool {
-        if self.inner.presence.set(db.clone()).is_err() {
-            return false;
-        }
-        heartbeat_presence(Arc::downgrade(&self.inner), db);
-        true
     }
 
     /// Send one request to a service and await its answer.
@@ -235,45 +205,6 @@ impl AiBridge {
     }
 }
 
-/// Republish this replica's live worker set to the `ai_worker` gate, forever.
-///
-/// The whole set every beat rather than deltas: it is the self-healing half of
-/// the gate (a row lost to a database blip, or a worker registered before
-/// presence was attached, comes back on the next tick), and the set is a
-/// handful of rows. The sweep rides along so a replica that died without
-/// deregistering stops holding anyone's gate open.
-///
-/// Holds a `Weak` on the bridge so that *this* task is not itself a reason to
-/// keep a listener alive. It is not a shutdown mechanism, and in the wired-up
-/// process it never fires: `chatbot::spawn_claim_loop` owns an `AiBridge` by
-/// value for the life of the process, so the strong count never reaches zero
-/// and both tasks run until exit. That is intended for a server — the bridge
-/// is not restartable — and is only visible in tests, which build many
-/// bridges. Correct that (a `CancellationToken` on both loops) the day a
-/// bridge needs to be torn down while the process lives.
-fn heartbeat_presence(inner: std::sync::Weak<Inner>, db: Database) {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(
-            crate::constant::AI_WORKER_HEARTBEAT_SECS,
-        ));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            // The first tick is immediate, so workers registered before the
-            // database arrived are published now and not one beat late.
-            ticker.tick().await;
-            let Some(inner) = inner.upgrade() else { return };
-            let workers = inner.registry.snapshot();
-            drop(inner);
-            if let Err(err) = presence::announce(&db, &workers).await {
-                tracing::warn!("could not publish the AI worker gate: {err}");
-            }
-            if let Err(err) = presence::sweep(&db).await {
-                tracing::warn!("could not sweep the AI worker gate: {err}");
-            }
-        }
-    });
-}
-
 /// Accept connections until the endpoint closes. One task per service.
 async fn accept_loop(inner: Arc<Inner>) {
     while let Some(incoming) = inner.endpoint.accept().await {
@@ -314,13 +245,6 @@ async fn serve_connection(inner: Arc<Inner>, conn: quinn::Connection, remote: So
     // dies without saying anything.
     let reason = conn.closed().await;
     inner.registry.remove(&worker_id);
-    // The gate closes with the registry, not a lease later — but only after
-    // the registry, which is the authoritative one (see `presence`).
-    if let Some(db) = inner.presence.get()
-        && let Err(err) = presence::withdraw(db, &worker_id).await
-    {
-        tracing::warn!("could not withdraw AI worker {worker_id} from the gate: {err}");
-    }
     tracing::info!("AI service `{service}` ({worker_id}) at {remote} disconnected: {reason}");
 }
 
@@ -409,23 +333,6 @@ async fn register(
         max_concurrent,
         conn.clone(),
     );
-    // …and only then published to the gate, so `ai_worker` can never advertise
-    // a worker the local dispatcher would refuse to pick.
-    if let Some(db) = inner.presence.get() {
-        let announced = WorkerSnapshot {
-            id: worker_id.clone(),
-            service: hello.service.clone(),
-            capabilities: hello.capabilities.clone(),
-            inflight: 0,
-            max_concurrent,
-        };
-        if let Err(err) = presence::announce(db, &[announced]).await {
-            // Not fatal, and not a reason to refuse the service: the worker is
-            // already usable by this replica, and the next heartbeat
-            // republishes the whole live set.
-            tracing::warn!("could not publish AI worker {worker_id} to the gate: {err}");
-        }
-    }
     tracing::info!(
         "AI service `{}` ({worker_id}) at {remote} registered: {:?}, max_concurrent {max_concurrent}",
         hello.service,

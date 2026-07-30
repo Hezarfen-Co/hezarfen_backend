@@ -68,8 +68,8 @@ impl Enrollment {
     /// the loser of the `CREATE` reads the winner's row back and returns it.
     /// When the course carries a capacity, a full roster refuses new members
     /// (409) — the seat is taken by [`cap::claim`] on the course row, an atomic
-    /// single-record conditional write, so the cap holds across replicas and
-    /// against a concurrent capacity PATCH alike. An already enrolled user is
+    /// single-record conditional write, so the cap holds against concurrent
+    /// enrolls and a concurrent capacity PATCH alike. An already enrolled user is
     /// returned as-is even when the roster is full, and never charged a seat.
     /// The same claim is the delete guard's other half: it is refused outright
     /// once the course row is gone, and while it holds a seat the course cannot

@@ -1,17 +1,17 @@
-//! Count caps that hold across replicas.
+//! Count caps the database enforces, not the process.
 //!
 //! Every "at most N children per parent" rule used to be a count-then-write
 //! under a process-wide `Mutex`, because a `BEGIN…COMMIT` cannot enforce it:
 //! SurrealDB does not conflict-check a cross-record `count()` against a
 //! concurrent insert (write-skew), so two racing writers both saw a free slot.
-//! A mutex only serializes the writers *inside one process*, and the backend
-//! now runs as two replicas against one database — so every one of those caps
-//! was open again.
+//! A mutex serializes the writers, but only around whatever it wraps: every
+//! one of those caps held a lock across a database round trip, and the count it
+//! was protecting was already a guess by the time the insert landed.
 //!
 //! The guard that does survive is a single-record conditional write: an
 //! `UPDATE … SET n += 1 WHERE n < cap` on the *parent* row is atomic, so of N
 //! concurrent claimers exactly `cap` get a non-empty result and the rest are
-//! refused, whatever process they run in. The counter is therefore the
+//! refused, with no lock and no window. The counter is therefore the
 //! authority on how many slots are taken, and the child rows follow it:
 //! [`claim`] before the insert, [`release`] if the insert then fails, and a
 //! decrement in the *same transaction* as every delete of a child row.
@@ -34,14 +34,13 @@ use crate::database::{Database, lost_the_race};
 use crate::domain::timestamp::Timestamp;
 use crate::error::AppError;
 
-/// One writer per process at a time, over every counter.
+/// One counter writer at a time, over every counter.
 ///
 /// Not the cap — the `WHERE` clause is the cap, and it holds with or without
-/// this. What the lock buys is that a replica sends its counter writes one at a
-/// time, so the only contention the database ever sees on a parent row is
-/// between replicas: at most as many concurrent writers as there are processes,
-/// instead of as many as there are in-flight requests. That keeps the optimistic
-/// retry loop below to a beat or two rather than a storm.
+/// this. What the lock buys is that the process sends its counter writes one at
+/// a time, so the database never sees a parent row contended by every in-flight
+/// request at once. That keeps the optimistic retry loop below to a beat or two
+/// rather than a storm.
 ///
 /// It is also what keeps the test suite deterministic. The embedded in-memory
 /// engine the tests run on does *not* have the real server's conflict
@@ -75,7 +74,8 @@ pub(crate) async fn claim(
 /// [`claim`], but only while `guard` — an extra predicate on that same parent
 /// row — also holds. A caller whose insert has a second precondition (a homework
 /// submission's file add is refused once the work is graded) gets both decided
-/// by the one conditional write, instead of by a read a peer replica can outrun.
+/// by the one conditional write, instead of by a read a concurrent write can
+/// outrun.
 /// A miss is either "full" *or* "the guard failed"; the caller re-reads to tell
 /// them apart, and only to pick the message. `guard` is always an in-crate SQL
 /// literal, never user input.
@@ -131,11 +131,11 @@ pub(crate) enum Claimed<T> {
 /// carries a deterministic id (one row per pair), two writers placing the *same*
 /// pair both pass the claim — neither row exists yet — so on a tight cap the
 /// second is told "full" for a seat it was never going to need, and a release
-/// afterwards is too late to unsay it. A process-wide mutex hid that inside one
-/// process and hid nothing between two. Here the duplicate `CREATE` aborts the
-/// transaction, which takes its own increment with it, and the caller reads the
-/// winner's row back — so the counter never counts a row that does not exist,
-/// in any replica.
+/// afterwards is too late to unsay it. A process-wide mutex could not hide that
+/// either: it is released around the very round trip the two writes race in.
+/// Here the duplicate `CREATE` aborts the transaction, which takes its own
+/// increment with it, and the caller reads the winner's row back — so the
+/// counter never counts a row that does not exist.
 ///
 /// The row is looked for *before* the seat is claimed, in that same
 /// transaction, because on a tight cap the claim is the first thing to fail: a

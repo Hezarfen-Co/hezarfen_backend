@@ -321,9 +321,10 @@ impl ExamAttempt {
     /// [`Self::FROZEN_SLOT`] onwards (`BEGIN` and the `IF` take a slot each).
     ///
     /// This replaces a process-wide `EXAM_LOCK.write()` held across the check
-    /// and the write. That lock served one process; the gate serves the
-    /// database, so a question edit on replica A can no longer sail past an
-    /// attempt started on replica B.
+    /// and the write. That lock ordered the two requests but still read the
+    /// attempt table a round trip before it wrote; the gate checks inside the
+    /// writing statement, so a question edit can no longer sail past an attempt
+    /// that started in that gap.
     //
     // ponytail: the count and a concurrent `CREATE exam_attempt` are still not
     // serialized against each other — SurrealDB does not conflict-check a

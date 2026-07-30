@@ -398,7 +398,7 @@ impl ExamQuestion {
         // is claimed before the child it caps ([`cap::claim`], here uncapped):
         // the subject delete is conditioned on that counter reading zero, so
         // the two contend on the subject record and a question can no longer
-        // land on a subject another replica is deleting. A miss means the
+        // land on a subject a concurrent request is deleting. A miss means the
         // subject is already gone — the same 400 the web layer's pre-flight
         // check answers with.
         let counted = subject.record();
@@ -423,7 +423,7 @@ impl ExamQuestion {
         };
         // The freeze gate rides in the same transaction as the insert: a
         // question cannot appear under an exam somebody has already started,
-        // whichever replica the two requests hit.
+        // however the two requests interleave.
         let inserted = async {
             let mut result = db
                 .query(ExamAttempt::unfrozen("CREATE $id CONTENT $question;"))

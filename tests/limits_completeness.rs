@@ -86,30 +86,6 @@ const EXCLUDED: &[(&str, &str)] = &[
         "CHATBOT_PENDING_STALE_SECS",
         "when a stuck answer is declared failed",
     ),
-    // The AI worker gate (`ai_worker`) and the chat claim queue. Both are
-    // between-replica plumbing: a browser cannot observe which process holds a
-    // worker or who claimed its turn, and it already learns everything it can
-    // act on from the 202/503 and the turn's own `status`.
-    ("AI_WORKER_TABLE", "AI worker presence table"),
-    ("AI_WORKER_ANNOUNCE", "AI worker presence upsert"),
-    ("AI_WORKER_WITHDRAW", "AI worker presence delete"),
-    ("AI_WORKER_SWEEP", "AI worker presence expiry"),
-    ("AI_WORKER_SERVES", "AI worker presence read"),
-    (
-        "AI_WORKER_HEARTBEAT_SECS",
-        "how often a replica restamps its AI workers",
-    ),
-    (
-        "AI_WORKER_LEASE_SECS",
-        "how long an unrestamped AI worker row is believed",
-    ),
-    ("CHATBOT_CLAIM", "chat claim-queue statement"),
-    ("CHATBOT_CLAIM_POLL_MS", "chat claim-loop cadence"),
-    ("CHATBOT_CLAIM_BATCH", "turns claimed per sweep"),
-    (
-        "CHATBOT_CLAIM_RECLAIM_SECS",
-        "when a dead claimer's turn goes back on the queue",
-    ),
     // Seed data for the settings singleton, not a bound. The live list is on
     // `GET /settings`, which is where a client must read it — publishing the
     // default too would invite rendering it instead of the school's actual one.
@@ -125,25 +101,6 @@ const EXCLUDED: &[(&str, &str)] = &[
         "DEFAULT_DIETARY_TAGS",
         "settings seed; the live list is on GET /settings",
     ),
-    // The boot leader election. A client never sees the lock, and the timings
-    // are startup mechanics between processes — publishing them would invite a
-    // frontend to reason about a boot it cannot observe.
-    ("MIGRATION_LOCK_DDL", "boot lock table definition"),
-    ("MIGRATION_LOCK_CLAIM", "boot lock claim statement"),
-    ("MIGRATION_LOCK_STATE", "boot lock read statement"),
-    ("MIGRATION_LOCK_TAKEOVER", "boot lock takeover statement"),
-    ("MIGRATION_LOCK_HEARTBEAT", "boot lock lease renewal"),
-    ("MIGRATION_LOCK_STAMP", "boot lock completion stamp"),
-    (
-        "MIGRATION_LOCK_LEASE_SECS",
-        "how long an unrenewed boot lock may be taken over after",
-    ),
-    ("MIGRATION_LOCK_HEARTBEAT_SECS", "boot lock renewal cadence"),
-    (
-        "MIGRATION_LOCK_WAIT_SECS",
-        "how long a non-leader waits for the boot migration",
-    ),
-    ("MIGRATION_LOCK_POLL_MS", "boot lock poll cadence"),
     // The three migration batches and their list moved to
     // `src/migration_sql.rs` — they are SurrealQL text, not bounds, and the
     // numeric sweep below still catches any bound that tries to follow them.
@@ -192,9 +149,9 @@ const EXCLUDED: &[(&str, &str)] = &[
         "ETag middleware's own buffering ceiling",
     ),
     ("PURGE_AT", "rate-limiter bucket eviction threshold"),
-    // How the tiers are kept fleet-wide. A client is held to the tier itself
-    // (published live in /limits `rate`), never to the cadence the replicas
-    // reconcile it at — publishing that would invite pacing against it.
+    // How a tier's window is carried through a restart. A client is held to
+    // the tier itself (published live in /limits `rate`), never to the cadence
+    // it is reconciled at — publishing that would invite pacing against it.
     (
         "RATE_SYNC_INTERVAL_SECS",
         "how often a replica reconciles its counters",

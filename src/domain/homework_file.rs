@@ -126,7 +126,7 @@ impl HomeworkFile {
     /// or once a grade has frozen it (`Ok(None)`, so the web layer keeps its own
     /// wording). Both are decided by one [`cap::claim_when`] on the submission
     /// row — a conditional single-record write, the only guard that holds when
-    /// the racing writers are in two replicas, the same story as
+    /// two uploads race, the same story as
     /// `NoteFile::insert`. Which of the two conditions failed is read back
     /// afterwards, off the losing path only, and only to pick the message.
     pub async fn insert(self, db: &Database) -> Result<Option<HomeworkFile>, AppError> {

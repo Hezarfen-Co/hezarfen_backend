@@ -192,8 +192,8 @@ async fn delete_subject(
     // No locks: the two checks *are* the delete's `WHERE`, decided against the
     // subject's own reference counters inside one statement. This used to be
     // three process-wide locks (the only site that held more than one) around
-    // two cross-table counts, which served one replica and let the other create
-    // a question on a subject being deleted.
+    // two cross-table counts, which were stale by the time the delete landed and
+    // let a concurrent request create a question on a subject being deleted.
     subject.delete(&st.db).await?;
     Ok(StatusCode::NO_CONTENT)
 }

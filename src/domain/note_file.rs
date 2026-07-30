@@ -157,8 +157,9 @@ impl NoteFile {
     /// already holds [`MAX_NOTE_FILES`]. The slot is taken by [`cap::claim`] on
     /// the note row: a `BEGIN…COMMIT` around a count can't enforce the cap
     /// (SurrealDB doesn't conflict-check a cross-record count against a
-    /// concurrent insert) and a process-wide mutex can't either once the
-    /// backend runs as two replicas — a conditional single-record write can.
+    /// concurrent insert) and a process-wide mutex can't either, since it is
+    /// released around the very round trip the insert races — a conditional
+    /// single-record write can.
     pub async fn insert(self, db: &Database) -> Result<NoteFile, AppError> {
         let note = self.note.record();
         if !cap::claim(&note, NOTE_FILE_COUNT_FIELD, MAX_NOTE_FILES as i64, db).await? {

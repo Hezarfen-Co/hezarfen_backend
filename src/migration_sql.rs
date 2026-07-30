@@ -4,8 +4,8 @@
 //! ~700 lines of schema, and left in the constants file they buried the
 //! validation bounds that file exists to hold. Nothing else changed — they are
 //! still `pub const`, still the only migration text, and
-//! [`crate::database::migrate`] and [`crate::database::migration_fingerprint`]
-//! still both read [`MIGRATION_BATCHES`] and nothing else.
+//! [`crate::database::migrate`] still reads [`MIGRATION_BATCHES`] and nothing
+//! else.
 //!
 //! Numbers stay in `constant.rs`: `tests/limits_completeness.rs` sweeps `src/`
 //! for stray bounds, and a bound hidden here would reach neither `GET /limits`
@@ -20,6 +20,9 @@
 /// UNSET included. So the value has to go while its definition is still
 /// standing. Runs as its own query for the usual reason (see `MIGRATION`).
 ///
+/// `chatbot_message.claimed_by` / `claimed_at` (retired 2026-07-30 with the
+/// chat claim queue) are the same story, one table over.
+///
 /// The table-exists guard is load-bearing: on a fresh database `MIGRATION` has
 /// not run yet, and an UPDATE against an undefined table is an error, not an
 /// empty result. On a database that has the table but never had the column the
@@ -27,6 +30,10 @@
 pub const PRE_REPAIR: &str = "
     IF 'exam_question' IN object::keys((INFO FOR DB).tables) {
         UPDATE exam_question UNSET source_bank WHERE source_bank != NONE
+    };
+    IF 'chatbot_message' IN object::keys((INFO FOR DB).tables) {
+        UPDATE chatbot_message UNSET claimed_by, claimed_at
+            WHERE claimed_by != NONE OR claimed_at != NONE
     };
 ";
 
@@ -116,26 +123,26 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS error_code ON chatbot_message TYPE option<string>;
     DEFINE FIELD IF NOT EXISTS created_at ON chatbot_message TYPE int READONLY;
     DEFINE FIELD IF NOT EXISTS completed_at ON chatbot_message TYPE option<int>;
-    -- The claim (2026-07-27): which replica's claim loop owes this turn an
-    -- answer, and when it said so. Absent = nobody has taken it yet; a claim
-    -- older than CHATBOT_CLAIM_RECLAIM_SECS is a dead claimer and the turn is
-    -- taken back (see `CHATBOT_CLAIM`).
-    DEFINE FIELD IF NOT EXISTS claimed_by ON chatbot_message TYPE option<string>;
-    DEFINE FIELD IF NOT EXISTS claimed_at ON chatbot_message TYPE option<int>;
+    -- The chat claim queue is gone (2026-07-30): one process answers its own
+    -- turns, so nothing claims them. PRE_REPAIR clears the values first —
+    -- SCHEMAFULL rejects every write to a row still storing a column that no
+    -- longer exists.
+    REMOVE FIELD IF EXISTS claimed_by ON TABLE chatbot_message;
+    REMOVE FIELD IF EXISTS claimed_at ON TABLE chatbot_message;
     DEFINE INDEX IF NOT EXISTS chatbot_message_thread_created ON chatbot_message FIELDS thread_id, created_at;
     DEFINE INDEX IF NOT EXISTS chatbot_message_user ON chatbot_message FIELDS user_id;
-    -- The claim loop's sweep: every poll asks for pending rows by age.
+    -- The boot sweep asks for pending rows by age.
     DEFINE INDEX IF NOT EXISTS chatbot_message_status_created ON chatbot_message FIELDS status, created_at;
 
-    -- Which AI workers are connected to *any* replica (2026-07-27). The GATE
-    -- and nothing else: a row only says a socket existed somewhere at
-    -- `seen_at`, so it may spare a user a 503 but must never pick who answers
-    -- — that is the in-process registry's call. Heartbeated by the replica
-    -- owning the connection; a stale row is ignored by the read and swept.
-    DEFINE TABLE IF NOT EXISTS ai_worker SCHEMAFULL;
-    DEFINE FIELD IF NOT EXISTS service ON ai_worker TYPE string;
-    DEFINE FIELD IF NOT EXISTS capabilities ON ai_worker TYPE array<string>;
-    DEFINE FIELD IF NOT EXISTS seen_at ON ai_worker TYPE int;
+    -- The AI worker presence table is gone (2026-07-30): one process holds
+    -- every worker socket, so its in-process registry is the whole truth and
+    -- nothing needed publishing.
+    REMOVE TABLE IF EXISTS ai_worker;
+
+    -- The elected-boot lease is gone with it (2026-07-30): one process migrates,
+    -- so nothing takes the lock. SCHEMALESS and read by nobody, so unlike the
+    -- claim columns it needs no PRE_REPAIR — the table just goes.
+    REMOVE TABLE IF EXISTS migration_lock;
 
     -- How much of a rate-limit budget the whole fleet has spent in one wall
     -- window (2026-07-27). One row per tier+client+window, id-keyed so every
@@ -740,33 +747,23 @@ pub const BACKFILL: &str = "
     -- which is what they were presented as all along.
     UPDATE chatbot_message SET truncated = false WHERE truncated = NONE;
 
-    -- An assistant turn is answered by a claim loop in some replica's process,
-    -- so a restart can leave its row `pending` with nobody left to complete it.
-    -- Only rows past the stale horizon ($stale_ms, from
-    -- `CHATBOT_PENDING_STALE_SECS`) are certainly abandoned though: a young one
-    -- may still be being answered on the other side of the AI bridge, and a
-    -- deploy must not shoot down a turn dispatched seconds ago. Nothing is lost
-    -- by waiting — a reader already presents an over-age `pending` row as
-    -- failed, and the next boot sweeps for real whatever crossed the horizon in
-    -- the meantime.
+    -- An assistant turn is answered by a task in this process, so a restart can
+    -- leave its row `pending` with nobody left to complete it. Only rows past
+    -- the stale horizon ($stale_ms, from `CHATBOT_PENDING_STALE_SECS`) are
+    -- certainly abandoned though: a young one may still be being answered on
+    -- the other side of the AI bridge, and a deploy must not shoot down a turn
+    -- dispatched seconds ago. Nothing is lost by waiting — a reader already
+    -- presents an over-age `pending` row as failed, and the next boot sweeps
+    -- for real whatever crossed the horizon in the meantime.
     --
-    -- Claim-aware since 2026-07-27, because the sweep is no longer school-wide
-    -- truth: under N replicas the row may belong to a *live peer's* claim loop,
-    -- and failing it here would shoot down another process's in-flight turn.
-    -- So a claim restamped within the window is left alone. Both disjuncts
-    -- matter — `claimed_by = NONE` alone would strand every row whose claimer
-    -- died, which is the one case the sweep exists for.
-    --
-    -- The claim age is measured against $stale_ms rather than
-    -- CHATBOT_CLAIM_RECLAIM_SECS only because the boot binds one horizon (see
-    -- `database::migration_binds`); erring long is the safe direction — the
-    -- cost is that a row claimed just before it aged out waits one more boot
-    -- for its durable stamp, while readers have shown it failed all along.
+    -- The claim half of this guard went with the claim queue (2026-07-30): it
+    -- only ever spared a row a *live peer* was answering, and there is no peer.
+    -- The rows selected are otherwise the same ones — an unclaimed row past the
+    -- horizon was always swept, and a claim of this process's own could not
+    -- outlive the process whose boot is running this.
     UPDATE chatbot_message SET status = 'failed', error_code = 'interrupted',
         completed_at = time::unix(time::now()) * 1000
-        WHERE status = 'pending' AND created_at < time::unix(time::now()) * 1000 - $stale_ms
-            AND (claimed_by = NONE
-                 OR claimed_at < time::unix(time::now()) * 1000 - $stale_ms);
+        WHERE status = 'pending' AND created_at < time::unix(time::now()) * 1000 - $stale_ms;
 
     -- Promotion out of student now deletes the user's enrollments (2026-07-18);
     -- this sweeps rows promoted before that fix. A deleted user reads as
@@ -953,10 +950,7 @@ pub const BACKFILL: &str = "
 ";
 
 /// The migration batches, in the order a boot applies them — and the *only*
-/// list of them. [`crate::database::migrate`] runs exactly these and
-/// [`crate::database::migration_fingerprint`] hashes exactly these, so a fourth
-/// batch cannot be executed without changing the fingerprint that decides
-/// whether a peer's schema is ours. They stay three separate queries: statements
-/// in one batch see the schema as it stood when the batch started (see
-/// `MIGRATION`).
+/// list of them. [`crate::database::migrate`] runs exactly these. They stay
+/// three separate queries: statements in one batch see the schema as it stood
+/// when the batch started (see `MIGRATION`).
 pub const MIGRATION_BATCHES: [&str; 3] = [PRE_REPAIR, MIGRATION, BACKFILL];

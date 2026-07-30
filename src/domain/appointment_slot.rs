@@ -5,7 +5,7 @@
 //! cancel that settles it — so the slot frees itself again, and unlike a UNIQUE
 //! index it does not keep a dead booking's seat. Stored rather than counted
 //! from the [`Appointment`] rows because a conditional write on one row is the
-//! only guard that survives a second replica.
+//! only guard a concurrent booking cannot outrun.
 //!
 //! A recurring publish is expanded into concrete rows here, at write time,
 //! sharing one `series` id — no recurrence rule is ever evaluated at read
@@ -434,7 +434,7 @@ impl AppointmentSlot {
     /// going away, so they cascade out with it, like [`Event::delete`]'s rows.
     ///
     /// The guard is the delete's own `WHERE`, so no booking can land between a
-    /// check and the row going away — in this replica or another.
+    /// check and the row going away.
     pub async fn delete(self, db: &Database) -> Result<AppointmentSlot, AppError> {
         Self::delete_free(std::slice::from_ref(&self.id), db).await?;
         Ok(self)
@@ -459,7 +459,7 @@ impl AppointmentSlot {
     /// Shared body of both deletes: drop every named slot, but only while its
     /// `occupied` counter says nobody is waiting on it — the delete's own
     /// `WHERE` is the guard, which is what makes it hold against a booking
-    /// landing in another replica (a separate read-then-delete could not).
+    /// landing in the middle of it (a separate read-then-delete could not).
     ///
     /// All-or-nothing across the whole list: if fewer rows go than were named,
     /// the transaction is thrown away, so a series never loses its free weeks
@@ -753,10 +753,10 @@ mod tests {
         );
     }
 
-    /// The delete-vs-book race: a booking that lands in another replica between
-    /// this delete's read and its write must still keep the slot alive, so the
-    /// guard has to be the delete's own `WHERE` — here driven by taking the seat
-    /// the way that replica would, with no booking row to read.
+    /// The delete-vs-book race: a booking that lands between this delete's read
+    /// and its write must still keep the slot alive, so the guard has to be the
+    /// delete's own `WHERE` — here driven by taking the seat the way that
+    /// booking would, with no booking row to read.
     ///
     /// A series is all-or-nothing: one taken week refuses the whole publish,
     /// and the free weeks must survive the refusal.
@@ -779,7 +779,7 @@ mod tests {
         // A free slot goes, and its series is deletable while every week is free.
         assert!(slots[0].clone().delete(&db).await.is_ok());
         // The seat on the middle week is taken — no booking row, exactly as a
-        // racing replica would leave it mid-flight.
+        // racing booking would leave it mid-flight.
         assert!(
             cap::claim(&slots[1].get_id().record(), SLOT_OCCUPIED_FIELD, 1, &db)
                 .await

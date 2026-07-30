@@ -107,7 +107,7 @@ impl ChatbotThread {
 
     /// Start a thread unless `user` is already at the school's
     /// `max_chatbot_threads`. The slot is taken by [`cap::claim`] on the user
-    /// row — an atomic single-record write, so two replicas racing the same
+    /// row — an atomic single-record write, so two requests racing the same
     /// user's last slot cannot both win, and the cap is read fresh so a
     /// concurrent settings PATCH is respected.
     pub async fn create_capped(

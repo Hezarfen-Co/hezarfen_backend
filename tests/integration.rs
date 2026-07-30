@@ -4140,7 +4140,7 @@ async fn concurrent_placements_never_exceed_capacity() {
 
 /// The course capacity cap is a counter column on the course row now, not a
 /// process mutex: `UPDATE ... SET n += 1 WHERE n < capacity` is atomic per
-/// record, so it holds whichever replica the racing enrolls land on. Removing
+/// record, so it holds however the racing enrolls interleave. Removing
 /// that `WHERE` (or the claim entirely) puts a third student on a capacity-2
 /// course and fails this. The unenroll each round proves the seat comes back —
 /// without the decrement the course is permanently full by round two.
@@ -21374,7 +21374,7 @@ async fn concurrent_meal_bookings_never_exceed_the_capacity() {
     assert_eq!(common::total(&res.body), 3, "and only three rows exist");
 
     // The rows are downstream of the counter, so assert the counter itself:
-    // it is what every replica's `WHERE` compares, and a drift here would open
+    // it is what every booking's `WHERE` compares, and a drift here would open
     // the cap on the next booking however tidy the listing looks.
     let mut counted = db
         .query("SELECT VALUE seats_booked FROM type::record('menu', $m)")
@@ -21393,8 +21393,7 @@ async fn concurrent_meal_bookings_never_exceed_the_capacity() {
 /// Publishing the same day+slot twice at once must be one menu and one 409 —
 /// never two rows and never a 500. The day and slot *are* the record id, so the
 /// racers collide on a single record inside the database rather than on a
-/// check-then-write pair, which is the only form that also holds when the two
-/// `POST`s land on different replicas.
+/// check-then-write pair, which is the only form no interleaving can defeat.
 #[tokio::test]
 async fn concurrent_duplicate_menu_publishes_conflict_not_500() {
     let (app, db) = app_and_db().await;

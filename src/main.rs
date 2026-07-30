@@ -19,8 +19,8 @@ async fn main() -> anyhow::Result<()> {
     // Hash the login decoy now, so the first unknown-username login is not the
     // one request that pays for it (see `PasswordHash::prewarm_decoy`).
     hezarfen_backend::domain::user::PasswordHash::prewarm_decoy();
-    // Schema *and* the admin seed: both are boot work that must happen once
-    // across overlapping processes, so both live behind the boot election.
+    // Connects, migrates the schema and seeds the admin — all of it idempotent
+    // and unconditional on every boot.
     let db = database::init(&cfg).await?;
     let db_up = DbHealth::default();
     keepalive(db.clone(), db_up.clone());

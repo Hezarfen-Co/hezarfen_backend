@@ -1,11 +1,9 @@
 //! One turn of a chatbot thread. Both sides are persisted: the user's prompt
 //! lands `complete`, and the assistant's row is written `pending` *before* the
-//! AI call so a reload never loses an answer in flight. A pending row is then
-//! a durable *job*: whichever replica holds a `chat.reply` worker claims it
-//! (`claim_pending`), dispatches it, and flips it to `complete` (with the text)
-//! or `failed` (with a code). A claimer that dies loses its claim to the next
-//! sweep, and the boot sweep in `database.rs` fails whatever nobody could
-//! answer inside the staleness window.
+//! AI call so a reload never loses an answer in flight. The task that owns the
+//! bridge round trip then flips it to `complete` (with the text) or `failed`
+//! (with a code), and the boot sweep in `database.rs` fails whatever a process
+//! death left behind past the staleness window.
 //!
 //! `user_id` is duplicated from the thread onto every message so an
 //! ownership check is one read, with no join.
@@ -16,8 +14,8 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use ulid::{Generator, Ulid};
 
 use crate::constant::{
-    CHAT_MESSAGE_TABLE, CHATBOT_CLAIM, CHATBOT_CLAIM_BATCH, CHATBOT_CLAIM_RECLAIM_SECS,
-    CHATBOT_PENDING_STALE_SECS, MAX_CHATBOT_MESSAGE_LEN, MAX_ERROR_CODE_LEN, STALE_ERROR_CODE,
+    CHAT_MESSAGE_TABLE, CHATBOT_PENDING_STALE_SECS, MAX_CHATBOT_MESSAGE_LEN, MAX_ERROR_CODE_LEN,
+    STALE_ERROR_CODE,
 };
 use crate::database::Database;
 use crate::domain::chatbot_thread::ChatbotThreadId;
@@ -148,15 +146,6 @@ pub struct ChatbotMessage {
     error_code: Option<String>,
     created_at: Timestamp,
     completed_at: Option<Timestamp>,
-    /// Which replica's claim loop owes this turn an answer, and when it said
-    /// so. `None` means nobody has taken it; a claim older than
-    /// [`CHATBOT_CLAIM_RECLAIM_SECS`] is a claimer that died, and the turn goes
-    /// back on the queue (see [`ChatbotMessage::claim_pending`]).
-    ///
-    /// Never read by an HTTP handler and never in the DTO: whose process is
-    /// answering is deployment plumbing, not something a client can act on.
-    claimed_by: Option<String>,
-    claimed_at: Option<Timestamp>,
 }
 
 impl ChatbotMessage {
@@ -245,8 +234,6 @@ impl ChatbotMessage {
                 error_code: None,
                 created_at: now,
                 completed_at: Some(now),
-                claimed_by: None,
-                claimed_at: None,
             },
             db,
         )
@@ -272,8 +259,6 @@ impl ChatbotMessage {
                 error_code: None,
                 created_at: Timestamp::now(),
                 completed_at: None,
-                claimed_by: None,
-                claimed_at: None,
             },
             db,
         )
@@ -351,37 +336,6 @@ impl ChatbotMessage {
         let mut messages: Vec<ChatbotMessage> = result.take(0)?;
         messages.reverse();
         Ok(messages)
-    }
-
-    /// Take up to [`CHATBOT_CLAIM_BATCH`] unanswered turns for the claimant
-    /// `me`, and hand back the rows now owed an answer by *this* process.
-    ///
-    /// The queue read. It is deliberately blind to which capabilities exist
-    /// anywhere: the caller has already asked its own in-process registry
-    /// whether it can answer, and that registry — never the `ai_worker` gate —
-    /// is what makes a claim honest. Claiming a turn this process cannot
-    /// dispatch would park it for a whole reclaim horizon.
-    ///
-    /// A lost race is not an error: the guard is re-evaluated per record inside
-    /// the `UPDATE`, so a row a peer took simply does not come back. A
-    /// transaction conflict is the same verdict one layer down and yields an
-    /// empty batch rather than a failure — the next poll re-reads the queue,
-    /// which is also the retry the conflict asks for.
-    pub async fn claim_pending(me: &str, db: &Database) -> Result<Vec<ChatbotMessage>, AppError> {
-        let result = db
-            .query(CHATBOT_CLAIM)
-            .bind(("me", me.to_string()))
-            .bind(("batch", CHATBOT_CLAIM_BATCH))
-            .bind(("stale_ms", CHATBOT_PENDING_STALE_SECS * 1_000))
-            .bind(("reclaim_ms", CHATBOT_CLAIM_RECLAIM_SECS * 1_000))
-            .await
-            .and_then(|response| response.check());
-        match result {
-            // Statement 0 is the `LET`; the claimed rows are statement 1.
-            Ok(mut response) => Ok(response.take::<Vec<ChatbotMessage>>(1)?),
-            Err(err) if lost_the_claim(&err) => Ok(Vec::new()),
-            Err(err) => Err(err.into()),
-        }
     }
 
     /// The user turn this reserved answer belongs to: the newest `user` row
@@ -478,23 +432,6 @@ impl ChatbotMessage {
     }
 }
 
-/// A concurrent claim that the key-value layer decided against us, rather than
-/// a broken query. Read from the *typed* surface: every engine's conflict
-/// wording funnels into `QueryError::TransactionConflict` (surrealdb-core
-/// 3.2.3 `err/to_types.rs:295`), where a substring match covers only whichever
-/// wording the engine of the day happens to use.
-///
-/// Deliberately a second copy of `database::lost_the_race` rather than a shared
-/// helper: that one is private to the boot election, which is owned elsewhere
-/// and must not gain a caller. Five lines is the cheaper coupling.
-fn lost_the_claim(err: &surrealdb::Error) -> bool {
-    use surrealdb::types::{ErrorDetails, QueryError};
-    matches!(
-        err.details(),
-        ErrorDetails::Query(Some(QueryError::TransactionConflict))
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -566,28 +503,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_claim_horizon_sits_between_the_inference_and_the_stale_window() {
-        // Both bounds are load-bearing and neither is decoration:
-        // below the AI request timeout, a reclaim fires while the first
-        // claimer is still legitimately waiting and two services answer the
-        // same turn; at or above the staleness horizon a turn stops being
-        // claimable before the reclaim could ever fire, so a dead claimer's
-        // turn is never retried at all.
-        use crate::constant::AI_DEFAULT_REQUEST_TIMEOUT_SECS;
-        assert!(
-            CHATBOT_CLAIM_RECLAIM_SECS > AI_DEFAULT_REQUEST_TIMEOUT_SECS as i64,
-            "a reclaim inside a legitimate inference double-answers the turn"
-        );
-        #[allow(clippy::assertions_on_constants)]
-        {
-            assert!(
-                CHATBOT_CLAIM_RECLAIM_SECS < CHATBOT_PENDING_STALE_SECS,
-                "a reclaim horizon past the staleness window can never fire"
-            );
-        }
-    }
-
     #[tokio::test]
     async fn stale_pending_projects_as_failed() {
         let aged = |secs: i64| {
@@ -602,8 +517,6 @@ mod tests {
                 error_code: None,
                 created_at: Timestamp::from_millis(Timestamp::now().as_millis() - secs * 1_000),
                 completed_at: None,
-                claimed_by: None,
-                claimed_at: None,
             }
             .projected()
         };

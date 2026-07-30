@@ -4,8 +4,8 @@
 //!
 //! The row is keyed `<plan>_<student>`, and every charge it raises is keyed
 //! from that same key plus the installment number, so the whole operation is
-//! idempotent **by identity**: assigning twice writes nothing the second time
-//! (on this replica or the other one), and an assign cut short after three of
+//! idempotent **by identity**: assigning twice writes nothing the second time,
+//! however the two requests interleave, and an assign cut short after three of
 //! twelve charges landed completes itself when it is repeated. No scan decides
 //! "has this been billed yet?" — a scan can be slipped past by a concurrent
 //! writer, and the cost of that mistake here is a double-billed family.
