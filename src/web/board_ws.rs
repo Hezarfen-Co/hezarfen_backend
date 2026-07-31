@@ -74,6 +74,10 @@ use crate::domain::user::UserId;
 use crate::error::AppError;
 use crate::state::AppState;
 use crate::web::CurrentUser;
+use crate::web::room::{self, Incoming, RoomClosed, send, with_client_seq};
+
+/// How this room names itself in the logs [`room::public_message`] writes.
+const ROOM: &str = "board room";
 
 /// What the client asked for, tagged by `type`.
 #[derive(Deserialize)]
@@ -165,37 +169,23 @@ async fn room(mut socket: WebSocket, st: AppState, board: BoardId, user: UserId)
                 }
                 Err(RecvError::Closed) => Err(RoomClosed),
             },
-            incoming = socket.recv() => match incoming {
-                Some(Ok(Message::Text(text))) => {
+            incoming = socket.recv() => match room::classify(incoming) {
+                Incoming::Text(text) => {
                     handle_message(&mut socket, text.as_str(), &board, &user, &mut mine, &st).await
                 }
-                // Ping/pong frames are answered by axum itself; other non-text
-                // frames carry nothing for this protocol.
-                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => Err(RoomClosed),
-                Some(Ok(_)) => Ok(()),
+                Incoming::Gone => Err(RoomClosed),
+                Incoming::Ignore => Ok(()),
             },
         };
         if step.is_err() {
             break;
         }
     }
-    // Best-effort closing handshake — a bare TCP teardown reads as an error on
-    // the client; a Close frame reads as "the room is over".
-    let _ = socket.send(Message::Close(None)).await;
+    room::close(&mut socket).await;
     st.board_hub.leave(board.key());
 }
 
-/// The room is over: the peer went away, or the board ended.
-struct RoomClosed;
-
 type Step = Result<(), RoomClosed>;
-
-async fn send(socket: &mut WebSocket, frame: Value) -> Step {
-    socket
-        .send(Message::Text(frame.to_string().into()))
-        .await
-        .map_err(|_| RoomClosed)
-}
 
 /// The board as it stands right now, for a caller who must still be on it.
 /// Every action re-reads through here: the roster, the lock and the epoch are
@@ -530,63 +520,36 @@ async fn creator_board(
     }
 }
 
-/// Attach the request's correlation id, if it sent one. Omitted stays omitted —
-/// never `null` — so a client that sends no `client_seq` sees byte-identical
-/// frames (mirrors [`super::exam_ws`]).
-fn with_client_seq(frame: &mut Value, client_seq: Option<u64>) {
-    if let Some(client_seq) = client_seq {
-        frame["client_seq"] = json!(client_seq);
-    }
-}
-
 /// A machine-readable `code` beside the public words. The three refusals the
 /// stroke path can raise are distinguished by their message, because that is
 /// what [`BoardStroke::append`] hands back and each one means a different thing
 /// to a client: `epoch_full` is recoverable by clearing, `locked` is a pause
 /// that will lift, `board_closed` is terminal.
 fn error_frame(err: &AppError, client_seq: Option<u64>) -> Value {
-    let (code, message) = match err {
-        AppError::Forbidden(message) => ("forbidden", (*message).to_string()),
-        AppError::Conflict(message) if message.contains("clear it to keep drawing") => {
-            ("epoch_full", (*message).to_string())
-        }
-        AppError::Conflict(message) if message.contains("locked") => {
-            ("locked", (*message).to_string())
-        }
+    let code = match err {
+        AppError::Forbidden(_) => "forbidden",
+        AppError::Conflict(message) if message.contains("clear it to keep drawing") => "epoch_full",
+        AppError::Conflict(message) if message.contains("locked") => "locked",
         // "read-only" (the lifetime cap), and the clear's own "it is closed, or
         // you did not create it" — the socket already checked the creator, so
         // what is left is closed, and that is what the client must act on.
         AppError::Conflict(message)
             if message.contains("read-only") || message.contains("closed") =>
         {
-            ("board_closed", (*message).to_string())
+            "board_closed"
         }
-        AppError::Conflict(message) => ("conflict", (*message).to_string()),
-        AppError::ConflictOwned(message) => ("conflict", message.clone()),
-        AppError::Validation(err) => ("invalid", err.to_string()),
-        AppError::PayloadTooLarge(message) => ("invalid", message.clone()),
-        AppError::NotFound => ("not_found", "not found".to_string()),
-        AppError::Unauthorized => ("unauthorized", "unauthorized".to_string()),
-        AppError::TooManyRequests { .. } => ("too_many_requests", "too many requests".to_string()),
-        AppError::DbUnavailable => {
-            tracing::warn!("board room: database reconnecting");
-            (
-                "internal",
-                "database reconnecting — retry shortly".to_string(),
-            )
-        }
-        AppError::DbTimeout => {
-            tracing::error!("board room: database timed out");
-            (
-                "internal",
-                "the database timed out — reload the room".to_string(),
-            )
-        }
-        AppError::Db(_) | AppError::Internal(_) => {
-            tracing::error!("board room error: {err}");
-            ("internal", "internal server error".to_string())
+        AppError::Conflict(_) | AppError::ConflictOwned(_) => "conflict",
+        AppError::Validation(_) | AppError::PayloadTooLarge(_) => "invalid",
+        AppError::NotFound => "not_found",
+        AppError::Unauthorized => "unauthorized",
+        AppError::TooManyRequests { .. } => "too_many_requests",
+        AppError::DbUnavailable | AppError::DbTimeout | AppError::Db(_) | AppError::Internal(_) => {
+            "internal"
         }
     };
+    // The words (and the logging of anything internal) are the rooms' shared
+    // half; only the `code` above is this room's own.
+    let message = room::public_message(err, ROOM);
     let mut frame = json!({ "type": "error", "code": code, "message": message });
     with_client_seq(&mut frame, client_seq);
     frame

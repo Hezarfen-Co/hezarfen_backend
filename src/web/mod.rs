@@ -25,6 +25,7 @@ pub mod notes;
 pub mod payments;
 pub mod pomodoro;
 pub mod questions;
+pub mod room;
 pub mod sessions;
 pub mod settings;
 pub mod subjects;
