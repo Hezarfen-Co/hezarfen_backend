@@ -1779,7 +1779,7 @@ async fn boards_and_their_strokes_survive_remigration() {
         "POST",
         "/boards",
         Some(&cookie),
-        Some(json!({ "title": "Geometri", "participant_ids": [veli_id] })),
+        Some(json!({ "title": "Geometri", "participants": [veli_id] })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);

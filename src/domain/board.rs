@@ -18,7 +18,7 @@ use crate::constant::{
     BOARD_TABLE, MAX_BOARD_PARTICIPANTS, MAX_BOARD_TITLE_LEN, MAX_BOARDS_PER_CREATOR,
     USER_BOARD_COUNT_FIELD,
 };
-use crate::database::Database;
+use crate::database::{Database, transaction_with_retry};
 use crate::domain::cap;
 use crate::domain::monotonic_id::next_ulid;
 use crate::domain::page::PagedList;
@@ -297,19 +297,29 @@ impl Board {
     /// and issued separately it could leave a board's whole history orphaned
     /// under a record that no longer exists.
     pub async fn delete(self, db: &Database) -> Result<Board, AppError> {
-        let mut result = db
-            .query(
-                "BEGIN TRANSACTION;
-                 DELETE board_stroke WHERE board = $id;
-                 LET $gone = (DELETE $id RETURN BEFORE);
-                 UPDATE $usr SET board_count = math::max([(board_count ?? 0) - array::len($gone), 0]);
-                 RETURN $gone;
-                 COMMIT TRANSACTION;",
-            )
-            .bind(("id", self.id.record()))
-            .bind(("usr", self.creator.record()))
-            .await?
-            .check()?;
+        // A stroke claim writes the very board row this deletes, so the store
+        // aborts one of the two and a lost round is ordinary here — re-sent
+        // rather than reported as a 500. Re-sending is sound: every statement
+        // is a `DELETE` or a field-scoped `UPDATE`, none of which can ever
+        // answer "already exists" (see [`transaction_with_retry`]).
+        let (mut result, mut errors) = transaction_with_retry(
+            db,
+            "BEGIN TRANSACTION;
+             DELETE board_stroke WHERE board = $id;
+             LET $gone = (DELETE $id RETURN BEFORE);
+             UPDATE $usr SET board_count = math::max([(board_count ?? 0) - array::len($gone), 0]);
+             RETURN $gone;
+             COMMIT TRANSACTION;",
+            &[
+                ("id".into(), self.id.record().into_value()),
+                ("usr".into(), self.creator.record().into_value()),
+            ],
+            &[],
+        )
+        .await?;
+        if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+            return Err(error.into());
+        }
         // Slots count BEGIN, the cascade, the LET and the UPDATE: the RETURN
         // is slot 4.
         one(result.take::<Vec<Board>>(4)?)

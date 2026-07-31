@@ -24075,7 +24075,7 @@ async fn create_board(
         "POST",
         "/boards",
         Some(cookie),
-        Some(json!({ "title": title, "participant_ids": participants })),
+        Some(json!({ "title": title, "participants": participants })),
     )
     .await;
     assert_eq!(
@@ -24267,7 +24267,7 @@ async fn a_parent_gets_no_whiteboard_at_all() {
         "POST",
         "/boards",
         Some(&anne),
-        Some(json!({ "title": "Gizli", "participant_ids": [] })),
+        Some(json!({ "title": "Gizli", "participants": [] })),
     )
     .await;
     assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
@@ -24281,7 +24281,7 @@ async fn a_parent_gets_no_whiteboard_at_all() {
         "POST",
         "/boards",
         Some(&ali),
-        Some(json!({ "title": "Geometri", "participant_ids": [&anne_id] })),
+        Some(json!({ "title": "Geometri", "participants": [&anne_id] })),
     )
     .await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
@@ -24336,6 +24336,50 @@ async fn a_parent_gets_no_whiteboard_at_all() {
     assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
     // None of it disturbed the board.
     assert!(stored_board(&db, &board).await.is_some());
+}
+
+/// The roster is spelled `participants` on the way in, out and through `PATCH`.
+/// It used to be `participant_ids` on `POST` alone, and with serde ignoring the
+/// unknown key a client that posted back a board it had just read got a `201`
+/// for a board it was silently alone on. A misspelled roster must now be
+/// refused, not dropped — the assert is the *stored* row, because the response
+/// echoing an empty list is exactly what the old bug looked like.
+#[tokio::test]
+async fn a_misspelled_roster_is_refused_instead_of_silently_dropped() {
+    let (app, db) = common::app_and_db().await;
+    let ali = login(&app, "ali").await;
+    let ali_id = me_id(&app, &ali).await;
+    let veli = login(&app, "veli").await;
+    let veli_id = me_id(&app, &veli).await;
+
+    let res = send(
+        &app,
+        "POST",
+        "/boards",
+        Some(&ali),
+        Some(json!({ "title": "Geometri", "participant_ids": [&veli_id] })),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "the old spelling must not open a board: {}",
+        res.body
+    );
+    // Refused whole: no solo board, and no seat spent on one.
+    assert_eq!(stored_board_count(&db, &ali_id).await, 0);
+
+    let board = create_board(&app, &ali, "Geometri", &[&veli_id]).await;
+    let stored = stored_board(&db, &board).await.unwrap();
+    assert_eq!(
+        stored
+            .get_participants()
+            .iter()
+            .map(|user| user.key().to_string())
+            .collect::<Vec<_>>(),
+        vec![veli_id],
+        "the roster must reach the row, not just the response"
+    );
 }
 
 /// The other half of the two-tier line: a participant sees the board and may

@@ -205,18 +205,24 @@ impl StrokeResponse {
     }
 }
 
+/// `deny_unknown_fields` on both board request bodies is deliberate: this DTO
+/// used to spell the roster `participant_ids` while the response and the PATCH
+/// spelled it `participants`, so a client posting a board it had just read got
+/// a `201` with a silently empty roster. A misspelled field is now refused
+/// instead of dropped.
 #[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 struct CreateBoard {
     #[schema(max_length = 200)]
     title: String,
     /// Who may draw, besides the creator. Omit or send an empty list to open a
     /// board alone and invite later.
     #[schema(max_items = 50)]
-    participant_ids: Option<Vec<String>>,
+    participants: Option<Vec<String>>,
 }
 
 /// Open a whiteboard. The caller becomes its creator — the only one who may
-/// clear, lock, close or delete it — and everyone named in `participant_ids`
+/// clear, lock, close or delete it — and everyone named in `participants`
 /// may draw on it. Student and above: the `parent` role has no whiteboard
 /// access at all, neither as a creator nor as a participant. `409` once the
 /// caller holds `max_boards_per_creator` boards (`GET /limits`); delete one to
@@ -241,7 +247,7 @@ async fn create_board(
     Json(req): Json<CreateBoard>,
 ) -> Result<(StatusCode, Json<BoardResponse>), AppError> {
     let title = BoardTitle::try_new(&req.title)?;
-    let participants = resolve_participants(req.participant_ids, &st.db).await?;
+    let participants = resolve_participants(req.participants, &st.db).await?;
     let board = Board::create(user.get_id(), title, participants, &st.db).await?;
     Ok((StatusCode::CREATED, Json(BoardResponse::new(&board))))
 }
@@ -412,6 +418,7 @@ async fn list_epochs(
 }
 
 #[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 struct UpdateBoard {
     /// Re-title. Any participant may. Omit to keep.
     #[schema(max_length = 200)]
