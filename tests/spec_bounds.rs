@@ -32,6 +32,7 @@ async fn spec() -> Value {
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
         chatbot_limit: Default::default(),
         exam_presence: Default::default(),
+        board_hub: Default::default(),
         db_up: Default::default(),
         ai: None,
     });
@@ -784,6 +785,31 @@ fn expectations() -> Vec<(&'static str, &'static str, &'static str, i64)> {
             "title",
             "maxLength",
             MAX_CHATBOT_THREAD_TITLE_LEN as i64,
+        ),
+        // --- whiteboards ---
+        (
+            "CreateBoard",
+            "title",
+            "maxLength",
+            MAX_BOARD_TITLE_LEN as i64,
+        ),
+        (
+            "CreateBoard",
+            "participant_ids",
+            "maxItems",
+            MAX_BOARD_PARTICIPANTS as i64,
+        ),
+        (
+            "UpdateBoard",
+            "title",
+            "maxLength",
+            MAX_BOARD_TITLE_LEN as i64,
+        ),
+        (
+            "UpdateBoard",
+            "participants",
+            "maxItems",
+            MAX_BOARD_PARTICIPANTS as i64,
         ),
     ]
 }

@@ -59,6 +59,7 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS language ON user TYPE option<string>;
     DEFINE FIELD IF NOT EXISTS palette_color ON user TYPE option<string>;
     DEFINE FIELD IF NOT EXISTS chatbot_thread_count ON user TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS board_count ON user TYPE option<int>;
     DEFINE INDEX IF NOT EXISTS user_username ON user FIELDS username UNIQUE;
 
     DEFINE TABLE IF NOT EXISTS session SCHEMAFULL;
@@ -93,6 +94,50 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS recipient_origin ON message TYPE option<string>;
     DEFINE INDEX IF NOT EXISTS message_sender ON message FIELDS sender;
     DEFINE INDEX IF NOT EXISTS message_recipient ON message FIELDS recipient;
+
+    -- Collaborative whiteboard (2026-07-31): one `board` is a room, one
+    -- `board_stroke` is one append-only mark. A clear NEVER deletes — it bumps
+    -- `epoch`, so the canvas empties while the whole history stays replayable.
+    -- `locked` is a plain bool, not an option: the open-board guard asks for
+    -- `locked = false`, which a NONE would never match. `locked_by`/`locked_at`/
+    -- `closed_at` are three top-level option columns rather than one nested
+    -- object, because SurrealDB 3 drops an object key valued NONE.
+    DEFINE TABLE IF NOT EXISTS board SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS creator ON board TYPE record<user>;
+    DEFINE FIELD IF NOT EXISTS title ON board TYPE string;
+    DEFINE FIELD IF NOT EXISTS participants ON board TYPE array<record<user>>;
+    DEFINE FIELD IF NOT EXISTS locked ON board TYPE bool DEFAULT false;
+    DEFINE FIELD IF NOT EXISTS locked_by ON board TYPE option<record<user>>;
+    DEFINE FIELD IF NOT EXISTS locked_at ON board TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS epoch ON board TYPE int DEFAULT 0;
+    -- Resets to 0 on every clear (recoverable); never resets (stamps closed_at).
+    DEFINE FIELD IF NOT EXISTS epoch_stroke_count ON board TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS total_stroke_count ON board TYPE option<int>;
+    -- Stamped once, when the lifetime cap is hit: permanently read-only.
+    DEFINE FIELD IF NOT EXISTS closed_at ON board TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS created_at ON board TYPE int;
+    DEFINE INDEX IF NOT EXISTS board_creator ON board FIELDS creator;
+    -- Listing a user's boards asks `creator = $u OR participants CONTAINS $u`;
+    -- without this the CONTAINS half is a full scan. SurrealDB indexes an
+    -- array field per element, so it covers the membership test directly.
+    DEFINE INDEX IF NOT EXISTS board_participants ON board FIELDS participants;
+
+    DEFINE TABLE IF NOT EXISTS board_stroke SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS board ON board_stroke TYPE record<board>;
+    DEFINE FIELD IF NOT EXISTS author ON board_stroke TYPE record<user>;
+    -- 'stroke' or 'clear'; `payload` is the opaque blob, absent on a clear
+    -- marker, and `count` is populated only on a clear marker — the final
+    -- stroke count of the epoch that marker closed.
+    DEFINE FIELD IF NOT EXISTS kind ON board_stroke TYPE string;
+    DEFINE FIELD IF NOT EXISTS payload ON board_stroke TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS count ON board_stroke TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS epoch ON board_stroke TYPE int;
+    DEFINE FIELD IF NOT EXISTS created_at ON board_stroke TYPE int;
+    -- Keeps a socket's join-replay scoped to the current epoch instead of
+    -- scanning the board's whole history.
+    DEFINE INDEX IF NOT EXISTS board_stroke_board_epoch ON board_stroke FIELDS board, epoch;
+    -- The clear markers ARE the epoch index, so listing them is a hot read.
+    DEFINE INDEX IF NOT EXISTS board_stroke_board_kind ON board_stroke FIELDS board, kind;
 
     DEFINE TABLE IF NOT EXISTS note_file SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS note ON note_file TYPE record<note>;

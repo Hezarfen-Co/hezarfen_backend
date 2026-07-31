@@ -49,6 +49,7 @@ pub async fn app_and_db() -> (Router, Database) {
         rate_limit: RateLimitConfig::unlimited(),
         chatbot_limit: Default::default(),
         exam_presence: Default::default(),
+        board_hub: Default::default(),
         db_up: Default::default(),
         ai: None,
     });

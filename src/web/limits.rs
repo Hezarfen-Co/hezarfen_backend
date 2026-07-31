@@ -267,6 +267,36 @@ struct ChatbotLimits {
     default_max_threads: i64,
 }
 
+/// A collaborative whiteboard: its title, its roster, and the two growth caps
+/// that decide when a canvas must be cleared and when a board is finished.
+#[derive(Serialize, ToSchema)]
+struct BoardLimits {
+    max_title_len: usize,
+    /// People the creator may name onto one board. Every participant draws, so
+    /// this also bounds a room's writer count.
+    max_participants: usize,
+    /// Ceiling on one stroke's serialized payload, bytes.
+    max_stroke_payload_len: usize,
+    /// The *live* canvas cap: strokes since the last clear. Hitting it is
+    /// recoverable — the creator clears, the canvas empties, the history is
+    /// kept, and drawing resumes.
+    max_epoch_strokes: i64,
+    /// The *lifetime* storage cap, which never resets because a clear keeps its
+    /// history. Hitting it makes the board permanently read-only: it stays
+    /// fully readable and replayable, and a new board must be opened.
+    max_board_strokes: i64,
+    /// Boards one creating user may hold. Deleting a board frees a seat.
+    max_boards_per_creator: i64,
+    /// The accepted stroke kinds. `clear` is a marker that ends an epoch, not a
+    /// deletion.
+    #[schema(example = json!(["stroke", "clear"]))]
+    stroke_kinds: Vec<&'static str>,
+    /// Cadence of the board-room WebSocket's keepalive ticks, seconds.
+    ws_tick_secs: u64,
+    /// Ceiling on a `board_id` sent over the board-room WebSocket.
+    ws_max_board_id_len: usize,
+}
+
 /// Bounds on the school-editable lists in `PATCH /settings`.
 #[derive(Serialize, ToSchema)]
 struct SettingsLimits {
@@ -333,6 +363,7 @@ struct LimitsResponse {
     meal: MealLimits,
     payment: PaymentLimits,
     chatbot: ChatbotLimits,
+    board: BoardLimits,
     settings: SettingsLimits,
     request: RequestLimits,
     rate: RateLimits,
@@ -466,6 +497,17 @@ impl LimitsResponse {
                 min_max_threads: MIN_MAX_CHATBOT_THREADS,
                 max_max_threads: MAX_MAX_CHATBOT_THREADS,
                 default_max_threads: DEFAULT_MAX_CHATBOT_THREADS,
+            },
+            board: BoardLimits {
+                max_title_len: MAX_BOARD_TITLE_LEN,
+                max_participants: MAX_BOARD_PARTICIPANTS,
+                max_stroke_payload_len: MAX_STROKE_PAYLOAD_LEN,
+                max_epoch_strokes: MAX_EPOCH_STROKES,
+                max_board_strokes: MAX_BOARD_STROKES,
+                max_boards_per_creator: MAX_BOARDS_PER_CREATOR,
+                stroke_kinds: BOARD_STROKE_KINDS.to_vec(),
+                ws_tick_secs: BOARD_WS_TICK_SECS,
+                ws_max_board_id_len: MAX_BOARD_ID_LEN,
             },
             settings: SettingsLimits {
                 max_list_len: MAX_SETTINGS_LIST_LEN,

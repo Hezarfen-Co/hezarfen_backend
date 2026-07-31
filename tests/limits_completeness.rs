@@ -58,6 +58,22 @@ const EXCLUDED: &[(&str, &str)] = &[
          409, never as a number",
     ),
     (
+        "BOARD_OPEN_GUARD",
+        "SQL fragment: the condition every whiteboard-stroke write carries so a \
+         locked or closed board freezes in the database; the client sees the \
+         freeze as a 409, never as a number",
+    ),
+    (
+        "BOARD_REPLAY_CHUNK",
+        "how the board-room socket batches its join replay; the client reads the \
+         strokes, not the batch size",
+    ),
+    (
+        "BOARD_HUB_CAPACITY",
+        "depth of one board room's fan-out channel; a lagging socket is dropped \
+         and rejoins, which the client handles as a reconnect, not as a number",
+    ),
+    (
         "UPLOAD_BODY_OVERHEAD_BYTES",
         "multipart headroom over max_file_bytes; the client sizes against \
          max_file_bytes itself, which /limits does publish",

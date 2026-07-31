@@ -273,6 +273,52 @@ pub const MAX_FEE_PLAN_ASSIGN_STUDENTS: usize = 200;
 /// UUID or a receipt number comfortably.
 pub const MAX_PAYMENT_REQUEST_KEY_LEN: usize = 64;
 
+/// Bounds on a whiteboard: its title, and how many people the creator may name
+/// onto it. Fifty is a class and its teachers, not the school; every
+/// participant may draw, so this is also what bounds one board's writer count.
+pub const MAX_BOARD_TITLE_LEN: usize = 200;
+pub const MAX_BOARD_PARTICIPANTS: usize = 50;
+
+/// Ceiling on one stroke's serialized payload. A stroke is a short path — a
+/// handful of points, a colour, a width — and it is stored verbatim and fanned
+/// out to every socket in the room, so it is bounded at the wire rather than at
+/// the canvas: 4 KiB takes a long freehand curve and still keeps the worst-case
+/// board (`MAX_BOARD_STROKES` of them) inside a couple hundred megabytes.
+pub const MAX_STROKE_PAYLOAD_LEN: usize = 4_096;
+
+/// The two growth caps, both counted on the board row (see the counter fields
+/// below). They are different kinds of full on purpose:
+///
+/// `MAX_EPOCH_STROKES` caps the *live* canvas — the strokes since the last
+/// clear. Hitting it is recoverable: the creator clears, the epoch counter
+/// resets to zero and drawing resumes. Nothing is deleted by that clear.
+///
+/// `MAX_BOARD_STROKES` caps the board's total *storage*, and never resets,
+/// because a clear keeps its history for playback. Hitting it stamps
+/// `closed_at`: the board turns permanently read-only, but stays fully
+/// readable and replayable — a closed board loses no stroke it ever carried.
+pub const MAX_EPOCH_STROKES: i64 = 5_000;
+pub const MAX_BOARD_STROKES: i64 = 50_000;
+
+/// How many boards one creator may hold. Without it the two caps above cost an
+/// attacker nothing — a full board is answered by opening the next one — so
+/// this is the counter that actually bounds a single account's storage. Kept on
+/// the user row, the same shape as `CHATBOT_THREAD_COUNT_FIELD`.
+pub const MAX_BOARDS_PER_CREATOR: i64 = 200;
+
+/// The only accepted stroke kinds. `stroke`: a drawn path, carrying its
+/// payload. `clear`: the marker row that ends an epoch — it deletes nothing,
+/// it is the epoch index, so replaying across it reconstructs the whole
+/// session.
+pub const BOARD_STROKE_KINDS: [&str; 2] = ["stroke", "clear"];
+
+/// Ceiling on a `board_id` arriving on the board WebSocket, for the same reason
+/// as [`MAX_QUESTION_ID_LEN`]: the field is a record key — a 26-char ULID in
+/// every real payload — and the error frame *echoes* it back, so an unbounded
+/// id lets a client make its own room reflect a 64 MiB frame at it. Checked
+/// before any database work.
+pub const MAX_BOARD_ID_LEN: usize = 64;
+
 /// Inclusive bounds for an exam's per-attempt duration, milliseconds
 /// (1 minute to 24 hours). Required for `async`, optional for `open`.
 pub const MIN_EXAM_DURATION_MS: i64 = 60 * 1000;
@@ -314,6 +360,22 @@ pub const DB_CONNECT_BACKOFF_MAX_SECS: u64 = 5;
 /// Cadence of the `state` ticks on the student exam-room WebSocket
 /// (`GET /exams/{id}/attempt/ws`).
 pub const EXAM_WS_TICK_SECS: u64 = 2;
+
+/// Cadence of the keepalive ticks on the whiteboard-room WebSocket. Slower than
+/// the exam room's, because a board room carries no countdown a client renders
+/// against — the tick only keeps an idle socket from being reaped.
+pub const BOARD_WS_TICK_SECS: u64 = 15;
+
+/// How many strokes one replay message carries when a socket joins. The join
+/// replays the current epoch, which is `MAX_EPOCH_STROKES` at worst, so it is
+/// sent in batches rather than as one frame that could reach the WebSocket
+/// frame limit on a busy board.
+pub const BOARD_REPLAY_CHUNK: usize = 200;
+
+/// Depth of one board room's fan-out channel: how far a slow socket may lag the
+/// strokes being drawn before it is dropped and has to rejoin (which replays
+/// the epoch from storage anyway, so nothing is lost by the drop).
+pub const BOARD_HUB_CAPACITY: usize = 256;
 
 /// Ceiling on a `question_id` arriving on the exam-room WebSocket. The field is
 /// a record key — a 26-char ULID in every real payload — not free text, so this
@@ -663,6 +725,8 @@ pub const MEAL_LEDGER_TABLE: &str = "meal_ledger";
 pub const FEE_PLAN_TABLE: &str = "fee_plan";
 pub const FEE_PLAN_ASSIGNMENT_TABLE: &str = "fee_plan_assignment";
 pub const PAYMENT_LEDGER_TABLE: &str = "payment_ledger";
+pub const BOARD_TABLE: &str = "board";
+pub const BOARD_STROKE_TABLE: &str = "board_stroke";
 /// One row per *name* the school's settings offer, keyed by the name itself:
 /// how many rows still reference it, and whether it has been retired out of the
 /// list (see the reference counters in [`crate::domain::cap`]).
@@ -702,6 +766,20 @@ pub const FEE_PLAN_UNASSIGNED_GUARD: &str = "(assignment_count ?? 0) = 0";
 pub const NOTE_FILE_COUNT_FIELD: &str = "file_count";
 pub const SUBMISSION_FILE_COUNT_FIELD: &str = "file_count";
 pub const CHATBOT_THREAD_COUNT_FIELD: &str = "chatbot_thread_count";
+/// How many boards this user created, on the user row — the same per-user shape
+/// as `CHATBOT_THREAD_COUNT_FIELD`, capped at `MAX_BOARDS_PER_CREATOR`. It is
+/// what closes the "open another board" way around the two board counters
+/// below; released when a board is deleted.
+pub const USER_BOARD_COUNT_FIELD: &str = "board_count";
+/// The two stroke counters on a board row. `epoch_stroke_count` is reset to
+/// zero by a clear and capped at `MAX_EPOCH_STROKES` — a full epoch is
+/// recoverable. `total_stroke_count` is never reset and capped at
+/// `MAX_BOARD_STROKES`; reaching it stamps `closed_at`, and a closed board is
+/// read-only for good. Both are claimed in the same conditional write as the
+/// stroke row, so two people drawing at once contend on the board record rather
+/// than on a `SELECT count()` either of them can outrun.
+pub const BOARD_EPOCH_STROKE_COUNT_FIELD: &str = "epoch_stroke_count";
+pub const BOARD_TOTAL_STROKE_COUNT_FIELD: &str = "total_stroke_count";
 /// Cap 1, not N: an appointment slot holds at most one live booking, so this
 /// counter is really an "is it taken" flag kept in the shape every other cap
 /// uses (`claim`/`release`), which is what makes rejecting or cancelling a
@@ -743,6 +821,12 @@ pub const SUBMISSION_GRADED_FIELD: &str = "graded_by_result";
 /// The condition itself, spelled once: a submission is writable exactly while
 /// its grade stamp is absent.
 pub const SUBMISSION_OPEN_GUARD: &str = "graded_by_result = NONE";
+/// The same idea for a whiteboard, spelled once: a board accepts strokes
+/// exactly while the creator has not locked it and it has not closed itself on
+/// `MAX_BOARD_STROKES`. Every stroke write carries it, so "is this board still
+/// open" and the write it licenses are one conditional single-record write —
+/// a lock landing mid-draw beats the stroke instead of racing it.
+pub const BOARD_OPEN_GUARD: &str = "locked = false AND closed_at = NONE";
 
 /// How hard a counter write tries before giving up, and the first backoff step
 /// it sleeps between attempts (doubling, plus jitter). Contention on one record
