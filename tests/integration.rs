@@ -9,7 +9,12 @@ use common::{
     app_and_db, create_course, create_exam, create_exam_with, create_homework, create_session,
     create_subject, enroll, id_of, login, login_as, me_id, mem_app, send, set_role, unenroll,
 };
-use hezarfen_backend::constant::{BANK_VISIBILITY_SCHOOL, MAX_FEE_PLAN_ASSIGN_STUDENTS};
+use hezarfen_backend::constant::{
+    BANK_VISIBILITY_SCHOOL, MAX_BOARD_STROKES, MAX_BOARDS_PER_CREATOR, MAX_EPOCH_STROKES,
+    MAX_FEE_PLAN_ASSIGN_STUDENTS,
+};
+use hezarfen_backend::domain::board::{Board, BoardId};
+use hezarfen_backend::domain::board_stroke::{BoardStroke, BoardStrokeId};
 use hezarfen_backend::domain::chatbot_message::ChatbotMessage;
 use hezarfen_backend::domain::chatbot_thread::ChatbotThreadId;
 use hezarfen_backend::domain::exam::ExamId;
@@ -24054,4 +24059,766 @@ async fn bulk_assignment_is_capped_at_two_hundred_students() {
     // Refused whole, not partly: nothing was written before the count check.
     assert_eq!(pay_row_count(&db, "fee_plan_assignment").await, 0);
     assert_eq!(pay_row_count(&db, "payment_ledger").await, 0);
+}
+
+// --- whiteboards ---------------------------------------------------------
+
+/// Open a board (asserts 201); returns its id.
+async fn create_board(
+    app: &axum::Router,
+    cookie: &str,
+    title: &str,
+    participants: &[&str],
+) -> String {
+    let res = send(
+        app,
+        "POST",
+        "/boards",
+        Some(cookie),
+        Some(json!({ "title": title, "participant_ids": participants })),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::CREATED,
+        "create board: {}",
+        res.body
+    );
+    id_of(&res.body)
+}
+
+/// Draw one mark straight through the domain. Drawing is a WebSocket surface
+/// (`tests/e2e.rs` owns the room), but every REST read below needs marks on the
+/// board first, and the two caps below need one refused at a boundary no HTTP
+/// route can reach.
+async fn draw(
+    db: &Database,
+    board: &str,
+    author: &str,
+    epoch: i64,
+    payload: &str,
+) -> Result<BoardStroke, hezarfen_backend::error::AppError> {
+    BoardStroke::append(
+        &BoardId::from_key(board),
+        &UserId::from_key(author),
+        payload,
+        epoch,
+        db,
+    )
+    .await
+}
+
+/// The board row as the store holds it — never the response body, which cannot
+/// prove a counter moved (src/domain/cap.rs:44-49).
+async fn stored_board(db: &Database, board: &str) -> Option<Board> {
+    Board::read(&BoardId::from_key(board), db).await.unwrap()
+}
+
+/// Every stroke row of a board, oldest first, straight out of the table.
+/// `SELECT *`, because SurrealDB 3 refuses `ORDER BY id` on a projection that
+/// omits `id`.
+async fn stroke_rows(db: &Database, board: &str) -> Vec<BoardStroke> {
+    let mut result = db
+        .query("SELECT * FROM board_stroke WHERE board = $b ORDER BY id")
+        .bind(("b", BoardId::from_key(board).record()))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    result.take(0).unwrap()
+}
+
+/// The stored `[epoch_stroke_count, total_stroke_count]` pair.
+async fn stored_counters(db: &Database, board: &str) -> Vec<i64> {
+    let mut result = db
+        .query(
+            "SELECT VALUE [epoch_stroke_count ?? 0, total_stroke_count ?? 0] \
+             FROM $id",
+        )
+        .bind(("id", BoardId::from_key(board).record()))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    result.take::<Vec<Vec<i64>>>(0).unwrap().remove(0)
+}
+
+async fn set_counters(db: &Database, board: &str, epoch: i64, total: i64) {
+    db.query("UPDATE $id SET epoch_stroke_count = $e, total_stroke_count = $t")
+        .bind(("id", BoardId::from_key(board).record()))
+        .bind(("e", epoch))
+        .bind(("t", total))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+}
+
+/// The creator's stored `board_count` — the authority on how many boards they
+/// hold, so the per-creator cap is asserted here and not off a 409.
+async fn stored_board_count(db: &Database, user: &str) -> i64 {
+    let mut result = db
+        .query("SELECT VALUE board_count ?? 0 FROM $id")
+        .bind(("id", UserId::from_key(user).record()))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    result.take::<Vec<i64>>(0).unwrap()[0]
+}
+
+/// Every id-scoped board route, with a body where the route needs one. The
+/// `PATCH` arms are split because they carry different rights: `title` is every
+/// participant's, `participants` and `locked` are the creator's alone.
+fn board_routes(id: &str) -> Vec<(&'static str, String, Option<serde_json::Value>)> {
+    vec![
+        ("GET", format!("/boards/{id}"), None),
+        ("GET", format!("/boards/{id}/strokes"), None),
+        ("GET", format!("/boards/{id}/history"), None),
+        ("GET", format!("/boards/{id}/epochs"), None),
+        (
+            "PATCH",
+            format!("/boards/{id}"),
+            Some(json!({"title": "x"})),
+        ),
+        (
+            "PATCH",
+            format!("/boards/{id}"),
+            Some(json!({"participants": []})),
+        ),
+        (
+            "PATCH",
+            format!("/boards/{id}"),
+            Some(json!({"locked": true})),
+        ),
+        ("POST", format!("/boards/{id}/clear"), None),
+        ("POST", format!("/boards/{id}/close"), None),
+        ("DELETE", format!("/boards/{id}"), None),
+    ]
+}
+
+/// A board that exists must be indistinguishable from one that does not, on
+/// every single route — a 403 anywhere here would tell an outsider the school
+/// holds a board with that id, and the id list is guessable from nothing else.
+#[tokio::test]
+async fn every_board_route_is_a_404_for_an_outsider() {
+    let (app, db) = app_and_db().await;
+    let ali = login(&app, "ali").await;
+    let veli = login(&app, "veli").await;
+    let zeynep = login(&app, "zeynep").await;
+    let veli_id = me_id(&app, &veli).await;
+    let board = create_board(&app, &ali, "Geometri", &[&veli_id]).await;
+    draw(&db, &board, &me_id(&app, &ali).await, 0, "{\"p\":[1,2]}")
+        .await
+        .unwrap();
+
+    // The real board and an id that was never minted answer identically.
+    let ghost = board_routes("nosuchboard");
+    for (n, (method, uri, body)) in board_routes(&board).into_iter().enumerate() {
+        let res = send(&app, method, &uri, Some(&zeynep), body).await;
+        assert_eq!(
+            res.status,
+            StatusCode::NOT_FOUND,
+            "{method} {uri} must 404 for an outsider, got {}",
+            res.body
+        );
+        let (gm, gu, gb) = ghost[n].clone();
+        let gone = send(&app, gm, &gu, Some(&zeynep), gb).await;
+        assert_eq!(
+            res.status, gone.status,
+            "{method} {uri} must answer exactly like a board that does not exist"
+        );
+        assert_eq!(res.body, gone.body, "{method} {uri} bodies must match too");
+    }
+
+    // The list route leaks nothing either, and none of the refusals above
+    // touched the row: still open, still one stroke, still the same roster.
+    let res = send(&app, "GET", "/boards", Some(&zeynep), None).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(common::total(&res.body), 0, "an outsider lists no boards");
+    let stored = stored_board(&db, &board).await.expect("board survived");
+    assert_eq!(stored.get_title().as_str(), "Geometri");
+    assert_eq!(stored.get_epoch(), 0);
+    assert!(!stored.is_locked());
+    assert!(stored.get_closed_at().is_none());
+    assert_eq!(stored.get_participants().len(), 1);
+    assert_eq!(stroke_rows(&db, &board).await.len(), 1);
+
+    // Opening a board is nobody's privilege — the outsider gets their own.
+    let mine = create_board(&app, &zeynep, "Kendi tahtam", &[]).await;
+    assert_ne!(mine, board);
+}
+
+/// The other half of the two-tier line: a participant sees the board and may
+/// re-title it, but the four commands and the roster/lock arms of `PATCH` are
+/// the creator's alone — a 403, because hiding a board they are already
+/// rendering would be a lie their client cannot act on.
+#[tokio::test]
+async fn a_participant_reads_and_retitles_but_cannot_command() {
+    let (app, db) = app_and_db().await;
+    let ali = login(&app, "ali").await;
+    let veli = login(&app, "veli").await;
+    let ali_id = me_id(&app, &ali).await;
+    let veli_id = me_id(&app, &veli).await;
+    let board = create_board(&app, &ali, "Geometri", &[&veli_id]).await;
+    draw(&db, &board, &veli_id, 0, "{\"p\":[1,2]}")
+        .await
+        .unwrap();
+
+    // Every read, and the title arm: the participant's.
+    for uri in [
+        format!("/boards/{board}"),
+        format!("/boards/{board}/strokes"),
+        format!("/boards/{board}/history"),
+        format!("/boards/{board}/epochs"),
+        "/boards".to_string(),
+    ] {
+        let res = send(&app, "GET", &uri, Some(&veli), None).await;
+        assert_eq!(res.status, StatusCode::OK, "GET {uri}: {}", res.body);
+    }
+    let res = send(&app, "GET", "/boards", Some(&veli), None).await;
+    assert_eq!(common::total(&res.body), 1, "an invitee lists the board");
+
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/boards/{board}"),
+        Some(&veli),
+        Some(json!({ "title": "Cebir" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(
+        stored_board(&db, &board)
+            .await
+            .unwrap()
+            .get_title()
+            .as_str(),
+        "Cebir",
+        "the re-title really landed"
+    );
+
+    // The creator's four commands, and the two creator-only PATCH arms.
+    for (method, uri, body) in [
+        (
+            "PATCH",
+            format!("/boards/{board}"),
+            Some(json!({"participants": []})),
+        ),
+        (
+            "PATCH",
+            format!("/boards/{board}"),
+            Some(json!({"locked": true})),
+        ),
+        ("POST", format!("/boards/{board}/clear"), None),
+        ("POST", format!("/boards/{board}/close"), None),
+        ("DELETE", format!("/boards/{board}"), None),
+    ] {
+        let res = send(&app, method, &uri, Some(&veli), body).await;
+        assert_eq!(
+            res.status,
+            StatusCode::FORBIDDEN,
+            "{method} {uri} must 403 for a non-creator participant, got {}",
+            res.body
+        );
+    }
+
+    // Not one of those refusals wrote anything.
+    let stored = stored_board(&db, &board).await.expect("board survived");
+    assert_eq!(stored.get_participants().len(), 1, "roster untouched");
+    assert!(!stored.is_locked(), "lock untouched");
+    assert_eq!(stored.get_epoch(), 0, "no clear landed");
+    assert!(stored.get_closed_at().is_none(), "not closed");
+    assert_eq!(stroke_rows(&db, &board).await.len(), 1, "stroke kept");
+    assert_eq!(stored.get_creator().key(), ali_id);
+
+    // And the creator's own PATCH arms do work — the 403s above are about the
+    // caller, not a route that refuses everyone.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/boards/{board}"),
+        Some(&ali),
+        Some(json!({ "locked": true })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert!(stored_board(&db, &board).await.unwrap().is_locked());
+}
+
+/// The user's core requirement, over HTTP: a clear empties the live canvas and
+/// destroys nothing. If `/history` ever shrinks here, the feature is wrong.
+#[tokio::test]
+async fn a_clear_empties_the_canvas_and_keeps_the_history() {
+    let (app, db) = app_and_db().await;
+    let ali = login(&app, "ali").await;
+    let ali_id = me_id(&app, &ali).await;
+    let board = create_board(&app, &ali, "Geometri", &[]).await;
+    for n in 0..3 {
+        draw(&db, &board, &ali_id, 0, &format!("{{\"p\":[{n}]}}"))
+            .await
+            .unwrap();
+    }
+    let before: Vec<String> = stroke_rows(&db, &board)
+        .await
+        .iter()
+        .map(|row| row.get_id().key().to_string())
+        .collect();
+    assert_eq!(before.len(), 3);
+
+    let res = send(
+        &app,
+        "GET",
+        &format!("/boards/{board}/strokes"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 3, "the live canvas has 3 marks");
+
+    let res = send(
+        &app,
+        "POST",
+        &format!("/boards/{board}/clear"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    assert_eq!(res.body["kind"], "clear");
+    assert_eq!(
+        res.body["epoch"], 0,
+        "the marker carries the epoch it closed"
+    );
+    assert_eq!(res.body["count"], 3);
+    assert!(res.body["payload"].is_null());
+
+    // The canvas is blank...
+    let res = send(
+        &app,
+        "GET",
+        &format!("/boards/{board}/strokes"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 0, "the canvas is empty");
+    assert!(common::items(&res.body).is_empty());
+
+    // ...and the history is not. 3 strokes + the marker.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/boards/{board}/history"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 4);
+    let kept: Vec<&str> = common::items(&res.body)
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    for id in &before {
+        assert!(kept.contains(&id.as_str()), "a clear lost stroke {id}");
+    }
+
+    // Asserted at the table too, not just through the reader that a bug could
+    // share with the writer.
+    let rows = stroke_rows(&db, &board).await;
+    assert_eq!(rows.len(), 4, "nothing was deleted");
+    let stored: Vec<String> = rows.iter().map(|r| r.get_id().key().to_string()).collect();
+    for id in &before {
+        assert!(stored.contains(id), "stroke {id} is gone from the table");
+    }
+
+    // Drawing resumes on the new epoch, and the old one is still readable
+    // whole through `?epoch=`.
+    let board_row = stored_board(&db, &board).await.unwrap();
+    assert_eq!(board_row.get_epoch(), 1);
+    draw(&db, &board, &ali_id, 1, "{\"p\":[9]}").await.unwrap();
+    let res = send(
+        &app,
+        "GET",
+        &format!("/boards/{board}/strokes"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 1, "the new canvas has one mark");
+    let res = send(
+        &app,
+        "GET",
+        &format!("/boards/{board}/history?epoch=0"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 4, "epoch 0 replays in full");
+    let res = send(
+        &app,
+        "GET",
+        &format!("/boards/{board}/history"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 5, "the whole session is one log");
+}
+
+/// The epoch index: one entry per clear, each carrying the final stroke count
+/// of the epoch it closed — which must equal the rows actually on the table for
+/// that epoch, or "replay session 2" replays the wrong thing.
+#[tokio::test]
+async fn the_epoch_index_counts_each_epoch_it_closed() {
+    let (app, db) = app_and_db().await;
+    let ali = login(&app, "ali").await;
+    let ali_id = me_id(&app, &ali).await;
+    let board = create_board(&app, &ali, "Geometri", &[]).await;
+
+    // Epoch 0 gets 2 marks, epoch 1 gets 3, then epoch 2 is left open.
+    for (epoch, marks) in [(0, 2), (1, 3)] {
+        for n in 0..marks {
+            draw(&db, &board, &ali_id, epoch, &format!("{{\"p\":[{n}]}}"))
+                .await
+                .unwrap();
+        }
+        let res = send(
+            &app,
+            "POST",
+            &format!("/boards/{board}/clear"),
+            Some(&ali),
+            None,
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    }
+    draw(&db, &board, &ali_id, 2, "{\"p\":[7]}").await.unwrap();
+
+    let res = send(
+        &app,
+        "GET",
+        &format!("/boards/{board}/epochs"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(common::total(&res.body), 2, "one marker per clear, no more");
+    let markers = common::items(&res.body);
+    assert_eq!(markers[0]["epoch"], 0);
+    assert_eq!(markers[0]["count"], 2);
+    assert_eq!(markers[1]["epoch"], 1);
+    assert_eq!(markers[1]["count"], 3);
+    for marker in markers {
+        assert_eq!(marker["kind"], "clear");
+        assert_eq!(marker["author"], ali_id.as_str());
+    }
+
+    // Each `count` against the rows really stored under that epoch.
+    let rows = stroke_rows(&db, &board).await;
+    for marker in markers {
+        let epoch = marker["epoch"].as_i64().unwrap();
+        let drawn = rows
+            .iter()
+            .filter(|row| row.get_epoch() == epoch && !row.is_clear())
+            .count() as i64;
+        assert_eq!(
+            marker["count"].as_i64().unwrap(),
+            drawn,
+            "marker for epoch {epoch} miscounts its strokes"
+        );
+    }
+    // The open epoch is deliberately absent — the markers *are* the index.
+    assert_eq!(stored_board(&db, &board).await.unwrap().get_epoch(), 2);
+}
+
+/// A full live canvas is a *recoverable* refusal: the board stays open and a
+/// clear hands the whole cap back.
+#[tokio::test]
+async fn a_full_canvas_is_refused_until_the_creator_clears_it() {
+    let (app, db) = app_and_db().await;
+    let ali = login(&app, "ali").await;
+    let ali_id = me_id(&app, &ali).await;
+    let board = create_board(&app, &ali, "Geometri", &[]).await;
+    set_counters(&db, &board, MAX_EPOCH_STROKES, MAX_EPOCH_STROKES).await;
+
+    let refused = draw(&db, &board, &ali_id, 0, "{\"p\":[1]}").await;
+    assert!(refused.is_err(), "a full canvas must refuse the append");
+    assert!(stroke_rows(&db, &board).await.is_empty(), "nothing written");
+    let stored = stored_board(&db, &board).await.unwrap();
+    assert!(
+        stored.get_closed_at().is_none(),
+        "a full canvas must NOT close the board — it is recoverable"
+    );
+    assert_eq!(
+        stored_counters(&db, &board).await,
+        vec![MAX_EPOCH_STROKES, MAX_EPOCH_STROKES],
+        "the refusal claimed nothing"
+    );
+
+    // The creator clears, and drawing resumes against a fresh cap.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/boards/{board}/clear"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    assert_eq!(res.body["count"], MAX_EPOCH_STROKES);
+    assert!(
+        draw(&db, &board, &ali_id, 1, "{\"p\":[1]}").await.is_ok(),
+        "a clear must un-refuse the board"
+    );
+    assert_eq!(
+        stored_counters(&db, &board).await,
+        vec![1, MAX_EPOCH_STROKES + 1],
+        "the epoch counter reset; the lifetime counter did not"
+    );
+    let res = send(
+        &app,
+        "GET",
+        &format!("/boards/{board}/strokes"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 1, "the new mark is on the canvas");
+}
+
+/// The lifetime cap is the permanent one: it stamps `closed_at`, and a closed
+/// board still serves every read it ever served.
+#[tokio::test]
+async fn the_lifetime_cap_closes_the_board_and_it_stays_readable() {
+    let (app, db) = app_and_db().await;
+    let ali = login(&app, "ali").await;
+    let ali_id = me_id(&app, &ali).await;
+    let board = create_board(&app, &ali, "Geometri", &[]).await;
+    draw(&db, &board, &ali_id, 0, "{\"p\":[1]}").await.unwrap();
+    let res = send(
+        &app,
+        "POST",
+        &format!("/boards/{board}/clear"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED);
+    set_counters(&db, &board, 0, MAX_BOARD_STROKES).await;
+
+    assert!(
+        draw(&db, &board, &ali_id, 1, "{\"p\":[2]}").await.is_err(),
+        "the lifetime cap must refuse the append"
+    );
+    let stamp = stored_board(&db, &board)
+        .await
+        .unwrap()
+        .get_closed_at()
+        .expect("the lifetime cap stamps closed_at");
+    assert_eq!(stroke_rows(&db, &board).await.len(), 2, "nothing written");
+
+    // Permanently read-only: no more strokes, and no more clears either.
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    assert!(draw(&db, &board, &ali_id, 1, "{\"p\":[3]}").await.is_err());
+    assert_eq!(
+        stored_board(&db, &board).await.unwrap().get_closed_at(),
+        Some(stamp),
+        "a second refusal must not re-stamp closed_at"
+    );
+    let res = send(
+        &app,
+        "POST",
+        &format!("/boards/{board}/clear"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+
+    // Still fully readable — that is the whole point of closing rather than
+    // deleting.
+    let res = send(&app, "GET", &format!("/boards/{board}"), Some(&ali), None).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["closed_at"], stamp.as_millis());
+    let res = send(
+        &app,
+        "GET",
+        &format!("/boards/{board}/history"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 2, "the whole log is still served");
+    let res = send(
+        &app,
+        "GET",
+        &format!("/boards/{board}/epochs"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 1);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/boards/{board}/strokes"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    let res = send(&app, "GET", "/boards", Some(&ali), None).await;
+    assert_eq!(
+        common::total(&res.body),
+        1,
+        "a closed board is still listed"
+    );
+}
+
+/// The per-creator cap, asserted on the stored counter — and a delete really
+/// hands the seat back, or a busy teacher's limit ratchets shut forever.
+#[tokio::test]
+async fn the_per_creator_cap_refuses_and_a_delete_frees_a_seat() {
+    let (app, db) = app_and_db().await;
+    let ali = login(&app, "ali").await;
+    let ali_id = me_id(&app, &ali).await;
+    let board = create_board(&app, &ali, "Geometri", &[]).await;
+    assert_eq!(stored_board_count(&db, &ali_id).await, 1);
+
+    // Age the counter to full rather than open 200 boards.
+    db.query("UPDATE $id SET board_count = $full")
+        .bind(("id", UserId::from_key(&ali_id).record()))
+        .bind(("full", MAX_BOARDS_PER_CREATOR))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+    let res = send(
+        &app,
+        "POST",
+        "/boards",
+        Some(&ali),
+        Some(json!({ "title": "Bir tane daha" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+    assert_eq!(
+        stored_board_count(&db, &ali_id).await,
+        MAX_BOARDS_PER_CREATOR,
+        "the refusal must not have claimed a seat"
+    );
+    let mut result = db
+        .query("SELECT VALUE id FROM board")
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    assert_eq!(
+        result
+            .take::<Vec<surrealdb::types::RecordId>>(0)
+            .unwrap()
+            .len(),
+        1,
+        "no row was written by the refused create"
+    );
+
+    // Deleting frees exactly one seat, and the next create takes it.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/boards/{board}"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        stored_board_count(&db, &ali_id).await,
+        MAX_BOARDS_PER_CREATOR - 1,
+        "the delete handed the seat back"
+    );
+    let next = create_board(&app, &ali, "Bir tane daha", &[]).await;
+    assert_eq!(
+        stored_board_count(&db, &ali_id).await,
+        MAX_BOARDS_PER_CREATOR
+    );
+    assert!(stored_board(&db, &next).await.is_some());
+    // And the deleted board is gone for its own creator too.
+    let res = send(&app, "GET", &format!("/boards/{board}"), Some(&ali), None).await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+}
+
+/// The `next_ulid` hazard, over HTTP: a burst of marks all lands inside one or
+/// two milliseconds, and `Ulid::new()` would sort those rows at random
+/// (src/domain/monotonic_id.rs:41-46). The canvas is a drawing, so an order
+/// that shuffles is a drawing that redraws wrong.
+#[tokio::test]
+async fn a_burst_of_strokes_comes_back_in_mint_order() {
+    let (app, db) = app_and_db().await;
+    let ali = login(&app, "ali").await;
+    let ali_id = me_id(&app, &ali).await;
+    let board = create_board(&app, &ali, "Geometri", &[]).await;
+
+    let mut minted = Vec::new();
+    for n in 0..60 {
+        minted.push(
+            draw(&db, &board, &ali_id, 0, &format!("{{\"p\":[{n}]}}"))
+                .await
+                .unwrap()
+                .get_id()
+                .key()
+                .to_string(),
+        );
+    }
+    // Whether *those* 60 shared a millisecond depends on how loaded the
+    // machine is, so the same-millisecond half of the hazard is pinned with no
+    // database in the way: a tight mint loop that certainly does share one, and
+    // `ORDER BY id` on a string key is a plain string sort — so mint order must
+    // already BE sorted order. `Ulid::new()` fails this within a few ids.
+    let ids: Vec<String> = (0..500)
+        .map(|_| BoardStrokeId::generate().key().to_string())
+        .collect();
+    let mut sorted = ids.clone();
+    sorted.sort();
+    assert_eq!(
+        sorted, ids,
+        "ids minted in one millisecond must sort in mint order"
+    );
+
+    let res = send(
+        &app,
+        "GET",
+        &format!("/boards/{board}/strokes"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    let served: Vec<&str> = common::items(&res.body)
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(served, minted, "/strokes must replay in mint order");
+    let res = send(
+        &app,
+        "GET",
+        &format!("/boards/{board}/history"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    let served: Vec<&str> = common::items(&res.body)
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(served, minted, "/history must replay in mint order too");
+    // And the payloads ride along in that same order.
+    let payloads: Vec<String> = common::items(&res.body)
+        .iter()
+        .map(|row| row["payload"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(payloads[0], "{\"p\":[0]}");
+    assert_eq!(payloads[59], "{\"p\":[59]}");
 }
