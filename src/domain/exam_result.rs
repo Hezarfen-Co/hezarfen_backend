@@ -5,7 +5,7 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use crate::constant::{
     EXAM_RESULT_COUNT_FIELD, EXAM_RESULT_TABLE, KIND_REF_TABLE, REF_COUNT_FIELD,
 };
-use crate::database::Database;
+use crate::database::{Database, transaction_with_retry};
 use crate::domain::cap;
 use crate::domain::course::CourseId;
 use crate::domain::exam::ExamId;
@@ -242,33 +242,55 @@ impl ExamResult {
             mark,
             graded_by: graded_by.clone(),
         };
-        // The "not a draft" gate rides in the same transaction as the mark, the
-        // mirror of the re-draft gate on `Exam::update_if_unchanged`: between
-        // them, a mark and a re-draft racing each other can only ever leave one
-        // of the two applied, whichever process either ran in. The caller's
-        // pre-flight check answers the same 409 one round trip earlier.
+        // The "exists" and "not a draft" gates ride in the same transaction as
+        // the mark, the mirror of the re-draft gate on
+        // `Exam::update_if_unchanged`: between them, a mark and a re-draft
+        // racing each other can only ever leave one of the two applied,
+        // whichever process either ran in. The existence gate is not
+        // redundant with the draft one — a deleted exam reads NONE, which is
+        // *falsy*, so the draft gate alone waved a mark onto an exam that no
+        // longer existed. The caller's pre-flight check answers the same 409
+        // one round trip earlier.
         // Whether the row was already there rides out of the transaction with
         // the mark: the answer decides if this grade owes the kind a reference,
         // and read anywhere else it would be a guess about a row two graders
         // may be writing at once.
-        let mut written = db
-            .query(
-                "BEGIN TRANSACTION;
+        //
+        // Re-sent while the store answers "conflict, retry": the gates read a
+        // column an exam PATCH writes, so the two contend on one record by
+        // design. Sound to re-send because the only write is an UPSERT on a
+        // deterministic id — `key::sitting(exam, user, seq)` *is* the
+        // `exam_result_exam_user_seq` unique tuple — so it can never answer
+        // "already exists", the one thing a retry cannot fix.
+        let (mut written, mut errors) = transaction_with_retry(
+            db,
+            "BEGIN TRANSACTION;
+                 IF (SELECT VALUE id FROM ONLY $exam) IS NONE { THROW 'exam_missing' };
                  IF (SELECT VALUE draft FROM ONLY $exam) { THROW 'exam_draft' };
                  LET $before = (SELECT VALUE id FROM ONLY $id);
                  LET $after = (UPSERT $id CONTENT $result RETURN AFTER);
                  RETURN { existed: $before != NONE, result: $after[0] };
                  COMMIT TRANSACTION;",
-            )
-            .bind(("exam", exam.record()))
-            .bind(("id", result.id.record()))
-            .bind(("result", result))
-            .await?;
-        let mut errors = written.take_errors();
-        if errors
-            .values()
-            .any(|error| error.to_string().contains("exam_draft"))
-        {
+            &[
+                ("exam".into(), exam.record().into_value()),
+                ("id".into(), result.id.record().into_value()),
+                ("result".into(), result.into_value()),
+            ],
+            &["exam_missing", "exam_draft"],
+        )
+        .await?;
+        // An aborted transaction errors every slot and only the THROW's own
+        // slot names the marker, so a refusal is read by marker while a lost
+        // round was already re-sent — never reported as a 500.
+        let thrown = |marker: &str| {
+            errors
+                .values()
+                .any(|error| error.to_string().contains(marker))
+        };
+        if thrown("exam_missing") {
+            return Err(AppError::NotFound);
+        }
+        if thrown("exam_draft") {
             return Err(draft_error());
         }
         if let Some(error) = errors.drain().map(|(_, error)| error).next() {
@@ -348,8 +370,18 @@ impl ExamResult {
         // release them a second time, and on a kind another exam still grades
         // under, one release too many reads as one mark too few — a kind
         // wrongly free to leave the settings.
-        let mut result = db
-            .query(format!(
+        //
+        // Re-sent while the store answers "conflict, retry": the counters this
+        // touches are the ones a concurrent grade claims, so a lost round is
+        // routine and aborts having written nothing. `check()` cannot be used
+        // to read the outcome — it takes the *lowest*-slot error, and an
+        // aborted transaction's generic "not executed" sibling masked the real
+        // conflict, the exact defect deleted from `Exam::delete`. No THROW of
+        // its own, and only `DELETE`/`UPDATE` inside, so nothing here can
+        // answer "already exists" and make a retry unsound.
+        let (mut result, mut errors) = transaction_with_retry(
+            db,
+            &format!(
                 "BEGIN TRANSACTION;
                  LET $gone = (DELETE exam_result WHERE exam = $ex AND user = $usr RETURN BEFORE);
                  IF array::len($gone) > 0 {{
@@ -360,12 +392,18 @@ impl ExamResult {
                  }};
                  RETURN $gone;
                  COMMIT TRANSACTION;"
-            ))
-            .bind(("ex", exam.record()))
-            .bind(("usr", user.record()))
-            .bind(("kind", kind.to_string()))
-            .await?
-            .check()?;
+            ),
+            &[
+                ("ex".into(), exam.record().into_value()),
+                ("usr".into(), user.record().into_value()),
+                ("kind".into(), kind.to_string().into_value()),
+            ],
+            &[],
+        )
+        .await?;
+        if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+            return Err(error.into());
+        }
         // `RETURN` is the last statement before `COMMIT`; its slot follows the
         // statement count, as in `Exam::delete`.
         let slot = result.num_statements().saturating_sub(2);
@@ -393,6 +431,17 @@ mod tests {
         let exam = ExamId::from_key("01TESTEXAMAAAAAAAAAAAAAAAA");
         let user = UserId::from_key("01TESTSTUDENTAAAAAAAAAAAAA");
         let teacher = UserId::from_key("01TESTTEACHERAAAAAAAAAAAAA");
+        // The exam has to be real: a mark is refused on one that isn't.
+        db.query(
+            "CREATE $ex SET creator = $t, course = course:c, title = 't',
+             description = '', kind = 'midterm'",
+        )
+        .bind(("ex", exam.record()))
+        .bind(("t", teacher.record()))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
 
         // Grade sitting #1, then a retake as sitting #2 — two rows, not one.
         ExamResult::grade(
@@ -448,6 +497,34 @@ mod tests {
         ExamResult::remove(&exam, &user, "midterm", &db)
             .await
             .unwrap();
+        assert!(
+            ExamResult::list_all_for_exam_user(&exam, &user, &db)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A deleted exam reads NONE, and NONE is falsy — the draft gate alone let
+    /// a mark land on an exam that no longer existed.
+    #[tokio::test]
+    async fn a_mark_is_refused_on_an_exam_that_no_longer_exists() {
+        let db = init_mem().await.unwrap();
+        let exam = ExamId::from_key("01TESTGONEEXAMAAAAAAAAAAAA");
+        let user = UserId::from_key("01TESTSTUDENTAAAAAAAAAAAAA");
+        let teacher = UserId::from_key("01TESTTEACHERAAAAAAAAAAAAA");
+
+        let refused = ExamResult::grade(
+            &exam,
+            &user,
+            1,
+            Mark::try_new(40).unwrap(),
+            &teacher,
+            "midterm",
+            &db,
+        )
+        .await;
+        assert!(matches!(refused, Err(AppError::NotFound)), "{refused:?}");
         assert!(
             ExamResult::list_all_for_exam_user(&exam, &user, &db)
                 .await

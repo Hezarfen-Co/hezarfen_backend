@@ -892,8 +892,14 @@ mod tests {
     /// The racer is a mark: [`ExamResult::grade`] claims the exam's own
     /// `result_count` (and the kind's reference) before writing, so it contends
     /// with the `DELETE $ex` and with the kind_ref decrement inside the same
-    /// transaction. The two stored counters assert the delete landed *inside*
-    /// the burst rather than before or after it.
+    /// transaction. A round where *some* of the six grades 404 and the rest
+    /// succeed is the witness that the delete landed inside the burst: the 404
+    /// comes from `write_mark`'s existence gate, so it can only be answered by a
+    /// grade that reached the store after the row was gone, and its siblings'
+    /// success says the same burst also had grades that got there first. Stored
+    /// state cannot say this any more — the gate is what stops a mark outliving
+    /// its exam, so the sweep now finds nothing to leave behind in *every*
+    /// round, which is asserted below as a fact rather than read as a signal.
     ///
     /// It does not prove the retry either: measured at 0 conflicts in 100 raced
     /// rounds, and green with
@@ -908,7 +914,7 @@ mod tests {
         use crate::domain::exam_result::{ExamResult, Mark};
         let (db, _serialized) = crate::database::init_test_server("exam_delete_race").await;
         let (mut delete_500, mut grade_500) = (0, 0);
-        let (mut marked, mut swept) = (0, 0);
+        let (mut split, mut swept) = (0, 0);
         let (mut last_delete, mut last_grade) = (String::new(), String::new());
         for round in 0..20 {
             let exam = published(&db).await;
@@ -953,34 +959,49 @@ mod tests {
                 delete_500 += 1;
                 last_delete = format!("{drop_it:?}");
             }
+            let mut refused = 0;
             for mark in marks {
                 let mark = mark.await.unwrap();
-                if matches!(mark, Err(AppError::Db(_))) {
-                    grade_500 += 1;
-                    last_grade = format!("{mark:?}");
+                match mark {
+                    // The existence gate: this grade reached the store after
+                    // the row was gone.
+                    Err(AppError::NotFound) => refused += 1,
+                    Err(AppError::Db(_)) => {
+                        grade_500 += 1;
+                        last_grade = format!("{mark:?}");
+                    }
+                    _ => {}
                 }
             }
-            // Stored state, and *both* outcomes are needed: marks surviving
-            // means the grades ran past the cascade, no marks left means the
-            // cascade ran past the grades. Seeing only one of the two is a run
-            // where the delete never landed inside the burst at all.
+            // Neither end of the burst: some grades beat the delete and some
+            // lost to it, so the delete landed *between* them. A round that is
+            // all-refused or all-through is one where it landed outside.
+            if (1..6).contains(&refused) {
+                split += 1;
+            }
             if ExamResult::list_for_exam(exam.get_id(), &db)
                 .await
                 .unwrap()
                 .is_empty()
             {
                 swept += 1;
-            } else {
-                marked += 1;
             }
         }
         eprintln!(
             "Exam::delete raced: {delete_500}/20 delete 500s, {grade_500} grade 500s, \
-             {marked} rounds with marks left / {swept} swept"
+             {split} rounds split by the delete / {swept} swept clean"
         );
         assert!(
-            marked > 0 && swept > 0,
-            "the delete never landed inside the burst ({marked} left / {swept} swept)"
+            split > 0,
+            "the delete never landed inside the burst (0/20 rounds split)"
+        );
+        // Not a race signal, an invariant: the gate refuses a mark for an exam
+        // that is gone, so no round can leave one behind for the next reader.
+        assert_eq!(
+            swept,
+            20,
+            "a mark outlived its exam in {} rounds",
+            20 - swept
         );
         assert_eq!(
             delete_500, 0,
