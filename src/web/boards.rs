@@ -38,6 +38,10 @@ use super::{CurrentUser, Page, PageParams, paginate, set_or_clear};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
+        // Plain route: OpenApiRouter can't describe a WebSocket upgrade, so
+        // the board room lives outside the generated spec (see the `boards`
+        // tag description and README for the protocol).
+        .route("/{id}/ws", axum::routing::get(super::board_ws::board_ws))
         .routes(routes!(create_board, list_boards))
         .routes(routes!(get_board, update_board, delete_board))
         .routes(routes!(list_strokes))

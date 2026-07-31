@@ -2038,3 +2038,901 @@ async fn chat_stream_replays_an_answer_that_already_landed() {
     let events = read_sse_to_end(&mut res, Duration::from_secs(10)).await;
     assert_deltas_then_done(&events, &mid, &answer);
 }
+
+// ---- the board room (WebSocket) ---------------------------------------------
+//
+// The room is a fan-out protocol over stateful, append-only storage, so every
+// test below asserts against the DATABASE as well as the wire: the in-memory
+// engine forges concurrent-write wins (src/domain/cap.rs:44-49), and a frame
+// proves only that the server said something.
+
+/// A booted server with creator `ali`, invited `veli`, outsider `ayse` and one
+/// open board — the spine of every board-room test.
+struct BoardRoom {
+    base: String,
+    db: Database,
+    creator: Client,
+    creator_cookie: String,
+    veli_cookie: String,
+    ayse_cookie: String,
+    veli_id: String,
+    board_id: String,
+}
+
+async fn board_room_fixture() -> BoardRoom {
+    let (base, db) = spawn_server().await;
+    let creator = client();
+    register(&creator, &base, "ali").await;
+    login(&creator, &base, "ali").await;
+    let veli = client();
+    register(&veli, &base, "veli").await;
+    login(&veli, &base, "veli").await;
+    let ayse = client();
+    register(&ayse, &base, "ayse").await;
+    login(&ayse, &base, "ayse").await;
+
+    let me: Value = veli
+        .get(format!("{base}/auth/me"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let veli_id = me["id"].as_str().unwrap().to_string();
+
+    let res = creator
+        .post(format!("{base}/boards"))
+        .json(&json!({ "title": "Geometri", "participant_ids": [veli_id] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let board: Value = res.json().await.unwrap();
+    let board_id = board["id"].as_str().unwrap().to_string();
+
+    BoardRoom {
+        creator_cookie: raw_session_cookie(&base, "ali").await,
+        veli_cookie: raw_session_cookie(&base, "veli").await,
+        ayse_cookie: raw_session_cookie(&base, "ayse").await,
+        base,
+        db,
+        creator,
+        veli_id,
+        board_id,
+    }
+}
+
+/// Open the board room. `Ok` is the upgraded socket; `Err` is the HTTP status
+/// a pre-upgrade gate refused with — the room must reject before the upgrade,
+/// so a refusal is a status and not an instant close.
+async fn board_open(base: &str, board_id: &str, cookie: Option<&str>) -> Result<WsStream, u16> {
+    let url = format!("{}/boards/{board_id}/ws", base.replace("http://", "ws://"));
+    let mut request = url.into_client_request().unwrap();
+    if let Some(cookie) = cookie {
+        request
+            .headers_mut()
+            .insert("cookie", cookie.parse().unwrap());
+    }
+    match connect_async(request).await {
+        Ok((ws, _)) => Ok(ws),
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            Err(response.status().as_u16())
+        }
+        Err(other) => panic!("unexpected handshake failure: {other}"),
+    }
+}
+
+/// Join and drain the replay, returning the strokes of the current epoch in
+/// the order they arrived across however many `strokes` chunks it took.
+async fn board_join(ws: &mut WsStream, after: Option<&str>, epoch: Option<i64>) -> Vec<Value> {
+    let mut frame = json!({ "type": "join" });
+    if let Some(after) = after {
+        frame["after"] = json!(after);
+    }
+    if let Some(epoch) = epoch {
+        frame["epoch"] = json!(epoch);
+    }
+    ws_send(ws, frame).await;
+    drain_replay(ws).await
+}
+
+/// Every stroke of a replay, from wherever the stream is now until `synced`.
+async fn drain_replay(ws: &mut WsStream) -> Vec<Value> {
+    let mut strokes = Vec::new();
+    loop {
+        let frame = ws_next_frame(ws).await.expect("room closed mid-replay");
+        match frame["type"].as_str().unwrap() {
+            "strokes" => strokes.extend(frame["strokes"].as_array().unwrap().clone()),
+            "synced" => return strokes,
+            // `state` ticks and other people's frames may interleave a replay.
+            _ => continue,
+        }
+    }
+}
+
+/// The next frame of `kind`, skipping anything else. Unlike the exam room's
+/// helper this tolerates every other frame type: a board room is multi-writer,
+/// so someone else's stroke can always land mid-wait.
+async fn board_frame_of_type(ws: &mut WsStream, kind: &str) -> Value {
+    loop {
+        let frame = ws_next_frame(ws)
+            .await
+            .unwrap_or_else(|| panic!("room closed while waiting for a {kind:?} frame"));
+        if frame["type"] == kind {
+            return frame;
+        }
+    }
+}
+
+fn board_record(board: &str) -> surrealdb::types::RecordId {
+    surrealdb::types::RecordId::new("board", board.to_string())
+}
+
+/// The stored stroke ids of one epoch, in mint order, read straight out of the
+/// database — the only proof that survives a lying frame.
+async fn stored_stroke_ids(db: &Database, board: &str, epoch: i64) -> Vec<String> {
+    let mut result = db
+        .query(
+            "SELECT VALUE record::id(id) FROM board_stroke \
+             WHERE board = $b AND epoch = $e AND kind = 'stroke' ORDER BY id",
+        )
+        .bind(("b", board_record(board)))
+        .bind(("e", epoch))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    result.take::<Vec<String>>(0).unwrap()
+}
+
+/// The stored payloads of one epoch, in mint order.
+async fn stored_payloads(db: &Database, board: &str, epoch: i64) -> Vec<String> {
+    let mut result = db
+        .query(
+            "SELECT VALUE payload FROM board_stroke \
+             WHERE board = $b AND epoch = $e AND kind = 'stroke' ORDER BY id",
+        )
+        .bind(("b", board_record(board)))
+        .bind(("e", epoch))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    result.take::<Vec<String>>(0).unwrap()
+}
+
+/// Draw one mark and wait for its ack, ignoring the fan-out of everyone else's
+/// strokes that may arrive first.
+async fn board_draw(ws: &mut WsStream, payload: &str) -> Value {
+    ws_send(ws, json!({ "type": "stroke", "payload": payload })).await;
+    board_frame_of_type(ws, "saved").await
+}
+
+/// Test 1 — the core of the feature: what one participant draws reaches the
+/// other, and is in the database afterwards. Kills the class where the room is
+/// a chat relay: frames fly, nothing persists, and a reload loses the canvas.
+#[tokio::test]
+async fn a_stroke_reaches_the_other_socket_and_the_database() {
+    let room = board_room_fixture().await;
+    let (base, board) = (&room.base, &room.board_id);
+    let mut ali = board_open(base, board, Some(&room.creator_cookie))
+        .await
+        .expect("creator upgrade");
+    let mut veli = board_open(base, board, Some(&room.veli_cookie))
+        .await
+        .expect("participant upgrade");
+    // Connect-time state names the room, its epoch and its roster.
+    let state = board_frame_of_type(&mut veli, "state").await;
+    assert_eq!(state["board"], *board);
+    assert_eq!(state["epoch"], 0);
+    assert_eq!(state["locked"], false);
+    assert_eq!(state["participants"][0], room.veli_id);
+
+    assert_eq!(board_join(&mut veli, None, None).await.len(), 0);
+
+    // ali draws; veli sees it.
+    ws_send(
+        &mut ali,
+        json!({ "type": "stroke", "payload": "{\"p\":[1,2]}", "client_seq": 41 }),
+    )
+    .await;
+    let saved = board_frame_of_type(&mut ali, "saved").await;
+    assert_eq!(saved["client_seq"], 41);
+    let fanned = board_frame_of_type(&mut veli, "stroke").await;
+    assert_eq!(fanned["payload"], "{\"p\":[1,2]}");
+    assert_eq!(fanned["id"], saved["id"]);
+    assert!(fanned["author"].as_str().is_some());
+
+    // And the other way round, so fan-out is not one-directional by accident.
+    // ali's next `stroke` frame is veli's mark and not the echo of its own:
+    // an author gets `saved`, never its own stroke back, or every client would
+    // have to filter the marks it just drew itself.
+    board_draw(&mut veli, "{\"p\":[3,4]}").await;
+    let fanned = board_frame_of_type(&mut ali, "stroke").await;
+    assert_eq!(fanned["payload"], "{\"p\":[3,4]}");
+
+    // THE assertion: stored state, re-read from the database.
+    assert_eq!(
+        stored_payloads(&room.db, board, 0).await,
+        vec!["{\"p\":[1,2]}".to_string(), "{\"p\":[3,4]}".to_string()],
+        "the database is the source of truth, not the channel"
+    );
+
+    // A third socket joining now replays exactly those two, in mint order.
+    let mut late = board_open(base, board, Some(&room.veli_cookie))
+        .await
+        .expect("second participant socket");
+    let replayed = board_join(&mut late, None, None).await;
+    assert_eq!(replayed.len(), 2);
+    assert_eq!(replayed[0]["payload"], "{\"p\":[1,2]}");
+    assert_eq!(replayed[1]["payload"], "{\"p\":[3,4]}");
+}
+
+/// Test 2 — the permission edge that must NOT kill the socket: a participant
+/// who is not the creator may not clear, and stays in the room drawing. Kills
+/// the "refuse by closing" reflex, which would boot a whole class off the
+/// board on one stray click.
+#[tokio::test]
+async fn a_participants_clear_is_refused_and_the_socket_keeps_drawing() {
+    let room = board_room_fixture().await;
+    let (base, board) = (&room.base, &room.board_id);
+    let mut veli = board_open(base, board, Some(&room.veli_cookie))
+        .await
+        .expect("upgrade");
+    board_join(&mut veli, None, None).await;
+    board_draw(&mut veli, "before").await;
+
+    ws_send(&mut veli, json!({ "type": "clear" })).await;
+    let error = board_frame_of_type(&mut veli, "error").await;
+    assert_eq!(error["code"], "forbidden");
+
+    // Alive, and still a full participant.
+    ws_send(&mut veli, json!({ "type": "ping" })).await;
+    board_frame_of_type(&mut veli, "pong").await;
+    board_draw(&mut veli, "after").await;
+    assert_eq!(
+        stored_payloads(&room.db, board, 0).await,
+        vec!["before".to_string(), "after".to_string()]
+    );
+    // The refusal wrote nothing: no clear marker, and the epoch never moved.
+    let mut result = room
+        .db
+        .query("SELECT VALUE epoch FROM $b")
+        .bind(("b", board_record(board)))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    assert_eq!(result.take::<Vec<i64>>(0).unwrap(), vec![0]);
+    let mut result = room
+        .db
+        .query("SELECT VALUE id FROM board_stroke WHERE kind = 'clear'")
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    assert!(
+        result
+            .take::<Vec<surrealdb::types::RecordId>>(0)
+            .unwrap()
+            .is_empty()
+    );
+
+    // A lock is creator-only on the same terms, and equally non-fatal.
+    ws_send(&mut veli, json!({ "type": "lock", "locked": true })).await;
+    assert_eq!(
+        board_frame_of_type(&mut veli, "error").await["code"],
+        "forbidden"
+    );
+    board_draw(&mut veli, "still here").await;
+}
+
+/// Test 3 — the user's core requirement, unambiguous: a clear empties the LIVE
+/// canvas and deletes nothing. A joiner sees only what came after; `/history`
+/// still holds every mark drawn before. Kills the truncate-on-clear
+/// implementation, which passes every happy-path test and destroys a lesson.
+#[tokio::test]
+async fn a_clear_empties_the_live_canvas_and_history_keeps_everything() {
+    let room = board_room_fixture().await;
+    let (base, board) = (&room.base, &room.board_id);
+    let mut ali = board_open(base, board, Some(&room.creator_cookie))
+        .await
+        .expect("upgrade");
+    board_join(&mut ali, None, None).await;
+    board_draw(&mut ali, "old-1").await;
+    board_draw(&mut ali, "old-2").await;
+
+    ws_send(&mut ali, json!({ "type": "clear" })).await;
+    let cleared = board_frame_of_type(&mut ali, "cleared").await;
+    assert_eq!(cleared["epoch"], 1, "the clear opens the NEXT epoch");
+
+    board_draw(&mut ali, "new-1").await;
+
+    // A joiner gets the post-clear canvas and nothing else.
+    let mut veli = board_open(base, board, Some(&room.veli_cookie))
+        .await
+        .expect("upgrade");
+    let replayed = board_join(&mut veli, None, None).await;
+    assert_eq!(replayed.len(), 1, "join replays the current epoch only");
+    assert_eq!(replayed[0]["payload"], "new-1");
+
+    // Nothing was destroyed: both pre-clear strokes are still stored...
+    assert_eq!(
+        stored_payloads(&room.db, board, 0).await,
+        vec!["old-1".to_string(), "old-2".to_string()]
+    );
+    // ...and still served, with the marker that closed their epoch.
+    let history: Value = room
+        .creator
+        .get(format!("{base}/boards/{board}/history"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let kinds: Vec<&str> = history["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, vec!["stroke", "stroke", "clear", "stroke"]);
+    assert_eq!(history["items"][0]["payload"], "old-1");
+    assert_eq!(history["items"][2]["count"], 2, "the epoch's final count");
+    assert_eq!(history["total"], 4);
+}
+
+/// Test 4 — reconnect with a cursor from an epoch that no longer exists. The
+/// client must be told the canvas was wiped and be given the WHOLE current
+/// epoch, never a diff from a cursor that means nothing now. Kills the
+/// "resume from `after` regardless" bug, which paints a blank board forever.
+#[tokio::test]
+async fn a_stale_cursor_gets_a_cleared_frame_and_a_full_replay() {
+    let room = board_room_fixture().await;
+    let (base, board) = (&room.base, &room.board_id);
+    let mut ali = board_open(base, board, Some(&room.creator_cookie))
+        .await
+        .expect("upgrade");
+    board_join(&mut ali, None, None).await;
+    board_draw(&mut ali, "old-1").await;
+    let stale_cursor = board_draw(&mut ali, "old-2").await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    ws_send(&mut ali, json!({ "type": "clear" })).await;
+    board_frame_of_type(&mut ali, "cleared").await;
+    board_draw(&mut ali, "new-1").await;
+    board_draw(&mut ali, "new-2").await;
+
+    // The reconnect: an epoch-0 cursor against an epoch-1 board.
+    let mut back = board_open(base, board, Some(&room.creator_cookie))
+        .await
+        .expect("reconnect");
+    ws_send(
+        &mut back,
+        json!({ "type": "join", "after": stale_cursor, "epoch": 0 }),
+    )
+    .await;
+    let cleared = board_frame_of_type(&mut back, "cleared").await;
+    assert_eq!(cleared["epoch"], 1, "wipe the stale canvas first");
+    let replayed = drain_replay(&mut back).await;
+    assert_eq!(
+        replayed
+            .iter()
+            .map(|s| s["payload"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["new-1", "new-2"],
+        "a full current-epoch replay, not a diff from a dead cursor"
+    );
+
+    // A cursor from the CURRENT epoch is still honoured as a cursor.
+    let mut resume = board_open(base, board, Some(&room.creator_cookie))
+        .await
+        .expect("reconnect");
+    let first_new = stored_stroke_ids(&room.db, board, 1).await[0].clone();
+    let replayed = board_join(&mut resume, Some(&first_new), Some(1)).await;
+    assert_eq!(replayed.len(), 1);
+    assert_eq!(replayed[0]["payload"], "new-2");
+}
+
+/// Test 5 — a subscriber that falls further behind than the hub's capacity
+/// must NOT quietly lose strokes. The lag is forced (well past
+/// `BOARD_HUB_CAPACITY` = 256 frames, each big enough to fill the socket
+/// buffers), and the canvas the laggard ends up with is compared to the
+/// database. Kills the `Err(_) => continue` handler, whose whole failure mode
+/// is a permanently corrupt canvas on one client and no error anywhere.
+#[tokio::test]
+async fn a_lagged_socket_resyncs_to_exactly_what_the_database_holds() {
+    let room = board_room_fixture().await;
+    let (base, board) = (&room.base, &room.board_id);
+    let mut veli = board_open(base, board, Some(&room.veli_cookie))
+        .await
+        .expect("upgrade");
+    board_join(&mut veli, None, None).await;
+
+    // veli stops reading. ali floods: 400 strokes of 4 KiB is ~1.6 MB, which
+    // overruns the socket buffers, stalls the room's writer, and backs the
+    // broadcast receiver up past its 256-frame capacity.
+    let mut ali = board_open(base, board, Some(&room.creator_cookie))
+        .await
+        .expect("upgrade");
+    board_join(&mut ali, None, None).await;
+    // In batches, acking each one: firing all 3000 first deadlocks the *test*
+    // (ali stops reading, so ali's own socket fills and the server stops
+    // reading ali), while one-at-a-time pays a round trip per stroke.
+    //
+    // 3000 x 4 KiB is ~12 MB. The number is empirical: the socket buffers
+    // between the two ends swallowed ~1200 frames on this machine before the
+    // room's writer stalled, and only then does the 256-frame channel start
+    // dropping — so the count carries roughly 2x the measured margin.
+    // ponytail: a host with `net.ipv4.tcp_wmem` tuned far past the 4 MB
+    // default could buffer more than this and the lag would stop being
+    // forced; the test would then pass vacuously up to the resync assert,
+    // which fails loudly rather than silently.
+    let big = "x".repeat(4_000);
+    let mut drawn = 0;
+    while drawn < 3_000 {
+        let batch = 50.min(3_000 - drawn);
+        for n in 0..batch {
+            ws_send(
+                &mut ali,
+                json!({ "type": "stroke", "payload": format!("{}:{big}", drawn + n) }),
+            )
+            .await;
+        }
+        for _ in 0..batch {
+            board_frame_of_type(&mut ali, "saved").await;
+        }
+        drawn += batch;
+    }
+    let stored = stored_stroke_ids(&room.db, board, 0).await;
+    assert_eq!(stored.len(), 3_000, "every flooded stroke persisted");
+
+    // veli starts reading again: the room notices the gap and says so.
+    let resync = loop {
+        let frame = ws_next_frame(&mut veli).await.expect("room stays open");
+        if frame["type"] == "error" {
+            break frame;
+        }
+    };
+    assert_eq!(
+        resync["code"], "resync",
+        "a dropped frame must be announced, never swallowed"
+    );
+    // ...and re-serves the current epoch in full.
+    let replayed = drain_replay(&mut veli).await;
+    assert_eq!(
+        replayed
+            .iter()
+            .map(|s| s["id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>(),
+        stored,
+        "after a lag the client's canvas must equal the database's"
+    );
+}
+
+/// Test 6 — the door. An outsider learns nothing: the same 404 as a board that
+/// was never created, and before the upgrade so it is an HTTP status rather
+/// than an instant close. Kills existence leaks (src/lib.rs:57).
+#[tokio::test]
+async fn the_door_is_a_404_for_an_outsider_and_an_unknown_board() {
+    let room = board_room_fixture().await;
+    let (base, board) = (&room.base, &room.board_id);
+    assert_eq!(
+        board_open(base, board, Some(&room.ayse_cookie)).await.err(),
+        Some(404),
+        "a non-participant must not learn the board exists"
+    );
+    assert_eq!(
+        board_open(
+            base,
+            "01JZZZZZZZZZZZZZZZZZZZZZZZ",
+            Some(&room.creator_cookie)
+        )
+        .await
+        .err(),
+        Some(404),
+        "indistinguishable from an unknown board"
+    );
+    // An over-long key is length-checked before it can be echoed anywhere.
+    assert_eq!(
+        board_open(base, &"x".repeat(200), Some(&room.creator_cookie))
+            .await
+            .err(),
+        Some(404)
+    );
+    // No cookie at all is a 401, not a silent upgrade.
+    assert_eq!(board_open(base, board, None).await.err(), Some(401));
+    // And the participant does get in, so the 404s above are about the caller.
+    board_open(base, board, Some(&room.veli_cookie))
+        .await
+        .expect("a participant is let in");
+}
+
+/// Test 7 — a participant dropped mid-session stops drawing. Twice over: once
+/// with the roster frame deliberately withheld (the socket's own gate is what
+/// actually protects the board), and once through the frame the REST route
+/// fans out.
+#[tokio::test]
+async fn a_removed_participant_can_no_longer_draw() {
+    let room = board_room_fixture().await;
+    let (base, board) = (&room.base, &room.board_id);
+    let mut veli = board_open(base, board, Some(&room.veli_cookie))
+        .await
+        .expect("upgrade");
+    board_join(&mut veli, None, None).await;
+    board_draw(&mut veli, "while invited").await;
+
+    // The silent removal first: write the roster straight into the database,
+    // so no frame is published and only the per-stroke gate can catch it.
+    room.db
+        .query("UPDATE $b SET participants = []")
+        .bind(("b", board_record(board)))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    ws_send(
+        &mut veli,
+        json!({ "type": "stroke", "payload": "after removal" }),
+    )
+    .await;
+    let error = board_frame_of_type(&mut veli, "error").await;
+    assert_eq!(
+        error["code"], "forbidden",
+        "the stroke path re-reads the roster; it cannot trust a frame it may have missed"
+    );
+    assert_eq!(
+        stored_payloads(&room.db, board, 0).await,
+        vec!["while invited".to_string()],
+        "the refused stroke wrote nothing"
+    );
+    // Re-entry is the outsider's 404 now.
+    assert_eq!(
+        board_open(base, board, Some(&room.veli_cookie)).await.err(),
+        Some(404)
+    );
+
+    // And the announced removal: re-invite, reconnect, then drop over REST.
+    let res = room
+        .creator
+        .patch(format!("{base}/boards/{board}"))
+        .json(&json!({ "participants": [room.veli_id] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let mut veli = board_open(base, board, Some(&room.veli_cookie))
+        .await
+        .expect("re-invited");
+    board_join(&mut veli, None, None).await;
+    let res = room
+        .creator
+        .patch(format!("{base}/boards/{board}"))
+        .json(&json!({ "participants": [] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let roster = board_frame_of_type(&mut veli, "participants").await;
+    assert_eq!(roster["participants"].as_array().unwrap().len(), 0);
+    // The room drops the socket rather than leaving it open and mute.
+    loop {
+        match ws_next_frame(&mut veli).await {
+            None => break,
+            Some(frame) => assert_ne!(frame["type"], "saved", "a dropped socket must not save"),
+        }
+    }
+}
+
+/// Test 8 — `client_seq` is the client's correlation id and is echoed
+/// verbatim, including a value no `i32` holds; a message without one gets a
+/// reply without the key at all. Kills the "helpfully normalize it" bug that
+/// silently breaks in-flight matching (mirrors src/web/exam_ws.rs:506-510).
+#[tokio::test]
+async fn client_seq_is_echoed_verbatim_or_omitted() {
+    let room = board_room_fixture().await;
+    let mut ali = board_open(&room.base, &room.board_id, Some(&room.creator_cookie))
+        .await
+        .expect("upgrade");
+    board_join(&mut ali, None, None).await;
+
+    let huge: u64 = 18_446_744_073_709_551_615;
+    ws_send(
+        &mut ali,
+        json!({ "type": "stroke", "payload": "a", "client_seq": huge }),
+    )
+    .await;
+    let saved = board_frame_of_type(&mut ali, "saved").await;
+    assert_eq!(saved["client_seq"].as_u64(), Some(huge));
+
+    // A refusal carries it too, or an in-flight failure cannot be matched.
+    ws_send(
+        &mut ali,
+        json!({ "type": "stroke", "payload": "", "client_seq": 5 }),
+    )
+    .await;
+    let error = board_frame_of_type(&mut ali, "error").await;
+    assert_eq!(error["client_seq"], 5);
+
+    // Omitted stays omitted — never `null`.
+    let saved = board_draw(&mut ali, "b").await;
+    assert!(
+        saved.get("client_seq").is_none(),
+        "a client that sends no seq must see byte-identical frames: {saved}"
+    );
+}
+
+/// Test 9 — replay across the `BOARD_REPLAY_CHUNK` (200) boundary: every
+/// stroke exactly once, in mint order, no gap at the seam and no row served
+/// twice. Kills both classic paging bugs (`>=` vs `>` on the cursor, and a
+/// loop that stops at the first full chunk).
+#[tokio::test]
+async fn replay_crosses_the_chunk_boundary_exactly_once() {
+    let room = board_room_fixture().await;
+    let (base, board) = (&room.base, &room.board_id);
+    let mut ali = board_open(base, board, Some(&room.creator_cookie))
+        .await
+        .expect("upgrade");
+    board_join(&mut ali, None, None).await;
+    for n in 0..205 {
+        board_draw(&mut ali, &format!("mark-{n}")).await;
+    }
+    let stored = stored_stroke_ids(&room.db, board, 0).await;
+    assert_eq!(stored.len(), 205);
+
+    let mut veli = board_open(base, board, Some(&room.veli_cookie))
+        .await
+        .expect("upgrade");
+    let replayed = board_join(&mut veli, None, None).await;
+    let ids: Vec<String> = replayed
+        .iter()
+        .map(|s| s["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids, stored, "every stroke once, in mint order");
+    assert_eq!(
+        replayed
+            .iter()
+            .map(|s| s["payload"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        (0..205).map(|n| format!("mark-{n}")).collect::<Vec<_>>()
+    );
+}
+
+/// Test 10 — the lock is a live pause, not a disconnect, and it reaches the
+/// room whichever way it was thrown (socket or REST). Kills the cached-flag
+/// implementation, where a client that missed the frame keeps drawing.
+#[tokio::test]
+async fn a_lock_pauses_drawing_for_everyone_and_a_thaw_resumes_it() {
+    let room = board_room_fixture().await;
+    let (base, board) = (&room.base, &room.board_id);
+    let mut ali = board_open(base, board, Some(&room.creator_cookie))
+        .await
+        .expect("upgrade");
+    let mut veli = board_open(base, board, Some(&room.veli_cookie))
+        .await
+        .expect("upgrade");
+    board_join(&mut ali, None, None).await;
+    board_join(&mut veli, None, None).await;
+
+    ws_send(&mut ali, json!({ "type": "lock", "locked": true })).await;
+    let locked = board_frame_of_type(&mut veli, "locked").await;
+    assert_eq!(locked["locked"], true);
+
+    ws_send(&mut veli, json!({ "type": "stroke", "payload": "sneaky" })).await;
+    assert_eq!(
+        board_frame_of_type(&mut veli, "error").await["code"],
+        "locked"
+    );
+    assert!(stored_payloads(&room.db, board, 0).await.is_empty());
+
+    // Thawed over REST this time: the room must re-read, not trust its cache.
+    let res = room
+        .creator
+        .patch(format!("{base}/boards/{board}"))
+        .json(&json!({ "locked": false }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        board_frame_of_type(&mut veli, "locked").await["locked"],
+        false
+    );
+    board_draw(&mut veli, "allowed again").await;
+    assert_eq!(
+        stored_payloads(&room.db, board, 0).await,
+        vec!["allowed again".to_string()]
+    );
+}
+
+/// Test 11 — the two terminal REST frames end the room. A closed board is
+/// read-only but still readable; a deleted one is gone, and a socket that
+/// outlives its board must not answer for it.
+#[tokio::test]
+async fn closing_and_deleting_the_board_end_the_room() {
+    let room = board_room_fixture().await;
+    let (base, board) = (&room.base, &room.board_id);
+    let mut veli = board_open(base, board, Some(&room.veli_cookie))
+        .await
+        .expect("upgrade");
+    board_join(&mut veli, None, None).await;
+    board_draw(&mut veli, "before the close").await;
+
+    let res = room
+        .creator
+        .post(format!("{base}/boards/{board}/close"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let closed = board_frame_of_type(&mut veli, "closed").await;
+    assert!(closed["closed_at"].as_i64().is_some());
+    assert!(
+        ws_next_frame(&mut veli).await.is_none(),
+        "a closed board ends the room"
+    );
+    // Read-only, not gone: the canvas still replays, drawing does not.
+    let mut veli = board_open(base, board, Some(&room.veli_cookie))
+        .await
+        .expect("a closed board is still readable");
+    assert_eq!(board_join(&mut veli, None, None).await.len(), 1);
+    ws_send(
+        &mut veli,
+        json!({ "type": "stroke", "payload": "too late" }),
+    )
+    .await;
+    assert_eq!(
+        board_frame_of_type(&mut veli, "error").await["code"],
+        "board_closed"
+    );
+    assert_eq!(stored_payloads(&room.db, board, 0).await.len(), 1);
+
+    let res = room
+        .creator
+        .delete(format!("{base}/boards/{board}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    board_frame_of_type(&mut veli, "deleted").await;
+    assert!(
+        ws_next_frame(&mut veli).await.is_none(),
+        "a deleted board ends the room"
+    );
+    assert!(stored_payloads(&room.db, board, 0).await.is_empty());
+}
+
+/// Test 12 — two sockets drawing at once. Every accepted stroke is in the
+/// database exactly once and both clients can reach that same canvas: the
+/// concurrent case the whole feature exists for.
+#[tokio::test]
+async fn simultaneous_drawing_lands_every_stroke_exactly_once() {
+    let room = board_room_fixture().await;
+    let (base, board) = (&room.base, &room.board_id);
+    let mut ali = board_open(base, board, Some(&room.creator_cookie))
+        .await
+        .expect("upgrade");
+    let mut veli = board_open(base, board, Some(&room.veli_cookie))
+        .await
+        .expect("upgrade");
+    board_join(&mut ali, None, None).await;
+    board_join(&mut veli, None, None).await;
+
+    // Interleaved without waiting for acks, so the two writers really overlap.
+    for n in 0..20 {
+        ws_send(
+            &mut ali,
+            json!({ "type": "stroke", "payload": format!("ali-{n}") }),
+        )
+        .await;
+        ws_send(
+            &mut veli,
+            json!({ "type": "stroke", "payload": format!("veli-{n}") }),
+        )
+        .await;
+    }
+    for _ in 0..20 {
+        board_frame_of_type(&mut ali, "saved").await;
+    }
+    for _ in 0..20 {
+        board_frame_of_type(&mut veli, "saved").await;
+    }
+
+    let stored = stored_payloads(&room.db, board, 0).await;
+    assert_eq!(stored.len(), 40, "no stroke lost, none duplicated");
+    let mut unique = stored.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), 40);
+
+    // A fresh joiner sees that exact canvas — the DB, not either socket's view.
+    let mut late = board_open(base, board, Some(&room.veli_cookie))
+        .await
+        .expect("upgrade");
+    assert_eq!(
+        board_join(&mut late, None, None)
+            .await
+            .iter()
+            .map(|s| s["payload"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>(),
+        stored
+    );
+}
+
+/// Test 13 — junk in, error out, room alive. A malformed frame or an unknown
+/// type must never take the canvas down with it.
+#[tokio::test]
+async fn junk_frames_do_not_end_the_room() {
+    let room = board_room_fixture().await;
+    let mut ali = board_open(&room.base, &room.board_id, Some(&room.creator_cookie))
+        .await
+        .expect("upgrade");
+    board_join(&mut ali, None, None).await;
+
+    ws_send(&mut ali, json!({ "type": "nonsense" })).await;
+    board_frame_of_type(&mut ali, "error").await;
+    ali.send(Message::Text("{not json".into())).await.unwrap();
+    board_frame_of_type(&mut ali, "error").await;
+    // An oversized payload is refused by the domain's own gate.
+    ws_send(
+        &mut ali,
+        json!({ "type": "stroke", "payload": "x".repeat(4_097) }),
+    )
+    .await;
+    board_frame_of_type(&mut ali, "error").await;
+
+    board_draw(&mut ali, "still fine").await;
+    assert_eq!(
+        stored_payloads(&room.db, &room.board_id, 0).await,
+        vec!["still fine".to_string()]
+    );
+}
+
+/// Test 14 (grafted from candidate B) — the half no other board test reaches:
+/// a `participants` frame drops *only* the socket it removed. Test 7 proves the
+/// removed one is dropped; nothing proved the survivors keep drawing, so a
+/// `forward` that closed the room on every roster change would pass the suite.
+#[tokio::test]
+async fn a_roster_change_drops_only_the_socket_it_removed() {
+    let room = board_room_fixture().await;
+    let (base, board) = (&room.base, &room.board_id);
+    let mut veli = board_open(base, board, Some(&room.veli_cookie))
+        .await
+        .expect("upgrade");
+    let mut ali = board_open(base, board, Some(&room.creator_cookie))
+        .await
+        .expect("upgrade");
+    board_join(&mut veli, None, None).await;
+    board_join(&mut ali, None, None).await;
+
+    // The creator empties the invite list over REST.
+    let res = room
+        .creator
+        .patch(format!("{base}/boards/{board}"))
+        .json(&json!({ "participants": [] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // The dropped participant is closed…
+    loop {
+        match ws_next_frame(&mut veli).await {
+            None => break,
+            Some(frame) => assert_ne!(frame["type"], "saved", "a dropped socket must not save"),
+        }
+    }
+    // … while the creator, still on the board, sees the new roster and keeps
+    // drawing on the very same socket.
+    let roster = board_frame_of_type(&mut ali, "participants").await;
+    assert!(roster["participants"].as_array().unwrap().is_empty());
+    board_draw(&mut ali, "still mine").await;
+    assert_eq!(
+        stored_payloads(&room.db, board, 0).await,
+        vec!["still mine".to_string()]
+    );
+}
