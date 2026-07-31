@@ -56,7 +56,7 @@
 
 use std::time::Duration;
 
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::response::Response;
 use serde::Deserialize;
@@ -78,6 +78,10 @@ use crate::web::exams::{
     EXAM_LOCK, check_rejoin, ensure_enrolled, ensure_sittable, ensure_student, save_answer_in,
     writable_attempt,
 };
+use crate::web::room::{self, Incoming, RoomClosed, send, with_client_seq};
+
+/// How this room names itself in the logs [`room::public_message`] writes.
+const ROOM: &str = "exam room";
 
 /// Serializes every presence transition with its matching `left_at` write:
 /// `enter` + clear at room start and `leave` + maybe-stamp at room teardown
@@ -179,12 +183,10 @@ async fn room(mut socket: WebSocket, st: AppState, exam: Exam, attempt: ExamAtte
                 }
             }
             incoming = socket.recv() => {
-                let text = match incoming {
-                    Some(Ok(Message::Text(text))) => text,
-                    // Ping/pong frames are answered by axum itself; other
-                    // non-text frames carry nothing for this protocol.
-                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
-                    Some(Ok(_)) => continue,
+                let text = match room::classify(incoming) {
+                    Incoming::Text(text) => text,
+                    Incoming::Gone => break,
+                    Incoming::Ignore => continue,
                 };
                 if handle_message(&mut socket, text.as_str(), &exam_id, &attempt_id, &user, &st.db)
                     .await
@@ -195,9 +197,7 @@ async fn room(mut socket: WebSocket, st: AppState, exam: Exam, attempt: ExamAtte
             }
         }
     }
-    // Best-effort closing handshake — a bare TCP teardown reads as an error
-    // on the client; a Close frame reads as "the room is over".
-    let _ = socket.send(Message::Close(None)).await;
+    room::close(&mut socket).await;
     // Leave critical section: only the last socket out means the student
     // actually left the room, and the count-down and its stamp are one atomic
     // step under PRESENCE_LOCK (a join racing this either lands wholly before
@@ -244,10 +244,6 @@ async fn stamp_left(exam_id: &ExamId, attempt_id: &ExamAttemptId, db: &Database)
     }
 }
 
-/// Errors that end the room: the peer went away, or the attempt reached a
-/// terminal state and the close frame was sent.
-struct RoomClosed;
-
 /// The room's own sitting, provided it is still the student's current one and
 /// writable. Messages act on the sitting the room was opened for — never on a
 /// retake started elsewhere while this socket lingered, which a stale tab
@@ -267,13 +263,6 @@ async fn writable_room_attempt(
         ));
     }
     Ok(attempt)
-}
-
-async fn send(socket: &mut WebSocket, frame: Value) -> Result<(), RoomClosed> {
-    socket
-        .send(Message::Text(frame.to_string().into()))
-        .await
-        .map_err(|_| RoomClosed)
 }
 
 /// Re-read everything, push a `state` frame, and close the room (after a
@@ -500,15 +489,6 @@ fn error_frame(err: &AppError) -> Value {
     error_frame_for(err, None, None)
 }
 
-/// Attach the request's correlation id, if it sent one. Omitted stays omitted
-/// — never `null` — so a client that sends no `client_seq` sees byte-identical
-/// frames.
-fn with_client_seq(frame: &mut Value, client_seq: Option<u64>) {
-    if let Some(client_seq) = client_seq {
-        frame["client_seq"] = json!(client_seq);
-    }
-}
-
 /// [`error_frame`] plus the optional blame: `question_id` when the failure
 /// belongs to one `answer` message, and `client_seq` whenever the `answer` carried
 /// one — the two are independent, so an unattributable failure is still
@@ -516,29 +496,7 @@ fn with_client_seq(frame: &mut Value, client_seq: Option<u64>) {
 /// an unattributed failure — so a client that ignores the fields behaves
 /// exactly as before.
 fn error_frame_for(err: &AppError, question: Option<&str>, client_seq: Option<u64>) -> Value {
-    let message = match err {
-        AppError::Validation(err) => err.to_string(),
-        AppError::NotFound => "not found".to_string(),
-        AppError::Unauthorized => "unauthorized".to_string(),
-        AppError::Forbidden(message) => (*message).to_string(),
-        AppError::Conflict(message) => (*message).to_string(),
-        AppError::ConflictOwned(message) => message.clone(),
-        AppError::PayloadTooLarge(message) => message.clone(),
-        AppError::TooManyRequests { .. } => "too many requests".to_string(),
-        AppError::DbUnavailable => {
-            tracing::warn!("exam room: database reconnecting");
-            "database reconnecting — retry shortly".to_string()
-        }
-        AppError::DbTimeout => {
-            tracing::error!("exam room: database timed out");
-            "the database timed out — reload the room".to_string()
-        }
-        AppError::Db(_) | AppError::Internal(_) => {
-            tracing::error!("exam room error: {err}");
-            "internal server error".to_string()
-        }
-    };
-    let mut frame = json!({ "type": "error", "message": message });
+    let mut frame = json!({ "type": "error", "message": room::public_message(err, ROOM) });
     if let Some(question) = question {
         frame["question_id"] = json!(question);
     }
