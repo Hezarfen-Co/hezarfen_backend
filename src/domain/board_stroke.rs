@@ -121,14 +121,13 @@ impl BoardStroke {
     /// resettable epoch counter, the lifetime counter, and the open-board guard
     /// are one conditional write, so a locked or closed board can never be
     /// drawn on by a writer that read it a moment earlier.
-    //
-    // ponytail: `epoch` is the caller's read of the board, so a clear landing
-    // between that read and this write files the stroke under the epoch that
-    // just ended — it is kept and replayable, but it never appears on the live
-    // canvas, and the marker's `count` under-reports it by one. Harmless (a
-    // stroke drawn during a clear is exactly the stroke the clear was erasing);
-    // closing it means passing the epoch through the conditional write, which
-    // the shared `cap` helper's static CONTENT cannot express.
+    ///
+    /// `epoch` rides in that guard too. Without it a clear landing between the
+    /// caller's board read and this write filed the row under the epoch that
+    /// just ended while its increment counted against the *new* epoch's
+    /// counter — one race, two markers corrupted for good (the closed one short
+    /// by a stroke, the next one claiming a stroke that is not there), and
+    /// markers are never rewritten. Now such a stroke is refused instead.
     pub async fn append(
         board: &BoardId,
         author: &UserId,
@@ -147,13 +146,16 @@ impl BoardStroke {
             epoch,
             created_at: Timestamp::now(),
         };
+        // `epoch` is an in-crate `i64` read off the board row, never text from
+        // a client, so it interpolates into the guard as a bare integer.
+        let guard = format!("{BOARD_OPEN_GUARD} AND epoch = {epoch}");
         match cap::claim_two_when_and_create(
             &board.record(),
             BOARD_EPOCH_STROKE_COUNT_FIELD,
             MAX_EPOCH_STROKES,
             BOARD_TOTAL_STROKE_COUNT_FIELD,
             MAX_BOARD_STROKES,
-            BOARD_OPEN_GUARD,
+            &guard,
             &stroke.id.record(),
             &stroke,
             db,
@@ -167,10 +169,10 @@ impl BoardStroke {
                 "this board is full — clear it to keep drawing",
             )),
             // Three refusals share this answer (lifetime full / guard failed /
-            // board gone), so the board is re-read to pick the message. The
-            // re-read decides *wording* only: every branch is a refusal the
-            // caller cannot retry into a success, so a board that changes state
-            // between the claim and the re-read still gets told "no".
+            // board gone), so the board is re-read to tell them apart. A board
+            // that changed state in between still gets told "no" — but only a
+            // re-read that *proves* the lifetime counter is spent may stamp
+            // `closed_at`, never elimination.
             cap::ClaimedTwo::FullHard => Err(Self::why_refused(board, db).await?),
         }
     }
@@ -183,7 +185,16 @@ impl BoardStroke {
             ));
         }
         if board.get_closed_at().is_none() {
-            // Neither locked nor closed, so the lifetime cap was just reached.
+            // Not closed yet. The lifetime counter has to say so *itself*:
+            // `FullHard` also fires when the guard failed, so a board that was
+            // locked (or a clear that moved the epoch) when the claim ran and
+            // is open again now would otherwise be stamped read-only at one
+            // stroke of a 50 000 budget — irreversibly, with no reopen.
+            if Self::total_strokes(board.get_id(), db).await? < MAX_BOARD_STROKES {
+                return Ok(AppError::Conflict(
+                    "this board changed while you were drawing — draw it again",
+                ));
+            }
             // `Board::close` is the one-way idempotent stamp: a second append
             // takes this branch too and leaves the first `closed_at` standing.
             board.close(db).await?;
@@ -191,6 +202,19 @@ impl BoardStroke {
         Ok(AppError::Conflict(
             "this board is closed — it is permanently read-only",
         ))
+    }
+
+    /// The lifetime counter as the store holds it — the board struct
+    /// deliberately does not carry it (src/domain/board.rs:9-13).
+    async fn total_strokes(board: &BoardId, db: &Database) -> Result<i64, AppError> {
+        let mut result = db
+            .query(format!(
+                "SELECT VALUE ({BOARD_TOTAL_STROKE_COUNT_FIELD} ?? 0) FROM $b"
+            ))
+            .bind(("b", board.record()))
+            .await?
+            .check()?;
+        Ok(result.take::<Vec<i64>>(0)?.into_iter().next().unwrap_or(0))
     }
 
     /// End the current epoch: the canvas empties, the history does not.
@@ -516,6 +540,79 @@ mod tests {
         assert!(reread(&board, &db).await.get_closed_at().is_none());
         let board = board.set_locked(false, &user("c"), &db).await.unwrap();
         assert!(draw(&board, &db).await.is_ok());
+    }
+
+    /// A lock the stroke lost to, unlocked again before the refusal re-reads
+    /// the row — which is the state `why_refused` is handed after a guard
+    /// failure. Reading "neither locked nor closed" as proof of the lifetime
+    /// cap stamped `closed_at` on a board holding one stroke of 50 000, with
+    /// no reopen. Only the counter itself may close a board.
+    #[tokio::test]
+    async fn a_refusal_on_an_open_board_never_closes_it() {
+        let db = a_db().await;
+        let board = a_board(&db).await;
+        let board = board.set_locked(true, &user("c"), &db).await.unwrap();
+        // The claim loses the open-guard while the board is locked...
+        assert!(matches!(
+            draw(&board, &db).await,
+            Err(AppError::Conflict(_))
+        ));
+        // ...and the creator unlocks before the refusal picks its message.
+        let board = board.set_locked(false, &user("c"), &db).await.unwrap();
+        let refused = BoardStroke::why_refused(board.get_id(), &db).await.unwrap();
+        assert!(matches!(refused, AppError::Conflict(msg) if !msg.contains("read-only")));
+        // Stored state, not the return value: the board is still open, and
+        // still drawable.
+        assert!(reread(&board, &db).await.get_closed_at().is_none());
+        assert!(draw(&reread(&board, &db).await, &db).await.is_ok());
+    }
+
+    /// The epoch index must never drift, in either direction. A stroke carrying
+    /// a pre-clear epoch used to land under the closed epoch while its
+    /// increment counted against the new one — the closed marker short by a
+    /// stroke, the next marker claiming one that is not there, both permanent.
+    #[tokio::test]
+    async fn a_stale_epoch_append_leaves_no_marker_drifted() {
+        let db = a_db().await;
+        let board = a_board(&db).await;
+        draw(&board, &db).await.unwrap();
+        BoardStroke::clear(board.get_id(), &user("c"), &db)
+            .await
+            .unwrap();
+
+        // Exactly what `live_board` hands `append` when a clear lands between
+        // the board read and the write (src/web/board_ws.rs:431).
+        let stale = BoardStroke::append(board.get_id(), &user("p"), "{\"p\":[9]}", 0, &db).await;
+        assert!(matches!(stale, Err(AppError::Conflict(_))));
+
+        let board = reread(&board, &db).await;
+        draw(&board, &db).await.unwrap();
+        BoardStroke::clear(board.get_id(), &user("c"), &db)
+            .await
+            .unwrap();
+
+        // Every marker's count is the rows the store actually holds at the
+        // epoch it closed.
+        let stored = rows(board.get_id(), &db).await;
+        for marker in stored.iter().filter(|row| row.is_clear()) {
+            let actual = stored
+                .iter()
+                .filter(|row| !row.is_clear() && row.get_epoch() == marker.get_epoch())
+                .count() as i64;
+            assert_eq!(
+                marker.get_count(),
+                Some(actual),
+                "marker for epoch {} drifted",
+                marker.get_epoch()
+            );
+        }
+        // And the refused stroke claimed nothing: two marks, two epochs.
+        assert_eq!(
+            BoardStroke::total_strokes(board.get_id(), &db)
+                .await
+                .unwrap(),
+            2
+        );
     }
 
     /// The `next_ulid` hazard: rows minted inside one millisecond must replay

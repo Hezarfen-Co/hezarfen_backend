@@ -594,6 +594,14 @@ mod tests {
             )),
             "board_closed"
         );
+        // A stroke that lost its epoch to a clear is none of the three: it is a
+        // plain retryable conflict, and must never be mistaken for terminal.
+        assert_eq!(
+            code(AppError::Conflict(
+                "this board changed while you were drawing — draw it again"
+            )),
+            "conflict"
+        );
         assert_eq!(code(AppError::Forbidden("nope")), "forbidden");
         // Internals are logged, never wired.
         let frame = error_frame(&AppError::Internal("secret".into()), None);
