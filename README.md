@@ -10,8 +10,8 @@ attendance, pomodoro, and homework reports — that's the whole role. Notes are 
 per-file size cap is school policy in settings (`max_file_bytes`, default
 5 MiB). Any two users can **message** each other, mail-style — subject +
 body into the recipient's inbox, each side filing its own copy through
-archive/trash with a read flag the sender sees as a receipt (the one place a
-`parent` writes). Attendance is event + attendees: create an event with an **audience**
+archive/trash with a read flag the sender sees as a receipt (one of the two
+places a `parent` writes — whiteboards below are the other). Attendance is event + attendees: create an event with an **audience**
 (the whole school, one role, a course's enrollment, or a **registration**
 signup list — omit for school-wide), then teachers mark the expected attendees
 present / absent / late / excused (students never self-mark), and a **roster
@@ -111,6 +111,15 @@ inference outlives a request: the turn plus an empty `pending` answer are
 written *first*, the call goes out after, so a reload never loses an answer;
 the client then polls the message or reads it off an SSE stream (see
 "Chatbot").
+Any signed-in account (a `parent` included) can also open a **collaborative
+whiteboard**: a titled board whose membership is an **ad-hoc invite list** —
+the creator names participant user ids, and no course, session or appointment
+is involved. Every participant draws over a WebSocket, the creator alone
+clears, locks, closes or deletes, and someone who is not on a board gets a
+`404` for it on every route, existence included. Strokes are **append-only and
+a clear deletes nothing** — it bumps the board's epoch, so the live canvas
+empties while every mark ever drawn stays stored and replayable through the
+history reads (see "Collaborative whiteboard").
 The school's **food program** is published here too: a manager puts up one
 **menu** per calendar day and meal slot (`date` as `YYYY-MM-DD` text, `slot`
 drawn from the school's `meal_slots`, unique per pair), lists its **dishes**
@@ -315,6 +324,12 @@ response in the same commit.
   "appointment":   { "max_note_len": 500, "max_reason_len": 1000, "max_slot_occurrences": 52 },
   "chatbot":       { "max_message_len": 8000, "max_thread_title_len": 200,
                      "min_max_message_len": 100, "…": 0 },
+  "board":         { "max_title_len": 200, "max_participants": 50,
+                     "max_stroke_payload_len": 4096,
+                     "max_epoch_strokes": 5000, "max_board_strokes": 50000,
+                     "max_boards_per_creator": 200,
+                     "stroke_kinds": ["stroke", "clear"],
+                     "ws_tick_secs": 15, "ws_max_board_id_len": 64 },
   "settings":      { "max_list_len": 20, "max_item_len": 50,
                      "min_exam_kind_weight": 1, "max_exam_kind_weight": 100,
                      "max_grade_bands": 20, "max_grade_label_len": 20,
@@ -349,7 +364,7 @@ drift from it**, which is enforced rather than asked for:
   and fails unless each one is either referenced by `src/web/limits.rs` or
   listed as a deliberate exclusion *with a reason*. A new constant breaks the
   suite until someone decides, consciously, whether clients need it.
-- `tests/spec_bounds.rs` builds the OpenAPI document, reads all 104 published
+- `tests/spec_bounds.rs` builds the OpenAPI document, reads all 161 published
   bounds back out of the emitted JSON, and asserts each equals its constant.
   This exists because utoipa's `#[schema(max_length = …)]` accepts a **literal
   only** — a `const` there does not compile — so the annotations are
@@ -387,7 +402,8 @@ Notes:
   it matches either case; the stored (and returned) value is lowercased, which
   is the one place a response may differ in case from the request.
 - **Closed value sets ride along.** `roles`, `themes`, `languages`, course
-  `kinds`, exam `modes`, `question_kinds`, homework `statuses`, and the
+  `kinds`, exam `modes`, `question_kinds`, homework `statuses`, board
+  `stroke_kinds`, and the
   uploadable `image_content_types` are the exact accepted spellings — build
   pickers from these rather than from a literal list.
 
@@ -842,6 +858,17 @@ window filtering, before paging; negative values are a `400` naming the field.
 | POST   | `/chatbot/threads/{id}/messages` | student | `{content}` (≤ `max_chatbot_message_len`) — send a turn; `202 {message_id, status: "pending"}`, the answer is fetched after (`503` when no AI service offers `chat.reply` — nothing is written; `429` + `Retry-After` on the send tier) |
 | GET    | `/chatbot/threads/{id}/messages/{mid}` | student | Poll one turn: `pending` until the answer lands, then `complete` + `content` or `failed` + `error_code` |
 | GET    | `/chatbot/threads/{id}/messages/{mid}/stream` | student | **SSE** on the same row: `delta` chunks then one `done` — or one `error` — and close; an already-finished answer replays (see "Chatbot") |
+| POST   | `/boards`                        | student | `{title, participant_ids?}` — open a whiteboard; the caller becomes its creator, everyone named may draw; `409` at `max_boards_per_creator` |
+| GET    | `/boards`                        | student | Boards the caller created or was invited to, newest first · paged |
+| GET    | `/boards/{id}`                   | student | One board — a `404`, never a `403`, for anyone not on it |
+| GET    | `/boards/{id}/strokes`           | student | The live canvas: the current epoch's strokes, oldest first · paged |
+| GET    | `/boards/{id}/history`           | student | The whole append-only log, oldest first, `clear` markers included · `?epoch=` for one epoch · paged |
+| GET    | `/boards/{id}/epochs`            | student | The epoch index: every `clear` marker (the epoch it closed, that epoch's final stroke count, who cleared, when) · paged |
+| PATCH  | `/boards/{id}`                   | student | `{title?, participants?, locked?}` — re-title (any participant); the roster and the lock are the creator's alone (`403`) |
+| POST   | `/boards/{id}/clear`             | student | **Creator only**: bump the epoch, blanking the live canvas and resetting its cap — nothing is deleted; `409` on a closed board |
+| POST   | `/boards/{id}/close`             | student | **Creator only**: retire the board — permanently read-only, still fully readable; idempotent, and there is no reopen |
+| DELETE | `/boards/{id}`                   | student | **Creator only**: delete the board and its whole stroke log; frees one of the creator's board seats |
+| GET    | `/boards/{id}/ws`                | student | **WebSocket** board room: a `join` replays the current epoch, every accepted stroke fans out to the other participants (see "Collaborative whiteboard") |
 
 `status` must be one of the school's attendance statuses (`GET /settings`);
 the core four `present | absent | late | excused` always exist, plus whatever
@@ -2472,6 +2499,132 @@ as the message's `error_code`.
 add fields (a model name, token counts) and a future backend may send more
 context without either end having to be redeployed in lockstep.
 
+## Collaborative whiteboard
+
+A board is a shared canvas whose membership is an **ad-hoc invite list**: the
+creator names participant user ids at `POST /boards` and that is the whole
+model — no course, no lesson session, no appointment. Any signed-in account
+(a `parent` included) may open one. **Every participant draws; the creator
+alone clears, locks, closes or deletes.**
+
+**Two doors, two statuses.** A caller who is not on a board gets a `404` on
+every route, its existence included — an outsider must never learn a board is
+there. A participant who is not the creator has already been told it exists, so
+the four creator-only commands answer them a `403`: hiding it at that point
+would be a lie their client cannot act on. Over the socket the same refusal is
+`error{code:"forbidden"}` and the socket **stays open** — someone clicking a
+button they don't own must not lose the canvas they were drawing on.
+
+**A clear deletes nothing.** Strokes are append-only. `POST /boards/{id}/clear`
+bumps the board's `epoch` and appends a `clear` **marker** carrying the epoch
+it closed, that epoch's final stroke count, who cleared and when — so the live
+canvas empties while every mark ever drawn stays stored and replayable. Those
+markers *are* the epoch index, which is why there is no epochs table and why
+the open (unclosed) epoch is deliberately absent from `GET /boards/{id}/epochs`.
+`DELETE /boards/{id}` is the one operation here that really destroys marks.
+
+**Three caps, and only one of them is terminal** (all three published at `GET
+/limits` under `board`):
+
+- `max_epoch_strokes` bounds the **live** canvas — `epoch_stroke_count`, which
+  every clear resets. Hitting it is **recoverable**: the creator clears, the
+  history is kept, drawing resumes.
+- `max_board_strokes` bounds the board's **lifetime** storage —
+  `total_stroke_count`, which never resets, because a clear keeps its history.
+  Hitting it stamps `closed_at` and the board becomes **permanently
+  read-only**: still fully readable and replayable, never deleted, and there is
+  no reopen — open a new board. `POST /boards/{id}/close` is the manual form of
+  the same thing, and idempotent.
+- `max_boards_per_creator` bounds how many boards one creator holds
+  (`board_count` on the user row). Deleting a board frees a seat; closing one
+  does not — a closed board is still stored.
+
+**Two ways to read the marks, and the difference matters most to a client
+author.** A socket `join` replays the **current epoch only**; history never
+rides the socket. History is an explicit paged REST read:
+`GET /boards/{id}/history` (the board's whole life, oldest first, `clear`
+markers included, `?epoch=` for a single one) and `GET /boards/{id}/epochs`
+(the marker index — enough to offer "replay session 3" without scanning the
+log). `GET /boards/{id}/strokes` is the current epoch over REST, the catch-up
+and fallback path for the same canvas the socket replays — with one deliberate
+difference: the REST read is *not* filtered by kind, while the socket serves
+`kind: "stroke"` rows only. In the steady state that is a distinction without a
+difference, since a marker is written with the epoch it *closed* and the open
+epoch has none; the case where it shows is a clear landing between the board
+read and the row read, which surfaces that epoch's closing marker in the page.
+For a live canvas the socket is the authority.
+
+**The board room (WebSocket)** — `GET /boards/{id}/ws`, cookie-authed like
+everything else and, like the exam room, outside the OpenAPI spec (an upgrade
+is not describable there); REST remains the full fallback. The gate before the
+upgrade is the same `404` door: not a participant, no room. Then JSON text
+frames:
+
+| direction | frame |
+|-----------|-------|
+| client →  | `{"type":"join", "after":"<last stroke id>", "epoch":3}` — both optional; replay the current epoch |
+| server →  | `{"type":"state", board, epoch, locked, closed_at, creator, participants, now}` on connect and every `ws_tick_secs` |
+| server →  | `{"type":"strokes", epoch, strokes:[{id, author, payload}]}` — one replay chunk, repeated until the epoch is served |
+| server →  | `{"type":"synced", epoch, cursor}` — the replay is complete; `cursor` is what to resume from |
+| client →  | `{"type":"stroke", "payload":"…"}`, optionally `+ "client_seq":7` — any participant |
+| server →  | `{"type":"saved", id, client_seq?}` — your stroke landed |
+| server →  | `{"type":"stroke", id, author, payload, epoch}` — someone *else* drew |
+| client →  | `{"type":"clear"}` / `{"type":"lock", "locked":true}` — **creator only** |
+| server →  | `{"type":"cleared", …}` / `{"type":"locked", locked, by}` — the canvas was emptied / drawing was paused |
+| server →  | `{"type":"closed", …}` / `{"type":"deleted"}` — the board is finished; both end the room |
+| server →  | `{"type":"participants", creator, participants}` — the roster changed; a socket no longer on it is dropped |
+| client →  | `{"type":"ping"}` → server `{"type":"pong"}` |
+| server →  | `{"type":"error", code, message, client_seq?}` |
+
+A `stroke` may carry a `client_seq` exactly as an exam-room `answer` does: any
+value the client picks, echoed **verbatim** on that message's `saved` or
+`error` and on nothing else, omitted entirely when the request omitted it. The
+server never reads it.
+
+`error` codes are a closed set: `epoch_full` (the live canvas is full — clear
+it and keep drawing), `board_closed` (permanently read-only), `locked`,
+`forbidden` (a creator-only command from a participant), `resync` (below),
+`invalid` (bad JSON, an unknown frame, an over-long payload), `not_found`,
+`unauthorized`, `too_many_requests`, `conflict`, `internal`.
+
+**Persist, then publish.** A stroke is fanned out only after its row has
+landed, so the channel can never carry a mark the database refused (a locked
+board, a full epoch, a closed board). The database is the canvas; the channel
+is a notification *about* it — which is why a client dedupes by stroke `id`,
+why a resync deliberately re-serves marks it already drew, and why a frame is
+never the authority: every stroke, clear and lock re-reads the board and
+re-checks the roster, so a socket that missed a `participants` or `locked`
+frame is refused all the same. One consequence of the same read-then-write
+shape: a stroke carries the epoch the server read for it, so a clear landing in
+that instant can file one stroke under the epoch it just closed — the stroke is
+kept and stays replayable in `/history`, it simply is not on the new canvas.
+
+**Reconnecting.** `join` carries a cursor: `after`, the last stroke id already
+drawn, plus the `epoch` it belongs to. Same epoch and only what is newer is
+replayed; an older epoch — or no cursor at all — gets a `cleared` frame first
+and then the whole current epoch, because a cursor into a closed epoch no
+longer means anything. If the room falls behind a slow socket the server sends
+`error{code:"resync"}` and immediately replays the current epoch **out of the
+database**: the client does not re-join, it throws its canvas away and takes
+what follows. The database is always the source of truth, never the channel.
+
+```js
+const ws = new WebSocket(`${BASE.replace("http", "ws")}/boards/${id}/ws`);
+let epoch = null, cursor = null, seq = 0;
+ws.onopen = () => ws.send(JSON.stringify({ type: "join", after: cursor, epoch }));
+ws.onmessage = (e) => {
+  const m = JSON.parse(e.data);
+  if (m.type === "cleared") wipeCanvas();
+  if (m.type === "strokes") m.strokes.forEach(draw);      // dedupe by m.id
+  if (m.type === "synced") ({ epoch, cursor } = m);
+  if (m.type === "stroke") draw(m);
+  if (m.type === "saved") settle(m.client_seq, m.id);
+  if (m.type === "error" && m.code === "resync") wipeCanvas();
+};
+const send = (payload) =>
+  ws.send(JSON.stringify({ type: "stroke", payload, client_seq: ++seq }));
+```
+
 ## Concurrency model
 
 The backend runs as **one process against one database**, and that buys less
@@ -2547,7 +2700,8 @@ src/
   migration_sql.rs the three boot batches as SurrealQL text (PRE_REPAIR,
                    MIGRATION, BACKFILL) + MIGRATION_BATCHES, the only list of them
   rate_limit.rs    fixed-window limiter: per-IP tiers + middleware, per-user chat tier
-  state.rs         AppState { db, files_path, cookie_secure, rate_limit, ai }
+  state.rs         AppState { db, files_path, cookie_secure, rate_limit,
+                   chatbot_limit, exam_presence, board_hub, db_up, ai }
   ai/              QUIC bridge to the out-of-process AI services
                    (see "AI bridge (QUIC)"; the HTTP half is web/ai.rs)
     protocol.rs    Hello/Greeting/Request/Response + length-prefixed JSON framing
@@ -2640,6 +2794,13 @@ src/
     chatbot_message.rs ChatbotMessageId · ChatContent · MessageRole · MessageStatus ·
                    ChatbotMessage (one turn; the assistant row is written
                    `pending` before the AI call and settled after)
+    board.rs       BoardId · BoardTitle · Board (a collaborative whiteboard:
+                   creator + ad-hoc participant list, `epoch`, the two stroke
+                   counters and `closed_at`)
+    board_stroke.rs BoardStrokeId · BoardStroke (the
+                   append-only stroke log; a `clear` row is the marker that
+                   closed an epoch, carrying its final count — nothing is
+                   ever deleted)
     appointment_slot.rs AppointmentSlotId · SlotSeries · SlotNote ·
                    AppointmentSlot (a teacher's published availability; a
                    recurring publish is expanded into rows sharing a series id)
@@ -2669,6 +2830,11 @@ src/
     extractor.rs   CurrentUser · RequireTeacher · RequireManager · RequireAdmin
     dto.rs         shared UserResponse · CourseResponse · ExamResponse · SessionResponse schemas
     exam_ws.rs     the student exam-room WebSocket (state ticks, autosave, finish)
+    board_ws.rs    the collaborative board room WebSocket (join replay, strokes
+                   fanned out to every participant, clear/lock)
+    room.rs        the plumbing both rooms share: sending a frame, classifying
+                   an incoming message, an AppError as a readable code, and a
+                   client_seq echoed untouched
     page.rs        PageParams · Page<T> (shared pagination)
     etag.rs        conditional-GET middleware: ETag over a 200 JSON body,
                    If-None-Match → 304 (GET only; SSE and blobs pass through)
@@ -2676,6 +2842,7 @@ src/
     courses.rs  subjects.rs  sessions.rs  exams.rs  homework.rs  questions.rs
     bank_questions.rs  marks.rs  work.rs  pomodoro.rs  attendance.rs
     settings.rs  terms.rs  meals.rs  payments.rs  ai.rs  chatbot.rs
+    boards.rs
     limits.rs      GET /limits: every constant.rs bound served as JSON
 ```
 
