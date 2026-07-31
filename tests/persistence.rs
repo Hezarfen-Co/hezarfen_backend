@@ -1759,3 +1759,147 @@ async fn a_user_row_without_palette_color_still_reads_and_patches() {
     assert_eq!(set.status, StatusCode::OK, "{}", set.body);
     assert_eq!(set.body["palette_color"], "#fefae0");
 }
+
+/// A whiteboard, its whole stroke log and the creator's `board_count` all
+/// survive a second boot. `board_count` is the authority on how many boards a
+/// creator holds, so a migration that reset it would ratchet a busy teacher's
+/// limit — and the strokes are the one thing in this feature that a clear is
+/// promised never to lose.
+#[tokio::test]
+async fn boards_and_their_strokes_survive_remigration() {
+    let (app, db) = common::app_and_db().await;
+    let creds = json!({ "username": "ali", "password": "secret1" });
+    let cookie = common::login(&app, "ali").await;
+    let veli = common::login(&app, "veli").await;
+    let ali_id = me_id(&app, &cookie).await;
+    let veli_id = me_id(&app, &veli).await;
+
+    let res = send(
+        &app,
+        "POST",
+        "/boards",
+        Some(&cookie),
+        Some(json!({ "title": "Geometri", "participant_ids": [veli_id] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let board = res.body["id"].as_str().unwrap().to_string();
+
+    // Two epochs: two marks cleared away, then one live mark.
+    let draw = async |epoch: i64, payload: &str| {
+        hezarfen_backend::domain::board_stroke::BoardStroke::append(
+            &hezarfen_backend::domain::board::BoardId::from_key(&board),
+            &hezarfen_backend::domain::user::UserId::from_key(&ali_id),
+            payload,
+            epoch,
+            &db,
+        )
+        .await
+        .expect("append")
+    };
+    draw(0, "{\"p\":[1]}").await;
+    draw(0, "{\"p\":[2]}").await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/boards/{board}/clear"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    draw(1, "{\"p\":[3]}").await;
+
+    // Second boot: the migration re-applied over live board data.
+    let app = reboot(&db).await;
+    let cookie = send(&app, "POST", "/auth/login", None, Some(creds))
+        .await
+        .cookie
+        .unwrap();
+
+    let res = send(
+        &app,
+        "GET",
+        &format!("/boards/{board}"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["title"], "Geometri");
+    assert_eq!(res.body["creator"], ali_id.as_str());
+    assert_eq!(res.body["participants"], json!([veli_id]));
+    assert_eq!(res.body["epoch"], 1, "the epoch survived");
+    assert!(res.body["closed_at"].is_null());
+
+    // The log came back whole: 2 marks, the marker that counted them, 1 live.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/boards/{board}/history"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 4, "{}", res.body);
+    let rows = common::items(&res.body);
+    assert_eq!(rows[0]["payload"], "{\"p\":[1]}");
+    assert_eq!(rows[2]["kind"], "clear");
+    assert_eq!(rows[2]["count"], 2, "the marker kept its count");
+    assert_eq!(rows[3]["payload"], "{\"p\":[3]}");
+    let res = send(
+        &app,
+        "GET",
+        &format!("/boards/{board}/strokes"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(
+        common::total(&res.body),
+        1,
+        "the live canvas is the new epoch"
+    );
+
+    // The counters the schema carries but the struct does not, straight from
+    // the row: a re-migration must not have reset either of them.
+    let mut result = db
+        .query(
+            "SELECT VALUE [epoch_stroke_count ?? 0, total_stroke_count ?? 0, \
+             (SELECT VALUE board_count ?? 0 FROM $usr)[0]] FROM $id",
+        )
+        .bind((
+            "id",
+            hezarfen_backend::domain::board::BoardId::from_key(&board).record(),
+        ))
+        .bind((
+            "usr",
+            hezarfen_backend::domain::user::UserId::from_key(&ali_id).record(),
+        ))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    assert_eq!(
+        result.take::<Vec<Vec<i64>>>(0).unwrap()[0],
+        vec![1, 3, 1],
+        "epoch counter, lifetime counter and the creator's board_count"
+    );
+
+    // And the board is still writable after the boot — the counters that came
+    // back are the ones the cap reads.
+    draw(1, "{\"p\":[4]}").await;
+    let res = send(
+        &app,
+        "GET",
+        &format!("/boards/{board}/strokes"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(
+        common::total(&res.body),
+        2,
+        "drawing resumed after the boot"
+    );
+}

@@ -388,3 +388,144 @@ async fn user_search_is_paged_not_capped() {
     assert_eq!(res.status, StatusCode::OK);
     assert_eq!(total(&res.body), 1, "role scope excludes the students");
 }
+
+/// The whiteboard's four lists all speak the envelope: the board list, the live
+/// canvas, the whole history and the epoch index. `/epochs` is the odd one —
+/// it pages in the web layer over a bounded read (`web/boards.rs:391`), so it
+/// gets the same windowing proof as the three DB-paged lists.
+#[tokio::test]
+async fn board_lists_are_paged() {
+    let (app, db) = app_and_db().await;
+    let ali = login(&app, "ali").await;
+    let ali_id = me_id(&app, &ali).await;
+
+    // Three boards, and one of them carries the strokes.
+    let mut boards = Vec::new();
+    for n in 0..3 {
+        let res = send(
+            &app,
+            "POST",
+            "/boards",
+            Some(&ali),
+            Some(json!({ "title": format!("Tahta {n}") })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+        boards.push(res.body["id"].as_str().unwrap().to_string());
+    }
+    let board = boards[0].clone();
+
+    // Two closed epochs of 2 marks each, then 5 live ones: 2 markers in the
+    // index, 11 rows in the history (4 marks + 2 markers + 5 live), 5 on the
+    // canvas.
+    for epoch in 0..2 {
+        for n in 0..2 {
+            hezarfen_backend::domain::board_stroke::BoardStroke::append(
+                &hezarfen_backend::domain::board::BoardId::from_key(&board),
+                &hezarfen_backend::domain::user::UserId::from_key(&ali_id),
+                &format!("{{\"p\":[{epoch},{n}]}}"),
+                epoch,
+                &db,
+            )
+            .await
+            .expect("append");
+        }
+        let res = send(
+            &app,
+            "POST",
+            &format!("/boards/{board}/clear"),
+            Some(&ali),
+            None,
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    }
+    for n in 0..5 {
+        hezarfen_backend::domain::board_stroke::BoardStroke::append(
+            &hezarfen_backend::domain::board::BoardId::from_key(&board),
+            &hezarfen_backend::domain::user::UserId::from_key(&ali_id),
+            &format!("{{\"p\":[2,{n}]}}"),
+            2,
+            &db,
+        )
+        .await
+        .expect("append");
+    }
+
+    for (uri, count) in [
+        ("/boards".to_string(), 3),
+        (format!("/boards/{board}/strokes"), 5),
+        (format!("/boards/{board}/history"), 11),
+        (format!("/boards/{board}/epochs"), 2),
+    ] {
+        // Unpaged: everything, `limit` echoes null.
+        let res = send(&app, "GET", &uri, Some(&ali), None).await;
+        assert_eq!(res.status, StatusCode::OK, "GET {uri}: {}", res.body);
+        assert_eq!(total(&res.body), count, "GET {uri} total");
+        assert_eq!(items(&res.body).len() as i64, count, "GET {uri} items");
+        assert!(res.body["limit"].is_null(), "GET {uri} echoes a null limit");
+        assert_eq!(res.body["offset"], 0);
+
+        // A window of 1: the total stays the unpaged count, the windows are
+        // disjoint, and the page past the end is empty rather than an error.
+        let res = send(
+            &app,
+            "GET",
+            &format!("{uri}?limit=1&offset=0"),
+            Some(&ali),
+            None,
+        )
+        .await;
+        assert_eq!(total(&res.body), count, "GET {uri} windowed total");
+        assert_eq!(items(&res.body).len(), 1, "GET {uri} window size");
+        assert_eq!(res.body["limit"], 1);
+        let first = items(&res.body)[0]["id"].clone();
+        let res = send(
+            &app,
+            "GET",
+            &format!("{uri}?limit=1&offset=1"),
+            Some(&ali),
+            None,
+        )
+        .await;
+        assert_eq!(res.body["offset"], 1);
+        assert_ne!(items(&res.body)[0]["id"], first, "GET {uri} pages overlap");
+        let res = send(
+            &app,
+            "GET",
+            &format!("{uri}?limit=1&offset=99"),
+            Some(&ali),
+            None,
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK);
+        assert!(items(&res.body).is_empty(), "GET {uri} past the end");
+        assert_eq!(total(&res.body), count, "GET {uri} total stays honest");
+
+        // The shared bounds bite on every one of them.
+        for bad in ["limit=0", "limit=501", "offset=-1"] {
+            let res = send(&app, "GET", &format!("{uri}?{bad}"), Some(&ali), None).await;
+            assert_eq!(
+                res.status,
+                StatusCode::BAD_REQUEST,
+                "GET {uri}?{bad} should be 400"
+            );
+        }
+    }
+
+    // `?epoch=` narrows the history and still pages: epoch 0 is 2 marks plus
+    // the marker that closed it.
+    let uri = format!("/boards/{board}/history?epoch=0");
+    let res = send(&app, "GET", &uri, Some(&ali), None).await;
+    assert_eq!(total(&res.body), 3, "{}", res.body);
+    let res = send(
+        &app,
+        "GET",
+        &format!("{uri}&limit=2&offset=2"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(total(&res.body), 3, "the scoped total is the scoped count");
+    assert_eq!(items(&res.body).len(), 1, "offset 2 of 3 leaves 1");
+}
