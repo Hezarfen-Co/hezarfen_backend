@@ -425,13 +425,21 @@ impl ExamQuestion {
         // question cannot appear under an exam somebody has already started,
         // however the two requests interleave.
         let inserted = async {
-            let mut result = db
-                .query(ExamAttempt::unfrozen("CREATE $id CONTENT $question;"))
-                .bind(("freeze_exam", exam.record()))
-                .bind(("id", question.id.record()))
-                .bind(("question", question))
-                .await?;
-            ExamAttempt::frozen_check(&mut result)?;
+            // Re-sendable despite the `CREATE`: a lost round aborts having
+            // written nothing and `$id` is a ULID minted once per call, so the
+            // re-send cannot answer "already exists" (there is no UNIQUE index
+            // on `exam_question`) — the one thing the retry cannot survive.
+            let id = question.id.record();
+            let mut result = ExamAttempt::write_unfrozen(
+                exam,
+                "CREATE $id CONTENT $question;",
+                vec![
+                    ("id".into(), id.into_value()),
+                    ("question".into(), question.into_value()),
+                ],
+                db,
+            )
+            .await?;
             result
                 .take::<Vec<ExamQuestion>>(ExamAttempt::FROZEN_SLOT)?
                 .into_iter()
@@ -502,21 +510,22 @@ impl ExamQuestion {
             }));
         }
         let written = async {
-            let mut result = db
-                .query(ExamAttempt::unfrozen(
-                    "UPDATE $id SET subject = $subject, text = $text, points = $points,
-                     kind = $kind, choices = $choices, correct = $correct RETURN AFTER;",
-                ))
-                .bind(("freeze_exam", self.exam.record()))
-                .bind(("id", self.id.record()))
-                .bind(("subject", subject.record()))
-                .bind(("text", text))
-                .bind(("points", points))
-                .bind(("kind", spec.kind))
-                .bind(("choices", spec.choices))
-                .bind(("correct", spec.correct))
-                .await?;
-            ExamAttempt::frozen_check(&mut result)?;
+            let mut result = ExamAttempt::write_unfrozen(
+                &self.exam,
+                "UPDATE $id SET subject = $subject, text = $text, points = $points,
+                 kind = $kind, choices = $choices, correct = $correct RETURN AFTER;",
+                vec![
+                    ("id".into(), self.id.record().into_value()),
+                    ("subject".into(), subject.record().into_value()),
+                    ("text".into(), text.into_value()),
+                    ("points".into(), points.into_value()),
+                    ("kind".into(), spec.kind.into_value()),
+                    ("choices".into(), spec.choices.into_value()),
+                    ("correct".into(), spec.correct.into_value()),
+                ],
+                db,
+            )
+            .await?;
             result
                 .take::<Vec<ExamQuestion>>(ExamAttempt::FROZEN_SLOT)?
                 .into_iter()
@@ -571,21 +580,20 @@ impl ExamQuestion {
     /// delete — and the cascade now shares that transaction too, so a failure
     /// mid-way can no longer strand answers whose question survived.
     pub async fn delete(self, db: &Database) -> Result<ExamQuestion, AppError> {
-        let mut result = db
-            .query(ExamAttempt::unfrozen(
-                "DELETE exam_answer WHERE question = $q;
-                 DELETE question_image WHERE question = $q;
-                 LET $gone = (DELETE $q RETURN BEFORE);
-                 FOR $sub IN ($gone.subject ?? []) {
-                     UPDATE $sub SET exam_question_count =
-                         math::max([(exam_question_count ?? 0) - 1, 0])
-                 };
-                 RETURN $gone;",
-            ))
-            .bind(("freeze_exam", self.exam.record()))
-            .bind(("q", self.id.record()))
-            .await?;
-        ExamAttempt::frozen_check(&mut result)?;
+        let mut result = ExamAttempt::write_unfrozen(
+            &self.exam,
+            "DELETE exam_answer WHERE question = $q;
+             DELETE question_image WHERE question = $q;
+             LET $gone = (DELETE $q RETURN BEFORE);
+             FOR $sub IN ($gone.subject ?? []) {
+                 UPDATE $sub SET exam_question_count =
+                     math::max([(exam_question_count ?? 0) - 1, 0])
+             };
+             RETURN $gone;",
+            vec![("q".into(), self.id.record().into_value())],
+            db,
+        )
+        .await?;
         // The subject's reference is given back inside this same transaction,
         // driven off what the delete actually removed — a question that wasn't
         // there decrements nothing. Read through the trailing `RETURN` rather

@@ -14,7 +14,7 @@ use crate::constant::{
     MAX_DISH_DESCRIPTION_LEN, MAX_DISH_NAME_LEN, MAX_DISH_PRICE_MINOR, MAX_DISH_TAGS,
     MENU_DISH_TABLE, MENU_VERSION_FIELD,
 };
-use crate::database::Database;
+use crate::database::{Database, transaction_with_retry};
 use crate::domain::cap;
 use crate::domain::field_update::FieldUpdate;
 use crate::domain::menu::MenuId;
@@ -210,22 +210,32 @@ impl MenuDish {
         // touches the very key this transaction writes, so the two cannot both
         // commit. Without that, a dish landing just after `DELETE /menus/{id}`
         // removed the row but before its cascade ran outlived its menu.
-        let mut result = db
-            .query(format!(
+        // Every other dish write bumps the same version key, so a lost round is
+        // ordinary here; it is re-sent rather than reported. Re-sending is sound
+        // even with the `CREATE` in the batch — the abort wrote nothing, the id
+        // is a ULID freshly generated above and never seen by a rival, and
+        // `menu_dish` carries no UNIQUE index — so the retry cannot answer
+        // "already exists" (see [`transaction_with_retry`]).
+        let (mut result, mut errors) = transaction_with_retry(
+            db,
+            &format!(
                 "BEGIN TRANSACTION;
                  LET $bumped = (UPDATE $menu SET {MENU_VERSION_FIELD} = \
                      ({MENU_VERSION_FIELD} ?? 0) + 1 RETURN VALUE id);
                  IF array::len($bumped) = 0 {{ THROW 'no_menu' }};
                  CREATE $id CONTENT $dish;
                  COMMIT TRANSACTION;"
-            ))
-            .bind(("menu", menu.record()))
-            .bind(("id", dish.id.record()))
-            .bind(("dish", dish))
-            .await?;
+            ),
+            &[
+                ("menu".into(), menu.record().into_value()),
+                ("id".into(), dish.id.record().into_value()),
+                ("dish".into(), dish.into_value()),
+            ],
+            &["no_menu"],
+        )
+        .await?;
         // An aborted transaction errors *every* slot, most with a generic "not
         // executed" — only the THROW's own slot names the reason.
-        let mut errors = result.take_errors();
         if errors
             .values()
             .any(|error| error.to_string().contains("no_menu"))

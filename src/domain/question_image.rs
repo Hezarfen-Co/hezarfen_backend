@@ -109,13 +109,17 @@ impl QuestionImage {
     /// the gate is in this transaction rather than in a lock the caller held.
     pub async fn upsert(self, db: &Database) -> Result<QuestionImage, AppError> {
         // whole-row-save-ok: self is built in place, never read back, and the slot id is deterministic
-        let mut result = db
-            .query(ExamAttempt::unfrozen("UPSERT $id CONTENT $image;"))
-            .bind(("freeze_exam", self.exam.record()))
-            .bind(("id", self.id.record()))
-            .bind(("image", self))
-            .await?;
-        ExamAttempt::frozen_check(&mut result)?;
+        let (exam, id) = (self.exam.clone(), self.id.record());
+        let mut result = ExamAttempt::write_unfrozen(
+            &exam,
+            "UPSERT $id CONTENT $image;",
+            vec![
+                ("id".into(), id.into_value()),
+                ("image".into(), self.into_value()),
+            ],
+            db,
+        )
+        .await?;
         result
             .take::<Vec<QuestionImage>>(ExamAttempt::FROZEN_SLOT)?
             .into_iter()
@@ -205,12 +209,13 @@ impl QuestionImage {
     /// Refused once the exam has an attempt, in the same transaction — same
     /// gate, same reason as [`Self::upsert`].
     pub async fn delete(self, db: &Database) -> Result<QuestionImage, AppError> {
-        let mut result = db
-            .query(ExamAttempt::unfrozen("DELETE $id RETURN BEFORE;"))
-            .bind(("freeze_exam", self.exam.record()))
-            .bind(("id", self.id.record()))
-            .await?;
-        ExamAttempt::frozen_check(&mut result)?;
+        let mut result = ExamAttempt::write_unfrozen(
+            &self.exam,
+            "DELETE $id RETURN BEFORE;",
+            vec![("id".into(), self.id.record().into_value())],
+            db,
+        )
+        .await?;
         result
             .take::<Vec<QuestionImage>>(ExamAttempt::FROZEN_SLOT)?
             .into_iter()

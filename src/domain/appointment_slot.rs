@@ -17,7 +17,7 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use crate::constant::{
     APPOINTMENT_SLOT_TABLE, MAX_APPOINTMENT_NOTE_LEN, MAX_SLOT_OCCURRENCES, MILLIS_PER_WEEK,
 };
-use crate::database::Database;
+use crate::database::{Database, transaction_with_retry};
 use crate::domain::appointment::{APPOINTMENT_LOCK, Appointment};
 use crate::domain::monotonic_id::next_ulid;
 use crate::domain::timestamp::Timestamp;
@@ -469,9 +469,9 @@ impl AppointmentSlot {
     /// used to get from a separate check.
     async fn delete_free(ids: &[AppointmentSlotId], db: &Database) -> Result<(), AppError> {
         let records: Vec<RecordId> = ids.iter().map(|id| id.record()).collect();
-        let mut result = db
-            .query(
-                "BEGIN TRANSACTION;
+        let (_, mut errors) = transaction_with_retry(
+            db,
+            "BEGIN TRANSACTION;
                  LET $gone = (DELETE $slots WHERE (occupied ?? 0) = 0 RETURN BEFORE);
                  IF array::len($gone) != array::len($slots) {
                      THROW IF array::len((SELECT VALUE id FROM appointment_slot
@@ -480,12 +480,14 @@ impl AppointmentSlot {
                  DELETE appointment WHERE slot IN $slots;
                  RETURN $gone;
                  COMMIT TRANSACTION;",
-            )
-            .bind(("slots", records))
-            .await?;
+            &[("slots".into(), records.into_value())],
+            &["slot_occupied", "slot_missing"],
+        )
+        .await?;
         // An aborted transaction errors every slot; only the THROW's own slot
-        // names the marker (the `Exam::update` treatment).
-        let mut errors = result.take_errors();
+        // names the marker (the `Exam::update` treatment), and a round lost to
+        // a booking landing on `occupied` mid-flight is re-sent rather than
+        // reported (see [`transaction_with_retry`]).
         let thrown = |marker: &str| {
             errors
                 .values()
