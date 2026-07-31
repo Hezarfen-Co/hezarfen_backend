@@ -8,6 +8,7 @@ pub mod appointments;
 pub mod attendance;
 pub mod auth;
 pub mod bank_questions;
+pub mod board_ws;
 pub mod boards;
 pub mod chatbot;
 pub mod courses;
