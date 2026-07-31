@@ -860,7 +860,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | POST   | `/chatbot/threads/{id}/messages` | student | `{content}` (≤ `max_chatbot_message_len`) — send a turn; `202 {message_id, status: "pending"}`, the answer is fetched after (`503` when no AI service offers `chat.reply` — nothing is written; `429` + `Retry-After` on the send tier) |
 | GET    | `/chatbot/threads/{id}/messages/{mid}` | student | Poll one turn: `pending` until the answer lands, then `complete` + `content` or `failed` + `error_code` |
 | GET    | `/chatbot/threads/{id}/messages/{mid}/stream` | student | **SSE** on the same row: `delta` chunks then one `done` — or one `error` — and close; an already-finished answer replays (see "Chatbot") |
-| POST   | `/boards`                        | student | `{title, participant_ids?}` — open a whiteboard; the caller becomes its creator, everyone named may draw; `409` at `max_boards_per_creator` |
+| POST   | `/boards`                        | student | `{title, participants?}` — open a whiteboard; the caller becomes its creator, everyone named may draw; `409` at `max_boards_per_creator` |
 | GET    | `/boards`                        | student | Boards the caller created or was invited to, newest first · paged |
 | GET    | `/boards/{id}`                   | student | One board — a `404`, never a `403`, for anyone not on it |
 | GET    | `/boards/{id}/strokes`           | student | The live canvas: the current epoch's strokes, oldest first · paged |
@@ -2508,6 +2508,12 @@ creator names participant user ids at `POST /boards` and that is the whole
 model — no course, no lesson session, no appointment. Any account from
 `student` upwards may open one. **Every participant draws; the creator
 alone clears, locks, closes or deletes.**
+
+The roster is spelled `participants` everywhere — in the `POST` body, in the
+`PATCH` body and in every board response — so a client may post back a board it
+just read. Unlike the rest of this API, the two board request bodies **reject
+an unknown key** (`422`) rather than ignoring it: a misspelled roster would
+otherwise open a board its author is silently alone on.
 
 **No parents, anywhere.** The `parent` role is the school's read-only observer,
 and it has no whiteboard access at all — not a view-only tier, none. It is

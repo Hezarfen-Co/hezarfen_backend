@@ -2083,7 +2083,7 @@ async fn board_room_fixture() -> BoardRoom {
 
     let res = creator
         .post(format!("{base}/boards"))
-        .json(&json!({ "title": "Geometri", "participant_ids": [veli_id] }))
+        .json(&json!({ "title": "Geometri", "participants": [veli_id] }))
         .send()
         .await
         .unwrap();

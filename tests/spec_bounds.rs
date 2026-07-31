@@ -795,7 +795,7 @@ fn expectations() -> Vec<(&'static str, &'static str, &'static str, i64)> {
         ),
         (
             "CreateBoard",
-            "participant_ids",
+            "participants",
             "maxItems",
             MAX_BOARD_PARTICIPANTS as i64,
         ),
