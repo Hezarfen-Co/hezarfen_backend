@@ -2552,6 +2552,72 @@ async fn the_door_is_a_404_for_an_outsider_and_an_unknown_board() {
         .expect("a participant is let in");
 }
 
+/// Test 6b — the door is shut on a `parent` too, and shut the same way: a 404,
+/// never a 403. Proved against the hardest case — the parent is forced onto the
+/// roster in the database first, so the roster gate would let them in and only
+/// the role bar refuses. No socket is the whole point: a parent that cannot
+/// upgrade can never send a `stroke` frame, and the store proves nothing landed.
+#[tokio::test]
+async fn a_parent_cannot_enter_the_room_or_draw() {
+    let room = board_room_fixture().await;
+    let (base, board) = (&room.base, &room.board_id);
+    let anne = client();
+    register(&anne, base, "anne").await;
+    promote(&room.db, "anne", "parent").await;
+    login(&anne, base, "anne").await;
+    let cookie = raw_session_cookie(base, "anne").await;
+
+    // On the roster by force — the stale row this rule leaves behind.
+    let me: Value = anne
+        .get(format!("{base}/auth/me"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // Beside `veli`, who stays: the two differ only by role, so the refusal
+    // below cannot be blamed on the roster.
+    room.db
+        .query("UPDATE $b SET participants = [$v, $u]")
+        .bind(("b", board_record(board)))
+        .bind((
+            "v",
+            surrealdb::types::RecordId::new("user", room.veli_id.clone()),
+        ))
+        .bind((
+            "u",
+            surrealdb::types::RecordId::new("user", me["id"].as_str().unwrap().to_string()),
+        ))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+    assert_eq!(
+        board_open(base, board, Some(&cookie)).await.err(),
+        Some(404),
+        "a parent on the roster must still be told the board does not exist"
+    );
+    // Not a 403 anywhere: identical to a board that was never minted.
+    assert_eq!(
+        board_open(base, "01JZZZZZZZZZZZZZZZZZZZZZZZ", Some(&cookie))
+            .await
+            .err(),
+        Some(404)
+    );
+    // No socket, so no stroke — asserted against the store, not the wire.
+    assert!(
+        stored_stroke_ids(&room.db, board, 0).await.is_empty(),
+        "a parent must not have drawn"
+    );
+    // And the bar is about the role, not the roster: `veli` sits on the same
+    // roster and is let straight in.
+    board_open(base, board, Some(&room.veli_cookie))
+        .await
+        .expect("a student participant is still let in");
+}
+
 /// Test 7 — a participant dropped mid-session stops drawing. Twice over: once
 /// with the roster frame deliberately withheld (the socket's own gate is what
 /// actually protects the board), and once through the frame the REST route

@@ -24249,6 +24249,95 @@ async fn every_board_route_is_a_404_for_an_outsider() {
     assert_ne!(mine, board);
 }
 
+/// The `parent` role has no whiteboard at all. Three cuts in one test, because
+/// they only work together: a parent cannot open a board, cannot be *named* on
+/// one, and — the stale-row case, forced here by writing a parent straight into
+/// a roster — still gets the outsider's `404` rather than a `403` that would
+/// confirm the board is there.
+#[tokio::test]
+async fn a_parent_gets_no_whiteboard_at_all() {
+    let (app, db) = app_and_db().await;
+    let ali = login(&app, "ali").await;
+    let anne = login_as(&app, &db, "anne", "parent").await;
+    let anne_id = me_id(&app, &anne).await;
+
+    // 1. A parent cannot open one. A 403, not a 404: no board exists to hide.
+    let res = send(
+        &app,
+        "POST",
+        "/boards",
+        Some(&anne),
+        Some(json!({ "title": "Gizli", "participant_ids": [] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+    // And nothing was written on the way to that refusal.
+    assert_eq!(stored_board_count(&db, &anne_id).await, 0);
+
+    // 2. A parent cannot be named on one either — refused whole, so the board
+    //    is not created half-invited.
+    let res = send(
+        &app,
+        "POST",
+        "/boards",
+        Some(&ali),
+        Some(json!({ "title": "Geometri", "participant_ids": [&anne_id] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+    assert_eq!(stored_board_count(&db, &me_id(&app, &ali).await).await, 0);
+
+    // The same refusal on the way in through PATCH, on a board that does exist.
+    let board = create_board(&app, &ali, "Geometri", &[]).await;
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/boards/{board}"),
+        Some(&ali),
+        Some(json!({ "participants": [&anne_id] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+    assert!(
+        stored_board(&db, &board)
+            .await
+            .unwrap()
+            .get_participants()
+            .is_empty(),
+        "a refused roster change must leave the old roster"
+    );
+
+    // 3. The stale row: a parent already on a roster, written before this rule.
+    //    Every id-scoped route must still answer exactly like a board that was
+    //    never minted — a 403 anywhere here leaks the board's existence.
+    db.query("UPDATE $b SET participants = [$u]")
+        .bind(("b", BoardId::from_key(&board).record()))
+        .bind(("u", UserId::from_key(&anne_id).record()))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    let ghost = board_routes("nosuchboard");
+    for (n, (method, uri, body)) in board_routes(&board).into_iter().enumerate() {
+        let res = send(&app, method, &uri, Some(&anne), body).await;
+        assert_eq!(
+            res.status,
+            StatusCode::NOT_FOUND,
+            "{method} {uri} must 404 for a parent, got {}",
+            res.body
+        );
+        let (gm, gu, gb) = ghost[n].clone();
+        let gone = send(&app, gm, &gu, Some(&anne), gb).await;
+        assert_eq!(res.status, gone.status, "{method} {uri}");
+        assert_eq!(res.body, gone.body, "{method} {uri} bodies must match too");
+    }
+    // The list route is barred outright — nothing to hide, so a 403 is honest.
+    let res = send(&app, "GET", "/boards", Some(&anne), None).await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+    // None of it disturbed the board.
+    assert!(stored_board(&db, &board).await.is_some());
+}
+
 /// The other half of the two-tier line: a participant sees the board and may
 /// re-title it, but the four commands and the roster/lock arms of `PATCH` are
 /// the creator's alone — a 403, because hiding a board they are already

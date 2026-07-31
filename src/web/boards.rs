@@ -3,8 +3,9 @@
 //! lock, close, delete). Live drawing itself rides the board-room WebSocket
 //! next door; everything here is the REST half it sits beside.
 //!
-//! The permission model is two predicates and nothing else
-//! ([`Board::is_participant`], [`Board::is_creator`]), applied in one order on
+//! The permission model is a role bar plus two predicates
+//! (student-and-above, then [`Board::is_participant`], [`Board::is_creator`]),
+//! applied in one order on
 //! every route: a non-participant gets a **404** even for a board that plainly
 //! exists (a 403 would confirm it — see the rationale at `src/lib.rs`), while a
 //! participant who is not the creator gets a **403** on the four commands. They
@@ -30,11 +31,12 @@ use crate::constant::MAX_BOARD_PARTICIPANTS;
 use crate::database::Database;
 use crate::domain::board::{Board, BoardId, BoardTitle};
 use crate::domain::board_stroke::BoardStroke;
+use crate::domain::role::Role;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
 
-use super::{CurrentUser, Page, PageParams, paginate, set_or_clear};
+use super::{CurrentUser, Page, PageParams, RequireStudent, paginate, set_or_clear};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -53,11 +55,16 @@ pub fn routes() -> OpenApiRouter<AppState> {
 
 /// The board, or a 404 — including the deliberate 404 for a caller who is not
 /// on it. Every route starts here, so existence never leaks.
+///
+/// A `parent` is treated as an outsider rather than refused with a 403: the
+/// role is barred from the whiteboard entirely, and a 403 would confirm the
+/// board exists. [`resolve_participants`] keeps parents off every roster, so
+/// this arm only ever fires for a row written before that rule.
 async fn board_for(id: &str, user: &User, db: &Database) -> Result<Board, AppError> {
     let board = Board::read(&BoardId::from_key(id), db)
         .await?
         .ok_or(AppError::NotFound)?;
-    if !board.is_participant(user.get_id()) {
+    if !user.get_role().at_least(Role::Student) || !board.is_participant(user.get_id()) {
         return Err(AppError::NotFound);
     }
     Ok(board)
@@ -80,6 +87,10 @@ fn ensure_creator(board: &Board, user: &User) -> Result<(), AppError> {
 /// but only after this loop would have run one read per id), and an unknown id
 /// is a 400 rather than a silently dropped invitation.
 ///
+/// A `parent` is refused here, and that is the cut that keeps the role off the
+/// whiteboard: never on a roster means [`board_for`] and the room's door already
+/// answer 404 on every id-scoped route, and no socket can ever open.
+///
 /// The creator is a participant by construction, so they are neither injected
 /// into the list nor rejected from it.
 async fn resolve_participants(
@@ -101,10 +112,11 @@ async fn resolve_participants(
     let mut users = Vec::with_capacity(ids.len());
     for id in ids {
         let user = UserId::from_key(&id);
-        if User::read(&user, db).await?.is_none() {
+        let found = User::read(&user, db).await?;
+        if !found.is_some_and(|found| found.get_role().at_least(Role::Student)) {
             return Err(AppError::Validation(ValidationError::Invalid {
                 field: "participants",
-                reason: "every participant must be an existing user",
+                reason: "every participant must be an existing user of at least the student role",
             }));
         }
         users.push(user);
@@ -205,8 +217,10 @@ struct CreateBoard {
 
 /// Open a whiteboard. The caller becomes its creator — the only one who may
 /// clear, lock, close or delete it — and everyone named in `participant_ids`
-/// may draw on it. `409` once the caller holds `max_boards_per_creator` boards
-/// (`GET /limits`); delete one to free a seat.
+/// may draw on it. Student and above: the `parent` role has no whiteboard
+/// access at all, neither as a creator nor as a participant. `409` once the
+/// caller holds `max_boards_per_creator` boards (`GET /limits`); delete one to
+/// free a seat.
 #[utoipa::path(
     post,
     path = "/",
@@ -215,14 +229,15 @@ struct CreateBoard {
     request_body = CreateBoard,
     responses(
         (status = 201, description = "The new board", body = BoardResponse),
-        (status = 400, description = "Invalid title, or a participant list that is too long or names an unknown user", body = ErrorResponse),
+        (status = 400, description = "Invalid title, or a participant list that is too long, names an unknown user, or names a parent", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "The caller is a parent", body = ErrorResponse),
         (status = 409, description = "The caller already holds the maximum number of boards", body = ErrorResponse),
     ),
 )]
 async fn create_board(
     State(st): State<AppState>,
-    CurrentUser(user): CurrentUser,
+    RequireStudent(user): RequireStudent,
     Json(req): Json<CreateBoard>,
 ) -> Result<(StatusCode, Json<BoardResponse>), AppError> {
     let title = BoardTitle::try_new(&req.title)?;
@@ -244,11 +259,12 @@ async fn create_board(
         (status = 200, description = "A page of the caller's boards", body = Page<BoardResponse>),
         (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "The caller is a parent", body = ErrorResponse),
     ),
 )]
 async fn list_boards(
     State(st): State<AppState>,
-    CurrentUser(user): CurrentUser,
+    RequireStudent(user): RequireStudent,
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<BoardResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
@@ -426,7 +442,7 @@ struct UpdateBoard {
     request_body = UpdateBoard,
     responses(
         (status = 200, description = "The updated board", body = BoardResponse),
-        (status = 400, description = "Invalid title, or a participant list that is too long or names an unknown user", body = ErrorResponse),
+        (status = 400, description = "Invalid title, or a participant list that is too long, names an unknown user, or names a parent", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Only the creator may change the participants or the lock", body = ErrorResponse),
         (status = 404, description = "Not found, or the caller is not on it", body = ErrorResponse),
