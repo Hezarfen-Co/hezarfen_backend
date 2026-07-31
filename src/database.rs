@@ -160,9 +160,19 @@ pub(crate) async fn write_with_retry<T: surrealdb::types::SurrealValue>(
 /// easier to trip: no statement inside may be able to answer "already exists",
 /// because that is the other thing [`lost_the_race`] matches and re-sending it
 /// would just fail the same way until the tries run out — turning a 409 into a
-/// 500, which is the exact defect this exists to prevent. So `UPDATE` and
-/// `DELETE`, and no `CREATE` and no write under a `UNIQUE` index anywhere in
-/// the batch. The four cascades on it today are clear on both counts.
+/// 500, which is the exact defect this exists to prevent. The test to apply to
+/// every statement in the batch is not which verb it uses but whether the store
+/// could *legitimately* answer "already exists" to it — that answer is a
+/// decision, and this loop cannot tell one from a conflict, so it would burn all
+/// the tries re-asking a question already settled. `UPDATE` and `DELETE` never
+/// can. A `CREATE` can, unless the id is unreachable by any rival: a freshly
+/// generated ULID on a table with no `UNIQUE` index is such an id. An `UPSERT`
+/// can, unless its id is *bijective* with every unique tuple its table indexes —
+/// then the index entry can only ever point at the row the id already names, and
+/// the write resolves onto it instead of colliding with it
+/// ([`crate::domain::exam_result::ExamResult`]'s composite id is that shape).
+/// A statement that fails this test belongs in front of the cascade, where its
+/// 409 can be read as the answer it is.
 pub(crate) async fn transaction_with_retry(
     db: &Database,
     sql: &str,

@@ -2,7 +2,7 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use ulid::Ulid;
 
 use crate::constant::POMODORO_SESSION_TABLE;
-use crate::database::Database;
+use crate::database::{Database, transaction_with_retry};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
@@ -97,10 +97,16 @@ impl PomodoroSession {
     /// Take and re-file share one transaction — a failed re-file rolls the
     /// take back, so a session can never vanish half-closed. Of two racing
     /// finishes exactly one receives the row (the other gets the conflict).
+    ///
+    /// A lost round is re-sent rather than reported (`transaction_with_retry`):
+    /// the abort wrote nothing, so the whole cascade is safe to repeat, and the
+    /// `CREATE` cannot answer "already exists" on the way back — the table
+    /// carries no `UNIQUE` index and `$closed` is one freshly minted ULID.
+    /// Only the guard's own `THROW` is a decision, and it stays a 409.
     pub async fn finish(user: &UserId, db: &Database) -> Result<PomodoroSession, AppError> {
-        let mut result = db
-            .query(
-                "BEGIN TRANSACTION;
+        let (mut result, mut errors) = transaction_with_retry(
+            db,
+            "BEGIN TRANSACTION;
                  LET $before = (DELETE $open RETURN BEFORE);
                  IF array::len($before) = 0 { THROW 'no_pomodoro_running' };
                  CREATE $closed CONTENT {
@@ -109,15 +115,23 @@ impl PomodoroSession {
                      finished_at: $done,
                  };
                  COMMIT TRANSACTION;",
-            )
-            .bind(("open", PomodoroSessionId::open_for(user).record()))
-            .bind(("closed", PomodoroSessionId::generate().record()))
-            .bind(("done", Timestamp::now()))
-            .await?;
+            &[
+                (
+                    "open".into(),
+                    PomodoroSessionId::open_for(user).record().into_value(),
+                ),
+                (
+                    "closed".into(),
+                    PomodoroSessionId::generate().record().into_value(),
+                ),
+                ("done".into(), Timestamp::now().into_value()),
+            ],
+            &["no_pomodoro_running"],
+        )
+        .await?;
         // An aborted transaction errors *every* slot, most with a generic
         // "not executed" — only the THROW's own slot names the reason, so scan
         // them all for the marker instead of trusting the first.
-        let mut errors = result.take_errors();
         if errors
             .values()
             .any(|error| error.to_string().contains("no_pomodoro_running"))

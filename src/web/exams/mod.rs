@@ -88,7 +88,7 @@ impl Scheduled for Exam {
 ///
 /// Two rules have left this list. The question freeze gate rides inside each
 /// question/image write's own transaction
-/// ([`crate::domain::exam_attempt::ExamAttempt::unfrozen`]), and the exam PATCH
+/// ([`crate::domain::exam_attempt::ExamAttempt::write_unfrozen`]), and the exam PATCH
 /// no longer needs the writer lease because its save is a compare-and-set. The
 /// subject delete's cascade — the only writer outside attempt starts, paired
 /// with the question writes' subject check — is now a conditional statement on

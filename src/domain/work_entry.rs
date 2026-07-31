@@ -2,7 +2,7 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use ulid::Ulid;
 
 use crate::constant::WORK_ENTRY_TABLE;
-use crate::database::Database;
+use crate::database::{Database, transaction_with_retry};
 use crate::domain::field_update::FieldUpdate;
 use crate::domain::page::PagedList;
 use crate::domain::timestamp::Timestamp;
@@ -117,10 +117,16 @@ impl WorkEntry {
     /// re-file share one transaction — a failed re-file rolls the take back,
     /// so a stint can never vanish half-closed. Of two racing check-outs
     /// exactly one receives the row (the other gets the conflict).
+    ///
+    /// A lost round is re-sent rather than reported (`transaction_with_retry`):
+    /// the abort wrote nothing, so the whole cascade is safe to repeat, and the
+    /// `CREATE` cannot answer "already exists" on the way back — the table
+    /// carries no `UNIQUE` index and `$closed` is one freshly minted ULID.
+    /// Only the guard's own `THROW` is a decision, and it stays a 409.
     pub async fn check_out(user: &UserId, db: &Database) -> Result<WorkEntry, AppError> {
-        let mut result = db
-            .query(
-                "BEGIN TRANSACTION;
+        let (mut result, mut errors) = transaction_with_retry(
+            db,
+            "BEGIN TRANSACTION;
                  LET $before = (DELETE $open RETURN BEFORE);
                  IF array::len($before) = 0 { THROW 'not_checked_in' };
                  CREATE $closed CONTENT {
@@ -129,15 +135,23 @@ impl WorkEntry {
                      check_out: $out,
                  };
                  COMMIT TRANSACTION;",
-            )
-            .bind(("open", WorkEntryId::open_for(user).record()))
-            .bind(("closed", WorkEntryId::generate().record()))
-            .bind(("out", Timestamp::now()))
-            .await?;
+            &[
+                (
+                    "open".into(),
+                    WorkEntryId::open_for(user).record().into_value(),
+                ),
+                (
+                    "closed".into(),
+                    WorkEntryId::generate().record().into_value(),
+                ),
+                ("out".into(), Timestamp::now().into_value()),
+            ],
+            &["not_checked_in"],
+        )
+        .await?;
         // An aborted transaction errors *every* slot, most with a generic
         // "not executed" — only the THROW's own slot names the reason, so scan
         // them all for the marker instead of trusting the first.
-        let mut errors = result.take_errors();
         if errors
             .values()
             .any(|error| error.to_string().contains("not_checked_in"))

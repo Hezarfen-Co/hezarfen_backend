@@ -1,7 +1,7 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
 use crate::constant::EXAM_ATTEMPT_TABLE;
-use crate::database::Database;
+use crate::database::{Database, transaction_with_retry};
 use crate::domain::exam::Exam;
 use crate::domain::exam::ExamId;
 use crate::domain::key;
@@ -314,10 +314,10 @@ impl ExamAttempt {
         Ok(result.take::<Vec<ExamAttempt>>(0)?)
     }
 
-    /// Wrap `statements` in a transaction that refuses to run them at all once
-    /// `$freeze_exam` has an attempt — the freeze gate, made atomic with the
-    /// write it guards instead of merely preceding it. Callers bind
-    /// `freeze_exam` and read their own results from
+    /// Send `statements` wrapped in a transaction that refuses to run them at
+    /// all once `exam` has an attempt — the freeze gate, made atomic with the
+    /// write it guards instead of merely preceding it. `freeze_exam` is bound
+    /// here; the caller binds the rest and reads its own results from
     /// [`Self::FROZEN_SLOT`] onwards (`BEGIN` and the `IF` take a slot each).
     ///
     /// This replaces a process-wide `EXAM_LOCK.write()` held across the check
@@ -325,6 +325,21 @@ impl ExamAttempt {
     /// attempt table a round trip before it wrote; the gate checks inside the
     /// writing statement, so a question edit can no longer sail past an attempt
     /// that started in that gap.
+    ///
+    /// The send lives here rather than at the five call sites because a lost
+    /// round has to be re-sent, and only whoever owns the send can re-send: the
+    /// gate reads the very table its rival writes, so the two contend by design
+    /// and a raced edit used to answer 500. The refusal outranks the conflict —
+    /// `FROZEN_MARK` is a decision and stays the 409 the pre-flight check
+    /// answers with, and only exhausting the tries becomes a 500. See
+    /// [`transaction_with_retry`] for why the whole error map is scanned: an
+    /// aborted transaction errors *every* slot and all but one say a generic
+    /// "not executed".
+    ///
+    /// Returning only on an empty error map is what keeps [`Self::FROZEN_SLOT`]
+    /// (and any slot counted off `num_statements`) correct — `take_errors`
+    /// `swap_remove`s errored slots, so a fixed slot read is meaningless once
+    /// anything failed.
     //
     // ponytail: the count and a concurrent `CREATE exam_attempt` are still not
     // serialized against each other — SurrealDB does not conflict-check a
@@ -334,26 +349,22 @@ impl ExamAttempt {
     // and there are two, so nothing is lost. Closing it properly means the
     // cap.rs shape: an attempt counter on the exam row, incremented by the
     // attempt create, and the write conditioned on `count ?? 0 = 0`.
-    pub(crate) fn unfrozen(statements: &str) -> String {
-        format!(
+    pub(crate) async fn write_unfrozen(
+        exam: &ExamId,
+        statements: &str,
+        bindings: Vec<(String, surrealdb::types::Value)>,
+        db: &Database,
+    ) -> Result<surrealdb::IndexedResults, AppError> {
+        let sql = format!(
             "BEGIN TRANSACTION;
              IF array::len((SELECT VALUE id FROM exam_attempt \
              WHERE exam = $freeze_exam LIMIT 1)) > 0 {{ THROW '{FROZEN_MARK}' }};
              {statements}
              COMMIT TRANSACTION;"
-        )
-    }
-
-    /// The first slot a [`Self::unfrozen`] caller's own statements land in.
-    pub(crate) const FROZEN_SLOT: usize = 2;
-
-    /// Turn a gate abort into the 409 the pre-flight check answers with, so
-    /// losing the race and failing the check read identically to a client.
-    /// An aborted transaction errors *every* slot with a generic "not
-    /// executed" — only the `THROW`'s own slot names the marker, so every slot
-    /// is scanned.
-    pub(crate) fn frozen_check(result: &mut surrealdb::IndexedResults) -> Result<(), AppError> {
-        let mut errors = result.take_errors();
+        );
+        let mut bound = vec![("freeze_exam".into(), exam.record().into_value())];
+        bound.extend(bindings);
+        let (result, mut errors) = transaction_with_retry(db, &sql, &bound, &[FROZEN_MARK]).await?;
         if errors
             .values()
             .any(|error| error.to_string().contains(FROZEN_MARK))
@@ -362,9 +373,12 @@ impl ExamAttempt {
         }
         match errors.drain().map(|(_, error)| error).next() {
             Some(error) => Err(error.into()),
-            None => Ok(()),
+            None => Ok(result),
         }
     }
+
+    /// The first slot a [`Self::write_unfrozen`] caller's own statements land in.
+    pub(crate) const FROZEN_SLOT: usize = 2;
 
     /// Whether anyone has started this exam — the gate that freezes `mode`
     /// edits once an attempt exists.

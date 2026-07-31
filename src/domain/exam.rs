@@ -563,7 +563,7 @@ impl Exam {
             .bind(("new", self))
             .await?;
         // An aborted transaction errors every slot; only the THROW's names the
-        // marker (the `frozen_check` treatment).
+        // marker (the [`ExamAttempt::write_unfrozen`] treatment).
         let mut errors = result.take_errors();
         if errors
             .values()
