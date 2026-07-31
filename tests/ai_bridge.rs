@@ -807,6 +807,7 @@ async fn fetch_certificate(ai: Option<AiBridge>) -> (axum::http::StatusCode, Val
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
         chatbot_limit: Default::default(),
         exam_presence: Default::default(),
+        board_hub: Default::default(),
         db_up: Default::default(),
         ai,
     });
@@ -940,6 +941,7 @@ async fn chat_app(bridge: &AiBridge) -> (Router, Database) {
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
         chatbot_limit: Default::default(),
         exam_presence: Default::default(),
+        board_hub: Default::default(),
         db_up: Default::default(),
         ai: Some(bridge.clone()),
     });

@@ -8,6 +8,8 @@ pub mod appointment_slot;
 pub mod attendance;
 pub mod bank_question;
 pub mod bank_question_image;
+pub mod board;
+pub mod board_stroke;
 pub mod cap;
 pub mod chatbot_message;
 pub mod chatbot_thread;

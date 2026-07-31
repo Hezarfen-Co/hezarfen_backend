@@ -159,6 +159,7 @@ async fn limits_still_answers_while_the_database_is_down() {
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
         chatbot_limit: Default::default(),
         exam_presence: Default::default(),
+        board_hub: Default::default(),
         db_up: db_up.clone(),
         ai: None,
     });
@@ -382,6 +383,19 @@ async fn protected_routes_require_session() {
         ("GET", "/pomodoro/u"),
         ("GET", "/attendance/me"),
         ("GET", "/attendance/u"),
+        ("GET", "/boards"),
+        ("POST", "/boards"),
+        ("GET", "/boards/x"),
+        ("PATCH", "/boards/x"),
+        ("DELETE", "/boards/x"),
+        ("GET", "/boards/x/strokes"),
+        ("GET", "/boards/x/history"),
+        ("GET", "/boards/x/epochs"),
+        ("POST", "/boards/x/clear"),
+        ("POST", "/boards/x/close"),
+        // The board room authenticates before it upgrades, so a rejection is
+        // an HTTP status here and not an instant close.
+        ("GET", "/boards/x/ws"),
     ] {
         let res = send(&app, method, uri, None, None).await;
         assert_eq!(res.status, StatusCode::UNAUTHORIZED, "{method} {uri}");
@@ -6023,6 +6037,7 @@ async fn session_cookie_secure_attribute_follows_config() {
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
         chatbot_limit: Default::default(),
         exam_presence: Default::default(),
+        board_hub: Default::default(),
         db_up: Default::default(),
         ai: None,
     });
@@ -6062,6 +6077,7 @@ async fn db_down_refuses_before_touching_the_database() {
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
         chatbot_limit: Default::default(),
         exam_presence: Default::default(),
+        board_hub: Default::default(),
         db_up: db_up.clone(),
         ai: None,
     });
@@ -15856,6 +15872,7 @@ async fn chat_app_limited(
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
         chatbot_limit,
         exam_presence: Default::default(),
+        board_hub: Default::default(),
         db_up: Default::default(),
         ai,
     });

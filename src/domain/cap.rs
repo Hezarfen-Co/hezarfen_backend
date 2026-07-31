@@ -112,6 +112,15 @@ async fn claim_at(
 const FULL_MARK: &str = "cap_full";
 const HELD_MARK: &str = "cap_held";
 
+/// The two markers [`claim_two_when_and_create`] aborts with, one per counter,
+/// deliberately *not* shared: its two caps mean opposite things to the person
+/// who hit one. The soft cap is a resettable working set (a whiteboard's live
+/// canvas, emptied by a clear and drawn on again); the hard cap is the parent's
+/// lifetime budget, and hitting it is terminal. One marker for both would tell
+/// a caller a recoverable state is a permanent one.
+const SOFT_FULL_MARK: &str = "cap_full_soft";
+const HARD_FULL_MARK: &str = "cap_full_hard";
+
 /// What [`claim_and_create`] settled.
 pub(crate) enum Claimed<T> {
     /// The seat and the row committed together.
@@ -213,6 +222,130 @@ pub(crate) async fn claim_and_create<T: SurrealValue + Clone>(
             .into_iter()
             .next()
             .map(Claimed::Made)
+            .ok_or_else(|| AppError::Internal("cap claim wrote no row".into()));
+    }
+    Err(last
+        .map(AppError::from)
+        .unwrap_or_else(|| AppError::Internal("cap counter write never ran".into())))
+}
+
+/// What [`claim_two_when_and_create`] settled.
+pub(crate) enum ClaimedTwo<T> {
+    /// Both seats and the row committed together.
+    Made(T),
+    /// The *resettable* counter (`fields[0]`) is full — nothing was written,
+    /// and whatever empties it lets the caller through again.
+    FullSoft,
+    /// The *lifetime* counter (`fields[1]`) is full, the guard failed, or the
+    /// parent row is gone — nothing was written. The caller re-reads the parent
+    /// to tell those apart, and only to pick the message: both are refusals the
+    /// caller cannot retry into a success.
+    FullHard,
+}
+
+/// Take a slot on *two* of `parent`'s counters, while `guard` holds, and write
+/// the child that fills them — one transaction, one verdict.
+///
+/// Two [`claim_when`] calls cannot promise this. A parent whose children are
+/// counted twice — once against a resettable working set, once against a
+/// lifetime budget — has the two counters describing the same rows, so a writer
+/// that lands one increment and loses the other leaves them disagreeing
+/// forever, and the lifetime cap stops bounding anything. Here either both
+/// increments and the row commit, or the transaction aborts having written
+/// nothing.
+///
+/// The hard cap is claimed *first*, carrying the guard, so a terminal refusal
+/// outranks a recoverable one: a parent that has spent its lifetime budget is
+/// not helped by being told its resettable counter is also full.
+///
+/// There is no `$held` gate — [`claim_and_create`]'s exists because its child
+/// carries a deterministic id two writers can both aim at. This one's caller
+/// mints a fresh monotonic ULID on a table with no `UNIQUE` index, so no rival
+/// can target that id, and its absence is also what keeps the batch retryable:
+/// no statement in it can legitimately answer "already exists" (see
+/// [`crate::database::transaction_with_retry`]).
+///
+/// The two counters are named one by one rather than passed as a pair of
+/// arrays: which slot is the resettable one and which is terminal decides
+/// whether a refusal is phrased "clear it and carry on" or "this is over", and
+/// two `[i64; 2]` positions swapped by mistake compile, pass every test — both
+/// slots are the same type — and misreport that forever. The names are the
+/// guard against it.
+///
+/// The fields and `guard` are always in-crate constants, never user input.
+pub(crate) async fn claim_two_when_and_create<T: SurrealValue + Clone>(
+    parent: &RecordId,
+    soft_field: &str,
+    soft_cap: i64,
+    hard_field: &str,
+    hard_cap: i64,
+    guard: &str,
+    id: &RecordId,
+    content: &T,
+    db: &Database,
+) -> Result<ClaimedTwo<T>, AppError> {
+    // Parenthesized `??` throughout: `n ?? 0 < $cap` parses as `n ?? (0 < $cap)`,
+    // which is truthy for every row and would claim past the cap.
+    let sql = format!(
+        "BEGIN TRANSACTION;
+         LET $lifetime = (UPDATE $parent SET {hard_field} = ({hard_field} ?? 0) + 1 \
+             WHERE ({hard_field} ?? 0) < $hard AND ({guard}) RETURN VALUE id);
+         IF array::len($lifetime) = 0 {{ THROW '{HARD_FULL_MARK}' }};
+         LET $seat = (UPDATE $parent SET {soft_field} = ({soft_field} ?? 0) + 1 \
+             WHERE ({soft_field} ?? 0) < $soft RETURN VALUE id);
+         IF array::len($seat) = 0 {{ THROW '{SOFT_FULL_MARK}' }};
+         CREATE $id CONTENT $row;
+         COMMIT TRANSACTION;"
+    );
+    let _guard = CLAIM_LOCK.lock().await;
+    let mut last = None;
+    for attempt in 0..CAP_WRITE_TRIES {
+        backoff(attempt).await;
+        let attempted = db
+            .query(sql.as_str())
+            .bind(("parent", parent.clone()))
+            .bind(("soft", soft_cap))
+            .bind(("hard", hard_cap))
+            .bind(("id", id.clone()))
+            .bind(("row", content.clone()))
+            .await;
+        let mut result = match attempted {
+            Ok(result) => result,
+            Err(err) if lost_the_race(&err) => {
+                last = Some(err);
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
+        // An aborted transaction errors *every* slot, most with a generic "not
+        // executed" — only the failing slot says why. The two markers are read
+        // before the conflict check, because a `THROW` is a decision.
+        let mut errors = result.take_errors();
+        if errors
+            .values()
+            .any(|error| error.to_string().contains(HARD_FULL_MARK))
+        {
+            return Ok(ClaimedTwo::FullHard);
+        }
+        if errors
+            .values()
+            .any(|error| error.to_string().contains(SOFT_FULL_MARK))
+        {
+            return Ok(ClaimedTwo::FullSoft);
+        }
+        if errors.values().any(lost_the_race) {
+            last = errors.drain().map(|(_, error)| error).find(lost_the_race);
+            continue;
+        }
+        if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+            return Err(error.into());
+        }
+        // Slots count BEGIN, two LETs and two IFs: the CREATE is slot 5.
+        return result
+            .take::<Vec<T>>(5)?
+            .into_iter()
+            .next()
+            .map(ClaimedTwo::Made)
             .ok_or_else(|| AppError::Internal("cap claim wrote no row".into()));
     }
     Err(last
@@ -340,4 +473,145 @@ async fn write(
     Err(last
         .map(AppError::from)
         .unwrap_or_else(|| AppError::Internal("cap counter write never ran".into())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::constant::{
+        BOARD_EPOCH_STROKE_COUNT_FIELD, BOARD_OPEN_GUARD, BOARD_TOTAL_STROKE_COUNT_FIELD,
+    };
+
+    #[derive(Debug, Clone, SurrealValue)]
+    struct Stroke {
+        board: RecordId,
+        author: RecordId,
+        kind: String,
+        epoch: i64,
+        created_at: i64,
+    }
+
+    /// The pair of counters, re-read out of the store — never off a return
+    /// value, which the in-memory engine forges wins on (see `CLAIM_LOCK`).
+    async fn stored(db: &Database) -> (i64, i64) {
+        let mut result = db
+            .query("SELECT VALUE [epoch_stroke_count ?? 0, total_stroke_count ?? 0] FROM board:b")
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let rows: Vec<Vec<i64>> = result.take(0).unwrap();
+        (rows[0][0], rows[0][1])
+    }
+
+    async fn strokes(db: &Database) -> usize {
+        let mut result = db
+            .query("SELECT VALUE id FROM board_stroke")
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        result.take::<Vec<RecordId>>(0).unwrap().len()
+    }
+
+    async fn a_board(epoch: i64, total: i64, locked: bool) -> Database {
+        let db = crate::database::init_mem().await.unwrap();
+        db.query(
+            "CREATE user:u SET username = 'u', password_hash = 'x';
+             CREATE board:b SET creator = user:u, title = 't', participants = [user:u],
+                 locked = $locked, epoch = 0, epoch_stroke_count = $epoch,
+                 total_stroke_count = $total, created_at = 1;",
+        )
+        .bind(("locked", locked))
+        .bind(("epoch", epoch))
+        .bind(("total", total))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+        db
+    }
+
+    fn a_stroke() -> Stroke {
+        Stroke {
+            board: RecordId::new("board", "b"),
+            author: RecordId::new("user", "u"),
+            kind: "stroke".into(),
+            epoch: 0,
+            created_at: 2,
+        }
+    }
+
+    async fn claim(db: &Database, caps: [i64; 2], key: &str) -> ClaimedTwo<Stroke> {
+        claim_two_when_and_create(
+            &RecordId::new("board", "b"),
+            BOARD_EPOCH_STROKE_COUNT_FIELD,
+            caps[0],
+            BOARD_TOTAL_STROKE_COUNT_FIELD,
+            caps[1],
+            BOARD_OPEN_GUARD,
+            &RecordId::new("board_stroke", key),
+            &a_stroke(),
+            db,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn both_counters_move_together_or_not_at_all() {
+        let db = a_board(0, 0, false).await;
+        assert!(matches!(
+            claim(&db, [2, 2], "s1").await,
+            ClaimedTwo::Made(_)
+        ));
+        assert_eq!(stored(&db).await, (1, 1));
+        assert_eq!(strokes(&db).await, 1);
+    }
+
+    /// One cap refuses; the *other* counter must not have advanced, asserted by
+    /// re-reading the row. A drift here would let the lifetime cap be passed.
+    #[tokio::test]
+    async fn a_refused_claim_advances_neither_counter() {
+        // Soft (epoch) full, hard (lifetime) with room to spare.
+        let db = a_board(5, 5, false).await;
+        assert!(matches!(
+            claim(&db, [5, 99], "s1").await,
+            ClaimedTwo::FullSoft
+        ));
+        assert_eq!(stored(&db).await, (5, 5));
+        assert_eq!(strokes(&db).await, 0);
+
+        // Hard full, soft with room to spare.
+        let db = a_board(5, 5, false).await;
+        assert!(matches!(
+            claim(&db, [99, 5], "s1").await,
+            ClaimedTwo::FullHard
+        ));
+        assert_eq!(stored(&db).await, (5, 5));
+        assert_eq!(strokes(&db).await, 0);
+    }
+
+    /// The two `THROW` markers must reach the caller as *different* answers:
+    /// one board is recoverable by a clear, the other is read-only for good.
+    #[tokio::test]
+    async fn the_two_caps_refuse_distinguishably() {
+        let db = a_board(5, 5, false).await;
+        let soft = claim(&db, [5, 99], "s1").await;
+        let hard = claim(&db, [99, 5], "s2").await;
+        assert!(matches!(soft, ClaimedTwo::FullSoft));
+        assert!(matches!(hard, ClaimedTwo::FullHard));
+        assert_eq!(stored(&db).await, (5, 5));
+    }
+
+    #[tokio::test]
+    async fn the_guard_refuses_a_locked_board() {
+        let db = a_board(0, 0, true).await;
+        assert!(matches!(
+            claim(&db, [9, 9], "s1").await,
+            ClaimedTwo::FullHard
+        ));
+        assert_eq!(stored(&db).await, (0, 0));
+        assert_eq!(strokes(&db).await, 0);
+    }
 }

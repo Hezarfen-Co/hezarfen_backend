@@ -29,6 +29,7 @@ async fn spawn_server_with_ai(ai: Option<hezarfen_backend::ai::AiBridge>) -> (St
         rate_limit: RateLimitConfig::unlimited(),
         chatbot_limit: Default::default(),
         exam_presence: Default::default(),
+        board_hub: Default::default(),
         db_up: Default::default(),
         ai,
     });

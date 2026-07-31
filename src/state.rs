@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use tokio::sync::broadcast;
+
 use crate::ai::AiBridge;
 use crate::database::Database;
 use crate::rate_limit::{RateLimitConfig, UserRateLimiter};
@@ -28,6 +30,8 @@ pub struct AppState {
     pub chatbot_limit: UserRateLimiter,
     /// Who is inside which exam room right now (see [`ExamPresence`]).
     pub exam_presence: ExamPresence,
+    /// Live stroke fan-out for the shared whiteboards (see [`BoardHub`]).
+    pub board_hub: BoardHub,
     /// Whether the database socket answered its last ping (see [`DbHealth`]).
     pub db_up: DbHealth,
     /// The QUIC bridge to the AI services, when one is configured
@@ -116,9 +120,86 @@ impl ExamPresence {
     }
 }
 
+/// One broadcast channel per live whiteboard, keyed by the board's record key,
+/// so a stroke saved by one socket reaches every *other* socket in that board.
+/// Nothing else in this codebase fans out — an exam room only ever replies to
+/// the socket that spoke — so this is the only multi-subscriber push we have.
+///
+/// The socket count exists to drop the entry when the last socket leaves;
+/// without it the map would keep one channel per board ever opened, forever.
+///
+/// The inner mutex only guards the map (never held across an await — keep it
+/// that way): every method locks, mutates or clones out, and drops the guard
+/// before the caller can await anything.
+#[derive(Clone, Default)]
+pub struct BoardHub(Arc<Mutex<HashMap<String, (broadcast::Sender<String>, usize)>>>);
+
+impl BoardHub {
+    /// Count one socket into `board` and hand back its stream of other
+    /// people's frames, creating the channel on the first join.
+    pub fn subscribe(&self, board: &str) -> broadcast::Receiver<String> {
+        let mut boards = self.0.lock().expect("board hub lock");
+        let room = boards
+            .entry(board.to_string())
+            .or_insert_with(|| (broadcast::channel(crate::constant::BOARD_HUB_CAPACITY).0, 0));
+        room.1 += 1;
+        room.0.subscribe()
+    }
+
+    /// Push `frame` to every socket currently subscribed to `board`. A send
+    /// with no receivers left is the normal empty-room case, not a failure.
+    pub fn publish(&self, board: &str, frame: String) {
+        let sender = {
+            let boards = self.0.lock().expect("board hub lock");
+            boards.get(board).map(|room| room.0.clone())
+        };
+        if let Some(sender) = sender {
+            let _ = sender.send(frame);
+        }
+    }
+
+    /// Count one socket out of `board`; the last one out drops the channel.
+    pub fn leave(&self, board: &str) {
+        let mut boards = self.0.lock().expect("board hub lock");
+        match boards.get_mut(board) {
+            Some(room) if room.1 > 1 => room.1 -= 1,
+            // Last one out, or an unbalanced leave — either way the room is
+            // empty, and a stale entry would leak for the process's lifetime.
+            _ => {
+                boards.remove(board);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn every_subscriber_gets_the_stroke_and_the_room_is_reclaimed() {
+        let hub = BoardHub::default();
+        let mut alice = hub.subscribe("board-a");
+        let mut bob = hub.subscribe("board-a");
+        hub.publish("board-a", "stroke".to_string());
+        assert_eq!(alice.recv().await.expect("alice"), "stroke");
+        assert_eq!(bob.recv().await.expect("bob"), "stroke");
+
+        // Boards are independent, and publishing into an empty one is a no-op.
+        hub.publish("board-b", "nobody home".to_string());
+        assert!(!hub.0.lock().unwrap().contains_key("board-b"));
+
+        hub.leave("board-a");
+        assert!(
+            hub.0.lock().unwrap().contains_key("board-a"),
+            "one socket of two out keeps the room"
+        );
+        hub.leave("board-a");
+        assert!(
+            hub.0.lock().unwrap().is_empty(),
+            "the last socket out must drop the entry, or the map leaks"
+        );
+    }
 
     #[tokio::test]
     async fn only_the_last_socket_out_is_a_real_exit() {
