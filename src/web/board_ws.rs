@@ -69,6 +69,7 @@ use crate::constant::{BOARD_REPLAY_CHUNK, BOARD_WS_TICK_SECS, MAX_BOARD_ID_LEN};
 use crate::database::Database;
 use crate::domain::board::{Board, BoardId};
 use crate::domain::board_stroke::BoardStroke;
+use crate::domain::role::Role;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
@@ -108,9 +109,12 @@ enum ClientMessage {
 
 /// Enter the caller's board room. Every gate runs *before* the upgrade so a
 /// rejection is an HTTP status rather than an instant close: no session (401),
-/// and a board that does not exist — or that the caller is not on — is the
+/// and a board that does not exist — or that the caller is not on, or that the
+/// caller is a `parent` and so barred from the whiteboard outright — is the
 /// same **404**, because a non-participant must not learn a board exists (the
-/// rationale at `src/lib.rs`).
+/// rationale at `src/lib.rs`). Refusing the door is also what stops a parent
+/// drawing: no socket, no `stroke` frame, and no per-stroke role read on the
+/// hot path.
 pub async fn board_ws(
     State(st): State<AppState>,
     CurrentUser(user): CurrentUser,
@@ -120,7 +124,7 @@ pub async fn board_ws(
     // Length-capped before the key is read back or echoed in a `state` frame.
     // A key this long names no board, so it answers like any other stranger's
     // board: 404.
-    if id.len() > MAX_BOARD_ID_LEN {
+    if id.len() > MAX_BOARD_ID_LEN || !user.get_role().at_least(Role::Student) {
         return Err(AppError::NotFound);
     }
     let board = Board::read(&BoardId::from_key(&id), &st.db)

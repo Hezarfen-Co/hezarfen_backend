@@ -10,8 +10,8 @@ attendance, pomodoro, and homework reports — that's the whole role. Notes are 
 per-file size cap is school policy in settings (`max_file_bytes`, default
 5 MiB). Any two users can **message** each other, mail-style — subject +
 body into the recipient's inbox, each side filing its own copy through
-archive/trash with a read flag the sender sees as a receipt (one of the two
-places a `parent` writes — whiteboards below are the other). Attendance is event + attendees: create an event with an **audience**
+archive/trash with a read flag the sender sees as a receipt (the only place a
+`parent` writes). Attendance is event + attendees: create an event with an **audience**
 (the whole school, one role, a course's enrollment, or a **registration**
 signup list — omit for school-wide), then teachers mark the expected attendees
 present / absent / late / excused (students never self-mark), and a **roster
@@ -111,8 +111,10 @@ inference outlives a request: the turn plus an empty `pending` answer are
 written *first*, the call goes out after, so a reload never loses an answer;
 the client then polls the message or reads it off an SSE stream (see
 "Chatbot").
-Any signed-in account (a `parent` included) can also open a **collaborative
-whiteboard**: a titled board whose membership is an **ad-hoc invite list** —
+Any account from `student` upwards can also open a **collaborative
+whiteboard** (a `parent` gets no whiteboard access at all — it can neither open
+one nor be invited onto one): a titled board whose membership is an **ad-hoc
+invite list** —
 the creator names participant user ids, and no course, session or appointment
 is involved. Every participant draws over a WebSocket, the creator alone
 clears, locks, closes or deletes, and someone who is not on a board gets a
@@ -2503,9 +2505,21 @@ context without either end having to be redeployed in lockstep.
 
 A board is a shared canvas whose membership is an **ad-hoc invite list**: the
 creator names participant user ids at `POST /boards` and that is the whole
-model — no course, no lesson session, no appointment. Any signed-in account
-(a `parent` included) may open one. **Every participant draws; the creator
+model — no course, no lesson session, no appointment. Any account from
+`student` upwards may open one. **Every participant draws; the creator
 alone clears, locks, closes or deletes.**
+
+**No parents, anywhere.** The `parent` role is the school's read-only observer,
+and it has no whiteboard access at all — not a view-only tier, none. It is
+refused `POST /boards` and `GET /boards` with a `403`, and it cannot be *named*
+in an invite list either: `resolve_participants` rejects a parent id with a
+`400`, so a parent is never on a roster in the first place. That one cut is
+what closes the rest — never on a roster means the id-scoped routes and the
+room's door already answer the outsider's `404` (never a `403`, which would
+confirm the board is there), and no socket opens, so no `stroke` frame can be
+sent. The role bar is re-checked on the read path and at the door as well, so a
+board row written before this rule that still lists a parent is inert: that
+parent sees a `404` for it like any stranger.
 
 **Two doors, two statuses.** A caller who is not on a board gets a `404` on
 every route, its existence included — an outsider must never learn a board is
