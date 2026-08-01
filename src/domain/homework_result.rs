@@ -128,14 +128,23 @@ impl HomeworkResult {
     /// concurrent write to slip past. A submission that does not exist yet is
     /// left alone — grading absent work must not conjure a hand-in (the report reads
     /// `submitted`/`missing`/`late` straight off that row).
+    ///
+    /// That one case is where this function stops defending itself: a student's
+    /// *first* hand-in committing between this grade and nothing-to-stamp would
+    /// land unstamped, leaving a grade beside an editable submission. Nothing
+    /// here forbids it — what forbids it is the caller. Grading holds
+    /// `HOMEWORK_LOCK` (see `crate::web::homework`) for writing across this
+    /// whole transaction while every student-side write holds it for reading across
+    /// its own, and the two leases are mutually exclusive in the one process
+    /// this backend runs as, so the interleaving never gets a window.
     //
-    // ponytail: that one case keeps a residual race — a student's *first* hand-in
-    // committing between this grade and nothing-to-stamp lands unstamped, so a
-    // grade of never-submitted work can end up beside an editable submission.
-    // The web layer's pre-flight read still refuses it whenever the grade landed
-    // first, so only a genuine collision slips through. Closing it needs a row to
-    // stamp: either a tombstone submission every read path learns to ignore, or
-    // moving the freeze onto a per-(homework, user) record both sides own.
+    // ponytail: that makes the freeze depend on lock discipline at the call
+    // sites, not on this row. Moving a student write's lease to *after* its
+    // database write — or sharding HOMEWORK_LOCK per homework — reopens the
+    // window with nothing to catch it. Closing it in the domain layer needs a
+    // record both sides own (a per-(homework, user) row the grade can always
+    // stamp); a tombstone submission is not it, since every read path would
+    // have to learn to ignore it and one missed filter fabricates a hand-in.
     pub async fn grade(
         homework: &HomeworkId,
         user: &UserId,

@@ -44,13 +44,17 @@ use super::{
 
 /// Serializes the homework subsystem's cross-record check-then-writes, which
 /// `BEGIN…COMMIT` cannot (write skew) — the same reasoning as
-/// [`crate::web::exams::EXAM_LOCK`]. It orders requests but cannot cover a
-/// round trip, so the rule it can no longer be trusted with is the freeze: a
-/// graded submission used to stay unedited because the "no grade yet" read and
-/// the write it licensed sat under one lease, with the database consulted in
-/// between. That rule moved into the database — grading stamps
-/// [`crate::constant::SUBMISSION_GRADED_FIELD`] on the submission row and every
-/// student-side write carries `graded_by_result = NONE` as its own condition.
+/// [`crate::web::exams::EXAM_LOCK`]. Every lease below is held across the
+/// database write it guards, so within this one process it does order a full
+/// round trip — but the freeze no longer *rests* on that: a graded submission
+/// used to stay unedited only because the "no grade yet" read and the write it
+/// licensed sat under one lease. That rule now lives in the database too —
+/// grading stamps [`crate::constant::SUBMISSION_GRADED_FIELD`] on the
+/// submission row and every student-side write carries `graded_by_result =
+/// NONE` as its own condition. The one case the stamp cannot cover — grading
+/// work with no submission row yet — falls back to the lease pair, so a write
+/// lease must never stop spanning its own database call (see
+/// [`crate::domain::homework_result::HomeworkResult::grade`]).
 ///
 /// What still leases it, honestly:
 /// - Write: the homework PATCH's orphan guard ([`update_homework`]), the
