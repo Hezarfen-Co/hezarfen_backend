@@ -617,7 +617,7 @@ pub(crate) async fn question_from_bank(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "No such exam, no such question in it, or no bank template the caller may see", body = ErrorResponse),
-        (status = 409, description = "Attempts have started — questions are frozen", body = ErrorResponse),
+        (status = 409, description = "Attempts have started — questions are frozen, or the question's subject was re-tagged since the caller read it — nothing was written, re-read and retry", body = ErrorResponse),
     ),
 )]
 pub(crate) async fn question_refresh_from_bank(
