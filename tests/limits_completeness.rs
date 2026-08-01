@@ -176,7 +176,7 @@ const EXCLUDED: &[(&str, &str)] = &[
     // it is reconciled at — publishing that would invite pacing against it.
     (
         "RATE_SYNC_INTERVAL_SECS",
-        "how often a replica reconciles its counters",
+        "how often the process folds its counters into the database",
     ),
     ("RATE_SYNC_TIMEOUT_SECS", "deadline on one sync round"),
     (
