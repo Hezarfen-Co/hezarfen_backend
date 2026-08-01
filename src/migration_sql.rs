@@ -239,6 +239,9 @@ pub const MIGRATION: &str = "
     -- write-skew between concurrent request tasks (see `crate::domain::cap`).
     -- Absent reads as zero, so no Rust struct needs it.
     DEFINE FIELD IF NOT EXISTS course_count ON term TYPE option<int>;
+    -- Classes linking this term, the other half of the same guard. A column of
+    -- its own because `course_count` is seeded from the course rows alone.
+    DEFINE FIELD IF NOT EXISTS class_count ON term TYPE option<int>;
 
     DEFINE TABLE IF NOT EXISTS course SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS creator ON course TYPE record<user>;
@@ -262,10 +265,41 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS homework_count ON subject TYPE option<int>;
     DEFINE INDEX IF NOT EXISTS subject_course ON subject FIELDS course;
 
+    -- A class (şube) is a named set of students that bulk-manages real
+    -- `enrollment` rows: `class_member` is one student in it, `class_course` one
+    -- course it is attached to. Both counters gate the class delete.
+    DEFINE TABLE IF NOT EXISTS class_group SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS name ON class_group TYPE string;
+    DEFINE FIELD IF NOT EXISTS grade ON class_group TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS term ON class_group TYPE option<record<term>>;
+    DEFINE FIELD IF NOT EXISTS creator ON class_group TYPE record<user>;
+    DEFINE FIELD IF NOT EXISTS class_member_count ON class_group TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS class_course_count ON class_group TYPE option<int>;
+
+    DEFINE TABLE IF NOT EXISTS class_member SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS class ON class_member TYPE record<class_group>;
+    DEFINE FIELD IF NOT EXISTS user ON class_member TYPE record<user>;
+    DEFINE FIELD IF NOT EXISTS added_by ON class_member TYPE record<user>;
+    DEFINE INDEX IF NOT EXISTS class_member_class_user ON class_member FIELDS class, user UNIQUE;
+    DEFINE INDEX IF NOT EXISTS class_member_class ON class_member FIELDS class;
+    DEFINE INDEX IF NOT EXISTS class_member_user ON class_member FIELDS user;
+
+    DEFINE TABLE IF NOT EXISTS class_course SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS class ON class_course TYPE record<class_group>;
+    DEFINE FIELD IF NOT EXISTS course ON class_course TYPE record<course>;
+    DEFINE FIELD IF NOT EXISTS attached_by ON class_course TYPE record<user>;
+    DEFINE INDEX IF NOT EXISTS class_course_class_course ON class_course FIELDS class, course UNIQUE;
+    DEFINE INDEX IF NOT EXISTS class_course_class ON class_course FIELDS class;
+    DEFINE INDEX IF NOT EXISTS class_course_course ON class_course FIELDS course;
+
     DEFINE TABLE IF NOT EXISTS enrollment SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS course ON enrollment TYPE record<course>;
     DEFINE FIELD IF NOT EXISTS user ON enrollment TYPE record<user>;
     DEFINE FIELD IF NOT EXISTS enrolled_by ON enrollment TYPE record<user>;
+    -- The class that pumped this row, absent when a human placed the student
+    -- directly. Absence is the meaning, so there is nothing to backfill: a class
+    -- sweep may only take back the rows it wrote.
+    DEFINE FIELD IF NOT EXISTS source ON enrollment TYPE option<record<class_group>>;
     DEFINE INDEX IF NOT EXISTS enrollment_course_user ON enrollment FIELDS course, user UNIQUE;
     DEFINE INDEX IF NOT EXISTS enrollment_user ON enrollment FIELDS user;
 
