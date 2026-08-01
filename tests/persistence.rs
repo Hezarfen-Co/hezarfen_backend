@@ -1606,6 +1606,203 @@ async fn subject_reference_counts_are_seeded_from_the_rows_that_predate_them() {
     assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
 }
 
+/// A term written before its refcount existed (2026-07-27) carries none, and an
+/// absent counter reads as zero — which would let a manager delete the term half
+/// the timetable still points at. The backfill counts the courses that actually
+/// link to each term, once; a term nobody links to gets an explicit zero, and a
+/// course with no term at all must not be counted into anyone's bucket.
+///
+/// The bite is the last pair of assertions: seed the counter wrong (or not at
+/// all) and the linked term's delete comes back `204` instead of `409`.
+#[tokio::test]
+async fn term_course_counts_are_seeded_from_the_courses_that_link_to_them() {
+    let (app, db) = common::app_and_db().await;
+    let manager = common::login_as(&app, &db, "term_seed_m", "manager").await;
+
+    async fn create_term(app: &Router, cookie: &str, name: &str, starts_at: i64) -> String {
+        let res = send(
+            app,
+            "POST",
+            "/terms",
+            Some(cookie),
+            Some(json!({ "name": name, "starts_at": starts_at, "ends_at": starts_at + 1 })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+        common::id_of(&res.body)
+    }
+    async fn link_course(app: &Router, cookie: &str, title: &str, term: Option<&str>) {
+        let res = send(
+            app,
+            "POST",
+            "/courses",
+            Some(cookie),
+            Some(json!({ "title": title, "term_id": term })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    }
+
+    let linked = create_term(&app, &manager, "linked term", 1).await;
+    let empty = create_term(&app, &manager, "empty term", 10).await;
+    link_course(&app, &manager, "History", Some(&linked)).await;
+    link_course(&app, &manager, "Physics", Some(&linked)).await;
+    link_course(&app, &manager, "Floating", None).await;
+
+    // Age both terms into the pre-counter shape.
+    db.query("UPDATE term UNSET course_count;")
+        .await
+        .expect("age the rows")
+        .check()
+        .expect("age the rows");
+
+    let app = reboot(&db).await;
+
+    let mut counted = db
+        .query("SELECT VALUE course_count FROM term ORDER BY starts_at ASC")
+        .await
+        .expect("counter read")
+        .check()
+        .expect("counter read");
+    assert_eq!(
+        counted.take::<Vec<i64>>(0).expect("counter column"),
+        vec![2, 0],
+        "each term must be seeded from the courses that link to it, \
+         and the termless course from neither"
+    );
+
+    // The seeded counter is the delete guard itself, not a decoration.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/terms/{linked}"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/terms/{empty}"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+}
+
+/// The settings removal guards are two reference-counter tables (2026-07-27):
+/// `kind_ref:<name>` counts the marks graded under an exam kind, `slot_ref:<name>`
+/// the menus published for a meal slot, and a name may leave the list exactly
+/// while its counter reads zero. A volume written before those tables existed
+/// carries no rows at all, and a missing row reads as zero — which would let a
+/// manager drop a kind the whole school is already graded under. The backfill
+/// counts what actually points at each name, once; a name nobody ever used needs
+/// no row (there is no zero pass here, deliberately).
+///
+/// The bite is the last three assertions: seed the counters at zero (or not at
+/// all) and the removals come back `200` instead of `409`.
+#[tokio::test]
+async fn settings_reference_counts_are_seeded_from_the_marks_and_menus_that_predate_them() {
+    let (app, db) = common::app_and_db().await;
+    let teacher = common::login_as(&app, &db, "ref_seed_t", "teacher").await;
+    let manager = common::login_as(&app, &db, "ref_seed_m", "manager").await;
+    let ali = common::login(&app, "ref_seed_ali").await;
+    let veli = common::login(&app, "ref_seed_veli").await;
+    let (ali_id, veli_id) = (me_id(&app, &ali).await, me_id(&app, &veli).await);
+
+    // Two marks under `final`, none under any other kind.
+    let course = create_course(&app, &teacher, "Biology").await;
+    enroll(&app, &teacher, &course, &ali_id).await;
+    enroll(&app, &teacher, &course, &veli_id).await;
+    let exam = create_exam(&app, &teacher, &course, "Final", "final").await;
+    for student in [&ali_id, &veli_id] {
+        let res = send(
+            &app,
+            "POST",
+            &format!("/exams/{exam}/results"),
+            Some(&teacher),
+            Some(json!({ "user_id": student, "mark": 70 })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    }
+
+    // Two menus under `lunch`, none under any other slot.
+    for date in ["2026-09-21", "2026-09-22"] {
+        let res = send(
+            &app,
+            "POST",
+            "/meals/menus",
+            Some(&manager),
+            Some(json!({ "date": date, "slot": "lunch" })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    }
+
+    // Age the volume into the pre-counter shape: the tables did not exist, so
+    // neither did any of their rows.
+    db.query("DELETE kind_ref; DELETE slot_ref;")
+        .await
+        .expect("age the volume")
+        .check()
+        .expect("age the volume");
+
+    let app = reboot(&db).await;
+
+    let mut counted = db
+        .query(
+            "SELECT VALUE [record::id(id), count ?? 0] FROM kind_ref ORDER BY id ASC; \
+             SELECT VALUE [record::id(id), count ?? 0] FROM slot_ref ORDER BY id ASC;",
+        )
+        .await
+        .expect("counter read")
+        .check()
+        .expect("counter read");
+    assert_eq!(
+        counted.take::<Vec<(String, i64)>>(0).expect("kind_ref"),
+        vec![("final".to_string(), 2)],
+        "the graded kind must be seeded from its marks, and only it"
+    );
+    assert_eq!(
+        counted.take::<Vec<(String, i64)>>(1).expect("slot_ref"),
+        vec![("lunch".to_string(), 2)],
+        "the published slot must be seeded from its menus, and only it"
+    );
+
+    // The seeded counters are the removal guards themselves, not decoration:
+    // the referenced names are stuck, an unreferenced one still leaves freely.
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&manager),
+        Some(json!({ "exam_kinds": [{ "name": "quiz", "weight": 1 }] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&manager),
+        Some(json!({ "meal_slots": [{ "name": "breakfast" }, { "name": "snack" }] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&manager),
+        Some(json!({ "meal_slots": [{ "name": "breakfast" }, { "name": "lunch" }] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+}
+
 /// A fee plan's installments are an `array<object>` on the plan row, and the
 /// charges it raised are frozen copies of them. A SCHEMAFULL re-migration
 /// rewrites every field definition it owns, so this is where a nested array
