@@ -498,4 +498,108 @@ mod tests {
             .unwrap();
         assert_eq!(result.take::<Vec<Vec<i64>>>(0).unwrap()[0], vec![7, 9]);
     }
+
+    /// [`Board::delete`] cascades the stroke log and decrements the creator's
+    /// `board_count` off the very record a concurrent stroke claim increments,
+    /// so the two contend by design. Losing that round writes nothing, which is
+    /// what makes re-sending it the recovery; without
+    /// [`crate::database::transaction_with_retry`] a lost round comes out as a
+    /// 500.
+    ///
+    /// A refusal or an `Err(NotFound)` is *correct* here — the board really is
+    /// gone — and must not fail this test. The only defect is `AppError::Db`.
+    ///
+    /// Multi-threaded and on a real server for the reason spelled out on
+    /// [`super::super::course`]'s twin: the current-thread runtime never
+    /// interleaves the two, and the embedded engine does not conflict-check
+    /// concurrent writes to one record at all.
+    ///
+    /// Mutation status, stated honestly: cutting
+    /// [`crate::database::transaction_with_retry`] to a single attempt leaves
+    /// this GREEN — 5 runs of 5, every one at 20/20 contended. The mutation is
+    /// real, not a dud: the same cut reddens the `course.rs` twin in 2 runs of
+    /// 3. So the delete here never actually loses a round in this window, and
+    /// nothing in the suite exercises its retry. Read this as a smoke test that
+    /// a contended delete does not 500 — the retry stays because the batch is
+    /// admissible for it and a lost round is possible in principle, not because
+    /// a test has ever caught it losing one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
+    async fn a_delete_racing_a_stroke_never_answers_500() {
+        use crate::domain::board_stroke::BoardStroke;
+        let (db, _serialized) = crate::database::init_test_server("board_delete_race").await;
+        db.query("CREATE user:c SET username = 'c', password_hash = 'x';")
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let (mut delete_500, mut stroke_500, mut drawn) = (0, 0, 0);
+        let (mut last_delete, mut last_stroke) = (String::new(), String::new());
+        for round in 0..20 {
+            let board = a_board(&db).await;
+            // The delete is held back by a sweeping beat: released together it
+            // is one statement while an append spends a read before it claims,
+            // so it would win every round and the guard would never be
+            // contended at all. Six racers over a 0-3ms sweep put the delete
+            // somewhere inside the counter writes instead.
+            let drop_it = {
+                let (board, db) = (board.clone(), db.clone());
+                let beat = std::time::Duration::from_millis(round % 4);
+                tokio::spawn(async move {
+                    tokio::time::sleep(beat).await;
+                    board.delete(&db).await
+                })
+            };
+            let marks: Vec<_> = (0..6)
+                .map(|mark| {
+                    let (id, db) = (board.get_id().clone(), db.clone());
+                    let author = user("c");
+                    tokio::spawn(async move {
+                        BoardStroke::append(&id, &author, &format!("{{\"m\":{mark}}}"), 0, &db)
+                            .await
+                    })
+                })
+                .collect();
+            let drop_it = drop_it.await.unwrap();
+            if matches!(drop_it, Err(AppError::Db(_))) {
+                delete_500 += 1;
+                last_delete = format!("{drop_it:?}");
+            }
+            // Contention is counted off the claim's own outcome, not off stored
+            // rows: the delete cascades `board_stroke`, so a stroke that landed
+            // and then lost its board leaves nothing behind to count. An `Ok`
+            // means the claim committed against the board row the delete was
+            // tearing down, which is exactly the overlap being measured.
+            let mut claimed = 0;
+            for mark in marks {
+                let mark = mark.await.unwrap();
+                if matches!(mark, Err(AppError::Db(_))) {
+                    stroke_500 += 1;
+                    last_stroke = format!("{mark:?}");
+                }
+                if mark.is_ok() {
+                    claimed += 1;
+                }
+            }
+            if claimed > 0 {
+                drawn += 1;
+            }
+        }
+        eprintln!(
+            "Board::delete raced: {delete_500}/20 delete 500s, {stroke_500} stroke 500s, \
+             {drawn}/20 rounds with a stroke claimed"
+        );
+        assert!(
+            drawn > 0,
+            "no round ever landed a stroke, so the delete's cascade was never contended"
+        );
+        assert_eq!(
+            delete_500, 0,
+            "a raced delete must retry, not 500: {delete_500}/20 rounds, last {last_delete}"
+        );
+        assert_eq!(
+            stroke_500, 0,
+            "a raced stroke must retry, not 500: {stroke_500}/20 rounds, last {last_stroke}"
+        );
+    }
 }

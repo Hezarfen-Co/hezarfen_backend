@@ -272,7 +272,10 @@ pub(crate) enum ClaimedTwo<T> {
 /// slots are the same type — and misreport that forever. The names are the
 /// guard against it.
 ///
-/// The fields and `guard` are always in-crate constants, never user input.
+/// The fields are always in-crate constants, and `guard` is either one or
+/// built in-crate out of numbers this crate read back itself
+/// (`board_stroke::append` appends an `epoch` it took off the board row) —
+/// never text from a client.
 pub(crate) async fn claim_two_when_and_create<T: SurrealValue + Clone>(
     parent: &RecordId,
     soft_field: &str,
