@@ -9,7 +9,7 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use ulid::Ulid;
 
-use crate::constant::{COURSE_COUNT_FIELD, MAX_TERM_NAME_LEN, TERM_TABLE};
+use crate::constant::{COURSE_COUNT_FIELD, MAX_TERM_NAME_LEN, TERM_CLASS_COUNT_FIELD, TERM_TABLE};
 use crate::database::{Database, write_with_retry};
 use crate::domain::field_update::FieldUpdate;
 use crate::domain::page::PagedList;
@@ -133,8 +133,8 @@ impl Term {
             .await
     }
 
-    /// Delete the term, but only while no course links it — nothing here
-    /// unlinks or cascades. `false` = refused, nothing was written.
+    /// Delete the term, but only while no course *and no class* links it —
+    /// nothing here unlinks or cascades. `false` = refused, nothing was written.
     ///
     /// The roster of linking courses is the term's own `course_count`
     /// refcount, claimed by [`crate::domain::course::Course::create`] and
@@ -143,8 +143,15 @@ impl Term {
     /// claims first (and the delete is refused) or finds the row gone (and is
     /// refused itself, with the same 400 the lookup gives). `Err(NotFound)`
     /// keeps the answer a concurrent *delete* used to get.
+    ///
+    /// Classes ([`crate::domain::class_group::ClassGroup`]) link a term the same
+    /// way and count on `class_count` — a column of their own, because
+    /// `course_count` is seeded at boot from the course rows alone.
     pub async fn delete(self, db: &Database) -> Result<bool, AppError> {
-        let sql = format!("DELETE $term WHERE ({COURSE_COUNT_FIELD} ?? 0) = 0 RETURN BEFORE");
+        let sql = format!(
+            "DELETE $term WHERE ({COURSE_COUNT_FIELD} ?? 0) = 0 \
+             AND ({TERM_CLASS_COUNT_FIELD} ?? 0) = 0 RETURN BEFORE"
+        );
         // Through the retry, because the guard reads the very column a course
         // create claims: a lost round writes nothing, and re-sending it is what
         // keeps the answer the 404 or 409 it owes instead of a 500.

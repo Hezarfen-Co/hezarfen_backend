@@ -2,8 +2,8 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use ulid::Ulid;
 
 use crate::constant::{
-    COURSE_COUNT_FIELD, COURSE_TABLE, ENROLLMENT_COUNT_FIELD, MAX_COURSE_DESCRIPTION_LEN,
-    MAX_COURSE_TITLE_LEN, REF_COUNT_FIELD,
+    CLASS_COURSE_COUNT_FIELD, COURSE_COUNT_FIELD, COURSE_TABLE, ENROLLMENT_COUNT_FIELD,
+    MAX_COURSE_DESCRIPTION_LEN, MAX_COURSE_TITLE_LEN, REF_COUNT_FIELD,
 };
 use crate::database::{Database, transaction_with_retry};
 use crate::domain::cap;
@@ -386,7 +386,9 @@ impl Course {
     /// Delete the course and cascade-remove everything inside it: results,
     /// attempts, answers, and question/answer images of its exams, its
     /// homework with their submissions, submission files, and grades, its
-    /// enrollments, its sessions with their roll call, its subjects, and the
+    /// enrollments, the class attachments that pumped some of them (each class
+    /// gets its count back, or it would be undeletable over rows pointing at
+    /// nothing), its sessions with their roll call, its subjects, and the
     /// exams themselves. The children go in one transaction so a crash can't
     /// leave an exam pointing at a deleted course. The image and
     /// homework-file *blobs* are the web layer's to remove — it collects
@@ -429,6 +431,11 @@ impl Course {
              DELETE homework_file WHERE submission IN (SELECT VALUE id FROM homework_submission WHERE homework IN (SELECT VALUE id FROM homework WHERE course = $course));
              DELETE homework_submission WHERE homework IN (SELECT VALUE id FROM homework WHERE course = $course);
              DELETE homework_result WHERE homework IN (SELECT VALUE id FROM homework WHERE course = $course);
+             LET $detached = (DELETE class_course WHERE course = $course RETURN BEFORE);
+             FOR $row IN ($detached ?? []) {{
+                 UPDATE $row.class SET {CLASS_COURSE_COUNT_FIELD} = \
+                     math::max([({CLASS_COURSE_COUNT_FIELD} ?? 0) - 1, 0]);
+             }};
              DELETE session_attendance WHERE course = $course;
              DELETE course_session WHERE course = $course;
              DELETE enrollment WHERE course = $course;

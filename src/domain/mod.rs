@@ -13,6 +13,7 @@ pub mod board_stroke;
 pub mod cap;
 pub mod chatbot_message;
 pub mod chatbot_thread;
+pub mod class_group;
 pub mod course;
 pub mod course_session;
 pub mod dietary_profile;

@@ -3,6 +3,7 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use crate::constant::{ENROLLMENT_COUNT_FIELD, ENROLLMENT_TABLE};
 use crate::database::Database;
 use crate::domain::cap;
+use crate::domain::class_group::ClassGroupId;
 use crate::domain::course::{Course, CourseId};
 use crate::domain::page::PagedList;
 use crate::domain::user::UserId;
@@ -37,12 +38,19 @@ impl EnrollmentId {
 
 /// A user's membership in a course. Grading requires it; removing it hides the
 /// user's marks from the report but never deletes result rows.
+///
+/// `source` names the class ([`crate::domain::class_group::ClassGroup`]) that
+/// pumped this row, and is absent when a human placed the student directly —
+/// every row written before classes existed, and every row placed by hand since.
+/// Absence *is* the meaning, so nothing backfills it: a class sweep may only take
+/// back the rows it wrote.
 #[derive(Debug, Clone, SurrealValue)]
 pub struct Enrollment {
     id: EnrollmentId,
     course: CourseId,
     user: UserId,
     enrolled_by: UserId,
+    source: Option<ClassGroupId>,
 }
 
 impl Enrollment {
@@ -60,6 +68,11 @@ impl Enrollment {
 
     pub fn get_enrolled_by(&self) -> &UserId {
         &self.enrolled_by
+    }
+
+    /// The class that pumped this row, or `None` for a hand-placed one.
+    pub fn get_source(&self) -> Option<&ClassGroupId> {
+        self.source.as_ref()
     }
 
     /// Enroll (idempotently) `user` into `course`. One row per (course, user),
@@ -92,6 +105,9 @@ impl Enrollment {
             course: course.clone(),
             user: user.clone(),
             enrolled_by: enrolled_by.clone(),
+            // Hand-placed: no source key at all is written, which is what makes
+            // a class sweep unable to take this row back.
+            source: None,
         };
         // CREATE, not UPSERT, and in the seat's own transaction: a duplicate has
         // to be *seen*, or the pair's second writer would keep the seat it
@@ -187,5 +203,74 @@ impl Enrollment {
             .await?
             .check()?;
         Ok(result.take::<Vec<Enrollment>>(3)?.into_iter().next())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The database strips `NONE`-valued optional columns, and every enrollment
+    /// row written before classes existed has no `source` key at all — both must
+    /// decode as a hand-placed row, never as a decode error that 500s a roster.
+    #[tokio::test]
+    async fn enrollment_decodes_without_source_key() {
+        use surrealdb::types::Value;
+
+        let class = crate::domain::class_group::ClassGroupId::from_key("9a");
+        let course = CourseId::from_key("01J8XZ0K3Q8G7X2M4N5P6R7S8T");
+        let student = UserId::from_key("01J8XZ0K3Q8G7X2M4N5P6R7S8U");
+        let enrollment = Enrollment {
+            id: EnrollmentId::composite(&course, &student),
+            course,
+            user: student,
+            enrolled_by: UserId::from_key("mgr"),
+            source: Some(class.clone()),
+        };
+        assert_eq!(enrollment.get_source(), Some(&class));
+
+        let Value::Object(mut object) = enrollment.into_value() else {
+            panic!("an enrollment must encode as an object");
+        };
+        object.remove("source");
+        let decoded = Enrollment::from_value(Value::Object(object)).unwrap();
+        assert_eq!(decoded.get_source(), None);
+    }
+
+    /// And the other half of "absence is the meaning": a hand-placed enrollment
+    /// must store *no* source key, or a class sweep would take back a row it
+    /// never wrote. Asserted on the stored row, not the returned one.
+    #[tokio::test]
+    async fn a_hand_placed_enrollment_stores_no_source_key() {
+        use crate::domain::course::{Course, CourseDescription, CourseKind, CourseTitle};
+
+        let db = crate::database::init_mem().await.unwrap();
+        let teacher = UserId::from_key("teacher");
+        let course = Course::create(
+            &teacher,
+            CourseTitle::try_new("algebra").unwrap(),
+            CourseDescription::try_new("").unwrap(),
+            CourseKind::course(),
+            None,
+            None,
+            &db,
+        )
+        .await
+        .unwrap();
+        Enrollment::enroll(course.get_id(), &UserId::from_key("student"), &teacher, &db)
+            .await
+            .unwrap();
+
+        let mut result = db
+            .query("SELECT VALUE 'source' IN object::keys($this) FROM enrollment")
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        assert_eq!(
+            result.take::<Vec<bool>>(0).unwrap(),
+            vec![false],
+            "a hand-placed row may carry no source key"
+        );
     }
 }
