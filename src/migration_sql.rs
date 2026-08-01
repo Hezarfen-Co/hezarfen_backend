@@ -189,11 +189,12 @@ pub const MIGRATION: &str = "
     -- claim columns it needs no PRE_REPAIR — the table just goes.
     REMOVE TABLE IF EXISTS migration_lock;
 
-    -- How much of a rate-limit budget the whole fleet has spent in one wall
-    -- window (2026-07-27). One row per tier+client+window, id-keyed so every
-    -- replica lands on the same record; `hits` is the cross-replica total each
-    -- replica folds its local admits into (see `crate::rate_limit`). Rows are
-    -- swept by the same task once their window is past.
+    -- How much of a rate-limit budget one client has spent in one wall window
+    -- (2026-07-27). One row per tier+client+window, id-keyed so a restart of
+    -- the process lands back on the same record; `hits` is the durable total
+    -- the in-memory bucket folds its local admits into (see
+    -- `crate::rate_limit`), which is what carries a window across a restart.
+    -- Rows are swept by the same task once their window is past.
     DEFINE TABLE IF NOT EXISTS rate_limit SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS hits ON rate_limit TYPE int DEFAULT 0;
     DEFINE FIELD IF NOT EXISTS window_start ON rate_limit TYPE int;
@@ -207,8 +208,9 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS audience.role ON event TYPE option<string>;
     DEFINE FIELD IF NOT EXISTS audience.course ON event TYPE option<record<course>>;
     DEFINE FIELD IF NOT EXISTS audience.capacity ON event TYPE option<int>;
-    -- Seats taken on the signup list, the cross-replica capacity guard (see
-    -- `crate::domain::cap`). Absent reads as zero, so no Rust struct needs it.
+    -- Seats taken on the signup list, the stored capacity guard that closes
+    -- write-skew between concurrent request tasks (see `crate::domain::cap`).
+    -- Absent reads as zero, so no Rust struct needs it.
     DEFINE FIELD IF NOT EXISTS registration_count ON event TYPE option<int>;
     REMOVE FIELD IF EXISTS audience.users ON TABLE event;
     DEFINE FIELD IF NOT EXISTS starts_at ON event TYPE option<int>;
@@ -233,8 +235,9 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS name ON term TYPE string;
     DEFINE FIELD IF NOT EXISTS starts_at ON term TYPE int;
     DEFINE FIELD IF NOT EXISTS ends_at ON term TYPE int;
-    -- Courses still linking this term, the cross-replica delete guard (see
-    -- `crate::domain::cap`). Absent reads as zero, so no Rust struct needs it.
+    -- Courses still linking this term, the stored delete guard that closes
+    -- write-skew between concurrent request tasks (see `crate::domain::cap`).
+    -- Absent reads as zero, so no Rust struct needs it.
     DEFINE FIELD IF NOT EXISTS course_count ON term TYPE option<int>;
 
     DEFINE TABLE IF NOT EXISTS course SCHEMAFULL;
@@ -254,7 +257,7 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS description ON subject TYPE string;
     -- How many exam questions and how many homework still point here. The
     -- delete is conditioned on both reading zero, which is what makes the
-    -- guard hold against a question created on another replica.
+    -- guard hold against a question created by a concurrent request task.
     DEFINE FIELD IF NOT EXISTS exam_question_count ON subject TYPE option<int>;
     DEFINE FIELD IF NOT EXISTS homework_count ON subject TYPE option<int>;
     DEFINE INDEX IF NOT EXISTS subject_course ON subject FIELDS course;
@@ -886,7 +889,8 @@ pub const BACKFILL: &str = "
     -- the owning row is addressed directly rather than searched for; an UPDATE
     -- of a record that isn't there (graded absent work) is an empty no-op. The
     -- `= NONE` guard keeps it one-time, for the same reason the counters below
-    -- are one-time — a peer replica is serving while this runs.
+    -- are one-time — migrate() runs again on every boot against a volume the
+    -- live system has been writing to since.
     FOR $r IN ((SELECT VALUE id FROM homework_result) ?? []) {
         UPDATE type::record('homework_submission', record::id($r))
             SET graded_by_result = $r WHERE graded_by_result = NONE;
@@ -897,9 +901,9 @@ pub const BACKFILL: &str = "
     -- that predates the column is seeded from the children it actually has.
     -- Runs LAST, after the sweeps above have deleted whatever they delete.
     --
-    -- Deliberately one-time (`= NONE` guards every write): a peer replica is
-    -- serving while this boots, and recomputing a counter it is concurrently
-    -- incrementing would hand back a seat that is already taken. An absent
+    -- Deliberately one-time (`= NONE` guards every write): migrate() reruns on
+    -- every boot of an existing volume, and recounting a seeded counter would
+    -- overwrite what the live system has maintained since. An absent
     -- counter reads as zero, so the group pass runs before the zero pass.
     FOR $row IN ((SELECT course, count() AS n FROM enrollment GROUP BY course) ?? []) {
         UPDATE $row.course SET enrollment_count = $row.n WHERE enrollment_count = NONE;
@@ -974,9 +978,10 @@ pub const BACKFILL: &str = "
     -- published for it, and a name is removable exactly while its counter reads
     -- zero. Rows written before the counters existed are counted once here.
     --
-    -- Same `= NONE` guard and the same reason as the caps above: a peer replica
-    -- may already be serving, and recomputing a counter it is incrementing
-    -- would hand back a reference that is still held. No zero pass either — an
+    -- Same `= NONE` guard and the same reason as the caps above: migrate()
+    -- reruns on every boot of an existing volume, and recounting a seeded
+    -- counter would overwrite what the live system has maintained since, handing
+    -- back a reference that is still held. No zero pass either — an
     -- absent counter already reads as zero, and a name nobody ever used needs
     -- no row at all.
     --
