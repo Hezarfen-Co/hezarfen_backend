@@ -759,6 +759,67 @@ mod tests {
         assert_eq!(stored.get_term(), Some(to.get_id()));
     }
 
+    /// The same race with the counters taken out of it. A PATCH that re-states
+    /// the term its snapshot showed shifts *nothing* — [`term::ref_move`] hands
+    /// back no claim and no release — so if the guard were armed off the counter
+    /// move it would not be armed here at all, and the write would land: the
+    /// winner's link silently dragged back, its claim stranded on a term nothing
+    /// points at (undeletable forever) and the reverted-to term linked at a
+    /// count of zero (deletable while linked). The guard is armed by the request
+    /// *carrying* the column instead, which is why this is refused.
+    #[tokio::test]
+    async fn a_stale_re_stater_is_refused_and_reverts_nothing() {
+        let db = crate::database::init_mem().await.unwrap();
+        let from = a_term("2026", &db).await;
+        let to = a_term("2027", &db).await;
+        let course = course_on(Some(from.get_id().clone()), &db).await;
+        let stale = course.clone();
+        course
+            .update(None, None, None, Some(Some(to.get_id().clone())), None, &db)
+            .await
+            .unwrap();
+
+        let error = stale
+            .clone()
+            .update(
+                None,
+                None,
+                None,
+                Some(Some(from.get_id().clone())),
+                None,
+                &db,
+            )
+            .await
+            .expect_err("re-stating a link someone else moved must be refused");
+        assert!(
+            matches!(error, AppError::Conflict(_)),
+            "a lost CAS is a conflict, not a silent 200: {error:?}"
+        );
+        let stored = Course::read(stale.get_id(), &db).await.unwrap().unwrap();
+        assert_eq!(stored.get_term(), Some(to.get_id()), "the winner's link");
+        assert_eq!(
+            count_on(from.get_id(), &db).await,
+            0,
+            "the reverted-to term must not end up linked at zero"
+        );
+        assert_eq!(
+            count_on(to.get_id(), &db).await,
+            1,
+            "…nor the winner's term counted with nothing pointing at it"
+        );
+
+        // A *genuine* no-op re-state — nobody moved underneath it — still lands,
+        // and still moves no counter: the CAS passes trivially.
+        let fresh = Course::read(stale.get_id(), &db).await.unwrap().unwrap();
+        let same = fresh
+            .update(None, None, None, Some(Some(to.get_id().clone())), None, &db)
+            .await
+            .expect("re-stating the link the row really holds is not a conflict");
+        assert_eq!(same.get_term(), Some(to.get_id()));
+        assert_eq!(count_on(from.get_id(), &db).await, 0, "nothing moved");
+        assert_eq!(count_on(to.get_id(), &db).await, 1, "…in either direction");
+    }
+
     /// The rollback proof. The transaction releases the old term *before* it
     /// claims the new one, so a move to a term that is gone has already
     /// decremented when the claim throws — the old count still being 1 is the

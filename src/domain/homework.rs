@@ -27,6 +27,17 @@ use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 use crate::validate::{validate_optional, validate_required};
 
+/// The answer a link to a subject that is not there gets, on create and on
+/// re-tag alike — both claims are conditional writes on the subject row, so a
+/// subject a delete already removed matches nothing and the caller says exactly
+/// what the web layer's pre-flight lookup would have.
+fn subject_gone() -> AppError {
+    AppError::Validation(ValidationError::Invalid {
+        field: "subject_id",
+        reason: "subject does not exist",
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct HomeworkId(RecordId);
 
@@ -160,20 +171,16 @@ impl Homework {
         created_by: &UserId,
         db: &Database,
     ) -> Result<Homework, AppError> {
-        // Take the subject's reference before the row exists — the exam
-        // question's twin ([`crate::domain::exam_question::ExamQuestion`]): the
-        // subject delete is refused while this counter is non-zero, so the
-        // create and the delete contend on the subject record rather than on a
-        // cross-table count neither of them sees the other move. A miss means the
-        // subject is already gone, which is the 400 the web layer's pre-flight
-        // check answers with.
+        // The subject's reference is taken in the very transaction that writes
+        // the row — the exam question's twin
+        // ([`crate::domain::exam_question::ExamQuestion`]): the subject delete
+        // is refused while this counter is non-zero, so the create and the
+        // delete contend on the subject record rather than on a cross-table
+        // count neither of them sees the other move, and a crash can no longer
+        // strand a claim that would make the subject undeletable forever. A
+        // refused claim means the subject is already gone, which is the 400 the
+        // web layer's pre-flight check answers with.
         let counted = subject.record();
-        if !cap::claim(&counted, SUBJECT_HOMEWORK_COUNT_FIELD, cap::UNLIMITED, db).await? {
-            return Err(AppError::Validation(ValidationError::Invalid {
-                field: "subject_id",
-                reason: "subject does not exist",
-            }));
-        }
         let homework = Homework {
             id: HomeworkId::generate(),
             course: course.clone(),
@@ -185,19 +192,20 @@ impl Homework {
             created_by: created_by.clone(),
             created_at: Timestamp::now(),
         };
-        let created: Result<Option<Homework>, AppError> = db
-            .create(homework.id.record())
-            .content(homework)
-            .await
-            .map_err(AppError::from);
-        match created {
-            Ok(Some(homework)) => Ok(homework),
-            other => {
-                // Nothing landed, so the reference goes straight back.
-                cap::release(&counted, SUBJECT_HOMEWORK_COUNT_FIELD, db).await?;
-                other?;
-                Err(AppError::Internal("failed to create homework".into()))
-            }
+        let id = homework.id.record();
+        match cap::claim_and_create(
+            &counted,
+            SUBJECT_HOMEWORK_COUNT_FIELD,
+            cap::UNLIMITED,
+            &id,
+            &homework,
+            db,
+        )
+        .await?
+        {
+            cap::Claimed::Made(created) => Ok(created),
+            cap::Claimed::Full => Err(subject_gone()),
+            cap::Claimed::Duplicate => Err(AppError::Internal("failed to create homework".into())),
         }
     }
 
@@ -296,35 +304,39 @@ impl Homework {
     ) -> Result<Homework, AppError> {
         let assigned = assigned
             .map(|subset| subset.map(|users| users.iter().map(UserId::record).collect::<Vec<_>>()));
-        // A re-tag moves a reference: claim the new subject before the write,
-        // release the old only after it lands, so neither is ever
-        // under-counted (the direction that would let a subject this homework
-        // points at be deleted). Same shape as the exam question's re-tag.
-        let retag = subject
+        // A re-tag moves a reference: the new subject's claim and the old one's
+        // release ride the same transaction as the link write, so no crash can
+        // leave a count without its link (the subject would be undeletable
+        // forever) or a link without its count. `subject` is required, so the
+        // snapshot's value is always the CAS expectation — two PATCHes moving
+        // the same homework off the same subject would otherwise both claim
+        // their target, and the loser is refused with a 409 instead. The
+        // `.refcount` call is unconditional: the CAS is armed by the request
+        // *carrying* `subject_id`, not by a counter moving, so a PATCH that
+        // re-states the tag its snapshot showed — shifting no counter at all —
+        // is still refused when a rival moved the tag in between. A PATCH that
+        // carried no `subject_id` arms nothing and writes what it always did.
+        let (claim, release) = subject
             .as_ref()
             .filter(|next| **next != self.subject)
-            .map(|next| (next.record(), self.subject.record()));
-        if let Some((next, _)) = &retag
-            && !cap::claim(next, SUBJECT_HOMEWORK_COUNT_FIELD, cap::UNLIMITED, db).await?
-        {
-            return Err(AppError::Validation(ValidationError::Invalid {
-                field: "subject_id",
-                reason: "subject does not exist",
-            }));
-        }
-        let written = FieldUpdate::new(self.id.record())
+            .map(|next| (next.record(), self.subject.record()))
+            .unzip();
+        FieldUpdate::new(self.id.record())
             .set("subject", subject.map(|subject| subject.record()))
             .set("title", title)
             .set("description", description)
             .set("due_at", due_at)
             .set("assigned", assigned)
+            .refcount(
+                SUBJECT_HOMEWORK_COUNT_FIELD,
+                "subject",
+                Some(self.subject.record()),
+                claim,
+                release,
+                subject_gone(),
+            )
             .run::<Homework>(db)
-            .await;
-        if let Some((next, previous)) = &retag {
-            let give_back = if written.is_ok() { previous } else { next };
-            cap::release(give_back, SUBJECT_HOMEWORK_COUNT_FIELD, db).await?;
-        }
-        written
+            .await
     }
 
     /// Delete the homework and cascade its submissions, their files, and its
@@ -398,5 +410,256 @@ mod tests {
         // Subset: only the named students.
         assert!(with(Some(vec![a.clone()])).student_sees(&a));
         assert!(!with(Some(vec![a.clone()])).student_sees(&b));
+    }
+
+    use crate::domain::subject::{Subject, SubjectDescription, SubjectName};
+
+    async fn a_subject(name: &str, db: &Database) -> Subject {
+        Subject::create(
+            &CourseId::from_key("course"),
+            SubjectName::try_new(name).unwrap(),
+            SubjectDescription::try_new("").unwrap(),
+            db,
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn homework_on(subject: &SubjectId, db: &Database) -> Homework {
+        Homework::create(
+            &CourseId::from_key("course"),
+            subject,
+            HomeworkTitle::try_new("essay").unwrap(),
+            None,
+            Timestamp::from_millis(1),
+            None,
+            &UserId::from_key("teacher"),
+            db,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// The stored `homework_count` on one subject, absent counting as zero.
+    async fn count_on(subject: &SubjectId, db: &Database) -> i64 {
+        let mut result = db
+            .query(format!(
+                "SELECT VALUE ({SUBJECT_HOMEWORK_COUNT_FIELD} ?? 0) FROM $sub"
+            ))
+            .bind(("sub", subject.record()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        result
+            .take::<Vec<i64>>(0)
+            .unwrap()
+            .first()
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// How many rows `sql` selects ids for.
+    async fn rows(sql: &str, db: &Database) -> usize {
+        let mut result = db.query(sql).await.unwrap().check().unwrap();
+        result.take::<Vec<RecordId>>(0).unwrap().len()
+    }
+
+    /// The invariant on the create path: the claim and the row it accounts for
+    /// commit together or not at all. A refused create leaves *neither* — no
+    /// homework row, and no count stranded on a subject (the subject's delete
+    /// guard reads that count, so a stray one makes it undeletable forever).
+    #[tokio::test]
+    async fn a_refused_create_writes_neither_row_nor_count() {
+        let db = crate::database::init_mem().await.unwrap();
+        let subject = a_subject("algebra", &db).await;
+        let id = subject.get_id().clone();
+        subject.delete(&db).await.unwrap();
+
+        let error = Homework::create(
+            &CourseId::from_key("course"),
+            &id,
+            HomeworkTitle::try_new("essay").unwrap(),
+            None,
+            Timestamp::from_millis(1),
+            None,
+            &UserId::from_key("teacher"),
+            &db,
+        )
+        .await
+        .expect_err("a subject that is gone must not be taggable");
+        assert!(error.to_string().contains("subject does not exist"));
+        assert_eq!(
+            rows("SELECT VALUE id FROM homework", &db).await,
+            0,
+            "a refused create may write no row"
+        );
+        assert_eq!(
+            rows("SELECT VALUE id FROM subject", &db).await,
+            0,
+            "…and least of all a count on a subject it just brought back"
+        );
+    }
+
+    /// The invariant on the PATCH path: a re-tag carries the new subject's
+    /// claim and the old one's release with the link itself.
+    #[tokio::test]
+    async fn a_subject_move_moves_the_count() {
+        let db = crate::database::init_mem().await.unwrap();
+        let from = a_subject("algebra", &db).await;
+        let to = a_subject("geometry", &db).await;
+        let homework = homework_on(from.get_id(), &db).await;
+        assert_eq!(count_on(from.get_id(), &db).await, 1);
+
+        let moved = homework
+            .update(Some(to.get_id().clone()), None, None, None, None, &db)
+            .await
+            .unwrap();
+        assert_eq!(moved.get_subject(), to.get_id());
+        assert_eq!(
+            count_on(from.get_id(), &db).await,
+            0,
+            "the old subject is free"
+        );
+        assert_eq!(count_on(to.get_id(), &db).await, 1, "the new one is not");
+        assert!(from.delete(&db).await.is_ok(), "no reference left");
+        assert!(
+            to.delete(&db).await.is_err(),
+            "the reference moved here refuses the delete"
+        );
+    }
+
+    /// The claim throws inside the same transaction as the link write, so a
+    /// move onto a subject that is gone rolls the release back with it: the row
+    /// keeps its tag and both counters read as if nothing ran.
+    #[tokio::test]
+    async fn a_move_to_a_dead_subject_leaves_everything_untouched() {
+        let db = crate::database::init_mem().await.unwrap();
+        let from = a_subject("algebra", &db).await;
+        let dead = a_subject("geometry", &db).await;
+        let gone = dead.get_id().clone();
+        dead.delete(&db).await.unwrap();
+        let homework = homework_on(from.get_id(), &db).await;
+
+        let error = homework
+            .clone()
+            .update(Some(gone.clone()), None, None, None, None, &db)
+            .await
+            .expect_err("a subject that is gone must not be taggable");
+        assert!(error.to_string().contains("subject does not exist"));
+        let stored = Homework::read(homework.get_id(), &db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.get_subject(), from.get_id(), "the tag never moved");
+        assert_eq!(
+            count_on(from.get_id(), &db).await,
+            1,
+            "the release rolled back with the claim"
+        );
+        assert_eq!(
+            rows("SELECT VALUE id FROM subject", &db).await,
+            1,
+            "the dead subject was not brought back by a count"
+        );
+        assert_eq!(count_on(&gone, &db).await, 0);
+    }
+
+    /// The double-claim guard. Both movers compute their claim and release from
+    /// the row as *they* read it, so two PATCHes re-tagging the same homework
+    /// off the same subject both release it and both claim their target — two
+    /// counts for one link, and the loser's target is undeletable forever. The
+    /// second call here runs on the struct read before the first one landed,
+    /// which is that race with the interleaving pinned: it must be refused
+    /// outright, and the counts must read as if it never ran.
+    #[tokio::test]
+    async fn a_stale_mover_is_refused_and_claims_nothing() {
+        let db = crate::database::init_mem().await.unwrap();
+        let from = a_subject("algebra", &db).await;
+        let to = a_subject("geometry", &db).await;
+        let other = a_subject("calculus", &db).await;
+        let homework = homework_on(from.get_id(), &db).await;
+        let stale = homework.clone();
+        homework
+            .update(Some(to.get_id().clone()), None, None, None, None, &db)
+            .await
+            .unwrap();
+
+        let error = stale
+            .clone()
+            .update(Some(other.get_id().clone()), None, None, None, None, &db)
+            .await
+            .expect_err("a mover that read a tag it no longer holds must be refused");
+        assert!(
+            matches!(error, AppError::Conflict(_)),
+            "a lost CAS is a conflict, not a 404 or a 500: {error:?}"
+        );
+        let stored = Homework::read(stale.get_id(), &db).await.unwrap().unwrap();
+        assert_eq!(stored.get_subject(), to.get_id(), "the winner's tag");
+        assert_eq!(
+            count_on(from.get_id(), &db).await,
+            0,
+            "released once, not twice"
+        );
+        assert_eq!(count_on(to.get_id(), &db).await, 1, "claimed once");
+        assert_eq!(count_on(other.get_id(), &db).await, 0, "never claimed");
+    }
+
+    /// The same race with the counters taken out of it. A PATCH that re-states
+    /// the subject its snapshot showed shifts *nothing* — no claim and no
+    /// release — so if the guard were armed off the counter move it would not be
+    /// armed here at all, and the write would land: the winner's tag silently
+    /// dragged back, its claim stranded on a subject nothing points at
+    /// (undeletable forever) and the reverted-to subject tagged at a count of
+    /// zero (deletable while tagged). The guard is armed by the request
+    /// *carrying* the column instead, which is why this is refused.
+    #[tokio::test]
+    async fn a_stale_re_stater_is_refused_and_reverts_nothing() {
+        let db = crate::database::init_mem().await.unwrap();
+        let from = a_subject("algebra", &db).await;
+        let to = a_subject("geometry", &db).await;
+        let homework = homework_on(from.get_id(), &db).await;
+        let stale = homework.clone();
+        homework
+            .update(Some(to.get_id().clone()), None, None, None, None, &db)
+            .await
+            .unwrap();
+
+        let error = stale
+            .clone()
+            .update(Some(from.get_id().clone()), None, None, None, None, &db)
+            .await
+            .expect_err("re-stating a tag someone else moved must be refused");
+        assert!(
+            matches!(error, AppError::Conflict(_)),
+            "a lost CAS is a conflict, not a silent 200: {error:?}"
+        );
+        let stored = Homework::read(stale.get_id(), &db).await.unwrap().unwrap();
+        assert_eq!(stored.get_subject(), to.get_id(), "the winner's tag");
+        assert_eq!(
+            count_on(from.get_id(), &db).await,
+            0,
+            "the reverted-to subject must not end up tagged at zero"
+        );
+        assert_eq!(
+            count_on(to.get_id(), &db).await,
+            1,
+            "…nor the winner's subject counted with nothing pointing at it"
+        );
+
+        // A *genuine* no-op re-state — nobody moved underneath it — still lands,
+        // and still moves no counter: the CAS passes trivially.
+        let fresh = Homework::read(stale.get_id(), &db).await.unwrap().unwrap();
+        let same = fresh
+            .update(Some(to.get_id().clone()), None, None, None, None, &db)
+            .await
+            .expect("re-stating the tag actually held is not a race");
+        assert_eq!(same.get_subject(), to.get_id());
+        assert_eq!(
+            count_on(from.get_id(), &db).await,
+            0,
+            "still no counter move"
+        );
+        assert_eq!(count_on(to.get_id(), &db).await, 1, "claimed once, still");
     }
 }

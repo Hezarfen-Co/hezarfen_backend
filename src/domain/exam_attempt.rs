@@ -355,6 +355,24 @@ impl ExamAttempt {
         bindings: Vec<(String, surrealdb::types::Value)>,
         db: &Database,
     ) -> Result<surrealdb::IndexedResults, AppError> {
+        Self::write_unfrozen_with(exam, statements, bindings, Vec::new(), db).await
+    }
+
+    /// [`Self::write_unfrozen`] for statements that carry gates of their own:
+    /// each `(marker, refusal)` names a `THROW` the caller's SQL aborts with and
+    /// the error it means. The markers are handed to [`transaction_with_retry`]
+    /// too, so an abort on one is a refusal rather than a round to re-send.
+    ///
+    /// The freeze still outranks every one of them: a caller folding a counter
+    /// claim in here is refused as frozen even when its own gate would also have
+    /// fired, which is the answer the pre-flight check has always given.
+    pub(crate) async fn write_unfrozen_with(
+        exam: &ExamId,
+        statements: &str,
+        bindings: Vec<(String, surrealdb::types::Value)>,
+        refusals: Vec<(&str, AppError)>,
+        db: &Database,
+    ) -> Result<surrealdb::IndexedResults, AppError> {
         let sql = format!(
             "BEGIN TRANSACTION;
              IF array::len((SELECT VALUE id FROM exam_attempt \
@@ -364,12 +382,21 @@ impl ExamAttempt {
         );
         let mut bound = vec![("freeze_exam".into(), exam.record().into_value())];
         bound.extend(bindings);
-        let (result, mut errors) = transaction_with_retry(db, &sql, &bound, &[FROZEN_MARK]).await?;
-        if errors
-            .values()
-            .any(|error| error.to_string().contains(FROZEN_MARK))
-        {
+        let mut marks = vec![FROZEN_MARK];
+        marks.extend(refusals.iter().map(|(marker, _)| *marker));
+        let (result, mut errors) = transaction_with_retry(db, &sql, &bound, &marks).await?;
+        let thrown = |marker: &str| {
+            errors
+                .values()
+                .any(|error| error.to_string().contains(marker))
+        };
+        if thrown(FROZEN_MARK) {
             return Err(frozen_error());
+        }
+        for (marker, refusal) in refusals {
+            if thrown(marker) {
+                return Err(refusal);
+            }
         }
         match errors.drain().map(|(_, error)| error).next() {
             Some(error) => Err(error.into()),

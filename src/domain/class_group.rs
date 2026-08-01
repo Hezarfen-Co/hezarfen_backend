@@ -522,6 +522,67 @@ mod tests {
         assert_eq!(count_on(to.get_id(), &db).await, 1, "the new one is not");
     }
 
+    /// The class twin of
+    /// [`crate::domain::course`]'s `a_stale_mover_is_refused_and_claims_nothing`
+    /// and `a_stale_re_stater_is_refused_and_reverts_nothing`, in one: both
+    /// PATCHes compute their counter move from the row as *they* read it, so a
+    /// second one running on the pre-move struct would claim a second seat for
+    /// one link (the mover) or drag the link back and strand the winner's claim
+    /// (the re-stater, which shifts no counter at all and so is only ever
+    /// stopped by a guard armed off the *carried column*). Both must be refused
+    /// with the counts reading as if they never ran.
+    #[tokio::test]
+    async fn a_stale_class_term_write_is_refused_and_moves_no_count() {
+        let db = crate::database::init_mem().await.unwrap();
+        let at = crate::domain::timestamp::Timestamp::from_millis;
+        let from = a_term(&db).await;
+        let to = Term::create(TermName::try_new("2027").unwrap(), at(100), at(200), &db)
+            .await
+            .unwrap();
+        let other = Term::create(TermName::try_new("2028").unwrap(), at(100), at(200), &db)
+            .await
+            .unwrap();
+        let class = class_on(Some(from.get_id().clone()), &db).await;
+        let stale = class.clone();
+        class
+            .update(None, None, Some(Some(to.get_id().clone())), &db)
+            .await
+            .unwrap();
+
+        // The mover: its snapshot says `from`, so it would release `from` and
+        // claim `other` on top of the winner's claim on `to`.
+        let error = stale
+            .clone()
+            .update(None, None, Some(Some(other.get_id().clone())), &db)
+            .await
+            .expect_err("a mover that read a link it no longer holds must be refused");
+        assert!(matches!(error, AppError::Conflict(_)), "{error:?}");
+        // The re-stater: shifts no counter, so only the CAS can stop it.
+        let error = stale
+            .clone()
+            .update(None, None, Some(Some(from.get_id().clone())), &db)
+            .await
+            .expect_err("re-stating a link someone else moved must be refused");
+        assert!(matches!(error, AppError::Conflict(_)), "{error:?}");
+
+        let stored = ClassGroup::read(stale.get_id(), &db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.get_term(), Some(to.get_id()), "the winner's link");
+        assert_eq!(count_on(from.get_id(), &db).await, 0, "released once");
+        assert_eq!(count_on(to.get_id(), &db).await, 1, "claimed once");
+        assert_eq!(count_on(other.get_id(), &db).await, 0, "never claimed");
+
+        // A genuine no-op re-state still lands and still moves nothing.
+        let same = stored
+            .update(None, None, Some(Some(to.get_id().clone())), &db)
+            .await
+            .expect("re-stating the link the row really holds is not a conflict");
+        assert_eq!(same.get_term(), Some(to.get_id()));
+        assert_eq!(count_on(to.get_id(), &db).await, 1, "still one seat");
+    }
+
     /// [`crate::domain::course::Course::delete`]'s class sweep: deleting a course
     /// takes its `class_course` attachments with it and gives each class its
     /// count back, or the classes would be undeletable forever over rows that
