@@ -2764,7 +2764,10 @@ src/
     course_session.rs CourseSessionId · SessionTopic · CourseSession (a course's lesson)
     session_attendance.rs SessionAttendanceId · SessionAttendance (roll call; one row per session+user)
     work_entry.rs  WorkEntryId · WorkEntry (staff stint; one open per user by construction)
-    enrollment.rs  EnrollmentId · Enrollment (one row per course+user)
+    enrollment.rs  EnrollmentId · Enrollment (one row per course+user; `source`
+                   names the class that pumped it, absent when hand-placed)
+    class_group.rs ClassGroupId · ClassName · ClassGrade · ClassGroup (a şube;
+                   deletable only with no members and no attached courses)
     exam.rs        ExamId · ExamTitle · ExamDescription · ExamKind · ExamWeight ·
                    ExamMode · ExamDuration · ExamSchedule · Exam (belongs to a course)
     exam_attempt.rs ExamAttemptId · AttemptStatus · ExamAttempt (numbered sittings per exam+user, metered by max_attempts)
