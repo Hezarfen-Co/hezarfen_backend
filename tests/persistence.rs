@@ -925,7 +925,7 @@ async fn chat_thread_delete_cascades_and_stays_owner_scoped() {
     let owner = UserId::from_key(&me_id(&app, &owner_cookie).await);
     let other = UserId::from_key(&me_id(&app, &other_cookie).await);
 
-    let thread = ChatbotThread::create(&owner, None, &db)
+    let thread = ChatbotThread::create_capped(&owner, None, &db)
         .await
         .expect("create");
     let id = thread.get_id().clone();
@@ -1040,7 +1040,7 @@ async fn legacy_chat_turns_backfill_to_untruncated() {
         .unwrap();
     let owner = UserId::from_key(&me_id(&app, &cookie).await);
 
-    let thread = ChatbotThread::create(&owner, None, &db)
+    let thread = ChatbotThread::create_capped(&owner, None, &db)
         .await
         .expect("create");
     let id = thread.get_id().clone();
