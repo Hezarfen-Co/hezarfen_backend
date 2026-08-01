@@ -3002,3 +3002,109 @@ async fn a_roster_change_drops_only_the_socket_it_removed() {
         vec!["still mine".to_string()]
     );
 }
+
+/// The class layer over real HTTP with three cookie jars: the office builds the
+/// class, the teacher hands over their own course, and the student — who was
+/// never enrolled by anyone — finds it on `GET /courses/me`. Taking them out of
+/// the class takes the seat back with them.
+#[tokio::test]
+async fn a_class_seats_its_roster_and_gives_the_seat_back() {
+    let (base, db) = spawn_server().await;
+    let manager = client();
+    let teacher = client();
+    let student = client();
+
+    for (c, name) in [(&manager, "mgr"), (&teacher, "tch"), (&student, "veli")] {
+        assert_eq!(register(c, &base, name).await.status(), StatusCode::CREATED);
+    }
+    promote(&db, "mgr", "manager").await;
+    promote(&db, "tch", "teacher").await;
+    for (c, name) in [(&manager, "mgr"), (&teacher, "tch"), (&student, "veli")] {
+        login(c, &base, name).await;
+    }
+
+    let id_of = |v: &Value| v["id"].as_str().unwrap().to_string();
+    let student_id = id_of(
+        &student
+            .get(format!("{base}/auth/me"))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap(),
+    );
+
+    // The office opens the class and puts the student in it.
+    let res = manager
+        .post(format!("{base}/classes"))
+        .json(&json!({ "name": "9-A", "grade": "9" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let class = id_of(&res.json::<Value>().await.unwrap());
+    let res = manager
+        .post(format!("{base}/classes/{class}/members"))
+        .json(&json!({ "user_id": student_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+
+    // The teacher hands their own course to the class …
+    let res = teacher
+        .post(format!("{base}/courses"))
+        .json(&json!({ "title": "Cebir" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let course = id_of(&res.json::<Value>().await.unwrap());
+    let res = teacher
+        .post(format!("{base}/classes/{class}/courses"))
+        .json(&json!({ "course_id": course }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+
+    // … and the student, whom nobody ever enrolled, is in it.
+    let mine: Value = student
+        .get(format!("{base}/courses/me"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(mine["total"], 1, "the class seated them: {mine}");
+    assert_eq!(mine["items"][0]["id"], course);
+    assert_eq!(mine["items"][0]["title"], "Cebir");
+
+    // Out of the class, out of the course — the seat comes back.
+    let res = manager
+        .delete(format!("{base}/classes/{class}/members/{student_id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    let mine: Value = student
+        .get(format!("{base}/courses/me"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(mine["total"], 0, "the seat went with them: {mine}");
+    let roster: Value = teacher
+        .get(format!("{base}/courses/{course}/enrollments"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(roster["total"], 0, "and off the teacher's roster: {roster}");
+}
