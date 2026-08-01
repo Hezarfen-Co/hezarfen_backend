@@ -86,6 +86,12 @@ pub const MAX_EXAM_DESCRIPTION_LEN: usize = 2_000;
 pub const MAX_COURSE_TITLE_LEN: usize = 200;
 pub const MAX_COURSE_DESCRIPTION_LEN: usize = 2_000;
 
+/// A class (şube) is named like a course, but its optional `grade` is a free-text
+/// label the school picks ("9", "10-A", "anaokulu") — a line of display text, so
+/// it is bounded like the other short labels, not like a description.
+pub const MAX_CLASS_NAME_LEN: usize = 200;
+pub const MAX_CLASS_GRADE_LEN: usize = 20;
+
 pub const MAX_SUBJECT_NAME_LEN: usize = 200;
 pub const MAX_SUBJECT_DESCRIPTION_LEN: usize = 2_000;
 
@@ -698,6 +704,9 @@ pub const BANK_QUESTION_TABLE: &str = "bank_question";
 pub const BANK_QUESTION_IMAGE_TABLE: &str = "bank_question_image";
 pub const COURSE_TABLE: &str = "course";
 pub const ENROLLMENT_TABLE: &str = "enrollment";
+pub const CLASS_GROUP_TABLE: &str = "class_group";
+pub const CLASS_MEMBER_TABLE: &str = "class_member";
+pub const CLASS_COURSE_TABLE: &str = "class_course";
 pub const PARENT_LINK_TABLE: &str = "parent_link";
 pub const COURSE_SESSION_TABLE: &str = "course_session";
 pub const SESSION_ATTENDANCE_TABLE: &str = "session_attendance";
@@ -750,6 +759,14 @@ pub const REGISTRATION_COUNT_FIELD: &str = "registration_count";
 /// is claimed before a course's link is written, so the two decisions contend
 /// on the term row instead of on a cross-table `SELECT` no transaction orders.
 pub const COURSE_COUNT_FIELD: &str = "course_count";
+/// The two refcounts on a class row: how many students it holds and how many
+/// courses it is attached to. A class may only be dropped at zero on both.
+pub const CLASS_MEMBER_COUNT_FIELD: &str = "class_member_count";
+pub const CLASS_COURSE_COUNT_FIELD: &str = "class_course_count";
+/// Classes linking a term, the second half of the term delete guard. Deliberately
+/// *not* `COURSE_COUNT_FIELD`: boot recounts that one from the course rows alone,
+/// so a class claiming into it would be wiped on the next migration.
+pub const TERM_CLASS_COUNT_FIELD: &str = "class_count";
 /// A refcount too, and the whole of the fee-plan edit *and* delete guard: how
 /// many students are on this plan. A plan may only be edited or deleted at
 /// zero, and the count is claimed in the same transaction as the assignment

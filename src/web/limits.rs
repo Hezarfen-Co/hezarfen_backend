@@ -106,7 +106,8 @@ struct EventLimits {
     max_description_len: usize,
 }
 
-/// Courses, their curriculum subjects, and lesson sessions.
+/// Courses, their curriculum subjects, lesson sessions, and the classes that
+/// bulk-enroll into them.
 #[derive(Serialize, ToSchema)]
 struct CourseLimits {
     max_title_len: usize,
@@ -118,6 +119,9 @@ struct CourseLimits {
     max_subject_description_len: usize,
     max_session_topic_len: usize,
     max_term_name_len: usize,
+    max_class_name_len: usize,
+    /// A class's optional free-text grade label ("9", "10-A").
+    max_class_grade_len: usize,
 }
 
 /// Exams, their questions, answers, and marks.
@@ -420,6 +424,8 @@ impl LimitsResponse {
                 max_subject_description_len: MAX_SUBJECT_DESCRIPTION_LEN,
                 max_session_topic_len: MAX_SESSION_TOPIC_LEN,
                 max_term_name_len: MAX_TERM_NAME_LEN,
+                max_class_name_len: MAX_CLASS_NAME_LEN,
+                max_class_grade_len: MAX_CLASS_GRADE_LEN,
             },
             exam: ExamLimits {
                 max_title_len: MAX_EXAM_TITLE_LEN,
