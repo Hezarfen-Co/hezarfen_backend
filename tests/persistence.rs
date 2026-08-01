@@ -2100,3 +2100,125 @@ async fn boards_and_their_strokes_survive_remigration() {
         "drawing resumed after the boot"
     );
 }
+
+/// Every course's `enrollment_count`, straight off the store.
+async fn seats_taken(db: &Database) -> Vec<i64> {
+    db.query("SELECT VALUE enrollment_count FROM course;")
+        .await
+        .expect("read the counter")
+        .check()
+        .expect("read the counter")
+        .take::<Vec<i64>>(0)
+        .expect("enrollment_count")
+}
+
+/// An `enrollment` row written before the class layer (2026-08-01) carries no
+/// `source` key at all, and that absence *is* the meaning — "a person placed
+/// this student" — so there is nothing to backfill and everything to preserve.
+/// Such a row must still decode once the column exists, still count towards its
+/// course's cap, and never be adopted by a class that later attaches the same
+/// course: the class skips a pair that already has a row, so the sweep on its
+/// way out must find nothing of its own to take.
+#[tokio::test]
+async fn pre_class_enrollments_keep_their_absent_source() {
+    let (app, db) = common::app_and_db().await;
+    let manager = common::login_as(&app, &db, "mgr", "manager").await;
+    let teacher = common::login_as(&app, &db, "teacher", "teacher").await;
+    let ali = common::login(&app, "ali").await;
+    let veli = common::login(&app, "veli").await;
+    let (ali_id, veli_id) = (me_id(&app, &ali).await, me_id(&app, &veli).await);
+
+    let course = create_course(&app, &teacher, "algebra").await;
+    enroll(&app, &teacher, &course, &ali_id).await;
+    enroll(&app, &teacher, &course, &veli_id).await;
+
+    // Age both rows into the pre-class shape — no `source` key — and the course
+    // into the pre-counter shape a volume that old also carries.
+    db.query("UPDATE enrollment UNSET source; UPDATE course UNSET enrollment_count;")
+        .await
+        .expect("age the rows")
+        .check()
+        .expect("age the rows");
+
+    let app = reboot(&db).await;
+
+    // They decode, and the counter is seeded from them.
+    let roster = send(
+        &app,
+        "GET",
+        &format!("/courses/{course}/enrollments"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(roster.status, StatusCode::OK, "{}", roster.body);
+    assert_eq!(
+        common::total(&roster.body),
+        2,
+        "a sourceless row must still read: {}",
+        roster.body
+    );
+    assert_eq!(seats_taken(&db).await, vec![2], "seeded from the roster");
+
+    // A class attaching that same course finds ali already seated: no second
+    // seat is charged, and their row keeps its absent `source`…
+    let res = send(
+        &app,
+        "POST",
+        "/classes",
+        Some(&manager),
+        Some(json!({ "name": "9-A" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let class = common::id_of(&res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/classes/{class}/members"),
+        Some(&manager),
+        Some(json!({ "user_id": ali_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/classes/{class}/courses"),
+        Some(&manager),
+        Some(json!({ "course_id": course })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    assert_eq!(seats_taken(&db).await, vec![2], "no second seat charged");
+
+    // …so the detach sweeps nothing, and the pre-class rows outlive the class.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/classes/{class}/courses/{course}"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    let roster = send(
+        &app,
+        "GET",
+        &format!("/courses/{course}/enrollments"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(
+        common::total(&roster.body),
+        2,
+        "hand-placed rows are never swept by a class: {}",
+        roster.body
+    );
+    assert_eq!(
+        seats_taken(&db).await,
+        vec![2],
+        "and no seat was given back"
+    );
+}

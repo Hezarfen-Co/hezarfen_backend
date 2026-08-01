@@ -401,6 +401,17 @@ async fn protected_routes_require_session() {
         // The board room authenticates before it upgrades, so a rejection is
         // an HTTP status here and not an instant close.
         ("GET", "/boards/x/ws"),
+        ("GET", "/classes"),
+        ("POST", "/classes"),
+        ("GET", "/classes/x"),
+        ("PATCH", "/classes/x"),
+        ("DELETE", "/classes/x"),
+        ("POST", "/classes/x/members"),
+        ("GET", "/classes/x/members"),
+        ("DELETE", "/classes/x/members/u"),
+        ("POST", "/classes/x/courses"),
+        ("GET", "/classes/x/courses"),
+        ("DELETE", "/classes/x/courses/c"),
     ] {
         let res = send(&app, method, uri, None, None).await;
         assert_eq!(res.status, StatusCode::UNAUTHORIZED, "{method} {uri}");
@@ -25152,4 +25163,477 @@ async fn a_class_pumps_enrollments_and_guards_each_axis_separately() {
         .status,
         StatusCode::NOT_FOUND
     );
+}
+
+/// Who may look at a class, and the one write a manager holds without teaching
+/// anything. Every `/classes` read is teacher+, so the student on the roster —
+/// and the parent watching them — is refused their own row; and attaching takes
+/// management of the course, which a manager has over every course in the
+/// school whether or not they run it.
+#[tokio::test]
+async fn class_reads_are_staff_only_and_a_manager_manages_every_course() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "mgr", "manager").await;
+    let teacher = login_as(&app, &db, "tch", "teacher").await;
+    let parent = login_as(&app, &db, "anne", "parent").await;
+    let student = login(&app, "stu").await;
+    let student_id = me_id(&app, &student).await;
+    let course = create_course(&app, &teacher, "algebra").await;
+
+    let res = send(
+        &app,
+        "POST",
+        "/classes",
+        Some(&manager),
+        Some(json!({ "name": "9-A" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let class = id_of(&res.body);
+    // The student really is on this roster, so the 403s below are the gate
+    // talking and not an empty database.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/classes/{class}/members"),
+        Some(&manager),
+        Some(json!({ "user_id": student_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+
+    for (who, cookie) in [("a student", &student), ("a parent", &parent)] {
+        for uri in [
+            "/classes".to_string(),
+            format!("/classes/{class}"),
+            format!("/classes/{class}/members"),
+            format!("/classes/{class}/courses"),
+        ] {
+            let res = send(&app, "GET", &uri, Some(cookie), None).await;
+            assert_eq!(res.status, StatusCode::FORBIDDEN, "GET {uri} for {who}");
+        }
+        // …and neither of them writes, on either axis.
+        let res = send(
+            &app,
+            "POST",
+            &format!("/classes/{class}/members"),
+            Some(cookie),
+            Some(json!({ "user_id": student_id })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::FORBIDDEN, "member add for {who}");
+        let res = send(
+            &app,
+            "POST",
+            &format!("/classes/{class}/courses"),
+            Some(cookie),
+            Some(json!({ "course_id": course })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::FORBIDDEN, "attach for {who}");
+    }
+
+    // The manager neither created this course nor teaches it, and still
+    // attaches it: the bar is management of the course, not authorship of it.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/classes/{class}/courses"),
+        Some(&manager),
+        Some(json!({ "course_id": course })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    // Stored, not merely answered: the link is on the class and the roster moved.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/classes/{class}/courses"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 1);
+    assert_eq!(common::items(&res.body)[0]["course"], course);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/courses/{course}/enrollments"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 1, "{}", res.body);
+}
+
+/// A student promoted out of studenthood leaves their class as well as their
+/// rosters. Two sweeps run on that path and each owns exactly half the state —
+/// the memberships and the class counter, the enrollment rows and the course
+/// counter — so both halves are asserted stored, and then the class is deleted,
+/// which only a *released* member counter permits.
+#[tokio::test]
+async fn a_demotion_sweeps_the_class_membership_and_what_it_pumped() {
+    let (app, db) = app_and_db().await;
+    let admin = login_as(&app, &db, "boss", "admin").await;
+    let manager = login_as(&app, &db, "mgr", "manager").await;
+    let teacher = login_as(&app, &db, "tch", "teacher").await;
+    let student = login(&app, "veli").await;
+    let student_id = me_id(&app, &student).await;
+    let course = create_course(&app, &teacher, "algebra").await;
+
+    let res = send(
+        &app,
+        "POST",
+        "/classes",
+        Some(&manager),
+        Some(json!({ "name": "9-A" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let class = id_of(&res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/classes/{class}/courses"),
+        Some(&teacher),
+        Some(json!({ "course_id": course })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/classes/{class}/members"),
+        Some(&manager),
+        Some(json!({ "user_id": student_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/courses/{course}/enrollments"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 1, "the class seated them first");
+
+    // Out of studenthood, through the endpoint an admin actually uses.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/users/{student_id}/role"),
+        Some(&admin),
+        Some(json!({ "role": "teacher" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    let res = send(
+        &app,
+        "GET",
+        &format!("/classes/{class}/members"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 0, "the roster let them go");
+    let res = send(
+        &app,
+        "GET",
+        &format!("/courses/{course}/enrollments"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 0, "and so did the course");
+
+    // Both tables and both counters, read off the store itself.
+    let mut result = db
+        .query(
+            "SELECT VALUE id FROM class_member; \
+             SELECT VALUE id FROM enrollment; \
+             SELECT VALUE class_member_count FROM class_group; \
+             SELECT VALUE enrollment_count FROM course;",
+        )
+        .await
+        .expect("read the swept state")
+        .check()
+        .expect("read the swept state");
+    assert!(
+        result
+            .take::<Vec<surrealdb::types::RecordId>>(0)
+            .expect("class_member rows")
+            .is_empty(),
+        "the membership row is deleted, not merely filtered out"
+    );
+    assert!(
+        result
+            .take::<Vec<surrealdb::types::RecordId>>(1)
+            .expect("enrollment rows")
+            .is_empty(),
+        "the pumped enrollment is deleted too"
+    );
+    assert_eq!(
+        result.take::<Vec<i64>>(2).expect("class_member_count"),
+        vec![0],
+        "the class counter came back"
+    );
+    assert_eq!(
+        result.take::<Vec<i64>>(3).expect("enrollment_count"),
+        vec![0],
+        "the course counter came back"
+    );
+
+    // The bite: a membership left behind (or a counter never released) makes
+    // the class undeletable forever.
+    assert_eq!(
+        send(
+            &app,
+            "DELETE",
+            &format!("/classes/{class}/courses/{course}"),
+            Some(&teacher),
+            None,
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/classes/{class}"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+}
+
+/// A class files itself under a term exactly as a course does, so the term's
+/// delete guard has to count classes too — otherwise deleting the calendar
+/// entry would leave the class pointing at nothing.
+#[tokio::test]
+async fn a_term_a_class_points_at_refuses_to_delete() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "mgr", "manager").await;
+
+    let res = send(
+        &app,
+        "POST",
+        "/terms",
+        Some(&manager),
+        Some(json!({
+            "name": "2025 Fall",
+            "starts_at": 1_600_000_000_000_i64,
+            "ends_at": 1_610_000_000_000_i64,
+        })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let term = id_of(&res.body);
+    let res = send(
+        &app,
+        "POST",
+        "/classes",
+        Some(&manager),
+        Some(json!({ "name": "9-A", "term_id": term })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    assert_eq!(res.body["term"].as_str(), Some(term.as_str()));
+    let class = id_of(&res.body);
+
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/terms/{term}"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::CONFLICT,
+        "a class still points at it: {}",
+        res.body
+    );
+
+    // Unlinking gives the reference back — an explicit `null` on the named
+    // field, because a `{}` body short-circuits before any guard runs.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/classes/{class}"),
+        Some(&manager),
+        Some(json!({ "term_id": null })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert!(res.body["term"].is_null());
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/terms/{term}"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    // And the class outlives the term it was filed under.
+    assert_eq!(
+        send(
+            &app,
+            "GET",
+            &format!("/classes/{class}"),
+            Some(&manager),
+            None
+        )
+        .await
+        .status,
+        StatusCode::OK
+    );
+}
+
+/// All-or-nothing where a client can see it: a course with one free seat and a
+/// class of two takes *neither* of them. The 409 names the course so a manager
+/// knows whose capacity to raise, and — the half only stored state can show —
+/// the seats spent on the way to that refusal are all given back.
+#[tokio::test]
+async fn a_course_that_cannot_seat_the_whole_class_seats_none_of_it() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "mgr", "manager").await;
+    let teacher = login_as(&app, &db, "tch", "teacher").await;
+    let hand = login(&app, "hand").await;
+    let ali = login(&app, "ali").await;
+    let veli = login(&app, "veli").await;
+    let hand_id = me_id(&app, &hand).await;
+    let ali_id = me_id(&app, &ali).await;
+    let veli_id = me_id(&app, &veli).await;
+
+    // Two seats, one of them already spent by hand: the class of two needs two.
+    let res = send(
+        &app,
+        "POST",
+        "/courses",
+        Some(&teacher),
+        Some(json!({ "title": "small", "capacity": 2 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let course = id_of(&res.body);
+    enroll(&app, &teacher, &course, &hand_id).await;
+
+    let res = send(
+        &app,
+        "POST",
+        "/classes",
+        Some(&manager),
+        Some(json!({ "name": "9-A" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let class = id_of(&res.body);
+    for student in [&ali_id, &veli_id] {
+        let res = send(
+            &app,
+            "POST",
+            &format!("/classes/{class}/members"),
+            Some(&manager),
+            Some(json!({ "user_id": student })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    }
+
+    let res = send(
+        &app,
+        "POST",
+        &format!("/classes/{class}/courses"),
+        Some(&teacher),
+        Some(json!({ "course_id": course })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+    let message = res.body["error"].as_str().unwrap_or_default();
+    assert!(
+        message.contains(&format!("course:{course}")),
+        "the refusal must name the full course: {message}"
+    );
+
+    // Nothing at all was written: not the seat that did fit, not the link.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/courses/{course}/enrollments"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 1, "{}", res.body);
+    assert_eq!(
+        common::items(&res.body)[0]["user"]["id"],
+        hand_id,
+        "only the hand-placed row survives"
+    );
+    let res = send(
+        &app,
+        "GET",
+        &format!("/classes/{class}/courses"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 0);
+    assert!(common::items(&res.body).is_empty(), "no link row");
+    let mut result = db
+        .query("SELECT VALUE enrollment_count FROM course; SELECT VALUE id FROM class_course;")
+        .await
+        .expect("read the refused state")
+        .check()
+        .expect("read the refused state");
+    assert_eq!(
+        result.take::<Vec<i64>>(0).expect("enrollment_count"),
+        vec![1],
+        "the counter must not have moved"
+    );
+    assert!(
+        result
+            .take::<Vec<surrealdb::types::RecordId>>(1)
+            .expect("class_course rows")
+            .is_empty(),
+    );
+
+    // It really was a seat shortfall: a class of one fits, and lands.
+    assert_eq!(
+        send(
+            &app,
+            "DELETE",
+            &format!("/classes/{class}/members/{veli_id}"),
+            Some(&manager),
+            None,
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
+    let res = send(
+        &app,
+        "POST",
+        &format!("/classes/{class}/courses"),
+        Some(&teacher),
+        Some(json!({ "course_id": course })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/courses/{course}/enrollments"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 2, "{}", res.body);
 }

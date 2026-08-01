@@ -529,3 +529,132 @@ async fn board_lists_are_paged() {
     assert_eq!(total(&res.body), 3, "the scoped total is the scoped count");
     assert_eq!(items(&res.body).len(), 1, "offset 2 of 3 leaves 1");
 }
+
+/// The class layer's three lists speak the same envelope: the class index, one
+/// class's roster and the courses it carries. All three join people onto the
+/// page, so the window is checked with the refs still riding on the rows.
+#[tokio::test]
+async fn class_lists_are_paged() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "mgr", "manager").await;
+
+    // Three classes; the first carries three students and three courses.
+    let mut classes = Vec::new();
+    for n in 0..3 {
+        let res = send(
+            &app,
+            "POST",
+            "/classes",
+            Some(&manager),
+            Some(json!({ "name": format!("9-{n}") })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+        classes.push(res.body["id"].as_str().unwrap().to_string());
+    }
+    let class = classes[0].clone();
+    for n in 0..3 {
+        let course = create_course(&app, &manager, &format!("ders{n}")).await;
+        let res = send(
+            &app,
+            "POST",
+            &format!("/classes/{class}/courses"),
+            Some(&manager),
+            Some(json!({ "course_id": course })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+
+        let student = login(&app, &format!("stud{n}")).await;
+        let sid = me_id(&app, &student).await;
+        let res = send(
+            &app,
+            "POST",
+            &format!("/classes/{class}/members"),
+            Some(&manager),
+            Some(json!({ "user_id": sid })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    }
+
+    for uri in [
+        "/classes".to_string(),
+        format!("/classes/{class}/members"),
+        format!("/classes/{class}/courses"),
+    ] {
+        // Unpaged: everything, `limit` echoes null.
+        let res = send(&app, "GET", &uri, Some(&manager), None).await;
+        assert_eq!(res.status, StatusCode::OK, "GET {uri}: {}", res.body);
+        assert_eq!(total(&res.body), 3, "GET {uri} total");
+        assert_eq!(items(&res.body).len(), 3, "GET {uri} items");
+        assert!(res.body["limit"].is_null(), "GET {uri} echoes a null limit");
+        assert_eq!(res.body["offset"], 0);
+
+        // A window of 1: the total stays the unpaged count, consecutive windows
+        // are disjoint, and past the end is an empty page rather than an error.
+        let res = send(
+            &app,
+            "GET",
+            &format!("{uri}?limit=1&offset=0"),
+            Some(&manager),
+            None,
+        )
+        .await;
+        assert_eq!(total(&res.body), 3, "GET {uri} windowed total");
+        assert_eq!(items(&res.body).len(), 1, "GET {uri} window size");
+        assert_eq!(res.body["limit"], 1);
+        let first = items(&res.body)[0]["id"].clone();
+        let res = send(
+            &app,
+            "GET",
+            &format!("{uri}?limit=1&offset=1"),
+            Some(&manager),
+            None,
+        )
+        .await;
+        assert_eq!(res.body["offset"], 1);
+        assert_ne!(items(&res.body)[0]["id"], first, "GET {uri} pages overlap");
+        let res = send(
+            &app,
+            "GET",
+            &format!("{uri}?limit=1&offset=99"),
+            Some(&manager),
+            None,
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK);
+        assert!(items(&res.body).is_empty(), "GET {uri} past the end");
+        assert_eq!(total(&res.body), 3, "GET {uri} total stays honest");
+
+        // The shared bounds bite on every one of them.
+        for bad in ["limit=0", "limit=501", "offset=-1"] {
+            let res = send(&app, "GET", &format!("{uri}?{bad}"), Some(&manager), None).await;
+            assert_eq!(
+                res.status,
+                StatusCode::BAD_REQUEST,
+                "GET {uri}?{bad} should be 400"
+            );
+        }
+    }
+
+    // The joins run over the page, not the table: each windowed row still
+    // carries the people it names.
+    let res = send(
+        &app,
+        "GET",
+        "/classes?limit=1&offset=0",
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(items(&res.body)[0]["creator"]["username"], "mgr");
+    let uri = format!("/classes/{class}/members?limit=1&offset=0");
+    let res = send(&app, "GET", &uri, Some(&manager), None).await;
+    let row = &items(&res.body)[0];
+    assert!(row["user"]["username"].is_string(), "member ref: {row}");
+    assert_eq!(row["added_by"]["username"], "mgr");
+    let uri = format!("/classes/{class}/courses?limit=1&offset=0");
+    let res = send(&app, "GET", &uri, Some(&manager), None).await;
+    assert_eq!(items(&res.body)[0]["attached_by"]["username"], "mgr");
+}
