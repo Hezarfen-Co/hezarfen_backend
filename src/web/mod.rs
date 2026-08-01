@@ -11,6 +11,7 @@ pub mod bank_questions;
 pub mod board_ws;
 pub mod boards;
 pub mod chatbot;
+pub mod classes;
 pub mod courses;
 pub mod etag;
 pub mod events;

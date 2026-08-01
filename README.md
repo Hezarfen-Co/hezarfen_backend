@@ -694,6 +694,17 @@ window filtering, before paging; negative values are a `400` naming the field.
 | POST   | `/courses/{id}/enrollments`      | teacher | `{user_id}` — enroll a **student** (idempotent upsert; course manager; only students can be enrolled; `409` once a capped course is full) |
 | GET    | `/courses/{id}/enrollments`      | teacher | List the course roster (course manager) · paged |
 | DELETE | `/courses/{id}/enrollments/{user}` | teacher | Unenroll (keeps recorded results; course manager) |
+| POST   | `/classes`                       | manager | `{name, grade?, term_id?}` — create a class (şube); `grade` is a free-text year label |
+| GET    | `/classes`                       | teacher | List classes, newest first · paged |
+| GET    | `/classes/{id}`                  | teacher | Get one class                   |
+| PATCH  | `/classes/{id}`                  | manager | Edit a class (`null` clears `grade`/`term_id`) |
+| DELETE | `/classes/{id}`                  | manager | Delete a class — `409` while it still holds students or courses |
+| POST   | `/classes/{id}/members`          | manager | `{user_id}` — add a **student**; enrolls them into every attached course (`409` if one is full, naming it, or if already a member) |
+| GET    | `/classes/{id}/members`          | teacher | List the class roster · paged   |
+| DELETE | `/classes/{id}/members/{user}`   | manager | Remove a student and sweep the enrollments the class pumped for them |
+| POST   | `/classes/{id}/courses`          | teacher | `{course_id}` — attach a course (that **course's** manager); enrolls the whole roster (`409` if it cannot hold them all, or if already attached) |
+| GET    | `/classes/{id}/courses`          | teacher | List the class's attached courses · paged |
+| DELETE | `/classes/{id}/courses/{course}` | teacher | Detach a course (that course's manager) and sweep the enrollments the class pumped |
 | POST   | `/courses/{id}/sessions`         | teacher | `{topic?, teacher_id?, starts_at, ends_at?}` — add a lesson (course manager; teacher defaults to the caller) |
 | GET    | `/courses/{id}/sessions`         | student | List the course's sessions, most recent first (enrolled, creator, assigned teacher, or manager+) · paged |
 | POST   | `/courses/{id}/subjects`         | teacher | `{name, description?}` — add a curriculum subject (course manager) |
@@ -2877,7 +2888,7 @@ src/
     courses.rs  subjects.rs  sessions.rs  exams.rs  homework.rs  questions.rs
     bank_questions.rs  marks.rs  work.rs  pomodoro.rs  attendance.rs
     settings.rs  terms.rs  meals.rs  payments.rs  ai.rs  chatbot.rs
-    boards.rs
+    boards.rs  classes.rs
     limits.rs      GET /limits: every constant.rs bound served as JSON
 ```
 

@@ -24955,3 +24955,201 @@ async fn a_burst_of_strokes_comes_back_in_mint_order() {
     assert_eq!(payloads[0], "{\"p\":[0]}");
     assert_eq!(payloads[59], "{\"p\":[59]}");
 }
+
+// --- classes (şube) ---------------------------------------------------------
+
+/// The class routes' own gates, end to end: who may write, who may not, and
+/// that the writes really are enrollments. The pump itself is proven in the
+/// domain unit tests — what only the router can prove is that the two axes are
+/// gated differently (roster = manager+, attach = *that course's* manager) and
+/// that a class is enrollment in bulk rather than a parallel roster.
+#[tokio::test]
+async fn a_class_pumps_enrollments_and_guards_each_axis_separately() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "mgr", "manager").await;
+    let teacher = login_as(&app, &db, "tch", "teacher").await;
+    let other = login_as(&app, &db, "other", "teacher").await;
+    let student = login_as(&app, &db, "stu", "student").await;
+    let student_id = me_id(&app, &student).await;
+    let teacher_id = me_id(&app, &teacher).await;
+    let course = create_course(&app, &teacher, "algebra").await;
+
+    // Creating a class is the office's call — a teacher may read, not write.
+    let res = send(
+        &app,
+        "POST",
+        "/classes",
+        Some(&teacher),
+        Some(json!({"name": "9-A"})),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::FORBIDDEN,
+        "class create is manager+"
+    );
+    let res = send(
+        &app,
+        "POST",
+        "/classes",
+        Some(&manager),
+        Some(json!({"name": "9-A", "grade": ""})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED);
+    assert!(res.body["grade"].is_null(), "an empty grade is no grade");
+    let class = id_of(&res.body);
+    assert_eq!(
+        send(&app, "GET", "/classes", Some(&teacher), None)
+            .await
+            .status,
+        StatusCode::OK,
+        "teachers read the class list"
+    );
+
+    // Only students go in a roster, and only real users.
+    for (body, who) in [
+        (json!({"user_id": "nobody"}), "an unknown user"),
+        (json!({"user_id": teacher_id}), "a teacher"),
+    ] {
+        let res = send(
+            &app,
+            "POST",
+            &format!("/classes/{class}/members"),
+            Some(&manager),
+            Some(body),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::BAD_REQUEST, "{who} is a 400");
+    }
+    let res = send(
+        &app,
+        "POST",
+        &format!("/classes/{class}/members"),
+        Some(&manager),
+        Some(json!({ "user_id": student_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED);
+
+    // Attaching writes the course's roster, so it takes the course's own bar —
+    // a teacher who does not manage it is refused even though they are teacher+.
+    let attach = json!({ "course_id": course });
+    let res = send(
+        &app,
+        "POST",
+        &format!("/classes/{class}/courses"),
+        Some(&other),
+        Some(attach.clone()),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::FORBIDDEN,
+        "attach needs course rights"
+    );
+    let res = send(
+        &app,
+        "POST",
+        &format!("/classes/{class}/courses"),
+        Some(&teacher),
+        Some(attach.clone()),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/classes/{class}/courses"),
+        Some(&teacher),
+        Some(attach),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "a second attach is a 409");
+
+    // The membership is a real enrollment: it shows up on the course roster.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/courses/{course}/enrollments"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(
+        common::total(&res.body),
+        1,
+        "the class must have enrolled its member"
+    );
+    assert_eq!(common::items(&res.body)[0]["user"]["id"], student_id);
+
+    // A class carrying either is undeletable until both ends are cleared.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/classes/{class}"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT);
+    assert_eq!(
+        send(
+            &app,
+            "DELETE",
+            &format!("/classes/{class}/courses/{course}"),
+            Some(&manager),
+            None,
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        send(
+            &app,
+            "DELETE",
+            &format!("/classes/{class}/members/{student_id}"),
+            Some(&manager),
+            None,
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/classes/{class}"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::NO_CONTENT,
+        "empty on both axes, it goes"
+    );
+    // And the pumped enrollment left with the detach.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/courses/{course}/enrollments"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 0);
+    assert_eq!(
+        send(
+            &app,
+            "GET",
+            &format!("/classes/{class}"),
+            Some(&teacher),
+            None
+        )
+        .await
+        .status,
+        StatusCode::NOT_FOUND
+    );
+}
