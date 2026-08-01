@@ -2768,6 +2768,13 @@ src/
                    names the class that pumped it, absent when hand-placed)
     class_group.rs ClassGroupId · ClassName · ClassGrade · ClassGroup (a şube;
                    deletable only with no members and no attached courses)
+    class_member.rs ClassMember (one student in a class; adding them enrolls
+                   them into every course the class holds)
+    class_course.rs ClassCourse (one course on a class; attaching it enrolls
+                   the class's whole roster)
+    class_pump.rs  attach/detach (the shared transaction behind both of those:
+                   link row, class counter and the enrollments it implies move
+                   together or not at all)
     exam.rs        ExamId · ExamTitle · ExamDescription · ExamKind · ExamWeight ·
                    ExamMode · ExamDuration · ExamSchedule · Exam (belongs to a course)
     exam_attempt.rs ExamAttemptId · AttemptStatus · ExamAttempt (numbered sittings per exam+user, metered by max_attempts)
