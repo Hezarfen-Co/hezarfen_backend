@@ -199,11 +199,19 @@ impl ClassGroup {
         db: &Database,
     ) -> Result<ClassGroup, AppError> {
         let (claim, release) = term::ref_move(self.term.as_ref(), &term);
+        let expected = self.term.as_ref().map(TermId::record);
         FieldUpdate::new(self.id.record())
             .set("name", name)
             .set("grade", grade)
             .set("term", term.map(|term| term.map(|term| term.record())))
-            .refcount(TERM_CLASS_COUNT_FIELD, claim, release, term::gone_error())
+            .refcount(
+                TERM_CLASS_COUNT_FIELD,
+                "term",
+                expected,
+                claim,
+                release,
+                term::gone_error(),
+            )
             .run::<ClassGroup>(db)
             .await
     }
@@ -489,7 +497,10 @@ mod tests {
             .await
             .expect_err("a term that is gone must not be linkable");
         assert!(error.to_string().contains("term does not exist"));
-        let stored = ClassGroup::read(class.get_id(), &db).await.unwrap().unwrap();
+        let stored = ClassGroup::read(class.get_id(), &db)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(stored.get_term(), Some(from.get_id()), "the link stays put");
         assert_eq!(stored.get_name().as_str(), "9-A", "…and so does the row");
         assert_eq!(
@@ -503,7 +514,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(moved.get_term(), Some(to.get_id()));
-        assert_eq!(count_on(from.get_id(), &db).await, 0, "the old term is free");
+        assert_eq!(
+            count_on(from.get_id(), &db).await,
+            0,
+            "the old term is free"
+        );
         assert_eq!(count_on(to.get_id(), &db).await, 1, "the new one is not");
     }
 

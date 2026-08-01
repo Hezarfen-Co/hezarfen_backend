@@ -29,10 +29,22 @@ use crate::domain::cap;
 use crate::error::AppError;
 
 /// The `THROW` markers [`FieldUpdate::refcount`]'s transaction aborts with: the
-/// row the reference was to be claimed on is gone, and the row being patched is
-/// gone (or its guard bit).
+/// row the reference was to be claimed on is gone, the row being patched is
+/// gone (or its guard bit), and the link this move started from is no longer
+/// the one the handler read.
 const CLAIM_MARK: &str = "ref_claim_gone";
 const ROW_MARK: &str = "ref_row_gone";
+const STALE_MARK: &str = "ref_stale_move";
+
+/// `(counter field, link column, expected link, claim, release, refusal)`.
+type Refcount = (
+    &'static str,
+    &'static str,
+    Option<RecordId>,
+    Option<RecordId>,
+    Option<RecordId>,
+    AppError,
+);
 
 pub struct FieldUpdate {
     id: RecordId,
@@ -43,8 +55,9 @@ pub struct FieldUpdate {
     ordered: Option<(&'static str, &'static str, AppError)>,
     /// `(condition, refusal)` for [`FieldUpdate::guard`].
     guard: Option<(&'static str, AppError)>,
-    /// `(counter field, claim, release, refusal)` for [`FieldUpdate::refcount`].
-    refcount: Option<(&'static str, Option<RecordId>, Option<RecordId>, AppError)>,
+    /// `(counter field, link column, expected link, claim, release, refusal)`
+    /// for [`FieldUpdate::refcount`].
+    refcount: Option<Refcount>,
 }
 
 impl FieldUpdate {
@@ -60,8 +73,9 @@ impl FieldUpdate {
     }
 
     /// Write `field` only when the request carried it. The bind variable is
-    /// named after the field, so `id` — and `ref_claim`/`ref_release`, which
-    /// [`FieldUpdate::refcount`] binds — are the names a caller must not use.
+    /// named after the field, so `id` — and `ref_claim`/`ref_release`/
+    /// `ref_expected`, which [`FieldUpdate::refcount`] binds — are the names a
+    /// caller must not use.
     #[must_use]
     pub fn set<T: SurrealValue>(mut self, field: &'static str, value: Option<T>) -> Self {
         if let Some(value) = value {
@@ -122,16 +136,28 @@ impl FieldUpdate {
     ///
     /// Only ever called alongside a `.set()` of the very column that carries the
     /// link, so the empty-request short-circuit below cannot swallow a move.
+    ///
+    /// `link` is that column (never `field`: the counter lives on the *other*
+    /// row, `course_count` on the term against a `term` link) and `expected` is
+    /// what the handler's snapshot said it held — `None` for a link that was
+    /// absent. The pair becomes a CAS on the row write, because claim and
+    /// release are computed from that snapshot: two PATCHes moving the same link
+    /// A→B both read A, and both would claim B, leaving B counted twice for one
+    /// link — a count with no link is exactly what makes a term undeletable
+    /// forever. The loser's row write matches nothing and the whole transaction
+    /// aborts, so it claims nothing and answers 409.
     #[must_use]
     pub fn refcount(
         mut self,
         field: &'static str,
+        link: &'static str,
+        expected: Option<RecordId>,
         claim: Option<RecordId>,
         release: Option<RecordId>,
         refused: AppError,
     ) -> Self {
         if claim.is_some() || release.is_some() {
-            self.refcount = Some((field, claim, release, refused));
+            self.refcount = Some((field, link, expected, claim, release, refused));
         }
         self
     }
@@ -173,7 +199,16 @@ impl FieldUpdate {
             None => (None, None),
         };
         refused = refused.or(extra_refused);
-        let conditions: Vec<String> = ordered.into_iter().chain(extra).collect();
+        // Armed only for a move that actually shifts a counter, so a plain PATCH
+        // — and a `term` PATCH that re-stated the link it already had — writes
+        // the same unguarded `UPDATE` it always did. Probed on the mem engine:
+        // a bound `None` comes through as `NONE` and `link = NONE` matches a row
+        // whose option column was never set, while failing one that holds a
+        // record, so the absent-link shape needs no `??`.
+        let cas = moved
+            .as_ref()
+            .map(|(_, link, ..)| format!("{link} = $ref_expected"));
+        let conditions: Vec<String> = ordered.into_iter().chain(extra).chain(cas).collect();
         let guard = if conditions.is_empty() {
             String::new()
         } else {
@@ -186,10 +221,7 @@ impl FieldUpdate {
         // its guard reads, and the loser wrote nothing, so re-sending it is the
         // recovery — see [`write_with_retry`].
         let rows: Vec<T> = match moved {
-            Some((field, claim, release, ref_refused)) => {
-                run_with_refcount(db, &sql, self.bindings, field, claim, release, ref_refused)
-                    .await?
-            }
+            Some(moved) => run_with_refcount(db, &sql, self.bindings, moved).await?,
             None => write_with_retry(db, &sql, &self.bindings).await?,
         };
         // No row back means the guard bit (or, in the window after the handler's
@@ -212,15 +244,11 @@ impl FieldUpdate {
 /// Admissible for [`transaction_with_retry`]: every statement is an `UPDATE`,
 /// an `IF`/`THROW` or a `RETURN`, and none of those can answer "already
 /// exists" — a lost round writes nothing and re-sending it is the recovery.
-#[allow(clippy::too_many_arguments)]
 async fn run_with_refcount<T: SurrealValue>(
     db: &Database,
     update: &str,
     mut bindings: Vec<(String, Value)>,
-    field: &'static str,
-    claim: Option<RecordId>,
-    release: Option<RecordId>,
-    refused: AppError,
+    (field, link, expected, claim, release, refused): Refcount,
 ) -> Result<Vec<T>, AppError> {
     // Parenthesized `??` throughout: `n ?? 0 + 1` parses as `n ?? (0 + 1)`.
     // Both counter writes commit with the row write or neither does, so their
@@ -239,13 +267,25 @@ async fn run_with_refcount<T: SurrealValue>(
         statements.push(format!(
             "LET $seat = (UPDATE $ref_claim SET {field} = ({field} ?? 0) + 1 RETURN VALUE id)"
         ));
-        statements.push(format!("IF array::len($seat) = 0 {{ THROW '{CLAIM_MARK}' }}"));
+        statements.push(format!(
+            "IF array::len($seat) = 0 {{ THROW '{CLAIM_MARK}' }}"
+        ));
         bindings.push(("ref_claim".into(), claim.into_value()));
     }
+    bindings.push(("ref_expected".into(), expected.into_value()));
     statements.push(format!("LET $row = ({update})"));
     // Without this the claim would outlive a row write that matched nothing —
-    // the very leak the transaction exists to close.
-    statements.push(format!("IF array::len($row) = 0 {{ THROW '{ROW_MARK}' }}"));
+    // the very leak the transaction exists to close. Nothing was written yet
+    // either way, so the probe that tells the two empty cases apart is free to
+    // be another `UPDATE`: it matches only a row that is *there* and whose link
+    // has moved off what the handler read, which is the CAS having bitten. A
+    // deleted row and a plain guard refusal both miss it and keep the answer
+    // they have always got.
+    statements.push(format!(
+        "IF array::len($row) = 0 {{ \
+         LET $live = (UPDATE $id WHERE {link} != $ref_expected RETURN VALUE id); \
+         IF array::len($live) = 0 {{ THROW '{ROW_MARK}' }} ELSE {{ THROW '{STALE_MARK}' }} }}"
+    ));
     statements.push("RETURN $row".into());
     let sql = format!(
         "BEGIN TRANSACTION; {}; COMMIT TRANSACTION;",
@@ -257,12 +297,20 @@ async fn run_with_refcount<T: SurrealValue>(
     // One counter write in flight at a time, like every other counter write.
     let _guard = cap::counter_lock().await;
     let (mut result, mut errors) =
-        transaction_with_retry(db, &sql, &bindings, &[CLAIM_MARK, ROW_MARK]).await?;
+        transaction_with_retry(db, &sql, &bindings, &[CLAIM_MARK, ROW_MARK, STALE_MARK]).await?;
     if errors
         .values()
         .any(|error| error.to_string().contains(CLAIM_MARK))
     {
         return Err(refused);
+    }
+    if errors
+        .values()
+        .any(|error| error.to_string().contains(STALE_MARK))
+    {
+        return Err(AppError::Conflict(
+            "the link this update moves changed since it was read; re-read and retry",
+        ));
     }
     if errors
         .values()

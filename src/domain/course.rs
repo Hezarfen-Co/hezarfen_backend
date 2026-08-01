@@ -290,13 +290,21 @@ impl Course {
         // without its count. A PATCH that carried no `term_id`, or re-stated the
         // link it already had, moves neither counter.
         let (claim, release) = term::ref_move(self.term.as_ref(), &term);
+        let expected = self.term.as_ref().map(TermId::record);
         FieldUpdate::new(self.id.record())
             .set("title", title)
             .set("description", description)
             .set("kind", kind)
             .set("term", term.map(|term| term.map(|term| term.record())))
             .set("capacity", capacity)
-            .refcount(COURSE_COUNT_FIELD, claim, release, term::gone_error())
+            .refcount(
+                COURSE_COUNT_FIELD,
+                "term",
+                expected,
+                claim,
+                release,
+                term::gone_error(),
+            )
             .run::<Course>(db)
             .await
     }
@@ -583,7 +591,9 @@ mod tests {
     /// The stored `course_count` on one term, absent counting as zero.
     async fn count_on(term: &TermId, db: &Database) -> i64 {
         let mut result = db
-            .query(format!("SELECT VALUE ({COURSE_COUNT_FIELD} ?? 0) FROM $term"))
+            .query(format!(
+                "SELECT VALUE ({COURSE_COUNT_FIELD} ?? 0) FROM $term"
+            ))
             .bind(("term", term.record()))
             .await
             .unwrap()
@@ -661,10 +671,92 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(moved.get_term(), Some(to.get_id()));
-        assert_eq!(count_on(from.get_id(), &db).await, 0, "the old term is free");
+        assert_eq!(
+            count_on(from.get_id(), &db).await,
+            0,
+            "the old term is free"
+        );
         assert_eq!(count_on(to.get_id(), &db).await, 1, "the new one is not");
         assert!(from.clone().delete(&db).await.unwrap());
         assert!(!to.clone().delete(&db).await.unwrap());
+    }
+
+    /// The double-claim guard. Both movers compute their claim and release from
+    /// the row as *they* read it, so two PATCHes moving the same course off the
+    /// same term both release it and both claim their target — two counts for
+    /// one link, and the loser's target is undeletable forever. The second call
+    /// here runs on the struct read before the first one landed, which is that
+    /// race with the interleaving pinned: it must be refused outright, and the
+    /// counts must read as if it never ran.
+    #[tokio::test]
+    async fn a_stale_mover_is_refused_and_claims_nothing() {
+        let db = crate::database::init_mem().await.unwrap();
+        let from = a_term("2026", &db).await;
+        let to = a_term("2027", &db).await;
+        let other = a_term("2028", &db).await;
+        let course = course_on(Some(from.get_id().clone()), &db).await;
+        let stale = course.clone();
+        course
+            .update(None, None, None, Some(Some(to.get_id().clone())), None, &db)
+            .await
+            .unwrap();
+
+        let error = stale
+            .clone()
+            .update(
+                None,
+                None,
+                None,
+                Some(Some(other.get_id().clone())),
+                None,
+                &db,
+            )
+            .await
+            .expect_err("a mover that read a link it no longer holds must be refused");
+        assert!(
+            matches!(error, AppError::Conflict(_)),
+            "a lost CAS is a conflict, not a 404 or a 500: {error:?}"
+        );
+        let stored = Course::read(stale.get_id(), &db).await.unwrap().unwrap();
+        assert_eq!(stored.get_term(), Some(to.get_id()), "the winner's link");
+        assert_eq!(
+            count_on(from.get_id(), &db).await,
+            0,
+            "released once, not twice"
+        );
+        assert_eq!(count_on(to.get_id(), &db).await, 1, "claimed once");
+        assert_eq!(count_on(other.get_id(), &db).await, 0, "never claimed");
+
+        // Same race from the other end: the snapshot says *no* link, so the CAS
+        // is against an absent column — the shape a bound `NONE` has to match.
+        let unlinked = course_on(None, &db).await;
+        let stale = unlinked.clone();
+        unlinked
+            .update(None, None, None, Some(Some(to.get_id().clone())), None, &db)
+            .await
+            .unwrap();
+        let error = stale
+            .clone()
+            .update(
+                None,
+                None,
+                None,
+                Some(Some(other.get_id().clone())),
+                None,
+                &db,
+            )
+            .await
+            .expect_err("a mover that read an absent link someone else filled must be refused");
+        assert!(matches!(error, AppError::Conflict(_)), "{error:?}");
+        assert_eq!(count_on(to.get_id(), &db).await, 2, "one claim per link");
+        assert_eq!(
+            count_on(other.get_id(), &db).await,
+            0,
+            "still never claimed"
+        );
+        // …and the unraced set still lands, so the CAS did not just break moves.
+        let stored = Course::read(stale.get_id(), &db).await.unwrap().unwrap();
+        assert_eq!(stored.get_term(), Some(to.get_id()));
     }
 
     /// The rollback proof. The transaction releases the old term *before* it
@@ -697,7 +789,11 @@ mod tests {
 
         let stored = Course::read(course.get_id(), &db).await.unwrap().unwrap();
         assert_eq!(stored.get_term(), Some(from.get_id()), "the link stays put");
-        assert_eq!(stored.get_title().as_str(), "algebra", "…and so does the row");
+        assert_eq!(
+            stored.get_title().as_str(),
+            "algebra",
+            "…and so does the row"
+        );
         assert_eq!(
             count_on(from.get_id(), &db).await,
             1,

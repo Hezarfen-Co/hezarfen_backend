@@ -120,6 +120,11 @@ async fn claim_at(
 const FULL_MARK: &str = "cap_full";
 const HELD_MARK: &str = "cap_held";
 
+/// [`claim_ref_and_create`]'s third answer: the *name* is retired, which is not
+/// a count being full — nothing empties it, and only putting the name back in
+/// service lets a claim through.
+const RETIRED_MARK: &str = "cap_retired";
+
 /// The two markers [`claim_two_when_and_create`] aborts with, one per counter,
 /// deliberately *not* shared: its two caps mean opposite things to the person
 /// who hit one. The soft cap is a resettable working set (a whiteboard's live
@@ -166,12 +171,54 @@ pub(crate) async fn claim_and_create<T: SurrealValue + Clone>(
     content: &T,
     db: &Database,
 ) -> Result<Claimed<T>, AppError> {
+    claim_at_and_create(parent, field, cap, "", id, content, db).await
+}
+
+/// [`claim_and_create`], but only while `guard` — an extra predicate on that
+/// same parent row — also holds, exactly as [`claim_when`] is to [`claim`]: one
+/// conditional write decides the cap *and* the caller's second precondition, so
+/// no read a concurrent write can outrun sits between them.
+///
+/// The contract that costs the caller something: [`Claimed::Full`] means "full
+/// **or** the guard failed **or** the parent row is gone" — one marker for all
+/// three, because the seat `UPDATE` matching nothing cannot say which clause
+/// refused it. A caller that needs to tell them apart re-reads the parent, and
+/// only to pick the message: none of the three is retryable into a success.
+///
+/// `guard` is always an in-crate SQL literal or built in-crate out of numbers
+/// this crate read back itself — never text from a client.
+pub(crate) async fn claim_when_and_create<T: SurrealValue + Clone>(
+    parent: &RecordId,
+    field: &str,
+    cap: i64,
+    guard: &str,
+    id: &RecordId,
+    content: &T,
+    db: &Database,
+) -> Result<Claimed<T>, AppError> {
+    claim_at_and_create(parent, field, cap, guard, id, content, db).await
+}
+
+async fn claim_at_and_create<T: SurrealValue + Clone>(
+    parent: &RecordId,
+    field: &str,
+    cap: i64,
+    extra: &str,
+    id: &RecordId,
+    content: &T,
+    db: &Database,
+) -> Result<Claimed<T>, AppError> {
+    let extra = if extra.is_empty() {
+        String::new()
+    } else {
+        format!(" AND ({extra})")
+    };
     let sql = format!(
         "BEGIN TRANSACTION;
          LET $held = (SELECT VALUE id FROM $id);
          IF array::len($held) > 0 {{ THROW '{HELD_MARK}' }};
          LET $seat = (UPDATE $parent SET {field} = ({field} ?? 0) + 1 \
-             WHERE ({field} ?? 0) < $num RETURN VALUE id);
+             WHERE ({field} ?? 0) < $num{extra} RETURN VALUE id);
          IF array::len($seat) = 0 {{ THROW '{FULL_MARK}' }};
          CREATE $id CONTENT $row;
          COMMIT TRANSACTION;"
@@ -408,6 +455,111 @@ pub(crate) async fn claim_ref(id: &RecordId, n: i64, db: &Database) -> Result<bo
     Ok(!write(&sql, id, n, db).await?.is_empty())
 }
 
+/// What [`claim_ref_and_create`] settled.
+pub(crate) enum ClaimedRef<T> {
+    /// The reference and the row committed together.
+    Made(T),
+    /// The name is retired — nothing was written, and no retry helps until the
+    /// name is put back in service.
+    Retired,
+    /// Another writer placed this very row first, so this caller never owed a
+    /// reference: nothing was written, and the winner's row is the answer.
+    Duplicate,
+}
+//
+// A separate enum rather than a `Retired` variant on [`Claimed`]: that enum is
+// matched exhaustively by a dozen callers in files this change does not touch,
+// and a cap has no retired state to answer for anyway.
+
+/// Take one reference on `counter` *and* write the row that holds it, in one
+/// transaction — [`claim_and_create`] pointed at a name instead of a cap.
+///
+/// [`claim_ref`] followed by a separate insert cannot promise this: the claim
+/// lands, the insert then fails or the process dies, and the name is counted as
+/// used by a row that does not exist — which is a name nobody can ever retire.
+/// Here the abort takes the increment with it.
+///
+/// The `$held` gate comes first for [`claim_and_create`]'s reason: where the
+/// child carries a deterministic id, a rival can place the very row this caller
+/// is placing, and "you already have it" is the honest answer — one that must
+/// not cost a reference. Which is also why this carries its own retry loop
+/// rather than [`crate::database::transaction_with_retry`]'s: the `CREATE` can
+/// legitimately answer "already exists", and that loop cannot tell that answer
+/// from a lost round. The `UPSERT` cannot answer it — `kind_ref`/`slot_ref`
+/// carry no `UNIQUE` index, so a write keyed by id resolves onto the row the id
+/// names.
+pub(crate) async fn claim_ref_and_create<T: SurrealValue + Clone>(
+    counter: &RecordId,
+    n: i64,
+    id: &RecordId,
+    content: &T,
+    db: &Database,
+) -> Result<ClaimedRef<T>, AppError> {
+    let sql = format!(
+        "BEGIN TRANSACTION;
+         LET $held = (SELECT VALUE id FROM $id);
+         IF array::len($held) > 0 {{ THROW '{HELD_MARK}' }};
+         LET $ref = (UPSERT $parent SET {REF_COUNT_FIELD} = ({REF_COUNT_FIELD} ?? 0) + $num \
+             WHERE {REF_RETIRED_FIELD} != true RETURN VALUE id);
+         IF array::len($ref) = 0 {{ THROW '{RETIRED_MARK}' }};
+         CREATE $id CONTENT $row;
+         COMMIT TRANSACTION;"
+    );
+    let _guard = CLAIM_LOCK.lock().await;
+    let mut last = None;
+    for attempt in 0..CAP_WRITE_TRIES {
+        backoff(attempt).await;
+        let attempted = db
+            .query(sql.as_str())
+            .bind(("parent", counter.clone()))
+            .bind(("num", n))
+            .bind(("id", id.clone()))
+            .bind(("row", content.clone()))
+            .await;
+        let mut result = match attempted {
+            Ok(result) => result,
+            Err(err) if lost_the_race(&err) => {
+                last = Some(err);
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
+        // An aborted transaction errors *every* slot, most with a generic "not
+        // executed" — only the failing slot says why. The markers are read
+        // before the conflict check, because a `THROW` is a decision.
+        let mut errors = result.take_errors();
+        if errors
+            .values()
+            .any(|error| error.to_string().contains(HELD_MARK) || error.is_already_exists())
+        {
+            return Ok(ClaimedRef::Duplicate);
+        }
+        if errors
+            .values()
+            .any(|error| error.to_string().contains(RETIRED_MARK))
+        {
+            return Ok(ClaimedRef::Retired);
+        }
+        if errors.values().any(lost_the_race) {
+            last = errors.drain().map(|(_, error)| error).find(lost_the_race);
+            continue;
+        }
+        if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+            return Err(error.into());
+        }
+        // Slots count BEGIN, two LETs and two IFs: the CREATE is slot 5.
+        return result
+            .take::<Vec<T>>(5)?
+            .into_iter()
+            .next()
+            .map(ClaimedRef::Made)
+            .ok_or_else(|| AppError::Internal("cap claim wrote no row".into()));
+    }
+    Err(last
+        .map(AppError::from)
+        .unwrap_or_else(|| AppError::Internal("cap counter write never ran".into())))
+}
+
 /// Give `n` references back — the referencing rows are gone (or never landed).
 /// Clamped at zero like [`release`], so a double release cannot push a counter
 /// below the rows it counts and let a used name be retired.
@@ -624,5 +776,141 @@ mod tests {
         ));
         assert_eq!(stored(&db).await, (0, 0));
         assert_eq!(strokes(&db).await, 0);
+    }
+
+    // --- claim_when_and_create ------------------------------------------
+
+    async fn claim_one(db: &Database, cap: i64, key: &str) -> Claimed<Stroke> {
+        claim_when_and_create(
+            &RecordId::new("board", "b"),
+            BOARD_EPOCH_STROKE_COUNT_FIELD,
+            cap,
+            BOARD_OPEN_GUARD,
+            &RecordId::new("board_stroke", key),
+            &a_stroke(),
+            db,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_guarded_claim_advances_its_counter_exactly_once() {
+        let db = a_board(0, 0, false).await;
+        assert!(matches!(claim_one(&db, 9, "s1").await, Claimed::Made(_)));
+        assert_eq!(stored(&db).await, (1, 0));
+        assert_eq!(strokes(&db).await, 1);
+    }
+
+    /// A failed guard is refused as `Full` (the one marker covers full, guard
+    /// and missing parent), and must leave the counter and the table alone.
+    #[tokio::test]
+    async fn a_guard_refusal_advances_neither_counter_nor_row() {
+        let db = a_board(0, 0, true).await;
+        assert!(matches!(claim_one(&db, 9, "s1").await, Claimed::Full));
+        assert_eq!(stored(&db).await, (0, 0));
+        assert_eq!(strokes(&db).await, 0);
+    }
+
+    /// The second writer at the same id owes no seat: the row is already there,
+    /// so the counter must not move a second time for it.
+    #[tokio::test]
+    async fn a_duplicate_row_claims_no_seat() {
+        let db = a_board(0, 0, false).await;
+        assert!(matches!(claim_one(&db, 9, "s1").await, Claimed::Made(_)));
+        assert!(matches!(claim_one(&db, 9, "s1").await, Claimed::Duplicate));
+        assert_eq!(stored(&db).await, (1, 0));
+        assert_eq!(strokes(&db).await, 1);
+    }
+
+    // --- claim_ref_and_create -------------------------------------------
+
+    #[derive(Debug, Clone, SurrealValue)]
+    struct Menu {
+        date: String,
+        slot: String,
+        created_by: RecordId,
+        created_at: i64,
+    }
+
+    async fn a_slot(count: i64, retired: bool) -> Database {
+        let db = crate::database::init_mem().await.unwrap();
+        db.query(
+            "CREATE user:u SET username = 'u', password_hash = 'x';
+             UPSERT slot_ref:lunch SET count = $count, retired = $retired;",
+        )
+        .bind(("count", count))
+        .bind(("retired", retired))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+        db
+    }
+
+    /// The reference count, re-read out of the store — never off a return
+    /// value, which the in-memory engine forges wins on (see `CLAIM_LOCK`).
+    async fn refs(db: &Database) -> i64 {
+        let mut result = db
+            .query("SELECT VALUE (count ?? 0) FROM slot_ref:lunch")
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        result.take::<Vec<i64>>(0).unwrap()[0]
+    }
+
+    async fn menus(db: &Database) -> usize {
+        let mut result = db
+            .query("SELECT VALUE id FROM menu")
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        result.take::<Vec<RecordId>>(0).unwrap().len()
+    }
+
+    async fn claim_slot(db: &Database, key: &str) -> ClaimedRef<Menu> {
+        claim_ref_and_create(
+            &RecordId::new(crate::constant::SLOT_REF_TABLE, "lunch"),
+            1,
+            &RecordId::new("menu", key),
+            &Menu {
+                date: "2026-08-02".into(),
+                slot: "lunch".into(),
+                created_by: RecordId::new("user", "u"),
+                created_at: 1,
+            },
+            db,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_reference_and_its_row_land_together() {
+        let db = a_slot(0, false).await;
+        assert!(matches!(claim_slot(&db, "m1").await, ClaimedRef::Made(_)));
+        assert_eq!(refs(&db).await, 1);
+        assert_eq!(menus(&db).await, 1);
+    }
+
+    /// A retired name refuses, and the refusal must cost nothing: no row, no
+    /// count — a counted row on a retired name is a name nobody can retire.
+    #[tokio::test]
+    async fn a_retired_name_refuses_with_no_row_and_no_count() {
+        let db = a_slot(0, true).await;
+        assert!(matches!(claim_slot(&db, "m1").await, ClaimedRef::Retired));
+        assert_eq!(refs(&db).await, 0);
+        assert_eq!(menus(&db).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_row_claims_no_reference() {
+        let db = a_slot(0, false).await;
+        assert!(matches!(claim_slot(&db, "m1").await, ClaimedRef::Made(_)));
+        assert!(matches!(claim_slot(&db, "m1").await, ClaimedRef::Duplicate));
+        assert_eq!(refs(&db).await, 1);
+        assert_eq!(menus(&db).await, 1);
     }
 }
