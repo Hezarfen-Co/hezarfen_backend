@@ -300,7 +300,7 @@ struct UpdateHomework {
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "Narrowing the assigned list would orphan an existing submission or result", body = ErrorResponse),
+        (status = 409, description = "Narrowing the assigned list would orphan an existing submission or result, or the subject this update re-tags from changed since the caller read it — nothing was written, re-read and retry", body = ErrorResponse),
     ),
 )]
 async fn update_homework(

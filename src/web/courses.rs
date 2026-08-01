@@ -409,6 +409,7 @@ async fn get_course(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 409, description = "The term this update moves the course off changed since the caller read it — nothing was written, re-read and retry", body = ErrorResponse),
     ),
 )]
 async fn update_course(
