@@ -696,7 +696,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/courses`                       | student | The caller's visible courses: created + enrolled (manager+: all) · paged |
 | GET    | `/courses/me`                    | student | The caller's **enrolled** courses · paged |
 | GET    | `/courses/{id}`                  | student | Get course (enrolled, creator, assigned teacher, or manager+) |
-| PATCH  | `/courses/{id}`                  | teacher | Edit course incl. `kind` and `capacity` (`null` lifts the cap) (course manager) |
+| PATCH  | `/courses/{id}`                  | teacher | Edit course incl. `kind` and `capacity` (`null` lifts the cap) (course manager; `409` if the `term_id` it moves off changed since the read — nothing written, re-read and retry) |
 | DELETE | `/courses/{id}`                  | teacher | Delete course + its exams, results, subjects, sessions, and homework (submissions, files, and grades included) (creator, or manager+ — **not** an assigned teacher; `409` while anyone is still enrolled) |
 | POST   | `/courses/{id}/teachers`         | manager | `{user_id}` — assign a **teacher+** to run the course (idempotent; returns the course) |
 | DELETE | `/courses/{id}/teachers/{user}`  | manager | Unassign a teacher (`404` if they weren't assigned) |
@@ -706,7 +706,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | POST   | `/classes`                       | manager | `{name, grade?, term_id?}` — create a class (şube); `grade` is a free-text year label |
 | GET    | `/classes`                       | teacher | List classes, newest first · paged |
 | GET    | `/classes/{id}`                  | teacher | Get one class                   |
-| PATCH  | `/classes/{id}`                  | manager | Edit a class (`null` clears `grade`/`term_id`) |
+| PATCH  | `/classes/{id}`                  | manager | Edit a class (`null` clears `grade`/`term_id`; `409` if the `term_id` it moves off changed since the read — nothing written, re-read and retry) |
 | DELETE | `/classes/{id}`                  | manager | Delete a class — `409` while it still holds students or courses |
 | POST   | `/classes/{id}/members`          | manager | `{user_id}` — add a **student**; enrolls them into every attached course (`409` if one is full, naming it, or if already a member) |
 | GET    | `/classes/{id}/members`          | teacher | List the class roster · paged   |
@@ -743,7 +743,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | POST   | `/exams/{id}/attempt/finish`     | student | Submit the attempt (`409` once the deadline passed); allowed even while locked out of the room |
 | POST   | `/exams/{id}/questions`          | teacher | `{subject_id, text, kind, points, choices?, correct?}` — add a question tagged with one of the course's subjects (course manager; frozen once attempted) |
 | GET    | `/exams/{id}/questions`          | teacher | The full question list, `correct` included (course manager) · paged |
-| PATCH  | `/exams/{id}/questions/{qid}`    | teacher | Edit a question — the kind bundle revalidates as a unit (course manager; frozen once attempted) |
+| PATCH  | `/exams/{id}/questions/{qid}`    | teacher | Edit a question — the kind bundle revalidates as a unit (course manager; frozen once attempted; an omitted `subject_id` is filled from the stored row, so *any* edit is a `409` if someone re-tagged the question since the read — nothing written, re-read and retry) |
 | DELETE | `/exams/{id}/questions/{qid}`    | teacher | Delete a question + its answers (course manager; frozen once attempted) |
 | POST   | `/exams/{id}/questions/from-bank/{bid}` | teacher | Instantiate a **bank question** into this exam — copies it to a fresh exam-scoped question (new id, own images + answers; records the template in `source_bank`); body `{subject_id}` retags it against the course's subjects (`400` cross-course; course manager; `409` once attempted) |
 | POST   | `/exams/{id}/questions/{qid}/to-bank` | teacher | Save an existing exam question into the school **question bank** — copies it to a detached bank row (new id, own images; records the origin exam in `source_exam`); the source question is untouched (course manager) |
@@ -786,7 +786,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/courses/{id}/homework`         | student | List the course's homework, newest first (enrolled, creator, assigned teacher, or manager+; students see only what they're assigned) · paged |
 | GET    | `/homework`                      | student | The caller's cross-course homework: their courses' (manager+: all; students only what they're assigned) · paged |
 | GET    | `/homework/{id}`                 | student | Get homework (course viewers; a subset homework is a `404` to students it doesn't name) |
-| PATCH  | `/homework/{id}`                 | teacher | Edit title/description/`due_at`/`subject_id`/`assigned` (course manager; a newly set due date is re-checked; `409` if narrowing `assigned` would strand an existing submission or grade — the blockers are named) |
+| PATCH  | `/homework/{id}`                 | teacher | Edit title/description/`due_at`/`subject_id`/`assigned` (course manager; a newly set due date is re-checked; `409` if narrowing `assigned` would strand an existing submission or grade — the blockers are named — or if the `subject_id` it re-tags from changed since the read: nothing written, re-read and retry) |
 | DELETE | `/homework/{id}`                 | teacher | Delete homework + its submissions, files, and grades — file blobs included (course manager) |
 | POST   | `/homework/{id}/submission`      | student | `{text?}` — hand in / re-edit own work (**students only**, enrolled, assigned): text replaces whole (omit clears), `submitted_at` pins the first hand-in, `updated_at` moves; `409` once graded |
 | GET    | `/homework/{id}/submission`      | student | Own submission: text, both stamps, computed `late`, files, grade-if-any (`404` until submitted) |

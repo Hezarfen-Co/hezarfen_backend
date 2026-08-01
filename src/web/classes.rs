@@ -281,6 +281,7 @@ async fn get_class(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 409, description = "The term this update moves the class off changed since the caller read it — nothing was written, re-read and retry", body = ErrorResponse),
     ),
 )]
 async fn update_class(

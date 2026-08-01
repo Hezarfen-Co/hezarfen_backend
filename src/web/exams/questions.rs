@@ -310,7 +310,9 @@ pub(crate) async fn question_page(
 /// course. Omitted fields keep their value; `kind`/`choices`/`correct` are
 /// re-validated as a unit, so a kind switch must bring the matching fields
 /// along. `subject_id` re-tags within the course's subjects. Locked once
-/// attempts exist.
+/// attempts exist. An omitted `subject_id` is filled from the stored row, so
+/// any edit here — not just a re-tag — is refused with a `409` when someone
+/// else moved the question's subject after the caller read it.
 #[utoipa::path(
     patch,
     path = "/{id}/questions/{qid}",
@@ -327,7 +329,7 @@ pub(crate) async fn question_page(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "No such exam, or no such question in it", body = ErrorResponse),
-        (status = 409, description = "Attempts have started — questions are frozen", body = ErrorResponse),
+        (status = 409, description = "Attempts have started — questions are frozen, or the subject the question was read on changed since — nothing was written, re-read and retry", body = ErrorResponse),
     ),
 )]
 pub(crate) async fn update_question(
