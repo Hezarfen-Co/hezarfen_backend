@@ -21,7 +21,7 @@ use crate::domain::cap;
 use crate::domain::field_update::FieldUpdate;
 use crate::domain::monotonic_id::next_ulid;
 use crate::domain::page::PagedList;
-use crate::domain::term::TermId;
+use crate::domain::term::{self, TermId};
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 use crate::validate::{validate_optional, validate_required};
@@ -122,10 +122,12 @@ impl ClassGroup {
         &self.creator == user
     }
 
-    /// Create the class, claiming a reference on the term it links (if any)
-    /// *before* the row is written: the claim is a conditional write on the term
-    /// row, so it fails when the term is already gone and it makes the term
-    /// undeletable the instant this link exists.
+    /// Create the class, claiming a reference on the term it links (if any) in
+    /// the *same transaction* as the row, exactly as
+    /// [`crate::domain::course::Course::create`] does: the claim is a
+    /// conditional write on the term row, so it fails when the term is already
+    /// gone, it makes the term undeletable the instant this link exists, and no
+    /// crash can leave either half without the other.
     pub async fn create(
         creator: &UserId,
         name: ClassName,
@@ -133,10 +135,6 @@ impl ClassGroup {
         term: Option<TermId>,
         db: &Database,
     ) -> Result<ClassGroup, AppError> {
-        if let Some(term) = &term {
-            claim_term(term, db).await?;
-        }
-        let claimed = term.clone();
         let class = ClassGroup {
             id: ClassGroupId::generate(),
             creator: creator.clone(),
@@ -144,20 +142,27 @@ impl ClassGroup {
             grade,
             term,
         };
-        let created: Result<Option<ClassGroup>, _> =
-            db.create(class.id.record()).content(class).await;
-        match created {
-            Ok(Some(created)) => Ok(created),
-            other => {
-                // The link never landed, so the reference has to go back.
-                if let Some(term) = &claimed {
-                    cap::release(&term.record(), TERM_CLASS_COUNT_FIELD, db).await?;
-                }
-                match other {
-                    Err(err) => Err(err.into()),
-                    _ => Err(AppError::Internal("failed to create class".into())),
-                }
-            }
+        let id = class.id.record();
+        let Some(term) = class.term.clone() else {
+            let created: Option<ClassGroup> = db.create(id).content(class).await?;
+            return created.ok_or_else(|| AppError::Internal("failed to create class".into()));
+        };
+        match cap::claim_and_create(
+            &term.record(),
+            TERM_CLASS_COUNT_FIELD,
+            cap::UNLIMITED,
+            &id,
+            &class,
+            db,
+        )
+        .await?
+        {
+            cap::Claimed::Made(created) => Ok(created),
+            // Uncapped, so "full" can only mean the conditional write matched no
+            // term row at all — the claim doubles as the existence check.
+            cap::Claimed::Full => Err(term::gone_error()),
+            // Unreachable: the id is a ULID this call just generated.
+            cap::Claimed::Duplicate => Err(AppError::Internal("failed to create class".into())),
         }
     }
 
@@ -182,10 +187,10 @@ impl ClassGroup {
     /// they take the outer/inner `Option<Option<_>>`: `None` = omitted (keep),
     /// `Some(None)` = clear.
     ///
-    /// A term move is claim-then-write-then-release, in that order, exactly as
-    /// in [`crate::domain::course::Course::update`]: the new term is made
-    /// undeletable before the link points at it, and the old one is only let go
-    /// once the link has actually moved off it.
+    /// A term move claims the new term and releases the old one inside the very
+    /// transaction that moves the link, exactly as in
+    /// [`crate::domain::course::Course::update`]: both counters and the link
+    /// commit together, so no crash can strand a count on a term nothing links.
     pub async fn update(
         self,
         name: Option<ClassName>,
@@ -193,37 +198,14 @@ impl ClassGroup {
         term: Option<Option<TermId>>,
         db: &Database,
     ) -> Result<ClassGroup, AppError> {
-        let claimed = match &term {
-            Some(Some(new)) if Some(new) != self.term.as_ref() => {
-                claim_term(new, db).await?;
-                Some(new.clone())
-            }
-            _ => None,
-        };
-        let updated = FieldUpdate::new(self.id.record())
+        let (claim, release) = term::ref_move(self.term.as_ref(), &term);
+        FieldUpdate::new(self.id.record())
             .set("name", name)
             .set("grade", grade)
             .set("term", term.map(|term| term.map(|term| term.record())))
+            .refcount(TERM_CLASS_COUNT_FIELD, claim, release, term::gone_error())
             .run::<ClassGroup>(db)
-            .await;
-        match updated {
-            Ok(updated) => {
-                // The stored row is the authority on where the link ended up —
-                // a PATCH that carried no `term_id` leaves it untouched.
-                if let Some(old) = &self.term
-                    && updated.term.as_ref() != Some(old)
-                {
-                    cap::release(&old.record(), TERM_CLASS_COUNT_FIELD, db).await?;
-                }
-                Ok(updated)
-            }
-            Err(err) => {
-                if let Some(new) = &claimed {
-                    cap::release(&new.record(), TERM_CLASS_COUNT_FIELD, db).await?;
-                }
-                Err(err)
-            }
-        }
+            .await
     }
 
     /// Delete the class and give its term reference back. Nothing cascades: a
@@ -280,19 +262,6 @@ impl ClassGroup {
     }
 }
 
-/// Take a reference on `term` for a class about to link it. The conditional
-/// write doubles as the existence check — the class half of
-/// [`crate::domain::course`]'s `claim_term`, against the class column.
-async fn claim_term(term: &TermId, db: &Database) -> Result<(), AppError> {
-    if cap::claim(&term.record(), TERM_CLASS_COUNT_FIELD, cap::UNLIMITED, db).await? {
-        return Ok(());
-    }
-    Err(AppError::Validation(ValidationError::Invalid {
-        field: "term_id",
-        reason: "term does not exist",
-    }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,6 +296,25 @@ mod tests {
             .first()
             .copied()
             .unwrap()
+    }
+
+    /// The stored `class_count` on one term, absent counting as zero.
+    async fn count_on(term: &TermId, db: &Database) -> i64 {
+        let mut result = db
+            .query(format!(
+                "SELECT VALUE ({TERM_CLASS_COUNT_FIELD} ?? 0) FROM $term"
+            ))
+            .bind(("term", term.record()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        result
+            .take::<Vec<i64>>(0)
+            .unwrap()
+            .first()
+            .copied()
+            .unwrap_or(0)
     }
 
     /// How many rows `sql` selects ids for.
@@ -436,6 +424,87 @@ mod tests {
                 "a second delete is a 404, not a refusal: {again:?}"
             );
         }
+    }
+
+    /// The class half of the invariant on the create path: a refused create
+    /// leaves neither the row nor a count stranded on a term (which the term's
+    /// delete guard reads, so a stray one would make it undeletable forever).
+    #[tokio::test]
+    async fn a_refused_create_writes_neither_row_nor_count() {
+        let db = crate::database::init_mem().await.unwrap();
+        let term = a_term(&db).await;
+        let id = term.get_id().clone();
+        assert!(term.delete(&db).await.unwrap());
+
+        let error = ClassGroup::create(
+            &UserId::from_key("manager"),
+            ClassName::try_new("9-A").unwrap(),
+            None,
+            Some(id),
+            &db,
+        )
+        .await
+        .expect_err("a term that is gone must not be linkable");
+        assert!(error.to_string().contains("term does not exist"));
+        assert_eq!(
+            rows("SELECT VALUE id FROM class_group", &db).await,
+            0,
+            "a refused create may write no row"
+        );
+        assert_eq!(
+            rows("SELECT VALUE id FROM term", &db).await,
+            0,
+            "…and least of all a count on a term it just brought back"
+        );
+    }
+
+    /// The class mirror of
+    /// [`crate::domain::course::Course`]'s move tests: a term move carries both
+    /// counters with the link, and a move to a term that is gone rolls the
+    /// release back with the abort (the transaction releases before it claims,
+    /// so the old count would be 0 if the abort did not undo it).
+    #[tokio::test]
+    async fn a_class_term_move_moves_both_counts_or_neither() {
+        let db = crate::database::init_mem().await.unwrap();
+        let at = crate::domain::timestamp::Timestamp::from_millis;
+        let from = a_term(&db).await;
+        let to = Term::create(TermName::try_new("2027").unwrap(), at(100), at(200), &db)
+            .await
+            .unwrap();
+        let dead = Term::create(TermName::try_new("2028").unwrap(), at(100), at(200), &db)
+            .await
+            .unwrap();
+        let dead_id = dead.get_id().clone();
+        assert!(dead.delete(&db).await.unwrap());
+        let class = class_on(Some(from.get_id().clone()), &db).await;
+
+        let error = class
+            .clone()
+            .update(
+                Some(ClassName::try_new("9-B").unwrap()),
+                None,
+                Some(Some(dead_id)),
+                &db,
+            )
+            .await
+            .expect_err("a term that is gone must not be linkable");
+        assert!(error.to_string().contains("term does not exist"));
+        let stored = ClassGroup::read(class.get_id(), &db).await.unwrap().unwrap();
+        assert_eq!(stored.get_term(), Some(from.get_id()), "the link stays put");
+        assert_eq!(stored.get_name().as_str(), "9-A", "…and so does the row");
+        assert_eq!(
+            count_on(from.get_id(), &db).await,
+            1,
+            "the release must roll back with the abort"
+        );
+
+        let moved = class
+            .update(None, None, Some(Some(to.get_id().clone())), &db)
+            .await
+            .unwrap();
+        assert_eq!(moved.get_term(), Some(to.get_id()));
+        assert_eq!(count_on(from.get_id(), &db).await, 0, "the old term is free");
+        assert_eq!(count_on(to.get_id(), &db).await, 1, "the new one is not");
     }
 
     /// [`crate::domain::course::Course::delete`]'s class sweep: deleting a course

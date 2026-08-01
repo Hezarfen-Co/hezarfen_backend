@@ -9,7 +9,7 @@ use crate::database::{Database, transaction_with_retry};
 use crate::domain::cap;
 use crate::domain::field_update::FieldUpdate;
 use crate::domain::page::PagedList;
-use crate::domain::term::TermId;
+use crate::domain::term::{self, TermId};
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 use crate::validate::{validate_course_kind, validate_optional, validate_required};
@@ -161,11 +161,12 @@ impl Course {
         self.teachers.contains(user)
     }
 
-    /// Create the course, claiming a reference on the term it links (if any)
-    /// *before* the row is written: the claim is a conditional write on the
-    /// term row, so it fails when the term is already gone and it makes the
-    /// term undeletable the instant this link exists, which the count-then-write
-    /// mutex it replaced could not do.
+    /// Create the course, claiming a reference on the term it links (if any) in
+    /// the *same transaction* as the row: the claim is a conditional write on
+    /// the term row, so it fails when the term is already gone and it makes the
+    /// term undeletable the instant this link exists — and a crash can never
+    /// leave one without the other, which a claim sent as its own query could
+    /// (the count would strand and the term be undeletable forever).
     pub async fn create(
         creator: &UserId,
         title: CourseTitle,
@@ -175,10 +176,6 @@ impl Course {
         capacity: Option<i64>,
         db: &Database,
     ) -> Result<Course, AppError> {
-        if let Some(term) = &term {
-            claim_term(term, db).await?;
-        }
-        let claimed = term.clone();
         let course = Course {
             id: CourseId::generate(),
             creator: creator.clone(),
@@ -189,20 +186,27 @@ impl Course {
             description,
             kind,
         };
-        let created: Result<Option<Course>, _> =
-            db.create(course.id.record()).content(course).await;
-        match created {
-            Ok(Some(created)) => Ok(created),
-            other => {
-                // The link never landed, so the reference has to go back.
-                if let Some(term) = &claimed {
-                    cap::release(&term.record(), COURSE_COUNT_FIELD, db).await?;
-                }
-                match other {
-                    Err(err) => Err(err.into()),
-                    _ => Err(AppError::Internal("failed to create course".into())),
-                }
-            }
+        let id = course.id.record();
+        let Some(term) = course.term.clone() else {
+            let created: Option<Course> = db.create(id).content(course).await?;
+            return created.ok_or_else(|| AppError::Internal("failed to create course".into()));
+        };
+        match cap::claim_and_create(
+            &term.record(),
+            COURSE_COUNT_FIELD,
+            cap::UNLIMITED,
+            &id,
+            &course,
+            db,
+        )
+        .await?
+        {
+            cap::Claimed::Made(created) => Ok(created),
+            // Uncapped, so "full" can only mean the conditional write matched no
+            // term row at all — the existence check the pre-flight lookup makes.
+            cap::Claimed::Full => Err(term::gone_error()),
+            // Unreachable: the id is a ULID this call just generated.
+            cap::Claimed::Duplicate => Err(AppError::Internal("failed to create course".into())),
         }
     }
 
@@ -280,43 +284,21 @@ impl Course {
         capacity: Option<Option<i64>>,
         db: &Database,
     ) -> Result<Course, AppError> {
-        // A term move is claim-then-write-then-release, in that order: the new
-        // term is made undeletable before the link points at it, and the old
-        // one is only let go once the link has actually moved off it. Doing it
-        // the other way round would open exactly the window this replaced.
-        let claimed = match &term {
-            Some(Some(new)) if Some(new) != self.term.as_ref() => {
-                claim_term(new, db).await?;
-                Some(new.clone())
-            }
-            _ => None,
-        };
-        let updated = FieldUpdate::new(self.id.record())
+        // A term move claims the new term and releases the old one inside the
+        // very transaction that moves the link, so no crash can leave a count
+        // without its link (the term would be undeletable forever) or a link
+        // without its count. A PATCH that carried no `term_id`, or re-stated the
+        // link it already had, moves neither counter.
+        let (claim, release) = term::ref_move(self.term.as_ref(), &term);
+        FieldUpdate::new(self.id.record())
             .set("title", title)
             .set("description", description)
             .set("kind", kind)
             .set("term", term.map(|term| term.map(|term| term.record())))
             .set("capacity", capacity)
+            .refcount(COURSE_COUNT_FIELD, claim, release, term::gone_error())
             .run::<Course>(db)
-            .await;
-        match updated {
-            Ok(updated) => {
-                // The stored row is the authority on where the link ended up —
-                // a PATCH that carried no `term_id` leaves it untouched.
-                if let Some(old) = &self.term
-                    && updated.term.as_ref() != Some(old)
-                {
-                    cap::release(&old.record(), COURSE_COUNT_FIELD, db).await?;
-                }
-                Ok(updated)
-            }
-            Err(err) => {
-                if let Some(new) = &claimed {
-                    cap::release(&new.record(), COURSE_COUNT_FIELD, db).await?;
-                }
-                Err(err)
-            }
-        }
+            .await
     }
 
     /// Assign `teacher` to run this course, or return the course untouched if
@@ -472,23 +454,10 @@ impl Course {
     }
 }
 
-/// Take a reference on `term` for a course about to link it. The conditional
-/// write doubles as the existence check: a term that a delete already removed
-/// matches nothing, and the caller answers exactly what the pre-flight lookup
-/// in `web::terms::resolve_term` would have.
-async fn claim_term(term: &TermId, db: &Database) -> Result<(), AppError> {
-    if cap::claim(&term.record(), COURSE_COUNT_FIELD, cap::UNLIMITED, db).await? {
-        return Ok(());
-    }
-    Err(AppError::Validation(ValidationError::Invalid {
-        field: "term_id",
-        reason: "term does not exist",
-    }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::term::{Term, TermName};
 
     async fn course_on(term: Option<TermId>, db: &Database) -> Course {
         Course::create(
@@ -557,8 +526,6 @@ mod tests {
     /// back. Dropping the release in `delete` leaves the term deletable never.
     #[tokio::test]
     async fn a_term_is_deletable_only_once_no_course_links_it() {
-        use crate::domain::term::{Term, TermName};
-
         let db = crate::database::init_mem().await.unwrap();
         let at = crate::domain::timestamp::Timestamp::from_millis;
         let term = Term::create(TermName::try_new("2026").unwrap(), at(100), at(200), &db)
@@ -611,6 +578,136 @@ mod tests {
         .await
         .expect_err("a missing term must not be linkable");
         assert!(error.to_string().contains("term does not exist"));
+    }
+
+    /// The stored `course_count` on one term, absent counting as zero.
+    async fn count_on(term: &TermId, db: &Database) -> i64 {
+        let mut result = db
+            .query(format!("SELECT VALUE ({COURSE_COUNT_FIELD} ?? 0) FROM $term"))
+            .bind(("term", term.record()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        result
+            .take::<Vec<i64>>(0)
+            .unwrap()
+            .first()
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// How many rows `sql` selects ids for.
+    async fn rows(sql: &str, db: &Database) -> usize {
+        let mut result = db.query(sql).await.unwrap().check().unwrap();
+        result.take::<Vec<RecordId>>(0).unwrap().len()
+    }
+
+    async fn a_term(name: &str, db: &Database) -> Term {
+        let at = crate::domain::timestamp::Timestamp::from_millis;
+        Term::create(TermName::try_new(name).unwrap(), at(100), at(200), db)
+            .await
+            .unwrap()
+    }
+
+    /// The invariant, on the create path: a claim and the row it accounts for
+    /// commit together or not at all. A refused create must therefore leave
+    /// *neither* — no course row, and no count stranded on a term (which is
+    /// worse than it sounds: the term's delete guard reads that count, so a
+    /// stray one makes the term undeletable forever).
+    #[tokio::test]
+    async fn a_refused_create_writes_neither_row_nor_count() {
+        let db = crate::database::init_mem().await.unwrap();
+        let term = a_term("2026", &db).await;
+        let id = term.get_id().clone();
+        assert!(term.delete(&db).await.unwrap());
+
+        let error = Course::create(
+            &UserId::from_key("teacher"),
+            CourseTitle::try_new("algebra").unwrap(),
+            CourseDescription::try_new("").unwrap(),
+            CourseKind::course(),
+            Some(id),
+            None,
+            &db,
+        )
+        .await
+        .expect_err("a term that is gone must not be linkable");
+        assert!(error.to_string().contains("term does not exist"));
+        assert_eq!(
+            rows("SELECT VALUE id FROM course", &db).await,
+            0,
+            "a refused create may write no row"
+        );
+        assert_eq!(
+            rows("SELECT VALUE id FROM term", &db).await,
+            0,
+            "…and least of all a count on a term it just brought back"
+        );
+    }
+
+    /// The invariant on the PATCH path, both directions: a move carries the new
+    /// term's claim and the old term's release with the link itself.
+    #[tokio::test]
+    async fn a_term_move_moves_the_count() {
+        let db = crate::database::init_mem().await.unwrap();
+        let from = a_term("2026", &db).await;
+        let to = a_term("2027", &db).await;
+        let course = course_on(Some(from.get_id().clone()), &db).await;
+        assert_eq!(count_on(from.get_id(), &db).await, 1);
+
+        let moved = course
+            .update(None, None, None, Some(Some(to.get_id().clone())), None, &db)
+            .await
+            .unwrap();
+        assert_eq!(moved.get_term(), Some(to.get_id()));
+        assert_eq!(count_on(from.get_id(), &db).await, 0, "the old term is free");
+        assert_eq!(count_on(to.get_id(), &db).await, 1, "the new one is not");
+        assert!(from.clone().delete(&db).await.unwrap());
+        assert!(!to.clone().delete(&db).await.unwrap());
+    }
+
+    /// The rollback proof. The transaction releases the old term *before* it
+    /// claims the new one, so a move to a term that is gone has already
+    /// decremented when the claim throws — the old count still being 1 is the
+    /// abort undoing a write that really happened, not a branch that never ran.
+    /// The title moves in the same PATCH, and must not stick either.
+    #[tokio::test]
+    async fn a_term_move_to_a_dead_term_leaves_everything_untouched() {
+        let db = crate::database::init_mem().await.unwrap();
+        let from = a_term("2026", &db).await;
+        let dead = a_term("2027", &db).await;
+        let dead_id = dead.get_id().clone();
+        assert!(dead.delete(&db).await.unwrap());
+        let course = course_on(Some(from.get_id().clone()), &db).await;
+
+        let error = course
+            .clone()
+            .update(
+                Some(CourseTitle::try_new("moved").unwrap()),
+                None,
+                None,
+                Some(Some(dead_id)),
+                None,
+                &db,
+            )
+            .await
+            .expect_err("a term that is gone must not be linkable");
+        assert!(error.to_string().contains("term does not exist"));
+
+        let stored = Course::read(course.get_id(), &db).await.unwrap().unwrap();
+        assert_eq!(stored.get_term(), Some(from.get_id()), "the link stays put");
+        assert_eq!(stored.get_title().as_str(), "algebra", "…and so does the row");
+        assert_eq!(
+            count_on(from.get_id(), &db).await,
+            1,
+            "the release must roll back with the abort"
+        );
+        assert_eq!(
+            rows("SELECT VALUE id FROM term", &db).await,
+            1,
+            "the dead term must not be resurrected by the claim"
+        );
     }
 
     #[tokio::test]

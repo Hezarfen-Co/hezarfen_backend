@@ -41,6 +41,32 @@ impl TermId {
     }
 }
 
+/// The answer every link to a term that is not there gets — the claim is a
+/// conditional write on the term row, so a term a delete already removed
+/// matches nothing and the caller says exactly what `web::terms::resolve_term`'s
+/// pre-flight lookup would have.
+pub fn gone_error() -> AppError {
+    AppError::Validation(ValidationError::Invalid {
+        field: "term_id",
+        reason: "term does not exist",
+    })
+}
+
+/// What a PATCH's `term` field owes the refcounts: the term to claim, and the
+/// one to give back. Covers all three moves — set (none→some), move
+/// (some→other) and clear (some→none) — and moves nothing for a PATCH that
+/// omitted the field or re-stated the link it already had.
+pub fn ref_move(
+    current: Option<&TermId>,
+    patch: &Option<Option<TermId>>,
+) -> (Option<RecordId>, Option<RecordId>) {
+    match patch {
+        None => (None, None),
+        Some(next) if next.as_ref() == current => (None, None),
+        Some(next) => (next.as_ref().map(TermId::record), current.map(TermId::record)),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct TermName(String);
 

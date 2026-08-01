@@ -53,6 +53,14 @@ use crate::error::AppError;
 // only about how many writes a process has in flight.
 static CLAIM_LOCK: Mutex<()> = Mutex::const_new(());
 
+/// [`CLAIM_LOCK`], for a counter write that rides someone else's transaction
+/// instead of [`write`]'s — [`crate::domain::field_update::FieldUpdate`]'s term
+/// move claims and releases inside the very `UPDATE`'s transaction, and still
+/// owes the process one counter write at a time.
+pub(crate) async fn counter_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    CLAIM_LOCK.lock().await
+}
+
 /// "No cap" as a number, so the guard stays one comparison instead of a
 /// nullable branch: `NONE`/`NULL` bind ambiguity is a worse trade than a
 /// sentinel no roster will ever reach.
