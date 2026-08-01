@@ -2510,10 +2510,15 @@ model — no course, no lesson session, no appointment. Any account from
 alone clears, locks, closes or deletes.**
 
 The roster is spelled `participants` everywhere — in the `POST` body, in the
-`PATCH` body and in every board response — so a client may post back a board it
-just read. Unlike the rest of this API, the two board request bodies **reject
-an unknown key** (`422`) rather than ignoring it: a misspelled roster would
-otherwise open a board its author is silently alone on.
+`PATCH` body and in every board response — so the field never changes name
+between a request and a reply. That is the *only* thing the shared spelling
+buys: unlike the rest of this API, the two board request bodies **reject an
+unknown key** (`422`) rather than ignoring it, because a misspelled roster
+would otherwise open a board its author is silently alone on. So a body must
+carry **only** the fields that request accepts — a board it just read is not a
+legal body, since `id`, `creator`, `locked_by`, `epoch` and the rest are all
+unknown to `POST` and `PATCH`. A read-modify-write client sends the writable
+fields it changed, never the whole board object back.
 
 **No parents, anywhere.** The `parent` role is the school's read-only observer,
 and it has no whiteboard access at all — not a view-only tier, none. It is

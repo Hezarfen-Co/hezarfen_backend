@@ -239,6 +239,7 @@ struct CreateBoard {
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "The caller is a parent", body = ErrorResponse),
         (status = 409, description = "The caller already holds the maximum number of boards", body = ErrorResponse),
+        (status = 422, description = "The body carries a key this request does not accept — a board response cannot be posted back verbatim"),
     ),
 )]
 async fn create_board(
@@ -453,6 +454,7 @@ struct UpdateBoard {
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Only the creator may change the participants or the lock", body = ErrorResponse),
         (status = 404, description = "Not found, or the caller is not on it", body = ErrorResponse),
+        (status = 422, description = "The body carries a key this request does not accept — a board response cannot be posted back verbatim"),
     ),
 )]
 async fn update_board(
