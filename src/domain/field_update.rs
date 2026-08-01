@@ -24,8 +24,15 @@
 
 use surrealdb::types::{RecordId, SurrealValue, Value};
 
-use crate::database::{Database, write_with_retry};
+use crate::database::{Database, transaction_with_retry, write_with_retry};
+use crate::domain::cap;
 use crate::error::AppError;
+
+/// The `THROW` markers [`FieldUpdate::refcount`]'s transaction aborts with: the
+/// row the reference was to be claimed on is gone, and the row being patched is
+/// gone (or its guard bit).
+const CLAIM_MARK: &str = "ref_claim_gone";
+const ROW_MARK: &str = "ref_row_gone";
 
 pub struct FieldUpdate {
     id: RecordId,
@@ -36,6 +43,8 @@ pub struct FieldUpdate {
     ordered: Option<(&'static str, &'static str, AppError)>,
     /// `(condition, refusal)` for [`FieldUpdate::guard`].
     guard: Option<(&'static str, AppError)>,
+    /// `(counter field, claim, release, refusal)` for [`FieldUpdate::refcount`].
+    refcount: Option<(&'static str, Option<RecordId>, Option<RecordId>, AppError)>,
 }
 
 impl FieldUpdate {
@@ -46,11 +55,13 @@ impl FieldUpdate {
             bindings: Vec::new(),
             ordered: None,
             guard: None,
+            refcount: None,
         }
     }
 
     /// Write `field` only when the request carried it. The bind variable is
-    /// named after the field, so `id` is the one name a caller must not use.
+    /// named after the field, so `id` — and `ref_claim`/`ref_release`, which
+    /// [`FieldUpdate::refcount`] binds — are the names a caller must not use.
     #[must_use]
     pub fn set<T: SurrealValue>(mut self, field: &'static str, value: Option<T>) -> Self {
         if let Some(value) = value {
@@ -97,9 +108,38 @@ impl FieldUpdate {
         self
     }
 
+    /// Move a reference counter *with* this write: `claim` takes one on the row
+    /// the link moves to, `release` gives one back on the row it moves off, and
+    /// both ride the same `BEGIN…COMMIT` as the `UPDATE` that moves the link.
+    ///
+    /// That is the whole point. A claim sent as its own query leaves a window
+    /// where a crash strands a count on a row nothing links any more — and a
+    /// count is what a delete guard reads, so the stranded one makes its parent
+    /// undeletable forever. `refused` is the answer when the claimed row is gone
+    /// (the conditional write doubles as the existence check, as in
+    /// [`crate::domain::cap`]); the transaction then aborts, so the release and
+    /// the row write never happened either.
+    ///
+    /// Only ever called alongside a `.set()` of the very column that carries the
+    /// link, so the empty-request short-circuit below cannot swallow a move.
+    #[must_use]
+    pub fn refcount(
+        mut self,
+        field: &'static str,
+        claim: Option<RecordId>,
+        release: Option<RecordId>,
+        refused: AppError,
+    ) -> Self {
+        if claim.is_some() || release.is_some() {
+            self.refcount = Some((field, claim, release, refused));
+        }
+        self
+    }
+
     /// Run the update and return the stored row. An empty request writes
     /// nothing at all and reads the row back unchanged.
     pub async fn run<T: SurrealValue>(mut self, db: &Database) -> Result<T, AppError> {
+        let moved = self.refcount.take();
         if self.assignments.is_empty() {
             let row: Option<T> = db.select(self.id).await?;
             return row.ok_or(AppError::NotFound);
@@ -145,7 +185,13 @@ impl FieldUpdate {
         // Retried on a write conflict: a guarded PATCH contends on the very row
         // its guard reads, and the loser wrote nothing, so re-sending it is the
         // recovery — see [`write_with_retry`].
-        let rows: Vec<T> = write_with_retry(db, &sql, &self.bindings).await?;
+        let rows: Vec<T> = match moved {
+            Some((field, claim, release, ref_refused)) => {
+                run_with_refcount(db, &sql, self.bindings, field, claim, release, ref_refused)
+                    .await?
+            }
+            None => write_with_retry(db, &sql, &self.bindings).await?,
+        };
         // No row back means the guard bit (or, in the window after the handler's
         // read, the row was deleted — the guard cannot tell the two apart, and
         // reports the refusal it was given).
@@ -157,4 +203,77 @@ impl FieldUpdate {
     fn is_set(&self, field: &str) -> bool {
         self.bindings.iter().any(|(name, _)| name == field)
     }
+}
+
+/// Send `update` with its counter move, as one transaction. An empty `Vec` back
+/// means the row write matched nothing, exactly as [`write_with_retry`] would
+/// have reported it, so the caller's refusal is unchanged.
+///
+/// Admissible for [`transaction_with_retry`]: every statement is an `UPDATE`,
+/// an `IF`/`THROW` or a `RETURN`, and none of those can answer "already
+/// exists" — a lost round writes nothing and re-sending it is the recovery.
+#[allow(clippy::too_many_arguments)]
+async fn run_with_refcount<T: SurrealValue>(
+    db: &Database,
+    update: &str,
+    mut bindings: Vec<(String, Value)>,
+    field: &'static str,
+    claim: Option<RecordId>,
+    release: Option<RecordId>,
+    refused: AppError,
+) -> Result<Vec<T>, AppError> {
+    // Parenthesized `??` throughout: `n ?? 0 + 1` parses as `n ?? (0 + 1)`.
+    // Both counter writes commit with the row write or neither does, so their
+    // order is free — the release goes first because that is what makes the
+    // rollback observable: a move to a term that is gone decrements before the
+    // claim throws, and the old count still being there proves the abort undid
+    // it (`a_term_move_to_a_dead_term_leaves_everything_untouched`).
+    let mut statements: Vec<String> = Vec::new();
+    if let Some(release) = release {
+        statements.push(format!(
+            "UPDATE $ref_release SET {field} = math::max([({field} ?? 0) - 1, 0])"
+        ));
+        bindings.push(("ref_release".into(), release.into_value()));
+    }
+    if let Some(claim) = claim {
+        statements.push(format!(
+            "LET $seat = (UPDATE $ref_claim SET {field} = ({field} ?? 0) + 1 RETURN VALUE id)"
+        ));
+        statements.push(format!("IF array::len($seat) = 0 {{ THROW '{CLAIM_MARK}' }}"));
+        bindings.push(("ref_claim".into(), claim.into_value()));
+    }
+    statements.push(format!("LET $row = ({update})"));
+    // Without this the claim would outlive a row write that matched nothing —
+    // the very leak the transaction exists to close.
+    statements.push(format!("IF array::len($row) = 0 {{ THROW '{ROW_MARK}' }}"));
+    statements.push("RETURN $row".into());
+    let sql = format!(
+        "BEGIN TRANSACTION; {}; COMMIT TRANSACTION;",
+        statements.join("; ")
+    );
+    // BEGIN is slot 0, so the trailing RETURN sits at `statements.len()`.
+    let slot = statements.len();
+
+    // One counter write in flight at a time, like every other counter write.
+    let _guard = cap::counter_lock().await;
+    let (mut result, mut errors) =
+        transaction_with_retry(db, &sql, &bindings, &[CLAIM_MARK, ROW_MARK]).await?;
+    if errors
+        .values()
+        .any(|error| error.to_string().contains(CLAIM_MARK))
+    {
+        return Err(refused);
+    }
+    if errors
+        .values()
+        .any(|error| error.to_string().contains(ROW_MARK))
+    {
+        return Ok(Vec::new());
+    }
+    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+        return Err(error.into());
+    }
+    // Sound only because the error map came back empty: `take_errors` swap-
+    // removes errored slots, which would renumber the rest.
+    Ok(result.take::<Vec<T>>(slot)?)
 }
