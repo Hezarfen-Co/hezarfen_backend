@@ -5,7 +5,8 @@
 //! Two *cross-record* invariants live here, guarded very differently:
 //!
 //! - **One live booking per slot** — the `occupied` counter on the slot row, a
-//!   [`cap`](crate::domain::cap) of one. Booking [`claim`](cap::claim)s it;
+//!   [`cap`](crate::domain::cap) of one. Booking claims it *with* the booking
+//!   row ([`claim_and_create`](cap::claim_and_create));
 //!   rejecting or cancelling gives it back in the *same transaction* as the
 //!   status flip, so the slot frees itself with nothing to sweep. Both are
 //!   single-record conditional writes, so the store decides it, not a lock.
@@ -320,10 +321,12 @@ impl Appointment {
     ///
     /// Refused (409) when the slot's window has already opened, when it is
     /// already taken, or when the requester is already committed elsewhere at
-    /// that time. The slot is taken by [`cap::claim`] on the slot row — a
-    /// conditional single-record write, so two racing requests cannot both find
-    /// it free however they interleave; the requester's own overlap is the
-    /// lock's part.
+    /// that time. The slot is taken by [`cap::claim_and_create`], which writes
+    /// the booking in the *same transaction* as the seat — a conditional
+    /// single-record write, so two racing requests cannot both find it free
+    /// however they interleave, and a crash between the two can no longer leave
+    /// the slot occupied by a booking that does not exist. The requester's own
+    /// overlap is the lock's part.
     pub async fn book(
         slot: &AppointmentSlotId,
         requester: &UserId,
@@ -363,12 +366,6 @@ impl Appointment {
         // finds no row either way, so the distinction is re-read rather than
         // guessed.
         let seat = slot.record();
-        if !cap::claim(&seat, SLOT_OCCUPIED_FIELD, 1, db).await? {
-            if AppointmentSlot::read(slot, db).await?.is_none() {
-                return Err(AppError::NotFound);
-            }
-            return Err(AppError::Conflict("the slot is already booked"));
-        }
         let appointment = Appointment {
             id: AppointmentId::generate(),
             slot: slot.clone(),
@@ -384,20 +381,26 @@ impl Appointment {
             reject_reason: None,
             created_at: Timestamp::now(),
         };
-        let created: Result<Option<Appointment>, _> = db
-            .create(appointment.id.record())
-            .content(appointment)
-            .await;
-        match created {
-            Ok(Some(created)) => Ok(created),
-            // The booking never landed, so the slot it took goes back.
-            other => {
-                cap::release(&seat, SLOT_OCCUPIED_FIELD, db).await?;
-                Err(match other {
-                    Err(err) => err.into(),
-                    _ => AppError::Internal("failed to book the appointment".into()),
-                })
+        match cap::claim_and_create(
+            &seat,
+            SLOT_OCCUPIED_FIELD,
+            1,
+            &appointment.id.record(),
+            &appointment,
+            db,
+        )
+        .await?
+        {
+            cap::Claimed::Made(created) => Ok(created),
+            cap::Claimed::Full => {
+                if AppointmentSlot::read(slot, db).await?.is_none() {
+                    return Err(AppError::NotFound);
+                }
+                Err(AppError::Conflict("the slot is already booked"))
             }
+            // The id is a freshly minted ULID on a table with no UNIQUE index,
+            // so no rival can have aimed at it.
+            cap::Claimed::Duplicate => Err(AppError::Internal("appointment id collided".into())),
         }
     }
 
@@ -1002,6 +1005,45 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    /// The seat and the booking row now land in one transaction, so the stored
+    /// state must move together: a taken slot refuses the next requester with
+    /// the counter *and* the row list untouched — a refusal that had already
+    /// bumped the counter would strand the slot forever.
+    #[tokio::test]
+    async fn a_refused_booking_moves_nothing() {
+        let db = crate::database::init_mem().await.unwrap();
+        let teacher = UserId::from_key("t1");
+        let slot = AppointmentSlot::create(&teacher, soon(60_000), soon(120_000), None, &db)
+            .await
+            .unwrap();
+        let reason = || AppointmentReason::try_new("görüşme").unwrap();
+
+        Appointment::book(slot.get_id(), &UserId::from_key("s1"), reason(), &db)
+            .await
+            .unwrap();
+        assert_eq!(occupied(slot.get_id(), &db).await, 1);
+
+        let refused =
+            Appointment::book(slot.get_id(), &UserId::from_key("s2"), reason(), &db).await;
+        assert!(
+            matches!(refused, Err(AppError::Conflict(_))),
+            "the slot is taken"
+        );
+        assert_eq!(
+            occupied(slot.get_id(), &db).await,
+            1,
+            "the refusal took no seat"
+        );
+        assert_eq!(
+            Appointment::list_for_slot(slot.get_id(), &db)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "and wrote no row"
         );
     }
 

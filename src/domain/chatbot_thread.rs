@@ -88,6 +88,10 @@ impl ChatbotThread {
         self.updated_at
     }
 
+    /// Write a thread row and nothing else. **Bypasses the cap counter**, so it
+    /// is only for tests that need a thread without one (`tests/persistence.rs`
+    /// cascade check); every production path goes through
+    /// [`ChatbotThread::create_capped`].
     pub async fn create(
         user: &UserId,
         title: Option<ChatbotThreadTitle>,
@@ -106,28 +110,44 @@ impl ChatbotThread {
     }
 
     /// Start a thread unless `user` is already at the school's
-    /// `max_chatbot_threads`. The slot is taken by [`cap::claim`] on the user
-    /// row — an atomic single-record write, so two requests racing the same
-    /// user's last slot cannot both win, and the cap is read fresh so a
-    /// concurrent settings PATCH is respected.
+    /// `max_chatbot_threads`. The slot is taken on the user row in the same
+    /// transaction as the thread ([`cap::claim_and_create`]) — an atomic
+    /// single-record write, so two requests racing the same user's last slot
+    /// cannot both win, the counter can never count a row that did not commit,
+    /// and the cap is read fresh so a concurrent settings PATCH is respected.
     pub async fn create_capped(
         user: &UserId,
         title: Option<ChatbotThreadTitle>,
         db: &Database,
     ) -> Result<ChatbotThread, AppError> {
         let limit = Settings::load(db).await?.get_max_chatbot_threads();
-        let owner = user.record();
-        if !cap::claim(&owner, CHATBOT_THREAD_COUNT_FIELD, limit, db).await? {
-            return Err(AppError::Conflict(
+        let now = Timestamp::now();
+        let thread = ChatbotThread {
+            id: ChatbotThreadId::generate(),
+            user_id: user.clone(),
+            title,
+            created_at: now,
+            updated_at: now,
+        };
+        match cap::claim_and_create(
+            &user.record(),
+            CHATBOT_THREAD_COUNT_FIELD,
+            limit,
+            &thread.id.record(),
+            &thread,
+            db,
+        )
+        .await?
+        {
+            cap::Claimed::Made(saved) => Ok(saved),
+            // Full, or the user's row is gone — the conditional write matches
+            // nothing either way.
+            cap::Claimed::Full => Err(AppError::Conflict(
                 "you have reached the school's limit on saved threads — delete one first",
-            ));
-        }
-        match Self::create(user, title, db).await {
-            Ok(thread) => Ok(thread),
-            Err(err) => {
-                cap::release(&owner, CHATBOT_THREAD_COUNT_FIELD, db).await?;
-                Err(err)
-            }
+            )),
+            // The id is a freshly minted ULID on a table with no UNIQUE index,
+            // so no rival can have aimed at it.
+            cap::Claimed::Duplicate => Err(AppError::Internal("thread id collided".into())),
         }
     }
 
@@ -238,6 +258,63 @@ impl ChatbotThread {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::settings::SettingsParams;
+
+    /// The owner's counter and the threads it counts, both re-read out of the
+    /// store — never off a return value, which the in-memory engine forges
+    /// wins on (see [`cap`]).
+    async fn stored(db: &Database) -> (i64, usize) {
+        let mut result = db
+            .query("SELECT VALUE (chatbot_thread_count ?? 0) FROM user:u")
+            .query("SELECT VALUE id FROM chatbot_thread")
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let counter = result.take::<Vec<i64>>(0).unwrap();
+        let rows = result.take::<Vec<RecordId>>(1).unwrap();
+        (counter[0], rows.len())
+    }
+
+    async fn a_user_capped_at(threads: i64) -> Database {
+        let db = crate::database::init_mem().await.unwrap();
+        db.query("CREATE user:u SET username = 'u', password_hash = 'x';")
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        Settings::try_new(SettingsParams {
+            max_chatbot_threads: threads,
+            ..Settings::defaults().params()
+        })
+        .unwrap()
+        .save(&db)
+        .await
+        .unwrap();
+        db
+    }
+
+    /// The seat and the row commit together, so the counter the cap reads can
+    /// never disagree with the threads it counts — and a create refused at the
+    /// cap advances neither.
+    #[tokio::test]
+    async fn a_capped_create_moves_the_counter_with_the_row() {
+        let db = a_user_capped_at(1).await;
+        let user = UserId::from_key("u");
+
+        ChatbotThread::create_capped(&user, None, &db)
+            .await
+            .expect("first thread");
+        assert_eq!(stored(&db).await, (1, 1));
+
+        let refused = ChatbotThread::create_capped(&user, None, &db).await;
+        assert!(matches!(refused, Err(AppError::Conflict(_))), "at the cap");
+        assert_eq!(
+            stored(&db).await,
+            (1, 1),
+            "a refused create advances neither"
+        );
+    }
 
     #[tokio::test]
     async fn title_is_required_and_bounded() {

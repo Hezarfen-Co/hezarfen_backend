@@ -63,7 +63,10 @@ pub fn ref_move(
     match patch {
         None => (None, None),
         Some(next) if next.as_ref() == current => (None, None),
-        Some(next) => (next.as_ref().map(TermId::record), current.map(TermId::record)),
+        Some(next) => (
+            next.as_ref().map(TermId::record),
+            current.map(TermId::record),
+        ),
     }
 }
 

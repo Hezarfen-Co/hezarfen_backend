@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
 use crate::constant::{
-    EXAM_RESULT_COUNT_FIELD, EXAM_RESULT_TABLE, KIND_REF_TABLE, REF_COUNT_FIELD,
+    EXAM_RESULT_COUNT_FIELD, EXAM_RESULT_TABLE, KIND_REF_TABLE, REF_COUNT_FIELD, REF_RETIRED_FIELD,
 };
 use crate::database::{Database, transaction_with_retry};
 use crate::domain::cap;
@@ -81,13 +81,9 @@ impl Mark {
     }
 }
 
-/// What one mark write reports back: the stored row, and whether it replaced a
-/// mark that was already there.
-#[derive(Debug, Clone, SurrealValue)]
-struct Written {
-    existed: bool,
-    result: ExamResult,
-}
+/// The `THROW` marker the in-transaction kind claim aborts with — the mark's
+/// own transaction refusing a name the school has retired.
+const RETIRED_MARK: &str = "kind_retired";
 
 #[derive(Debug, Clone, SurrealValue)]
 pub struct ExamResult {
@@ -188,17 +184,23 @@ impl ExamResult {
     /// prior sittings' marks; the latest seq is the grade-of-record.
     ///
     /// `kind` is the exam's kind, and this is where a mark takes its reference
-    /// on it — claimed *before* the write, given back when the write turns out
-    /// to have been an overwrite (one mark, one reference) or to have failed. A
-    /// kind the school has retired refuses the claim, which is the same
-    /// invariant the settings guard enforces from the other side, and the one
-    /// crash window left over-counts a kind (refusing a removal) rather than
-    /// letting a mark exist under a kind nothing counted.
+    /// on it — claimed *inside the mark's own transaction*, and only on the
+    /// branch that is about to add a row. A kind the school has retired refuses
+    /// the claim, which is the same invariant the settings guard enforces from
+    /// the other side. Claimed before the write and released after, the pair had
+    /// two crash windows either side of the write that leaked a reference (a
+    /// kind frozen out of the settings for good) and an exam's `result_count`;
+    /// riding the transaction, both counters land exactly when the row does.
     ///
     /// The exam's own `result_count` is claimed in the same breath, and it is
     /// what a kind change is refused against: the exam PATCH pins that counter,
     /// so a mark landing while it decides cannot slip past its gate and leave
     /// itself counted under a kind its exam no longer carries.
+    ///
+    /// An overwrite (a regrade of a sitting already marked) claims *nothing*:
+    /// one mark, one reference, so the branch that finds a row simply leaves
+    /// both counters where they are — there is no claim to give back, and so no
+    /// window in which a crash could fail to give it.
     pub async fn grade(
         exam: &ExamId,
         user: &UserId,
@@ -208,32 +210,6 @@ impl ExamResult {
         kind: &str,
         db: &Database,
     ) -> Result<ExamResult, AppError> {
-        let counter = kind_ref(kind);
-        if !cap::claim_ref(&counter, 1, db).await? {
-            return Err(retired_kind_error(kind));
-        }
-        cap::claim(&exam.record(), EXAM_RESULT_COUNT_FIELD, cap::UNLIMITED, db).await?;
-        let written = Self::write_mark(exam, user, seq, mark, graded_by, db).await;
-        match written {
-            // An overwrite is not a second mark: both counters go back, or a
-            // regrade would drift them upward and freeze the kind for good.
-            Ok(Written { existed: true, .. }) | Err(_) => {
-                cap::release_ref(&counter, 1, db).await?;
-                cap::release(&exam.record(), EXAM_RESULT_COUNT_FIELD, db).await?;
-            }
-            Ok(_) => {}
-        }
-        written.map(|written| written.result)
-    }
-
-    async fn write_mark(
-        exam: &ExamId,
-        user: &UserId,
-        seq: i64,
-        mark: Mark,
-        graded_by: &UserId,
-        db: &Database,
-    ) -> Result<Written, AppError> {
         let result = ExamResult {
             id: ExamResultId::composite(exam, user, seq),
             exam: exam.clone(),
@@ -250,33 +226,52 @@ impl ExamResult {
         // redundant with the draft one — a deleted exam reads NONE, which is
         // *falsy*, so the draft gate alone waved a mark onto an exam that no
         // longer existed. The caller's pre-flight check answers the same 409
-        // one round trip earlier.
-        // Whether the row was already there rides out of the transaction with
-        // the mark: the answer decides if this grade owes the kind a reference,
-        // and read anywhere else it would be a guess about a row two graders
-        // may be writing at once.
+        // one round trip earlier. It is also what makes a separate "did the
+        // exam survive my claim?" check moot: the claim now sits behind this
+        // gate instead of in front of it.
+        //
+        // Whether the row was already there decides both counters, and it is
+        // read one statement before them inside the same transaction — read
+        // anywhere else it would be a guess about a row two graders may be
+        // writing at once.
         //
         // Re-sent while the store answers "conflict, retry": the gates read a
-        // column an exam PATCH writes, so the two contend on one record by
-        // design. Sound to re-send because the only write is an UPSERT on a
-        // deterministic id — `key::sitting(exam, user, seq)` *is* the
-        // `exam_result_exam_user_seq` unique tuple — so it can never answer
-        // "already exists", the one thing a retry cannot fix.
+        // column an exam PATCH writes, and the counters are the ones a
+        // concurrent delete gives back, so this contends on three records by
+        // design. Sound to re-send because no statement in it can legitimately
+        // answer "already exists": the counter writes are `UPDATE`/`UPSERT` on
+        // ids no rival can collide *into*, and the mark's own UPSERT is on a
+        // deterministic id bijective with the `exam_result_exam_user_seq`
+        // unique tuple — `key::sitting(exam, user, seq)` *is* that tuple, so
+        // the index entry can only ever point at the row the id already names
+        // and the write resolves onto it. A lost round aborts having written
+        // nothing, counters included.
+        let _guard = cap::counter_lock().await;
         let (mut written, mut errors) = transaction_with_retry(
             db,
-            "BEGIN TRANSACTION;
-                 IF (SELECT VALUE id FROM ONLY $exam) IS NONE { THROW 'exam_missing' };
-                 IF (SELECT VALUE draft FROM ONLY $exam) { THROW 'exam_draft' };
+            &format!(
+                "BEGIN TRANSACTION;
+                 IF (SELECT VALUE id FROM ONLY $exam) IS NONE {{ THROW 'exam_missing' }};
+                 IF (SELECT VALUE draft FROM ONLY $exam) {{ THROW 'exam_draft' }};
                  LET $before = (SELECT VALUE id FROM ONLY $id);
+                 IF $before = NONE {{
+                     LET $kind = (UPSERT $kref SET {REF_COUNT_FIELD} = ({REF_COUNT_FIELD} ?? 0) + 1
+                         WHERE {REF_RETIRED_FIELD} != true RETURN VALUE id);
+                     IF array::len($kind) = 0 {{ THROW '{RETIRED_MARK}' }};
+                     UPDATE $exam SET {EXAM_RESULT_COUNT_FIELD} =
+                         ({EXAM_RESULT_COUNT_FIELD} ?? 0) + 1;
+                 }};
                  LET $after = (UPSERT $id CONTENT $result RETURN AFTER);
-                 RETURN { existed: $before != NONE, result: $after[0] };
-                 COMMIT TRANSACTION;",
+                 RETURN $after[0];
+                 COMMIT TRANSACTION;"
+            ),
             &[
                 ("exam".into(), exam.record().into_value()),
                 ("id".into(), result.id.record().into_value()),
+                ("kref".into(), kind_ref(kind).into_value()),
                 ("result".into(), result.into_value()),
             ],
-            &["exam_missing", "exam_draft"],
+            &["exam_missing", "exam_draft", RETIRED_MARK],
         )
         .await?;
         // An aborted transaction errors every slot and only the THROW's own
@@ -293,15 +288,20 @@ impl ExamResult {
         if thrown("exam_draft") {
             return Err(draft_error());
         }
+        if thrown(RETIRED_MARK) {
+            return Err(retired_kind_error(kind));
+        }
         if let Some(error) = errors.drain().map(|(_, error)| error).next() {
             return Err(error.into());
         }
         // The trailing `RETURN` is always the last statement before `COMMIT`,
         // so its slot follows the statement count instead of a hand-kept
         // number — see `Exam::delete` for the bug the hand-kept one caused.
+        // Probed on crate 3.2.3: an `IF { … }` block occupies exactly one slot
+        // however many statements it holds, and one whether or not it is taken.
         let slot = written.num_statements().saturating_sub(2);
         written
-            .take::<Vec<Written>>(slot)?
+            .take::<Vec<ExamResult>>(slot)?
             .into_iter()
             .next()
             .ok_or_else(|| AppError::Internal("failed to record exam result".into()))
@@ -531,5 +531,135 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        assert_eq!(counters(&db, "midterm").await, (0, 0));
+    }
+
+    /// The two counters, re-read out of the store — never off a return value,
+    /// which the in-memory engine forges wins on (see `cap::CLAIM_LOCK`). A
+    /// missing `kind_ref` row is a zero, which is exactly how the backfill
+    /// treats it (`tests/persistence.rs` — no zero pass, deliberately).
+    async fn counters(db: &Database, kind: &str) -> (i64, i64) {
+        let mut result = db
+            .query(
+                "SELECT VALUE count ?? 0 FROM kind_ref WHERE record::id(id) = $kind;
+                 SELECT VALUE result_count ?? 0 FROM exam;",
+            )
+            .bind(("kind", kind.to_string()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let kinds: Vec<i64> = result.take(0).unwrap();
+        let exams: Vec<i64> = result.take(1).unwrap();
+        (
+            kinds.into_iter().next().unwrap_or(0),
+            exams.into_iter().next().unwrap_or(0),
+        )
+    }
+
+    async fn an_exam(db: &Database, exam: &ExamId, kind: &str) {
+        db.query(
+            "CREATE $ex SET creator = user:t, course = course:c, title = 't',
+             description = '', kind = $kind",
+        )
+        .bind(("ex", exam.record()))
+        .bind(("kind", kind.to_string()))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    }
+
+    async fn grade(
+        db: &Database,
+        exam: &ExamId,
+        seq: i64,
+        mark: i64,
+        kind: &str,
+    ) -> Result<ExamResult, AppError> {
+        ExamResult::grade(
+            exam,
+            &UserId::from_key("01TESTSTUDENTAAAAAAAAAAAAA"),
+            seq,
+            Mark::try_new(mark).unwrap(),
+            &UserId::from_key("01TESTTEACHERAAAAAAAAAAAAA"),
+            kind,
+            db,
+        )
+        .await
+    }
+
+    /// Both counters ride the mark's own transaction: a new mark claims each
+    /// exactly once, and a *regrade* of the same sitting claims neither — one
+    /// mark, one reference. Claimed-then-released around the write, a regrade
+    /// drifted them upward and froze the kind out of the settings for good.
+    #[tokio::test]
+    async fn a_new_mark_moves_both_counters_and_a_regrade_moves_neither() {
+        let db = init_mem().await.unwrap();
+        let exam = ExamId::from_key("01TESTEXAMCOUNTAAAAAAAAAAA");
+        an_exam(&db, &exam, "midterm").await;
+
+        grade(&db, &exam, 1, 40, "midterm").await.unwrap();
+        assert_eq!(counters(&db, "midterm").await, (1, 1));
+
+        // Same sitting, new mark: an overwrite, so neither counter moves.
+        let regraded = grade(&db, &exam, 1, 90, "midterm").await.unwrap();
+        assert_eq!(regraded.get_mark().as_i64(), 90);
+        assert_eq!(counters(&db, "midterm").await, (1, 1));
+
+        // A retake is a second row, so it does claim.
+        grade(&db, &exam, 2, 70, "midterm").await.unwrap();
+        assert_eq!(counters(&db, "midterm").await, (2, 2));
+    }
+
+    /// A retired kind refuses the claim from inside the transaction, which
+    /// takes the mark and the exam's counter down with it — the settings guard
+    /// enforcing the same invariant from the other side.
+    #[tokio::test]
+    async fn a_retired_kind_refuses_the_mark_and_leaves_both_counters_alone() {
+        let db = init_mem().await.unwrap();
+        let exam = ExamId::from_key("01TESTEXAMRETIREDAAAAAAAAA");
+        an_exam(&db, &exam, "midterm").await;
+        assert!(cap::retire(&kind_ref("midterm"), &db).await.unwrap());
+
+        let refused = grade(&db, &exam, 1, 40, "midterm").await;
+        assert!(
+            matches!(&refused, Err(AppError::ConflictOwned(message))
+                if message.contains("has been removed from the school's settings")),
+            "{refused:?}"
+        );
+        assert!(
+            ExamResult::list_for_exam(&exam, &db)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the mark must not have landed"
+        );
+        assert_eq!(counters(&db, "midterm").await, (0, 0));
+    }
+
+    /// A draft exam refuses the mark, and the counters stay put — the gate
+    /// runs before the claim now, so there is nothing to give back.
+    #[tokio::test]
+    async fn a_draft_exam_refuses_the_mark_and_leaves_both_counters_alone() {
+        let db = init_mem().await.unwrap();
+        let exam = ExamId::from_key("01TESTEXAMDRAFTAAAAAAAAAAA");
+        an_exam(&db, &exam, "midterm").await;
+        db.query("UPDATE $ex SET draft = true")
+            .bind(("ex", exam.record()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        let refused = grade(&db, &exam, 1, 40, "midterm").await;
+        assert!(matches!(refused, Err(AppError::Conflict(_))), "{refused:?}");
+        assert!(
+            ExamResult::list_for_exam(&exam, &db)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(counters(&db, "midterm").await, (0, 0));
     }
 }
