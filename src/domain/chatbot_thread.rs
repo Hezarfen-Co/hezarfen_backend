@@ -88,27 +88,6 @@ impl ChatbotThread {
         self.updated_at
     }
 
-    /// Write a thread row and nothing else. **Bypasses the cap counter**, so it
-    /// is only for tests that need a thread without one (`tests/persistence.rs`
-    /// cascade check); every production path goes through
-    /// [`ChatbotThread::create_capped`].
-    pub async fn create(
-        user: &UserId,
-        title: Option<ChatbotThreadTitle>,
-        db: &Database,
-    ) -> Result<ChatbotThread, AppError> {
-        let now = Timestamp::now();
-        let thread = ChatbotThread {
-            id: ChatbotThreadId::generate(),
-            user_id: user.clone(),
-            title,
-            created_at: now,
-            updated_at: now,
-        };
-        let created: Option<ChatbotThread> = db.create(thread.id.record()).content(thread).await?;
-        created.ok_or_else(|| AppError::Internal("failed to create thread".into()))
-    }
-
     /// Start a thread unless `user` is already at the school's
     /// `max_chatbot_threads`. The slot is taken on the user row in the same
     /// transaction as the thread ([`cap::claim_and_create`]) — an atomic

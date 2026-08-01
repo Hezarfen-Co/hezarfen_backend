@@ -12,9 +12,10 @@
 //! `UPDATE … SET n += 1 WHERE n < cap` on the *parent* row is atomic, so of N
 //! concurrent claimers exactly `cap` get a non-empty result and the rest are
 //! refused, with no lock and no window. The counter is therefore the
-//! authority on how many slots are taken, and the child rows follow it:
-//! [`claim`] before the insert, [`release`] if the insert then fails, and a
-//! decrement in the *same transaction* as every delete of a child row.
+//! authority on how many slots are taken, and the child rows follow it: the
+//! claim and the child's insert land in one transaction ([`claim_and_create`]
+//! and its variants), and a decrement rides the *same transaction* as every
+//! delete of a child row.
 //!
 //! The counters are `option<int>` columns on the parent table, absent meaning
 //! zero, so no Rust struct carries them and no whole-row save can clobber one
@@ -66,51 +67,28 @@ pub(crate) async fn counter_lock() -> tokio::sync::MutexGuard<'static, ()> {
 /// sentinel no roster will ever reach.
 pub(crate) const UNLIMITED: i64 = i64::MAX;
 
-/// Take one slot on `parent`'s `field` counter. `false` means the cap is full
-/// (or the parent row is gone) and the caller must refuse — nothing was
-/// written. `field` is always an in-crate constant, never user input.
+/// Take one slot on `parent`'s `field` counter, and nothing else. `false` means
+/// the cap is full (or the parent row is gone) and the caller must refuse —
+/// nothing was written. `field` is always an in-crate constant, never user
+/// input.
+///
+/// **Test-only.** Every production claim now lands its child row in the same
+/// transaction ([`claim_and_create`] and its variants); a bare claim followed by
+/// a separate insert is the leak those exist to close. What survives is the
+/// probe: the appointment tests put the double-book question to this `WHERE`
+/// directly (a `join!` would ask the in-memory engine instead, which forges
+/// wins), and staging a taken seat with *no* child row — exactly what a booking
+/// mid-flight looks like — is a state no `*_and_create` can produce.
+#[cfg(test)]
 pub(crate) async fn claim(
     parent: &RecordId,
     field: &str,
     cap: i64,
     db: &Database,
 ) -> Result<bool, AppError> {
-    claim_at(parent, field, cap, "", db).await
-}
-
-/// [`claim`], but only while `guard` — an extra predicate on that same parent
-/// row — also holds. A caller whose insert has a second precondition (a homework
-/// submission's file add is refused once the work is graded) gets both decided
-/// by the one conditional write, instead of by a read a concurrent write can
-/// outrun.
-/// A miss is either "full" *or* "the guard failed"; the caller re-reads to tell
-/// them apart, and only to pick the message. `guard` is always an in-crate SQL
-/// literal, never user input.
-pub(crate) async fn claim_when(
-    parent: &RecordId,
-    field: &str,
-    cap: i64,
-    guard: &str,
-    db: &Database,
-) -> Result<bool, AppError> {
-    claim_at(parent, field, cap, guard, db).await
-}
-
-async fn claim_at(
-    parent: &RecordId,
-    field: &str,
-    cap: i64,
-    extra: &str,
-    db: &Database,
-) -> Result<bool, AppError> {
-    let extra = if extra.is_empty() {
-        String::new()
-    } else {
-        format!(" AND ({extra})")
-    };
     let sql = format!(
         "UPDATE $parent SET {field} = ({field} ?? 0) + 1 \
-         WHERE ({field} ?? 0) < $num{extra} RETURN VALUE id"
+         WHERE ({field} ?? 0) < $num RETURN VALUE id"
     );
     Ok(!write(&sql, parent, cap, db).await?.is_empty())
 }
@@ -148,7 +126,7 @@ pub(crate) enum Claimed<T> {
 /// Take a slot on `parent`'s `field` counter *and* write the child that fills
 /// it, in one transaction.
 ///
-/// [`claim`] followed by a separate insert cannot promise this. Where the child
+/// A bare claim followed by a separate insert cannot promise this. Where the child
 /// carries a deterministic id (one row per pair), two writers placing the *same*
 /// pair both pass the claim — neither row exists yet — so on a tight cap the
 /// second is told "full" for a seat it was never going to need, and a release
@@ -175,9 +153,10 @@ pub(crate) async fn claim_and_create<T: SurrealValue + Clone>(
 }
 
 /// [`claim_and_create`], but only while `guard` — an extra predicate on that
-/// same parent row — also holds, exactly as [`claim_when`] is to [`claim`]: one
-/// conditional write decides the cap *and* the caller's second precondition, so
-/// no read a concurrent write can outrun sits between them.
+/// same parent row — also holds: one conditional write decides the cap *and*
+/// the caller's second precondition (a homework submission's file add is
+/// refused once the work is graded), so no read a concurrent write can outrun
+/// sits between them.
 ///
 /// The contract that costs the caller something: [`Claimed::Full`] means "full
 /// **or** the guard failed **or** the parent row is gone" — one marker for all
@@ -301,7 +280,7 @@ pub(crate) enum ClaimedTwo<T> {
 /// Take a slot on *two* of `parent`'s counters, while `guard` holds, and write
 /// the child that fills them — one transaction, one verdict.
 ///
-/// Two [`claim_when`] calls cannot promise this. A parent whose children are
+/// Two separate guarded claims cannot promise this. A parent whose children are
 /// counted twice — once against a resettable working set, once against a
 /// lifetime budget — has the two counters describing the same rows, so a writer
 /// that lands one increment and loses the other leaves them disagreeing
@@ -422,15 +401,6 @@ pub(crate) async fn bump(parent: &RecordId, field: &str, db: &Database) -> Resul
     Ok(())
 }
 
-/// Give a claimed slot back, for the insert that never landed. Clamped at zero
-/// so a double release can never push a counter negative and open the cap.
-pub(crate) async fn release(parent: &RecordId, field: &str, db: &Database) -> Result<(), AppError> {
-    let sql =
-        format!("UPDATE $parent SET {field} = math::max([({field} ?? 0) - 1, 0]) RETURN VALUE id");
-    write(&sql, parent, UNLIMITED, db).await?;
-    Ok(())
-}
-
 // --- reference counters --------------------------------------------------
 //
 // The same single-record guard, pointed the other way. A cap asks "is there
@@ -444,16 +414,6 @@ pub(crate) async fn release(parent: &RecordId, field: &str, db: &Database) -> Re
 // The two writes are exact mirrors: a claim lands only while the name is not
 // retired, a retirement lands only while the count is zero. Whichever reaches
 // the record first, the other is refused — in any process.
-
-/// Take `n` references on `id`. `false` = the name is retired and the caller
-/// must refuse; nothing was written.
-pub(crate) async fn claim_ref(id: &RecordId, n: i64, db: &Database) -> Result<bool, AppError> {
-    let sql = format!(
-        "UPSERT $parent SET {REF_COUNT_FIELD} = ({REF_COUNT_FIELD} ?? 0) + $num \
-         WHERE {REF_RETIRED_FIELD} != true RETURN VALUE id"
-    );
-    Ok(!write(&sql, id, n, db).await?.is_empty())
-}
 
 /// What [`claim_ref_and_create`] settled.
 pub(crate) enum ClaimedRef<T> {
@@ -474,7 +434,7 @@ pub(crate) enum ClaimedRef<T> {
 /// Take one reference on `counter` *and* write the row that holds it, in one
 /// transaction — [`claim_and_create`] pointed at a name instead of a cap.
 ///
-/// [`claim_ref`] followed by a separate insert cannot promise this: the claim
+/// A bare reference claim followed by a separate insert cannot promise this: it
 /// lands, the insert then fails or the process dies, and the name is counted as
 /// used by a row that does not exist — which is a name nobody can ever retire.
 /// Here the abort takes the increment with it.
@@ -558,18 +518,6 @@ pub(crate) async fn claim_ref_and_create<T: SurrealValue + Clone>(
     Err(last
         .map(AppError::from)
         .unwrap_or_else(|| AppError::Internal("cap counter write never ran".into())))
-}
-
-/// Give `n` references back — the referencing rows are gone (or never landed).
-/// Clamped at zero like [`release`], so a double release cannot push a counter
-/// below the rows it counts and let a used name be retired.
-pub(crate) async fn release_ref(id: &RecordId, n: i64, db: &Database) -> Result<(), AppError> {
-    let sql = format!(
-        "UPSERT $parent SET {REF_COUNT_FIELD} = \
-         math::max([({REF_COUNT_FIELD} ?? 0) - $num, 0]) RETURN VALUE id"
-    );
-    write(&sql, id, n, db).await?;
-    Ok(())
 }
 
 /// Retire the name behind `id`: no further claim succeeds. `false` = something
