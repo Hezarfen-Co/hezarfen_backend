@@ -208,6 +208,30 @@ fn expectations() -> Vec<(&'static str, &'static str, &'static str, i64)> {
             MAX_COURSE_DESCRIPTION_LEN as i64,
         ),
         (
+            "CreateClass",
+            "name",
+            "maxLength",
+            MAX_CLASS_NAME_LEN as i64,
+        ),
+        (
+            "CreateClass",
+            "grade",
+            "maxLength",
+            MAX_CLASS_GRADE_LEN as i64,
+        ),
+        (
+            "UpdateClass",
+            "name",
+            "maxLength",
+            MAX_CLASS_NAME_LEN as i64,
+        ),
+        (
+            "UpdateClass",
+            "grade",
+            "maxLength",
+            MAX_CLASS_GRADE_LEN as i64,
+        ),
+        (
             "CreateExamInCourse",
             "title",
             "maxLength",
