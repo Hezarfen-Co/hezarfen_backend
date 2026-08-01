@@ -22,7 +22,7 @@ closes the moment the event starts (or, for an event with only an end time —
 a pure signup deadline — the moment that end passes). Every event stays visible to everyone —
 the audience is a roster, not a wall. Marks are course-shaped
 (Google Classroom style): a teacher creates a course — kind **`course`** (a
-regular class), **`study`** (a supervised study session — *etüt*), or
+regular taught course), **`study`** (a supervised study session — *etüt*), or
 **`club`** (a student club — *kulüp*; same behavior, different label),
 optionally capped by a `capacity` that refuses new enrolls once the roster is
 full — lays out its **subjects** (curriculum topics —
@@ -33,7 +33,14 @@ all student-only, staff never take part. A course is run by whoever created it
 plus any teachers a **manager assigns** to it (`POST /courses/{id}/teachers`):
 an assigned teacher manages everything inside the course — exams, sessions,
 subjects, roster, grading — but can't delete it or change who else teaches it,
-and a demotion below `teacher` sweeps their assignments away. Students read a per-course weighted average and
+and a demotion below `teacher` sweeps their assignments away. Students are
+grouped into **classes** (*şube* — 9-A, 10-B) when a school teaches that way:
+a class is bulk enrollment and not a second kind of membership — attaching a
+course to it enrolls the whole roster, adding a member enrolls them into every
+course already attached, and what lands are ordinary enrollment rows tagged
+with the class that pumped them (untagged = placed by hand, and hand-placed
+rows are never adopted and never swept). A course without room for everyone
+refuses the whole operation, naming it (see "Classes (şube)"). Students read a per-course weighted average and
 an overall average from their mark report — each exam weighted by its **kind**
 (midterms can count double, orals once: weights are set per kind in settings,
 not per exam). Exams run **sync** (one
@@ -55,7 +62,7 @@ whoever saved them. Teachers
 watch attendance, per-student remaining time,
 sittings, walk-outs, no-shows (`absent` once the window closes), submissions,
 and marks land live on a monitor endpoint (snapshot or SSE stream). Courses also hand out
-**homework**: assigned to the whole class or a named subset (the unnamed never
+**homework**: assigned to the whole course or a named subset (the unnamed never
 even see it), tagged with a course subject, due by a required future `due_at`
 — students hand in text and/or **files of any type** (same size cap, 10 per
 submission, served back only as forced downloads), editable until the teacher
@@ -514,6 +521,8 @@ course enrollments.
 | Delete a course                          | teacher      | Only the **creator**, or a `manager`+ — an assigned teacher runs the course but doesn't own it |
 | Manage inside a course: edit it, enroll/unenroll **students**, add/edit/delete its exams and **subjects**, grade, remove results | teacher | The **course creator**, a teacher **assigned** to it, or a `manager`+ for any course; only students can be enrolled; a subject still referenced by exam questions or homework won't delete (`409`) |
 | View a course's roster, an exam's result list / statistics | teacher | Course-management rights |
+| Create / edit / delete a **class** (şube); add or remove its members | manager | Reading classes, their rosters and their course lists is teacher+; a member must be a `student` |
+| Attach / detach a course on a class | teacher | Course-management rights on **that course** — attaching enrolls the whole class into it, so it takes exactly the right enrolling one student takes |
 | Read another user's mark report          | teacher      | Narrowed to the caller's managed courses; `manager`+ sees all; a `parent` sees a linked student's in full |
 | Grade students                           | teacher      | Target must be an **enrolled student**; grading never targets oneself |
 | Assign / edit / delete homework; grade it; read its roster | teacher | Course-management rights; an `assigned` subset (≤ 200 enrolled students) can't be narrowed over existing work (`409`); a grade (`done`/`incomplete`/`missing` + optional mark) freezes the submission until removed |
@@ -561,7 +570,7 @@ against the SurrealDB server — e.g.
 `Auth` is the minimum role; `no` means no session required, `student` means any
 logged-in user.
 
-A course is a regular class (kind `course`, the default), an *etüt* (kind
+A course is a regular taught course (kind `course`, the default), an *etüt* (kind
 `study` — a supervised study session), or a *kulüp* (kind `club` — a student
 club). The three kinds behave identically everywhere — enrollment, exams,
 sessions, marks — the kind is a label the UI renders differently, settable at
@@ -701,10 +710,10 @@ window filtering, before paging; negative values are a `400` naming the field.
 | DELETE | `/classes/{id}`                  | manager | Delete a class — `409` while it still holds students or courses |
 | POST   | `/classes/{id}/members`          | manager | `{user_id}` — add a **student**; enrolls them into every attached course (`409` if one is full, naming it, or if already a member) |
 | GET    | `/classes/{id}/members`          | teacher | List the class roster · paged   |
-| DELETE | `/classes/{id}/members/{user}`   | manager | Remove a student and sweep the enrollments the class pumped for them |
+| DELETE | `/classes/{id}/members/{user}`   | manager | Remove a member — sweeps only the enrollments **this class** pumped for them (one another class still claims is re-tagged to it; hand-placed rows stay) |
 | POST   | `/classes/{id}/courses`          | teacher | `{course_id}` — attach a course (that **course's** manager); enrolls the whole roster (`409` if it cannot hold them all, or if already attached) |
 | GET    | `/classes/{id}/courses`          | teacher | List the class's attached courses · paged |
-| DELETE | `/classes/{id}/courses/{course}` | teacher | Detach a course (that course's manager) and sweep the enrollments the class pumped |
+| DELETE | `/classes/{id}/courses/{course}` | teacher | Detach a course (that course's manager) — the same sweep along the course axis |
 | POST   | `/courses/{id}/sessions`         | teacher | `{topic?, teacher_id?, starts_at, ends_at?}` — add a lesson (course manager; teacher defaults to the caller) |
 | GET    | `/courses/{id}/sessions`         | student | List the course's sessions, most recent first (enrolled, creator, assigned teacher, or manager+) · paged |
 | POST   | `/courses/{id}/subjects`         | teacher | `{name, description?}` — add a curriculum subject (course manager) |
@@ -825,7 +834,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/terms`                         | student | List terms, newest first · paged |
 | GET    | `/terms/{id}`                    | student | Get one term                    |
 | PATCH  | `/terms/{id}`                    | manager | Edit a term (the merged range must stay ordered) |
-| DELETE | `/terms/{id}`                    | manager | Delete a term — `409` while any course still links to it |
+| DELETE | `/terms/{id}`                    | manager | Delete a term — `409` while any course or class still links to it |
 | POST   | `/meals/menus`                   | manager | `{date, slot, capacity?}` — publish a menu; `date` is `YYYY-MM-DD` text, `slot` must be one of the school's `meal_slots`; `409` when that day+slot is already published |
 | GET    | `/meals/menus`                   | student | List menus with their dishes, newest day first · `?from=&to=` inclusive `YYYY-MM-DD` range · paged |
 | GET    | `/meals/menus/{id}`              | student | One menu with its dishes |
@@ -1258,10 +1267,11 @@ The kitchen is data too: a manager publishes a **menu** per calendar day and mea
 
 Academic structure is data too. **Terms** (`/terms`) model whatever calendar
 the school runs — semester, trimester, quarter systems are just rows with a
-name and a date range. Courses may link to one via `term_id` (nullable), and
-deleting a term is refused with a `409` while any course still links to it —
-unlink those courses (`PATCH /courses/{id}` with `"term_id": null`) or delete
-them first, so the calendar never disappears under them. Term dates may lie in the past,
+name and a date range. Courses *and classes* may link to one via `term_id` (nullable),
+and deleting a term is refused with a `409` while any of them still links to
+it — unlink them (`PATCH /courses/{id}` or `PATCH /classes/{id}` with
+`"term_id": null`) or delete them first, so the calendar never disappears
+under them. Term dates may lie in the past,
 deliberately: a school adopting the app mid-year backfills its calendar —
 unlike exam/lesson/event times, which reject backdating.
 
@@ -2130,6 +2140,89 @@ counts as attending, and an excused absence counts against no one (`rate` is
 for every course the user has roll-call rows in — attendance is a historical
 record, so unenrolling hides marks from the marks report but never hides an
 absence.
+
+## Classes (şube)
+
+A **class** is the group a school actually teaches in — 9-A, 10-B — and here
+it is a bulk-enrollment tool rather than a second kind of membership. A class
+row carries a name, an optional free-text `grade` label in the school's own
+vocabulary (`"9"`, `"Lise 2"`; `""` means no grade, exactly like omitting it)
+and an optional `term_id`; nothing else about a course changes because a class
+exists. Schools that run electives or a college-style timetable simply never
+create one — individual enrollment is untouched, and classes are a
+convenience.
+
+**The pump.** A class holds **members** (students) and **attached courses**,
+and owes the product of the two: every member enrolled in every attached
+course. So both writes push the same way — attaching a course
+(`POST /classes/{id}/courses`) enrolls the whole roster into it, adding a
+member (`POST /classes/{id}/members`) enrolls them into every course the class
+already carries — and what gets written is an ordinary `enrollment` row, the
+same one `POST /courses/{id}/enrollments` writes, counted against the same
+`enrollment_count`. Each row a class writes is tagged with it as the row's
+`source`; **no `source` means placed by hand**, and that one bit is what makes
+the sweeps below safe. It is internal bookkeeping, not API surface: no
+enrollment response returns it.
+
+**Already enrolled is skipped.** A pair that already has an enrollment row is
+left exactly as it stands — no second seat charged, no `source` rewritten. A
+student a teacher enrolled by hand *stays* hand-placed when the class later
+attaches that course, so the class never quietly adopts someone else's roster
+decision.
+
+**Capacity is all-or-nothing.** Attaching a course, or adding a member, claims
+one seat per pair that needs a new row, each against its own course's
+`capacity` — and if any single course has no room the whole call is a `409`
+naming it (`course:<key> is full, so the class cannot take this student`,
+`course:<key> cannot hold the whole class`). Nothing lands, not even the seats
+claimed earlier in the same run: a half-enrolled class is worse than a refused
+one, and the refusal names the course whose capacity to raise.
+
+**Removals take back only what the class pumped, and repair before they
+delete.** Removing a member (`DELETE /classes/{id}/members/{user}`) or
+detaching a course (`DELETE /classes/{id}/courses/{course}`) sweeps the
+enrollment rows whose `source` is *this* class and no others — hand-placed
+rows survive every class operation. Even a tagged row is not automatically
+deleted: if a **second class** still claims that pair (it holds the same
+student *and* that course attached), the row is re-tagged to that class
+instead, because the row it skipped writing is the row now being swept and the
+student is still owed the seat. The heir is the lowest class id among the
+claimants, so repeating a sweep lands on the same class. Only a row nobody is
+left to claim is deleted and its seat handed back. Sweeps also tolerate rows
+that are already gone — deleting a course wipes its enrollments wholesale
+while the class memberships survive — so "this class has a member" and "that
+member holds a pumped row" are independent facts.
+
+**A manual unenroll wins, permanently.** `DELETE /courses/{id}/enrollments/{user}`
+on a pumped student is allowed and sticks: nothing re-pumps them while they
+remain a member, because the pump runs on writes, never on a schedule. Staff
+put them back by enrolling them by hand (which makes the row hand-placed) or
+by detaching and re-attaching the course.
+
+**Delete guards.** A class still holding members or attached courses refuses
+deletion with a `409` ("remove its members and detach its courses first") —
+the roster it owes is never dropped out from under the courses silently. A
+term linked by any class refuses deletion the same way courses make it refuse.
+Deleting a **course** detaches it from every class it was on (its enrollments
+go with it), and a role change that takes a user off `student` drops their
+class memberships exactly as it drops their enrollments — a membership left
+behind would keep pumping them back into courses.
+
+**Who may.** Creating, editing and deleting a class, and adding or removing
+its members, is **manager+** — a class is school structure, not classroom
+work. Attaching or detaching a course takes management rights on **that
+course** (its creator, a teacher assigned to it, or manager+), since the call
+writes that course's roster and nothing else: the same right enrolling one
+student takes. Every read (`GET /classes`, `/classes/{id}`, its members and
+its courses, all paged, newest first) is **teacher+**.
+
+**Codes.** Adding a member or attaching a course answers `201`; a repeat is a
+`409` ("the student is already in this class", "the course is already on this
+class"). An id in the **body** that names nothing — an unknown `user_id` or
+`course_id`, or a member who is not a `student` — is a `400`; an id in the
+**path** that names nothing (the class, or a member/course that was not on it)
+is a `404`. Bounds: name ≤ 200 characters, grade ≤ 20, both published in the
+`course` group of `GET /limits`.
 
 ## Quick tour (curl)
 
