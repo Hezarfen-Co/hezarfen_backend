@@ -14,9 +14,10 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use tokio::sync::Mutex;
 
 use crate::constant::{
-    MAX_MENU_CAPACITY, MENU_SEAT_COUNT_FIELD, MENU_TABLE, MENU_VERSION_FIELD, SLOT_REF_TABLE,
+    MAX_MENU_CAPACITY, MENU_SEAT_COUNT_FIELD, MENU_TABLE, MENU_VERSION_FIELD, REF_COUNT_FIELD,
+    SLOT_REF_TABLE,
 };
-use crate::database::{Database, lost_the_race};
+use crate::database::{Database, transaction_with_retry};
 use crate::domain::cap;
 use crate::domain::field_update::FieldUpdate;
 use crate::domain::menu_dish::MenuDish;
@@ -228,15 +229,11 @@ impl Menu {
         }
         // The menu takes a reference on its slot, which is what stops the slot
         // being dropped from the settings while this menu (whose slot is only
-        // snapshotted text) still points at it. Claimed before the write and
-        // given back if the write does not land, exactly like a seat.
+        // snapshotted text) still points at it. Claimed *inside* the write's own
+        // transaction: a claim of its own could land and the row then fail to,
+        // leaving the slot counted by a menu that does not exist — a slot
+        // nobody can ever retire, and no crash window is small enough for that.
         let counter = slot_ref(slot.as_str());
-        if !cap::claim_ref(&counter, 1, db).await? {
-            return Err(AppError::ConflictOwned(format!(
-                "the '{}' meal slot has been removed from the school's settings",
-                slot.as_str()
-            )));
-        }
         let menu = Menu {
             id: MenuId::for_slot(&date, &slot),
             date,
@@ -246,19 +243,14 @@ impl Menu {
             created_by: created_by.clone(),
             created_at: Timestamp::now(),
         };
-        match db.create(menu.id.record()).content(menu).await {
-            Ok(Some(created)) => Ok(created),
-            Ok(None) => {
-                cap::release_ref(&counter, 1, db).await?;
-                Err(AppError::Internal("failed to publish the menu".into()))
-            }
-            Err(err) => {
-                cap::release_ref(&counter, 1, db).await?;
-                match lost_the_race(&err) {
-                    true => Err(taken),
-                    false => Err(err.into()),
-                }
-            }
+        let id = menu.id.record();
+        match cap::claim_ref_and_create(&counter, 1, &id, &menu, db).await? {
+            cap::ClaimedRef::Made(created) => Ok(created),
+            cap::ClaimedRef::Duplicate => Err(taken),
+            cap::ClaimedRef::Retired => Err(AppError::ConflictOwned(format!(
+                "the '{}' meal slot has been removed from the school's settings",
+                menu.slot.as_str()
+            ))),
         }
     }
 
@@ -332,17 +324,44 @@ impl Menu {
     /// (and finds no menu). A read-then-delete pair had a window where both
     /// happened — a paid seat on a menu that no longer exists.
     ///
+    /// The slot gets its reference back in that same transaction — a slot no
+    /// menu is published for any more may leave the settings again, and the
+    /// `FOR` runs only over a row the guard actually took. Released afterwards
+    /// in a query of its own, a crash between the two left the slot counted by
+    /// a menu that no longer exists: a slot nobody can retire.
+    ///
     /// The dishes go *after* the row: their cascade must not run for a delete
     /// the counter refused.
     pub async fn delete(self, db: &Database) -> Result<Menu, AppError> {
-        let mut result = db
-            .query(format!(
-                "DELETE $id WHERE ({MENU_SEAT_COUNT_FIELD} ?? 0) = 0 RETURN BEFORE"
-            ))
-            .bind(("id", self.id.record()))
-            .await?
-            .check()?;
-        let Some(deleted) = result.take::<Vec<Menu>>(0)?.into_iter().next() else {
+        let sql = format!(
+            "BEGIN TRANSACTION;
+             LET $gone = (DELETE $id WHERE ({MENU_SEAT_COUNT_FIELD} ?? 0) = 0 RETURN BEFORE);
+             FOR $row IN ($gone ?? []) {{
+                 UPSERT $counter SET {REF_COUNT_FIELD} = \
+                     math::max([({REF_COUNT_FIELD} ?? 0) - 1, 0]);
+             }};
+             RETURN $gone;
+             COMMIT TRANSACTION;"
+        );
+        // `slot` is a `READONLY` column, so this counter is the one the deleted
+        // row carries. Nothing here can answer "already exists" — the `UPSERT`
+        // is keyed by a slot name on a table with no `UNIQUE` index, so it
+        // resolves onto the row it names ([`transaction_with_retry`]).
+        let (mut result, mut errors) = transaction_with_retry(
+            db,
+            &sql,
+            &[
+                ("id".into(), self.id.record().into_value()),
+                ("counter".into(), slot_ref(self.slot.as_str()).into_value()),
+            ],
+            &[],
+        )
+        .await?;
+        if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+            return Err(error.into());
+        }
+        // BEGIN, the LET and the FOR take a slot each.
+        let Some(deleted) = result.take::<Vec<Menu>>(3)?.into_iter().next() else {
             // Nothing back: either seats are held, or the menu is already gone.
             return Err(match Self::read(&self.id, db).await? {
                 Some(_) => AppError::Conflict("the menu still has live bookings"),
@@ -350,10 +369,6 @@ impl Menu {
             });
         };
         MenuDish::delete_for_menu(&self.id, db).await?;
-        // The slot gets its reference back — a slot no menu is published for
-        // any more may leave the settings again. After the delete, so a crash
-        // over-counts (refusing a removal) rather than under-counts.
-        cap::release_ref(&slot_ref(deleted.slot.as_str()), 1, db).await?;
         Ok(deleted)
     }
 }
@@ -395,5 +410,166 @@ mod tests {
         assert!(validate_capacity(Some(MAX_MENU_CAPACITY)).is_ok());
         assert!(validate_capacity(Some(-1)).is_err());
         assert!(validate_capacity(Some(MAX_MENU_CAPACITY + 1)).is_err());
+    }
+
+    // --- the slot reference and the menu row move together ---------------
+
+    async fn school() -> Database {
+        let db = crate::database::init_mem().await.unwrap();
+        db.query("CREATE user:teacher SET username = 'teacher', password_hash = 'x';")
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        db
+    }
+
+    fn lunch() -> MenuSlot {
+        MenuSlot::try_new("lunch", &[MealSlotDef::try_new("lunch", None).unwrap()]).unwrap()
+    }
+
+    /// The reference count, re-read out of the store — never off a return
+    /// value, which the in-memory engine forges wins on.
+    async fn refs(db: &Database) -> i64 {
+        let mut result = db
+            .query("SELECT VALUE (count ?? 0) FROM $id")
+            .bind(("id", slot_ref("lunch")))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        result
+            .take::<Vec<i64>>(0)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap_or(0)
+    }
+
+    async fn publish(date: &str, db: &Database) -> Result<Menu, AppError> {
+        Menu::create(
+            MenuDate::try_new(date).unwrap(),
+            lunch(),
+            None,
+            &UserId::from_key("teacher"),
+            db,
+        )
+        .await
+    }
+
+    /// Plant a menu row the pre-check will (or will not) find, without going
+    /// through the claim — a row published before the counter existed.
+    async fn plant(id: &MenuId, date: &str, db: &Database) {
+        db.query(
+            "CREATE $id SET date = $date, slot = 'lunch', \
+             created_by = user:teacher, created_at = 1",
+        )
+        .bind(("id", id.record()))
+        .bind(("date", date.to_string()))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn publishing_lands_the_menu_and_its_reference_together() {
+        let db = school().await;
+        let menu = publish("2026-08-02", &db).await.unwrap();
+        assert!(Menu::read(menu.get_id(), &db).await.unwrap().is_some());
+        assert_eq!(refs(&db).await, 1);
+
+        // The day+slot pre-check answers the second publish — and a refusal
+        // may not count the slot, or the menu would outlive its own reference.
+        let again = publish("2026-08-02", &db)
+            .await
+            .expect_err("that day and slot are taken");
+        assert!(matches!(again, AppError::Conflict(_)), "got {again:?}");
+        assert_eq!(refs(&db).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_retired_slot_refuses_and_writes_nothing() {
+        let db = school().await;
+        assert!(cap::retire(&slot_ref("lunch"), &db).await.unwrap());
+
+        let refused = publish("2026-08-02", &db)
+            .await
+            .expect_err("the slot left the settings");
+        assert!(
+            matches!(refused, AppError::ConflictOwned(_)),
+            "got {refused:?}"
+        );
+        assert_eq!(refs(&db).await, 0);
+        assert!(
+            Menu::find(&MenuDate::try_new("2026-08-02").unwrap(), &lunch(), &db)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// The race the fold exists for: a rival places the very row this publish
+    /// is placing, between the pre-check and the write. Only the claim's own
+    /// gate can answer it, and its answer must cost no reference.
+    #[tokio::test]
+    async fn a_rival_on_the_id_answers_taken_and_counts_nothing() {
+        let db = school().await;
+        let id = MenuId::for_slot(&MenuDate::try_new("2026-08-02").unwrap(), &lunch());
+        // Planted under another day, so `find` misses it exactly as it would
+        // in the instant before the rival's own row was visible.
+        plant(&id, "1999-01-01", &db).await;
+
+        let taken = publish("2026-08-02", &db)
+            .await
+            .expect_err("the id is taken");
+        assert!(matches!(taken, AppError::Conflict(_)), "got {taken:?}");
+        assert_eq!(refs(&db).await, 0);
+    }
+
+    /// Menus published before ids were derived keep a ULID key a new publish
+    /// cannot collide with, so the pre-check is the only thing that can refuse.
+    #[tokio::test]
+    async fn a_legacy_ulid_menu_still_answers_taken() {
+        let db = school().await;
+        plant(&MenuId::from_key("01JLEGACYMENU"), "2026-08-02", &db).await;
+
+        let taken = publish("2026-08-02", &db)
+            .await
+            .expect_err("that day and slot are taken");
+        assert!(matches!(taken, AppError::Conflict(_)), "got {taken:?}");
+        assert_eq!(refs(&db).await, 0);
+    }
+
+    #[tokio::test]
+    async fn deleting_hands_the_reference_back_in_the_same_step() {
+        let db = school().await;
+        let monday = publish("2026-08-03", &db).await.unwrap();
+        publish("2026-08-04", &db).await.unwrap();
+        assert_eq!(refs(&db).await, 2);
+
+        let id = monday.get_id().clone();
+        let ghost = monday.clone();
+        monday.delete(&db).await.unwrap();
+        assert!(Menu::read(&id, &db).await.unwrap().is_none());
+        assert_eq!(refs(&db).await, 1, "the row and its reference go together");
+
+        // Deleting what is already gone hands nothing back: a second release
+        // would leave a slot one menu still uses free to be retired.
+        let gone = ghost.delete(&db).await.expect_err("already deleted");
+        assert!(matches!(gone, AppError::NotFound), "got {gone:?}");
+        assert_eq!(refs(&db).await, 1);
+        assert!(
+            !cap::retire(&slot_ref("lunch"), &db).await.unwrap(),
+            "a slot a menu is still published for may not be retired"
+        );
+
+        // …and once the last menu goes, it may.
+        let last = Menu::find(&MenuDate::try_new("2026-08-04").unwrap(), &lunch(), &db)
+            .await
+            .unwrap()
+            .unwrap();
+        last.delete(&db).await.unwrap();
+        assert_eq!(refs(&db).await, 0);
     }
 }

@@ -146,6 +146,16 @@ impl FieldUpdate {
     /// link — a count with no link is exactly what makes a term undeletable
     /// forever. The loser's row write matches nothing and the whole transaction
     /// aborts, so it claims nothing and answers 409.
+    ///
+    /// **Carrying the link and shifting a counter are separate questions**, and
+    /// the CAS keys off the first one — `run` arms it for any request that
+    /// `.set()` this column, `claim`/`release` both `None` included. A PATCH
+    /// *re-stating* the link its snapshot showed shifts no counter, but it is
+    /// the same stale read: run it against a row someone else has since moved
+    /// and the unguarded write silently drags the link back, stranding the
+    /// winner's claim on a term nothing points at (undeletable forever) and
+    /// leaving the reverted-to term linked at zero (deletable while linked).
+    /// Gating the CAS on the counters is what let that through.
     #[must_use]
     pub fn refcount(
         mut self,
@@ -156,16 +166,19 @@ impl FieldUpdate {
         release: Option<RecordId>,
         refused: AppError,
     ) -> Self {
-        if claim.is_some() || release.is_some() {
-            self.refcount = Some((field, link, expected, claim, release, refused));
-        }
+        self.refcount = Some((field, link, expected, claim, release, refused));
         self
     }
 
     /// Run the update and return the stored row. An empty request writes
     /// nothing at all and reads the row back unchanged.
     pub async fn run<T: SurrealValue>(mut self, db: &Database) -> Result<T, AppError> {
+        // Armed by the *request*, not by the counters: a PATCH that carries the
+        // link column gets the CAS even when it re-states the value it read and
+        // so shifts nothing. Decided here rather than in `refcount` so the
+        // builder's call order cannot silently disarm it — `run` is always last.
         let moved = self.refcount.take();
+        let moved = moved.filter(|(_, link, ..)| self.is_set(link));
         if self.assignments.is_empty() {
             let row: Option<T> = db.select(self.id).await?;
             return row.ok_or(AppError::NotFound);
@@ -199,9 +212,9 @@ impl FieldUpdate {
             None => (None, None),
         };
         refused = refused.or(extra_refused);
-        // Armed only for a move that actually shifts a counter, so a plain PATCH
-        // — and a `term` PATCH that re-stated the link it already had — writes
-        // the same unguarded `UPDATE` it always did. Probed on the mem engine:
+        // A PATCH that does not carry the link at all writes the same unguarded
+        // `UPDATE` it always did — it re-states nothing and races nobody. Probed
+        // on the mem engine:
         // a bound `None` comes through as `NONE` and `link = NONE` matches a row
         // whose option column was never set, while failing one that holds a
         // record, so the absent-link shape needs no `??`.
@@ -240,6 +253,11 @@ impl FieldUpdate {
 /// Send `update` with its counter move, as one transaction. An empty `Vec` back
 /// means the row write matched nothing, exactly as [`write_with_retry`] would
 /// have reported it, so the caller's refusal is unchanged.
+///
+/// A re-statement shifts no counter, so `claim` and `release` are both `None`
+/// and the transaction is the CAS'd row write and its split alone — still a
+/// transaction, because the split's probe must see the same snapshot the write
+/// was refused against.
 ///
 /// Admissible for [`transaction_with_retry`]: every statement is an `UPDATE`,
 /// an `IF`/`THROW` or a `RETURN`, and none of those can answer "already

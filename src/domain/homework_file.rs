@@ -124,42 +124,38 @@ impl HomeworkFile {
     /// Persist the row assembled by [`Self::new`], refusing once its submission
     /// already holds [`MAX_HOMEWORK_FILES_PER_SUBMISSION`] (an `Err(Conflict)`)
     /// or once a grade has frozen it (`Ok(None)`, so the web layer keeps its own
-    /// wording). Both are decided by one [`cap::claim_when`] on the submission
-    /// row — a conditional single-record write, the only guard that holds when
-    /// two uploads race, the same story as
-    /// `NoteFile::insert`. Which of the two conditions failed is read back
-    /// afterwards, off the losing path only, and only to pick the message.
+    /// wording). Both are decided by one [`cap::claim_when_and_create`] on the
+    /// submission row — the seat and the file row commit together, so a crash
+    /// between them can no longer leave a slot claimed by a file that does not
+    /// exist, and a losing upload never has to be un-counted. Which of the two
+    /// conditions refused it is read back afterwards, off the losing path only,
+    /// and only to pick the message: `Claimed::Full` says "full *or* graded *or*
+    /// the submission is gone".
     pub async fn insert(self, db: &Database) -> Result<Option<HomeworkFile>, AppError> {
-        let submission = self.submission.record();
-        if !cap::claim_when(
-            &submission,
+        // whole-row-save-ok: create of a fresh ULID row built in place by `new` — there is no prior row to clobber
+        match cap::claim_when_and_create(
+            &self.submission.record(),
             SUBMISSION_FILE_COUNT_FIELD,
             MAX_HOMEWORK_FILES_PER_SUBMISSION as i64,
             SUBMISSION_OPEN_GUARD,
+            &self.id.record(),
+            &self,
             db,
         )
         .await?
         {
-            if HomeworkSubmission::is_graded(&self.submission, db).await? {
-                return Ok(None);
+            cap::Claimed::Made(created) => Ok(Some(created)),
+            cap::Claimed::Full => {
+                if HomeworkSubmission::is_graded(&self.submission, db).await? {
+                    return Ok(None);
+                }
+                Err(AppError::Conflict(
+                    "the submission already holds the maximum of 10 files — delete one first",
+                ))
             }
-            return Err(AppError::Conflict(
-                "the submission already holds the maximum of 10 files — delete one first",
-            ));
-        }
-        // whole-row-save-ok: create of a fresh ULID row built in place by `new` — there is no prior row to clobber
-        let created: Result<Option<HomeworkFile>, _> =
-            db.create(self.id.record()).content(self).await;
-        match created {
-            Ok(Some(created)) => Ok(Some(created)),
-            Ok(None) => {
-                cap::release(&submission, SUBMISSION_FILE_COUNT_FIELD, db).await?;
-                Err(AppError::Internal("failed to create homework file".into()))
-            }
-            Err(err) => {
-                cap::release(&submission, SUBMISSION_FILE_COUNT_FIELD, db).await?;
-                Err(err.into())
-            }
+            // The id is a fresh ULID minted by `new`, so a row already holding it
+            // is a collision, not a re-upload.
+            cap::Claimed::Duplicate => Err(AppError::Internal("homework file id collided".into())),
         }
     }
 
@@ -317,6 +313,20 @@ mod tests {
         )
     }
 
+    /// The counter as *stored* — the only witness that the seat and the row
+    /// moved together, since every other read counts the rows themselves.
+    async fn stored_count(submission: &HomeworkSubmissionId, db: &Database) -> i64 {
+        db.query("SELECT VALUE file_count FROM $sub")
+            .bind(("sub", submission.record()))
+            .await
+            .unwrap()
+            .take::<Vec<i64>>(0)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap_or(0)
+    }
+
     #[tokio::test]
     async fn rows_scope_to_their_submission_gc_and_cap() {
         let db = crate::database::init_mem().await.unwrap();
@@ -353,6 +363,11 @@ mod tests {
                 .unwrap(),
             1
         );
+        assert_eq!(
+            stored_count(&sub_a, &db).await,
+            1,
+            "the seat rode with the row"
+        );
 
         // The grader's download scoping: found under its own homework, invisible
         // under another — so a teacher can't read it by naming a homework they
@@ -388,6 +403,17 @@ mod tests {
             a_file(&sub_a).insert(&db).await,
             Err(AppError::Conflict(_))
         ));
+        // The refusal wrote nothing at all: neither a row nor a seat.
+        assert_eq!(
+            HomeworkFile::count_for_submission(&sub_a, &db)
+                .await
+                .unwrap() as i64,
+            stored_count(&sub_a, &db).await,
+        );
+        assert_eq!(
+            stored_count(&sub_a, &db).await,
+            MAX_HOMEWORK_FILES_PER_SUBMISSION as i64
+        );
     }
 
     /// A graded submission takes no more files and gives none up — decided by
@@ -395,8 +421,8 @@ mod tests {
     /// `homework_result` read stands between the check and the write.
     ///
     /// Bite check: drop [`SUBMISSION_OPEN_GUARD`] from `insert`'s
-    /// [`cap::claim_when`] and the add below lands; drop it from `delete`'s gate
-    /// and the delete below succeeds.
+    /// [`cap::claim_when_and_create`] and the add below lands; drop it from
+    /// `delete`'s gate and the delete below succeeds.
     #[tokio::test]
     async fn a_grade_freezes_the_files_too() {
         use crate::domain::homework_result::{HomeworkResult, HomeworkStatus};
@@ -431,6 +457,9 @@ mod tests {
             1,
             "the graded submission keeps exactly the files it was graded on"
         );
+        // Refused by the *guard*, not the cap (nine seats free) — and still no
+        // seat moved, so the counter matches the rows.
+        assert_eq!(stored_count(&sub, &db).await, 1);
         // The refused add took no slot either, so un-grading gives back a
         // submission with room, not one that silently lost nine.
         HomeworkResult::remove(&homework, &user, &db).await.unwrap();
