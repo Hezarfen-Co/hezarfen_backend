@@ -362,7 +362,7 @@ async fn delete_class(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "Class not found", body = ErrorResponse),
-        (status = 409, description = "Already in this class, or one of its courses is full", body = ErrorResponse),
+        (status = 409, description = "Already in this class, the class is at its student ceiling (max_class_members), one of its courses is full, or one of them no longer exists (a stale attachment — detach it)", body = ErrorResponse),
     ),
 )]
 async fn add_member(
@@ -488,7 +488,7 @@ async fn remove_member(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Class not found", body = ErrorResponse),
-        (status = 409, description = "Already attached, or the course cannot hold the whole class", body = ErrorResponse),
+        (status = 409, description = "Already attached, the class is at its course ceiling (max_class_courses), or the course cannot hold the whole class", body = ErrorResponse),
     ),
 )]
 async fn attach_course(
@@ -556,7 +556,9 @@ async fn list_class_courses(
 /// that course, like attaching. The enrollments the class pumped into it are
 /// swept — except rows another attached class still claims (re-tagged to it)
 /// and rows placed by hand (left standing). A course that was not attached is a
-/// 404.
+/// 404 — but a course row that is *gone* is not: the link a deleted course left
+/// behind detaches (the rights check has nothing left to read, and no roster
+/// left to protect), or the class holding it could never be deleted.
 #[utoipa::path(
     delete,
     path = "/{id}/courses/{course}",
@@ -570,7 +572,7 @@ async fn list_class_courses(
         (status = 204, description = "Detached"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
-        (status = 404, description = "Class or course not found, or that course was not attached", body = ErrorResponse),
+        (status = 404, description = "Class not found, or that course was not attached — a course row that is gone does not refuse the detach, it is the reason for it", body = ErrorResponse),
     ),
 )]
 async fn detach_course(
@@ -579,15 +581,21 @@ async fn detach_course(
     Path((id, course)): Path<(String, String)>,
 ) -> Result<StatusCode, AppError> {
     let class = class_or_404(&id, &st.db).await?;
-    let course = Course::read(&CourseId::from_key(&course), &st.db)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    if !can_manage_course(&course, &user) {
+    let course = CourseId::from_key(&course);
+    // The rights check is skipped when the course row is gone, rather than the
+    // whole detach refused: management rights are read *off* the course, so a
+    // link left pointing at a deleted course had no readable owner and this
+    // route answered 404 forever — which also left the class undeletable, its
+    // attachment counter counting a row nothing could sweep. There is no roster
+    // left to protect, and the caller is already teacher+.
+    if let Some(course) = Course::read(&course, &st.db).await?
+        && !can_manage_course(&course, &user)
+    {
         return Err(AppError::Forbidden(
             "only the course creator, an assigned teacher, or a manager/admin can detach this course from a class",
         ));
     }
-    ClassCourse::detach(class.get_id(), course.get_id(), &st.db).await?;
+    ClassCourse::detach(class.get_id(), &course, &st.db).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

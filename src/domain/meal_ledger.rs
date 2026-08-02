@@ -26,8 +26,12 @@
 //!   seat taken while the menu was free stays free, because "free" is recorded
 //!   on the row rather than inferred from the absence of a charge.
 //! - **A cancel appends a `reversal`**, for the charge's exact amount, with
-//!   `source` pointing at the charge it undoes. The charge row stays. Booking
-//!   again after a cancel is a *fresh* charge at the then-current price.
+//!   `source` pointing at the charge it undoes, *in the same transaction as the
+//!   flip that frees the seat*. The charge row stays. Booking again after a
+//!   cancel is a *fresh* charge at the then-current price — and since every
+//!   line is keyed by the attempt, a reversal that landed a transaction later
+//!   than its flip could be overtaken by that re-book and then never be
+//!   writable at all.
 //! - **Every booking line is keyed by `(booking, attempt)`.** Both the charge
 //!   and its reversal derive their record id from the seat and the attempt
 //!   number, so replaying either writes nothing at all. Money must never
@@ -348,29 +352,38 @@ impl MealLedger {
         recorded_by: &UserId,
         db: &Database,
     ) -> Result<(), AppError> {
-        let Some(amount) = booking.get_price_minor() else {
+        let Some(line) = Self::charge_for(booking, recorded_by) else {
             return Ok(());
         };
-        Self::append(
-            MealLedger {
-                id: MealLedgerId::for_attempt(
-                    booking.get_id(),
-                    booking.get_attempt(),
-                    MealLedgerKind::Charge,
-                ),
-                student: booking.get_student().clone(),
-                kind: MealLedgerKind::Charge,
-                amount_minor: amount,
-                source: Some(booking.get_id().record()),
-                method: None,
-                note: None,
-                recorded_by: recorded_by.clone(),
-                created_at: Timestamp::now(),
-            },
-            db,
-        )
-        .await?;
+        Self::append(line, db).await?;
         Ok(())
+    }
+
+    /// The charge `booking`'s current attempt owes — the line
+    /// [`MealBooking::claim_and_place`] appends inside the very transaction that
+    /// takes the seat. `None` when the menu was free, which owes no line.
+    ///
+    /// Only the row is built here; whether it is already there is a read, and
+    /// the caller that writes in one transaction has to make it there. Note the
+    /// attempt has to be settled *before* the SQL runs, which is why the claim
+    /// mints the number itself rather than letting the revival increment it.
+    pub(crate) fn charge_for(booking: &MealBooking, recorded_by: &UserId) -> Option<MealLedger> {
+        let amount = booking.get_price_minor()?;
+        Some(MealLedger {
+            id: MealLedgerId::for_attempt(
+                booking.get_id(),
+                booking.get_attempt(),
+                MealLedgerKind::Charge,
+            ),
+            student: booking.get_student().clone(),
+            kind: MealLedgerKind::Charge,
+            amount_minor: amount,
+            source: Some(booking.get_id().record()),
+            method: None,
+            note: None,
+            recorded_by: recorded_by.clone(),
+            created_at: Timestamp::now(),
+        })
     }
 
     /// Give the money back for a cancelled `booking`: a new `reversal` line for
@@ -380,46 +393,60 @@ impl MealLedger {
     /// the very charge it undoes, so it can only exist alongside it.
     ///
     /// Keyed by `(booking, attempt)` like the charge, so a retried cancel
-    /// refunds once. A cancel cut short between the status flip and this
-    /// reversal is recovered by repeating the cancel — which is precisely why
-    /// [`MealBooking::cancel`] replays this on an already-cancelled row instead
+    /// refunds once. The line normally lands *inside* the flip's own
+    /// transaction ([`MealBooking::release_seat`]); this path is what heals a
+    /// seat flipped before that was true, and it is why
+    /// [`MealBooking::cancel`] replays it on an already-cancelled row instead
     /// of refusing it. Nothing else on the API can append the missing line.
     pub async fn reverse_booking(
         booking: &MealBooking,
         recorded_by: &UserId,
         db: &Database,
     ) -> Result<(), AppError> {
-        let Some(amount) = booking.get_price_minor() else {
+        let Some((charge, line)) = Self::reversal_for(booking, recorded_by) else {
             return Ok(());
         };
+        if Self::read(&charge, db).await?.is_none() {
+            return Ok(());
+        }
+        Self::append(line, db).await?;
+        Ok(())
+    }
+
+    /// The refund `booking`'s current attempt owes, as `(the charge it undoes,
+    /// the reversal line)` — the two ids [`MealBooking::release_seat`] needs to
+    /// append the money back inside the transaction that frees the seat.
+    /// `None` when the seat was never billed (a free menu), which owes no line.
+    ///
+    /// Only the ids and the row are built here: whether the charge exists is a
+    /// read, and the caller that writes in one transaction has to make it there
+    /// rather than a round trip earlier.
+    pub(crate) fn reversal_for(
+        booking: &MealBooking,
+        recorded_by: &UserId,
+    ) -> Option<(MealLedgerId, MealLedger)> {
+        let amount = booking.get_price_minor()?;
         let charge = MealLedgerId::for_attempt(
             booking.get_id(),
             booking.get_attempt(),
             MealLedgerKind::Charge,
         );
-        if Self::read(&charge, db).await?.is_none() {
-            return Ok(());
-        }
-        Self::append(
-            MealLedger {
-                id: MealLedgerId::for_attempt(
-                    booking.get_id(),
-                    booking.get_attempt(),
-                    MealLedgerKind::Reversal,
-                ),
-                student: booking.get_student().clone(),
-                kind: MealLedgerKind::Reversal,
-                amount_minor: amount,
-                source: Some(charge.record()),
-                method: None,
-                note: None,
-                recorded_by: recorded_by.clone(),
-                created_at: Timestamp::now(),
-            },
-            db,
-        )
-        .await?;
-        Ok(())
+        let line = MealLedger {
+            id: MealLedgerId::for_attempt(
+                booking.get_id(),
+                booking.get_attempt(),
+                MealLedgerKind::Reversal,
+            ),
+            student: booking.get_student().clone(),
+            kind: MealLedgerKind::Reversal,
+            amount_minor: amount,
+            source: Some(charge.record()),
+            method: None,
+            note: None,
+            recorded_by: recorded_by.clone(),
+            created_at: Timestamp::now(),
+        };
+        Some((charge, line))
     }
 
     /// Money in: a payment received, or an opening balance.

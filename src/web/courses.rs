@@ -160,6 +160,13 @@ struct EnrollmentResponse {
     user: PersonRef,
     /// Who enrolled them.
     enrolled_by: PersonRef,
+    /// The class (`GET /classes/{id}`) this row was pumped by, or `null` when a
+    /// human placed it directly. A row with a class on it is *swept* when that
+    /// class drops the student or detaches the course; a `null` one is nobody's
+    /// to take back. Without it no client could tell which of its roster rows a
+    /// class change is about to remove.
+    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    source: Option<String>,
 }
 
 impl EnrollmentResponse {
@@ -169,6 +176,7 @@ impl EnrollmentResponse {
             course: enrollment.get_course().key().to_string(),
             user: PersonRef::resolve(people, enrollment.get_user()),
             enrolled_by: PersonRef::resolve(people, enrollment.get_enrolled_by()),
+            source: enrollment.get_source().map(|class| class.key().to_string()),
         }
     }
 }
@@ -609,6 +617,9 @@ async fn unassign_teacher(
 /// student membership, and it gates sitting exams, being graded, and the class
 /// roster, all student-only. A course with a `capacity` refuses new members
 /// once the roster is full (someone already enrolled is returned as-is).
+/// Enrolling a student a class pumped in takes the row *off* that class —
+/// `source` comes back `null` — so a later class sweep can no longer undo a
+/// placement made by hand, the mirror of a manual unenroll winning permanently.
 #[utoipa::path(
     post,
     path = "/{id}/enrollments",

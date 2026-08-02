@@ -348,16 +348,19 @@ impl Homework {
     pub async fn delete(self, db: &Database) -> Result<Homework, AppError> {
         let mut result = db
             .query(
-                "BEGIN TRANSACTION;
-                 DELETE homework_file WHERE submission IN (SELECT VALUE id FROM homework_submission WHERE homework = $hw);
-                 DELETE homework_submission WHERE homework = $hw;
-                 DELETE homework_result WHERE homework = $hw;
-                 LET $gone = (DELETE $hw RETURN BEFORE);
-                 FOR $sub IN ($gone.subject ?? []) {
-                     UPDATE $sub SET homework_count = math::max([(homework_count ?? 0) - 1, 0])
-                 };
-                 RETURN $gone;
-                 COMMIT TRANSACTION;",
+                format!(
+                    "BEGIN TRANSACTION;
+                     DELETE homework_file WHERE submission IN (SELECT VALUE id FROM homework_submission WHERE homework = $hw);
+                     DELETE homework_submission WHERE homework = $hw;
+                     DELETE homework_result WHERE homework = $hw;
+                     LET $gone = (DELETE $hw RETURN BEFORE);
+                     FOR $sub IN ($gone.subject ?? []) {{
+                         UPDATE $sub SET {SUBJECT_HOMEWORK_COUNT_FIELD} =
+                             math::max([({SUBJECT_HOMEWORK_COUNT_FIELD} ?? 0) - 1, 0])
+                     }};
+                     RETURN $gone;
+                     COMMIT TRANSACTION;"
+                ),
             )
             .bind(("hw", self.id.record()))
             .await?

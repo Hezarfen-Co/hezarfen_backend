@@ -92,6 +92,24 @@ pub const MAX_COURSE_DESCRIPTION_LEN: usize = 2_000;
 pub const MAX_CLASS_NAME_LEN: usize = 200;
 pub const MAX_CLASS_GRADE_LEN: usize = 20;
 
+/// How big one class may get, on each of its two axes. These are not comfort
+/// numbers: attaching a course to a class writes one enrollment per member and
+/// adding a member writes one per attached course, both in a *single*
+/// transaction, so each axis's counter is the bound on the other axis's write
+/// loop — a class with no ceiling is an unbounded transaction anyone with the
+/// manager role can trigger. A şube is a homeroom (`MAX_HOMEWORK_ASSIGNED`
+/// shares the 200) and its timetable is a school week, not a catalogue.
+///
+/// Which is also why each write is refused on the *other* axis: a class created
+/// before these numbers existed can stand above one of them, and the axis being
+/// added to having room says nothing about the loop's length — that is set by
+/// the axis it multiplies against. So the pump refuses a member while the class
+/// holds more than `MAX_CLASS_COURSES` courses and a course while it holds more
+/// than `MAX_CLASS_MEMBERS` students, and only shrinking the overloaded side
+/// clears it.
+pub const MAX_CLASS_MEMBERS: i64 = 200;
+pub const MAX_CLASS_COURSES: i64 = 50;
+
 pub const MAX_SUBJECT_NAME_LEN: usize = 200;
 pub const MAX_SUBJECT_DESCRIPTION_LEN: usize = 2_000;
 

@@ -280,6 +280,14 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS class ON class_member TYPE record<class_group>;
     DEFINE FIELD IF NOT EXISTS user ON class_member TYPE record<user>;
     DEFINE FIELD IF NOT EXISTS added_by ON class_member TYPE record<user>;
+    -- When the student was put in. Both link tables key on the *pair*
+    -- (`<class>_<user>`), so ordering a roster by its record id sorts it by the
+    -- member's account ULID — an arbitrary order the routes nevertheless
+    -- documented as newest-first. `option<int>` and no BACKFILL: rows written
+    -- before this column are of unknown age, and an absent stamp is NONE, which
+    -- SurrealDB sorts *last* under DESC — already the honest place for them, so
+    -- there is no number to invent.
+    DEFINE FIELD IF NOT EXISTS added_at ON class_member TYPE option<int>;
     DEFINE INDEX IF NOT EXISTS class_member_class_user ON class_member FIELDS class, user UNIQUE;
     DEFINE INDEX IF NOT EXISTS class_member_class ON class_member FIELDS class;
     DEFINE INDEX IF NOT EXISTS class_member_user ON class_member FIELDS user;
@@ -288,6 +296,9 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS class ON class_course TYPE record<class_group>;
     DEFINE FIELD IF NOT EXISTS course ON class_course TYPE record<course>;
     DEFINE FIELD IF NOT EXISTS attached_by ON class_course TYPE record<user>;
+    -- The mirror of `class_member.added_at`, for the same reason: without it
+    -- the course list is ordered by the *course's* ULID.
+    DEFINE FIELD IF NOT EXISTS attached_at ON class_course TYPE option<int>;
     DEFINE INDEX IF NOT EXISTS class_course_class_course ON class_course FIELDS class, course UNIQUE;
     DEFINE INDEX IF NOT EXISTS class_course_class ON class_course FIELDS class;
     DEFINE INDEX IF NOT EXISTS class_course_course ON class_course FIELDS course;
@@ -1056,6 +1067,23 @@ pub const BACKFILL: &str = "
     -- the guard — writing it would touch every plan row to say what it says.
     FOR $row IN ((SELECT plan, count() AS n FROM fee_plan_assignment GROUP BY plan) ?? []) {
         UPDATE $row.plan SET assignment_count = $row.n WHERE assignment_count = NONE;
+    };
+
+    -- The clear marker began paying the board's lifetime counter (2026-08-02):
+    -- it is a real `board_stroke` row, so a marker that charged nothing left
+    -- `total_stroke_count` counting marks *drawn* instead of rows *stored*, and
+    -- every board an older binary cleared is short exactly one per past clear.
+    --
+    -- The only repair here that is NOT `= NONE`-guarded, and the one counter
+    -- that may be: it is not an opinion the live system maintains, it is the
+    -- board's row count — every stroke and every marker charges 1, and a stroke
+    -- row is only ever deleted with the board itself (domain::board_stroke).
+    -- So recomputing converges instead of overwriting, and `!= $row.n` writes
+    -- nothing on the next boot, when every counter already equals its count.
+    -- No zero pass: a board nobody drew on forms no group, and an absent
+    -- counter already reads as zero through the `?? 0` every reader applies.
+    FOR $row IN ((SELECT board, count() AS n FROM board_stroke GROUP BY board) ?? []) {
+        UPDATE $row.board SET total_stroke_count = $row.n WHERE total_stroke_count != $row.n;
     };
 ";
 

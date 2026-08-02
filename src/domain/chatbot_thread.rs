@@ -7,12 +7,12 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use ulid::Ulid;
 
 use crate::constant::{
-    CHATBOT_THREAD_COUNT_FIELD, CHATBOT_THREAD_TABLE, MAX_CHATBOT_THREAD_TITLE_LEN,
+    CHATBOT_THREAD_COUNT_FIELD, CHATBOT_THREAD_TABLE, DEFAULT_MAX_CHATBOT_THREADS,
+    MAX_CHATBOT_THREAD_TITLE_LEN, SETTINGS_KEY, SETTINGS_TABLE,
 };
 use crate::database::Database;
 use crate::domain::cap;
 use crate::domain::page::PagedList;
-use crate::domain::settings::Settings;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
@@ -90,16 +90,24 @@ impl ChatbotThread {
 
     /// Start a thread unless `user` is already at the school's
     /// `max_chatbot_threads`. The slot is taken on the user row in the same
-    /// transaction as the thread ([`cap::claim_and_create`]) — an atomic
+    /// transaction as the thread ([`cap::claim_live_and_create`]) — an atomic
     /// single-record write, so two requests racing the same user's last slot
-    /// cannot both win, the counter can never count a row that did not commit,
-    /// and the cap is read fresh so a concurrent settings PATCH is respected.
+    /// cannot both win and the counter can never count a row that did not
+    /// commit.
+    ///
+    /// The cap is the one *live* on the settings singleton, sub-queried inside
+    /// that same conditional write rather than bound as a number: this cap does
+    /// not live on the parent row (the seat is on the user, the limit is the
+    /// school's), and a snapshot of it admits every request already in flight
+    /// when a `PATCH /settings` lowers it. The subquery costs one extra record
+    /// read per claim on a path that already reads the row it writes.
+    /// `DEFAULT_MAX_CHATBOT_THREADS` is the fallback the settings row's own
+    /// absent column means — no row, or a school that never set the knob.
     pub async fn create_capped(
         user: &UserId,
         title: Option<ChatbotThreadTitle>,
         db: &Database,
     ) -> Result<ChatbotThread, AppError> {
-        let limit = Settings::load(db).await?.get_max_chatbot_threads();
         let now = Timestamp::now();
         let thread = ChatbotThread {
             id: ChatbotThreadId::generate(),
@@ -108,10 +116,13 @@ impl ChatbotThread {
             created_at: now,
             updated_at: now,
         };
-        match cap::claim_and_create(
+        match cap::claim_live_and_create(
             &user.record(),
             CHATBOT_THREAD_COUNT_FIELD,
-            limit,
+            &format!(
+                "(SELECT VALUE max_chatbot_threads FROM ONLY {SETTINGS_TABLE}:{SETTINGS_KEY}) ?? $num"
+            ),
+            DEFAULT_MAX_CHATBOT_THREADS,
             &thread.id.record(),
             &thread,
             db,
@@ -237,7 +248,7 @@ impl ChatbotThread {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::settings::SettingsParams;
+    use crate::domain::settings::{Settings, SettingsParams};
 
     /// The owner's counter and the threads it counts, both re-read out of the
     /// store — never off a return value, which the in-memory engine forges

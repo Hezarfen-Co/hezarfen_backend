@@ -2079,8 +2079,9 @@ async fn boards_and_their_strokes_survive_remigration() {
         .unwrap();
     assert_eq!(
         result.take::<Vec<Vec<i64>>>(0).unwrap()[0],
-        vec![1, 3, 1],
-        "epoch counter, lifetime counter and the creator's board_count"
+        vec![1, 4, 1],
+        "epoch counter, lifetime counter (three strokes and the clear marker \
+         they paid for) and the creator's board_count"
     );
 
     // And the board is still writable after the boot — the counters that came

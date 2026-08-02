@@ -504,7 +504,9 @@ async fn update_board(
 /// stroke count, so the live canvas is blank while every mark ever drawn stays
 /// readable through `/history`. Also resets the live-canvas cap, which is how a
 /// board that answered "clear it to keep drawing" is recovered. `409` on a
-/// closed board.
+/// closed board, and on a canvas that is **already blank** — the marker is a
+/// real stroke row charged to the board's lifetime cap, so a clear has to close
+/// at least one mark to be worth a row.
 #[utoipa::path(
     post,
     path = "/{id}/clear",
@@ -516,7 +518,7 @@ async fn update_board(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Only the creator may clear the board", body = ErrorResponse),
         (status = 404, description = "Not found, or the caller is not on it", body = ErrorResponse),
-        (status = 409, description = "The board is closed", body = ErrorResponse),
+        (status = 409, description = "The canvas is already blank, or the board is closed", body = ErrorResponse),
     ),
 )]
 async fn clear_board(

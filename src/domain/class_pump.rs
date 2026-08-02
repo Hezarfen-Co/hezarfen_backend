@@ -26,22 +26,44 @@ use surrealdb::types::{RecordId, SurrealValue, Value};
 
 use crate::constant::{
     CLASS_COURSE_COUNT_FIELD, CLASS_COURSE_TABLE, CLASS_MEMBER_COUNT_FIELD, CLASS_MEMBER_TABLE,
-    ENROLLMENT_COUNT_FIELD, ENROLLMENT_TABLE,
+    ENROLLMENT_COUNT_FIELD, ENROLLMENT_TABLE, MAX_CLASS_COURSES, MAX_CLASS_MEMBERS,
 };
 use crate::database::{Database, transaction_with_retry};
 use crate::domain::cap;
-use crate::domain::class_group::ClassGroupId;
+use crate::domain::class_group::{ClassGroup, ClassGroupId};
+use crate::domain::user::UserId;
 use crate::error::AppError;
 
-/// The `THROW` markers [`attach`] aborts with. `FULL_MARK` is a *prefix*: the
-/// record id of the course that had no seat is appended to it, because "the
-/// class does not fit" is unanswerable without knowing which course to raise
-/// the capacity of, and the loop only learns that at runtime. The whole id and
-/// not just the key, so the refusal names something a caller can look up
-/// without knowing which table it came from.
+/// The `THROW` markers [`attach`] aborts with. `FULL_MARK` and `MISSING_MARK`
+/// are *prefixes*: the record id of the course the loop stopped on is appended
+/// to them, because neither "the class does not fit" nor "that course is gone"
+/// is answerable without naming the course, and the loop only learns which one
+/// at runtime. The whole id and not just the key, so the refusal names
+/// something a caller can look up without knowing which table it came from.
+///
+/// `MISSING_MARK` is deliberately not `FULL_MARK`: a seat claim that matches
+/// nothing means "full" *or* "no such row", and reporting a class-course link
+/// left pointing at a deleted course as a full course sends the caller to raise
+/// a capacity that does not exist, on a class every member add now fails on.
+///
+/// `CAP_MARK` is the class counter's claim matching nothing, which is "the
+/// class is full" *or* "the class is gone" — one conditional write cannot say
+/// which, so it stays one marker and the read that tells them apart is paid for
+/// only on that path (the same shape as
+/// [`crate::domain::enrollment::Enrollment::enroll`]). It is not `GONE_MARK`:
+/// that one is the *pivot* claim, which is a different row.
+///
+/// `OVER_MARK` is the *other* axis already standing above its own ceiling —
+/// which no claim on this axis can see, and which is what bounds this
+/// transaction's write loop (see [`Axis::cap`]). It is its own marker because
+/// "this class holds too many courses" is not an answer anyone can act on when
+/// it is reported as "this class holds too many students".
 const HELD_MARK: &str = "class_held";
 const GONE_MARK: &str = "class_gone";
+const CAP_MARK: &str = "class_cap";
+const OVER_MARK: &str = "class_over";
 const FULL_MARK: &str = "class_full:";
+const MISSING_MARK: &str = "class_no_course:";
 
 /// What [`attach`] settled.
 pub(crate) enum Attached<T> {
@@ -51,12 +73,26 @@ pub(crate) enum Attached<T> {
     /// The link already exists — nothing was written, and no seat was spent
     /// finding that out.
     Duplicate,
-    /// The class row is gone (a concurrent delete won). Nothing was written.
+    /// The class row — or, on the course axis, the course being attached — is
+    /// gone (a concurrent delete won). Nothing was written.
     Gone,
+    /// The class is at its own ceiling on this axis. Nothing was written, and
+    /// it is told apart from [`Attached::Gone`] because a full class is a
+    /// standing row someone can make room in, not a 404.
+    ClassFull,
+    /// The class stands *above* the ceiling on the other axis, so the write
+    /// loop this attach would run is longer than any transaction is allowed to
+    /// be. Only a class predating the ceilings can be here, and only its own
+    /// axis can make room — which is why it is not [`Attached::ClassFull`].
+    ClassOverloaded,
     /// One of the courses had no free seat, named by its key. Nothing was
     /// written — not one of the earlier seats in the same run, which is the
     /// whole point of doing this in a transaction.
     Full(String),
+    /// One of the courses the class carries no longer exists, named by its id:
+    /// a stale `class_course` link. Nothing was written, and no capacity anyone
+    /// can raise will change that answer.
+    CourseGone(String),
 }
 
 /// Which way the pump runs: the loop below needs a `(course, user)` pair per
@@ -96,6 +132,37 @@ impl Axis {
         }
     }
 
+    /// The in-transaction proof that this axis's *pivot* row is still there,
+    /// as the statements that claim it.
+    ///
+    /// The class counter's conditional claim covers the class; nothing covered
+    /// the course. With an empty roster the pair loop in [`attach`] touches no
+    /// row at all, so a concurrent `DELETE /courses/{id}` conflicts with
+    /// nothing — SurrealDB does not conflict-check that (write-skew) — and the
+    /// attach commits a `class_course` row pointing at a course that no longer
+    /// exists. A conditional write on the course row *is* the check: it matches
+    /// nothing once the row is gone, and it puts this transaction on the very
+    /// record the course's delete guard writes.
+    ///
+    /// The counter is re-stated verbatim rather than incremented: the row must
+    /// be touched, not changed, and `count = count` leaves an absent counter
+    /// absent, so the boot backfill still sees the `NONE` it seeds off.
+    ///
+    /// The member axis claims nothing: its pivot is a user, whose row is no
+    /// class write's to touch, and a membership left pointing at a deleted user
+    /// is still removable by its own route — which is exactly what a link to a
+    /// deleted course was not.
+    fn pivot_claim(&self) -> String {
+        match self {
+            Axis::Member => String::new(),
+            Axis::Course => format!(
+                "LET $alive = (UPDATE $pivot SET {ENROLLMENT_COUNT_FIELD} = \
+                     {ENROLLMENT_COUNT_FIELD} RETURN VALUE id);
+                 IF array::len($alive) = 0 {{ THROW '{GONE_MARK}' }};"
+            ),
+        }
+    }
+
     /// The class counter this axis's link rows are counted on. Taken off the
     /// axis rather than passed in beside it, because the two are one fact and a
     /// call site that paired the member axis with the course counter would
@@ -107,15 +174,87 @@ impl Axis {
             Axis::Course => CLASS_COURSE_COUNT_FIELD,
         }
     }
+
+    /// How many link rows this axis's counter may reach. Taken off the axis
+    /// beside the counter it bounds, for the same reason.
+    ///
+    /// This is what makes the pair loop in [`attach`] finite, and it does it
+    /// *crosswise*: the member axis's loop iterates the class's `class_course`
+    /// rows, which the course axis's counter caps, and the course axis's loop
+    /// iterates its `class_member` rows, which the member axis's counter caps.
+    /// So bounding the two counters bounds both write loops — one transaction
+    /// can never carry more than `MAX_CLASS_MEMBERS`/`MAX_CLASS_COURSES`
+    /// enrollment writes.
+    ///
+    /// Crosswise is also why the claim alone is not enough. It bounds the axis
+    /// being *added*, and the loop it runs is the length of the *other* one: a
+    /// class that already holds more members than `MAX_CLASS_MEMBERS` — the
+    /// layer shipped before either ceiling existed, so a real volume can carry
+    /// one — could still have a course attached, and that attach writes one
+    /// enrollment per member. So [`attach`] checks the other axis too
+    /// ([`Axis::other`]), and the bound holds for stale classes as well.
+    fn cap(&self) -> i64 {
+        match self {
+            Axis::Member => MAX_CLASS_MEMBERS,
+            Axis::Course => MAX_CLASS_COURSES,
+        }
+    }
+
+    /// The axis whose link rows this one's write loop iterates — its counter is
+    /// the length of that loop, and its ceiling is therefore the second half of
+    /// the bound.
+    fn other(&self) -> Axis {
+        match self {
+            Axis::Member => Axis::Course,
+            Axis::Course => Axis::Member,
+        }
+    }
 }
 
-/// Whether a [`detach`] also reconciles the enrollment rows its links pumped.
-pub(crate) enum Sweep {
-    /// Repair or delete them, per the rule in [`detach`].
-    Rows,
-    /// Release the counters and touch nothing else, because something else owns
-    /// the enrollment side of this same event.
-    CounterOnly,
+/// Everything a user's role change *off* `student` invalidates, in one
+/// transaction: every class membership they hold (each class getting its member
+/// count back) and every enrollment row they hold (each course getting its seat
+/// back).
+///
+/// One transaction because the two halves are one fact. Run as two, a failure
+/// between them released the memberships and both class counters while the
+/// enrollment rows kept `source = class_group:X` — the class then passed its
+/// zero-zero delete guard, and the rows were left tagged with a class that no
+/// longer existed and that no sweep could ever reach. Ordering them the other
+/// way only swaps which corruption is reachable: memberships surviving on a
+/// non-student are memberships the next attach pumps back into a course.
+///
+/// The enrollment side takes *every* row, hand-placed ones included, and that
+/// is the rule rather than an oversight: what the role change invalidates is
+/// not "rows a class wrote" but enrollment itself — only students enroll, and
+/// enrollment is what gates sitting exams, being graded and appearing on a
+/// roster. A row kept for a teacher would grant nothing and count a seat.
+/// Nothing restores them on a demotion back to `student`; a promotion is a
+/// roster decision of its own.
+pub(crate) async fn sweep_non_student(user: &UserId, db: &Database) -> Result<(), AppError> {
+    let sql = format!(
+        "BEGIN TRANSACTION;
+         LET $links = (DELETE {CLASS_MEMBER_TABLE} WHERE user = $usr RETURN BEFORE);
+         FOR $link IN ($links ?? []) {{
+             UPDATE $link.class SET {CLASS_MEMBER_COUNT_FIELD} = \
+                 math::max([({CLASS_MEMBER_COUNT_FIELD} ?? 0) - 1, 0]);
+         }};
+         LET $gone = (DELETE {ENROLLMENT_TABLE} WHERE user = $usr RETURN BEFORE);
+         FOR $row IN ($gone ?? []) {{
+             UPDATE $row.course SET {ENROLLMENT_COUNT_FIELD} = \
+                 math::max([({ENROLLMENT_COUNT_FIELD} ?? 0) - 1, 0]);
+         }};
+         COMMIT TRANSACTION;"
+    );
+    // Admissible by construction: `DELETE` and `UPDATE` only, so no statement
+    // can answer "already exists" and every lost round is a plain re-send.
+    let (_, mut errors) =
+        transaction_with_retry(db, &sql, &[("usr".into(), user.record().into_value())], &[])
+            .await?;
+    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 /// Write `link` and enroll everything it implies, or write nothing at all.
@@ -129,7 +268,9 @@ pub(crate) enum Sweep {
 /// The class counter is claimed by a conditional write rather than a bare
 /// increment, so a class deleted out from under this run matches nothing and
 /// the whole cascade aborts: [`Attached::Gone`] instead of a counter on a row
-/// that no longer exists.
+/// that no longer exists. The same write carries the axis's [`Axis::cap`],
+/// which is what keeps the pair loop below — and therefore this transaction —
+/// finite: [`Attached::ClassFull`] once the class is at its ceiling.
 ///
 /// Every enrollment in the loop is *skipped* when the pair already has a row —
 /// no seat charged, and the existing row's `source` left exactly as it was, so
@@ -153,18 +294,29 @@ pub(crate) async fn attach<T: SurrealValue + Clone>(
 ) -> Result<Attached<T>, AppError> {
     let count_field = axis.counter();
     let pairs = axis.pairs();
+    let alive = axis.pivot_claim();
+    let other = axis.other();
+    let over_field = other.counter();
+    // Read off the class row inside the transaction that claims it, so the
+    // count this refuses on is the one the pair loop below would iterate.
     let sql = format!(
         "BEGIN TRANSACTION;
          LET $held = (SELECT VALUE id FROM $link);
          IF array::len($held) > 0 {{ THROW '{HELD_MARK}' }};
+         {alive}
+         LET $over = (SELECT VALUE id FROM $class WHERE ({over_field} ?? 0) > $other_cap);
+         IF array::len($over) > 0 {{ THROW '{OVER_MARK}' }};
          LET $counted = (UPDATE $class SET {count_field} = ({count_field} ?? 0) + 1 \
-             WHERE ({count_field} ?? 0) < $unlimited RETURN VALUE id);
-         IF array::len($counted) = 0 {{ THROW '{GONE_MARK}' }};
+             WHERE ({count_field} ?? 0) < $class_cap RETURN VALUE id);
+         IF array::len($counted) = 0 {{ THROW '{CAP_MARK}' }};
          CREATE $link CONTENT $row;
          FOR $pair IN (({pairs}) ?? []) {{
              LET $seat_of = type::record('{ENROLLMENT_TABLE}', string::concat(
                  record::id($pair.course), '_', record::id($pair.user)));
              IF array::len((SELECT VALUE id FROM $seat_of)) = 0 {{
+                 IF array::len((SELECT VALUE id FROM $pair.course)) = 0 {{
+                     THROW '{MISSING_MARK}' + <string>$pair.course
+                 }};
                  LET $seat = (UPDATE $pair.course SET {ENROLLMENT_COUNT_FIELD} = \
                      ({ENROLLMENT_COUNT_FIELD} ?? 0) + 1 \
                      WHERE ({ENROLLMENT_COUNT_FIELD} ?? 0) < (capacity ?? $unlimited) \
@@ -188,8 +340,17 @@ pub(crate) async fn attach<T: SurrealValue + Clone>(
             ("pivot".into(), pivot.into_value()),
             ("by".into(), by.into_value()),
             ("unlimited".into(), cap::UNLIMITED.into_value()),
+            ("class_cap".into(), axis.cap().into_value()),
+            ("other_cap".into(), other.cap().into_value()),
         ],
-        &[HELD_MARK, GONE_MARK, FULL_MARK],
+        &[
+            HELD_MARK,
+            GONE_MARK,
+            OVER_MARK,
+            CAP_MARK,
+            FULL_MARK,
+            MISSING_MARK,
+        ],
     )
     .await?;
     // "Already linked" is read first: it outranks both refusals below, and the
@@ -214,30 +375,60 @@ pub(crate) async fn attach<T: SurrealValue + Clone>(
     {
         return Ok(Attached::Gone);
     }
+    // Read before the ceiling below: a class over the *other* axis's ceiling is
+    // refused whether or not this axis has room, and being told it is full on
+    // an axis with places left is an answer nobody can act on.
+    if errors
+        .values()
+        .any(|error| error.to_string().contains(OVER_MARK))
+    {
+        return Ok(Attached::ClassOverloaded);
+    }
+    // Full, or the class is gone — the counter claim matches nothing either
+    // way, and only this path pays for the read that tells them apart.
+    if errors
+        .values()
+        .any(|error| error.to_string().contains(CAP_MARK))
+    {
+        return Ok(match ClassGroup::read(class, db).await? {
+            Some(_) => Attached::ClassFull,
+            None => Attached::Gone,
+        });
+    }
+    // The stale link is read before "full": both come out of the same seat
+    // claim matching nothing, and only one of them is a capacity problem.
     if let Some(course) = errors
         .values()
-        .find_map(|error| full_course(&error.to_string()))
+        .find_map(|error| named_course(&error.to_string(), MISSING_MARK))
+    {
+        return Ok(Attached::CourseGone(course));
+    }
+    if let Some(course) = errors
+        .values()
+        .find_map(|error| named_course(&error.to_string(), FULL_MARK))
     {
         return Ok(Attached::Full(course));
     }
     if let Some(error) = errors.drain().map(|(_, error)| error).next() {
         return Err(error.into());
     }
-    // Slots count BEGIN, two LETs and two IFs: the CREATE is slot 5.
+    // Slots count BEGIN and three LET/IF pairs: the CREATE is slot 7 — or 9 on
+    // an axis that claims its pivot with a LET/IF pair of its own.
+    let made = if alive.is_empty() { 7 } else { 9 };
     result
-        .take::<Vec<T>>(5)?
+        .take::<Vec<T>>(made)?
         .into_iter()
         .next()
         .map(Attached::Made)
         .ok_or_else(|| AppError::Internal("the class pump wrote no link row".into()))
 }
 
-/// The course id out of a `class_full:<table>:<key>` abort. Table names and the
+/// The course id out of a `<mark><table>:<key>` abort. Table names and the
 /// generated ULID keys here are alphanumeric and `:` joins them, so the id ends
 /// where the store's own wrapping around the thrown text begins.
-fn full_course(message: &str) -> Option<String> {
+fn named_course(message: &str, mark: &str) -> Option<String> {
     let id: String = message
-        .split_once(FULL_MARK)?
+        .split_once(mark)?
         .1
         .chars()
         .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':'))
@@ -264,28 +455,19 @@ fn full_course(message: &str) -> Option<String> {
 /// "this class has a member" and "that member has a live pumped row" are
 /// independent facts and the loop simply finds nothing to sweep.
 ///
-/// [`Sweep::CounterOnly`] is the deliberate half of this: dropping a *user's*
-/// whole membership releases the counters and nothing else, because
-/// `Enrollment::delete_for_user` owns the enrollment side of that same event and
-/// a second decrement of the same seat is a bug, not a belt.
-///
 /// Admissible by construction: `DELETE` and `UPDATE` only, so no statement in
 /// the cascade can answer "already exists" and every lost round is a plain
 /// re-send.
 pub(crate) async fn detach(
     links: &str,
     axis: Axis,
-    sweep: Sweep,
     bindings: &[(String, Value)],
     db: &Database,
 ) -> Result<i64, AppError> {
     let count_field = axis.counter();
-    let sweep = match sweep {
-        Sweep::CounterOnly => String::new(),
-        Sweep::Rows => {
-            let scope = axis.scope();
-            format!(
-                "FOR $row IN ((SELECT id, course, user FROM {ENROLLMENT_TABLE} \
+    let scope = axis.scope();
+    let sweep = format!(
+        "FOR $row IN ((SELECT id, course, user FROM {ENROLLMENT_TABLE} \
                  WHERE {scope} AND source = $link.class) ?? []) {{
                  LET $rivals = (SELECT VALUE class FROM {CLASS_COURSE_TABLE} \
                      WHERE course = $row.course AND class != $link.class);
@@ -299,9 +481,7 @@ pub(crate) async fn detach(
                          math::max([({ENROLLMENT_COUNT_FIELD} ?? 0) - 1, 0]);
                  }};
              }};"
-            )
-        }
-    };
+    );
     let sql = format!(
         "BEGIN TRANSACTION;
          LET $gone = (DELETE {links} RETURN BEFORE);
@@ -386,7 +566,6 @@ mod tests {
         let gone = detach(
             &format!("{CLASS_MEMBER_TABLE} WHERE user = $usr"),
             Axis::Member,
-            Sweep::CounterOnly,
             &[("usr".into(), student.record().into_value())],
             &db,
         )
@@ -409,7 +588,6 @@ mod tests {
         let again = detach(
             &format!("{CLASS_MEMBER_TABLE} WHERE user = $usr"),
             Axis::Member,
-            Sweep::CounterOnly,
             &[("usr".into(), student.record().into_value())],
             &db,
         )
@@ -421,14 +599,22 @@ mod tests {
     #[test]
     fn a_full_abort_names_its_course() {
         assert_eq!(
-            full_course("An error occurred: class_full:course:01J8XZ0K3Q"),
+            named_course("An error occurred: class_full:course:01J8XZ0K3Q", FULL_MARK),
             Some("course:01J8XZ0K3Q".to_string())
         );
         assert_eq!(
-            full_course("class_full:course:algebra'"),
+            named_course("class_full:course:algebra'", FULL_MARK),
             Some("course:algebra".into())
         );
-        assert_eq!(full_course("class_held"), None);
-        assert_eq!(full_course("class_full:"), None);
+        assert_eq!(named_course("class_held", FULL_MARK), None);
+        assert_eq!(named_course("class_full:", FULL_MARK), None);
+        // And the stale-link abort reads off the same shape, without the two
+        // markers ever matching each other's text.
+        assert_eq!(
+            named_course("class_no_course:course:algebra'", MISSING_MARK),
+            Some("course:algebra".into())
+        );
+        assert_eq!(named_course("class_no_course:course:a", FULL_MARK), None);
+        assert_eq!(named_course("class_full:course:a", MISSING_MARK), None);
     }
 }

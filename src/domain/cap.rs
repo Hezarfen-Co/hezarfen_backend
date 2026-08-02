@@ -58,6 +58,17 @@ static CLAIM_LOCK: Mutex<()> = Mutex::const_new(());
 /// instead of [`write`]'s — [`crate::domain::field_update::FieldUpdate`]'s term
 /// move claims and releases inside the very `UPDATE`'s transaction, and still
 /// owes the process one counter write at a time.
+///
+/// **Is it load-bearing?** For the caps themselves, no — every one of them is a
+/// single conditional write the store decides, and it decides it the same way
+/// with a dozen writers in flight. So a counter write that skips this lock is
+/// not a hole in a cap, and "every other site takes it" is not a correctness
+/// argument. What the lock *is* load-bearing for is (a) the test suite, whose
+/// in-memory engine forges wins under concurrency, and (b) any guard built out
+/// of **two** statements that must not interleave with a rival's pair —
+/// [`retire_name`] is exactly that, and it is why a skipped lock there would be
+/// a real bug while a skipped lock around a lone `UPDATE … WHERE` is only
+/// contention.
 pub(crate) async fn counter_lock() -> tokio::sync::MutexGuard<'static, ()> {
     CLAIM_LOCK.lock().await
 }
@@ -149,7 +160,33 @@ pub(crate) async fn claim_and_create<T: SurrealValue + Clone>(
     content: &T,
     db: &Database,
 ) -> Result<Claimed<T>, AppError> {
-    claim_at_and_create(parent, field, cap, "", id, content, db).await
+    claim_at_and_create(parent, field, "$num", cap, "", id, content, db).await
+}
+
+/// [`claim_and_create`] against a cap the *statement* reads rather than one the
+/// caller snapshotted: `cap_expr` is SQL evaluated on the parent row at write
+/// time (`audience.capacity ?? $num`, a subquery onto the settings singleton),
+/// and `fallback` is the `$num` it coalesces to when the column is unset.
+///
+/// A snapshotted cap is only ever a claim about the past. Bound as an integer,
+/// a `PATCH` that *lowers* the cap while N requests are in flight admits all N
+/// anyway — each one is measured against the number its own read saw, and the
+/// single-record guard that makes concurrent claimers safe against each other
+/// says nothing about the writer of the cap itself. Read inside the same
+/// conditional write, the lowered cap refuses the very next claimer, because
+/// the write that lowered it and the write that reads it contend on one record.
+///
+/// `cap_expr` is always an in-crate SQL literal, never text from a client.
+pub(crate) async fn claim_live_and_create<T: SurrealValue + Clone>(
+    parent: &RecordId,
+    field: &str,
+    cap_expr: &str,
+    fallback: i64,
+    id: &RecordId,
+    content: &T,
+    db: &Database,
+) -> Result<Claimed<T>, AppError> {
+    claim_at_and_create(parent, field, cap_expr, fallback, "", id, content, db).await
 }
 
 /// [`claim_and_create`], but only while `guard` — an extra predicate on that
@@ -175,12 +212,14 @@ pub(crate) async fn claim_when_and_create<T: SurrealValue + Clone>(
     content: &T,
     db: &Database,
 ) -> Result<Claimed<T>, AppError> {
-    claim_at_and_create(parent, field, cap, guard, id, content, db).await
+    claim_at_and_create(parent, field, "$num", cap, guard, id, content, db).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn claim_at_and_create<T: SurrealValue + Clone>(
     parent: &RecordId,
     field: &str,
+    cap_expr: &str,
     cap: i64,
     extra: &str,
     id: &RecordId,
@@ -197,7 +236,7 @@ async fn claim_at_and_create<T: SurrealValue + Clone>(
          LET $held = (SELECT VALUE id FROM $id);
          IF array::len($held) > 0 {{ THROW '{HELD_MARK}' }};
          LET $seat = (UPDATE $parent SET {field} = ({field} ?? 0) + 1 \
-             WHERE ({field} ?? 0) < $num{extra} RETURN VALUE id);
+             WHERE ({field} ?? 0) < ({cap_expr}){extra} RETURN VALUE id);
          IF array::len($seat) = 0 {{ THROW '{FULL_MARK}' }};
          CREATE $id CONTENT $row;
          COMMIT TRANSACTION;"
@@ -390,17 +429,6 @@ pub(crate) async fn claim_two_when_and_create<T: SurrealValue + Clone>(
         .unwrap_or_else(|| AppError::Internal("cap counter write never ran".into())))
 }
 
-/// Move `parent` to its next revision. A revision column is not a cap: it is
-/// what a reader pins a value it took off the parent to, so that a write which
-/// invalidates that value (a menu's price) can refuse the claim carrying the old
-/// one. Every such mutation bumps *before* it writes, so a stale claim is
-/// refused whether or not the mutation itself then lands.
-pub(crate) async fn bump(parent: &RecordId, field: &str, db: &Database) -> Result<(), AppError> {
-    let sql = format!("UPDATE $parent SET {field} = ({field} ?? 0) + 1 RETURN VALUE id");
-    write(&sql, parent, UNLIMITED, db).await?;
-    Ok(())
-}
-
 // --- reference counters --------------------------------------------------
 //
 // The same single-record guard, pointed the other way. A cap asks "is there
@@ -520,25 +548,104 @@ pub(crate) async fn claim_ref_and_create<T: SurrealValue + Clone>(
         .unwrap_or_else(|| AppError::Internal("cap counter write never ran".into())))
 }
 
-/// Retire the name behind `id`: no further claim succeeds. `false` = something
-/// still references it and the caller must refuse; nothing was written.
-/// Idempotent — retiring an already-retired unused name lands again.
-pub(crate) async fn retire(id: &RecordId, db: &Database) -> Result<bool, AppError> {
+/// What a retire / un-retire write did to the name's bit.
+///
+/// The distinction a rollback lives on. Both writes are idempotent, so "it
+/// ended up retired" says nothing about *who* retired it: a caller that undoes
+/// a no-op undoes whoever really did flip the bit — two settings PATCHes each
+/// dropping the same exam kind, one of them losing the row's compare-and-set,
+/// left the kind gone from the list with its counter reading "in service",
+/// which is a kind that grades again and can then never be removed.
+pub(crate) enum Switched {
+    /// This call flipped the bit; a rollback owes the opposite write.
+    Flipped,
+    /// The bit already stood that way — this call wrote nothing, so there is
+    /// nothing to take back, and taking it back would undo somebody else.
+    Unchanged,
+    /// Retirement only: something still references the name and the caller must
+    /// refuse. Nothing was written.
+    InUse,
+}
+
+/// Retire the name behind `id`: no further claim succeeds. Idempotent — a
+/// retirement of an already-retired unused name lands again, and says so
+/// ([`Switched::Unchanged`]) so the caller does not roll back a bit it never
+/// set.
+pub(crate) async fn retire_name(id: &RecordId, db: &Database) -> Result<Switched, AppError> {
     // Parenthesized `??`: `count ?? 0 = 0` parses as `count ?? (0 = 0)`, which
     // is truthy for *every* row and would retire a name still in use.
+    //
+    // The bit as it stood is read in the *same round trip* as the write, so the
+    // pair is one hold of `CLAIM_LOCK` (see [`switch`]) and no rival in this
+    // process can retire the name between them and be undone by this caller.
     let sql = format!(
-        "UPSERT $parent SET {REF_RETIRED_FIELD} = true \
-         WHERE ({REF_COUNT_FIELD} ?? 0) = 0 RETURN VALUE id"
+        "SELECT VALUE ({REF_RETIRED_FIELD} ?? false) FROM $parent;
+         UPSERT $parent SET {REF_RETIRED_FIELD} = true \
+             WHERE ({REF_COUNT_FIELD} ?? 0) = 0 RETURN VALUE id"
     );
-    Ok(!write(&sql, id, UNLIMITED, db).await?.is_empty())
+    let (was, landed) = switch(&sql, id, db).await?;
+    Ok(match (landed, was) {
+        (false, _) => Switched::InUse,
+        (true, true) => Switched::Unchanged,
+        (true, false) => Switched::Flipped,
+    })
 }
 
 /// Put a name back in service — it re-entered the list it was retired from, or
-/// the edit that retired it never landed.
-pub(crate) async fn unretire(id: &RecordId, db: &Database) -> Result<(), AppError> {
-    let sql = format!("UPSERT $parent SET {REF_RETIRED_FIELD} = false RETURN VALUE id");
-    write(&sql, id, UNLIMITED, db).await?;
-    Ok(())
+/// the edit that retired it never landed. [`Switched::Flipped`] only when the
+/// name really was retired, for [`retire_name`]'s reason pointed the other way.
+pub(crate) async fn unretire_name(id: &RecordId, db: &Database) -> Result<Switched, AppError> {
+    let sql = format!(
+        "SELECT VALUE ({REF_RETIRED_FIELD} ?? false) FROM $parent;
+         UPSERT $parent SET {REF_RETIRED_FIELD} = false RETURN VALUE id"
+    );
+    let (was, _) = switch(&sql, id, db).await?;
+    Ok(if was {
+        Switched::Flipped
+    } else {
+        Switched::Unchanged
+    })
+}
+
+/// [`retire_name`] as the yes/no the domain probes ask — did the name end up
+/// retired? **Test-only**: production callers roll their edit back and need to
+/// know which of the two "yes" answers they got.
+#[cfg(test)]
+pub(crate) async fn retire(id: &RecordId, db: &Database) -> Result<bool, AppError> {
+    Ok(!matches!(retire_name(id, db).await?, Switched::InUse))
+}
+
+/// The read of the `retired` bit and the write that moves it, one round trip
+/// under one [`CLAIM_LOCK`] hold: `(bit as it stood, did the write match)`.
+async fn switch(sql: &str, parent: &RecordId, db: &Database) -> Result<(bool, bool), AppError> {
+    let _guard = CLAIM_LOCK.lock().await;
+    let mut last = None;
+    for attempt in 0..CAP_WRITE_TRIES {
+        backoff(attempt).await;
+        let attempted = async {
+            let mut result = db
+                .query(sql)
+                .bind(("parent", parent.clone()))
+                .await?
+                .check()?;
+            let was = result
+                .take::<Vec<bool>>(0)?
+                .first()
+                .copied()
+                .unwrap_or(false);
+            let landed = !result.take::<Vec<RecordId>>(1)?.is_empty();
+            Ok::<_, surrealdb::Error>((was, landed))
+        }
+        .await;
+        match attempted {
+            Ok(answer) => return Ok(answer),
+            Err(err) if lost_the_race(&err) => last = Some(err),
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Err(last
+        .map(AppError::from)
+        .unwrap_or_else(|| AppError::Internal("cap counter write never ran".into())))
 }
 
 /// Run one conditional counter write, retrying while the store reports a write
@@ -550,8 +657,11 @@ pub(crate) async fn unretire(id: &RecordId, db: &Database) -> Result<(), AppErro
 /// never letting two writers reach the database at once. So the queueing has to
 /// happen here. Backoff is exponential with jitter, because racers arrive in
 /// lockstep (one HTTP burst) and a fixed delay would just re-synchronize them.
-/// `num` is the statement's one number, bound as `$num`: a cap for the claims,
-/// a step for the reference counters below.
+/// `num` is the statement's one number, bound as `$num` — the cap.
+///
+/// **Test-only**, like its one caller [`claim`]: every production counter write
+/// now rides its child row's transaction and carries its own loop.
+#[cfg(test)]
 async fn write(
     sql: &str,
     parent: &RecordId,
@@ -851,6 +961,125 @@ mod tests {
         assert!(matches!(claim_slot(&db, "m1").await, ClaimedRef::Retired));
         assert_eq!(refs(&db).await, 0);
         assert_eq!(menus(&db).await, 0);
+    }
+
+    /// The `retired` bit as the store holds it, `None` when the row is absent.
+    async fn bit(db: &Database) -> Option<bool> {
+        let mut result = db
+            .query("SELECT VALUE retired FROM slot_ref:lunch")
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        result.take::<Vec<bool>>(0).unwrap().first().copied()
+    }
+
+    fn lunch() -> RecordId {
+        RecordId::new(crate::constant::SLOT_REF_TABLE, "lunch")
+    }
+
+    /// Retirement is idempotent, so "it is retired now" is *not* "I retired
+    /// it" — and a caller that rolls back on the second answer un-retires a
+    /// name somebody else legitimately took out of service. That is the whole
+    /// settings-CAS wedge: the list drops the name, the counter says in
+    /// service, the name grades again and can then never be removed.
+    #[tokio::test]
+    async fn a_second_retirement_says_it_changed_nothing() {
+        let db = a_slot(0, false).await;
+        assert!(matches!(
+            retire_name(&lunch(), &db).await.unwrap(),
+            Switched::Flipped
+        ));
+        assert!(matches!(
+            retire_name(&lunch(), &db).await.unwrap(),
+            Switched::Unchanged
+        ));
+        assert_eq!(bit(&db).await, Some(true), "the winner's bit still stands");
+    }
+
+    /// The mirror: only the un-retire that really put a name back in service
+    /// owes a re-retirement, so a re-add that never lands cannot be undone
+    /// twice.
+    #[tokio::test]
+    async fn a_second_un_retirement_says_it_changed_nothing() {
+        let db = a_slot(0, true).await;
+        assert!(matches!(
+            unretire_name(&lunch(), &db).await.unwrap(),
+            Switched::Flipped
+        ));
+        assert!(matches!(
+            unretire_name(&lunch(), &db).await.unwrap(),
+            Switched::Unchanged
+        ));
+        assert_eq!(bit(&db).await, Some(false));
+    }
+
+    /// A referenced name is refused, and the refusal writes nothing — the
+    /// caller must not record an undo for it either.
+    #[tokio::test]
+    async fn a_referenced_name_refuses_and_leaves_the_bit_alone() {
+        let db = a_slot(1, false).await;
+        assert!(matches!(
+            retire_name(&lunch(), &db).await.unwrap(),
+            Switched::InUse
+        ));
+        assert_eq!(bit(&db).await, Some(false));
+    }
+
+    // --- claim_live_and_create ------------------------------------------
+
+    /// The cap the statement reads and the cap the caller remembers are
+    /// different numbers the moment anyone edits the cap. `epoch` stands in for
+    /// a capacity column here — any int on the parent row does.
+    #[tokio::test]
+    async fn a_live_cap_refuses_where_the_caller_s_snapshot_admits() {
+        let db = a_board(1, 0, false).await;
+        db.query("UPDATE board:b SET epoch = 1")
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        // Live: one seat, one taken — full, and nothing written.
+        let live = claim_live_and_create(
+            &RecordId::new("board", "b"),
+            BOARD_EPOCH_STROKE_COUNT_FIELD,
+            "epoch ?? $num",
+            UNLIMITED,
+            &RecordId::new("board_stroke", "s1"),
+            &a_stroke(),
+            &db,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(live, Claimed::Full));
+        assert_eq!(stored(&db).await, (1, 0));
+        assert_eq!(strokes(&db).await, 0);
+
+        // The same row, the same instant, against a cap of 5 the caller read
+        // before it was lowered: admitted. That gap is the over-admission.
+        assert!(matches!(claim_one(&db, 5, "s2").await, Claimed::Made(_)));
+        assert_eq!(stored(&db).await, (2, 0));
+    }
+
+    /// An unset capacity column means "no cap", which is the bound `$num`
+    /// fallback — not a cap of zero that refuses everything.
+    #[tokio::test]
+    async fn an_absent_live_cap_falls_back_to_the_bound_number() {
+        let db = a_board(0, 0, false).await;
+        let made = claim_live_and_create(
+            &RecordId::new("board", "b"),
+            BOARD_EPOCH_STROKE_COUNT_FIELD,
+            "capacity ?? $num",
+            UNLIMITED,
+            &RecordId::new("board_stroke", "s1"),
+            &a_stroke(),
+            &db,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(made, Claimed::Made(_)));
+        assert_eq!(stored(&db).await, (1, 0));
     }
 
     #[tokio::test]

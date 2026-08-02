@@ -23,7 +23,10 @@
 //!   price its menu genuinely carried.
 //! - **The seat and its money move together.** Booking charges and cancelling
 //!   reverses right here, not in the web layer — a seam between the two let
-//!   concurrent `POST`s bill one seat twice.
+//!   concurrent `POST`s bill one seat twice — and *both* ledger lines are
+//!   written by the very transaction that moves the seat, because money that
+//!   trails the seat by one write can be overtaken by the next attempt and
+//!   stranded forever: every ledger id carries the attempt it belongs to.
 
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
@@ -162,10 +165,10 @@ impl MealBooking {
     /// instant the seat was taken — a guarantee a lock around the read could
     /// not give, since the price is read a round trip before the claim.
     ///
-    /// The charge is appended after, keyed by (seat, attempt): eight concurrent
-    /// `POST`s of one seat hold one seat and write one charge line. The price is
-    /// `None` when the menu is free, and that `None` is stored, so a dish added
-    /// later never bills a seat retroactively.
+    /// The charge rides that same transaction, keyed by (seat, attempt): eight
+    /// concurrent `POST`s of one seat hold one seat and write one charge line.
+    /// The price is `None` when the menu is free, and that `None` is stored, so
+    /// a dish added later never bills a seat retroactively.
     ///
     /// `cutoff` is the school's one meal deadline (see [`MealCutoff`]): once
     /// serving time is that close, the seat is fixed either way.
@@ -181,14 +184,17 @@ impl MealBooking {
         for _ in 0..CAS_UPDATE_RETRIES {
             let fresh = Menu::read(menu, db).await?.ok_or(AppError::NotFound)?;
             check_cutoff(fresh.get_date(), fresh.get_slot(), cutoff)?;
-            // Before the seat: an unchargeable menu (dishes summing past the
-            // cap) must refuse the booking outright, never leave a
-            // booked-but-unbilled row behind.
-            let price = MealLedger::price_snapshot(menu, db).await?;
             let existing: Option<MealBooking> = db.select(id.record()).await?;
             // The seat is already held: same attempt, same price it was taken
             // at. Today's menu price bills nobody who booked yesterday's. No
             // seat is claimed, so a double-click cannot count two.
+            //
+            // Answered *before* the menu is priced, and that ordering is the
+            // rule: pricing first made a repeat POST of a seat already held 400
+            // ("amount_minor must be between…") as soon as the menu's dishes
+            // summed past the chargeable maximum — refusing to replay a seat
+            // the student holds, over a price that seat was never going to be
+            // billed.
             if let Some(held) = existing
                 .clone()
                 .filter(|row| row.status == MealBookingStatus::Booked)
@@ -196,32 +202,47 @@ impl MealBooking {
                 MealLedger::charge_booking(&held, booked_by, db).await?;
                 return Ok(held);
             }
+            // Before the seat: an unchargeable menu (dishes summing past the
+            // cap) must refuse the booking outright, never leave a
+            // booked-but-unbilled row behind.
+            let price = MealLedger::price_snapshot(menu, db).await?;
+            // The attempt is settled *here*, not by the revival's `attempt + 1`,
+            // because the charge id is (seat, attempt) and the charge has to be
+            // built before the transaction that writes it. `existing` is either
+            // absent or cancelled — a booked row returned above.
             let fresh_row = MealBooking {
                 id: id.clone(),
                 menu: menu.clone(),
                 student: student.clone(),
                 booked_by: booked_by.clone(),
                 status: MealBookingStatus::Booked,
-                attempt: 1,
+                attempt: existing.map_or(1, |prior| prior.attempt + 1),
                 price_minor: price,
                 cancelled_at: None,
                 created_at: Timestamp::now(),
             };
-            let booking = match Self::claim_and_place(
+            let charge = MealLedger::charge_for(&fresh_row, booked_by);
+            match Self::claim_and_place(
                 &seats,
                 fresh.get_capacity().unwrap_or(cap::UNLIMITED),
                 fresh.get_version(),
                 &fresh_row,
                 price,
+                charge.as_ref(),
                 db,
             )
             .await?
             {
-                Claimed::Made(booking) => booking,
-                // Another `POST` of this very pair placed the row first, and it
-                // owed no second seat: this caller never took one (the whole
-                // transaction rolled back), so the winner's row is the answer.
-                Claimed::Duplicate => Self::read(&id, db).await?.ok_or(AppError::NotFound)?,
+                // Seat, row and charge committed together; nothing is owed
+                // after this call, which is the whole point of folding them.
+                Claimed::Made(booking) => return Ok(booking),
+                // Another `POST` of this very pair moved the row first, and this
+                // caller never took a seat (the whole transaction rolled back).
+                // The decision is simply made again rather than answered off a
+                // row read here: the winner may have left it `cancelled` at an
+                // attempt this call never saw, and the loop's own held-seat path
+                // is what returns a live seat *and* replays its charge.
+                Claimed::Duplicate => continue,
                 // Full, moved, or gone — one `WHERE` refused all three, so the
                 // reason is re-read rather than guessed. A moved menu is not a
                 // refusal: the price above is stale, so price and seat are
@@ -231,11 +252,7 @@ impl MealBooking {
                     Some(now) if now.get_version() != fresh.get_version() => continue,
                     Some(_) => return Err(AppError::Conflict("the menu is fully booked")),
                 },
-            };
-            // Writes nothing when this attempt is already billed, so the repeat
-            // POST above costs nothing and a charge that failed once self-heals.
-            MealLedger::charge_booking(&booking, booked_by, db).await?;
-            return Ok(booking);
+            }
         }
         Err(AppError::Conflict(
             "the menu kept changing underneath this booking",
@@ -258,14 +275,42 @@ impl MealBooking {
     /// A cancelled row is revived in place (a fresh attempt at `price`) rather
     /// than recreated: `booked_by` and `created_at` are READONLY history — who
     /// opened the seat, and when.
+    ///
+    /// **The charge rides this transaction too**, for the same reason the
+    /// refund rides the cancel's: appended a write later, a cancel landing in
+    /// the gap finds no charge, reverses nothing, and the charge lands after it
+    /// — the seat given back and the money still owed, unreversible by any
+    /// route, because every ledger id carries the attempt the cancel has already
+    /// moved past. That is why `row.attempt` is minted by the *caller*: the
+    /// charge's id is (seat, attempt), so the number cannot be the revival's own
+    /// `attempt + 1` any more. The revival is fenced on the attempt it read
+    /// instead, so a rival that revived first loses this claim (the `CREATE`
+    /// below then finds the row and aborts the whole transaction) rather than
+    /// billing its attempt at this call's id.
+    ///
+    /// The charge is created only if it is not already there — a duplicate
+    /// `CREATE` would abort the transaction and cost the seat, and an attempt
+    /// billed twice is the one thing money code may never do.
     async fn claim_and_place(
         seats: &RecordId,
         cap: i64,
         seen: i64,
         row: &MealBooking,
         price: Option<LedgerAmount>,
+        charge: Option<&MealLedger>,
         db: &Database,
     ) -> Result<Claimed<MealBooking>, AppError> {
+        // Empty when the menu is free: a seat that costs nothing owes no line.
+        let bill = match charge {
+            Some(_) => {
+                "IF array::len((SELECT VALUE id FROM $charge)) = 0 \
+                     { CREATE $charge CONTENT $line };"
+            }
+            None => "",
+        };
+        // Slots count BEGIN, three LETs, three IFs and — when there is money to
+        // take — the charge's IF, so the RETURN is slot 7 or 8.
+        let returned = if charge.is_some() { 8 } else { 7 };
         // Parenthesized `??` throughout: `a ?? 0 = $seen` binds the wrong way.
         let sql = format!(
             "BEGIN TRANSACTION;
@@ -276,24 +321,31 @@ impl MealBooking {
                  WHERE ({MENU_SEAT_COUNT_FIELD} ?? 0) < $cap \
                    AND ({MENU_VERSION_FIELD} ?? 0) = $seen RETURN VALUE id);
              IF array::len($seat) = 0 {{ THROW 'no_seat' }};
-             LET $revived = (UPDATE $id SET status = 'booked', attempt = attempt + 1, \
+             LET $revived = (UPDATE $id SET status = 'booked', attempt = $attempt, \
                  price_minor = $price, cancelled_at = NONE \
-                 WHERE status = 'cancelled' RETURN AFTER);
+                 WHERE status = 'cancelled' AND attempt = $attempt - 1 RETURN AFTER);
              IF array::len($revived) = 0 {{ CREATE $id CONTENT $row }};
+             {bill}
              RETURN SELECT * FROM ONLY $id;
              COMMIT TRANSACTION;"
         );
         for _ in 0..CAS_UPDATE_RETRIES {
-            let mut result = match db
+            let query = db
                 .query(sql.as_str())
                 .bind(("menu", seats.clone()))
                 .bind(("cap", cap))
                 .bind(("seen", seen))
                 .bind(("id", row.id.record()))
+                .bind(("attempt", row.attempt))
                 .bind(("price", price))
-                .bind(("row", row.clone()))
-                .await
-            {
+                .bind(("row", row.clone()));
+            let query = match charge {
+                Some(line) => query
+                    .bind(("charge", line.get_id().record()))
+                    .bind(("line", line.clone())),
+                None => query,
+            };
+            let mut result = match query.await {
                 Ok(result) => result,
                 Err(err) if lost_the_race(&err) => continue,
                 Err(err) => return Err(err.into()),
@@ -319,8 +371,7 @@ impl MealBooking {
             if let Some(error) = errors.drain().map(|(_, error)| error).next() {
                 return Err(error.into());
             }
-            // Slots count BEGIN, three LETs and three IFs: the RETURN is slot 7.
-            return match result.take::<Option<MealBooking>>(7)? {
+            return match result.take::<Option<MealBooking>>(returned)? {
                 Some(placed) => Ok(Claimed::Made(placed)),
                 None => Err(AppError::Internal("failed to book the meal".into())),
             };
@@ -338,16 +389,19 @@ impl MealBooking {
     /// cancelling a stale attempt would strand that attempt's charge forever.
     /// The reversal is keyed to the attempt, so a retried cancel refunds once.
     ///
-    /// **Idempotent, and that is what makes the refund recoverable.** The flip
-    /// and the reversal are two writes; a handler future dropped between them
-    /// (the client closed the tab, a proxy timed out) or a `create` that errors
-    /// leaves the seat free and the charge standing. Refusing an
-    /// already-cancelled row — as this used to — made that state permanent:
-    /// no route on the API could ever append the missing reversal. So a
-    /// cancelled row replays the reversal instead, which either heals the gap
-    /// or writes nothing at all. The cutoff is not re-checked on that path: the
-    /// seat is already given back, and refusing to finish the refund because
-    /// the meal has since closed would strand the money exactly as before.
+    /// **The refund is not a second write.** It is appended by the very
+    /// transaction that flips the row (see [`Self::release_seat`]), so a
+    /// handler future dropped mid-cancel, a proxy timing out or the store going
+    /// away cannot leave the seat free with the charge standing — the state a
+    /// re-book then made permanent, since every ledger id carries the attempt
+    /// the re-book has already moved past.
+    ///
+    /// **Idempotent all the same**, which is what heals a seat flipped before
+    /// that was true: a cancelled row replays the reversal instead of being
+    /// refused, and that either completes an old missing line or writes nothing
+    /// at all. The cutoff is not re-checked on that path: the seat is already
+    /// given back, and refusing to finish the refund because the meal has since
+    /// closed would strand the money exactly as before.
     pub async fn cancel(
         self,
         cutoff: &MealCutoff,
@@ -363,14 +417,36 @@ impl MealBooking {
             .await?
             .ok_or(AppError::NotFound)?;
         check_cutoff(menu.get_date(), menu.get_slot(), cutoff)?;
-        // Lost the flip to a concurrent cancel: its row is the truth, and the
-        // reversal replay below heals whatever it left unfinished.
-        let saved = match Self::release_seat(&fresh, db).await? {
+        // Lost the flip: another cancel took the seat back first. Its row is
+        // the truth — but only the attempt *this* call was cancelling may be
+        // refunded off it (see [`Self::refundable_after_lost_flip`]).
+        let saved = match Self::release_seat(&fresh, recorded_by, db).await? {
             Some(cancelled) => cancelled,
-            None => Self::read(&self.id, db).await?.ok_or(AppError::NotFound)?,
+            None => {
+                let live = Self::read(&self.id, db).await?.ok_or(AppError::NotFound)?;
+                if !Self::refundable_after_lost_flip(&fresh, &live) {
+                    return Ok(live);
+                }
+                live
+            }
         };
         MealLedger::reverse_booking(&saved, recorded_by, db).await?;
         Ok(saved)
+    }
+
+    /// May a cancel that released *nothing* still refund what it read?
+    ///
+    /// Only when the row it finds is the very attempt it was cancelling, still
+    /// cancelled. A cancel is two writes, and between them the seat can be
+    /// re-booked: the row then reads `booked` at attempt N+1 with a live charge
+    /// against it, and reversing that — as re-reading and refunding blindly did
+    /// — refunds a seat that is still held *and* still counted, and burns the
+    /// `(booking, attempt)` ledger id that attempt's own cancel needs, so it
+    /// could never be refunded afterwards. A row at another attempt is the same
+    /// story one step further on: whoever cancelled attempt N appended its
+    /// reversal, and this call has nothing left to heal.
+    fn refundable_after_lost_flip(seen: &MealBooking, live: &MealBooking) -> bool {
+        live.status == MealBookingStatus::Cancelled && live.attempt == seen.attempt
     }
 
     /// Flip the seat to `cancelled` and give it back to the menu's counter **in
@@ -380,32 +456,69 @@ impl MealBooking {
     /// flip's own result (`array::len`), so a row already cancelled — by a
     /// racing cancel, or by this call retried — decrements nothing.
     ///
+    /// **The refund rides this transaction too**, and it has to: the flip and a
+    /// reversal appended after it are two writes, and a crash in between leaves
+    /// the seat free with the charge standing — after which a re-book moves the
+    /// row to attempt N+1 and *no* route can ever write the `(booking, N)`
+    /// reversal, because the money is keyed to the attempt. Folded in here the
+    /// seat cannot come back without the money, the same way the counter cannot
+    /// move without the flip. The reversal is written only when the charge it
+    /// undoes is really there (checked in the transaction, so no round trip can
+    /// invalidate it): a refund with no charge behind it invents money.
+    ///
+    /// The book side is folded the same way ([`Self::claim_and_place`]), so
+    /// there is no half-second anywhere in which a seat is held with no charge
+    /// against it, or a charge stands with no seat behind it.
+    ///
     /// `None` = the row was not `booked` any more. Retried while the store
     /// reports a write conflict: the menu row is contended by every booking on
     /// it, and that contention is the cap working, not an error.
     async fn release_seat(
         booked: &MealBooking,
+        recorded_by: &UserId,
         db: &Database,
     ) -> Result<Option<MealBooking>, AppError> {
+        let refund = MealLedger::reversal_for(booked, recorded_by);
+        // Guarded three ways: nothing was flipped (a rival cancelled first, and
+        // its own transaction carried the refund), the charge never landed, or
+        // this attempt is already refunded — none of which may abort the flip.
+        let reverse = match refund {
+            Some(_) => {
+                "IF array::len($flipped) > 0 \
+                     AND array::len((SELECT VALUE id FROM $charge)) > 0 \
+                     AND array::len((SELECT VALUE id FROM $reversal)) = 0 \
+                     { CREATE $reversal CONTENT $line };"
+            }
+            None => "",
+        };
+        // Slots count BEGIN, the LET, the seat UPDATE and — when there is money
+        // to give back — the IF.
+        let returned = if refund.is_some() { 4 } else { 3 };
         for _ in 0..CAS_UPDATE_RETRIES {
             let attempted = async {
-                let mut result = db
+                let query = db
                     .query(format!(
                         "BEGIN TRANSACTION;
                          LET $flipped = (UPDATE $id SET status = 'cancelled', \
                              cancelled_at = $now WHERE status = 'booked' RETURN AFTER);
                          UPDATE $menu SET {MENU_SEAT_COUNT_FIELD} = math::max([\
                              ({MENU_SEAT_COUNT_FIELD} ?? 0) - array::len($flipped), 0]);
+                         {reverse}
                          RETURN $flipped;
                          COMMIT TRANSACTION;"
                     ))
                     .bind(("id", booked.id.record()))
                     .bind(("menu", booked.menu.record()))
-                    .bind(("now", Timestamp::now()))
-                    .await?
-                    .check()?;
-                // Slots count BEGIN and the LET: the RETURN is slot 3.
-                result.take::<Vec<MealBooking>>(3)
+                    .bind(("now", Timestamp::now()));
+                let query = match &refund {
+                    Some((charge, line)) => query
+                        .bind(("charge", charge.record()))
+                        .bind(("reversal", line.get_id().record()))
+                        .bind(("line", line.clone())),
+                    None => query,
+                };
+                let mut result = query.await?.check()?;
+                result.take::<Vec<MealBooking>>(returned)
             }
             .await;
             match attempted {
@@ -687,9 +800,17 @@ mod tests {
             created_at: Timestamp::now(),
         };
         let place = async |seen| {
-            MealBooking::claim_and_place(&menu.record(), cap::UNLIMITED, seen, &row, None, &db)
-                .await
-                .unwrap()
+            MealBooking::claim_and_place(
+                &menu.record(),
+                cap::UNLIMITED,
+                seen,
+                &row,
+                None,
+                None,
+                &db,
+            )
+            .await
+            .unwrap()
         };
         assert!(
             matches!(place(seen).await, Claimed::Full),
@@ -793,6 +914,162 @@ mod tests {
             held.get_price_minor().map(LedgerAmount::as_minor),
             Some(1_000)
         );
+    }
+
+    /// A cancel that lost its flip may only refund the attempt it was actually
+    /// cancelling. Driven against the predicate rather than through `cancel`:
+    /// the row is re-read *inside* the call, so the only way it can disagree
+    /// with what the flip found is a genuine concurrent write, which no
+    /// single-process interleaving (and no in-memory engine) can stage.
+    #[tokio::test]
+    async fn a_lost_flip_refunds_only_the_attempt_it_released() {
+        let (db, menu) = menu(None).await;
+        let (ali, veli) = (UserId::generate(), UserId::generate());
+        let open = MealCutoff::default();
+        add_dish(&menu, 1_000, &db).await;
+
+        let seen = MealBooking::book(&menu, &ali, &ali, &open, &db)
+            .await
+            .unwrap();
+        let cancelled = seen.clone().cancel(&open, &ali, &db).await.unwrap();
+        // The seat this cancel released: its own attempt, still cancelled.
+        assert!(MealBooking::refundable_after_lost_flip(&seen, &cancelled));
+
+        // A re-book landed in the window. The row is `booked` again with a live
+        // charge against it — refunding that frees money for a seat that is
+        // still held, and burns the ledger id its own cancel will need.
+        let rebooked = MealBooking::book(&menu, &ali, &ali, &open, &db)
+            .await
+            .unwrap();
+        assert_eq!(rebooked.get_attempt(), seen.get_attempt() + 1);
+        assert!(!MealBooking::refundable_after_lost_flip(&seen, &rebooked));
+
+        // Re-booked *and* cancelled again: that cancel appended the reversal
+        // for its own attempt, and this call has nothing left to heal.
+        let later = rebooked.cancel(&open, &ali, &db).await.unwrap();
+        assert!(!MealBooking::refundable_after_lost_flip(&seen, &later));
+
+        // And the ordinary lost race — another cancel of the same attempt got
+        // there first — still replays the refund, which is what heals a cancel
+        // cut short between the flip and the ledger line.
+        let other = MealBooking::book(&menu, &veli, &veli, &open, &db)
+            .await
+            .unwrap();
+        let freed = other.clone().cancel(&open, &veli, &db).await.unwrap();
+        assert!(MealBooking::refundable_after_lost_flip(&other, &freed));
+    }
+
+    /// The seat may not come back without the money. Driven against
+    /// [`MealBooking::release_seat`] rather than through `cancel`, because what
+    /// is under test is precisely what a *crash right after the flip* leaves
+    /// behind: appended a write later, the reversal is lost with the process,
+    /// and a re-book then moves the row to the next attempt and locks the
+    /// `(booking, attempt)` reversal id out for good — the charge is
+    /// unreversible by any route on the API.
+    #[tokio::test]
+    async fn the_seat_cannot_be_freed_without_its_refund() {
+        let (db, menu) = menu(None).await;
+        let ali = UserId::generate();
+        let open = MealCutoff::default();
+        add_dish(&menu, 1_000, &db).await;
+        let booked = MealBooking::book(&menu, &ali, &ali, &open, &db)
+            .await
+            .unwrap();
+
+        // The flip alone — nothing else runs afterwards, as after a crash.
+        let freed = MealBooking::release_seat(&booked, &ali, &db)
+            .await
+            .unwrap()
+            .expect("the seat was held, so the flip must take it back");
+        assert_eq!(freed.get_status(), MealBookingStatus::Cancelled);
+        assert_eq!(seats(&menu, &db).await, 0);
+        assert_eq!(
+            MealLedger::balance_of(&ali, &db).await.unwrap(),
+            0,
+            "the reversal must have committed with the flip, not after it"
+        );
+
+        // And the re-book that used to strand the charge now finds it settled:
+        // a fresh attempt, billed once more, with the old one squared away.
+        MealBooking::book(&menu, &ali, &ali, &open, &db)
+            .await
+            .unwrap();
+        assert_eq!(MealLedger::balance_of(&ali, &db).await.unwrap(), -1_000);
+    }
+
+    /// The seat may not be held without its money. Driven against
+    /// [`MealBooking::claim_and_place`] rather than through `book`, because what
+    /// is under test is precisely what the gap between the two writes leaves
+    /// behind: a cancel landing there finds no charge to reverse, reverses
+    /// nothing, and the charge then lands anyway — a student holding no seat and
+    /// owing money, with the `(booking, attempt)` reversal id burnt for good.
+    #[tokio::test]
+    async fn the_seat_cannot_be_claimed_without_its_charge() {
+        let (db, menu) = menu(None).await;
+        let ali = UserId::generate();
+        add_dish(&menu, 1_000, &db).await;
+        let price = MealLedger::price_snapshot(&menu, &db).await.unwrap();
+        let seen = Menu::read(&menu, &db).await.unwrap().unwrap().get_version();
+        let row = MealBooking {
+            id: MealBookingId::composite(&menu, &ali),
+            menu: menu.clone(),
+            student: ali.clone(),
+            booked_by: ali.clone(),
+            status: MealBookingStatus::Booked,
+            attempt: 1,
+            price_minor: price,
+            cancelled_at: None,
+            created_at: Timestamp::now(),
+        };
+        let charge = MealLedger::charge_for(&row, &ali);
+        // The claim alone — nothing else runs afterwards, as after a crash.
+        let place = async || {
+            MealBooking::claim_and_place(
+                &menu.record(),
+                cap::UNLIMITED,
+                seen,
+                &row,
+                price,
+                charge.as_ref(),
+                &db,
+            )
+            .await
+            .unwrap()
+        };
+        assert!(matches!(place().await, Claimed::Made(_)));
+        assert_eq!(seats(&menu, &db).await, 1);
+        assert_eq!(
+            MealLedger::balance_of(&ali, &db).await.unwrap(),
+            -1_000,
+            "the charge must have committed with the claim, not after it"
+        );
+
+        // Replayed: the seat is already held, so the whole transaction rolls
+        // back — no second seat and, just as importantly, no second charge.
+        assert!(matches!(place().await, Claimed::Duplicate));
+        assert_eq!(seats(&menu, &db).await, 1);
+        assert_eq!(MealLedger::balance_of(&ali, &db).await.unwrap(), -1_000);
+    }
+
+    /// A free menu owes no refund, so the flip must carry no ledger line at all
+    /// — the branch the reversal's conditional statement adds.
+    #[tokio::test]
+    async fn a_seat_that_was_never_billed_frees_without_a_line() {
+        let (db, menu) = menu(None).await;
+        let ali = UserId::generate();
+        let booked = MealBooking::book(&menu, &ali, &ali, &MealCutoff::default(), &db)
+            .await
+            .unwrap();
+
+        MealBooking::release_seat(&booked, &ali, &db)
+            .await
+            .unwrap()
+            .expect("a free seat is still a seat");
+        assert_eq!(seats(&menu, &db).await, 0);
+        let (lines, total) = MealLedger::list_for_student(&ali, None, 0, &db)
+            .await
+            .unwrap();
+        assert!(lines.is_empty() && total == 0, "a free seat moves no money");
     }
 
     fn cutoff(minutes: Option<i64>, serving_minute: Option<i64>) -> MealCutoff {

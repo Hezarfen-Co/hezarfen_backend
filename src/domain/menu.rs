@@ -14,13 +14,11 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use tokio::sync::Mutex;
 
 use crate::constant::{
-    MAX_MENU_CAPACITY, MENU_SEAT_COUNT_FIELD, MENU_TABLE, MENU_VERSION_FIELD, REF_COUNT_FIELD,
-    SLOT_REF_TABLE,
+    MAX_MENU_CAPACITY, MEAL_ATTENDANCE_TABLE, MENU_DISH_TABLE, MENU_SEAT_COUNT_FIELD, MENU_TABLE,
+    MENU_VERSION_FIELD, REF_COUNT_FIELD, SLOT_REF_TABLE,
 };
-use crate::database::{Database, transaction_with_retry};
+use crate::database::{Database, transaction_with_retry, write_with_retry};
 use crate::domain::cap;
-use crate::domain::field_update::FieldUpdate;
-use crate::domain::menu_dish::MenuDish;
 use crate::domain::page::PagedList;
 use crate::domain::settings::MealSlotDef;
 use crate::domain::timestamp::Timestamp;
@@ -40,7 +38,13 @@ use crate::error::{AppError, ValidationError};
 // backfill; the ceiling is 51 dishes on a menu, not money or a seat, so it was
 // not worth the column here.
 ///
-/// A leaf: nothing held under it takes another lock.
+/// **A leaf**: every dish write held under it moves the menu's revision inside
+/// its *own* transaction ([`MenuDish::bump_menu_and_write`](crate::domain::menu_dish)),
+/// so no path under this lock reaches `cap`'s counter lock any more — it did
+/// while the bump was a `cap` call of its own. Should one ever need both, the
+/// order is `MENU_LOCK` → `CLAIM_LOCK` and nothing may take this lock while
+/// holding a counter lock: that is the invariant a new caller must keep, and it
+/// is what would keep the pair deadlock-free.
 pub(crate) static MENU_LOCK: Mutex<()> = Mutex::const_new(());
 
 /// The reference counter for one meal slot — how many menus are published under
@@ -136,6 +140,22 @@ impl MenuSlot {
             return Err(ValidationError::Invalid {
                 field: "slot",
                 reason: "not one of the school's meal slots (see GET /settings)",
+            });
+        }
+        // The slot goes verbatim into the menu's record id ([`MenuId::for_slot`]),
+        // and that id is a URL path segment: a slot named `a/b` publishes a menu
+        // at `/meals/menus/2026-09-14_a/b`, which no route can ever address
+        // again — the menu could not be read, edited or deleted.
+        // `MealSlotDef::try_new` refuses the same characters, so no school can
+        // define such a slot; this is the second gate, and it is what a
+        // settings row written before that rule runs into.
+        if value
+            .chars()
+            .any(|c| matches!(c, '/' | '\\' | '?' | '#' | '%'))
+        {
+            return Err(ValidationError::Invalid {
+                field: "slot",
+                reason: "meal slot names used for menus must not contain / \\ ? # or %",
             });
         }
         Ok(Self(value.to_string()))
@@ -297,21 +317,40 @@ impl Menu {
     /// because moving a published menu to another day is a different menu.
     /// `None` keeps the stored cap, `Some(None)` clears it back to uncapped.
     ///
-    /// Moving the cap moves the revision first ([`cap::bump`]): a booking that
-    /// read the old cap must not claim its seat against it, or a shrink
-    /// over-admits by exactly the bookings in flight.
+    /// The revision moves **in the same statement** as the cap, indivisibly: a
+    /// booking claims its seat against the revision
+    /// it read the cap at, so a shrink that bumped in a query of its own left a
+    /// window where the row carried the *new* revision and the *old* cap — and
+    /// a booking arriving there passes a CAS meant to refuse it, over-admitting
+    /// by exactly the seats in flight.
     pub async fn update(
         self,
         capacity: Option<Option<i64>>,
         db: &Database,
     ) -> Result<Menu, AppError> {
-        if capacity.is_some() {
-            cap::bump(&self.id.record(), MENU_VERSION_FIELD, db).await?;
-        }
-        FieldUpdate::new(self.id.record())
-            .set("capacity", capacity)
-            .run::<Menu>(db)
-            .await
+        let Some(capacity) = capacity else {
+            // A PATCH carrying nothing writes nothing and bumps nothing: no
+            // booking's price or cap has moved, so none owes a re-read.
+            return Self::read(&self.id, db).await?.ok_or(AppError::NotFound);
+        };
+        let sql = format!(
+            "UPDATE $id SET capacity = $capacity, \
+             {MENU_VERSION_FIELD} = ({MENU_VERSION_FIELD} ?? 0) + 1 RETURN AFTER"
+        );
+        // One counter write in flight at a time, like every other one.
+        let _guard = cap::counter_lock().await;
+        write_with_retry::<Menu>(
+            db,
+            &sql,
+            &[
+                ("id".into(), self.id.record().into_value()),
+                ("capacity".into(), capacity.into_value()),
+            ],
+        )
+        .await?
+        .into_iter()
+        .next()
+        .ok_or(AppError::NotFound)
     }
 
     /// Delete the menu and the dishes on it — a dish has no meaning without
@@ -330,8 +369,22 @@ impl Menu {
     /// in a query of its own, a crash between the two left the slot counted by
     /// a menu that no longer exists: a slot nobody can retire.
     ///
-    /// The dishes go *after* the row: their cascade must not run for a delete
-    /// the counter refused.
+    /// The marks go in that same `FOR`, for a sharper reason than tidiness:
+    /// [`MenuId::for_slot`] is deterministic, so republishing the same day and
+    /// slot mints the *same* record id. A mark left behind would come back as a
+    /// mark on the new menu — the kitchen reading "served" for a student who
+    /// never came — and until then the student's own report cites a menu that
+    /// is gone. Attendance carries no money and no counter, so it is safe to
+    /// drop; cancelled *bookings* deliberately stay, because their `attempt`
+    /// counter is what keeps the ledger's `(booking, attempt)` keys unique. Cut
+    /// those and a re-book on a republished menu would reuse a charge id the
+    /// ledger already holds, and the append (idempotent by design) would bill
+    /// the seat nothing.
+    ///
+    /// The dishes ride in that `FOR` too, and for the same reason as the marks:
+    /// run after the transaction committed, a crash between the two orphaned
+    /// them on a record id republishing the day and slot mints again — a new
+    /// menu serving (and pricing) the old one's food.
     pub async fn delete(self, db: &Database) -> Result<Menu, AppError> {
         let sql = format!(
             "BEGIN TRANSACTION;
@@ -339,6 +392,8 @@ impl Menu {
              FOR $row IN ($gone ?? []) {{
                  UPSERT $counter SET {REF_COUNT_FIELD} = \
                      math::max([({REF_COUNT_FIELD} ?? 0) - 1, 0]);
+                 DELETE {MEAL_ATTENDANCE_TABLE} WHERE menu = $id;
+                 DELETE {MENU_DISH_TABLE} WHERE menu = $id;
              }};
              RETURN $gone;
              COMMIT TRANSACTION;"
@@ -368,7 +423,6 @@ impl Menu {
                 None => AppError::NotFound,
             });
         };
-        MenuDish::delete_for_menu(&self.id, db).await?;
         Ok(deleted)
     }
 }
@@ -401,6 +455,40 @@ mod tests {
         assert!(MenuSlot::try_new("lunch", &allowed).is_ok());
         assert!(MenuSlot::try_new("brunch", &allowed).is_err());
         assert!(MenuSlot::try_new("lunch", &[]).is_err());
+    }
+
+    /// The slot becomes the menu's record id, and the id becomes a URL path
+    /// segment: a name carrying a separator publishes a menu at an address no
+    /// route can match again. `MealSlotDef::try_new` refuses the name too, so
+    /// no school can define such a slot any more — this gate is what a settings
+    /// row written *before* that rule still runs into. Ordinary names — spaces
+    /// and Turkish letters included — are untouched; they percent-encode into
+    /// one segment as they always have.
+    #[test]
+    fn a_slot_name_that_would_break_the_menu_url_is_refused() {
+        // The only shape that can still carry such a name: a stored slot,
+        // decoded rather than constructed.
+        use surrealdb::types::Value;
+        let stale = |name: &str| {
+            let Value::Object(mut object) =
+                MealSlotDef::try_new("lunch", None).unwrap().into_value()
+            else {
+                panic!("a slot must encode as an object");
+            };
+            object.insert("name".to_string(), Value::String(name.into()));
+            vec![MealSlotDef::from_value(Value::Object(object)).unwrap()]
+        };
+        let named = |name: &str| {
+            MenuSlot::try_new(name, &stale(name))
+                .map(|slot| MenuId::for_slot(&MenuDate::try_new("2026-09-14").unwrap(), &slot))
+        };
+        for broken in ["a/b", "a\\b", "a?b", "a#b", "a%b"] {
+            assert!(named(broken).is_err(), "{broken} must not become an id");
+        }
+        assert_eq!(
+            named("öğle yemeği").unwrap().key(),
+            "2026-09-14_öğle yemeği"
+        );
     }
 
     #[test]
@@ -539,6 +627,35 @@ mod tests {
             .expect_err("that day and slot are taken");
         assert!(matches!(taken, AppError::Conflict(_)), "got {taken:?}");
         assert_eq!(refs(&db).await, 0);
+    }
+
+    /// The cap and the revision are one write. Nothing single-process can
+    /// observe the torn state the two-query version left (a bumped revision
+    /// over a cap that had not moved yet), so what is pinned here is the pair:
+    /// the revision steps exactly once per cap move, and never for a PATCH that
+    /// carried no cap at all — a booking re-reads only when something it priced
+    /// itself against actually changed.
+    #[tokio::test]
+    async fn the_cap_and_the_revision_move_together_or_not_at_all() {
+        let db = school().await;
+        let menu = publish("2026-08-05", &db).await.unwrap();
+        let id = menu.get_id().clone();
+        assert_eq!(menu.get_version(), 0);
+
+        let capped = menu.update(Some(Some(5)), &db).await.unwrap();
+        assert_eq!(capped.get_capacity(), Some(5));
+        assert_eq!(capped.get_version(), 1);
+        // Re-read out of the store, never off the return value.
+        let stored = Menu::read(&id, &db).await.unwrap().unwrap();
+        assert_eq!((stored.get_capacity(), stored.get_version()), (Some(5), 1));
+
+        // An empty PATCH moves neither, and reads the row back unchanged.
+        let same = stored.update(None, &db).await.unwrap();
+        assert_eq!((same.get_capacity(), same.get_version()), (Some(5), 1));
+
+        // Clearing the cap is a move like any other.
+        let uncapped = same.update(Some(None), &db).await.unwrap();
+        assert_eq!((uncapped.get_capacity(), uncapped.get_version()), (None, 2));
     }
 
     #[tokio::test]

@@ -3,7 +3,8 @@
 //!
 //! Reads are open to every authenticated user (a student picks their lunch),
 //! writes are manager+ — publishing what the school serves is kitchen
-//! administration, not teaching.
+//! administration, not teaching. The balance and the ledger are the exception:
+//! they are manager+ like `/payments`, since canteen debt is family debt.
 //!
 //! Money only ever *appends* here (see [`MealLedger`]): booking charges a price
 //! snapshot, cancelling reverses it, and recording a payment is admin-only.
@@ -414,7 +415,10 @@ async fn add_dish(
     // is write-skew, so the count and the insert have to be one step. The
     // *price* no longer needs it — a dish write moves the menu's revision, and
     // a booking claims its seat at the revision it priced itself against.
-    // The lock stays a leaf: nothing below here takes another.
+    // The lock is a leaf again: the revision bump rides the dish write's own
+    // transaction now, so nothing held under it takes `cap`'s counter lock. It
+    // stays a leaf only while that holds — see [`MENU_LOCK`] for the order a
+    // caller that changes it must keep.
     let _guard = MENU_LOCK.lock().await;
     // The menu is read *inside* the lock: read before it, a `DELETE /menus/{id}`
     // running in the gap takes its cascade with it and this dish lands on a menu
@@ -902,8 +906,13 @@ async fn list_menu_bookings(
 
 /// Give the seat back. The row survives, flipped to `cancelled` — the seat is
 /// free for someone else, and the cancellation stays auditable. Only the
-/// student it is for, or their parent, may cancel it. Refused (`409`) once the
-/// school's `meal_cancel_cutoff_minutes` has closed the meal.
+/// student it is for, or their parent, may cancel it — and for them it is
+/// refused (`409`) once the school's `meal_cancel_cutoff_minutes` has closed
+/// the meal.
+///
+/// Manager+ may cancel anyone's booking, and is not bound by the cutoff — the
+/// seat and the money have to stay reachable when the student it was booked for
+/// is no longer a student, or when the meal has already closed.
 ///
 /// **Idempotent**: cancelling an already-cancelled booking is a `200` with the
 /// row as it stands, not a `409`. Repeating it also replays the refund, so a
@@ -919,9 +928,9 @@ async fn list_menu_bookings(
     responses(
         (status = 200, description = "Cancelled (also when it already was — the call is idempotent and replays the refund)", body = BookingResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the booking's student, nor their parent", body = ErrorResponse),
+        (status = 403, description = "Not the booking's student, their parent, nor a manager", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "The cutoff has passed, or the menu was too contended to free the seat", body = ErrorResponse),
+        (status = 409, description = "The cutoff has passed (students and parents only), or the menu was too contended to free the seat", body = ErrorResponse),
     ),
 )]
 async fn cancel_booking(
@@ -932,14 +941,34 @@ async fn cancel_booking(
     let booking = MealBooking::read(&MealBookingId::from_key(&bid), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    // Same door as booking: whoever may take the seat may give it back.
-    let target = booking_target(&user, Some(booking.get_student().key()), &st.db).await?;
-    if &target != booking.get_student() {
-        return Err(AppError::Forbidden("not your booking"));
+    // Manager+ may give back *any* seat. Not a convenience: `booking_target`
+    // grants only students and parents, so a student promoted to staff (or a
+    // parent unlinked) left a live seat nobody on the API could cancel — the
+    // menu 409s its own delete forever and the charge can never be reversed,
+    // since cancelling is the only route that reverses one. Promotion itself
+    // deliberately sweeps nothing: moving money is a decision, not a side
+    // effect of a role change.
+    let staff = user.get_role().at_least(Role::Manager);
+    if !staff {
+        // Same door as booking: whoever may take the seat may give it back.
+        let target = booking_target(&user, Some(booking.get_student().key()), &st.db).await?;
+        if &target != booking.get_student() {
+            return Err(AppError::Forbidden("not your booking"));
+        }
     }
-    let cutoff = meal_cutoff(&st.db).await?;
-    // Flips the row and appends the reversal for that attempt's charge
-    // together, under the same lock booking uses; the charge itself stays.
+    // …and the cutoff does not bind them either. It exists to stop students
+    // gaming the kitchen's headcount, which is no reason to leave staff holding
+    // a seat they cannot free: past the cutoff the seat was uncancellable, and
+    // its menu — which refuses its own delete while a seat is held — was
+    // undeletable with it, forever. A deadline that binds nobody is exactly the
+    // one a school that set no `meal_cancel_cutoff_minutes` already runs under.
+    let cutoff = if staff {
+        MealCutoff::default()
+    } else {
+        meal_cutoff(&st.db).await?
+    };
+    // Flips the row and appends the reversal for that attempt's charge in one
+    // transaction; the charge itself stays.
     let cancelled = booking.cancel(&cutoff, user.get_id(), &st.db).await?;
     let items = booking_responses(std::slice::from_ref(&cancelled), &st.db).await?;
     Ok(Json(
@@ -1051,8 +1080,12 @@ async fn mark_attendance(
             reason: "target user does not exist",
         }));
     }
-    let row =
-        MealAttendance::mark(menu.get_id(), &student, status, marker.get_id(), &st.db).await?;
+    // The menu rides in the write's own target (see [`MealAttendance::mark`]),
+    // so a delete landing between the read above and this write leaves no mark
+    // behind — it answers 404 instead, exactly as the read would have.
+    let row = MealAttendance::mark(menu.get_id(), &student, status, marker.get_id(), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
     let items = attendance_responses(std::slice::from_ref(&row), &st.db).await?;
     Ok(Json(
         items.into_iter().next().expect("one mark in, one out"),
@@ -1225,6 +1258,39 @@ async fn ensure_can_read_student(
     super::ensure_can_observe(caller, target, db).await
 }
 
+/// May `caller` read `target`'s meal *money* — balance and ledger? Own always;
+/// a parent only for a student they hold a live link to; manager+ for anyone.
+///
+/// Deliberately narrower than [`ensure_can_read_student`], which still gates
+/// the profile, booking and attendance reads at teacher+: **a teacher sees no
+/// money**. Canteen debt is family debt, so this is the same rule (and the same
+/// 403) `/payments` has always held — what a family owes the school is not
+/// classroom information, and neither is what it owes the canteen.
+async fn ensure_can_read_money(
+    caller: &User,
+    target: &UserId,
+    db: &Database,
+) -> Result<(), AppError> {
+    if caller.get_id() == target || caller.get_role().at_least(Role::Manager) {
+        return Ok(());
+    }
+    // The link row alone is not the grant: a link whose student side changed
+    // role must be inert, so the target's live role is re-read. A missing or
+    // non-student target falls through to the same 403 — a parent never gets an
+    // existence oracle.
+    if caller.get_role() == Role::Parent
+        && ParentLink::exists(caller.get_id(), target, db).await?
+        && User::read(target, db)
+            .await?
+            .is_some_and(|target| target.get_role() == Role::Student)
+    {
+        return Ok(());
+    }
+    Err(AppError::Forbidden(
+        "requires manager role or higher, or a parent link to this student",
+    ))
+}
+
 /// What the caller owes or has on account.
 #[utoipa::path(
     get,
@@ -1243,8 +1309,9 @@ async fn my_balance(
     balance_response(user.get_id(), &st.db).await
 }
 
-/// One student's meal balance. Requires teacher+, or a parent link to them —
-/// the caller's own id always passes.
+/// One student's meal balance. Requires manager+, or a parent link to them —
+/// the caller's own id always passes. A teacher gets a `403`: canteen debt is
+/// family debt, gated exactly like `/payments`.
 #[utoipa::path(
     get,
     path = "/balance/{user}",
@@ -1254,7 +1321,7 @@ async fn my_balance(
     responses(
         (status = 200, description = "The student's meal balance", body = BalanceResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Requires teacher role or higher, or a parent link", body = ErrorResponse),
+        (status = 403, description = "Requires manager role or higher, or a parent link", body = ErrorResponse),
     ),
 )]
 async fn user_balance(
@@ -1263,7 +1330,7 @@ async fn user_balance(
     Path(user): Path<String>,
 ) -> Result<Json<BalanceResponse>, AppError> {
     let target = UserId::from_key(&user);
-    ensure_can_read_student(&caller, &target, &st.db).await?;
+    ensure_can_read_money(&caller, &target, &st.db).await?;
     balance_response(&target, &st.db).await
 }
 
@@ -1280,7 +1347,7 @@ async fn user_balance(
         (status = 200, description = "A page of ledger lines (all of them when unpaged)", body = Page<LedgerResponse>),
         (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Requires teacher role or higher, or a parent link", body = ErrorResponse),
+        (status = 403, description = "Requires manager role or higher, or a parent link", body = ErrorResponse),
     ),
 )]
 async fn user_ledger(
@@ -1291,7 +1358,7 @@ async fn user_ledger(
 ) -> Result<Json<Page<LedgerResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
     let target = UserId::from_key(&user);
-    ensure_can_read_student(&caller, &target, &st.db).await?;
+    ensure_can_read_money(&caller, &target, &st.db).await?;
     let (rows, total) = MealLedger::list_for_student(&target, limit, offset, &st.db).await?;
     let items = ledger_responses(&rows, &st.db).await?;
     Ok(Json(Page::new(items, total, limit, offset)))
@@ -1313,7 +1380,9 @@ struct RecordCredit {
 }
 
 /// Record money received from a student. **Admin only** — not manager: writing
-/// down cash is the highest-trust action in the app. Appends a `credit` line;
+/// down cash is the highest-trust action in the app. The target must be a
+/// student, or anyone who already carries meal-ledger lines — a debt survives
+/// its debtor's role change, and it has to stay settleable. Appends a `credit` line;
 /// nothing in the ledger is ever edited or removed, so an over-credit is
 /// corrected by a compensating line, not by a fix-up.
 #[utoipa::path(
@@ -1337,12 +1406,20 @@ async fn record_credit(
 ) -> Result<(StatusCode, Json<LedgerResponse>), AppError> {
     let student = UserId::from_key(&req.student_id);
     // Only a student carries a meal balance; crediting anyone else is a typo,
-    // and a typo here is money in the wrong ledger.
+    // and a typo here is money in the wrong ledger. Unless they already carry
+    // ledger lines: a debt outlives its debtor's role change (a student
+    // promoted to staff keeps what they owed), and the student rule alone made
+    // that debt permanently unsettleable — there is no other route that
+    // appends a credit. A typo'd staff id has no lines, so it still 400s.
     if User::read(&student, &st.db)
         .await?
         .ok_or(AppError::NotFound)?
         .get_role()
         != Role::Student
+        && MealLedger::list_for_student(&student, Some(1), 0, &st.db)
+            .await?
+            .0
+            .is_empty()
     {
         return Err(AppError::Validation(ValidationError::Invalid {
             field: "student_id",

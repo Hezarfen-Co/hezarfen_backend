@@ -221,6 +221,15 @@ impl FieldUpdate {
         let cas = moved
             .as_ref()
             .map(|(_, link, ..)| format!("{link} = $ref_expected"));
+        // The caller's own guards, kept apart from the CAS: the split below has
+        // to ask "did *only* the link move?", and a probe that ignores them
+        // answers "the link moved" to a write its `.guard()` refused outright.
+        let own = ordered
+            .iter()
+            .chain(extra.iter())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" AND ");
         let conditions: Vec<String> = ordered.into_iter().chain(extra).chain(cas).collect();
         let guard = if conditions.is_empty() {
             String::new()
@@ -234,7 +243,7 @@ impl FieldUpdate {
         // its guard reads, and the loser wrote nothing, so re-sending it is the
         // recovery — see [`write_with_retry`].
         let rows: Vec<T> = match moved {
-            Some(moved) => run_with_refcount(db, &sql, self.bindings, moved).await?,
+            Some(moved) => run_with_refcount(db, &sql, &own, self.bindings, moved).await?,
             None => write_with_retry(db, &sql, &self.bindings).await?,
         };
         // No row back means the guard bit (or, in the window after the handler's
@@ -265,6 +274,7 @@ impl FieldUpdate {
 async fn run_with_refcount<T: SurrealValue>(
     db: &Database,
     update: &str,
+    own_guards: &str,
     mut bindings: Vec<(String, Value)>,
     (field, link, expected, claim, release, refused): Refcount,
 ) -> Result<Vec<T>, AppError> {
@@ -295,13 +305,22 @@ async fn run_with_refcount<T: SurrealValue>(
     // Without this the claim would outlive a row write that matched nothing —
     // the very leak the transaction exists to close. Nothing was written yet
     // either way, so the probe that tells the two empty cases apart is free to
-    // be another `UPDATE`: it matches only a row that is *there* and whose link
-    // has moved off what the handler read, which is the CAS having bitten. A
-    // deleted row and a plain guard refusal both miss it and keep the answer
-    // they have always got.
+    // be another `UPDATE`: it matches only a row that is *there*, whose *own*
+    // guards still hold, and whose link has moved off what the handler read —
+    // which is the CAS, and nothing else, having bitten. A deleted row and a
+    // plain guard refusal both miss it and keep the answer they have always
+    // got. Carrying the caller's guards is what keeps that true when a write is
+    // refused for *both* reasons at once: a `.guard()`/`.ordered()` refusal is
+    // the caller's own answer to give, and reporting it as "the link moved"
+    // would send the client to re-read a link that was never its problem.
+    let still_mine = if own_guards.is_empty() {
+        String::new()
+    } else {
+        format!("({own_guards}) AND ")
+    };
     statements.push(format!(
         "IF array::len($row) = 0 {{ \
-         LET $live = (UPDATE $id WHERE {link} != $ref_expected RETURN VALUE id); \
+         LET $live = (UPDATE $id WHERE {still_mine}{link} != $ref_expected RETURN VALUE id); \
          IF array::len($live) = 0 {{ THROW '{ROW_MARK}' }} ELSE {{ THROW '{STALE_MARK}' }} }}"
     ));
     statements.push("RETURN $row".into());
@@ -342,4 +361,132 @@ async fn run_with_refcount<T: SurrealValue>(
     // Sound only because the error map came back empty: `take_errors` swap-
     // removes errored slots, which would renumber the rest.
     Ok(result.take::<Vec<T>>(slot)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::constant::SUBJECT_HOMEWORK_COUNT_FIELD;
+    use crate::database::init_mem;
+
+    /// Two subjects and one homework tagged with the first. The `course` and
+    /// `created_by` links point at rows that do not exist — a `record<…>` type
+    /// constrains the table, not the existence, and nothing here reads them.
+    async fn seeded() -> Database {
+        let db = init_mem().await.unwrap();
+        db.query(
+            "CREATE subject:s1 SET course = course:c, name = 'a', description = '';
+             CREATE subject:s2 SET course = course:c, name = 'b', description = '';
+             CREATE homework:h1 SET course = course:c, subject = subject:s1,
+                 title = 't', due_at = 1, created_by = user:u, created_at = 1;",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+        db
+    }
+
+    /// The two subjects' homework counters, re-read out of the store.
+    async fn counts(db: &Database) -> Vec<i64> {
+        let mut result = db
+            .query(format!(
+                "SELECT VALUE ({SUBJECT_HOMEWORK_COUNT_FIELD} ?? 0) FROM subject ORDER BY id"
+            ))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        result.take::<Vec<i64>>(0).unwrap()
+    }
+
+    fn homework() -> RecordId {
+        RecordId::new("homework", "h1")
+    }
+
+    fn subject(key: &str) -> RecordId {
+        RecordId::new("subject", key)
+    }
+
+    /// A write refused by the caller's *own* guard must answer with the
+    /// caller's own refusal, even when the link it carries has also moved since
+    /// the handler read it. Both are true; only one is the client's problem,
+    /// and "re-read the link and retry" sends them chasing a `409` that a retry
+    /// cannot clear — the guard will refuse the next attempt exactly the same.
+    #[tokio::test]
+    async fn a_guard_refusal_outranks_a_link_that_also_moved() {
+        let db = seeded().await;
+        let refused = FieldUpdate::new(homework())
+            .set("subject", Some(subject("s2")))
+            .guard("title = 'never'", AppError::Conflict("the caller's own no"))
+            .refcount(
+                SUBJECT_HOMEWORK_COUNT_FIELD,
+                "subject",
+                // Stale: the row says `s1`, so the CAS bites too.
+                Some(subject("s9")),
+                Some(subject("s2")),
+                Some(subject("s9")),
+                AppError::Conflict("the subject is gone"),
+            )
+            .run::<Value>(&db)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.to_string(), "conflict: the caller's own no");
+        // The abort took the claim with it, and the link never moved.
+        assert_eq!(counts(&db).await, vec![0, 0]);
+    }
+
+    /// ...and with the guard satisfied, a moved link is still reported as a
+    /// moved link — the answer every current caller relies on.
+    #[tokio::test]
+    async fn a_moved_link_alone_is_still_the_stale_move_409() {
+        let db = seeded().await;
+        let refused = FieldUpdate::new(homework())
+            .set("subject", Some(subject("s2")))
+            .guard("title = 't'", AppError::Conflict("the caller's own no"))
+            .refcount(
+                SUBJECT_HOMEWORK_COUNT_FIELD,
+                "subject",
+                Some(subject("s9")),
+                Some(subject("s2")),
+                Some(subject("s9")),
+                AppError::Conflict("the subject is gone"),
+            )
+            .run::<Value>(&db)
+            .await
+            .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("the link this update moves changed"),
+            "{refused}"
+        );
+        assert_eq!(counts(&db).await, vec![0, 0]);
+    }
+
+    /// The unguarded shape every production caller uses today: the link moves,
+    /// the counters move with it, in one transaction.
+    #[tokio::test]
+    async fn an_unguarded_move_still_lands_with_both_counters() {
+        let db = seeded().await;
+        db.query("UPDATE subject:s1 SET homework_count = 1")
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        FieldUpdate::new(homework())
+            .set("subject", Some(subject("s2")))
+            .refcount(
+                SUBJECT_HOMEWORK_COUNT_FIELD,
+                "subject",
+                Some(subject("s1")),
+                Some(subject("s2")),
+                Some(subject("s1")),
+                AppError::Conflict("the subject is gone"),
+            )
+            .run::<Value>(&db)
+            .await
+            .unwrap();
+        assert_eq!(counts(&db).await, vec![0, 1]);
+    }
 }

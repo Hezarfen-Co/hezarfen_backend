@@ -641,14 +641,16 @@ impl ExamQuestion {
     pub async fn delete(self, db: &Database) -> Result<ExamQuestion, AppError> {
         let mut result = ExamAttempt::write_unfrozen(
             &self.exam,
-            "DELETE exam_answer WHERE question = $q;
-             DELETE question_image WHERE question = $q;
-             LET $gone = (DELETE $q RETURN BEFORE);
-             FOR $sub IN ($gone.subject ?? []) {
-                 UPDATE $sub SET exam_question_count =
-                     math::max([(exam_question_count ?? 0) - 1, 0])
-             };
-             RETURN $gone;",
+            &format!(
+                "DELETE exam_answer WHERE question = $q;
+                 DELETE question_image WHERE question = $q;
+                 LET $gone = (DELETE $q RETURN BEFORE);
+                 FOR $sub IN ($gone.subject ?? []) {{
+                     UPDATE $sub SET {SUBJECT_QUESTION_COUNT_FIELD} =
+                         math::max([({SUBJECT_QUESTION_COUNT_FIELD} ?? 0) - 1, 0])
+                 }};
+                 RETURN $gone;"
+            ),
             vec![("q".into(), self.id.record().into_value())],
             db,
         )

@@ -7,9 +7,8 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::database::Database;
-use crate::domain::class_member::ClassMember;
+use crate::domain::class_pump;
 use crate::domain::course::Course;
-use crate::domain::enrollment::Enrollment;
 use crate::domain::parent_link::ParentLink;
 use crate::domain::preferences::{Language, PaletteColor, Theme};
 use crate::domain::profile::{BirthDate, Email, PersonName, Phone};
@@ -399,14 +398,12 @@ async fn set_role(
     // Parent links get the same sweep on both sides: only students are
     // observed and only parents observe, so a role change off either end
     // drops the rows instead of leaving dead grants around.
-    // The class memberships go first and the enrollments second: the class
-    // sweep deliberately leaves the enrollment rows alone, so running it after
-    // would find nothing to repair and running it before costs nothing either
-    // way. Both are needed — a membership left behind would keep pumping the
-    // user back into courses and make its class undeletable.
+    // The class memberships and the enrollments go in *one* transaction: run
+    // as two, a failure between them left enrollment rows tagged with a class
+    // whose counters had already been released, so the class could be deleted
+    // and nothing could ever sweep the rows again.
     if role != Role::Student {
-        ClassMember::delete_for_user(&target, &st.db).await?;
-        Enrollment::delete_for_user(&target, &st.db).await?;
+        class_pump::sweep_non_student(&target, &st.db).await?;
         ParentLink::delete_where_student(&target, &st.db).await?;
     }
     if role != Role::Parent {

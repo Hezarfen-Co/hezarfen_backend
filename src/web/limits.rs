@@ -122,6 +122,10 @@ struct CourseLimits {
     max_class_name_len: usize,
     /// A class's optional free-text grade label ("9", "10-A").
     max_class_grade_len: usize,
+    /// Students one class may hold. Removing one frees a place.
+    max_class_members: i64,
+    /// Courses one class may be attached to. Detaching one frees a place.
+    max_class_courses: i64,
 }
 
 /// Exams, their questions, answers, and marks.
@@ -426,6 +430,8 @@ impl LimitsResponse {
                 max_term_name_len: MAX_TERM_NAME_LEN,
                 max_class_name_len: MAX_CLASS_NAME_LEN,
                 max_class_grade_len: MAX_CLASS_GRADE_LEN,
+                max_class_members: MAX_CLASS_MEMBERS,
+                max_class_courses: MAX_CLASS_COURSES,
             },
             exam: ExamLimits {
                 max_title_len: MAX_EXAM_TITLE_LEN,
