@@ -22076,9 +22076,9 @@ async fn meal_credits_are_admin_only_and_raise_the_balance() {
 }
 
 /// Whose money a caller may read: their own, their linked child's, or — as
-/// teacher+ — anyone's. Never another family's.
+/// manager+ — anyone's. Never another family's, and never a teacher's business.
 #[tokio::test]
-async fn meal_balance_reads_follow_the_observer_gate() {
+async fn meal_balance_reads_are_manager_only_outside_the_family() {
     let (app, db) = app_and_db().await;
     let admin = login_as(&app, &db, "wallet_boss", "admin").await;
     let teacher = login_as(&app, &db, "wallet_teacher", "teacher").await;
@@ -22149,12 +22149,24 @@ async fn meal_balance_reads_follow_the_observer_gate() {
     .await;
     assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
 
-    // Teacher+ reads any student's.
+    // A teacher does not, however: what a family owes the canteen is money,
+    // and money is manager+ here exactly as it is on /payments.
     let res = send(
         &app,
         "GET",
         &format!("/meals/balance/{ali_id}"),
         Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+
+    // Manager+ reads any student's.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/meals/balance/{ali_id}"),
+        Some(&admin),
         None,
     )
     .await;
@@ -22320,6 +22332,90 @@ async fn meal_attendance_never_moves_money() {
     )
     .await;
     assert_eq!(res.status, StatusCode::NOT_FOUND, "{}", res.body);
+}
+
+/// Deleting a menu takes its marks with it. The menu id is deterministic on
+/// `(date, slot)`, so republishing the same meal mints the *same* record id: a
+/// mark left behind by the deleted menu would come back as a mark on the new
+/// one — the kitchen would read "served" for a student who never came, and the
+/// student's own report would cite a menu that no longer exists.
+#[tokio::test]
+async fn deleting_a_menu_takes_its_attendance_with_it() {
+    let (app, db) = app_and_db().await;
+    let mgr = login_as(&app, &db, "ghost_mgr", "manager").await;
+    let teacher = login_as(&app, &db, "ghost_teacher", "teacher").await;
+    let ali = login(&app, "ghost_ali").await;
+    let ali_id = me_id(&app, &ali).await;
+
+    let publish = json!({ "date": "2026-10-05", "slot": "lunch" });
+    let res = send(
+        &app,
+        "POST",
+        "/meals/menus",
+        Some(&mgr),
+        Some(publish.clone()),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let menu = id_of(&res.body);
+
+    let res = send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/attendance"),
+        Some(&teacher),
+        Some(json!({ "student_id": ali_id, "status": "served" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    // No seat was ever taken, so the counter guard lets the delete through.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/meals/menus/{menu}"),
+        Some(&mgr),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+
+    // The student's own report must not cite a menu that is gone.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/meals/attendance/{ali_id}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(
+        common::total(&res.body),
+        0,
+        "the mark outlived the menu it was taken on"
+    );
+
+    // Republishing the same day and slot lands on the same record id.
+    let res = send(&app, "POST", "/meals/menus", Some(&mgr), Some(publish)).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let again = id_of(&res.body);
+    assert_eq!(again, menu, "the id is deterministic on (date, slot)");
+
+    let res = send(
+        &app,
+        "GET",
+        &format!("/meals/menus/{menu}/attendance"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(
+        common::total(&res.body),
+        0,
+        "the deleted menu's mark came back on the republished one"
+    );
 }
 
 /// The per-student report: a lexical `?from=&to=` window over the menu's day,
@@ -24718,8 +24814,9 @@ async fn a_full_canvas_is_refused_until_the_creator_clears_it() {
     );
     assert_eq!(
         stored_counters(&db, &board).await,
-        vec![1, MAX_EPOCH_STROKES + 1],
-        "the epoch counter reset; the lifetime counter did not"
+        vec![1, MAX_EPOCH_STROKES + 2],
+        "the epoch counter reset; the lifetime counter kept the clear marker \
+         it minted and the new stroke"
     );
     let res = send(
         &app,

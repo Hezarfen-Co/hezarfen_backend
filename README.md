@@ -700,20 +700,20 @@ window filtering, before paging; negative values are a `400` naming the field.
 | DELETE | `/courses/{id}`                  | teacher | Delete course + its exams, results, subjects, sessions, and homework (submissions, files, and grades included) (creator, or manager+ — **not** an assigned teacher; `409` while anyone is still enrolled) |
 | POST   | `/courses/{id}/teachers`         | manager | `{user_id}` — assign a **teacher+** to run the course (idempotent; returns the course) |
 | DELETE | `/courses/{id}/teachers/{user}`  | manager | Unassign a teacher (`404` if they weren't assigned) |
-| POST   | `/courses/{id}/enrollments`      | teacher | `{user_id}` — enroll a **student** (idempotent upsert; course manager; only students can be enrolled; `409` once a capped course is full) |
-| GET    | `/courses/{id}/enrollments`      | teacher | List the course roster (course manager) · paged |
+| POST   | `/courses/{id}/enrollments`      | teacher | `{user_id}` — enroll a **student** (idempotent upsert; course manager; only students can be enrolled; `409` once a capped course is full); enrolling a class-pumped student clears the row's `source`, so a class sweep can no longer take them back |
+| GET    | `/courses/{id}/enrollments`      | teacher | List the course roster (course manager) — each row carries `source`, the class that pumped it or `null` for hand-placed · paged |
 | DELETE | `/courses/{id}/enrollments/{user}` | teacher | Unenroll (keeps recorded results; course manager) |
 | POST   | `/classes`                       | manager | `{name, grade?, term_id?}` — create a class (şube); `grade` is a free-text year label |
 | GET    | `/classes`                       | teacher | List classes, newest first · paged |
 | GET    | `/classes/{id}`                  | teacher | Get one class                   |
 | PATCH  | `/classes/{id}`                  | manager | Edit a class (`null` clears `grade`/`term_id`; `409` if the `term_id` it moves off changed since the read — nothing written, re-read and retry) |
 | DELETE | `/classes/{id}`                  | manager | Delete a class — `409` while it still holds students or courses |
-| POST   | `/classes/{id}/members`          | manager | `{user_id}` — add a **student**; enrolls them into every attached course (`409` if one is full, naming it, or if already a member) |
-| GET    | `/classes/{id}/members`          | teacher | List the class roster · paged   |
+| POST   | `/classes/{id}/members`          | manager | `{user_id}` — add a **student**; enrolls them into every attached course (`409` if one is full, naming it, if one of them no longer exists — detach that link first — if already a member, or once the class holds `max_class_members`) |
+| GET    | `/classes/{id}/members`          | teacher | List the class roster, newest added first · paged |
 | DELETE | `/classes/{id}/members/{user}`   | manager | Remove a member — sweeps only the enrollments **this class** pumped for them (one another class still claims is re-tagged to it; hand-placed rows stay) |
-| POST   | `/classes/{id}/courses`          | teacher | `{course_id}` — attach a course (that **course's** manager); enrolls the whole roster (`409` if it cannot hold them all, or if already attached) |
-| GET    | `/classes/{id}/courses`          | teacher | List the class's attached courses · paged |
-| DELETE | `/classes/{id}/courses/{course}` | teacher | Detach a course (that course's manager) — the same sweep along the course axis |
+| POST   | `/classes/{id}/courses`          | teacher | `{course_id}` — attach a course (that **course's** manager); enrolls the whole roster (`409` if it cannot hold them all, if already attached, or once the class holds `max_class_courses`) |
+| GET    | `/classes/{id}/courses`          | teacher | List the class's attached courses, newest attached first · paged |
+| DELETE | `/classes/{id}/courses/{course}` | teacher | Detach a course (that course's manager) — the same sweep along the course axis; a link left behind by a **deleted** course detaches too, rather than `404`-ing forever |
 | POST   | `/courses/{id}/sessions`         | teacher | `{topic?, teacher_id?, starts_at, ends_at?}` — add a lesson (course manager; teacher defaults to the caller) |
 | GET    | `/courses/{id}/sessions`         | student | List the course's sessions, most recent first (enrolled, creator, assigned teacher, or manager+) · paged |
 | POST   | `/courses/{id}/subjects`         | teacher | `{name, description?}` — add a curriculum subject (course manager) |
@@ -829,34 +829,34 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/attendance/me`                 | student | Own attendance report: events + sessions + per-course tallies |
 | GET    | `/attendance/{user}`             | teacher* | A user's attendance report, narrowed to the caller's courses (manager+: full); *or a `parent` linked to `{user}` — full |
 | GET    | `/settings`                      | student | The school's policy: `exam_kinds` (`{name, weight}` each), `attendance_statuses`, `grade_bands`, `max_file_bytes`, `chatbot_history_turns`, `max_chatbot_threads`, `max_chatbot_message_len` |
-| PATCH  | `/settings`                      | manager | Replace any subset of the fields (lists wholesale); concurrent edits merge, never silently revert each other; `400` on "Invalid lists, bands, file limit, or chat limits"; `409` when a removed exam kind still has graded exams, or a removed meal slot still has published menus (see "Per-school policy") |
+| PATCH  | `/settings`                      | manager | Replace any subset of the fields (lists wholesale); concurrent edits merge, never silently revert each other; `400` on "Invalid lists, bands, file limit, or chat limits" — a meal slot name carrying `/ \ ? # %` is refused here too, since the name becomes a menu's URL id (a name the stored list already carries is exempt, so an older list stays editable — it still cannot carry a new menu); `409` when a removed exam kind still has graded exams, or a removed meal slot still has published menus (see "Per-school policy") |
 | POST   | `/terms`                         | manager | `{name, starts_at, ends_at}` — past dates allowed (calendar backfill) |
 | GET    | `/terms`                         | student | List terms, newest first · paged |
 | GET    | `/terms/{id}`                    | student | Get one term                    |
 | PATCH  | `/terms/{id}`                    | manager | Edit a term (the merged range must stay ordered) |
 | DELETE | `/terms/{id}`                    | manager | Delete a term — `409` while any course or class still links to it |
-| POST   | `/meals/menus`                   | manager | `{date, slot, capacity?}` — publish a menu; `date` is `YYYY-MM-DD` text, `slot` must be one of the school's `meal_slots`; `409` when that day+slot is already published |
+| POST   | `/meals/menus`                   | manager | `{date, slot, capacity?}` — publish a menu; `date` is `YYYY-MM-DD` text, `slot` must be one of the school's `meal_slots` and may not contain `/ \ ? # %` (it becomes part of the menu's URL id); `409` when that day+slot is already published |
 | GET    | `/meals/menus`                   | student | List menus with their dishes, newest day first · `?from=&to=` inclusive `YYYY-MM-DD` range · paged |
 | GET    | `/meals/menus/{id}`              | student | One menu with its dishes |
 | PATCH  | `/meals/menus/{id}`              | manager | `{capacity}` — the only mutable field (`null` = uncapped); `date` and `slot` are immutable |
-| DELETE | `/meals/menus/{id}`              | manager | Unpublish a menu; its dishes go with it; `409` while anyone still holds a seat |
+| DELETE | `/meals/menus/{id}`              | manager | Unpublish a menu; its dishes and its attendance marks go with it, in the same transaction; `409` while anyone still holds a seat |
 | POST   | `/meals/menus/{id}/dishes`       | manager | `{name, description?, price_minor, tags?}` — add a dish (≤ 50 per menu, `409` at the cap); `tags` must come from the school's `dietary_tags` |
-| PATCH  | `/meals/dishes/{did}`            | manager | Edit a dish (`tags` replaces the list, `"description": null` clears it) |
-| DELETE | `/meals/dishes/{did}`            | manager | Remove a dish from its menu |
+| PATCH  | `/meals/dishes/{did}`            | manager | Edit a dish (`tags` replaces the list, `"description": null` clears it); `404` once its menu is gone |
+| DELETE | `/meals/dishes/{did}`            | manager | Remove a dish from its menu; `404` once that menu is gone |
 | GET    | `/meals/profiles/me`             | student | The caller's own dietary profile (empty when the school recorded none) |
 | GET    | `/meals/profiles/{user}`         | student | One student's dietary profile; own id always, otherwise teacher+ or a parent link |
 | PATCH  | `/meals/profiles/{user}`         | manager | `{tags?, note?}` — record what a student may not eat (`tags` replaces the list, `"note": null` clears it); **manager+**, a student never edits their own |
 | POST   | `/meals/menus/{id}/bookings`     | student | `{student_id?}` — take a seat; a student books for themselves, a parent for a linked student; `409` when the menu is full, its cutoff has passed, or the menu was edited so often mid-booking that the price could not be pinned |
 | GET    | `/meals/bookings/me`             | student | The caller's own bookings (seats held for them + for a parent, their currently linked children's), newest first · paged |
 | GET    | `/meals/menus/{id}/bookings`     | manager | Every booking on one menu, cancelled ones included · paged |
-| DELETE | `/meals/bookings/{bid}`          | student | Cancel a booking (status flip, the row stays); idempotent — cancelling again is a `200` that replays the refund; `409` past the cutoff |
-| POST   | `/meals/menus/{id}/attendance`   | teacher | `{student_id, status}` — mark who was served (`served`/`missed`); one row per (menu, student), re-marking flips it; **moves no money** |
+| DELETE | `/meals/bookings/{bid}`          | student | Cancel a booking (status flip, the row stays) — its student or their parent, **or any manager+**, whose seat and money must stay reachable after a role change; idempotent — cancelling again is a `200` that replays the refund; `409` past the cutoff, which binds **students and parents only** — a manager+ frees a closed meal's seat |
+| POST   | `/meals/menus/{id}/attendance`   | teacher | `{student_id, status}` — mark who was served (`served`/`missed`); one row per (menu, student), re-marking flips it; `404` if the menu is unpublished mid-request; **moves no money** |
 | GET    | `/meals/menus/{id}/attendance`   | teacher | Who ate off one menu · paged |
 | GET    | `/meals/attendance/{user}`       | student | One student's meal-attendance history · `?from=&to=` inclusive `YYYY-MM-DD` range over the menu's day · paged · own id always, otherwise teacher+ or a parent link |
 | GET    | `/meals/balance/me`              | student | The caller's meal balance, minor units (negative = owes) |
-| GET    | `/meals/balance/{user}`          | student | One student's balance; own id always, otherwise teacher+ or a parent link |
-| GET    | `/meals/ledger/{user}`           | student | That student's statement — every charge, credit, reversal — newest first · paged · same gate |
-| POST   | `/meals/credits`                 | admin   | `{student_id, amount_minor, method?, note?}` — record money received; **admin only**, appends a `credit` line |
+| GET    | `/meals/balance/{user}`          | student | One student's balance; own id always, otherwise **manager+** or a parent link — a teacher gets a `403`, canteen debt is family debt |
+| GET    | `/meals/ledger/{user}`           | student | That student's statement — every charge, credit, reversal — newest first · paged · same gate (manager+, parent link, or own) |
+| POST   | `/meals/credits`                 | admin   | `{student_id, amount_minor, method?, note?}` — record money received; **admin only**, appends a `credit` line; the target must be a student, or anyone already carrying ledger lines (a debt outlives a role change) |
 | POST   | `/payments/plans`                | manager | `{name, installments}` — write a fee plan (1–60 installments, each `{amount_minor, due_at}`; `due_at` may be in the past); bills nobody |
 | GET    | `/payments/plans`                | manager | List fee plans, newest first · paged |
 | GET    | `/payments/plans/{id}`           | manager | One fee plan with its schedule |
@@ -887,7 +887,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/boards/{id}/history`           | student | The whole append-only log, oldest first, `clear` markers included · `?epoch=` for one epoch · paged |
 | GET    | `/boards/{id}/epochs`            | student | The epoch index: every `clear` marker (the epoch it closed, that epoch's final stroke count, who cleared, when) · paged |
 | PATCH  | `/boards/{id}`                   | student | `{title?, participants?, locked?}` — re-title (any participant); the roster and the lock are the creator's alone (`403`) |
-| POST   | `/boards/{id}/clear`             | student | **Creator only**: bump the epoch, blanking the live canvas and resetting its cap — nothing is deleted; `409` on a closed board |
+| POST   | `/boards/{id}/clear`             | student | **Creator only**: bump the epoch, blanking the live canvas and resetting its cap — nothing is deleted; `409` on a closed board, and on a canvas that is **already blank** (the marker is a stored row, so a clear has to close at least one mark to be worth one) |
 | POST   | `/boards/{id}/close`             | student | **Creator only**: retire the board — permanently read-only, still fully readable; idempotent, and there is no reopen |
 | DELETE | `/boards/{id}`                   | student | **Creator only**: delete the board and its whole stroke log; frees one of the creator's board seats |
 | GET    | `/boards/{id}/ws`                | student | **WebSocket** board room: a `join` replays the current epoch, every accepted stroke fans out to the other participants (see "Collaborative whiteboard") |
@@ -1263,7 +1263,7 @@ rewrites history: an exam keeps its retired kind, a roll-call row keeps its
 retired status — only **new writes** are held to the current lists (which is
 why grading an exam whose kind has left the list is refused).
 
-The kitchen is data too: a manager publishes a **menu** per calendar day and meal slot, with its dishes, their dietary tags, and prices in minor units; booking a seat charges that price as a snapshot and an admin records the cash that comes back in (see "Food program: menus, dishes, bookings & the ledger").
+The kitchen is data too: a manager publishes a **menu** per calendar day and meal slot, with its dishes, their dietary tags, and prices in minor units; booking a seat charges that price as a snapshot and an admin records the cash that comes back in (see "Food program: menus, dishes, bookings & the ledger"). The one shape rule on a **meal slot's name** lives here: it may not contain `/`, `\`, `?`, `#` or `%` (`400`), because the name is copied verbatim into a menu's record id and that id is a URL path segment — a slot the settings accepted but no menu could be addressed under would be a slot the canteen cannot use. A name the stored list *already* carries is exempt, so a list written before the rule existed can still be edited around the offending name — otherwise one bad slot froze the whole list, since re-sending it is a `400` and dropping it is a `409` once a menu used it. The grandfathered name still cannot carry a new menu, and dropping it is still the only way to remove it.
 
 Academic structure is data too. **Terms** (`/terms`) model whatever calendar
 the school runs — semester, trimester, quarter systems are just rows with a
@@ -1299,6 +1299,22 @@ The school publishes **one menu per calendar day and meal slot** (`POST
   booking cutoff resolves it live from the current list. The mirror of that rule lives in settings: a slot any
   menu was published for cannot be removed from the list (`409`), same
   contract exam kinds have with graded exams.
+- **A slot name may not contain `/`, `\`, `?`, `#` or `%`** — a `400` at
+  `PATCH /settings` when the slot is defined, and again here when a menu is
+  published under one. The name goes verbatim into the menu's record id, and
+  that id is a URL path segment: a slot called `a/b` would publish a menu at
+  `/meals/menus/2026-09-14_a/b`, an address no route can ever match again — the
+  menu could not be read, edited or deleted. Ordinary names are untouched;
+  spaces and Turkish letters percent-encode into one segment as they always
+  have.
+- **A name the school's stored list already carries is exempt from that rule.**
+  It is younger than the lists it validates, and `PATCH /settings` re-validates
+  the *whole* submitted list — so a school that stored `a/b` before the rule
+  existed could never edit `meal_slots` again: re-sending the name is a `400`
+  and dropping it is a `409` the moment a menu was published under it. The
+  grandfathered name is exactly as unusable as it already was — no menu may be
+  published under it — and dropping it is still the only way to be rid of it.
+  The rule stays in full force for every *new* name.
 
 The day+slot pair is unique: a second publish for the same meal answers `409`
 — edit the first one instead. Only `capacity` is patchable (`null` = uncapped)
@@ -1309,7 +1325,11 @@ menu.
 `PATCH`/`DELETE /meals/dishes/{did}`). Each carries a name, an optional
 description (blank or `null` clears it), dietary `tags` drawn from the
 school's `dietary_tags` list — an unknown tag is a `400`, never a stored
-string — and a `price_minor`.
+string — and a `price_minor`. Every dish write moves its **menu's** revision in
+the same transaction (that is what keeps a booking from freezing a price the
+menu has already left, below), which also makes the menu's existence part of
+the write: editing or deleting a dish whose menu has since been unpublished is
+a `404`, not a write onto a menu that is gone.
 
 ### Dietary profiles and conflicts
 
@@ -1343,8 +1363,18 @@ many menus or dishes the page holds.
 is ever introduced by transport or by a client's JSON number parser.
 
 Reads are open to every authenticated user — a student has to see what is
-being served — and every write is manager+. Deleting a menu takes its dishes
-with it: a dish has no meaning apart from the menu it was published on.
+being served — and every write is manager+. The exception is the money:
+`GET /meals/balance/{user}` and `GET /meals/ledger/{user}` are manager+ (or
+the student, or their parent), gated exactly like `/payments`. Deleting a menu takes its dishes
+**and its attendance marks** with it, in the same transaction as the row: a
+dish has no meaning apart from the menu it was published on, and a menu's
+record id is deterministic on day+slot, so anything left behind would come back
+attached to the *next* menu published for that meal — the kitchen reading
+"served" for a student who never came, priced off food nobody re-entered.
+Cancelled **bookings** deliberately stay: their `attempt` counter is what keeps
+the ledger's `(booking, attempt)` ids unique, and a re-book on a republished
+menu would otherwise reuse an id the ledger already holds and bill the seat
+nothing.
 
 **Bookings** are seats on a published menu (`POST
 /meals/menus/{id}/bookings`). One row per (menu, student), keyed by a
@@ -1365,15 +1395,33 @@ teacher or manager ordering a child's lunch is a `403`.
   timed out) is recovered by sending it again. Refusing it as a `409` — as it
   once did — made that state permanent: no route could append the missing
   reversal, and the student stayed billed for a seat they no longer held.
-- **The capacity check is serialized in-process.** Counting rows and then
-  writing one is write-skew: SurrealDB does not conflict-check a cross-record
-  count against a concurrent insert, so 24 students racing for 3 seats would
-  otherwise all pass the count. The whole check-then-write runs under the same
-  lock a menu publish takes, and the cap is re-read inside it.
-- **One cutoff closes both ends.** Within the school's
-  `meal_cancel_cutoff_minutes` of the meal's serving time, neither a new
-  booking nor a cancellation lands (`409`) — the kitchen's headcount has to
-  settle at some point. `null` (the default) means no cutoff at all. The
+- **A manager+ may cancel anybody's seat.** Booking is student-and-parent
+  only, and cancelling used to be the same door — which left a seat nobody on
+  the API could give back the moment its student was promoted to staff or its
+  parent was unlinked: the menu refused its own deletion forever and the charge
+  could never be reversed, since cancelling is the only route that reverses
+  one. A role change deliberately sweeps no bookings on its own; moving money
+  is a decision, not a side effect.
+- **The capacity check is a single conditional write, decided by the
+  database.** Counting rows and then writing one would be write-skew —
+  SurrealDB does not conflict-check a cross-record count against a concurrent
+  insert, so 24 students racing for 3 seats would all pass the count — so the
+  seat is instead claimed on a counter kept on the **menu row itself**, taken
+  and spent by one `UPDATE … WHERE` that also places the booking row in the
+  same transaction. No lock is involved and none would help: a duplicate
+  `POST` rolls its own seat back rather than costing a stranger their place.
+- **One cutoff closes both ends — for the people it is aimed at.** Within the
+  school's `meal_cancel_cutoff_minutes` of the meal's serving time, neither a
+  new booking nor a cancellation lands (`409`) — the kitchen's headcount has to
+  settle at some point. `null` (the default) means no cutoff at all. It binds
+  **students and parents only**: a manager+ cancelling somebody's seat is not
+  held to it, because the deadline exists to stop students gaming the headcount
+  and that is no reason to leave staff holding a seat they cannot free. Past
+  the cutoff an uncancellable seat also made its menu undeletable forever (a
+  menu with a live booking refuses its own deletion) and its charge
+  unreversable, since cancelling is the only route that reverses one. A meal
+  already closed is therefore still freeable, and its menu still deletable, by
+  manager+ — the same state a school that set no cutoff at all runs under. The
   cutoff is measured back from the menu's `date` **plus the slot's
   `serving_minute`** (`GET /settings`), so a two-hour cutoff on a lunch served
   at `720` closes at 10:00 UTC that morning, not at 22:00 the night before.
@@ -1411,6 +1459,13 @@ student never marks, not even themselves). The status is the fixed pair
 list meaning two things would let a school change one by editing the other.
 One row per (menu, student) keyed by a composite id, so a correction re-marks
 the same row instead of stacking a second one.
+
+The menu has to still be there: a mark whose menu is unpublished mid-request is
+a `404` and writes nothing. The existence check *is* the write's own target
+rather than a read the write then trusts, because a menu's id is deterministic
+on day+slot — an unconditional mark landing just after the delete committed
+would be swept by nothing and would reappear as a mark on the next menu
+published for that meal.
 
 **Attendance has zero billing effect.** Booking is the sole charge trigger, so
 a student who booked and did not eat still pays — the kitchen bought the food.
@@ -1459,29 +1514,54 @@ money on account. Amounts are stored positive; the sign lives in the `kind`.
   but the booking row records that it *was* free, so "free when taken" is
   never confused with "not billed yet": pricing the menu afterwards leaves
   every seat already taken on it free.
-- **Charge and reversal are keyed by `(booking, attempt)`.** The seat and its
-  money move together under one in-process lock, and the ledger id is derived
+- **Charge and reversal are keyed by `(booking, attempt)`.** The seat, its row
+  and its money move together in one transaction on *both* sides — the claim
+  writes the charge, the flip writes the reversal — and the ledger id is derived
   from the seat plus how many times it has been taken — so eight simultaneous
   `POST`s of one seat write one charge, a retried cancel refunds once, and a
   write that failed halfway heals when the request is repeated. Booking the
   same seat twice bills once because the *identity* is the same, never
   because a scan happened to see the first charge in time.
 - **Cancelling appends a `reversal`** for the charge's exact amount, with
-  `source` pointing at the charge it undoes. The charge row itself stays. A
-  cancel past the cutoff is already a `409`, so a reversal only ever follows a
-  legal cancel — and repeating a cancel replays the reversal, which is what
-  makes the refund recoverable rather than a one-shot the network can lose.
-  Re-booking afterwards is a **fresh** charge at the then-current price.
-- **The price snapshot is taken under the booking lock**, and dish
-  create/edit/delete take that same lock. Taken outside it, a dish added
-  between the sum and the seat would be frozen onto the row as "the menu was
-  free then" — and nothing heals it, since a seat already held is returned
-  as-is, never re-priced.
+  `source` pointing at the charge it undoes, and it is written **by the same
+  transaction that flips the seat** — not appended after it. The two as
+  separate writes left a crash in between with a seat given back and the
+  student still billed, and no later cancel would ever repay it, because the
+  money is keyed to the attempt the flip had already consumed. Folded in, the
+  seat cannot come back without the money. Booking is folded the same way — the
+  charge rides the claim's own transaction, because a charge appended afterwards
+  let a cancel land in the gap, reverse nothing (there was no charge yet), and
+  the bill arrive anyway: a student holding no seat and owing money. The reversal is written only when
+  the charge it undoes is really there, checked inside that same transaction —
+  a refund with no charge behind it invents money. The charge row itself stays.
+  Repeating a cancel replays the reversal, which is what heals a seat flipped
+  before that was true and makes the refund recoverable rather than a one-shot
+  the network can lose; the cutoff is deliberately not re-checked on that path,
+  since the seat is already given back. Re-booking afterwards is a **fresh**
+  charge at the then-current price.
+- **The price snapshot is pinned by the menu's revision, not by a lock.** The
+  dishes are summed a round trip before the seat is claimed, so a dish landing
+  in between would otherwise be frozen onto the row as "the menu was free
+  then" — and nothing heals that, since a seat already held is returned as-is,
+  never re-priced. Instead every dish write bumps a revision counter on the
+  menu, and the claim that takes the seat *also* asserts the menu is still at
+  the revision the price was read at: the booking is refused, re-reads, and
+  prices and seats itself again together. A lock around the read could not have
+  promised this — the price is read a round trip before the claim either way —
+  so what is frozen is always a price the menu genuinely carried at the instant
+  the seat was taken. A menu edited over and over under one booking gives up
+  after a few rounds with a `409`.
 - **A no-show still pays.** Meal attendance has zero billing effect — nothing
   in the ledger reads or writes it. The seat was reserved and the food was
   cooked; there is no no-show penalty and no no-show refund.
 - **`POST /meals/credits` is admin-only**, not manager: writing down cash
-  received is the highest-trust action in the app. It appends a `credit` for a
+  received is the highest-trust action in the app. The target must be a
+  **student, or anyone who already carries meal-ledger lines**: only a student
+  runs up a meal balance, so crediting anyone else is a typo and a typo here is
+  money in the wrong ledger — but a debt outlives its debtor's role change, and
+  the student-only rule alone made a promoted student's debt permanently
+  unsettleable, since no other route appends a credit. A mistyped staff id
+  carries no lines, so it is still a `400`. It appends a `credit` for a
   student with a positive `amount_minor` (≤ 10 000 000), an optional `method`
   ("cash", "havale", …) and `note`, and records the admin as `recorded_by`.
   There is no payment gateway and no card data, ever. An over-credit is
@@ -1490,7 +1570,10 @@ money on account. Amounts are stored positive; the sign lives in the `kind`.
 `GET /meals/balance/me` is the caller's own balance. `GET
 /meals/balance/{user}` and `GET /meals/ledger/{user}` (paged, newest line
 first) read a student's: your own id always passes, anyone else's needs
-teacher+ or a `parent_link` to that student. A charge's `source` is the
+**manager+** or a `parent_link` to that student — **a teacher gets a `403`**,
+the one pair in this block narrower than the rest of it. Canteen debt is
+family debt: the money follows the `/payments` rule, not the classroom one,
+while the dietary profile, booking and attendance reads stay teacher+. A charge's `source` is the
 booking id it came from, a reversal's is the charge line it reverses, and a
 credit has none.
 
@@ -1505,7 +1588,8 @@ them would make either statement unreadable.
 Every write here is **manager+**. Reads are narrower than the other
 per-student reports: the student themselves, a parent holding a live link to
 them, or manager+ — **a teacher gets a `403` on every `/payments` route**,
-because what a family owes the school is not classroom information.
+because what a family owes the school is not classroom information. The
+canteen's balance and ledger follow the same rule, for the same reason.
 
 ### Fee plans and what turns them into money
 
@@ -2161,8 +2245,10 @@ already carries — and what gets written is an ordinary `enrollment` row, the
 same one `POST /courses/{id}/enrollments` writes, counted against the same
 `enrollment_count`. Each row a class writes is tagged with it as the row's
 `source`; **no `source` means placed by hand**, and that one bit is what makes
-the sweeps below safe. It is internal bookkeeping, not API surface: no
-enrollment response returns it.
+the sweeps below safe. It rides back out on every enrollment response
+(`GET /courses/{id}/enrollments`) as the class's id, or `null` for a
+hand-placed row — without it no client could tell which of the roster rows it
+is showing a class change is about to remove.
 
 **Already enrolled is skipped.** A pair that already has an enrollment row is
 left exactly as it stands — no second seat charged, no `source` rewritten. A
@@ -2177,6 +2263,14 @@ naming it (`course:<key> is full, so the class cannot take this student`,
 `course:<key> cannot hold the whole class`). Nothing lands, not even the seats
 claimed earlier in the same run: a half-enrolled class is worse than a refused
 one, and the refusal names the course whose capacity to raise.
+
+A second `409` reads off the same claim and is deliberately told apart from it:
+one of the class's attached courses **no longer exists**
+(`course:<key> no longer exists — detach it from this class first`). A seat
+claim that matches nothing means "full" *or* "no such row", and reporting a
+stale attachment as a full course would send staff off to raise a capacity that
+is not there — on a class every member-add now fails on. Detach the link and
+the class works again.
 
 **Removals take back only what the class pumped, and repair before they
 delete.** Removing a member (`DELETE /classes/{id}/members/{user}`) or
@@ -2199,14 +2293,31 @@ remain a member, because the pump runs on writes, never on a schedule. Staff
 put them back by enrolling them by hand (which makes the row hand-placed) or
 by detaching and re-attaching the course.
 
+**And a manual enroll wins too, permanently.** `POST /courses/{id}/enrollments`
+landing on a row a class pumped takes the row *off* that class — its `source`
+is cleared, the response comes back with `"source": null` — so no later class
+sweep can undo a placement an operator made on purpose. That is the mirror of
+the rule above: hand-placed beats pumped in both directions, and without it
+"hand-placed" was a state only a *first* enroll could ever reach.
+
 **Delete guards.** A class still holding members or attached courses refuses
 deletion with a `409` ("remove its members and detach its courses first") —
 the roster it owes is never dropped out from under the courses silently. A
 term linked by any class refuses deletion the same way courses make it refuse.
 Deleting a **course** detaches it from every class it was on (its enrollments
 go with it), and a role change that takes a user off `student` drops their
-class memberships exactly as it drops their enrollments — a membership left
-behind would keep pumping them back into courses.
+class memberships exactly as it drops their enrollments — in one transaction,
+because a membership left behind would keep pumping them back into courses,
+while an enrollment left behind would stay tagged with a class the released
+counters had already made deletable, and nothing could ever sweep it again.
+
+**A link to a deleted course detaches instead of refusing.** Should a
+`class_course` row ever be left pointing at a course row that is gone,
+`DELETE /classes/{id}/courses/{course}` still answers `204`: management rights
+are read *off* the course, so a stale link had no readable owner and the detach
+used to `404` forever — which also left the class permanently undeletable, its
+attachment counter counting a row nothing could sweep. There is no roster left
+to protect, and the caller is already teacher+.
 
 **Who may.** Creating, editing and deleting a class, and adding or removing
 its members, is **manager+** — a class is school structure, not classroom
@@ -2214,15 +2325,37 @@ work. Attaching or detaching a course takes management rights on **that
 course** (its creator, a teacher assigned to it, or manager+), since the call
 writes that course's roster and nothing else: the same right enrolling one
 student takes. Every read (`GET /classes`, `/classes/{id}`, its members and
-its courses, all paged, newest first) is **teacher+**.
+its courses, all paged, newest first) is **teacher+** — and "newest" here means
+when the student was *added* or the course *attached*, not the student's or the
+course's own id, which is what a link row keyed on the pair would otherwise
+sort by. Rows written before that stamp existed carry none, and sort last.
 
 **Codes.** Adding a member or attaching a course answers `201`; a repeat is a
 `409` ("the student is already in this class", "the course is already on this
 class"). An id in the **body** that names nothing — an unknown `user_id` or
 `course_id`, or a member who is not a `student` — is a `400`; an id in the
 **path** that names nothing (the class, or a member/course that was not on it)
-is a `404`. Bounds: name ≤ 200 characters, grade ≤ 20, both published in the
-`course` group of `GET /limits`.
+is a `404`. Bounds: name ≤ 200 characters, grade ≤ 20, **at most 200 students
+and 50 courses** per class (`max_class_members`, `max_class_courses`), all four
+published in the `course` group of `GET /limits`. Past either ceiling the
+add or the attach is a `409` naming it ("this class already holds 200
+students") — a standing class someone can make room in, which is why it is not
+the `404` a deleted class answers. Those two numbers are not comfort limits:
+adding a member writes one enrollment per attached course and attaching a
+course writes one per member, both in a *single* transaction, so each axis's
+ceiling is the bound on the other axis's write loop — an unbounded class is an
+unbounded transaction any manager could trigger.
+
+Which is why each write is refused on the **other** axis too. A class already
+standing *above* a ceiling cannot take a member while it holds more than 50
+courses ("this class holds more than 50 courses — detach some before adding a
+student"), nor a course while it holds more than 200 students ("this class
+holds more than 200 students — remove some before attaching a course"), both
+`409`. Room on the axis being written is not the question: the write loop's
+length is set by the other one, and letting it run because *this* side has
+space is exactly the unbounded transaction the ceilings exist to prevent. Only
+a class that predates the ceilings can be there, and only shrinking the
+overloaded axis clears it.
 
 ## Quick tour (curl)
 
@@ -2652,6 +2785,13 @@ markers *are* the epoch index, which is why there is no epochs table and why
 the open (unclosed) epoch is deliberately absent from `GET /boards/{id}/epochs`.
 `DELETE /boards/{id}` is the one operation here that really destroys marks.
 
+**A blank canvas cannot be cleared** (`409` — as a closed board is, while a
+participant who is not the creator gets the `403` the two doors above give
+them). The marker is a real stored row and it is charged to the board's
+lifetime budget, so a clear has to close at least one mark to be worth one —
+without that rule every press of a button the creator can hold down minted a
+free row, and the epoch index filled with zero-stroke sessions.
+
 **Three caps, and only one of them is terminal** (all three published at `GET
 /limits` under `board`):
 
@@ -2660,6 +2800,19 @@ the open (unclosed) epoch is deliberately absent from `GET /boards/{id}/epochs`.
   history is kept, drawing resumes.
 - `max_board_strokes` bounds the board's **lifetime** storage —
   `total_stroke_count`, which never resets, because a clear keeps its history.
+  It counts **rows on the board**, not strokes drawn: a `clear` marker is a
+  stored row, so it costs one unit of the budget like any mark. The marker's
+  own unit is the one thing not refused at the ceiling — the last stroke of a
+  board's budget may well be closed by a clear, and refusing that would drop
+  the very marker the history needs to index the final epoch — so a board holds
+  at most `max_board_strokes + 1` rows. That held only for boards born after
+  the marker started paying, so **boot recomputes every board's
+  `total_stroke_count` from its actual rows**: a board an older binary cleared
+  is short exactly one per past clear, and an under-counting board is one that
+  keeps taking marks past the storage ceiling. This is the one backfill that is
+  not `= NONE`-guarded, and the one counter that may be recomputed — it is not
+  an opinion the live system maintains, it is the board's row count, so
+  recomputing converges instead of overwriting and the next boot writes nothing.
   Hitting it stamps `closed_at` and the board becomes **permanently
   read-only**: still fully readable and replayable, never deleted, and there is
   no reopen — open a new board. `POST /boards/{id}/close` is the manual form of
@@ -2711,10 +2864,19 @@ value the client picks, echoed **verbatim** on that message's `saved` or
 server never reads it.
 
 `error` codes are a closed set: `epoch_full` (the live canvas is full — clear
-it and keep drawing), `board_closed` (permanently read-only), `locked`,
-`forbidden` (a creator-only command from a participant), `resync` (below),
-`invalid` (bad JSON, an unknown frame, an over-long payload), `not_found`,
-`unauthorized`, `too_many_requests`, `conflict`, `internal`.
+it and keep drawing), `canvas_blank` (there was nothing on the canvas to clear
+— the board is still live and still drawable), `board_closed` (permanently
+read-only), `locked`, `forbidden` (a creator-only command from a participant),
+`resync` (below), `invalid` (bad JSON, an unknown frame, an over-long payload),
+`not_found`, `unauthorized`, `too_many_requests`, `conflict`, `internal`.
+
+The two that look alike are the two that must not be confused: `board_closed`
+is **terminal** and `canvas_blank` is **nothing to do**. A client that treats
+them alike sends a live room off clearing a canvas it never needed to lose —
+which is exactly what a code guessed from a *substring* of the refusal did
+("the canvas is already blank" contains the word "closed"), so the server now
+matches the refusal constants by value and a test pairs every one of them with
+the code its client must act on.
 
 **Persist, then publish.** A stroke is fanned out only after its row has
 landed, so the channel can never carry a mark the database refused (a locked
@@ -2812,7 +2974,11 @@ stop-the-world — `podman compose down` then `up`, never overlapping — and a
 release that adds or renames a stored counter *requires* it. An old binary
 writes rows without touching the new counter, the `= NONE` backfill guard
 (correctly) refuses to re-seed, and the resulting permanent under-count lets a
-guard approve exactly what it exists to refuse. In-flight work does not survive
+guard approve exactly what it exists to refuse. The one exception is a counter
+that is not an opinion but a plain row count — a board's `total_stroke_count`,
+recomputed from its strokes on every boot rather than seeded once, which is why
+that repair heals an under-count the `= NONE` guard would have skipped.
+In-flight work does not survive
 a restart either: a chatbot turn mid-inference settles `failed`/`interrupted`.
 
 ## Layout

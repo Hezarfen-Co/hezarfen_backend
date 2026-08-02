@@ -3003,6 +3003,44 @@ async fn a_roster_change_drops_only_the_socket_it_removed() {
     );
 }
 
+/// Test 15 — clearing a blank canvas is a *live* board saying "nothing to do",
+/// and the room must say so with a non-terminal code. It shipped as
+/// `board_closed` — the terminal one — because the classifier guessed the code
+/// from a substring of the refusal's words, and the reworded refusal happens to
+/// contain "closed". A creator who double-clicks clear would have been told the
+/// board was finished forever, on a board still open and still drawable.
+#[tokio::test]
+async fn clearing_a_blank_canvas_never_tells_the_room_the_board_is_closed() {
+    let room = board_room_fixture().await;
+    let (base, board) = (&room.base, &room.board_id);
+    let mut ali = board_open(base, board, Some(&room.creator_cookie))
+        .await
+        .expect("upgrade");
+    board_join(&mut ali, None, None).await;
+
+    // Nothing drawn yet: there is no epoch to close.
+    ws_send(&mut ali, json!({ "type": "clear" })).await;
+    let error = board_frame_of_type(&mut ali, "error").await;
+    assert_eq!(error["code"], "canvas_blank", "{error}");
+
+    // The same refusal after a real clear — the second press of the button.
+    board_draw(&mut ali, "one").await;
+    ws_send(&mut ali, json!({ "type": "clear" })).await;
+    board_frame_of_type(&mut ali, "cleared").await;
+    ws_send(&mut ali, json!({ "type": "clear" })).await;
+    assert_eq!(
+        board_frame_of_type(&mut ali, "error").await["code"],
+        "canvas_blank"
+    );
+
+    // And the board really is live: the socket draws on, into the new epoch.
+    board_draw(&mut ali, "two").await;
+    assert_eq!(
+        stored_payloads(&room.db, board, 1).await,
+        vec!["two".to_string()]
+    );
+}
+
 /// The class layer over real HTTP with three cookie jars: the office builds the
 /// class, the teacher hands over their own course, and the student — who was
 /// never enrolled by anyone — finds it on `GET /courses/me`. Taking them out of

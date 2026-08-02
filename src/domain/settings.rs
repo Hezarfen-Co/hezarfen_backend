@@ -12,6 +12,7 @@
 //! existing rows, and `UPDATE` re-validates whole records).
 
 use surrealdb::types::{RecordId, SurrealValue};
+use tokio::sync::Mutex;
 
 use crate::constant::{
     DEFAULT_ATTENDANCE_STATUSES, DEFAULT_CHATBOT_HISTORY_TURNS, DEFAULT_DIETARY_TAGS,
@@ -26,6 +27,32 @@ use crate::constant::{
 use crate::database::Database;
 use crate::domain::text_fold;
 use crate::error::{AppError, ValidationError};
+
+/// One settings edit at a time, over the whole process.
+///
+/// A list edit is a **pair** of writes, and the pair is the guard: every name
+/// the edit drops is retired on its reference counter first (which refuses
+/// every later claim), and only then is the list itself committed with a
+/// compare-and-set against the snapshot the removals were judged from. Neither
+/// write can be made to cover the other. Both retirement and un-retirement are
+/// *idempotent*, so a rival that decided the same removal against the same
+/// snapshot is told "already retired" and records no rollback — and when it is
+/// that rival's save that wins the compare-and-set, the attempt which really
+/// flipped the bit rolls it back, leaving the name off the stored list with a
+/// counter reading "in service": gradable again, and unremovable for good once
+/// a mark lands. No per-name bit can close that, because `Unchanged` has
+/// erased which attempt owns the flip.
+///
+/// So the pair is serialized instead. Every writer of the singleton goes
+/// through `PATCH /settings`, and the deployment runs one replica by contract
+/// (stop-the-world upgrades), so process-wide is deployment-wide here — the
+/// same argument [`crate::domain::cap`]'s own lock makes for `retire_name`'s
+/// two statements, one level up. The compare-and-set stays: it is what keeps a
+/// crashed or rolled-back attempt from writing a list nobody merged.
+///
+/// **Lock order:** `SETTINGS_LOCK` → `cap`'s `CLAIM_LOCK`, never the reverse —
+/// the retirements are taken while this is held.
+pub(crate) static SETTINGS_LOCK: Mutex<()> = Mutex::const_new(());
 
 /// One exam kind the school runs (`"midterm"`, `"oral"`, …) with its weight:
 /// how many times an exam of that kind counts into its course's average.
@@ -86,11 +113,44 @@ pub struct MealSlotDef {
 
 impl MealSlotDef {
     pub fn try_new(name: &str, serving_minute: Option<i64>) -> Result<Self, ValidationError> {
+        Self::build(name, serving_minute, false)
+    }
+
+    /// [`Self::try_new`] for a name the stored list *already* carries.
+    ///
+    /// The URL-safety rule below is younger than the lists it validates, and
+    /// `PATCH /settings` re-validates the whole submitted list — so a school
+    /// that stored a slot named `a/b` before the rule existed could never edit
+    /// `meal_slots` again: re-sending the name is a 400, and dropping it is a
+    /// 409 the moment a menu was published under it. Grandfathering a name the
+    /// row already holds unwedges the rest of the list while leaving the rule
+    /// in full force for every *new* name — the stored one is exactly as
+    /// unusable as it already was, and dropping it stays the only way out.
+    pub fn try_kept(name: &str, serving_minute: Option<i64>) -> Result<Self, ValidationError> {
+        Self::build(name, serving_minute, true)
+    }
+
+    fn build(name: &str, serving_minute: Option<i64>, kept: bool) -> Result<Self, ValidationError> {
         let name = name.trim();
         if name.is_empty() || name.chars().count() > MAX_SETTINGS_ITEM_LEN {
             return Err(ValidationError::Invalid {
                 field: "meal_slots",
                 reason: "slot names must be 1 to 50 characters",
+            });
+        }
+        // The name goes verbatim into a menu's record id, and that id is a URL
+        // path segment: a slot named `a/b` would define a slot no menu can ever
+        // be published under (`MenuSlot::try_new` refuses the same characters,
+        // at the one place a name becomes an id). Refusing it here too is what
+        // keeps the settings from offering a slot the canteen cannot use.
+        if !kept
+            && name
+                .chars()
+                .any(|c| matches!(c, '/' | '\\' | '?' | '#' | '%'))
+        {
+            return Err(ValidationError::Invalid {
+                field: "meal_slots",
+                reason: "meal slot names used for menus must not contain / \\ ? # or %",
             });
         }
         if let Some(minute) = serving_minute {

@@ -68,7 +68,7 @@ use tokio::sync::broadcast::error::RecvError;
 use crate::constant::{BOARD_REPLAY_CHUNK, BOARD_WS_TICK_SECS, MAX_BOARD_ID_LEN};
 use crate::database::Database;
 use crate::domain::board::{Board, BoardId};
-use crate::domain::board_stroke::BoardStroke;
+use crate::domain::board_stroke::{self, BoardStroke};
 use crate::domain::role::Role;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
@@ -524,24 +524,23 @@ async fn creator_board(
     }
 }
 
-/// A machine-readable `code` beside the public words. The three refusals the
-/// stroke path can raise are distinguished by their message, because that is
-/// what [`BoardStroke::append`] hands back and each one means a different thing
-/// to a client: `epoch_full` is recoverable by clearing, `locked` is a pause
-/// that will lift, `board_closed` is terminal.
+/// A machine-readable `code` beside the public words. Each refusal the board
+/// path can raise means a different thing to a client: `epoch_full` is
+/// recoverable by clearing, `locked` is a pause that will lift, `canvas_blank`
+/// is nothing to do, `board_closed` is terminal.
+///
+/// The match is on the refusal *constants* [`board_stroke`] raises, by value —
+/// never on a substring of them. Guessing from a substring made every reworded
+/// refusal a silent re-labelling: "the canvas is already blank" contains the
+/// word "closed", so a blank canvas told a live room its board was finished.
 fn error_frame(err: &AppError, client_seq: Option<u64>) -> Value {
     let code = match err {
         AppError::Forbidden(_) => "forbidden",
-        AppError::Conflict(message) if message.contains("clear it to keep drawing") => "epoch_full",
-        AppError::Conflict(message) if message.contains("locked") => "locked",
-        // "read-only" (the lifetime cap), and the clear's own "it is closed, or
-        // you did not create it" — the socket already checked the creator, so
-        // what is left is closed, and that is what the client must act on.
-        AppError::Conflict(message)
-            if message.contains("read-only") || message.contains("closed") =>
-        {
-            "board_closed"
-        }
+        AppError::Conflict(message) if *message == board_stroke::EPOCH_FULL => "epoch_full",
+        AppError::Conflict(message) if *message == board_stroke::BOARD_LOCKED => "locked",
+        AppError::Conflict(message) if *message == board_stroke::BOARD_CLOSED => "board_closed",
+        AppError::Conflict(message) if *message == board_stroke::CANVAS_BLANK => "canvas_blank",
+        // Everything else, `BOARD_MOVED` included: retryable, never terminal.
         AppError::Conflict(_) | AppError::ConflictOwned(_) => "conflict",
         AppError::Validation(_) | AppError::PayloadTooLarge(_) => "invalid",
         AppError::NotFound => "not_found",
@@ -563,45 +562,44 @@ fn error_frame(err: &AppError, client_seq: Option<u64>) -> Value {
 mod tests {
     use super::*;
 
-    /// The three refusals `append` can answer with are one `Conflict` variant
-    /// apiece, told apart only by their wording — so this pairing is the whole
-    /// contract behind `epoch_full` (clear and carry on), `locked` (wait) and
-    /// `board_closed` (never again). Getting it wrong sends a paused room off
-    /// clearing a canvas it never needed to lose.
+    fn code(err: AppError) -> String {
+        error_frame(&err, None)["code"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// The pairing is the whole contract behind `epoch_full` (clear and carry
+    /// on), `locked` (wait), `canvas_blank` (nothing to do) and `board_closed`
+    /// (never again). Getting it wrong sends a paused room off clearing a
+    /// canvas it never needed to lose.
+    ///
+    /// Written against the constants, never against copies of their words: a
+    /// test that pins the wording rots into a test of a string the code can no
+    /// longer emit, which is exactly how the blank canvas shipped as
+    /// `board_closed` through a green suite. The length assertion is the other
+    /// half — a refusal added to `board_stroke::REFUSALS` fails here until it
+    /// is given the code its client must act on.
     #[test]
     fn every_refusal_gets_the_code_its_client_must_act_on() {
-        let code = |err: AppError| {
-            error_frame(&err, None)["code"]
-                .as_str()
-                .unwrap()
-                .to_string()
-        };
+        let pairs = [
+            (board_stroke::EPOCH_FULL, "epoch_full"),
+            (board_stroke::BOARD_LOCKED, "locked"),
+            (board_stroke::BOARD_CLOSED, "board_closed"),
+            (board_stroke::CANVAS_BLANK, "canvas_blank"),
+            // A stroke that lost its epoch to a clear is a plain retryable
+            // conflict, and must never be mistaken for terminal.
+            (board_stroke::BOARD_MOVED, "conflict"),
+        ];
         assert_eq!(
-            code(AppError::Conflict(
-                "this board is full — clear it to keep drawing"
-            )),
-            "epoch_full"
+            pairs.len(),
+            board_stroke::REFUSALS.len(),
+            "a refusal the room cannot code"
         );
-        assert_eq!(
-            code(AppError::Conflict(
-                "this board is locked — the creator has paused drawing"
-            )),
-            "locked"
-        );
-        assert_eq!(
-            code(AppError::Conflict(
-                "this board is closed — it is permanently read-only"
-            )),
-            "board_closed"
-        );
-        // A stroke that lost its epoch to a clear is none of the three: it is a
-        // plain retryable conflict, and must never be mistaken for terminal.
-        assert_eq!(
-            code(AppError::Conflict(
-                "this board changed while you were drawing — draw it again"
-            )),
-            "conflict"
-        );
+        for (message, expected) in pairs {
+            assert!(board_stroke::REFUSALS.contains(&message));
+            assert_eq!(code(AppError::Conflict(message)), expected, "{message}");
+        }
         assert_eq!(code(AppError::Forbidden("nope")), "forbidden");
         // Internals are logged, never wired.
         let frame = error_frame(&AppError::Internal("secret".into()), None);
@@ -609,36 +607,23 @@ mod tests {
         assert_eq!(frame["message"], "internal server error");
     }
 
-    /// Every refusal the room can raise has to reach the client as the code
-    /// that tells it what to *do*: clear (recoverable), wait (paused) or stop
-    /// (terminal). The clear's own refusal is the one that hides — it names two
-    /// causes, but the socket has already checked the creator, so what is left
-    /// is `board_closed` and never the generic `conflict`.
+    /// A blank canvas is the refusal that hides: it is a *live* board saying
+    /// "nothing to clear", so it must never carry the terminal code. The two it
+    /// sits between are checked with it, since what matters is that no two of
+    /// the three collapse into one code.
     #[test]
-    fn each_refusal_keeps_its_own_code() {
-        let code = |err: AppError| {
-            error_frame(&err, None)["code"]
-                .as_str()
-                .unwrap()
-                .to_string()
-        };
+    fn a_blank_canvas_is_never_terminal() {
         assert_eq!(
-            code(AppError::Conflict(
-                "this board cannot be cleared — it is closed, or you did not create it"
-            )),
+            code(AppError::Conflict(board_stroke::CANVAS_BLANK)),
+            "canvas_blank"
+        );
+        assert_eq!(
+            code(AppError::Conflict(board_stroke::BOARD_CLOSED)),
             "board_closed"
         );
         assert_eq!(
-            code(AppError::Conflict(
-                "this board is locked — the creator has paused drawing"
-            )),
+            code(AppError::Conflict(board_stroke::BOARD_LOCKED)),
             "locked"
-        );
-        assert_eq!(
-            code(AppError::Conflict(
-                "this board is full — clear it to keep drawing"
-            )),
-            "epoch_full"
         );
     }
 

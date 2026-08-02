@@ -38,9 +38,33 @@ use crate::validate::validate_required;
 const KIND_STROKE: &str = BOARD_STROKE_KINDS[0];
 const KIND_CLEAR: &str = BOARD_STROKE_KINDS[1];
 
-/// The `THROW` the clear transaction refuses with: not the creator, or the
-/// board is already closed. A decision, so it outranks a lost round.
+/// The `THROW` the clear transaction refuses with: a blank canvas, not the
+/// creator, or the board is already closed. A decision, so it outranks a lost
+/// round.
 const CLEAR_REFUSED: &str = "board_clear_refused";
+
+/// The public words of every refusal this module raises. `pub` because
+/// `src/web/board_ws.rs` turns each into the machine-readable `code` its room
+/// sends, and it matches these constants by value — a classifier that guessed
+/// from a substring silently re-labelled a blank canvas as the *terminal*
+/// `board_closed` the moment this wording changed.
+pub const EPOCH_FULL: &str = "this board is full — clear it to keep drawing";
+pub const BOARD_LOCKED: &str = "this board is locked — the creator has paused drawing";
+pub const BOARD_CLOSED: &str = "this board is closed — it is permanently read-only";
+pub const BOARD_MOVED: &str = "this board changed while you were drawing — draw it again";
+pub const CANVAS_BLANK: &str = "there is nothing on this canvas to clear";
+pub const NOT_THE_CREATOR: &str = "only the board's creator can clear the board";
+
+/// Every *conflict* refusal above — `NOT_THE_CREATOR` is a `Forbidden`, coded
+/// by its variant alone. Listed so the room's classifier can be *proved* to
+/// cover them all (src/web/board_ws.rs) rather than trusted to.
+pub const REFUSALS: [&str; 5] = [
+    EPOCH_FULL,
+    BOARD_LOCKED,
+    BOARD_CLOSED,
+    BOARD_MOVED,
+    CANVAS_BLANK,
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct BoardStrokeId(RecordId);
@@ -165,9 +189,7 @@ impl BoardStroke {
             cap::ClaimedTwo::Made(saved) => Ok(saved),
             // The live canvas is full and nothing else: recoverable by a clear,
             // which resets this counter without losing a single mark.
-            cap::ClaimedTwo::FullSoft => Err(AppError::Conflict(
-                "this board is full — clear it to keep drawing",
-            )),
+            cap::ClaimedTwo::FullSoft => Err(AppError::Conflict(EPOCH_FULL)),
             // Three refusals share this answer (lifetime full / guard failed /
             // board gone), so the board is re-read to tell them apart. A board
             // that changed state in between still gets told "no" — but only a
@@ -180,9 +202,7 @@ impl BoardStroke {
     async fn why_refused(board: &BoardId, db: &Database) -> Result<AppError, AppError> {
         let board = Board::read(board, db).await?.ok_or(AppError::NotFound)?;
         if board.is_locked() {
-            return Ok(AppError::Conflict(
-                "this board is locked — the creator has paused drawing",
-            ));
+            return Ok(AppError::Conflict(BOARD_LOCKED));
         }
         if board.get_closed_at().is_none() {
             // Not closed yet. The lifetime counter has to say so *itself*:
@@ -191,17 +211,13 @@ impl BoardStroke {
             // is open again now would otherwise be stamped read-only at one
             // stroke of a 50 000 budget — irreversibly, with no reopen.
             if Self::total_strokes(board.get_id(), db).await? < MAX_BOARD_STROKES {
-                return Ok(AppError::Conflict(
-                    "this board changed while you were drawing — draw it again",
-                ));
+                return Ok(AppError::Conflict(BOARD_MOVED));
             }
             // `Board::close` is the one-way idempotent stamp: a second append
             // takes this branch too and leaves the first `closed_at` standing.
             board.close(db).await?;
         }
-        Ok(AppError::Conflict(
-            "this board is closed — it is permanently read-only",
-        ))
+        Ok(AppError::Conflict(BOARD_CLOSED))
     }
 
     /// The lifetime counter as the store holds it — the board struct
@@ -223,6 +239,26 @@ impl BoardStroke {
     /// the epoch's final count — written apart, a crash between them would
     /// leave an epoch no marker indexes, and the playback would silently join
     /// two sessions into one.
+    ///
+    /// **The marker pays the lifetime counter.** It is a real `board_stroke`
+    /// row, so a marker that claimed nothing left `total_stroke_count` counting
+    /// strokes *drawn* rather than rows *stored*, and `MAX_BOARD_STROKES`
+    /// stopped bounding the table. Charged here, the counter is exactly the row
+    /// count again — the counter is reset and re-read in the same statement, so
+    /// the increment cannot be split off from the marker it pays for.
+    ///
+    /// **A blank canvas cannot be cleared.** Without it every call minted a row
+    /// for free, one per press of a button the creator can hold down. Requiring
+    /// the epoch counter to be non-zero pays for each marker with at least one
+    /// stroke it closes — and "there is nothing on this canvas to clear" is the
+    /// honest answer to the call it refuses. The epochs index keeps its meaning
+    /// too: no zero-stroke epoch can enter it.
+    ///
+    /// The marker's own increment is not capped: the last stroke of a board's
+    /// budget may be closed by a marker, so a board holds at most
+    /// `MAX_BOARD_STROKES + 1` rows. Capping it would refuse the clear that
+    /// files the final epoch in the index, which is the one clear the history
+    /// needs.
     pub async fn clear(
         board: &BoardId,
         by: &UserId,
@@ -233,8 +269,10 @@ impl BoardStroke {
         // parses as `?? (0 = …)` and stores a boolean count (src/constant.rs:699).
         let sql = format!(
             "BEGIN TRANSACTION;
-             LET $before = (UPDATE $b SET epoch += 1, {BOARD_EPOCH_STROKE_COUNT_FIELD} = 0 \
-                 WHERE creator = $by AND closed_at = NONE RETURN BEFORE);
+             LET $before = (UPDATE $b SET epoch += 1, {BOARD_EPOCH_STROKE_COUNT_FIELD} = 0, \
+                 {BOARD_TOTAL_STROKE_COUNT_FIELD} = ({BOARD_TOTAL_STROKE_COUNT_FIELD} ?? 0) + 1 \
+                 WHERE creator = $by AND closed_at = NONE \
+                   AND ({BOARD_EPOCH_STROKE_COUNT_FIELD} ?? 0) > 0 RETURN BEFORE);
              IF array::len($before) = 0 {{ THROW '{CLEAR_REFUSED}' }};
              CREATE $mid CONTENT {{ board: $b, author: $by, kind: $kind, \
                  epoch: $before[0].epoch, \
@@ -249,15 +287,18 @@ impl BoardStroke {
             ("kind".into(), KIND_CLEAR.into_value()),
             ("now".into(), Timestamp::now().as_millis().into_value()),
         ];
+        // The epoch counter is reset here, which is a counter write like any
+        // other, so it owes the process the same one-at-a-time discipline
+        // (`cap::counter_lock`) — and unlike a lone conditional claim it is
+        // read back in the same statement, by the marker's `count`.
+        let _guard = cap::counter_lock().await;
         let (mut result, mut errors) =
             transaction_with_retry(db, &sql, &bound, &[CLEAR_REFUSED]).await?;
         if errors
             .values()
             .any(|error| error.to_string().contains(CLEAR_REFUSED))
         {
-            return Err(AppError::Conflict(
-                "this board cannot be cleared — it is closed, or you did not create it",
-            ));
+            return Err(Self::why_clear_refused(board, by, db).await?);
         }
         if let Some(error) = errors.drain().map(|(_, error)| error).next() {
             return Err(error.into());
@@ -269,6 +310,26 @@ impl BoardStroke {
             .into_iter()
             .next()
             .ok_or_else(|| AppError::Internal("board clear wrote no marker".into()))
+    }
+
+    /// Which of the clear guard's three conditions said no. One `WHERE` cannot
+    /// report that itself, so the board is re-read — on the refusal path only,
+    /// like [`Self::why_refused`]. The distinction is not cosmetic: a closed
+    /// board is terminal for the room, a blank canvas is an ordinary "nothing
+    /// to do" and a room told otherwise stops drawing for good.
+    async fn why_clear_refused(
+        board: &BoardId,
+        by: &UserId,
+        db: &Database,
+    ) -> Result<AppError, AppError> {
+        let board = Board::read(board, db).await?.ok_or(AppError::NotFound)?;
+        if board.get_closed_at().is_some() {
+            return Ok(AppError::Conflict(BOARD_CLOSED));
+        }
+        if !board.is_creator(by) {
+            return Ok(AppError::Forbidden(NOT_THE_CREATOR));
+        }
+        Ok(AppError::Conflict(CANVAS_BLANK))
     }
 
     /// What a joining socket draws: the current epoch's marks only, in mint
@@ -606,13 +667,15 @@ mod tests {
                 marker.get_epoch()
             );
         }
-        // And the refused stroke claimed nothing: two marks, two epochs.
+        // And the refused stroke claimed nothing: two marks and the two
+        // markers that closed them, which is every row on the table.
         assert_eq!(
             BoardStroke::total_strokes(board.get_id(), &db)
                 .await
                 .unwrap(),
-            2
+            4
         );
+        assert_eq!(stored.len(), 4);
     }
 
     /// The `next_ulid` hazard: rows minted inside one millisecond must replay

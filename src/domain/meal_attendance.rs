@@ -110,13 +110,22 @@ impl MealAttendance {
     /// Record (or overwrite) whether `student` ate off `menu`. One row per
     /// pair by construction, so a correction is the same UPSERT flipping the
     /// status. No ledger line, ever — see the module header.
+    ///
+    /// `None` = the menu is gone, and the mark was *not* written. The menu's
+    /// existence is the `UPSERT`'s own target rather than a read the write then
+    /// trusts: the id list comes out of a `SELECT` over the menu row, so a menu
+    /// deleted a moment ago yields no target and the statement writes nothing.
+    /// An unconditional upsert landing just after `DELETE /meals/menus/{id}`
+    /// committed left a mark its cascade had already swept — and since
+    /// [`MenuId::for_slot`] is deterministic, republishing that day and slot
+    /// resurrected it as a mark on the new menu.
     pub async fn mark(
         menu: &MenuId,
         student: &UserId,
         status: MealAttendanceStatus,
         marked_by: &UserId,
         db: &Database,
-    ) -> Result<MealAttendance, AppError> {
+    ) -> Result<Option<MealAttendance>, AppError> {
         let row = MealAttendance {
             id: MealAttendanceId::composite(menu, student),
             menu: menu.clone(),
@@ -125,8 +134,14 @@ impl MealAttendance {
             marked_by: marked_by.clone(),
             marked_at: Timestamp::now(),
         };
-        let saved: Option<MealAttendance> = db.upsert(row.id.record()).content(row).await?;
-        saved.ok_or_else(|| AppError::Internal("failed to mark meal attendance".into()))
+        let mut result = db
+            .query("UPSERT (SELECT VALUE $id FROM $menu) CONTENT $row RETURN AFTER")
+            .bind(("id", row.id.record()))
+            .bind(("menu", menu.record()))
+            .bind(("row", row))
+            .await?
+            .check()?;
+        Ok(result.take::<Vec<MealAttendance>>(0)?.into_iter().next())
     }
 
     /// The kitchen's list for one menu.

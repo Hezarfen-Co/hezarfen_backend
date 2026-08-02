@@ -12,7 +12,7 @@ use crate::database::Database;
 use crate::domain::cap;
 use crate::domain::exam_result::kind_ref;
 use crate::domain::menu::slot_ref;
-use crate::domain::settings::{ExamKindDef, GradeBand, MealSlotDef, Settings};
+use crate::domain::settings::{ExamKindDef, GradeBand, MealSlotDef, SETTINGS_LOCK, Settings};
 use crate::error::{AppError, ErrorResponse};
 use crate::state::AppState;
 
@@ -189,7 +189,10 @@ struct UpdateSettings {
     /// (minutes past midnight **UTC**, `0`–`1439`) the booking cutoff counts
     /// back from. `[]` switches the meal program off. A slot a menu was already
     /// published for cannot be removed (409); its serving time may be edited
-    /// freely and applies live, to menus already published for it too.
+    /// freely and applies live, to menus already published for it too. Names
+    /// must not contain `/ \ ? # %` (a menu's id carries the name into a URL) —
+    /// except a name the school already stores, which stays submittable so a
+    /// list written before that rule can still be edited.
     #[schema(max_items = 20)]
     meal_slots: Option<Vec<MealSlotDto>>,
     /// Replaces the whole list when present: at most 20 unique entries, each
@@ -239,7 +242,10 @@ async fn get_settings(
 /// applies at upload time only — already-stored files keep their size, and the
 /// chatbot knobs apply to the next chat request only. `meal_slots` follows the
 /// exam-kind rule: a slot a menu was already published for cannot be dropped
-/// (409), because the menu snapshotted its name.
+/// (409), because the menu snapshotted its name. Slot names must not contain
+/// `/ \ ? # %` (400) — a menu's id carries the name into a URL — but a name
+/// already on the school's stored list is exempt, so a list written before that
+/// rule can still be edited around it.
 #[utoipa::path(
     patch,
     path = "/",
@@ -259,12 +265,24 @@ async fn update_settings(
     RequireManager(_user): RequireManager,
     Json(req): Json<UpdateSettings>,
 ) -> Result<Json<SettingsResponse>, AppError> {
+    Ok(Json(SettingsResponse::new(&apply(&req, &st.db).await?)))
+}
+
+/// The whole edit — snapshot, merge, retire, save — as one operation, so the
+/// tests can drive it the way two managers do. Split out of the handler for
+/// nothing else.
+async fn apply(req: &UpdateSettings, db: &Database) -> Result<Settings, AppError> {
+    // One settings edit at a time: the removals below are decided against the
+    // snapshot this loop loads and written *before* the save that justifies
+    // them, and no per-name bookkeeping can make that pair survive a rival's
+    // pair interleaving with it (see `SETTINGS_LOCK`).
+    let _guard = SETTINGS_LOCK.lock().await;
     // Merge over a snapshot, then save only while the row still matches it —
     // otherwise a concurrent PATCH of a *different* field would be silently
     // reverted by whichever whole-row write lands second. A refused save
     // reloads and re-merges, so both edits land.
     for _ in 0..CAS_UPDATE_RETRIES {
-        let current = Settings::load(&st.db).await?;
+        let current = Settings::load(db).await?;
 
         let exam_kinds = match &req.exam_kinds {
             Some(kinds) => kinds
@@ -273,10 +291,21 @@ async fn update_settings(
                 .collect::<Result<Vec<_>, _>>()?,
             None => current.get_exam_kinds().to_vec(),
         };
+        let was_slots = slot_names(&current.get_meal_slots());
         let meal_slots = match &req.meal_slots {
             Some(slots) => slots
                 .iter()
-                .map(|slot| MealSlotDef::try_new(&slot.name, slot.serving_minute))
+                .map(|slot| {
+                    // A name the row already carries is validated as a kept one:
+                    // the charset rule is younger than the stored lists, and
+                    // re-validating one under it would leave a school unable to
+                    // edit the rest of its slots at all (`MealSlotDef::try_kept`).
+                    if was_slots.iter().any(|kept| kept == slot.name.trim()) {
+                        MealSlotDef::try_kept(&slot.name, slot.serving_minute)
+                    } else {
+                        MealSlotDef::try_new(&slot.name, slot.serving_minute)
+                    }
+                })
                 .collect::<Result<Vec<_>, _>>()?,
             None => current.get_meal_slots(),
         };
@@ -295,7 +324,6 @@ async fn update_settings(
         // guards below — a list edit is judged by which names it drops.
         let was_kinds = kind_names(current.get_exam_kinds());
         let now_kinds = kind_names(&exam_kinds);
-        let was_slots = slot_names(&current.get_meal_slots());
         let now_slots = slot_names(&meal_slots);
 
         // Merge over the snapshot's resolved values: an omitted field keeps
@@ -336,17 +364,27 @@ async fn update_settings(
         // Retired before the save, never after: the other order leaves a window
         // in which a mark lands under a kind the settings no longer list. A save
         // that then does not land undoes them (`restore`) before the next try.
-        let mut retired: Vec<RecordId> = Vec::new();
+        //
+        // Only a write that actually *flipped* a bit is recorded for that undo.
+        // Retirement is idempotent, so two PATCHes dropping the same kind are
+        // both told "retired" — and the one whose save then loses the row's CAS
+        // used to un-retire the winner's kind, leaving it off the list with its
+        // counter in service: gradable again, its count then non-zero, and so
+        // impossible to remove ever after.
+        let mut undo: Vec<Undo> = Vec::new();
         let mut refused = None;
         for gone in missing(&was_kinds, &now_kinds) {
             let counter = kind_ref(&gone);
-            if !cap::retire(&counter, &st.db).await? {
-                refused = Some(AppError::ConflictOwned(format!(
-                    "exams of kind '{gone}' are already graded — the kind cannot be removed"
-                )));
-                break;
+            match cap::retire_name(&counter, db).await? {
+                cap::Switched::Flipped => undo.push(Undo::Retired(counter)),
+                cap::Switched::Unchanged => {}
+                cap::Switched::InUse => {
+                    refused = Some(AppError::ConflictOwned(format!(
+                        "exams of kind '{gone}' are already graded — the kind cannot be removed"
+                    )));
+                    break;
+                }
             }
-            retired.push(counter);
         }
         // Same shape for meal slots: a slot a menu was already published for
         // cannot leave the list — the menu snapshotted the name as text, and a
@@ -355,37 +393,46 @@ async fn update_settings(
         if refused.is_none() {
             for gone in missing(&was_slots, &now_slots) {
                 let counter = slot_ref(&gone);
-                if !cap::retire(&counter, &st.db).await? {
-                    refused = Some(AppError::ConflictOwned(format!(
-                        "menus are already published for the '{gone}' slot — it cannot be removed"
-                    )));
-                    break;
+                match cap::retire_name(&counter, db).await? {
+                    cap::Switched::Flipped => undo.push(Undo::Retired(counter)),
+                    cap::Switched::Unchanged => {}
+                    cap::Switched::InUse => {
+                        refused = Some(AppError::ConflictOwned(format!(
+                            "menus are already published for the '{gone}' slot — it cannot be removed"
+                        )));
+                        break;
+                    }
                 }
-                retired.push(counter);
             }
         }
         if let Some(refused) = refused {
-            restore(&retired, &st.db).await?;
+            restore(&undo, db).await?;
             return Err(refused);
         }
         // A name re-entering a list is back in service: its counter still
         // carries the retirement from the edit that dropped it, and a mark (or
         // a menu) under a kind the school offers again must not be refused.
+        // Recorded for the same undo as the retirements — a re-add whose save
+        // does not land leaves a name off the list that grades happily.
         for back in missing(&now_kinds, &was_kinds) {
-            cap::unretire(&kind_ref(&back), &st.db).await?;
+            if let cap::Switched::Flipped = cap::unretire_name(&kind_ref(&back), db).await? {
+                undo.push(Undo::Unretired(kind_ref(&back)));
+            }
         }
         for back in missing(&now_slots, &was_slots) {
-            cap::unretire(&slot_ref(&back), &st.db).await?;
+            if let cap::Switched::Flipped = cap::unretire_name(&slot_ref(&back), db).await? {
+                undo.push(Undo::Unretired(slot_ref(&back)));
+            }
         }
 
-        match settings.save_if_unchanged(&current, &st.db).await {
-            Ok(Some(saved)) => return Ok(Json(SettingsResponse::new(&saved))),
+        match settings.save_if_unchanged(&current, db).await {
+            Ok(Some(saved)) => return Ok(saved),
             // The row moved under the snapshot these guards were judged against:
             // put the names back and re-merge, or the next attempt would decide
             // against a list nobody asked for.
-            Ok(None) => restore(&retired, &st.db).await?,
+            Ok(None) => restore(&undo, db).await?,
             Err(err) => {
-                restore(&retired, &st.db).await?;
+                restore(&undo, db).await?;
                 return Err(err);
             }
         }
@@ -419,11 +466,335 @@ fn missing(before: &[String], after: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Put back every name this attempt retired: the edit that would have removed
-/// them did not land, so they are still names the school offers.
-async fn restore(names: &[RecordId], db: &Database) -> Result<(), AppError> {
-    for name in names {
-        cap::unretire(name, db).await?;
+/// One `retired` bit this attempt moved, and which way — what `restore` needs
+/// to put it back. Only bits this attempt actually *flipped* are listed: a
+/// write that changed nothing has nothing to take back, and taking it back
+/// would undo the concurrent edit that really did move it.
+enum Undo {
+    /// Retired for a removal; put it back in service.
+    Retired(RecordId),
+    /// Put back in service for a re-add; retire it again.
+    Unretired(RecordId),
+}
+
+/// Undo every bit this attempt moved: the edit that justified them did not
+/// land, so the lists the school offers are still the ones it started with.
+async fn restore(undo: &[Undo], db: &Database) -> Result<(), AppError> {
+    for step in undo {
+        match step {
+            Undo::Retired(name) => {
+                cap::unretire_name(name, db).await?;
+            }
+            // A re-retirement can be refused: a mark (or a menu) landed under
+            // the name during the window it was in service. Refusing to undo is
+            // then the honest answer — the reference is real, and retiring over
+            // it would make the row's kind ungradable while nothing lists it.
+            // The name is left in service, matching the list this attempt is
+            // about to re-read.
+            Undo::Unretired(name) => {
+                cap::retire_name(name, db).await?;
+            }
+        }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::init_mem;
+
+    /// The `retired` bit as the store holds it, `None` when no counter row was
+    /// ever written — read back, never inferred from a return value.
+    async fn bit(db: &Database, counter: RecordId) -> Option<bool> {
+        let mut result = db
+            .query("SELECT VALUE retired FROM $id")
+            .bind(("id", counter))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        result.take::<Vec<bool>>(0).unwrap().first().copied()
+    }
+
+    /// Two managers drop the same exam kind at once; one of them loses the
+    /// row's compare-and-set and rolls its attempt back. The winner's
+    /// retirement must survive that rollback — undone, the kind is off the list
+    /// with a counter that still grades, and the first mark to land makes it
+    /// unremovable for good.
+    ///
+    /// The loser's half is what runs here: a retirement that changed nothing
+    /// records no undo, so `restore` has nothing to take back.
+    #[tokio::test]
+    async fn the_loser_of_a_settings_race_cannot_un_retire_the_winner_s_kind() {
+        let db = init_mem().await.unwrap();
+        let counter = kind_ref("midterm");
+
+        // The winner's PATCH retires the kind.
+        assert!(matches!(
+            cap::retire_name(&counter, &db).await.unwrap(),
+            cap::Switched::Flipped
+        ));
+
+        // The loser's PATCH decides the same removal against the same snapshot,
+        // then its save is refused.
+        let mut undo = Vec::new();
+        if let cap::Switched::Flipped = cap::retire_name(&counter, &db).await.unwrap() {
+            undo.push(Undo::Retired(counter.clone()));
+        }
+        assert!(undo.is_empty(), "a no-op retirement records no undo");
+        restore(&undo, &db).await.unwrap();
+
+        assert_eq!(
+            bit(&db, counter).await,
+            Some(true),
+            "the winner's retirement must outlive the loser's rollback"
+        );
+    }
+
+    /// The mirror hole: a re-*added* name is put back in service before the
+    /// save, so a save that does not land owes a re-retirement. Without it the
+    /// name is off the stored list with a counter that grades happily.
+    #[tokio::test]
+    async fn a_rollback_re_retires_a_name_this_attempt_put_back_in_service() {
+        let db = init_mem().await.unwrap();
+        let counter = slot_ref("lunch");
+        cap::retire_name(&counter, &db).await.unwrap();
+
+        // The attempt re-adds the slot, then its save is refused.
+        let mut undo = Vec::new();
+        if let cap::Switched::Flipped = cap::unretire_name(&counter, &db).await.unwrap() {
+            undo.push(Undo::Unretired(counter.clone()));
+        }
+        assert_eq!(undo.len(), 1, "a real un-retirement is undoable");
+        restore(&undo, &db).await.unwrap();
+
+        assert_eq!(
+            bit(&db, counter).await,
+            Some(true),
+            "a re-add that never landed must leave the slot retired"
+        );
+    }
+
+    /// ...unless a menu was published in the window the slot was back in
+    /// service. The reference is real, so the re-retirement is refused and the
+    /// slot stays usable — the honest end of the same rule, not a silent
+    /// overwrite of a live reference.
+    #[tokio::test]
+    async fn a_rollback_leaves_a_name_that_gained_a_reference_in_service() {
+        let db = init_mem().await.unwrap();
+        let counter = slot_ref("lunch");
+        cap::retire_name(&counter, &db).await.unwrap();
+        cap::unretire_name(&counter, &db).await.unwrap();
+        db.query("UPDATE $id SET count = 1")
+            .bind(("id", counter.clone()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        restore(&[Undo::Unretired(counter.clone())], &db)
+            .await
+            .unwrap();
+
+        assert_eq!(bit(&db, counter).await, Some(false));
+    }
+
+    // --- the whole edit, driven the way two managers drive it -------------
+
+    /// A `PATCH` body, built the way the router builds one.
+    fn patch(body: serde_json::Value) -> UpdateSettings {
+        serde_json::from_value(body).unwrap()
+    }
+
+    /// A `meal_slots`/`exam_kinds` list as the DTO carries it.
+    fn kinds(names: &[&str]) -> serde_json::Value {
+        names
+            .iter()
+            .map(|name| serde_json::json!({ "name": name, "weight": 1 }))
+            .collect()
+    }
+
+    fn slots(names: &[&str]) -> serde_json::Value {
+        names
+            .iter()
+            .map(|name| serde_json::json!({ "name": name, "serving_minute": null }))
+            .collect()
+    }
+
+    /// The lists as the store holds them.
+    async fn stored(db: &Database) -> (Vec<String>, Vec<String>) {
+        let settings = Settings::load(db).await.unwrap();
+        (
+            kind_names(settings.get_exam_kinds()),
+            slot_names(&settings.get_meal_slots()),
+        )
+    }
+
+    /// The whole invariant, over the reachable half of the race: two managers
+    /// drop the same exam kind at once, both edits go through the real path,
+    /// and when both have returned the counter's `retired` bit must agree with
+    /// the list the store actually holds.
+    ///
+    /// One of the two decides the removal, retires the kind and saves; the
+    /// other cannot even see the old list, because the whole snapshot-retire-
+    /// save pair is serialized (`SETTINGS_LOCK`). Interleaved, the second
+    /// attempt would be told "already retired", record no undo, win the
+    /// compare-and-set, and leave the first attempt un-retiring the kind it had
+    /// legitimately removed — off the list and gradable.
+    #[tokio::test]
+    async fn two_edits_dropping_the_same_kind_leave_it_retired() {
+        let db = init_mem().await.unwrap();
+        let without = patch(serde_json::json!({
+            "exam_kinds": kinds(&["homework", "quiz", "final", "project", "oral"]),
+        }));
+
+        let (a, b) = tokio::join!(apply(&without, &db), apply(&without, &db));
+        a.unwrap();
+        b.unwrap();
+
+        let (kinds, _) = stored(&db).await;
+        assert!(
+            !kinds.contains(&"midterm".to_string()),
+            "dropped from the list"
+        );
+        assert_eq!(
+            bit(&db, kind_ref("midterm")).await,
+            Some(true),
+            "a kind the stored list no longer offers must not grade"
+        );
+    }
+
+    /// The property those two outcomes rest on, asserted on its own because a
+    /// `join!` cannot be made to schedule the losing order: the edit is a pair
+    /// of writes — retire the dropped names, then commit the list — and no
+    /// rival's pair may run between them.
+    ///
+    /// Retirement is idempotent, so an interleaved rival is told "already
+    /// retired", records no rollback, wins the compare-and-set, and leaves the
+    /// attempt that really flipped the bit un-retiring a kind the stored list
+    /// no longer offers: gradable again, and unremovable for good once a mark
+    /// lands. Holding the lock stands in for a rival mid-pair here — nothing
+    /// the other edit does may be visible until the pair completes.
+    #[tokio::test]
+    async fn a_rival_edit_cannot_run_between_a_retirement_and_its_save() {
+        let db = init_mem().await.unwrap();
+        let without = patch(serde_json::json!({
+            "exam_kinds": kinds(&["homework", "quiz", "final", "project", "oral"]),
+        }));
+
+        let held = SETTINGS_LOCK.lock().await;
+        let rival = tokio::spawn({
+            let db = db.clone();
+            async move { apply(&without, &db).await.map(|_| ()) }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        assert_eq!(
+            bit(&db, kind_ref("midterm")).await,
+            None,
+            "a rival's pair must not have started, let alone half-landed"
+        );
+        assert!(stored(&db).await.0.contains(&"midterm".to_string()));
+
+        drop(held);
+        rival.await.unwrap().unwrap();
+        assert_eq!(bit(&db, kind_ref("midterm")).await, Some(true));
+        assert!(!stored(&db).await.0.contains(&"midterm".to_string()));
+    }
+
+    /// The mirror: two managers put the same kind *back* at once. The attempt
+    /// that loses must not re-retire a name the winner's stored list carries —
+    /// a listed kind that refuses every grade.
+    #[tokio::test]
+    async fn two_edits_re_adding_the_same_kind_leave_it_in_service() {
+        let db = init_mem().await.unwrap();
+        let without = patch(serde_json::json!({
+            "exam_kinds": kinds(&["homework", "quiz", "final", "project", "oral"]),
+        }));
+        apply(&without, &db).await.unwrap();
+        let with = patch(serde_json::json!({
+            "exam_kinds": kinds(&["homework", "quiz", "midterm", "final", "project", "oral"]),
+        }));
+
+        let (a, b) = tokio::join!(apply(&with, &db), apply(&with, &db));
+        a.unwrap();
+        b.unwrap();
+
+        let (kinds, _) = stored(&db).await;
+        assert!(kinds.contains(&"midterm".to_string()), "back on the list");
+        assert_eq!(
+            bit(&db, kind_ref("midterm")).await,
+            Some(false),
+            "a kind the stored list offers must grade"
+        );
+    }
+
+    /// The same pair over meal slots, which retire on their own counters.
+    #[tokio::test]
+    async fn two_edits_dropping_the_same_slot_leave_it_retired() {
+        let db = init_mem().await.unwrap();
+        let without = patch(serde_json::json!({
+            "meal_slots": slots(&["breakfast", "snack"]),
+        }));
+
+        let (a, b) = tokio::join!(apply(&without, &db), apply(&without, &db));
+        a.unwrap();
+        b.unwrap();
+
+        let (_, stored_slots) = stored(&db).await;
+        assert!(!stored_slots.contains(&"lunch".to_string()));
+        assert_eq!(bit(&db, slot_ref("lunch")).await, Some(true));
+    }
+
+    // --- the stale slot name that wedged the whole list -------------------
+
+    /// A school that stored `a/b` before the URL-safety rule existed.
+    async fn a_school_with_a_stale_slot(db: &Database) {
+        let mut params = Settings::defaults().params();
+        params.meal_slots = vec![
+            MealSlotDef::try_kept("a/b", None).unwrap(),
+            MealSlotDef::try_new("lunch", None).unwrap(),
+        ];
+        Settings::try_new(params).unwrap().save(db).await.unwrap();
+    }
+
+    /// The wedge: re-sending a stored name is the only way to *keep* it, and
+    /// dropping it 409s once a menu references it — so validating it under the
+    /// younger rule locks the school out of its own `meal_slots` forever. A
+    /// stored name is submittable; a new one with the same characters is not.
+    #[tokio::test]
+    async fn a_stored_slot_name_stays_submittable_but_a_new_one_does_not() {
+        let db = init_mem().await.unwrap();
+        a_school_with_a_stale_slot(&db).await;
+
+        let edit = patch(serde_json::json!({
+            "meal_slots": slots(&["a/b", "lunch", "dinner"]),
+        }));
+        apply(&edit, &db).await.unwrap();
+        let (_, stored_slots) = stored(&db).await;
+        assert_eq!(stored_slots, ["a/b", "lunch", "dinner"]);
+
+        let fresh = patch(serde_json::json!({
+            "meal_slots": slots(&["a/b", "lunch", "c/d"]),
+        }));
+        assert!(
+            apply(&fresh, &db).await.is_err(),
+            "a name no school ever stored is still refused"
+        );
+    }
+
+    /// And an edit that never mentions `meal_slots` still carries the list
+    /// over unvalidated — the behaviour the wedge report leaned on.
+    #[tokio::test]
+    async fn an_unrelated_edit_carries_a_stale_slot_name_over() {
+        let db = init_mem().await.unwrap();
+        a_school_with_a_stale_slot(&db).await;
+
+        let elsewhere = patch(serde_json::json!({ "max_file_bytes": 2048 }));
+        let saved = apply(&elsewhere, &db).await.unwrap();
+
+        assert_eq!(saved.get_max_file_bytes(), 2048);
+        assert_eq!(slot_names(&saved.get_meal_slots()), ["a/b", "lunch"]);
+    }
 }

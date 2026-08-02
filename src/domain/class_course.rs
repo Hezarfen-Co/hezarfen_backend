@@ -6,12 +6,13 @@
 
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
-use crate::constant::CLASS_COURSE_TABLE;
+use crate::constant::{CLASS_COURSE_TABLE, MAX_CLASS_COURSES, MAX_CLASS_MEMBERS};
 use crate::database::Database;
 use crate::domain::class_group::ClassGroupId;
-use crate::domain::class_pump::{Attached, Axis, Sweep, attach, detach, link_id};
+use crate::domain::class_pump::{Attached, Axis, attach, detach, link_id};
 use crate::domain::course::CourseId;
 use crate::domain::page::PagedList;
+use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 
@@ -43,6 +44,11 @@ pub struct ClassCourse {
     class: ClassGroupId,
     course: CourseId,
     attached_by: UserId,
+    /// When it was attached, and the *only* thing "newest first" can mean here:
+    /// the row's id is the (class, course) pair, so ordering by it sorts the
+    /// list by the course's own ULID. Optional because rows written before this
+    /// column carry no stamp — see the migration note.
+    attached_at: Option<Timestamp>,
 }
 
 impl ClassCourse {
@@ -79,6 +85,7 @@ impl ClassCourse {
             class: class.clone(),
             course: course.clone(),
             attached_by: attached_by.clone(),
+            attached_at: Some(Timestamp::now()),
         };
         match attach(
             class,
@@ -94,8 +101,23 @@ impl ClassCourse {
             Attached::Made(saved) => Ok(saved),
             Attached::Duplicate => Err(AppError::Conflict("the course is already on this class")),
             Attached::Gone => Err(AppError::NotFound),
+            Attached::ClassFull => Err(AppError::ConflictOwned(format!(
+                "this class already holds {MAX_CLASS_COURSES} courses"
+            ))),
+            // The other axis: attaching one course enrolls the whole roster, so
+            // a class over *that* ceiling cannot take a course however few it
+            // carries. Only a class predating the ceiling can be here.
+            Attached::ClassOverloaded => Err(AppError::ConflictOwned(format!(
+                "this class holds more than {MAX_CLASS_MEMBERS} students — \
+                 remove some before attaching a course"
+            ))),
             Attached::Full(full) => Err(AppError::ConflictOwned(format!(
                 "{full} cannot hold the whole class"
+            ))),
+            // Another of the class's links points at a deleted course. This
+            // axis claims its own pivot, so it is never *this* course.
+            Attached::CourseGone(course) => Err(AppError::ConflictOwned(format!(
+                "{course} no longer exists — detach it from this class first"
             ))),
         }
     }
@@ -114,7 +136,6 @@ impl ClassCourse {
         let gone = detach(
             "$link",
             Axis::Course,
-            Sweep::Rows,
             &[(
                 "link".into(),
                 ClassCourseId::composite(class, course)
@@ -127,7 +148,10 @@ impl ClassCourse {
         (gone > 0).then_some(()).ok_or(AppError::NotFound)
     }
 
-    /// The courses a class is attached to, newest first.
+    /// The courses a class is attached to, newest first — by when they were
+    /// attached, not by the course's own id, which is what the composite record
+    /// id sorts on. A row older than the column carries no stamp at all, and
+    /// NONE sorts last under DESC — the honest place for a row of unknown age.
     pub async fn list_for_class(
         class: &ClassGroupId,
         limit: Option<i64>,
@@ -136,7 +160,7 @@ impl ClassCourse {
     ) -> Result<(Vec<ClassCourse>, i64), AppError> {
         PagedList::new(
             format!("{CLASS_COURSE_TABLE} WHERE class = $class"),
-            "ORDER BY id DESC",
+            "ORDER BY attached_at DESC, id DESC",
         )
         .bind("class", class.record())
         .run(limit, offset, db)

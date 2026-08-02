@@ -644,6 +644,22 @@ async fn grade(
     if exam.is_draft() {
         return Err(crate::domain::exam_result::draft_error());
     }
+    // The exam's kind must still be one the school offers. `kind_ref`'s retired
+    // bit is what actually refuses the mark inside `ExamResult::grade`, and it
+    // is a *different record* from the list — a settings PATCH moves both, so
+    // anything that leaves them disagreeing (a rolled-back retirement, a hand
+    // edit) would otherwise reopen grading under a kind nobody lists, which is
+    // also a mark that averages at weight 1 forever. Both gates, same answer;
+    // this one is a read, the counter's is the one that survives a race.
+    let kind = exam.get_kind().as_str();
+    if !Settings::load(&st.db)
+        .await?
+        .get_exam_kinds()
+        .iter()
+        .any(|offered| offered.get_name() == kind)
+    {
+        return Err(crate::domain::exam_result::retired_kind_error(kind));
+    }
 
     let mark = Mark::try_new(req.mark)?;
     let target = UserId::from_key(&req.user_id);

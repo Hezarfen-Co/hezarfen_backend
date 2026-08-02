@@ -67,9 +67,12 @@ impl Registration {
     /// cap is set and every seat is taken. Someone already listed gets their
     /// existing row back untouched — a true no-op that never counts against
     /// the cap and never rewrites who placed them. The seat is taken by
-    /// [`cap::claim`] on the event row — an atomic single-record conditional
-    /// write, so neither a racing registration nor a concurrent
-    /// capacity/audience/schedule PATCH can over-admit.
+    /// [`cap::claim_live_and_create`] on the event row — an atomic single-record
+    /// conditional write that reads `audience.capacity` off that same row as it
+    /// decides, so neither a racing registration nor a concurrent PATCH
+    /// *lowering* the capacity can over-admit. Bound as a number instead, the
+    /// snapshot below would admit every request already in flight when the
+    /// lower cap landed.
     pub async fn register(
         event: &EventId,
         user: &UserId,
@@ -79,7 +82,9 @@ impl Registration {
         if let Some(existing) = Self::read_for_user(event, user, db).await? {
             return Ok(existing);
         }
-        let capacity = Event::read(event, db)
+        // Read for its refusals only — the audience kind and the closing time.
+        // The seat count itself is re-read by the claim.
+        Event::read(event, db)
             .await?
             .ok_or(AppError::NotFound)?
             .registration_capacity()?;
@@ -89,10 +94,14 @@ impl Registration {
             user: user.clone(),
             registered_by: registered_by.clone(),
         };
-        match cap::claim_and_create(
+        match cap::claim_live_and_create(
             &event.record(),
             REGISTRATION_COUNT_FIELD,
-            capacity.unwrap_or(cap::UNLIMITED),
+            // An uncapped registration list stores no `capacity` key at all
+            // (SurrealDB drops a `NONE`-valued object key), so the coalesce is
+            // what "unlimited" reads as.
+            "audience.capacity ?? $num",
+            cap::UNLIMITED,
             &registration.id.record(),
             &registration,
             db,

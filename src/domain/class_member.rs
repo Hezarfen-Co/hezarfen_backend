@@ -7,11 +7,12 @@
 
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
-use crate::constant::CLASS_MEMBER_TABLE;
+use crate::constant::{CLASS_MEMBER_TABLE, MAX_CLASS_COURSES, MAX_CLASS_MEMBERS};
 use crate::database::Database;
 use crate::domain::class_group::ClassGroupId;
-use crate::domain::class_pump::{Attached, Axis, Sweep, attach, detach, link_id};
+use crate::domain::class_pump::{Attached, Axis, attach, detach, link_id};
 use crate::domain::page::PagedList;
+use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 
@@ -43,6 +44,11 @@ pub struct ClassMember {
     class: ClassGroupId,
     user: UserId,
     added_by: UserId,
+    /// When they were added, and the *only* thing "newest first" can mean here:
+    /// the row's id is the (class, user) pair, so ordering by it sorts the
+    /// roster by the student's account ULID. Optional because rows written
+    /// before this column carry no stamp — see the migration note.
+    added_at: Option<Timestamp>,
 }
 
 impl ClassMember {
@@ -80,6 +86,7 @@ impl ClassMember {
             class: class.clone(),
             user: user.clone(),
             added_by: added_by.clone(),
+            added_at: Some(Timestamp::now()),
         };
         match attach(
             class,
@@ -95,8 +102,24 @@ impl ClassMember {
             Attached::Made(saved) => Ok(saved),
             Attached::Duplicate => Err(AppError::Conflict("the student is already in this class")),
             Attached::Gone => Err(AppError::NotFound),
+            Attached::ClassFull => Err(AppError::ConflictOwned(format!(
+                "this class already holds {MAX_CLASS_MEMBERS} students"
+            ))),
+            // The other axis: adding one student enrolls them into every
+            // attached course, so a class over *that* ceiling cannot take a
+            // member however much room its roster has.
+            Attached::ClassOverloaded => Err(AppError::ConflictOwned(format!(
+                "this class holds more than {MAX_CLASS_COURSES} courses — \
+                 detach some before adding a student"
+            ))),
             Attached::Full(course) => Err(AppError::ConflictOwned(format!(
                 "{course} is full, so the class cannot take this student"
+            ))),
+            // Not a capacity problem, and told apart from one on purpose: no
+            // number anyone can raise unblocks this class, only detaching the
+            // link the deleted course left behind.
+            Attached::CourseGone(course) => Err(AppError::ConflictOwned(format!(
+                "{course} no longer exists — detach it from this class first"
             ))),
         }
     }
@@ -116,7 +139,6 @@ impl ClassMember {
         let gone = detach(
             "$link",
             Axis::Member,
-            Sweep::Rows,
             &[(
                 "link".into(),
                 ClassMemberId::composite(class, user).record().into_value(),
@@ -127,23 +149,10 @@ impl ClassMember {
         (gone > 0).then_some(()).ok_or(AppError::NotFound)
     }
 
-    /// Drop every class `user` belongs to, giving each class its member count
-    /// back — and nothing else. The enrollments are
-    /// [`crate::domain::enrollment::Enrollment::delete_for_user`]'s to delete;
-    /// this sweeping them too would decrement the same seats twice.
-    pub async fn delete_for_user(user: &UserId, db: &Database) -> Result<(), AppError> {
-        detach(
-            &format!("{CLASS_MEMBER_TABLE} WHERE user = $usr"),
-            Axis::Member,
-            Sweep::CounterOnly,
-            &[("usr".into(), user.record().into_value())],
-            db,
-        )
-        .await?;
-        Ok(())
-    }
-
-    /// The class's roster, newest first.
+    /// The class's roster, newest first — by when the student was added, not by
+    /// their account id, which is what the composite record id sorts on.
+    /// A row older than the column carries no stamp at all, and NONE sorts last
+    /// under DESC — which is the honest place for a row of unknown age.
     pub async fn list_for_class(
         class: &ClassGroupId,
         limit: Option<i64>,
@@ -152,7 +161,7 @@ impl ClassMember {
     ) -> Result<(Vec<ClassMember>, i64), AppError> {
         PagedList::new(
             format!("{CLASS_MEMBER_TABLE} WHERE class = $class"),
-            "ORDER BY id DESC",
+            "ORDER BY added_at DESC, id DESC",
         )
         .bind("class", class.record())
         .run(limit, offset, db)
@@ -476,11 +485,12 @@ pub(crate) mod tests {
         assert_eq!(counter("class_member_count", class.record(), &db).await, 0);
     }
 
-    /// The role-demotion sweep: memberships go and their counters come back,
-    /// while the enrollment rows are left for `Enrollment::delete_for_user`.
-    /// Decrementing those seats here as well would take each one back twice.
+    /// The role-change sweep, which is now one transaction over both tables:
+    /// the memberships go with their counters, the enrollment rows go with
+    /// their seats, and each seat comes back exactly once — the double
+    /// decrement the old two-call split existed to avoid.
     #[tokio::test]
-    async fn delete_for_user_leaves_the_enrollments_alone() {
+    async fn the_role_sweep_takes_memberships_and_enrollments_together() {
         let db = crate::database::init_mem().await.unwrap();
         let manager = UserId::from_key("manager");
         let student = UserId::from_key("student");
@@ -497,7 +507,9 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        ClassMember::delete_for_user(&student, &db).await.unwrap();
+        crate::domain::class_pump::sweep_non_student(&student, &db)
+            .await
+            .unwrap();
         assert_eq!(rows("SELECT VALUE id FROM class_member", &db).await, 0);
         for class in [&first, &second] {
             assert_eq!(
@@ -508,18 +520,26 @@ pub(crate) mod tests {
         }
         assert_eq!(
             source_of(&algebra, &student, &db).await,
-            Some(Some(first.clone())),
-            "the enrollment is the other sweep's to delete"
+            None,
+            "the enrollment goes in the same transaction as the membership"
         );
         assert_eq!(
             counter("enrollment_count", algebra.record(), &db).await,
-            1,
-            "…and its seat is the other sweep's to release"
+            0,
+            "…and its seat comes back once, not twice"
         );
-
-        // Which is exactly what the demotion calls next, and the seat comes
-        // back once, not twice.
-        Enrollment::delete_for_user(&student, &db).await.unwrap();
-        assert_eq!(counter("enrollment_count", algebra.record(), &db).await, 0);
+        // Which is the point of folding them: the class the student was in is
+        // free of them entirely — no membership, no count, and no enrollment
+        // row left tagged with a class that is about to be deletable.
+        assert!(
+            crate::domain::class_group::ClassGroup::read(&second, &db)
+                .await
+                .unwrap()
+                .unwrap()
+                .delete(&db)
+                .await
+                .unwrap(),
+            "a class holding neither members nor courses must delete"
+        );
     }
 }
