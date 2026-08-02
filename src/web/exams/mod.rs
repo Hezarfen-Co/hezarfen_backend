@@ -333,6 +333,13 @@ async fn list_exams(
 /// course creator, and managers/admins — except drafts, which only the
 /// course's managers see (everyone else gets a `404`, as if the exam doesn't
 /// exist yet — because it doesn't, officially).
+///
+/// Gate order is deliberate and must stay as written: a caller with no view of
+/// the course is refused by the *view* gate (`403`) before the draft gate is
+/// reached, so the `404` rule covers only callers who can see the course — a
+/// demoted creator, for instance, gets the `403` unless they are enrolled.
+/// Moving the draft check above the view check to "make the 404 universal"
+/// would hand every unenrolled caller a probe for which exams exist.
 #[utoipa::path(
     get,
     path = "/{id}",

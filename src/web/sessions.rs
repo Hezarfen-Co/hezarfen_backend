@@ -126,10 +126,21 @@ async fn session_with_course(id: &str, db: &Database) -> Result<(CourseSession, 
     Ok((session, course))
 }
 
+/// Whether `user` is the session's own teacher *and* still `teacher`+ today.
+///
+/// The `teacher` column is a historical fact like a course's `creator` (a
+/// demotion never rewrites past sessions), so teaching a session grants nothing
+/// once the account falls below `teacher` — see [`can_manage_course`], which
+/// carries the same floor.
+fn is_live_session_teacher(session: &CourseSession, user: &User) -> bool {
+    user.get_role().at_least(Role::Teacher) && session.is_teacher(user.get_id())
+}
+
 /// Who may take (or amend) a session's roll call: the session's own teacher,
-/// or anyone with course-management rights (creator / manager+).
+/// or anyone with course-management rights (creator / manager+) — in both
+/// cases only while still `teacher`+.
 fn can_roll_call(session: &CourseSession, course: &Course, user: &User) -> bool {
-    session.is_teacher(user.get_id()) || can_manage_course(course, user)
+    is_live_session_teacher(session, user) || can_manage_course(course, user)
 }
 
 // ---- sessions -------------------------------------------------------------
@@ -155,7 +166,8 @@ async fn get_session(
     Path(id): Path<String>,
 ) -> Result<Json<SessionResponse>, AppError> {
     let (session, course) = session_with_course(&id, &st.db).await?;
-    if !session.is_teacher(user.get_id()) && !can_view_course(&course, &user, &st.db).await? {
+    if !is_live_session_teacher(&session, &user) && !can_view_course(&course, &user, &st.db).await?
+    {
         return Err(AppError::Forbidden(
             "only enrolled users, the session teacher, the course's teachers, or a manager/admin can view this session",
         ));
