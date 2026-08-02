@@ -16741,6 +16741,26 @@ async fn propose(
     .await
 }
 
+/// Accept the standing counter-proposal on `id`, naming the window the
+/// requester read — the accept pins *which* proposal it answers, so the body
+/// is required (a bodyless PATCH is a `415`, not a `400`).
+async fn accept_reschedule(
+    app: &axum::Router,
+    cookie: &str,
+    id: &str,
+    starts_at: i64,
+    ends_at: i64,
+) -> common::Res {
+    send(
+        app,
+        "PATCH",
+        &format!("/appointments/{id}/reschedule/accept"),
+        Some(cookie),
+        Some(json!({ "proposed_starts_at": starts_at, "proposed_ends_at": ends_at })),
+    )
+    .await
+}
+
 #[tokio::test]
 async fn appointment_book_and_approve_holds_the_slot() {
     let (app, db) = app_and_db().await;
@@ -16879,7 +16899,14 @@ async fn approval_refuses_a_teacher_double_booking() {
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-    let res = decide(&app, &ayse, &two, "reschedule/accept").await;
+    let res = accept_reschedule(
+        &app,
+        &ayse,
+        &two,
+        now + HOUR_MS + 600_000,
+        now + 2 * HOUR_MS + 600_000,
+    )
+    .await;
     assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
     // Refused, not half-applied: it is still pending and still decidable.
     let res = decide(&app, &ali, &two, "reject").await;
@@ -16965,13 +16992,14 @@ async fn reschedule_returns_to_pending_until_the_requester_accepts() {
     // The effective window already reads as the proposed one.
     assert_eq!(res.body["starts_at"], now + 3 * HOUR_MS);
 
-    // Only the requester may answer it.
-    let res = decide(&app, &ayse, &booking, "reschedule/accept").await;
+    // Only the requester may answer it. A valid pin still 403s for the wrong
+    // caller: `ensure_requester` runs ahead of the domain either way.
+    let res = accept_reschedule(&app, &ayse, &booking, now + 3 * HOUR_MS, now + 4 * HOUR_MS).await;
     assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
-    let res = decide(&app, &ali, &booking, "reschedule/accept").await;
+    let res = accept_reschedule(&app, &ali, &booking, now + 3 * HOUR_MS, now + 4 * HOUR_MS).await;
     assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
 
-    let res = decide(&app, &veli, &booking, "reschedule/accept").await;
+    let res = accept_reschedule(&app, &veli, &booking, now + 3 * HOUR_MS, now + 4 * HOUR_MS).await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     assert_eq!(res.body["status"], "approved");
     assert_eq!(res.body["starts_at"], now + 3 * HOUR_MS);
@@ -17007,7 +17035,7 @@ async fn a_started_proposal_is_refused() {
             .status,
         StatusCode::OK
     );
-    let res = decide(&app, &veli, &booking, "reschedule/accept").await;
+    let res = accept_reschedule(&app, &veli, &booking, now + 3 * HOUR_MS, now + 4 * HOUR_MS).await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     assert_eq!(res.body["status"], "approved");
 }
@@ -17115,7 +17143,7 @@ async fn accepting_a_reschedule_re_runs_the_overlap_guard() {
             .status,
         StatusCode::OK
     );
-    let res = decide(&app, &veli, &booking, "reschedule/accept").await;
+    let res = accept_reschedule(&app, &veli, &booking, now + 5 * HOUR_MS, now + 6 * HOUR_MS).await;
     assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
     assert_eq!(
         send(&app, "GET", "/appointments", Some(&veli), None)
@@ -18000,6 +18028,15 @@ async fn self_review_returns_own_seqs_and_per_sitting_answers() {
         Some(json!({ "mark": 90, "user_id": student_id })),
     )
     .await;
+    // Review refuses while the sitting is still writable, so submit it first.
+    send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt/finish"),
+        Some(&student),
+        None,
+    )
+    .await;
 
     // Own seqs, ascending.
     let res = send(
@@ -18116,6 +18153,15 @@ async fn self_review_is_own_scoped_between_students() {
             &results_uri,
             Some(&teacher),
             Some(json!({ "mark": mark, "user_id": id })),
+        )
+        .await;
+        // Review refuses while the sitting is still writable.
+        send(
+            &app,
+            "POST",
+            &format!("/exams/{exam}/attempt/finish"),
+            Some(who),
+            None,
         )
         .await;
     }

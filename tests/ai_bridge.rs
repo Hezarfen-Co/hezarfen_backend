@@ -129,6 +129,10 @@ enum Behaviour {
     SlowEcho(Duration),
     /// Answer a chatbot turn with a fixed reply text (`{"text": ...}`).
     Reply(String),
+    /// Answer a chatbot turn with `cevap::<the prompt it was given>`. The reply
+    /// carries the question inside it, so an answer stored against the wrong
+    /// prompt is visible in the row rather than merely suspected.
+    EchoPrompt,
     /// Answer with a handled failure.
     Fail { code: String, message: String },
     /// Accept the stream and never answer, holding it open.
@@ -184,6 +188,15 @@ fn serve(conn: quinn::Connection, behaviour: Behaviour, seen: Arc<Mutex<Vec<Requ
                         id: request.id.clone(),
                         payload: json!({ "text": text }),
                     }),
+                    Behaviour::EchoPrompt => {
+                        let asked = request.payload["message"]
+                            .as_str()
+                            .unwrap_or("<no message>");
+                        Some(Response::Ok {
+                            id: request.id.clone(),
+                            payload: json!({ "text": format!("cevap::{asked}") }),
+                        })
+                    }
                     Behaviour::Fail { code, message } => Some(Response::Err {
                         id: request.id.clone(),
                         code,
@@ -1162,6 +1175,99 @@ async fn a_blank_chat_answer_fails_as_empty_reply() {
     let turn = settled(&app, &cookie, &thread, &mid).await;
     assert_eq!(turn["status"], "failed", "{turn}");
     assert_eq!(turn["error_code"], "empty_reply");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_racing_turns_on_one_thread_each_answer_their_own_prompt() {
+    // Two `POST .../messages` genuinely in flight on ONE thread. Their two
+    // creates interleave, so the rows land `userA, userB, asstA, asstB` — and
+    // any rule that resolves an answer's question by write order ("the newest
+    // user row before this answer") then hands *both* answers prompt B and
+    // never answers prompt A at all. The prompt travels by id precisely so
+    // that ordering cannot decide it.
+    //
+    // The service echoes the prompt it was given back inside its reply, so a
+    // crossed pair is legible in the stored row rather than inferred: the
+    // answer to "soru A" would read `cevap::soru B`.
+    //
+    // The interleave is scheduled, not forced — nothing in the handler can be
+    // held open between its two creates. So the round is replayed on a fresh
+    // user/thread until the row order proves it happened, and a run that never
+    // interleaves fails rather than passing vacuously.
+    const ROUNDS: usize = 60;
+    const ENOUGH: usize = 3;
+    let bridge = bridge_with_timeout(Duration::from_secs(20)).await;
+    let mut chatty = hello("tutor", &[AI_CHAT_CAPABILITY]);
+    chatty.max_concurrent = Some(8);
+    let _service = connect_service(&bridge, chatty, Behaviour::EchoPrompt).await;
+    await_workers(&bridge, 1).await;
+    let (app, _db) = chat_app(&bridge).await;
+
+    let mut interleaved = 0usize;
+    for round in 0..ROUNDS {
+        let (cookie, thread) = chat_user(&app, &format!("ali{round}")).await;
+        let asks = ["soru A", "soru B"].map(|text| {
+            let (app, cookie, thread) = (app.clone(), cookie.clone(), thread.clone());
+            tokio::spawn(async move { ask(&app, &cookie, &thread, text).await })
+        });
+        let mut mids = Vec::new();
+        for handle in asks {
+            mids.push(handle.await.expect("the POST task did not panic"));
+        }
+
+        // Both prompts appended before either answer row: the interleave the
+        // bug needed. Ids are minted in write order, so the list is that order.
+        let rows = thread_rows(&app, &cookie, &thread).await;
+        let roles: Vec<String> = rows
+            .iter()
+            .map(|row| row["role"].as_str().expect("role").to_string())
+            .collect();
+        assert_eq!(roles.len(), 4, "two turns are four rows: {roles:?}");
+        if roles == ["user", "user", "assistant", "assistant"] {
+            interleaved += 1;
+        }
+
+        for (mid, asked) in mids.iter().zip(["soru A", "soru B"]) {
+            let turn = settled(&app, &cookie, &thread, mid).await;
+            assert_eq!(turn["status"], "complete", "round {round}: {turn}");
+            assert_eq!(
+                turn["content"],
+                format!("cevap::{asked}"),
+                "round {round}, rows {roles:?}: this answer was paired with the other request's prompt",
+            );
+        }
+
+        // The other half of the bug: a prompt nothing ever answered left its
+        // reserved row spinning. Nothing in the thread may stay `pending`.
+        for row in thread_rows(&app, &cookie, &thread).await {
+            assert_ne!(row["status"], "pending", "round {round}: {row}");
+        }
+
+        // A few proven races are the point; the rest of the budget only exists
+        // for a machine that schedules them rarely.
+        if interleaved == ENOUGH {
+            break;
+        }
+    }
+    assert!(
+        interleaved > 0,
+        "the two POSTs never interleaved in {ROUNDS} rounds — this run proved nothing \
+         about prompt pairing; widen the race rather than trusting the pass",
+    );
+}
+
+/// Every row of a thread, oldest first.
+async fn thread_rows(app: &Router, cookie: &str, thread: &str) -> Vec<Value> {
+    let res = common::send(
+        app,
+        "GET",
+        &format!("/chatbot/threads/{thread}/messages"),
+        Some(cookie),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    common::items(&res.body).clone()
 }
 
 // ------------------------------------------------------------- boot wiring --

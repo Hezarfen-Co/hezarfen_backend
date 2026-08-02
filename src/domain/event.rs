@@ -1,13 +1,13 @@
 // `Value` looks unused but is load-bearing: the `SurrealValue` derive on the
 // tagged `EventAudience` enum expands to code that names `Value` unqualified.
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue, Value};
-use ulid::Ulid;
 
 use crate::constant::{EVENT_TABLE, MAX_EVENT_DESCRIPTION_LEN, MAX_EVENT_TITLE_LEN};
 use crate::database::Database;
 use crate::domain::course::CourseId;
 use crate::domain::enrollment::Enrollment;
 use crate::domain::field_update::FieldUpdate;
+use crate::domain::monotonic_id::next_ulid;
 use crate::domain::registration::Registration;
 use crate::domain::role::Role;
 use crate::domain::timestamp::{Timestamp, range_error};
@@ -19,8 +19,11 @@ use crate::validate::{validate_optional, validate_required};
 pub struct EventId(RecordId);
 
 impl EventId {
+    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
+    /// events list `id DESC` (newest first, [`Event::list_all`]),
+    /// and a random low half scrambles rows minted in the same millisecond.
     pub fn generate() -> Self {
-        Self(RecordId::new(EVENT_TABLE, Ulid::new().to_string()))
+        Self(RecordId::new(EVENT_TABLE, next_ulid().to_string()))
     }
 
     pub fn from_key(key: &str) -> Self {
@@ -282,13 +285,30 @@ impl Event {
     }
 
     /// Delete the event and cascade-remove its attendance and signup rows.
+    ///
+    /// Children first, and all of it in one transaction the way
+    /// [`crate::domain::course::Course::delete`] does it: run as two queries, a
+    /// registration or a mark that committed in between outlived its event —
+    /// an orphan no read path can ever reach and no delete can ever reclaim,
+    /// since every one of them is keyed on the event that is now gone.
     pub async fn delete(self, db: &Database) -> Result<Event, AppError> {
-        db.query("DELETE attendance WHERE event = $ev; DELETE registration WHERE event = $ev;")
+        let mut result = db
+            .query(
+                "BEGIN TRANSACTION;
+                 DELETE attendance WHERE event = $ev;
+                 DELETE registration WHERE event = $ev;
+                 LET $gone = (DELETE $ev RETURN BEFORE);
+                 RETURN $gone;
+                 COMMIT TRANSACTION;",
+            )
             .bind(("ev", self.id.record()))
             .await?
             .check()?;
-        let deleted: Option<Event> = db.delete(self.id.record()).await?;
-        deleted.ok_or(AppError::NotFound)
+        result
+            .take::<Vec<Event>>(4)?
+            .into_iter()
+            .next()
+            .ok_or(AppError::NotFound)
     }
 }
 

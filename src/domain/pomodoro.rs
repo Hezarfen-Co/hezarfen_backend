@@ -1,8 +1,8 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-use ulid::Ulid;
 
 use crate::constant::POMODORO_SESSION_TABLE;
 use crate::database::{Database, transaction_with_retry};
+use crate::domain::monotonic_id::next_ulid;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
@@ -11,10 +11,14 @@ use crate::error::AppError;
 pub struct PomodoroSessionId(RecordId);
 
 impl PomodoroSessionId {
+    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
+    /// the log sorts `started_at DESC, id DESC` and the id breaks the tie between
+    /// two sessions started at the same instant. The `open_` key below never ties
+    /// with itself (one running session per user), so it needs no ordering.
     pub fn generate() -> Self {
         Self(RecordId::new(
             POMODORO_SESSION_TABLE,
-            Ulid::new().to_string(),
+            next_ulid().to_string(),
         ))
     }
 
@@ -148,14 +152,17 @@ impl PomodoroSession {
     }
 
     /// Every session of `user`, newest first — the running one (if any)
-    /// included. Ordered by `started_at`: the open entry's `open_` key doesn't
-    /// sort with the ULIDs, so id order would misplace it.
+    /// included. Ordered by `started_at`, never by id alone: the open entry's
+    /// `open_` key doesn't sort with the ULIDs, so id order would misplace it.
+    /// The `id` tie-break behind it only ever separates two *finished* stints
+    /// sharing a `started_at` — there is one running row per user, so it can
+    /// never tie with itself.
     pub async fn list_for_user(
         user: &UserId,
         db: &Database,
     ) -> Result<Vec<PomodoroSession>, AppError> {
         let mut result = db
-            .query("SELECT * FROM pomodoro_session WHERE user = $usr ORDER BY started_at DESC")
+            .query("SELECT * FROM pomodoro_session WHERE user = $usr ORDER BY started_at DESC, id DESC")
             .bind(("usr", user.record()))
             .await?
             .check()?;
@@ -165,6 +172,8 @@ impl PomodoroSession {
 
 #[cfg(test)]
 mod tests {
+    use ulid::Ulid;
+
     use super::*;
     use crate::database;
 

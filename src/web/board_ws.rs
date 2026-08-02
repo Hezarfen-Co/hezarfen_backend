@@ -48,12 +48,12 @@
 //! - the five frames the REST routes publish, forwarded verbatim: `cleared`,
 //!   `locked`, `closed`, `participants`, `deleted`
 //!
-//! `closed` and `deleted` end the room. `participants` is re-derived against
-//! the database and drops this socket if it is no longer on the board — but the
-//! notification is only the *prompt* half of that: every stroke, clear and lock
-//! re-reads the board and re-checks the roster, so a socket that missed the
-//! frame (it lagged, or the roster changed without one) is refused all the
-//! same. A frame is never the authority here.
+//! `closed` and `deleted` end the room. A frame is never the authority here:
+//! every frame is authorized against the database *before* it is delivered,
+//! and every stroke, clear and lock re-reads the board and re-checks the role
+//! and the roster before it is written. So a caller who lost the right to be
+//! here — taken off the roster, or demoted out of whiteboard access — is
+//! refused and dropped whether or not any notification reached them.
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -71,7 +71,7 @@ use crate::domain::board::{Board, BoardId};
 use crate::domain::board_stroke::{self, BoardStroke};
 use crate::domain::role::Role;
 use crate::domain::timestamp::Timestamp;
-use crate::domain::user::UserId;
+use crate::domain::user::{User, UserId};
 use crate::error::AppError;
 use crate::state::AppState;
 use crate::web::CurrentUser;
@@ -112,9 +112,9 @@ enum ClientMessage {
 /// and a board that does not exist — or that the caller is not on, or that the
 /// caller is a `parent` and so barred from the whiteboard outright — is the
 /// same **404**, because a non-participant must not learn a board exists (the
-/// rationale at `src/lib.rs`). Refusing the door is also what stops a parent
-/// drawing: no socket, no `stroke` frame, and no per-stroke role read on the
-/// hot path.
+/// rationale at `src/lib.rs`). Refusing the door keeps a parent out; keeping
+/// one out who was demoted *after* the upgrade is [`live_board`]'s job, which
+/// every action already re-reads through.
 pub async fn board_ws(
     State(st): State<AppState>,
     CurrentUser(user): CurrentUser,
@@ -191,11 +191,24 @@ async fn room(mut socket: WebSocket, st: AppState, board: BoardId, user: UserId)
 
 type Step = Result<(), RoomClosed>;
 
-/// The board as it stands right now, for a caller who must still be on it.
-/// Every action re-reads through here: the roster, the lock and the epoch are
-/// all live facts, and a frame this socket may never have seen is not an
-/// authority over any of them.
+/// The board as it stands right now, for a caller who must still be on it and
+/// who must still hold a role the whiteboard is open to. Every action re-reads
+/// through here: the role, the roster, the lock and the epoch are all live
+/// facts, and a frame this socket may never have seen is not an authority over
+/// any of them.
+///
+/// The role is re-read for the same reason the roster is: the upgrade door's
+/// bar (`board_ws`, mirroring [`super::boards`]'s `board_for`) is checked once,
+/// nothing publishes a frame on a role change, and a demotion to `parent` — the
+/// role barred from the whiteboard outright — must not leave an open socket
+/// still committing strokes.
 async fn live_board(board: &BoardId, user: &UserId, db: &Database) -> Result<Board, AppError> {
+    let barred = User::read(user, db)
+        .await?
+        .is_none_or(|caller| !caller.get_role().at_least(Role::Student));
+    if barred {
+        return Err(AppError::Forbidden("your role can no longer use boards"));
+    }
     let board = Board::read(board, db).await?.ok_or(AppError::NotFound)?;
     if !board.is_participant(user) {
         return Err(AppError::Forbidden("you are no longer on this board"));
@@ -268,6 +281,29 @@ async fn forward(
         mine.pop_front();
         return Ok(());
     }
+    // Authorize *before* the frame is handed over, never after. This used to
+    // run only for the `participants` frame, so a caller who lost the right to
+    // read — a roster removal that published nothing, or a demotion to
+    // `parent`, the role with no whiteboard access at all — was served every
+    // mark, clear and lock for up to [`BOARD_WS_TICK_SECS`] before the state
+    // tick noticed. Re-derived against the database, never read off the frame:
+    // the frame is the prompt, the row is the authority.
+    //
+    // ponytail: that is one `live_board` (two reads) per forwarded frame, paid
+    // by every listening socket, where the fan-out used to be read-free — a
+    // busy board now multiplies its database traffic by the size of the room.
+    // The drawer's own echo is dropped above without paying it, which is the
+    // only relief. Upgrade path: give [`crate::state::BoardHub`] a generation
+    // counter bumped by every role/roster write, and re-read only when this
+    // socket's copy is stale.
+    if let Err(err) = live_board(board, user, db).await {
+        let refusal = match err {
+            AppError::NotFound => json!({ "type": "deleted" }),
+            err => error_frame(&err, None),
+        };
+        let _ = send(socket, refusal).await;
+        return Err(RoomClosed);
+    }
     socket
         .send(Message::Text(frame.to_string().into()))
         .await
@@ -276,15 +312,6 @@ async fn forward(
     match kind.as_deref() {
         // The board ended. Nothing left to serve either way.
         Some("closed" | "deleted") => Err(RoomClosed),
-        // Re-derived against the database rather than read off the frame: the
-        // frame is the prompt, the row is the authority.
-        Some("participants") => match live_board(board, user, db).await {
-            Ok(_) => Ok(()),
-            Err(err) => {
-                let _ = send(socket, error_frame(&err, None)).await;
-                Err(RoomClosed)
-            }
-        },
         _ => Ok(()),
     }
 }
@@ -624,6 +651,68 @@ mod tests {
         assert_eq!(
             code(AppError::Conflict(board_stroke::BOARD_LOCKED)),
             "locked"
+        );
+    }
+
+    /// The upgrade door's role bar has to hold for the *life* of the socket.
+    /// Nothing publishes a frame on a role change and the state tick used not
+    /// to look, so a student demoted to `parent` — the one role the whiteboard
+    /// is closed to outright — kept committing strokes on the socket they
+    /// already held. Driven at [`live_board`] because that is where every
+    /// stroke, clear, lock, join and tick funnels through; a real upgrade
+    /// cannot be driven from the `oneshot` harness the suites use.
+    #[tokio::test]
+    async fn a_demotion_bars_the_open_socket_from_every_write() {
+        use crate::domain::board::BoardTitle;
+        use crate::domain::user::{Password, Username};
+
+        let db = crate::database::init_mem().await.unwrap();
+        let password = Password::try_new("secret1").unwrap();
+        let creator = User::create(
+            Username::try_new("ogretmen").unwrap(),
+            password.hash_async().await.unwrap(),
+            &db,
+        )
+        .await
+        .unwrap();
+        let mate = User::create(
+            Username::try_new("ogrenci").unwrap(),
+            password.hash_async().await.unwrap(),
+            &db,
+        )
+        .await
+        .unwrap();
+        let mate_id = mate.get_id().clone();
+        let board = Board::create(
+            creator.get_id(),
+            BoardTitle::try_new("Tahta").unwrap(),
+            vec![mate_id.clone()],
+            &db,
+        )
+        .await
+        .unwrap();
+
+        // A student participant draws.
+        assert!(
+            live_board(board.get_id(), &mate_id, &db).await.is_ok(),
+            "a student on the board must pass"
+        );
+
+        // Demoted while the socket is open: refused from here on, and with the
+        // frame a denied write already uses — no new frame type.
+        mate.set_role(Role::Parent, &db).await.unwrap();
+        let err = live_board(board.get_id(), &mate_id, &db).await.unwrap_err();
+        assert!(
+            matches!(err, AppError::Forbidden(_)),
+            "a parent must be refused"
+        );
+        assert_eq!(error_frame(&err, None)["code"], "forbidden");
+
+        // Nobody else is affected.
+        assert!(
+            live_board(board.get_id(), creator.get_id(), &db)
+                .await
+                .is_ok()
         );
     }
 

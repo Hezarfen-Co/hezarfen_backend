@@ -562,8 +562,15 @@ pub const DEFAULT_API_RATE_LIMIT: u32 = 300;
 /// bridge — which is the cost this tier rations, not this process.
 pub const DEFAULT_CHATBOT_RATE_LIMIT: u32 = 20;
 
-/// Once the bucket map holds this many distinct client IPs, expired entries are
-/// swept out on the next check. Keeps memory bounded without a reaper task.
+/// Once the bucket map holds this many distinct clients, a new key sweeps out
+/// the expired entries and, if that frees nothing, evicts the least-spent live
+/// buckets — **never an exhausted one** — down to three quarters of this.
+/// Evicting a bucket that had reached its limit would hand back the very
+/// refusal it was enforcing, so a flood cannot make the limiter fail open; the
+/// concession is that while the map is saturated with exhausted buckets a
+/// never-before-seen client is admitted unmetered, which is preferred to
+/// refusing it (that would let an attacker `429` the world). Keeps memory
+/// bounded without a reaper task.
 pub const PURGE_AT: usize = 10_000;
 
 /// The shared counter the limiter folds its local admits into, so a window's

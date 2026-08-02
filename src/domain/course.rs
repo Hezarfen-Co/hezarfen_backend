@@ -1,5 +1,4 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-use ulid::Ulid;
 
 use crate::constant::{
     CLASS_COURSE_COUNT_FIELD, COURSE_COUNT_FIELD, COURSE_TABLE, ENROLLMENT_COUNT_FIELD,
@@ -8,6 +7,7 @@ use crate::constant::{
 use crate::database::{Database, transaction_with_retry};
 use crate::domain::cap;
 use crate::domain::field_update::FieldUpdate;
+use crate::domain::monotonic_id::next_ulid;
 use crate::domain::page::PagedList;
 use crate::domain::term::{self, TermId};
 use crate::domain::user::UserId;
@@ -22,8 +22,11 @@ const ROSTER_MARK: &str = "course_roster";
 pub struct CourseId(RecordId);
 
 impl CourseId {
+    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
+    /// courses list `id DESC` (newest first, [`Course::list_all`]),
+    /// and a random low half scrambles rows minted in the same millisecond.
     pub fn generate() -> Self {
-        Self(RecordId::new(COURSE_TABLE, Ulid::new().to_string()))
+        Self(RecordId::new(COURSE_TABLE, next_ulid().to_string()))
     }
 
     pub fn from_key(key: &str) -> Self {

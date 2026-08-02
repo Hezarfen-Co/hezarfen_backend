@@ -7,13 +7,13 @@
 //! removed.
 
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-use ulid::Ulid;
 
 use crate::constant::{
     MAX_MESSAGE_BODY_LEN, MAX_MESSAGE_LABEL_LEN, MAX_MESSAGE_SUBJECT_LEN, MESSAGE_TABLE,
     RECIPIENT_FOLDERS, SENDER_FOLDERS,
 };
 use crate::database::Database;
+use crate::domain::monotonic_id::next_ulid;
 use crate::domain::page::PagedList;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
@@ -102,8 +102,11 @@ impl Folder {
 pub struct MessageId(RecordId);
 
 impl MessageId {
+    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
+    /// the folder listings sort `id DESC` (newest first, [`Message::list_folder`]),
+    /// and a random low half scrambles rows minted in the same millisecond.
     pub fn generate() -> Self {
-        Self(RecordId::new(MESSAGE_TABLE, Ulid::new().to_string()))
+        Self(RecordId::new(MESSAGE_TABLE, next_ulid().to_string()))
     }
 
     pub fn from_key(key: &str) -> Self {
@@ -427,6 +430,42 @@ mod tests {
         assert_eq!(MessageSubject::try_new("hi").unwrap().as_str(), "hi");
         assert!(MessageSubject::try_new("  ").is_err());
         assert_eq!(MessageBody::try_new("").unwrap().as_str(), "");
+    }
+
+    /// The `next_ulid` hazard: an inbox is documented newest-first and sorts
+    /// `id DESC`, so messages sent inside one millisecond must come back in
+    /// exact reverse write order, not at random (src/domain/monotonic_id.rs).
+    /// Asserts the *stored* order, not the mint order.
+    #[tokio::test]
+    async fn inbox_is_newest_first_within_a_millisecond() {
+        let db = crate::database::init_mem().await.unwrap();
+        let sender = UserId::from_key("a");
+        let recipient = UserId::from_key("b");
+        let mut sent = Vec::new();
+        for i in 0..25 {
+            let message = Message::send(
+                &sender,
+                &recipient,
+                MessageSubject::try_new(&format!("s{i}")).unwrap(),
+                MessageBody::try_new("").unwrap(),
+                None,
+                &db,
+            )
+            .await
+            .unwrap();
+            sent.push(message.get_id().key().to_string());
+        }
+
+        let (listed, total) = Message::list_folder(&recipient, Folder::Inbox, None, None, 0, &db)
+            .await
+            .unwrap();
+        assert_eq!(total, 25);
+        sent.reverse();
+        let read_back: Vec<String> = listed
+            .iter()
+            .map(|row| row.get_id().key().to_string())
+            .collect();
+        assert_eq!(read_back, sent);
     }
 
     #[tokio::test]

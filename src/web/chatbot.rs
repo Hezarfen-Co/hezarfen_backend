@@ -401,7 +401,8 @@ async fn send_message(
         return Ok(unavailable("no AI service is connected right now"));
     }
 
-    ChatbotMessage::append_user(thread.get_id(), user.get_id(), content, &st.db).await?;
+    let prompt =
+        ChatbotMessage::append_user(thread.get_id(), user.get_id(), content, &st.db).await?;
     let answer =
         ChatbotMessage::append_pending_assistant(thread.get_id(), user.get_id(), &st.db).await?;
     // Never fatal: both rows are already written, and failing here would strand
@@ -420,9 +421,14 @@ async fn send_message(
     // timeout that guards every handler, and the POST must return now. The
     // settings snapshot goes with it, so the whole turn is judged by the policy
     // that was live when it was accepted.
+    // The prompt travels by id, not by write order: two POSTs on one thread
+    // interleave across the two creates above, and picking "the newest user row
+    // before this answer" out of the thread then answers the *other* request's
+    // question twice.
     tokio::spawn(answer_turn(
         bridge,
         st.db.clone(),
+        prompt.get_id().clone(),
         answer,
         settings.get_chatbot_history_turns().max(0) as usize,
         reply_cap,
@@ -462,21 +468,21 @@ fn unavailable(message: &str) -> Response {
 async fn answer_turn(
     bridge: AiBridge,
     db: Database,
+    prompt_id: ChatbotMessageId,
     answer: ChatbotMessage,
     history_turns: usize,
     reply_cap: usize,
 ) {
     let answer_id = answer.get_id().clone();
     let thread = answer.get_thread_id().clone();
-    // The question this reserved row was written next to, read back from the
-    // thread — the prompt is already stored, so passing it along would only be
-    // a second copy of the same string.
-    let prompt = match answer.prompt_for(&db).await {
+    // This request's own question, read back by id — the text is already
+    // stored, so carrying the id rather than the string keeps the prompt and
+    // its answer paired however two POSTs on one thread interleave.
+    let prompt = match ChatbotMessage::prompt_of(&prompt_id, &db).await {
         Ok(Some(prompt)) => prompt,
         Ok(None) => {
-            // A reserved answer with no question before it. Only reachable if
-            // the user row was deleted out from under it; there is nothing to
-            // ask, so settle rather than re-claim it every reclaim horizon.
+            // The prompt row is gone — only reachable if the thread was deleted
+            // out from under this task. There is nothing to ask, so settle.
             tracing::warn!("chat answer {} has no prompt to send", answer_id.key());
             let _ = ChatbotMessage::fail(&answer_id, "internal", &db).await;
             return;

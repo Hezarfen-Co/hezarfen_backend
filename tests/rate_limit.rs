@@ -224,6 +224,38 @@ async fn only_the_rightmost_forwarded_hop_counts() {
     );
 }
 
+/// A proxy that appends its hop as a *separate* `X-Forwarded-For` line leaves
+/// the client's forged line first. Billing that first line would mint a bucket
+/// per attempt and the credential tier would never fire, so the last line —
+/// the only one the client cannot write — is what keys the request.
+#[tokio::test]
+async fn only_the_last_forwarded_header_line_counts() {
+    let app = app_with(auth_only(2)).await;
+
+    let attempt = |forged: &'static str| {
+        let app = app.clone();
+        async move {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/auth/login")
+                .header("x-forwarded-for", forged)
+                .header("x-forwarded-for", "9.9.9.9")
+                .header("content-type", "application/json")
+                .body(Body::from(bad_login().unwrap().to_string()))
+                .unwrap();
+            app.oneshot(request).await.unwrap().status()
+        }
+    };
+
+    assert_eq!(attempt("1.1.1.1").await, StatusCode::UNAUTHORIZED);
+    assert_eq!(attempt("2.2.2.2").await, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        attempt("3.3.3.3").await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "a forged first line must not mint a fresh bucket per attempt"
+    );
+}
+
 #[tokio::test]
 async fn ipv6_clients_are_keyed_too() {
     let app = app_with(auth_only(1)).await;

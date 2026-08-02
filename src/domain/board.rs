@@ -270,6 +270,32 @@ impl Board {
         one(result.take::<Vec<Board>>(0)?)
     }
 
+    /// Strip `user` off every board roster they are listed on — the sweep for a
+    /// user demoted below `student`, who may no longer touch a whiteboard at
+    /// all ([`crate::web::boards`] keeps such a role off every roster at
+    /// invite time, so a stale row is exactly what a demotion used to leave).
+    /// Nothing is deleted: no board, no stroke, not even a board whose roster
+    /// this empties — a role change must never destroy other people's work.
+    ///
+    /// Boards the user *created* come back too, and deliberately unchanged: the
+    /// creator is not a roster entry (`is_participant` reads the column) and
+    /// removing them is not expressible. They are returned so the caller can
+    /// prompt those rooms as well.
+    pub async fn drop_participant_everywhere(
+        user: &UserId,
+        db: &Database,
+    ) -> Result<Vec<Board>, AppError> {
+        let mut result = db
+            .query(
+                "UPDATE board SET participants -= $usr \
+                 WHERE $usr IN participants OR creator = $usr RETURN AFTER",
+            )
+            .bind(("usr", user.record()))
+            .await?
+            .check()?;
+        Ok(result.take::<Vec<Board>>(0)?)
+    }
+
     /// Retire the board: permanently read-only, history still readable.
     /// Idempotent by the `WHERE` — a second call matches nothing and the first
     /// stamp stands, which is what the stroke path's open-guard reads.

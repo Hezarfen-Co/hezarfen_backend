@@ -20,6 +20,7 @@ use crate::domain::cap;
 use crate::domain::course::CourseId;
 use crate::domain::homework::HomeworkId;
 use crate::domain::homework_submission::{HomeworkSubmission, HomeworkSubmissionId};
+use crate::domain::monotonic_id::next_ulid;
 use crate::domain::note_file::{FileContentType, FileName};
 use crate::domain::timestamp::Timestamp;
 use crate::error::AppError;
@@ -28,8 +29,11 @@ use crate::error::AppError;
 pub struct HomeworkFileId(RecordId);
 
 impl HomeworkFileId {
+    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
+    /// a submission's files list `id DESC` (newest first, [`HomeworkFile::list_for_submission`]),
+    /// and a random low half scrambles rows minted in the same millisecond.
     pub fn generate() -> Self {
-        Self(RecordId::new(HOMEWORK_FILE_TABLE, Ulid::new().to_string()))
+        Self(RecordId::new(HOMEWORK_FILE_TABLE, next_ulid().to_string()))
     }
 
     pub fn from_key(key: &str) -> Self {

@@ -4,7 +4,6 @@
 //! [`crate::domain::chatbot_message`], and deleting a thread cascades them.
 
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-use ulid::Ulid;
 
 use crate::constant::{
     CHATBOT_THREAD_COUNT_FIELD, CHATBOT_THREAD_TABLE, DEFAULT_MAX_CHATBOT_THREADS,
@@ -12,6 +11,7 @@ use crate::constant::{
 };
 use crate::database::Database;
 use crate::domain::cap;
+use crate::domain::monotonic_id::next_ulid;
 use crate::domain::page::PagedList;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
@@ -22,8 +22,12 @@ use crate::validate::validate_required;
 pub struct ChatbotThreadId(RecordId);
 
 impl ChatbotThreadId {
+    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
+    /// threads sort `updated_at DESC, id DESC` and the id breaks the tie
+    /// between two threads last touched in the same millisecond,
+    /// and a random low half sorts arbitrarily inside one millisecond.
     pub fn generate() -> Self {
-        Self(RecordId::new(CHATBOT_THREAD_TABLE, Ulid::new().to_string()))
+        Self(RecordId::new(CHATBOT_THREAD_TABLE, next_ulid().to_string()))
     }
 
     pub fn from_key(key: &str) -> Self {
@@ -151,7 +155,7 @@ impl ChatbotThread {
     ) -> Result<(Vec<ChatbotThread>, i64), AppError> {
         PagedList::new(
             "chatbot_thread WHERE user_id = $usr",
-            "ORDER BY updated_at DESC",
+            "ORDER BY updated_at DESC, id DESC",
         )
         .bind("usr", user.record())
         .run(limit, offset, db)

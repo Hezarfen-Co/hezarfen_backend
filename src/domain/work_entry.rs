@@ -1,9 +1,9 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-use ulid::Ulid;
 
 use crate::constant::WORK_ENTRY_TABLE;
 use crate::database::{Database, transaction_with_retry};
 use crate::domain::field_update::FieldUpdate;
+use crate::domain::monotonic_id::next_ulid;
 use crate::domain::page::PagedList;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
@@ -23,8 +23,12 @@ pub(crate) fn out_before_in_error() -> AppError {
 pub struct WorkEntryId(RecordId);
 
 impl WorkEntryId {
+    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
+    /// the log sorts `check_in DESC, id DESC` and the id breaks the tie between
+    /// two stints checked in at the same instant. The `open_` key below never
+    /// ties with itself (one open stint per user), so it needs no ordering.
     pub fn generate() -> Self {
-        Self(RecordId::new(WORK_ENTRY_TABLE, Ulid::new().to_string()))
+        Self(RecordId::new(WORK_ENTRY_TABLE, next_ulid().to_string()))
     }
 
     /// The deterministic id of `user`'s *open* entry. At most one open stint
@@ -171,18 +175,24 @@ impl WorkEntry {
     }
 
     /// Every stint of `user`, newest first — the open one (if any) included.
-    /// Ordered by `check_in`: the open entry's `open_` key doesn't sort with
-    /// the ULIDs, so id order would misplace it.
+    /// Ordered by `check_in`, never by id alone: the open entry's `open_` key
+    /// doesn't sort with the ULIDs, so id order would misplace it. The `id`
+    /// tie-break behind it only ever separates two *closed* stints sharing a
+    /// `check_in` — there is one open row per user, so it can never tie with
+    /// itself — and that is what keeps offset paging from skipping a row.
     pub async fn list_for_user(
         user: &UserId,
         limit: Option<i64>,
         offset: i64,
         db: &Database,
     ) -> Result<(Vec<WorkEntry>, i64), AppError> {
-        PagedList::new("work_entry WHERE user = $usr", "ORDER BY check_in DESC")
-            .bind("usr", user.record())
-            .run(limit, offset, db)
-            .await
+        PagedList::new(
+            "work_entry WHERE user = $usr",
+            "ORDER BY check_in DESC, id DESC",
+        )
+        .bind("usr", user.record())
+        .run(limit, offset, db)
+        .await
     }
 
     /// Persist corrected instants (manager fix-ups on closed entries; the web
@@ -216,6 +226,8 @@ impl WorkEntry {
 
 #[cfg(test)]
 mod tests {
+    use ulid::Ulid;
+
     use super::*;
     use crate::database;
 

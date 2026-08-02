@@ -2,16 +2,19 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::database::Database;
+use crate::domain::board::Board;
 use crate::domain::class_pump;
 use crate::domain::course::Course;
 use crate::domain::parent_link::ParentLink;
 use crate::domain::preferences::{Language, PaletteColor, Theme};
 use crate::domain::profile::{BirthDate, Email, PersonName, Phone};
+use crate::domain::registration::Registration;
 use crate::domain::role::Role;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
@@ -362,6 +365,10 @@ async fn update_user_preferences(
 /// Setting any non-`student` role also drops the user's course enrollments —
 /// only students enroll, so a promoted user leaves every roster. Demoting below
 /// `teacher` drops their course teaching assignments for the mirror reason.
+/// Demoting to `parent` additionally gives back the seats they hold on
+/// still-open event signup lists: a parent can no longer free them, and nobody
+/// else may. Seats on lists that have already closed stay as they are — that
+/// roster is history.
 #[utoipa::path(
     patch,
     path = "/{id}/role",
@@ -405,6 +412,39 @@ async fn set_role(
     if role != Role::Student {
         class_pump::sweep_non_student(&target, &st.db).await?;
         ParentLink::delete_where_student(&target, &st.db).await?;
+    }
+    // Event signups are swept for a `parent` only — not for every non-student.
+    // Staff free their own seats by hand (`DELETE /events/{id}/register/{me}`
+    // allows the self case), so a promotion strands nothing and those signups
+    // are the teacher's to keep; a parent can reach no such door, and nobody
+    // else may free a non-student's seat, so theirs is the seat that would
+    // stay claimed forever. Frozen lists are left alone — see the sweep.
+    if role == Role::Parent {
+        Registration::sweep_for_parent(&target, &st.db).await?;
+        // Whiteboards: the role is barred from them outright, so a demoted user
+        // comes off every roster they are listed on — otherwise they stay a
+        // participant forever and their stale id 400s the creator's next roster
+        // PATCH (`resolve_participants` refuses a below-student id). Nothing is
+        // deleted, not even a board this empties: their own boards keep every
+        // stroke and stay readable to the rest of the room, they simply have a
+        // creator who can no longer use them. Each affected room is prompted
+        // with the same `participants` frame the roster PATCH publishes — the
+        // room re-reads the database before it acts on it.
+        for board in Board::drop_participant_everywhere(&target, &st.db).await? {
+            st.board_hub.publish(
+                board.get_id().key(),
+                json!({
+                    "type": "participants",
+                    "creator": board.get_creator().key(),
+                    "participants": board
+                        .get_participants()
+                        .iter()
+                        .map(|user| user.key())
+                        .collect::<Vec<_>>(),
+                })
+                .to_string(),
+            );
+        }
     }
     if role != Role::Parent {
         ParentLink::delete_where_parent(&target, &st.db).await?;

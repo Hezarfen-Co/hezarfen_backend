@@ -338,26 +338,19 @@ impl ChatbotMessage {
         Ok(messages)
     }
 
-    /// The user turn this reserved answer belongs to: the newest `user` row
-    /// written before it in the same thread.
+    /// The user turn a reserved answer belongs to, by *identity*: the prompt
+    /// row of the very POST that reserved it, whose id the answering task
+    /// carries.
     ///
-    /// Ordered by `created_at` then `id`, exactly like every other read path —
-    /// the two rows one POST writes routinely share a millisecond, so the id
-    /// tie-break is what keeps this from picking the prompt of the *previous*
-    /// turn (see [`IDS`]).
-    pub async fn prompt_for(&self, db: &Database) -> Result<Option<ChatbotMessage>, AppError> {
-        let mut result = db
-            .query(
-                "SELECT * FROM chatbot_message WHERE thread_id = $conv AND role = 'user' \
-                 AND (created_at < $at OR (created_at = $at AND id < $id)) \
-                 ORDER BY created_at DESC, id DESC LIMIT 1",
-            )
-            .bind(("conv", self.thread_id.record()))
-            .bind(("at", self.created_at.as_millis()))
-            .bind(("id", self.id.record()))
-            .await?
-            .check()?;
-        Ok(result.take::<Vec<ChatbotMessage>>(0)?.into_iter().next())
+    /// Never derived from write order. Two POSTs on one thread interleave
+    /// across the two creates — the rows land `userA, userB, asstA, asstB` —
+    /// so "the newest user row written before this answer" resolves *both*
+    /// answers to prompt B, and prompt A is never answered.
+    pub async fn prompt_of(
+        id: &ChatbotMessageId,
+        db: &Database,
+    ) -> Result<Option<ChatbotMessage>, AppError> {
+        Ok(db.select(id.record()).await?)
     }
 
     /// Read one turn only if `user` owns it — the poll loop's read.

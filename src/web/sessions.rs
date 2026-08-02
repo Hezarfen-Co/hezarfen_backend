@@ -392,8 +392,8 @@ async fn list_roll_call(
 }
 
 /// Remove a user's roll-call row from a session. Same rights as marking:
-/// session teacher or course manager for students, manager+ for the session
-/// teacher's own row.
+/// session teacher or course manager for students, manager+ for a staff row
+/// (any target holding teacher or higher).
 #[utoipa::path(
     delete,
     path = "/{id}/attendance/{user}",
@@ -406,7 +406,7 @@ async fn list_roll_call(
     responses(
         (status = 204, description = "Removed"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the session teacher or a course manager; or removing the teacher's row without manager+", body = ErrorResponse),
+        (status = 403, description = "Not the session teacher or a course manager; or removing a staff row without manager+", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
     ),
 )]
@@ -422,9 +422,18 @@ async fn remove_roll_call(
         ));
     }
     let target = UserId::from_key(&target);
-    if session.is_teacher(&target) && !user.get_role().at_least(Role::Manager) {
+    // A staff row is management's to remove, keyed on the *target's live role*
+    // rather than on `is_teacher`: reassigning a session's teacher used to hand
+    // the incoming teacher — an ordinary one — the outgoing teacher's staff row
+    // to delete without the manager+ this guard exists to require. A target
+    // whose user row is gone can only be a student's stale row (marking checks
+    // the role at write time), so it stays the session teacher's to clear.
+    let staff_row = User::read(&target, &st.db)
+        .await?
+        .is_some_and(|target_user| target_user.get_role().at_least(Role::Teacher));
+    if staff_row && !user.get_role().at_least(Role::Manager) {
         return Err(AppError::Forbidden(
-            "removing the session teacher's row requires manager role or higher",
+            "removing a staff roll-call row requires manager role or higher",
         ));
     }
     let removed = SessionAttendance::remove(session.get_id(), &target, &st.db).await?;

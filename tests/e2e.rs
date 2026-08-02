@@ -2620,8 +2620,9 @@ async fn a_parent_cannot_enter_the_room_or_draw() {
 
 /// Test 7 — a participant dropped mid-session stops drawing. Twice over: once
 /// with the roster frame deliberately withheld (the socket's own gate is what
-/// actually protects the board), and once through the frame the REST route
-/// fans out.
+/// actually protects the board), and once through the REST route's fan-out —
+/// which the removed socket never receives, because the authorization in front
+/// of every delivery refuses it first.
 #[tokio::test]
 async fn a_removed_participant_can_no_longer_draw() {
     let room = board_room_fixture().await;
@@ -2683,13 +2684,27 @@ async fn a_removed_participant_can_no_longer_draw() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    let roster = board_frame_of_type(&mut veli, "participants").await;
-    assert_eq!(roster["participants"].as_array().unwrap().len(), 0);
-    // The room drops the socket rather than leaving it open and mute.
+    // The removed socket is *not* handed the new roster: authorization runs in
+    // front of every delivery now, so what reaches it is its own refusal and
+    // not one more fact about a board it is no longer on.
+    let refusal = board_frame_of_type(&mut veli, "error").await;
+    assert_eq!(refusal["code"], "forbidden", "{refusal}");
+    assert_eq!(
+        refusal["message"], "you are no longer on this board",
+        "a roster removal must still explain itself — and say something other \
+         than the role bar's refusal, or a client cannot tell them apart"
+    );
+    // And the room drops the socket rather than leaving it open and mute.
     loop {
         match ws_next_frame(&mut veli).await {
             None => break,
-            Some(frame) => assert_ne!(frame["type"], "saved", "a dropped socket must not save"),
+            Some(frame) => {
+                assert_ne!(frame["type"], "saved", "a dropped socket must not save");
+                assert_ne!(
+                    frame["type"], "participants",
+                    "a removed socket is told it is out, never who is in"
+                );
+            }
         }
     }
 }
@@ -3145,4 +3160,63 @@ async fn a_class_seats_its_roster_and_gives_the_seat_back() {
         .await
         .unwrap();
     assert_eq!(roster["total"], 0, "and off the teacher's roster: {roster}");
+}
+
+/// The role bar has to close READS, not only writes. `forward` used to hand the
+/// frame to the socket first and authorize afterwards — and only on a
+/// `participants` frame or the 15-second state tick — so a participant demoted
+/// to `parent`, the role with no whiteboard access at all, kept being served
+/// every mark drawn on a live canvas until the tick caught up. Driven over a
+/// real socket, because the leak lives in the fan-out and nowhere else.
+///
+/// The role is moved straight in the database, which is both the school's
+/// documented bootstrap and the harshest case: no `participants` frame is
+/// published to prompt the room, so only the authorization in front of the send
+/// can refuse it.
+#[tokio::test]
+async fn a_demoted_participant_stops_reading_the_canvas_at_once() {
+    let room = board_room_fixture().await;
+    let (base, board) = (&room.base, &room.board_id);
+    let mut ali = board_open(base, board, Some(&room.creator_cookie))
+        .await
+        .expect("creator upgrade");
+    let mut veli = board_open(base, board, Some(&room.veli_cookie))
+        .await
+        .expect("participant upgrade");
+    board_join(&mut veli, None, None).await;
+
+    // Still a student: the fan-out reaches them.
+    board_draw(&mut ali, "{\"p\":[1,2]}").await;
+    let fanned = board_frame_of_type(&mut veli, "stroke").await;
+    assert_eq!(fanned["payload"], "{\"p\":[1,2]}");
+
+    promote(&room.db, "veli", "parent").await;
+    board_draw(&mut ali, "{\"p\":[3,4]}").await;
+
+    // The next thing that socket hears is its refusal, and the room ends. It
+    // must never be the mark: `parent` has no whiteboard access whatsoever.
+    let mut refused = false;
+    while let Some(frame) = ws_next_frame(&mut veli).await {
+        assert_ne!(
+            frame["type"], "stroke",
+            "a demoted participant read live canvas content: {frame}"
+        );
+        if frame["type"] == "error" {
+            assert_eq!(frame["code"], "forbidden", "{frame}");
+            // Its own words, distinct from a roster removal's: the client can
+            // tell "you were taken off this board" from "your account may no
+            // longer use boards at all".
+            assert_eq!(frame["message"], "your role can no longer use boards");
+            refused = true;
+        }
+    }
+    assert!(refused, "the socket must be told why it was dropped");
+
+    // Nothing was destroyed by the refusal, and the room carries on for the
+    // people still entitled to it.
+    assert_eq!(
+        stored_payloads(&room.db, board, 0).await,
+        vec!["{\"p\":[1,2]}".to_string(), "{\"p\":[3,4]}".to_string()],
+    );
+    board_draw(&mut ali, "{\"p\":[5,6]}").await;
 }

@@ -16,14 +16,31 @@
 //! Requests are keyed by client IP. By default that is the peer address of the
 //! TCP connection ([`ConnectInfo`]). Behind a reverse proxy every connection
 //! shows the proxy's address, so set `TRUST_PROXY=true` to key on the
-//! **rightmost** `X-Forwarded-For` entry instead — that hop is appended by the
-//! nearest proxy and is the only one the client cannot forge. Never enable it
-//! when clients can reach the server directly: the header is then entirely
-//! attacker-controlled and the limiter is trivially bypassed.
+//! **rightmost entry of the last** `X-Forwarded-For` header instead — that hop
+//! is appended by the nearest proxy and is the only one the client cannot
+//! forge. Both halves matter: a proxy may append its hop as a separate header
+//! line rather than into the client's, and reading only the first line would
+//! hand the key straight back to the client. Never enable it when clients can
+//! reach the server directly: the header is then entirely attacker-controlled
+//! and the limiter is trivially bypassed.
 //!
 //! Fixed windows admit up to a 2× burst straddling a window boundary. That is
 //! an accepted trade-off for an implementation simple enough to read in one
 //! sitting; argon2 keeps each allowed login attempt expensive anyway.
+//!
+//! # Bounding the bucket map
+//!
+//! One client, one bucket, so the map is only as bounded as the client set —
+//! and an IPv6 /64 is not bounded at all. At [`crate::constant::PURGE_AT`] a
+//! new key first sweeps out the lapsed windows and then, if that frees
+//! nothing, evicts down to three quarters of the cap ([`evict_cheapest`]).
+//! Exhausted buckets are exempt from eviction: they are the only ones actually
+//! refusing anyone, and freeing one *raises* the limit for a client that had
+//! reached it. When every bucket is exhausted there is nothing to evict and
+//! the map stays at the cap; the unknown key is then admitted without a bucket
+//! rather than refused, which concedes that a new client is unmetered while
+//! the map is saturated but keeps an attacker from `429`-ing everyone at once
+//! simply by filling it.
 //!
 //! # The shared window
 //!
@@ -221,8 +238,27 @@ impl<K: Eq + Hash> RateLimiter<K> {
         let now = Instant::now();
         let mut buckets = self.buckets.lock().expect("rate limiter mutex poisoned");
 
-        if buckets.len() >= PURGE_AT {
+        // Only a *new* key can grow the map, so only a new key pays for a sweep
+        // — a client already in there stays one hash lookup, saturated or not.
+        // ponytail: while the map is saturated every new key still pays one
+        // O(n) scan. Ceiling: it takes 10k live exhausted clients to get there
+        // and the scan is the attacker's own request. Upgrade path: keep the
+        // earliest `window_start` beside the map and skip the scan until then.
+        if buckets.len() >= PURGE_AT && !buckets.contains_key(&key) {
             buckets.retain(|_, b| now.duration_since(b.window_start) < self.window);
+            // Lapsed buckets alone are no bound: enough distinct clients inside
+            // one window (one IPv6 /64 is enough) frees nothing, and the map
+            // would grow while every request paid for the scan.
+            if buckets.len() >= PURGE_AT {
+                evict_cheapest(&mut buckets, PURGE_AT - PURGE_AT / 4, self.max);
+            }
+            if buckets.len() >= PURGE_AT {
+                // Every bucket left is exhausted and none may be dropped. Admit
+                // this unknown key without a bucket rather than refuse it: an
+                // attacker who can saturate the map must not be able to 429 the
+                // world, and every client already in the map keeps its counter.
+                return Ok(());
+            }
         }
 
         let bucket = buckets.entry(key).or_insert_with(|| Bucket::opened_at(now));
@@ -241,6 +277,50 @@ impl<K: Eq + Hash> RateLimiter<K> {
             Err((remaining.as_secs_f64().ceil() as u64).max(1))
         }
     }
+}
+
+/// Drop buckets until at most `target` remain, cheapest first, and **never** a
+/// bucket that has spent `max` or more.
+///
+/// The exemption is the whole point. An exhausted bucket is the only thing in
+/// here actually refusing anyone, and evicting it hands that refusal straight
+/// back to whoever earned it. Cheapest-first alone does not protect it: the
+/// cutoff is a `<=`, so ties go arbitrarily, and an attacker who drives every
+/// flood key to exactly the victim's spend puts the victim inside the tie band
+/// (measured: a victim at `max` freed after ~12.5k flood keys). Exhaustion,
+/// not rank, is what decides.
+///
+/// Among the rest, least-spent-first: those are the throwaway keys a flood is
+/// made of, and evicting one gives away only what it had spent. Evicting by
+/// age would instead pick out long-running buckets, which is backwards.
+///
+/// One pass over the map, and only when a new key arrives at the cap: the
+/// target sits a quarter below it, so the sweep is amortised over that many
+/// further inserts and the common path stays a single hash lookup.
+fn evict_cheapest<K: Eq + Hash>(buckets: &mut HashMap<K, Bucket>, target: usize, max: u32) {
+    let Some(excess) = buckets.len().checked_sub(target).filter(|n| *n > 0) else {
+        return;
+    };
+    let mut spent: Vec<u32> = buckets
+        .values()
+        .map(Bucket::spent)
+        .filter(|spent| *spent < max)
+        .collect();
+    // Nothing but exhausted buckets: the caller decides what to do instead.
+    let Some(excess) = Some(excess.min(spent.len())).filter(|n| *n > 0) else {
+        return;
+    };
+    // The `excess`-th smallest spend among the evictable: at least `excess`
+    // buckets are at or under it, which is what makes the budgeted retain
+    // below drop exactly `excess`.
+    let (_, &mut cutoff, _) = spent.select_nth_unstable(excess - 1);
+    let mut budget = excess;
+    buckets.retain(|_, b| {
+        let spent = b.spent();
+        let evict = budget > 0 && spent < max && spent <= cutoff;
+        budget -= usize::from(evict);
+        !evict
+    });
 }
 
 /// One bucket's report, taken while the map was locked so the round can run
@@ -435,19 +515,23 @@ async fn with_deadline<T>(
 
 /// Resolve the client IP a request is billed against.
 ///
-/// With `trust_proxy`, prefer the rightmost `X-Forwarded-For` entry — appended
-/// by the nearest (trusted) proxy, unlike the left entries which arrive
-/// attacker-controlled. Otherwise (or when the header is missing/unparseable)
-/// fall back to the connection's peer address. `oneshot`-driven routers carry
-/// no [`ConnectInfo`]; those requests share the unspecified-address bucket.
+/// With `trust_proxy`, prefer the rightmost entry of the *last*
+/// `X-Forwarded-For` header — appended by the nearest (trusted) proxy, unlike
+/// the left entries and the earlier header lines, which arrive
+/// attacker-controlled (a proxy that appends its own header line instead of
+/// extending the client's leaves the client's line first). Earlier lines are
+/// only consulted if the last one is empty or unparseable; if none yield an
+/// address (or the header is missing) fall back to the connection's peer
+/// address. `oneshot`-driven routers carry no [`ConnectInfo`]; those requests
+/// share the unspecified-address bucket.
 fn client_ip(req: &Request, trust_proxy: bool) -> IpAddr {
     if trust_proxy
         && let Some(ip) = req
             .headers()
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.rsplit(',').next())
-            .and_then(|entry| entry.trim().parse().ok())
+            .get_all("x-forwarded-for")
+            .iter()
+            .rev()
+            .find_map(|v| v.to_str().ok()?.rsplit(',').next()?.trim().parse().ok())
     {
         return ip;
     }
@@ -494,6 +578,32 @@ mod tests {
         assert_eq!(
             client_ip(&single, true),
             "2001:db8::7".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    /// A proxy that appends its hop as its own header line instead of
+    /// extending the client's: the client's line comes first and is entirely
+    /// forged, so only the last line may be billed.
+    #[tokio::test]
+    async fn client_ip_takes_the_last_forwarded_header_line() {
+        let two_lines = |first: &str, last: &str| {
+            axum::http::Request::builder()
+                .uri("/")
+                .header("x-forwarded-for", first)
+                .header("x-forwarded-for", last)
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        assert_eq!(
+            client_ip(&two_lines("1.1.1.1, 6.6.6.6", "9.9.9.9"), true),
+            "9.9.9.9".parse::<IpAddr>().unwrap()
+        );
+        // An unusable last line falls back through the earlier ones before it
+        // gives up on the header entirely.
+        assert_eq!(
+            client_ip(&two_lines("1.1.1.1, 6.6.6.6", "not-an-ip"), true),
+            "6.6.6.6".parse::<IpAddr>().unwrap()
         );
     }
 
@@ -634,9 +744,77 @@ mod tests {
         }
         assert_eq!(limiter.buckets.lock().unwrap().len(), PURGE_AT);
 
-        // All those windows lapse; the next check sweeps them out.
+        // All those windows lapse; the next *new* client sweeps them out (only
+        // a key that would grow the map pays for a sweep — 10.x is taken above,
+        // so the new client has to come from somewhere else).
         tokio::time::advance(Duration::from_secs(61)).await;
-        assert!(limiter.check(ip(1)).is_ok());
+        let newcomer = IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1));
+        assert!(limiter.check(newcomer).is_ok());
         assert_eq!(limiter.buckets.lock().unwrap().len(), 1);
+    }
+
+    /// The bound has to hold when *nothing* has lapsed — the sweep above frees
+    /// nothing then, and one IPv6 /64 supplies all the live keys it takes. The
+    /// eviction must spend itself on the throwaway keys, never on the
+    /// exhausted bucket that the flood is trying to buy a fresh window for.
+    #[tokio::test(start_paused = true)]
+    async fn live_buckets_are_evicted_so_the_map_stays_bounded() {
+        let limiter = RateLimiter::per_minute(5, false);
+        for _ in 0..5 {
+            assert!(limiter.check(ip(1)).is_ok());
+        }
+        assert!(limiter.check(ip(1)).is_err(), "victim starts exhausted");
+
+        // Twice the threshold in distinct clients, all inside one window.
+        for i in 0..2 * PURGE_AT as u32 {
+            let addr = IpAddr::V4(Ipv4Addr::from(0x0b00_0000 + i));
+            assert!(limiter.check(addr).is_ok());
+            assert!(
+                limiter.buckets.lock().unwrap().len() <= PURGE_AT,
+                "map grew past the cap at client {i}"
+            );
+        }
+
+        assert!(
+            limiter.check(ip(1)).is_err(),
+            "the flood must not have bought the exhausted bucket a fresh window"
+        );
+    }
+
+    /// The flood above was cheap to tell apart. This one is not: every flood
+    /// key is driven to *exactly* the spend of the bucket it is trying to
+    /// free, so a cheapest-first cutoff of `<=` puts the victim inside the tie
+    /// band and picks arbitrarily. Nothing that has reached its limit may be
+    /// evicted, whoever else shares its spend — a limiter that forgets an
+    /// exhausted bucket fails open, which is worse than the unbounded map.
+    #[tokio::test(start_paused = true)]
+    async fn a_flood_at_the_victims_own_spend_frees_nobody() {
+        const MAX: u32 = 5;
+        let limiter = RateLimiter::per_minute(MAX, false);
+        // Every key here is driven to exhaustion, the named victim first.
+        let keys: Vec<IpAddr> = std::iter::once(ip(1))
+            .chain((0..PURGE_AT as u32).map(|i| IpAddr::V4(Ipv4Addr::from(0x0b00_0000 + i))))
+            .collect();
+        for key in &keys {
+            for _ in 0..MAX {
+                assert!(limiter.check(*key).is_ok());
+            }
+        }
+
+        assert!(
+            limiter.buckets.lock().unwrap().len() <= PURGE_AT,
+            "map grew past the cap"
+        );
+
+        // The first `PURGE_AT` keys — the victim among them — filled the map
+        // before it saturated, so every one of them was metered all the way to
+        // its limit and every one of them must still be refused. An eviction
+        // that dropped an exhausted bucket shows up right here, as an admit.
+        for key in &keys[..PURGE_AT] {
+            assert!(
+                limiter.check(*key).is_err(),
+                "{key} was exhausted and is being served again"
+            );
+        }
     }
 }
