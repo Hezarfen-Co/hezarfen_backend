@@ -172,6 +172,7 @@ impl MessageResponse {
         (status = 400, description = "Invalid subject or body, or the recipient is yourself", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 404, description = "No such recipient", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn send_message(
@@ -270,6 +271,7 @@ async fn list(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Only the recipient can change the read flag", body = ErrorResponse),
         (status = 404, description = "Not found (or not a party to it)", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn update_message(

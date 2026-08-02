@@ -81,6 +81,7 @@ impl NoteResponse {
         (status = 400, description = "Invalid title or content", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires the student role or higher", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn create(
@@ -160,6 +161,7 @@ async fn get_one(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires the student role or higher", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn update(
@@ -211,9 +213,9 @@ async fn delete_one(
         .ok_or(AppError::NotFound)?;
     // Rows go first (the note delete cascades them), blobs after: a crash in
     // between strands at worst an unreachable blob, never a row whose blob is
-    // already gone.
-    let (files, _) = NoteFile::list_for(note.get_id(), None, 0, &st.db).await?;
-    note.delete(&st.db).await?;
+    // already gone. The files to unlink come from the delete itself, not a
+    // pre-read list — an upload that landed in between is in the cascade too.
+    let (_, files) = note.delete(&st.db).await?;
     for file in &files {
         remove_blob(&st.files_path, file.get_id().key()).await;
     }

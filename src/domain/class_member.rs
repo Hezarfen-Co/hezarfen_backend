@@ -101,7 +101,9 @@ impl ClassMember {
         {
             Attached::Made(saved) => Ok(saved),
             Attached::Duplicate => Err(AppError::Conflict("the student is already in this class")),
-            Attached::Gone => Err(AppError::NotFound),
+            // The member axis claims no pivot, so `PivotGone` cannot arrive
+            // here; the class being gone is the only 404 this route can see.
+            Attached::Gone | Attached::PivotGone => Err(AppError::NotFound),
             Attached::ClassFull => Err(AppError::ConflictOwned(format!(
                 "this class already holds {MAX_CLASS_MEMBERS} students"
             ))),
@@ -504,15 +506,28 @@ pub(crate) mod tests {
         assert_eq!(counter("class_member_count", class.record(), &db).await, 0);
     }
 
-    /// The role-change sweep, which is now one transaction over both tables:
-    /// the memberships go with their counters, the enrollment rows go with
-    /// their seats, and each seat comes back exactly once — the double
+    /// The role-change sweep, which is one transaction with the role write
+    /// itself: the memberships go with their counters, the enrollment rows go
+    /// with their seats, and each seat comes back exactly once — the double
     /// decrement the old two-call split existed to avoid.
     #[tokio::test]
     async fn the_role_sweep_takes_memberships_and_enrollments_together() {
         let db = crate::database::init_mem().await.unwrap();
         let manager = UserId::from_key("manager");
-        let student = UserId::from_key("student");
+        // A real row, because the sweep now rides on the role write.
+        let hash = crate::domain::user::Password::try_new("secret1")
+            .unwrap()
+            .hash_async()
+            .await
+            .unwrap();
+        let account = crate::domain::user::User::create(
+            crate::domain::user::Username::try_new("ogrenci").unwrap(),
+            hash,
+            &db,
+        )
+        .await
+        .unwrap();
+        let student = account.get_id().clone();
         let first = a_class("9-A", &db).await;
         let second = a_class("club", &db).await;
         let algebra = a_course("algebra", None, &db).await;
@@ -526,7 +541,8 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        crate::domain::class_pump::sweep_non_student(&student, &db)
+        account
+            .set_role(crate::domain::role::Role::Teacher, &db)
             .await
             .unwrap();
         assert_eq!(rows("SELECT VALUE id FROM class_member", &db).await, 0);

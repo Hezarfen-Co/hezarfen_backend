@@ -244,6 +244,7 @@ async fn one_menu(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 409, description = "A menu already exists for that date and slot, or the slot was removed from the settings mid-request", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn create_menu(
@@ -329,6 +330,7 @@ async fn get_menu(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn update_menu(
@@ -394,6 +396,7 @@ async fn delete_menu(
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "No such menu", body = ErrorResponse),
         (status = 409, description = "The menu already carries the maximum number of dishes", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn add_dish(
@@ -454,6 +457,7 @@ async fn add_dish(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn update_dish(
@@ -636,6 +640,7 @@ async fn user_profile(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "No such user", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn update_profile(
@@ -809,6 +814,7 @@ async fn booking_target(
         (status = 403, description = "Not a student booking for themselves, nor a parent booking for a linked student", body = ErrorResponse),
         (status = 404, description = "No such menu", body = ErrorResponse),
         (status = 409, description = "The menu is full, its cutoff has passed, or the menu kept being edited while the seat was being taken", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn book_meal(
@@ -1059,6 +1065,7 @@ async fn attendance_responses(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
         (status = 404, description = "No such menu", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn mark_attendance(
@@ -1397,6 +1404,7 @@ struct RecordCredit {
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires the admin role", body = ErrorResponse),
         (status = 404, description = "No such user", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn record_credit(

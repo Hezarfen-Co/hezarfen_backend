@@ -4,6 +4,8 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue, Value};
 
 use crate::constant::{EVENT_TABLE, MAX_EVENT_DESCRIPTION_LEN, MAX_EVENT_TITLE_LEN};
 use crate::database::Database;
+use crate::domain::class_group::ClassGroupId;
+use crate::domain::class_member::{ClassMember, ClassMemberId};
 use crate::domain::course::CourseId;
 use crate::domain::enrollment::Enrollment;
 use crate::domain::field_update::FieldUpdate;
@@ -78,7 +80,8 @@ impl EventDescription {
 /// expected and who may be marked.
 ///
 /// Stored internally tagged: `{kind: 'school'}`, `{kind: 'role', role: 'student'}`,
-/// `{kind: 'course', course: course:…}`, `{kind: 'registration', capacity: 30}`.
+/// `{kind: 'course', course: course:…}`, `{kind: 'class', class: class_group:…}`,
+/// `{kind: 'registration', capacity: 30}`.
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 #[surreal(tag = "kind", rename_all = "lowercase")]
 pub enum EventAudience {
@@ -89,6 +92,13 @@ pub enum EventAudience {
     /// A course's enrolled students. Staff running the course are not implied
     /// members — a mixed gathering wants a registration or role audience.
     Course { course: CourseId },
+    /// A class section's (şube) students, read live off `class_member` — the
+    /// same live resolution `Course` and `Role` get, so adding a student to the
+    /// class puts them on every one of its events' rosters at once. The
+    /// homeroom teacher is not implied, matching `Course`. A deleted class
+    /// leaves the event standing with an empty roster, exactly as a deleted
+    /// course does (`Course::delete` never touches `event`).
+    Class { class: ClassGroupId },
     /// A signup list built one person at a time through the register
     /// endpoints — teachers place students, staff take their own seat. The
     /// list is capped at `capacity` seats when set (`None` = unlimited) and
@@ -114,6 +124,14 @@ impl EventAudience {
                 Ok(Enrollment::read_for_user(course, user.get_id(), db)
                     .await?
                     .is_some())
+            }
+            // The (class, user) pair is the membership row's own id, so the
+            // point check is a single select — no scan, no index needed.
+            EventAudience::Class { class } => {
+                let member: Option<ClassMember> = db
+                    .select(ClassMemberId::composite(class, user.get_id()).record())
+                    .await?;
+                Ok(member.is_some())
             }
             EventAudience::Registration { .. } => {
                 Ok(Registration::read_for_user(event, user.get_id(), db)
@@ -147,6 +165,12 @@ impl EventAudience {
                     .map(|enrollment| enrollment.get_user().clone())
                     .collect())
             }
+            EventAudience::Class { class } => Ok(ClassMember::list_for_class(class, None, 0, db)
+                .await?
+                .0
+                .iter()
+                .map(|member| member.get_user().clone())
+                .collect()),
             EventAudience::Registration { .. } => Ok(Registration::list_for_event(event, db)
                 .await?
                 .iter()
@@ -316,6 +340,94 @@ impl Event {
 mod tests {
     use super::*;
 
+    /// The forcing function behind the one rule with two spellings: the freeze
+    /// this file decides in Rust ([`Event::registration_capacity`]) and
+    /// [`crate::constant::REGISTRATION_FROZEN_GUARD`], its SurrealQL copy, which
+    /// the role cascade (`User::set_role`) carries because it frees a demoted
+    /// parent's seats inside a transaction and cannot call Rust from there.
+    ///
+    /// Every schedule shape is put to both, including the three the SQL is most
+    /// likely to get wrong: the ends_at-only event (`??` must fall through to
+    /// it), the boundary itself (closed *at* the instant, not after it — `>=` in
+    /// Rust, `<=` in SQL, and the two read opposite ways round; `$now` is bound
+    /// to that exact instant so the boundary is really exercised), and an event
+    /// that takes no registrations at all, which Rust refuses one arm *earlier*
+    /// — so the SQL must not report it frozen, or a stray row on it would be
+    /// preserved forever instead of swept.
+    #[tokio::test]
+    async fn the_sql_freeze_guard_matches_the_rust_one() {
+        use crate::constant::REGISTRATION_FROZEN_GUARD;
+
+        let db = crate::database::init_mem().await.unwrap();
+        let now = Timestamp::now().as_millis();
+        let past = Some(Timestamp::from_millis(now - 60_000));
+        let future = Some(Timestamp::from_millis(now + 3_600_000));
+        let later = Some(Timestamp::from_millis(now + 7_200_000));
+        let signup = EventAudience::Registration { capacity: None };
+        let cases = [
+            ("timeless", signup.clone(), None, None),
+            ("deadline ahead", signup.clone(), None, future),
+            ("deadline passed", signup.clone(), None, past),
+            ("starts later", signup.clone(), future, later),
+            ("already started", signup.clone(), past, None),
+            ("started, ends later", signup.clone(), past, future),
+            (
+                "closing this instant",
+                signup.clone(),
+                Some(Timestamp::from_millis(now)),
+                None,
+            ),
+            // No signup list to freeze: `registration_capacity` refuses these on
+            // the audience, before it ever looks at the clock.
+            ("started school event", EventAudience::School, past, None),
+            (
+                "started class event",
+                EventAudience::Class {
+                    class: ClassGroupId::from_key("g1"),
+                },
+                past,
+                None,
+            ),
+        ];
+        for (name, audience, starts_at, ends_at) in cases {
+            let event = Event::create(
+                &UserId::from_key("teacher"),
+                EventTitle::try_new(name).unwrap(),
+                EventDescription::try_new("").unwrap(),
+                audience,
+                starts_at,
+                ends_at,
+                &db,
+            )
+            .await
+            .unwrap();
+            let rust = matches!(
+                event.registration_capacity(),
+                Err(AppError::Conflict(_) | AppError::ConflictOwned(_))
+            );
+            let mut result = db
+                .query(format!(
+                    "SELECT VALUE id FROM $ev WHERE {REGISTRATION_FROZEN_GUARD}"
+                ))
+                .bind(("ev", event.get_id().record()))
+                .bind(("now", now))
+                .await
+                .unwrap()
+                .check()
+                .unwrap();
+            let sql = !result
+                .take::<Vec<surrealdb::types::RecordId>>(0)
+                .unwrap()
+                .is_empty();
+            assert_eq!(
+                sql, rust,
+                "the SQL freeze guard and registration_capacity disagree on a \
+                 {name} event — the role cascade would rewrite a closed signup \
+                 list, or strand a seat on an open one"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn title_is_required() {
         assert!(EventTitle::try_new("standup").is_ok());
@@ -349,6 +461,12 @@ mod tests {
                     course: CourseId::from_key("c1"),
                 },
                 "course",
+            ),
+            (
+                EventAudience::Class {
+                    class: ClassGroupId::from_key("g1"),
+                },
+                "class",
             ),
             (
                 EventAudience::Registration { capacity: Some(30) },

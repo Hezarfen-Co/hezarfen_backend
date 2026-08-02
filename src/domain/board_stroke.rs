@@ -39,8 +39,8 @@ const KIND_STROKE: &str = BOARD_STROKE_KINDS[0];
 const KIND_CLEAR: &str = BOARD_STROKE_KINDS[1];
 
 /// The `THROW` the clear transaction refuses with: a blank canvas, not the
-/// creator, or the board is already closed. A decision, so it outranks a lost
-/// round.
+/// creator, or the board is locked or already closed. A decision, so it
+/// outranks a lost round.
 const CLEAR_REFUSED: &str = "board_clear_refused";
 
 /// The public words of every refusal this module raises. `pub` because
@@ -254,6 +254,13 @@ impl BoardStroke {
     /// honest answer to the call it refuses. The epochs index keeps its meaning
     /// too: no zero-stroke epoch can enter it.
     ///
+    /// **A locked board cannot be cleared.** The lock is the creator's own
+    /// pause on the canvas, and it holds against every write to it including
+    /// theirs — [`BOARD_OPEN_GUARD`] is the same condition the stroke path
+    /// claims under, so "locked" means one thing everywhere. The cost is
+    /// accepted: a locked board sitting at `MAX_EPOCH_STROKES` is recovered by
+    /// unlock, clear, relock.
+    ///
     /// The marker's own increment is not capped: the last stroke of a board's
     /// budget may be closed by a marker, so a board holds at most
     /// `MAX_BOARD_STROKES + 1` rows. Capping it would refuse the clear that
@@ -271,7 +278,7 @@ impl BoardStroke {
             "BEGIN TRANSACTION;
              LET $before = (UPDATE $b SET epoch += 1, {BOARD_EPOCH_STROKE_COUNT_FIELD} = 0, \
                  {BOARD_TOTAL_STROKE_COUNT_FIELD} = ({BOARD_TOTAL_STROKE_COUNT_FIELD} ?? 0) + 1 \
-                 WHERE creator = $by AND closed_at = NONE \
+                 WHERE creator = $by AND {BOARD_OPEN_GUARD} \
                    AND ({BOARD_EPOCH_STROKE_COUNT_FIELD} ?? 0) > 0 RETURN BEFORE);
              IF array::len($before) = 0 {{ THROW '{CLEAR_REFUSED}' }};
              CREATE $mid CONTENT {{ board: $b, author: $by, kind: $kind, \
@@ -312,7 +319,7 @@ impl BoardStroke {
             .ok_or_else(|| AppError::Internal("board clear wrote no marker".into()))
     }
 
-    /// Which of the clear guard's three conditions said no. One `WHERE` cannot
+    /// Which of the clear guard's four conditions said no. One `WHERE` cannot
     /// report that itself, so the board is re-read — on the refusal path only,
     /// like [`Self::why_refused`]. The distinction is not cosmetic: a closed
     /// board is terminal for the room, a blank canvas is an ordinary "nothing
@@ -328,6 +335,12 @@ impl BoardStroke {
         }
         if !board.is_creator(by) {
             return Ok(AppError::Forbidden(NOT_THE_CREATOR));
+        }
+        // A lock pauses the *creator* too, and it is a state the caller can
+        // undo — a `Conflict`, not the `Forbidden` a wrong caller gets. Unlock,
+        // clear, relock is the recovery for a locked board that is also full.
+        if board.is_locked() {
+            return Ok(AppError::Conflict(BOARD_LOCKED));
         }
         Ok(AppError::Conflict(CANVAS_BLANK))
     }
@@ -370,9 +383,17 @@ impl BoardStroke {
     /// The whole log, oldest first — every epoch, or one named epoch. Both
     /// kinds of row come back: the `clear` markers are what tell a reader where
     /// one epoch ended and the next began.
+    ///
+    /// `marks_only` drops the markers, which is what the *live canvas* wants:
+    /// the current epoch holds no marker by construction, except in the one
+    /// race where a clear commits between the board read and this read and
+    /// files its marker under the epoch just named. The room's replay filters
+    /// to `kind = 'stroke'` ([`Self::replay_current`]), so without this the two
+    /// views disagree in exactly that window.
     pub async fn history(
         board: &BoardId,
         epoch: Option<i64>,
+        marks_only: bool,
         limit: Option<i64>,
         offset: i64,
         db: &Database,
@@ -381,12 +402,18 @@ impl BoardStroke {
             Some(_) => " AND epoch = $e",
             None => "",
         };
+        let kinds = if marks_only {
+            " AND kind != $clear"
+        } else {
+            ""
+        };
         PagedList::new(
-            format!("{BOARD_STROKE_TABLE} WHERE board = $b{scope}"),
+            format!("{BOARD_STROKE_TABLE} WHERE board = $b{scope}{kinds}"),
             "ORDER BY id",
         )
         .bind("b", board.record())
         .bind("e", epoch.unwrap_or_default())
+        .bind("clear", KIND_CLEAR.to_string())
         .run(limit, offset, db)
         .await
     }
@@ -678,6 +705,38 @@ mod tests {
         assert_eq!(stored.len(), 4);
     }
 
+    /// The lock pauses the canvas against *every* write to it, its creator's
+    /// clear included — a `Conflict`, since unlocking undoes it, not the
+    /// `Forbidden` a non-creator gets. Asserted off stored rows: the refusal
+    /// must mint no marker and must not bump the epoch.
+    #[tokio::test]
+    async fn a_locked_board_refuses_its_creator_s_clear() {
+        let db = a_db().await;
+        let board = a_board(&db).await;
+        draw(&board, &db).await.unwrap();
+        let board = board.set_locked(true, &user("c"), &db).await.unwrap();
+
+        let refused = BoardStroke::clear(board.get_id(), &user("c"), &db).await;
+        assert!(matches!(refused, Err(AppError::Conflict(msg)) if msg == BOARD_LOCKED));
+        assert_eq!(rows(board.get_id(), &db).await.len(), 1);
+        assert_eq!(reread(&board, &db).await.get_epoch(), 0);
+        assert!(
+            BoardStroke::epochs(board.get_id(), &db)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Unlock, and the same clear lands: unlock → clear → relock is the
+        // recovery for a locked board sitting at the epoch cap.
+        let board = board.set_locked(false, &user("c"), &db).await.unwrap();
+        let marker = BoardStroke::clear(board.get_id(), &user("c"), &db)
+            .await
+            .unwrap();
+        assert_eq!(marker.get_count(), Some(1));
+        assert_eq!(reread(&board, &db).await.get_epoch(), 1);
+    }
+
     /// The `next_ulid` hazard: rows minted inside one millisecond must replay
     /// in mint order, not at random (src/domain/monotonic_id.rs:41-46).
     #[tokio::test]
@@ -760,14 +819,21 @@ mod tests {
         let board = reread(&board, &db).await;
         draw(&board, &db).await.unwrap();
 
-        let (all, total) = BoardStroke::history(board.get_id(), None, None, 0, &db)
+        let (all, total) = BoardStroke::history(board.get_id(), None, false, None, 0, &db)
             .await
             .unwrap();
         assert_eq!((all.len(), total), (3, 3));
-        let (first, total) = BoardStroke::history(board.get_id(), Some(0), None, 0, &db)
+        let (first, total) = BoardStroke::history(board.get_id(), Some(0), false, None, 0, &db)
             .await
             .unwrap();
         // Epoch 0: its stroke and the marker that closed it.
         assert_eq!((first.len(), total), (2, 2));
+        // `marks_only` drops the marker from that same epoch — and its `total`
+        // with it, so the envelope's count stays the count of what is served.
+        let (marks, total) = BoardStroke::history(board.get_id(), Some(0), true, None, 0, &db)
+            .await
+            .unwrap();
+        assert_eq!((marks.len(), total), (1, 1));
+        assert!(marks.iter().all(|row| !row.is_clear()));
     }
 }

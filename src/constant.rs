@@ -569,10 +569,28 @@ pub const DEFAULT_CHATBOT_RATE_LIMIT: u32 = 20;
 /// Evicting a bucket that had reached its limit would hand back the very
 /// refusal it was enforcing, so a flood cannot make the limiter fail open; the
 /// concession is that while the map is saturated with exhausted buckets a
-/// never-before-seen client is admitted unmetered, which is preferred to
-/// refusing it (that would let an attacker `429` the world). Keeps memory
-/// bounded without a reaper task.
+/// never-before-seen client gets no bucket of its own and is metered against
+/// the one shared [`RATE_LIMIT_OVERFLOW_MAX`] budget instead — so newcomers
+/// during a flood can be refused, while every client already in the map keeps
+/// its own counter untouched. Keeps memory bounded without a reaper task.
 pub const PURGE_AT: usize = 10_000;
+
+/// Requests per window every client that finds the bucket map saturated shares
+/// between them — one aggregate counter, no key, no map entry.
+///
+/// It is the bound on the fail-open path: without it a new key arriving at a
+/// full map is admitted unmetered, so an attacker who first fills the map with
+/// exhausted buckets buys unlimited throughput from fresh keys. With it that
+/// bypass is capped at this many requests a minute, fleet-wide, and a genuine
+/// newcomer gets in on whatever of it is left — an attacker who burns the lot
+/// does `429` the newcomers, which refusing them outright would have done for
+/// free. Clients already in the map are unaffected throughout. Sized for the
+/// genuine side: this is a *request* budget, not a client one (a keyless client
+/// spends it on every request, not just its first), so roughly 10 requests a
+/// second for all newcomers together — far under any single client's API tier,
+/// and only ever in force while 10k buckets sit exhausted at once, which is an
+/// attack and not a school day.
+pub const RATE_LIMIT_OVERFLOW_MAX: u32 = 600;
 
 /// The shared counter the limiter folds its local admits into, so a window's
 /// budget survives a restart (see [`crate::rate_limit`]).
@@ -733,6 +751,7 @@ pub const ENROLLMENT_TABLE: &str = "enrollment";
 pub const CLASS_GROUP_TABLE: &str = "class_group";
 pub const CLASS_MEMBER_TABLE: &str = "class_member";
 pub const CLASS_COURSE_TABLE: &str = "class_course";
+pub const CLASS_BLUEPRINT_TABLE: &str = "class_blueprint";
 pub const PARENT_LINK_TABLE: &str = "parent_link";
 pub const COURSE_SESSION_TABLE: &str = "course_session";
 pub const SESSION_ATTENDANCE_TABLE: &str = "session_attendance";
@@ -870,6 +889,23 @@ pub const SUBMISSION_OPEN_GUARD: &str = "graded_by_result = NONE";
 /// open" and the write it licenses are one conditional single-record write —
 /// a lock landing mid-draw beats the stroke instead of racing it.
 pub const BOARD_OPEN_GUARD: &str = "locked = false AND closed_at = NONE";
+/// A signup list has **frozen**: the event takes registrations at all *and* it
+/// started, or — for an ends_at-only event (a pure signup deadline) — that end
+/// passed. A timeless event never freezes. Matched against `$now` in millis, on
+/// an `event` row.
+///
+/// This is `Event::registration_capacity`'s `Conflict` arm re-spelled in
+/// SurrealQL, because the role cascade (`User::set_role`) frees a demoted
+/// parent's seats *inside* its transaction and cannot call Rust from there. The
+/// audience conjunct is what keeps it that arm and only that arm: an event that
+/// takes no registrations is refused earlier, by the `Validation` arm, so a
+/// stray row on one is deleted rather than frozen — which is what the pre-fold
+/// sweep did, and dropping the conjunct would silently change it. Two spellings
+/// of one rule is a drift risk, so it is spelled once here and
+/// `event::tests::the_sql_freeze_guard_matches_the_rust_one` fails the suite the
+/// day the two disagree.
+pub const REGISTRATION_FROZEN_GUARD: &str = "audience.kind = 'registration' \
+     AND (starts_at ?? ends_at) != NONE AND (starts_at ?? ends_at) <= $now";
 
 /// How hard a counter write tries before giving up, and the first backoff step
 /// it sleeps between attempts (doubling, plus jitter). Contention on one record

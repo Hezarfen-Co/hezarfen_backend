@@ -301,6 +301,7 @@ struct UpdateHomework {
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
         (status = 409, description = "Narrowing the assigned list would orphan an existing submission or result, or the subject this update re-tags from changed since the caller read it — nothing was written, re-read and retry", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn update_homework(
@@ -616,6 +617,7 @@ struct SubmitHomework {
         (status = 403, description = "Not a student, or not enrolled in the homework's course", body = ErrorResponse),
         (status = 404, description = "No such homework (or a subset assignment the caller is not part of)", body = ErrorResponse),
         (status = 409, description = "The homework has been graded — the submission is frozen until the grade is removed", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn submit(
@@ -1028,6 +1030,7 @@ struct GradeHomework {
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin), or attempted to grade yourself", body = ErrorResponse),
         (status = 404, description = "Homework not found", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn grade_homework(

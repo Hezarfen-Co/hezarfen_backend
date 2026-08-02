@@ -437,6 +437,7 @@ pub(crate) async fn store_image(
         (status = 400, description = "Invalid text, kind, points, choices, or correct — or an unknown subject", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn create_question(
@@ -625,6 +626,7 @@ async fn get_question(
         (status = 403, description = "Not the template's owner (and not an admin)", body = ErrorResponse),
         (status = 404, description = "No such template", body = ErrorResponse),
         (status = 409, description = "The template kept changing under concurrent edits — retry", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn update_question(
@@ -947,7 +949,7 @@ mod tests {
         let user = User::create(Username::try_new(username).unwrap(), hash, db)
             .await
             .unwrap();
-        user.set_role(role, db).await.unwrap()
+        user.set_role(role, db).await.unwrap().0
     }
 
     /// Every bank route is `RequireTeacher` today, so this is pinned at the
@@ -973,7 +975,7 @@ mod tests {
         assert!(ensure_owner(&question, &owner).is_ok());
 
         for role in [Role::Student, Role::Parent] {
-            let demoted = owner.clone().set_role(role, &db).await.unwrap();
+            let demoted = owner.clone().set_role(role, &db).await.unwrap().0;
             assert!(
                 !can_see(&question, &demoted),
                 "{role:?} owner still reads their template"

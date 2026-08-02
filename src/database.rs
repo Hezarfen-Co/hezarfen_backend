@@ -469,6 +469,118 @@ mod tests {
         assert!(free.delete(&db).await.unwrap());
     }
 
+    /// Stale-data path for the 2026-08-02 board-roster repair. `set_role`
+    /// sweeps a demoted user off every board going forward, but an existing
+    /// volume still names parents on rosters — and ids of users deleted before
+    /// any sweep existed. Both freeze the creator's roster `PATCH` at a 400
+    /// (see `web::boards::resolve_participants`), so boot has to clean them.
+    #[tokio::test]
+    async fn a_board_roster_written_before_the_sweep_is_repaired_at_boot() {
+        let db = super::init_mem().await.unwrap();
+        db.query(
+            "CREATE user:s SET username = 's', password_hash = 'x', role = 'student';
+             CREATE user:p SET username = 'p', password_hash = 'x', role = 'parent';
+             CREATE board:keep SET creator = user:s, title = 'B',
+                 participants = [user:s, user:p, user:ghost], created_at = 1;
+             CREATE board:gone SET creator = user:s, title = 'C',
+                 participants = [user:p], created_at = 1;
+             CREATE board:clean SET creator = user:s, title = 'D',
+                 participants = [user:s], created_at = 1;
+             DELETE migration_mark:board_roster;",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+        // `init_mem` boots a *migrated* database, so it has already marked the
+        // repair done on an empty store — which is right, and is exactly why the
+        // mark is dropped here: a volume written before the mark existed carries
+        // stale rosters and no mark at all, and that is the state under test.
+        // A write probe on the table under repair: the event fires *inside* the
+        // UPDATE, so it counts real writes rather than trusting a re-read.
+        db.query(
+            "DEFINE TABLE board_write_probe SCHEMALESS;
+             DEFINE EVENT board_write ON board WHEN $event = 'UPDATE' THEN {
+                 UPSERT type::record('board_write_probe', 'n') SET n = (n ?? 0) + 1;
+             };",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+        super::migrate(&db).await.unwrap();
+
+        async fn rosters(db: &super::Database) -> Vec<Vec<surrealdb::types::RecordId>> {
+            let mut rows = db
+                .query("SELECT VALUE participants FROM board ORDER BY id")
+                .await
+                .unwrap();
+            rows.take(0).unwrap()
+        }
+        let after_first = rosters(&db).await;
+        let s = surrealdb::types::RecordId::new("user", "s");
+        // `clean`, `gone`, `keep` by id. The parent and the vanished user are
+        // both gone; a board whose whole roster was stale ends empty, which is
+        // the same shape a board opened without invites carries.
+        assert_eq!(
+            after_first,
+            vec![vec![s.clone()], vec![], vec![s.clone()]],
+            "{after_first:?}"
+        );
+
+        async fn writes(db: &super::Database) -> Vec<i64> {
+            let mut rows = db
+                .query("SELECT VALUE n FROM board_write_probe:n")
+                .await
+                .unwrap();
+            rows.take(0).unwrap()
+        }
+        assert_eq!(
+            writes(&db).await,
+            vec![2],
+            "only the two stale rows repaired"
+        );
+
+        // The second boot: every boot runs the backfill, and a converged row
+        // must not be written again.
+        super::migrate(&db).await.unwrap();
+        assert_eq!(rosters(&db).await, after_first);
+        assert_eq!(writes(&db).await, vec![2], "the second pass wrote nothing");
+
+        // …and it did not *look*, either, which is the whole point of the mark:
+        // the repair's cost is a `user` table scan per board, and writing
+        // nothing is not the same as scanning nothing. A roster made stale after
+        // the mark landed is the probe — it survives the next boot untouched,
+        // which no converging `WHERE` could produce.
+        let mut mark = db
+            .query("SELECT VALUE done_at FROM migration_mark:board_roster")
+            .await
+            .unwrap();
+        assert_eq!(
+            mark.take::<Vec<i64>>(0).unwrap().len(),
+            1,
+            "the repair marks itself finished"
+        );
+        db.query("CREATE board:late SET creator = user:s, title = 'E', participants = [user:p], created_at = 1")
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        super::migrate(&db).await.unwrap();
+        assert_eq!(
+            rosters(&db).await,
+            vec![
+                vec![s.clone()],
+                vec![],
+                vec![s.clone()],
+                vec![surrealdb::types::RecordId::new("user", "p")]
+            ],
+            "a marked database skips the scan entirely"
+        );
+        assert_eq!(writes(&db).await, vec![2]);
+    }
+
     #[tokio::test]
     async fn the_retired_claim_columns_are_dropped_off_a_live_row() {
         // Stale-data path for the 2026-07-30 removal of the chat claim queue.

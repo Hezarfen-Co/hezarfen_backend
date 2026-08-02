@@ -292,6 +292,7 @@ fn check_capacity(capacity: Option<i64>) -> Result<(), AppError> {
         (status = 400, description = "Invalid fields, kind, or capacity", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn create_course(
@@ -444,6 +445,7 @@ async fn get_course(
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
         (status = 409, description = "The term this update moves the course off changed since the caller read it — nothing was written, re-read and retry", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn update_course(
@@ -567,6 +569,7 @@ async fn delete_course(
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
         (status = 409, description = "That user was demoted below teacher while the request ran — the assignment was undone", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn assign_teacher(
@@ -665,6 +668,7 @@ async fn unassign_teacher(
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
         (status = 409, description = "The course is full", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn enroll(
@@ -818,6 +822,7 @@ async fn unenroll(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn create_exam_in_course(
@@ -946,6 +951,7 @@ struct CreateSubject {
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn create_subject_in_course(
@@ -1053,6 +1059,7 @@ struct CreateHomework {
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn create_homework_in_course(
@@ -1178,6 +1185,7 @@ struct CreateSessionInCourse {
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn create_session_in_course(
@@ -1280,7 +1288,7 @@ mod tests {
         let user = User::create(Username::try_new(username).unwrap(), hash, db)
             .await
             .unwrap();
-        user.set_role(role, db).await.unwrap()
+        user.set_role(role, db).await.unwrap().0
     }
 
     /// A course `creator` made, with nobody assigned.
@@ -1309,7 +1317,7 @@ mod tests {
         assert!(owns_course(&course, &creator));
 
         for role in [Role::Student, Role::Parent] {
-            let demoted = creator.clone().set_role(role, &db).await.unwrap();
+            let demoted = creator.clone().set_role(role, &db).await.unwrap().0;
             assert!(
                 !can_manage_course(&course, &demoted),
                 "{role:?} creator still manages the course"
@@ -1338,7 +1346,7 @@ mod tests {
         // ...but never an owner, assigned or not.
         assert!(!owns_course(&course, &assigned));
 
-        let demoted = assigned.set_role(Role::Student, &db).await.unwrap();
+        let demoted = assigned.set_role(Role::Student, &db).await.unwrap().0;
         assert!(!can_manage_course(&course, &demoted));
     }
 

@@ -257,6 +257,21 @@ impl ClassGroup {
         Ok(result.take::<Vec<ClassGroup>>(0)?)
     }
 
+    /// Every class section at one grade label, in no particular order — what a
+    /// grade blueprint pumps. Unpaged on purpose: the caller is reconciling all
+    /// of them, and a page would silently stock only the first window.
+    pub async fn list_for_grade(
+        grade: &ClassGrade,
+        db: &Database,
+    ) -> Result<Vec<ClassGroup>, AppError> {
+        let mut result = db
+            .query("SELECT * FROM class_group WHERE grade = $grade")
+            .bind(("grade", grade.as_str().to_string()))
+            .await?
+            .check()?;
+        Ok(result.take::<Vec<ClassGroup>>(0)?)
+    }
+
     /// Strip `user` from every class they were the homeroom teacher of — the
     /// sweep for a user demoted below `teacher`, who may no longer hold one.
     /// The mirror of [`crate::domain::course::Course::unassign_everywhere`];

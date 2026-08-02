@@ -93,8 +93,17 @@ fn ensure_creator(board: &Board, user: &User) -> Result<(), AppError> {
 ///
 /// The creator is a participant by construction, so they are neither injected
 /// into the list nor rejected from it.
+///
+/// `current` is the board's roster as it stands (empty when a board is being
+/// created), and it is what makes a read-modify-write PATCH survive: an id
+/// *already* on the board that no longer qualifies — demoted, or deleted
+/// outright — is dropped silently instead of failing the whole call, so a
+/// creator echoing back the roster they were just served gets a 200 and a
+/// cleaned list. An id that is **new** to the board still 400s; without that
+/// split the drop would be a hole letting a caller seed a roster with anyone.
 async fn resolve_participants(
     ids: Option<Vec<String>>,
+    current: &[UserId],
     db: &Database,
 ) -> Result<Vec<UserId>, AppError> {
     let Some(mut ids) = ids else {
@@ -114,6 +123,9 @@ async fn resolve_participants(
         let user = UserId::from_key(&id);
         let found = User::read(&user, db).await?;
         if !found.is_some_and(|found| found.get_role().at_least(Role::Student)) {
+            if current.contains(&user) {
+                continue;
+            }
             return Err(AppError::Validation(ValidationError::Invalid {
                 field: "participants",
                 reason: "every participant must be an existing user of at least the student role",
@@ -239,7 +251,7 @@ struct CreateBoard {
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "The caller is a parent", body = ErrorResponse),
         (status = 409, description = "The caller already holds the maximum number of boards", body = ErrorResponse),
-        (status = 422, description = "The body carries a key this request does not accept — a board response cannot be posted back verbatim"),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, a required field is missing, or it carries a key this request does not accept — a board response cannot be posted back verbatim"),
     ),
 )]
 async fn create_board(
@@ -248,20 +260,35 @@ async fn create_board(
     Json(req): Json<CreateBoard>,
 ) -> Result<(StatusCode, Json<BoardResponse>), AppError> {
     let title = BoardTitle::try_new(&req.title)?;
-    let participants = resolve_participants(req.participants, &st.db).await?;
+    // No roster yet, so nothing is grandfathered: every id must qualify.
+    let participants = resolve_participants(req.participants, &[], &st.db).await?;
     let board = Board::create(user.get_id(), title, participants, &st.db).await?;
     Ok((StatusCode::CREATED, Json(BoardResponse::new(&board))))
 }
 
+#[derive(Deserialize, utoipa::IntoParams)]
+struct ListFilter {
+    /// Narrow by `closed_at`: `true` = still open, `false` = closed only. Omit
+    /// for both. A closed board is never deleted, so this is how a heavy
+    /// creator trims a list of retired boards.
+    open: Option<bool>,
+}
+
 /// Every board the caller may open — the ones they created and the ones they
-/// were invited to — newest first. Paged via `?limit=&offset=` (omit `limit`
+/// were invited to — newest first. `?open=` narrows by the closed flag, and
+/// `total` counts the filtered list. Paged via `?limit=&offset=` (omit `limit`
 /// for all of them).
+///
+/// `?open=true` means "not closed", nothing more: a **locked** board, and one
+/// that has spent its lifetime stroke budget but was never drawn on again, are
+/// both still open — the closing stamp is only ever written by `/close` or by
+/// the append that the lifetime cap refuses.
 #[utoipa::path(
     get,
     path = "/",
     tag = "boards",
     security(("session_cookie" = [])),
-    params(PageParams),
+    params(ListFilter, PageParams),
     responses(
         (status = 200, description = "A page of the caller's boards", body = Page<BoardResponse>),
         (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
@@ -272,10 +299,12 @@ async fn create_board(
 async fn list_boards(
     State(st): State<AppState>,
     RequireStudent(user): RequireStudent,
+    Query(filter): Query<ListFilter>,
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<BoardResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let (boards, total) = Board::list_for_user(user.get_id(), limit, offset, &st.db).await?;
+    let (boards, total) =
+        Board::list_for_user(user.get_id(), filter.open, limit, offset, &st.db).await?;
     let items = boards.iter().map(BoardResponse::new).collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
@@ -306,7 +335,9 @@ async fn get_board(
 
 /// The live canvas: the current epoch's strokes, oldest first, paged via
 /// `?limit=&offset=`. This is what a client draws to catch up — earlier epochs
-/// are still stored, and read through `/history`.
+/// are still stored, and read through `/history`. Drawn marks only: a `clear`
+/// marker never appears here, exactly as it never appears on the board room's
+/// socket. Read `/history` or `/epochs` for the markers.
 #[utoipa::path(
     get,
     path = "/{id}/strokes",
@@ -328,12 +359,16 @@ async fn list_strokes(
 ) -> Result<Json<Page<StrokeResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
     let board = board_for(&id, &user, &st.db).await?;
-    // The current epoch has no `clear` marker yet — a marker is written with
-    // the epoch it *closed* — so scoping history to it is exactly the live
-    // canvas, and needs no second query shape.
+    // The current epoch holds no `clear` marker — a marker is written with the
+    // epoch it *closed* — so scoping history to it is the live canvas. Markers
+    // are dropped anyway: a clear committing between the board read above and
+    // this read files one under the epoch just named, and the room's socket
+    // never shows it, so without the filter the two views disagree in exactly
+    // that race.
     let (strokes, total) = BoardStroke::history(
         board.get_id(),
         Some(board.get_epoch()),
+        true,
         limit,
         offset,
         &st.db,
@@ -376,7 +411,7 @@ async fn list_history(
     let (limit, offset) = page.resolve()?;
     let board = board_for(&id, &user, &st.db).await?;
     let (strokes, total) =
-        BoardStroke::history(board.get_id(), scope.epoch, limit, offset, &st.db).await?;
+        BoardStroke::history(board.get_id(), scope.epoch, false, limit, offset, &st.db).await?;
     let items = strokes.iter().map(StrokeResponse::new).collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
@@ -441,6 +476,10 @@ struct UpdateBoard {
 /// A roster change and a lock change are both fanned out to the live room at
 /// once — a participant removed here would otherwise keep drawing over the
 /// socket they already hold.
+///
+/// The roster this route just served can always be sent back: an id already on
+/// the board that stopped qualifying is dropped rather than refused (see
+/// [`resolve_participants`]). Adding an unqualified id is still a 400.
 #[utoipa::path(
     patch,
     path = "/{id}",
@@ -450,11 +489,11 @@ struct UpdateBoard {
     request_body = UpdateBoard,
     responses(
         (status = 200, description = "The updated board", body = BoardResponse),
-        (status = 400, description = "Invalid title, or a participant list that is too long, names an unknown user, or names a parent", body = ErrorResponse),
+        (status = 400, description = "Invalid title, or a participant list that is too long, or one that newly names an unknown user or a parent. An id already on the board that no longer qualifies is dropped instead, so the roster just read can be sent back verbatim", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Only the creator may change the participants or the lock", body = ErrorResponse),
         (status = 404, description = "Not found, or the caller is not on it", body = ErrorResponse),
-        (status = 422, description = "The body carries a key this request does not accept — a board response cannot be posted back verbatim"),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, a required field is missing, or it carries a key this request does not accept — a board response cannot be posted back verbatim"),
     ),
 )]
 async fn update_board(
@@ -472,7 +511,8 @@ async fn update_board(
         board = board.set_title(BoardTitle::try_new(title)?, &st.db).await?;
     }
     if let Some(participants) = req.participants {
-        let participants = resolve_participants(participants, &st.db).await?;
+        let participants =
+            resolve_participants(participants, board.get_participants(), &st.db).await?;
         board = board.set_participants(participants, &st.db).await?;
         fan_out(
             &st,
@@ -504,9 +544,11 @@ async fn update_board(
 /// stroke count, so the live canvas is blank while every mark ever drawn stays
 /// readable through `/history`. Also resets the live-canvas cap, which is how a
 /// board that answered "clear it to keep drawing" is recovered. `409` on a
-/// closed board, and on a canvas that is **already blank** — the marker is a
-/// real stroke row charged to the board's lifetime cap, so a clear has to close
-/// at least one mark to be worth a row.
+/// closed board, on a **locked** one — the pause holds against its own creator,
+/// so a locked full board is recovered by unlock, clear, relock — and on a
+/// canvas that is **already blank**: the marker is a real stroke row charged to
+/// the board's lifetime cap, so a clear has to close at least one mark to be
+/// worth a row.
 #[utoipa::path(
     post,
     path = "/{id}/clear",
@@ -518,7 +560,7 @@ async fn update_board(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Only the creator may clear the board", body = ErrorResponse),
         (status = 404, description = "Not found, or the caller is not on it", body = ErrorResponse),
-        (status = 409, description = "The canvas is already blank, or the board is closed", body = ErrorResponse),
+        (status = 409, description = "The canvas is already blank, or the board is locked or closed", body = ErrorResponse),
     ),
 )]
 async fn clear_board(

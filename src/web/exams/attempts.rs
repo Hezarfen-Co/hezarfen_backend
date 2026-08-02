@@ -850,6 +850,7 @@ pub(crate) async fn attempt_questions(
         (status = 403, description = "Not a student, or not enrolled in the exam's course", body = ErrorResponse),
         (status = 404, description = "No such exam, question, or attempt", body = ErrorResponse),
         (status = 409, description = "Attempt already submitted, time is up, or rejoin is closed", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 pub(crate) async fn save_answer(
@@ -924,19 +925,29 @@ pub(crate) async fn attempt_answers(
         .await?
         .ok_or(AppError::NotFound)?
         .get_seq();
-    Ok(Json(answer_sheet(&exam, &target, seq, &st.db).await?))
+    Ok(Json(
+        answer_sheet(&exam, &target, seq, &HashSet::new(), &st.db).await?,
+    ))
 }
 
 /// One sitting's judged answer sheet: the `seq`th attempt's answers, drawing
 /// refs, correctness flags, and auto-score suggestion. Shared by the latest-
 /// sitting grading view and the per-attempt history endpoint.
+///
+/// `hidden` names the questions whose answer key must not leak out of this
+/// sheet (empty for a teacher). Dropping them from the question list is the
+/// whole redaction: their `is_correct` falls to `null` for want of a question,
+/// and they leave `auto_score` entirely — a per-question score still standing
+/// in the total is the same bit, arrived at by subtraction.
 pub(crate) async fn answer_sheet(
     exam: &Exam,
     target: &UserId,
     seq: i64,
+    hidden: &HashSet<String>,
     db: &Database,
 ) -> Result<AttemptAnswersResponse, AppError> {
-    let (questions, _) = ExamQuestion::list_for_exam(exam.get_id(), None, 0, db).await?;
+    let (mut questions, _) = ExamQuestion::list_for_exam(exam.get_id(), None, 0, db).await?;
+    questions.retain(|question| !hidden.contains(question.get_id().key()));
     let answers = ExamAnswer::list_for_exam_user(exam.get_id(), target, seq, db).await?;
     let answer_images: HashMap<String, AnswerImage> =
         AnswerImage::list_for_exam_user(exam.get_id(), target, seq, db)

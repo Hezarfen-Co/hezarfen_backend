@@ -310,6 +310,7 @@ async fn for_decision(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
         (status = 409, description = "The window overlaps one the caller has already published, or (weekly) two occurrences overlap each other — the whole publish is refused, nothing is written", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn publish_slots(
@@ -508,6 +509,7 @@ async fn delete_slot_series(
         (status = 403, description = "Only students and parents book appointments", body = ErrorResponse),
         (status = 404, description = "Slot not found", body = ErrorResponse),
         (status = 409, description = "The slot has started or is taken, the requester is busy, or its teacher is no longer staff", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn book(
@@ -628,6 +630,7 @@ async fn approve(
         (status = 403, description = "Not the slot's teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
         (status = 409, description = "No longer pending", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn reject(
@@ -670,6 +673,7 @@ async fn reject(
         (status = 403, description = "Not the requester", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
         (status = 409, description = "Already settled, or the appointment has already started", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn cancel(
@@ -729,6 +733,7 @@ async fn cancel(
         (status = 403, description = "Not the slot's teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
         (status = 409, description = "The appointment is already settled, or the proposed window has already started", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn reschedule(
@@ -775,6 +780,7 @@ async fn reschedule(
         (status = 403, description = "Not the requester", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
         (status = 409, description = "No time has been proposed, the proposal has since changed (re-read it), the booking is no longer pending, the proposed time has already started, or it collides with another approved appointment", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn accept_reschedule(
@@ -866,7 +872,7 @@ mod tests {
         let user = User::create(Username::try_new(username).unwrap(), hash, db)
             .await
             .unwrap();
-        user.set_role(role, db).await.unwrap()
+        user.set_role(role, db).await.unwrap().0
     }
 
     /// All five `can_manage` sites are `RequireTeacher` today, so this is
@@ -888,7 +894,7 @@ mod tests {
         assert!(can_manage(&slot, &owner));
 
         for role in [Role::Student, Role::Parent] {
-            let demoted = owner.clone().set_role(role, &db).await.unwrap();
+            let demoted = owner.clone().set_role(role, &db).await.unwrap().0;
             assert!(
                 !can_manage(&slot, &demoted),
                 "{role:?} slot owner still decides its bookings"

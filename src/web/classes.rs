@@ -16,6 +16,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::database::Database;
+use crate::domain::class_blueprint::{ClassBlueprint, ClassBlueprintId, Skip};
 use crate::domain::class_course::ClassCourse;
 use crate::domain::class_group::{ClassGrade, ClassGroup, ClassGroupId, ClassName};
 use crate::domain::class_member::ClassMember;
@@ -48,6 +49,12 @@ pub fn routes() -> OpenApiRouter<AppState> {
         .routes(routes!(remove_member))
         .routes(routes!(attach_course, list_class_courses))
         .routes(routes!(detach_course))
+        // Static before parameter is a matchit rule, not a registration order —
+        // `/classes/blueprints` reaches the template list and never `get_class`
+        // with an id of `"blueprints"`, exactly as `/classes/me` does.
+        .routes(routes!(create_blueprint, list_blueprints))
+        .routes(routes!(get_blueprint, update_blueprint, delete_blueprint))
+        .routes(routes!(apply_blueprint))
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -302,6 +309,7 @@ async fn classes_page(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 409, description = "The named homeroom teacher was demoted below teacher while the request ran — the class was rolled back, nothing was created", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn create_class(
@@ -435,6 +443,7 @@ async fn get_class(
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
         (status = 409, description = "The term this update moves the class off changed since the caller read it (nothing was written, re-read and retry), or the named homeroom teacher was demoted below teacher while the request ran (the assignment was undone)", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn update_class(
@@ -623,6 +632,7 @@ async fn delete_class(
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "Class not found", body = ErrorResponse),
         (status = 409, description = "Already in this class, the class is at its student ceiling (max_class_members), one of its courses is full, or one of them no longer exists (a stale attachment — detach it)", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn add_member(
@@ -749,6 +759,7 @@ async fn remove_member(
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Class not found", body = ErrorResponse),
         (status = 409, description = "Already attached, the class is at its course ceiling (max_class_courses), or the course cannot hold the whole class", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn attach_course(
@@ -859,6 +870,336 @@ async fn detach_course(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ---- grade blueprints ------------------------------------------------------
+
+#[derive(Deserialize, ToSchema)]
+struct CreateBlueprint {
+    /// The grade label this template stocks — the same free text a class
+    /// carries in `grade` ("9", "10-A"). It is the blueprint's own id, so it
+    /// must be non-empty and free of `/ \ ? # %`.
+    #[schema(max_length = 20, example = "9")]
+    grade: String,
+    /// The courses every class section at that grade takes.
+    course_ids: Vec<String>,
+}
+
+#[derive(Deserialize, ToSchema)]
+struct UpdateBlueprint {
+    /// The whole new course list — a *set*, not a delta: courses missing from
+    /// it are dropped from the blueprint and detached from the classes it
+    /// attached them to.
+    course_ids: Vec<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct BlueprintResponse {
+    /// The grade label, which is also the blueprint's id in every path here.
+    #[schema(example = "9")]
+    grade: String,
+    /// The course ids this grade's sections take.
+    courses: Vec<String>,
+    /// Who wrote the template.
+    creator: PersonRef,
+}
+
+impl BlueprintResponse {
+    fn new(
+        blueprint: &ClassBlueprint,
+        people: &std::collections::HashMap<String, PersonRef>,
+    ) -> Self {
+        Self {
+            grade: blueprint.get_grade().as_str().to_string(),
+            courses: blueprint
+                .get_courses()
+                .iter()
+                .map(|course| course.key().to_string())
+                .collect(),
+            creator: PersonRef::resolve(people, blueprint.get_creator()),
+        }
+    }
+}
+
+/// One class a pump did *not* stock, and why. The class is named as well as
+/// identified: a manager reading a skip list has to know which section is short
+/// a course, and a bare ULID is not that.
+#[derive(Serialize, ToSchema)]
+struct SkipResponse {
+    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    class: String,
+    #[schema(example = "9-C")]
+    class_name: String,
+    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    course: String,
+    /// Why that course could not be attached to that class.
+    #[schema(example = "the course has no free seat for the whole class")]
+    reason: String,
+}
+
+impl SkipResponse {
+    fn new(skip: &Skip) -> Self {
+        Self {
+            class: skip.class.key().to_string(),
+            class_name: skip.class_name.clone(),
+            course: skip.course.key().to_string(),
+            reason: skip.reason.to_string(),
+        }
+    }
+}
+
+#[derive(Serialize, ToSchema)]
+struct BlueprintPumpResponse {
+    blueprint: BlueprintResponse,
+    /// Every (class, course) pair this write could not place. Empty when every
+    /// section at the grade took the whole list. The blueprint itself was still
+    /// saved — a pump is best-effort by design.
+    skipped: Vec<SkipResponse>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct ApplyResponse {
+    /// The courses this class could not take, empty when it took them all.
+    skipped: Vec<SkipResponse>,
+}
+
+/// The courses a request names, each of which must exist. Order and duplicates
+/// are the blueprint's to settle ([`ClassBlueprint`] deduplicates).
+async fn resolve_courses(ids: &[String], db: &Database) -> Result<Vec<CourseId>, AppError> {
+    let mut courses = Vec::with_capacity(ids.len());
+    for id in ids {
+        let course = CourseId::from_key(id);
+        if Course::read(&course, db).await?.is_none() {
+            return Err(AppError::Validation(ValidationError::Invalid {
+                field: "course_ids",
+                reason: "one of these courses does not exist",
+            }));
+        }
+        courses.push(course);
+    }
+    Ok(courses)
+}
+
+/// The blueprint a path grade names, or a 404.
+async fn blueprint_or_404(grade: &str, db: &Database) -> Result<ClassBlueprint, AppError> {
+    ClassBlueprint::read(&ClassBlueprintId::from_key(grade), db)
+        .await?
+        .ok_or(AppError::NotFound)
+}
+
+async fn blueprint_body(
+    blueprint: &ClassBlueprint,
+    skipped: &[Skip],
+    db: &Database,
+) -> Result<BlueprintPumpResponse, AppError> {
+    let people = person_map([blueprint.get_creator().clone()], db).await?;
+    Ok(BlueprintPumpResponse {
+        blueprint: BlueprintResponse::new(blueprint, &people),
+        skipped: skipped.iter().map(SkipResponse::new).collect(),
+    })
+}
+
+/// Create a grade's course blueprint and stock every class section already at
+/// that grade with it. Requires manager+.
+///
+/// The pump is **best-effort**: a class that cannot take one of the courses (it
+/// is at its own course ceiling, or the course has no free seat for the whole
+/// section) is skipped and reported in `skipped`, while every other class is
+/// still stocked. The blueprint is saved either way.
+#[utoipa::path(
+    post,
+    path = "/blueprints",
+    tag = "classes",
+    security(("session_cookie" = [])),
+    request_body = CreateBlueprint,
+    responses(
+        (status = 201, description = "Blueprint created, with the classes it could not stock", body = BlueprintPumpResponse),
+        (status = 400, description = "Invalid or unaddressable grade, too many courses, or a course that does not exist", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
+        (status = 409, description = "A blueprint already exists for that grade", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
+    ),
+)]
+async fn create_blueprint(
+    State(st): State<AppState>,
+    RequireManager(user): RequireManager,
+    Json(req): Json<CreateBlueprint>,
+) -> Result<(StatusCode, Json<BlueprintPumpResponse>), AppError> {
+    let grade = ClassBlueprint::grade_key(&req.grade)?;
+    let courses = resolve_courses(&req.course_ids, &st.db).await?;
+    let blueprint = ClassBlueprint::create(user.get_id(), grade, courses, &st.db).await?;
+    let skipped = blueprint.pump(user.get_id(), &st.db).await?;
+    let body = blueprint_body(&blueprint, &skipped, &st.db).await?;
+    Ok((StatusCode::CREATED, Json(body)))
+}
+
+/// List every grade blueprint, by grade label. Requires manager+. Paged via
+/// `?limit=&offset=` (omit `limit` for all of them).
+#[utoipa::path(
+    get,
+    path = "/blueprints",
+    tag = "classes",
+    security(("session_cookie" = [])),
+    params(PageParams),
+    responses(
+        (status = 200, description = "A page of blueprints (all of them when unpaged)", body = Page<BlueprintResponse>),
+        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
+    ),
+)]
+async fn list_blueprints(
+    State(st): State<AppState>,
+    RequireManager(_user): RequireManager,
+    Query(page): Query<PageParams>,
+) -> Result<Json<Page<BlueprintResponse>>, AppError> {
+    let (limit, offset) = page.resolve()?;
+    let (blueprints, total) = ClassBlueprint::list_all(limit, offset, &st.db).await?;
+    let people = person_map(
+        blueprints
+            .iter()
+            .map(|blueprint| blueprint.get_creator().clone()),
+        &st.db,
+    )
+    .await?;
+    let items = blueprints
+        .iter()
+        .map(|blueprint| BlueprintResponse::new(blueprint, &people))
+        .collect();
+    Ok(Json(Page::new(items, total, limit, offset)))
+}
+
+/// Fetch one grade's blueprint. Requires manager+.
+#[utoipa::path(
+    get,
+    path = "/blueprints/{grade}",
+    tag = "classes",
+    security(("session_cookie" = [])),
+    params(("grade" = String, Path, description = "Grade label")),
+    responses(
+        (status = 200, description = "The blueprint", body = BlueprintResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
+        (status = 404, description = "No blueprint for that grade", body = ErrorResponse),
+    ),
+)]
+async fn get_blueprint(
+    State(st): State<AppState>,
+    RequireManager(_user): RequireManager,
+    Path(grade): Path<String>,
+) -> Result<Json<BlueprintResponse>, AppError> {
+    let blueprint = blueprint_or_404(&grade, &st.db).await?;
+    let people = person_map([blueprint.get_creator().clone()], &st.db).await?;
+    Ok(Json(BlueprintResponse::new(&blueprint, &people)))
+}
+
+/// Replace a blueprint's course list and reconcile every class section at that
+/// grade with it. Requires manager+.
+///
+/// `course_ids` is the whole list, not a delta. A course dropped from it is
+/// **detached** from the classes this blueprint attached it to (their pumped
+/// enrollments swept the usual way) — but a course a human attached to a class
+/// by hand carries no blueprint tag and is left exactly where it is. Courses
+/// still in the list are pumped into every class at the grade that does not
+/// already carry them.
+///
+/// The pump is **best-effort**: a class that cannot take a course is skipped
+/// and reported in `skipped`, and the rest are still stocked. A `409` means the
+/// list changed since you read it — nothing was written; re-read and retry.
+#[utoipa::path(
+    patch,
+    path = "/blueprints/{grade}",
+    tag = "classes",
+    security(("session_cookie" = [])),
+    params(("grade" = String, Path, description = "Grade label")),
+    request_body = UpdateBlueprint,
+    responses(
+        (status = 200, description = "Updated blueprint, with the classes it could not stock", body = BlueprintPumpResponse),
+        (status = 400, description = "Too many courses, or a course that does not exist", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
+        (status = 404, description = "No blueprint for that grade", body = ErrorResponse),
+        (status = 409, description = "The course list changed since the caller read it — nothing was written, re-read and retry", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
+    ),
+)]
+async fn update_blueprint(
+    State(st): State<AppState>,
+    RequireManager(user): RequireManager,
+    Path(grade): Path<String>,
+    Json(req): Json<UpdateBlueprint>,
+) -> Result<Json<BlueprintPumpResponse>, AppError> {
+    let blueprint = blueprint_or_404(&grade, &st.db).await?;
+    let courses = resolve_courses(&req.course_ids, &st.db).await?;
+    let (saved, skipped) = blueprint
+        .set_courses(courses, user.get_id(), &st.db)
+        .await?;
+    Ok(Json(blueprint_body(&saved, &skipped, &st.db).await?))
+}
+
+/// Delete a grade's blueprint. Requires manager+. Every attachment the
+/// blueprint made is detached with it (their pumped enrollments swept the usual
+/// way); a course a human attached to one of those classes by hand carries no
+/// blueprint tag and survives.
+#[utoipa::path(
+    delete,
+    path = "/blueprints/{grade}",
+    tag = "classes",
+    security(("session_cookie" = [])),
+    params(("grade" = String, Path, description = "Grade label")),
+    responses(
+        (status = 204, description = "Deleted"),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
+        (status = 404, description = "No blueprint for that grade", body = ErrorResponse),
+    ),
+)]
+async fn delete_blueprint(
+    State(st): State<AppState>,
+    RequireManager(_user): RequireManager,
+    Path(grade): Path<String>,
+) -> Result<StatusCode, AppError> {
+    blueprint_or_404(&grade, &st.db)
+        .await?
+        .delete(&st.db)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Stock one class section from its grade's blueprint. Requires manager+ — this
+/// writes the roster of every course in the template, which is the office's
+/// call, not one course owner's.
+///
+/// Idempotent: a course the class already carries is left alone, whoever
+/// attached it. Best-effort like every other pump — the courses that did not
+/// fit come back in `skipped` and the rest are attached. A class with no grade,
+/// or a grade no blueprint covers, is a 404.
+#[utoipa::path(
+    post,
+    path = "/{id}/blueprint",
+    tag = "classes",
+    security(("session_cookie" = [])),
+    params(("id" = String, Path, description = "Class id")),
+    responses(
+        (status = 200, description = "The class was stocked, minus the courses it could not take", body = ApplyResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
+        (status = 404, description = "Class not found, or no blueprint covers its grade", body = ErrorResponse),
+    ),
+)]
+async fn apply_blueprint(
+    State(st): State<AppState>,
+    RequireManager(user): RequireManager,
+    Path(id): Path<String>,
+) -> Result<Json<ApplyResponse>, AppError> {
+    let class = class_or_404(&id, &st.db).await?;
+    let grade = class.get_grade().ok_or(AppError::NotFound)?;
+    let blueprint = blueprint_or_404(grade.as_str(), &st.db).await?;
+    let skipped = blueprint.apply_to(&class, user.get_id(), &st.db).await?;
+    Ok(Json(ApplyResponse {
+        skipped: skipped.iter().map(SkipResponse::new).collect(),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -904,7 +1245,7 @@ mod tests {
             )
             .await
             .unwrap();
-            user.set_role(role, &db).await.unwrap()
+            user.set_role(role, &db).await.unwrap().0
         };
         let student = make("ali", Role::Student).await;
         let teacher = make("ada", Role::Teacher).await;
