@@ -9,6 +9,7 @@ use utoipa_axum::routes;
 
 use crate::database::Database;
 use crate::domain::board::Board;
+use crate::domain::class_group::ClassGroup;
 use crate::domain::class_pump;
 use crate::domain::course::Course;
 use crate::domain::parent_link::ParentLink;
@@ -399,6 +400,19 @@ async fn set_role(
         .await?
         .ok_or(AppError::NotFound)?;
     let updated = user.set_role(role, &st.db).await?;
+    // KNOWN GAP (deliberate, not an oversight): the role write above and the
+    // sweeps below are separate statements, so a sweep that errors answers 500
+    // with the role already lowered and some of the old grants still standing.
+    // Every one of them is idempotent and re-running the same PATCH repairs it,
+    // and every security gate re-reads the live role rather than trusting a
+    // swept row — the residue pollutes rosters and lists, it does not grant
+    // anything. Folding it into one transaction means folding eight tables plus
+    // `class_pump`'s own transaction and the board-hub publish (an in-process
+    // side effect that cannot sit inside a database transaction) — see the
+    // report accompanying this change. The write ordering *within* a request is
+    // closed from the other end instead: a handler that assigns a teacher-only
+    // role re-reads the live role after its write ([`super::undo_if_demoted`]),
+    // so a demotion racing an assignment is caught by whichever side is second.
     // Roster hygiene: only students enroll, so a non-student sheds all their
     // enrollment rows (security checks re-read the live role and never
     // trusted these; this just stops them polluting rosters and counts).
@@ -454,6 +468,11 @@ async fn set_role(
     // rows that grant nothing and still list a demoted user as its teacher.
     if !role.at_least(Role::Teacher) {
         Course::unassign_everywhere(&target, &st.db).await?;
+        // Same story for a class's homeroom teacher (sınıf öğretmeni): only
+        // teacher+ may hold one, so a demotion clears the column everywhere
+        // rather than leaving a class section (şube) listing a demoted account
+        // as its teacher.
+        ClassGroup::unassign_everywhere(&target, &st.db).await?;
     }
     Ok(Json(UserResponse::new(&updated)))
 }

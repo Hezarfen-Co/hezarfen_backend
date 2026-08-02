@@ -167,6 +167,24 @@ impl ClassMember {
         .run(limit, offset, db)
         .await
     }
+
+    /// The classes one student belongs to, newest membership first — the read
+    /// behind "which class section (şube) am I in". Same ordering story as
+    /// [`ClassMember::list_for_class`], along the other axis of the same index.
+    pub async fn list_for_user(
+        user: &UserId,
+        limit: Option<i64>,
+        offset: i64,
+        db: &Database,
+    ) -> Result<(Vec<ClassMember>, i64), AppError> {
+        PagedList::new(
+            format!("{CLASS_MEMBER_TABLE} WHERE user = $usr"),
+            "ORDER BY added_at DESC, id DESC",
+        )
+        .bind("usr", user.record())
+        .run(limit, offset, db)
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -181,6 +199,7 @@ pub(crate) mod tests {
         ClassGroup::create(
             &UserId::from_key("manager"),
             ClassName::try_new(name).unwrap(),
+            None,
             None,
             None,
             db,

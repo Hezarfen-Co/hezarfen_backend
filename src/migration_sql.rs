@@ -265,7 +265,7 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS homework_count ON subject TYPE option<int>;
     DEFINE INDEX IF NOT EXISTS subject_course ON subject FIELDS course;
 
-    -- A class (şube) is a named set of students that bulk-manages real
+    -- A class section (şube) is a named set of students that bulk-manages real
     -- `enrollment` rows: `class_member` is one student in it, `class_course` one
     -- course it is attached to. Both counters gate the class delete.
     DEFINE TABLE IF NOT EXISTS class_group SCHEMAFULL;
@@ -273,6 +273,7 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS grade ON class_group TYPE option<string>;
     DEFINE FIELD IF NOT EXISTS term ON class_group TYPE option<record<term>>;
     DEFINE FIELD IF NOT EXISTS creator ON class_group TYPE record<user>;
+    DEFINE FIELD IF NOT EXISTS teacher ON class_group TYPE option<record<user>>;
     DEFINE FIELD IF NOT EXISTS class_member_count ON class_group TYPE option<int>;
     DEFINE FIELD IF NOT EXISTS class_course_count ON class_group TYPE option<int>;
 

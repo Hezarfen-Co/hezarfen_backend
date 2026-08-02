@@ -98,6 +98,41 @@ pub(crate) async fn ensure_can_observe(
     ))
 }
 
+/// Close the window between "this account is teacher+" and the write that
+/// records a teacher-only assignment (a class's homeroom teacher, a course's
+/// teacher list). Call it *after* the write, with the account it named.
+///
+/// WHY: the demotion sweeps in `set_role` run **once**, over the rows that
+/// exist at that moment. A `PATCH /users/{id}/role` interleaving between a
+/// handler's role check and its write sweeps nothing — and nothing ever
+/// re-sweeps — so the assignment stands forever, naming an account that may no
+/// longer be a teacher at all. Re-reading the live role after the write is what
+/// makes the pair ordered: either the sweep sees the row, or this read sees the
+/// demotion.
+///
+/// The undo is the very sweep `set_role` owed, and both halves of it are
+/// conditional writes scoped to *this* user (`teacher = $usr`,
+/// `$usr IN teachers`), so a legitimate concurrent assignment of somebody else
+/// is untouched — no lock, the repo's existing idiom. Both are run, not just
+/// the caller's own: a demoted account may hold neither, and the row this
+/// request did not write is exactly the one a lost sweep left behind.
+///
+/// A missing user counts as demoted. The ordinary path is one extra read and no
+/// write at all.
+pub(crate) async fn undo_if_demoted(target: &UserId, db: &Database) -> Result<(), AppError> {
+    if User::read(target, db)
+        .await?
+        .is_some_and(|user| user.get_role().at_least(Role::Teacher))
+    {
+        return Ok(());
+    }
+    crate::domain::class_group::ClassGroup::unassign_everywhere(target, db).await?;
+    crate::domain::course::Course::unassign_everywhere(target, db).await?;
+    Err(AppError::Conflict(
+        "that user was demoted below teacher while this request ran — the assignment was undone; re-read their role and retry",
+    ))
+}
+
 /// If both ends are present, `ends_at` must not precede `starts_at`. Shared by
 /// everything that carries a time range (events, course sessions). The PATCH
 /// paths re-check this at write time via
@@ -336,6 +371,132 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The demotion-vs-assign race, driven in the order the race produces it:
+    /// both assignments are already written (the handler's role check has
+    /// passed), *then* the account drops below `teacher` with no sweep — which
+    /// is exactly what `set_role`'s one-shot sweep leaves behind when it runs
+    /// before the write. The post-write re-read must undo both columns and
+    /// refuse; with the account still staff it must undo nothing at all.
+    ///
+    /// Asserted on stored state, never on a return value: the in-memory engine
+    /// forges those (see [`crate::domain::cap`]).
+    #[tokio::test]
+    async fn undo_if_demoted_repairs_both_assignments_or_neither() {
+        use crate::domain::class_group::{ClassGroup, ClassName};
+        use crate::domain::course::{Course, CourseDescription, CourseKind, CourseTitle};
+        use crate::domain::user::{Password, Username};
+
+        let db = crate::database::init_mem().await.unwrap();
+        let office = UserId::from_key("office");
+        let teacher = User::create(
+            Username::try_new("ada").unwrap(),
+            Password::try_new("secret1")
+                .unwrap()
+                .hash_async()
+                .await
+                .unwrap(),
+            &db,
+        )
+        .await
+        .unwrap()
+        .set_role(Role::Teacher, &db)
+        .await
+        .unwrap();
+
+        let assigned = async |db: &Database| {
+            let class = ClassGroup::create(
+                &office,
+                ClassName::try_new("9-A").unwrap(),
+                None,
+                None,
+                Some(teacher.get_id().clone()),
+                db,
+            )
+            .await
+            .unwrap();
+            let course = Course::create(
+                &office,
+                CourseTitle::try_new("algebra").unwrap(),
+                CourseDescription::try_new("").unwrap(),
+                CourseKind::course(),
+                None,
+                None,
+                db,
+            )
+            .await
+            .unwrap()
+            .assign_teacher(teacher.get_id(), db)
+            .await
+            .unwrap();
+            (class, course)
+        };
+        /// `(the class's stored teacher, the course's stored teacher list)`.
+        async fn stored(
+            class: &crate::domain::class_group::ClassGroupId,
+            course: &crate::domain::course::CourseId,
+            db: &Database,
+        ) -> (Option<UserId>, Vec<UserId>) {
+            (
+                ClassGroup::read(class, db)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .get_teacher()
+                    .cloned(),
+                Course::read(course, db)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .get_teachers()
+                    .to_vec(),
+            )
+        }
+
+        // Still staff: one read, and not a single write.
+        let (class, course) = assigned(&db).await;
+        undo_if_demoted(teacher.get_id(), &db)
+            .await
+            .expect("an account that is still teacher+ keeps what it was given");
+        assert_eq!(
+            stored(class.get_id(), course.get_id(), &db).await,
+            (
+                Some(teacher.get_id().clone()),
+                vec![teacher.get_id().clone()]
+            ),
+            "nothing may be undone while the bar still holds"
+        );
+
+        // Demoted with no sweep — the state a lost race leaves.
+        db.query("UPDATE $usr SET role = 'student'")
+            .bind(("usr", teacher.get_id().record()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let refused = undo_if_demoted(teacher.get_id(), &db).await;
+        assert!(
+            matches!(refused, Err(AppError::Conflict(message)) if message.contains("demoted")),
+            "a demotion mid-request must be a 409 naming it: {refused:?}"
+        );
+        assert_eq!(
+            stored(class.get_id(), course.get_id(), &db).await,
+            (None, Vec::new()),
+            "…with both assignments taken back, not just the caller's own"
+        );
+
+        // A user that is gone counts as demoted, and the repair is idempotent.
+        assert!(
+            undo_if_demoted(&UserId::from_key("ghost"), &db)
+                .await
+                .is_err()
+        );
+        assert!(undo_if_demoted(teacher.get_id(), &db).await.is_err());
+        assert_eq!(
+            stored(class.get_id(), course.get_id(), &db).await,
+            (None, Vec::new())
+        );
+    }
 
     #[tokio::test]
     async fn check_time_range_orders_the_ends() {

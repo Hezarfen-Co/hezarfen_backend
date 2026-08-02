@@ -86,9 +86,10 @@ pub const MAX_EXAM_DESCRIPTION_LEN: usize = 2_000;
 pub const MAX_COURSE_TITLE_LEN: usize = 200;
 pub const MAX_COURSE_DESCRIPTION_LEN: usize = 2_000;
 
-/// A class (şube) is named like a course, but its optional `grade` is a free-text
-/// label the school picks ("9", "10-A", "anaokulu") — a line of display text, so
-/// it is bounded like the other short labels, not like a description.
+/// A class section (şube) is named like a course, but its optional `grade` is
+/// a free-text label the school picks ("9", "10-A", "anaokulu") — a line of
+/// display text, so it is bounded like the other short labels, not like a
+/// description.
 pub const MAX_CLASS_NAME_LEN: usize = 200;
 pub const MAX_CLASS_GRADE_LEN: usize = 20;
 
@@ -97,7 +98,7 @@ pub const MAX_CLASS_GRADE_LEN: usize = 20;
 /// adding a member writes one per attached course, both in a *single*
 /// transaction, so each axis's counter is the bound on the other axis's write
 /// loop — a class with no ceiling is an unbounded transaction anyone with the
-/// manager role can trigger. A şube is a homeroom (`MAX_HOMEWORK_ASSIGNED`
+/// manager role can trigger. A section is a homeroom (`MAX_HOMEWORK_ASSIGNED`
 /// shares the 200) and its timetable is a school week, not a catalogue.
 ///
 /// Which is also why each write is refused on the *other* axis: a class created

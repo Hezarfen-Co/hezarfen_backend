@@ -1,4 +1,4 @@
-//! Regressions for the class (şube) layer, its enrollment side, and the sweep a
+//! Regressions for the class section (şube) layer, its enrollment side, and the sweep a
 //! role change runs. Every test here pins a defect that shipped: a link left
 //! pointing at a deleted course, the refusal that misnamed it, a hand enroll a
 //! class could still undo, and the two-transaction role sweep.
@@ -6,7 +6,7 @@
 mod common;
 
 use axum::http::StatusCode;
-use common::{app_and_db, create_course, login_as, me_id, send};
+use common::{Res, app_and_db, create_course, login_as, me_id, send, total};
 use hezarfen_backend::constant::{MAX_CLASS_COURSES, MAX_CLASS_MEMBERS};
 use hezarfen_backend::database::Database;
 use hezarfen_backend::domain::class_course::ClassCourse;
@@ -62,6 +62,7 @@ async fn an_attach_onto_a_deleted_course_writes_no_link() {
     let class = ClassGroup::create(
         &manager,
         ClassName::try_new("9-A").unwrap(),
+        None,
         None,
         None,
         &db,
@@ -503,6 +504,7 @@ async fn a_roster_is_ordered_by_when_a_student_was_added() {
         ClassName::try_new("9-A").unwrap(),
         None,
         None,
+        None,
         &db,
     )
     .await
@@ -570,6 +572,7 @@ async fn a_class_course_list_is_ordered_by_when_it_was_attached() {
         ClassName::try_new("9-A").unwrap(),
         None,
         None,
+        None,
         &db,
     )
     .await
@@ -621,6 +624,7 @@ async fn a_class_refuses_the_member_past_its_ceiling() {
     let class = ClassGroup::create(
         &manager,
         ClassName::try_new("9-A").unwrap(),
+        None,
         None,
         None,
         &db,
@@ -689,6 +693,7 @@ async fn a_class_over_the_other_axis_ceiling_attaches_nothing() {
         ClassName::try_new("9-A").unwrap(),
         None,
         None,
+        None,
         &db,
     )
     .await
@@ -746,6 +751,7 @@ async fn a_class_over_the_course_ceiling_takes_no_member() {
         ClassName::try_new("9-B").unwrap(),
         None,
         None,
+        None,
         &db,
     )
     .await
@@ -770,5 +776,789 @@ async fn a_class_over_the_course_ceiling_takes_no_member() {
     assert_eq!(
         counter("SELECT VALUE class_member_count ?? 0 FROM class_group", &db).await,
         0
+    );
+}
+
+// ---- homeroom teacher (sınıf öğretmeni) ------------------------------------
+
+/// Create a class as `cookie` (asserts 201); returns the whole response body.
+async fn create_class(app: &axum::Router, cookie: &str, body: serde_json::Value) -> Res {
+    let res = send(app, "POST", "/classes", Some(cookie), Some(body)).await;
+    assert_eq!(res.status, StatusCode::CREATED, "create class");
+    res
+}
+
+/// The `teacher` block of `GET /classes/{id}`, straight out of the store's own
+/// read path — never off the write's response body.
+async fn stored_teacher(app: &axum::Router, cookie: &str, class: &str) -> serde_json::Value {
+    let res = send(app, "GET", &format!("/classes/{class}"), Some(cookie), None).await;
+    assert_eq!(res.status, StatusCode::OK, "GET /classes/{class}");
+    res.body["teacher"].clone()
+}
+
+/// The whole write contract for the homeroom teacher over HTTP: set at create,
+/// re-set and cleared by PATCH (both `null` and `""`), and — the one a
+/// whole-row save would break — untouched by a PATCH of another field. The
+/// response always names the person, never a bare id.
+#[tokio::test]
+async fn the_homeroom_teacher_round_trips_through_create_and_patch() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "manager", "manager").await;
+    let teacher = login_as(&app, &db, "teacher", "teacher").await;
+    let other = login_as(&app, &db, "other", "teacher").await;
+    let teacher_id = me_id(&app, &teacher).await;
+    let other_id = me_id(&app, &other).await;
+
+    let created = create_class(
+        &app,
+        &manager,
+        json!({ "name": "9-A", "teacher_id": teacher_id }),
+    )
+    .await;
+    let class = created.body["id"].as_str().unwrap().to_string();
+    assert_eq!(created.body["teacher"]["id"], json!(teacher_id));
+    assert_eq!(
+        created.body["teacher"]["username"],
+        json!("teacher"),
+        "the response must name the teacher, not echo an id"
+    );
+    assert_eq!(
+        stored_teacher(&app, &manager, &class).await["id"],
+        json!(teacher_id)
+    );
+
+    // A name-only PATCH must leave the teacher exactly where it is.
+    let renamed = send(
+        &app,
+        "PATCH",
+        &format!("/classes/{class}"),
+        Some(&manager),
+        Some(json!({ "name": "9-B" })),
+    )
+    .await;
+    assert_eq!(renamed.status, StatusCode::OK);
+    assert_eq!(renamed.body["teacher"]["id"], json!(teacher_id));
+    assert_eq!(
+        stored_teacher(&app, &manager, &class).await["id"],
+        json!(teacher_id)
+    );
+
+    // …and a teacher-only PATCH must leave the name alone.
+    let moved = send(
+        &app,
+        "PATCH",
+        &format!("/classes/{class}"),
+        Some(&manager),
+        Some(json!({ "teacher_id": other_id })),
+    )
+    .await;
+    assert_eq!(moved.status, StatusCode::OK);
+    assert_eq!(moved.body["name"], json!("9-B"));
+    assert_eq!(moved.body["teacher"]["id"], json!(other_id));
+
+    // Both spellings of "no teacher" land on the same stored row.
+    for clear in [json!(null), json!("")] {
+        send(
+            &app,
+            "PATCH",
+            &format!("/classes/{class}"),
+            Some(&manager),
+            Some(json!({ "teacher_id": other_id })),
+        )
+        .await;
+        let cleared = send(
+            &app,
+            "PATCH",
+            &format!("/classes/{class}"),
+            Some(&manager),
+            Some(json!({ "teacher_id": clear })),
+        )
+        .await;
+        assert_eq!(cleared.status, StatusCode::OK, "clearing with {clear}");
+        assert_eq!(
+            cleared.body["teacher"],
+            json!(null),
+            "clearing with {clear}"
+        );
+        assert_eq!(stored_teacher(&app, &manager, &class).await, json!(null));
+    }
+}
+
+/// A student is not staff: naming one as the homeroom teacher is a `400` on
+/// both write paths, and so is an id that names nobody at all.
+#[tokio::test]
+async fn a_student_or_a_ghost_cannot_be_the_homeroom_teacher() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "manager", "manager").await;
+    let student = login_as(&app, &db, "ali", "student").await;
+    let student_id = me_id(&app, &student).await;
+    let ghost = "01J8XZ0K3Q8G7X2M4N5P6R7S8T";
+
+    for bad in [student_id.as_str(), ghost] {
+        let refused = send(
+            &app,
+            "POST",
+            "/classes",
+            Some(&manager),
+            Some(json!({ "name": "9-A", "teacher_id": bad })),
+        )
+        .await;
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST, "create with {bad}");
+    }
+    assert_eq!(
+        rows("SELECT VALUE id FROM class_group", &db).await,
+        0,
+        "a refused create may write no class"
+    );
+
+    let class = create_class(&app, &manager, json!({ "name": "9-A" }))
+        .await
+        .body["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for bad in [student_id.as_str(), ghost] {
+        let refused = send(
+            &app,
+            "PATCH",
+            &format!("/classes/{class}"),
+            Some(&manager),
+            Some(json!({ "name": "9-B", "teacher_id": bad })),
+        )
+        .await;
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST, "patch with {bad}");
+    }
+    // The refused PATCH carried a name too — it must not have landed either.
+    let stored = send(
+        &app,
+        "GET",
+        &format!("/classes/{class}"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(stored.body["name"], json!("9-A"));
+    assert_eq!(stored.body["teacher"], json!(null));
+}
+
+/// End-to-end demotion: `PATCH /users/{id}/role` down to `student` clears that
+/// account off every class it homeroomed, and off nobody else's — a demoted
+/// user may hold no section.
+#[tokio::test]
+async fn a_demotion_clears_the_homeroom_teacher_everywhere() {
+    let (app, db) = app_and_db().await;
+    let admin = login_as(&app, &db, "mudur", "admin").await;
+    let teacher = login_as(&app, &db, "teacher", "teacher").await;
+    let keeper = login_as(&app, &db, "keeper", "teacher").await;
+    let teacher_id = me_id(&app, &teacher).await;
+    let keeper_id = me_id(&app, &keeper).await;
+
+    let mut held = Vec::new();
+    for name in ["9-A", "9-B"] {
+        held.push(
+            create_class(
+                &app,
+                &admin,
+                json!({ "name": name, "teacher_id": teacher_id }),
+            )
+            .await
+            .body["id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+    }
+    let untouched = create_class(
+        &app,
+        &admin,
+        json!({ "name": "10-A", "teacher_id": keeper_id }),
+    )
+    .await
+    .body["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let demoted = send(
+        &app,
+        "PATCH",
+        &format!("/users/{teacher_id}/role"),
+        Some(&admin),
+        Some(json!({ "role": "student" })),
+    )
+    .await;
+    assert_eq!(demoted.status, StatusCode::OK);
+
+    for class in &held {
+        assert_eq!(
+            stored_teacher(&app, &admin, class).await,
+            json!(null),
+            "a demoted user may not stay a class's homeroom teacher"
+        );
+    }
+    assert_eq!(
+        stored_teacher(&app, &admin, &untouched).await["id"],
+        json!(keeper_id),
+        "…and nobody else's assignment may move"
+    );
+}
+
+// ---- a student's own section ------------------------------------------------
+
+/// `GET /classes/me` is the one class read a student can make: it returns
+/// exactly their own memberships (with the homeroom teacher joined on), it does
+/// not fall through to the teacher-only `GET /classes/{id}`, and it pages.
+#[tokio::test]
+async fn a_student_reads_exactly_their_own_classes() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "manager", "manager").await;
+    let teacher = login_as(&app, &db, "teacher", "teacher").await;
+    let student = login_as(&app, &db, "ali", "student").await;
+    let lonely = login_as(&app, &db, "veli", "student").await;
+    let teacher_id = me_id(&app, &teacher).await;
+    let student_id = me_id(&app, &student).await;
+
+    // Added oldest-first, with a gap wide enough that `added_at` really
+    // orders them — the composite ids break a tie in account-ULID order, which
+    // says nothing about who joined first.
+    let mut mine = Vec::new();
+    for name in ["9-A", "9-B"] {
+        let class = create_class(
+            &app,
+            &manager,
+            json!({ "name": name, "teacher_id": teacher_id }),
+        )
+        .await
+        .body["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let added = send(
+            &app,
+            "POST",
+            &format!("/classes/{class}/members"),
+            Some(&manager),
+            Some(json!({ "user_id": student_id })),
+        )
+        .await;
+        assert_eq!(added.status, StatusCode::CREATED);
+        mine.push(class);
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // A class the student is *not* in must never show up.
+    create_class(&app, &manager, json!({ "name": "10-A" })).await;
+
+    let res = send(&app, "GET", "/classes/me", Some(&student), None).await;
+    assert_eq!(
+        res.status,
+        StatusCode::OK,
+        "/classes/me must not fall through to the teacher-only /classes/{{id}}"
+    );
+    assert!(
+        res.body.get("items").is_some() && res.body.get("total").is_some(),
+        "…which is what a page envelope, rather than one class object, proves: {:?}",
+        res.body
+    );
+    assert_eq!(total(&res.body), 2);
+    let ids = |body: &serde_json::Value| -> Vec<String> {
+        body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    // Unsorted: the documented order is newest membership first, so the class
+    // joined *second* must lead. Sorting here is what made this assertion dead.
+    assert_eq!(
+        ids(&res.body),
+        vec![mine[1].clone(), mine[0].clone()],
+        "exactly the student's own classes, newest membership first"
+    );
+    assert_eq!(
+        res.body["items"][0]["teacher"]["username"],
+        json!("teacher"),
+        "the homeroom teacher must be resolved, not left a bare id"
+    );
+    // The office's account names stay out of a student's reach.
+    assert_eq!(
+        res.body["items"][0]["creator"],
+        json!(null),
+        "a student may not learn who in the office created their class"
+    );
+    let staff = send(&app, "GET", "/classes/me", Some(&manager), None).await;
+    assert_eq!(total(&staff.body), 0, "staff are never class members");
+    let staff_view = send(
+        &app,
+        "GET",
+        &format!("/classes/user/{student_id}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(
+        staff_view.body["items"][0]["creator"]["username"],
+        json!("manager"),
+        "…but teacher+ still sees the creator"
+    );
+
+    // The window must actually move: the second page is the *older* class, not
+    // the first page again. Asserting only the length let `offset` be ignored.
+    let paged = send(
+        &app,
+        "GET",
+        "/classes/me?limit=1&offset=1",
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(paged.status, StatusCode::OK);
+    assert_eq!(total(&paged.body), 2);
+    assert_eq!(
+        ids(&paged.body),
+        vec![mine[0].clone()],
+        "?offset=1 must return the second row of the full order, not the first"
+    );
+    let first = send(
+        &app,
+        "GET",
+        "/classes/me?limit=1&offset=0",
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(ids(&first.body), vec![mine[1].clone()]);
+
+    // A student in no class gets an empty page, not a 404.
+    let empty = send(&app, "GET", "/classes/me", Some(&lonely), None).await;
+    assert_eq!(empty.status, StatusCode::OK);
+    assert_eq!(total(&empty.body), 0);
+    assert!(empty.body["items"].as_array().unwrap().is_empty());
+}
+
+/// `GET /classes/user/{id}` follows the observer rule the per-student reports
+/// use: teacher+ and a *linked* parent may read it, everyone else — an
+/// unlinked parent, another student — is a `403` with no existence leak.
+#[tokio::test]
+async fn only_staff_and_a_linked_parent_read_another_users_classes() {
+    let (app, db) = app_and_db().await;
+    let admin = login_as(&app, &db, "mudur", "admin").await;
+    let teacher = login_as(&app, &db, "teacher", "teacher").await;
+    let student = login_as(&app, &db, "ali", "student").await;
+    let peer = login_as(&app, &db, "veli", "student").await;
+    let parent = login_as(&app, &db, "anne", "parent").await;
+    let stranger = login_as(&app, &db, "baba", "parent").await;
+    let student_id = me_id(&app, &student).await;
+    let parent_id = me_id(&app, &parent).await;
+    let teacher_id = me_id(&app, &teacher).await;
+
+    let class = create_class(
+        &app,
+        &admin,
+        json!({ "name": "9-A", "teacher_id": teacher_id }),
+    )
+    .await
+    .body["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    send(
+        &app,
+        "POST",
+        &format!("/classes/{class}/members"),
+        Some(&admin),
+        Some(json!({ "user_id": student_id })),
+    )
+    .await;
+    let linked = send(
+        &app,
+        "POST",
+        &format!("/users/{parent_id}/students"),
+        Some(&admin),
+        Some(json!({ "user_id": student_id })),
+    )
+    .await;
+    assert!(
+        linked.status.is_success(),
+        "link student: {}",
+        linked.status
+    );
+
+    let path = format!("/classes/user/{student_id}");
+    // `creator` is the half of this route that is not about who may read it:
+    // a linked parent is below teacher+, so the office account that made the
+    // class must be hidden from them exactly as it is from their child — while
+    // the homeroom teacher, which is the point of the read, stays named for
+    // both.
+    for (who, cookie, creator) in [
+        ("teacher", &teacher, json!("mudur")),
+        ("linked parent", &parent, json!(null)),
+    ] {
+        let res = send(&app, "GET", &path, Some(cookie), None).await;
+        assert_eq!(res.status, StatusCode::OK, "{who} may read");
+        assert_eq!(total(&res.body), 1, "{who} sees the class");
+        assert_eq!(res.body["items"][0]["id"], json!(class));
+        assert_eq!(
+            res.body["items"][0]["teacher"]["username"],
+            json!("teacher"),
+            "{who} must be told who the homeroom teacher is"
+        );
+        let seen = &res.body["items"][0]["creator"];
+        match creator.as_str() {
+            Some(name) => assert_eq!(seen["username"], json!(name), "{who} may see the creator"),
+            None => assert_eq!(
+                *seen,
+                json!(null),
+                "{who} is below teacher+ and may not learn an office account's name"
+            ),
+        }
+    }
+    for (who, cookie) in [("unlinked parent", &stranger), ("another student", &peer)] {
+        let res = send(&app, "GET", &path, Some(cookie), None).await;
+        assert_eq!(res.status, StatusCode::FORBIDDEN, "{who} may not");
+    }
+
+    // The pagination envelope, and the 404 a user who does not exist gets.
+    let paged = send(
+        &app,
+        "GET",
+        &format!("{path}?limit=1&offset=0"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(paged.status, StatusCode::OK);
+    assert_eq!(total(&paged.body), 1);
+    assert_eq!(paged.body["items"].as_array().unwrap().len(), 1);
+    let ghost = send(
+        &app,
+        "GET",
+        "/classes/user/01J8XZ0K3Q8G7X2M4N5P6R7S8T",
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(ghost.status, StatusCode::NOT_FOUND);
+}
+
+/// The documented decision on a `class_member` row whose class is gone: the
+/// page still *counts* it (the window was cut from the membership rows) but
+/// skips it from `items`, and answers `200` rather than a `500` or a short
+/// page that silently loses the rest. Unreachable through the API — the class
+/// delete guard refuses while members exist — so the row is forced here the
+/// only way it could ever arise, a class row vanishing under its memberships.
+#[tokio::test]
+async fn a_membership_whose_class_is_gone_is_counted_but_skipped() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "manager", "manager").await;
+    let student = login_as(&app, &db, "ali", "student").await;
+    let student_id = me_id(&app, &student).await;
+
+    let mut classes = Vec::new();
+    for name in ["9-A", "9-B"] {
+        let class = create_class(&app, &manager, json!({ "name": name }))
+            .await
+            .body["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let added = send(
+            &app,
+            "POST",
+            &format!("/classes/{class}/members"),
+            Some(&manager),
+            Some(json!({ "user_id": student_id })),
+        )
+        .await;
+        assert_eq!(added.status, StatusCode::CREATED);
+        classes.push(class);
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // The guard would refuse this, so it is spelled as the raw row loss it
+    // stands in for; the membership row is deliberately left behind.
+    db.query("DELETE type::record('class_group', $key)")
+        .bind(("key", classes[0].clone()))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+    let res = send(&app, "GET", "/classes/me", Some(&student), None).await;
+    assert_eq!(
+        res.status,
+        StatusCode::OK,
+        "a dangling membership is not a 500"
+    );
+    assert_eq!(
+        total(&res.body),
+        2,
+        "total counts the membership rows, which is what the window was cut from"
+    );
+    let items = res.body["items"].as_array().unwrap();
+    assert_eq!(
+        items.len(),
+        1,
+        "the class that is gone is skipped, not faked"
+    );
+    assert_eq!(
+        items[0]["id"],
+        json!(classes[1]),
+        "…and the surviving class is still there, in order"
+    );
+}
+
+// ---- the demotion-vs-assign race, made deterministic -----------------------
+//
+// The window is between a handler's "this account is teacher+" check and the
+// write that records it: a `PATCH /users/{id}/role` landing in there sweeps
+// nothing (the rows it would sweep are not written yet) and nothing ever
+// re-sweeps, so the assignment would stand forever naming a non-teacher. Every
+// such handler therefore re-reads the live role *after* its write
+// (`web::undo_if_demoted`).
+//
+// Racing it from a second task would be a coin flip the in-memory engine is
+// known to lie about, so the demotion is injected by the database itself: a
+// `DEFINE EVENT` on the very table the handler writes fires *inside* that
+// write, which is exactly "after the role check, before the re-read", every
+// single time. Nothing in `src/` knows about it — the seam is the schema, and
+// these tests are what stop the three `undo_if_demoted` calls being deleted.
+
+/// Demote `user` from inside the next write to `table`, the instant it lands.
+async fn demote_during_writes_to(table: &str, event: &str, user: &str, db: &Database) {
+    db.query(format!(
+        "DEFINE EVENT demote_mid_write ON TABLE {table} WHEN $event = '{event}' THEN {{ \
+         UPDATE type::record('user', '{user}') SET role = 'student'; }};"
+    ))
+    .await
+    .unwrap()
+    .check()
+    .unwrap();
+}
+
+/// The homeroom teacher's live role, straight out of the store.
+async fn role_of(user: &str, db: &Database) -> String {
+    let mut result = db
+        .query("SELECT VALUE role FROM user WHERE id = type::record('user', $k)")
+        .bind(("k", user.to_string()))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    result.take::<Vec<String>>(0).unwrap().pop().unwrap()
+}
+
+/// `POST /classes` naming a teacher who is demoted while the row is being
+/// written: `409`, and the class is rolled back **whole** — no teacherless
+/// class left standing, and no reference stranded on the term it linked (which
+/// would make that term undeletable forever).
+#[tokio::test]
+async fn a_create_whose_teacher_is_demoted_mid_write_rolls_back_whole() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "manager", "manager").await;
+    let teacher = login_as(&app, &db, "teacher", "teacher").await;
+    let teacher_id = me_id(&app, &teacher).await;
+    let term = send(
+        &app,
+        "POST",
+        "/terms",
+        Some(&manager),
+        Some(json!({ "name": "2026", "starts_at": 100, "ends_at": 200 })),
+    )
+    .await;
+    assert_eq!(term.status, StatusCode::CREATED);
+    let term_id = term.body["id"].as_str().unwrap().to_string();
+
+    demote_during_writes_to("class_group", "CREATE", &teacher_id, &db).await;
+    let res = send(
+        &app,
+        "POST",
+        "/classes",
+        Some(&manager),
+        Some(json!({ "name": "9-A", "teacher_id": teacher_id, "term_id": term_id })),
+    )
+    .await;
+
+    assert_eq!(
+        res.status,
+        StatusCode::CONFLICT,
+        "a teacher demoted mid-write must not be recorded as one: {:?}",
+        res.body
+    );
+    assert!(
+        res.body["error"].as_str().unwrap().contains("demoted"),
+        "the 409 must say why: {:?}",
+        res.body
+    );
+    assert_eq!(role_of(&teacher_id, &db).await, "student", "the seam fired");
+    assert_eq!(
+        rows("SELECT VALUE id FROM class_group", &db).await,
+        0,
+        "the 409 promises nothing was created — so nothing may be there"
+    );
+    assert_eq!(
+        counter("SELECT VALUE class_count ?? 0 FROM term", &db).await,
+        0,
+        "…and least of all a reference stranded on the term"
+    );
+    let freed = send(
+        &app,
+        "DELETE",
+        &format!("/terms/{term_id}"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(
+        freed.status,
+        StatusCode::NO_CONTENT,
+        "which is the point: the term must still be deletable"
+    );
+}
+
+/// `PATCH /classes/{id}` naming a teacher who is demoted while the row is being
+/// written: `409`, and the column it just set is taken back.
+#[tokio::test]
+async fn a_patch_whose_teacher_is_demoted_mid_write_undoes_the_column() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "manager", "manager").await;
+    let teacher = login_as(&app, &db, "teacher", "teacher").await;
+    let teacher_id = me_id(&app, &teacher).await;
+    let class = create_class(&app, &manager, json!({ "name": "9-A" }))
+        .await
+        .body["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    demote_during_writes_to("class_group", "UPDATE", &teacher_id, &db).await;
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/classes/{class}"),
+        Some(&manager),
+        Some(json!({ "teacher_id": teacher_id })),
+    )
+    .await;
+
+    assert_eq!(
+        res.status,
+        StatusCode::CONFLICT,
+        "a teacher demoted mid-write must not be recorded as one: {:?}",
+        res.body
+    );
+    assert_eq!(role_of(&teacher_id, &db).await, "student", "the seam fired");
+    assert_eq!(
+        counter(
+            "SELECT VALUE (IF teacher = NONE { 0 } ELSE { 1 }) FROM class_group",
+            &db
+        )
+        .await,
+        0,
+        "the assignment this request wrote must be taken back"
+    );
+    // The class itself is untouched — only the column this request set is.
+    let stored = send(
+        &app,
+        "GET",
+        &format!("/classes/{class}"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(stored.status, StatusCode::OK);
+    assert_eq!(stored.body["name"], json!("9-A"));
+    assert_eq!(stored.body["teacher"], json!(null));
+}
+
+/// The same guard on the other assignment it protects:
+/// `POST /courses/{id}/teachers` for an account demoted while the list is being
+/// written is a `409`, with the assignment dropped again.
+#[tokio::test]
+async fn a_course_assignment_whose_teacher_is_demoted_mid_write_is_undone() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "manager", "manager").await;
+    let teacher = login_as(&app, &db, "teacher", "teacher").await;
+    let teacher_id = me_id(&app, &teacher).await;
+    let course = create_course(&app, &manager, "algebra").await;
+
+    demote_during_writes_to("course", "UPDATE", &teacher_id, &db).await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/courses/{course}/teachers"),
+        Some(&manager),
+        Some(json!({ "user_id": teacher_id })),
+    )
+    .await;
+
+    assert_eq!(
+        res.status,
+        StatusCode::CONFLICT,
+        "a teacher demoted mid-write must not be recorded as one: {:?}",
+        res.body
+    );
+    assert_eq!(role_of(&teacher_id, &db).await, "student", "the seam fired");
+    assert_eq!(
+        counter("SELECT VALUE array::len(teachers ?? []) FROM course", &db).await,
+        0,
+        "the assignment must be dropped again, not left granting nothing"
+    );
+}
+
+/// The other end of that rollback: if the delete is ever *refused* — the class
+/// took a member or a course between its own create and the rollback — the
+/// class is still there, so answering the `409` whose text promises "nothing
+/// was created" would be a lie about the stored state. It must surface as an
+/// internal error instead.
+///
+/// Unreachable through the API (the class is one statement old and both of its
+/// counters are absent), so the seam does both halves at once: demote the
+/// teacher *and* tick `class_member_count` inside the very write that creates
+/// the row, which is the only ordering that reaches this branch.
+#[tokio::test]
+async fn a_rollback_the_guard_refuses_is_a_500_not_a_lying_409() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "manager", "manager").await;
+    let teacher = login_as(&app, &db, "teacher", "teacher").await;
+    let teacher_id = me_id(&app, &teacher).await;
+
+    db.query(format!(
+        "DEFINE EVENT demote_and_occupy ON TABLE class_group WHEN $event = 'CREATE' THEN {{ \
+         UPDATE type::record('user', '{teacher_id}') SET role = 'student'; \
+         UPDATE $after.id SET class_member_count = 1; }};"
+    ))
+    .await
+    .unwrap()
+    .check()
+    .unwrap();
+
+    let res = send(
+        &app,
+        "POST",
+        "/classes",
+        Some(&manager),
+        Some(json!({ "name": "9-A", "teacher_id": teacher_id })),
+    )
+    .await;
+
+    assert_eq!(
+        res.status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a rollback that could not happen may not be reported as one: {:?}",
+        res.body
+    );
+    assert_eq!(
+        rows("SELECT VALUE id FROM class_group", &db).await,
+        1,
+        "the class really is still there — which is why the 409 would have lied"
+    );
+    assert_eq!(
+        counter(
+            "SELECT VALUE (IF teacher = NONE { 0 } ELSE { 1 }) FROM class_group",
+            &db
+        )
+        .await,
+        0,
+        "…though the demoted teacher is off it, the undo having run first"
     );
 }

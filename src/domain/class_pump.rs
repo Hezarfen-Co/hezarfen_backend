@@ -1,7 +1,8 @@
 //! The pump behind the class layer: one link row changed, and every
 //! `enrollment` row that link implies reconciled with it, in one transaction.
 //!
-//! A class (şube) has two link tables — `class_member` (a student in it) and
+//! A class section (şube) has two link tables — `class_member` (a student in
+//! it) and
 //! `class_course` (a course attached to it) — and the *product* of the two is
 //! the roster it owes: every member is enrolled in every attached course, in
 //! real `enrollment` rows tagged [`source`](crate::domain::enrollment) with the
