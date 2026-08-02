@@ -452,19 +452,59 @@ impl Appointment {
         Ok(result.take::<Vec<Appointment>>(0)?)
     }
 
-    /// Confirm the meeting. Re-runs the double-booking guard for both teacher
-    /// and requester against a fresh read under [`APPOINTMENT_LOCK`] — the
-    /// authoritative check, since only approval commits anyone. Refused (409)
-    /// when the effective window has already started; that also covers
-    /// [`accept_proposal`], which lands here.
+    /// Confirm the meeting at the slot's own window. Re-runs the double-booking
+    /// guard for both teacher and requester against a fresh read under
+    /// [`APPOINTMENT_LOCK`] — the authoritative check, since only approval
+    /// commits anyone. Refused (409) when the effective window has already
+    /// started; that also covers [`accept_proposal`], which lands here.
+    ///
+    /// Also refused (409) while a counter-proposal stands: the effective window
+    /// would then be the *proposed* one, and the deciding side here is the
+    /// teacher's, so approving would commit the requester to a time only the
+    /// teacher ever named. That move belongs to [`accept_proposal`], which the
+    /// web layer opens to the requester alone.
     pub async fn approve(
         id: &AppointmentId,
         decided_by: &UserId,
         db: &Database,
     ) -> Result<Appointment, AppError> {
+        Self::approve_inner(id, decided_by, None, db).await
+    }
+
+    /// The one approval path. `accepting` carries the window the caller is
+    /// answering *for*, which is the only way a proposed one may be committed:
+    /// it both marks the caller as the proposal's counterparty and pins which
+    /// proposal they saw. Re-checked on every retry round, so a proposal that
+    /// moved between the read and the write is refused rather than confirmed.
+    async fn approve_inner(
+        id: &AppointmentId,
+        decided_by: &UserId,
+        accepting: Option<(Timestamp, Timestamp)>,
+        db: &Database,
+    ) -> Result<Appointment, AppError> {
         let _guard = APPOINTMENT_LOCK.lock().await;
         for _ in 0..CAS_UPDATE_RETRIES {
             let expected = Self::read_pending(id, db).await?;
+            match accepting {
+                None if expected.has_proposal() => {
+                    return Err(AppError::Conflict(
+                        "a counter-proposal is standing; only the requester can accept it",
+                    ));
+                }
+                Some(_) if !expected.has_proposal() => {
+                    return Err(AppError::Conflict("no time has been proposed"));
+                }
+                // The proposal moved between the requester reading it and
+                // accepting it. Committing here would bind them to a window the
+                // teacher swapped in after they clicked, which is the whole
+                // thing the requester-only accept exists to prevent.
+                Some(accepted) if !expected.proposes(accepted) => {
+                    return Err(AppError::Conflict(
+                        "the proposed time has changed; re-read the booking and accept the new one",
+                    ));
+                }
+                _ => {}
+            }
             let slot = AppointmentSlot::read(&expected.slot, db)
                 .await?
                 .ok_or(AppError::NotFound)?;
@@ -612,20 +652,38 @@ impl Appointment {
 
     /// Accept the standing proposal — approval at the proposed time. The
     /// overlap guard runs again because the time moved.
+    ///
+    /// `starts_at`/`ends_at` are the proposal the caller is answering, as they
+    /// read it. They are not a request to move the meeting: they *pin* the one
+    /// being accepted, and a proposal that has since been superseded is refused
+    /// (409) rather than committed. `propose` takes no lock and the two calls
+    /// are minutes apart, so nothing but this pin can tell "the requester
+    /// agreed to 10:00" from "the requester's click landed on 23:00".
     pub async fn accept_proposal(
         id: &AppointmentId,
         decided_by: &UserId,
+        starts_at: Timestamp,
+        ends_at: Timestamp,
         db: &Database,
     ) -> Result<Appointment, AppError> {
-        {
-            let appointment = Self::read(id, db).await?.ok_or(AppError::NotFound)?;
-            if appointment.proposed_starts_at.is_none() || appointment.proposed_ends_at.is_none() {
-                return Err(AppError::Conflict("no time has been proposed"));
-            }
-        }
-        // `approve` re-reads under the lock and reads the proposed window off
-        // the row, so accepting is approval — no second code path.
-        Self::approve(id, decided_by, db).await
+        // The same approval path re-reads under the lock and reads the proposed
+        // window off the row, so accepting is approval — no second code path.
+        // Only this door passes `accepting`, and the web layer opens it to the
+        // requester alone.
+        Self::approve_inner(id, decided_by, Some((starts_at, ends_at)), db).await
+    }
+
+    /// Is a counter-proposal standing? Both halves, exactly as [`window`](Self::window)
+    /// prefers them: a half-written triple is not a proposal and the slot's own
+    /// window still rules.
+    fn has_proposal(&self) -> bool {
+        self.proposed_starts_at.is_some() && self.proposed_ends_at.is_some()
+    }
+
+    /// Is the standing proposal exactly this window? Milliseconds, the one form
+    /// both the API and the row speak.
+    fn proposes(&self, (starts_at, ends_at): (Timestamp, Timestamp)) -> bool {
+        self.proposed_starts_at == Some(starts_at) && self.proposed_ends_at == Some(ends_at)
     }
 
     /// The row, insisting it is still open for a decision.
@@ -853,28 +911,54 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let (passed_starts_at, passed_ends_at) = (soon(-30_000), soon(30_000));
         let mut standing = current.clone();
-        standing.proposed_starts_at = Some(soon(-30_000));
-        standing.proposed_ends_at = Some(soon(30_000));
+        standing.proposed_starts_at = Some(passed_starts_at);
+        standing.proposed_ends_at = Some(passed_ends_at);
         standing
             .save_if_unchanged(&current, &db)
             .await
             .unwrap()
             .unwrap();
         assert!(matches!(
-            Appointment::accept_proposal(booking.get_id(), &student, &db).await,
+            Appointment::accept_proposal(
+                booking.get_id(),
+                &student,
+                passed_starts_at,
+                passed_ends_at,
+                &db
+            )
+            .await,
             Err(AppError::Conflict("that time has already started"))
         ));
         // Refused, not half-applied: still pending, still decidable at a time
         // that can actually happen.
         let after = Appointment::read(booking.get_id(), &db).await.unwrap();
         assert_eq!(after.unwrap().get_status(), AppointmentStatus::Pending);
-        Appointment::propose(booking.get_id(), soon(60_000), soon(120_000), &teacher, &db)
+        let (starts_at, ends_at) = (soon(60_000), soon(120_000));
+        Appointment::propose(booking.get_id(), starts_at, ends_at, &teacher, &db)
             .await
             .unwrap();
-        let accepted = Appointment::accept_proposal(booking.get_id(), &student, &db)
-            .await
-            .unwrap();
+        // Accepting a window that is *not* the standing proposal is refused —
+        // the pin is what the requester saw, not a request to move the meeting.
+        assert!(matches!(
+            Appointment::accept_proposal(
+                booking.get_id(),
+                &student,
+                passed_starts_at,
+                passed_ends_at,
+                &db
+            )
+            .await,
+            Err(AppError::Conflict(
+                "the proposed time has changed; \
+                 re-read the booking and accept the new one"
+            ))
+        ));
+        let accepted =
+            Appointment::accept_proposal(booking.get_id(), &student, starts_at, ends_at, &db)
+                .await
+                .unwrap();
         assert_eq!(accepted.get_status(), AppointmentStatus::Approved);
     }
 

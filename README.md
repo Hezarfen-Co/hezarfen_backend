@@ -482,7 +482,14 @@ messages, which any role sends and receives (that's how a parent reaches a
 teacher). A role
 change off either end of a tie (the parent stops being a `parent`, the
 student stops being a `student`) drops the tie, exactly like promotion drops
-course enrollments.
+course enrollments. A demotion to `parent` also gives back the seats that
+account holds on still-open **event signup lists** — a parent cannot reach
+`DELETE /events/{id}/register/{user}` and no one else may free a non-student's
+seat, so those seats would stay claimed forever and a capped event would answer
+"full" for good. Every other role change leaves signups alone: staff free their
+own seats by hand. Seats on lists that have already closed (the event started,
+or its `ends_at`-only deadline passed) are never touched — that roster is
+history, and re-registering is refused.
 
 | Action                                   | Minimum role | Notes                                         |
 |------------------------------------------|--------------|-----------------------------------------------|
@@ -650,7 +657,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/users/search`                  | teacher | `?q=<fragment>&role=<role?>` — find users by username/name fragment (pickers); refs only, no contact info · paged |
 | GET    | `/users`                         | admin   | List all users · paged          |
 | GET    | `/users/{id}`                    | admin   | Get one user                    |
-| PATCH  | `/users/{id}/role`               | admin   | `{role}` — set a user's role; promotion out of `student` drops the user's course enrollments (only students enroll) |
+| PATCH  | `/users/{id}/role`               | admin   | `{role}` — set a user's role; promotion out of `student` drops the user's course enrollments (only students enroll), and a demotion to `parent` also frees their seats on still-open event signup lists |
 | PATCH  | `/users/{id}/profile`            | admin   | Update any user's personal info |
 | PATCH  | `/users/{id}/preferences`        | admin   | Update any user's UI preferences |
 | POST   | `/users/{id}/students`           | admin   | `{user_id}` — tie a **student** to a **parent** account `{id}` (idempotent); the tie is the parent's read grant |
@@ -686,11 +693,11 @@ window filtering, before paging; negative values are a `400` naming the field.
 | DELETE | `/appointments/slots/series/{series}` | teacher | Withdraw a whole recurring publish (same rights); `409` if **any** occurrence has a live booking |
 | POST   | `/appointments`                  | student | `{slot, reason}` — book a slot; **students and parents only** (a parent books for themselves); lands `pending`, `409` if the slot's window has already started, the slot is taken, the caller is busy at that time, or its teacher is no longer staff |
 | GET    | `/appointments`                  | student | Teacher+: bookings on own slots (the request inbox). Everyone else: own requests · paged |
-| PATCH  | `/appointments/{id}/approve`     | teacher | Confirm a pending booking (slot's teacher, or manager+); `409` when settled, when the effective window has already started, or when the time collides with another approved meeting of either side |
+| PATCH  | `/appointments/{id}/approve`     | teacher | Confirm a pending booking (slot's teacher, or manager+); `409` when settled, **while a counter-proposal stands** (only the requester may approve at a proposed time, via `/reschedule/accept`), when the effective window has already started, or when the time collides with another approved meeting of either side |
 | PATCH  | `/appointments/{id}/reject`      | teacher | Turn it down (same rights); the slot frees up |
 | PATCH  | `/appointments/{id}/cancel`      | student | `{reason?}` — call it off; **the requester only** (`403` for anyone else, the slot's teacher and manager+ included — they reject, or reschedule then reject); `409` once settled or the meeting has started |
 | PATCH  | `/appointments/{id}/reschedule`  | teacher | `{starts_at, ends_at}` — counter-propose another time (same rights); the booking goes back to `pending`; `409` if the proposed window has already started |
-| PATCH  | `/appointments/{id}/reschedule/accept` | student | Requester only: approval at the proposed time (the overlap guard runs again) |
+| PATCH  | `/appointments/{id}/reschedule/accept` | student | `{proposed_starts_at, proposed_ends_at}` — requester only: accept the counter-proposal **as read**; this *is* approval at that time (the overlap guard runs again); `409` if the proposal has since changed, if none stands, if the booking is no longer pending, if that time has started, or if it collides with another approved meeting of either side |
 | PATCH  | `/appointments/{id}/reschedule/decline` | student | Requester only: refuse the proposal — this **cancels** the booking, so the cancel deadline applies (`409` once the meeting's window has started) |
 | POST   | `/courses`                       | teacher | `{title, description?, kind?, term_id?, capacity?}` — `kind` is `course` (default), `study` (etüt), or `club` (kulüp); `capacity` caps the roster (creator manages it) |
 | GET    | `/courses`                       | student | The caller's visible courses: created + enrolled (manager+: all) · paged |
@@ -726,7 +733,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | DELETE | `/sessions/{id}`                 | teacher | Delete session + its roll call (course manager) |
 | POST   | `/sessions/{id}/attendance`      | teacher | `{status, user_id}` — roll call: session teacher/course manager mark **enrolled students** (students only); the teacher's own row needs manager+ |
 | GET    | `/sessions/{id}/attendance`      | teacher | List the session's roll call (session teacher or course manager) · paged |
-| DELETE | `/sessions/{id}/attendance/{user}` | teacher | Remove a roll-call row (same rights as marking) |
+| DELETE | `/sessions/{id}/attendance/{user}` | teacher | Remove a roll-call row (same rights as marking); a **staff** row — any target whose live role is teacher or higher, not just the session's current teacher — needs manager+ |
 | POST   | `/courses/{id}/exams`            | teacher | `{title, description?, kind, mode?, starts_at?, ends_at?, duration_ms?, max_attempts?, allow_rejoin?, allow_review?, draft?}` — add an exam (course manager); its weight comes from the kind; `draft: true` keeps it hidden while it's written |
 | GET    | `/courses/{id}/exams`            | student | List the course's exams (enrolled, creator, assigned teacher, or manager+; drafts appear to course managers only) · paged |
 | GET    | `/exams`                         | student | The caller's visible exams: their courses' (manager+: all; drafts of managed courses only) · paged · `?starts_after=&ends_after=` window (soonest first) |
@@ -766,7 +773,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/exams/{id}/students/{user}/attempts/{seq}/answers/{qid}/image` | teacher | One prior sitting's drawn-answer bytes, inline (course manager) |
 | GET    | `/exams/{id}/students/{user}/marks` | teacher | A student's full per-sitting mark history, oldest first — the latest seq is the grade-of-record (course manager) |
 | GET    | `/exams/{id}/review/questions`   | student | The exam's question list **with `correct`** — the answer key the caller checks their own sheet against (same review gate) · paged |
-| GET    | `/exams/{id}/review/attempts`    | student | The caller's **own** sitting numbers (answers ⋃ marks), ascending — only when `allow_review` is on and the caller has been marked (`403`/`404` otherwise) |
+| GET    | `/exams/{id}/review/attempts`    | student | The caller's **own** sitting numbers (answers ⋃ marks), ascending — only when `allow_review` is on and the caller has been marked (`403`/`404` otherwise), and `409` while the caller's latest sitting is still in progress (all four review reads share that gate) |
 | GET    | `/exams/{id}/review/attempts/{seq}/answers` | student | One of the caller's **own** sittings, judged: `is_correct` flags + suggested `auto_score` (same review gate) |
 | GET    | `/exams/{id}/review/attempts/{seq}/answers/{qid}/image` | student | The caller's **own** drawn-answer bytes for a sitting, inline (same review gate) |
 | GET    | `/exams/{id}/attempt/ws`         | student | **WebSocket** exam room (students only): state ticks, autosave, finish; entering clears `left_at`, leaving stamps it (see "Taking an exam") |
@@ -951,7 +958,11 @@ someone is a no-op, a full list is a `409`, and the list freezes the moment
 the event starts — or, when only `ends_at` is set (a pure signup deadline),
 the moment it passes (register and unregister both). Signup rows survive an
 audience switch inertly and resurface if the event returns to the registration
-kind; deleting the event deletes them. Pre-existing hand-picked (`users`)
+kind; deleting the event deletes them, in one transaction with the attendance
+rows. A demotion to `parent` sweeps that user's signups off **still-open**
+lists and hands each seat back (`PATCH /users/{id}/role`): unregistering is
+student-or-self only, so a parent's seat had no other way out. Staff free their
+own, and a closed list is never rewritten. Pre-existing hand-picked (`users`)
 audiences convert on boot: each listed user becomes a signup row credited to
 the event's creator, and the audience becomes an uncapped registration list.
 Reading a child collection of a missing parent (`/events/{id}/attendance`,
@@ -1059,7 +1070,9 @@ it, so the seat is decided by the database rather than by a count two
 concurrent bookings can both read as free). The decisions:
 
 - `PATCH /{id}/approve` — the slot's teacher (or manager+) confirms. Refused
-  (`409`) when the effective window has already started.
+  (`409`) when the effective window has already started, and refused while a
+  counter-proposal stands: the proposal is the teacher's own, so approving it
+  here would let them confirm a time the requester never accepted.
 - `PATCH /{id}/reject` — turns it down; the slot frees up.
 - `PATCH /{id}/cancel` — **the requester only**, from either live state.
   Anyone else is a `403`, the slot's teacher and a manager/admin included (the
@@ -1078,12 +1091,27 @@ concurrent bookings can both read as free). The decisions:
   confirmed appointment. The slot stays held meanwhile. A window that has
   already opened is refused (`409`): the 60-second grace on the times is for
   clock skew, not for proposing into a meeting already underway — one nobody
-  could then cancel.
-- `PATCH /{id}/reschedule/accept` — the **requester** only: this *is* approval
+  could then cancel. While the proposal stands, `PATCH /{id}/approve` is
+  refused (`409`): the effective window is now the teacher's own proposal, so
+  confirming it there would commit the requester to a time they never agreed
+  to. Only `/reschedule/accept` may approve at a proposed time, and only the
+  requester may call it. Re-proposing supersedes the previous proposal, so any
+  accept still carrying the old one is refused.
+- `PATCH /{id}/reschedule/accept` (`{proposed_starts_at, proposed_ends_at}`) —
+  the **requester** only: this *is* approval
   at the new time, so the overlap guard runs again — and so does the
   already-started guard (`409`). Agreeing to a window that has begun does not
   help: the meeting could never be cancelled. The booking stays `pending`, so
   the teacher just proposes a time that can still happen.
+  The body **names the proposal being accepted**, copied from the booking's
+  `proposed_starts_at`/`proposed_ends_at` as the requester read them. It is not
+  a request to move the meeting: it pins *which* proposal this answer is for. A
+  teacher may re-propose at any moment and `/reschedule` takes no lock, so
+  without the pin the teacher would decide which window the requester's click
+  commits them to — propose 10:00, wait for them to open the page, propose
+  23:00, and their accept lands on 23:00. A superseded pin answers `409` (*the
+  proposed time has changed*); re-read the booking and accept or decline what
+  actually stands.
 - `PATCH /{id}/reschedule/decline` — the requester only, and it **cancels the
   booking**: the proposal replaced the time that was asked for, so there is
   nothing to fall back to. The row stays readable as `cancelled` with the
@@ -1780,6 +1808,19 @@ Two per-exam policy knobs ride along, both **live-editable** at any point:
   reads (`GET /exams/{id}/review/attempts[/{seq}/answers[/{qid}/image]]`). A
   student may review only when this is on **and** the teacher has marked them
   (an `ExamResult` row exists); own-scoped, so no student reads another's sheet.
+  All four reads are refused (`409`) while the caller's latest sitting is still
+  in progress — a mark on sitting 1 must not open the answer key to someone
+  midway through sitting 2. Submit the sitting first; an expired one reviews
+  fine.
+
+  **Known limit, accepted:** that gate is *per exam*. Instantiating one question
+  bank template into two exams copies its `correct` verbatim into both (the bank
+  is a copy-into-exam model, not a link), so a student sitting exam A can read
+  the same question's answer off exam B if B is graded and has review on. The
+  narrower gate cannot see it, and widening review to "no in-progress sitting on
+  *any* exam" would close review far too broadly, since `open`-mode sittings
+  never expire on their own. Teachers reusing one template across a live exam
+  and a reviewable one should expect that overlap.
 
 A student **sits** an exam through attempts (sitting 1, 2, … — each row id is
 the composite `exam_user[_seq]` key, so a sitting exists at most once by

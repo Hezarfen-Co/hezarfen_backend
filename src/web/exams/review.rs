@@ -170,8 +170,15 @@ pub(crate) async fn student_marks_history(
 // marked this student (an ExamResult row proves it).
 
 /// The exam plus the per-student review gate the three self-review reads share.
-/// 404 if the exam is missing or still a draft, 403 if review is off for it, and
-/// 404 until the caller has a mark on it (nothing to review yet).
+/// 404 if the exam is missing or still a draft, 403 if review is off for it,
+/// 404 until the caller has a mark on it (nothing to review yet), and 409 while
+/// the caller's latest sitting is still writable.
+///
+/// That last check is the one a mark alone can't make: the mark lookup reads the
+/// *latest* sitting's mark, so a mark left at seq 1 satisfies it forever — a
+/// student who starts a retake would otherwise read the answer key and their own
+/// correctness flags while still writing seq 2. Only `InProgress` is refused;
+/// an expired or submitted sitting reviews normally.
 pub(crate) async fn reviewable_exam(
     st: &AppState,
     user: &User,
@@ -189,12 +196,21 @@ pub(crate) async fn reviewable_exam(
     ExamResult::read_for_user(exam.get_id(), user.get_id(), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
+    if let Some(attempt) =
+        ExamAttempt::read_latest_for_user(exam.get_id(), user.get_id(), &st.db).await?
+        && attempt.status(&exam, Timestamp::now()) == AttemptStatus::InProgress
+    {
+        return Err(AppError::Conflict(
+            "finish your sitting before reviewing this exam",
+        ));
+    }
     Ok(exam)
 }
 
 /// The caller's own sitting numbers at an exam — every seq that carries answers
 /// or a mark, ascending. Own-scoped review view; opens once the teacher enables
-/// review and has marked the caller.
+/// review and has marked the caller, and closes again (409) while the caller has
+/// a sitting in progress.
 #[utoipa::path(
     get,
     path = "/{id}/review/attempts",
@@ -206,6 +222,7 @@ pub(crate) async fn reviewable_exam(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Review not enabled for this exam", body = ErrorResponse),
         (status = 404, description = "Exam not found, still a draft, or the caller has no mark on it", body = ErrorResponse),
+        (status = 409, description = "The caller's latest sitting is still in progress", body = ErrorResponse),
     ),
 )]
 pub(crate) async fn review_attempts(
@@ -227,7 +244,8 @@ pub(crate) async fn review_attempts(
 /// The exam's full question list, `correct` choice ids included — the answer key
 /// the caller reviews their own sheet against. Same review gate as the other
 /// self-review reads; revealing `correct` is the point (the gate already proves
-/// the caller was marked). Paged via `?limit=&offset=`.
+/// the caller was marked and has no sitting still open). Paged via
+/// `?limit=&offset=`.
 #[utoipa::path(
     get,
     path = "/{id}/review/questions",
@@ -240,6 +258,7 @@ pub(crate) async fn review_attempts(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Review not enabled for this exam", body = ErrorResponse),
         (status = 404, description = "Exam not found, still a draft, or the caller has no mark on it", body = ErrorResponse),
+        (status = 409, description = "The caller's latest sitting is still in progress", body = ErrorResponse),
     ),
 )]
 pub(crate) async fn review_questions(
@@ -255,7 +274,8 @@ pub(crate) async fn review_questions(
 
 /// One of the caller's own sittings, judged — the `seq`th attempt's answers,
 /// drawing refs, correctness flags, and auto-score suggestion. Own-scoped
-/// review view.
+/// review view; 409 while the caller has a sitting in progress, so a retake
+/// can't read its own correctness off an earlier seq.
 #[utoipa::path(
     get,
     path = "/{id}/review/attempts/{seq}/answers",
@@ -270,6 +290,7 @@ pub(crate) async fn review_questions(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Review not enabled for this exam", body = ErrorResponse),
         (status = 404, description = "Exam not found, still a draft, or the caller has no mark on it", body = ErrorResponse),
+        (status = 409, description = "The caller's latest sitting is still in progress", body = ErrorResponse),
     ),
 )]
 pub(crate) async fn review_attempt_answers(
@@ -282,7 +303,8 @@ pub(crate) async fn review_attempt_answers(
 }
 
 /// The caller's own drawn-answer bytes for one of their sittings — the
-/// seq-scoped, own-scoped mirror of the grader's drawing read.
+/// seq-scoped, own-scoped mirror of the grader's drawing read. Same 409 while a
+/// sitting is still open.
 #[utoipa::path(
     get,
     path = "/{id}/review/attempts/{seq}/answers/{qid}/image",
@@ -298,6 +320,7 @@ pub(crate) async fn review_attempt_answers(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Review not enabled for this exam", body = ErrorResponse),
         (status = 404, description = "No such exam/question/drawing, a draft, or the caller has no mark on it", body = ErrorResponse),
+        (status = 409, description = "The caller's latest sitting is still in progress", body = ErrorResponse),
     ),
 )]
 pub(crate) async fn review_attempt_answer_image(

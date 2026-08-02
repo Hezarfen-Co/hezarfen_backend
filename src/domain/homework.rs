@@ -11,7 +11,6 @@
 //! same-course by the web layer, exactly like an exam question's subject.
 
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-use ulid::Ulid;
 
 use crate::constant::{
     HOMEWORK_TABLE, MAX_HOMEWORK_DESCRIPTION_LEN, MAX_HOMEWORK_TITLE_LEN,
@@ -21,6 +20,7 @@ use crate::database::Database;
 use crate::domain::cap;
 use crate::domain::course::CourseId;
 use crate::domain::field_update::FieldUpdate;
+use crate::domain::monotonic_id::next_ulid;
 use crate::domain::subject::SubjectId;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
@@ -42,8 +42,11 @@ fn subject_gone() -> AppError {
 pub struct HomeworkId(RecordId);
 
 impl HomeworkId {
+    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
+    /// homework lists `id DESC` (newest first, [`Homework::list_all`]),
+    /// and a random low half scrambles rows minted in the same millisecond.
     pub fn generate() -> Self {
-        Self(RecordId::new(HOMEWORK_TABLE, Ulid::new().to_string()))
+        Self(RecordId::new(HOMEWORK_TABLE, next_ulid().to_string()))
     }
 
     pub fn from_key(key: &str) -> Self {

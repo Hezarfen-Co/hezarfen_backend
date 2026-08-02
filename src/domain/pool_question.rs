@@ -11,13 +11,13 @@
 //! this module owns the rows.
 
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-use ulid::Ulid;
 
 use crate::constant::{
     MAX_POOL_QUESTION_BODY_LEN, MAX_POOL_QUESTION_TITLE_LEN, POOL_QUESTION_TABLE, STATUS_APPROVED,
     STATUS_PENDING,
 };
 use crate::database::Database;
+use crate::domain::monotonic_id::next_ulid;
 use crate::domain::note_file::FileContentType;
 use crate::domain::solution::Solution;
 use crate::domain::timestamp::Timestamp;
@@ -29,8 +29,11 @@ use crate::validate::validate_required;
 pub struct PoolQuestionId(RecordId);
 
 impl PoolQuestionId {
+    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
+    /// the pool sorts `asked_at DESC, id DESC` and the id *is* the tie-break ([`PoolQuestion::list_all`]),
+    /// and a random low half scrambles rows minted in the same millisecond.
     pub fn generate() -> Self {
-        Self(RecordId::new(POOL_QUESTION_TABLE, Ulid::new().to_string()))
+        Self(RecordId::new(POOL_QUESTION_TABLE, next_ulid().to_string()))
     }
 
     pub fn from_key(key: &str) -> Self {
@@ -294,6 +297,8 @@ impl PoolQuestion {
 
 #[cfg(test)]
 mod tests {
+    use ulid::Ulid;
+
     use super::*;
     use crate::database;
     use crate::domain::solution::{Solution, SolutionBody};

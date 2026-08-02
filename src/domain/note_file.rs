@@ -6,7 +6,6 @@
 //! before blob on delete); this module owns the rows.
 
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-use ulid::Ulid;
 
 use crate::constant::{
     MAX_FILE_CONTENT_TYPE_LEN, MAX_FILE_NAME_LEN, MAX_NOTE_FILES, NOTE_FILE_COUNT_FIELD,
@@ -14,6 +13,7 @@ use crate::constant::{
 };
 use crate::database::Database;
 use crate::domain::cap;
+use crate::domain::monotonic_id::next_ulid;
 use crate::domain::note::NoteId;
 use crate::domain::page::PagedList;
 use crate::error::{AppError, ValidationError};
@@ -22,8 +22,11 @@ use crate::error::{AppError, ValidationError};
 pub struct NoteFileId(RecordId);
 
 impl NoteFileId {
+    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
+    /// a note's files list `id DESC` (newest first, [`NoteFile::list_for_note`]),
+    /// and a random low half scrambles rows minted in the same millisecond.
     pub fn generate() -> Self {
-        Self(RecordId::new(NOTE_FILE_TABLE, Ulid::new().to_string()))
+        Self(RecordId::new(NOTE_FILE_TABLE, next_ulid().to_string()))
     }
 
     pub fn from_key(key: &str) -> Self {

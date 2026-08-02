@@ -7,11 +7,11 @@
 //! rule that guards exams/lessons/events deliberately does not apply here.
 
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-use ulid::Ulid;
 
 use crate::constant::{COURSE_COUNT_FIELD, MAX_TERM_NAME_LEN, TERM_CLASS_COUNT_FIELD, TERM_TABLE};
 use crate::database::{Database, write_with_retry};
 use crate::domain::field_update::FieldUpdate;
+use crate::domain::monotonic_id::next_ulid;
 use crate::domain::page::PagedList;
 use crate::domain::timestamp::{Timestamp, range_error};
 use crate::error::{AppError, ValidationError};
@@ -21,8 +21,12 @@ use crate::validate::validate_required;
 pub struct TermId(RecordId);
 
 impl TermId {
+    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
+    /// terms sort `starts_at DESC, id DESC` and the id breaks the tie between
+    /// two terms starting at the same instant,
+    /// and a random low half sorts arbitrarily inside one millisecond.
     pub fn generate() -> Self {
-        Self(RecordId::new(TERM_TABLE, Ulid::new().to_string()))
+        Self(RecordId::new(TERM_TABLE, next_ulid().to_string()))
     }
 
     pub fn from_key(key: &str) -> Self {
@@ -137,7 +141,7 @@ impl Term {
         offset: i64,
         db: &Database,
     ) -> Result<(Vec<Term>, i64), AppError> {
-        PagedList::new("term", "ORDER BY starts_at DESC")
+        PagedList::new("term", "ORDER BY starts_at DESC, id DESC")
             .run(limit, offset, db)
             .await
     }
@@ -230,6 +234,48 @@ mod tests {
         // A move that keeps the range ordered still lands, guard and all.
         let moved = term.update(None, None, Some(at(300)), &db).await.unwrap();
         assert_eq!(moved.get_ends_at(), at(300));
+    }
+
+    /// Terms are listed newest-first *and* paged by offset, so the sort has to
+    /// be a total order: `starts_at` alone leaves rows that share an instant in
+    /// an arbitrary order, and offset paging over an unstable order can hand
+    /// the same row out twice while skipping another. Pins the `id DESC`
+    /// tie-break on identical `starts_at` — stored read-back, then page by page.
+    #[tokio::test]
+    async fn identical_starts_at_still_pages_each_term_exactly_once() {
+        let db = crate::database::init_mem().await.unwrap();
+        let at = Timestamp::from_millis;
+        let mut minted = Vec::new();
+        for i in 0..12 {
+            let term = Term::create(
+                TermName::try_new(&format!("t{i}")).unwrap(),
+                at(100),
+                at(200),
+                &db,
+            )
+            .await
+            .unwrap();
+            minted.push(term.get_id().key().to_string());
+        }
+        // Newest first: the tie-break runs the same way as the primary column.
+        minted.reverse();
+
+        let (listed, total) = Term::list_all(None, 0, &db).await.unwrap();
+        assert_eq!(total, 12);
+        let read_back: Vec<String> = listed
+            .iter()
+            .map(|row| row.get_id().key().to_string())
+            .collect();
+        assert_eq!(read_back, minted);
+
+        // The assertion that catches skip/duplicate: walk it in pages of 5.
+        let mut paged = Vec::new();
+        for offset in [0, 5, 10] {
+            let (page, total) = Term::list_all(Some(5), offset, &db).await.unwrap();
+            assert_eq!(total, 12);
+            paged.extend(page.iter().map(|row| row.get_id().key().to_string()));
+        }
+        assert_eq!(paged, minted, "every term exactly once, in list order");
     }
 
     #[tokio::test]

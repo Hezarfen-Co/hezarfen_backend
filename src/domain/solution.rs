@@ -10,10 +10,10 @@
 use std::collections::HashMap;
 
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-use ulid::Ulid;
 
 use crate::constant::{MAX_SOLUTION_BODY_LEN, SOLUTION_TABLE};
 use crate::database::Database;
+use crate::domain::monotonic_id::next_ulid;
 use crate::domain::note_file::FileContentType;
 use crate::domain::page::PagedList;
 use crate::domain::pool_question::PoolQuestionId;
@@ -26,8 +26,11 @@ use crate::validate::validate_required;
 pub struct SolutionId(RecordId);
 
 impl SolutionId {
+    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
+    /// solutions sort `offered_at ASC, id ASC` and the id *is* the tie-break ([`Solution::list_for_question`]),
+    /// and a random low half scrambles rows minted in the same millisecond.
     pub fn generate() -> Self {
-        Self(RecordId::new(SOLUTION_TABLE, Ulid::new().to_string()))
+        Self(RecordId::new(SOLUTION_TABLE, next_ulid().to_string()))
     }
 
     pub fn from_key(key: &str) -> Self {
@@ -249,6 +252,8 @@ impl Solution {
 
 #[cfg(test)]
 mod tests {
+    use ulid::Ulid;
+
     use super::*;
 
     #[tokio::test]

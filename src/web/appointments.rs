@@ -87,6 +87,18 @@ struct Reschedule {
     ends_at: i64,
 }
 
+#[derive(Deserialize, ToSchema)]
+struct AcceptReschedule {
+    /// The proposal being accepted, copied from the booking's
+    /// `proposed_starts_at`/`proposed_ends_at` as it was read. Not a request to
+    /// move the meeting: it pins *which* proposal this answer is for, so one the
+    /// teacher has since replaced answers `409` instead of committing you to a
+    /// window you never saw.
+    #[schema(example = 1_900_000_000_000_i64)]
+    proposed_starts_at: i64,
+    proposed_ends_at: i64,
+}
+
 #[derive(Serialize, ToSchema)]
 struct SlotResponse {
     #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
@@ -563,6 +575,12 @@ async fn list_appointments(
 /// approval is what commits anyone, so a time colliding with another approved
 /// meeting of the teacher or of the requester is refused (`409`), as is a
 /// window that has already started — that meeting could never be cancelled.
+///
+/// Refused (`409`) too while a counter-proposal stands: the proposed time is
+/// the teacher's own, so confirming it here would commit the requester to a
+/// time they never agreed to. Answering a proposal is the requester's alone:
+/// `PATCH /{id}/reschedule/accept` (which *is* approval, at the proposed time)
+/// or `PATCH /{id}/reschedule/decline` (which cancels the booking).
 #[utoipa::path(
     patch,
     path = "/{id}/approve",
@@ -574,7 +592,7 @@ async fn list_appointments(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the slot's teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "No longer pending, the time has already started, or it collides with another approved appointment", body = ErrorResponse),
+        (status = 409, description = "No longer pending, a counter-proposal is standing (only the requester can accept it), the time has already started, or it collides with another approved appointment", body = ErrorResponse),
     ),
 )]
 async fn approve(
@@ -731,28 +749,49 @@ async fn reschedule(
 /// double-booking guard runs again for both sides (`409` if the moved time now
 /// collides with something else, or has already started — agreeing to a window
 /// that began would mint a meeting nobody can cancel).
+///
+/// The body **names the proposal being accepted** (`proposed_starts_at` /
+/// `proposed_ends_at`, copied from the booking as it was read). A teacher may
+/// re-propose at any time, and the two calls are minutes apart, so without the
+/// pin the teacher would choose which window the requester's click commits
+/// them to. A superseded proposal answers `409` — re-read the booking and
+/// accept (or decline) the new one.
 #[utoipa::path(
     patch,
     path = "/{id}/reschedule/accept",
     tag = "appointments",
     security(("session_cookie" = [])),
     params(("id" = String, Path, description = "Appointment id")),
+    request_body = AcceptReschedule,
     responses(
         (status = 200, description = "Approved at the proposed time", body = AppointmentResponse),
+        (status = 400, description = "Missing or unreadable body", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the requester", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "No time has been proposed, the booking is no longer pending, the proposed time has already started, or it collides with another approved appointment", body = ErrorResponse),
+        (status = 409, description = "No time has been proposed, the proposal has since changed (re-read it), the booking is no longer pending, the proposed time has already started, or it collides with another approved appointment", body = ErrorResponse),
     ),
 )]
 async fn accept_reschedule(
     State(st): State<AppState>,
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
+    Json(req): Json<AcceptReschedule>,
 ) -> Result<Json<AppointmentResponse>, AppError> {
     let id = AppointmentId::from_key(&id);
     ensure_requester(&id, &user, &st.db).await?;
-    let appointment = Appointment::accept_proposal(&id, user.get_id(), &st.db).await?;
+    // Unvalidated on purpose: these are not a time to meet, they are the
+    // requester's answer to "which proposal?" — the domain compares them to the
+    // row and refuses anything else, so a past or inverted pair is simply a
+    // mismatch (409), never a booking.
+    let appointment = Appointment::accept_proposal(
+        &id,
+        user.get_id(),
+        Timestamp::from_millis(req.proposed_starts_at),
+        Timestamp::from_millis(req.proposed_ends_at),
+        &st.db,
+    )
+    .await?;
     one_appointment(appointment, &st.db).await
 }
 

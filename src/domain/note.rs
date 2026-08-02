@@ -1,9 +1,9 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-use ulid::Ulid;
 
 use crate::constant::{MAX_NOTE_CONTENT_LEN, MAX_NOTE_TITLE_LEN, NOTE_TABLE};
 use crate::database::Database;
 use crate::domain::field_update::FieldUpdate;
+use crate::domain::monotonic_id::next_ulid;
 use crate::domain::page::PagedList;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
@@ -13,8 +13,11 @@ use crate::validate::{validate_optional, validate_required};
 pub struct NoteId(RecordId);
 
 impl NoteId {
+    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
+    /// notes list `id DESC` (newest first, [`Note::list_for_user`]),
+    /// and a random low half scrambles rows minted in the same millisecond.
     pub fn generate() -> Self {
-        Self(RecordId::new(NOTE_TABLE, Ulid::new().to_string()))
+        Self(RecordId::new(NOTE_TABLE, next_ulid().to_string()))
     }
 
     pub fn from_key(key: &str) -> Self {
@@ -143,13 +146,35 @@ impl Note {
     /// disk are the web layer's to remove (it lists them before calling this);
     /// a crash in between leaves at worst an unreachable blob, never a row
     /// pointing at nothing.
+    ///
+    /// Children first, in one transaction, the way
+    /// [`crate::domain::course::Course::delete`] does it: as two queries, an
+    /// upload that committed in between kept its row while the note went, and
+    /// nothing could ever list or delete it again.
+    ///
+    /// ponytail: the blob of *that* upload is still orphaned on disk — the web
+    /// layer snapshots the file list before this call, so a row created inside
+    /// the window is deleted here but its file is never unlinked. Ceiling: one
+    /// leaked blob per racing upload-vs-delete, unreachable but not reclaimed.
+    /// Upgrade path: return the deleted `note_file` rows from this transaction
+    /// and have the handler unlink *those* instead of its snapshot.
     pub async fn delete(self, db: &Database) -> Result<Note, AppError> {
-        db.query("DELETE note_file WHERE note = $note")
+        let mut result = db
+            .query(
+                "BEGIN TRANSACTION;
+                 DELETE note_file WHERE note = $note;
+                 LET $gone = (DELETE $note RETURN BEFORE);
+                 RETURN $gone;
+                 COMMIT TRANSACTION;",
+            )
             .bind(("note", self.id.record()))
             .await?
             .check()?;
-        let deleted: Option<Note> = db.delete(self.id.record()).await?;
-        deleted.ok_or(AppError::NotFound)
+        result
+            .take::<Vec<Note>>(3)?
+            .into_iter()
+            .next()
+            .ok_or(AppError::NotFound)
     }
 }
 

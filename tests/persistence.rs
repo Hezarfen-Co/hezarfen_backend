@@ -684,7 +684,10 @@ async fn appointments_survive_remigration() {
         "PATCH",
         &format!("/appointments/{appointment}/reschedule/accept"),
         Some(&student),
-        None,
+        Some(json!({
+            "proposed_starts_at": PROPOSED_START,
+            "proposed_ends_at": PROPOSED_END,
+        })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);

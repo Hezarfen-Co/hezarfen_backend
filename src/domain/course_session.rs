@@ -1,10 +1,10 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-use ulid::Ulid;
 
 use crate::constant::{COURSE_SESSION_TABLE, MAX_SESSION_TOPIC_LEN};
-use crate::database::Database;
+use crate::database::{Database, transaction_with_retry};
 use crate::domain::course::CourseId;
 use crate::domain::field_update::FieldUpdate;
+use crate::domain::monotonic_id::next_ulid;
 use crate::domain::page::PagedList;
 use crate::domain::timestamp::{Timestamp, range_error};
 use crate::domain::user::UserId;
@@ -15,8 +15,12 @@ use crate::validate::validate_optional;
 pub struct CourseSessionId(RecordId);
 
 impl CourseSessionId {
+    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
+    /// a course's sessions sort `starts_at DESC, id DESC` and the id breaks
+    /// the tie between two sessions starting at the same instant,
+    /// and a random low half sorts arbitrarily inside one millisecond.
     pub fn generate() -> Self {
-        Self(RecordId::new(COURSE_SESSION_TABLE, Ulid::new().to_string()))
+        Self(RecordId::new(COURSE_SESSION_TABLE, next_ulid().to_string()))
     }
 
     pub fn from_key(key: &str) -> Self {
@@ -132,7 +136,7 @@ impl CourseSession {
     ) -> Result<(Vec<CourseSession>, i64), AppError> {
         PagedList::new(
             "course_session WHERE course = $course",
-            "ORDER BY starts_at DESC",
+            "ORDER BY starts_at DESC, id DESC",
         )
         .bind("course", course.record())
         .run(limit, offset, db)
@@ -164,13 +168,34 @@ impl CourseSession {
             .await
     }
 
-    /// Delete the session and cascade-remove its roll-call rows.
+    /// Delete the session and cascade-remove its roll-call rows, in one
+    /// transaction: as two unbatched queries a failure between them stranded
+    /// roll-call rows on a session that was already gone. The other half of
+    /// that invariant is [`crate::domain::session_attendance::SessionAttendance::mark`],
+    /// which proves the session still exists inside its own write — a
+    /// transaction here cannot stop a mark that commits *after* this one.
     pub async fn delete(self, db: &Database) -> Result<CourseSession, AppError> {
-        db.query("DELETE session_attendance WHERE session = $s")
-            .bind(("s", self.id.record()))
-            .await?
-            .check()?;
-        let deleted: Option<CourseSession> = db.delete(self.id.record()).await?;
+        let (mut result, mut errors) = transaction_with_retry(
+            db,
+            "BEGIN TRANSACTION;
+                 DELETE session_attendance WHERE session = $s;
+                 LET $before = (DELETE $s RETURN BEFORE);
+                 RETURN $before;
+                 COMMIT TRANSACTION;",
+            &[("s".into(), self.id.record().into_value())],
+            // No THROW of its own — an unconditional cascade, so the only
+            // error worth telling apart is a lost round (see
+            // [`crate::domain::exam::Exam::delete`]).
+            &[],
+        )
+        .await?;
+        if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+            return Err(error.into());
+        }
+        // Read through the trailing `RETURN`, never a hand-counted slot.
+        let slot = result.num_statements().saturating_sub(2);
+        let deleted: Option<CourseSession> =
+            result.take::<Vec<CourseSession>>(slot)?.into_iter().next();
         deleted.ok_or(AppError::NotFound)
     }
 }

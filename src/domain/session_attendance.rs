@@ -1,7 +1,7 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
 use crate::constant::SESSION_ATTENDANCE_TABLE;
-use crate::database::Database;
+use crate::database::{Database, transaction_with_retry};
 use crate::domain::attendance::AttendanceStatus;
 use crate::domain::course::CourseId;
 use crate::domain::course_session::{CourseSession, CourseSessionId};
@@ -77,6 +77,22 @@ impl SessionAttendance {
     /// Record (or overwrite) `user`'s status for the session. One row per
     /// (session, user), keyed by a deterministic composite id so this is a
     /// single atomic UPSERT — concurrent marks converge on the one row.
+    ///
+    /// The "session still exists" gate rides in the same transaction as the
+    /// mark, the mirror of the cascade in [`CourseSession::delete`]: the
+    /// caller's pre-flight read sits four round trips in front of this write,
+    /// so a delete landing in that gap used to leave a roll-call row on a
+    /// session that was gone — and that row was *unremovable*, its only delete
+    /// route 404ing on the vanished session while the attendance report went
+    /// on counting it. A deleted session reads NONE, which is falsy, so the
+    /// gate is written as an explicit `IS NONE` (see
+    /// [`crate::domain::exam_result::ExamResult::grade`]).
+    ///
+    /// Sound to re-send while the store answers "conflict, retry": the gate
+    /// reads the record a delete writes, so the two contend by design, and the
+    /// UPSERT cannot legitimately answer "already exists" — its composite id is
+    /// bijective with the `session_attendance_session_user` unique tuple, so
+    /// the index entry can only point at the row the id already names.
     pub async fn mark(
         session: &CourseSession,
         user: &UserId,
@@ -92,11 +108,43 @@ impl SessionAttendance {
             status,
             marked_by: marked_by.clone(),
         };
-        let saved: Option<SessionAttendance> = db
-            .upsert(attendance.id.record())
-            .content(attendance)
-            .await?;
-        saved.ok_or_else(|| AppError::Internal("failed to mark session attendance".into()))
+        let (mut written, mut errors) = transaction_with_retry(
+            db,
+            "BEGIN TRANSACTION;
+                 IF (SELECT VALUE id FROM ONLY $sess) IS NONE { THROW 'session_missing' };
+                 LET $after = (UPSERT $id CONTENT $row RETURN AFTER);
+                 RETURN $after;
+                 COMMIT TRANSACTION;",
+            &[
+                // `$session` is SurrealDB's own protected variable (the auth
+                // session): binding that name errors the whole query.
+                ("sess".into(), session.get_id().record().into_value()),
+                ("id".into(), attendance.id.record().into_value()),
+                ("row".into(), attendance.into_value()),
+            ],
+            &["session_missing"],
+        )
+        .await?;
+        // An aborted transaction errors every slot and only the THROW's own
+        // slot names the marker, so a refusal is read by marker while a lost
+        // round was already re-sent — never reported as a 500.
+        if errors
+            .values()
+            .any(|error| error.to_string().contains("session_missing"))
+        {
+            return Err(AppError::NotFound);
+        }
+        if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+            return Err(error.into());
+        }
+        // The trailing `RETURN` is always the last statement before `COMMIT`,
+        // so its slot follows the statement count instead of a hand-kept one.
+        let slot = written.num_statements().saturating_sub(2);
+        written
+            .take::<Vec<SessionAttendance>>(slot)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| AppError::Internal("failed to mark session attendance".into()))
     }
 
     pub async fn list_for_session(

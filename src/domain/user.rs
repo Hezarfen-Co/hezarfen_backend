@@ -3,11 +3,11 @@ use std::sync::OnceLock;
 use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHasher, PasswordVerifier};
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-use ulid::Ulid;
 
 use crate::constant::{DECOY_PASSWORD, USER_TABLE};
 use crate::database::Database;
 use crate::domain::field_update::FieldUpdate;
+use crate::domain::monotonic_id::next_ulid;
 use crate::domain::page::PagedList;
 use crate::domain::preferences::{Language, PaletteColor, Theme};
 use crate::domain::profile::{BirthDate, Email, PersonName, Phone};
@@ -21,8 +21,13 @@ use crate::validate::{validate_password, validate_username};
 pub struct UserId(RecordId);
 
 impl UserId {
+    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
+    /// users list `id DESC` (newest first, [`User::list_all`]) and page by
+    /// offset over that order, and a random low half scrambles rows minted in
+    /// the same millisecond. Not a secret: the session token is separate
+    /// (32-byte CSPRNG, `web::auth`), so id order carries no authority.
     pub fn generate() -> Self {
-        Self(RecordId::new(USER_TABLE, Ulid::new().to_string()))
+        Self(RecordId::new(USER_TABLE, next_ulid().to_string()))
     }
 
     pub fn from_key(key: &str) -> Self {

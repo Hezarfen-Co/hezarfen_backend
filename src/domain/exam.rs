@@ -1,11 +1,11 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-use ulid::Ulid;
 
 use crate::constant::{
     EXAM_TABLE, MAX_EXAM_DESCRIPTION_LEN, MAX_EXAM_TITLE_LEN, UNLIMITED_EXAM_ATTEMPTS,
 };
 use crate::database::{Database, transaction_with_retry};
 use crate::domain::course::CourseId;
+use crate::domain::monotonic_id::next_ulid;
 use crate::domain::settings::ExamKindDef;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
@@ -28,8 +28,11 @@ use crate::validate::{
 pub struct ExamId(RecordId);
 
 impl ExamId {
+    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
+    /// exams list `id DESC` (newest first, [`Exam::list_all`]),
+    /// and a random low half scrambles rows minted in the same millisecond.
     pub fn generate() -> Self {
-        Self(RecordId::new(EXAM_TABLE, Ulid::new().to_string()))
+        Self(RecordId::new(EXAM_TABLE, next_ulid().to_string()))
     }
 
     pub fn from_key(key: &str) -> Self {
