@@ -506,11 +506,11 @@ history, and re-registering is refused.
 | Create events                            | teacher      | The audience (school / role / course / registration) is set at creation and editable later |
 | Register users onto a registration event | teacher      | Teachers place **students** (students never register themselves) and take a seat for **themselves** — never for another staff member. Unregistering mirrors the same rule |
 | List an event's attendance or its roster report | teacher | Students read their own tallies via the attendance report |
-| Edit / delete an event                   | teacher      | Only the **creator**, or a `manager`+ for any event |
+| Edit / delete an event                   | teacher      | Only the **creator**, or a `manager`+ for any event — in both cases only while still `teacher`+ |
 | View a course's sessions                 | student      | Only inside **visible** courses: enrolled, creator, assigned teacher, or `manager`+ |
-| List a session's roll call               | teacher      | The **session's teacher**, or anyone with course-management rights |
+| List a session's roll call               | teacher      | The **session's teacher** (while still `teacher`+), or anyone with course-management rights |
 | Create / edit / delete a course session  | teacher      | Course-management rights (course creator, an assigned teacher, or `manager`+) |
-| Take a session's roll call (mark/remove **enrolled students**) | teacher | The **session's teacher**, or anyone with course-management rights; only students sit on a roster |
+| Take a session's roll call (mark/remove **enrolled students**) | teacher | The **session's teacher** (while still `teacher`+), or anyone with course-management rights; only students sit on a roster |
 | Mark / remove the **session teacher's** presence row | manager | Staff presence is management's call — the teacher can't self-mark |
 | Work check-in / check-out; view **own** work log | teacher | Instants are server-stamped, never client-supplied |
 | View / correct / delete **any** staff work log entry | manager | Corrections only on closed entries |
@@ -520,7 +520,7 @@ history, and re-registering is refused.
 | Read the pool; offer / edit / withdraw own solutions | student | Every `approved` question is school-wide (parents stay out); a solution's author edits its body and photo anytime (solutions never freeze) and deletes it, teacher+ delete any |
 | Approve a pending pool question; delete any question or solution | teacher | Approval publishes school-wide and **freezes** the content; rejection = deletion — moderation never edits, so teacher+ cannot rewrite a solution |
 | Read the school **question bank**; save / instantiate bank questions | teacher | Every bank row is school-wide (reads + copy into an exam); saving one makes the caller its owner |
-| Edit / delete a bank question (and its images) | teacher | **Owner only** (admin bypass); bank rows carry no exam link, so they never freeze |
+| Edit / delete a bank question (and its images) | teacher | **Owner only** (admin bypass), and only while still `teacher`+ — owning a template is history, not a standing grant; bank rows carry no exam link, so they never freeze |
 | Read **own** attendance report           | student      |                                               |
 | Read another user's attendance report    | teacher      | Narrowed to the caller's managed courses; `manager`+ sees all; a `parent` sees a linked student's in full |
 | View **visible** courses/exams and a course's subjects; read **own** result, courses, mark report | student | Visible = enrolled (teachers: + created + assigned; `manager`+: all); exam **drafts** show only to the course's managers |
@@ -531,8 +531,8 @@ history, and re-registering is refused.
 | Watch an exam's live monitor (poll the snapshot) | teacher | Course-management rights |
 | Create courses                           | teacher      | The creator manages the course, and owns it for good |
 | Assign / unassign a course's teachers    | manager      | Staffing is the office's call — a course's own creator cannot hand rights to peers; the assignee must be `teacher`+ |
-| Delete a course                          | teacher      | Only the **creator**, or a `manager`+ — an assigned teacher runs the course but doesn't own it |
-| Manage inside a course: edit it, enroll/unenroll **students**, add/edit/delete its exams and **subjects**, grade, remove results | teacher | The **course creator**, a teacher **assigned** to it, or a `manager`+ for any course; only students can be enrolled; a subject still referenced by exam questions or homework won't delete (`409`) |
+| Delete a course                          | teacher      | Only the **creator**, or a `manager`+ — an assigned teacher runs the course but doesn't own it; a creator demoted below `teacher` owns nothing |
+| Manage inside a course: edit it, enroll/unenroll **students**, add/edit/delete its exams and **subjects**, grade, remove results | teacher | The **course creator**, a teacher **assigned** to it, or a `manager`+ for any course — in every case only while that account is *still* `teacher`+, so a demoted creator keeps nothing; only students can be enrolled; a subject still referenced by exam questions or homework won't delete (`409`) |
 | View a course's roster, an exam's result list / statistics | teacher | Course-management rights |
 | Create / edit / delete a **class section** (şube); add or remove its members | manager | Reading classes, their rosters and their course lists is teacher+ — except `GET /classes/me`, which any authenticated user reads for themselves, and `GET /classes/user/{user}`, open to teacher+ and a linked parent; a member must be a `student`, a `teacher_id` must be teacher+ |
 | Attach / detach a course on a class | teacher | Course-management rights on **that course** — attaching enrolls the whole class into it, so it takes exactly the right enrolling one student takes |
@@ -610,6 +610,21 @@ role **after** its write and answers `409` — dropping the assignment again —
 it has since fallen below `teacher`. Same guard, same wording, as a class's
 homeroom teacher.
 
+Ownership is **not** a standing grant. `creator` is a historical column that no
+demotion sweeps (unlike the assignment list above), so every course-management
+and course-ownership check re-reads the caller's *live* role first: a creator
+demoted to `student` or `parent` keeps neither management nor deletion of the
+course they made — it stays reachable to its still-`teacher`+ assignees and to
+manager+, who can hand it to someone else. Nothing below is a right a caller
+holds while under `teacher`. The column is deliberately **not** swept the way
+the assignment list is: it answers "who made this", which stays true after a
+demotion — it is the *grant* that is role-gated, not the history. The same
+floor applies to the catalogs: a demoted creator's own course drops out of
+their `/courses`, `/exams` and `/homework` lists, and comes back only if they
+are enrolled in it, as any student would be. A session's `teacher` behaves
+identically — teaching a session grants no roll call, and no view of it, once
+the account is below `teacher`.
+
 Course data is walled per course. A course, its exams, its sessions, and its
 subjects are
 **visible** only to its enrolled users, its creator, its assigned teachers,
@@ -618,7 +633,7 @@ sees just the classes they were added to, and the `/courses` / `/exams`
 catalogs are filtered accordingly. Teacher-level reads *inside* a course
 (roster, results, statistics, the question list, answer sheets, the live
 monitor) additionally need **course-management rights** (creator, an assigned
-teacher, or manager+):
+teacher, or manager+ — each of them still `teacher`+ today):
 one teacher cannot look into another teacher's course, and the per-user
 marks/attendance reports narrow to the courses the caller manages.
 
@@ -1081,7 +1096,10 @@ and handed back in the same transaction as the reject or cancel that settles
 it, so the seat is decided by the database rather than by a count two
 concurrent bookings can both read as free). The decisions:
 
-- `PATCH /{id}/approve` — the slot's teacher (or manager+) confirms. Refused
+- `PATCH /{id}/approve` — the slot's teacher (or manager+) confirms; the
+  slot's `teacher` is history, not a standing grant, so an owner demoted below
+  `teacher` decides nothing on it any more — manager+ still can, and the
+  requester can still cancel. Refused
   (`409`) when the effective window has already started, and refused while a
   counter-proposal stands: the proposal is the teacher's own, so approving it
   here would let them confirm a time the requester never accepted.

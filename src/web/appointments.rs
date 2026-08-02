@@ -249,14 +249,19 @@ async fn one_appointment(
 }
 
 /// Who may act on a slot (and on the bookings sitting on it): the teacher who
-/// published it, or anyone `manager` and above. This asks about *ownership*
-/// only — it does not re-check the role bar, and `cancel` reaches it from a
-/// plain `CurrentUser` handler. So a slot owner demoted to student or parent
-/// still passes here and can cancel bookings on their now-inert slot; that is
-/// deliberate — the slot is unbookable anyway (`book` refuses it) and calling
-/// off a meeting they can no longer hold is the right outcome.
+/// published it, or anyone `manager` and above — in both cases only while the
+/// caller is *still* `teacher` or above.
+///
+/// The `teacher` floor is enforced here, not left to the extractors: a slot's
+/// `teacher` column is a historical fact no demotion rewrites, so a grant read
+/// off it has to re-read the live role or it outlives the role that earned it
+/// (see `courses::can_manage_course`, where trusting the callers instead cost
+/// exactly that). A demoted owner's outstanding bookings are not stranded: the
+/// requester still cancels their own (`cancel` is requester-only and never
+/// comes through here), and manager+ still approves, rejects or reschedules.
 fn can_manage(slot: &AppointmentSlot, user: &User) -> bool {
-    slot.get_teacher() == user.get_id() || user.get_role().at_least(Role::Manager)
+    user.get_role().at_least(Role::Teacher)
+        && (slot.get_teacher() == user.get_id() || user.get_role().at_least(Role::Manager))
 }
 
 /// The booking plus the slot it sits on, insisting the caller may decide it.
@@ -843,4 +848,54 @@ async fn ensure_requester(
         ));
     }
     Ok(appointment)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::init_mem;
+    use crate::domain::user::{Password, Username};
+
+    /// A user at `role`, minted through the real create path.
+    async fn user(username: &str, role: Role, db: &Database) -> User {
+        let hash = Password::try_new("secret1")
+            .unwrap()
+            .hash_async()
+            .await
+            .unwrap();
+        let user = User::create(Username::try_new(username).unwrap(), hash, db)
+            .await
+            .unwrap();
+        user.set_role(role, db).await.unwrap()
+    }
+
+    /// All five `can_manage` sites are `RequireTeacher` today, so this is
+    /// pinned at the helper — the level where the floor is observable, and the
+    /// level that has to hold when the next route arrives with `CurrentUser`.
+    #[tokio::test]
+    async fn demoted_slot_owner_loses_management() {
+        let db = init_mem().await.unwrap();
+        let owner = user("ogretmen", Role::Teacher, &db).await;
+        let slot = AppointmentSlot::create(
+            owner.get_id(),
+            Timestamp::from_millis(1_000),
+            Timestamp::from_millis(2_000),
+            None,
+            &db,
+        )
+        .await
+        .unwrap();
+        assert!(can_manage(&slot, &owner));
+
+        for role in [Role::Student, Role::Parent] {
+            let demoted = owner.clone().set_role(role, &db).await.unwrap();
+            assert!(
+                !can_manage(&slot, &demoted),
+                "{role:?} slot owner still decides its bookings"
+            );
+        }
+        // Never orphaned: manager+ still decides everything on the slot.
+        let boss = user("mudur", Role::Manager, &db).await;
+        assert!(can_manage(&slot, &boss));
+    }
 }

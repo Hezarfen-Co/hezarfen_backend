@@ -12,6 +12,7 @@ mod common;
 use axum::http::StatusCode;
 use common::{app_and_db, id_of, login, login_as, me_id, send};
 use hezarfen_backend::database::Database;
+use hezarfen_backend::domain::timestamp::Timestamp;
 use serde_json::json;
 
 /// One counter, re-read out of the store — never off a response body.
@@ -474,5 +475,290 @@ async fn deleting_a_note_takes_its_attachment_rows_with_it() {
         rows("SELECT VALUE id FROM note_file", &db).await,
         0,
         "no attachment row may outlive its note"
+    );
+}
+
+/// Ids in a `Page` envelope (or a bare array).
+fn ids(body: &serde_json::Value) -> Vec<String> {
+    common::items(body).iter().map(id_of).collect()
+}
+
+/// The demoted-creator privilege leak: `creator` is a historical column no
+/// demotion sweeps, so course management had to re-read the caller's *live*
+/// role. Both halves are asserted — the gate passes before the demotion and
+/// refuses after it, so this proves the gate flipped, not a permanent 404.
+#[tokio::test]
+async fn demoted_creator_loses_course_management_over_http() {
+    let (app, db) = app_and_db().await;
+    let admin = login_as(&app, &db, "yonetici", "admin").await;
+    let teacher = login_as(&app, &db, "ogretmen", "teacher").await;
+    let student = login_as(&app, &db, "ogrenci", "student").await;
+    let teacher_id = me_id(&app, &teacher).await;
+    let student_id = me_id(&app, &student).await;
+
+    let course = common::create_course(&app, &teacher, "Fizik").await;
+    let subject = common::create_subject(&app, &teacher, &course, "Kuvvet").await;
+    let res = common::create_exam_with(
+        &app,
+        &teacher,
+        &course,
+        json!({ "title": "Ara", "kind": "quiz", "draft": true }),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let draft = id_of(&res.body);
+    // Assigned to the other student only, so seeing it is a *management* right
+    // and never the audience right a course member has.
+    let due = Timestamp::now().as_millis() + 86_400_000;
+    common::enroll(&app, &teacher, &course, &student_id).await;
+    let res = common::create_homework_with(
+        &app,
+        &teacher,
+        &course,
+        json!({ "title": "Odev", "subject_id": subject, "due_at": due, "assigned": [student_id] }),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let homework = id_of(&res.body);
+
+    // Before the demotion: the creator manages the course.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/exams/{draft}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(&app, "GET", "/homework", Some(&teacher), None).await;
+    assert!(ids(&res.body).contains(&homework), "{}", res.body);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/homework/{homework}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    // Demote, then enroll them as an ordinary member of their own course: the
+    // course-view gate still passes, so what answers below is the management
+    // gate alone.
+    common::set_role(&db, "ogretmen", "student").await;
+    common::enroll(&app, &admin, &course, &teacher_id).await;
+
+    let res = send(
+        &app,
+        "GET",
+        &format!("/exams/{draft}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::NOT_FOUND,
+        "a demoted creator still reads a draft: {}",
+        res.body
+    );
+    let res = send(&app, "GET", "/homework", Some(&teacher), None).await;
+    assert!(
+        !ids(&res.body).contains(&homework),
+        "a demoted creator still lists another student's homework: {}",
+        res.body
+    );
+    let res = send(
+        &app,
+        "GET",
+        &format!("/homework/{homework}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::NOT_FOUND,
+        "a demoted creator still reads another student's homework: {}",
+        res.body
+    );
+    // ...and the writes are gone too.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/courses/{course}"),
+        Some(&teacher),
+        Some(json!({ "title": "Kimya" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/courses/{course}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+}
+
+/// The no-orphan half: the role floor must never leave a course nobody can
+/// manage, and it must not touch a teacher who is still teacher+.
+#[tokio::test]
+async fn manager_and_assigned_teacher_keep_a_demoted_creators_course() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "mudur", "manager").await;
+    let teacher = login_as(&app, &db, "ogretmen", "teacher").await;
+    let helper = login_as(&app, &db, "yardimci", "teacher").await;
+    let helper_id = me_id(&app, &helper).await;
+
+    let course = common::create_course(&app, &teacher, "Fizik").await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/courses/{course}/teachers"),
+        Some(&manager),
+        Some(json!({ "user_id": helper_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    common::set_role(&db, "ogretmen", "student").await;
+
+    // The course keeps two managers: the manager, and the still-teacher
+    // assignee — a course the floor orphaned would be the worse bug.
+    for cookie in [&manager, &helper] {
+        let res = send(
+            &app,
+            "PATCH",
+            &format!("/courses/{course}"),
+            Some(cookie),
+            Some(json!({ "title": "Kimya" })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    }
+    // Deleting still needs ownership, which an assignee never had.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/courses/{course}"),
+        Some(&helper),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/courses/{course}"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+}
+
+/// The catalog half of the same leak: `visible_courses` built its teacher half
+/// out of the creator/assignee columns, so a demoted creator kept seeing the
+/// course — and its published exams and homework — in the three catalogs.
+#[tokio::test]
+async fn demoted_creator_drops_out_of_the_catalogs() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "ogretmen", "teacher").await;
+
+    let course = common::create_course(&app, &teacher, "Fizik").await;
+    let subject = common::create_subject(&app, &teacher, &course, "Kuvvet").await;
+    let exam = common::create_exam(&app, &teacher, &course, "Ara", "quiz").await;
+    let due = Timestamp::now().as_millis() + 86_400_000;
+    let homework = common::create_homework(&app, &teacher, &course, &subject, "Odev", due).await;
+
+    for (path, wanted) in [
+        ("/courses", &course),
+        ("/exams", &exam),
+        ("/homework", &homework),
+    ] {
+        let res = send(&app, "GET", path, Some(&teacher), None).await;
+        assert!(ids(&res.body).contains(wanted), "{path}: {}", res.body);
+    }
+
+    // Demoted and *not* enrolled: the course is nothing to them now.
+    common::set_role(&db, "ogretmen", "student").await;
+
+    for (path, gone) in [
+        ("/courses", &course),
+        ("/exams", &exam),
+        ("/homework", &homework),
+    ] {
+        let res = send(&app, "GET", path, Some(&teacher), None).await;
+        assert!(
+            !ids(&res.body).contains(gone),
+            "a demoted creator still sees their course in {path}: {}",
+            res.body
+        );
+    }
+}
+
+/// A session's `teacher` is the same shape of historical column as a course's
+/// `creator`: it must grant nothing once the account falls below `teacher`.
+#[tokio::test]
+async fn demoted_session_teacher_loses_the_session() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "mudur", "manager").await;
+    let teacher = login_as(&app, &db, "ogretmen", "teacher").await;
+    let teacher_id = me_id(&app, &teacher).await;
+
+    // Owned by the manager, so losing the session is not just a side effect of
+    // losing the course: the demoted account was only ever its *teacher*.
+    let course = common::create_course(&app, &manager, "Fizik").await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/courses/{course}/teachers"),
+        Some(&manager),
+        Some(json!({ "user_id": teacher_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let starts_at = Timestamp::now().as_millis() + 86_400_000;
+    let session = common::create_session(&app, &teacher, &course, starts_at).await;
+    // Drop the assignment: only the session's own teacher column is left.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/courses/{course}/teachers/{teacher_id}"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+
+    let res = send(
+        &app,
+        "GET",
+        &format!("/sessions/{session}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    common::set_role(&db, "ogretmen", "student").await;
+
+    let res = send(
+        &app,
+        "GET",
+        &format!("/sessions/{session}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::FORBIDDEN,
+        "a demoted session teacher still reads their session: {}",
+        res.body
     );
 }

@@ -340,25 +340,37 @@ async fn question_or_404(st: &AppState, bid: &str) -> Result<BankQuestion, AppEr
         .ok_or(AppError::NotFound)
 }
 
-/// Whether `user` may read the template at all: it is published to the school,
-/// or it is theirs, or they are an admin.
+/// Whether `user` may read the template at all: they are `teacher`+ *today*,
+/// and it is published to the school, or it is theirs, or they are an admin.
+///
+/// The bank is a teacher+ resource end to end, so the floor lives here rather
+/// than in the extractors: `owner` is a historical column no demotion sweeps,
+/// and a grant read off it has to re-read the live role or it outlives the role
+/// that earned it. Every route into this helper happens to be `RequireTeacher`
+/// today — that is exactly the assumption that let a demoted course creator
+/// keep course-management rights, so it is not the thing standing guard here.
 ///
 /// Admins **do** see `private` templates. They already read every exam's
 /// questions — `correct` included — through `can_manage_course`, and
 /// `ensure_owner` already lets them edit and delete any template; letting them
 /// delete a row they may not look at would be the odd rule, not this one.
 pub(crate) fn can_see(question: &BankQuestion, user: &User) -> bool {
-    question.get_visibility().is_school()
-        || question.get_owner() == user.get_id()
-        || user.get_role().at_least(Role::Admin)
+    user.get_role().at_least(Role::Teacher)
+        && (question.get_visibility().is_school()
+            || question.get_owner() == user.get_id()
+            || user.get_role().at_least(Role::Admin))
 }
 
 /// Reads are gated by [`can_see`], and a mutation additionally needs ownership:
 /// the caller owns the template, or is an admin. Everyone else gets a 403 —
 /// but only for a template they can see; an invisible one is a 404 long before
-/// this runs, so a 403 never doubles as proof the template exists.
+/// this runs, so a 403 never doubles as proof the template exists. Carries the
+/// same live-`teacher` floor as [`can_see`], for the same reason: owning a row
+/// is history, not a standing grant.
 fn ensure_owner(question: &BankQuestion, user: &User) -> Result<(), AppError> {
-    if question.get_owner() == user.get_id() || user.get_role().at_least(Role::Admin) {
+    if user.get_role().at_least(Role::Teacher)
+        && (question.get_owner() == user.get_id() || user.get_role().at_least(Role::Admin))
+    {
         return Ok(());
     }
     Err(AppError::Forbidden(
@@ -916,4 +928,94 @@ async fn delete_choice_image(
     let image = image.delete(&st.db).await?;
     remove_blob(&st.files_path, image.get_file()).await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::{Database, init_mem};
+    use crate::domain::role::Role;
+    use crate::domain::user::{Password, Username};
+
+    /// A user at `role`, minted through the real create path.
+    async fn user(username: &str, role: Role, db: &Database) -> User {
+        let hash = Password::try_new("secret1")
+            .unwrap()
+            .hash_async()
+            .await
+            .unwrap();
+        let user = User::create(Username::try_new(username).unwrap(), hash, db)
+            .await
+            .unwrap();
+        user.set_role(role, db).await.unwrap()
+    }
+
+    /// Every bank route is `RequireTeacher` today, so this is pinned at the
+    /// helpers — the level where the floor is observable. The helpers are what
+    /// must hold when a future route arrives with a different extractor.
+    #[tokio::test]
+    async fn demoted_owner_loses_their_own_template() {
+        let db = init_mem().await.unwrap();
+        let owner = user("ogretmen", Role::Teacher, &db).await;
+        let question = BankQuestion::create(
+            owner.get_id().clone(),
+            SubjectId::from_key("01TESTSUBJECTAAAAAAAAAAAAA"),
+            QuestionText::try_new("2 + 2 = ?").unwrap(),
+            QuestionPoints::try_new(1).unwrap(),
+            QuestionSpec::try_new(QuestionKind::try_new("text").unwrap(), None, None, &[]).unwrap(),
+            &db,
+        )
+        .await
+        .unwrap();
+        // Born `private`, so `can_see` here is the owner arm alone.
+        assert!(!question.get_visibility().is_school());
+        assert!(can_see(&question, &owner));
+        assert!(ensure_owner(&question, &owner).is_ok());
+
+        for role in [Role::Student, Role::Parent] {
+            let demoted = owner.clone().set_role(role, &db).await.unwrap();
+            assert!(
+                !can_see(&question, &demoted),
+                "{role:?} owner still reads their template"
+            );
+            assert!(
+                ensure_owner(&question, &demoted).is_err(),
+                "{role:?} owner still edits their template"
+            );
+        }
+        // The admin arm, judged while the row is still `private` and owned by
+        // somebody else — the rule this helper's doc argues for at length. Read
+        // it against a `school` row and the assertion passes on the school arm
+        // instead, proving nothing.
+        assert!(!question.get_visibility().is_school());
+        let admin = user("yonetici", Role::Admin, &db).await;
+        assert_ne!(question.get_owner(), admin.get_id());
+        assert!(
+            can_see(&question, &admin),
+            "an admin must see another teacher's private template"
+        );
+        assert!(
+            ensure_owner(&question, &admin).is_ok(),
+            "an admin must be able to edit another teacher's private template"
+        );
+
+        // The bank is teacher+ end to end, so a school-wide row is no way in
+        // either.
+        let question = question
+            .update_if_unchanged(
+                None,
+                QuestionText::try_new("2 + 2 = ?").unwrap(),
+                QuestionPoints::try_new(1).unwrap(),
+                QuestionSpec::try_new(QuestionKind::try_new("text").unwrap(), None, None, &[])
+                    .unwrap(),
+                BankVisibility::try_new("school").unwrap(),
+                &db,
+            )
+            .await
+            .unwrap()
+            .expect("nothing raced this update");
+        let student = user("ogrenci", Role::Student, &db).await;
+        assert!(!can_see(&question, &student));
+        assert!(can_see(&question, &admin));
+    }
 }

@@ -184,22 +184,33 @@ impl EnrollmentResponse {
 
 /// Who may write inside a specific course (edit it, enroll, add exams,
 /// sessions, subjects, grade): its creator, a teacher a manager assigned to
-/// it, or anyone `manager` and above. Callers have already cleared the
-/// `teacher` bar via `RequireTeacher`.
+/// it, or anyone `manager` and above — and in every case only while the
+/// caller is *still* `teacher` or above.
+///
+/// The `teacher` floor is enforced here rather than left to the callers: half
+/// of them extract `CurrentUser`, not `RequireTeacher`, so a creator demoted
+/// to `student` or `parent` used to keep course-management rights forever (the
+/// `creator` column is a historical fact and is never swept, unlike the
+/// assignment list).
 ///
 /// Deleting the course and changing its teacher list sit *above* this bar —
 /// see [`owns_course`].
 pub(crate) fn can_manage_course(course: &Course, user: &User) -> bool {
-    course.is_creator(user.get_id())
-        || course.is_assigned(user.get_id())
-        || user.get_role().at_least(Role::Manager)
+    user.get_role().at_least(Role::Teacher)
+        && (course.is_creator(user.get_id())
+            || course.is_assigned(user.get_id())
+            || user.get_role().at_least(Role::Manager))
 }
 
 /// Who may destroy a course: its creator, or anyone `manager` and above. An
 /// assigned teacher runs the course but does not own it — they cannot delete
 /// it out from under the person who made it.
+///
+/// Carries the same live-`teacher` floor as [`can_manage_course`], and for the
+/// same reason: a demoted creator owns nothing.
 fn owns_course(course: &Course, user: &User) -> bool {
-    course.is_creator(user.get_id()) || user.get_role().at_least(Role::Manager)
+    user.get_role().at_least(Role::Teacher)
+        && (course.is_creator(user.get_id()) || user.get_role().at_least(Role::Manager))
 }
 
 /// Who may read inside a specific course (its details, exams, sessions):
@@ -221,12 +232,24 @@ pub(crate) async fn can_view_course(
 }
 
 /// The catalog as one user sees it: every course for manager+, otherwise the
-/// courses they created plus the ones they're enrolled in, newest first.
+/// courses they created or were assigned to plus the ones they're enrolled in,
+/// newest first.
+///
+/// The created/assigned half carries the same live-`teacher` floor as
+/// [`can_manage_course`], and for the same reason: `creator` is a historical
+/// column no demotion sweeps, so without it a demoted creator kept seeing the
+/// course — and, through the `/exams` and `/homework` catalogs that build on
+/// this list, its published exams and homework. Below `teacher` a course is
+/// visible only the way it is to any other student: by enrollment.
 pub(crate) async fn visible_courses(user: &User, db: &Database) -> Result<Vec<Course>, AppError> {
     if user.get_role().at_least(Role::Manager) {
         return Course::list_all(db).await;
     }
-    let mut courses = Course::list_for_teacher(user.get_id(), db).await?;
+    let mut courses = if user.get_role().at_least(Role::Teacher) {
+        Course::list_for_teacher(user.get_id(), db).await?
+    } else {
+        Vec::new()
+    };
     for course in Course::list_enrolled(user.get_id(), None, 0, db).await?.0 {
         if !courses
             .iter()
@@ -370,8 +393,10 @@ async fn my_courses(
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 
-/// Fetch a single course by id. Visible to its enrolled users, its creator,
-/// and managers/admins.
+/// Fetch a single course by id. Visible to its enrolled users, and to its
+/// creator, its assigned teachers and managers/admins while those accounts are
+/// still `teacher`+ — a demoted creator sees it only if they are enrolled, like
+/// any other student (see [`can_manage_course`]).
 #[utoipa::path(
     get,
     path = "/{id}",
@@ -381,7 +406,7 @@ async fn my_courses(
     responses(
         (status = 200, description = "The course", body = CourseResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not enrolled, not the course creator or an assigned teacher, and not a manager/admin", body = ErrorResponse),
+        (status = 403, description = "Not enrolled, and not a still-`teacher`+ course creator, assigned teacher, or manager/admin", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
     ),
 )]
@@ -1237,4 +1262,99 @@ async fn list_course_sessions(
         .map(|s| SessionResponse::new(s, &people))
         .collect();
     Ok(Json(Page::new(items, total, limit, offset)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::init_mem;
+    use crate::domain::user::{Password, Username};
+
+    /// A user at `role`, minted through the real create path.
+    async fn user(username: &str, role: Role, db: &Database) -> User {
+        let hash = Password::try_new("secret1")
+            .unwrap()
+            .hash_async()
+            .await
+            .unwrap();
+        let user = User::create(Username::try_new(username).unwrap(), hash, db)
+            .await
+            .unwrap();
+        user.set_role(role, db).await.unwrap()
+    }
+
+    /// A course `creator` made, with nobody assigned.
+    async fn course(creator: &User, db: &Database) -> Course {
+        Course::create(
+            creator.get_id(),
+            CourseTitle::try_new("Matematik").unwrap(),
+            CourseDescription::try_new("").unwrap(),
+            CourseKind::try_new("course").unwrap(),
+            None,
+            None,
+            db,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// The leak: `creator` is a historical column that demotion never sweeps,
+    /// so the grant itself has to re-read the live role on every call.
+    #[tokio::test]
+    async fn demoted_creator_loses_management_and_ownership() {
+        let db = init_mem().await.unwrap();
+        let creator = user("teacher", Role::Teacher, &db).await;
+        let course = course(&creator, &db).await;
+        assert!(can_manage_course(&course, &creator));
+        assert!(owns_course(&course, &creator));
+
+        for role in [Role::Student, Role::Parent] {
+            let demoted = creator.clone().set_role(role, &db).await.unwrap();
+            assert!(
+                !can_manage_course(&course, &demoted),
+                "{role:?} creator still manages the course"
+            );
+            assert!(
+                !owns_course(&course, &demoted),
+                "{role:?} creator still owns the course"
+            );
+        }
+    }
+
+    /// The same floor on the assignment list — the demotion sweep clears it,
+    /// but the grant must not depend on that sweep having run.
+    #[tokio::test]
+    async fn demoted_assigned_teacher_loses_management() {
+        let db = init_mem().await.unwrap();
+        let creator = user("creator", Role::Teacher, &db).await;
+        let assigned = user("assigned", Role::Teacher, &db).await;
+        let course = course(&creator, &db)
+            .await
+            .assign_teacher(assigned.get_id(), &db)
+            .await
+            .unwrap();
+        // Still teacher+: untouched by the floor.
+        assert!(can_manage_course(&course, &assigned));
+        // ...but never an owner, assigned or not.
+        assert!(!owns_course(&course, &assigned));
+
+        let demoted = assigned.set_role(Role::Student, &db).await.unwrap();
+        assert!(!can_manage_course(&course, &demoted));
+    }
+
+    /// No course is left orphaned by the floor: manager+ reaches a course whose
+    /// creator was demoted and which has no assigned teachers.
+    #[tokio::test]
+    async fn manager_still_manages_a_demoted_creators_course() {
+        let db = init_mem().await.unwrap();
+        let creator = user("teacher", Role::Teacher, &db).await;
+        let course = course(&creator, &db).await;
+        creator.set_role(Role::Student, &db).await.unwrap();
+
+        for role in [Role::Manager, Role::Admin] {
+            let boss = user(&format!("boss{}", role.as_str()), role, &db).await;
+            assert!(can_manage_course(&course, &boss), "{role:?} locked out");
+            assert!(owns_course(&course, &boss), "{role:?} cannot delete");
+        }
+    }
 }

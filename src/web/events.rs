@@ -194,10 +194,18 @@ impl EventResponse {
 }
 
 /// Who may edit/delete a specific event: its creator, or anyone `manager` and
-/// above (who can manage any event regardless of ownership). Callers have
-/// already cleared the `teacher` bar via the `RequireTeacher` extractor.
+/// above (who can manage any event regardless of ownership) — in both cases
+/// only while the caller is *still* `teacher` or above.
+///
+/// The `teacher` floor is enforced here, not left to the extractors: `creator`
+/// is a historical column no demotion sweeps, so a grant read off it has to
+/// re-read the live role or it outlives the role that earned it. This helper
+/// deliberately does not trust its callers to have cleared the bar — the same
+/// assumption, written into the same comment, is what let a demoted course
+/// creator keep course-management rights (see `courses::can_manage_course`).
 fn can_manage(event: &Event, user: &User) -> bool {
-    event.is_creator(user.get_id()) || user.get_role().at_least(Role::Manager)
+    user.get_role().at_least(Role::Teacher)
+        && (event.is_creator(user.get_id()) || user.get_role().at_least(Role::Manager))
 }
 
 #[derive(Serialize, ToSchema)]
@@ -810,4 +818,56 @@ async fn unregister(
         return Err(AppError::NotFound);
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::init_mem;
+    use crate::domain::user::{Password, Username};
+
+    /// A user at `role`, minted through the real create path.
+    async fn user(username: &str, role: Role, db: &Database) -> User {
+        let hash = Password::try_new("secret1")
+            .unwrap()
+            .hash_async()
+            .await
+            .unwrap();
+        let user = User::create(Username::try_new(username).unwrap(), hash, db)
+            .await
+            .unwrap();
+        user.set_role(role, db).await.unwrap()
+    }
+
+    /// `can_manage` is only reached behind `RequireTeacher` today, so this is
+    /// pinned at the helper — the level where the floor is observable. The
+    /// helper is what must hold when a future route arrives with `CurrentUser`.
+    #[tokio::test]
+    async fn demoted_event_creator_loses_management() {
+        let db = init_mem().await.unwrap();
+        let creator = user("ogretmen", Role::Teacher, &db).await;
+        let event = Event::create(
+            creator.get_id(),
+            EventTitle::try_new("Gezi").unwrap(),
+            EventDescription::try_new("").unwrap(),
+            EventAudience::School,
+            None,
+            None,
+            &db,
+        )
+        .await
+        .unwrap();
+        assert!(can_manage(&event, &creator));
+
+        for role in [Role::Student, Role::Parent] {
+            let demoted = creator.clone().set_role(role, &db).await.unwrap();
+            assert!(
+                !can_manage(&event, &demoted),
+                "{role:?} creator still manages the event"
+            );
+        }
+        // ...and the event is never orphaned: manager+ still reaches it.
+        let boss = user("mudur", Role::Manager, &db).await;
+        assert!(can_manage(&event, &boss));
+    }
 }
