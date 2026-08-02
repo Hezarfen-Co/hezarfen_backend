@@ -25110,7 +25110,7 @@ async fn a_burst_of_strokes_comes_back_in_mint_order() {
     assert_eq!(payloads[59], "{\"p\":[59]}");
 }
 
-// --- classes (şube) ---------------------------------------------------------
+// --- class sections (şube) --------------------------------------------------
 
 /// The class routes' own gates, end to end: who may write, who may not, and
 /// that the writes really are enrollments. The pump itself is proven in the

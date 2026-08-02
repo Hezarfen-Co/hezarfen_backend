@@ -36,6 +36,7 @@ use super::{
     CourseResponse, CurrentUser, ExamResponse, HomeworkResponse, Page, PageParams, PersonRef,
     RequireManager, RequireTeacher, SessionResponse, SubjectResponse, check_not_past,
     check_time_range, course_people, paginate, person_map, remove_blob, set_or_clear,
+    undo_if_demoted,
 };
 
 pub fn routes() -> OpenApiRouter<AppState> {
@@ -540,6 +541,7 @@ async fn delete_course(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
+        (status = 409, description = "That user was demoted below teacher while the request ran — the assignment was undone", body = ErrorResponse),
     ),
 )]
 async fn assign_teacher(
@@ -570,6 +572,10 @@ async fn assign_teacher(
     }
 
     let updated = course.assign_teacher(&target, &st.db).await?;
+    // The row is written; a demotion that raced the bar above swept the list
+    // before this assignment was in it, and nothing re-sweeps (see
+    // [`super::undo_if_demoted`]).
+    undo_if_demoted(&target, &st.db).await?;
     let people = person_map(course_people(&updated), &st.db).await?;
     Ok(Json(CourseResponse::new(&updated, &people)))
 }

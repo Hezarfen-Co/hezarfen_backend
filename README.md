@@ -34,13 +34,19 @@ plus any teachers a **manager assigns** to it (`POST /courses/{id}/teachers`):
 an assigned teacher manages everything inside the course — exams, sessions,
 subjects, roster, grading — but can't delete it or change who else teaches it,
 and a demotion below `teacher` sweeps their assignments away. Students are
-grouped into **classes** (*şube* — 9-A, 10-B) when a school teaches that way:
-a class is bulk enrollment and not a second kind of membership — attaching a
+grouped into a **class section** (*şube* — 9-A, 10-B) when a school teaches
+that way: it is bulk enrollment, not a second kind of membership — attaching a
 course to it enrolls the whole roster, adding a member enrolls them into every
 course already attached, and what lands are ordinary enrollment rows tagged
-with the class that pumped them (untagged = placed by hand, and hand-placed
+with the section that pumped them (untagged = placed by hand, and hand-placed
 rows are never adopted and never swept). A course without room for everyone
-refuses the whole operation, naming it (see "Classes (şube)"). Students read a per-course weighted average and
+refuses the whole operation, naming it (see "Class sections (şube)"). A section
+may also
+name a **homeroom teacher** (*sınıf öğretmeni*, `teacher_id` — any teacher+
+account, cleared automatically when that account is demoted), and while every
+other class read is teacher+, a student reads their own section at
+`GET /classes/me` (staff and a linked parent read anyone's at
+`GET /classes/user/{user}`). Students read a per-course weighted average and
 an overall average from their mark report — each exam weighted by its **kind**
 (midterms can count double, orals once: weights are set per kind in settings,
 not per exam). Exams run **sync** (one
@@ -528,7 +534,7 @@ history, and re-registering is refused.
 | Delete a course                          | teacher      | Only the **creator**, or a `manager`+ — an assigned teacher runs the course but doesn't own it |
 | Manage inside a course: edit it, enroll/unenroll **students**, add/edit/delete its exams and **subjects**, grade, remove results | teacher | The **course creator**, a teacher **assigned** to it, or a `manager`+ for any course; only students can be enrolled; a subject still referenced by exam questions or homework won't delete (`409`) |
 | View a course's roster, an exam's result list / statistics | teacher | Course-management rights |
-| Create / edit / delete a **class** (şube); add or remove its members | manager | Reading classes, their rosters and their course lists is teacher+; a member must be a `student` |
+| Create / edit / delete a **class section** (şube); add or remove its members | manager | Reading classes, their rosters and their course lists is teacher+ — except `GET /classes/me`, which any authenticated user reads for themselves, and `GET /classes/user/{user}`, open to teacher+ and a linked parent; a member must be a `student`, a `teacher_id` must be teacher+ |
 | Attach / detach a course on a class | teacher | Course-management rights on **that course** — attaching enrolls the whole class into it, so it takes exactly the right enrolling one student takes |
 | Read another user's mark report          | teacher      | Narrowed to the caller's managed courses; `manager`+ sees all; a `parent` sees a linked student's in full |
 | Grade students                           | teacher      | Target must be an **enrolled student**; grading never targets oneself |
@@ -598,7 +604,11 @@ call, so a course's own creator cannot hand rights to their peers; only
 manager+ may touch the list. Every course response carries its `teachers`
 array alongside `creator`, and a user demoted below `teacher` is swept off
 every course they were assigned to (the mirror of promotion dropping
-enrollments).
+enrollments). That sweep runs once, so an assignment landing in the same
+instant would survive it: the assign call therefore re-reads the account's live
+role **after** its write and answers `409` — dropping the assignment again — if
+it has since fallen below `teacher`. Same guard, same wording, as a class's
+homeroom teacher.
 
 Course data is walled per course. A course, its exams, its sessions, and its
 subjects are
@@ -705,15 +715,17 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/courses/{id}`                  | student | Get course (enrolled, creator, assigned teacher, or manager+) |
 | PATCH  | `/courses/{id}`                  | teacher | Edit course incl. `kind` and `capacity` (`null` lifts the cap) (course manager; `409` if the `term_id` it moves off changed since the read — nothing written, re-read and retry) |
 | DELETE | `/courses/{id}`                  | teacher | Delete course + its exams, results, subjects, sessions, and homework (submissions, files, and grades included) (creator, or manager+ — **not** an assigned teacher; `409` while anyone is still enrolled) |
-| POST   | `/courses/{id}/teachers`         | manager | `{user_id}` — assign a **teacher+** to run the course (idempotent; returns the course) |
+| POST   | `/courses/{id}/teachers`         | manager | `{user_id}` — assign a **teacher+** to run the course (idempotent; returns the course; `409` + undo if that account is demoted mid-request) |
 | DELETE | `/courses/{id}/teachers/{user}`  | manager | Unassign a teacher (`404` if they weren't assigned) |
 | POST   | `/courses/{id}/enrollments`      | teacher | `{user_id}` — enroll a **student** (idempotent upsert; course manager; only students can be enrolled; `409` once a capped course is full); enrolling a class-pumped student clears the row's `source`, so a class sweep can no longer take them back |
 | GET    | `/courses/{id}/enrollments`      | teacher | List the course roster (course manager) — each row carries `source`, the class that pumped it or `null` for hand-placed · paged |
 | DELETE | `/courses/{id}/enrollments/{user}` | teacher | Unenroll (keeps recorded results; course manager) |
-| POST   | `/classes`                       | manager | `{name, grade?, term_id?}` — create a class (şube); `grade` is a free-text year label |
+| POST   | `/classes`                       | manager | `{name, grade?, term_id?, teacher_id?}` — create a class section (şube); `grade` is a free-text year label, `teacher_id` the homeroom teacher (sınıf öğretmeni, teacher+; `409` + full rollback if that account is demoted mid-request) |
 | GET    | `/classes`                       | teacher | List classes, newest first · paged |
+| GET    | `/classes/me`                    | any     | The caller's own classes, newest membership first · paged; `creator` is `null` below teacher+ |
+| GET    | `/classes/user/{user}`           | teacher | Another user's classes (a parent linked to that student may read it too) · paged; `creator` is `null` below teacher+ |
 | GET    | `/classes/{id}`                  | teacher | Get one class                   |
-| PATCH  | `/classes/{id}`                  | manager | Edit a class (`null` clears `grade`/`term_id`; `409` if the `term_id` it moves off changed since the read — nothing written, re-read and retry) |
+| PATCH  | `/classes/{id}`                  | manager | Edit a class (`null` clears `grade`/`term_id`/`teacher_id`; `409` if the `term_id` it moves off changed since the read — nothing written, re-read and retry) |
 | DELETE | `/classes/{id}`                  | manager | Delete a class — `409` while it still holds students or courses |
 | POST   | `/classes/{id}/members`          | manager | `{user_id}` — add a **student**; enrolls them into every attached course (`409` if one is full, naming it, if one of them no longer exists — detach that link first — if already a member, or once the class holds `max_class_members`) |
 | GET    | `/classes/{id}/members`          | teacher | List the class roster, newest added first · paged |
@@ -2266,16 +2278,36 @@ for every course the user has roll-call rows in — attendance is a historical
 record, so unenrolling hides marks from the marks report but never hides an
 absence.
 
-## Classes (şube)
+## Class sections (şube)
 
-A **class** is the group a school actually teaches in — 9-A, 10-B — and here
-it is a bulk-enrollment tool rather than a second kind of membership. A class
+A **class section** is the group a school actually teaches in — 9-A, 10-B — and
+here it is a bulk-enrollment tool rather than a second kind of membership. Its
 row carries a name, an optional free-text `grade` label in the school's own
 vocabulary (`"9"`, `"Lise 2"`; `""` means no grade, exactly like omitting it)
 and an optional `term_id`; nothing else about a course changes because a class
 exists. Schools that run electives or a college-style timetable simply never
 create one — individual enrollment is untouched, and classes are a
 convenience.
+
+**The homeroom teacher.** A class may also name one — the *sınıf öğretmeni* —
+with `teacher_id` on create or `PATCH`, and it rides back out as a `teacher`
+person block (`null` when there is none, exactly like `grade`; both `null` and
+`""` clear it). The account must exist and hold **teacher, manager or admin**
+(anything else is a `400` naming `teacher_id`, the same shape a non-student
+member gets). It is a label and nothing more: it grants no rights over the
+class, is not counted, and is not a second teacher assignment — courses keep
+their own `teachers` list. A role change that takes the account below `teacher`
+clears the column on **every** class it held, in the same sweep that drops
+their course assignments, so no section ever lists a demoted account.
+
+That sweep runs once, over the rows that exist when it runs — so a demotion
+that lands *between* a request's role check and its write would sweep nothing
+and leave the assignment standing forever. Both writers close it from the other
+end: `POST /classes`, `PATCH /classes/{id}` and `POST /courses/{id}/teachers`
+re-read the account's live role **after** their write and answer `409` if it
+has since dropped below `teacher`, taking the assignment back (a create is
+rolled back whole — no half-made class is left behind). Whichever side is
+second catches it; the ordinary path costs one extra read and no extra write.
 
 **The pump.** A class holds **members** (students) and **attached courses**,
 and owes the product of the two: every member enrolled in every attached
@@ -2370,6 +2402,24 @@ its courses, all paged, newest first) is **teacher+** — and "newest" here mean
 when the student was *added* or the course *attached*, not the student's or the
 course's own id, which is what a link row keyed on the pair would otherwise
 sort by. Rows written before that stamp existed carry none, and sort last.
+
+**Except your own section.** Every route above is staff-only, which left a student
+with no way to learn which class they are in. Two reads fix that, both paged
+and both returning the same class objects: `GET /classes/me` is the caller's
+own memberships (**any authenticated role** — staff, who are never members,
+simply get an empty page), and `GET /classes/user/{user}` is somebody else's,
+gated exactly like the per-student reports — **teacher+, or a parent linked to
+that student**; anyone else gets a `403` that leaks no existence, and a user
+who does not exist is a `404`. Ordering is by when the membership was added,
+newest first, and `total` counts the memberships the window was cut from.
+
+Both of them hide one field: **`creator` is `null` below teacher+**. A class is
+created by manager+ only, so shipping the creator to a student (or to their
+linked parent) would hand out an office account's username and real name — an
+identity `GET /users` (admin-only) and `/users/search` (teacher+) both withhold.
+The homeroom teacher is *not* hidden: naming them is the point of the read. On
+every staff-facing route (`GET /classes`, `/classes/{id}`, and the create/edit
+responses) `creator` is populated exactly as before.
 
 **Codes.** Adding a member or attaching a course answers `201`; a repeat is a
 `409` ("the student is already in this class", "the course is already on this
@@ -3077,7 +3127,7 @@ src/
     work_entry.rs  WorkEntryId · WorkEntry (staff stint; one open per user by construction)
     enrollment.rs  EnrollmentId · Enrollment (one row per course+user; `source`
                    names the class that pumped it, absent when hand-placed)
-    class_group.rs ClassGroupId · ClassName · ClassGrade · ClassGroup (a şube;
+    class_group.rs ClassGroupId · ClassName · ClassGrade · ClassGroup (a class section;
                    deletable only with no members and no attached courses)
     class_member.rs ClassMember (one student in a class; adding them enrolls
                    them into every course the class holds)

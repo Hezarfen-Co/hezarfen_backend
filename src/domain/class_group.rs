@@ -1,5 +1,5 @@
-//! A class (şube): a named set of students the school manages as one, so a
-//! course attach enrolls the whole set at once. The membership and the
+//! A class section (şube): a named set of students the school manages as one,
+//! so a course attach enrolls the whole set at once. The membership and the
 //! attachments live in their own tables (`class_member`, `class_course`) and are
 //! counted on this row — a class may only be deleted at zero on both, the same
 //! stored guard shape courses and terms use.
@@ -88,6 +88,12 @@ impl ClassGrade {
 /// One class. `creator` is who made it; the two refcounts behind the delete
 /// guard are database-side columns only, so no whole-row save can clobber one
 /// (see [`crate::domain::cap`]).
+///
+/// `teacher` is the section's homeroom teacher (sınıf öğretmeni): optional, not
+/// refcounted, and merely a label pointing at a teacher-or-higher account — the
+/// web layer holds that bar, and a demotion sweeps the column
+/// ([`ClassGroup::unassign_everywhere`]). Rows written before the column exists
+/// carry no key at all, which reads back as `None`.
 #[derive(Debug, Clone, SurrealValue)]
 pub struct ClassGroup {
     id: ClassGroupId,
@@ -95,6 +101,7 @@ pub struct ClassGroup {
     name: ClassName,
     grade: Option<ClassGrade>,
     term: Option<TermId>,
+    teacher: Option<UserId>,
 }
 
 impl ClassGroup {
@@ -118,6 +125,11 @@ impl ClassGroup {
         self.term.as_ref()
     }
 
+    /// The homeroom teacher (sınıf öğretmeni), if one is assigned.
+    pub fn get_teacher(&self) -> Option<&UserId> {
+        self.teacher.as_ref()
+    }
+
     pub fn is_creator(&self, user: &UserId) -> bool {
         &self.creator == user
     }
@@ -133,6 +145,7 @@ impl ClassGroup {
         name: ClassName,
         grade: Option<ClassGrade>,
         term: Option<TermId>,
+        teacher: Option<UserId>,
         db: &Database,
     ) -> Result<ClassGroup, AppError> {
         let class = ClassGroup {
@@ -141,6 +154,7 @@ impl ClassGroup {
             name,
             grade,
             term,
+            teacher,
         };
         let id = class.id.record();
         let Some(term) = class.term.clone() else {
@@ -183,9 +197,9 @@ impl ClassGroup {
 
     /// Write only the fields the PATCH carried — `None` means the request
     /// omitted it, so the column is left alone rather than re-stated from the
-    /// snapshot this struct was read into. `grade` and `term` are nullable, so
-    /// they take the outer/inner `Option<Option<_>>`: `None` = omitted (keep),
-    /// `Some(None)` = clear.
+    /// snapshot this struct was read into. `grade`, `term` and `teacher` are
+    /// nullable, so they take the outer/inner `Option<Option<_>>`: `None` =
+    /// omitted (keep), `Some(None)` = clear.
     ///
     /// A term move claims the new term and releases the old one inside the very
     /// transaction that moves the link, exactly as in
@@ -196,6 +210,7 @@ impl ClassGroup {
         name: Option<ClassName>,
         grade: Option<Option<ClassGrade>>,
         term: Option<Option<TermId>>,
+        teacher: Option<Option<UserId>>,
         db: &Database,
     ) -> Result<ClassGroup, AppError> {
         let (claim, release) = term::ref_move(self.term.as_ref(), &term);
@@ -204,6 +219,12 @@ impl ClassGroup {
             .set("name", name)
             .set("grade", grade)
             .set("term", term.map(|term| term.map(|term| term.record())))
+            // Not refcounted: a homeroom assignment is a label, so it rides the
+            // plain `set` path and never arms the term CAS.
+            .set(
+                "teacher",
+                teacher.map(|teacher| teacher.map(|teacher| teacher.record())),
+            )
             .refcount(
                 TERM_CLASS_COUNT_FIELD,
                 "term",
@@ -214,6 +235,38 @@ impl ClassGroup {
             )
             .run::<ClassGroup>(db)
             .await
+    }
+
+    /// The classes `ids` names, in no particular order — the join behind
+    /// "which class section is this student in", where the ids come from
+    /// `class_member` rows already paged. Ids that name no row are simply
+    /// absent.
+    pub async fn list_by_ids(
+        ids: &[ClassGroupId],
+        db: &Database,
+    ) -> Result<Vec<ClassGroup>, AppError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let records: Vec<RecordId> = ids.iter().map(ClassGroupId::record).collect();
+        let mut result = db
+            .query("SELECT * FROM class_group WHERE id IN $ids")
+            .bind(("ids", records))
+            .await?
+            .check()?;
+        Ok(result.take::<Vec<ClassGroup>>(0)?)
+    }
+
+    /// Strip `user` from every class they were the homeroom teacher of — the
+    /// sweep for a user demoted below `teacher`, who may no longer hold one.
+    /// The mirror of [`crate::domain::course::Course::unassign_everywhere`];
+    /// nothing is counted on this column, so there is no reference to give back.
+    pub async fn unassign_everywhere(user: &UserId, db: &Database) -> Result<(), AppError> {
+        db.query("UPDATE class_group SET teacher = NONE WHERE teacher = $usr")
+            .bind(("usr", user.record()))
+            .await?
+            .check()?;
+        Ok(())
     }
 
     /// Delete the class and give its term reference back. Nothing cascades: a
@@ -281,10 +334,35 @@ mod tests {
             ClassName::try_new("9-A").unwrap(),
             None,
             term,
+            None,
             db,
         )
         .await
         .unwrap()
+    }
+
+    /// A class with a homeroom teacher, no term.
+    async fn class_of(teacher: Option<UserId>, db: &Database) -> ClassGroup {
+        ClassGroup::create(
+            &UserId::from_key("manager"),
+            ClassName::try_new("9-A").unwrap(),
+            None,
+            None,
+            teacher,
+            db,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// The stored `teacher` column, re-read.
+    async fn teacher_of(class: &ClassGroupId, db: &Database) -> Option<UserId> {
+        ClassGroup::read(class, db)
+            .await
+            .unwrap()
+            .unwrap()
+            .get_teacher()
+            .cloned()
     }
 
     async fn a_term(db: &Database) -> Term {
@@ -342,6 +420,92 @@ mod tests {
         assert!(ClassGrade::try_new(&"x".repeat(MAX_CLASS_GRADE_LEN + 1)).is_err());
     }
 
+    /// The homeroom teacher survives a create, is set and cleared by a PATCH,
+    /// and — the part a `.content(self)` save would break — is left alone by a
+    /// PATCH of another field. A row written before the column exists carries
+    /// no key at all, which must read back as `None`, not fail the decode.
+    #[tokio::test]
+    async fn the_homeroom_teacher_is_stored_set_cleared_and_left_alone() {
+        let db = crate::database::init_mem().await.unwrap();
+        let ada = UserId::from_key("ada");
+        let boole = UserId::from_key("boole");
+
+        let bare = class_of(None, &db).await;
+        assert_eq!(teacher_of(bare.get_id(), &db).await, None);
+        let held = class_of(Some(ada.clone()), &db).await;
+        assert_eq!(teacher_of(held.get_id(), &db).await, Some(ada.clone()));
+
+        // A name-only PATCH must not re-state the teacher out of its snapshot.
+        let renamed = held
+            .update(
+                Some(ClassName::try_new("9-B").unwrap()),
+                None,
+                None,
+                None,
+                &db,
+            )
+            .await
+            .unwrap();
+        assert_eq!(renamed.get_name().as_str(), "9-B");
+        assert_eq!(teacher_of(renamed.get_id(), &db).await, Some(ada));
+
+        let moved = renamed
+            .update(None, None, None, Some(Some(boole.clone())), &db)
+            .await
+            .unwrap();
+        assert_eq!(teacher_of(moved.get_id(), &db).await, Some(boole));
+
+        let cleared = moved
+            .update(None, None, None, Some(None), &db)
+            .await
+            .unwrap();
+        assert_eq!(teacher_of(cleared.get_id(), &db).await, None);
+
+        // …and the mirror: a teacher-only PATCH leaves the name alone.
+        let again = cleared
+            .update(None, None, None, Some(Some(UserId::from_key("ada"))), &db)
+            .await
+            .unwrap();
+        assert_eq!(again.get_name().as_str(), "9-B");
+
+        // A row that predates the column: absent key, not NULL.
+        db.query("UPDATE $class UNSET teacher")
+            .bind(("class", bare.get_id().record()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        assert_eq!(teacher_of(bare.get_id(), &db).await, None);
+    }
+
+    /// The demotion sweep: a user who drops below `teacher` is cleared from
+    /// *every* class they homeroomed, and nobody else's is touched.
+    #[tokio::test]
+    async fn unassign_everywhere_clears_only_that_users_classes() {
+        let db = crate::database::init_mem().await.unwrap();
+        let ada = UserId::from_key("ada");
+        let boole = UserId::from_key("boole");
+        let first = class_of(Some(ada.clone()), &db).await;
+        let second = class_of(Some(ada.clone()), &db).await;
+        let other = class_of(Some(boole.clone()), &db).await;
+        let none = class_of(None, &db).await;
+
+        ClassGroup::unassign_everywhere(&ada, &db).await.unwrap();
+        for class in [&first, &second] {
+            assert_eq!(
+                teacher_of(class.get_id(), &db).await,
+                None,
+                "every class the demoted user homeroomed must be cleared"
+            );
+        }
+        assert_eq!(
+            teacher_of(other.get_id(), &db).await,
+            Some(boole),
+            "…and nobody else's"
+        );
+        assert_eq!(teacher_of(none.get_id(), &db).await, None);
+    }
+
     /// The bite test for the class half of the term delete guard: a term is
     /// undeletable while a *class* links it, on its own column, and every way
     /// that link can end gives the reference back. Claiming into `course_count`
@@ -368,7 +532,10 @@ mod tests {
             "two linked classes must refuse the delete"
         );
 
-        patched.update(None, None, Some(None), &db).await.unwrap();
+        patched
+            .update(None, None, Some(None), None, &db)
+            .await
+            .unwrap();
         assert!(
             !term.clone().delete(&db).await.unwrap(),
             "one link is still one link"
@@ -449,6 +616,7 @@ mod tests {
             ClassName::try_new("9-A").unwrap(),
             None,
             Some(id),
+            None,
             &db,
         )
         .await
@@ -492,6 +660,7 @@ mod tests {
                 Some(ClassName::try_new("9-B").unwrap()),
                 None,
                 Some(Some(dead_id)),
+                None,
                 &db,
             )
             .await
@@ -510,7 +679,7 @@ mod tests {
         );
 
         let moved = class
-            .update(None, None, Some(Some(to.get_id().clone())), &db)
+            .update(None, None, Some(Some(to.get_id().clone())), None, &db)
             .await
             .unwrap();
         assert_eq!(moved.get_term(), Some(to.get_id()));
@@ -545,7 +714,7 @@ mod tests {
         let class = class_on(Some(from.get_id().clone()), &db).await;
         let stale = class.clone();
         class
-            .update(None, None, Some(Some(to.get_id().clone())), &db)
+            .update(None, None, Some(Some(to.get_id().clone())), None, &db)
             .await
             .unwrap();
 
@@ -553,14 +722,14 @@ mod tests {
         // claim `other` on top of the winner's claim on `to`.
         let error = stale
             .clone()
-            .update(None, None, Some(Some(other.get_id().clone())), &db)
+            .update(None, None, Some(Some(other.get_id().clone())), None, &db)
             .await
             .expect_err("a mover that read a link it no longer holds must be refused");
         assert!(matches!(error, AppError::Conflict(_)), "{error:?}");
         // The re-stater: shifts no counter, so only the CAS can stop it.
         let error = stale
             .clone()
-            .update(None, None, Some(Some(from.get_id().clone())), &db)
+            .update(None, None, Some(Some(from.get_id().clone())), None, &db)
             .await
             .expect_err("re-stating a link someone else moved must be refused");
         assert!(matches!(error, AppError::Conflict(_)), "{error:?}");
@@ -576,7 +745,7 @@ mod tests {
 
         // A genuine no-op re-state still lands and still moves nothing.
         let same = stored
-            .update(None, None, Some(Some(to.get_id().clone())), &db)
+            .update(None, None, Some(Some(to.get_id().clone())), None, &db)
             .await
             .expect("re-stating the link the row really holds is not a conflict");
         assert_eq!(same.get_term(), Some(to.get_id()));

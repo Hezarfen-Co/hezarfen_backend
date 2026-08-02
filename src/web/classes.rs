@@ -1,4 +1,4 @@
-//! Classes (şube): a named set of students the school moves as one.
+//! Class sections (şube): a named set of students the school moves as one.
 //!
 //! Nothing here is a second kind of membership — adding a student to a class
 //! enrolls them into every course the class carries, and attaching a course
@@ -28,12 +28,21 @@ use crate::state::AppState;
 use super::courses::can_manage_course;
 use super::terms::resolve_term;
 use super::{
-    Page, PageParams, PersonRef, RequireManager, RequireTeacher, person_map, set_or_clear,
+    CurrentUser, Page, PageParams, PersonRef, RequireManager, RequireTeacher, ensure_can_observe,
+    person_map, set_or_clear, undo_if_demoted,
 };
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(create_class, list_classes))
+        // Registration order is irrelevant here, and saying otherwise would be
+        // a comment pinning nothing: axum routes on `matchit`, which prefers a
+        // static segment over a parameter no matter when either was added, so
+        // `/classes/me` reaches `my_classes` and never `get_class` with an id
+        // of `"me"`. `a_student_reads_exactly_their_own_classes` is what
+        // actually checks it, by asserting the body is a page envelope.
+        .routes(routes!(my_classes))
+        .routes(routes!(user_classes))
         .routes(routes!(get_class, update_class, delete_class))
         .routes(routes!(add_member, list_members))
         .routes(routes!(remove_member))
@@ -51,6 +60,10 @@ struct CreateClass {
     grade: Option<String>,
     /// The academic term this class belongs to (`GET /terms`). Optional.
     term_id: Option<String>,
+    /// The class's homeroom teacher (sınıf öğretmeni) — a teacher, manager or
+    /// admin account. Optional; omit (or send `""`) for a class with none.
+    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    teacher_id: Option<String>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -67,6 +80,11 @@ struct UpdateClass {
     #[serde(default, deserialize_with = "set_or_clear")]
     #[schema(value_type = Option<String>)]
     term_id: Option<Option<String>>,
+    /// Omit to keep the current homeroom teacher, send `null` (or `""`) to
+    /// clear it, or send a teacher+ user id to (re)assign.
+    #[serde(default, deserialize_with = "set_or_clear")]
+    #[schema(value_type = Option<String>)]
+    teacher_id: Option<Option<String>>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -87,8 +105,12 @@ struct AttachCourse {
 struct ClassResponse {
     #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
     id: String,
-    /// Who created the class.
-    creator: PersonRef,
+    /// Who created the class — always a manager or admin, so it is `null` for
+    /// a caller below teacher+. `GET /classes/me` and a parent's
+    /// `GET /classes/user/{user}` are the only reads a non-staff account can
+    /// make here, and the office's account names are not theirs to learn:
+    /// `GET /users` is admin-only and `/users/search` is teacher+.
+    creator: Option<PersonRef>,
     #[schema(example = "9-A")]
     name: String,
     /// The school's own free-text grade label; `null` when the class has none.
@@ -97,18 +119,44 @@ struct ClassResponse {
     /// The academic term this class belongs to (`GET /terms`); `null` when
     /// unassigned.
     term: Option<String>,
+    /// The class's homeroom teacher (sınıf öğretmeni); `null` when none is
+    /// assigned — as it is for every class after the account was demoted below
+    /// `teacher`.
+    teacher: Option<PersonRef>,
 }
 
 impl ClassResponse {
-    fn new(class: &ClassGroup, people: &std::collections::HashMap<String, PersonRef>) -> Self {
+    /// `with_creator` is the caller's clearance: every route but the two
+    /// membership reads is teacher+ and passes `true`; those two pass it only
+    /// for a staff caller. The homeroom teacher is never hidden — naming them
+    /// is the whole point of a student's own section read.
+    fn new(
+        class: &ClassGroup,
+        people: &std::collections::HashMap<String, PersonRef>,
+        with_creator: bool,
+    ) -> Self {
         Self {
             id: class.get_id().key().to_string(),
-            creator: PersonRef::resolve(people, class.get_creator()),
+            creator: with_creator.then(|| PersonRef::resolve(people, class.get_creator())),
             name: class.get_name().as_str().to_string(),
             grade: class.get_grade().map(|g| g.as_str().to_string()),
             term: class.get_term().map(|term| term.key().to_string()),
+            teacher: class
+                .get_teacher()
+                .map(|teacher| PersonRef::resolve(people, teacher)),
         }
     }
+}
+
+/// Every person a [`ClassResponse`] names: its homeroom teacher, plus its
+/// creator when the caller is cleared to see one. Feed this into `person_map` —
+/// an id the map is missing renders as a bare ULID, so a creator left out here
+/// must also be left out of the response.
+fn class_people(class: &ClassGroup, with_creator: bool) -> impl Iterator<Item = UserId> + '_ {
+    with_creator
+        .then(|| class.get_creator().clone())
+        .into_iter()
+        .chain(class.get_teacher().cloned())
 }
 
 #[derive(Serialize, ToSchema)]
@@ -170,9 +218,78 @@ fn grade_or_none(text: Option<&str>) -> Result<Option<ClassGrade>, AppError> {
     }
 }
 
+/// The homeroom teacher a request names, as the row itself — an empty string is
+/// *no* teacher, exactly like `grade`, so omitting the field and clearing it
+/// with `""` land on the same stored row. The named account must exist and hold
+/// teacher-or-higher: a class's sınıf öğretmeni is staff, and the check is the
+/// same shape `add_member` uses for a non-student. The `User` comes back so the
+/// caller can name them in the response without a second read.
+async fn teacher_or_none(text: Option<&str>, db: &Database) -> Result<Option<User>, AppError> {
+    let (None | Some("")) = text else {
+        return resolve_teacher(text.unwrap_or_default(), db)
+            .await
+            .map(Some);
+    };
+    Ok(None)
+}
+
+/// The teacher-or-higher account `key` names, or the 400 both write paths give.
+async fn resolve_teacher(key: &str, db: &Database) -> Result<User, AppError> {
+    let Some(teacher) = User::read(&UserId::from_key(key), db).await? else {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "teacher_id",
+            reason: "target user does not exist",
+        }));
+    };
+    if !teacher.get_role().at_least(Role::Teacher) {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "teacher_id",
+            reason: "only a teacher, manager or admin can be a class's homeroom teacher",
+        }));
+    }
+    Ok(teacher)
+}
+
+/// One page of classes with their people joined on — the shared tail of the two
+/// membership reads. Ordering follows `rows`, so the page stays newest-first.
+///
+/// A membership whose class id resolves to nothing is *skipped*: class deletion
+/// is refused while members exist, so it is unreachable, and if a repair ever
+/// left one behind a student's own section list must degrade to one row short
+/// rather than 500. `total` still counts the membership rows, which is what the
+/// window was cut from.
+async fn classes_page(
+    ids: &[ClassGroupId],
+    total: i64,
+    limit: Option<i64>,
+    offset: i64,
+    with_creator: bool,
+    db: &Database,
+) -> Result<Page<ClassResponse>, AppError> {
+    let classes = ClassGroup::list_by_ids(ids, db).await?;
+    let by_id: std::collections::HashMap<&str, &ClassGroup> = classes
+        .iter()
+        .map(|class| (class.get_id().key(), class))
+        .collect();
+    let people = person_map(
+        classes
+            .iter()
+            .flat_map(|class| class_people(class, with_creator)),
+        db,
+    )
+    .await?;
+    let items = ids
+        .iter()
+        .filter_map(|id| by_id.get(id.key()))
+        .map(|class| ClassResponse::new(class, &people, with_creator))
+        .collect();
+    Ok(Page::new(items, total, limit, offset))
+}
+
 /// Create a class. Requires manager+ — a class is school structure, not a
 /// teacher's own room. `grade` is a free-text label for the year ("9", "10-A"),
-/// `term_id` links the school calendar; both optional.
+/// `term_id` links the school calendar, `teacher_id` names the homeroom teacher
+/// (sınıf öğretmeni, a teacher+ account); all optional.
 #[utoipa::path(
     post,
     path = "/",
@@ -181,9 +298,10 @@ fn grade_or_none(text: Option<&str>) -> Result<Option<ClassGrade>, AppError> {
     request_body = CreateClass,
     responses(
         (status = 201, description = "Class created", body = ClassResponse),
-        (status = 400, description = "Invalid name or grade, or an unknown term", body = ErrorResponse),
+        (status = 400, description = "Invalid name or grade, an unknown term, or a teacher_id naming nobody or a non-teacher", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
+        (status = 409, description = "The named homeroom teacher was demoted below teacher while the request ran — the class was rolled back, nothing was created", body = ErrorResponse),
     ),
 )]
 async fn create_class(
@@ -197,12 +315,47 @@ async fn create_class(
     // before it writes the link, and a term deleted in between fails that claim
     // with this very error — so an unknown id reads the same whichever side wins.
     let term = resolve_term(req.term_id.as_deref(), &st.db).await?;
-    let class = ClassGroup::create(user.get_id(), name, grade, term, &st.db).await?;
-    // The creator is the caller — already loaded, no extra lookup.
-    let people = PersonRef::map_of(&[&user]);
+    let teacher = teacher_or_none(req.teacher_id.as_deref(), &st.db).await?;
+    let class = ClassGroup::create(
+        user.get_id(),
+        name,
+        grade,
+        term,
+        teacher.as_ref().map(|t| t.get_id().clone()),
+        &st.db,
+    )
+    .await?;
+    // The row is written; a demotion that raced this request's role check swept
+    // it too early to see it, so the live role is re-read now (see
+    // [`undo_if_demoted`]).
+    if let Some(teacher) = teacher.as_ref()
+        && let Err(demoted) = undo_if_demoted(teacher.get_id(), &st.db).await
+    {
+        // Roll the whole create back, not just the column: a `409` that left a
+        // teacherless class standing would have the caller either retrying into
+        // a duplicate or never learning it was there.
+        //
+        // The guard cannot refuse this delete — the class is one statement old
+        // and both of its counters are still absent — so a refusal is a broken
+        // invariant, not a client error, and it must not be reported as the
+        // `409` whose text promises nothing was created.
+        if !class.clone().delete(&st.db).await? {
+            return Err(AppError::Internal(format!(
+                "class {} took a member or a course between its create and the \
+                 rollback of a demoted homeroom teacher; it is still there, \
+                 without a teacher",
+                class.get_id().key()
+            )));
+        }
+        return Err(demoted);
+    }
+    // The creator is the caller and the teacher was just read — no extra lookup.
+    let mut named = vec![&user];
+    named.extend(teacher.as_ref());
+    let people = PersonRef::map_of(&named);
     Ok((
         StatusCode::CREATED,
-        Json(ClassResponse::new(&class, &people)),
+        Json(ClassResponse::new(&class, &people, true)),
     ))
 }
 
@@ -229,15 +382,15 @@ async fn list_classes(
 ) -> Result<Json<Page<ClassResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
     let (classes, total) = ClassGroup::list_all(limit, offset, &st.db).await?;
-    // Join creators onto the page alone — the lookup shrinks with the window.
+    // Join people onto the page alone — the lookup shrinks with the window.
     let people = person_map(
-        classes.iter().map(|class| class.get_creator().clone()),
+        classes.iter().flat_map(|class| class_people(class, true)),
         &st.db,
     )
     .await?;
     let items = classes
         .iter()
-        .map(|class| ClassResponse::new(class, &people))
+        .map(|class| ClassResponse::new(class, &people, true))
         .collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
@@ -262,12 +415,12 @@ async fn get_class(
     Path(id): Path<String>,
 ) -> Result<Json<ClassResponse>, AppError> {
     let class = class_or_404(&id, &st.db).await?;
-    let people = person_map(std::iter::once(class.get_creator().clone()), &st.db).await?;
-    Ok(Json(ClassResponse::new(&class, &people)))
+    let people = person_map(class_people(&class, true), &st.db).await?;
+    Ok(Json(ClassResponse::new(&class, &people, true)))
 }
 
-/// Update a class. Requires manager+. Omitted fields keep their value; `grade`
-/// and `term_id` are nullable, so an explicit `null` clears them.
+/// Update a class. Requires manager+. Omitted fields keep their value; `grade`,
+/// `term_id` and `teacher_id` are nullable, so an explicit `null` clears them.
 #[utoipa::path(
     patch,
     path = "/{id}",
@@ -277,11 +430,11 @@ async fn get_class(
     request_body = UpdateClass,
     responses(
         (status = 200, description = "Updated class", body = ClassResponse),
-        (status = 400, description = "Invalid name or grade, or an unknown term", body = ErrorResponse),
+        (status = 400, description = "Invalid name or grade, an unknown term, or a teacher_id naming nobody or a non-teacher", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "The term this update moves the class off changed since the caller read it — nothing was written, re-read and retry", body = ErrorResponse),
+        (status = 409, description = "The term this update moves the class off changed since the caller read it (nothing was written, re-read and retry), or the named homeroom teacher was demoted below teacher while the request ran (the assignment was undone)", body = ErrorResponse),
     ),
 )]
 async fn update_class(
@@ -305,10 +458,117 @@ async fn update_class(
         Some(ref update) => Some(resolve_term(update.as_deref(), &st.db).await?),
         None => None,
     };
+    let teacher = match req.teacher_id {
+        // Explicit `null` (or `""`) clears it; a value must name a teacher+.
+        Some(ref update) => Some(teacher_or_none(update.as_deref(), &st.db).await?),
+        None => None,
+    };
 
-    let updated = class.update(name, grade, term, &st.db).await?;
-    let people = person_map(std::iter::once(updated.get_creator().clone()), &st.db).await?;
-    Ok(Json(ClassResponse::new(&updated, &people)))
+    let assigned = teacher
+        .as_ref()
+        .and_then(|teacher| teacher.as_ref().map(|teacher| teacher.get_id().clone()));
+    let updated = class
+        .update(
+            name,
+            grade,
+            term,
+            teacher.map(|teacher| teacher.map(|teacher| teacher.get_id().clone())),
+            &st.db,
+        )
+        .await?;
+    // Only when this request named a teacher: a PATCH that left the column
+    // alone raced nobody's demotion (see [`undo_if_demoted`]). The undo clears
+    // the column, which is the whole of what this request wrote to it.
+    if let Some(teacher) = assigned.as_ref() {
+        undo_if_demoted(teacher, &st.db).await?;
+    }
+    let people = person_map(class_people(&updated, true), &st.db).await?;
+    Ok(Json(ClassResponse::new(&updated, &people, true)))
+}
+
+// ---- a student's own class -------------------------------------------------
+
+/// The classes the caller is a member of, newest membership first. Any
+/// authenticated role — this is the one class read a student (or a parent, for
+/// themselves) can make, since every other `/classes` route is teacher+. Paged
+/// via `?limit=&offset=` (omit `limit` for all of them); returns a
+/// `{items, total, limit, offset}` envelope. Staff, who are never class
+/// members, simply get an empty page.
+#[utoipa::path(
+    get,
+    path = "/me",
+    tag = "classes",
+    security(("session_cookie" = [])),
+    params(PageParams),
+    responses(
+        (status = 200, description = "A page of the caller's classes (all of them when unpaged)", body = Page<ClassResponse>),
+        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+    ),
+)]
+async fn my_classes(
+    State(st): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    Query(page): Query<PageParams>,
+) -> Result<Json<Page<ClassResponse>>, AppError> {
+    let (limit, offset) = page.resolve()?;
+    // A student may not learn who in the office created their class; staff may.
+    let with_creator = user.get_role().at_least(Role::Teacher);
+    Ok(Json(
+        classes_of(user.get_id(), limit, offset, with_creator, &st.db).await?,
+    ))
+}
+
+/// Another user's classes. Requires teacher+, or a parent tied to the target
+/// student — the same bar the per-student reports hold, and the same 403 for
+/// everyone else (a student reads their own at `GET /classes/me`).
+#[utoipa::path(
+    get,
+    path = "/user/{user}",
+    tag = "classes",
+    security(("session_cookie" = [])),
+    params(("user" = String, Path, description = "User id"), PageParams),
+    responses(
+        (status = 200, description = "A page of that user's classes (all of them when unpaged)", body = Page<ClassResponse>),
+        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires teacher role or higher, or a parent link to this student", body = ErrorResponse),
+        (status = 404, description = "User not found", body = ErrorResponse),
+    ),
+)]
+async fn user_classes(
+    State(st): State<AppState>,
+    CurrentUser(caller): CurrentUser,
+    Path(user): Path<String>,
+    Query(page): Query<PageParams>,
+) -> Result<Json<Page<ClassResponse>>, AppError> {
+    let (limit, offset) = page.resolve()?;
+    let target = UserId::from_key(&user);
+    ensure_can_observe(&caller, &target, &st.db).await?;
+    // User must exist — a missing user is a 404, not an empty page.
+    User::read(&target, &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    // A linked parent reads this too, and is no more entitled to the office's
+    // account names than their child is.
+    let with_creator = caller.get_role().at_least(Role::Teacher);
+    Ok(Json(
+        classes_of(&target, limit, offset, with_creator, &st.db).await?,
+    ))
+}
+
+/// One user's class page: the membership rows are what the window is cut from,
+/// and the class rows are joined onto that page alone.
+async fn classes_of(
+    user: &UserId,
+    limit: Option<i64>,
+    offset: i64,
+    with_creator: bool,
+    db: &Database,
+) -> Result<Page<ClassResponse>, AppError> {
+    let (rows, total) = ClassMember::list_for_user(user, limit, offset, db).await?;
+    let ids: Vec<ClassGroupId> = rows.iter().map(|row| row.get_class().clone()).collect();
+    classes_page(&ids, total, limit, offset, with_creator, db).await
 }
 
 /// Delete a class. Requires manager+. Refused with a 409 while it still holds
@@ -617,5 +877,61 @@ mod tests {
             Some("9".to_string())
         );
         assert!(grade_or_none(Some(&"x".repeat(1000))).is_err());
+    }
+
+    /// The same nullable rule on the homeroom teacher, plus the bar it holds:
+    /// absent and `""` are the same *no teacher* (and never touch the store),
+    /// an id naming nobody is a `400`, and so is one naming a student — a
+    /// class's sınıf öğretmeni is staff.
+    #[tokio::test]
+    async fn an_empty_teacher_is_no_teacher_and_a_student_is_never_one() {
+        use crate::domain::role::Role;
+        use crate::domain::user::{Password, User, Username};
+
+        let db = crate::database::init_mem().await.unwrap();
+        assert!(teacher_or_none(None, &db).await.unwrap().is_none());
+        assert!(teacher_or_none(Some(""), &db).await.unwrap().is_none());
+
+        let make = async |name: &str, role: Role| {
+            let user = User::create(
+                Username::try_new(name).unwrap(),
+                Password::try_new("secret1")
+                    .unwrap()
+                    .hash_async()
+                    .await
+                    .unwrap(),
+                &db,
+            )
+            .await
+            .unwrap();
+            user.set_role(role, &db).await.unwrap()
+        };
+        let student = make("ali", Role::Student).await;
+        let teacher = make("ada", Role::Teacher).await;
+
+        for (field, id) in [
+            ("gone", "01J8XZ0K3Q8G7X2M4N5P6R7S8T"),
+            ("student", student.get_id().key()),
+        ] {
+            let refused = teacher_or_none(Some(id), &db).await;
+            assert!(
+                matches!(
+                    refused,
+                    Err(AppError::Validation(ValidationError::Invalid {
+                        field: "teacher_id",
+                        ..
+                    }))
+                ),
+                "a {field} id must be a 400 naming teacher_id: {refused:?}"
+            );
+        }
+        assert_eq!(
+            teacher_or_none(Some(teacher.get_id().key()), &db)
+                .await
+                .unwrap()
+                .map(|found| found.get_id().clone()),
+            Some(teacher.get_id().clone()),
+            "a teacher account is the one thing that resolves"
+        );
     }
 }
