@@ -8,6 +8,7 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
 use crate::constant::{CLASS_COURSE_TABLE, MAX_CLASS_COURSES, MAX_CLASS_MEMBERS};
 use crate::database::Database;
+use crate::domain::class_blueprint::ClassBlueprintId;
 use crate::domain::class_group::ClassGroupId;
 use crate::domain::class_pump::{Attached, Axis, attach, detach, link_id};
 use crate::domain::course::CourseId;
@@ -44,6 +45,13 @@ pub struct ClassCourse {
     class: ClassGroupId,
     course: CourseId,
     attached_by: UserId,
+    /// The grade blueprint that placed this attachment, absent when a human
+    /// attached the course to this class directly — the mirror of
+    /// [`crate::domain::enrollment`]'s `source`, and read the same way: only a
+    /// row carrying the key is a blueprint's to take back, so a hand-attached
+    /// course survives every blueprint sweep. Rows written before the column
+    /// carry no key at all, which is exactly "hand-attached".
+    source: Option<ClassBlueprintId>,
     /// When it was attached, and the *only* thing "newest first" can mean here:
     /// the row's id is the (class, course) pair, so ordering by it sorts the
     /// list by the course's own ULID. Optional because rows written before this
@@ -68,6 +76,11 @@ impl ClassCourse {
         &self.attached_by
     }
 
+    /// The blueprint that placed this attachment, or `None` for a hand attach.
+    pub fn get_source(&self) -> Option<&ClassBlueprintId> {
+        self.source.as_ref()
+    }
+
     /// Attach `course` to `class` and enroll the class's whole roster into it,
     /// in one transaction.
     ///
@@ -80,27 +93,13 @@ impl ClassCourse {
         attached_by: &UserId,
         db: &Database,
     ) -> Result<ClassCourse, AppError> {
-        let link = ClassCourse {
-            id: ClassCourseId::composite(class, course),
-            class: class.clone(),
-            course: course.clone(),
-            attached_by: attached_by.clone(),
-            attached_at: Some(Timestamp::now()),
-        };
-        match attach(
-            class,
-            Axis::Course,
-            &link.id.record(),
-            &link,
-            course.record(),
-            attached_by.record(),
-            db,
-        )
-        .await?
-        {
+        match Self::attach_sourced(class, course, attached_by, None, db).await? {
             Attached::Made(saved) => Ok(saved),
             Attached::Duplicate => Err(AppError::Conflict("the course is already on this class")),
-            Attached::Gone => Err(AppError::NotFound),
+            // The class or the course: either end of the link being gone is a
+            // 404 on this route, and only a blueprint's skip list needs them
+            // told apart.
+            Attached::Gone | Attached::PivotGone => Err(AppError::NotFound),
             Attached::ClassFull => Err(AppError::ConflictOwned(format!(
                 "this class already holds {MAX_CLASS_COURSES} courses"
             ))),
@@ -120,6 +119,45 @@ impl ClassCourse {
                 "{course} no longer exists — detach it from this class first"
             ))),
         }
+    }
+
+    /// The attach itself, with the refusals left *unmapped*.
+    ///
+    /// A hand attach ([`ClassCourse::attach`]) turns each of them into the
+    /// error the route answers with, because one call is one course and a
+    /// refusal is that call's whole answer. A blueprint pump cannot: it runs
+    /// one of these per (class, course), and a course that does not fit one
+    /// section must not abort the other eleven — so it needs to *read* the
+    /// refusal and carry on ([`crate::domain::class_blueprint`]).
+    ///
+    /// `source` is the provenance tag, and it is written by the same statement
+    /// that writes the link, so no attachment can exist without the answer to
+    /// "may a blueprint take this back".
+    pub(crate) async fn attach_sourced(
+        class: &ClassGroupId,
+        course: &CourseId,
+        attached_by: &UserId,
+        source: Option<&ClassBlueprintId>,
+        db: &Database,
+    ) -> Result<Attached<ClassCourse>, AppError> {
+        let link = ClassCourse {
+            id: ClassCourseId::composite(class, course),
+            class: class.clone(),
+            course: course.clone(),
+            attached_by: attached_by.clone(),
+            source: source.cloned(),
+            attached_at: Some(Timestamp::now()),
+        };
+        attach(
+            class,
+            Axis::Course,
+            &link.id.record(),
+            &link,
+            course.record(),
+            attached_by.record(),
+            db,
+        )
+        .await
     }
 
     /// Detach `course` from `class` and sweep the enrollments the class pumped

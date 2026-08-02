@@ -64,6 +64,12 @@ const EXCLUDED: &[(&str, &str)] = &[
          freeze as a 409, never as a number",
     ),
     (
+        "REGISTRATION_FROZEN_GUARD",
+        "SQL fragment: the condition the role cascade carries so a frozen signup \
+         list is left exactly as it stands; the client sees the freeze as a 409, \
+         never as a number",
+    ),
+    (
         "BOARD_REPLAY_CHUNK",
         "how the board-room socket batches its join replay; the client reads the \
          strokes, not the batch size",
@@ -171,6 +177,13 @@ const EXCLUDED: &[(&str, &str)] = &[
         "ETag middleware's own buffering ceiling",
     ),
     ("PURGE_AT", "rate-limiter bucket eviction threshold"),
+    // Not a per-client budget: one fleet-wide counter that only exists while
+    // the bucket map is saturated. A client cannot compute its own allowance
+    // from it, and publishing it would advertise the flood threshold.
+    (
+        "RATE_LIMIT_OVERFLOW_MAX",
+        "aggregate budget for keyless clients while the bucket map is full",
+    ),
     // How a tier's window is carried through a restart. A client is held to
     // the tier itself (published live in /limits `rate`), never to the cadence
     // it is reconciled at — publishing that would invite pacing against it.

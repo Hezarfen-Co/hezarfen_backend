@@ -170,6 +170,7 @@ async fn require_plan(id: &str, db: &Database) -> Result<FeePlan, AppError> {
         (status = 400, description = "Invalid name, amount, or installment count", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn create_plan(
@@ -267,6 +268,7 @@ async fn get_plan(
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "No such plan", body = ErrorResponse),
         (status = 409, description = "The plan is already assigned to a student", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn update_plan(
@@ -376,6 +378,7 @@ struct FeePlanAssignmentResponse {
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "No such plan", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn assign_plan(
@@ -630,6 +633,7 @@ fn request_key_of(raw: Option<&str>) -> Result<Option<PaymentRequestKey>, AppErr
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "No such ledger line", body = ErrorResponse),
         (status = 409, description = "The charge is already paid in full, or the request_key was used for a different amount or charge", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn record_payment(
@@ -671,6 +675,7 @@ async fn record_payment(
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "No such ledger line", body = ErrorResponse),
         (status = 409, description = "The payment is already refunded in full, or the request_key was used for a different amount or payment", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn record_refund(
@@ -709,6 +714,7 @@ async fn record_refund(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "No such ledger line", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn record_reversal(

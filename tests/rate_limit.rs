@@ -343,6 +343,40 @@ async fn concurrent_bursts_never_over_admit() {
     assert_eq!((ok, limited), (5, 15));
 }
 
+/// A saturated bucket map must not be a bypass. Fill it to `PURGE_AT` with
+/// exhausted buckets — nothing lapsed, nothing evictable — and every further
+/// *new* key gets no bucket of its own. It is still metered: all of them share
+/// one aggregate budget, `RATE_LIMIT_OVERFLOW_MAX` per window, and past that
+/// they are refused. Admitting them unmetered would let an attacker buy
+/// unlimited throughput from fresh keys after paying to fill the map once.
+#[tokio::test]
+async fn keyless_clients_share_one_budget_once_the_map_is_saturated() {
+    use hezarfen_backend::constant::{PURGE_AT, RATE_LIMIT_OVERFLOW_MAX};
+
+    // One request per key exhausts it, so the map fills with buckets that can
+    // neither be swept (same window) nor evicted (all at their limit).
+    let limiter = UserRateLimiter::per_user_minute(1);
+    for i in 0..PURGE_AT {
+        assert!(limiter.enforce_user(&format!("flood-{i}")).is_ok());
+    }
+    assert!(
+        limiter.enforce_user("flood-0").is_err(),
+        "the map must be full of exhausted buckets"
+    );
+
+    // Distinct newcomers, none of which can get into the map.
+    for i in 0..RATE_LIMIT_OVERFLOW_MAX {
+        assert!(
+            limiter.enforce_user(&format!("newcomer-{i}")).is_ok(),
+            "newcomer {i} is within the shared overflow budget"
+        );
+    }
+    assert!(
+        limiter.enforce_user("newcomer-last").is_err(),
+        "past the shared budget a keyless client must be refused, not admitted"
+    );
+}
+
 // --- the window outlives the process ------------------------------------
 //
 // Two `UserRateLimiter`s over one database stand in for the process before and

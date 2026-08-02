@@ -528,6 +528,46 @@ async fn board_lists_are_paged() {
     .await;
     assert_eq!(total(&res.body), 3, "the scoped total is the scoped count");
     assert_eq!(items(&res.body).len(), 1, "offset 2 of 3 leaves 1");
+
+    // `?open=` narrows the board list the same way `?read=` narrows a message
+    // folder: the filter reaches the database, so `total` is the filtered count
+    // and the window still pages. A closed board is never deleted, so this is
+    // the only way a heavy creator trims the retired ones out.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/boards/{}/close", boards[2]),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    for (query, count) in [("", 3), ("?open=true", 2), ("?open=false", 1)] {
+        let res = send(&app, "GET", &format!("/boards{query}"), Some(&ali), None).await;
+        assert_eq!(
+            res.status,
+            StatusCode::OK,
+            "GET /boards{query}: {}",
+            res.body
+        );
+        assert_eq!(total(&res.body), count, "GET /boards{query} total");
+        assert_eq!(items(&res.body).len() as i64, count, "GET /boards{query}");
+    }
+    // The board that is merely *locked* is still open — `?open=` filters
+    // `closed_at` and nothing else.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/boards/{}", boards[1]),
+        Some(&ali),
+        Some(json!({ "locked": true })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(&app, "GET", "/boards?open=true&limit=1", Some(&ali), None).await;
+    assert_eq!(total(&res.body), 2, "a locked board is still an open one");
+    assert_eq!(items(&res.body).len(), 1, "the filtered list still windows");
+    assert_eq!(res.body["limit"], 1);
 }
 
 /// The class layer's three lists speak the same envelope: the class index, one

@@ -120,24 +120,9 @@ impl ParentLink {
         Ok(result.take::<Vec<ParentLink>>(0)?.into_iter().next())
     }
 
-    /// Drop every link where `user` is the observed student — called when a
-    /// role change takes the student side out of the `student` role, mirroring
-    /// the enrollment sweep.
-    pub async fn delete_where_student(user: &UserId, db: &Database) -> Result<(), AppError> {
-        db.query("DELETE parent_link WHERE student = $usr")
-            .bind(("usr", user.record()))
-            .await?
-            .check()?;
-        Ok(())
-    }
-
-    /// Drop every link where `user` is the observing parent — called when a
-    /// role change takes the parent side out of the `parent` role.
-    pub async fn delete_where_parent(user: &UserId, db: &Database) -> Result<(), AppError> {
-        db.query("DELETE parent_link WHERE parent = $usr")
-            .bind(("usr", user.record()))
-            .await?
-            .check()?;
-        Ok(())
-    }
+    // Both role-change sweeps (the observed student leaving `student`, the
+    // observing parent leaving `parent`) live in
+    // [`crate::domain::user::User::set_role`]: they commit with the role write
+    // itself, so there is no window where a link outlives the role that
+    // justified it.
 }

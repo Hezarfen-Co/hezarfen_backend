@@ -111,6 +111,7 @@ impl ChatbotThreadResponse {
         (status = 400, description = "Invalid title", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 409, description = "At the school's thread cap", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn create_thread(
@@ -187,6 +188,7 @@ struct RenameChatbotThread {
         (status = 400, description = "Invalid title", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 404, description = "Not found (or not the caller's)", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn rename_thread(
@@ -364,6 +366,7 @@ async fn list_messages(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 404, description = "Not found (or not the caller's)", body = ErrorResponse),
         (status = 429, description = "Over the per-user message rate limit; see `Retry-After`", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
         (status = 503, description = "No AI service is available — nothing was written, retry later", body = ErrorResponse),
     ),
 )]

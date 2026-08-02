@@ -251,6 +251,7 @@ async fn question_responses(
         (status = 400, description = "Invalid title or body", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires the student role", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn ask_question(
@@ -618,6 +619,7 @@ async fn author_solution(
         (status = 403, description = "Requires student role or higher", body = ErrorResponse),
         (status = 404, description = "No such question (or pending and not yours)", body = ErrorResponse),
         (status = 409, description = "The question is not approved yet", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn offer_solution(
@@ -742,6 +744,7 @@ async fn delete_solution(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the author", body = ErrorResponse),
         (status = 404, description = "No such question or solution", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn edit_solution(

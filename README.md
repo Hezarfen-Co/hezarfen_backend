@@ -12,8 +12,8 @@ per-file size cap is school policy in settings (`max_file_bytes`, default
 body into the recipient's inbox, each side filing its own copy through
 archive/trash with a read flag the sender sees as a receipt (the only place a
 `parent` writes). Attendance is event + attendees: create an event with an **audience**
-(the whole school, one role, a course's enrollment, or a **registration**
-signup list — omit for school-wide), then teachers mark the expected attendees
+(the whole school, one role, a course's enrollment, a **class section's**
+roster, or a **registration** signup list — omit for school-wide), then teachers mark the expected attendees
 present / absent / late / excused (students never self-mark), and a **roster
 report** shows who was expected and who missed. Registration lists fill seat
 by seat: teachers register students (never the other way round), staff
@@ -46,7 +46,11 @@ name a **homeroom teacher** (*sınıf öğretmeni*, `teacher_id` — any teacher
 account, cleared automatically when that account is demoted), and while every
 other class read is teacher+, a student reads their own section at
 `GET /classes/me` (staff and a linked parent read anyone's at
-`GET /classes/user/{user}`). Students read a per-course weighted average and
+`GET /classes/user/{user}`). A grade can also carry a **blueprint** — the
+course list every section at that grade takes (`/classes/blueprints`), applied
+to each section best-effort, with anything a limit refuses returned in
+`skipped` and anything a human attached by hand left alone. Students read a
+per-course weighted average and
 an overall average from their mark report — each exam weighted by its **kind**
 (midterms can count double, orals once: weights are set per kind in settings,
 not per exam). Exams run **sync** (one
@@ -422,6 +426,25 @@ Notes:
   uploadable `image_content_types` are the exact accepted spellings — build
   pickers from these rather than from a literal list.
 
+**`422` versus `400`.** The two refusals mean different things and a client
+must not treat them alike. Every JSON-bodied route can answer **`422`**: the
+body never became the type the handler asked for — a field of the wrong type,
+or a required field missing. It answers with a **`text/plain` diagnostic**, not
+the `{"error": …}` envelope every other failure carries — e.g. `Failed to
+deserialize the JSON body into the target type: username: invalid type:
+integer 5, expected a string at line 1 column 14` — so a client must not try to
+parse it like the other errors: log it, and show the user the field rules
+`/limits` publishes. **`400`** is the other failure and it does carry the usual
+`{"error": "…"}`: either the bytes were not JSON (`{not json`), or the body
+parsed cleanly and then broke a domain rule — `{"username":"a"}` answers
+`400 {"error": "username must be at least 3 characters (got 1)"}`. So `422`
+says the shape is wrong and `400` says the value is. **Multipart uploads never
+answer `422`** — a bad boundary or the wrong content type on a file route is a
+`400`, since there is no JSON body to reject. Each JSON operation declares its
+`422` in the OpenAPI spec and a drift test (`spec_bounds.rs`) checks that in
+both directions, so the spec cannot fall behind the handlers and the multipart
+routes cannot quietly gain a status they never return.
+
 ## Rate limiting
 
 Requests are limited per client IP over a fixed 60-second window, in two tiers:
@@ -447,6 +470,19 @@ so a restart mid-minute does not hand every client a fresh budget. One caveat:
 a just-started process can spend up to the tier's budget in the 2 seconds
 before its first fold tightens it. If the database is down the tiers simply
 fall back to their own local budgets — nobody is refused for it.
+
+One client, one bucket, so the bucket map is only as bounded as the client
+set — and a single IPv6 /64 is not bounded at all. Past 10 000 live clients a
+new key first sweeps out lapsed windows, then evicts the least-spent live
+buckets, and never a bucket that has reached its limit (freeing one would hand
+back the refusal it was enforcing). If every bucket is exhausted there is
+nothing to evict, and a client that has never been seen gets no bucket of its
+own: those clients are metered together against one shared budget of 600
+requests a minute for all of them. Refusing them outright would let an attacker
+who can fill the map `429` the whole school; admitting them freely would make a
+filled map the way to buy unmetered throughput. Only reachable under a
+deliberate flood, and only newcomers during it are affected — every client
+already in the map keeps its own counter.
 
 Behind a reverse proxy every connection carries the proxy's address, so also
 set `TRUST_PROXY=true` to key clients by the rightmost `X-Forwarded-For` entry
@@ -497,13 +533,22 @@ own seats by hand. Seats on lists that have already closed (the event started,
 or its `ends_at`-only deadline passed) are never touched — that roster is
 history, and re-registering is refused.
 
+The role write and every sweep it implies — class memberships and their
+counters, all enrollments and their seats, parent ties on both sides, a
+demoted parent's still-freeable event seats, whiteboard rosters, course
+staffing and homeroom-teacher columns — commit as **one transaction**. It
+either all lands or none of it does: a failure answers `500` with the account
+still holding its old role and every grant of it still standing, and the same
+`PATCH` retried applies the lot. Signup lists that have already frozen are
+still left exactly as they stand.
+
 | Action                                   | Minimum role | Notes                                         |
 |------------------------------------------|--------------|-----------------------------------------------|
 | Register / login / view own account      | (any)        | Registration always creates a `student`       |
 | View events, own notes; CRUD notes + their files | student | Everyone can read events and keep notes; note files (upload/download) are walled per owner like the notes themselves |
 | Send / read / file / delete messages     | (any)        | One-to-one, any user to any user (`parent` included — the role's one write); each party only ever touches their own copy |
 | Mark event attendance; remove attendance rows | teacher | Only users in the event's **audience** can be marked; students never mark — a teacher+ may mark anyone expected, themselves included |
-| Create events                            | teacher      | The audience (school / role / course / registration) is set at creation and editable later |
+| Create events                            | teacher      | The audience (school / role / course / class / registration) is set at creation and editable later |
 | Register users onto a registration event | teacher      | Teachers place **students** (students never register themselves) and take a seat for **themselves** — never for another staff member. Unregistering mirrors the same rule |
 | List an event's attendance or its roster report | teacher | Students read their own tallies via the attendance report |
 | Edit / delete an event                   | teacher      | Only the **creator**, or a `manager`+ for any event — in both cases only while still `teacher`+ |
@@ -748,6 +793,12 @@ window filtering, before paging; negative values are a `400` naming the field.
 | POST   | `/classes/{id}/courses`          | teacher | `{course_id}` — attach a course (that **course's** manager); enrolls the whole roster (`409` if it cannot hold them all, if already attached, or once the class holds `max_class_courses`) |
 | GET    | `/classes/{id}/courses`          | teacher | List the class's attached courses, newest attached first · paged |
 | DELETE | `/classes/{id}/courses/{course}` | teacher | Detach a course (that course's manager) — the same sweep along the course axis; a link left behind by a **deleted** course detaches too, rather than `404`-ing forever |
+| POST   | `/classes/blueprints`            | manager | Create a grade's course blueprint and stock every section already at that grade (best-effort; returns `skipped`) |
+| GET    | `/classes/blueprints`            | manager | List every grade blueprint · paged |
+| GET    | `/classes/blueprints/{grade}`    | manager | One grade's blueprint            |
+| PATCH  | `/classes/blueprints/{grade}`    | manager | Replace the course list and reconcile every section at that grade (returns `skipped`) |
+| DELETE | `/classes/blueprints/{grade}`    | manager | Delete the blueprint and detach every attachment it made |
+| POST   | `/classes/{id}/blueprint`        | manager | Stock one section from its grade's blueprint (returns `skipped`) |
 | POST   | `/courses/{id}/sessions`         | teacher | `{topic?, teacher_id?, starts_at, ends_at?}` — add a lesson (course manager; teacher defaults to the caller) |
 | GET    | `/courses/{id}/sessions`         | student | List the course's sessions, most recent first (enrolled, creator, assigned teacher, or manager+) · paged |
 | POST   | `/courses/{id}/subjects`         | teacher | `{name, description?}` — add a curriculum subject (course manager) |
@@ -915,13 +966,13 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/chatbot/threads/{id}/messages/{mid}` | student | Poll one turn: `pending` until the answer lands, then `complete` + `content` or `failed` + `error_code` |
 | GET    | `/chatbot/threads/{id}/messages/{mid}/stream` | student | **SSE** on the same row: `delta` chunks then one `done` — or one `error` — and close; an already-finished answer replays (see "Chatbot") |
 | POST   | `/boards`                        | student | `{title, participants?}` — open a whiteboard; the caller becomes its creator, everyone named may draw; `409` at `max_boards_per_creator` |
-| GET    | `/boards`                        | student | Boards the caller created or was invited to, newest first · paged |
+| GET    | `/boards`                        | student | Boards the caller created or was invited to, newest first. `?open=true\|false` narrows by the closing stamp · paged |
 | GET    | `/boards/{id}`                   | student | One board — a `404`, never a `403`, for anyone not on it |
 | GET    | `/boards/{id}/strokes`           | student | The live canvas: the current epoch's strokes, oldest first · paged |
 | GET    | `/boards/{id}/history`           | student | The whole append-only log, oldest first, `clear` markers included · `?epoch=` for one epoch · paged |
 | GET    | `/boards/{id}/epochs`            | student | The epoch index: every `clear` marker (the epoch it closed, that epoch's final stroke count, who cleared, when) · paged |
 | PATCH  | `/boards/{id}`                   | student | `{title?, participants?, locked?}` — re-title (any participant); the roster and the lock are the creator's alone (`403`) |
-| POST   | `/boards/{id}/clear`             | student | **Creator only**: bump the epoch, blanking the live canvas and resetting its cap — nothing is deleted; `409` on a closed board, and on a canvas that is **already blank** (the marker is a stored row, so a clear has to close at least one mark to be worth one) |
+| POST   | `/boards/{id}/clear`             | student | **Creator only**: bump the epoch, blanking the live canvas and resetting its cap — nothing is deleted; `409` on a closed board, on a **locked** board, and on a canvas that is **already blank** (the marker is a stored row, so a clear has to close at least one mark to be worth one) |
 | POST   | `/boards/{id}/close`             | student | **Creator only**: retire the board — permanently read-only, still fully readable; idempotent, and there is no reopen |
 | DELETE | `/boards/{id}`                   | student | **Creator only**: delete the board and its whole stroke log; frees one of the creator's board seats |
 | GET    | `/boards/{id}/ws`                | student | **WebSocket** board room: a `join` replays the current epoch, every accepted stroke fans out to the other participants (see "Collaborative whiteboard") |
@@ -968,11 +1019,18 @@ the past (else `400`). On `PATCH`, an omitted time keeps its value and an
 explicit `null` clears it.
 An event's `audience` is a tagged object — `{"kind": "school"}` (the default),
 `{"kind": "role", "role": "student"}` (that exact role, no "and above"),
-`{"kind": "course", "course": "<id>"}` (the course's current enrollment), or
+`{"kind": "course", "course": "<id>"}` (the course's current enrollment),
+`{"kind": "class", "class": "<class id>"}` (the students currently in that
+class section — şube), or
 `{"kind": "registration", "capacity": 30}` (a signup list; `capacity` optional,
 `null` = unlimited) — and is the event's **expected-attendee roster**, resolved
-live at read time: role changes, (un)enrollments, and (un)registrations move
-people in and out by themselves. It never hides the event — everyone sees every
+live at read time: role changes, (un)enrollments, class-roster changes, and
+(un)registrations move people in and out by themselves. A class audience is
+live like the rest: adding a student to the class puts them on every one of its
+events' rosters at once, and removing them takes them off. The homeroom teacher
+is not implied — a mixed gathering wants a `role` or `registration` audience.
+An unknown class id is a `400`, and a class deleted later leaves the event
+standing with an empty roster, exactly as a deleted course does. It never hides the event — everyone sees every
 event. Only audience members can be marked; `GET /events/{id}/roster` joins the
 live roster with the recorded marks (`status: null` = expected but never
 marked). Attendance rows for people a later audience edit (or unenrollment /
@@ -1843,14 +1901,36 @@ Two per-exam policy knobs ride along, both **live-editable** at any point:
   midway through sitting 2. Submit the sitting first; an expired one reviews
   fine.
 
-  **Known limit, accepted:** that gate is *per exam*. Instantiating one question
-  bank template into two exams copies its `correct` verbatim into both (the bank
-  is a copy-into-exam model, not a link), so a student sitting exam A can read
-  the same question's answer off exam B if B is graded and has review on. The
-  narrower gate cannot see it, and widening review to "no in-progress sitting on
-  *any* exam" would close review far too broadly, since `open`-mode sittings
-  never expire on their own. Teachers reusing one template across a live exam
-  and a reviewable one should expect that overlap.
+  That gate is *per exam*, and a second, narrower one covers what it cannot see.
+  Instantiating one question bank template into two exams copies its `correct`
+  verbatim into both (the bank is a copy-into-exam model, not a link), so
+  reviewing exam A used to hand out the answer to a question the caller was
+  still writing in exam B. Review now blanks those questions instead of closing:
+  a question whose bank template also sits under an exam the caller has an
+  in-progress sitting on comes back with `correct: null` from `GET
+  /exams/{id}/review/questions`, and with `is_correct: null` and no share of
+  `auto_score` on the answer sheet. The key is what is hidden, never the
+  question or the caller's own answer. Keyed on the template rather than the
+  exam deliberately: widening the gate to "no in-progress sitting on *any* exam"
+  would close review far too broadly, since `open`-mode sittings never expire on
+  their own, whereas this hides only the overlapping questions and gives the key
+  back the moment that other sitting is submitted or expires. A question links
+  to a template whichever way it got there, and both links are matched: the
+  template it was instantiated from (`from_bank`) *and* the template minted by
+  saving it into the bank (`banked_as`). So a question written by hand into
+  exam A, saved to the bank, and then instantiated into exam B is hidden while
+  B is live — the two copies hold the identical `correct` even though A's copy
+  never came out of the bank. Only a question with no bank link at all, in
+  either direction, is never hidden.
+
+  **Known limit, accepted:** deleting a bank template clears *both* columns —
+  `from_bank` on every question it produced and `banked_as` on the question it
+  was saved out of — so a pair linked through a template that was since deleted
+  keeps the identical `correct` with nothing left to join them by. That overlap
+  is invisible to the redaction. It is the only one left: the copy is made at
+  instantiate time and the link is written in the same request, so a shared
+  `correct` and a live template link are created together and only a template
+  delete separates them again.
 
 A student **sits** an exam through attempts (sitting 1, 2, … — each row id is
 the composite `exam_user[_seq]` key, so a sitting exists at most once by
@@ -2466,6 +2546,54 @@ space is exactly the unbounded transaction the ceilings exist to prevent. Only
 a class that predates the ceilings can be there, and only shrinking the
 overloaded axis clears it.
 
+### Grade blueprints
+
+A Turkish school runs many şube at one grade and stocks each with the same
+courses. A blueprint says that list once: `POST /classes/blueprints` with a
+`grade` label and `course_ids`, and every section already at that grade is
+stocked immediately. `POST /classes/{id}/blueprint` stocks one section from its
+grade's template — idempotent, so it is safe on a class that already carries
+some of the courses.
+
+The blueprint is a template, not a new kind of membership. Applying it calls
+the same attach a manager's own `POST /classes/{id}/courses` does, so what
+lands is ordinary `class_course` links and ordinary `enrollment` rows, and an
+elective a student takes alone stays an individual enrollment nothing here can
+see.
+
+**Editing retro-pumps.** `PATCH /classes/blueprints/{grade}` takes the whole
+new list (a set, not a delta) and reconciles every section at the grade,
+including the ones that existed before the blueprint did.
+
+**Pumping is best-effort.** Each (section, course) pair is one all-or-nothing
+transaction. A pair that would breach a limit — the section is at
+`max_class_courses`, or the course has no free seat for the whole section — is
+skipped and reported in `skipped`, naming the class, the class's name, the
+course and the reason; every other section is still stocked. So a blueprint
+edit is allowed to leave a partial state: one full course must not stop the
+other eleven sections from being set up. Nothing moves on a skipped section —
+not its attachment count, not a seat on the course.
+
+A skip names the record that failed: `the class was deleted while the blueprint
+was being applied` (the section vanished mid-pump), `this course no longer
+exists — it has been dropped from the blueprint` (the course was deleted; the
+pump also removes the dangling id from the template, so the template shrinks
+and the skip is reported once and never again), `the class is already at its
+course ceiling`, `the class holds more students than a course attach is allowed
+to enroll at once`, `the course has no free seat for the whole class`, and
+`another course attached to this class no longer exists — detach it first`.
+
+**Removal spares what a human placed.** Every attachment a blueprint makes is
+tagged with it. Dropping a course from the list detaches it only where the
+blueprint attached it (sweeping the enrollments it pumped, repairing to a rival
+class first exactly as a manual detach does), and a course a human attached to
+that class by hand carries no tag and is left exactly where it is. Deleting a
+blueprint applies that to its whole list.
+
+A blueprint names no term — the class names its own. The grade label is the
+blueprint's id, so there is one per grade (a second is a `409`), and it must be
+non-empty and contain none of `/ \ ? # %`.
+
 ## Quick tour (curl)
 
 ```sh
@@ -2859,12 +2987,23 @@ The roster is spelled `participants` everywhere — in the `POST` body, in the
 `PATCH` body and in every board response — so the field never changes name
 between a request and a reply. That is the *only* thing the shared spelling
 buys: unlike the rest of this API, the two board request bodies **reject an
-unknown key** (`422`) rather than ignoring it, because a misspelled roster
+unknown key** rather than ignoring it — the same `422` any JSON-bodied route
+answers a malformed body with — because a misspelled roster
 would otherwise open a board its author is silently alone on. So a body must
 carry **only** the fields that request accepts — a board it just read is not a
 legal body, since `id`, `creator`, `locked_by`, `epoch` and the rest are all
 unknown to `POST` and `PATCH`. A read-modify-write client sends the writable
 fields it changed, never the whole board object back.
+
+**Roster repair.** A roster only ever holds users of at least the `student`
+role. A demotion sweeps the user off every board they were on, and the first
+boot of this version repaired the rosters an older binary left behind —
+parents, and ids of users deleted since. On top of that, a `PATCH` may always
+send back the roster it was just served: an id already on the board that has
+stopped qualifying is dropped silently rather than refused, so a
+read-modify-write never wedges on a value the server itself handed over.
+Naming a *new* id that is unknown or a parent is still a `400`, and the whole
+call is refused — the roster is never half-applied.
 
 **No parents, anywhere.** The `parent` role is the school's read-only observer,
 and it has no whiteboard access at all — not a view-only tier, none. It is
@@ -2894,12 +3033,21 @@ markers *are* the epoch index, which is why there is no epochs table and why
 the open (unclosed) epoch is deliberately absent from `GET /boards/{id}/epochs`.
 `DELETE /boards/{id}` is the one operation here that really destroys marks.
 
-**A blank canvas cannot be cleared** (`409` — as a closed board is, while a
-participant who is not the creator gets the `403` the two doors above give
-them). The marker is a real stored row and it is charged to the board's
+**A blank canvas cannot be cleared** (`409` — as a closed board is, and as a
+**locked** one is, while a participant who is not the creator gets the `403`
+the two doors above give them). The marker is a real stored row and it is
+charged to the board's
 lifetime budget, so a clear has to close at least one mark to be worth one —
 without that rule every press of a button the creator can hold down minted a
 free row, and the epoch index filled with zero-stroke sessions.
+
+**A locked board cannot be cleared.** The lock is the creator's pause on the
+canvas and it holds against every write to it, including their own
+`POST /boards/{id}/clear` (and the socket's `clear` command,
+`error{code:"locked"}`). A locked board that is also at `max_epoch_strokes` is
+therefore recovered by unlock → clear → relock; that cost is deliberate, so
+that "locked" means one thing everywhere rather than "locked, except for one
+caller".
 
 **Three caps, and only one of them is terminal** (all three published at `GET
 /limits` under `board`):
@@ -2937,13 +3085,25 @@ rides the socket. History is an explicit paged REST read:
 markers included, `?epoch=` for a single one) and `GET /boards/{id}/epochs`
 (the marker index — enough to offer "replay session 3" without scanning the
 log). `GET /boards/{id}/strokes` is the current epoch over REST, the catch-up
-and fallback path for the same canvas the socket replays — with one deliberate
-difference: the REST read is *not* filtered by kind, while the socket serves
-`kind: "stroke"` rows only. In the steady state that is a distinction without a
-difference, since a marker is written with the epoch it *closed* and the open
-epoch has none; the case where it shows is a clear landing between the board
-read and the row read, which surfaces that epoch's closing marker in the page.
-For a live canvas the socket is the authority.
+and fallback path for the same canvas the socket replays. For a live canvas the
+socket is the authority.
+
+**The live canvas never shows a marker.** `GET /boards/{id}/strokes` serves
+drawn marks only. The current epoch holds no `clear` marker by construction — a
+marker records the epoch it *closed* — but a clear committing between the board
+read and the row read would otherwise put one in the page, and the board room's
+socket, which replays strokes only, would never show it. The markers are not
+lost: `GET /boards/{id}/history` and `GET /boards/{id}/epochs` are where they
+live.
+
+**Listing.** `GET /boards?open=true` is every board of the caller's that has
+not been closed; `?open=false` is the closed ones; omit it for both. The filter
+reaches the database, so `total` is the filtered count and `?open=true&limit=1`
+is a cheap "do I have a live board" probe. It reads `closed_at` and only that —
+a locked board is still an open board, and so is one whose lifetime stroke
+budget is spent but which was never drawn on again, because nothing has stamped
+it. A closed board is never deleted, so with `max_boards_per_creator` at 200
+this is the only way a heavy creator keeps the list readable.
 
 **The board room (WebSocket)** — `GET /boards/{id}/ws`, cookie-authed like
 everything else and, like the exam room, outside the OpenAPI spec (an upgrade
@@ -3078,7 +3238,8 @@ throughput or an accepted race; removing the conditional write behind it costs
 the invariant.
 
 Boot is unconditional: the schema batches, the backfills and the admin seed all
-run on every start, because exactly one process ever starts. Deployment is
+run on every start, because exactly one process ever starts (the one exception
+is the marked one-time repair below). Deployment is
 stop-the-world — `podman compose down` then `up`, never overlapping — and a
 release that adds or renames a stored counter *requires* it. An old binary
 writes rows without touching the new counter, the `= NONE` backfill guard
@@ -3089,6 +3250,14 @@ recomputed from its strokes on every boot rather than seeded once, which is why
 that repair heals an under-count the `= NONE` guard would have skipped.
 In-flight work does not survive
 a restart either: a chatbot turn mid-inference settles `failed`/`interrupted`.
+
+The one thing boot does *not* redo is tracked in `migration_mark` — one row per
+backfill that is genuinely one-time, keyed by the backfill's own name. Most
+backfills converge to a `WHERE` that matches nothing and are free to re-run, so
+they carry no mark; the board-roster repair is different because its cost is
+the **scan** (a `user` pass per board) rather than the write, so it is gated on
+`migration_mark:board_roster` and skipped entirely once done. A volume that
+never ran the repair holds no mark and still gets repaired on its next boot.
 
 ## Layout
 
@@ -3151,6 +3320,8 @@ src/
                    them into every course the class holds)
     class_course.rs ClassCourse (one course on a class; attaching it enrolls
                    the class's whole roster)
+    class_blueprint.rs ClassBlueprintId · ClassBlueprint (a grade's course list;
+                   applying it stocks every section at that grade, best-effort)
     class_pump.rs  attach/detach (the shared transaction behind both of those:
                    link row, class counter and the enrollments it implies move
                    together or not at all)

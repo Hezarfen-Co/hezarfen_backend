@@ -182,6 +182,7 @@ async fn user_work(
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
         (status = 409, description = "Entry is still open", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn update_entry(

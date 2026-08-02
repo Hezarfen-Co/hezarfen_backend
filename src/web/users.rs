@@ -8,14 +8,9 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::database::Database;
-use crate::domain::board::Board;
-use crate::domain::class_group::ClassGroup;
-use crate::domain::class_pump;
-use crate::domain::course::Course;
 use crate::domain::parent_link::ParentLink;
 use crate::domain::preferences::{Language, PaletteColor, Theme};
 use crate::domain::profile::{BirthDate, Email, PersonName, Phone};
-use crate::domain::registration::Registration;
 use crate::domain::role::Role;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
@@ -239,6 +234,7 @@ async fn list_users(
         (status = 200, description = "Updated user", body = UserResponse),
         (status = 400, description = "Invalid field", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn update_my_profile(
@@ -265,6 +261,7 @@ async fn update_my_profile(
         (status = 200, description = "Updated user", body = UserResponse),
         (status = 400, description = "Invalid theme, language, or palette color", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn update_my_preferences(
@@ -316,6 +313,7 @@ async fn get_user(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires admin role", body = ErrorResponse),
         (status = 404, description = "User not found", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn update_user_profile(
@@ -346,6 +344,7 @@ async fn update_user_profile(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires admin role", body = ErrorResponse),
         (status = 404, description = "User not found", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn update_user_preferences(
@@ -383,6 +382,7 @@ async fn update_user_preferences(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires admin, or attempted to change own role", body = ErrorResponse),
         (status = 404, description = "User not found", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn set_role(
@@ -399,80 +399,30 @@ async fn set_role(
     let user = User::read(&target, &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    let updated = user.set_role(role, &st.db).await?;
-    // KNOWN GAP (deliberate, not an oversight): the role write above and the
-    // sweeps below are separate statements, so a sweep that errors answers 500
-    // with the role already lowered and some of the old grants still standing.
-    // Every one of them is idempotent and re-running the same PATCH repairs it,
-    // and every security gate re-reads the live role rather than trusting a
-    // swept row — the residue pollutes rosters and lists, it does not grant
-    // anything. Folding it into one transaction means folding eight tables plus
-    // `class_pump`'s own transaction and the board-hub publish (an in-process
-    // side effect that cannot sit inside a database transaction) — see the
-    // report accompanying this change. The write ordering *within* a request is
-    // closed from the other end instead: a handler that assigns a teacher-only
-    // role re-reads the live role after its write ([`super::undo_if_demoted`]),
-    // so a demotion racing an assignment is caught by whichever side is second.
-    // Roster hygiene: only students enroll, so a non-student sheds all their
-    // enrollment rows (security checks re-read the live role and never
-    // trusted these; this just stops them polluting rosters and counts).
-    // Parent links get the same sweep on both sides: only students are
-    // observed and only parents observe, so a role change off either end
-    // drops the rows instead of leaving dead grants around.
-    // The class memberships and the enrollments go in *one* transaction: run
-    // as two, a failure between them left enrollment rows tagged with a class
-    // whose counters had already been released, so the class could be deleted
-    // and nothing could ever sweep the rows again.
-    if role != Role::Student {
-        class_pump::sweep_non_student(&target, &st.db).await?;
-        ParentLink::delete_where_student(&target, &st.db).await?;
-    }
-    // Event signups are swept for a `parent` only — not for every non-student.
-    // Staff free their own seats by hand (`DELETE /events/{id}/register/{me}`
-    // allows the self case), so a promotion strands nothing and those signups
-    // are the teacher's to keep; a parent can reach no such door, and nobody
-    // else may free a non-student's seat, so theirs is the seat that would
-    // stay claimed forever. Frozen lists are left alone — see the sweep.
-    if role == Role::Parent {
-        Registration::sweep_for_parent(&target, &st.db).await?;
-        // Whiteboards: the role is barred from them outright, so a demoted user
-        // comes off every roster they are listed on — otherwise they stay a
-        // participant forever and their stale id 400s the creator's next roster
-        // PATCH (`resolve_participants` refuses a below-student id). Nothing is
-        // deleted, not even a board this empties: their own boards keep every
-        // stroke and stay readable to the rest of the room, they simply have a
-        // creator who can no longer use them. Each affected room is prompted
-        // with the same `participants` frame the roster PATCH publishes — the
-        // room re-reads the database before it acts on it.
-        for board in Board::drop_participant_everywhere(&target, &st.db).await? {
-            st.board_hub.publish(
-                board.get_id().key(),
-                json!({
-                    "type": "participants",
-                    "creator": board.get_creator().key(),
-                    "participants": board
-                        .get_participants()
-                        .iter()
-                        .map(|user| user.key())
-                        .collect::<Vec<_>>(),
-                })
-                .to_string(),
-            );
-        }
-    }
-    if role != Role::Parent {
-        ParentLink::delete_where_parent(&target, &st.db).await?;
-    }
-    // Course staffing gets the same sweep: only teacher+ may be assigned to
-    // run a course, so a demotion drops every assignment instead of leaving
-    // rows that grant nothing and still list a demoted user as its teacher.
-    if !role.at_least(Role::Teacher) {
-        Course::unassign_everywhere(&target, &st.db).await?;
-        // Same story for a class's homeroom teacher (sınıf öğretmeni): only
-        // teacher+ may hold one, so a demotion clears the column everywhere
-        // rather than leaving a class section (şube) listing a demoted account
-        // as its teacher.
-        ClassGroup::unassign_everywhere(&target, &st.db).await?;
+    // The role write and every sweep it owes commit together ([`User::set_role`]
+    // carries the whole list and the reasoning behind each arm). The write
+    // ordering *within* a request is closed from the other end: a handler that
+    // assigns a teacher-only role re-reads the live role after its write
+    // ([`super::undo_if_demoted`]), so a demotion racing an assignment is caught
+    // by whichever side is second.
+    let (updated, boards) = user.set_role(role, &st.db).await?;
+    // Whiteboard rooms whose roster the commit above changed, prompted with the
+    // same `participants` frame the roster PATCH publishes — after the commit,
+    // because the room re-reads the database before it acts on the frame.
+    for board in boards {
+        st.board_hub.publish(
+            board.get_id().key(),
+            json!({
+                "type": "participants",
+                "creator": board.get_creator().key(),
+                "participants": board
+                    .get_participants()
+                    .iter()
+                    .map(|user| user.key())
+                    .collect::<Vec<_>>(),
+            })
+            .to_string(),
+        );
     }
     Ok(Json(UserResponse::new(&updated)))
 }
@@ -537,6 +487,7 @@ async fn students_page(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires admin role", body = ErrorResponse),
         (status = 404, description = "Parent user not found", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn link_student(

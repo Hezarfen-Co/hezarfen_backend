@@ -173,52 +173,11 @@ impl Registration {
         Ok(result.take::<Vec<Registration>>(3)?.into_iter().next())
     }
 
-    /// Free every *still-freeable* seat a demotion to `parent` strands.
-    ///
-    /// Only a `parent` is swept, and that is the whole rule rather than the
-    /// non-student sweep the enrollment side runs: staff free their own seats
-    /// by hand (`unregister` allows the self case), so a promoted student is
-    /// never stranded and their signups are theirs to keep. A parent holds no
-    /// such door — the route is `RequireTeacher`, and no one else may free a
-    /// non-student's seat — so their row is the one thing on a signup list
-    /// nothing can ever remove: the event answers "full" forever and the
-    /// parent stays on the roster and stays markable, because the registration
-    /// audience resolves on the row's mere existence.
-    ///
-    /// A list that has already **frozen** is left exactly as it stands. The
-    /// freeze is not re-spelled here — [`Event::registration_capacity`] is the
-    /// one place it is decided, and its `Conflict` arm *is* the freeze (its
-    /// other refusal is the audience). Past that point the list is historical
-    /// record, the way a roll-call row keeps its retired exam kind: the seat
-    /// costs nothing (nobody can book the event again either) and deleting the
-    /// row would rewrite an attendance roster behind the freeze's back,
-    /// irrecoverably — re-registering answers 409.
-    ///
-    /// Row and seat still move together: each removal is
-    /// [`Registration::remove`]'s single transaction. Per row rather than one
-    /// transaction for all of them, because the seats are independent facts on
-    /// unrelated events — nothing is left inconsistent by stopping halfway.
-    pub async fn sweep_for_parent(user: &UserId, db: &Database) -> Result<(), AppError> {
-        let mut result = db
-            .query("SELECT * FROM registration WHERE user = $usr")
-            .bind(("usr", user.record()))
-            .await?
-            .check()?;
-        for row in result.take::<Vec<Registration>>(0)? {
-            // A row whose event record is *gone* is deleted, never skipped:
-            // there is no seat to hand back and no list to freeze, so the
-            // carve-out below cannot apply to it — and `unregister` answers 404
-            // on the missing event, so a skipped orphan is stranded forever.
-            if let Some(event) = Event::read(&row.event, db).await?
-                && matches!(
-                    event.registration_capacity(),
-                    Err(AppError::Conflict(_) | AppError::ConflictOwned(_))
-                )
-            {
-                continue;
-            }
-            Self::remove(&row.event, user, db).await?;
-        }
-        Ok(())
-    }
+    // The demotion sweep — freeing every seat a fall to `parent` would strand,
+    // and leaving a list that has already frozen exactly as it stands — is an
+    // arm of [`crate::domain::user::User::set_role`], so the seat comes back in
+    // the same transaction as the role that invalidated it. The freeze it obeys
+    // is [`Event::registration_capacity`]'s `Conflict` arm, re-spelled for
+    // SurrealQL as [`crate::constant::REGISTRATION_FROZEN_GUARD`] and held to it
+    // by `event::tests::the_sql_freeze_guard_matches_the_rust_one`.
 }

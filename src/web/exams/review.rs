@@ -83,7 +83,9 @@ pub(crate) async fn student_attempt_answers(
 ) -> Result<Json<AttemptAnswersResponse>, AppError> {
     let exam = gradable_exam(&st, &user, &id).await?;
     let target = UserId::from_key(&target);
-    Ok(Json(answer_sheet(&exam, &target, seq, &st.db).await?))
+    Ok(Json(
+        answer_sheet(&exam, &target, seq, &HashSet::new(), &st.db).await?,
+    ))
 }
 
 /// A prior sitting's drawn-answer bytes. Requires teacher+ and management
@@ -207,6 +209,43 @@ pub(crate) async fn reviewable_exam(
     Ok(exam)
 }
 
+/// The questions of `exam` whose answer key is live somewhere else right now:
+/// the bank templates that were also copied into an exam the caller has a
+/// sitting open on. The bank is copy-into-exam, so one template's `correct`
+/// lands verbatim in every exam it is instantiated into — reviewing a graded
+/// exam A would otherwise hand out the key to the very question the caller is
+/// still answering in exam B.
+///
+/// Keyed on the template, never on the exam: a reviewed exam still reviews in
+/// full, and only the overlapping questions blank out. Both link directions
+/// count — a question authored by hand and *saved* to the bank shares its key
+/// with every later instantiation just as an instantiated one does, so only a
+/// question with no bank link at all is never hidden
+/// ([`ExamQuestion::list_shared_with`]).
+///
+/// The open sittings are read whole and judged here rather than filtered in
+/// SurrealQL, because "in progress" is [`ExamAttempt::status`]'s call off the
+/// exam's *live* schedule and that rule lives in one place. One exam read per
+/// unsubmitted sitting — a student has at most a handful, and none of it scales
+/// with the page being read.
+async fn live_elsewhere(
+    st: &AppState,
+    user: &User,
+    exam: &Exam,
+) -> Result<HashSet<String>, AppError> {
+    let now = Timestamp::now();
+    let mut live = Vec::new();
+    for attempt in ExamAttempt::list_unfinished_for_user(user.get_id(), &st.db).await? {
+        let Some(other) = Exam::read(attempt.get_exam(), &st.db).await? else {
+            continue;
+        };
+        if attempt.status(&other, now) == AttemptStatus::InProgress {
+            live.push(other.get_id().clone());
+        }
+    }
+    ExamQuestion::list_shared_with(exam.get_id(), &live, &st.db).await
+}
+
 /// The caller's own sitting numbers at an exam — every seq that carries answers
 /// or a mark, ascending. Own-scoped review view; opens once the teacher enables
 /// review and has marked the caller, and closes again (409) while the caller has
@@ -246,6 +285,13 @@ pub(crate) async fn review_attempts(
 /// self-review reads; revealing `correct` is the point (the gate already proves
 /// the caller was marked and has no sitting still open). Paged via
 /// `?limit=&offset=`.
+///
+/// One exception, per question: a question tied to a question-bank template —
+/// added out of the bank, or saved into it — comes back with `correct: null`
+/// while the caller has a sitting open on *another* exam holding a question
+/// tied to that same template, since the copy would be that sitting's answer
+/// key. The rest of the list is unaffected, and the `correct`
+/// returns once that sitting is submitted or expires.
 #[utoipa::path(
     get,
     path = "/{id}/review/questions",
@@ -253,7 +299,7 @@ pub(crate) async fn review_attempts(
     security(("session_cookie" = [])),
     params(("id" = String, Path, description = "Exam id"), PageParams),
     responses(
-        (status = 200, description = "A page of the exam's questions with `correct` (all of them when unpaged)", body = Page<QuestionResponse>),
+        (status = 200, description = "A page of the exam's questions with `correct` (all of them when unpaged); `correct` is `null` on a question whose bank template the caller has live under an open sitting elsewhere", body = Page<QuestionResponse>),
         (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Review not enabled for this exam", body = ErrorResponse),
@@ -269,13 +315,20 @@ pub(crate) async fn review_questions(
 ) -> Result<Json<Page<QuestionResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
     let exam = reviewable_exam(&st, &user, &id).await?;
-    Ok(Json(question_page(&exam, limit, offset, &st.db).await?))
+    let hidden = live_elsewhere(&st, &user, &exam).await?;
+    Ok(Json(
+        question_page(&exam, limit, offset, &hidden, &st.db).await?,
+    ))
 }
 
 /// One of the caller's own sittings, judged — the `seq`th attempt's answers,
 /// drawing refs, correctness flags, and auto-score suggestion. Own-scoped
 /// review view; 409 while the caller has a sitting in progress, so a retake
 /// can't read its own correctness off an earlier seq.
+///
+/// A question the caller has live under an open sitting on another exam (same
+/// bank template) comes back with `is_correct: null` and is left out of
+/// `auto_score` — the same redaction `GET /{id}/review/questions` makes.
 #[utoipa::path(
     get,
     path = "/{id}/review/attempts/{seq}/answers",
@@ -299,7 +352,10 @@ pub(crate) async fn review_attempt_answers(
     Path((id, seq)): Path<(String, i64)>,
 ) -> Result<Json<AttemptAnswersResponse>, AppError> {
     let exam = reviewable_exam(&st, &user, &id).await?;
-    Ok(Json(answer_sheet(&exam, user.get_id(), seq, &st.db).await?))
+    let hidden = live_elsewhere(&st, &user, &exam).await?;
+    Ok(Json(
+        answer_sheet(&exam, user.get_id(), seq, &hidden, &st.db).await?,
+    ))
 }
 
 /// The caller's own drawn-answer bytes for one of their sittings — the

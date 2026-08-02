@@ -4,8 +4,13 @@ use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHasher, PasswordVerifier};
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
-use crate::constant::{DECOY_PASSWORD, USER_TABLE};
-use crate::database::Database;
+use crate::constant::{
+    BOARD_TABLE, CLASS_GROUP_TABLE, CLASS_MEMBER_COUNT_FIELD, CLASS_MEMBER_TABLE, COURSE_TABLE,
+    DECOY_PASSWORD, ENROLLMENT_COUNT_FIELD, ENROLLMENT_TABLE, PARENT_LINK_TABLE,
+    REGISTRATION_COUNT_FIELD, REGISTRATION_FROZEN_GUARD, REGISTRATION_TABLE, USER_TABLE,
+};
+use crate::database::{Database, transaction_with_retry};
+use crate::domain::board::Board;
 use crate::domain::field_update::FieldUpdate;
 use crate::domain::monotonic_id::next_ulid;
 use crate::domain::page::PagedList;
@@ -13,6 +18,7 @@ use crate::domain::preferences::{Language, PaletteColor, Theme};
 use crate::domain::profile::{BirthDate, Email, PersonName, Phone};
 use crate::domain::role::Role;
 use crate::domain::text_fold::{search_fold, search_fold_sql};
+use crate::domain::timestamp::Timestamp;
 use crate::error::{AppError, ValidationError};
 use crate::validate::{validate_password, validate_username};
 
@@ -447,28 +453,145 @@ impl User {
         list.run(limit, offset, db).await
     }
 
-    /// Overwrite this user's role. The caller is responsible for authorizing it.
+    /// Overwrite this user's role **and** shed every grant the new role may not
+    /// hold, in one transaction. The caller is responsible for authorizing it.
     ///
-    /// Writes *only* the `role` field (never the whole row): the row mixes
-    /// admin-owned (role) and self-service (profile, preferences) fields, and
-    /// each writer starts from a snapshot read at request start. A whole-row
-    /// write would carry the snapshot's copy of the *other* group back over a
-    /// concurrent edit — an in-flight profile save silently reverting an
+    /// Writes *only* the `role` field of the user row (never the whole row):
+    /// the row mixes admin-owned (role) and self-service (profile, preferences)
+    /// fields, and each writer starts from a snapshot read at request start. A
+    /// whole-row write would carry the snapshot's copy of the *other* group back
+    /// over a concurrent edit — an in-flight profile save silently reverting an
     /// admin's demotion, or this write erasing a profile edit that raced it.
     /// [`User::set_profile`] and [`User::set_preferences`] are scoped for the
     /// same reason.
-    pub async fn set_role(self, role: Role, db: &Database) -> Result<User, AppError> {
-        let mut result = db
-            .query("UPDATE $id SET role = $role RETURN AFTER")
-            .bind(("id", self.id.record()))
-            .bind(("role", role))
-            .await?
-            .check()?;
-        result
-            .take::<Vec<User>>(0)?
+    ///
+    /// One transaction and not eight statements, which is what this used to be:
+    /// a sweep that errored answered 500 with the role already lowered and some
+    /// of the old grants still standing — exactly the state the sweeps exist to
+    /// prevent, and a crash between them left it with nobody to answer to.
+    /// Nothing here is a security hole either way (every gate re-reads the live
+    /// role, `web::mod`), but the residue pollutes rosters, counts and signup
+    /// lists, and one of those, the event seat, nothing could ever free again.
+    ///
+    /// What is swept, and why the conditions differ:
+    ///
+    /// * **Non-student** sheds class memberships, *every* enrollment row
+    ///   (hand-placed ones included — only students enroll, and a kept row
+    ///   would grant nothing and count a seat) and the parent links observing
+    ///   them. Memberships and enrollments were already one transaction and
+    ///   still are: released apart, an enrollment row could be left tagged with
+    ///   a class whose counters had been given back, so the class passed its
+    ///   zero-zero delete guard and no sweep could ever reach the row again.
+    /// * **Parent** additionally frees event seats and comes off every
+    ///   whiteboard roster. The seat is the one thing on a signup list nothing
+    ///   else could remove: staff free their own by hand (`unregister` allows
+    ///   the self case) but a parent can reach no such door, so a promotion
+    ///   strands nothing and only this demotion does. A list that has already
+    ///   **frozen** ([`REGISTRATION_FROZEN_GUARD`]) is left exactly as it
+    ///   stands — past the freeze it is historical record, re-registering
+    ///   answers 409, and rewriting it here would be irrecoverable. A signup
+    ///   whose event record is *gone* has no seat to hand back and no list that
+    ///   can freeze, so it is deleted rather than skipped: skipped, it is
+    ///   stranded forever (`unregister` 404s on the missing event).
+    /// * **Below teacher** gives up course staffing and homeroom-teacher
+    ///   columns — only teacher+ may hold either.
+    ///
+    /// The returned boards are the rooms whose roster this changed (plus those
+    /// the user created, which cannot be changed and are returned so their room
+    /// is prompted too). Publishing to them is the caller's job: an in-process
+    /// fan-out cannot sit inside a database transaction, and a room told before
+    /// the commit would re-read the pre-commit state.
+    ///
+    /// Admissible for [`transaction_with_retry`] by construction: `SELECT`,
+    /// `UPDATE` and `DELETE` only, so no statement can answer "already exists"
+    /// and every lost round is a plain re-send.
+    pub async fn set_role(self, role: Role, db: &Database) -> Result<(User, Vec<Board>), AppError> {
+        // Built as a statement list rather than one string so the result slot
+        // of the board write is *counted*, not hand-tallied against arms that
+        // may or may not be in the batch. Slot 0 is `BEGIN`, as everywhere.
+        let mut batch = vec![
+            "BEGIN TRANSACTION".to_string(),
+            "UPDATE $usr SET role = $role RETURN AFTER".to_string(),
+        ];
+        if role != Role::Student {
+            batch.push(format!(
+                "LET $links = (DELETE {CLASS_MEMBER_TABLE} WHERE user = $usr RETURN BEFORE)"
+            ));
+            batch.push(format!(
+                "FOR $link IN ($links ?? []) {{ UPDATE $link.class SET \
+                 {CLASS_MEMBER_COUNT_FIELD} = \
+                 math::max([({CLASS_MEMBER_COUNT_FIELD} ?? 0) - 1, 0]); }}"
+            ));
+            batch.push(format!(
+                "LET $rows = (DELETE {ENROLLMENT_TABLE} WHERE user = $usr RETURN BEFORE)"
+            ));
+            batch.push(format!(
+                "FOR $row IN ($rows ?? []) {{ UPDATE $row.course SET \
+                 {ENROLLMENT_COUNT_FIELD} = \
+                 math::max([({ENROLLMENT_COUNT_FIELD} ?? 0) - 1, 0]); }}"
+            ));
+            batch.push(format!("DELETE {PARENT_LINK_TABLE} WHERE student = $usr"));
+        }
+        let mut board_slot = None;
+        if role == Role::Parent {
+            batch.push(format!(
+                "LET $signups = (SELECT * FROM {REGISTRATION_TABLE} WHERE user = $usr)"
+            ));
+            // Row and seat move together per signup, the way `unregister` does:
+            // the seats are independent facts on unrelated events. A missing
+            // event matches nothing in the guard *and* nothing in the counter
+            // write, which is precisely the orphan rule.
+            batch.push(format!(
+                "FOR $signup IN ($signups ?? []) {{ \
+                 IF array::len((SELECT VALUE id FROM $signup.event \
+                 WHERE {REGISTRATION_FROZEN_GUARD})) = 0 {{ \
+                 LET $freed = (DELETE $signup.id RETURN BEFORE); \
+                 UPDATE $signup.event SET {REGISTRATION_COUNT_FIELD} = \
+                 math::max([({REGISTRATION_COUNT_FIELD} ?? 0) - array::len($freed), 0]); \
+                 }}; }}"
+            ));
+            board_slot = Some(batch.len());
+            batch.push(format!(
+                "UPDATE {BOARD_TABLE} SET participants -= $usr \
+                 WHERE $usr IN participants OR creator = $usr RETURN AFTER"
+            ));
+        }
+        if role != Role::Parent {
+            batch.push(format!("DELETE {PARENT_LINK_TABLE} WHERE parent = $usr"));
+        }
+        if !role.at_least(Role::Teacher) {
+            batch.push(format!(
+                "UPDATE {COURSE_TABLE} SET teachers -= $usr WHERE $usr IN teachers"
+            ));
+            batch.push(format!(
+                "UPDATE {CLASS_GROUP_TABLE} SET teacher = NONE WHERE teacher = $usr"
+            ));
+        }
+        let sql = format!("{};\nCOMMIT TRANSACTION;", batch.join(";\n"));
+        let (mut result, mut errors) = transaction_with_retry(
+            db,
+            &sql,
+            &[
+                ("usr".into(), self.id.record().into_value()),
+                ("role".into(), role.into_value()),
+                ("now".into(), Timestamp::now().as_millis().into_value()),
+            ],
+            &[],
+        )
+        .await?;
+        if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+            return Err(error.into());
+        }
+        let updated = result
+            .take::<Vec<User>>(1)?
             .into_iter()
             .next()
-            .ok_or(AppError::NotFound)
+            .ok_or(AppError::NotFound)?;
+        let boards = match board_slot {
+            Some(slot) => result.take::<Vec<Board>>(slot)?,
+            None => Vec::new(),
+        };
+        Ok((updated, boards))
     }
 
     /// Write the personal-info fields the request actually carried. Every
@@ -533,6 +656,55 @@ impl User {
 mod tests {
     use super::*;
     use crate::database::init_mem;
+
+    /// The board result slot is an *index* into a batch whose length depends on
+    /// which arms the role selected, so it is the one number in the cascade a
+    /// silent mistake would not show up in the store: pointed at the wrong
+    /// statement it yields an empty list, and every whiteboard room whose roster
+    /// just changed is simply never told. Assert the rows come back.
+    #[tokio::test]
+    async fn the_cascade_returns_the_boards_it_stripped() {
+        use crate::domain::board::{Board, BoardTitle};
+
+        let db = init_mem().await.unwrap();
+        let creator = User::create(
+            Username::try_new("ogretmen").unwrap(),
+            Password::try_new("secret1").unwrap().hash().unwrap(),
+            &db,
+        )
+        .await
+        .unwrap();
+        let guest = User::create(
+            Username::try_new("ogrenci").unwrap(),
+            Password::try_new("secret1").unwrap().hash().unwrap(),
+            &db,
+        )
+        .await
+        .unwrap();
+        let board = Board::create(
+            creator.get_id(),
+            BoardTitle::try_new("Geometri").unwrap(),
+            vec![guest.get_id().clone()],
+            &db,
+        )
+        .await
+        .unwrap();
+
+        // A promotion touches no roster and must report none.
+        let (guest, boards) = guest.set_role(Role::Teacher, &db).await.unwrap();
+        assert!(
+            boards.is_empty(),
+            "only a demotion to parent strips rosters"
+        );
+
+        let (_, boards) = guest.set_role(Role::Parent, &db).await.unwrap();
+        assert_eq!(boards.len(), 1, "the stripped room must be reported back");
+        assert_eq!(boards[0].get_id(), board.get_id());
+        assert!(
+            boards[0].get_participants().is_empty(),
+            "and carry the roster the room is about to be told about"
+        );
+    }
 
     #[tokio::test]
     async fn a_stale_profile_write_cannot_revert_a_role_change() {

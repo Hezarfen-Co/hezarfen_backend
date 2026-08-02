@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use ulid::Ulid;
 
@@ -487,6 +489,59 @@ impl ExamQuestion {
             .bind("ex", exam.record())
             .run(limit, offset, db)
             .await
+    }
+
+    /// The ids of `exam`'s questions that share a bank template with a question
+    /// under one of `live` — the questions two exams hold identical `correct`
+    /// for, because the bank copies the key into every instantiation. Keyed on
+    /// the template, never on the exam, so only the overlapping questions are
+    /// named. Empty when `live` is empty.
+    ///
+    /// A question links to a template through *either* column and both must be
+    /// read, on both sides of the join: `from_bank` is the template it was
+    /// instantiated from, `banked_as` the template minted by saving it into the
+    /// bank ([`Self::link_banked_as`]). A question authored by hand in exam A
+    /// and then saved to the bank holds only `banked_as`, while its copy in
+    /// exam B holds only `from_bank` — matching `from_bank` to `from_bank` saw
+    /// neither and leaked A's key while B was live. A single coalesced key per
+    /// row is not enough either: a question instantiated from one template and
+    /// re-saved as another carries *both*, and only the second one may be the
+    /// shared link.
+    ///
+    /// So: collect every template id reachable from a live exam by either
+    /// column, then name any of `exam`'s questions pointing at one by either
+    /// column. `$shared` is built from `!= NONE` filters, so it never holds a
+    /// `NONE` for an unlinked question's absent column to match against.
+    pub async fn list_shared_with(
+        exam: &ExamId,
+        live: &[ExamId],
+        db: &Database,
+    ) -> Result<HashSet<String>, AppError> {
+        if live.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let mut result = db
+            .query(
+                "LET $shared = array::union(
+                   (SELECT VALUE from_bank FROM exam_question
+                    WHERE exam IN $live AND from_bank != NONE),
+                   (SELECT VALUE banked_as FROM exam_question
+                    WHERE exam IN $live AND banked_as != NONE));
+                 SELECT VALUE id FROM exam_question
+                 WHERE exam = $ex AND (from_bank IN $shared OR banked_as IN $shared)",
+            )
+            .bind(("ex", exam.record()))
+            .bind((
+                "live",
+                live.iter().map(ExamId::record).collect::<Vec<RecordId>>(),
+            ))
+            .await?
+            .check()?;
+        Ok(result
+            .take::<Vec<ExamQuestionId>>(1)?
+            .iter()
+            .map(|id| id.key().to_string())
+            .collect())
     }
 
     /// Write the editable fields, refused outright once the exam has an

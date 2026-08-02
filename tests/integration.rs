@@ -333,89 +333,101 @@ async fn login_rejects_bad_credentials() {
     assert_eq!(res.status, StatusCode::UNAUTHORIZED);
 }
 
+/// Routes that answer without a session, on purpose. Adding a route here is a
+/// deliberate, reviewable decision to leave a door open — everything else in
+/// the spec is asserted to reject an anonymous caller with a 401.
+const PUBLIC: &[(&str, &str)] = &[
+    ("GET", "/health"),
+    ("GET", "/time"),
+    ("GET", "/limits"),
+    ("POST", "/auth/register"),
+    ("POST", "/auth/login"),
+    // Idempotent: revokes the session if there is one, `204` either way.
+    ("POST", "/auth/logout"),
+    // A server certificate is handed to every peer in the TLS handshake, so
+    // publishing it discloses nothing (see the module doc in `web/ai.rs`).
+    ("GET", "/ai/certificate"),
+];
+
+/// Router paths that carry no OpenAPI operation, so the derived sweep below
+/// cannot see them: `OpenApiRouter` has no way to describe a WebSocket
+/// upgrade, so both rooms are plain `.route()`s. They authenticate before they
+/// upgrade, so a rejection is an ordinary HTTP status here.
+const UNDOCUMENTED_WS: &[(&str, &str)] = &[("GET", "/exams/x/attempt/ws"), ("GET", "/boards/x/ws")];
+
+/// Every protected operation the server publishes must reject a caller with no
+/// cookie — derived from the emitted OpenAPI document, never from a list
+/// somebody keeps by hand. A hand-kept list drifts silently, and the drift is
+/// auth coverage: ~10 route families were missing from the one this replaced.
+///
+/// Route and spec entry come from the same `routes!()` macro, so a family that
+/// leaves the router leaves the document too; `MIN_PROTECTED` is what makes
+/// that visible instead of a quietly shorter sweep.
 #[tokio::test]
 async fn protected_routes_require_session() {
+    /// Floor on the number of protected operations swept. It only ever goes
+    /// up: raise it when routes are added. Without it, deleting a route family
+    /// would delete its own coverage and still pass.
+    const MIN_PROTECTED: usize = 254;
+
     let app = mem_app().await;
-    for (method, uri) in [
-        ("GET", "/auth/me"),
-        ("GET", "/notes"),
-        ("POST", "/notes"),
-        ("GET", "/events"),
-        ("POST", "/events"),
-        ("POST", "/events/x/attendance"),
-        ("GET", "/events/x/roster"),
-        ("GET", "/exams"),
-        ("GET", "/courses"),
-        ("POST", "/courses"),
-        ("GET", "/courses/me"),
-        ("GET", "/marks/me"),
-        ("POST", "/exams/x/attempt"),
-        ("GET", "/exams/x/attempt"),
-        ("POST", "/exams/x/attempt/finish"),
-        ("GET", "/exams/x/live"),
-        ("POST", "/exams/x/questions"),
-        ("GET", "/exams/x/questions"),
-        ("PATCH", "/exams/x/questions/y"),
-        ("DELETE", "/exams/x/questions/y"),
-        ("GET", "/exams/x/attempt/questions"),
-        ("POST", "/exams/x/attempt/answers"),
-        ("GET", "/exams/x/attempts/u/answers"),
-        ("POST", "/exams/x/questions/y/image"),
-        ("GET", "/exams/x/questions/y/image"),
-        ("DELETE", "/exams/x/questions/y/image"),
-        ("POST", "/exams/x/questions/y/choices/0/image"),
-        ("GET", "/exams/x/questions/y/choices/0/image"),
-        ("DELETE", "/exams/x/questions/y/choices/0/image"),
-        // The WebSocket room authenticates before it upgrades.
-        ("GET", "/exams/x/attempt/ws"),
-        ("POST", "/courses/x/sessions"),
-        ("GET", "/courses/x/sessions"),
-        ("GET", "/sessions/x"),
-        ("PATCH", "/sessions/x"),
-        ("DELETE", "/sessions/x"),
-        ("POST", "/sessions/x/attendance"),
-        ("GET", "/sessions/x/attendance"),
-        ("DELETE", "/sessions/x/attendance/u"),
-        ("POST", "/work/check-in"),
-        ("POST", "/work/check-out"),
-        ("GET", "/work/me"),
-        ("GET", "/work/u"),
-        ("PATCH", "/work/entries/x"),
-        ("DELETE", "/work/entries/x"),
-        ("POST", "/pomodoro/start"),
-        ("POST", "/pomodoro/finish"),
-        ("GET", "/pomodoro/me"),
-        ("GET", "/pomodoro/u"),
-        ("GET", "/attendance/me"),
-        ("GET", "/attendance/u"),
-        ("GET", "/boards"),
-        ("POST", "/boards"),
-        ("GET", "/boards/x"),
-        ("PATCH", "/boards/x"),
-        ("DELETE", "/boards/x"),
-        ("GET", "/boards/x/strokes"),
-        ("GET", "/boards/x/history"),
-        ("GET", "/boards/x/epochs"),
-        ("POST", "/boards/x/clear"),
-        ("POST", "/boards/x/close"),
-        // The board room authenticates before it upgrades, so a rejection is
-        // an HTTP status here and not an instant close.
-        ("GET", "/boards/x/ws"),
-        ("GET", "/classes"),
-        ("POST", "/classes"),
-        ("GET", "/classes/x"),
-        ("PATCH", "/classes/x"),
-        ("DELETE", "/classes/x"),
-        ("POST", "/classes/x/members"),
-        ("GET", "/classes/x/members"),
-        ("DELETE", "/classes/x/members/u"),
-        ("POST", "/classes/x/courses"),
-        ("GET", "/classes/x/courses"),
-        ("DELETE", "/classes/x/courses/c"),
-    ] {
+    let spec = send(&app, "GET", "/api-docs/openapi.json", None, None)
+        .await
+        .body;
+    let paths = spec["paths"].as_object().expect("spec has paths");
+
+    let mut checked = 0;
+    for (path, item) in paths {
+        let item = item.as_object().expect("path item is an object");
+        for (method, operation) in item {
+            let secured = operation["security"]
+                .as_array()
+                .is_some_and(|requirements| {
+                    requirements
+                        .iter()
+                        .any(|requirement| requirement.get("session_cookie").is_some())
+                });
+            let method = method.to_uppercase();
+            if !secured {
+                assert!(
+                    PUBLIC.contains(&(method.as_str(), path.as_str())),
+                    "{method} {path} declares no session requirement and is not \
+                     in the deliberate PUBLIC list"
+                );
+                continue;
+            }
+
+            // `{id}` → `x`, but an integer-typed parameter (a choice index)
+            // has to stay parseable or axum answers 400 before the extractor
+            // that would have answered 401.
+            let mut uri = path.clone();
+            for parameter in operation["parameters"].as_array().unwrap_or(&vec![]) {
+                let name = parameter["name"].as_str().expect("parameter name");
+                let placeholder = if parameter["schema"]["type"] == "integer" {
+                    "0"
+                } else {
+                    "x"
+                };
+                uri = uri.replace(&format!("{{{name}}}"), placeholder);
+            }
+            assert!(!uri.contains('{'), "unsubstituted path parameter: {uri}");
+
+            let res = send(&app, &method, &uri, None, None).await;
+            assert_eq!(res.status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+            checked += 1;
+        }
+    }
+
+    for (method, uri) in UNDOCUMENTED_WS {
         let res = send(&app, method, uri, None, None).await;
         assert_eq!(res.status, StatusCode::UNAUTHORIZED, "{method} {uri}");
     }
+
+    assert!(
+        checked >= MIN_PROTECTED,
+        "swept only {checked} protected operations, expected at least \
+         {MIN_PROTECTED} — did a route family leave the router?"
+    );
 }
 
 #[tokio::test]
@@ -984,6 +996,126 @@ async fn concurrent_uploads_never_exceed_the_file_cap() {
         common::total(&list.body),
         10,
         "the cap must hold exactly under concurrency, statuses={statuses:?}"
+    );
+}
+
+/// The crate-wide `422` is a *behaviour*, not just 74 utoipa annotations.
+///
+/// Every JSON-bodied operation declares `422` with no `ErrorResponse`, and the
+/// only thing making that true is axum's default [`JsonRejection`]: a custom
+/// mapping added anywhere (an `AppError` `From`, a `WithRejection` wrapper, a
+/// hand-rolled `Json`) would silently turn the whole surface into `400`, or into
+/// a `422` carrying an `ErrorResponse` the annotations say it does not, and the
+/// spec-drift test in `spec_bounds.rs` — which only reads the document — would
+/// still pass.
+///
+/// Four extractor shapes stand in for all 74 sites, because the rejection is a
+/// property of the *extractor*, never of the route:
+///   1. plain `Json<T>`, unauthenticated — the bare shape most sites are;
+///   2. `Json<T>` behind a role gate (`RequireTeacher`), where the gate runs
+///      first: proves the gate passing still leaves the body rejection in
+///      charge (a `403`/`400` here would mean the order had changed);
+///   3. `deny_unknown_fields` — the only DTO flavour that can reject a body
+///      that is otherwise perfectly typed;
+///   4. `Multipart`, which has a different rejection entirely and must answer
+///      `400`, never `422` — that is why those routes declare no `422`.
+/// Both `422` triggers are covered (a type-mismatched field and a missing
+/// required one), as is the `400` line either side of them: unparseable JSON
+/// and a well-typed value that a domain rule refuses.
+#[tokio::test]
+async fn malformed_json_bodies_answer_422_across_every_extractor_shape() {
+    let (app, db) = app_and_db().await;
+    let ali = login(&app, "ali").await;
+    let ogretmen = login_as(&app, &db, "ogretmen", "teacher").await;
+    let json = Some("application/json");
+
+    // 422: the body reached serde and did not fit the target type.
+    for (uri, cookie, body, shape) in [
+        (
+            "/auth/register",
+            None,
+            r#"{"username": 5, "password": "secret1"}"#,
+            "plain Json, type mismatch",
+        ),
+        (
+            "/auth/register",
+            None,
+            r#"{"username": "veli"}"#,
+            "plain Json, missing required field",
+        ),
+        (
+            "/courses",
+            Some(ogretmen.as_str()),
+            r#"{"title": 42}"#,
+            "role-gated Json, type mismatch",
+        ),
+        (
+            "/boards",
+            Some(ali.as_str()),
+            r#"{"title": "Geometri", "participant_ids": []}"#,
+            "deny_unknown_fields, unknown key",
+        ),
+    ] {
+        let (status, headers, bytes) =
+            common::send_raw(&app, "POST", uri, cookie, json, body.as_bytes().to_vec()).await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{shape} ({uri}) must be 422"
+        );
+        // The declared shape is "422, no `ErrorResponse`": axum answers a
+        // plain-text explanation, *not* the `{"error": ...}` body every other
+        // failure carries. A custom mapping that started emitting one would
+        // make the annotations lie, so pin the negative rather than the text.
+        assert_eq!(
+            headers.get("content-type").and_then(|v| v.to_str().ok()),
+            Some("text/plain; charset=utf-8"),
+            "{shape} ({uri}) must not answer an ErrorResponse body"
+        );
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).is_err(),
+            "{shape} ({uri}) body must not be JSON, got {}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+
+    // 400, both flavours: never a 422. Syntax that serde cannot even parse, and
+    // a value that parsed fine but a domain rule refuses.
+    for (body, why) in [
+        ("not json at all", "unparseable JSON"),
+        (
+            r#"{"username": "a", "password": "secret1"}"#,
+            "well-typed value refused by a domain rule",
+        ),
+    ] {
+        let (status, _, _) = common::send_raw(
+            &app,
+            "POST",
+            "/auth/register",
+            None,
+            json,
+            body.as_bytes().to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{why} must be 400");
+    }
+
+    // The multipart shape: a different rejection, and it must stay 400 — those
+    // routes deliberately declare no 422 at all.
+    let note = create_note(&app, &ali, "attachments").await;
+    let (status, _, _) = common::send_raw(
+        &app,
+        "POST",
+        &format!("/notes/{note}/files"),
+        Some(&ali),
+        Some("multipart/form-data; boundary=hezarfen-test-boundary"),
+        b"not a multipart body".to_vec(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a multipart route must answer 400, never 422"
     );
 }
 
@@ -24489,6 +24621,82 @@ async fn a_parent_gets_no_whiteboard_at_all() {
     assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
     // None of it disturbed the board.
     assert!(stored_board(&db, &board).await.is_some());
+}
+
+/// The read-modify-write half of the same defect. A roster the creator was just
+/// served carries a participant who has since stopped qualifying, and echoing
+/// it back used to be a `400` — the invite list frozen by a value the server
+/// itself handed over. It is dropped now, silently. What must NOT be dropped is
+/// a *newly named* unqualified id: that split is the whole of the fix, and
+/// backwards it would let any caller seed a roster with anyone.
+#[tokio::test]
+async fn a_creator_can_patch_back_a_roster_holding_a_participant_who_no_longer_qualifies() {
+    let (app, db) = app_and_db().await;
+    let ali = login(&app, "ali").await;
+    let veli = login(&app, "veli").await;
+    let veli_id = me_id(&app, &veli).await;
+    let anne = login_as(&app, &db, "anne", "parent").await;
+    let anne_id = me_id(&app, &anne).await;
+
+    let board = create_board(&app, &ali, "Geometri", &[&veli_id]).await;
+    // Demoted straight in the store: `set_role` would sweep the roster, and the
+    // stale row is exactly the shape a volume written before that sweep holds.
+    db.query("UPDATE $u SET role = 'parent'")
+        .bind(("u", UserId::from_key(&veli_id).record()))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+    // What the client sees, and sends straight back.
+    let read = send(&app, "GET", &format!("/boards/{board}"), Some(&ali), None).await;
+    assert_eq!(read.status, StatusCode::OK, "{}", read.body);
+    let roster = read.body["participants"].clone();
+    assert_eq!(
+        roster,
+        json!([&veli_id]),
+        "the stale id is served, not hidden"
+    );
+
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/boards/{board}"),
+        Some(&ali),
+        Some(json!({ "participants": roster })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["participants"], json!([]), "{}", res.body);
+    assert!(
+        stored_board(&db, &board)
+            .await
+            .unwrap()
+            .get_participants()
+            .is_empty(),
+        "the drop is stored, not just rendered"
+    );
+
+    // The other half: a fresh unqualified id still fails the whole call, and
+    // both flavours of it — a parent, and an id no user answers to.
+    for id in [anne_id.as_str(), "nosuchuser"] {
+        let res = send(
+            &app,
+            "PATCH",
+            &format!("/boards/{board}"),
+            Some(&ali),
+            Some(json!({ "participants": [id] })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::BAD_REQUEST, "{id}: {}", res.body);
+    }
+    assert!(
+        stored_board(&db, &board)
+            .await
+            .unwrap()
+            .get_participants()
+            .is_empty()
+    );
 }
 
 /// The roster is spelled `participants` on the way in, out and through `PATCH`.

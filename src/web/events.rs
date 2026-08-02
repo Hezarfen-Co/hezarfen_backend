@@ -10,6 +10,7 @@ use utoipa_axum::routes;
 
 use crate::database::Database;
 use crate::domain::attendance::{Attendance, AttendanceStatus};
+use crate::domain::class_group::{ClassGroup, ClassGroupId};
 use crate::domain::course::{Course, CourseId};
 use crate::domain::event::{Event, EventAudience, EventDescription, EventId, EventTitle};
 use crate::domain::registration::Registration;
@@ -64,6 +65,11 @@ enum AudienceDto {
     /// The students currently enrolled in this course (live — enrollment
     /// changes move people in and out).
     Course { course: String },
+    /// The students currently in this class section (şube) — live, so adding
+    /// or removing a member moves them in and out. The homeroom teacher is not
+    /// implied. If the class is later deleted the event survives with an empty
+    /// roster.
+    Class { class: String },
     /// A signup list built through `POST /events/{id}/register` — teachers
     /// place students, staff take their own seat. `capacity` caps the seats;
     /// `null` or omitted = unlimited. The list closes when the event starts.
@@ -92,6 +98,16 @@ impl AudienceDto {
                 }
                 Ok(EventAudience::Course { course })
             }
+            AudienceDto::Class { class } => {
+                let class = ClassGroupId::from_key(&class);
+                if ClassGroup::read(&class, db).await?.is_none() {
+                    return Err(AppError::Validation(ValidationError::Invalid {
+                        field: "audience",
+                        reason: "class does not exist",
+                    }));
+                }
+                Ok(EventAudience::Class { class })
+            }
             AudienceDto::Registration { capacity } => {
                 if capacity.is_some_and(|capacity| capacity < 1) {
                     return Err(AppError::Validation(ValidationError::Invalid {
@@ -112,6 +128,9 @@ impl AudienceDto {
             },
             EventAudience::Course { course } => AudienceDto::Course {
                 course: course.key().to_string(),
+            },
+            EventAudience::Class { class } => AudienceDto::Class {
+                class: class.key().to_string(),
             },
             EventAudience::Registration { capacity } => AudienceDto::Registration {
                 capacity: *capacity,
@@ -234,8 +253,9 @@ impl AttendanceResponse {
 // ---- events -------------------------------------------------------------
 
 /// Create an event owned by the current user. Requires the `teacher` role or
-/// higher. `audience` targets it at a role, a course's enrollment, or a
-/// registration list (filled via `POST /events/{id}/register`); omitted it is
+/// higher. `audience` targets it at a role, a course's enrollment, a class
+/// section's roster, or a registration list (filled via
+/// `POST /events/{id}/register`); omitted it is
 /// school-wide. Everyone still sees every event — the audience is the
 /// expected-attendee roster, not a visibility wall.
 #[utoipa::path(
@@ -249,6 +269,7 @@ impl AttendanceResponse {
         (status = 400, description = "Invalid fields, audience, time range, or times in the past", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn create_event(
@@ -360,6 +381,7 @@ async fn get_event(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn update_event(
@@ -472,6 +494,7 @@ async fn delete_event(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
         (status = 404, description = "Event not found", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn mark(
@@ -609,7 +632,8 @@ struct RosterEntry {
 
 /// The event's expected-attendee roster joined with its attendance marks — the
 /// who-came/who-missed report. Resolved live from the audience (today's role
-/// holders, current enrollment, the current signup list), so it always reflects
+/// holders, current enrollment, the current class roster, the current signup
+/// list), so it always reflects
 /// the present roster;
 /// attendance rows for people no longer in the audience are omitted here (they
 /// remain in `GET /events/{id}/attendance`). Requires teacher+. Paged via
@@ -713,6 +737,7 @@ struct RegistrationResponse {
         (status = 403, description = "Requires teacher role or higher, or the target is another staff member", body = ErrorResponse),
         (status = 404, description = "Event not found", body = ErrorResponse),
         (status = 409, description = "The event is full, or it already started or ended", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn register(
@@ -836,7 +861,7 @@ mod tests {
         let user = User::create(Username::try_new(username).unwrap(), hash, db)
             .await
             .unwrap();
-        user.set_role(role, db).await.unwrap()
+        user.set_role(role, db).await.unwrap().0
     }
 
     /// `can_manage` is only reached behind `RequireTeacher` today, so this is
@@ -860,7 +885,7 @@ mod tests {
         assert!(can_manage(&event, &creator));
 
         for role in [Role::Student, Role::Parent] {
-            let demoted = creator.clone().set_role(role, &db).await.unwrap();
+            let demoted = creator.clone().set_role(role, &db).await.unwrap().0;
             assert!(
                 !can_manage(&event, &demoted),
                 "{role:?} creator still manages the event"

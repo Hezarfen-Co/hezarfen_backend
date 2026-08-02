@@ -396,6 +396,247 @@ async fn a_demotion_to_parent_leaves_every_board_roster_and_deletes_nothing() {
     assert_eq!(res.status, StatusCode::NOT_FOUND, "{}", res.body);
 }
 
+/// Everything a demotion to `parent` must sweep, set up on one student: an
+/// enrollment (with its seat), a parent link, a board roster entry and an event
+/// signup. Answers `(admin cookie, teacher cookie, ali's id)`.
+async fn a_student_holding_every_grant(
+    app: &axum::Router,
+    db: &Database,
+) -> (String, String, String) {
+    let admin = login_as(app, db, "yonetici", "admin").await;
+    let teacher = login_as(app, db, "ogretmen", "teacher").await;
+    let anne = login_as(app, db, "anne", "parent").await;
+    let anne_id = me_id(app, &anne).await;
+    let ali = login(app, "ali").await;
+    let veli = login(app, "veli").await;
+    let ali_id = me_id(app, &ali).await;
+
+    let course = common::create_course(app, &teacher, "Fizik").await;
+    common::enroll(app, &teacher, &course, &ali_id).await;
+    let res = send(
+        app,
+        "POST",
+        &format!("/users/{anne_id}/students"),
+        Some(&admin),
+        Some(json!({ "user_id": ali_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(
+        app,
+        "POST",
+        "/boards",
+        Some(&veli),
+        Some(json!({ "title": "Geometri", "participants": [ali_id] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let event = capped_event(app, &teacher, Some(1)).await;
+    let res = seat(app, &teacher, &event, &ali_id).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    (admin, teacher, ali_id)
+}
+
+/// `user`'s live role, read out of the store.
+async fn role_of(user: &str, db: &Database) -> String {
+    let mut result = db
+        .query("SELECT VALUE role FROM type::record('user', $u)")
+        .bind(("u", user.to_string()))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    result
+        .take::<Vec<String>>(0)
+        .unwrap()
+        .first()
+        .cloned()
+        .expect("the user row must exist")
+}
+
+/// Make the next write of `kind` on `table` fail, from inside whatever
+/// transaction performs it: a `DEFINE EVENT` on the table under write fires
+/// *within* that write, which is the only way to fail one statement of a
+/// cascade deterministically (no sleeps, no racing tasks).
+async fn poison(table: &str, kind: &str, db: &Database) {
+    db.query(format!(
+        "DEFINE EVENT poison ON TABLE {table} WHEN $event = '{kind}' \
+         THEN {{ THROW 'poisoned' }}"
+    ))
+    .await
+    .unwrap()
+    .check()
+    .unwrap();
+}
+
+/// Every grant of `ali_id` still standing, and the old role with them — what
+/// must hold after a cascade that failed anywhere in its middle.
+async fn nothing_was_swept(ali_id: &str, db: &Database) {
+    assert_eq!(
+        role_of(ali_id, db).await,
+        "student",
+        "the role write must roll back with the sweep that failed"
+    );
+    assert_eq!(
+        rows("SELECT VALUE id FROM enrollment", db).await,
+        1,
+        "the enrollment must survive a failed cascade"
+    );
+    assert_eq!(
+        counter("SELECT VALUE enrollment_count ?? 0 FROM course", db).await,
+        1,
+        "…and so must its seat, or the roster and the count disagree forever"
+    );
+    assert_eq!(
+        rows("SELECT VALUE id FROM parent_link", db).await,
+        1,
+        "the parent link must survive a failed cascade"
+    );
+    assert_eq!(
+        rows("SELECT VALUE id FROM registration", db).await,
+        1,
+        "the signup must survive a failed cascade"
+    );
+    assert_eq!(
+        counter("SELECT VALUE registration_count ?? 0 FROM event", db).await,
+        1,
+        "…with its seat still claimed"
+    );
+    assert_eq!(
+        boards_listing(ali_id, db).await,
+        1,
+        "the board roster must be untouched"
+    );
+}
+
+/// The demotion, re-sent with the fault gone: it must land whole, and the seat
+/// it frees must be a seat somebody else can actually take — the capacity check
+/// reads the counter, so a row deleted without its counter frees nothing.
+async fn the_retry_takes_everything(
+    app: &axum::Router,
+    db: &Database,
+    admin: &str,
+    teacher: &str,
+    ali_id: &str,
+) {
+    let res = send(
+        app,
+        "PATCH",
+        &format!("/users/{ali_id}/role"),
+        Some(admin),
+        Some(json!({ "role": "parent" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(role_of(ali_id, db).await, "parent");
+    for table in ["enrollment", "parent_link", "registration", "class_member"] {
+        assert_eq!(
+            rows(&format!("SELECT VALUE id FROM {table}"), db).await,
+            0,
+            "{table} must be swept by the re-sent PATCH"
+        );
+    }
+    assert_eq!(boards_listing(ali_id, db).await, 0);
+    assert_eq!(
+        counter("SELECT VALUE enrollment_count ?? 0 FROM course", db).await,
+        0
+    );
+    assert_eq!(
+        counter("SELECT VALUE registration_count ?? 0 FROM event", db).await,
+        0
+    );
+    // The seat is usable, which is the whole point of freeing it: the one-seat
+    // list took the demoted user's row back and answers a new booking.
+    let kemal_id = me_id(app, &login(app, "kemal").await).await;
+    let event = ids(&send(app, "GET", "/events", Some(teacher), None).await.body)
+        .first()
+        .cloned()
+        .expect("the event");
+    let res = seat(app, teacher, &event, &kemal_id).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+}
+
+/// The role write and every sweep it owes are **one** transaction, and this is
+/// what proves it: a statement in the middle of the cascade is made to fail, and
+/// the whole thing must be as if the PATCH never ran — the *old* role, and every
+/// grant of it still standing. Run as the eight separate queries this used to
+/// be, the same failure answered 500 with the role already lowered, the
+/// enrollment, the parent link and the event seat already gone, and nothing to
+/// ever put them back.
+///
+/// The failure is injected the way `regress_classes` does it: a `DEFINE EVENT`
+/// on a table the cascade writes fires *inside* that write, so the abort is
+/// deterministic instead of a race the in-memory engine would lie about. Both
+/// ends of the cascade are poisoned, in two tests, because they fail different
+/// things: the board roster is the *last* statement of the parent arm (so every
+/// assertion below it is about a write that already succeeded and must be
+/// undone), the enrollment delete is one of the *first* (so the assertions are
+/// about writes that must never be reached).
+#[tokio::test]
+async fn a_failure_late_in_the_cascade_leaves_the_old_role_and_every_grant_standing() {
+    let (app, db) = app_and_db().await;
+    let (admin, teacher, ali_id) = a_student_holding_every_grant(&app, &db).await;
+
+    poison("board", "UPDATE", &db).await;
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/users/{ali_id}/role"),
+        Some(&admin),
+        Some(json!({ "role": "parent" })),
+    )
+    .await;
+    assert!(
+        res.status.is_server_error(),
+        "the injected failure must not be answered as success: {} {}",
+        res.status,
+        res.body
+    );
+    nothing_was_swept(&ali_id, &db).await;
+
+    db.query("REMOVE EVENT poison ON TABLE board")
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    the_retry_takes_everything(&app, &db, &admin, &teacher, &ali_id).await;
+}
+
+/// The same fold, failed at the other end: the enrollment delete is an *early*
+/// statement of the cascade, so what this pins is that the role write ahead of
+/// it and every arm behind it come down with it too — a cascade that only rolls
+/// back what ran after the fault is no transaction at all.
+#[tokio::test]
+async fn a_failure_early_in_the_cascade_rolls_the_role_write_back_with_it() {
+    let (app, db) = app_and_db().await;
+    let (admin, teacher, ali_id) = a_student_holding_every_grant(&app, &db).await;
+
+    poison("enrollment", "DELETE", &db).await;
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/users/{ali_id}/role"),
+        Some(&admin),
+        Some(json!({ "role": "parent" })),
+    )
+    .await;
+    assert!(
+        res.status.is_server_error(),
+        "the injected failure must not be answered as success: {} {}",
+        res.status,
+        res.body
+    );
+    nothing_was_swept(&ali_id, &db).await;
+
+    db.query("REMOVE EVENT poison ON TABLE enrollment")
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    the_retry_takes_everything(&app, &db, &admin, &teacher, &ali_id).await;
+}
+
 /// The cascade and the parent row now commit together. Run as two queries, a
 /// register or a mark landing in between outlived its event — an orphan keyed
 /// on a row that no longer exists, so no read path could reach it and no delete
@@ -446,7 +687,8 @@ async fn deleting_an_event_takes_its_children_with_it() {
 
 /// The note half of the same defect: the attachment rows and the note commit
 /// together, so an upload can no longer leave a `note_file` pointing at a note
-/// that is gone (its *blob* is a known, documented leak — see `Note::delete`).
+/// that is gone (its *blob* goes too: `Note::delete` returns the rows it
+/// removed and the handler unlinks exactly those).
 #[tokio::test]
 async fn deleting_a_note_takes_its_attachment_rows_with_it() {
     let (app, db) = app_and_db().await;

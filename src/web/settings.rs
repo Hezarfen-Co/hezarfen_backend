@@ -258,6 +258,7 @@ async fn get_settings(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 409, description = "A removed exam kind still has graded exams, a removed meal slot still has published menus, or concurrent edits kept changing the settings mid-save", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn update_settings(

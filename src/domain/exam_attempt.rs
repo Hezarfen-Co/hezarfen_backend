@@ -305,6 +305,22 @@ impl ExamAttempt {
         Ok(result.take::<Vec<ExamAttempt>>(0)?)
     }
 
+    /// Every sitting of `user` nobody has submitted yet, across all exams. Only
+    /// the *candidates* for "in progress": a deadline comes off the exam's live
+    /// schedule, so the caller still judges [`Self::status`] per exam rather
+    /// than re-spelling that rule in SurrealQL.
+    pub async fn list_unfinished_for_user(
+        user: &UserId,
+        db: &Database,
+    ) -> Result<Vec<ExamAttempt>, AppError> {
+        let mut result = db
+            .query("SELECT * FROM exam_attempt WHERE user = $usr AND finished_at = NONE")
+            .bind(("usr", user.record()))
+            .await?
+            .check()?;
+        Ok(result.take::<Vec<ExamAttempt>>(0)?)
+    }
+
     pub async fn list_for_exam(exam: &ExamId, db: &Database) -> Result<Vec<ExamAttempt>, AppError> {
         let mut result = db
             .query("SELECT * FROM exam_attempt WHERE exam = $ex ORDER BY id DESC")

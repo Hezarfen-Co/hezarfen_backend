@@ -4,6 +4,7 @@ use crate::constant::{MAX_NOTE_CONTENT_LEN, MAX_NOTE_TITLE_LEN, NOTE_TABLE};
 use crate::database::Database;
 use crate::domain::field_update::FieldUpdate;
 use crate::domain::monotonic_id::next_ulid;
+use crate::domain::note_file::NoteFile;
 use crate::domain::page::PagedList;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
@@ -62,6 +63,15 @@ impl NoteContent {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// What [`Note::delete`]'s transaction removed: the note row (empty if it had
+/// already vanished) and every attachment row the cascade took with it — the
+/// only set whose blobs are safe to unlink.
+#[derive(Debug, SurrealValue)]
+struct DeleteOutcome {
+    note: Vec<Note>,
+    files: Vec<NoteFile>,
 }
 
 #[derive(Debug, Clone, SurrealValue)]
@@ -142,39 +152,38 @@ impl Note {
             .await
     }
 
-    /// Delete the note and cascade-remove its attachment rows. Blob files on
-    /// disk are the web layer's to remove (it lists them before calling this);
-    /// a crash in between leaves at worst an unreachable blob, never a row
-    /// pointing at nothing.
+    /// Delete the note and cascade-remove its attachment rows, returning both:
+    /// the note, and the attachment rows this transaction actually removed.
+    /// Blob files on disk are the web layer's to remove, but only for *these*
+    /// rows — a row uploaded after the caller listed the note's files is
+    /// deleted here too, and a pre-read snapshot would strand its blob. A crash
+    /// between commit and unlink leaves at worst an unreachable blob, never a
+    /// row pointing at nothing.
     ///
     /// Children first, in one transaction, the way
     /// [`crate::domain::course::Course::delete`] does it: as two queries, an
     /// upload that committed in between kept its row while the note went, and
     /// nothing could ever list or delete it again.
-    ///
-    /// ponytail: the blob of *that* upload is still orphaned on disk — the web
-    /// layer snapshots the file list before this call, so a row created inside
-    /// the window is deleted here but its file is never unlinked. Ceiling: one
-    /// leaked blob per racing upload-vs-delete, unreachable but not reclaimed.
-    /// Upgrade path: return the deleted `note_file` rows from this transaction
-    /// and have the handler unlink *those* instead of its snapshot.
-    pub async fn delete(self, db: &Database) -> Result<Note, AppError> {
+    pub async fn delete(self, db: &Database) -> Result<(Note, Vec<NoteFile>), AppError> {
         let mut result = db
             .query(
                 "BEGIN TRANSACTION;
-                 DELETE note_file WHERE note = $note;
+                 LET $files = (DELETE note_file WHERE note = $note RETURN BEFORE);
                  LET $gone = (DELETE $note RETURN BEFORE);
-                 RETURN $gone;
+                 RETURN { note: $gone, files: $files };
                  COMMIT TRANSACTION;",
             )
             .bind(("note", self.id.record()))
             .await?
             .check()?;
-        result
-            .take::<Vec<Note>>(3)?
+        // BEGIN is slot 0, the two LETs slots 1-2; the RETURN is slot 3.
+        let outcome = result
+            .take::<Vec<DeleteOutcome>>(3)?
             .into_iter()
             .next()
-            .ok_or(AppError::NotFound)
+            .ok_or_else(|| AppError::Internal("failed to delete note".into()))?;
+        let note = outcome.note.into_iter().next().ok_or(AppError::NotFound)?;
+        Ok((note, outcome.files))
     }
 }
 
@@ -186,6 +195,70 @@ mod tests {
     async fn title_is_required() {
         assert_eq!(NoteTitle::try_new("hi").unwrap().as_str(), "hi");
         assert!(NoteTitle::try_new("  ").is_err());
+    }
+
+    /// The blobs the handler unlinks are exactly the rows this transaction
+    /// removed — including one uploaded after any pre-read snapshot would have
+    /// been taken, which is the row whose blob used to leak.
+    #[tokio::test]
+    async fn delete_returns_the_attachment_rows_it_removed() {
+        use crate::domain::note_file::{FileContentType, FileName};
+
+        let db = crate::database::init_mem().await.unwrap();
+        let owner = crate::domain::user::UserId::generate();
+        let note = Note::create(
+            &owner,
+            NoteTitle::try_new("a").unwrap(),
+            NoteContent::try_new("body").unwrap(),
+            &db,
+        )
+        .await
+        .unwrap();
+        // What a handler snapshot would have seen...
+        let early = NoteFile::new(
+            note.get_id(),
+            FileName::try_new("early.pdf").unwrap(),
+            FileContentType::try_new("application/pdf").unwrap(),
+            3,
+        )
+        .insert(&db)
+        .await
+        .unwrap();
+        let (snapshot, _) = NoteFile::list_for(note.get_id(), None, 0, &db)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.len(), 1);
+        // ...and the upload that races in after it.
+        let late = NoteFile::new(
+            note.get_id(),
+            FileName::try_new("late.pdf").unwrap(),
+            FileContentType::try_new("application/pdf").unwrap(),
+            3,
+        )
+        .insert(&db)
+        .await
+        .unwrap();
+
+        let (gone, files) = note.delete(&db).await.unwrap();
+        assert_eq!(gone.get_title().as_str(), "a");
+        let mut keys: Vec<_> = files
+            .iter()
+            .map(|file| file.get_id().key().to_string())
+            .collect();
+        keys.sort();
+        let mut want = vec![
+            early.get_id().key().to_string(),
+            late.get_id().key().to_string(),
+        ];
+        want.sort();
+        assert_eq!(keys, want);
+        assert!(
+            NoteFile::list_for(gone.get_id(), None, 0, &db)
+                .await
+                .unwrap()
+                .0
+                .is_empty()
+        );
     }
 
     #[tokio::test]

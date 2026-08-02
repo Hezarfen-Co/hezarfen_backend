@@ -13,6 +13,7 @@ pub mod board_stroke;
 pub mod cap;
 pub mod chatbot_message;
 pub mod chatbot_thread;
+pub mod class_blueprint;
 pub mod class_course;
 pub mod class_group;
 pub mod class_member;

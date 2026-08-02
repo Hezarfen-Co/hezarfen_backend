@@ -191,6 +191,7 @@ async fn get_session(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn update_session(
@@ -295,6 +296,7 @@ async fn delete_session(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the session teacher or a course manager; or marking the teacher without manager+", body = ErrorResponse),
         (status = 404, description = "Session not found", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn mark_roll_call(

@@ -37,10 +37,28 @@
 //! Exhausted buckets are exempt from eviction: they are the only ones actually
 //! refusing anyone, and freeing one *raises* the limit for a client that had
 //! reached it. When every bucket is exhausted there is nothing to evict and
-//! the map stays at the cap; the unknown key is then admitted without a bucket
-//! rather than refused, which concedes that a new client is unmetered while
-//! the map is saturated but keeps an attacker from `429`-ing everyone at once
-//! simply by filling it.
+//! the map stays at the cap; the unknown key is then metered against one shared
+//! overflow counter ([`crate::constant::RATE_LIMIT_OVERFLOW_MAX`] per window,
+//! for every keyless client together) instead of getting a bucket.
+//!
+//! Be precise about what that buys, because it is not everyone. A client
+//! **already in the map** keeps its own counter throughout: no flood can starve
+//! it, evict it, or spend its budget, which is the property worth having.
+//! A **newcomer during** the flood is a different story — it never gets a
+//! bucket while the map stays saturated, so *all* of its traffic (not just its
+//! first request) comes out of the one shared budget, and once that budget is
+//! spent every further newcomer is refused. An attacker who first fills the map
+//! and then burns the shared budget therefore does `429` every newcomer for the
+//! rest of the window; `tests/rate_limit.rs` asserts exactly that, ending on a
+//! refused `newcomer-last`.
+//!
+//! That is the accepted trade, not an oversight. The alternative — admitting
+//! keyless clients freely — makes a filled map the way to buy unmetered
+//! throughput from fresh keys, which is an unbounded bypass rather than a
+//! bounded outage, and refusing them outright would hand the attacker the same
+//! `429`-the-newcomers result for free. The shared budget costs an attacker the
+//! flood *plus* [`crate::constant::RATE_LIMIT_OVERFLOW_MAX`] requests a minute,
+//! every minute, to keep it going.
 //!
 //! # The shared window
 //!
@@ -75,7 +93,8 @@ use surrealdb::types::RecordId;
 use tokio::time::Instant;
 
 use crate::constant::{
-    PURGE_AT, RATE_LIMIT_TABLE, RATE_SYNC_INTERVAL_SECS, RATE_SYNC_MAX_KEYS, RATE_SYNC_TIMEOUT_SECS,
+    PURGE_AT, RATE_LIMIT_OVERFLOW_MAX, RATE_LIMIT_TABLE, RATE_SYNC_INTERVAL_SECS,
+    RATE_SYNC_MAX_KEYS, RATE_SYNC_TIMEOUT_SECS,
 };
 use crate::database::Database;
 use crate::domain::timestamp::Timestamp;
@@ -117,6 +136,10 @@ pub struct RateLimiter<K = IpAddr> {
     /// Only meaningful for the IP tiers; the keyed tiers never look at it.
     trust_proxy: bool,
     buckets: Arc<Mutex<HashMap<K, Bucket>>>,
+    /// The single bucket every client shares once the map is saturated and no
+    /// eviction is allowed (see the module docs). Local only: it is keyless, so
+    /// it is never synced to the shared table.
+    overflow: Arc<Mutex<Bucket>>,
 }
 
 struct Bucket {
@@ -225,7 +248,24 @@ impl<K: Eq + Hash> RateLimiter<K> {
             window: Duration::from_secs(60),
             trust_proxy,
             buckets: Arc::new(Mutex::new(HashMap::new())),
+            overflow: Arc::new(Mutex::new(Bucket::opened_at(Instant::now()))),
         }
+    }
+
+    /// Meter one keyless request against the shared overflow budget. Same fixed
+    /// window as a real bucket, one counter for everyone who lands here.
+    fn check_overflow(&self, now: Instant) -> Result<(), u64> {
+        let mut bucket = self.overflow.lock().expect("rate limiter mutex poisoned");
+        if now.duration_since(bucket.window_start) >= self.window {
+            *bucket = Bucket::opened_at(now);
+        }
+        // `count` and not `spent()`: nothing shared ever reaches this bucket.
+        if bucket.count < RATE_LIMIT_OVERFLOW_MAX {
+            bucket.count += 1;
+            return Ok(());
+        }
+        let remaining = self.window - now.duration_since(bucket.window_start);
+        Err((remaining.as_secs_f64().ceil() as u64).max(1))
     }
 
     /// Count one request from `key`. `Err` carries the whole seconds (rounded
@@ -253,11 +293,14 @@ impl<K: Eq + Hash> RateLimiter<K> {
                 evict_cheapest(&mut buckets, PURGE_AT - PURGE_AT / 4, self.max);
             }
             if buckets.len() >= PURGE_AT {
-                // Every bucket left is exhausted and none may be dropped. Admit
-                // this unknown key without a bucket rather than refuse it: an
-                // attacker who can saturate the map must not be able to 429 the
-                // world, and every client already in the map keeps its counter.
-                return Ok(());
+                // Every bucket left is exhausted and none may be dropped. This
+                // key gets no bucket, but it is still metered: everyone in that
+                // position shares one aggregate counter. Refusing outright
+                // would 429 every newcomer for free; admitting freely would
+                // make a saturated map the bypass. Clients already in the map
+                // are untouched either way (see the module docs).
+                drop(buckets);
+                return self.check_overflow(now);
             }
         }
 

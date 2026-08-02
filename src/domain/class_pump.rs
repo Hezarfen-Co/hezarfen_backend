@@ -32,7 +32,6 @@ use crate::constant::{
 use crate::database::{Database, transaction_with_retry};
 use crate::domain::cap;
 use crate::domain::class_group::{ClassGroup, ClassGroupId};
-use crate::domain::user::UserId;
 use crate::error::AppError;
 
 /// The `THROW` markers [`attach`] aborts with. `FULL_MARK` and `MISSING_MARK`
@@ -67,6 +66,7 @@ const FULL_MARK: &str = "class_full:";
 const MISSING_MARK: &str = "class_no_course:";
 
 /// What [`attach`] settled.
+#[derive(Debug)]
 pub(crate) enum Attached<T> {
     /// The link row, the counter and every enrollment it implied committed
     /// together.
@@ -74,9 +74,13 @@ pub(crate) enum Attached<T> {
     /// The link already exists — nothing was written, and no seat was spent
     /// finding that out.
     Duplicate,
-    /// The class row — or, on the course axis, the course being attached — is
-    /// gone (a concurrent delete won). Nothing was written.
+    /// The class row is gone (a concurrent delete won). Nothing was written.
     Gone,
+    /// The *pivot* — on the course axis, the course being attached — is gone.
+    /// Nothing was written. Told apart from [`Attached::Gone`] because the two
+    /// send a caller to look at different records, and a report that guesses
+    /// between them names the wrong one half the time.
+    PivotGone,
     /// The class is at its own ceiling on this axis. Nothing was written, and
     /// it is told apart from [`Attached::Gone`] because a full class is a
     /// standing row someone can make room in, not a 404.
@@ -212,51 +216,15 @@ impl Axis {
     }
 }
 
-/// Everything a user's role change *off* `student` invalidates, in one
-/// transaction: every class membership they hold (each class getting its member
-/// count back) and every enrollment row they hold (each course getting its seat
-/// back).
-///
-/// One transaction because the two halves are one fact. Run as two, a failure
-/// between them released the memberships and both class counters while the
-/// enrollment rows kept `source = class_group:X` — the class then passed its
-/// zero-zero delete guard, and the rows were left tagged with a class that no
-/// longer existed and that no sweep could ever reach. Ordering them the other
-/// way only swaps which corruption is reachable: memberships surviving on a
-/// non-student are memberships the next attach pumps back into a course.
-///
-/// The enrollment side takes *every* row, hand-placed ones included, and that
-/// is the rule rather than an oversight: what the role change invalidates is
-/// not "rows a class wrote" but enrollment itself — only students enroll, and
-/// enrollment is what gates sitting exams, being graded and appearing on a
-/// roster. A row kept for a teacher would grant nothing and count a seat.
-/// Nothing restores them on a demotion back to `student`; a promotion is a
-/// roster decision of its own.
-pub(crate) async fn sweep_non_student(user: &UserId, db: &Database) -> Result<(), AppError> {
-    let sql = format!(
-        "BEGIN TRANSACTION;
-         LET $links = (DELETE {CLASS_MEMBER_TABLE} WHERE user = $usr RETURN BEFORE);
-         FOR $link IN ($links ?? []) {{
-             UPDATE $link.class SET {CLASS_MEMBER_COUNT_FIELD} = \
-                 math::max([({CLASS_MEMBER_COUNT_FIELD} ?? 0) - 1, 0]);
-         }};
-         LET $gone = (DELETE {ENROLLMENT_TABLE} WHERE user = $usr RETURN BEFORE);
-         FOR $row IN ($gone ?? []) {{
-             UPDATE $row.course SET {ENROLLMENT_COUNT_FIELD} = \
-                 math::max([({ENROLLMENT_COUNT_FIELD} ?? 0) - 1, 0]);
-         }};
-         COMMIT TRANSACTION;"
-    );
-    // Admissible by construction: `DELETE` and `UPDATE` only, so no statement
-    // can answer "already exists" and every lost round is a plain re-send.
-    let (_, mut errors) =
-        transaction_with_retry(db, &sql, &[("usr".into(), user.record().into_value())], &[])
-            .await?;
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    Ok(())
-}
+// The sweep a role change *off* `student` owes — every class membership (each
+// class getting its member count back) and every enrollment row (each course
+// getting its seat back) — is two of the arms of
+// [`crate::domain::user::User::set_role`], because it belongs in the same
+// transaction as the role write that invalidates them. It stays one fact with
+// the counters either way: released separately, a failure between the halves
+// left enrollment rows tagged `source = class_group:X` while the class had its
+// counters back, so the class passed its zero-zero delete guard and the rows
+// were left pointing at a class no sweep could ever reach again.
 
 /// Write `link` and enroll everything it implies, or write nothing at all.
 ///
@@ -374,7 +342,7 @@ pub(crate) async fn attach<T: SurrealValue + Clone>(
         .values()
         .any(|error| error.to_string().contains(GONE_MARK))
     {
-        return Ok(Attached::Gone);
+        return Ok(Attached::PivotGone);
     }
     // Read before the ceiling below: a class over the *other* axis's ceiling is
     // refused whether or not this axis has room, and being told it is full on

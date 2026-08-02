@@ -82,6 +82,7 @@ struct RegisterResponse {
         (status = 201, description = "Account created, or the username was already taken — deliberately indistinguishable. Carries no `id`: on the taken path there is no row to name, so log in to learn who you are", body = RegisterResponse),
         (status = 400, description = "Invalid username or password", body = ErrorResponse),
         (status = 429, description = "Too many attempts from this address; see Retry-After", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn register(
@@ -135,6 +136,7 @@ async fn register(
         (status = 200, description = "Logged in; session cookie set", body = UserResponse),
         (status = 401, description = "Bad credentials", body = ErrorResponse),
         (status = 429, description = "Too many attempts from this address; see Retry-After", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 async fn login(

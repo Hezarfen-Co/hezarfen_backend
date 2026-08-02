@@ -201,6 +201,7 @@ pub(crate) fn choice_slot(question: &ExamQuestion, choice_id: &str) -> Result<Ch
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
         (status = 409, description = "Attempts have started — questions are frozen", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 pub(crate) async fn create_question(
@@ -278,16 +279,20 @@ pub(crate) async fn list_questions(
             "only the course creator, an assigned teacher, or a manager/admin can read the question list",
         ));
     }
-    Ok(Json(question_page(&exam, limit, offset, &st.db).await?))
+    Ok(Json(
+        question_page(&exam, limit, offset, &HashSet::new(), &st.db).await?,
+    ))
 }
 
 /// The paged answer-key list (`correct` included) shared by the teacher
 /// `list_questions` read and the student `review_questions` read — the two
-/// differ only in the access wall they run first.
+/// differ only in the access wall they run first, and in `hidden`: the question
+/// ids whose `correct` must come back `null` (empty for a teacher).
 pub(crate) async fn question_page(
     exam: &Exam,
     limit: Option<i64>,
     offset: i64,
+    hidden: &HashSet<String>,
     db: &Database,
 ) -> Result<Page<QuestionResponse>, AppError> {
     let (questions, total) = ExamQuestion::list_for_exam(exam.get_id(), limit, offset, db).await?;
@@ -295,12 +300,16 @@ pub(crate) async fn question_page(
     let items = questions
         .iter()
         .map(|question| {
-            QuestionResponse::new(
+            let mut item = QuestionResponse::new(
                 question,
                 images
                     .get(question.get_id().key())
                     .map_or(&[][..], Vec::as_slice),
-            )
+            );
+            if hidden.contains(question.get_id().key()) {
+                item.correct = None;
+            }
+            item
         })
         .collect();
     Ok(Page::new(items, total, limit, offset))
@@ -330,6 +339,7 @@ pub(crate) async fn question_page(
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "No such exam, or no such question in it", body = ErrorResponse),
         (status = 409, description = "Attempts have started — questions are frozen, or the subject the question was read on changed since — nothing was written, re-read and retry", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 pub(crate) async fn update_question(
@@ -487,6 +497,7 @@ pub(crate) struct InstantiateFromBank {
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "No such exam, or no bank template the caller may see", body = ErrorResponse),
         (status = 409, description = "Attempts have started — questions are frozen", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
 pub(crate) async fn question_from_bank(

@@ -220,6 +220,12 @@ fn expectations() -> Vec<(&'static str, &'static str, &'static str, i64)> {
             MAX_CLASS_GRADE_LEN as i64,
         ),
         (
+            "CreateBlueprint",
+            "grade",
+            "maxLength",
+            MAX_CLASS_GRADE_LEN as i64,
+        ),
+        (
             "UpdateClass",
             "name",
             "maxLength",
@@ -859,6 +865,67 @@ async fn published_bounds_match_the_constants() {
          validators from it would enforce the wrong rule:\n{}\n\nutoipa takes \
          literals only, so fix the `#[schema(...)]` attribute to match the constant.",
         wrong.join("\n")
+    );
+}
+
+/// Every JSON-bodied operation must publish its `422`.
+///
+/// axum's `Json` extractor answers `422 Unprocessable Entity` whenever the body
+/// parses as JSON but does not fit the DTO — a number where a string belongs, a
+/// missing required field, or (on the three `deny_unknown_fields` DTOs) a key
+/// the request does not accept. That is a status the server really returns on
+/// *every* route taking a JSON body, so a generated client that has no case for
+/// it will mishandle the most common client mistake there is. (`400` is a
+/// different failure: a body that is not JSON at all, or one whose values are
+/// well-typed but violate a domain rule — those already carry an `{error}`
+/// payload and their own declarations.)
+///
+/// Hand-applying that declaration across ~24 files drifts the moment someone
+/// adds a route, so the emitted document is what gets asserted, not the source:
+/// a new JSON-bodied operation fails this test until it declares its `422`.
+/// Multipart operations are out of scope on purpose — their rejection is
+/// `400`, and they are checked by the same walk below.
+#[tokio::test]
+async fn every_json_body_operation_declares_422() {
+    let spec = spec().await;
+
+    let mut missing = Vec::new();
+    let mut wrongly_declared = Vec::new();
+    for (path, item) in spec["paths"].as_object().expect("paths").iter() {
+        for (method, operation) in item.as_object().expect("path item").iter() {
+            let Some(content) = operation["requestBody"]["content"].as_object() else {
+                continue;
+            };
+            let declares_422 = operation["responses"]["422"].is_object();
+            if content.contains_key("application/json") {
+                if !declares_422 {
+                    missing.push(format!("  {} {path}", method.to_uppercase()));
+                }
+            } else if declares_422 {
+                wrongly_declared.push(format!(
+                    "  {} {path} ({})",
+                    method.to_uppercase(),
+                    content.keys().cloned().collect::<Vec<_>>().join(", ")
+                ));
+            }
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "{} operation(s) take a JSON body but do not declare the `422` axum answers \
+         when that body does not fit the DTO — a generated client has no case for a \
+         status the server really returns:\n{}\n\nAdd \
+         `(status = 422, description = \"…\")` to each `responses(...)` block.",
+        missing.len(),
+        missing.join("\n")
+    );
+    assert!(
+        wrongly_declared.is_empty(),
+        "{} non-JSON operation(s) declare a `422` they never return — a malformed \
+         multipart body is rejected with `400`:\n{}",
+        wrongly_declared.len(),
+        wrongly_declared.join("\n")
     );
 }
 

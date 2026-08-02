@@ -207,6 +207,7 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS audience.kind ON event TYPE string;
     DEFINE FIELD IF NOT EXISTS audience.role ON event TYPE option<string>;
     DEFINE FIELD IF NOT EXISTS audience.course ON event TYPE option<record<course>>;
+    DEFINE FIELD IF NOT EXISTS audience.class ON event TYPE option<record<class_group>>;
     DEFINE FIELD IF NOT EXISTS audience.capacity ON event TYPE option<int>;
     -- Seats taken on the signup list, the stored capacity guard that closes
     -- write-skew between concurrent request tasks (see `crate::domain::cap`).
@@ -276,6 +277,20 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS teacher ON class_group TYPE option<record<user>>;
     DEFINE FIELD IF NOT EXISTS class_member_count ON class_group TYPE option<int>;
     DEFINE FIELD IF NOT EXISTS class_course_count ON class_group TYPE option<int>;
+    -- Every class at one grade is what a blueprint pumps, so the grade label is
+    -- that read's whole `WHERE`.
+    DEFINE INDEX IF NOT EXISTS class_group_grade ON class_group FIELDS grade;
+
+    -- A grade's course template: the courses every class section at that grade
+    -- carries. The grade label *is* the record key, so a second blueprint for
+    -- one grade cannot exist and no find-then-insert has to race for it (the shape
+    -- `menu` uses for its date+slot). It holds no term — the class names its
+    -- own — and `courses` carries no DEFAULT: a defaulted array on a SCHEMAFULL
+    -- row is what broke every settings PATCH.
+    DEFINE TABLE IF NOT EXISTS class_blueprint SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS grade ON class_blueprint TYPE string;
+    DEFINE FIELD IF NOT EXISTS courses ON class_blueprint TYPE array<record<course>>;
+    DEFINE FIELD IF NOT EXISTS creator ON class_blueprint TYPE record<user>;
 
     DEFINE TABLE IF NOT EXISTS class_member SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS class ON class_member TYPE record<class_group>;
@@ -300,6 +315,16 @@ pub const MIGRATION: &str = "
     -- The mirror of `class_member.added_at`, for the same reason: without it
     -- the course list is ordered by the *course's* ULID.
     DEFINE FIELD IF NOT EXISTS attached_at ON class_course TYPE option<int>;
+    -- The blueprint that attached this course, absent when a human attached it
+    -- by hand — the same shape, and the same meaning, as `enrollment.source`
+    -- one table down. The line is not optional bookkeeping: `class_course` is
+    -- SCHEMAFULL with a definition per key, so an undefined column is silently
+    -- stripped on write and a blueprint could never take back what it placed.
+    -- Absence *is* the meaning, so there is nothing to backfill: a row written
+    -- before this column reads back as hand-attached, and `source = $blueprint`
+    -- is false for an absent key, which is what keeps a hand-attached course
+    -- unreachable by every blueprint sweep.
+    DEFINE FIELD IF NOT EXISTS source ON class_course TYPE option<record<class_blueprint>>;
     DEFINE INDEX IF NOT EXISTS class_course_class_course ON class_course FIELDS class, course UNIQUE;
     DEFINE INDEX IF NOT EXISTS class_course_class ON class_course FIELDS class;
     DEFINE INDEX IF NOT EXISTS class_course_course ON class_course FIELDS course;
@@ -796,6 +821,18 @@ pub const MIGRATION: &str = "
     DEFINE TABLE IF NOT EXISTS slot_ref SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS count ON slot_ref TYPE option<int>;
     DEFINE FIELD IF NOT EXISTS retired ON slot_ref TYPE option<bool>;
+
+    -- One row per backfill that is genuinely *one-time*, keyed by the backfill's
+    -- own name (2026-08-02). Most of `BACKFILL` is a `WHERE` that matches no row
+    -- once it has converged, so re-running it is free — but a repair whose cost
+    -- is the *scan* rather than the write pays that cost on every boot forever,
+    -- and the board-roster sweep's scan is one full `user` pass per board. A
+    -- marker row is the smallest thing that can say 'this one is finished': the
+    -- boot loop carries no lock and no fingerprint any more (2026-07-30), so
+    -- there is nowhere else for that fact to live. A database that never ran the
+    -- repair holds no row and runs it; the row is written by the same query.
+    DEFINE TABLE IF NOT EXISTS migration_mark SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS done_at ON migration_mark TYPE int;
 ";
 
 /// Data backfills for rows written by older binaries. Runs *after* (and apart
@@ -1085,6 +1122,47 @@ pub const BACKFILL: &str = "
     -- counter already reads as zero through the `?? 0` every reader applies.
     FOR $row IN ((SELECT board, count() AS n FROM board_stroke GROUP BY board) ?? []) {
         UPDATE $row.board SET total_stroke_count = $row.n WHERE total_stroke_count != $row.n;
+    };
+
+    -- Board rosters became self-repairing (2026-08-02). `set_role` sweeps a
+    -- demoted user off every board *going forward*, but a volume written before
+    -- that sweep still holds rosters naming parents — and ids of users who have
+    -- since been deleted outright, which no sweep ever covered.
+    --
+    -- It is not a cosmetic staleness: the roster is served back on every read
+    -- and `resolve_participants` refuses an id that no longer resolves to a
+    -- student-or-above, so the creator's next read-modify-write roster PATCH
+    -- echoes the stale id and takes a 400 — the board's invite list is frozen
+    -- until the row is repaired.
+    --
+    -- `parent` is the only role below `student` (domain::role), so `!= 'parent'`
+    -- is the same cut `Role::at_least(Student)` makes; a missing user matches no
+    -- row and so falls out of `$keep` for free. A board whose whole roster is
+    -- stale ends with `participants = []` — the creator alone on it, which is
+    -- the same shape a board created without invites carries. Not `= NONE`
+    -- guarded and it need not be: `$keep` is derived from the rows that exist,
+    -- so it converges, and `WHERE participants != $keep` writes nothing on the
+    -- next boot. `$keep` comes back deduped and in record-id order, so a
+    -- repaired row can be *reordered* relative to what it stored, never
+    -- duplicated — and the roster is a set to every reader.
+    --
+    -- Marked one-time (`migration_mark`), unlike every backfill above it. Those
+    -- converge to a `WHERE` that matches nothing, so their second run is a cheap
+    -- index probe; this one's cost is the *scan* — a `board` table scan whose
+    -- body runs a full `user` scan per row, measured at 773ms for 300 boards
+    -- over 2000 users on a boot with nothing left to write. That is paid on
+    -- every restart forever, and it buys nothing: `set_role` sweeps rosters
+    -- going forward and a deleted user is swept with its row, so no new stale id
+    -- is ever created. The mark is written *after* the loop and in the same
+    -- statement batch, so a boot killed mid-repair writes no mark and the next
+    -- one redoes the whole sweep — which is free, because the sweep is
+    -- idempotent. `UPSERT`, not `CREATE`: re-marking must never be an error.
+    IF array::len((SELECT VALUE id FROM migration_mark:board_roster)) = 0 {
+        FOR $row IN ((SELECT id, participants FROM board WHERE array::len(participants ?? []) > 0) ?? []) {
+            LET $keep = (SELECT VALUE id FROM user WHERE id IN $row.participants AND role != 'parent');
+            UPDATE $row.id SET participants = $keep WHERE participants != $keep;
+        };
+        UPSERT migration_mark:board_roster SET done_at = time::unix(time::now()) * 1000;
     };
 ";
 

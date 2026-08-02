@@ -402,7 +402,8 @@ mod tests {
         .unwrap()
         .set_role(Role::Teacher, &db)
         .await
-        .unwrap();
+        .unwrap()
+        .0;
 
         let assigned = async |db: &Database| {
             let class = ClassGroup::create(
