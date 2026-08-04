@@ -343,7 +343,7 @@ response in the same commit.
   "appointment":   { "max_note_len": 500, "max_reason_len": 1000, "max_slot_occurrences": 52 },
   "chatbot":       { "max_message_len": 8000, "max_thread_title_len": 200,
                      "min_max_message_len": 100, "…": 0 },
-  "board":         { "max_title_len": 200, "max_participants": 50,
+  "board":         { "max_title_len": 200, "max_participants": 200,
                      "max_stroke_payload_len": 4096,
                      "max_epoch_strokes": 5000, "max_board_strokes": 50000,
                      "max_boards_per_creator": 200,
@@ -972,6 +972,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/boards/{id}/history`           | student | The whole append-only log, oldest first, `clear` markers included · `?epoch=` for one epoch · paged |
 | GET    | `/boards/{id}/epochs`            | student | The epoch index: every `clear` marker (the epoch it closed, that epoch's final stroke count, who cleared, when) · paged |
 | PATCH  | `/boards/{id}`                   | student | `{title?, participants?, locked?}` — re-title (any participant); the roster and the lock are the creator's alone (`403`) |
+| POST   | `/boards/{id}/invite`            | teacher | **Creator only**, additive: fill the roster from a group — `{kind:"class", class}`, `{kind:"course", course}` (a club is a course), `{kind:"event", event}`. Resolved once, never live; `409` all-or-nothing at `max_participants` |
 | POST   | `/boards/{id}/clear`             | student | **Creator only**: bump the epoch, blanking the live canvas and resetting its cap — nothing is deleted; `409` on a closed board, on a **locked** board, and on a canvas that is **already blank** (the marker is a stored row, so a clear has to close at least one mark to be worth one) |
 | POST   | `/boards/{id}/close`             | student | **Creator only**: retire the board — permanently read-only, still fully readable; idempotent, and there is no reopen |
 | DELETE | `/boards/{id}`                   | student | **Creator only**: delete the board and its whole stroke log; frees one of the creator's board seats |
@@ -2979,9 +2980,12 @@ context without either end having to be redeployed in lockstep.
 
 A board is a shared canvas whose membership is an **ad-hoc invite list**: the
 creator names participant user ids at `POST /boards` and that is the whole
-model — no course, no lesson session, no appointment. Any account from
-`student` upwards may open one. **Every participant draws; the creator
-alone clears, locks, closes or deletes.**
+model — no course, no lesson session, no appointment binds a board. Any account
+from `student` upwards may open one. **Every participant draws; the creator
+alone clears, locks, closes or deletes.** A teacher who does not want to type
+thirty ids fills the same list in one call with `POST /boards/{id}/invite`
+(below) — that is a bulk *write* into the ad-hoc list, not a binding: the board
+still owns its roster afterwards.
 
 The roster is spelled `participants` everywhere — in the `POST` body, in the
 `PATCH` body and in every board response — so the field never changes name
@@ -3004,6 +3008,62 @@ stopped qualifying is dropped silently rather than refused, so a
 read-modify-write never wedges on a value the server itself handed over.
 Naming a *new* id that is unknown or a parent is still a `400`, and the whole
 call is refused — the roster is never half-applied.
+
+**Bulk invite.** `POST /boards/{id}/invite` fills the roster from a group that
+already exists instead of one id at a time. The body is tagged by `kind`, the
+same wire shape an event audience uses:
+
+```json
+{ "kind": "class",  "class":  "01J…" }   // everyone in a class section (şube)
+{ "kind": "course", "course": "01J…" }   // everyone enrolled in a course
+{ "kind": "event",  "event":  "01J…" }   // the event's expected-attendee roster
+```
+
+A **club is a course** (`kind` `club`), so "invite the whole club" is the
+`course` form; so is a study group (`study`). The `event` form resolves exactly
+what `GET /events/{id}/roster` resolves, which is the signup list for a
+registration event and the class or course roster for the others — a
+school-wide or role-wide event will normally overflow the cap, and that is a
+`409` rather than a truncation.
+
+It is the creator's call and **additive**: everyone the source names is *added*,
+nobody is ever removed by it. Removal stays `PATCH /boards/{id}` — send the
+roster you want.
+
+**The ids are resolved once, at the call — this is a snapshot, not a
+subscription.** A board keeps a flat list of ids and no memory of where they
+came from, so a student who joins that class tomorrow is *not* on today's board,
+and nothing the class does afterwards puts back a student the creator took off.
+Re-inviting the same source is how a board is topped up after the class changed;
+it adds only who is missing, so it is idempotent when nothing did — and it is
+also the one thing that undoes a removal, because the source still names that
+student. Removing someone from a board you intend to re-invite the class to is
+therefore not a ban; there is no per-board exclusion list. Live resolution was the alternative and
+was rejected here: it would turn the permission check behind every stroke, the
+room's door and "which boards may I open" into cross-table queries, and it would
+take the per-person removal away from the creator — which is most of what a
+whiteboard roster is for.
+
+Three filters run before the ids land, and all three are **silent**, because one
+ineligible member must not fail the invite for the other twenty-nine: ids that
+no longer resolve to a user are dropped, anyone below `student` is dropped (the
+same cut that keeps `parent` off a whiteboard), and anyone already on the board
+— the creator included — is not added twice.
+
+The cap, though, is **all-or-nothing**: if the union would carry the board past
+`max_participants` the whole invite is refused with a `409` naming both numbers
+and the roster is left exactly as it was. A partial invite would silently pick
+which half of a class gets to draw.
+
+**Inviting a group discloses that group.** A board's roster is visible to every
+participant, so each source carries the gate its own listing route carries —
+teacher+ for a class (`GET /classes/{id}/members`), the course's creator, an
+assigned teacher or a manager+ for a course (`GET /courses/{id}/enrollments`),
+teacher+ for an event (`GET /events/{id}/roster`). A student may still build a
+board one id at a time; they cannot pour a class roster into one. A source that
+does not exist is a `400` naming the field, never a `404` — on these routes a
+`404` means "no such board, or not yours", and reusing it here would tell a
+creator their own board had vanished.
 
 **No parents, anywhere.** The `parent` role is the school's read-only observer,
 and it has no whiteboard access at all — not a view-only tier, none. It is
