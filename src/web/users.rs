@@ -1,24 +1,34 @@
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::Response;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use crate::constant::{
+    MAX_MAX_FILE_BYTES, MAX_PROFILE_CLASSES, MAX_PROFILE_COURSES, UPLOAD_BODY_OVERHEAD_BYTES,
+};
 use crate::database::Database;
+use crate::domain::class_group::{ClassGroup, ClassGroupId};
+use crate::domain::class_member::ClassMember;
+use crate::domain::course::Course;
 use crate::domain::parent_link::ParentLink;
 use crate::domain::preferences::{Language, PaletteColor, Theme};
-use crate::domain::profile::{BirthDate, Email, PersonName, Phone};
+use crate::domain::profile::{Bio, BirthDate, DisplayName, Email, PersonName, Phone, ProfileStats};
 use crate::domain::role::Role;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
 
+use super::courses::visible_courses;
 use super::dto::Role as RoleSchema;
 use super::{
-    CurrentUser, Page, PageParams, PersonRef, RequireAdmin, RequireTeacher, UserResponse, paginate,
+    CurrentUser, Page, PageParams, PersonRef, RequireAdmin, RequireTeacher, UploadFileForm,
+    UserResponse, ensure_can_observe, paginate, read_image_upload, remove_blob, serve_inline_blob,
+    store_blob,
 };
 
 pub fn routes() -> OpenApiRouter<AppState> {
@@ -27,13 +37,26 @@ pub fn routes() -> OpenApiRouter<AppState> {
         .routes(routes!(update_my_profile))
         .routes(routes!(update_my_preferences))
         .routes(routes!(my_students))
+        .routes(routes!(my_profile))
         .routes(routes!(search_users))
         .routes(routes!(get_user))
         .routes(routes!(set_role))
-        .routes(routes!(update_user_profile))
+        .routes(routes!(update_user_profile, get_user_profile))
         .routes(routes!(update_user_preferences))
         .routes(routes!(link_student, list_parent_students))
         .routes(routes!(unlink_student))
+        // The avatar routes get their own HTTP body cap, like the note-file and
+        // question-image ones: the server-wide hard ceiling plus multipart
+        // framing headroom. It must stay on this sub-router — on the whole
+        // `/users` router every JSON endpoint would start accepting 25 MB.
+        .merge(
+            OpenApiRouter::new()
+                .routes(routes!(upload_my_avatar, get_my_avatar, delete_my_avatar))
+                .routes(routes!(get_avatar, delete_avatar))
+                .layer(DefaultBodyLimit::max(
+                    MAX_MAX_FILE_BYTES as usize + UPLOAD_BODY_OVERHEAD_BYTES,
+                )),
+        )
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -61,6 +84,12 @@ struct UpdateProfile {
     /// Birth date in `YYYY-MM-DD` form.
     #[schema(example = "1990-01-02")]
     birth_date: Option<String>,
+    /// The name the public profile is shown under, instead of the legal one.
+    #[schema(example = "Ada", max_length = 50)]
+    display_name: Option<String>,
+    /// Free text under the profile's name.
+    #[schema(example = "Sınıfın en hızlı pomodorocusu.", max_length = 500)]
+    bio: Option<String>,
 }
 
 /// Partial UI-preference update. Same field semantics as [`UpdateProfile`]:
@@ -112,8 +141,19 @@ async fn apply_profile(
     let email = merge_field(req.email.as_deref(), Email::try_new)?;
     let phone = merge_field(req.phone.as_deref(), Phone::try_new)?;
     let birth_date = merge_field(req.birth_date.as_deref(), BirthDate::try_new)?;
+    let display_name = merge_field(req.display_name.as_deref(), DisplayName::try_new)?;
+    let bio = merge_field(req.bio.as_deref(), Bio::try_new)?;
     let updated = user
-        .set_profile(name, surname, email, phone, birth_date, db)
+        .set_profile(
+            name,
+            surname,
+            email,
+            phone,
+            birth_date,
+            display_name,
+            bio,
+            db,
+        )
         .await?;
     Ok(UserResponse::new(&updated))
 }
@@ -222,8 +262,10 @@ async fn list_users(
 }
 
 /// Update the caller's own personal info: name, surname, email, phone, birth
-/// date. Any authenticated role. Omitted fields stay as they are; an empty
-/// string clears a field.
+/// date, plus the public-profile pair `display_name` and `bio` (both readable
+/// school-wide at `GET /users/{id}/profile`, unlike the contact fields). Any
+/// authenticated role. Omitted fields stay as they are; an empty string clears
+/// a field.
 #[utoipa::path(
     patch,
     path = "/me",
@@ -614,4 +656,421 @@ async fn my_students(
         return Err(AppError::Forbidden("requires the parent role"));
     }
     Ok(Json(students_page(user.get_id(), page, &st.db).await?))
+}
+
+// ---- the public profile -----------------------------------------------------
+// The school-wide read half of a user row: who they are, what they belong to,
+// and the counters that motivate. Deliberately *not* `UserResponse` — that one
+// carries email, phone, and birth date, which keep exactly the gate they have
+// today (self, teacher+, admin). Nothing here widens where they are reachable.
+
+/// A user's public profile. Contact details are not part of it, at any role.
+#[derive(Serialize, ToSchema)]
+struct ProfileResponse {
+    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    id: String,
+    #[schema(example = "ada")]
+    username: String,
+    /// The self-chosen `display_name`, falling back to `"Name Surname"`, then
+    /// `null` when the row carries neither.
+    #[schema(example = "Ada Lovelace")]
+    display_name: Option<String>,
+    role: RoleSchema,
+    #[schema(example = "Sınıfın en hızlı pomodorocusu.")]
+    bio: Option<String>,
+    /// Present only once a picture is uploaded; the bytes are at
+    /// `GET /users/{id}/avatar`.
+    avatar: Option<ProfileAvatar>,
+    /// At most `max_profile_classes` sections — the full list is at
+    /// `GET /classes/me`.
+    classes: Vec<ProfileClassRef>,
+    /// At most `max_profile_courses` courses, and only the ones the *reader*
+    /// may already read at `GET /courses/{id}` — a stranger sees an empty
+    /// block, the owner and manager+ see it whole. The full list is at
+    /// `GET /courses/me`.
+    courses: Vec<ProfileCourseRef>,
+    stats: ProfileStatsResponse,
+}
+
+/// What a stored avatar is, without its bytes.
+#[derive(Serialize, ToSchema)]
+struct ProfileAvatar {
+    #[schema(example = "image/png")]
+    content_type: String,
+    /// Size in bytes.
+    #[schema(example = 20_480)]
+    size: i64,
+}
+
+/// A class section as a profile shows it: the label, and nothing about who runs
+/// it. The office-side view (creator, homeroom teacher) stays behind
+/// `GET /classes/{id}`, which is teacher+.
+#[derive(Serialize, ToSchema)]
+struct ProfileClassRef {
+    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    id: String,
+    #[schema(example = "9-A")]
+    name: String,
+    #[schema(example = "9")]
+    grade: Option<String>,
+}
+
+/// A course as a profile shows it — a label, nothing more.
+#[derive(Serialize, ToSchema)]
+struct ProfileCourseRef {
+    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    id: String,
+    #[schema(example = "Matematik")]
+    title: String,
+    /// `course`, `study` (etüt), or `club` (kulüp).
+    #[schema(example = "course")]
+    kind: String,
+}
+
+/// The motivational counters. Derived, never settable, and never `null`: an
+/// account with no rows behind a counter reads a true `0`.
+#[derive(Serialize, ToSchema)]
+struct ProfileStatsResponse {
+    /// Finished pomodoro stints; an open one counts for nothing.
+    pomodoro_sessions: i64,
+    /// Total focused milliseconds across those stints.
+    pomodoro_focus_ms: i64,
+    /// Every course behind the `courses` block, not just the embedded window.
+    courses: i64,
+    /// Every class behind the `classes` block, not just the embedded window.
+    classes: i64,
+}
+
+/// Build one profile as `viewer` may see it. The course block is chosen off the
+/// owner's **live** role, not off the `creator`/`teachers` columns: those are
+/// historical and no demotion sweeps them, so a demoted ex-teacher lists what
+/// they are enrolled in, like any other student.
+///
+/// A course carries a title, and `GET /courses/{id}` hands that title only to
+/// the enrolled, the staff who run it, and manager+ — so the block is
+/// intersected with [`visible_courses`], the same catalog `GET /courses`
+/// serves. Nothing here crosses a gate the viewer would fail directly. Reading
+/// your own profile, or reading as manager+, needs no intersection: both
+/// already see the whole list. `stats.courses` stays the owner's true total —
+/// it is the motivational counter, and a magnitude names no course.
+async fn profile_of(
+    st: &AppState,
+    user: &User,
+    viewer: &User,
+) -> Result<ProfileResponse, AppError> {
+    let id = user.get_id();
+    // One catalog read per request, never one authorization call per course.
+    let readable = match viewer.get_id() == id || viewer.get_role().at_least(Role::Manager) {
+        true => None,
+        false => Some(
+            visible_courses(viewer, &st.db)
+                .await?
+                .iter()
+                .map(|course| course.get_id().clone())
+                .collect::<Vec<_>>(),
+        ),
+    };
+    // The window is cut after the intersection, so a filtered viewer still gets
+    // up to `MAX_PROFILE_COURSES` courses they can actually see.
+    let (mut courses, course_total) = match user.get_role().at_least(Role::Teacher) {
+        // The teacher read is unpaged, so the total is what came back.
+        true => {
+            let courses = Course::list_for_teacher(id, &st.db).await?;
+            let total = courses.len() as i64;
+            (courses, total)
+        }
+        // Unfiltered readers can take the window from the database.
+        false => {
+            let window = readable.is_none().then_some(MAX_PROFILE_COURSES as i64);
+            Course::list_enrolled(id, window, 0, &st.db).await?
+        }
+    };
+    if let Some(readable) = &readable {
+        courses.retain(|course| readable.contains(course.get_id()));
+    }
+    courses.truncate(MAX_PROFILE_COURSES);
+    let (members, class_total) =
+        ClassMember::list_for_user(id, Some(MAX_PROFILE_CLASSES as i64), 0, &st.db).await?;
+    let class_ids: Vec<ClassGroupId> = members.iter().map(|row| row.get_class().clone()).collect();
+    let classes = ClassGroup::list_by_ids(&class_ids, &st.db).await?;
+    // Both totals are the full counts, not the windowed ones — the blocks are a
+    // preview, the stats are the truth.
+    let stats = ProfileStats::load(id, course_total, class_total, &st.db).await?;
+    Ok(ProfileResponse {
+        id: id.key().to_string(),
+        username: user.get_username().as_str().to_string(),
+        display_name: user
+            .get_display_name()
+            .map(|name| name.as_str().to_string())
+            // The legal-name join lives in `PersonRef` — one spelling of it.
+            .or_else(|| PersonRef::new(user).display_name),
+        role: user.get_role().into(),
+        bio: user.get_bio().map(|bio| bio.as_str().to_string()),
+        avatar: user
+            .get_avatar_content_type()
+            .map(|content_type| ProfileAvatar {
+                content_type: content_type.as_str().to_string(),
+                size: user.get_avatar_size().unwrap_or_default(),
+            }),
+        classes: classes
+            .iter()
+            .map(|class| ProfileClassRef {
+                id: class.get_id().key().to_string(),
+                name: class.get_name().as_str().to_string(),
+                grade: class.get_grade().map(|grade| grade.as_str().to_string()),
+            })
+            .collect(),
+        courses: courses
+            .iter()
+            .map(|course| ProfileCourseRef {
+                id: course.get_id().key().to_string(),
+                title: course.get_title().as_str().to_string(),
+                kind: course.get_kind().as_str().to_string(),
+            })
+            .collect(),
+        stats: ProfileStatsResponse {
+            pomodoro_sessions: stats.get_pomodoro_sessions(),
+            pomodoro_focus_ms: stats.get_pomodoro_focus_ms(),
+            courses: stats.get_courses(),
+            classes: stats.get_classes(),
+        },
+    })
+}
+
+/// The profile gate: any authenticated account reads any profile — except a
+/// parent, who is an observer of their own children and of nobody else. The
+/// link alone is not the grant either; [`ensure_can_observe`] re-reads the
+/// target's live role, so a student who was promoted out stops being readable.
+async fn ensure_may_read_profile(
+    caller: &User,
+    target: &UserId,
+    db: &Database,
+) -> Result<(), AppError> {
+    if caller.get_role() == Role::Parent && caller.get_id() != target {
+        ensure_can_observe(caller, target, db).await?;
+    }
+    Ok(())
+}
+
+/// The target's row, 404 if it is gone, once the caller is allowed to see it.
+async fn readable_profile_user(st: &AppState, caller: &User, id: &str) -> Result<User, AppError> {
+    let target = UserId::from_key(id);
+    ensure_may_read_profile(caller, &target, &st.db).await?;
+    User::read(&target, &st.db).await?.ok_or(AppError::NotFound)
+}
+
+/// The caller's own public profile — what everyone else sees of them.
+#[utoipa::path(
+    get,
+    path = "/me/profile",
+    tag = "users",
+    security(("session_cookie" = [])),
+    responses(
+        (status = 200, description = "The caller's profile", body = ProfileResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+    ),
+)]
+async fn my_profile(
+    State(st): State<AppState>,
+    CurrentUser(user): CurrentUser,
+) -> Result<Json<ProfileResponse>, AppError> {
+    Ok(Json(profile_of(&st, &user, &user).await?))
+}
+
+/// One user's public profile: display name, bio, avatar meta, their class and
+/// course blocks, and the motivational counters. Readable by every
+/// authenticated account — except a parent, who reads only their own and their
+/// linked students'. Never carries email, phone, or birth date; those stay on
+/// `GET /users/{id}` (admin) and `GET /auth/me`. The embedded blocks are capped
+/// at `max_profile_classes` / `max_profile_courses` (see `GET /limits`) — the
+/// full paged lists are `GET /classes/me` and `GET /courses/me`. The course
+/// block is also cut to what the *reader* may already see: only courses they
+/// would pass `GET /courses/{id}` on. `stats.courses` stays the owner's true
+/// total either way.
+#[utoipa::path(
+    get,
+    path = "/{id}/profile",
+    tag = "users",
+    security(("session_cookie" = [])),
+    params(("id" = String, Path, description = "User id")),
+    responses(
+        (status = 200, description = "The user's profile", body = ProfileResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "A parent without a link to this student", body = ErrorResponse),
+        (status = 404, description = "User not found", body = ErrorResponse),
+    ),
+)]
+async fn get_user_profile(
+    State(st): State<AppState>,
+    CurrentUser(caller): CurrentUser,
+    Path(id): Path<String>,
+) -> Result<Json<ProfileResponse>, AppError> {
+    let target = readable_profile_user(&st, &caller, &id).await?;
+    Ok(Json(profile_of(&st, &target, &caller).await?))
+}
+
+// ---- the avatar -------------------------------------------------------------
+// One optional picture per user, the same one-image-on-the-owning-row shape the
+// question pool uses: bytes on disk under a server-generated ULID, metadata on
+// the user row. Every write here must take the replaced blob off disk — no
+// route deletes a user, so nothing else would ever collect it.
+
+/// Upload (or replace) the caller's own avatar. `multipart/form-data` with the
+/// image under a `file` field; the declared content type must be `image/png`,
+/// `image/jpeg`, `image/webp`, or `image/gif` (rasters only — no SVG), the
+/// bytes at most the school's `max_file_bytes` (settings). Replacing one drops
+/// the previous picture.
+#[utoipa::path(
+    post,
+    path = "/me/avatar",
+    tag = "users",
+    security(("session_cookie" = [])),
+    request_body(content = UploadFileForm, content_type = "multipart/form-data"),
+    responses(
+        (status = 201, description = "Avatar stored", body = ProfileAvatar),
+        (status = 400, description = "Missing file field, empty file, or a content type outside the image allowlist", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 404, description = "The account no longer exists", body = ErrorResponse),
+        (status = 413, description = "Image exceeds the school's size limit", body = ErrorResponse),
+    ),
+)]
+async fn upload_my_avatar(
+    State(st): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    mut multipart: Multipart,
+) -> Result<(StatusCode, Json<ProfileAvatar>), AppError> {
+    let upload = read_image_upload(&st, &mut multipart).await?;
+    let size = upload.size();
+
+    let file = ulid::Ulid::new().to_string();
+    store_blob(&st, &file, &upload.data, || async {
+        match User::set_avatar(user.get_id(), &file, &upload.content_type, size, &st.db).await? {
+            // Row written; the picture this one replaced comes off disk.
+            Some(before) => Ok(((), before.get_avatar_file().map(str::to_string))),
+            // The account went away mid-upload — the fresh blob is an orphan.
+            None => Err(AppError::NotFound),
+        }
+    })
+    .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(ProfileAvatar {
+            content_type: upload.content_type.as_str().to_string(),
+            size,
+        }),
+    ))
+}
+
+/// The caller's own avatar bytes. The self alias of `GET /{id}/avatar` — the
+/// static `/me/avatar` segment wins over `/{id}/avatar` in the router, so
+/// without this a client that never learned its own id gets a bodyless `405`
+/// on the obvious route. It serves the caller's own row and nothing else, so
+/// it asks no gate: the session already proves the reach.
+#[utoipa::path(
+    get,
+    path = "/me/avatar",
+    tag = "users",
+    security(("session_cookie" = [])),
+    responses(
+        (status = 200, description = "The image bytes", content_type = "image/*"),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 404, description = "The caller has no avatar", body = ErrorResponse),
+    ),
+)]
+async fn get_my_avatar(
+    State(st): State<AppState>,
+    CurrentUser(user): CurrentUser,
+) -> Result<Response, AppError> {
+    serve_avatar(&st, &user).await
+}
+
+/// The avatar bytes. Same reach as the profile itself: every authenticated
+/// account, except a parent, who is limited to their own and their linked
+/// students'.
+#[utoipa::path(
+    get,
+    path = "/{id}/avatar",
+    tag = "users",
+    security(("session_cookie" = [])),
+    params(("id" = String, Path, description = "User id")),
+    responses(
+        (status = 200, description = "The image bytes", content_type = "image/*"),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "A parent without a link to this student", body = ErrorResponse),
+        (status = 404, description = "No such user, or they have no avatar", body = ErrorResponse),
+    ),
+)]
+async fn get_avatar(
+    State(st): State<AppState>,
+    CurrentUser(caller): CurrentUser,
+    Path(id): Path<String>,
+) -> Result<Response, AppError> {
+    let target = readable_profile_user(&st, &caller, &id).await?;
+    serve_avatar(&st, &target).await
+}
+
+/// The shared tail of both avatar reads: the bytes, or a `404` when the row
+/// carries none. The caller owns the gate — this one is reached already.
+async fn serve_avatar(st: &AppState, user: &User) -> Result<Response, AppError> {
+    match (user.get_avatar_file(), user.get_avatar_content_type()) {
+        (Some(file), Some(content_type)) => {
+            serve_inline_blob(&st.files_path, file, content_type).await
+        }
+        _ => Err(AppError::NotFound),
+    }
+}
+
+/// Remove the caller's own avatar.
+#[utoipa::path(
+    delete,
+    path = "/me/avatar",
+    tag = "users",
+    security(("session_cookie" = [])),
+    responses(
+        (status = 204, description = "Avatar removed"),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 404, description = "No avatar to remove", body = ErrorResponse),
+    ),
+)]
+async fn delete_my_avatar(
+    State(st): State<AppState>,
+    CurrentUser(user): CurrentUser,
+) -> Result<StatusCode, AppError> {
+    drop_avatar(&st, user.get_id()).await
+}
+
+/// Remove any user's avatar. Admin only — the moderation path: an offensive
+/// picture is a school problem, and no route deletes the account it hangs on.
+#[utoipa::path(
+    delete,
+    path = "/{id}/avatar",
+    tag = "users",
+    security(("session_cookie" = [])),
+    params(("id" = String, Path, description = "User id")),
+    responses(
+        (status = 204, description = "Avatar removed"),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires admin role", body = ErrorResponse),
+        (status = 404, description = "No such user, or no avatar to remove", body = ErrorResponse),
+    ),
+)]
+async fn delete_avatar(
+    State(st): State<AppState>,
+    _admin: RequireAdmin,
+    Path(id): Path<String>,
+) -> Result<StatusCode, AppError> {
+    drop_avatar(&st, &UserId::from_key(&id)).await
+}
+
+/// Clear the row's avatar and take its blob off disk — the shared tail of the
+/// self and moderation deletes. A row without one (or no row at all) is a 404.
+async fn drop_avatar(st: &AppState, user: &UserId) -> Result<StatusCode, AppError> {
+    let before = User::clear_avatar(user, &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let Some(file) = before.get_avatar_file() else {
+        return Err(AppError::NotFound);
+    };
+    remove_blob(&st.files_path, file).await;
+    Ok(StatusCode::NO_CONTENT)
 }

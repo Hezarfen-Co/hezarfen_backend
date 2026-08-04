@@ -58,6 +58,11 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS theme ON user TYPE option<string>;
     DEFINE FIELD IF NOT EXISTS language ON user TYPE option<string>;
     DEFINE FIELD IF NOT EXISTS palette_color ON user TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS display_name ON user TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS bio ON user TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS avatar_file ON user TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS avatar_content_type ON user TYPE option<string>;
+    DEFINE FIELD IF NOT EXISTS avatar_size ON user TYPE option<int>;
     DEFINE FIELD IF NOT EXISTS chatbot_thread_count ON user TYPE option<int>;
     DEFINE FIELD IF NOT EXISTS board_count ON user TYPE option<int>;
     DEFINE INDEX IF NOT EXISTS user_username ON user FIELDS username UNIQUE;

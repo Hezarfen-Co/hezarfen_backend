@@ -107,6 +107,15 @@ impl PomodoroSession {
     /// `CREATE` cannot answer "already exists" on the way back — the table
     /// carries no `UNIQUE` index and `$closed` is one freshly minted ULID.
     /// Only the guard's own `THROW` is a decision, and it stays a 409.
+    ///
+    /// `finished_at` is floored at the row's own `started_at`. Both stamps come
+    /// from [`Timestamp::now`], i.e. the wall clock, which an NTP step can move
+    /// *backwards* mid-stint — so a close can legitimately read earlier than its
+    /// own start with nothing wrong on the client's side. Refusing it would lose
+    /// a real study session and leave the open slot wedged for a fault the
+    /// student did not cause; recording a zero-length stint keeps the session
+    /// count honest and its duration merely understated. Nothing downstream may
+    /// then read a negative duration (`ProfileStats::load` sums these).
     pub async fn finish(user: &UserId, db: &Database) -> Result<PomodoroSession, AppError> {
         let (mut result, mut errors) = transaction_with_retry(
             db,
@@ -116,7 +125,7 @@ impl PomodoroSession {
                  CREATE $closed CONTENT {
                      user: $before[0].user,
                      started_at: $before[0].started_at,
-                     finished_at: $done,
+                     finished_at: math::max([$before[0].started_at, $done]),
                  };
                  COMMIT TRANSACTION;",
             &[
@@ -211,5 +220,33 @@ mod tests {
         PomodoroSession::start(&user, &db).await.unwrap();
         let sessions = PomodoroSession::list_for_user(&user, &db).await.unwrap();
         assert_eq!(sessions.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_backwards_clock_records_a_zero_stint_not_a_negative_one() {
+        let db = database::init_mem().await.unwrap();
+        let user = UserId::from_key(&Ulid::new().to_string());
+
+        PomodoroSession::start(&user, &db).await.unwrap();
+        // Stand in for the NTP step: push the running stint's start an hour
+        // ahead, so the server clock `finish` reads is *behind* it.
+        db.query("UPDATE $open SET started_at = $future")
+            .bind(("open", PomodoroSessionId::open_for(&user).record()))
+            .bind(("future", Timestamp::now().as_millis() + 3_600_000))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        let closed = PomodoroSession::finish(&user, &db).await.unwrap();
+        let started = closed.get_started_at().as_millis();
+        assert_eq!(closed.get_finished_at().unwrap().as_millis(), started);
+
+        // And the stat that sums these stays non-negative.
+        let stats = crate::domain::profile::ProfileStats::load(&user, 0, 0, &db)
+            .await
+            .unwrap();
+        assert_eq!(stats.get_pomodoro_sessions(), 1);
+        assert_eq!(stats.get_pomodoro_focus_ms(), 0);
     }
 }

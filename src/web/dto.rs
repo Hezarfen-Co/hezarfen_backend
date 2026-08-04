@@ -140,6 +140,14 @@ pub struct UserResponse {
     /// never chosen — the client should fall back to its default accent.
     #[schema(example = "#fefae0")]
     pub palette_color: Option<String>,
+    /// The name the public profile is shown under, instead of the legal one.
+    /// `null` = never chosen; unlike [`PersonRef::display_name`] this is the
+    /// stored column, never a fallback to `"Name Surname"`.
+    #[schema(example = "Ada")]
+    pub display_name: Option<String>,
+    /// Free text under the profile's name; `null` when unset.
+    #[schema(example = "Sınıfın en hızlı pomodorocusu.")]
+    pub bio: Option<String>,
 }
 
 impl UserResponse {
@@ -156,6 +164,8 @@ impl UserResponse {
             theme: user.get_theme().map(|v| v.as_str().to_string()),
             language: user.get_language().map(|v| v.as_str().to_string()),
             palette_color: user.get_palette_color().map(|v| v.as_str().to_string()),
+            display_name: user.get_display_name().map(|v| v.as_str().to_string()),
+            bio: user.get_bio().map(|v| v.as_str().to_string()),
         }
     }
 }

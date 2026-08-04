@@ -87,6 +87,13 @@ fn expectations() -> Vec<(&'static str, &'static str, &'static str, i64)> {
         ("UpdateProfile", "surname", "maxLength", MAX_NAME_LEN as i64),
         ("UpdateProfile", "email", "maxLength", MAX_EMAIL_LEN as i64),
         (
+            "UpdateProfile",
+            "display_name",
+            "maxLength",
+            MAX_DISPLAY_NAME_LEN as i64,
+        ),
+        ("UpdateProfile", "bio", "maxLength", MAX_BIO_LEN as i64),
+        (
             "CreateNote",
             "title",
             "maxLength",
@@ -1070,7 +1077,7 @@ async fn the_image_meta_bodies_stay_the_same_shape() {
     };
 
     let want = shape("ImageMetaResponse");
-    for other in ["BankImageMeta", "PoolImageMeta"] {
+    for other in ["BankImageMeta", "PoolImageMeta", "ProfileAvatar"] {
         assert_eq!(
             want,
             shape(other),

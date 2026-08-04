@@ -114,6 +114,13 @@ also carries its own **UI preferences** — theme (`light`/`dark`), language
 any hex, deliberately not a fixed palette) — self-managed, admin-editable for
 anyone, `null` until chosen so the client can fall back to the device
 preference (or, for the accent, its own default).
+Every account also has a **public profile** (`/users/{id}/profile`): a
+self-chosen `display_name` and `bio`, one **avatar**, the classes and courses
+it belongs to, and counters computed at read (finished pomodoro stints, course
+and class totals). Contact details are deliberately not part of it — email,
+phone and birth date keep the gate they already have — and any authenticated
+account reads any profile, except a `parent`, who reads their own and their
+linked students' only (see "User profiles & avatars").
 The **AI features live in separate projects**, so the backend also opens a
 QUIC **AI bridge** (`AI_QUIC_ADDR`, off by default): AI services dial in,
 register the capabilities they serve, and each request rides its own QUIC
@@ -318,7 +325,10 @@ response in the same commit.
                      "username_separators": [".", "_", "-"],
                      "reserved_usernames": ["admin", "…"],
                      "min_password_len": 6, "max_password_len": 128,
-                     "max_name_len": 100, "max_email_len": 254,
+                     "max_name_len": 100, "max_display_name_len": 50,
+                     "max_bio_len": 500,
+                     "max_profile_courses": 20, "max_profile_classes": 5,
+                     "max_email_len": 254,
                      "min_phone_digits": 7, "max_phone_digits": 15,
                      "roles": ["parent", "student", "teacher", "manager", "admin"],
                      "themes": ["light", "dark"], "languages": ["tr", "en"],
@@ -588,6 +598,7 @@ still left exactly as they stand.
 | Read another user's homework report      | teacher      | Narrowed to the caller's managed courses; `manager`+ sees all; a `parent` sees a linked student's in full — statuses/marks/flags, never files |
 | Edit **own** personal info (name, surname, email, phone, birth date) | student | Every account carries the same optional info fields |
 | Edit **own** UI preferences (theme, language, accent color) | student | `null` until chosen — the client then follows the device preference |
+| Read any user's **public profile** and avatar; upload/remove **own** avatar | student | A `parent` is the exception: own and linked students' only, the link and the target's live role re-read per call. Removing *another* user's avatar is admin-only moderation |
 | List **own** linked students             | parent       | Read-only: the list plus each student's mark/attendance/pomodoro/homework reports — a parent changes nothing, anywhere |
 | Read the school settings and the term list | student | Clients need them to render kind/status pickers, grades, and the calendar |
 | Edit school settings; create / edit / delete terms | manager | School policy (exam kinds, attendance statuses, grade bands, the note-file size limit) and the academic calendar are management's call |
@@ -721,14 +732,21 @@ window filtering, before paging; negative values are a `400` naming the field.
 | POST   | `/auth/login`                    | no      | `{username, password}` -> cookie|
 | POST   | `/auth/logout`                   | no      | Clear session (no-op if none)   |
 | GET    | `/auth/me`                       | student | Current user (incl. `role` and personal info) |
-| PATCH  | `/users/me`                      | student | Update own personal info (see below) |
+| PATCH  | `/users/me`                      | student | Update own personal info, `display_name` and `bio` included (see below) |
 | PATCH  | `/users/me/preferences`          | student | `{theme?, language?, palette_color?}` — own UI preferences (see below) |
+| GET    | `/users/me/profile`              | student | Own public profile — what everyone else sees of the caller |
+| POST   | `/users/me/avatar`               | student | Upload/replace own avatar: `multipart/form-data`, one `file` part, raster images only, ≤ the school's `max_file_bytes` -> `{content_type, size}` |
+| GET    | `/users/me/avatar`               | student | Own avatar bytes (`404` if there is none) — the self alias of `/users/{id}/avatar` |
+| DELETE | `/users/me/avatar`               | student | Remove own avatar (`404` if there is none) |
 | GET    | `/users/me/students`             | parent  | The caller's linked students (refs, sorted by username) · paged |
 | GET    | `/users/search`                  | teacher | `?q=<fragment>&role=<role?>` — find users by username/name fragment (pickers); refs only, no contact info · paged |
 | GET    | `/users`                         | admin   | List all users · paged          |
+| GET    | `/users/{id}/profile`            | student | Any user's public profile — a `parent` reads only their own and their linked students' (`403`) |
+| GET    | `/users/{id}/avatar`             | student | The avatar bytes (`nosniff`, `private, no-store`); same reach as the profile |
+| DELETE | `/users/{id}/avatar`             | admin   | Remove any user's avatar — the moderation path |
 | GET    | `/users/{id}`                    | admin   | Get one user                    |
 | PATCH  | `/users/{id}/role`               | admin   | `{role}` — set a user's role; promotion out of `student` drops the user's course enrollments (only students enroll), and a demotion to `parent` also frees their seats on still-open event signup lists |
-| PATCH  | `/users/{id}/profile`            | admin   | Update any user's personal info |
+| PATCH  | `/users/{id}/profile`            | admin   | Update any user's personal info, `display_name` and `bio` included |
 | PATCH  | `/users/{id}/preferences`        | admin   | Update any user's UI preferences |
 | POST   | `/users/{id}/students`           | admin   | `{user_id}` — tie a **student** to a **parent** account `{id}` (idempotent); the tie is the parent's read grant |
 | GET    | `/users/{id}/students`           | admin   | List a parent's linked students · paged |
@@ -1068,7 +1086,8 @@ digits plus non-consecutive interior `.`, `_`, `-` separators, starting and
 ending with a letter or digit (3–32 chars). Staff-looking names (`admin`,
 `administrator`, `root`, `support`, `system`, `moderator`, `staff`) are
 rejected at `/auth/register` only — the `ADMIN_USERNAME` bootstrap may still
-seed them.
+seed them. `display_name` (≤ 50) and `bio` (≤ 500) ride the same two patches
+under the same rules, `""` clearing either (see "User profiles & avatars").
 UI preferences (`theme`: `light`/`dark`, `language`: `tr`/`en`,
 `palette_color`: an accent color as `#` plus exactly 6 hex digits) ride on the
 same account row and come back on every user response (`/auth/me` included).
@@ -1080,6 +1099,101 @@ whole patch is a `400`. `palette_color` is the one **open** set: any valid hex
 passes (mixed case in, stored and returned lowercase), so a new frontend
 palette needs no backend change — `/limits` publishes its pattern rather than a
 list of colors.
+
+## User profiles & avatars
+
+The public half of an account: who someone is inside the school, readable by
+the school. `GET /users/me/profile` is the caller's own copy of it,
+`GET /users/{id}/profile` anyone's, and both return the same document:
+
+```json
+{
+  "id": "01J8XZ0K3Q8G7X2M4N5P6R7S8T",
+  "username": "ada",
+  "display_name": "Ada Lovelace",
+  "role": "student",
+  "bio": "Sınıfın en hızlı pomodorocusu.",
+  "avatar": { "content_type": "image/png", "size": 20480 },
+  "classes": [ { "id": "01J8…", "name": "9-A", "grade": "9" } ],
+  "courses": [ { "id": "01J8…", "title": "Matematik", "kind": "course" } ],
+  "stats": { "pomodoro_sessions": 42, "pomodoro_focus_ms": 63000000,
+             "courses": 7, "classes": 1 }
+}
+```
+
+**Contact fields are absent by design.** `email`, `phone` and `birth_date` are
+not on this document at any role — they keep exactly the gate they have today
+(`GET /auth/me` for oneself, `GET /users/{id}` for an admin). A school-wide
+read surface is not the place to widen where a phone number is reachable.
+
+**Visibility** is every authenticated account reading every profile, with one
+exception: a `parent` reads their own and their currently-linked students', and
+nothing else (`403`). Both halves of that grant are re-read on each call — the
+link *and* the target's live role — so unlinking a student, or promoting one
+out of `student`, stops the reads at once rather than at the next login.
+
+**`display_name`** resolves in three steps: the stored `display_name`, else the
+`"name surname"` join, else `null`. It does **not** replace `name`/`surname` —
+those stay the school-office record, and an admin still edits them — and it
+deliberately does not enter the user search fold: `/users/search` finds people
+by the name the office knows them under, not by a nickname they picked this
+morning. `display_name` and `bio` are patched through the ordinary
+`PATCH /users/me` (or the admin `PATCH /users/{id}/profile`) with the same
+field semantics as the rest: omitted keeps, `""` clears, anything else is
+validated.
+
+**The class and course blocks are a narrowed projection**, not the rows
+themselves: id/name/grade for a class, id/title/kind for a course. A class's
+`creator` and its homeroom teacher are office data behind the teacher+
+`GET /classes/{id}` and stay there — a profile that carried them would widen
+that gate by accident. Both blocks are truncated (20 courses, 5 classes, both
+published in `/limits` as `max_profile_courses` / `max_profile_classes`); a
+profile is a preview, and `GET /courses/me` and `GET /classes/me` are the full
+paged lists.
+
+**The courses block follows the profile owner's live role**: teacher+ lists the
+courses they teach, everyone else the courses they are enrolled in. It is read
+off the role, never off the stored `creator`/`teachers` columns, because
+ownership here is a live grant and no demotion sweeps those columns — so a
+demoted ex-teacher lists what they are enrolled in, like any other student.
+
+**and it is then cut to what the *reader* may already see**: a course appears
+only if the reader would pass the ordinary course-read gate for it
+(`GET /courses/{id}` — enrolled, creator, assigned teacher, or manager+). A
+course title is not public: a peer who is `403` on the course itself, and gets
+an empty `GET /courses`, must not read it off somebody's profile instead. Your
+own profile and a manager's read are never cut, since both already see the
+whole list, and the 20-course truncation runs *after* the filter, so a reader
+gets up to 20 courses they can actually open. `stats.courses` stays the
+owner's true total on purpose — it is the motivational counter, a per-reader
+number would be meaningless, and a magnitude names no course. One consequence,
+by design: a teacher you share nothing with has an empty `courses` block.
+
+**Stats are computed at read, never stored.** No counter column can drift out
+of sync with the rows behind it, and an account with no data reads a true `0`
+rather than `null`. Only *finished* pomodoro stints count — a timer left
+running is not study time. Exam averages, homework-done rates and attendance
+rates are deliberately absent: those tables are indexed for their own reads, so
+a per-user aggregate over them is a full table scan, and a profile is far too
+cheap a page to pay for one.
+
+**The avatar** is one picture per account, uploaded as `multipart/form-data`
+with the image under a `file` field. Raster types only (`image/png`,
+`image/jpeg`, `image/webp`, `image/gif`) — an SVG can carry script, and these
+bytes render inline all over the school. The size cap is the school's existing
+`max_file_bytes` setting rather than a new knob: one number to raise when a
+school wants bigger uploads. Uploading replaces, and the picture it replaced
+comes off disk. The owner removes theirs at `DELETE /users/me/avatar`; an admin
+removes anyone's at `DELETE /users/{id}/avatar`, the moderation path — an
+offensive picture is a school problem. The bytes come back from
+`GET /users/{id}/avatar` under the same reach as the profile itself, served
+`X-Content-Type-Options: nosniff` and `Cache-Control: private, no-store`;
+`GET /users/me/avatar` is the same read for the caller's own picture, so a
+client that never learned its own id still has a route.
+
+There is no `badges` key yet. Auto-earned badges are a planned second pass and
+will be added to `stats`' neighborhood additively, so a client written against
+today's document keeps working.
 
 ## Appointments
 
