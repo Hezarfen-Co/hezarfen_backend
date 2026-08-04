@@ -1,5 +1,6 @@
 //! Validation limits, in one place.
 
+use crate::domain::badge::BadgeStat;
 use crate::domain::message::Folder;
 use crate::domain::preferences::{Language, Theme};
 use crate::domain::role::Role;
@@ -798,6 +799,11 @@ pub const FEE_PLAN_ASSIGNMENT_TABLE: &str = "fee_plan_assignment";
 pub const PAYMENT_LEDGER_TABLE: &str = "payment_ledger";
 pub const BOARD_TABLE: &str = "board";
 pub const BOARD_STROKE_TABLE: &str = "board_stroke";
+/// One row per badge a user has earned, keyed by the pair. A table of its own
+/// rather than an array column on the user row: an `array<…>` there breaks
+/// every `PATCH` of that row, and awards are append-only facts with their own
+/// timestamp (see [`crate::domain::badge`]).
+pub const BADGE_AWARD_TABLE: &str = "badge_award";
 /// One row per *name* the school's settings offer, keyed by the name itself:
 /// how many rows still reference it, and whether it has been retired out of the
 /// list (see the reference counters in [`crate::domain::cap`]).
@@ -850,6 +856,62 @@ pub const CHATBOT_THREAD_COUNT_FIELD: &str = "chatbot_thread_count";
 /// what closes the "open another board" way around the two board counters
 /// below; released when a board is deleted.
 pub const USER_BOARD_COUNT_FIELD: &str = "board_count";
+/// The lifetime totals behind the badges, all on the user row. Not caps: each
+/// one counts something the student *did*. Only the two homework counters ever
+/// come down, and in exactly one case — a student withdrawing their own
+/// submission — because that route is self-service and a strictly monotonic
+/// counter would let one homework be farmed into fifty by submit/delete/submit.
+/// The exam and pomodoro totals never decrease at all: there is no student-facing
+/// delete behind them, so sitting an exam or finishing a stint is a lifetime
+/// fact. Nothing else decrements: a teacher's delete and the course cascade
+/// (which do take the attempt rows with them) leave them alone,
+/// since history a teacher erased is still history the student lived. A badge
+/// already earned is never taken back either, whatever a counter does
+/// afterwards — [`crate::domain::badge`] only ever adds award rows. Floored at
+/// zero, and absent means zero: an account older than the columns reads exactly
+/// like a fresh one.
+pub const HOMEWORK_SUBMITTED_TOTAL_FIELD: &str = "homework_submitted_total";
+pub const HOMEWORK_ON_TIME_TOTAL_FIELD: &str = "homework_on_time_total";
+pub const EXAM_SAT_TOTAL_FIELD: &str = "exam_sat_total";
+pub const POMODORO_FINISHED_TOTAL_FIELD: &str = "pomodoro_finished_total";
+pub const POMODORO_FOCUS_MS_TOTAL_FIELD: &str = "pomodoro_focus_ms_total";
+
+/// The badge catalog: every badge the system can award, as
+/// `(id, the counter it reads, the value that earns it)`. Hardcoded on
+/// purpose — moving a threshold is a deploy, which is what keeps
+/// [`crate::domain::badge::earned`] a pure function of the stats and makes the
+/// rules reviewable in a diff instead of editable in a settings row.
+///
+/// The ids are the API: the frontend maps them to a label and an icon, and an
+/// award row stores one forever. So an id is never reused for a different
+/// meaning; retiring one is done by deleting the line, and the awards that
+/// carry it simply stop being served (no data migration —
+/// [`crate::domain::badge::BadgeAward::list_for`] filters to the live
+/// catalog).
+pub const BADGES: [(&str, BadgeStat, i64); 13] = [
+    ("homework_submitted_1", BadgeStat::HomeworkSubmitted, 1),
+    ("homework_submitted_10", BadgeStat::HomeworkSubmitted, 10),
+    ("homework_submitted_50", BadgeStat::HomeworkSubmitted, 50),
+    ("homework_on_time_10", BadgeStat::HomeworkOnTime, 10),
+    ("homework_on_time_25", BadgeStat::HomeworkOnTime, 25),
+    ("exam_sat_1", BadgeStat::ExamSat, 1),
+    ("exam_sat_10", BadgeStat::ExamSat, 10),
+    ("exam_sat_25", BadgeStat::ExamSat, 25),
+    ("pomodoro_finished_10", BadgeStat::PomodoroFinished, 10),
+    ("pomodoro_finished_50", BadgeStat::PomodoroFinished, 50),
+    ("pomodoro_finished_200", BadgeStat::PomodoroFinished, 200),
+    // Ten and fifty hours of focus, in the milliseconds the counter stores.
+    (
+        "pomodoro_focus_ms_36000000",
+        BadgeStat::PomodoroFocusMs,
+        36_000_000,
+    ),
+    (
+        "pomodoro_focus_ms_180000000",
+        BadgeStat::PomodoroFocusMs,
+        180_000_000,
+    ),
+];
 /// The two stroke counters on a board row. `epoch_stroke_count` is reset to
 /// zero by a clear and capped at `MAX_EPOCH_STROKES` — a full epoch is
 /// recoverable. `total_stroke_count` is never reset and capped at

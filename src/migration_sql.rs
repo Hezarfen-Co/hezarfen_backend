@@ -65,6 +65,16 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS avatar_size ON user TYPE option<int>;
     DEFINE FIELD IF NOT EXISTS chatbot_thread_count ON user TYPE option<int>;
     DEFINE FIELD IF NOT EXISTS board_count ON user TYPE option<int>;
+    -- Lifetime badge counters (2026-08-04). Not caps and never released: each
+    -- counts something the student *did*, so a badge earned off one stands even
+    -- if the counter later drops. `option<int>` and absent reads as zero, so a
+    -- row written before them needs no repair to be *readable* — but it does
+    -- need one to be *right*, which is what the BACKFILL seeding is for.
+    DEFINE FIELD IF NOT EXISTS homework_submitted_total ON user TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS homework_on_time_total ON user TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS exam_sat_total ON user TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS pomodoro_finished_total ON user TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS pomodoro_focus_ms_total ON user TYPE option<int>;
     DEFINE INDEX IF NOT EXISTS user_username ON user FIELDS username UNIQUE;
 
     DEFINE TABLE IF NOT EXISTS session SCHEMAFULL;
@@ -613,6 +623,18 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS submitted_at ON homework_submission TYPE int READONLY;
     DEFINE FIELD IF NOT EXISTS updated_at ON homework_submission TYPE int;
     DEFINE FIELD IF NOT EXISTS file_count ON homework_submission TYPE option<int>;
+    -- The on-time verdict the badge counter was actually credited with, stamped
+    -- at the first hand-in and never re-judged. `due_at` is mutable (a teacher
+    -- moves a deadline with `PATCH /homework/{id}`), so re-deriving the verdict
+    -- at withdrawal read a *different* deadline than the credit did and gave
+    -- back the wrong thing in both directions — extend the deadline after a late
+    -- hand-in and the withdrawal debited an on-time credit that was never given;
+    -- pull it back after a punctual one and it debited nothing, leaving on_time
+    -- above submitted. `option<>` because every row predating 2026-08-04 has no
+    -- stored verdict and cannot be given one for a credit that already happened:
+    -- those fall back to the old comparison (see
+    -- [`crate::domain::homework_submission::HomeworkSubmission::delete`]).
+    DEFINE FIELD IF NOT EXISTS counted_on_time ON homework_submission TYPE option<bool>;
     -- The grade that froze this submission, absent while it is still open. The
     -- freeze used to be a cross-table read (does a homework_result exist?)
     -- followed by a write here, which no lock can hold across replicas; the
@@ -811,6 +833,20 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS created_at ON payment_ledger TYPE int READONLY;
     DEFINE INDEX IF NOT EXISTS payment_ledger_student ON payment_ledger FIELDS student;
     DEFINE INDEX IF NOT EXISTS payment_ledger_source ON payment_ledger FIELDS source;
+
+    -- One row per badge a user has earned, keyed `{user}_{badge}` so the award
+    -- is written by an UPSERT that can never double (domain::badge). `earned_at`
+    -- is `option<int>` because that is what makes the stamp write-once: the
+    -- UPSERT carries `WHERE earned_at = NONE`, so a re-sync of a badge already
+    -- held leaves the original date standing. Awards are permanent — nothing
+    -- deletes a row here — so the table needs no repair and no BACKFILL.
+    DEFINE TABLE IF NOT EXISTS badge_award SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS user ON badge_award TYPE record<user>;
+    DEFINE FIELD IF NOT EXISTS badge ON badge_award TYPE string;
+    DEFINE FIELD IF NOT EXISTS earned_at ON badge_award TYPE option<int>;
+    -- A plain field index, never `FIELDS user[*]`: the per-element form is used
+    -- by the planner and then returns zero rows (see the `course.teachers` note).
+    DEFINE INDEX IF NOT EXISTS badge_award_user ON badge_award FIELDS user;
 
     -- Reference counters, one row per *name* the settings offer, keyed by the
     -- name itself (2026-07-27). They are how 'a kind nothing is graded under
@@ -1168,6 +1204,83 @@ pub const BACKFILL: &str = "
             UPDATE $row.id SET participants = $keep WHERE participants != $keep;
         };
         UPSERT migration_mark:board_roster SET done_at = time::unix(time::now()) * 1000;
+    };
+
+    -- The badge counters, seeded from the history that already exists
+    -- (2026-08-04). Badges are earned off stored lifetime totals, and every
+    -- account on an existing volume predates the columns — so starting them all
+    -- at zero would not merely lose a number, it would mis-award every student
+    -- permanently: someone who really handed in 40 homeworks would owe 10 *more*
+    -- than a new account does to reach the same badge. The counts below are the
+    -- rows that exist, so the seed says exactly what the student did.
+    --
+    -- Marked one-time, like the board-roster sweep above and unlike every other
+    -- backfill in this file — but for the opposite reason. Those recompute a
+    -- number the live system does not own; these columns are maintained by the
+    -- request path from here on (a submission increments as it lands), so a
+    -- second recount would not converge, it would *overwrite* everything earned
+    -- since boot. The mark is the only thing that makes that safe.
+    --
+    -- The reset is inside the mark and comes first, so the whole block is
+    -- recompute-from-scratch: a boot killed mid-seed writes no mark and the next
+    -- one redoes it from a clean slate, and an operator who clears the mark to
+    -- force a re-seed gets the counts as they stand rather than a stale high
+    -- water mark. It is the one place a *zero pass* is right: it writes over
+    -- whatever a half-finished pass left, and it runs exactly once per volume.
+    --
+    -- Every counter here has to *mean* what the request path means, or a
+    -- pre-existing student diverges from a new one forever. So the on-time cut
+    -- is `submitted_at <= due_at`, the stamp both live sites use: the create
+    -- credits on the first hand-in and the delete debits by `submitted_at`, so
+    -- judging the seed by `updated_at` would let a withdrawal decrement a
+    -- submission the seed never credited and drive the counter *below* the
+    -- truth — and `touch()` moves `updated_at` on every file add or delete, so
+    -- merely attaching a file after the deadline would have done it. A dangling
+    -- `homework` link still falls out of the pass rather than counting as on
+    -- time (the traversal yields no value, so the comparison fails).
+    --
+    -- The focus sum floors *per row*, like the live close does
+    -- (`math::max([started_at, done])`), not per user: a legacy stint written
+    -- with a backwards clock is negative, and flooring the total instead would
+    -- let one such row swallow the real stints beside it. `math::max` *around*
+    -- the aggregate is the spelling that is rejected ('nested aggregate
+    -- functions are not supported'); inside it, per row, is fine.
+    --
+    -- Two counters the seed cannot make whole, for the same reason:
+    -- `exam_sat_total` (deleting an exam or a course deletes its `exam_attempt`
+    -- rows) and `homework_submitted_total` (deleting a homework cascades its
+    -- `homework_submission` rows away). Neither delete decrements — deliberate,
+    -- a lifetime 'did it' tally must not shrink because a teacher tidied up — so
+    -- the live count stands where the request path left it while a re-seed of
+    -- the same volume would read *lower*: the rows do not exist to be counted.
+    -- Do not 'repair' this by making the live path decrement; that breaks the
+    -- tally for everyone to patch history for a few.
+    --
+    -- `counted_on_time` is stamped here too, for every row the pass looks at and
+    -- by the very same cut, so a submission that predates this seed debits at
+    -- withdrawal exactly what the seed credited it. Absolute like every SET
+    -- below, so it converges on a forced re-seed.
+    IF array::len((SELECT VALUE id FROM migration_mark:profile_counters)) = 0 {
+        UPDATE user SET homework_submitted_total = 0, homework_on_time_total = 0,
+            exam_sat_total = 0, pomodoro_finished_total = 0, pomodoro_focus_ms_total = 0;
+        FOR $row IN ((SELECT user, count() AS n FROM homework_submission GROUP BY user) ?? []) {
+            UPDATE $row.user SET homework_submitted_total = $row.n;
+        };
+        FOR $row IN ((SELECT user, count() AS n FROM homework_submission
+                      WHERE submitted_at <= homework.due_at GROUP BY user) ?? []) {
+            UPDATE $row.user SET homework_on_time_total = $row.n;
+        };
+        UPDATE homework_submission SET counted_on_time = submitted_at <= homework.due_at;
+        FOR $row IN ((SELECT user, count() AS n FROM exam_attempt GROUP BY user) ?? []) {
+            UPDATE $row.user SET exam_sat_total = $row.n;
+        };
+        FOR $row IN ((SELECT user, count() AS sessions,
+                             math::sum(math::max([finished_at - started_at, 0])) AS focus_ms
+                      FROM pomodoro_session WHERE finished_at != NONE GROUP BY user) ?? []) {
+            UPDATE $row.user SET pomodoro_finished_total = $row.sessions,
+                pomodoro_focus_ms_total = $row.focus_ms;
+        };
+        UPSERT migration_mark:profile_counters SET done_at = time::unix(time::now()) * 1000;
     };
 ";
 

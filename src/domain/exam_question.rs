@@ -1183,7 +1183,22 @@ mod tests {
             let question = a_question(&exam, &from, &db).await;
             assert_eq!(count_on(&from, &db).await, 1);
 
-            ExamAttempt::start(&exam, &UserId::from_key("01TESTSTUDENTAAAAAAAAAAAAA"), &db)
+            // A real user row: starting a sitting moves that student's badge
+            // counter in the same transaction, and an `UPDATE` has nothing to
+            // write to without one.
+            let hash = crate::domain::user::Password::try_new("secret1")
+                .unwrap()
+                .hash_async()
+                .await
+                .unwrap();
+            let student = crate::domain::user::User::create(
+                crate::domain::user::Username::try_new("ogrenci").unwrap(),
+                hash,
+                &db,
+            )
+            .await
+            .unwrap();
+            ExamAttempt::start(&exam, student.get_id(), &db)
                 .await
                 .unwrap();
 

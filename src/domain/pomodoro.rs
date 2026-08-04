@@ -1,7 +1,10 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
-use crate::constant::POMODORO_SESSION_TABLE;
+use crate::constant::{
+    POMODORO_FINISHED_TOTAL_FIELD, POMODORO_FOCUS_MS_TOTAL_FIELD, POMODORO_SESSION_TABLE,
+};
 use crate::database::{Database, transaction_with_retry};
+use crate::domain::badge;
 use crate::domain::monotonic_id::next_ulid;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
@@ -116,23 +119,41 @@ impl PomodoroSession {
     /// student did not cause; recording a zero-length stint keeps the session
     /// count honest and its duration merely understated. Nothing downstream may
     /// then read a negative duration (`ProfileStats::load` sums these).
+    ///
+    /// The lifetime badge counters on the user row move in this same
+    /// transaction, so they can never count a stint the log does not hold (nor
+    /// miss one it does), and a retried round re-applies nothing — the abort
+    /// rolled the increment back with the rest. They are written field-scoped:
+    /// the row also carries admin-owned data (`role`), which a whole-row save
+    /// would silently revert. The clamped duration is the *same* expression the
+    /// `CREATE` stores, so the counter can never take a negative summand and
+    /// nothing downstream needs a floor. Only *finished* stints reach here — an
+    /// open row is a `pomodoro_session` row and nothing else — and there is no
+    /// student-facing delete for a stint, so neither counter ever decrements.
     pub async fn finish(user: &UserId, db: &Database) -> Result<PomodoroSession, AppError> {
         let (mut result, mut errors) = transaction_with_retry(
             db,
-            "BEGIN TRANSACTION;
+            &format!(
+                "BEGIN TRANSACTION;
                  LET $before = (DELETE $open RETURN BEFORE);
-                 IF array::len($before) = 0 { THROW 'no_pomodoro_running' };
-                 CREATE $closed CONTENT {
+                 IF array::len($before) = 0 {{ THROW 'no_pomodoro_running' }};
+                 UPDATE $usr SET
+                     {POMODORO_FINISHED_TOTAL_FIELD} = ({POMODORO_FINISHED_TOTAL_FIELD} ?? 0) + 1,
+                     {POMODORO_FOCUS_MS_TOTAL_FIELD} = ({POMODORO_FOCUS_MS_TOTAL_FIELD} ?? 0)
+                         + (math::max([$before[0].started_at, $done]) - $before[0].started_at);
+                 CREATE $closed CONTENT {{
                      user: $before[0].user,
                      started_at: $before[0].started_at,
                      finished_at: math::max([$before[0].started_at, $done]),
-                 };
-                 COMMIT TRANSACTION;",
+                 }};
+                 COMMIT TRANSACTION;"
+            ),
             &[
                 (
                     "open".into(),
                     PomodoroSessionId::open_for(user).record().into_value(),
                 ),
+                ("usr".into(), user.record().into_value()),
                 (
                     "closed".into(),
                     PomodoroSessionId::generate().record().into_value(),
@@ -154,10 +175,26 @@ impl PomodoroSession {
         if let Some(error) = errors.drain().map(|(_, error)| error).next() {
             return Err(error.into());
         }
-        // Statement slots count BEGIN, the LET, and the IF: the CREATE is slot 3.
-        let saved: Option<PomodoroSession> =
-            result.take::<Vec<PomodoroSession>>(3)?.into_iter().next();
-        saved.ok_or_else(|| AppError::Internal("failed to close pomodoro session".into()))
+        // The `CREATE` is deliberately kept the last statement before `COMMIT`
+        // (the counter `UPDATE` sits ahead of it — same transaction, so the
+        // order is free), which is what lets its slot follow the statement
+        // count instead of a hand-kept number: `num_statements` counts `BEGIN`
+        // and `COMMIT` too, hence -2. See `ExamResult::record` for the bug a
+        // hand-kept slot caused.
+        let slot = result.num_statements().saturating_sub(2);
+        let saved: Option<PomodoroSession> = result
+            .take::<Vec<PomodoroSession>>(slot)?
+            .into_iter()
+            .next();
+        let saved =
+            saved.ok_or_else(|| AppError::Internal("failed to close pomodoro session".into()))?;
+        // A badge is a decoration on top of the stint: losing one to a
+        // transient database error must never fail the finish, and the next
+        // counter move re-runs this and heals it.
+        if let Err(err) = badge::sync(user, db).await {
+            tracing::warn!("failed to sync badges for {}: {err}", user.key());
+        }
+        Ok(saved)
     }
 
     /// Every session of `user`, newest first — the running one (if any)
@@ -185,6 +222,79 @@ mod tests {
 
     use super::*;
     use crate::database;
+
+    /// A real `user` row: the counters land with `UPDATE`, which only ever
+    /// touches a record that exists, so a fabricated id would silently store
+    /// nothing. The tests above need no row — they read only the stint log.
+    async fn a_user(db: &Database) -> UserId {
+        let user = UserId::from_key(&Ulid::new().to_string());
+        db.query("CREATE $usr SET username = $name, password_hash = 'x'")
+            .bind(("usr", user.record()))
+            .bind(("name", user.key().to_string()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        user
+    }
+
+    /// `(finished_total, focus_ms_total)` re-read from the store — never off
+    /// what `finish` returned, which proves nothing about what was written.
+    async fn counters(user: &UserId, db: &Database) -> (i64, i64) {
+        let mut result = db
+            .query(format!(
+                "SELECT VALUE [({POMODORO_FINISHED_TOTAL_FIELD} ?? 0),
+                               ({POMODORO_FOCUS_MS_TOTAL_FIELD} ?? 0)] FROM $usr"
+            ))
+            .bind(("usr", user.record()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let rows: Vec<Vec<i64>> = result.take(0).unwrap();
+        let row = rows.into_iter().next().expect("the user row");
+        (row[0], row[1])
+    }
+
+    #[tokio::test]
+    async fn finishing_bumps_the_stored_counters_and_an_open_stint_bumps_neither() {
+        let db = database::init_mem().await.unwrap();
+        let user = a_user(&db).await;
+        assert_eq!(counters(&user, &db).await, (0, 0));
+
+        // An open stint is not a finished one: neither counter moves until it
+        // closes.
+        PomodoroSession::start(&user, &db).await.unwrap();
+        assert_eq!(counters(&user, &db).await, (0, 0));
+
+        let mut focus_ms = 0;
+        for _ in 0..2 {
+            let closed = PomodoroSession::finish(&user, &db).await.unwrap();
+            focus_ms +=
+                closed.get_finished_at().unwrap().as_millis() - closed.get_started_at().as_millis();
+            PomodoroSession::start(&user, &db).await.unwrap();
+        }
+        // Three starts, two finishes — the third is still running.
+        assert_eq!(counters(&user, &db).await, (2, focus_ms));
+    }
+
+    #[tokio::test]
+    async fn a_backwards_clock_adds_zero_ms_to_the_counter_never_a_negative() {
+        let db = database::init_mem().await.unwrap();
+        let user = a_user(&db).await;
+
+        PomodoroSession::start(&user, &db).await.unwrap();
+        db.query("UPDATE $open SET started_at = $future")
+            .bind(("open", PomodoroSessionId::open_for(&user).record()))
+            .bind(("future", Timestamp::now().as_millis() + 3_600_000))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        PomodoroSession::finish(&user, &db).await.unwrap();
+        assert_eq!(counters(&user, &db).await, (1, 0));
+    }
 
     #[tokio::test]
     async fn restart_replaces_the_open_session_and_finish_closes_it() {

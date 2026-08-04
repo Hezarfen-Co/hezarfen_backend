@@ -308,6 +308,36 @@ mod tests {
     use crate::domain::homework_submission::HomeworkSubmission;
     use crate::domain::user::UserId;
 
+    /// A real homework row (with the subject it references): `upsert` reads the
+    /// deadline off the entity now, so a bare id no longer does.
+    async fn a_homework(db: &Database) -> crate::domain::homework::Homework {
+        use crate::domain::course::CourseId;
+        use crate::domain::homework::{Homework, HomeworkTitle};
+        use crate::domain::subject::{Subject, SubjectDescription, SubjectName};
+
+        let course = CourseId::from_key("course");
+        let subject = Subject::create(
+            &course,
+            SubjectName::try_new("topic").unwrap(),
+            SubjectDescription::try_new("").unwrap(),
+            db,
+        )
+        .await
+        .unwrap();
+        Homework::create(
+            &course,
+            subject.get_id(),
+            HomeworkTitle::try_new("essay").unwrap(),
+            None,
+            crate::domain::timestamp::Timestamp::from_millis(1),
+            None,
+            &UserId::from_key("teacher"),
+            db,
+        )
+        .await
+        .unwrap()
+    }
+
     fn a_file(submission: &HomeworkSubmissionId) -> HomeworkFile {
         HomeworkFile::new(
             submission,
@@ -334,10 +364,11 @@ mod tests {
     #[tokio::test]
     async fn rows_scope_to_their_submission_gc_and_cap() {
         let db = crate::database::init_mem().await.unwrap();
-        let homework = HomeworkId::from_key("01TESTHWAAAAAAAAAAAAAAAAAA");
+        let hw = a_homework(&db).await;
+        let homework = hw.get_id().clone();
         let user = UserId::from_key("01TESTUSERAAAAAAAAAAAAAAAA");
         // A real submission row, so the GC join through it resolves.
-        let submission = HomeworkSubmission::upsert(&homework, &user, None, &db)
+        let submission = HomeworkSubmission::upsert(&hw, &user, None, &db)
             .await
             .unwrap()
             .unwrap();
@@ -432,9 +463,10 @@ mod tests {
         use crate::domain::homework_result::{HomeworkResult, HomeworkStatus};
 
         let db = crate::database::init_mem().await.unwrap();
-        let homework = HomeworkId::from_key("01TESTHWAAAAAAAAAAAAAAAAAA");
+        let hw = a_homework(&db).await;
+        let homework = hw.get_id().clone();
         let user = UserId::from_key("01TESTUSERAAAAAAAAAAAAAAAA");
-        let submission = HomeworkSubmission::upsert(&homework, &user, None, &db)
+        let submission = HomeworkSubmission::upsert(&hw, &user, None, &db)
             .await
             .unwrap()
             .unwrap();

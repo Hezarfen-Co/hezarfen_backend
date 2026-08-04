@@ -74,6 +74,36 @@ struct UserLimits {
     session_duration_days: i64,
 }
 
+/// The auto-earned badge catalog. A group like every other key here, so a
+/// client can walk this response uniformly; the catalog itself is the one
+/// field inside.
+#[derive(Serialize, ToSchema)]
+struct BadgeLimits {
+    /// Every badge the system can auto-award, in catalog order. Hardcoded, so
+    /// like everything else here it moves only with a deploy.
+    catalog: Vec<BadgeLimit>,
+}
+
+/// One badge in the auto-earned catalog. The id is the whole contract: a
+/// profile hands back ids and nothing else, and the label and icon behind one
+/// live in the client, exactly as they do for a role or a course kind.
+#[derive(Serialize, ToSchema)]
+struct BadgeLimit {
+    /// Stable id, never reused for another meaning. A retired badge simply
+    /// stops appearing here.
+    #[schema(example = "homework_submitted_10")]
+    id: &'static str,
+    /// The lifetime counter it reads — badges sharing one form a ladder. An
+    /// API-side name, not the column it is stored in, so storage can be
+    /// renamed without moving this contract.
+    #[schema(example = "homework_submitted")]
+    stat: &'static str,
+    /// Counter value that earns it. Awards are permanent: a counter that later
+    /// falls back below this does not take the badge away.
+    #[schema(example = 10)]
+    threshold: i64,
+}
+
 /// Note bodies and their attachments.
 #[derive(Serialize, ToSchema)]
 struct NoteLimits {
@@ -368,6 +398,7 @@ struct RequestLimits {
 #[derive(Serialize, ToSchema)]
 struct LimitsResponse {
     user: UserLimits,
+    badges: BadgeLimits,
     note: NoteLimits,
     file: FileLimits,
     message: MessageLimits,
@@ -410,6 +441,16 @@ impl LimitsResponse {
                 palette_color_pattern: PALETTE_COLOR_PATTERN,
                 palette_color_len: PALETTE_COLOR_LEN,
                 session_duration_days: SESSION_DURATION_DAYS,
+            },
+            badges: BadgeLimits {
+                catalog: BADGES
+                    .iter()
+                    .map(|(id, stat, threshold)| BadgeLimit {
+                        id,
+                        stat: stat.as_str(),
+                        threshold: *threshold,
+                    })
+                    .collect(),
             },
             note: NoteLimits {
                 max_title_len: MAX_NOTE_TITLE_LEN,

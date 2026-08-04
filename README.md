@@ -116,8 +116,11 @@ anyone, `null` until chosen so the client can fall back to the device
 preference (or, for the accent, its own default).
 Every account also has a **public profile** (`/users/{id}/profile`): a
 self-chosen `display_name` and `bio`, one **avatar**, the classes and courses
-it belongs to, and counters computed at read (finished pomodoro stints, course
-and class totals). Contact details are deliberately not part of it — email,
+it belongs to, counters computed at read (finished pomodoro stints, course and
+class totals) beside stored lifetime tallies of homework handed in, exams sat
+and focus time, and the **badges** those tallies have earned — auto-earned
+only, no route awards or revokes one, and permanent once earned even if the
+counter later falls. Contact details are deliberately not part of it — email,
 phone and birth date keep the gate they already have — and any authenticated
 account reads any profile, except a `parent`, who reads their own and their
 linked students' only (see "User profiles & avatars").
@@ -334,6 +337,9 @@ response in the same commit.
                      "themes": ["light", "dark"], "languages": ["tr", "en"],
                      "palette_color_pattern": "^#[0-9a-fA-F]{6}$", "palette_color_len": 7,
                      "session_duration_days": 7 },
+  "badges":        { "catalog": [ { "id": "homework_submitted_10",
+                                    "stat": "homework_submitted", "threshold": 10 },
+                                  { "…": 0 } ] },
   "note":          { "max_title_len": 200, "max_content_len": 10000, "max_files": 10 },
   "file":          { "max_name_len": 255, "max_content_type_len": 100,
                      "min_max_file_bytes": 1024, "max_max_file_bytes": 26214400,
@@ -393,7 +399,7 @@ drift from it**, which is enforced rather than asked for:
   and fails unless each one is either referenced by `src/web/limits.rs` or
   listed as a deliberate exclusion *with a reason*. A new constant breaks the
   suite until someone decides, consciously, whether clients need it.
-- `tests/spec_bounds.rs` builds the OpenAPI document, reads all 161 published
+- `tests/spec_bounds.rs` builds the OpenAPI document, reads all 168 published
   bounds back out of the emitted JSON, and asserts each equals its constant.
   This exists because utoipa's `#[schema(max_length = …)]` accepts a **literal
   only** — a `const` there does not compile — so the annotations are
@@ -435,6 +441,19 @@ Notes:
   `stroke_kinds`, and the
   uploadable `image_content_types` are the exact accepted spellings — build
   pickers from these rather than from a literal list.
+- **The badge catalog rides here too.** `badges.catalog[]` is every badge the
+  system can auto-award — `{id, stat, threshold}`, 13 of them, in catalog
+  order. It is a group (an object with one `catalog` key) rather than a bare
+  array because every key of this document is a group, and that uniformity is
+  what lets a client walk the response generically. `stat` is the API's name
+  for the lifetime counter behind the badge (`homework_submitted`,
+  `homework_on_time`, `exam_sat`, `pomodoro_finished`, `pomodoro_focus_ms`),
+  deliberately not the database column it is stored in, so storage can be
+  renamed without moving a published contract; badges sharing a `stat` form a
+  ladder. The catalog is compiled in, so a threshold moves only with a deploy —
+  the rules stay reviewable in a diff instead of editable in a settings row.
+  Labels and icons are **not** here: like `roles` and course `kinds`, the id is
+  the whole contract and the client owns what it looks like.
 
 **`422` versus `400`.** The two refusals mean different things and a client
 must not treat them alike. Every JSON-bodied route can answer **`422`**: the
@@ -1116,8 +1135,12 @@ the school. `GET /users/me/profile` is the caller's own copy of it,
   "avatar": { "content_type": "image/png", "size": 20480 },
   "classes": [ { "id": "01J8…", "name": "9-A", "grade": "9" } ],
   "courses": [ { "id": "01J8…", "title": "Matematik", "kind": "course" } ],
+  "badges": [ { "id": "homework_submitted_10", "earned_at": 1754300000000 } ],
   "stats": { "pomodoro_sessions": 42, "pomodoro_focus_ms": 63000000,
-             "courses": 7, "classes": 1 }
+             "courses": 7, "classes": 1,
+             "homework_submitted_total": 12, "homework_on_time_total": 11,
+             "exam_sat_total": 5, "pomodoro_finished_total": 44,
+             "pomodoro_focus_ms_total": 65400000 }
 }
 ```
 
@@ -1169,13 +1192,20 @@ owner's true total on purpose — it is the motivational counter, a per-reader
 number would be meaningless, and a magnitude names no course. One consequence,
 by design: a teacher you share nothing with has an empty `courses` block.
 
-**Stats are computed at read, never stored.** No counter column can drift out
-of sync with the rows behind it, and an account with no data reads a true `0`
-rather than `null`. Only *finished* pomodoro stints count — a timer left
-running is not study time. Exam averages, homework-done rates and attendance
-rates are deliberately absent: those tables are indexed for their own reads, so
-a per-user aggregate over them is a full table scan, and a profile is far too
-cheap a page to pay for one.
+**`stats` holds nine numbers of two different kinds, and the difference is
+worth knowing.** `pomodoro_sessions`, `pomodoro_focus_ms`, `courses` and
+`classes` are **computed at read**: they are recounted from the live rows on
+every call, so no column can drift out of sync with what is behind it. The five
+`*_total` keys are **stored lifetime tallies**, maintained at write time (see
+below), so a tally can outlive the rows behind it — a student's
+`exam_sat_total` still counts an exam a teacher has since deleted, which is the
+point of a lifetime counter. Either kind reads a true `0` on a fresh account,
+never `null`. Only *finished* pomodoro stints count on either side — a timer
+left running is not study time. Exam averages, homework-done rates and
+attendance rates are deliberately absent: those tables are indexed for their
+own reads, so a per-user aggregate over them is a full table scan, and a
+profile is far too cheap a page to pay for one — which is also why the five
+lifetime counters are tallied at write rather than recounted here.
 
 **The avatar** is one picture per account, uploaded as `multipart/form-data`
 with the image under a `file` field. Raster types only (`image/png`,
@@ -1191,9 +1221,57 @@ offensive picture is a school problem. The bytes come back from
 `GET /users/me/avatar` is the same read for the caller's own picture, so a
 client that never learned its own id still has a route.
 
-There is no `badges` key yet. Auto-earned badges are a planned second pass and
-will be added to `stats`' neighborhood additively, so a client written against
-today's document keeps working.
+### Badges
+
+**`badges` is auto-earned and nothing else.** There is no route that awards one
+and none that revokes one — a badge appears when a stored counter crosses a
+hardcoded threshold, normally on the same write that moved the counter (and, as
+a backstop, on a profile read that finds an earned badge missing — the sync
+after a write is best-effort, so a failed one heals rather than being lost).
+The rule is the only author. Handing a teacher an award button would make
+the counters decorative, and a badge that can be given can be argued about.
+
+**A badge is permanent.** Once earned it stays, whatever the counter does
+afterwards: withdraw a submission and `homework_submitted_total` falls, but the
+badge it earned does not come off. The award records that the student *did* the
+thing, not that they still have it. `earned_at` is pinned at the first crossing
+and never moved, so the list is a history and stays in order — it comes back
+oldest first.
+
+**Ids only.** Each entry is `{id, earned_at}`. The label, the icon and the
+description are the frontend's, keyed by the id — the same deal `roles` and
+course `kinds` already have. The catalog behind the ids is at `GET /limits` as
+`badges.catalog[]` (`{id, stat, threshold}`, 13 badges); it is compiled into
+the binary, so changing a threshold is a deploy, not a settings edit. An id is
+never reused for another meaning, and retiring a badge just drops it from the
+catalog — awards carrying it stop being served, no migration.
+
+**How the counters move**, since a badge is exactly a threshold on one of them:
+
+- **Homework.** A genuine first hand-in is `+1 homework_submitted_total`, and
+  `+1 homework_on_time_total` if that hand-in beat `due_at`. **Withdrawing your
+  own submission decrements both** — the one place a counter comes down, and it
+  exists because withdrawal is student-callable: without it, submit/delete/
+  submit farms one homework into fifty. Editing an existing submission moves
+  nothing, so the on-time verdict is fixed at the first hand-in and attaching a
+  file after the deadline cannot turn an on-time submission late.
+- **Exams.** `+1 exam_sat_total` per attempt created, retakes included —
+  sitting an exam twice is two sittings. Resuming an attempt already running is
+  not a new one. Deleting an exam removes the attempt rows but does **not**
+  decrement anyone: a teacher tidying up does not un-sit the exam.
+- **Pomodoro.** Finishing a stint is `+1 pomodoro_finished_total` and its
+  duration into `pomodoro_focus_ms_total`. An open stint counts for neither —
+  unfinished focus has no honest duration to add.
+
+**Existing accounts are seeded once.** The first boot of this version tallies
+every account from its real history, so nobody starts at zero for work they
+already did; the pass is marked done and skipped on every boot after. One
+consequence is not fixable and is not an oversight: the seed can only count
+rows that still exist, so a student whose exam was deleted before the upgrade
+is seeded short on `exam_sat_total`. The live rule (never decrement) and the
+seed (count what is there) simply cannot agree about history that is gone —
+and the fix is not to make deletion decrement, which would break the tally for
+everyone in order to patch it for a few.
 
 ## Appointments
 
@@ -3516,6 +3594,8 @@ src/
     bank_question_image.rs BankQuestionImageId · BankQuestionImage (bank
                    question/choice picture metadata; bytes on disk under FILES_PATH)
     profile.rs     PersonName · Email · Phone · BirthDate (personal-info newtypes)
+    badge.rs       BadgeStat · BadgeStats · earned · BadgeAward (auto-earned,
+                   permanent badges off the lifetime counters on the user row)
     preferences.rs Theme · Language · PaletteColor (own UI preferences)
     message.rs     MessageId · MessageSubject · MessageBody · MessageLabel ·
                    Message (per-copy folders: inbox/sent/archive/trash)

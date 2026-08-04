@@ -17,6 +17,7 @@ use utoipa_axum::routes;
 
 use crate::constant::{MAX_HOMEWORK_ASSIGNED, MAX_MAX_FILE_BYTES, UPLOAD_BODY_OVERHEAD_BYTES};
 use crate::database::Database;
+use crate::domain::badge;
 use crate::domain::course::{Course, CourseId};
 use crate::domain::enrollment::Enrollment;
 use crate::domain::exam_result::Mark;
@@ -654,12 +655,17 @@ async fn submit(
         .await?
         .is_some();
     let Some(submission) =
-        HomeworkSubmission::upsert(homework.get_id(), user.get_id(), text, &st.db).await?
+        HomeworkSubmission::upsert(&homework, user.get_id(), text, &st.db).await?
     else {
         return Err(AppError::Conflict(
             "this homework has been graded — ask the teacher to remove the grade before editing your submission",
         ));
     };
+    // Only a first hand-in moved a counter, so only a first hand-in can have
+    // earned anything — an edit re-runs nothing.
+    if !existed {
+        award_badges(user.get_id(), &st.db).await;
+    }
     let files = HomeworkFile::list_for_submission(submission.get_id(), &st.db).await?;
     let status = if existed {
         StatusCode::OK
@@ -760,10 +766,24 @@ async fn delete_submission(
             "this homework has been graded — ask the teacher to remove the grade before deleting your submission",
         ));
     }
+    // The counters just came down; a badge already earned stays earned (`sync`
+    // only ever adds), so this is here to keep the award rows in step with the
+    // *next* submission rather than to take anything back.
+    award_badges(user.get_id(), &st.db).await;
     for file in &files {
         remove_blob(&st.files_path, file.get_file()).await;
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Bring the student's badge awards up to date after a submission moved their
+/// counters. Never fails the request it follows: a badge is a decoration on top
+/// of the work, and losing one to a transient database error is not worth
+/// refusing a hand-in over — the next counter move re-runs this and heals it.
+async fn award_badges(user: &UserId, db: &Database) {
+    if let Err(err) = badge::sync(user, db).await {
+        tracing::warn!("failed to sync badges for {}: {err}", user.key());
+    }
 }
 
 /// Serve a submission file as a download — `Content-Disposition: attachment`,
@@ -857,9 +877,15 @@ async fn upload_submission_file(
     let submission =
         match HomeworkSubmission::read_for(homework.get_id(), user.get_id(), &st.db).await? {
             Some(existing) => existing,
-            None => HomeworkSubmission::upsert(homework.get_id(), user.get_id(), None, &st.db)
-                .await?
-                .ok_or(GRADED)?,
+            // A photo-only hand-in is a hand-in: it creates the row, so it moves
+            // the counters, so it earns badges exactly as a text submit does.
+            None => {
+                let created = HomeworkSubmission::upsert(&homework, user.get_id(), None, &st.db)
+                    .await?
+                    .ok_or(GRADED)?;
+                award_badges(user.get_id(), &st.db).await;
+                created
+            }
         };
 
     // Blob first, row second — a stored row always points at a real blob. The

@@ -15,11 +15,11 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
 use crate::constant::{
-    HOMEWORK_SUBMISSION_TABLE, MAX_HOMEWORK_TEXT_LEN, SUBMISSION_GRADED_FIELD,
-    SUBMISSION_OPEN_GUARD,
+    HOMEWORK_ON_TIME_TOTAL_FIELD, HOMEWORK_SUBMISSION_TABLE, HOMEWORK_SUBMITTED_TOTAL_FIELD,
+    MAX_HOMEWORK_TEXT_LEN, SUBMISSION_GRADED_FIELD, SUBMISSION_OPEN_GUARD,
 };
-use crate::database::Database;
-use crate::domain::homework::HomeworkId;
+use crate::database::{Database, transaction_with_retry};
+use crate::domain::homework::{Homework, HomeworkId};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
@@ -119,29 +119,80 @@ impl HomeworkSubmission {
     /// yet" a condition of this very write instead of a read a concurrent grade
     /// can land behind. An absent row satisfies it (the stamp is `NONE` there
     /// too), so a first submit still creates.
+    ///
+    /// The badge counters on the student's user row move in this very
+    /// transaction, and the order is load-bearing: the increment sits *after*
+    /// the UPSERT and is conditional on it having matched a row, because a
+    /// frozen row makes that `WHERE` match nothing **silently** (unlike
+    /// [`crate::domain::exam_result::ExamResult::grade`], which `THROW`s) — put
+    /// first, it would count a submission the freeze refused. `$before = NONE`
+    /// keeps it to a genuine first create, so an edit moves neither counter,
+    /// which is what makes the live count mean the same thing the one-time
+    /// backfill seeded (one per row; on time judged against `due_at`, equal
+    /// counting as on time). Takes the whole [`Homework`] only for that
+    /// deadline — both callers already hold the row.
+    ///
+    /// `counted_on_time` is stamped on the row from the *same* `$on_time`
+    /// expression the increment adds, in the same statement block: the deadline
+    /// is mutable, so a withdrawal that re-judged it against the live `due_at`
+    /// gave back something other than what was taken. Writing the verdict beside
+    /// the counter is what keeps the two from ever disagreeing — read back by
+    /// [`HomeworkSubmission::delete`], never re-derived.
     pub async fn upsert(
-        homework: &HomeworkId,
+        homework: &Homework,
         user: &UserId,
         text: Option<SubmissionText>,
         db: &Database,
     ) -> Result<Option<HomeworkSubmission>, AppError> {
-        let id = HomeworkSubmissionId::composite(homework, user);
+        let id = HomeworkSubmissionId::composite(homework.get_id(), user);
         let now = Timestamp::now();
         let text = text.map(|text| text.as_str().to_string());
-        let mut saved = db
-            .query(format!(
-                "UPSERT $id SET homework = $hw, user = $usr, text = $text, \
-                 updated_at = $now, submitted_at = submitted_at ?? $now \
-                 WHERE {SUBMISSION_OPEN_GUARD} RETURN AFTER"
-            ))
-            .bind(("id", id.record()))
-            .bind(("hw", homework.record()))
-            .bind(("usr", user.record()))
-            .bind(("text", text))
-            .bind(("now", now))
-            .await?
-            .check()?;
-        Ok(saved.take::<Vec<HomeworkSubmission>>(0)?.into_iter().next())
+        // Sound to re-send: the UPSERT is on a deterministic id on a table with
+        // no unique index, so it can never legitimately answer "already exists",
+        // and the counter UPDATE never can either.
+        let (mut saved, mut errors) = transaction_with_retry(
+            db,
+            &format!(
+                "BEGIN TRANSACTION;
+                 LET $before = (SELECT VALUE id FROM ONLY $id);
+                 LET $on_time = $now <= $due;
+                 LET $after = (UPSERT $id SET homework = $hw, user = $usr, text = $text,
+                     updated_at = $now, submitted_at = submitted_at ?? $now
+                     WHERE {SUBMISSION_OPEN_GUARD} RETURN AFTER);
+                 IF $before = NONE AND array::len($after) > 0 {{
+                     UPDATE $id SET counted_on_time = $on_time;
+                     UPDATE $usr SET
+                         {HOMEWORK_SUBMITTED_TOTAL_FIELD} = ({HOMEWORK_SUBMITTED_TOTAL_FIELD} ?? 0) + 1,
+                         {HOMEWORK_ON_TIME_TOTAL_FIELD} = ({HOMEWORK_ON_TIME_TOTAL_FIELD} ?? 0)
+                             + IF $on_time {{ 1 }} ELSE {{ 0 }}
+                 }};
+                 RETURN $after;
+                 COMMIT TRANSACTION;"
+            ),
+            &[
+                ("id".into(), id.record().into_value()),
+                ("hw".into(), homework.get_id().record().into_value()),
+                ("usr".into(), user.record().into_value()),
+                ("text".into(), text.into_value()),
+                ("now".into(), now.into_value()),
+                ("due".into(), homework.get_due_at().into_value()),
+            ],
+            &[],
+        )
+        .await?;
+        if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+            return Err(error.into());
+        }
+        // The trailing `RETURN` is always the last statement before `COMMIT`, so
+        // its slot follows the statement count rather than a hand-kept number.
+        // It returns the whole array, never `$after[0]`: a refused write makes
+        // that `NONE`, which fails to deserialize ("expected object, got none")
+        // instead of reading as the "frozen" the caller answers 409 to.
+        let slot = saved.num_statements().saturating_sub(2);
+        Ok(saved
+            .take::<Vec<HomeworkSubmission>>(slot)?
+            .into_iter()
+            .next())
     }
 
     /// Re-stamp a submission's `updated_at` to now, leaving its text and files
@@ -216,21 +267,64 @@ impl HomeworkSubmission {
     /// answers 409): the submission's own delete carries
     /// [`SUBMISSION_OPEN_GUARD`], and the file wipe is conditional on it having
     /// bitten, so a refused delete leaves the children standing too.
+    ///
+    /// The one place either badge counter comes back down, and deliberately the
+    /// only one: this route is student-callable on their own row, so without it
+    /// a student farms "handed in 50 homeworks" by submit/delete/submit on a
+    /// single homework. A teacher's homework delete and the course cascade
+    /// leave the counters alone — history a teacher erased is still history the
+    /// student lived.
+    ///
+    /// The on-time half is given back by the verdict [`HomeworkSubmission::upsert`]
+    /// *stored* on the row, never by re-judging the deadline: `due_at` is
+    /// mutable, so re-deriving read whatever the teacher had moved it to since
+    /// and gave back something other than what was taken — extend it after a
+    /// late hand-in and this debited a credit that was never given; pull it back
+    /// after a punctual one and it debited nothing, leaving `on_time` above
+    /// `submitted`. A row from before the column exists carries no verdict, and
+    /// cannot be given one for a credit that already happened, so it falls back
+    /// to the old cut (`submitted_at`, the readonly stamp the increment judged,
+    /// against the live deadline); a dangling `homework` link leaves `$due`
+    /// `NONE` there, which compares false and so counts as late, matching the
+    /// backfill. Floored at zero: a row that predates the columns has none.
+    ///
+    /// Badges already earned are never taken away — [`crate::domain::badge`] is
+    /// add-only, which is where that permanence lives.
     pub async fn delete(self, db: &Database) -> Result<Option<HomeworkSubmission>, AppError> {
-        let mut result = db
-            .query(format!(
+        // Sound to re-send: DELETE and UPDATE can never answer "already exists".
+        let (mut result, mut errors) = transaction_with_retry(
+            db,
+            &format!(
                 "BEGIN TRANSACTION;
+                 LET $due = (SELECT VALUE homework.due_at FROM ONLY $sub);
                  LET $gone = (DELETE $sub WHERE {SUBMISSION_OPEN_GUARD} RETURN BEFORE);
-                 IF array::len($gone) > 0 {{ DELETE homework_file WHERE submission = $sub }};
+                 IF array::len($gone) > 0 {{
+                     DELETE homework_file WHERE submission = $sub;
+                     LET $on_time = IF ($gone[0].counted_on_time
+                         ?? ($gone[0].submitted_at <= $due)) {{ 1 }} ELSE {{ 0 }};
+                     UPDATE $usr SET
+                         {HOMEWORK_SUBMITTED_TOTAL_FIELD} =
+                             math::max([({HOMEWORK_SUBMITTED_TOTAL_FIELD} ?? 0) - 1, 0]),
+                         {HOMEWORK_ON_TIME_TOTAL_FIELD} =
+                             math::max([({HOMEWORK_ON_TIME_TOTAL_FIELD} ?? 0) - $on_time, 0])
+                 }};
                  RETURN $gone;
                  COMMIT TRANSACTION;"
-            ))
-            .bind(("sub", self.id.record()))
-            .await?
-            .check()?;
-        // BEGIN is slot 0, the LET slot 1 and the IF slot 2; the RETURN is slot 3.
+            ),
+            &[
+                ("sub".into(), self.id.record().into_value()),
+                ("usr".into(), self.user.record().into_value()),
+            ],
+            &[],
+        )
+        .await?;
+        if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+            return Err(error.into());
+        }
+        // The trailing `RETURN` is always the last statement before `COMMIT`.
+        let slot = result.num_statements().saturating_sub(2);
         Ok(result
-            .take::<Vec<HomeworkSubmission>>(3)?
+            .take::<Vec<HomeworkSubmission>>(slot)?
             .into_iter()
             .next())
     }
@@ -239,6 +333,81 @@ impl HomeworkSubmission {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::domain::course::CourseId;
+    use crate::domain::homework::HomeworkTitle;
+    use crate::domain::subject::{Subject, SubjectDescription, SubjectName};
+
+    /// A real homework row (and the subject it must reference) due at `due_at` —
+    /// `upsert` now reads the deadline off the entity, so the tests need one.
+    async fn a_homework(due_at: Timestamp, db: &Database) -> Homework {
+        let course = CourseId::from_key("course");
+        let subject = Subject::create(
+            &course,
+            SubjectName::try_new("topic").unwrap(),
+            SubjectDescription::try_new("").unwrap(),
+            db,
+        )
+        .await
+        .unwrap();
+        Homework::create(
+            &course,
+            subject.get_id(),
+            HomeworkTitle::try_new("essay").unwrap(),
+            None,
+            due_at,
+            None,
+            &UserId::from_key("teacher"),
+            db,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// A deadline no test run can reach, so a submission is unambiguously on
+    /// time; `Timestamp::from_millis(1)` is its late twin.
+    fn far_future() -> Timestamp {
+        Timestamp::from_millis(Timestamp::now().as_millis() + 3_600_000)
+    }
+
+    /// A real user row: the counters live on it, and an `UPDATE` has nothing to
+    /// write to without one.
+    async fn a_student(username: &str, db: &Database) -> UserId {
+        let hash = crate::domain::user::Password::try_new("secret1")
+            .unwrap()
+            .hash_async()
+            .await
+            .unwrap();
+        crate::domain::user::User::create(
+            crate::domain::user::Username::try_new(username).unwrap(),
+            hash,
+            db,
+        )
+        .await
+        .unwrap()
+        .get_id()
+        .clone()
+    }
+
+    /// The two badge counters on a user row, absent counting as zero.
+    async fn counters(user: &UserId, db: &Database) -> (i64, i64) {
+        let mut result = db
+            .query(format!(
+                "SELECT VALUE [({HOMEWORK_SUBMITTED_TOTAL_FIELD} ?? 0),
+                               ({HOMEWORK_ON_TIME_TOTAL_FIELD} ?? 0)] FROM $usr"
+            ))
+            .bind(("usr", user.record()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let rows = result.take::<Vec<Vec<i64>>>(0).unwrap();
+        let row = rows.first().cloned().unwrap_or_default();
+        (
+            row.first().copied().unwrap_or(0),
+            row.get(1).copied().unwrap_or(0),
+        )
+    }
 
     #[tokio::test]
     async fn text_is_optional_but_bounded() {
@@ -250,8 +419,8 @@ mod tests {
     #[tokio::test]
     async fn resubmit_keeps_submitted_at_and_restamps_updated_at() {
         let db = crate::database::init_mem().await.unwrap();
-        let homework = HomeworkId::generate();
-        let user = UserId::from_key("01TESTUSERAAAAAAAAAAAAAAAA");
+        let homework = a_homework(far_future(), &db).await;
+        let user = a_student("ogrenci", &db).await;
 
         let first = HomeworkSubmission::upsert(
             &homework,
@@ -268,13 +437,15 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        // ... and it is one submission, not two: the edit moves no counter.
+        assert_eq!(counters(&user, &db).await, (1, 1));
         assert_eq!(first.get_id(), second.get_id());
         assert_eq!(first.get_submitted_at(), second.get_submitted_at());
         assert!(second.get_updated_at() >= first.get_updated_at());
         assert!(second.get_text().is_none());
         // One row per (homework, user), whatever the re-submit count.
         assert_eq!(
-            HomeworkSubmission::list_for_homework(&homework, &db)
+            HomeworkSubmission::list_for_homework(homework.get_id(), &db)
                 .await
                 .unwrap()
                 .len(),
@@ -294,8 +465,8 @@ mod tests {
     #[tokio::test]
     async fn a_grade_freezes_the_submission_row_itself() {
         let db = crate::database::init_mem().await.unwrap();
-        let homework = HomeworkId::from_key("01TESTHWAAAAAAAAAAAAAAAAAA");
-        let user = UserId::from_key("01TESTUSERAAAAAAAAAAAAAAAA");
+        let homework = a_homework(far_future(), &db).await;
+        let user = a_student("ogrenci", &db).await;
         let teacher = UserId::from_key("01TESTTEACHERAAAAAAAAAAAAA");
         let graded = |value| {
             let text = SubmissionText::try_new(value).unwrap();
@@ -309,8 +480,10 @@ mod tests {
                 .unwrap()
         );
 
+        assert_eq!(counters(&user, &db).await, (1, 1));
+
         crate::domain::homework_result::HomeworkResult::grade(
-            &homework,
+            homework.get_id(),
             &user,
             crate::domain::homework_result::HomeworkStatus::try_new("done").unwrap(),
             None,
@@ -329,27 +502,33 @@ mod tests {
         // still the version that was graded.
         assert!(graded("version B").await.unwrap().is_none());
         assert_eq!(
-            HomeworkSubmission::read_for(&homework, &user, &db)
+            HomeworkSubmission::read_for(homework.get_id(), &user, &db)
                 .await
                 .unwrap()
                 .and_then(|row| row.get_text().map(|text| text.as_str().to_string())),
             Some("version A".to_string())
         );
+        // The refusal is silent — the UPSERT simply matches nothing — so the
+        // counters are the only thing that can catch an increment placed in
+        // front of it: a submission the freeze refused must count for nothing.
+        assert_eq!(counters(&user, &db).await, (1, 1));
         // ... and so is withdrawing it wholesale.
-        let frozen = HomeworkSubmission::read_for(&homework, &user, &db)
+        let frozen = HomeworkSubmission::read_for(homework.get_id(), &user, &db)
             .await
             .unwrap()
             .unwrap();
         assert!(frozen.delete(&db).await.unwrap().is_none());
         assert!(
-            HomeworkSubmission::read_for(&homework, &user, &db)
+            HomeworkSubmission::read_for(homework.get_id(), &user, &db)
                 .await
                 .unwrap()
                 .is_some()
         );
+        // A refused delete decrements nothing either.
+        assert_eq!(counters(&user, &db).await, (1, 1));
 
         // Un-grading unfreezes it, stamp and all.
-        crate::domain::homework_result::HomeworkResult::remove(&homework, &user, &db)
+        crate::domain::homework_result::HomeworkResult::remove(homework.get_id(), &user, &db)
             .await
             .unwrap();
         assert!(
@@ -362,6 +541,8 @@ mod tests {
             reopened.get_text().map(SubmissionText::as_str),
             Some("version B")
         );
+        // Still an edit to the row that was already counted, un-freeze or not.
+        assert_eq!(counters(&user, &db).await, (1, 1));
         // The two-stamp lateness rule is untouched by any of it: the first
         // hand-in is still the first hand-in.
         assert_eq!(reopened.get_submitted_at(), version_a.get_submitted_at());
@@ -371,8 +552,8 @@ mod tests {
     #[tokio::test]
     async fn touch_moves_updated_at_but_not_submitted_at_or_text() {
         let db = crate::database::init_mem().await.unwrap();
-        let homework = HomeworkId::generate();
-        let user = UserId::from_key("01TESTUSERAAAAAAAAAAAAAAAA");
+        let homework = a_homework(far_future(), &db).await;
+        let user = a_student("ogrenci", &db).await;
 
         let original = HomeworkSubmission::upsert(
             &homework,
@@ -394,5 +575,133 @@ mod tests {
             touched.get_text().map(SubmissionText::as_str),
             Some("photo answer")
         );
+    }
+
+    /// The farm, closed: `delete_submission` is the student's own route, so a
+    /// counter that only ever went up would let one homework be handed in fifty
+    /// times. Submit → withdraw → submit is worth exactly one submission.
+    ///
+    /// Bite check: drop the `UPDATE $usr` from [`HomeworkSubmission::delete`]
+    /// and the last assertion reads `(2, 2)` — the farm.
+    #[tokio::test]
+    async fn submit_delete_submit_is_worth_one_submission() {
+        let db = crate::database::init_mem().await.unwrap();
+        let homework = a_homework(far_future(), &db).await;
+        let user = a_student("ogrenci", &db).await;
+
+        HomeworkSubmission::upsert(&homework, &user, None, &db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(counters(&user, &db).await, (1, 1));
+
+        let mine = HomeworkSubmission::read_for(homework.get_id(), &user, &db)
+            .await
+            .unwrap()
+            .unwrap();
+        mine.delete(&db).await.unwrap().unwrap();
+        assert_eq!(counters(&user, &db).await, (0, 0));
+        // Floored: a second withdrawal (or a row from before the columns
+        // existed) can never push either counter negative.
+        assert!(
+            HomeworkSubmission::read_for(homework.get_id(), &user, &db)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        HomeworkSubmission::upsert(&homework, &user, None, &db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(counters(&user, &db).await, (1, 1));
+    }
+
+    /// Lateness is judged against the homework's own deadline at hand-in, the
+    /// same cut the one-time backfill used, and only the on-time counter sees
+    /// it: a late hand-in is still a hand-in. Its withdrawal gives back only
+    /// what it took.
+    #[tokio::test]
+    async fn a_late_submission_counts_as_submitted_but_not_on_time() {
+        let db = crate::database::init_mem().await.unwrap();
+        let punctual = a_homework(far_future(), &db).await;
+        let overdue = a_homework(Timestamp::from_millis(1), &db).await;
+        let user = a_student("ogrenci", &db).await;
+
+        HomeworkSubmission::upsert(&punctual, &user, None, &db)
+            .await
+            .unwrap()
+            .unwrap();
+        HomeworkSubmission::upsert(&overdue, &user, None, &db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(counters(&user, &db).await, (2, 1));
+
+        // Withdrawing the *late* one takes back only the submission, never the
+        // on-time credit the punctual one earned — the zero floor would hide a
+        // wrong subtraction here if the on-time count were sitting at zero.
+        let late = HomeworkSubmission::read_for(overdue.get_id(), &user, &db)
+            .await
+            .unwrap()
+            .unwrap();
+        late.delete(&db).await.unwrap().unwrap();
+        assert_eq!(counters(&user, &db).await, (1, 1));
+
+        // ... and withdrawing the punctual one gives back exactly that credit.
+        let kept = HomeworkSubmission::read_for(punctual.get_id(), &user, &db)
+            .await
+            .unwrap()
+            .unwrap();
+        kept.delete(&db).await.unwrap().unwrap();
+        assert_eq!(counters(&user, &db).await, (0, 0));
+    }
+
+    /// A row from before `counted_on_time` existed carries no verdict — it was
+    /// credited by a comparison that left no trace, and cannot be given one
+    /// retroactively. Withdrawing it falls back to that same comparison, so the
+    /// pre-2026-08-04 rows on a live volume keep behaving exactly as they did.
+    ///
+    /// Bite check: an absent verdict read as `false` rather than falling through
+    /// (`??` binding the wrong side of the `<=`) leaves the last assertion at
+    /// `(0, 1)` — on time above submitted, the shape the stored verdict exists
+    /// to prevent.
+    #[tokio::test]
+    async fn a_row_with_no_stored_verdict_falls_back_to_the_deadline() {
+        let db = crate::database::init_mem().await.unwrap();
+        let punctual = a_homework(far_future(), &db).await;
+        let overdue = a_homework(Timestamp::from_millis(1), &db).await;
+        let user = a_student("ogrenci", &db).await;
+
+        HomeworkSubmission::upsert(&punctual, &user, None, &db)
+            .await
+            .unwrap()
+            .unwrap();
+        HomeworkSubmission::upsert(&overdue, &user, None, &db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(counters(&user, &db).await, (2, 1));
+        // Aged into legacy rows: the counters keep the credit, the rows lose the
+        // verdict — the exact state of every submission on an existing volume.
+        db.query("UPDATE homework_submission UNSET counted_on_time")
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        let late = HomeworkSubmission::read_for(overdue.get_id(), &user, &db)
+            .await
+            .unwrap()
+            .unwrap();
+        late.delete(&db).await.unwrap().unwrap();
+        assert_eq!(counters(&user, &db).await, (1, 1));
+
+        let kept = HomeworkSubmission::read_for(punctual.get_id(), &user, &db)
+            .await
+            .unwrap()
+            .unwrap();
+        kept.delete(&db).await.unwrap().unwrap();
+        assert_eq!(counters(&user, &db).await, (0, 0));
     }
 }

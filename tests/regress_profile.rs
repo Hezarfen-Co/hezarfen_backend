@@ -12,8 +12,13 @@ mod common;
 
 use axum::Router;
 use axum::http::StatusCode;
-use common::{app_and_db, create_course, enroll, login, login_as, me_id, send, set_role};
+use common::{
+    app_and_db, create_course, create_exam_with, create_homework, create_subject, enroll, id_of,
+    login, login_as, me_id, send, set_role,
+};
 use hezarfen_backend::constant::{MAX_BIO_LEN, MAX_DISPLAY_NAME_LEN};
+use hezarfen_backend::database::Database;
+use hezarfen_backend::domain::timestamp::Timestamp;
 use serde_json::{Value, json};
 
 const BOUNDARY: &str = "multipart/form-data; boundary=hezarfen-test-boundary";
@@ -102,13 +107,16 @@ async fn a_peer_profile_carries_no_contact_fields() {
     let seen = profile(&app, &peer, &ada_id).await;
     assert_eq!(seen.status, StatusCode::OK, "{}", seen.body);
     assert_eq!(seen.body["username"], "ada");
-    for private in ["email", "phone", "birth_date", "badges"] {
+    for private in ["email", "phone", "birth_date"] {
         assert!(
             seen.body.get(private).is_none(),
             "{private} must not ride on a profile: {}",
             seen.body
         );
     }
+    // Badges are public, unlike the contact fields — and an account that has
+    // earned none says so with an empty list, never with a missing key.
+    assert_eq!(seen.body["badges"], json!([]), "{}", seen.body);
 }
 
 /// A parent is an observer of their own children and of nobody else: the
@@ -238,6 +246,75 @@ async fn display_name_falls_back_to_the_legal_name_then_null() {
     );
 }
 
+/// The read-time badge backstop, and the write it must not make.
+///
+/// A counter is moved behind the API's back — exactly what a lost `badge::sync`
+/// leaves behind, since every counter writer logs and swallows that error. The
+/// first profile read must heal it and serve the badges with their stamps; the
+/// second must serve the identical shelf and write *nothing*, which is what the
+/// `badge_award` write probe counts. Zero extra writes on a read is the whole
+/// point: a profile is a read endpoint.
+#[tokio::test]
+async fn a_profile_read_heals_a_missed_badge_then_writes_nothing() {
+    let (app, db) = app_and_db().await;
+    let ada = login(&app, "ada").await;
+    let ada_id = me_id(&app, &ada).await;
+
+    // Fires inside any write to the award table, so a write this read should
+    // not make cannot hide behind an unchanged-looking response.
+    db.query(
+        "DEFINE EVENT award_write ON badge_award WHEN true THEN {
+             UPSERT type::record('award_write_probe', 'n') SET n = (n ?? 0) + 1;
+         };",
+    )
+    .await
+    .unwrap()
+    .check()
+    .unwrap();
+    let writes = || async {
+        db.query("SELECT VALUE n FROM award_write_probe:n")
+            .await
+            .unwrap()
+            .take::<Vec<i64>>(0)
+            .unwrap()
+            .first()
+            .copied()
+            .unwrap_or(0)
+    };
+
+    db.query("UPDATE type::record('user', $id) SET homework_submitted_total = 10")
+        .bind(("id", ada_id.clone()))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+    let healed = profile(&app, &ada, &ada_id).await;
+    assert_eq!(healed.status, StatusCode::OK, "{}", healed.body);
+    let ids: Vec<&str> = healed.body["badges"]
+        .as_array()
+        .expect("badges array")
+        .iter()
+        .map(|badge| badge["id"].as_str().expect("badge id"))
+        .collect();
+    assert_eq!(ids, vec!["homework_submitted_1", "homework_submitted_10"]);
+    assert!(
+        healed.body["badges"][0]["earned_at"].as_i64().unwrap_or(0) > 0,
+        "a badge carries when it was earned: {}",
+        healed.body
+    );
+    assert_eq!(healed.body["stats"]["homework_submitted_total"], 10);
+    let after_heal = writes().await;
+    assert!(after_heal > 0, "the heal wrote the awards");
+
+    // Steady state: everything earned is already held, so this read must not
+    // touch the award table at all.
+    let again = profile(&app, &ada, &ada_id).await;
+    assert_eq!(again.status, StatusCode::OK, "{}", again.body);
+    assert_eq!(again.body["badges"], healed.body["badges"], "same shelf");
+    assert_eq!(writes().await, after_heal, "a profile read wrote something");
+}
+
 /// The counters are derived, so a fresh account reads a true `0` on all four —
 /// never `null`, never an absent key a client would have to guard.
 #[tokio::test]
@@ -253,6 +330,13 @@ async fn fresh_stats_read_zero_on_every_field() {
         "pomodoro_focus_ms",
         "courses",
         "classes",
+        // The stored lifetime counters: a row that predates the columns carries
+        // none of them, and absent must still read as a numeric 0.
+        "homework_submitted_total",
+        "homework_on_time_total",
+        "exam_sat_total",
+        "pomodoro_finished_total",
+        "pomodoro_focus_ms_total",
     ] {
         assert_eq!(
             stats.get(field).and_then(Value::as_i64),
@@ -261,7 +345,7 @@ async fn fresh_stats_read_zero_on_every_field() {
             stats.get(field)
         );
     }
-    assert_eq!(stats.len(), 4, "no fifth counter shipped: {stats:?}");
+    assert_eq!(stats.len(), 9, "no tenth counter shipped: {stats:?}");
     assert!(mine.body["avatar"].is_null());
     assert_eq!(mine.body["classes"], json!([]));
     assert_eq!(mine.body["courses"], json!([]));
@@ -683,6 +767,472 @@ async fn stats_courses_stays_the_owners_true_total() {
     let peer = profile(&s.app, &s.peer, &s.teacher_id).await;
     assert_eq!(peer.body["courses"].as_array().expect("courses").len(), 1);
     assert_eq!(peer.body["stats"]["courses"], 2);
+}
+
+// --- Badges ---------------------------------------------------------------
+//
+// Badges are *permanent*: an award row is stamped once and nothing ever moves
+// or removes it, while the counters underneath it move both ways. Every test
+// below is written against that split — the award, not the counter, is what
+// carries the promise — and the counter tests read off the profile rather than
+// the database, because the profile is the only surface a client has.
+
+/// A course with a subject and one enrolled student: the smallest cast that
+/// can move a homework counter.
+struct Classroom {
+    app: Router,
+    db: Database,
+    teacher: String,
+    student: String,
+    student_id: String,
+    course: String,
+    subject: String,
+}
+
+async fn classroom() -> Classroom {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "teach", "teacher").await;
+    let student = login(&app, "stu").await;
+    let student_id = me_id(&app, &student).await;
+    let course = create_course(&app, &teacher, "Algebra").await;
+    enroll(&app, &teacher, &course, &student_id).await;
+    let subject = create_subject(&app, &teacher, &course, "Fractions").await;
+    Classroom {
+        app,
+        db,
+        teacher,
+        student,
+        student_id,
+        course,
+        subject,
+    }
+}
+
+/// A homework due `in_ms` from now. Negative backdates it *inside* the
+/// scheduling grace — the only way to hand something in late in one test.
+async fn homework(c: &Classroom, title: &str, in_ms: i64) -> String {
+    let due = Timestamp::now().as_millis() + in_ms;
+    create_homework(&c.app, &c.teacher, &c.course, &c.subject, title, due).await
+}
+
+/// Move `homework`'s deadline to `in_ms` from now, as the teacher who set it.
+/// Negative backdates it *inside* the scheduling grace, which is legal — the
+/// deadline is mutable in both directions, which is what the two tests below
+/// are about.
+async fn move_deadline(c: &Classroom, homework: &str, in_ms: i64) {
+    let due = Timestamp::now().as_millis() + in_ms;
+    let res = send(
+        &c.app,
+        "PATCH",
+        &format!("/homework/{homework}"),
+        Some(&c.teacher),
+        Some(json!({ "due_at": due })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+}
+
+/// Hand in `homework` as `cookie`, asserting the first-hand-in `201`.
+async fn hand_in(app: &Router, cookie: &str, homework: &str) {
+    let res = send(
+        app,
+        "POST",
+        &format!("/homework/{homework}/submission"),
+        Some(cookie),
+        Some(json!({ "text": "done" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+}
+
+/// Withdraw the caller's own submission, asserting the `204`.
+async fn withdraw(app: &Router, cookie: &str, homework: &str) {
+    let res = send(
+        app,
+        "DELETE",
+        &format!("/homework/{homework}/submission"),
+        Some(cookie),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+}
+
+/// The caller's own profile body (asserts the `200`).
+async fn my_profile(app: &Router, cookie: &str) -> Value {
+    let res = send(app, "GET", "/users/me/profile", Some(cookie), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    res.body
+}
+
+/// When `id` was earned, off a profile body — `None` if the shelf lacks it.
+fn stamp_of(profile: &Value, id: &str) -> Option<i64> {
+    profile["badges"]
+        .as_array()
+        .expect("badges array")
+        .iter()
+        .find(|badge| badge["id"] == id)
+        .map(|badge| badge["earned_at"].as_i64().expect("earned_at millis"))
+}
+
+/// The badge ids on a profile, in the order served.
+fn badge_ids(profile: &Value) -> Vec<&str> {
+    profile["badges"]
+        .as_array()
+        .expect("badges array")
+        .iter()
+        .map(|badge| badge["id"].as_str().expect("badge id"))
+        .collect()
+}
+
+/// Crossing a threshold earns the badge there and then, stamped with the
+/// moment it happened — not at some later sweep. The window is taken around
+/// the request, so a stamp copied from anywhere else fails.
+#[tokio::test]
+async fn a_badge_lands_the_moment_its_threshold_is_crossed() {
+    let c = classroom().await;
+    let first = homework(&c, "Fractions I", 600_000).await;
+
+    let before = my_profile(&c.app, &c.student).await;
+    assert_eq!(badge_ids(&before), Vec::<&str>::new(), "nothing earned yet");
+
+    let opened = Timestamp::now().as_millis();
+    hand_in(&c.app, &c.student, &first).await;
+    let closed = Timestamp::now().as_millis();
+
+    let mine = my_profile(&c.app, &c.student).await;
+    assert_eq!(badge_ids(&mine), ["homework_submitted_1"], "{mine}");
+    let earned = stamp_of(&mine, "homework_submitted_1").expect("the badge");
+    assert!(
+        (opened..=closed).contains(&earned),
+        "earned_at {earned} is outside the request window {opened}..={closed}: {mine}"
+    );
+    // One hand-in is one submission, and the ten-badge is nine away.
+    assert_eq!(mine["stats"]["homework_submitted_total"], 1);
+    assert_eq!(mine["stats"]["homework_on_time_total"], 1);
+}
+
+/// The permanence guarantee, at the stamp: crossing again re-runs the sync,
+/// and the sync's `WHERE earned_at = NONE` must leave the original stamp
+/// standing. The clock is given room to move between the two hand-ins, so a
+/// sync that *did* overwrite would write a demonstrably later value.
+#[tokio::test]
+async fn a_second_crossing_never_moves_the_stamp() {
+    let c = classroom().await;
+    let first = homework(&c, "Fractions I", 600_000).await;
+    let second = homework(&c, "Fractions II", 600_000).await;
+
+    hand_in(&c.app, &c.student, &first).await;
+    let earned = stamp_of(
+        &my_profile(&c.app, &c.student).await,
+        "homework_submitted_1",
+    )
+    .expect("the badge");
+
+    // Any overwrite from here on is strictly later than this instant.
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let moved_on = Timestamp::now().as_millis();
+    assert!(earned < moved_on, "the clock never moved — test is vacuous");
+
+    hand_in(&c.app, &c.student, &second).await;
+    let after = my_profile(&c.app, &c.student).await;
+    assert_eq!(after["stats"]["homework_submitted_total"], 2, "{after}");
+    assert_eq!(
+        stamp_of(&after, "homework_submitted_1"),
+        Some(earned),
+        "a re-sync moved a permanent stamp: {after}"
+    );
+}
+
+/// The whole point of an award row: permanence lives at the award, not at the
+/// counter. Withdrawing the submission takes the counter back to zero — and
+/// the badge it earned stays on the shelf, stamp untouched.
+#[tokio::test]
+async fn a_badge_outlives_the_counter_that_earned_it() {
+    let c = classroom().await;
+    let only = homework(&c, "Fractions I", 600_000).await;
+
+    hand_in(&c.app, &c.student, &only).await;
+    let earned_it = my_profile(&c.app, &c.student).await;
+    let earned = stamp_of(&earned_it, "homework_submitted_1").expect("the badge");
+    assert_eq!(earned_it["stats"]["homework_submitted_total"], 1);
+
+    withdraw(&c.app, &c.student, &only).await;
+
+    let after = my_profile(&c.app, &c.student).await;
+    assert_eq!(
+        after["stats"]["homework_submitted_total"], 0,
+        "the counter must come back down: {after}"
+    );
+    assert_eq!(after["stats"]["homework_on_time_total"], 0, "{after}");
+    assert_eq!(
+        stamp_of(&after, "homework_submitted_1"),
+        Some(earned),
+        "a badge is never taken back: {after}"
+    );
+}
+
+/// The farm hole, closed at the counter: withdrawing gives the credit back, so
+/// submit → withdraw → submit is worth exactly one submission however many
+/// times it is run. Without the decrement, one homework mints unlimited ones.
+#[tokio::test]
+async fn submit_withdraw_submit_is_worth_one_submission() {
+    let c = classroom().await;
+    let only = homework(&c, "Fractions I", 600_000).await;
+
+    for _ in 0..3 {
+        hand_in(&c.app, &c.student, &only).await;
+        withdraw(&c.app, &c.student, &only).await;
+    }
+    hand_in(&c.app, &c.student, &only).await;
+
+    let mine = my_profile(&c.app, &c.student).await;
+    assert_eq!(
+        mine["stats"]["homework_submitted_total"], 1,
+        "one homework handed in once, whatever the churn: {mine}"
+    );
+    assert_eq!(mine["stats"]["homework_on_time_total"], 1, "{mine}");
+}
+
+/// The two homework counters part company at the deadline: everything handed
+/// in counts as submitted, only what beat `due_at` counts as on time. The
+/// on-time hand-in in the same test is what proves the counter still moves at
+/// all, so a permanently-stuck `on_time` cannot pass as "the late one".
+#[tokio::test]
+async fn a_late_submission_moves_submitted_but_not_on_time() {
+    let c = classroom().await;
+    // Backdated inside the scheduling grace: already due, still creatable.
+    let overdue = homework(&c, "Yesterday's", -30_000).await;
+    let punctual = homework(&c, "Next week's", 600_000).await;
+
+    hand_in(&c.app, &c.student, &overdue).await;
+    let late = my_profile(&c.app, &c.student).await;
+    assert_eq!(late["stats"]["homework_submitted_total"], 1, "{late}");
+    assert_eq!(
+        late["stats"]["homework_on_time_total"], 0,
+        "a submission past due_at earns no on-time credit: {late}"
+    );
+
+    hand_in(&c.app, &c.student, &punctual).await;
+    let both = my_profile(&c.app, &c.student).await;
+    assert_eq!(both["stats"]["homework_submitted_total"], 2, "{both}");
+    assert_eq!(both["stats"]["homework_on_time_total"], 1, "{both}");
+}
+
+/// A withdrawal gives back what the hand-in was credited with, not what the
+/// deadline says *now*: a teacher who extends `due_at` after a late hand-in has
+/// not made it on time retroactively. Re-judging at withdrawal debited an
+/// on-time credit that was never given, and the zero floor hid it — so a
+/// genuinely on-time submission is held throughout, and it is that one's credit
+/// the late withdrawal used to eat.
+#[tokio::test]
+async fn extending_a_deadline_never_debits_an_on_time_credit_it_never_gave() {
+    let c = classroom().await;
+    let punctual = homework(&c, "Next week's", 600_000).await;
+    // Backdated inside the scheduling grace: already due, still creatable.
+    let overdue = homework(&c, "Yesterday's", -30_000).await;
+
+    hand_in(&c.app, &c.student, &punctual).await;
+    hand_in(&c.app, &c.student, &overdue).await;
+    let both = my_profile(&c.app, &c.student).await;
+    assert_eq!(both["stats"]["homework_submitted_total"], 2, "{both}");
+    assert_eq!(both["stats"]["homework_on_time_total"], 1, "{both}");
+
+    // The teacher relents and moves the deadline out. The hand-in that was late
+    // when it landed was still late when it landed.
+    move_deadline(&c, &overdue, 600_000).await;
+    let moved = my_profile(&c.app, &c.student).await;
+    assert_eq!(moved["stats"]["homework_on_time_total"], 1, "{moved}");
+
+    withdraw(&c.app, &c.student, &overdue).await;
+    let after = my_profile(&c.app, &c.student).await;
+    assert_eq!(after["stats"]["homework_submitted_total"], 1, "{after}");
+    assert_eq!(
+        after["stats"]["homework_on_time_total"], 1,
+        "withdrawing the late one took the punctual one's credit: {after}"
+    );
+
+    // ... and the punctual one still has exactly its own credit to give back.
+    withdraw(&c.app, &c.student, &punctual).await;
+    let empty = my_profile(&c.app, &c.student).await;
+    assert_eq!(empty["stats"]["homework_submitted_total"], 0, "{empty}");
+    assert_eq!(empty["stats"]["homework_on_time_total"], 0, "{empty}");
+}
+
+/// The other direction, where the floor cannot hide it: pulling `due_at` back
+/// after a punctual hand-in used to make the withdrawal debit *nothing* on
+/// time, leaving `on_time` standing above `submitted` — a student credited with
+/// more punctual hand-ins than hand-ins. The invariant is checked at every step,
+/// not just at the end.
+#[tokio::test]
+async fn pulling_a_deadline_back_leaves_on_time_no_higher_than_submitted() {
+    let c = classroom().await;
+    let only = homework(&c, "Next week's", 600_000).await;
+
+    let counted = |profile: &Value| -> (i64, i64) {
+        let submitted = profile["stats"]["homework_submitted_total"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("submitted total: {profile}"));
+        let on_time = profile["stats"]["homework_on_time_total"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("on-time total: {profile}"));
+        assert!(
+            on_time <= submitted,
+            "on_time {on_time} exceeds submitted {submitted}: {profile}"
+        );
+        (submitted, on_time)
+    };
+
+    hand_in(&c.app, &c.student, &only).await;
+    assert_eq!(counted(&my_profile(&c.app, &c.student).await), (1, 1));
+
+    // Backdating inside the grace is a legal PATCH, and it moves the very cut
+    // the credit was judged by.
+    move_deadline(&c, &only, -30_000).await;
+    assert_eq!(
+        counted(&my_profile(&c.app, &c.student).await),
+        (1, 1),
+        "moving a deadline re-judges nothing already credited"
+    );
+
+    withdraw(&c.app, &c.student, &only).await;
+    assert_eq!(
+        counted(&my_profile(&c.app, &c.student).await),
+        (0, 0),
+        "the withdrawal gave back the on-time credit it took"
+    );
+}
+
+/// `exam_sat_total` counts sittings, not requests: re-posting a running
+/// attempt resumes it (`200`, same clock) and must leave the counter alone.
+#[tokio::test]
+async fn a_resumed_exam_attempt_counts_once() {
+    let c = classroom().await;
+    let now = Timestamp::now().as_millis();
+    let res = create_exam_with(
+        &c.app,
+        &c.teacher,
+        &c.course,
+        json!({ "title": "Midterm", "kind": "quiz", "mode": "sync",
+                "starts_at": now - 1_000, "ends_at": now + 600_000 }),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let exam = id_of(&res.body);
+
+    let started = send(
+        &c.app,
+        "POST",
+        &format!("/exams/{exam}/attempt"),
+        Some(&c.student),
+        None,
+    )
+    .await;
+    assert_eq!(started.status, StatusCode::CREATED, "{}", started.body);
+
+    let resumed = send(
+        &c.app,
+        "POST",
+        &format!("/exams/{exam}/attempt"),
+        Some(&c.student),
+        None,
+    )
+    .await;
+    assert_eq!(
+        resumed.status,
+        StatusCode::OK,
+        "the second post must resume, not start: {}",
+        resumed.body
+    );
+
+    let mine = my_profile(&c.app, &c.student).await;
+    assert_eq!(
+        mine["stats"]["exam_sat_total"], 1,
+        "a resume is not a second sitting: {mine}"
+    );
+    assert_eq!(badge_ids(&mine), ["exam_sat_1"], "{mine}");
+}
+
+/// The catalog a client renders badges from, end to end. `stat` is a **wire**
+/// name: a domain test pins that it differs from the user-row column, and this
+/// pins that what ships is the wire one — and that appending `_total` to it
+/// lands on a real key of a real profile's stats, which is the only thing that
+/// lets a client join the two surfaces at all.
+#[tokio::test]
+async fn the_badge_catalog_is_reachable_and_wire_named() {
+    let (app, _db) = app_and_db().await;
+    let fresh = login(&app, "fresh").await;
+    let stats = my_profile(&app, &fresh).await["stats"]
+        .as_object()
+        .expect("stats object")
+        .clone();
+
+    // Unauthenticated: the form that renders a badge needs no session.
+    let res = send(&app, "GET", "/limits", None, None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let catalog = res.body["badges"]["catalog"]
+        .as_array()
+        .unwrap_or_else(|| panic!("badges.catalog array: {}", res.body));
+    assert!(!catalog.is_empty(), "an empty catalog awards nothing");
+
+    for badge in catalog {
+        let id = badge["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("id: {badge}"));
+        let stat = badge["stat"]
+            .as_str()
+            .unwrap_or_else(|| panic!("stat: {badge}"));
+        let threshold = badge["threshold"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("threshold: {badge}"));
+        assert!(threshold > 0, "{id} is earned by doing nothing");
+        assert!(
+            !stat.ends_with("_total"),
+            "{id} serves the database column {stat}, not a wire name: renaming \
+             the column would break the API"
+        );
+        assert!(
+            stats.contains_key(&format!("{stat}_total")),
+            "{id}'s stat {stat} joins no profile stats key: {stats:?}"
+        );
+    }
+    assert!(
+        catalog
+            .iter()
+            .any(|badge| badge["id"] == "homework_submitted_1" && badge["threshold"] == 1),
+        "the first-homework badge left the catalog: {res_body}",
+        res_body = res.body
+    );
+}
+
+/// Badges are public — they are a decoration, not a record — so they ride the
+/// profile's existing gate and open no door of their own: a peer reads them,
+/// and a parent with no link to the student is still refused the whole
+/// profile, badges included.
+#[tokio::test]
+async fn badges_ride_the_profile_gate_and_open_no_new_door() {
+    let c = classroom().await;
+    let only = homework(&c, "Fractions I", 600_000).await;
+    hand_in(&c.app, &c.student, &only).await;
+
+    let peer = login(&c.app, "peer").await;
+    let seen = profile(&c.app, &peer, &c.student_id).await;
+    assert_eq!(seen.status, StatusCode::OK, "{}", seen.body);
+    assert_eq!(
+        badge_ids(&seen.body),
+        ["homework_submitted_1"],
+        "a peer sees the shelf: {}",
+        seen.body
+    );
+
+    let stranger = login_as(&c.app, &c.db, "mom", "parent").await;
+    let blocked = profile(&c.app, &stranger, &c.student_id).await;
+    assert_eq!(
+        blocked.status,
+        StatusCode::FORBIDDEN,
+        "an unlinked parent reads no profile, badges included: {}",
+        blocked.body
+    );
 }
 
 /// A profile that was never there is a 404, at any role — the id is not an
