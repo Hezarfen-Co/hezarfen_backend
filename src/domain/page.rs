@@ -18,6 +18,9 @@
 //! emits exactly one statement (no count — the rows in hand *are* the total),
 //! so internal callers that just want the list pay nothing.
 //!
+//! The count's result shape is the planner's to choose (see [`total_of`]) —
+//! both shapes decode to the same `total`.
+//!
 //! Only for lists the database can express whole. A handler that filters rows
 //! in Rust after the read (visibility, audience resolution, a schedule window)
 //! must keep slicing in the web layer: a DB `LIMIT` in front of a Rust filter
@@ -41,17 +44,8 @@ impl PagedList {
     /// `from_where` is a whole-table read (`"term"`) or a filtered one
     /// (`"note WHERE user = $usr"`).
     pub fn new(from_where: impl Into<String>, order: &'static str) -> Self {
-        let from_where = from_where.into();
         Self {
-            // A *bare* `SELECT VALUE count() FROM t GROUP ALL` comes back as an
-            // object rather than the projected int ("Expected int, got object")
-            // — the whole-table read takes a path that drops the `VALUE`. Any
-            // `WHERE`, even a trivial one, keeps it an int, so an unfiltered
-            // list gets one. Cheaper than special-casing the take.
-            from_where: match from_where.contains(" WHERE ") {
-                true => from_where,
-                false => format!("{from_where} WHERE true"),
-            },
+            from_where: from_where.into(),
             order,
             bindings: Vec::new(),
         }
@@ -104,13 +98,39 @@ impl PagedList {
         }
         let mut result = query.await?.check()?;
         let rows = result.take::<Vec<T>>(0)?;
-        let total = if counted {
-            // `GROUP ALL` yields no row at all when nothing matched.
-            result.take::<Vec<i64>>(1)?.first().copied().unwrap_or(0)
-        } else {
-            rows.len() as i64
+        let total = match counted {
+            true => total_of(result.take::<Value>(1)?)?,
+            false => rows.len() as i64,
         };
         Ok((rows, total))
+    }
+}
+
+/// The count statement's slot, in either shape the planner answers in.
+///
+/// `SELECT VALUE count() ... GROUP ALL` normally yields the projected int, but
+/// whenever the planner can answer the count straight out of an index or the
+/// table count (`IndexCountScan` — an indexed field compared to a value known
+/// at plan time, `grade IS NONE` or a *literal*, and any bare table read) it
+/// returns `{ count: N }` and drops the `SELECT VALUE` projection. Decoding
+/// only the int is where "Expected int, got object" came from; the number is
+/// the same either way. The in-memory engine never rewrites the plan, so only
+/// a real server ever produces the object.
+fn total_of(count: Value) -> Result<i64, AppError> {
+    // `GROUP ALL` yields no row at all when nothing matched.
+    let row = match count {
+        Value::Array(rows) => rows.into_iter().next().unwrap_or_default(),
+        other => other,
+    };
+    let row = match row {
+        Value::Object(mut object) => object.remove("count").unwrap_or_default(),
+        other => other,
+    };
+    match row.is_nullish() {
+        true => Ok(0),
+        false => row
+            .into_t::<i64>()
+            .map_err(|e| AppError::Internal(format!("count decode: {e}"))),
     }
 }
 
@@ -136,12 +156,39 @@ mod tests {
         assert!(counted);
     }
 
-    /// A whole-table read still gets a `WHERE`, or its count comes back as an
-    /// object instead of an int.
+    /// A whole-table read counts the table as it stands — no `WHERE true` to
+    /// force a scan, because [`total_of`] now takes the count-from-index shape
+    /// that hack existed to avoid.
     #[test]
-    fn an_unfiltered_list_still_counts_as_an_int() {
+    fn an_unfiltered_list_counts_the_bare_table() {
         let (sql, _) = PagedList::new("term", "ORDER BY starts_at DESC").statements(Some(5), 0);
-        assert!(sql.contains("SELECT VALUE count() FROM term WHERE true GROUP ALL;"));
+        assert!(sql.contains("SELECT VALUE count() FROM term GROUP ALL;"));
+    }
+
+    /// Both shapes of the count slot mean the same number. The object is what
+    /// a real server returns whenever it answers `count()` from an index or the
+    /// table count; the in-memory engine only ever produces the int, so this is
+    /// the only place the object arm can be pinned. Drop that arm and the
+    /// second assert fails with "count decode: Expected int, got object" —
+    /// which is the 500 `GET /classes?grade=&limit=1` served.
+    #[test]
+    fn a_count_decodes_from_either_shape() {
+        let projected = Value::Array([Value::from_t(7i64)].into_iter().collect());
+        let from_index = Value::Array(
+            [Value::Object(
+                [("count".to_string(), Value::from_t(7i64))]
+                    .into_iter()
+                    .collect(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        assert_eq!(total_of(projected).unwrap(), 7);
+        assert_eq!(total_of(from_index).unwrap(), 7);
+        // `GROUP ALL` yields no row at all when nothing matched.
+        assert_eq!(total_of(Value::Array(Default::default())).unwrap(), 0);
+        // Any other shape is an error, never a silently wrong `total`.
+        assert!(total_of(Value::Array([Value::from_t("7")].into_iter().collect())).is_err());
     }
 
     /// Unpaged from row zero: the rows in hand are the total, so no count runs.
