@@ -1201,8 +1201,16 @@ async fn the_class_refusal_codes_stay_published() {
     }
 
     // …and the closed set itself, on the one field that explains all of it: the
-    // union of both routes plus the pump, so a code documented on no surface at
-    // all still fails here.
+    // union of both routes plus the pump, so a code documented on one surface
+    // but missing from the field that collects them all still fails here.
+    //
+    // What this cannot catch: a code this file has never heard of. The three
+    // lists above are hand-kept, so a new `Attached` variant reaches the API
+    // documented nowhere and every assertion here still passes. The compiler
+    // holds that end instead — `refusal_code`'s match is exhaustive, so the
+    // variant cannot be added without a code — and
+    // `class_blueprint::tests::each_axis_names_the_ceiling_it_actually_hit`
+    // pins what that code is per axis. Adding one means editing both.
     let reason =
         spec["components"]["schemas"]["SkipResponse"]["properties"]["reason"]["description"]
             .as_str()
