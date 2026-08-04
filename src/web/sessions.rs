@@ -10,6 +10,7 @@ use utoipa_axum::routes;
 
 use crate::database::Database;
 use crate::domain::attendance::AttendanceStatus;
+use crate::domain::badge;
 use crate::domain::course::Course;
 use crate::domain::course_session::{CourseSession, CourseSessionId, SessionTopic};
 use crate::domain::enrollment::Enrollment;
@@ -354,6 +355,20 @@ async fn mark_roll_call(
 
     let attendance =
         SessionAttendance::mark(&session, &target, status, user.get_id(), &st.db).await?;
+    // A badge is a decoration on top of the roll call: losing one to a
+    // transient database error must never fail the mark, and the next counter
+    // move re-runs this and heals it. Both people the mark can credit are
+    // synced — the person marked (`lessons_attended`) and the lesson's teacher
+    // (`lessons_held`, on the first roll call only). The teacher's runs on every
+    // mark rather than only that first one: `sync` is add-only and idempotent,
+    // so the extra calls cost one record read and are what heals a first sync
+    // that failed, and knowing here whether the credit landed would mean
+    // widening `mark`'s return type for nothing.
+    for who in [&target, session.get_teacher()] {
+        if let Err(err) = badge::sync(who, &st.db).await {
+            tracing::warn!("failed to sync badges for {}: {err}", who.key());
+        }
+    }
     let people = PersonRef::map_of(&[&target_user, &user]);
     Ok(Json(SessionAttendanceResponse::new(&attendance, &people)))
 }

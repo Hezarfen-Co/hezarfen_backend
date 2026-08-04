@@ -13,7 +13,9 @@
 
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
-use crate::constant::{HOMEWORK_RESULT_TABLE, SUBMISSION_GRADED_FIELD, SUBMISSION_OPEN_GUARD};
+use crate::constant::{
+    HOMEWORK_RESULT_TABLE, MARKS_GIVEN_TOTAL_FIELD, SUBMISSION_GRADED_FIELD, SUBMISSION_OPEN_GUARD,
+};
 use crate::database::Database;
 use crate::domain::course::CourseId;
 use crate::domain::exam_result::Mark;
@@ -164,22 +166,47 @@ impl HomeworkResult {
             graded_by: graded_by.clone(),
             created_at: Timestamp::now(),
         };
+        // Whether the pair was already graded is read one statement ahead of
+        // the write, inside the same transaction — it is what keeps a regrade
+        // from crediting the grader a second time. No mark counter here: a
+        // homework mark is optional and most grades are status-only, so
+        // `high_mark` is an exam-only family.
+        //
+        // ponytail: this is a plain query, not `transaction_with_retry`, so a
+        // store conflict on the grader's row — another domain writing the same
+        // user row in the same instant — comes back as a 500 rather than a
+        // re-send. Rare (grading is serialised by `HOMEWORK_LOCK` and a
+        // teacher's row moves nowhere else but exam grading), and the upgrade
+        // is the shape `HomeworkSubmission::upsert` already uses: the whole
+        // transaction is re-sendable, since nothing in it can legitimately
+        // answer "already exists".
         let mut saved = db
             .query(format!(
                 "BEGIN TRANSACTION;
-                 UPSERT $id CONTENT $row RETURN AFTER;
+                 LET $before = (SELECT VALUE id FROM ONLY $id);
+                 LET $after = (UPSERT $id CONTENT $row RETURN AFTER);
                  UPDATE $sub SET {SUBMISSION_GRADED_FIELD} = $id \
                      WHERE {SUBMISSION_OPEN_GUARD};
+                 IF $before = NONE {{
+                     UPDATE $grader SET {MARKS_GIVEN_TOTAL_FIELD} =
+                         ({MARKS_GIVEN_TOTAL_FIELD} ?? 0) + 1
+                 }};
+                 RETURN $after;
                  COMMIT TRANSACTION;"
             ))
             .bind(("id", id.record()))
             .bind(("sub", submission.record()))
+            .bind(("grader", graded_by.record()))
             .bind(("row", result.into_value()))
             .await?
             .check()?;
-        // BEGIN is slot 0; the result's UPSERT is slot 1, the stamp slot 2.
+        // The trailing `RETURN` is always the last statement before `COMMIT`,
+        // so its slot follows the statement count instead of a hand-kept
+        // number — which the counter statement above would otherwise have
+        // shifted, silently handing back the stamp's row.
+        let slot = saved.num_statements().saturating_sub(2);
         saved
-            .take::<Vec<HomeworkResult>>(1)?
+            .take::<Vec<HomeworkResult>>(slot)?
             .into_iter()
             .next()
             .ok_or_else(|| AppError::Internal("failed to record homework result".into()))
@@ -338,5 +365,60 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// The grader is credited once per graded pair: a regrade lands on the same
+    /// row, so it is not a mark given twice. The student's counters are not
+    /// touched at all — a homework grade is not a homework submission.
+    #[tokio::test]
+    async fn a_first_grade_credits_the_grader_and_a_regrade_does_not() {
+        let db = crate::database::init_mem().await.unwrap();
+        let homework = HomeworkId::from_key("01TESTHWBADGEAAAAAAAAAAAAA");
+        let user = UserId::from_key("01TESTUSERAAAAAAAAAAAAAAAA");
+        let teacher = UserId::from_key("01TESTTEACHERAAAAAAAAAAAAA");
+        // `UPDATE` writes nothing to a user row that does not exist.
+        db.query("CREATE $usr SET username = 't', password_hash = 'x'")
+            .bind(("usr", teacher.record()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        for status in ["incomplete", "done"] {
+            HomeworkResult::grade(
+                &homework,
+                &user,
+                HomeworkStatus::try_new(status).unwrap(),
+                None,
+                &teacher,
+                &db,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            marks_given(&teacher, &db).await,
+            1,
+            "one graded pair, one mark given"
+        );
+    }
+
+    /// The grader's badge counter, re-read out of the store.
+    async fn marks_given(user: &UserId, db: &Database) -> i64 {
+        let mut result = db
+            .query(format!(
+                "SELECT VALUE ({MARKS_GIVEN_TOTAL_FIELD} ?? 0) FROM $usr"
+            ))
+            .bind(("usr", user.record()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        result
+            .take::<Vec<i64>>(0)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap_or(0)
     }
 }

@@ -82,6 +82,11 @@ struct BadgeLimits {
     /// Every badge the system can auto-award, in catalog order. Hardcoded, so
     /// like everything else here it moves only with a deploy.
     catalog: Vec<BadgeLimit>,
+    /// The exam mark that counts as a high one, out of `mark.max_mark`, behind
+    /// the `high_mark` ladder. Published because the id alone does not say it:
+    /// deliberately not the school's grade bands, which are renameable labels.
+    #[schema(example = 90)]
+    high_mark_min: i64,
 }
 
 /// One badge in the auto-earned catalog. The id is the whole contract: a
@@ -451,6 +456,7 @@ impl LimitsResponse {
                         threshold: *threshold,
                     })
                     .collect(),
+                high_mark_min: HIGH_MARK_MIN,
             },
             note: NoteLimits {
                 max_title_len: MAX_NOTE_TITLE_LEN,

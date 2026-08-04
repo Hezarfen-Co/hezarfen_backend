@@ -201,13 +201,27 @@ impl ProfileStats {
                         ({homework_on_time} ?? 0) AS homework_on_time,
                         ({exam_sat} ?? 0) AS exam_sat,
                         ({pomodoro_finished} ?? 0) AS pomodoro_finished,
-                        ({pomodoro_focus_ms} ?? 0) AS pomodoro_focus_ms
+                        ({pomodoro_focus_ms} ?? 0) AS pomodoro_focus_ms,
+                        ({marks_given} ?? 0) AS marks_given,
+                        ({lessons_held} ?? 0) AS lessons_held,
+                        ({pool_approved} ?? 0) AS pool_approved,
+                        ({pool_published} ?? 0) AS pool_published,
+                        ({lessons_attended} ?? 0) AS lessons_attended,
+                        ({high_mark} ?? 0) AS high_mark,
+                        ({study_streak} ?? 0) AS study_streak
                  FROM $usr;",
                 homework_submitted = BadgeStat::HomeworkSubmitted.field(),
                 homework_on_time = BadgeStat::HomeworkOnTime.field(),
                 exam_sat = BadgeStat::ExamSat.field(),
                 pomodoro_finished = BadgeStat::PomodoroFinished.field(),
                 pomodoro_focus_ms = BadgeStat::PomodoroFocusMs.field(),
+                marks_given = BadgeStat::MarksGiven.field(),
+                lessons_held = BadgeStat::LessonsHeld.field(),
+                pool_approved = BadgeStat::PoolApproved.field(),
+                pool_published = BadgeStat::PoolPublished.field(),
+                lessons_attended = BadgeStat::LessonsAttended.field(),
+                high_mark = BadgeStat::HighMark.field(),
+                study_streak = BadgeStat::StudyStreak.field(),
             ))
             .bind(("usr", user.record()))
             .await?
@@ -215,7 +229,7 @@ impl ProfileStats {
         // `GROUP ALL` yields no row at all when nothing matched — that is the
         // zero case, not a missing one.
         let row = result.take::<Vec<PomodoroTotals>>(0)?.into_iter().next();
-        // A vanished user row reads as five zeros, same as a fresh account.
+        // A vanished user row reads as all zeros, same as a fresh account.
         let totals = result
             .take::<Vec<BadgeStats>>(1)?
             .into_iter()

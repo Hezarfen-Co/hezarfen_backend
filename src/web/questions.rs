@@ -18,6 +18,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::constant::{MAX_MAX_FILE_BYTES, POOL_QUESTION_STATUSES, UPLOAD_BODY_OVERHEAD_BYTES};
+use crate::domain::badge;
 use crate::domain::pool_question::{
     PoolQuestion, PoolQuestionBody, PoolQuestionId, PoolQuestionTitle,
 };
@@ -386,6 +387,16 @@ async fn approve_question(
             return Err(AppError::Conflict("the question is already approved"));
         }
     };
+    // Both counters moved inside the approval's own transaction; the badges
+    // they may have earned are a decoration on top of it. Losing one to a
+    // transient database error must never fail the approval behind it, and the
+    // next counter move re-runs this and heals it. Two users, because the
+    // transition credits the approver and the asker alike.
+    for earner in [user.get_id(), question.get_asker()] {
+        if let Err(err) = badge::sync(earner, &st.db).await {
+            tracing::warn!("failed to sync badges for {}: {err}", earner.key());
+        }
+    }
     let responses = question_responses(std::slice::from_ref(&question), &st).await?;
     let response = responses
         .into_iter()

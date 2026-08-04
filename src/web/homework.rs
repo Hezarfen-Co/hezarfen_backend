@@ -776,8 +776,9 @@ async fn delete_submission(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Bring the student's badge awards up to date after a submission moved their
-/// counters. Never fails the request it follows: a badge is a decoration on top
+/// Bring one user's badge awards up to date after a write moved their counters
+/// — the student's after a submission, the grader's after a grade. Never fails
+/// the request it follows: a badge is a decoration on top
 /// of the work, and losing one to a transient database error is not worth
 /// refusing a hand-in over — the next counter move re-runs this and heals it.
 async fn award_badges(user: &UserId, db: &Database) {
@@ -1135,6 +1136,9 @@ async fn grade_homework(
         &st.db,
     )
     .await?;
+    // The grade credited the *grader*'s `marks_given`, not the student's — a
+    // homework grade moves no counter of the student's at all.
+    award_badges(teacher.get_id(), &st.db).await;
     Ok(Json(HomeworkResultResponse::new(&result)))
 }
 

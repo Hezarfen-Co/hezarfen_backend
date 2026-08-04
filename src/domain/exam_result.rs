@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
 use crate::constant::{
-    EXAM_RESULT_COUNT_FIELD, EXAM_RESULT_TABLE, KIND_REF_TABLE, REF_COUNT_FIELD, REF_RETIRED_FIELD,
+    EXAM_RESULT_COUNT_FIELD, EXAM_RESULT_TABLE, HIGH_MARK_MIN, HIGH_MARK_TOTAL_FIELD,
+    KIND_REF_TABLE, MARKS_GIVEN_TOTAL_FIELD, REF_COUNT_FIELD, REF_RETIRED_FIELD,
 };
 use crate::database::{Database, transaction_with_retry};
 use crate::domain::cap;
@@ -201,6 +202,14 @@ impl ExamResult {
     /// one mark, one reference, so the branch that finds a row simply leaves
     /// both counters where they are — there is no claim to give back, and so no
     /// window in which a crash could fail to give it.
+    ///
+    /// The two badge counters ride that same first-time branch: the grader's
+    /// `marks_given_total`, and — only when the mark clears
+    /// [`HIGH_MARK_MIN`] — the student's `high_mark_total`. So a regrade of a
+    /// sitting moves neither however often it is run, while a retake, being a
+    /// distinct `seq` and so a distinct row, counts on its own. They are
+    /// written field-scoped: a user row also carries admin-owned data (`role`)
+    /// that a whole-row save would revert.
     pub async fn grade(
         exam: &ExamId,
         user: &UserId,
@@ -246,6 +255,17 @@ impl ExamResult {
         // the index entry can only ever point at the row the id already names
         // and the write resolves onto it. A lost round aborts having written
         // nothing, counters included.
+        // Below the line the student's counter is left out of the statement
+        // list entirely, rather than added to by a zero: a low mark is most
+        // marks, and it must not write the student's row at all.
+        let high_mark = if mark.as_i64() >= HIGH_MARK_MIN {
+            format!(
+                "UPDATE $student SET {HIGH_MARK_TOTAL_FIELD} =
+                         ({HIGH_MARK_TOTAL_FIELD} ?? 0) + 1;"
+            )
+        } else {
+            String::new()
+        };
         let _guard = cap::counter_lock().await;
         let (mut written, mut errors) = transaction_with_retry(
             db,
@@ -260,6 +280,9 @@ impl ExamResult {
                      IF array::len($kind) = 0 {{ THROW '{RETIRED_MARK}' }};
                      UPDATE $exam SET {EXAM_RESULT_COUNT_FIELD} =
                          ({EXAM_RESULT_COUNT_FIELD} ?? 0) + 1;
+                     UPDATE $grader SET {MARKS_GIVEN_TOTAL_FIELD} =
+                         ({MARKS_GIVEN_TOTAL_FIELD} ?? 0) + 1;
+                     {high_mark}
                  }};
                  LET $after = (UPSERT $id CONTENT $result RETURN AFTER);
                  RETURN $after[0];
@@ -269,6 +292,8 @@ impl ExamResult {
                 ("exam".into(), exam.record().into_value()),
                 ("id".into(), result.id.record().into_value()),
                 ("kref".into(), kind_ref(kind).into_value()),
+                ("grader".into(), graded_by.record().into_value()),
+                ("student".into(), user.record().into_value()),
                 ("result".into(), result.into_value()),
             ],
             &["exam_missing", "exam_draft", RETIRED_MARK],
@@ -570,6 +595,9 @@ mod tests {
         .unwrap();
     }
 
+    const STUDENT: &str = "01TESTSTUDENTAAAAAAAAAAAAA";
+    const TEACHER: &str = "01TESTTEACHERAAAAAAAAAAAAA";
+
     async fn grade(
         db: &Database,
         exam: &ExamId,
@@ -579,10 +607,10 @@ mod tests {
     ) -> Result<ExamResult, AppError> {
         ExamResult::grade(
             exam,
-            &UserId::from_key("01TESTSTUDENTAAAAAAAAAAAAA"),
+            &UserId::from_key(STUDENT),
             seq,
             Mark::try_new(mark).unwrap(),
-            &UserId::from_key("01TESTTEACHERAAAAAAAAAAAAA"),
+            &UserId::from_key(TEACHER),
             kind,
             db,
         )
@@ -610,6 +638,86 @@ mod tests {
         // A retake is a second row, so it does claim.
         grade(&db, &exam, 2, 70, "midterm").await.unwrap();
         assert_eq!(counters(&db, "midterm").await, (2, 2));
+    }
+
+    /// The two badge counters, re-read out of the store: the grader's marks
+    /// given and the student's high marks.
+    async fn badge_counters(db: &Database) -> (i64, i64) {
+        let mut result = db
+            .query(format!(
+                "SELECT VALUE ({MARKS_GIVEN_TOTAL_FIELD} ?? 0) FROM $grader;
+                 SELECT VALUE ({HIGH_MARK_TOTAL_FIELD} ?? 0) FROM $student;"
+            ))
+            .bind(("grader", UserId::from_key(TEACHER).record()))
+            .bind(("student", UserId::from_key(STUDENT).record()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let given: Vec<i64> = result.take(0).unwrap();
+        let high: Vec<i64> = result.take(1).unwrap();
+        (
+            given.into_iter().next().unwrap_or(0),
+            high.into_iter().next().unwrap_or(0),
+        )
+    }
+
+    /// The rows a counter needs to land on — `UPDATE` writes nothing to a user
+    /// that does not exist, so the badge tests must make both real.
+    async fn the_two_people(db: &Database) {
+        for key in [TEACHER, STUDENT] {
+            db.query("CREATE $usr SET username = $name, password_hash = 'x'")
+                .bind(("usr", UserId::from_key(key).record()))
+                .bind(("name", key.to_string()))
+                .await
+                .unwrap()
+                .check()
+                .unwrap();
+        }
+    }
+
+    /// A first grade credits the grader once and the student only when the mark
+    /// clears the line; a regrade of the same sitting credits neither again,
+    /// while a retake — a distinct seq, so a distinct row — counts on its own.
+    #[tokio::test]
+    async fn a_grade_credits_the_grader_once_and_a_high_mark_the_student() {
+        let db = init_mem().await.unwrap();
+        let exam = ExamId::from_key("01TESTEXAMBADGEAAAAAAAAAAA");
+        an_exam(&db, &exam, "midterm").await;
+        the_two_people(&db).await;
+
+        grade(&db, &exam, 1, 90, "midterm").await.unwrap();
+        assert_eq!(badge_counters(&db).await, (1, 1), "at the line earns it");
+
+        // Same sitting graded again: neither counter may move, however high.
+        grade(&db, &exam, 1, 100, "midterm").await.unwrap();
+        assert_eq!(badge_counters(&db).await, (1, 1), "a regrade moves nothing");
+
+        // A retake below the line: the grader is credited, the student is not.
+        grade(&db, &exam, 2, 89, "midterm").await.unwrap();
+        assert_eq!(badge_counters(&db).await, (2, 1), "89 is under the line");
+
+        // …and a high-scoring retake counts as its own sitting.
+        grade(&db, &exam, 3, 95, "midterm").await.unwrap();
+        assert_eq!(badge_counters(&db).await, (3, 2));
+    }
+
+    /// A refused mark leaves the badge counters where the other two are left.
+    #[tokio::test]
+    async fn a_refused_mark_credits_nobody() {
+        let db = init_mem().await.unwrap();
+        let exam = ExamId::from_key("01TESTEXAMBADGEDRAFTAAAAAA");
+        an_exam(&db, &exam, "midterm").await;
+        the_two_people(&db).await;
+        db.query("UPDATE $ex SET draft = true")
+            .bind(("ex", exam.record()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        assert!(grade(&db, &exam, 1, 100, "midterm").await.is_err());
+        assert_eq!(badge_counters(&db).await, (0, 0));
     }
 
     /// A retired kind refuses the claim from inside the transaction, which

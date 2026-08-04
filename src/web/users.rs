@@ -749,12 +749,18 @@ struct ProfileCourseRef {
 /// account with no rows behind a counter reads a true `0`.
 ///
 /// Two kinds live here. The first four are **computed at read time** from the
-/// rows that exist right now, so deleting the rows moves them down. The five
-/// `*_total` ones are **stored lifetime counters**, incremented as the work
+/// rows that exist right now, so deleting the rows moves them down. Every
+/// `*_total` one is a **stored lifetime counter**, incremented as the work
 /// happens and never recomputed — they can therefore outlive the rows behind
 /// them (an exam deleted by its teacher still counts as sat), which is exactly
 /// why a badge earned off them stays earned. Each is named for a `stat` of the
-/// badge catalog at `GET /limits`, plus `_total`.
+/// badge catalog at `GET /limits`, plus `_total`, and that spelling is the join
+/// a client makes between the two surfaces — so the suffix is on the key even
+/// where the counter is not a running total (`study_streak_total` is a longest,
+/// not a sum).
+///
+/// Some are staff counters and some student ones; a role that never does the
+/// work simply reads zero, which is why no key is conditional.
 #[derive(Serialize, ToSchema)]
 struct ProfileStatsResponse {
     /// Finished pomodoro stints; an open one counts for nothing.
@@ -777,6 +783,28 @@ struct ProfileStatsResponse {
     pomodoro_finished_total: i64,
     /// Lifetime focused milliseconds.
     pomodoro_focus_ms_total: i64,
+    /// Lifetime grades this teacher recorded — exam sittings and homework
+    /// submissions alike, once per pair: a regrade moves nothing.
+    marks_given_total: i64,
+    /// Lifetime lessons this teacher held, credited at the **first roll call**
+    /// taken for one — a lesson scheduled and cancelled counts for nothing.
+    lessons_held_total: i64,
+    /// Lifetime pool questions this teacher approved.
+    pool_approved_total: i64,
+    /// Lifetime questions of this author that reached the school-wide pool,
+    /// counted when the approval lands.
+    pool_published_total: i64,
+    /// Lifetime lesson roll calls that put this **student** `present` or
+    /// `late`; a correction to any other status takes one back. Daily and event
+    /// attendance moves it not at all.
+    lessons_attended_total: i64,
+    /// Lifetime exam marks at or above the high-mark cut published as
+    /// `badges.high_mark_min` on `GET /limits`, one per graded sitting.
+    /// Homework marks never count — they are optional and often status-only.
+    high_mark_total: i64,
+    /// Longest run of consecutive study days ever held — a high-water mark, so
+    /// breaking the run never brings it down. Days end at midnight UTC.
+    study_streak_total: i64,
 }
 
 /// Build one profile as `viewer` may see it. The course block is chosen off the
@@ -884,6 +912,13 @@ async fn profile_of(
             exam_sat_total: stats.get_totals().get_exam_sat(),
             pomodoro_finished_total: stats.get_totals().get_pomodoro_finished(),
             pomodoro_focus_ms_total: stats.get_totals().get_pomodoro_focus_ms(),
+            marks_given_total: stats.get_totals().get_marks_given(),
+            lessons_held_total: stats.get_totals().get_lessons_held(),
+            pool_approved_total: stats.get_totals().get_pool_approved(),
+            pool_published_total: stats.get_totals().get_pool_published(),
+            lessons_attended_total: stats.get_totals().get_lessons_attended(),
+            high_mark_total: stats.get_totals().get_high_mark(),
+            study_streak_total: stats.get_totals().get_study_streak(),
         },
     })
 }
