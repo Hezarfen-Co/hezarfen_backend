@@ -140,6 +140,24 @@ pub struct Pumped {
     pub skipped: Vec<Skip>,
 }
 
+/// One section's distance from its grade's template: the courses it does not
+/// carry. Named as well as identified, like [`Skip`], and for the same reason.
+#[derive(Debug, Clone)]
+pub struct SectionStatus {
+    pub class: ClassGroupId,
+    pub class_name: String,
+    pub missing: Vec<CourseId>,
+}
+
+/// One `class_course` row, projected down to the pair that answers "does this
+/// section carry that course". `source` is deliberately not read: a link of any
+/// provenance satisfies the template.
+#[derive(SurrealValue)]
+struct Held {
+    class: ClassGroupId,
+    course: CourseId,
+}
+
 /// Why this attach did not land, or `None` when it did. A duplicate is not a
 /// skip: the course is already on the class, which is exactly what the
 /// blueprint asks for, and re-running a pump must therefore report nothing.
@@ -510,6 +528,62 @@ impl ClassBlueprint {
             }
         }
         Ok(pumped)
+    }
+
+    /// How far every section at this grade stands from the template: the
+    /// courses each one does not carry. Writes nothing — a pump's skip list
+    /// lives only in the response that reported it, and this is the read that
+    /// answers "which sections are still out of sync" afterwards.
+    ///
+    /// **A link of any source counts as satisfied.** A course a human attached
+    /// by hand fulfils the template exactly as a pumped one does — that is
+    /// [`Self::apply_to`]'s own idempotence rule, and a status read that
+    /// disagreed with it would send managers chasing rows no pump will ever
+    /// write.
+    ///
+    /// A course id the blueprint holds but that no longer exists reads as
+    /// missing from every section. It is the truth about the section, and this
+    /// read cannot prune it the way a pump does ([`Self::prune`]) without
+    /// writing; the next pump — `PATCH`ing the same list back — drops the id
+    /// and this noise with it.
+    ///
+    /// Unpaged, like the [`ClassGroup::list_for_grade`] it is built on: the set
+    /// is the şube one school runs at one grade, and the caller is asking about
+    /// all of them.
+    pub async fn status(&self, db: &Database) -> Result<Vec<SectionStatus>, AppError> {
+        let sections = ClassGroup::list_for_grade(&self.grade, db).await?;
+        if sections.is_empty() {
+            return Ok(Vec::new());
+        }
+        let classes: Vec<RecordId> = sections
+            .iter()
+            .map(|class| class.get_id().record())
+            .collect();
+        let mut result = db
+            .query(format!(
+                "SELECT class, course FROM {CLASS_COURSE_TABLE} WHERE class IN $classes"
+            ))
+            .bind(("classes", classes))
+            .await?
+            .check()?;
+        let held = result.take::<Vec<Held>>(0)?;
+        Ok(sections
+            .iter()
+            .map(|class| SectionStatus {
+                class: class.get_id().clone(),
+                class_name: class.get_name().as_str().to_string(),
+                missing: self
+                    .courses
+                    .iter()
+                    .filter(|course| {
+                        !held
+                            .iter()
+                            .any(|row| &row.class == class.get_id() && &&row.course == course)
+                    })
+                    .cloned()
+                    .collect(),
+            })
+            .collect())
     }
 
     /// Drop a course that no longer exists out of this blueprint's list.

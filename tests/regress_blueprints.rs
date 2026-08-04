@@ -128,6 +128,26 @@ fn skips(res: &Res) -> &Vec<Value> {
     res.body["skipped"].as_array().expect("a skip list")
 }
 
+/// One section's entry in a `GET /classes/blueprints/{grade}/status` body.
+fn section<'a>(res: &'a Res, class: &str) -> &'a Value {
+    res.body["sections"]
+        .as_array()
+        .expect("a section list")
+        .iter()
+        .find(|section| section["class"] == class)
+        .unwrap_or_else(|| panic!("no section {class} in {:?}", res.body))
+}
+
+/// The courses a section is short, as plain strings.
+fn missing(res: &Res, class: &str) -> Vec<String> {
+    section(res, class)["missing"]
+        .as_array()
+        .expect("a missing list")
+        .iter()
+        .map(|course| course.as_str().expect("a course id").to_string())
+        .collect()
+}
+
 /// The whole CRUD surface, and the 409s that keep one blueprint per grade.
 #[tokio::test]
 async fn a_blueprint_is_created_read_updated_and_deleted() {
@@ -1006,4 +1026,136 @@ async fn a_grade_label_nothing_carries_reports_matched_zero() {
         right.body
     );
     assert!(attached(&class, &algebra, &db).await);
+}
+
+/// The skip list a pump returns lives only in that one response body, so
+/// `GET /classes/blueprints/{grade}/status` is what a manager asks afterwards:
+/// which sections are out of sync, and with which courses.
+///
+/// Three rules in one run, because they are the same run: a section short a
+/// course names *exactly* that pair; satisfying it **by hand** empties the list
+/// (the template asks for the course, not for the pump's tag); and a grade with
+/// every section in sync reports them all with nothing missing, `matched`
+/// counting the sections rather than the courses.
+///
+/// The store is asserted alongside the body — the in-memory engine forges wins,
+/// and a status read agreeing with a `class_course` table that says otherwise
+/// would be worse than no read at all.
+#[tokio::test]
+async fn a_status_read_names_the_course_a_section_is_short() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "mgr", "manager").await;
+    let algebra = create_course(&app, &manager, "algebra").await;
+    // One seat, and a section with two students: the attach cannot hold the
+    // whole class, so that (section, course) pair is skipped.
+    let tight = create_capped_course(&app, &manager, "seminar", 1).await;
+    let short = create_class(&app, &manager, "9-A", "9").await;
+    let full = create_class(&app, &manager, "9-B", "9").await;
+    let ali = student_in(&app, &db, &short, &manager, "ali").await;
+    student_in(&app, &db, &short, &manager, "veli").await;
+
+    // No template covers the grade yet, and that is a 404 rather than an empty
+    // report — there is nothing to be out of sync with.
+    let nothing = send(
+        &app,
+        "GET",
+        "/classes/blueprints/9/status",
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(nothing.status, StatusCode::NOT_FOUND, "{:?}", nothing.body);
+
+    let made = send(
+        &app,
+        "POST",
+        "/classes/blueprints",
+        Some(&manager),
+        Some(json!({ "grade": "9", "course_ids": [algebra.clone(), tight.clone()] })),
+    )
+    .await;
+    assert_eq!(made.status, StatusCode::CREATED, "{:?}", made.body);
+    assert_eq!(skips(&made).len(), 1, "{:?}", made.body);
+
+    let drifted = send(
+        &app,
+        "GET",
+        "/classes/blueprints/9/status",
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(drifted.status, StatusCode::OK, "{:?}", drifted.body);
+    assert_eq!(drifted.body["grade"], "9");
+    assert_eq!(drifted.body["matched"], 2, "both sections carry the label");
+    assert_eq!(
+        missing(&drifted, &short),
+        vec![tight.clone()],
+        "exactly the pair the pump refused — not the course it did place: {:?}",
+        drifted.body
+    );
+    assert_eq!(section(&drifted, &short)["class_name"], "9-A");
+    assert!(
+        missing(&drifted, &full).is_empty(),
+        "the section that took the whole list is in sync: {:?}",
+        drifted.body
+    );
+    // …and the report agrees with the store on both halves.
+    assert!(attached(&short, &algebra, &db).await);
+    assert!(!attached(&short, &tight, &db).await);
+
+    // Now a human fixes it: one student out (so the seat fits) and the course
+    // attached by hand, carrying no blueprint tag at all.
+    let removed = send(
+        &app,
+        "DELETE",
+        &format!("/classes/{short}/members/{ali}"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(removed.status, StatusCode::NO_CONTENT);
+    let byhand = send(
+        &app,
+        "POST",
+        &format!("/classes/{short}/courses"),
+        Some(&manager),
+        Some(json!({ "course_id": tight.clone() })),
+    )
+    .await;
+    assert_eq!(byhand.status, StatusCode::CREATED, "{:?}", byhand.body);
+    assert_eq!(
+        source_of(&short, &tight, &db).await,
+        None,
+        "a hand attach carries no blueprint key — which is the point of the next \
+         assertion"
+    );
+
+    let synced = send(
+        &app,
+        "GET",
+        "/classes/blueprints/9/status",
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(synced.status, StatusCode::OK, "{:?}", synced.body);
+    assert_eq!(
+        synced.body["sections"].as_array().unwrap().len(),
+        2,
+        "every section at the grade is listed, in sync or not: {:?}",
+        synced.body
+    );
+    assert_eq!(
+        synced.body["matched"], 2,
+        "matched counts the sections, not the courses: {:?}",
+        synced.body
+    );
+    for class in [&short, &full] {
+        assert!(
+            missing(&synced, class).is_empty(),
+            "a link of any source satisfies the template: {:?}",
+            synced.body
+        );
+    }
 }

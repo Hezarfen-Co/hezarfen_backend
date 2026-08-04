@@ -52,8 +52,10 @@ to each section best-effort, with anything a limit refuses returned in
 `skipped` and anything a human attached by hand left alone; a section created
 afterwards at that grade is stocked by `POST /classes` itself, which reports it
 as `stocked_from`; `GET /classes?grade=<label>` lists the sections carrying a
-label (matched exactly, `?grade=` alone the ones carrying none), which is how a
-partial pump is chased down. Students read a
+label (matched exactly, `?grade=` alone the ones carrying none), and
+`GET /classes/blueprints/{grade}/status` names, per section, the template
+courses it is still missing — which is how a partial pump is chased down after
+the response that reported it is gone. Students read a
 per-course weighted average and
 an overall average from their mark report — each exam weighted by its **kind**
 (midterms can count double, orals once: weights are set per kind in settings,
@@ -852,6 +854,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/classes/blueprints/{grade}`    | manager | One grade's blueprint            |
 | PATCH  | `/classes/blueprints/{grade}`    | manager | Replace the course list and reconcile every section at that grade (returns `matched` + `skipped`) |
 | DELETE | `/classes/blueprints/{grade}`    | manager | Delete the blueprint and detach every attachment it made (409 if the list changed since it was read) |
+| GET    | `/classes/blueprints/{grade}/status` | manager | Which sections at that grade are out of sync with the template — read-only, unpaged, `{grade, courses, matched, sections[{class, class_name, missing}]}` |
 | POST   | `/classes/{id}/blueprint`        | manager | Stock one section from its grade's blueprint (returns `skipped`) |
 | POST   | `/courses/{id}/sessions`         | teacher | `{topic?, teacher_id?, starts_at, ends_at?}` — add a lesson (course manager; teacher defaults to the caller) |
 | GET    | `/courses/{id}/sessions`         | student | List the course's sessions, most recent first (enrolled, creator, assigned teacher, or manager+) · paged |
@@ -2918,6 +2921,51 @@ there is no such thing as a grade that does not exist. The filter is part of the
 query, so `total` counts the filtered set and `?limit=&offset=` pages through
 that set alone; a label longer than 20 characters is the same `400` a create
 gives.
+
+**`GET /classes/blueprints/{grade}/status` is the standing version of that skip
+list.** A pump is best-effort, so a partial state is normal — but the skips only
+ever existed in the one response body that reported them, and a manager who
+refreshed the page had no way left to ask which sections were out of sync. This
+read answers it from stored state: `{grade, courses, matched, sections}`, where
+each section is `{class, class_name, missing}` and `missing` is the template
+courses that section does not carry. `matched` is the same count the pumps
+report — how many sections carry the label — so `matched: 0` here means the same
+thing it means there. It is **read-only**: nothing is attached, detached or
+pruned by looking, and a `404` means no blueprint covers the grade. Unpaged, for
+the same reason the pump's own section list is: it is the şube one school runs
+at one grade, and the caller is asking about all of them.
+
+A course a human attached by hand **counts as carried**. The template asks for
+the course, not for the pump's tag, and a course already on the class is a no-op
+for a pump whoever attached it — a status read that disagreed would send
+managers chasing rows no pump will ever write. A course in the template that no
+longer exists is the one deliberate piece of noise: it reads as missing from
+every section, because that is the truth about the section and this route may
+not write, so the dangling id stays until the next pump prunes it.
+
+**Finishing a partial pump** is one of two idempotent calls, and neither needs
+any new machinery:
+
+- `POST /classes/{id}/blueprint` re-stocks **one** section from its grade's
+  template, skipping whatever it already carries.
+- `PATCH /classes/blueprints/{grade}` with the **identical** course list re-runs
+  the whole grade's pump: the compare-and-set matches the unchanged list, no
+  course is dropped (so nothing is detached), and every course is re-attached
+  idempotently. Fix whatever caused the skip first — free a seat on the full
+  course, take a course off a section standing at its ceiling — and then repeat
+  the call.
+
+**A class whose `grade` is edited after it was stocked keeps what it has.** The
+courses the *old* grade's blueprint attached stay attached and keep carrying
+that blueprint's tag, so dropping one of them from that old template still
+detaches them from this class; and the class takes nothing from its *new*
+grade's template until somebody runs one of the two calls above (or that
+template is next edited, which pumps every section then at the grade). This is
+deliberate: reconciling on a label `PATCH` would sweep the old template's
+courses and, with them, delete live enrollments as a side effect of a rename.
+The drift is real, and this status read is what makes it visible instead of
+silent — the moved section shows up under its new grade with the new template's
+courses listed as `missing`.
 
 A skip's `reason` is a **machine code**, not a sentence: the client owns the
 wording (and the language), the same id-plus-client-label shape roles and
