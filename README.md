@@ -1868,9 +1868,10 @@ matters more here than tidiness, because a menu's id is deterministic on
 day+slot — a mark that outlived its menu would come back as a mark on the next
 menu published for that meal. Only the *write* paths ever check the menu:
 `GET /meals/attendance/{user}` filters on the student, never on the menu still
-existing, so such a mark would be read back there (a `?from=/?to=` bounded read
-drops it, since a link to a deleted menu has no date to compare) while no write
-could touch it. Nothing can create one any more, and the menu delete's own
+existing, so such a mark would be read back there while no write could touch it.
+Its date bounds only apply when you send them, and a link to a deleted menu has
+no date to compare, so `?from=` drops such a mark while `?to=` on its own still
+returns it. Nothing can create one any more, and the menu delete's own
 sweep is what clears the marks a menu leaves behind.
 
 **Attendance has zero billing effect.** Booking is the sole charge trigger, so
