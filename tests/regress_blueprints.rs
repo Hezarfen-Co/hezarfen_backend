@@ -745,3 +745,63 @@ async fn a_blueprint_lost_mid_attach_strands_a_row_that_stays_detachable() {
         "a stranded row still releases its counter when it is detached"
     );
 }
+
+/// The silent miss `matched` exists for: a grade label is free text and matched
+/// exactly, so a template keyed `"9 "` reaches none of the sections keyed `"9"`
+/// — and it says so with an empty `skipped`, which is the same body a template
+/// that stocked every section returns.
+///
+/// Both halves are asserted from the same section, one label apart, because the
+/// count only means anything against the case that *does* reach it: a `matched`
+/// wired to the course list would claim 1 on the typo, and one wired to the
+/// skip count would answer 0 on the label that works.
+#[tokio::test]
+async fn a_grade_label_nothing_carries_reports_matched_zero() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "mgr", "manager").await;
+    let algebra = create_course(&app, &manager, "algebra").await;
+    // The section exists first, so a template that finds it stocks it on
+    // create.
+    let class = create_class(&app, &manager, "9-A", "9").await;
+
+    let typo = send(
+        &app,
+        "POST",
+        "/classes/blueprints",
+        Some(&manager),
+        Some(json!({ "grade": "9 ", "course_ids": [algebra.clone()] })),
+    )
+    .await;
+    assert_eq!(typo.status, StatusCode::CREATED, "{:?}", typo.body);
+    assert!(
+        skips(&typo).is_empty(),
+        "nothing was refused — there was nothing to refuse: {:?}",
+        typo.body
+    );
+    assert_eq!(
+        typo.body["matched"], 0,
+        "no section carries \"9 \", and that must not read as success: {:?}",
+        typo.body
+    );
+    assert!(
+        !attached(&class, &algebra, &db).await,
+        "a trailing space really is a different grade"
+    );
+
+    let right = send(
+        &app,
+        "POST",
+        "/classes/blueprints",
+        Some(&manager),
+        Some(json!({ "grade": "9", "course_ids": [algebra.clone()] })),
+    )
+    .await;
+    assert_eq!(right.status, StatusCode::CREATED, "{:?}", right.body);
+    assert!(skips(&right).is_empty(), "{:?}", right.body);
+    assert_eq!(
+        right.body["matched"], 1,
+        "the one section at the grade was reached: {:?}",
+        right.body
+    );
+    assert!(attached(&class, &algebra, &db).await);
+}
