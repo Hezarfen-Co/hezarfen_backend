@@ -51,7 +51,9 @@ course list every section at that grade takes (`/classes/blueprints`), applied
 to each section best-effort, with anything a limit refuses returned in
 `skipped` and anything a human attached by hand left alone; a section created
 afterwards at that grade is stocked by `POST /classes` itself, which reports it
-as `stocked_from`. Students read a
+as `stocked_from`; `GET /classes?grade=<label>` lists the sections carrying a
+label (matched exactly, `?grade=` alone the ones carrying none), which is how a
+partial pump is chased down. Students read a
 per-course weighted average and
 an overall average from their mark report — each exam weighted by its **kind**
 (midterms can count double, orals once: weights are set per kind in settings,
@@ -833,7 +835,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/courses/{id}/enrollments`      | teacher | List the course roster (course manager) — each row carries `source`, the class that pumped it or `null` for hand-placed · paged |
 | DELETE | `/courses/{id}/enrollments/{user}` | teacher | Unenroll (keeps recorded results; course manager) |
 | POST   | `/classes`                       | manager | `{name, grade?, term_id?, teacher_id?}` — create a class section (şube); `grade` is a free-text year label, `teacher_id` the homeroom teacher (sınıf öğretmeni, teacher+; `409` + full rollback if that account is demoted mid-request). Stocked at once from its grade's blueprint when one covers it, so the `201` is `{class, skipped, stocked_from}` |
-| GET    | `/classes`                       | teacher | List classes, newest first · paged |
+| GET    | `/classes`                       | teacher | List classes, newest first · paged; `?grade=` narrows to one grade label (matched exactly; `?grade=` alone lists the sections with no grade, an unknown label an empty page) |
 | GET    | `/classes/me`                    | any     | The caller's own classes, newest membership first · paged; `creator` is `null` below teacher+ |
 | GET    | `/classes/user/{user}`           | teacher | Another user's classes (a parent linked to that student may read it too) · paged; `creator` is `null` below teacher+ |
 | GET    | `/classes/{id}`                  | teacher | Get one class                   |
@@ -2901,6 +2903,21 @@ template. It counts the sections **reached**, not the ones the grade holds:
 the path — and neither has `POST /classes`, for the same reason: the one
 section it pumps is the one it just created, and `stocked_from` already says
 whether a template was found.
+
+**`GET /classes?grade=<label>` is the read on the other side of that count.**
+`matched: 0` says no section carries the label; this says which labels the
+sections actually carry, so a manager holding a skip list can go find the three
+sections at grade `"9"` and fix them. The match is verbatim — no trimming, no
+case folding — for the same reason the pump's is: the label *is* a blueprint's
+record id, schools spell their ladders differently on purpose, and a filter that
+normalized would disagree with the pump it exists to debug. `?grade=` with an
+empty value is *no* grade, exactly as an empty `grade` on a write means no
+grade, so it lists the sections a blueprint can never cover; omit the parameter
+entirely for every class. An unknown label is an empty page, never a `404` —
+there is no such thing as a grade that does not exist. The filter is part of the
+query, so `total` counts the filtered set and `?limit=&offset=` pages through
+that set alone; a label longer than 20 characters is the same `400` a create
+gives.
 
 A skip's `reason` is a **machine code**, not a sentence: the client owns the
 wording (and the language), the same id-plus-client-label shape roles and
