@@ -88,7 +88,7 @@ impl ClassMember {
             added_by: added_by.clone(),
             added_at: Some(Timestamp::now()),
         };
-        match attach(
+        let landed = attach(
             class,
             Axis::Member,
             &member.id.record(),
@@ -98,32 +98,45 @@ impl ClassMember {
             None,
             db,
         )
-        .await?
-        {
+        .await?;
+        // Read off the refusal, never respelled here: this route and a
+        // blueprint pump answer one vocabulary. `Made` is the only `None`, and
+        // it takes the `Ok` arm below.
+        let code = landed.refusal_code().unwrap_or_default();
+        match landed {
             Attached::Made(saved) => Ok(saved),
-            Attached::Duplicate => Err(AppError::Conflict("the student is already in this class")),
+            Attached::Duplicate => Err(AppError::ConflictCoded {
+                code,
+                message: "the student is already in this class".into(),
+            }),
             // The member axis claims no pivot, so `PivotGone` cannot arrive
             // here; the class being gone is the only 404 this route can see.
             Attached::Gone | Attached::PivotGone => Err(AppError::NotFound),
-            Attached::ClassFull => Err(AppError::ConflictOwned(format!(
-                "this class already holds {MAX_CLASS_MEMBERS} students"
-            ))),
+            Attached::ClassFull => Err(AppError::ConflictCoded {
+                code,
+                message: format!("this class already holds {MAX_CLASS_MEMBERS} students"),
+            }),
             // The other axis: adding one student enrolls them into every
             // attached course, so a class over *that* ceiling cannot take a
             // member however much room its roster has.
-            Attached::ClassOverloaded => Err(AppError::ConflictOwned(format!(
-                "this class holds more than {MAX_CLASS_COURSES} courses — \
-                 detach some before adding a student"
-            ))),
-            Attached::Full(course) => Err(AppError::ConflictOwned(format!(
-                "{course} is full, so the class cannot take this student"
-            ))),
+            Attached::ClassOverloaded => Err(AppError::ConflictCoded {
+                code,
+                message: format!(
+                    "this class holds more than {MAX_CLASS_COURSES} courses — \
+                     detach some before adding a student"
+                ),
+            }),
+            Attached::Full(course) => Err(AppError::ConflictCoded {
+                code,
+                message: format!("{course} is full, so the class cannot take this student"),
+            }),
             // Not a capacity problem, and told apart from one on purpose: no
             // number anyone can raise unblocks this class, only detaching the
             // link the deleted course left behind.
-            Attached::CourseGone(course) => Err(AppError::ConflictOwned(format!(
-                "{course} no longer exists — detach it from this class first"
-            ))),
+            Attached::CourseGone(course) => Err(AppError::ConflictCoded {
+                code,
+                message: format!("{course} no longer exists — detach it from this class first"),
+            }),
             // Only an attach run on a blueprint's behalf states that claim, and
             // a membership is nobody's but its own.
             Attached::SourceGone => Err(AppError::Internal(
@@ -355,8 +368,8 @@ pub(crate) mod tests {
 
         let again = ClassMember::add(&class, &student, &manager, &db).await;
         assert!(
-            matches!(again, Err(AppError::Conflict(_))),
-            "a second add is a 409: {again:?}"
+            matches!(again, Err(AppError::ConflictCoded { code, .. }) if code == "duplicate"),
+            "a second add is a 409 coded `duplicate`: {again:?}"
         );
         assert_eq!(
             counter("class_member_count", class.record(), &db).await,
@@ -388,8 +401,10 @@ pub(crate) mod tests {
         let named = format!("{}:{}", crate::constant::COURSE_TABLE, full.key());
         let refused = ClassMember::add(&class, &student, &manager, &db).await;
         assert!(
-            matches!(refused, Err(AppError::ConflictOwned(ref message)) if message.contains(&named)),
-            "the refusal must name the course that had no seat as {named}: {refused:?}"
+            matches!(refused, Err(AppError::ConflictCoded { code, ref message })
+                if code == "course_full" && message.contains(&named)),
+            "the refusal must be coded `course_full` and name the course that had no seat \
+             as {named}: {refused:?}"
         );
         assert_eq!(
             rows("SELECT VALUE id FROM enrollment", &db).await,
