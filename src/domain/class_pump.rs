@@ -220,9 +220,17 @@ impl Axis {
     /// nothing once the row is gone, and it puts this transaction on the very
     /// record the course's delete guard writes.
     ///
-    /// The counter is re-stated verbatim rather than incremented: the row must
-    /// be touched, not changed, and `count = count` leaves an absent counter
-    /// absent, so the boot backfill still sees the `NONE` it seeds off.
+    /// The counter is *moved* — bumped, gated, then restored to the value this
+    /// transaction found — because re-stating it verbatim claims nothing: an
+    /// `UPDATE` that leaves the document unchanged is elided by SurrealDB 3.2.3
+    /// and never enters the write set, so `count = count` sat on no key at all
+    /// and a concurrent `DELETE /courses/{id}` committed beside it with both
+    /// callers told OK (measured on 3.2.3, counter present and absent alike).
+    /// Same shape as [`crate::domain::exam_answer::ExamAnswer::save`]: the
+    /// restore is by captured value, `NONE` included, so the row is
+    /// byte-identical afterwards and the boot backfill still sees the `NONE` it
+    /// seeds off. Both statements are inside the transaction, so an abort
+    /// between them cannot leave a course counting a seat nobody took.
     ///
     /// The member axis claims nothing: its pivot is a user, whose row is no
     /// class write's to touch, and a membership left pointing at a deleted user
@@ -231,14 +239,23 @@ impl Axis {
     fn pivot_claim(&self) -> Vec<String> {
         match self {
             Axis::Member => Vec::new(),
-            Axis::Course => claim(
-                "alive",
-                &format!(
-                    "UPDATE $pivot SET {ENROLLMENT_COUNT_FIELD} = \
-                     {ENROLLMENT_COUNT_FIELD} RETURN VALUE id"
-                ),
-                GONE_MARK,
-            ),
+            Axis::Course => {
+                let mut claimed = vec![format!(
+                    "LET $was_alive = (SELECT VALUE {ENROLLMENT_COUNT_FIELD} FROM ONLY $pivot)"
+                )];
+                claimed.extend(claim(
+                    "alive",
+                    &format!(
+                        "UPDATE $pivot SET {ENROLLMENT_COUNT_FIELD} = \
+                         ({ENROLLMENT_COUNT_FIELD} ?? 0) + 1 RETURN VALUE id"
+                    ),
+                    GONE_MARK,
+                ));
+                claimed.push(format!(
+                    "UPDATE $pivot SET {ENROLLMENT_COUNT_FIELD} = $was_alive"
+                ));
+                claimed
+            }
         }
     }
 
