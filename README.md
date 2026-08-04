@@ -2869,13 +2869,18 @@ wording (and the language), the same id-plus-client-label shape roles and
 course kinds have. The set is closed, and each code names the record that
 actually failed: `class_deleted` (the section vanished mid-pump),
 `course_deleted` (the course was deleted; the pump also removes the dangling id
-from the template, so the template shrinks and the skip is reported once and
-never again), `class_at_course_ceiling`, `class_roster_too_large` (the section
-holds more students than one attach may enroll at once), `course_full` (no free
+from the template, so the template shrinks and the skip is reported once for the
+whole grade — the sections after the first one are not asked again — and never
+again on a later pump), `class_at_course_ceiling`, `class_roster_too_large`
+(the section holds more students than one attach may enroll at once),
+`course_full` (no free
 seat for the whole section), `linked_course_missing` (another course
 already attached to that section no longer exists — detach it first), and
 `blueprint_deleted` (the template itself was deleted while the pump ran —
-nothing was attached, and there is nothing left to retry).
+nothing was attached, and there is nothing left to retry). That last one **ends
+the run**: it says nothing about the (section, course) pair it names, so every
+remaining section would only repeat it. It is reported once, the sections
+already stocked stay stocked, and the call still succeeds.
 
 **Removal spares what a human placed.** Every attachment a blueprint makes is
 tagged with it. Dropping a course from the list detaches it only where the
