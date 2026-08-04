@@ -97,7 +97,7 @@ impl ClassCourse {
         // Read off the refusal, never respelled here: this route and a
         // blueprint pump answer one vocabulary. `Made` is the only `None`, and
         // it takes the `Ok` arm below.
-        let code = landed.refusal_code().unwrap_or_default();
+        let code = landed.refusal_code(&Axis::Course).unwrap_or_default();
         match landed {
             Attached::Made(saved) => Ok(saved),
             Attached::Duplicate => Err(AppError::ConflictCoded {
@@ -126,8 +126,14 @@ impl ClassCourse {
                 code,
                 message: format!("{full} cannot hold the whole class"),
             }),
-            // Another of the class's links points at a deleted course. This
-            // axis claims its own pivot, so it is never *this* course.
+            // Unreachable on this axis, and kept because the match is
+            // exhaustive: the pair loop enrolls the roster into `$pivot` and
+            // nothing else, and the pivot claim already proved *that* course
+            // alive inside the same transaction. Only a member add walks a
+            // class's existing course links, so `linked_course_missing` is that
+            // route's alone — which is why this route's `409` does not publish
+            // it. Left mapped rather than folded into an `Internal`, so a future
+            // axis change is a wrong-looking 409, not a 500.
             Attached::CourseGone(course) => Err(AppError::ConflictCoded {
                 code,
                 message: format!("{course} no longer exists — detach it from this class first"),

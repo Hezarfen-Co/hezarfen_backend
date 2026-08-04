@@ -102,7 +102,7 @@ impl ClassMember {
         // Read off the refusal, never respelled here: this route and a
         // blueprint pump answer one vocabulary. `Made` is the only `None`, and
         // it takes the `Ok` arm below.
-        let code = landed.refusal_code().unwrap_or_default();
+        let code = landed.refusal_code(&Axis::Member).unwrap_or_default();
         match landed {
             Attached::Made(saved) => Ok(saved),
             Attached::Duplicate => Err(AppError::ConflictCoded {

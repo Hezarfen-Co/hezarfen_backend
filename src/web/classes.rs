@@ -726,7 +726,7 @@ async fn delete_class(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "Class not found", body = ErrorResponse),
-        (status = 409, description = "Already in this class, the class is at its student ceiling (max_class_members), one of its courses is full, or one of them no longer exists (a stale attachment — detach it). The body carries a machine `code` beside the prose, out of the same closed set a blueprint pump reports: `duplicate`, `class_at_course_ceiling`, `class_roster_too_large`, `course_full`, `linked_course_missing`", body = ErrorResponse),
+        (status = 409, description = "Already in this class, the class is at its student ceiling (max_class_members), it carries more courses than one add may enroll at once, one of its courses is full, or one of them no longer exists (a stale attachment — detach it). The body carries a machine `code` beside the prose, and this route answers exactly these: `duplicate`, `class_at_roster_ceiling`, `class_course_list_too_large`, `course_full`, `linked_course_missing`", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -853,7 +853,7 @@ async fn remove_member(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Class not found", body = ErrorResponse),
-        (status = 409, description = "Already attached, the class is at its course ceiling (max_class_courses), or the course cannot hold the whole class. The body carries a machine `code` beside the prose, out of the same closed set a blueprint pump reports: `duplicate`, `class_at_course_ceiling`, `class_roster_too_large`, `course_full`", body = ErrorResponse),
+        (status = 409, description = "Already attached, the class is at its course ceiling (max_class_courses), it holds more students than one attach may enroll at once, or the course cannot hold the whole class. The body carries a machine `code` beside the prose, and this route answers exactly these: `duplicate`, `class_at_course_ceiling`, `class_roster_too_large`, `course_full`", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -1039,14 +1039,18 @@ struct SkipResponse {
     /// ran; nothing was attached, and there is nothing left to retry — it ends
     /// the run, so it appears once however many sections were left).
     ///
-    /// The **same vocabulary** answers the manual routes: a `409` from
-    /// `POST /classes/{id}/members` or `POST /classes/{id}/courses` carries
-    /// these codes as its `code` field, plus two a pump never reports —
-    /// `duplicate`, a refusal there (the call asked for a row and did not get
-    /// it) but not here (the course is already on the class, which is what the
-    /// blueprint asks for), and `linked_course_missing` (another course
-    /// already attached to that section no longer exists — detach it first),
-    /// which only a member add can meet: it is the one attach that walks the
+    /// The **same vocabulary** answers the manual routes as their `code`
+    /// field. `POST /classes/{id}/courses` attaches along this very axis and so
+    /// answers this list's ceilings, plus `duplicate` — a refusal there (the
+    /// call asked for a row and did not get it) but not here (the course is
+    /// already on the class, which is what the blueprint asks for).
+    /// `POST /classes/{id}/members` attaches along the *other* axis, so its two
+    /// ceilings are the mirror ones, named for the ceiling actually hit:
+    /// `class_at_roster_ceiling` (the section already holds
+    /// `max_class_members`) and `class_course_list_too_large` (it carries more
+    /// courses than one member add may enroll at once). It also owns
+    /// `linked_course_missing` (another course already attached to that section
+    /// no longer exists — detach it first): it is the one attach that walks the
     /// section's existing course links, while a pump attaches a course it has
     /// just proved alive.
     #[schema(example = "course_full")]
