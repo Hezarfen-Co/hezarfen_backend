@@ -1087,12 +1087,12 @@ async fn mark_attendance(
             reason: "target user does not exist",
         }));
     }
-    // The menu rides in the write's own target (see [`MealAttendance::mark`]),
-    // so a delete landing between the read above and this write leaves no mark
-    // behind — it answers 404 instead, exactly as the read would have.
-    let row = MealAttendance::mark(menu.get_id(), &student, status, marker.get_id(), &st.db)
-        .await?
-        .ok_or(AppError::NotFound)?;
+    // The write moves the menu's own revision (see [`MealAttendance::mark`]), so
+    // a delete landing between the read above and this write cannot commit
+    // alongside it — one of the two loses its round, and this one then answers
+    // 404 with no mark behind it, exactly as the read would have.
+    let row =
+        MealAttendance::mark(menu.get_id(), &student, status, marker.get_id(), &st.db).await?;
     let items = attendance_responses(std::slice::from_ref(&row), &st.db).await?;
     Ok(Json(
         items.into_iter().next().expect("one mark in, one out"),

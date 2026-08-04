@@ -15,7 +15,7 @@ use crate::constant::{
     MENU_DISH_TABLE, MENU_VERSION_FIELD,
 };
 use crate::database::{Database, transaction_with_retry};
-use crate::domain::menu::MenuId;
+use crate::domain::menu::{MenuId, bump_menu_and_write};
 use crate::domain::timestamp::Timestamp;
 use crate::error::{AppError, ValidationError};
 use crate::validate::{validate_optional, validate_required};
@@ -184,7 +184,7 @@ impl MenuDish {
         self.created_at
     }
 
-    /// Add a dish. Moves the menu's revision *first* — see [`Self::bump_menu`].
+    /// Add a dish. Moves the menu's revision *first* — see [`bump_menu_and_write`].
     pub async fn create(
         menu: &MenuId,
         name: DishName,
@@ -285,65 +285,6 @@ impl MenuDish {
         Ok(Self::list_for_menu(menu, db).await?.len())
     }
 
-    /// Move the menu's revision **and** run `statement`, in one transaction.
-    ///
-    /// What a seat on this dish's menu costs is about to change, so any booking
-    /// that priced itself against the old revision has to re-read. The bump
-    /// cannot be a query of its own: in the gap the menu row carries the *new*
-    /// revision with the *old* price, and a booking reading there passes the
-    /// very CAS that exists to refuse it — a seat billed a price the menu had
-    /// already left, or admitted past a capacity that had already shrunk.
-    ///
-    /// The bump also makes the menu's existence part of the write ([`Self::create`]
-    /// leans on the same thing): the `UPDATE` matches nothing once the menu row
-    /// is deleted, and a delete racing this one touches the very key this
-    /// transaction writes, so the two cannot both commit.
-    ///
-    /// Deliberately on every dish write, not only the ones that move
-    /// `price_minor`: a re-tagged dish is cheap to re-read, and a rule that
-    /// applies to every write cannot be forgotten by the next field added here.
-    ///
-    /// Admissible for [`transaction_with_retry`]: every statement is an
-    /// `UPDATE`, a `DELETE`, a `SELECT`, an `IF`/`THROW` or a `RETURN`, and none
-    /// of those can answer "already exists" — a lost round wrote nothing, so
-    /// re-sending it is the recovery.
-    async fn bump_menu_and_write(
-        menu: &MenuId,
-        statement: &str,
-        mut bindings: Vec<(String, Value)>,
-        db: &Database,
-    ) -> Result<Option<MenuDish>, AppError> {
-        bindings.push(("menu".into(), menu.record().into_value()));
-        let (mut result, mut errors) = transaction_with_retry(
-            db,
-            &format!(
-                "BEGIN TRANSACTION;
-                 LET $bumped = (UPDATE $menu SET {MENU_VERSION_FIELD} = \
-                     ({MENU_VERSION_FIELD} ?? 0) + 1 RETURN VALUE id);
-                 IF array::len($bumped) = 0 {{ THROW 'no_menu' }};
-                 LET $row = ({statement});
-                 RETURN $row;
-                 COMMIT TRANSACTION;"
-            ),
-            &bindings,
-            &["no_menu"],
-        )
-        .await?;
-        // An aborted transaction errors *every* slot, most with a generic "not
-        // executed" — only the THROW's own slot names the reason.
-        if errors
-            .values()
-            .any(|error| error.to_string().contains("no_menu"))
-        {
-            return Err(AppError::NotFound);
-        }
-        if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-            return Err(error.into());
-        }
-        // Slots count BEGIN, the LET, the IF and the second LET: the RETURN is 4.
-        Ok(result.take::<Vec<MenuDish>>(4)?.into_iter().next())
-    }
-
     /// Write only the fields the PATCH carried. `description` is nullable, so
     /// it takes the three-way shape: absent = keep, `Some(None)` = clear.
     ///
@@ -388,13 +329,13 @@ impl MenuDish {
                     .join(", ")
             )
         };
-        Self::bump_menu_and_write(&self.menu, &statement, bindings, db)
+        bump_menu_and_write(&self.menu, &statement, bindings, db)
             .await?
             .ok_or(AppError::NotFound)
     }
 
     pub async fn delete(self, db: &Database) -> Result<MenuDish, AppError> {
-        Self::bump_menu_and_write(
+        bump_menu_and_write(
             &self.menu,
             "DELETE $id RETURN BEFORE",
             vec![("id".into(), self.id.record().into_value())],

@@ -23368,90 +23368,95 @@ async fn a_cancel_cut_short_mid_flight_is_healed_by_repeating_it() {
     );
 }
 
-/// A dish must never land on a menu that is already gone. `add_dish` reading
-/// the menu *before* `MENU_LOCK` left a window: `DELETE /menus/{id}` ran its
-/// cascade in the gap, the create landed after it, and the row survived
-/// pointing at a menu the API 404s. Unreachable, but real orphaned data — so
-/// the read moved inside the lock, the way `MealBooking::book` does it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+/// A dish must never outlive its menu — the two orderings that decide it, with
+/// no race in either: adding to a menu that is already gone is a `404` that
+/// writes nothing, and deleting a menu takes the dishes on it with it.
+///
+/// This deliberately does **not** race the two requests. It used to (40 rounds,
+/// two spawned tasks), and that assertion could not be honest here: the
+/// production guard is a store-detected conflict — both transactions write
+/// `menu:<id>`'s revision, so one is refused — and the embedded engine behind
+/// `init_mem` does not conflict-check concurrent writes to one record at all.
+/// It committed **both** and answered `Ok` to each, orphaning 4 of 3600 and 13
+/// of 6000 rounds, which surfaced as a whole-suite failure a few percent of
+/// runs. The same code orphaned 0 of 9600 rounds against a real server. So the
+/// concurrent claim lives where the store can testify about it —
+/// `domain::menu::tests::a_child_written_inside_a_delete_never_outlives_the_menu`,
+/// `#[ignore]`d and run against a real server — and what stays here is the
+/// logic, pinned deterministically.
+#[tokio::test]
 async fn a_dish_never_lands_on_a_deleted_menu() {
     let (app, db) = app_and_db().await;
     let mgr = login_as(&app, &db, "orphan_mgr", "manager").await;
-    for round in 0..40 {
+    let dishes_on = async |menu: &str| -> Vec<surrealdb::types::RecordId> {
+        let mut res = db
+            .query("SELECT VALUE id FROM menu_dish WHERE menu = $menu")
+            .bind(("menu", surrealdb::types::RecordId::new("menu", menu)))
+            .await
+            .unwrap();
+        res.take(0).unwrap()
+    };
+    let publish = async |date: &str| -> String {
         let res = send(
             &app,
             "POST",
             "/meals/menus",
             Some(&mgr),
-            Some(json!({ "date": format!("2027-10-{:02}", round % 28 + 1), "slot": "lunch" })),
+            Some(json!({ "date": date, "slot": "lunch" })),
         )
         .await;
         assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
-        let menu = id_of(&res.body);
-
-        let add = {
-            let (app, menu, mgr) = (app.clone(), menu.clone(), mgr.clone());
-            tokio::spawn(async move {
-                send(
-                    &app,
-                    "POST",
-                    &format!("/meals/menus/{menu}/dishes"),
-                    Some(&mgr),
-                    Some(json!({ "name": "Pilav", "price_minor": 1 })),
-                )
-                .await
-            })
-        };
-        let remove = {
-            let (app, menu, mgr) = (app.clone(), menu.clone(), mgr.clone());
-            tokio::spawn(async move {
-                send(
-                    &app,
-                    "DELETE",
-                    &format!("/meals/menus/{menu}"),
-                    Some(&mgr),
-                    None,
-                )
-                .await
-            })
-        };
-        add.await.unwrap();
-        remove.await.unwrap();
-
-        let gone = send(
-            &app,
-            "GET",
-            &format!("/meals/menus/{menu}"),
-            Some(&mgr),
-            None,
-        )
-        .await
-        .status
-            == StatusCode::NOT_FOUND;
-        if gone {
-            let mut res = db
-                .query("SELECT VALUE id FROM menu_dish WHERE menu = $menu")
-                .bind((
-                    "menu",
-                    surrealdb::types::RecordId::new("menu", menu.clone()),
-                ))
-                .await
-                .unwrap();
-            let left: Vec<surrealdb::types::RecordId> = res.take(0).unwrap();
-            assert!(
-                left.is_empty(),
-                "round {round}: a dish outlived its menu: {left:?}"
-            );
-        }
+        id_of(&res.body)
+    };
+    let add_dish = async |menu: &str| -> common::Res {
         send(
             &app,
-            "DELETE",
-            &format!("/meals/menus/{menu}"),
+            "POST",
+            &format!("/meals/menus/{menu}/dishes"),
             Some(&mgr),
-            None,
+            Some(json!({ "name": "Pilav", "price_minor": 1 })),
         )
-        .await;
-    }
+        .await
+    };
+
+    // Gone first: the add is refused, and refusing must write nothing.
+    let menu = publish("2027-10-01").await;
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/meals/menus/{menu}"),
+        Some(&mgr),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    let res = add_dish(&menu).await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND, "{}", res.body);
+    assert!(
+        dishes_on(&menu).await.is_empty(),
+        "a refused add left a dish behind"
+    );
+
+    // Dish first: the delete's cascade takes it. Menu ids are deterministic on
+    // (date, slot), so a survivor would come back as a dish on the next menu
+    // published for that meal — priced by the old one.
+    let menu = publish("2027-10-01").await;
+    let res = add_dish(&menu).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    assert_eq!(dishes_on(&menu).await.len(), 1);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/meals/menus/{menu}"),
+        Some(&mgr),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    assert!(
+        dishes_on(&menu).await.is_empty(),
+        "the delete's cascade left a dish on a menu that is gone"
+    );
 }
 
 // --- school payments -----------------------------------------------------
