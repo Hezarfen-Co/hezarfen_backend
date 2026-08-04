@@ -96,27 +96,29 @@ pub struct Skip {
 /// skip: the course is already on the class, which is exactly what the
 /// blueprint asks for, and re-running a pump must therefore report nothing.
 ///
-/// Each reason names the record that actually failed. The pump's two "gone"
-/// answers are a *class* delete ([`Attached::Gone`], the class counter's claim
-/// matching nothing on a row a re-read no longer finds) and a *course* delete
-/// ([`Attached::PivotGone`], the course's own claim matching nothing) — and
-/// telling a manager the class vanished when the course did sends them to look
-/// at a section that is standing right there.
+/// A machine code, not a sentence: the client owns the wording and this API
+/// only says *which* refusal it was, the shape every other enum here has
+/// (roles, course kinds, the badge catalog). The set is closed and documented
+/// on `SkipResponse.reason`.
+///
+/// Each code names the record that actually failed. The pump's two "gone"
+/// answers are a *class* delete ([`Attached::Gone`] → `class_deleted`, the
+/// class counter's claim matching nothing on a row a re-read no longer finds)
+/// and a *course* delete ([`Attached::PivotGone`] → `course_deleted`, the
+/// course's own claim matching nothing) — and telling a manager the class
+/// vanished when the course did sends them to look at a section that is
+/// standing right there. `linked_course_missing` is a third: *another* course
+/// already attached to this class no longer exists, and it must be detached
+/// before this attach can be retried.
 fn skip_reason(landed: &Attached<ClassCourse>) -> Option<&'static str> {
     match landed {
         Attached::Made(_) | Attached::Duplicate => None,
-        Attached::Gone => Some("the class was deleted while the blueprint was being applied"),
-        Attached::PivotGone => {
-            Some("this course no longer exists — it has been dropped from the blueprint")
-        }
-        Attached::ClassFull => Some("the class is already at its course ceiling"),
-        Attached::ClassOverloaded => {
-            Some("the class holds more students than a course attach is allowed to enroll at once")
-        }
-        Attached::Full(_) => Some("the course has no free seat for the whole class"),
-        Attached::CourseGone(_) => {
-            Some("another course attached to this class no longer exists — detach it first")
-        }
+        Attached::Gone => Some("class_deleted"),
+        Attached::PivotGone => Some("course_deleted"),
+        Attached::ClassFull => Some("class_at_course_ceiling"),
+        Attached::ClassOverloaded => Some("class_roster_too_large"),
+        Attached::Full(_) => Some("course_full"),
+        Attached::CourseGone(_) => Some("linked_course_missing"),
     }
 }
 
@@ -443,10 +445,9 @@ mod tests {
             .unwrap();
         let skipped = blueprint.apply_to(&class, &manager, &db).await.unwrap();
         assert_eq!(skipped.len(), 1, "{skipped:?}");
-        assert!(
-            skipped[0].reason.contains("course no longer exists"),
-            "the course went, not the class: {}",
-            skipped[0].reason
+        assert_eq!(
+            skipped[0].reason, "course_deleted",
+            "the course went, not the class"
         );
         // …and the dangling id is taken out of the list, so the skip is
         // reported once instead of on every pump forever.
@@ -477,10 +478,9 @@ mod tests {
             .unwrap();
         let skipped = blueprint.apply_to(&class, &manager, &db).await.unwrap();
         assert_eq!(skipped.len(), 1, "{skipped:?}");
-        assert!(
-            skipped[0].reason.contains("class was deleted"),
-            "the class went, not the course: {}",
-            skipped[0].reason
+        assert_eq!(
+            skipped[0].reason, "class_deleted",
+            "the class went, not the course"
         );
         assert_eq!(
             ClassBlueprint::read(blueprint.get_id(), &db)
@@ -513,10 +513,9 @@ mod tests {
         .unwrap();
         let skipped = blueprint.apply_to(&class, &manager, &db).await.unwrap();
         assert_eq!(skipped.len(), 1, "{skipped:?}");
-        assert!(
-            skipped[0].reason.contains("ceiling"),
-            "a full class is not a deleted one: {}",
-            skipped[0].reason
+        assert_eq!(
+            skipped[0].reason, "class_at_course_ceiling",
+            "a full class is not a deleted one"
         );
     }
 
@@ -553,20 +552,31 @@ mod tests {
     /// A blueprint pumps best-effort, so every refusal the pump can answer must
     /// map to a reported skip rather than fall through as a success — and the
     /// two "nothing to do" answers must map to no skip at all.
+    ///
+    /// The codes are pinned exactly, not merely as "some": they are a published
+    /// vocabulary a bilingual client branches and translates on, so a reworded
+    /// one is a silent contract break. A new [`Attached`] variant fails the
+    /// match arm above, and this pins what the existing ones say.
     #[test]
     fn every_refusal_the_pump_can_answer_is_a_skip() {
+        // `Made` shares `Duplicate`'s arm, and building one needs a live link
+        // row — the arm itself is the only thing to check there.
         assert!(skip_reason(&Attached::Duplicate).is_none());
-        for refusal in [
-            Attached::Gone,
-            Attached::PivotGone,
-            Attached::ClassFull,
-            Attached::ClassOverloaded,
-            Attached::Full("course:algebra".into()),
-            Attached::CourseGone("course:algebra".into()),
+        for (refusal, code) in [
+            (Attached::Gone, "class_deleted"),
+            (Attached::PivotGone, "course_deleted"),
+            (Attached::ClassFull, "class_at_course_ceiling"),
+            (Attached::ClassOverloaded, "class_roster_too_large"),
+            (Attached::Full("course:algebra".into()), "course_full"),
+            (
+                Attached::CourseGone("course:algebra".into()),
+                "linked_course_missing",
+            ),
         ] {
-            assert!(
-                skip_reason(&refusal).is_some(),
-                "{refusal:?} must be reported, not swallowed"
+            assert_eq!(
+                skip_reason(&refusal),
+                Some(code),
+                "{refusal:?} must be reported as its own code, not swallowed or reworded"
             );
         }
     }

@@ -930,8 +930,18 @@ struct SkipResponse {
     class_name: String,
     #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
     course: String,
-    /// Why that course could not be attached to that class.
-    #[schema(example = "the course has no free seat for the whole class")]
+    /// Why that course could not be attached to that class, as a machine code
+    /// the client words itself — the same id-plus-client-label shape roles and
+    /// course kinds have. The set is closed: `class_deleted` (the section was
+    /// deleted while the pump ran), `course_deleted` (the course itself is
+    /// gone; the pump also drops that dangling id from the blueprint, so this
+    /// is reported once and never again), `class_at_course_ceiling` (the
+    /// section already holds `max_class_courses`), `class_roster_too_large`
+    /// (the section holds more students than one attach may enroll at once),
+    /// `course_full` (the course has no free seat for the whole section), and
+    /// `linked_course_missing` (another course already attached to this
+    /// section no longer exists — detach it before retrying).
+    #[schema(example = "course_full")]
     reason: String,
 }
 

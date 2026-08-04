@@ -2864,14 +2864,16 @@ edit is allowed to leave a partial state: one full course must not stop the
 other eleven sections from being set up. Nothing moves on a skipped section —
 not its attachment count, not a seat on the course.
 
-A skip names the record that failed: `the class was deleted while the blueprint
-was being applied` (the section vanished mid-pump), `this course no longer
-exists — it has been dropped from the blueprint` (the course was deleted; the
-pump also removes the dangling id from the template, so the template shrinks
-and the skip is reported once and never again), `the class is already at its
-course ceiling`, `the class holds more students than a course attach is allowed
-to enroll at once`, `the course has no free seat for the whole class`, and
-`another course attached to this class no longer exists — detach it first`.
+A skip's `reason` is a **machine code**, not a sentence: the client owns the
+wording (and the language), the same id-plus-client-label shape roles and
+course kinds have. The set is closed, and each code names the record that
+actually failed: `class_deleted` (the section vanished mid-pump),
+`course_deleted` (the course was deleted; the pump also removes the dangling id
+from the template, so the template shrinks and the skip is reported once and
+never again), `class_at_course_ceiling`, `class_roster_too_large` (the section
+holds more students than one attach may enroll at once), `course_full` (no free
+seat for the whole section), and `linked_course_missing` (another course
+already attached to that section no longer exists — detach it first).
 
 **Removal spares what a human placed.** Every attachment a blueprint makes is
 tagged with it. Dropping a course from the list detaches it only where the
