@@ -3,10 +3,12 @@
 
 use surrealdb::types::SurrealValue;
 
-use crate::constant::MAX_NAME_LEN;
+use crate::constant::{MAX_BIO_LEN, MAX_DISPLAY_NAME_LEN, MAX_NAME_LEN};
+use crate::database::Database;
 use crate::domain::timestamp::Timestamp;
-use crate::error::ValidationError;
-use crate::validate::{validate_email, validate_phone, validate_required};
+use crate::domain::user::UserId;
+use crate::error::{AppError, ValidationError};
+use crate::validate::{validate_email, validate_optional, validate_phone, validate_required};
 
 /// A person's given or family name. One type serves both fields — the `field`
 /// tag only steers the error message ("name …" vs "surname …"). Stored trimmed;
@@ -92,6 +94,122 @@ impl BirthDate {
     }
 }
 
+/// The name a profile shows instead of the legal one — a nickname, a shortened
+/// form, whatever the person answers to. Stored trimmed; unicode is welcome,
+/// same as [`PersonName`] and unlike the ASCII-only username.
+#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+pub struct DisplayName(String);
+
+impl DisplayName {
+    pub fn try_new(value: &str) -> Result<Self, ValidationError> {
+        validate_required("display_name", value, MAX_DISPLAY_NAME_LEN)?;
+        Ok(Self(value.trim().to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A short self-description on the public profile. Free text within
+/// [`MAX_BIO_LEN`], blank allowed — an empty bio is a written-then-erased one,
+/// which is a legitimate state and not an error. Stored trimmed.
+#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+pub struct Bio(String);
+
+impl Bio {
+    pub fn try_new(value: &str) -> Result<Self, ValidationError> {
+        validate_optional("bio", value, MAX_BIO_LEN)?;
+        Ok(Self(value.trim().to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The motivational counters on a public profile. Every field is a derived
+/// count, never a settable one: zero rows is a true zero, so these are `i64`
+/// and never `Option` — a `null` in this API means "never chose", which a
+/// derived number can't be. An account that predates the feature therefore
+/// reads exactly like a fresh one.
+///
+/// One named struct on purpose: the auto-earned badge rules take a whole
+/// `ProfileStats` as their sole input, so a counter added here reaches them
+/// without touching a signature.
+#[derive(Debug, Clone, SurrealValue)]
+pub struct ProfileStats {
+    pomodoro_sessions: i64,
+    pomodoro_focus_ms: i64,
+    courses: i64,
+    classes: i64,
+}
+
+impl ProfileStats {
+    pub fn get_pomodoro_sessions(&self) -> i64 {
+        self.pomodoro_sessions
+    }
+
+    pub fn get_pomodoro_focus_ms(&self) -> i64 {
+        self.pomodoro_focus_ms
+    }
+
+    pub fn get_courses(&self) -> i64 {
+        self.courses
+    }
+
+    pub fn get_classes(&self) -> i64 {
+        self.classes
+    }
+
+    /// One query, and only one: `courses` and `classes` arrive from the caller,
+    /// which already holds them as the `total` of the paged class and course
+    /// readers it ran for the profile's own blocks — re-counting them here
+    /// would be two extra reads for numbers already in hand.
+    ///
+    /// The pomodoro aggregate rides the per-user index, so it is a lookup and
+    /// not a scan. `finished_at != NONE` is the filter because NONE is falsy: a
+    /// bare truthiness test would also drop a stint that finished at epoch. An
+    /// open stint contributes to neither the count nor the sum — unfinished
+    /// focus has no honest duration to add.
+    pub async fn load(
+        user: &UserId,
+        courses: i64,
+        classes: i64,
+        db: &Database,
+    ) -> Result<ProfileStats, AppError> {
+        let mut result = db
+            .query(
+                "SELECT count() AS sessions, math::sum(finished_at - started_at) AS focus_ms
+                 FROM pomodoro_session WHERE user = $usr AND finished_at != NONE GROUP ALL",
+            )
+            .bind(("usr", user.record()))
+            .await?
+            .check()?;
+        // `GROUP ALL` yields no row at all when nothing matched — that is the
+        // zero case, not a missing one.
+        let row = result.take::<Vec<PomodoroTotals>>(0)?.into_iter().next();
+        Ok(ProfileStats {
+            pomodoro_sessions: row.as_ref().map_or(0, |totals| totals.sessions),
+            // Floored at zero: a stint stamped by a wall clock that stepped
+            // backwards mid-session sums as negative time, and "you focused for
+            // minus five seconds" is never the truthful answer. New stints
+            // cannot go inverted (see [`PomodoroSession::finish`]); rows written
+            // before that guard still can, and this is what covers them.
+            pomodoro_focus_ms: row.map_or(0, |totals| totals.focus_ms.max(0)),
+            courses,
+            classes,
+        })
+    }
+}
+
+/// The aggregate row of [`ProfileStats::load`].
+#[derive(Debug, SurrealValue)]
+struct PomodoroTotals {
+    sessions: i64,
+    focus_ms: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,5 +273,90 @@ mod tests {
         // Two days out is beyond any real timezone: still rejected.
         let two_days_out = today.succ_opt().unwrap().succ_opt().unwrap();
         assert!(BirthDate::try_new(&fmt(two_days_out)).is_err());
+    }
+
+    #[tokio::test]
+    async fn display_name_trims_and_validates() {
+        assert_eq!(DisplayName::try_new("  Ada  ").unwrap().as_str(), "Ada");
+        // A display name is a name, not a username: unicode passes.
+        assert_eq!(
+            DisplayName::try_new("Gümüş 🐢").unwrap().as_str(),
+            "Gümüş 🐢"
+        );
+        assert!(DisplayName::try_new("   ").is_err());
+        assert!(DisplayName::try_new(&"x".repeat(MAX_DISPLAY_NAME_LEN + 1)).is_err());
+    }
+
+    #[tokio::test]
+    async fn bio_trims_and_validates() {
+        assert_eq!(Bio::try_new("  hello  ").unwrap().as_str(), "hello");
+        // Blank is a legitimate bio (erased), unlike a blank display name.
+        assert_eq!(Bio::try_new("   ").unwrap().as_str(), "");
+        assert!(Bio::try_new(&"é".repeat(MAX_BIO_LEN)).is_ok());
+        assert!(Bio::try_new(&"é".repeat(MAX_BIO_LEN + 1)).is_err());
+    }
+
+    #[tokio::test]
+    async fn stats_are_zero_without_pomodoro_rows() {
+        let db = crate::database::init_mem().await.unwrap();
+        let user = UserId::from_key(&ulid::Ulid::new().to_string());
+
+        let stats = ProfileStats::load(&user, 3, 1, &db).await.unwrap();
+        // Derived counters: no rows is a true zero, never a null.
+        assert_eq!(stats.get_pomodoro_sessions(), 0);
+        assert_eq!(stats.get_pomodoro_focus_ms(), 0);
+        // The passed-in counts survive untouched.
+        assert_eq!(stats.get_courses(), 3);
+        assert_eq!(stats.get_classes(), 1);
+    }
+
+    #[tokio::test]
+    async fn stats_count_finished_stints_only() {
+        let db = crate::database::init_mem().await.unwrap();
+        let user = UserId::from_key(&ulid::Ulid::new().to_string());
+        let other = UserId::from_key(&ulid::Ulid::new().to_string());
+
+        // Two finished stints (1000 ms + 2500 ms), one still running, and one
+        // finished stint belonging to somebody else.
+        db.query(
+            "CREATE pomodoro_session CONTENT { user: $usr, started_at: 1000, finished_at: 2000 };
+             CREATE pomodoro_session CONTENT { user: $usr, started_at: 5000, finished_at: 7500 };
+             CREATE pomodoro_session CONTENT { user: $usr, started_at: 9000 };
+             CREATE pomodoro_session CONTENT { user: $oth, started_at: 0, finished_at: 60000 };",
+        )
+        .bind(("usr", user.record()))
+        .bind(("oth", other.record()))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+        let stats = ProfileStats::load(&user, 0, 0, &db).await.unwrap();
+        assert_eq!(stats.get_pomodoro_sessions(), 2);
+        assert_eq!(stats.get_pomodoro_focus_ms(), 3500);
+    }
+
+    #[tokio::test]
+    async fn focus_time_never_reads_negative() {
+        let db = crate::database::init_mem().await.unwrap();
+        let user = UserId::from_key(&ulid::Ulid::new().to_string());
+
+        // One honest 1000 ms stint and one inverted row — what a backwards
+        // clock step left behind before `finish` grew its floor. The raw sum is
+        // -5000; the profile must still answer a duration, not an accusation.
+        db.query(
+            "CREATE pomodoro_session CONTENT { user: $usr, started_at: 1000, finished_at: 2000 };
+             CREATE pomodoro_session CONTENT { user: $usr, started_at: 9000, finished_at: 3000 };",
+        )
+        .bind(("usr", user.record()))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+        let stats = ProfileStats::load(&user, 0, 0, &db).await.unwrap();
+        // The stints still happened, so the count is honest at 2.
+        assert_eq!(stats.get_pomodoro_sessions(), 2);
+        assert_eq!(stats.get_pomodoro_focus_ms(), 0);
     }
 }

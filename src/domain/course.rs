@@ -244,6 +244,19 @@ impl Course {
 
     /// The courses `user` runs — the ones they created plus the ones a manager
     /// assigned them to. A teacher's slice of the catalog.
+    ///
+    /// ponytail: unpaged full table scan, and it stays one — every profile read
+    /// of a teacher pays it, so the ceiling is the course table's size. It
+    /// cannot be indexed away on SurrealDB 3.2.3: an index on `creator` alone
+    /// leaves the `OR` a `TableScan` (EXPLAIN), and the per-element index the
+    /// membership half would need (`DEFINE INDEX ... FIELDS teachers[*]`) is
+    /// *wrong*, not merely useless — with it, `$usr IN teachers` and
+    /// `teachers CONTAINS $usr` return **no rows at all**, which is what the
+    /// integration test `assigned_teacher_manages_course_without_owning_it`
+    /// catches. A plain `FIELDS teachers` index is correct but unused. The
+    /// upgrade path is structural: a `course_teacher` link table indexed on
+    /// `user`, the shape `enrollment` already has, turning this into two
+    /// index-backed reads.
     pub async fn list_for_teacher(user: &UserId, db: &Database) -> Result<Vec<Course>, AppError> {
         let mut result = db
             .query("SELECT * FROM course WHERE creator = $usr OR $usr IN teachers ORDER BY id DESC")

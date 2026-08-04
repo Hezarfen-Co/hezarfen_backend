@@ -9,13 +9,14 @@ use crate::constant::{
     DECOY_PASSWORD, ENROLLMENT_COUNT_FIELD, ENROLLMENT_TABLE, PARENT_LINK_TABLE,
     REGISTRATION_COUNT_FIELD, REGISTRATION_FROZEN_GUARD, REGISTRATION_TABLE, USER_TABLE,
 };
-use crate::database::{Database, transaction_with_retry};
+use crate::database::{Database, transaction_with_retry, write_with_retry};
 use crate::domain::board::Board;
 use crate::domain::field_update::FieldUpdate;
 use crate::domain::monotonic_id::next_ulid;
+use crate::domain::note_file::FileContentType;
 use crate::domain::page::PagedList;
 use crate::domain::preferences::{Language, PaletteColor, Theme};
-use crate::domain::profile::{BirthDate, Email, PersonName, Phone};
+use crate::domain::profile::{Bio, BirthDate, DisplayName, Email, PersonName, Phone};
 use crate::domain::role::Role;
 use crate::domain::text_fold::{search_fold, search_fold_sql};
 use crate::domain::timestamp::Timestamp;
@@ -216,6 +217,17 @@ pub struct User {
     theme: Option<Theme>,
     language: Option<Language>,
     palette_color: Option<PaletteColor>,
+    // The public profile: what other people see instead of the credentials.
+    // Optional like everything above — a profile is written after the account
+    // exists, so rows from before these fields existed read back as `None`,
+    // which is exactly a fresh account that never filled one in. The avatar is
+    // a blob on disk (`FILES_PATH`) like every other upload; only its name,
+    // type and size live on the row.
+    display_name: Option<DisplayName>,
+    bio: Option<Bio>,
+    avatar_file: Option<String>,
+    avatar_content_type: Option<FileContentType>,
+    avatar_size: Option<i64>,
 }
 
 impl User {
@@ -267,6 +279,26 @@ impl User {
         self.palette_color.as_ref()
     }
 
+    pub fn get_display_name(&self) -> Option<&DisplayName> {
+        self.display_name.as_ref()
+    }
+
+    pub fn get_bio(&self) -> Option<&Bio> {
+        self.bio.as_ref()
+    }
+
+    pub fn get_avatar_file(&self) -> Option<&str> {
+        self.avatar_file.as_deref()
+    }
+
+    pub fn get_avatar_content_type(&self) -> Option<&FileContentType> {
+        self.avatar_content_type.as_ref()
+    }
+
+    pub fn get_avatar_size(&self) -> Option<i64> {
+        self.avatar_size
+    }
+
     /// Register a new account. New users always start as [`Role::Student`];
     /// elevation is a separate, admin-only action (see [`User::set_role`]).
     pub async fn create(
@@ -308,6 +340,11 @@ impl User {
             theme: None,
             language: None,
             palette_color: None,
+            display_name: None,
+            bio: None,
+            avatar_file: None,
+            avatar_content_type: None,
+            avatar_size: None,
         };
         let created: Result<Option<User>, surrealdb::Error> =
             db.create(user.id.record()).content(user.clone()).await;
@@ -594,7 +631,9 @@ impl User {
         Ok((updated, boards))
     }
 
-    /// Write the personal-info fields the request actually carried. Every
+    /// Write the personal-info and public-profile fields the request actually
+    /// carried — everything a person edits about themselves except the avatar
+    /// blob, which needs its own writer ([`User::set_avatar`]). Every
     /// column is nullable, so each argument is an outer/inner `Option`: `None`
     /// = omitted (not written at all), `Some(None)` = cleared, `Some(Some(v))`
     /// = set. Merging the request against the current row is the HTTP layer's
@@ -605,6 +644,10 @@ impl User {
     /// for an omitted field would revert a concurrent PATCH of that field —
     /// two profile edits (a name and a phone) used to lose each other. See
     /// [`User::set_role`] for why no writer here touches the whole row.
+    // One argument per nullable column is the point: folding them into a struct
+    // would just re-spell the HTTP DTO here and cost the compiler's check that
+    // every column was considered at the call site.
+    #[allow(clippy::too_many_arguments)]
     pub async fn set_profile(
         self,
         name: Option<Option<PersonName>>,
@@ -612,6 +655,8 @@ impl User {
         email: Option<Option<Email>>,
         phone: Option<Option<Phone>>,
         birth_date: Option<Option<BirthDate>>,
+        display_name: Option<Option<DisplayName>>,
+        bio: Option<Option<Bio>>,
         db: &Database,
     ) -> Result<User, AppError> {
         FieldUpdate::new(self.id.record())
@@ -620,8 +665,58 @@ impl User {
             .set("email", email)
             .set("phone", phone)
             .set("birth_date", birth_date)
+            .set("display_name", display_name)
+            .set("bio", bio)
             .run::<User>(db)
             .await
+    }
+
+    /// Point the row at a freshly uploaded avatar blob, returning the row *as
+    /// it was* — the caller deletes `before.get_avatar_file()` off disk. Losing
+    /// `RETURN BEFORE` here strands the replaced blob forever: no route ever
+    /// deletes a user, so nothing else would collect it.
+    ///
+    /// Field-scoped for the same reason as [`User::set_profile`]: an avatar
+    /// upload must not carry a stale snapshot's role back over an admin's
+    /// change. `None` means the row is gone.
+    ///
+    /// Sent through [`write_with_retry`] like every other single-statement row
+    /// write here, unguarded or not: the user row is contended (preferences,
+    /// profile, role all write it), and a lost round wrote nothing, so
+    /// re-sending it is the recovery rather than a 500 in the caller's face.
+    pub async fn set_avatar(
+        id: &UserId,
+        file: &str,
+        content_type: &FileContentType,
+        size: i64,
+        db: &Database,
+    ) -> Result<Option<User>, AppError> {
+        let rows: Vec<User> = write_with_retry(
+            db,
+            "UPDATE $u SET avatar_file = $file, avatar_content_type = $ct, avatar_size = $size \
+             RETURN BEFORE",
+            &[
+                ("u".into(), id.record().into_value()),
+                ("file".into(), file.to_string().into_value()),
+                ("ct".into(), content_type.clone().into_value()),
+                ("size".into(), size.into_value()),
+            ],
+        )
+        .await?;
+        Ok(rows.into_iter().next())
+    }
+
+    /// Drop the avatar, returning the row as it was so the caller can delete
+    /// the blob. Same `RETURN BEFORE` contract as [`User::set_avatar`].
+    pub async fn clear_avatar(id: &UserId, db: &Database) -> Result<Option<User>, AppError> {
+        let rows: Vec<User> = write_with_retry(
+            db,
+            "UPDATE $u SET avatar_file = NONE, avatar_content_type = NONE, \
+             avatar_size = NONE RETURN BEFORE",
+            &[("u".into(), id.record().into_value())],
+        )
+        .await?;
+        Ok(rows.into_iter().next())
     }
 
     /// Write the UI-preference fields the request actually carried. Same
@@ -734,7 +829,16 @@ mod tests {
         // admin's change.
         let name = PersonName::try_new("name", "Ayşenur").unwrap();
         stale
-            .set_profile(Some(Some(name.clone())), None, None, None, None, &db)
+            .set_profile(
+                Some(Some(name.clone())),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &db,
+            )
             .await
             .unwrap();
 
@@ -748,6 +852,121 @@ mod tests {
             after.get_name(),
             Some(&name),
             "the profile edit itself lands"
+        );
+    }
+
+    fn png() -> FileContentType {
+        FileContentType::try_new("image/png").unwrap()
+    }
+
+    async fn a_user(username: &str, db: &Database) -> User {
+        User::create(
+            Username::try_new(username).unwrap(),
+            Password::try_new("secret1").unwrap().hash().unwrap(),
+            db,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_avatar_upload_cannot_revert_a_role_change() {
+        let db = init_mem().await.unwrap();
+        let user = a_user("berk", &db).await;
+
+        // The upload handler holds its snapshot (role = student)...
+        let stale = User::read(user.get_id(), &db).await.unwrap().unwrap();
+
+        // ...an admin promotes and the person edits their bio, both while the
+        // blob is still being written...
+        User::read(user.get_id(), &db)
+            .await
+            .unwrap()
+            .unwrap()
+            .set_role(Role::Teacher, &db)
+            .await
+            .unwrap();
+        let display_name = DisplayName::try_new("Berk").unwrap();
+        User::read(user.get_id(), &db)
+            .await
+            .unwrap()
+            .unwrap()
+            .set_profile(
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(Some(display_name.clone())),
+                None,
+                &db,
+            )
+            .await
+            .unwrap();
+
+        // ...and only then does the avatar land, from the stale row's id.
+        User::set_avatar(stale.get_id(), "blob-1", &png(), 42, &db)
+            .await
+            .unwrap()
+            .expect("the row exists");
+
+        let after = User::read(user.get_id(), &db).await.unwrap().unwrap();
+        assert_eq!(
+            after.get_role(),
+            Role::Teacher,
+            "the role change must survive the racing avatar write"
+        );
+        assert_eq!(
+            after.get_display_name(),
+            Some(&display_name),
+            "and so must every other column the avatar write never named"
+        );
+        assert_eq!(after.get_avatar_file(), Some("blob-1"));
+        assert_eq!(after.get_avatar_content_type(), Some(&png()));
+        assert_eq!(after.get_avatar_size(), Some(42));
+    }
+
+    /// The blob cleanup is built entirely on `RETURN BEFORE`: without the old
+    /// `avatar_file` coming back, every replace strands a file on disk that no
+    /// route ever collects.
+    #[tokio::test]
+    async fn the_avatar_writers_return_the_replaced_blob() {
+        let db = init_mem().await.unwrap();
+        let user = a_user("ceyda", &db).await;
+
+        let before = User::set_avatar(user.get_id(), "blob-1", &png(), 10, &db)
+            .await
+            .unwrap()
+            .expect("the row exists");
+        assert_eq!(before.get_avatar_file(), None, "no blob to collect yet");
+
+        let before = User::set_avatar(user.get_id(), "blob-2", &png(), 20, &db)
+            .await
+            .unwrap()
+            .expect("the row exists");
+        assert_eq!(
+            before.get_avatar_file(),
+            Some("blob-1"),
+            "the replaced blob is what the caller must delete"
+        );
+
+        let before = User::clear_avatar(user.get_id(), &db)
+            .await
+            .unwrap()
+            .expect("the row exists");
+        assert_eq!(before.get_avatar_file(), Some("blob-2"));
+
+        let after = User::read(user.get_id(), &db).await.unwrap().unwrap();
+        assert_eq!(after.get_avatar_file(), None);
+        assert_eq!(after.get_avatar_content_type(), None);
+        assert_eq!(after.get_avatar_size(), None);
+
+        assert!(
+            User::clear_avatar(&UserId::from_key("yok"), &db)
+                .await
+                .unwrap()
+                .is_none(),
+            "a missing row is None, not an error"
         );
     }
 
