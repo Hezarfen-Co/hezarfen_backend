@@ -10,7 +10,7 @@
 //! - **`slot` is a snapshot**, not a link into settings. Retiring a slot must
 //!   never rewrite a menu already published under it.
 
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
+use surrealdb::types::{RecordId, RecordIdKey, SurrealValue, Value};
 use tokio::sync::Mutex;
 
 use crate::constant::{
@@ -39,7 +39,7 @@ use crate::error::{AppError, ValidationError};
 // not worth the column here.
 ///
 /// **A leaf**: every dish write held under it moves the menu's revision inside
-/// its *own* transaction ([`MenuDish::bump_menu_and_write`](crate::domain::menu_dish)),
+/// its *own* transaction ([`bump_menu_and_write`]),
 /// so no path under this lock reaches `cap`'s counter lock any more — it did
 /// while the bump was a `cap` call of its own. Should one ever need both, the
 /// order is `MENU_LOCK` → `CLAIM_LOCK` and nothing may take this lock while
@@ -55,6 +55,72 @@ pub(crate) static MENU_LOCK: Mutex<()> = Mutex::const_new(());
 /// tables' relationship is a single record concurrent writes can contend on.
 pub(crate) fn slot_ref(slot: &str) -> RecordId {
     RecordId::new(SLOT_REF_TABLE, slot)
+}
+
+/// Move the menu's revision **and** run `statement` — a write to something
+/// hanging off a menu — in one transaction, handing back the row it returned.
+///
+/// What a seat on that menu costs, or who is recorded against it, is about to
+/// change, so any booking that priced itself against the old revision has to
+/// re-read. The bump cannot be a query of its own: in the gap the menu row
+/// carries the *new* revision with the *old* price, and a booking reading there
+/// passes the very CAS that exists to refuse it — a seat billed a price the
+/// menu had already left, or admitted past a capacity that had already shrunk.
+///
+/// The bump is also what makes the menu's **existence** part of the write
+/// ([`MenuDish::create`](crate::domain::menu_dish::MenuDish::create) leans on
+/// the same thing): the `UPDATE` matches nothing once the menu row is deleted,
+/// and a delete racing this one touches the very key this transaction writes,
+/// so the two cannot both commit. Reading the menu instead — even as the write
+/// statement's own target — does not survive that race: the read sees a row the
+/// delete has not committed yet, and [`Menu::delete`]'s sweep ran on a snapshot
+/// predating this insert, so both commit and the child outlives its menu
+/// (measured 378 of 3600 raced rounds before this shape was shared).
+///
+/// Deliberately on every such write, not only the ones that move
+/// `price_minor`: a re-tagged dish is cheap to re-read, and a rule that applies
+/// to every write cannot be forgotten by the next one added.
+///
+/// Admissible for [`transaction_with_retry`] as long as `statement` is: an
+/// `UPDATE`, a `DELETE`, a `SELECT`, an `IF`/`THROW` or a `RETURN` can never
+/// answer "already exists", and neither can an `UPSERT` whose id is bijective
+/// with every unique tuple its table indexes — a lost round wrote nothing, so
+/// re-sending it is the recovery.
+pub(crate) async fn bump_menu_and_write<T: SurrealValue>(
+    menu: &MenuId,
+    statement: &str,
+    mut bindings: Vec<(String, Value)>,
+    db: &Database,
+) -> Result<Option<T>, AppError> {
+    bindings.push(("menu".into(), menu.record().into_value()));
+    let (mut result, mut errors) = transaction_with_retry(
+        db,
+        &format!(
+            "BEGIN TRANSACTION;
+             LET $bumped = (UPDATE $menu SET {MENU_VERSION_FIELD} = \
+                 ({MENU_VERSION_FIELD} ?? 0) + 1 RETURN VALUE id);
+             IF array::len($bumped) = 0 {{ THROW 'no_menu' }};
+             LET $row = ({statement});
+             RETURN $row;
+             COMMIT TRANSACTION;"
+        ),
+        &bindings,
+        &["no_menu"],
+    )
+    .await?;
+    // An aborted transaction errors *every* slot, most with a generic "not
+    // executed" — only the THROW's own slot names the reason.
+    if errors
+        .values()
+        .any(|error| error.to_string().contains("no_menu"))
+    {
+        return Err(AppError::NotFound);
+    }
+    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+        return Err(error.into());
+    }
+    // Slots count BEGIN, the LET, the IF and the second LET: the RETURN is 4.
+    Ok(result.take::<Vec<T>>(4)?.into_iter().next())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
@@ -688,5 +754,129 @@ mod tests {
             .unwrap();
         last.delete(&db).await.unwrap();
         assert_eq!(refs(&db).await, 0);
+    }
+
+    /// Nothing hanging off a menu may survive the delete that swept it — not a
+    /// dish, and not an attendance mark. Menu ids are deterministic on
+    /// (date, slot), so a survivor is not litter: republishing that meal mints
+    /// the *same* id and the orphan comes back attached to the new menu — the
+    /// kitchen reading "served" for a student who never came, or pricing the
+    /// old menu's food.
+    ///
+    /// The window is between [`Menu::delete`]'s `DELETE` and its cascade: a
+    /// child write committing in there is a phantom insert into a range the
+    /// delete already swept on an older snapshot, so the sweep removes nothing
+    /// and *both* commit. It is closed by making every child write **write** the
+    /// menu row too ([`bump_menu_and_write`]) instead of reading it: the two
+    /// transactions then touch one key and the store refuses to commit both.
+    ///
+    /// The window is opened by the database itself rather than by a lucky
+    /// interleaving — a `DEFINE EVENT` on `menu` fires *inside* the delete's own
+    /// transaction, the instant the row goes, so the `SLEEP` lands exactly
+    /// between the delete and its sweep every single time. Nothing in `src/`
+    /// knows about it; the seam is the schema.
+    ///
+    /// Real server, and `#[ignore]`d for it: the subject *is* the store's
+    /// conflict detection, which `init_mem`'s embedded engine does not have —
+    /// it commits both writes and answers `Ok` to each, which would fail this
+    /// test on correct code (see [`crate::database::init_test_server`]).
+    /// Mutation-tested: putting `MealAttendance::mark` back on a menu *read*
+    /// (`UPSERT (SELECT VALUE $id FROM $menu) …`, the shape it shipped with)
+    /// turns this red at **both** of its two rounds — the mark commits, the
+    /// sweep misses it, and the row is left pointing at a menu that is gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
+    async fn a_child_written_inside_a_delete_never_outlives_the_menu() {
+        use crate::domain::meal_attendance::{MealAttendance, MealAttendanceStatus};
+        use crate::domain::menu_dish::{DishName, DishPrice, DishTags, MenuDish};
+
+        let (db, _serialized) = crate::database::init_test_server("menu_delete_race").await;
+        db.query("CREATE user:teacher SET username = 'teacher', password_hash = 'x';")
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        // Hold the delete open for a full second after the row is gone, while
+        // its cascade still has to run.
+        db.query(
+            "DEFINE EVENT hold_the_window ON TABLE menu WHEN $event = 'DELETE' \
+             THEN { SLEEP 1s; };",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+        let (mut dishes, mut marks, mut swept) = (0, 0, 0);
+        for round in 0..4 {
+            let menu = publish(&format!("2026-09-{:02}", round + 1), &db)
+                .await
+                .unwrap();
+            let id = menu.get_id().clone();
+
+            let drop_it = {
+                let db = db.clone();
+                tokio::spawn(async move { menu.delete(&db).await })
+            };
+            // The child starts inside the held window — the delete's row is
+            // gone but uncommitted, which is exactly what a menu read believes.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            // One child per round, never both: whichever wrote first forces the
+            // delete to re-send, and its second pass sweeps the other's row —
+            // which would mask exactly the defect this test exists to catch.
+            let child = {
+                let (id, db, dish) = (id.clone(), db.clone(), round % 2 == 0);
+                tokio::spawn(async move {
+                    if dish {
+                        MenuDish::create(
+                            &id,
+                            DishName::try_new("Pilav").unwrap(),
+                            None,
+                            DishPrice::try_new(1).unwrap(),
+                            DishTags::try_new(&[], &[]).unwrap(),
+                            &db,
+                        )
+                        .await
+                        .map(|_| ())
+                    } else {
+                        MealAttendance::mark(
+                            &id,
+                            &UserId::from_key("teacher"),
+                            MealAttendanceStatus::try_new("served").unwrap(),
+                            &UserId::from_key("teacher"),
+                            &db,
+                        )
+                        .await
+                        .map(|_| ())
+                    }
+                })
+            };
+            let (drop_it, child) = (drop_it.await.unwrap(), child.await.unwrap());
+            // A 404 for the child, or a 409/NotFound for the delete, is a
+            // correct answer — the only defect is stored state.
+            assert!(
+                !matches!(child, Err(AppError::Db(_))),
+                "round {round}: a raced child write must be answered, not 500: {child:?}"
+            );
+
+            // Stored state is the whole verdict; a return value is not evidence.
+            if Menu::read(&id, &db).await.unwrap().is_none() {
+                swept += 1;
+                dishes += MenuDish::list_for_menu(&id, &db).await.unwrap().len();
+                marks += MealAttendance::list_for_menu(&id, None, 0, &db)
+                    .await
+                    .unwrap()
+                    .1;
+            } else if drop_it.is_ok() {
+                panic!("round {round}: the delete reported success but the menu is still there");
+            }
+        }
+        eprintln!("Menu::delete raced by its children: {swept}/4 rounds deleted the menu");
+        assert!(
+            swept > 0,
+            "no round ever deleted the menu, so the window was never reached"
+        );
+        assert_eq!(dishes, 0, "a dish outlived its menu");
+        assert_eq!(marks, 0, "a mark outlived its menu");
     }
 }

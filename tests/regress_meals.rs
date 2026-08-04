@@ -14,6 +14,7 @@ use common::{app_and_db, id_of, login, login_as, me_id, send, set_role};
 use hezarfen_backend::domain::meal_attendance::{MealAttendance, MealAttendanceStatus};
 use hezarfen_backend::domain::menu::MenuId;
 use hezarfen_backend::domain::user::UserId;
+use hezarfen_backend::error::AppError;
 use serde_json::json;
 
 /// Publish a menu for `date`, uncapped unless told otherwise.
@@ -297,8 +298,19 @@ async fn a_mark_for_a_menu_that_is_gone_writes_no_row() {
         &db,
     )
     .await
-    .expect("the mark is refused, not an error");
-    assert!(marked.is_none(), "no menu, no mark");
+    .expect_err("the mark is refused");
+    assert!(
+        matches!(marked, AppError::NotFound),
+        "no menu, no mark: {marked:?}"
+    );
+    assert_eq!(
+        MealAttendance::list_for_menu(&menu, None, 0, &db)
+            .await
+            .unwrap()
+            .1,
+        0,
+        "the refusal must have written nothing"
+    );
 
     // Republishing that very day and slot mints the same id — and must not
     // inherit a mark for a meal nobody attended.

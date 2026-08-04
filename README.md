@@ -1860,11 +1860,14 @@ One row per (menu, student) keyed by a composite id, so a correction re-marks
 the same row instead of stacking a second one.
 
 The menu has to still be there: a mark whose menu is unpublished mid-request is
-a `404` and writes nothing. The existence check *is* the write's own target
-rather than a read the write then trusts, because a menu's id is deterministic
-on day+slot — an unconditional mark landing just after the delete committed
-would be swept by nothing and would reappear as a mark on the next menu
-published for that meal.
+a `404` and writes nothing. Like a dish write, the mark moves its **menu's**
+revision in the same transaction, so the menu's existence is something this
+write *writes* rather than something it reads and then trusts: a delete racing
+it touches the very row it bumps, and the store refuses to commit both. That
+matters more here than tidiness, because a menu's id is deterministic on
+day+slot — a mark that outlived its menu would come back as a mark on the next
+menu published for that meal, and reading it or clearing it is impossible in
+the meantime, since every path to it goes through the menu.
 
 **Attendance has zero billing effect.** Booking is the sole charge trigger, so
 a student who booked and did not eat still pays — the kitchen bought the food.
