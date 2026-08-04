@@ -422,10 +422,9 @@ async fn a_class_that_does_not_fit_is_reported_not_aborted() {
     assert_eq!(skipped[0]["class"], full.as_str());
     assert_eq!(skipped[0]["class_name"], "9-A", "name the section");
     assert_eq!(skipped[0]["course"], tight.as_str());
-    assert!(
-        skipped[0]["reason"].as_str().unwrap().contains("seat"),
-        "the reason must be actionable: {:?}",
-        skipped[0]["reason"]
+    assert_eq!(
+        skipped[0]["reason"], "course_full",
+        "the reason must be the exact machine code a client branches on"
     );
 
     assert!(
