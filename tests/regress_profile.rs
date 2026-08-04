@@ -315,8 +315,9 @@ async fn a_profile_read_heals_a_missed_badge_then_writes_nothing() {
     assert_eq!(writes().await, after_heal, "a profile read wrote something");
 }
 
-/// The counters are derived, so a fresh account reads a true `0` on all four —
-/// never `null`, never an absent key a client would have to guard.
+/// A fresh account reads a true `0` on every counter — never `null`, never an
+/// absent key a client would have to guard. Both kinds: the four derived ones
+/// have no rows behind them, and the stored ones have no columns on the row.
 #[tokio::test]
 async fn fresh_stats_read_zero_on_every_field() {
     let (app, _db) = app_and_db().await;
@@ -337,6 +338,15 @@ async fn fresh_stats_read_zero_on_every_field() {
         "exam_sat_total",
         "pomodoro_finished_total",
         "pomodoro_focus_ms_total",
+        "marks_given_total",
+        "lessons_held_total",
+        "pool_approved_total",
+        "pool_published_total",
+        "lessons_attended_total",
+        "high_mark_total",
+        // A longest, not a running total — the key still carries `_total`
+        // because that suffix is how a client joins a badge `stat` to a stat.
+        "study_streak_total",
     ] {
         assert_eq!(
             stats.get(field).and_then(Value::as_i64),
@@ -345,7 +355,7 @@ async fn fresh_stats_read_zero_on_every_field() {
             stats.get(field)
         );
     }
-    assert_eq!(stats.len(), 9, "no tenth counter shipped: {stats:?}");
+    assert_eq!(stats.len(), 16, "an unlisted counter shipped: {stats:?}");
     assert!(mine.body["avatar"].is_null());
     assert_eq!(mine.body["classes"], json!([]));
     assert_eq!(mine.body["courses"], json!([]));

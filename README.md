@@ -117,10 +117,12 @@ preference (or, for the accent, its own default).
 Every account also has a **public profile** (`/users/{id}/profile`): a
 self-chosen `display_name` and `bio`, one **avatar**, the classes and courses
 it belongs to, counters computed at read (finished pomodoro stints, course and
-class totals) beside stored lifetime tallies of homework handed in, exams sat
-and focus time, and the **badges** those tallies have earned — auto-earned
-only, no route awards or revokes one, and permanent once earned even if the
-counter later falls. Contact details are deliberately not part of it — email,
+class totals) beside stored lifetime tallies of what the account has done —
+homework handed in, exams sat and focus time, lessons attended, high exam
+marks and the longest run of consecutive study days for a student; grades
+given, lessons held and question-pool approvals for a teacher — and the
+**badges** those tallies have earned — auto-earned only, no route awards or
+revokes one, and permanent once earned even if the counter later falls. Contact details are deliberately not part of it — email,
 phone and birth date keep the gate they already have — and any authenticated
 account reads any profile, except a `parent`, who reads their own and their
 linked students' only (see "User profiles & avatars").
@@ -339,7 +341,8 @@ response in the same commit.
                      "session_duration_days": 7 },
   "badges":        { "catalog": [ { "id": "homework_submitted_10",
                                     "stat": "homework_submitted", "threshold": 10 },
-                                  { "…": 0 } ] },
+                                  { "…": 0 } ],
+                     "high_mark_min": 90 },
   "note":          { "max_title_len": 200, "max_content_len": 10000, "max_files": 10 },
   "file":          { "max_name_len": 255, "max_content_type_len": 100,
                      "min_max_file_bytes": 1024, "max_max_file_bytes": 26214400,
@@ -442,18 +445,28 @@ Notes:
   uploadable `image_content_types` are the exact accepted spellings — build
   pickers from these rather than from a literal list.
 - **The badge catalog rides here too.** `badges.catalog[]` is every badge the
-  system can auto-award — `{id, stat, threshold}`, 13 of them, in catalog
+  system can auto-award — `{id, stat, threshold}`, 34 of them, in catalog
   order. It is a group (an object with one `catalog` key) rather than a bare
   array because every key of this document is a group, and that uniformity is
   what lets a client walk the response generically. `stat` is the API's name
   for the lifetime counter behind the badge (`homework_submitted`,
-  `homework_on_time`, `exam_sat`, `pomodoro_finished`, `pomodoro_focus_ms`),
-  deliberately not the database column it is stored in, so storage can be
-  renamed without moving a published contract; badges sharing a `stat` form a
-  ladder. The catalog is compiled in, so a threshold moves only with a deploy —
-  the rules stay reviewable in a diff instead of editable in a settings row.
-  Labels and icons are **not** here: like `roles` and course `kinds`, the id is
-  the whole contract and the client owns what it looks like.
+  `homework_on_time`, `exam_sat`, `pomodoro_finished`, `pomodoro_focus_ms`,
+  `marks_given`, `lessons_held`, `pool_approved`, `pool_published`,
+  `lessons_attended`, `high_mark`, `study_streak` — twelve counters over the
+  34 badges), deliberately not the database column it is stored in, so storage
+  can be renamed without moving a published contract; badges sharing a `stat`
+  form a ladder. Every one of them joins the profile's `stats` key of the same
+  name plus `_total`, mechanically and without exception — including
+  `study_streak_total`, which is a *longest run* rather than a sum and keeps
+  the suffix anyway so the join needs no special case. The catalog is compiled
+  in, so a threshold moves only with a deploy — the rules stay reviewable in a
+  diff instead of editable in a settings row. Labels and icons are **not**
+  here: like `roles` and course `kinds`, the id is the whole contract and the
+  client owns what it looks like. Beside it, `badges.high_mark_min` (90) is the
+  exam mark the `high_mark` ladder counts from — published because
+  `high_mark_10` does not say what a high mark is, and deliberately not the
+  school's grade bands, whose labels a school renames at will while a badge id
+  must mean the same thing in every deployment forever.
 
 **`422` versus `400`.** The two refusals mean different things and a client
 must not treat them alike. Every JSON-bodied route can answer **`422`**: the
@@ -1140,7 +1153,11 @@ the school. `GET /users/me/profile` is the caller's own copy of it,
              "courses": 7, "classes": 1,
              "homework_submitted_total": 12, "homework_on_time_total": 11,
              "exam_sat_total": 5, "pomodoro_finished_total": 44,
-             "pomodoro_focus_ms_total": 65400000 }
+             "pomodoro_focus_ms_total": 65400000,
+             "marks_given_total": 0, "lessons_held_total": 0,
+             "pool_approved_total": 0, "pool_published_total": 3,
+             "lessons_attended_total": 58, "high_mark_total": 2,
+             "study_streak_total": 9 }
 }
 ```
 
@@ -1192,20 +1209,32 @@ owner's true total on purpose — it is the motivational counter, a per-reader
 number would be meaningless, and a magnitude names no course. One consequence,
 by design: a teacher you share nothing with has an empty `courses` block.
 
-**`stats` holds nine numbers of two different kinds, and the difference is
+**`stats` holds sixteen numbers of two different kinds, and the difference is
 worth knowing.** `pomodoro_sessions`, `pomodoro_focus_ms`, `courses` and
 `classes` are **computed at read**: they are recounted from the live rows on
-every call, so no column can drift out of sync with what is behind it. The five
-`*_total` keys are **stored lifetime tallies**, maintained at write time (see
-below), so a tally can outlive the rows behind it — a student's
+every call, so no column can drift out of sync with what is behind it. The
+twelve `*_total` keys are **stored lifetime tallies**, maintained at write time
+(see below), so a tally can outlive the rows behind it — a student's
 `exam_sat_total` still counts an exam a teacher has since deleted, which is the
 point of a lifetime counter. Either kind reads a true `0` on a fresh account,
 never `null`. Only *finished* pomodoro stints count on either side — a timer
 left running is not study time. Exam averages, homework-done rates and
 attendance rates are deliberately absent: those tables are indexed for their
 own reads, so a per-user aggregate over them is a full table scan, and a
-profile is far too cheap a page to pay for one — which is also why the five
+profile is far too cheap a page to pay for one — which is also why the twelve
 lifetime counters are tallied at write rather than recounted here.
+
+**Every key is unconditional, whatever the role.** Some counters are a
+student's (`exam_sat_total`, `lessons_attended_total`, `high_mark_total`,
+`study_streak_total`, the two homework ones), some a teacher's
+(`marks_given_total`, `lessons_held_total`, `pool_approved_total`), and a role
+that never does the work simply reads `0` — no key appears or disappears with a
+role, so a client renders one shape. Each `*_total` is the badge catalog's
+`stat` name plus `_total` and nothing else, which is how a client joins a
+profile to `badges.catalog[]` at `/limits` without a lookup table.
+`study_streak_total` keeps that suffix even though it is a **longest run and
+not a sum** — the mechanical spelling is worth more than the accurate one, so
+do not "fix" it.
 
 **The avatar** is one picture per account, uploaded as `multipart/form-data`
 with the image under a `file` field. Raster types only (`image/png`,
@@ -1241,7 +1270,8 @@ oldest first.
 **Ids only.** Each entry is `{id, earned_at}`. The label, the icon and the
 description are the frontend's, keyed by the id — the same deal `roles` and
 course `kinds` already have. The catalog behind the ids is at `GET /limits` as
-`badges.catalog[]` (`{id, stat, threshold}`, 13 badges); it is compiled into
+`badges.catalog[]` (`{id, stat, threshold}`, 34 badges over twelve counters,
+alongside `badges.high_mark_min`); it is compiled into
 the binary, so changing a threshold is a deploy, not a settings edit. An id is
 never reused for another meaning, and retiring a badge just drops it from the
 catalog — awards carrying it stop being served, no migration.
@@ -1262,6 +1292,50 @@ catalog — awards carrying it stop being served, no migration.
 - **Pomodoro.** Finishing a stint is `+1 pomodoro_finished_total` and its
   duration into `pomodoro_focus_ms_total`. An open stint counts for neither —
   unfinished focus has no honest duration to add.
+- **Study streak.** Finishing a stint also extends `study_streak_total`, the
+  **longest** run of consecutive days on which the student finished one. A
+  second stint the same day extends nothing; a gap of any length starts the run
+  over at 1. The badge reads the longest run ever held, never the run in
+  progress, so a broken streak takes no badge away and the counter never comes
+  down. A day is a **UTC calendar day**: this API stores no school timezone
+  anywhere, and the boundary is midnight UTC, the same one every other day
+  calculation here uses (meal cutoffs, menu dates, birth dates).
+- **Grades given.** `+1 marks_given_total` for the **grader**, the first time
+  they record a grade for a given exam sitting or homework submission — exam
+  and homework alike, since grading is grading. A regrade of the same pair moves
+  nothing: the counter counts work judged, not times the mark was edited.
+- **High marks.** `+1 high_mark_total` for the **student** whenever an exam
+  mark lands at or above `badges.high_mark_min` (90, published at `/limits`),
+  once per sitting — a retake is another sitting and can earn another. Homework
+  marks never count here: a homework mark is optional and most grades are
+  status-only, so counting them would reward a teacher's habit rather than a
+  student's work. The cut is compiled in rather than read from the school's
+  grade bands, which are renameable display labels — `high_mark_10` has to mean
+  the same thing in every school, forever.
+- **Lessons held.** `+1 lessons_held_total` for the **session's teacher**, once
+  per lesson, credited by the **first roll call taken for it**. It means "a
+  lesson whose roll call was taken", not "a lesson on the timetable" —
+  scheduling two hundred lessons and cancelling them all earns nothing. The
+  thirtieth student marked in that lesson credits nothing further (a stamp on
+  the session row is the guard), and taking one student back off the roll does
+  not un-hold the lesson.
+- **Lessons attended.** `+1 lessons_attended_total` for a **student** marked
+  `present` or `late` at lesson roll call — the same cut the attendance report's
+  `rate` uses, so a student's badge and their attendance rate never disagree
+  about what attending is; `excused` and every school-added status are neutral.
+  It is a **delta, not a tally**: a teacher correcting `present` → `absent`
+  moves it back down (floored at 0), and clearing the row does too. Student-only
+  — a teacher marked present in their own lesson moves nothing — and course
+  roll call only: the daily/event attendance at `/attendance` earns none of it.
+- **The question pool.** One pending → approved transition credits two people:
+  `+1 pool_approved_total` for the **approver** and `+1 pool_published_total`
+  for the **asker** whose question reached the pool. The asker is credited at
+  approval and never at asking, because asking is self-service — delete and
+  re-ask would farm it — which is why the counter is named `published` rather
+  than `asked`. And a teacher **approving their own question** earns neither:
+  the approval itself is unchanged (same `200`, same freeze), but a counter
+  moves only where one person's work was judged by somebody else, which closes
+  the ask-approve-delete farm from the other end too.
 
 **Existing accounts are seeded once.** The first boot of this version tallies
 every account from its real history, so nobody starts at zero for work they
@@ -1272,6 +1346,15 @@ is seeded short on `exam_sat_total`. The live rule (never decrement) and the
 seed (count what is there) simply cannot agree about history that is gone —
 and the fix is not to make deletion decrement, which would break the tally for
 everyone in order to patch it for a few.
+
+**The seven newer counters are not seeded at all**, deliberately:
+`marks_given_total`, `high_mark_total`, `lessons_held_total`,
+`lessons_attended_total`, `pool_approved_total`, `pool_published_total` and
+`study_streak_total` **begin at this deploy**, at zero, and no history is
+reconstructed for them. The columns are defined and absent reads `0`, so an
+account written before them is indistinguishable from a fresh one; the first
+grade recorded, roll call taken, approval landed or stint finished after the
+upgrade is what starts each of them counting.
 
 ## Appointments
 
@@ -2521,6 +2604,17 @@ it; a student reads their own tallies through the attendance report instead.
 Re-marking overwrites: one row per session+user, by construction. Deleting a
 session (or its course) cascades its roll-call rows.
 
+**Roll call is also what credits two badge counters** (see "Badges"). The
+**first** mark taken for a lesson credits its teacher's `lessons_held_total`,
+once — a lesson counts as held when its roll call is taken, so one merely
+scheduled (and then cancelled) counts for nothing, and the marks after that
+first one credit nothing further. And a **student** marked `present` or `late`
+gains a `lessons_attended_total`, using the same cut the attendance `rate`
+below uses; correcting that mark to any other status, or clearing the row, gives
+it back. The session teacher's own presence row moves neither counter — the
+attendance one is a student's badge, and a teacher does not attend their own
+lesson.
+
 The **work log** (`/work`) is the staff timesheet, for teachers and above.
 `POST /work/check-in` opens a stint and `POST /work/check-out` closes it, both
 stamped by the **server clock** — a request never carries an instant, so a
@@ -2546,6 +2640,9 @@ Logs return the usual page envelope plus `total_focus_ms`, the unpaged sum of
 every finished session's duration: `GET /pomodoro/me` for your own,
 `GET /pomodoro/{user}` for teacher+ (study oversight). Only students start
 sessions — pomodoro is the study tool, the work log is the staff timesheet.
+Finishing a stint also feeds the **study streak** behind the `study_streak`
+badges: consecutive **UTC** days on which one was finished, kept as the longest
+run ever held (see "Badges").
 
 **Attendance reports** mirror the marks report: `GET /attendance/me` for any
 logged-in user, `GET /attendance/{user}` for teacher+ — narrowed to the

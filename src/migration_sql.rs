@@ -75,6 +75,21 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS exam_sat_total ON user TYPE option<int>;
     DEFINE FIELD IF NOT EXISTS pomodoro_finished_total ON user TYPE option<int>;
     DEFINE FIELD IF NOT EXISTS pomodoro_focus_ms_total ON user TYPE option<int>;
+    -- Pass 3 (2026-08-04): the staff-side counters, two more student ones, and
+    -- the study streak. `study_streak_longest` is the badge counter; the other
+    -- two streak columns are bookkeeping the write site needs to compute it and
+    -- are read by nothing else. Definitions only — the seeding of the
+    -- row-derivable ones is a BACKFILL under its own migration mark, never in
+    -- this batch (same-batch DDL + backfill reads a stale schema).
+    DEFINE FIELD IF NOT EXISTS marks_given_total ON user TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS lessons_held_total ON user TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS pool_approved_total ON user TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS pool_published_total ON user TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS lessons_attended_total ON user TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS high_mark_total ON user TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS study_streak_longest ON user TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS study_streak_current ON user TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS study_streak_last_day ON user TYPE option<int>;
     DEFINE INDEX IF NOT EXISTS user_username ON user FIELDS username UNIQUE;
 
     DEFINE TABLE IF NOT EXISTS session SCHEMAFULL;
@@ -369,6 +384,12 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS topic ON course_session TYPE string;
     DEFINE FIELD IF NOT EXISTS starts_at ON course_session TYPE int;
     DEFINE FIELD IF NOT EXISTS ends_at ON course_session TYPE option<int>;
+    -- The once-per-session guard behind `lessons_held_total` (2026-08-04):
+    -- stamped by the first roll call taken for the lesson, read by nothing but
+    -- that guard. Definition only, and deliberately no backfill — a session
+    -- that predates it carries no stamp, so the next roll call taken on it
+    -- credits its teacher once, which is the rule this column encodes anyway.
+    DEFINE FIELD IF NOT EXISTS held_counted_at ON course_session TYPE option<int>;
     DEFINE INDEX IF NOT EXISTS course_session_course ON course_session FIELDS course;
 
     DEFINE TABLE IF NOT EXISTS session_attendance SCHEMAFULL;

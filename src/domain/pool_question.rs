@@ -13,10 +13,10 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
 use crate::constant::{
-    MAX_POOL_QUESTION_BODY_LEN, MAX_POOL_QUESTION_TITLE_LEN, POOL_QUESTION_TABLE, STATUS_APPROVED,
-    STATUS_PENDING,
+    MAX_POOL_QUESTION_BODY_LEN, MAX_POOL_QUESTION_TITLE_LEN, POOL_APPROVED_TOTAL_FIELD,
+    POOL_PUBLISHED_TOTAL_FIELD, POOL_QUESTION_TABLE, STATUS_APPROVED, STATUS_PENDING,
 };
-use crate::database::Database;
+use crate::database::{Database, transaction_with_retry};
 use crate::domain::monotonic_id::next_ulid;
 use crate::domain::note_file::FileContentType;
 use crate::domain::solution::Solution;
@@ -202,23 +202,76 @@ impl PoolQuestion {
     /// racing approvals exactly one wins, and an approve can never land on a
     /// question deleted mid-flight. `None` = the question wasn't pending
     /// (already approved, or gone) — the caller sorts out which.
+    ///
+    /// Two lifetime badge counters ride that same guard, inside this
+    /// transaction: the approver's `pool_approved_total` and the *asker's*
+    /// `pool_published_total`. Both hang off `array::len($done) > 0` — the
+    /// guard's own verdict — so the pair moves once per real transition and
+    /// never on a second approve of an already-approved question.
+    /// (`count ?? 0 > 0` misparses here; `array::len` is the spelling that
+    /// holds.) The second conjunct is the self-approval rule below.
+    ///
+    /// Two rules keep the pair unfarmable, one per side of the transition.
+    ///
+    /// The asker is credited at *approval*, not at asking: a bare
+    /// [`insert`](PoolQuestion::insert) is self-service and the author can
+    /// delete their own question and ask again forever, so a counter moved
+    /// there is farmable. Approval is teacher-gated and one-way, which is why
+    /// the family is named `pool_published` and not `pool_asked`. That closes
+    /// the student side.
+    ///
+    /// And a *self*-approval — a teacher+ approving a question they asked
+    /// themselves, which the route deliberately still allows — moves neither
+    /// counter, hence the `$done[0].asker != $by` half of the condition. It is
+    /// the same farm from the other end (ask, approve, delete, repeat, with no
+    /// second person involved), and the two together are why a counter can only
+    /// move when one person's work was judged by another's. Nothing else about
+    /// a self-approval changes: same 200, same freeze, same stamp — this skips
+    /// the credit, not the approval.
+    ///
+    /// Re-sent while the store answers "conflict, retry": the guard reads a
+    /// column a rival approve writes, and both counters sit on user rows every
+    /// other counter site writes too. Sound to re-send — every statement is an
+    /// `UPDATE`, none of which can legitimately answer "already exists" — and a
+    /// lost round aborts having written nothing, increments included.
     pub async fn approve(
         id: &PoolQuestionId,
         approver: &UserId,
         db: &Database,
     ) -> Result<Option<PoolQuestion>, AppError> {
-        let mut result = db
-            .query(
-                "UPDATE $q SET status = $approved, approved_by = $by \
-                 WHERE status = $pending RETURN AFTER",
-            )
-            .bind(("q", id.record()))
-            .bind(("approved", STATUS_APPROVED))
-            .bind(("by", approver.record()))
-            .bind(("pending", STATUS_PENDING))
-            .await?
-            .check()?;
-        Ok(result.take::<Vec<PoolQuestion>>(0)?.into_iter().next())
+        let (mut result, mut errors) = transaction_with_retry(
+            db,
+            &format!(
+                "BEGIN TRANSACTION;
+                 LET $done = (UPDATE $q SET status = $approved, approved_by = $by
+                     WHERE status = $pending RETURN AFTER);
+                 IF array::len($done) > 0 AND $done[0].asker != $by {{
+                     UPDATE $by SET
+                         {POOL_APPROVED_TOTAL_FIELD} = ({POOL_APPROVED_TOTAL_FIELD} ?? 0) + 1;
+                     LET $asker = $done[0].asker;
+                     UPDATE $asker SET
+                         {POOL_PUBLISHED_TOTAL_FIELD} = ({POOL_PUBLISHED_TOTAL_FIELD} ?? 0) + 1;
+                 }};
+                 RETURN $done;
+                 COMMIT TRANSACTION;"
+            ),
+            &[
+                ("q".into(), id.record().into_value()),
+                ("approved".into(), STATUS_APPROVED.to_string().into_value()),
+                ("by".into(), approver.record().into_value()),
+                ("pending".into(), STATUS_PENDING.to_string().into_value()),
+            ],
+            &[],
+        )
+        .await?;
+        if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+            return Err(error.into());
+        }
+        // The trailing `RETURN` is always the last statement before `COMMIT`,
+        // so its slot follows the statement count rather than a hand-kept
+        // number (`num_statements` counts `BEGIN` and `COMMIT` too, hence -2).
+        let slot = result.num_statements().saturating_sub(2);
+        Ok(result.take::<Vec<PoolQuestion>>(slot)?.into_iter().next())
     }
 
     /// Point the question at a freshly written image blob. Guarded on
@@ -303,6 +356,45 @@ mod tests {
     use crate::database;
     use crate::domain::solution::{Solution, SolutionBody};
 
+    /// The two counter columns plus a row to carry them: the `user` table is
+    /// SCHEMAFULL in production, and the counters are `option<int>` there.
+    async fn a_user(db: &Database) -> UserId {
+        let user = UserId::from_key(&Ulid::new().to_string());
+        db.query(format!(
+            "DEFINE FIELD IF NOT EXISTS {POOL_APPROVED_TOTAL_FIELD} ON user TYPE option<int>;
+             DEFINE FIELD IF NOT EXISTS {POOL_PUBLISHED_TOTAL_FIELD} ON user TYPE option<int>;
+             CREATE $usr SET username = $name, password_hash = 'x';"
+        ))
+        .bind(("usr", user.record()))
+        .bind(("name", user.key().to_string()))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+        user
+    }
+
+    /// `(pool_approved_total, pool_published_total)` as stored — absent reads
+    /// zero, the way `BadgeStats::load` reads it.
+    async fn counters(user: &UserId, db: &Database) -> (i64, i64) {
+        let mut result = db
+            .query(format!(
+                "SELECT VALUE [({POOL_APPROVED_TOTAL_FIELD} ?? 0),
+                               ({POOL_PUBLISHED_TOTAL_FIELD} ?? 0)] FROM $usr"
+            ))
+            .bind(("usr", user.record()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let rows = result.take::<Vec<Vec<i64>>>(0).unwrap();
+        let row = rows.into_iter().next().unwrap_or_default();
+        (
+            row.first().copied().unwrap_or(0),
+            row.get(1).copied().unwrap_or(0),
+        )
+    }
+
     fn question(asker: &UserId) -> PoolQuestion {
         PoolQuestion::new(
             asker,
@@ -342,6 +434,77 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// The publish counters ride the guard, so they move exactly once per real
+    /// transition: the approver's on the approve side, the asker's on the
+    /// published side, and neither on a second approve of the same question.
+    #[tokio::test]
+    async fn approval_moves_both_counters_once_and_only_once() {
+        let db = database::init_mem().await.unwrap();
+        let asker = a_user(&db).await;
+        let teacher = a_user(&db).await;
+
+        let q = question(&asker).insert(&db).await.unwrap();
+        assert_eq!(counters(&asker, &db).await, (0, 0), "absent reads zero");
+
+        PoolQuestion::approve(q.get_id(), &teacher, &db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(counters(&teacher, &db).await, (1, 0), "the approver");
+        assert_eq!(counters(&asker, &db).await, (0, 1), "the asker");
+
+        // The guard finds nothing pending, so neither counter may move — this
+        // is what stops an approve loop from farming either one.
+        assert!(
+            PoolQuestion::approve(q.get_id(), &teacher, &db)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(counters(&teacher, &db).await, (1, 0), "still one approve");
+        assert_eq!(counters(&asker, &db).await, (0, 1), "still one publish");
+
+        // And an approve that lands on nothing at all writes nothing.
+        assert!(
+            PoolQuestion::approve(&PoolQuestionId::generate(), &teacher, &db)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(counters(&teacher, &db).await, (1, 0));
+    }
+
+    /// A teacher may ask a question and the route does not bar them from
+    /// approving it — that still works, unchanged. What it does not do is pay
+    /// for itself: ask, approve, delete, repeat is the staff-side farm, and
+    /// neither counter moves when one person is both ends of the transition.
+    #[tokio::test]
+    async fn self_approval_still_approves_but_moves_neither_counter() {
+        let db = database::init_mem().await.unwrap();
+        let teacher = a_user(&db).await;
+
+        let q = question(&teacher).insert(&db).await.unwrap();
+        let approved = PoolQuestion::approve(q.get_id(), &teacher, &db)
+            .await
+            .unwrap()
+            .unwrap();
+        // The approval itself is untouched: published, stamped, frozen.
+        assert!(approved.is_approved());
+        assert_eq!(approved.get_approved_by(), Some(&teacher));
+        assert_eq!(counters(&teacher, &db).await, (0, 0), "no self-credit");
+
+        // And the skip is about the *pair*, not about the teacher: approving
+        // somebody else's question right after still pays.
+        let asker = a_user(&db).await;
+        let other = question(&asker).insert(&db).await.unwrap();
+        PoolQuestion::approve(other.get_id(), &teacher, &db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(counters(&teacher, &db).await, (1, 0));
+        assert_eq!(counters(&asker, &db).await, (0, 1));
     }
 
     #[tokio::test]

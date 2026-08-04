@@ -1,11 +1,15 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
-use crate::constant::SESSION_ATTENDANCE_TABLE;
+use crate::constant::{
+    LESSON_COUNTED_AT_FIELD, LESSONS_ATTENDED_TOTAL_FIELD, LESSONS_HELD_TOTAL_FIELD,
+    SESSION_ATTENDANCE_TABLE,
+};
 use crate::database::{Database, transaction_with_retry};
 use crate::domain::attendance::AttendanceStatus;
 use crate::domain::course::CourseId;
 use crate::domain::course_session::{CourseSession, CourseSessionId};
 use crate::domain::page::PagedList;
+use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 
@@ -34,6 +38,22 @@ impl SessionAttendanceId {
             _ => "",
         }
     }
+}
+
+/// Whether a status means the person was *there*, for the `lessons_attended`
+/// badge counter. Exactly the rule `GET /attendance/me` already publishes —
+/// `StatusCounts::tally` in `src/web/attendance.rs` puts `present` and `late`
+/// over the line and leaves `excused` and every school-added status neutral —
+/// so a student's badge and their attendance rate never disagree about what
+/// attending is.
+///
+/// Hardcoding the two literals is safe by construction: statuses are the
+/// school's to extend, but [`crate::domain::settings`] refuses any write that
+/// drops one of the core four, so `present` and `late` can never be renamed
+/// away. The SQL below repeats them — they are one rule in two languages, and
+/// the transition test is what pins them together.
+fn counts_as_attended(status: &AttendanceStatus) -> bool {
+    matches!(status.as_str(), "present" | "late")
 }
 
 /// One person's roll-call state for one lesson. `course` is denormalized from
@@ -86,13 +106,42 @@ impl SessionAttendance {
     /// route 404ing on the vanished session while the attendance report went
     /// on counting it. A deleted session reads NONE, which is falsy, so the
     /// gate is written as an explicit `IS NONE` (see
-    /// [`crate::domain::exam_result::ExamResult::grade`]).
+    /// [`crate::domain::exam_result::ExamResult::grade`]). It reads the
+    /// session's `teacher` — required on every row, so NONE means "no row" just
+    /// as `id` did — because the counter below needs that teacher anyway, and
+    /// one read serves both.
     ///
     /// Sound to re-send while the store answers "conflict, retry": the gate
     /// reads the record a delete writes, so the two contend by design, and the
     /// UPSERT cannot legitimately answer "already exists" — its composite id is
     /// bijective with the `session_attendance_session_user` unique tuple, so
     /// the index entry can only point at the row the id already names.
+    ///
+    /// Two badge counters move in this same transaction, both of them read
+    /// from the store rather than taken on the caller's word:
+    ///
+    /// - `lessons_attended_total`, on the person marked, as a *delta* rather
+    ///   than an increment, because this is an upsert: a re-mark that changes
+    ///   nothing must change nothing, and a teacher's correction must move it
+    ///   back down. `$was` is read before the upsert overwrites it (`NONE` when
+    ///   the pair has no row yet), so it writes only on a real crossing of the
+    ///   attended line, and only for a **student** — attending lessons is a
+    ///   student's badge, the same student-only rule enrolling and sitting an
+    ///   exam already carry, so a teacher marked present in their own lesson
+    ///   moves it in neither direction. The live `role` decides that, not the
+    ///   role someone held when the row was written.
+    /// - `lessons_held_total`, on the *session's* teacher, exactly once per
+    ///   session: the first roll call taken stamps
+    ///   [`LESSON_COUNTED_AT_FIELD`] on the lesson and every later mark sees
+    ///   the stamp and credits nothing. It counts lessons that actually
+    ///   happened — scheduling one and cancelling it earns nothing, which is
+    ///   why the credit does not live in `CourseSession::create`. Two
+    ///   simultaneous first marks both write the lesson row, so the store's own
+    ///   conflict detection (and `transaction_with_retry` behind it) is what
+    ///   keeps the stamp from being set twice.
+    ///
+    /// Both are floored/guarded rather than trusting the column to exist: a row
+    /// written before these columns carries none of them.
     pub async fn mark(
         session: &CourseSession,
         user: &UserId,
@@ -100,6 +149,8 @@ impl SessionAttendance {
         marked_by: &UserId,
         db: &Database,
     ) -> Result<SessionAttendance, AppError> {
+        let attended = counts_as_attended(&status);
+        let delta: i64 = if attended { 1 } else { -1 };
         let attendance = SessionAttendance {
             id: SessionAttendanceId::composite(session.get_id(), user),
             session: session.get_id().clone(),
@@ -110,16 +161,35 @@ impl SessionAttendance {
         };
         let (mut written, mut errors) = transaction_with_retry(
             db,
-            "BEGIN TRANSACTION;
-                 IF (SELECT VALUE id FROM ONLY $sess) IS NONE { THROW 'session_missing' };
+            &format!(
+                "BEGIN TRANSACTION;
+                 LET $teacher = (SELECT VALUE teacher FROM ONLY $sess);
+                 IF $teacher IS NONE {{ THROW 'session_missing' }};
+                 LET $counted = (SELECT VALUE {LESSON_COUNTED_AT_FIELD} FROM ONLY $sess);
+                 LET $student = ((SELECT VALUE role FROM ONLY $usr) = 'student');
+                 LET $was = ((SELECT VALUE status FROM ONLY $id) IN ['present', 'late']);
                  LET $after = (UPSERT $id CONTENT $row RETURN AFTER);
+                 IF $student AND $was != $now {{
+                     UPDATE $usr SET {LESSONS_ATTENDED_TOTAL_FIELD} =
+                         math::max([({LESSONS_ATTENDED_TOTAL_FIELD} ?? 0) + $delta, 0])
+                 }};
+                 IF $counted IS NONE {{
+                     UPDATE $sess SET {LESSON_COUNTED_AT_FIELD} = $stamp;
+                     UPDATE $teacher SET {LESSONS_HELD_TOTAL_FIELD} =
+                         ({LESSONS_HELD_TOTAL_FIELD} ?? 0) + 1
+                 }};
                  RETURN $after;
-                 COMMIT TRANSACTION;",
+                 COMMIT TRANSACTION;"
+            ),
             &[
                 // `$session` is SurrealDB's own protected variable (the auth
                 // session): binding that name errors the whole query.
                 ("sess".into(), session.get_id().record().into_value()),
                 ("id".into(), attendance.id.record().into_value()),
+                ("usr".into(), user.record().into_value()),
+                ("now".into(), attended.into_value()),
+                ("delta".into(), delta.into_value()),
+                ("stamp".into(), Timestamp::now().into_value()),
                 ("row".into(), attendance.into_value()),
             ],
             &["session_missing"],
@@ -175,17 +245,361 @@ impl SessionAttendance {
         Ok(result.take::<Vec<SessionAttendance>>(0)?)
     }
 
+    /// Clearing a row the student was counted for gives the count back, in the
+    /// delete's own transaction — the other direction of the delta in
+    /// [`SessionAttendance::mark`], so a row that never existed and a row that
+    /// was withdrawn leave the same number behind. Only *this* route decrements:
+    /// [`CourseSession::delete`]'s cascade sweeps the rows with a `DELETE` of
+    /// its own and never comes through here, which is the ruling
+    /// `exam_sat_total` already carries — deleting the lesson does not un-attend
+    /// it. `lessons_held_total` is never given back either: the lesson was
+    /// taken, and clearing one student's row does not un-take it.
+    ///
+    /// Student-only on the same terms as the mark, and read from the store for
+    /// the same reason.
+    ///
+    /// Sound to re-send: neither statement can answer "already exists".
+    //
+    // ponytail: both ends read the *live* role, so a student promoted between
+    // being marked present and having that row corrected leaves the counter one
+    // high (the credit landed as a student, the refund is refused as staff).
+    // Upgrade path is stamping the credit on the roll-call row itself and
+    // refunding off that stamp, the way `counted_on_time` works for homework —
+    // not worth a column until a promotion mid-term is a real complaint.
     pub async fn remove(
         session: &CourseSessionId,
         user: &UserId,
         db: &Database,
     ) -> Result<Option<SessionAttendance>, AppError> {
-        let mut result = db
-            .query("DELETE session_attendance WHERE session = $s AND user = $usr RETURN BEFORE")
-            .bind(("s", session.record()))
+        let (mut result, mut errors) = transaction_with_retry(
+            db,
+            &format!(
+                "BEGIN TRANSACTION;
+                 LET $student = ((SELECT VALUE role FROM ONLY $usr) = 'student');
+                 LET $gone = (DELETE session_attendance
+                     WHERE session = $s AND user = $usr RETURN BEFORE);
+                 IF $student AND array::len($gone) > 0 AND $gone[0].status IN ['present', 'late'] {{
+                     UPDATE $usr SET {LESSONS_ATTENDED_TOTAL_FIELD} =
+                         math::max([({LESSONS_ATTENDED_TOTAL_FIELD} ?? 0) - 1, 0])
+                 }};
+                 RETURN $gone;
+                 COMMIT TRANSACTION;"
+            ),
+            &[
+                ("s".into(), session.record().into_value()),
+                ("usr".into(), user.record().into_value()),
+            ],
+            &[],
+        )
+        .await?;
+        if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+            return Err(error.into());
+        }
+        // The trailing `RETURN` is always the last statement before `COMMIT`.
+        let slot = result.num_statements().saturating_sub(2);
+        Ok(result
+            .take::<Vec<SessionAttendance>>(slot)?
+            .into_iter()
+            .next())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::constant::DEFAULT_ATTENDANCE_STATUSES;
+    use crate::database::init_mem;
+    use crate::domain::badge::BadgeStats;
+    use crate::domain::course_session::SessionTopic;
+    use crate::domain::role::Role;
+
+    /// A user row carrying its role — the counters are `UPDATE`s on one (which
+    /// writes nothing at all to a record that does not exist), and the live
+    /// role is what decides whether the attended counter moves.
+    async fn a_user(key: &str, role: Role, db: &Database) -> UserId {
+        let user = UserId::from_key(key);
+        db.query("CREATE $usr SET username = $name, password_hash = 'x', role = $role")
             .bind(("usr", user.record()))
-            .await?
-            .check()?;
-        Ok(result.take::<Vec<SessionAttendance>>(0)?.into_iter().next())
+            .bind(("name", key.to_string()))
+            .bind(("role", role))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        user
+    }
+
+    async fn a_student(key: &str, db: &Database) -> UserId {
+        a_user(key, Role::Student, db).await
+    }
+
+    async fn a_teacher(key: &str, db: &Database) -> UserId {
+        a_user(key, Role::Teacher, db).await
+    }
+
+    async fn a_session(teacher: &UserId, db: &Database) -> CourseSession {
+        CourseSession::create(
+            &CourseId::from_key("c"),
+            teacher,
+            SessionTopic::try_new("limits").unwrap(),
+            Timestamp::from_millis(1),
+            None,
+            db,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// A status this school allows — the four core ones plus a school-added
+    /// `online`, which is exactly the open half of the set.
+    fn status(value: &str) -> AttendanceStatus {
+        let allowed: Vec<String> = DEFAULT_ATTENDANCE_STATUSES
+            .iter()
+            .map(|s| s.to_string())
+            .chain(["online".to_string()])
+            .collect();
+        AttendanceStatus::try_new(value, &allowed).unwrap()
+    }
+
+    /// The two counters as the badge rules read them, off the stored row.
+    async fn attended(user: &UserId, db: &Database) -> i64 {
+        BadgeStats::load(user, db)
+            .await
+            .unwrap()
+            .get_lessons_attended()
+    }
+
+    async fn held(user: &UserId, db: &Database) -> i64 {
+        BadgeStats::load(user, db).await.unwrap().get_lessons_held()
+    }
+
+    /// The whole transition table in one pass: an upsert may only move the
+    /// counter when the mark crosses the attended line, in either direction, so
+    /// a re-mark and a swap within the same class are both no-ops.
+    #[tokio::test]
+    async fn the_counter_follows_every_crossing_and_no_other_move() {
+        let db = init_mem().await.unwrap();
+        let teacher = a_teacher("t", &db).await;
+        let student = a_student("s", &db).await;
+        let session = a_session(&teacher, &db).await;
+        let mark = async |value: &str, db: &Database| {
+            SessionAttendance::mark(&session, &student, status(value), &teacher, db)
+                .await
+                .unwrap();
+        };
+
+        for (value, expected, why) in [
+            ("present", 1, "first mark counts"),
+            ("present", 1, "re-marking the same status changes nothing"),
+            ("late", 1, "late is attending too, so no crossing"),
+            ("absent", 0, "a correction gives the count back"),
+            ("absent", 0, "and does not keep giving it back"),
+            ("late", 1, "absent -> late crosses back up"),
+            ("excused", 0, "excused is neutral: a crossing down"),
+            ("online", 0, "a school-added status stays neutral"),
+            ("present", 1, "…and crossing up from one still counts"),
+            ("online", 0, "…as does crossing down to one"),
+        ] {
+            mark(value, &db).await;
+            assert_eq!(attended(&student, &db).await, expected, "{why}");
+        }
+        assert_eq!(attended(&teacher, &db).await, 0, "credited the marker");
+        // Ten marks, one lesson: correcting a roll call is not holding another.
+        assert_eq!(held(&teacher, &db).await, 1, "the lesson was counted twice");
+    }
+
+    /// The lesson is credited to its teacher when the roll call is *taken*, and
+    /// once: the whole roster, and every later correction, ride the same stamp.
+    #[tokio::test]
+    async fn the_first_roll_call_counts_the_lesson_once() {
+        let db = init_mem().await.unwrap();
+        let teacher = a_teacher("t", &db).await;
+        let other = a_teacher("o", &db).await;
+        let session = a_session(&teacher, &db).await;
+        assert_eq!(held(&teacher, &db).await, 0, "scheduling counts nothing");
+
+        for key in ["s1", "s2", "s3"] {
+            let student = a_student(key, &db).await;
+            SessionAttendance::mark(&session, &student, status("present"), &teacher, &db)
+                .await
+                .unwrap();
+            assert_eq!(held(&teacher, &db).await, 1, "{key} counted it again");
+        }
+        assert_eq!(held(&other, &db).await, 0, "credited the wrong teacher");
+
+        // A second lesson is a second count — the stamp is per session.
+        let second = a_session(&teacher, &db).await;
+        let student = a_student("s4", &db).await;
+        SessionAttendance::mark(&second, &student, status("present"), &teacher, &db)
+            .await
+            .unwrap();
+        assert_eq!(held(&teacher, &db).await, 2);
+    }
+
+    /// Attending lessons is a student's badge. A teacher marked present in
+    /// their own lesson (which management does, not the teacher) moves nothing
+    /// for them as an attendee — while the roll call itself still counts as a
+    /// lesson held.
+    #[tokio::test]
+    async fn a_teacher_marked_present_earns_nothing_for_attending() {
+        let db = init_mem().await.unwrap();
+        let teacher = a_teacher("t", &db).await;
+        let session = a_session(&teacher, &db).await;
+
+        SessionAttendance::mark(&session, &teacher, status("present"), &teacher, &db)
+            .await
+            .unwrap();
+        assert_eq!(attended(&teacher, &db).await, 0, "staff attended a lesson");
+        assert_eq!(held(&teacher, &db).await, 1, "the roll call was taken");
+
+        // And the correction direction is just as closed: nothing was taken, so
+        // nothing may be given back.
+        SessionAttendance::mark(&session, &teacher, status("absent"), &teacher, &db)
+            .await
+            .unwrap();
+        assert_eq!(attended(&teacher, &db).await, 0);
+        SessionAttendance::remove(session.get_id(), &teacher, &db)
+            .await
+            .unwrap()
+            .expect("the row was there");
+        assert_eq!(attended(&teacher, &db).await, 0);
+        assert_eq!(held(&teacher, &db).await, 1, "the lesson still happened");
+    }
+
+    /// Two lessons are two counts — the counter is per row, not per student.
+    #[tokio::test]
+    async fn each_lesson_counts_once_for_the_student_marked() {
+        let db = init_mem().await.unwrap();
+        let teacher = a_teacher("t", &db).await;
+        let student = a_student("s", &db).await;
+        let other = a_student("o", &db).await;
+        for _ in 0..2 {
+            let session = a_session(&teacher, &db).await;
+            SessionAttendance::mark(&session, &student, status("present"), &teacher, &db)
+                .await
+                .unwrap();
+        }
+        assert_eq!(attended(&student, &db).await, 2);
+        assert_eq!(attended(&other, &db).await, 0, "credited the wrong student");
+    }
+
+    /// Removing the row is the other direction of the delta, and only for a row
+    /// that was counted.
+    #[tokio::test]
+    async fn removing_a_row_gives_back_only_what_it_took() {
+        let db = init_mem().await.unwrap();
+        let teacher = a_teacher("t", &db).await;
+        let student = a_student("s", &db).await;
+
+        let counted = a_session(&teacher, &db).await;
+        SessionAttendance::mark(&counted, &student, status("present"), &teacher, &db)
+            .await
+            .unwrap();
+        let neutral = a_session(&teacher, &db).await;
+        SessionAttendance::mark(&neutral, &student, status("absent"), &teacher, &db)
+            .await
+            .unwrap();
+        assert_eq!(attended(&student, &db).await, 1);
+
+        SessionAttendance::remove(neutral.get_id(), &student, &db)
+            .await
+            .unwrap()
+            .expect("the absent row was there");
+        assert_eq!(attended(&student, &db).await, 1, "absent took nothing");
+        SessionAttendance::remove(counted.get_id(), &student, &db)
+            .await
+            .unwrap()
+            .expect("the present row was there");
+        assert_eq!(attended(&student, &db).await, 0);
+        assert!(
+            SessionAttendance::remove(counted.get_id(), &student, &db)
+                .await
+                .unwrap()
+                .is_none(),
+            "nothing left to remove"
+        );
+        assert_eq!(attended(&student, &db).await, 0, "and nothing to give back");
+        assert_eq!(
+            held(&teacher, &db).await,
+            2,
+            "clearing a row un-held a lesson"
+        );
+    }
+
+    /// The floor: however the corrections and removals interleave, and whatever
+    /// a stale row starts from, the counter never goes negative.
+    #[tokio::test]
+    async fn the_counter_never_goes_below_zero() {
+        let db = init_mem().await.unwrap();
+        let teacher = a_teacher("t", &db).await;
+        let student = a_student("s", &db).await;
+
+        // Ten counted lessons whose counter was never credited — the stale-data
+        // case, an account that predates the column. Every one of them is now
+        // corrected away, which is ten decrements against a zero.
+        let mut sessions = Vec::new();
+        for _ in 0..10 {
+            let session = a_session(&teacher, &db).await;
+            SessionAttendance::mark(&session, &student, status("present"), &teacher, &db)
+                .await
+                .unwrap();
+            sessions.push(session);
+        }
+        db.query(format!(
+            "UPDATE $usr SET {LESSONS_ATTENDED_TOTAL_FIELD} = 0"
+        ))
+        .bind(("usr", student.record()))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+        for session in &sessions {
+            SessionAttendance::mark(session, &student, status("absent"), &teacher, &db)
+                .await
+                .unwrap();
+            SessionAttendance::remove(session.get_id(), &student, &db)
+                .await
+                .unwrap();
+            assert!(attended(&student, &db).await >= 0);
+        }
+        assert_eq!(attended(&student, &db).await, 0, "floored, never negative");
+    }
+
+    /// Deleting the lesson sweeps its roll-call rows with a `DELETE` of its own
+    /// — it never reaches [`SessionAttendance::remove`] — so the count stands,
+    /// the ruling every other counter here carries.
+    #[tokio::test]
+    async fn deleting_the_session_leaves_the_counters_alone() {
+        let db = init_mem().await.unwrap();
+        let teacher = a_teacher("t", &db).await;
+        let student = a_student("s", &db).await;
+        let session = a_session(&teacher, &db).await;
+        SessionAttendance::mark(&session, &student, status("present"), &teacher, &db)
+            .await
+            .unwrap();
+
+        session.delete(&db).await.unwrap();
+        assert_eq!(attended(&student, &db).await, 1, "the cascade decremented");
+        assert_eq!(held(&teacher, &db).await, 1, "the cascade decremented");
+    }
+
+    /// A mark on a session that is already gone is refused, so it cannot leave
+    /// a count behind either.
+    #[tokio::test]
+    async fn a_refused_mark_moves_nothing() {
+        let db = init_mem().await.unwrap();
+        let teacher = a_teacher("t", &db).await;
+        let student = a_student("s", &db).await;
+        let session = a_session(&teacher, &db).await;
+        let ghost = session.clone();
+        session.delete(&db).await.unwrap();
+
+        assert!(matches!(
+            SessionAttendance::mark(&ghost, &student, status("present"), &teacher, &db).await,
+            Err(AppError::NotFound)
+        ));
+        assert_eq!(attended(&student, &db).await, 0);
+        assert_eq!(held(&teacher, &db).await, 0, "a refused mark held a lesson");
     }
 }

@@ -12,6 +12,7 @@ use utoipa_axum::routes;
 use crate::constant::{CAS_UPDATE_RETRIES, MAX_MAX_FILE_BYTES, UPLOAD_BODY_OVERHEAD_BYTES};
 use crate::database::Database;
 use crate::domain::answer_image::AnswerImage;
+use crate::domain::badge;
 use crate::domain::bank_question::{BankQuestion, BankQuestionId};
 use crate::domain::bank_question_image::BankQuestionImage;
 use crate::domain::course::Course;
@@ -723,6 +724,15 @@ async fn grade(
         &st.db,
     )
     .await?;
+    // Both sides of the grade moved a counter — the grader's `marks_given`,
+    // the student's `high_mark` — so both are brought up to date. A badge is a
+    // decoration on top of the mark: losing one to a transient database error
+    // must never fail the grading, and the next counter move heals it.
+    for person in [teacher.get_id(), &target] {
+        if let Err(err) = badge::sync(person, &st.db).await {
+            tracing::warn!("failed to sync badges for {}: {err}", person.key());
+        }
+    }
     let people = PersonRef::map_of(&[&target_user, &teacher]);
     Ok(Json(ExamResultResponse::new(&result, &people)))
 }

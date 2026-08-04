@@ -16,8 +16,11 @@
 use surrealdb::types::SurrealValue;
 
 use crate::constant::{
-    BADGE_AWARD_TABLE, BADGES, EXAM_SAT_TOTAL_FIELD, HOMEWORK_ON_TIME_TOTAL_FIELD,
-    HOMEWORK_SUBMITTED_TOTAL_FIELD, POMODORO_FINISHED_TOTAL_FIELD, POMODORO_FOCUS_MS_TOTAL_FIELD,
+    BADGE_AWARD_TABLE, BADGES, EXAM_SAT_TOTAL_FIELD, HIGH_MARK_TOTAL_FIELD,
+    HOMEWORK_ON_TIME_TOTAL_FIELD, HOMEWORK_SUBMITTED_TOTAL_FIELD, LESSONS_ATTENDED_TOTAL_FIELD,
+    LESSONS_HELD_TOTAL_FIELD, MARKS_GIVEN_TOTAL_FIELD, POMODORO_FINISHED_TOTAL_FIELD,
+    POMODORO_FOCUS_MS_TOTAL_FIELD, POOL_APPROVED_TOTAL_FIELD, POOL_PUBLISHED_TOTAL_FIELD,
+    STUDY_STREAK_LONGEST_FIELD,
 };
 use crate::database::Database;
 use crate::domain::timestamp::Timestamp;
@@ -35,6 +38,17 @@ pub enum BadgeStat {
     ExamSat,
     PomodoroFinished,
     PomodoroFocusMs,
+    MarksGiven,
+    LessonsHeld,
+    PoolApproved,
+    PoolPublished,
+    LessonsAttended,
+    HighMark,
+    /// The *longest* run of study days, not the run in progress: the two
+    /// bookkeeping columns behind it are not counters and are deliberately not
+    /// variants here, because nothing may award a badge off a number that comes
+    /// back down.
+    StudyStreak,
 }
 
 impl BadgeStat {
@@ -48,6 +62,13 @@ impl BadgeStat {
             BadgeStat::ExamSat => EXAM_SAT_TOTAL_FIELD,
             BadgeStat::PomodoroFinished => POMODORO_FINISHED_TOTAL_FIELD,
             BadgeStat::PomodoroFocusMs => POMODORO_FOCUS_MS_TOTAL_FIELD,
+            BadgeStat::MarksGiven => MARKS_GIVEN_TOTAL_FIELD,
+            BadgeStat::LessonsHeld => LESSONS_HELD_TOTAL_FIELD,
+            BadgeStat::PoolApproved => POOL_APPROVED_TOTAL_FIELD,
+            BadgeStat::PoolPublished => POOL_PUBLISHED_TOTAL_FIELD,
+            BadgeStat::LessonsAttended => LESSONS_ATTENDED_TOTAL_FIELD,
+            BadgeStat::HighMark => HIGH_MARK_TOTAL_FIELD,
+            BadgeStat::StudyStreak => STUDY_STREAK_LONGEST_FIELD,
         }
     }
 
@@ -65,6 +86,13 @@ impl BadgeStat {
             BadgeStat::ExamSat => "exam_sat",
             BadgeStat::PomodoroFinished => "pomodoro_finished",
             BadgeStat::PomodoroFocusMs => "pomodoro_focus_ms",
+            BadgeStat::MarksGiven => "marks_given",
+            BadgeStat::LessonsHeld => "lessons_held",
+            BadgeStat::PoolApproved => "pool_approved",
+            BadgeStat::PoolPublished => "pool_published",
+            BadgeStat::LessonsAttended => "lessons_attended",
+            BadgeStat::HighMark => "high_mark",
+            BadgeStat::StudyStreak => "study_streak",
         }
     }
 }
@@ -79,6 +107,15 @@ pub struct BadgeStats {
     exam_sat: i64,
     pomodoro_finished: i64,
     pomodoro_focus_ms: i64,
+    marks_given: i64,
+    lessons_held: i64,
+    pool_approved: i64,
+    pool_published: i64,
+    lessons_attended: i64,
+    high_mark: i64,
+    /// The longest study run, off `study_streak_longest`. Named for the wire,
+    /// like every field here, and never the run in progress.
+    study_streak: i64,
 }
 
 impl BadgeStats {
@@ -102,14 +139,42 @@ impl BadgeStats {
         self.pomodoro_focus_ms
     }
 
-    /// All five counters off the user row, in one statement — a record lookup,
-    /// not a scan.
+    pub fn get_marks_given(&self) -> i64 {
+        self.marks_given
+    }
+
+    pub fn get_lessons_held(&self) -> i64 {
+        self.lessons_held
+    }
+
+    pub fn get_pool_approved(&self) -> i64 {
+        self.pool_approved
+    }
+
+    pub fn get_pool_published(&self) -> i64 {
+        self.pool_published
+    }
+
+    pub fn get_lessons_attended(&self) -> i64 {
+        self.lessons_attended
+    }
+
+    pub fn get_high_mark(&self) -> i64 {
+        self.high_mark
+    }
+
+    pub fn get_study_streak(&self) -> i64 {
+        self.study_streak
+    }
+
+    /// Every counter off the user row, in one statement — a record lookup, not
+    /// a scan.
     ///
     /// Each projection is `(column ?? 0)`, parenthesized because `??` binds
     /// loosely, and it is the whole stale-data story: the columns are
     /// `option<int>`, a row written before they existed carries none of them,
     /// and absent must read as zero rather than as a null or an error. A user
-    /// row that is gone entirely reads as five zeros too — a badge sync is not
+    /// row that is gone entirely reads as all zeros too — a badge sync is not
     /// the place to discover a deleted account.
     pub async fn load(user: &UserId, db: &Database) -> Result<BadgeStats, AppError> {
         let mut result = db
@@ -118,13 +183,27 @@ impl BadgeStats {
                         ({homework_on_time} ?? 0) AS homework_on_time,
                         ({exam_sat} ?? 0) AS exam_sat,
                         ({pomodoro_finished} ?? 0) AS pomodoro_finished,
-                        ({pomodoro_focus_ms} ?? 0) AS pomodoro_focus_ms
+                        ({pomodoro_focus_ms} ?? 0) AS pomodoro_focus_ms,
+                        ({marks_given} ?? 0) AS marks_given,
+                        ({lessons_held} ?? 0) AS lessons_held,
+                        ({pool_approved} ?? 0) AS pool_approved,
+                        ({pool_published} ?? 0) AS pool_published,
+                        ({lessons_attended} ?? 0) AS lessons_attended,
+                        ({high_mark} ?? 0) AS high_mark,
+                        ({study_streak} ?? 0) AS study_streak
                  FROM $usr",
                 homework_submitted = BadgeStat::HomeworkSubmitted.field(),
                 homework_on_time = BadgeStat::HomeworkOnTime.field(),
                 exam_sat = BadgeStat::ExamSat.field(),
                 pomodoro_finished = BadgeStat::PomodoroFinished.field(),
                 pomodoro_focus_ms = BadgeStat::PomodoroFocusMs.field(),
+                marks_given = BadgeStat::MarksGiven.field(),
+                lessons_held = BadgeStat::LessonsHeld.field(),
+                pool_approved = BadgeStat::PoolApproved.field(),
+                pool_published = BadgeStat::PoolPublished.field(),
+                lessons_attended = BadgeStat::LessonsAttended.field(),
+                high_mark = BadgeStat::HighMark.field(),
+                study_streak = BadgeStat::StudyStreak.field(),
             ))
             .bind(("usr", user.record()))
             .await?
@@ -153,6 +232,13 @@ pub fn earned(stats: &BadgeStats) -> Vec<&'static str> {
                 BadgeStat::ExamSat => stats.exam_sat,
                 BadgeStat::PomodoroFinished => stats.pomodoro_finished,
                 BadgeStat::PomodoroFocusMs => stats.pomodoro_focus_ms,
+                BadgeStat::MarksGiven => stats.marks_given,
+                BadgeStat::LessonsHeld => stats.lessons_held,
+                BadgeStat::PoolApproved => stats.pool_approved,
+                BadgeStat::PoolPublished => stats.pool_published,
+                BadgeStat::LessonsAttended => stats.lessons_attended,
+                BadgeStat::HighMark => stats.high_mark,
+                BadgeStat::StudyStreak => stats.study_streak,
             };
             value >= *threshold
         })
@@ -258,6 +344,7 @@ pub async fn sync(user: &UserId, db: &Database) -> Result<(), AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constant::{STUDY_STREAK_CURRENT_FIELD, STUDY_STREAK_LAST_DAY_FIELD};
 
     /// The schema these rows need, which `src/migration_sql.rs` owns. Spelled
     /// with the same `IF NOT EXISTS` guards the migration uses, so it is a
@@ -269,6 +356,15 @@ mod tests {
              DEFINE FIELD IF NOT EXISTS {EXAM_SAT_TOTAL_FIELD} ON user TYPE option<int>;
              DEFINE FIELD IF NOT EXISTS {POMODORO_FINISHED_TOTAL_FIELD} ON user TYPE option<int>;
              DEFINE FIELD IF NOT EXISTS {POMODORO_FOCUS_MS_TOTAL_FIELD} ON user TYPE option<int>;
+             DEFINE FIELD IF NOT EXISTS {MARKS_GIVEN_TOTAL_FIELD} ON user TYPE option<int>;
+             DEFINE FIELD IF NOT EXISTS {LESSONS_HELD_TOTAL_FIELD} ON user TYPE option<int>;
+             DEFINE FIELD IF NOT EXISTS {POOL_APPROVED_TOTAL_FIELD} ON user TYPE option<int>;
+             DEFINE FIELD IF NOT EXISTS {POOL_PUBLISHED_TOTAL_FIELD} ON user TYPE option<int>;
+             DEFINE FIELD IF NOT EXISTS {LESSONS_ATTENDED_TOTAL_FIELD} ON user TYPE option<int>;
+             DEFINE FIELD IF NOT EXISTS {HIGH_MARK_TOTAL_FIELD} ON user TYPE option<int>;
+             DEFINE FIELD IF NOT EXISTS {STUDY_STREAK_LONGEST_FIELD} ON user TYPE option<int>;
+             DEFINE FIELD IF NOT EXISTS {STUDY_STREAK_CURRENT_FIELD} ON user TYPE option<int>;
+             DEFINE FIELD IF NOT EXISTS {STUDY_STREAK_LAST_DAY_FIELD} ON user TYPE option<int>;
              DEFINE TABLE IF NOT EXISTS {BADGE_AWARD_TABLE} SCHEMAFULL;
              DEFINE FIELD IF NOT EXISTS user ON {BADGE_AWARD_TABLE} TYPE record<user>;
              DEFINE FIELD IF NOT EXISTS badge ON {BADGE_AWARD_TABLE} TYPE string;
@@ -326,6 +422,13 @@ mod tests {
             (BadgeStat::ExamSat, "exam_sat"),
             (BadgeStat::PomodoroFinished, "pomodoro_finished"),
             (BadgeStat::PomodoroFocusMs, "pomodoro_focus_ms"),
+            (BadgeStat::MarksGiven, "marks_given"),
+            (BadgeStat::LessonsHeld, "lessons_held"),
+            (BadgeStat::PoolApproved, "pool_approved"),
+            (BadgeStat::PoolPublished, "pool_published"),
+            (BadgeStat::LessonsAttended, "lessons_attended"),
+            (BadgeStat::HighMark, "high_mark"),
+            (BadgeStat::StudyStreak, "study_streak"),
         ] {
             assert_eq!(stat.as_str(), wire, "the published name is frozen");
             assert_ne!(stat.as_str(), stat.field(), "{stat:?} collapsed the two");
@@ -333,7 +436,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_row_without_the_columns_loads_as_five_zeros() {
+    async fn a_row_without_the_columns_loads_as_zeros() {
         let db = crate::database::init_mem().await.unwrap();
         schema(&db).await;
         // The stale-data case: an account written before the counters existed
@@ -345,6 +448,13 @@ mod tests {
             assert_eq!(stats.get_exam_sat(), 0);
             assert_eq!(stats.get_pomodoro_finished(), 0);
             assert_eq!(stats.get_pomodoro_focus_ms(), 0);
+            assert_eq!(stats.get_marks_given(), 0);
+            assert_eq!(stats.get_lessons_held(), 0);
+            assert_eq!(stats.get_pool_approved(), 0);
+            assert_eq!(stats.get_pool_published(), 0);
+            assert_eq!(stats.get_lessons_attended(), 0);
+            assert_eq!(stats.get_high_mark(), 0);
+            assert_eq!(stats.get_study_streak(), 0);
             assert!(earned(&stats).is_empty(), "zero earns nothing");
         }
     }
@@ -357,6 +467,10 @@ mod tests {
             exam_sat: 0,
             pomodoro_finished: 200,
             pomodoro_focus_ms: 36_000_000,
+            high_mark: 1,
+            // The longest run, so 7 keeps the 3 even once the run breaks.
+            study_streak: 7,
+            ..BadgeStats::default()
         };
         assert_eq!(
             earned(&stats),
@@ -370,6 +484,9 @@ mod tests {
                 "pomodoro_finished_200",
                 // Exactly at the threshold earns it.
                 "pomodoro_focus_ms_36000000",
+                "high_mark_1",
+                "study_streak_3",
+                "study_streak_7",
             ]
         );
     }

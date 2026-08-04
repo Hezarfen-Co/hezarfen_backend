@@ -1350,6 +1350,52 @@ mod tests {
         assert!(!can_manage_course(&course, &demoted));
     }
 
+    /// A manager may schedule a lesson on a teacher's behalf, and the session
+    /// belongs to the teacher they named — not to the caller. Everything hung
+    /// off that column (who may take the roll call, and who the roll call
+    /// credits) follows it, so a handler that stored the caller instead would
+    /// hand the office staff somebody else's lesson.
+    #[tokio::test]
+    async fn a_manager_scheduling_a_lesson_names_the_teacher_not_themselves() {
+        let db = init_mem().await.unwrap();
+        let manager = user("manager", Role::Manager, &db).await;
+        let teacher = user("teacher", Role::Teacher, &db).await;
+        let course = course(&manager, &db).await;
+        let st = AppState {
+            db: db.clone(),
+            files_path: std::env::temp_dir(),
+            cookie_secure: false,
+            rate_limit: crate::rate_limit::RateLimitConfig::unlimited(),
+            chatbot_limit: Default::default(),
+            exam_presence: Default::default(),
+            board_hub: Default::default(),
+            db_up: Default::default(),
+            ai: None,
+        };
+
+        let (status, Json(session)) = create_session_in_course(
+            State(st),
+            RequireTeacher(manager.clone()),
+            Path(course.get_id().key().to_string()),
+            Json(CreateSessionInCourse {
+                topic: None,
+                teacher_id: Some(teacher.get_id().key().to_string()),
+                starts_at: Timestamp::now().as_millis() + 60_000,
+                ends_at: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+        // Read back off the stored row, which is what `SessionResponse` names.
+        assert_eq!(session.teacher.id, teacher.get_id().key());
+        assert_ne!(
+            session.teacher.id,
+            manager.get_id().key(),
+            "the caller took the lesson instead of the teacher they named"
+        );
+    }
+
     /// No course is left orphaned by the floor: manager+ reaches a course whose
     /// creator was demoted and which has no assigned teachers.
     #[tokio::test]

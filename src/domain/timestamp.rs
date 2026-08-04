@@ -11,6 +11,7 @@
 //! - Durations that only pace things (rate limiter) use the monotonic
 //!   `Instant` clock instead, which NTP adjustments cannot move backwards.
 
+use chrono::Datelike;
 use surrealdb::types::SurrealValue;
 
 use crate::constant::MILLIS_PER_DAY;
@@ -69,6 +70,26 @@ impl Timestamp {
             .expect("current time is within chrono's representable range")
             .date_naive()
     }
+
+    /// *This* instant's UTC calendar day as a stable integer (days since the
+    /// Common Era epoch). The day a stored value can be compared and
+    /// incremented as an `int` — `day == stored + 1` is exactly "the next
+    /// day", with no string parsing and no month/year arithmetic.
+    ///
+    /// Takes the instant instead of reading the clock, which is what makes a
+    /// day-boundary rule testable without sleeping: [`Timestamp::now`] stays
+    /// the single clock read, and the caller derives the day from the same
+    /// stamp it already took. Midnight UTC is the boundary, like every other
+    /// day calculation here ([`Timestamp::today_utc`], menu dates, the meal
+    /// cutoff) — no timezone is stored anywhere, deliberately.
+    pub fn day_number(&self) -> i64 {
+        chrono::DateTime::from_timestamp_millis(self.0)
+            // Reachable only for an instant ±262 000 years from the epoch; the
+            // callers derive this from a server clock read.
+            .expect("timestamp is within chrono's representable range")
+            .date_naive()
+            .num_days_from_ce() as i64
+    }
 }
 
 #[cfg(test)]
@@ -106,6 +127,27 @@ mod tests {
     #[tokio::test]
     async fn in_days_saturates_instead_of_panicking() {
         assert_eq!(Timestamp::in_days(i64::MAX).as_millis(), i64::MAX);
+    }
+
+    #[tokio::test]
+    async fn day_number_is_a_midnight_utc_day_counter() {
+        // The unix epoch, pinned: a drifting origin would silently shift every
+        // stored streak day.
+        let epoch = Timestamp::from_millis(0);
+        assert_eq!(epoch.day_number(), 719_163);
+        // Same UTC day, different hours — one day number.
+        assert_eq!(Timestamp::from_millis(86_399_999).day_number(), 719_163);
+        // The next millisecond is the next day, and a whole day is +1.
+        assert_eq!(Timestamp::from_millis(86_400_000).day_number(), 719_164);
+        assert_eq!(
+            Timestamp::from_millis(1_700_000_000_000 + MILLIS_PER_DAY).day_number(),
+            Timestamp::from_millis(1_700_000_000_000).day_number() + 1
+        );
+        // Before the epoch still counts forward.
+        assert_eq!(Timestamp::from_millis(-1).day_number(), 719_162);
+        // And it agrees with the crate's other day calculation. Not flaky: a
+        // day boundary between the two clock reads still leaves `<=`.
+        assert!(Timestamp::now().day_number() <= Timestamp::today_utc().num_days_from_ce() as i64);
     }
 
     #[tokio::test]

@@ -2,6 +2,7 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
 use crate::constant::{
     POMODORO_FINISHED_TOTAL_FIELD, POMODORO_FOCUS_MS_TOTAL_FIELD, POMODORO_SESSION_TABLE,
+    STUDY_STREAK_CURRENT_FIELD, STUDY_STREAK_LAST_DAY_FIELD, STUDY_STREAK_LONGEST_FIELD,
 };
 use crate::database::{Database, transaction_with_retry};
 use crate::domain::badge;
@@ -130,7 +131,51 @@ impl PomodoroSession {
     /// nothing downstream needs a floor. Only *finished* stints reach here — an
     /// open row is a `pomodoro_session` row and nothing else — and there is no
     /// student-facing delete for a stint, so neither counter ever decrements.
+    ///
+    /// The **study streak** rides the same transaction. A study day is a UTC
+    /// calendar day on which a stint was *finished* (midnight UTC, like every
+    /// other day calculation here — no timezone is stored anywhere): the same
+    /// day again changes nothing, the next day extends the run, any other gap
+    /// starts a new one at 1. It is written as **two** statements, not one:
+    /// every field reference on the right-hand side of a `SET` resolves
+    /// against the row as it was *before* that statement, so a single
+    /// `SET current = …, longest = math::max([longest, current])` would take
+    /// the *old* `current` and lag one write behind forever (probed on a real
+    /// 3.2.3 server: day two left `current = 2, longest = 1`). Across
+    /// statements *inside a transaction* the read does see the prior write, so
+    /// the pair is correct and still atomic. Absent columns are read through
+    /// `?? 0` (and `?? -1` for the day — a sentinel no real day number
+    /// reaches), because `math::max` errors outright on a `NONE` argument and
+    /// every account older than these columns carries none of them.
+    ///
+    /// The read-back is `$streak[0].…`, the same shape `$before[0]` uses two
+    /// lines up: a plain `UPDATE` hands back an array, so a user row that is
+    /// missing (a `record<user>` column checks only the table of the id) simply
+    /// yields nothing to index and the second statement matches no row either.
+    /// `UPDATE ONLY` would work too — it answers `null`, not an error, on zero
+    /// rows; it errors on *many* — but a `null` is a shape the read then has to
+    /// special-case, so the file's existing idiom wins.
+    ///
+    /// No `cap::counter_lock` is taken, deliberately. The pair cannot tear:
+    /// both statements sit inside one `BEGIN…COMMIT`, and a real server aborts
+    /// a rival that touched the row in between — `transaction_with_retry` then
+    /// re-sends the whole round. And `longest` is written as
+    /// `max(longest, current)`, which cannot come down under *any*
+    /// interleaving, so even a torn pair could only under-count `current`,
+    /// never lower the high-water mark the badges read. The lock would only
+    /// serialize this process's writers (its other job, keeping the in-memory
+    /// test engine deterministic, is moot here — these tests are sequential).
+    /// Probed on a real 3.2.3 server, 2026-08-04: 60 rounds of 4 concurrent
+    /// finishes for one user left `current = 60, longest = 60` with no
+    /// anomaly; a rival write forced *between* the two statements (a `sleep`
+    /// wedged into the batch) aborted the whole cascade with a write conflict,
+    /// wrote nothing, and left the rival's value standing.
+    ///
+    /// Streaks begin at this deploy: nothing reconstructs history from the
+    /// stint log, so every account starts with no streak columns and its first
+    /// finish sets a run of 1.
     pub async fn finish(user: &UserId, db: &Database) -> Result<PomodoroSession, AppError> {
+        let done = Timestamp::now();
         let (mut result, mut errors) = transaction_with_retry(
             db,
             &format!(
@@ -141,6 +186,18 @@ impl PomodoroSession {
                      {POMODORO_FINISHED_TOTAL_FIELD} = ({POMODORO_FINISHED_TOTAL_FIELD} ?? 0) + 1,
                      {POMODORO_FOCUS_MS_TOTAL_FIELD} = ({POMODORO_FOCUS_MS_TOTAL_FIELD} ?? 0)
                          + (math::max([$before[0].started_at, $done]) - $before[0].started_at);
+                 LET $streak = (UPDATE $usr SET
+                     {STUDY_STREAK_CURRENT_FIELD} =
+                         IF ({STUDY_STREAK_LAST_DAY_FIELD} ?? -1) == $day
+                             THEN ({STUDY_STREAK_CURRENT_FIELD} ?? 0)
+                         ELSE IF ({STUDY_STREAK_LAST_DAY_FIELD} ?? -1) == ($day - 1)
+                             THEN (({STUDY_STREAK_CURRENT_FIELD} ?? 0) + 1)
+                         ELSE 1 END,
+                     {STUDY_STREAK_LAST_DAY_FIELD} = $day
+                     RETURN AFTER);
+                 UPDATE $usr SET {STUDY_STREAK_LONGEST_FIELD} = math::max([
+                     ({STUDY_STREAK_LONGEST_FIELD} ?? 0),
+                     ($streak[0].{STUDY_STREAK_CURRENT_FIELD} ?? 0)]);
                  CREATE $closed CONTENT {{
                      user: $before[0].user,
                      started_at: $before[0].started_at,
@@ -158,7 +215,8 @@ impl PomodoroSession {
                     "closed".into(),
                     PomodoroSessionId::generate().record().into_value(),
                 ),
-                ("done".into(), Timestamp::now().into_value()),
+                ("done".into(), done.into_value()),
+                ("day".into(), done.day_number().into_value()),
             ],
             &["no_pomodoro_running"],
         )
@@ -254,6 +312,197 @@ mod tests {
         let rows: Vec<Vec<i64>> = result.take(0).unwrap();
         let row = rows.into_iter().next().expect("the user row");
         (row[0], row[1])
+    }
+
+    /// `(current, longest, last_day)` re-read from the store.
+    async fn streak(user: &UserId, db: &Database) -> (i64, i64, i64) {
+        let mut result = db
+            .query(format!(
+                "SELECT VALUE [({STUDY_STREAK_CURRENT_FIELD} ?? 0),
+                               ({STUDY_STREAK_LONGEST_FIELD} ?? 0),
+                               ({STUDY_STREAK_LAST_DAY_FIELD} ?? -1)] FROM $usr"
+            ))
+            .bind(("usr", user.record()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        let rows: Vec<Vec<i64>> = result.take(0).unwrap();
+        let row = rows.into_iter().next().expect("the user row");
+        (row[0], row[1], row[2])
+    }
+
+    /// Age the streak bookkeeping by `days`, so the *next* finish lands that
+    /// many days later on the calendar. The day is injected into the stored
+    /// state rather than into the clock, which keeps `Timestamp::now` the sole
+    /// clock read and the test free of sleeping.
+    ///
+    /// Known flake, left as-is: every caller assumes the UTC day does not turn
+    /// over mid-test — a crossing between two stints shifts the real day under
+    /// the injected one and reddens the run. That is one ~ms-wide window per
+    /// day (~5e-6 per run), and the alternative is a clock seam in production
+    /// code to serve a test. Re-run before believing a failure that only ever
+    /// happens near midnight UTC.
+    async fn age_by_days(user: &UserId, db: &Database, days: i64) {
+        db.query(format!(
+            "UPDATE $usr SET {STUDY_STREAK_LAST_DAY_FIELD} = {STUDY_STREAK_LAST_DAY_FIELD} - $days"
+        ))
+        .bind(("usr", user.record()))
+        .bind(("days", days))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    }
+
+    /// Start and close one stint.
+    async fn one_stint(user: &UserId, db: &Database) {
+        PomodoroSession::start(user, db).await.unwrap();
+        PomodoroSession::finish(user, db).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn consecutive_days_extend_the_streak_and_a_repeat_day_does_not() {
+        let db = database::init_mem().await.unwrap();
+        let user = a_user(&db).await;
+        // The stale-data case: a row that predates all three columns reads as
+        // no streak at all, and its first finish opens a run of one.
+        assert_eq!(streak(&user, &db).await, (0, 0, -1));
+
+        one_stint(&user, &db).await;
+        let today = Timestamp::now().day_number();
+        assert_eq!(streak(&user, &db).await, (1, 1, today));
+
+        // A second stint the same day is not a second day.
+        one_stint(&user, &db).await;
+        assert_eq!(streak(&user, &db).await, (1, 1, today));
+
+        // Days N+1 and N+2.
+        for day in 2..=3 {
+            age_by_days(&user, &db, 1).await;
+            one_stint(&user, &db).await;
+            assert_eq!(streak(&user, &db).await, (day, day, today));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_gap_resets_the_run_but_never_the_high_water_mark() {
+        let db = database::init_mem().await.unwrap();
+        let user = a_user(&db).await;
+
+        one_stint(&user, &db).await;
+        age_by_days(&user, &db, 1).await;
+        one_stint(&user, &db).await;
+        assert_eq!(streak(&user, &db).await.0, 2);
+
+        // Skip a day: the run restarts at one, the longest stays where it got.
+        age_by_days(&user, &db, 2).await;
+        one_stint(&user, &db).await;
+        let (current, longest, _) = streak(&user, &db).await;
+        assert_eq!((current, longest), (1, 2));
+
+        // A backwards day (a clock stepped back over a boundary) is a gap too,
+        // and still cannot lower the mark.
+        age_by_days(&user, &db, -5).await;
+        one_stint(&user, &db).await;
+        assert_eq!(
+            streak(&user, &db).await,
+            (1, 2, Timestamp::now().day_number())
+        );
+    }
+
+    /// The transaction boundary itself, on a real server: the streak pair and
+    /// the counters must commit with the stint or not at all, under real
+    /// contention on one user row.
+    ///
+    /// Multi-threaded and off the embedded engine for the reason
+    /// [`crate::domain::cap`] spells out: the in-memory engine does not
+    /// conflict-check two concurrent writes to one record, so it would answer
+    /// `Ok` to a write it dropped and *forge* the integrity failure this test
+    /// exists to catch.
+    ///
+    /// It bites — proved by mutation, not assumed: deleting the `BEGIN`/`COMMIT`
+    /// pair from the batch turns all 20 rounds red. A `THROW` then errors only
+    /// its own statement, so the losers of the open-row race run the rest of
+    /// the cascade anyway — they bump the counters for a stint they never
+    /// closed and `CREATE` a session row out of an empty `$before`, which comes
+    /// back as `500 … Expected record, got none` (the `errors` assertion below
+    /// fires first; `finished_total` running ahead of the `Ok` finishes is the
+    /// same wound one statement later). What it does *not* pin is the
+    /// streak arithmetic under concurrency: same-day finishes all compute the
+    /// same value, so that stays green either way — it is
+    /// `max(longest, current)` that makes that robust, not the isolation.
+    ///
+    /// The shape of the contention, measured rather than assumed: four racers
+    /// per round is four `start`s collapsing onto *one* open row (the id is
+    /// deterministic per user), so typically exactly one `finish` commits and
+    /// three lose the `DELETE` and abort their whole cascade — 20 finishes and
+    /// 60 conflicts over 20 rounds, measured. That is the contention: the
+    /// losers' cascades are live against the same user row, which is precisely
+    /// what must leave nothing behind. Two commits in one round are possible
+    /// (a racer scheduled entirely after another's finish frees the slot) and
+    /// the assertions allow it — the day count is per round, not per stint.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
+    async fn concurrent_finishes_commit_the_streak_with_the_stint_or_not_at_all() {
+        let (db, _serialized) = crate::database::init_test_server("pomodoro_streak_race").await;
+        let user = a_user(&db).await;
+        let (mut finished, mut conflicts, mut errors) = (0, 0, 0);
+        let mut last_error = String::new();
+        for round in 1..=20 {
+            let racers: Vec<_> = (0..4)
+                .map(|_| {
+                    let (user, db) = (user.clone(), db.clone());
+                    tokio::spawn(async move {
+                        PomodoroSession::start(&user, &db).await?;
+                        PomodoroSession::finish(&user, &db).await
+                    })
+                })
+                .collect();
+            let mut won = 0;
+            for racer in racers {
+                match racer.await.unwrap() {
+                    Ok(_) => won += 1,
+                    // Losing the open row is the correct answer for a racer
+                    // whose stint someone else closed; only `Db` is a defect.
+                    Err(AppError::Conflict(_)) => conflicts += 1,
+                    Err(err) => {
+                        errors += 1;
+                        last_error = format!("{err:?}");
+                    }
+                }
+            }
+            finished += won;
+            // One day per round, however many stints landed in it, and the
+            // mark never lags the run in progress.
+            let (current, longest, _) = streak(&user, &db).await;
+            assert_eq!(
+                (current, longest),
+                (round, round),
+                "round {round} counted {won} finishes as {current} days"
+            );
+            age_by_days(&user, &db, 1).await;
+        }
+        // The atomicity claim: the counter counts exactly the stints that were
+        // closed, never a loser's aborted round.
+        let (counted, _) = counters(&user, &db).await;
+        eprintln!(
+            "PomodoroSession::finish raced: {finished} finishes over 20 days, \
+             {conflicts} rivals refused, {errors} 500s"
+        );
+        assert_eq!(
+            errors, 0,
+            "a raced finish must conflict, not 500: {last_error}"
+        );
+        assert_eq!(
+            counted, finished,
+            "the counter counted {counted} stints for {finished} finishes"
+        );
+        assert!(
+            conflicts > 0,
+            "every racer won its own round, so no cascade was ever aborted mid-flight \
+             and this run proves nothing about the transaction boundary"
+        );
     }
 
     #[tokio::test]

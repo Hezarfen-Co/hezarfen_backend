@@ -875,6 +875,43 @@ pub const HOMEWORK_ON_TIME_TOTAL_FIELD: &str = "homework_on_time_total";
 pub const EXAM_SAT_TOTAL_FIELD: &str = "exam_sat_total";
 pub const POMODORO_FINISHED_TOTAL_FIELD: &str = "pomodoro_finished_total";
 pub const POMODORO_FOCUS_MS_TOTAL_FIELD: &str = "pomodoro_focus_ms_total";
+/// The staff-side and second student-side totals, same shape and same rules:
+/// lifetime, floored at zero, absent reads as zero. `MARKS_GIVEN` and
+/// `LESSONS_HELD` are what a teacher accumulates; `POOL_APPROVED` counts the
+/// approvals a teacher hands out and `POOL_PUBLISHED` the questions whose
+/// author got approved — credited at approval, which is why the name says
+/// published rather than asked.
+pub const MARKS_GIVEN_TOTAL_FIELD: &str = "marks_given_total";
+pub const LESSONS_HELD_TOTAL_FIELD: &str = "lessons_held_total";
+pub const POOL_APPROVED_TOTAL_FIELD: &str = "pool_approved_total";
+pub const POOL_PUBLISHED_TOTAL_FIELD: &str = "pool_published_total";
+pub const LESSONS_ATTENDED_TOTAL_FIELD: &str = "lessons_attended_total";
+pub const HIGH_MARK_TOTAL_FIELD: &str = "high_mark_total";
+/// The longest run of consecutive days the student has studied, and the two
+/// bookkeeping columns the write site needs to compute it: the run in progress
+/// and the last day counted (both plain day numbers, midnight UTC — the same
+/// boundary every other day calculation here uses).
+///
+/// Only the longest is a badge counter: it never comes down, which is what
+/// keeps it on the ordinary `>=` rule with no second catalog shape. The other
+/// two are internal state — no badge reads them, `/limits` never names them,
+/// and no profile key serves them.
+pub const STUDY_STREAK_LONGEST_FIELD: &str = "study_streak_longest";
+pub const STUDY_STREAK_CURRENT_FIELD: &str = "study_streak_current";
+pub const STUDY_STREAK_LAST_DAY_FIELD: &str = "study_streak_last_day";
+/// When a lesson was first counted towards its teacher's `lessons_held_total`,
+/// stamped on the `course_session` row by the first roll call taken for it.
+/// Bookkeeping like the two streak columns above: no badge reads it, `/limits`
+/// never names it, no profile key serves it. Its only job is the once-per-
+/// session guard — a lesson is credited when it is *taken*, and the thirtieth
+/// student marked must credit nothing further.
+pub const LESSON_COUNTED_AT_FIELD: &str = "held_counted_at";
+/// What counts as a high mark, out of `MAX_MARK`. Hardcoded next to the badge
+/// thresholds rather than read from the school's grade bands: those are
+/// renameable display labels, and a badge id must never depend on a value a
+/// school can change at runtime — `high_mark_10` has to mean the same thing in
+/// every deployment, forever.
+pub const HIGH_MARK_MIN: i64 = 90;
 
 /// The badge catalog: every badge the system can award, as
 /// `(id, the counter it reads, the value that earns it)`. Hardcoded on
@@ -888,7 +925,7 @@ pub const POMODORO_FOCUS_MS_TOTAL_FIELD: &str = "pomodoro_focus_ms_total";
 /// carry it simply stop being served (no data migration —
 /// [`crate::domain::badge::BadgeAward::list_for`] filters to the live
 /// catalog).
-pub const BADGES: [(&str, BadgeStat, i64); 13] = [
+pub const BADGES: [(&str, BadgeStat, i64); 34] = [
     ("homework_submitted_1", BadgeStat::HomeworkSubmitted, 1),
     ("homework_submitted_10", BadgeStat::HomeworkSubmitted, 10),
     ("homework_submitted_50", BadgeStat::HomeworkSubmitted, 50),
@@ -911,6 +948,30 @@ pub const BADGES: [(&str, BadgeStat, i64); 13] = [
         BadgeStat::PomodoroFocusMs,
         180_000_000,
     ),
+    ("marks_given_10", BadgeStat::MarksGiven, 10),
+    ("marks_given_50", BadgeStat::MarksGiven, 50),
+    ("marks_given_250", BadgeStat::MarksGiven, 250),
+    ("lessons_held_10", BadgeStat::LessonsHeld, 10),
+    ("lessons_held_50", BadgeStat::LessonsHeld, 50),
+    ("lessons_held_200", BadgeStat::LessonsHeld, 200),
+    ("pool_approved_5", BadgeStat::PoolApproved, 5),
+    ("pool_approved_25", BadgeStat::PoolApproved, 25),
+    ("pool_approved_100", BadgeStat::PoolApproved, 100),
+    ("pool_published_1", BadgeStat::PoolPublished, 1),
+    ("pool_published_10", BadgeStat::PoolPublished, 10),
+    ("pool_published_50", BadgeStat::PoolPublished, 50),
+    ("lessons_attended_10", BadgeStat::LessonsAttended, 10),
+    ("lessons_attended_50", BadgeStat::LessonsAttended, 50),
+    ("lessons_attended_200", BadgeStat::LessonsAttended, 200),
+    // Exam marks at or above `HIGH_MARK_MIN`, counted per graded sitting.
+    ("high_mark_1", BadgeStat::HighMark, 1),
+    ("high_mark_10", BadgeStat::HighMark, 10),
+    ("high_mark_25", BadgeStat::HighMark, 25),
+    // Consecutive study days, read off the longest run ever held — so these
+    // are earned once and never lost when the run breaks.
+    ("study_streak_3", BadgeStat::StudyStreak, 3),
+    ("study_streak_7", BadgeStat::StudyStreak, 7),
+    ("study_streak_30", BadgeStat::StudyStreak, 30),
 ];
 /// The two stroke counters on a board row. `epoch_stroke_count` is reset to
 /// zero by a clear and capped at `MAX_EPOCH_STROKES` — a full epoch is
