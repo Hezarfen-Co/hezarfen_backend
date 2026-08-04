@@ -16,7 +16,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::database::Database;
-use crate::domain::class_blueprint::{ClassBlueprint, ClassBlueprintId, Skip};
+use crate::domain::class_blueprint::{ClassBlueprint, ClassBlueprintId, Pumped, Skip};
 use crate::domain::class_course::ClassCourse;
 use crate::domain::class_group::{ClassGrade, ClassGroup, ClassGroupId, ClassName};
 use crate::domain::class_member::ClassMember;
@@ -963,8 +963,20 @@ impl SkipResponse {
 #[derive(Serialize, ToSchema)]
 struct BlueprintPumpResponse {
     blueprint: BlueprintResponse,
+    /// How many class sections this pump reached. **`0` means no section
+    /// carries this grade label** — the template was saved and stocked
+    /// nothing. A grade is free text and matched exactly, so `"9 "`, `"9-A"`
+    /// and `"9"` are three different grades: check the label against the one
+    /// the sections actually carry, since an empty `skipped` alone reads the
+    /// same whether every section took the list or none was found.
+    ///
+    /// The sections *reached*, not the ones the grade holds: a
+    /// `blueprint_deleted` skip ends the run, and this then counts the ones
+    /// walked before it.
+    #[schema(example = 12)]
+    matched: i64,
     /// Every (class, course) pair this write could not place. Empty when every
-    /// section at the grade took the whole list. The blueprint itself was still
+    /// section it reached took the whole list. The blueprint itself was still
     /// saved — a pump is best-effort by design.
     skipped: Vec<SkipResponse>,
 }
@@ -1001,13 +1013,14 @@ async fn blueprint_or_404(grade: &str, db: &Database) -> Result<ClassBlueprint, 
 
 async fn blueprint_body(
     blueprint: &ClassBlueprint,
-    skipped: &[Skip],
+    pumped: &Pumped,
     db: &Database,
 ) -> Result<BlueprintPumpResponse, AppError> {
     let people = person_map([blueprint.get_creator().clone()], db).await?;
     Ok(BlueprintPumpResponse {
         blueprint: BlueprintResponse::new(blueprint, &people),
-        skipped: skipped.iter().map(SkipResponse::new).collect(),
+        matched: pumped.matched,
+        skipped: pumped.skipped.iter().map(SkipResponse::new).collect(),
     })
 }
 
@@ -1018,6 +1031,10 @@ async fn blueprint_body(
 /// is at its own course ceiling, or the course has no free seat for the whole
 /// section) is skipped and reported in `skipped`, while every other class is
 /// still stocked. The blueprint is saved either way.
+///
+/// `matched` says how many sections it actually reached — `0` with an empty
+/// `skipped` is a saved template that stocked nothing, which almost always
+/// means the grade label does not match the one those sections carry.
 #[utoipa::path(
     post,
     path = "/blueprints",
@@ -1025,7 +1042,7 @@ async fn blueprint_body(
     security(("session_cookie" = [])),
     request_body = CreateBlueprint,
     responses(
-        (status = 201, description = "Blueprint created, with the classes it could not stock", body = BlueprintPumpResponse),
+        (status = 201, description = "Blueprint created, with the number of sections it reached and the classes it could not stock", body = BlueprintPumpResponse),
         (status = 400, description = "Invalid or unaddressable grade, too many courses, or a course that does not exist", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
@@ -1041,8 +1058,8 @@ async fn create_blueprint(
     let grade = ClassBlueprint::grade_key(&req.grade)?;
     let courses = resolve_courses(&req.course_ids, &st.db).await?;
     let blueprint = ClassBlueprint::create(user.get_id(), grade, courses, &st.db).await?;
-    let skipped = blueprint.pump(user.get_id(), &st.db).await?;
-    let body = blueprint_body(&blueprint, &skipped, &st.db).await?;
+    let pumped = blueprint.pump(user.get_id(), &st.db).await?;
+    let body = blueprint_body(&blueprint, &pumped, &st.db).await?;
     Ok((StatusCode::CREATED, Json(body)))
 }
 
@@ -1117,8 +1134,10 @@ async fn get_blueprint(
 /// already carry them.
 ///
 /// The pump is **best-effort**: a class that cannot take a course is skipped
-/// and reported in `skipped`, and the rest are still stocked. A `409` means the
-/// list changed since you read it — nothing was written; re-read and retry.
+/// and reported in `skipped`, and the rest are still stocked. `matched` says
+/// how many sections it reached, so a `0` tells a grade label nothing carries
+/// apart from a list every section already had. A `409` means the list changed
+/// since you read it — nothing was written; re-read and retry.
 #[utoipa::path(
     patch,
     path = "/blueprints/{grade}",
@@ -1127,7 +1146,7 @@ async fn get_blueprint(
     params(("grade" = String, Path, description = "Grade label")),
     request_body = UpdateBlueprint,
     responses(
-        (status = 200, description = "Updated blueprint, with the classes it could not stock", body = BlueprintPumpResponse),
+        (status = 200, description = "Updated blueprint, with the number of sections it reached and the classes it could not stock", body = BlueprintPumpResponse),
         (status = 400, description = "Too many courses, or a course that does not exist", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
@@ -1144,10 +1163,10 @@ async fn update_blueprint(
 ) -> Result<Json<BlueprintPumpResponse>, AppError> {
     let blueprint = blueprint_or_404(&grade, &st.db).await?;
     let courses = resolve_courses(&req.course_ids, &st.db).await?;
-    let (saved, skipped) = blueprint
+    let (saved, pumped) = blueprint
         .set_courses(courses, user.get_id(), &st.db)
         .await?;
-    Ok(Json(blueprint_body(&saved, &skipped, &st.db).await?))
+    Ok(Json(blueprint_body(&saved, &pumped, &st.db).await?))
 }
 
 /// Delete a grade's blueprint. Requires manager+. Every attachment the

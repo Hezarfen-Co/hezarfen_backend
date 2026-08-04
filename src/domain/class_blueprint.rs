@@ -120,6 +120,26 @@ pub struct Skip {
     pub reason: &'static str,
 }
 
+/// What a pump did: how many sections it reached, and the pairs it refused.
+///
+/// `matched` exists because an empty `skipped` is not success on its own. A
+/// grade label is free text ([`ClassGrade`]) and [`ClassGroup::list_for_grade`]
+/// matches it exactly, so a blueprint keyed `"9 "` reaches none of the sections
+/// keyed `"9"` — and with nothing to skip it answers exactly like a pump that
+/// stocked every one of them. The count is the only thing that tells those
+/// apart.
+///
+/// A struct rather than a pair with [`ClassBlueprint::set_courses`]'s: three
+/// unlabelled fields off one call is a shape a caller has to remember.
+#[derive(Debug)]
+pub struct Pumped {
+    /// The sections this pump **reached** — not the ones the grade holds. The
+    /// two differ when the run ended early (`blueprint_deleted`), and what
+    /// happened is the actionable one.
+    pub matched: i64,
+    pub skipped: Vec<Skip>,
+}
+
 /// Why this attach did not land, or `None` when it did. A duplicate is not a
 /// skip: the course is already on the class, which is exactly what the
 /// blueprint asks for, and re-running a pump must therefore report nothing.
@@ -286,7 +306,7 @@ impl ClassBlueprint {
         courses: Vec<CourseId>,
         by: &UserId,
         db: &Database,
-    ) -> Result<(ClassBlueprint, Vec<Skip>), AppError> {
+    ) -> Result<(ClassBlueprint, Pumped), AppError> {
         let wanted = Self::course_list(courses)?;
         let dropped: Vec<CourseId> = self
             .courses
@@ -313,8 +333,8 @@ impl ClassBlueprint {
             };
         };
         saved.drop_courses(Some(&dropped), db).await?;
-        let skipped = saved.pump(by, db).await?;
-        Ok((saved, skipped))
+        let pumped = saved.pump(by, db).await?;
+        Ok((saved, pumped))
     }
 
     /// Delete the blueprint, taking every attachment it made with it. Courses a
@@ -466,22 +486,30 @@ impl ClassBlueprint {
     /// delete landed mid-pump", so it is reported once and the remaining
     /// classes are not walked.
     ///
-    /// The abort is still a `Ok(skipped)`, not an error: the attaches that
-    /// committed before the delete stand (its sweep took the ones it could
-    /// reach), and a partial state reported in full is what best-effort means
-    /// everywhere else here.
-    pub async fn pump(&self, by: &UserId, db: &Database) -> Result<Vec<Skip>, AppError> {
-        let mut skipped = Vec::new();
+    /// The abort is still a `Ok(..)`, not an error: the attaches that committed
+    /// before the delete stand (its sweep took the ones it could reach), and a
+    /// partial state reported in full is what best-effort means everywhere else
+    /// here.
+    ///
+    /// [`Pumped::matched`] is counted off this loop rather than asked of a
+    /// second query — the sections the run *walked*, so an abort reports what
+    /// it did and not what the grade holds.
+    pub async fn pump(&self, by: &UserId, db: &Database) -> Result<Pumped, AppError> {
+        let mut pumped = Pumped {
+            matched: 0,
+            skipped: Vec::new(),
+        };
         let mut dead = Vec::new();
         for class in ClassGroup::list_for_grade(&self.grade, db).await? {
+            pumped.matched += 1;
             if !self
-                .apply_courses(&class, by, &mut dead, &mut skipped, db)
+                .apply_courses(&class, by, &mut dead, &mut pumped.skipped, db)
                 .await?
             {
                 break;
             }
         }
-        Ok(skipped)
+        Ok(pumped)
     }
 
     /// Drop a course that no longer exists out of this blueprint's list.
@@ -890,7 +918,8 @@ mod tests {
             .check()
             .unwrap();
 
-        let skipped = blueprint.pump(&manager, &db).await.unwrap();
+        let Pumped { matched, skipped } = blueprint.pump(&manager, &db).await.unwrap();
+        assert_eq!(matched, 2, "both sections at the grade were walked");
         assert_eq!(
             skipped.len(),
             1,
@@ -947,13 +976,17 @@ mod tests {
             .await
             .unwrap();
 
-        let skipped = stale.pump(&manager, &db).await.unwrap();
+        let Pumped { matched, skipped } = stale.pump(&manager, &db).await.unwrap();
         assert_eq!(
             skipped.len(),
             1,
             "the template went once, not once per section: {skipped:?}"
         );
         assert_eq!(skipped[0].reason, "blueprint_deleted");
+        assert_eq!(
+            matched, 1,
+            "an abort reports the sections it walked, not the two the grade holds"
+        );
         assert_eq!(
             rows("SELECT VALUE id FROM class_course", &db).await,
             0,

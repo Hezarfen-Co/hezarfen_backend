@@ -843,10 +843,10 @@ window filtering, before paging; negative values are a `400` naming the field.
 | POST   | `/classes/{id}/courses`          | teacher | `{course_id}` — attach a course (that **course's** manager); enrolls the whole roster (`409` if it cannot hold them all, if already attached, or once the class holds `max_class_courses`) |
 | GET    | `/classes/{id}/courses`          | teacher | List the class's attached courses, newest attached first · paged |
 | DELETE | `/classes/{id}/courses/{course}` | teacher | Detach a course (that course's manager) — the same sweep along the course axis; a link left behind by a **deleted** course detaches too, rather than `404`-ing forever |
-| POST   | `/classes/blueprints`            | manager | Create a grade's course blueprint and stock every section already at that grade (best-effort; returns `skipped`) |
+| POST   | `/classes/blueprints`            | manager | Create a grade's course blueprint and stock every section already at that grade (best-effort; returns `matched` + `skipped`) |
 | GET    | `/classes/blueprints`            | manager | List every grade blueprint · paged |
 | GET    | `/classes/blueprints/{grade}`    | manager | One grade's blueprint            |
-| PATCH  | `/classes/blueprints/{grade}`    | manager | Replace the course list and reconcile every section at that grade (returns `skipped`) |
+| PATCH  | `/classes/blueprints/{grade}`    | manager | Replace the course list and reconcile every section at that grade (returns `matched` + `skipped`) |
 | DELETE | `/classes/blueprints/{grade}`    | manager | Delete the blueprint and detach every attachment it made (409 if the list changed since it was read) |
 | POST   | `/classes/{id}/blueprint`        | manager | Stock one section from its grade's blueprint (returns `skipped`) |
 | POST   | `/courses/{id}/sessions`         | teacher | `{topic?, teacher_id?, starts_at, ends_at?}` — add a lesson (course manager; teacher defaults to the caller) |
@@ -2863,6 +2863,18 @@ course and the reason; every other section is still stocked. So a blueprint
 edit is allowed to leave a partial state: one full course must not stop the
 other eleven sections from being set up. Nothing moves on a skipped section —
 not its attachment count, not a seat on the course.
+
+**`matched` is how many sections the pump reached**, and it is on both write
+responses (`POST /classes/blueprints` and `PATCH /classes/blueprints/{grade}`)
+because an empty `skipped` alone cannot be read: a template that stocked every
+section and one that found no section at all return the same list. A grade
+label is free text and matched exactly, so `"9 "`, `"9-A"` and `"9"` are three
+different grades — `matched: 0` with an empty `skipped` means the label does
+not match the one those sections carry, and the fix is the label, not the
+template. It counts the sections **reached**, not the ones the grade holds:
+`blueprint_deleted` ends the run, and then the number is what happened.
+`POST /classes/{id}/blueprint` has no `matched` — it pumps the one section in
+the path.
 
 A skip's `reason` is a **machine code**, not a sentence: the client owns the
 wording (and the language), the same id-plus-client-label shape roles and
