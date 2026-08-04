@@ -1,7 +1,7 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
-use crate::constant::{EXAM_ANSWER_TABLE, MAX_ANSWER_TEXT_LEN};
-use crate::database::Database;
+use crate::constant::{EXAM_ANSWER_TABLE, EXAM_RESULT_COUNT_FIELD, MAX_ANSWER_TEXT_LEN};
+use crate::database::{Database, transaction_with_retry};
 use crate::domain::exam::ExamId;
 use crate::domain::exam_question::{ChoiceId, ExamQuestion, ExamQuestionId};
 use crate::domain::key;
@@ -171,8 +171,82 @@ impl ExamAnswer {
             text,
             updated_at: Timestamp::now(),
         };
-        let saved: Option<ExamAnswer> = db.upsert(answer.id.record()).content(answer).await?;
-        saved.ok_or_else(|| AppError::Internal("failed to save exam answer".into()))
+        // The save writes the *exam row* as well as the answer, in one
+        // transaction, and that is what ties the answer's fate to its exam:
+        // reading the exam does not survive [`crate::domain::exam::Exam::delete`]'s
+        // window — a save landing after its `DELETE exam_answer WHERE exam = $ex`
+        // but before the commit reads an exam that is still there (uncommitted)
+        // while the sweep ran on a snapshot predating this row, so both commit
+        // and the answer outlives the exam (measured 4 of 4 raced rounds).
+        // Writing the key the delete removes makes the two collide, and the
+        // store refuses one of them. It is the shape
+        // [`crate::domain::menu::bump_menu_and_write`] uses, and the one a mark
+        // already uses on this very row
+        // ([`crate::domain::exam_result::ExamResult::grade`]).
+        //
+        // The bump-and-restore is not a flourish, it is the whole instrument.
+        // The exam carries no revision to bump and must not grow one — its save
+        // is a whole-row `CONTENT` write, so a column this struct did not know
+        // about would be wiped by the next PATCH — so this touches the one
+        // counter it already has and puts it back. Writing the *same* value is
+        // not enough: an `UPDATE` that leaves the document unchanged is elided
+        // and never reaches the store's write set, which the race test proved
+        // (green on the raced delete, red the moment the value moves for real).
+        // The restore is by captured value, `NONE` included, so the row is
+        // byte-identical afterwards: the boot backfill still finds the rows it
+        // keys on (`WHERE result_count = NONE`), the PATCH's
+        // `(result_count ?? 0) = $was_results` still passes, and no teacher's
+        // edit is refused because a student typed. Both statements are inside
+        // the transaction, so a crash between them cannot leave the counter up.
+        // No `cap::counter_lock` either: no counter moves here, and the hottest
+        // write path in the app should not queue behind one.
+        //
+        // Admissible for `transaction_with_retry`: the `UPDATE`s, `SELECT`,
+        // `IF`/`THROW` and `RETURN` can never answer "already exists", and the
+        // `UPSERT`'s id is bijective with the (question, user, seq) triple
+        // `exam_answer` keys — a lost round wrote nothing, and re-sending
+        // resolves onto the same row rather than colliding with it.
+        let (mut result, mut errors) = transaction_with_retry(
+            db,
+            &format!(
+                "BEGIN TRANSACTION;
+                 LET $was = (SELECT VALUE {EXAM_RESULT_COUNT_FIELD} FROM ONLY $ex);
+                 LET $touched = (UPDATE $ex SET {EXAM_RESULT_COUNT_FIELD} = \
+                     ({EXAM_RESULT_COUNT_FIELD} ?? 0) + 1 RETURN VALUE id);
+                 IF array::len($touched) = 0 {{ THROW 'no_exam' }};
+                 UPDATE $ex SET {EXAM_RESULT_COUNT_FIELD} = $was;
+                 LET $row = (UPSERT $id CONTENT $answer RETURN AFTER);
+                 RETURN $row[0];
+                 COMMIT TRANSACTION;"
+            ),
+            &[
+                ("ex".into(), answer.exam.record().into_value()),
+                ("id".into(), answer.id.record().into_value()),
+                ("answer".into(), answer.into_value()),
+            ],
+            &["no_exam"],
+        )
+        .await?;
+        // An aborted transaction errors *every* slot, most with a generic "not
+        // executed" — only the THROW's own slot names the reason.
+        if errors
+            .values()
+            .any(|error| error.to_string().contains("no_exam"))
+        {
+            return Err(AppError::NotFound);
+        }
+        if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+            return Err(error.into());
+        }
+        // The trailing `RETURN` is the last statement before `COMMIT`, so its
+        // slot follows the statement count rather than a hand-kept number (the
+        // `Exam::delete` treatment); `num_statements` counts BEGIN and COMMIT.
+        let slot = result.num_statements().saturating_sub(2);
+        result
+            .take::<Vec<ExamAnswer>>(slot)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| AppError::Internal("failed to save exam answer".into()))
     }
 
     /// One student's stored answer for a question in sitting `seq`, if any.
@@ -414,5 +488,82 @@ mod tests {
         );
         let text = text_question(&exam, 10);
         assert_eq!(answer(&text, &user, None).is_correct(&text), None);
+    }
+
+    /// The bite test for the exam-row touch in [`ExamAnswer::save`]: it exists
+    /// to collide with [`crate::domain::exam::Exam::delete`], so it must leave
+    /// the counter it borrows exactly where it found it — absent stays absent
+    /// (the boot backfill keys on `result_count = NONE`), and a real count is
+    /// not moved by a student typing. The race half is
+    /// `domain::exam::tests::an_answer_written_inside_a_delete_never_outlives_the_exam`,
+    /// which needs a real server; this half is the arithmetic and runs anywhere.
+    #[tokio::test]
+    async fn a_save_puts_the_exams_mark_counter_back_exactly() {
+        use crate::domain::exam::{
+            Exam, ExamAttemptLimit, ExamDescription, ExamKind, ExamSchedule, ExamTitle,
+        };
+        let db = crate::database::init_mem().await.unwrap();
+        let kinds = crate::domain::settings::Settings::defaults()
+            .get_exam_kinds()
+            .to_vec();
+        let exam = Exam::create(
+            &student(),
+            &crate::domain::course::CourseId::generate(),
+            ExamTitle::try_new("quiz").unwrap(),
+            ExamDescription::try_new("").unwrap(),
+            ExamKind::try_new("quiz", &kinds).unwrap(),
+            ExamSchedule::try_new(None, None, None, None).unwrap(),
+            ExamAttemptLimit::try_new(1).unwrap(),
+            true,
+            false,
+            false,
+            &db,
+        )
+        .await
+        .unwrap();
+        let stored = async |db: &Database| -> Option<i64> {
+            let mut result = db
+                .query("SELECT VALUE result_count FROM ONLY $ex")
+                .bind(("ex", exam.get_id().record()))
+                .await
+                .unwrap()
+                .check()
+                .unwrap();
+            result.take::<Option<i64>>(0).unwrap()
+        };
+        let question = choice_question(exam.get_id(), 10, 1);
+        let pick = choice_id(&question, 1).as_str().to_string();
+
+        // A fresh exam carries no counter at all, and must still not after a save.
+        assert_eq!(stored(&db).await, None, "the fixture must start absent");
+        ExamAnswer::save(&question, &student(), 1, Some(pick.clone()), None, &db)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored(&db).await,
+            None,
+            "the touch left the counter set — the backfill keys on NONE"
+        );
+
+        // …and a counter that marks have moved is put back at its own value.
+        db.query("UPDATE $ex SET result_count = 7")
+            .bind(("ex", exam.get_id().record()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        ExamAnswer::save(&question, &student(), 2, Some(pick), None, &db)
+            .await
+            .unwrap();
+        assert_eq!(stored(&db).await, Some(7), "the touch moved a real count");
+
+        // The gate that makes the touch worth having: no exam, no answer.
+        let orphan = choice_question(&ExamId::from_key("01NOSUCHEXAMAAAAAAAAAAAAAA"), 10, 0);
+        let pick = choice_id(&orphan, 0).as_str().to_string();
+        let refused = ExamAnswer::save(&orphan, &student(), 1, Some(pick), None, &db).await;
+        assert!(
+            matches!(refused, Err(AppError::NotFound)),
+            "a save into a missing exam must 404, got {refused:?}"
+        );
     }
 }
