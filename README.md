@@ -1866,8 +1866,12 @@ write *writes* rather than something it reads and then trusts: a delete racing
 it touches the very row it bumps, and the store refuses to commit both. That
 matters more here than tidiness, because a menu's id is deterministic on
 day+slot — a mark that outlived its menu would come back as a mark on the next
-menu published for that meal, and reading it or clearing it is impossible in
-the meantime, since every path to it goes through the menu.
+menu published for that meal. Only the *write* paths ever check the menu:
+`GET /meals/attendance/{user}` filters on the student, never on the menu still
+existing, so such a mark would be read back there (a `?from=/?to=` bounded read
+drops it, since a link to a deleted menu has no date to compare) while no write
+could touch it. Nothing can create one any more, and the menu delete's own
+sweep is what clears the marks a menu leaves behind.
 
 **Attendance has zero billing effect.** Booking is the sole charge trigger, so
 a student who booked and did not eat still pays — the kitchen bought the food.
