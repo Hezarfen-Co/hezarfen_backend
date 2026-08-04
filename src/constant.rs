@@ -299,10 +299,16 @@ pub const MAX_FEE_PLAN_ASSIGN_STUDENTS: usize = 200;
 pub const MAX_PAYMENT_REQUEST_KEY_LEN: usize = 64;
 
 /// Bounds on a whiteboard: its title, and how many people the creator may name
-/// onto it. Fifty is a class and its teachers, not the school; every
+/// onto it. Two hundred is a big club or a whole grade, not the school; every
 /// participant may draw, so this is also what bounds one board's writer count.
+///
+/// It was fifty while a roster could only be typed one id at a time. Bulk
+/// invite (`POST /boards/{id}/invite`) resolves a class section, a course or an
+/// event's roster in one call, and fifty refused an ordinary club — so the
+/// ceiling moved to the size of the largest group a school actually puts on one
+/// canvas. Raising it can only widen what an existing row is allowed to hold.
 pub const MAX_BOARD_TITLE_LEN: usize = 200;
-pub const MAX_BOARD_PARTICIPANTS: usize = 50;
+pub const MAX_BOARD_PARTICIPANTS: usize = 200;
 
 /// Ceiling on one stroke's serialized payload. A stroke is a short path — a
 /// handful of points, a colour, a width — and it is stored verbatim and fanned

@@ -2709,6 +2709,82 @@ async fn a_removed_participant_can_no_longer_draw() {
     }
 }
 
+/// A bulk invite (`POST /boards/{id}/invite`) must reach the live room like any
+/// other roster change. The room authorizes every delivery against the roster it
+/// is told about, so a path that widens the array and stays silent leaves the
+/// new participant unrenderable to the people already drawing — and this one is
+/// easy to forget precisely because it only ever *adds*, so it can never trip
+/// the removal test above.
+#[tokio::test]
+async fn a_bulk_invite_announces_the_widened_roster_to_the_room() {
+    let room = board_room_fixture().await;
+    let (base, board) = (room.base.as_str(), room.board_id.as_str());
+    // The invite gates are teacher+, and the fixture's creator is a student.
+    promote(&room.db, "ali", "teacher").await;
+
+    let mut veli = board_open(base, board, Some(&room.veli_cookie))
+        .await
+        .expect("invited");
+    board_join(&mut veli, None, None).await;
+
+    // A school-wide event resolves to every account, which here is the three the
+    // fixture registered — so the invite adds exactly the outsider, ayşe.
+    let res = room
+        .creator
+        .post(format!("{base}/events"))
+        .json(&json!({ "title": "Tüm okul" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let event: Value = res.json().await.unwrap();
+    let event_id = event["id"].as_str().unwrap().to_string();
+
+    let res = room
+        .creator
+        .post(format!("{base}/boards/{board}/invite"))
+        .json(&json!({ "kind": "event", "event": event_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let widened: Value = res.json().await.unwrap();
+
+    let frame = board_frame_of_type(&mut veli, "participants").await;
+    let announced = frame["participants"].as_array().unwrap();
+    assert!(
+        announced.iter().any(|id| id == &json!(room.veli_id)),
+        "the standing participant must still be on the announced roster: {frame}"
+    );
+    assert_eq!(
+        announced.len(),
+        2,
+        "the outsider should have been added and announced: {frame}"
+    );
+    // The wire and the reply are the same list, and the creator is in neither
+    // array — they are a participant by construction.
+    let mut from_frame: Vec<&Value> = announced.iter().collect();
+    let served = widened["participants"].as_array().unwrap();
+    let mut from_body: Vec<&Value> = served.iter().collect();
+    from_frame.sort_by_key(|id| id.as_str().unwrap());
+    from_body.sort_by_key(|id| id.as_str().unwrap());
+    assert_eq!(from_frame, from_body, "{frame} vs {widened}");
+    assert_eq!(frame["creator"], widened["creator"], "{frame}");
+
+    // The stored row is the authority — the mem engine forges write wins, so a
+    // frame alone proves only that the server said something.
+    let stored: Value = room
+        .creator
+        .get(format!("{base}/boards/{board}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stored["participants"], widened["participants"]);
+}
+
 /// Test 8 — `client_seq` is the client's correlation id and is echoed
 /// verbatim, including a value no `i32` holds; a message without one gets a
 /// reply without the key at all. Kills the "helpfully normalize it" bug that
