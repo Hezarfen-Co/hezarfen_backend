@@ -394,6 +394,10 @@ impl ClassBlueprint {
     /// at their own in-transaction claim and answer `blueprint_deleted`. Per
     /// course rather than per pump, because the pump's loop is unbounded and a
     /// delete may not wait behind all of it.
+    ///
+    /// One class, so `blueprint_deleted` is an ordinary skip here: the courses
+    /// after it are not tried, because the template they would ask for is the
+    /// one that just went.
     pub async fn apply_to(
         &self,
         class: &ClassGroup,
@@ -401,13 +405,39 @@ impl ClassBlueprint {
         db: &Database,
     ) -> Result<Vec<Skip>, AppError> {
         let mut skipped = Vec::new();
+        self.apply_courses(class, by, &mut Vec::new(), &mut skipped, db)
+            .await?;
+        Ok(skipped)
+    }
+
+    /// One class's share of a pump, and the body both callers above share.
+    ///
+    /// `dead` is the courses this run already found deleted: they are not
+    /// attempted again, so neither the skip nor [`Self::prune`]'s write repeats
+    /// on the next section. A course newly found gone joins it.
+    ///
+    /// Answers `false` when the blueprint itself is gone — a caller looping
+    /// over classes must stop, because every remaining one would answer exactly
+    /// the same.
+    async fn apply_courses(
+        &self,
+        class: &ClassGroup,
+        by: &UserId,
+        dead: &mut Vec<CourseId>,
+        skipped: &mut Vec<Skip>,
+        db: &Database,
+    ) -> Result<bool, AppError> {
         for course in &self.courses {
+            if dead.contains(course) {
+                continue;
+            }
             let landed = {
                 let _lease = BLUEPRINT_LOCK.read().await;
                 ClassCourse::attach_sourced(class.get_id(), course, by, Some(&self.id), db).await?
             };
             if matches!(landed, Attached::PivotGone) {
                 self.prune(course, db).await?;
+                dead.push(course.clone());
             }
             if let Some(reason) = skip_reason(&landed) {
                 skipped.push(Skip {
@@ -417,17 +447,39 @@ impl ClassBlueprint {
                     reason,
                 });
             }
+            if matches!(landed, Attached::SourceGone) {
+                return Ok(false);
+            }
         }
-        Ok(skipped)
+        Ok(true)
     }
 
     /// [`Self::apply_to`] every class at this blueprint's grade. The write loop
     /// is one transaction per (class, course) and bounded by neither — see the
     /// module note.
+    ///
+    /// Two things are said once for the whole run rather than once per section,
+    /// since a section cannot make either of them untrue. A course that no
+    /// longer exists is pruned and skipped on the first class that meets it and
+    /// left out of every class after it. And a `blueprint_deleted` **aborts the
+    /// grade loop**: under [`BLUEPRINT_LOCK`] that answer is precisely "a
+    /// delete landed mid-pump", so it is reported once and the remaining
+    /// classes are not walked.
+    ///
+    /// The abort is still a `Ok(skipped)`, not an error: the attaches that
+    /// committed before the delete stand (its sweep took the ones it could
+    /// reach), and a partial state reported in full is what best-effort means
+    /// everywhere else here.
     pub async fn pump(&self, by: &UserId, db: &Database) -> Result<Vec<Skip>, AppError> {
         let mut skipped = Vec::new();
+        let mut dead = Vec::new();
         for class in ClassGroup::list_for_grade(&self.grade, db).await? {
-            skipped.extend(self.apply_to(&class, by, db).await?);
+            if !self
+                .apply_courses(&class, by, &mut dead, &mut skipped, db)
+                .await?
+            {
+                break;
+            }
         }
         Ok(skipped)
     }
@@ -438,8 +490,10 @@ impl ClassBlueprint {
     /// a course had, but nothing it can reach names the blueprints holding its
     /// id — so a deleted course stays in the list and every future pump refuses
     /// it again, on every class, forever. A skip a manager cannot act on is
-    /// noise, so the pump that *finds* the dangling id also removes it, and the
-    /// removal is reported once (the skip) rather than every time.
+    /// noise, so the pump that *finds* the dangling id also removes it: once
+    /// for the run that found it (later classes in the same [`Self::pump`] skip
+    /// it by its dead-course set rather than re-attempting and re-pruning it),
+    /// and never again afterwards, because the list no longer holds it.
     ///
     /// Not a compare-and-set, unlike [`Self::set_courses`]: "a course that does
     /// not exist is not in this list" holds for every version of the list, so
@@ -531,7 +585,24 @@ impl ClassBlueprint {
 mod tests {
     use super::*;
     use crate::constant::CLASS_COURSE_COUNT_FIELD;
-    use crate::domain::class_member::tests::{a_class, a_course, counter, rows};
+    use crate::domain::class_course::ClassCourseId;
+    use crate::domain::class_group::ClassName;
+    use crate::domain::class_member::tests::{a_class, a_course, counter, exists, rows};
+
+    /// A section that a pump's own grade loop can actually find — [`a_class`]
+    /// carries no grade at all, so `list_for_grade` reaches none of them.
+    async fn a_section(name: &str, db: &Database) -> ClassGroup {
+        ClassGroup::create(
+            &UserId::from_key("manager"),
+            ClassName::try_new(name).unwrap(),
+            Some(ClassBlueprint::grade_key("9").unwrap()),
+            None,
+            None,
+            db,
+        )
+        .await
+        .unwrap()
+    }
 
     /// A blueprint holding `courses`, at grade "9".
     async fn a_blueprint(courses: Vec<CourseId>, db: &Database) -> ClassBlueprint {
@@ -793,6 +864,100 @@ mod tests {
             counter(CLASS_COURSE_COUNT_FIELD, class.get_id().record(), &db).await,
             0,
             "…and no counter moved for it"
+        );
+    }
+
+    /// A course that no longer exists is pruned and reported **once for the
+    /// pump**, not once per section: twelve sections at a grade must not answer
+    /// one dead course with twelve identical skips and twelve identical prune
+    /// writes. The live course still reaches every section.
+    ///
+    /// Stored state is what is asserted — the in-memory engine forges wins, so
+    /// the links are re-read rather than counted off the return value.
+    #[tokio::test]
+    async fn a_dead_course_is_pruned_and_skipped_once_for_the_whole_grade() {
+        let db = crate::database::init_mem().await.unwrap();
+        let manager = UserId::from_key("manager");
+        let astronomy = a_course("astronomy", None, &db).await;
+        let algebra = a_course("algebra", None, &db).await;
+        let a = a_section("9-A", &db).await;
+        let b = a_section("9-B", &db).await;
+        let blueprint = a_blueprint(vec![astronomy.clone(), algebra.clone()], &db).await;
+        db.query("DELETE $c")
+            .bind(("c", astronomy.record()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        let skipped = blueprint.pump(&manager, &db).await.unwrap();
+        assert_eq!(
+            skipped.len(),
+            1,
+            "one dead course is one skip for the grade, not one per section: {skipped:?}"
+        );
+        assert_eq!(skipped[0].reason, "course_deleted");
+        assert_eq!(
+            ClassBlueprint::read(blueprint.get_id(), &db)
+                .await
+                .unwrap()
+                .unwrap()
+                .get_courses(),
+            &[algebra.clone()],
+            "and the list is pruned to the course that still exists"
+        );
+        for class in [&a, &b] {
+            assert!(
+                exists(
+                    ClassCourseId::composite(class.get_id(), &algebra).record(),
+                    &db
+                )
+                .await,
+                "the live course still reached {}",
+                class.get_name().as_str()
+            );
+        }
+        assert_eq!(
+            rows("SELECT VALUE id FROM class_course", &db).await,
+            2,
+            "…and nothing else was attached"
+        );
+    }
+
+    /// A blueprint that is gone ends the whole grade loop: the answer is about
+    /// the template, so every remaining section would only repeat it. Reported
+    /// once, and as `Ok` — best-effort, with whatever committed left standing.
+    ///
+    /// Provoked with a stale handle rather than a live interleaving, which the
+    /// in-memory engine cannot be made to produce; it is the same state a
+    /// delete landing between the read and the pump leaves this caller in.
+    #[tokio::test]
+    async fn a_deleted_blueprint_stops_the_grade_loop_after_one_skip() {
+        let db = crate::database::init_mem().await.unwrap();
+        let manager = UserId::from_key("manager");
+        let algebra = a_course("algebra", None, &db).await;
+        a_section("9-A", &db).await;
+        a_section("9-B", &db).await;
+        let stale = a_blueprint(vec![algebra], &db).await;
+        ClassBlueprint::read(stale.get_id(), &db)
+            .await
+            .unwrap()
+            .unwrap()
+            .delete(&db)
+            .await
+            .unwrap();
+
+        let skipped = stale.pump(&manager, &db).await.unwrap();
+        assert_eq!(
+            skipped.len(),
+            1,
+            "the template went once, not once per section: {skipped:?}"
+        );
+        assert_eq!(skipped[0].reason, "blueprint_deleted");
+        assert_eq!(
+            rows("SELECT VALUE id FROM class_course", &db).await,
+            0,
+            "…and nothing was attached under a blueprint nothing could sweep"
         );
     }
 

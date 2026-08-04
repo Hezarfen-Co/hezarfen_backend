@@ -935,14 +935,16 @@ struct SkipResponse {
     /// course kinds have. The set is closed: `class_deleted` (the section was
     /// deleted while the pump ran), `course_deleted` (the course itself is
     /// gone; the pump also drops that dangling id from the blueprint, so this
-    /// is reported once and never again), `class_at_course_ceiling` (the
+    /// is reported once for the whole grade and never again),
+    /// `class_at_course_ceiling` (the
     /// section already holds `max_class_courses`), `class_roster_too_large`
     /// (the section holds more students than one attach may enroll at once),
     /// `course_full` (the course has no free seat for the whole section),
     /// `linked_course_missing` (another course already attached to this
     /// section no longer exists — detach it before retrying), and
     /// `blueprint_deleted` (the blueprint itself was deleted while the pump
-    /// ran; nothing was attached, and there is nothing left to retry).
+    /// ran; nothing was attached, and there is nothing left to retry — it ends
+    /// the run, so it appears once however many sections were left).
     #[schema(example = "course_full")]
     reason: String,
 }
