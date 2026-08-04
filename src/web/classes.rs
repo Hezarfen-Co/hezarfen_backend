@@ -54,6 +54,7 @@ pub fn routes() -> OpenApiRouter<AppState> {
         // with an id of `"blueprints"`, exactly as `/classes/me` does.
         .routes(routes!(create_blueprint, list_blueprints))
         .routes(routes!(get_blueprint, update_blueprint, delete_blueprint))
+        .routes(routes!(blueprint_status))
         .routes(routes!(apply_blueprint))
 }
 
@@ -1075,6 +1076,35 @@ struct BlueprintPumpResponse {
     skipped: Vec<SkipResponse>,
 }
 
+/// One section measured against its grade's template.
+#[derive(Serialize, ToSchema)]
+struct SectionStatusResponse {
+    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    class: String,
+    #[schema(example = "9-C")]
+    class_name: String,
+    /// The template's courses this section does not carry, empty when it is in
+    /// sync. A course attached **by hand** counts as carried, exactly as it
+    /// does for the pump.
+    missing: Vec<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct BlueprintStatusResponse {
+    #[schema(example = "9")]
+    grade: String,
+    /// The template every section below is measured against.
+    courses: Vec<String>,
+    /// How many sections carry this grade label — the same count a pump
+    /// reports, and `0` still means the label matches nothing rather than that
+    /// every section is stocked.
+    #[schema(example = 12)]
+    matched: i64,
+    /// Every section at the grade, in sync or not. Unpaged: it is the şube one
+    /// school runs at one grade.
+    sections: Vec<SectionStatusResponse>,
+}
+
 #[derive(Serialize, ToSchema)]
 struct ApplyResponse {
     /// The courses this class could not take, empty when it took them all.
@@ -1294,6 +1324,65 @@ async fn delete_blueprint(
         .delete(&st.db)
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Which sections at a grade are out of sync with its blueprint. Requires
+/// manager+. Reads only — nothing is attached, detached or pruned.
+///
+/// A pump's `skipped` list lives only in the response that reported it; this is
+/// how a manager asks the same question afterwards. Every section carrying the
+/// grade label is listed with the template courses it does not carry, so an
+/// empty `missing` everywhere is a grade fully stocked.
+///
+/// A course a human attached by hand counts as carried, exactly as it does for
+/// the pump — the template asks for the course, not for the pump's tag. A
+/// course in the template that no longer exists reads as missing from every
+/// section; the next pump drops the dangling id from the template.
+///
+/// The fix for anything listed is one of two idempotent calls:
+/// `POST /classes/{id}/blueprint` for one section, or `PATCH` the blueprint
+/// with the list it already holds to re-run the whole grade's pump.
+#[utoipa::path(
+    get,
+    path = "/blueprints/{grade}/status",
+    tag = "classes",
+    security(("session_cookie" = [])),
+    params(("grade" = String, Path, description = "Grade label")),
+    responses(
+        (status = 200, description = "Every section at the grade, with the template courses it is missing", body = BlueprintStatusResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
+        (status = 404, description = "No blueprint for that grade", body = ErrorResponse),
+    ),
+)]
+async fn blueprint_status(
+    State(st): State<AppState>,
+    RequireManager(_user): RequireManager,
+    Path(grade): Path<String>,
+) -> Result<Json<BlueprintStatusResponse>, AppError> {
+    let blueprint = blueprint_or_404(&grade, &st.db).await?;
+    let sections = blueprint.status(&st.db).await?;
+    Ok(Json(BlueprintStatusResponse {
+        grade: blueprint.get_grade().as_str().to_string(),
+        courses: blueprint
+            .get_courses()
+            .iter()
+            .map(|course| course.key().to_string())
+            .collect(),
+        matched: sections.len() as i64,
+        sections: sections
+            .iter()
+            .map(|section| SectionStatusResponse {
+                class: section.class.key().to_string(),
+                class_name: section.class_name.clone(),
+                missing: section
+                    .missing
+                    .iter()
+                    .map(|course| course.key().to_string())
+                    .collect(),
+            })
+            .collect(),
+    }))
 }
 
 /// Stock one class section from its grade's blueprint. Requires manager+ — this
