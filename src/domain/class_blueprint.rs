@@ -32,6 +32,7 @@
 //! the same reason the pump does.
 
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
+use tokio::sync::RwLock;
 
 use crate::constant::{CLASS_BLUEPRINT_TABLE, CLASS_COURSE_TABLE, MAX_CLASS_COURSES};
 use crate::database::Database;
@@ -42,6 +43,33 @@ use crate::domain::course::CourseId;
 use crate::domain::page::PagedList;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
+
+/// Serializes a blueprint's delete against the attaches made on its behalf.
+///
+/// [`ClassBlueprint::delete`] removes the row and then sweeps by the provenance
+/// tag, and every guarded attach reads that same row *inside* its own
+/// transaction ([`crate::domain::class_pump::attach`]'s `source` claim). Those
+/// two are a cross-record read-then-write racing a write to the record read,
+/// which `BEGIN`/`COMMIT` does not serialize (SurrealDB write skew): a pump can
+/// see the blueprint alive, have the delete commit and sweep past it, and only
+/// then commit its own `class_course` row — tagged with a record that no longer
+/// exists and that no sweep can ever reach again, since the grade label *is*
+/// the id. Delete-first and the in-transaction claim narrow that window; this
+/// closes it.
+///
+/// The delete holds the **write** lease across its compare-and-set and its
+/// sweep, so the sweep sees every attach that committed before it and no attach
+/// commits after it. Each guarded attach holds the **read** lease for the span
+/// of its own transaction — taken per course in [`ClassBlueprint::apply_to`],
+/// never around a whole pump, so a delete waits behind one attach rather than
+/// an unbounded loop. `tokio`'s `RwLock` is fair, so a steady stream of pump
+/// leases cannot starve that waiting delete.
+///
+/// In-process is deployment-wide here: single-replica by decision, with
+/// stop-the-world upgrades — the same argument
+/// [`crate::domain::settings::SETTINGS_LOCK`] makes. No other lock is taken
+/// under it, so it has no ordering rule to break.
+pub(crate) static BLUEPRINT_LOCK: RwLock<()> = RwLock::const_new(());
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct ClassBlueprintId(RecordId);
@@ -109,7 +137,9 @@ pub struct Skip {
 /// vanished when the course did sends them to look at a section that is
 /// standing right there. `linked_course_missing` is a third: *another* course
 /// already attached to this class no longer exists, and it must be detached
-/// before this attach can be retried.
+/// before this attach can be retried. `blueprint_deleted` is the pump losing
+/// the template itself mid-run — the only skip that says nothing about the
+/// (class, course) pair it names.
 fn skip_reason(landed: &Attached<ClassCourse>) -> Option<&'static str> {
     match landed {
         Attached::Made(_) | Attached::Duplicate => None,
@@ -119,6 +149,7 @@ fn skip_reason(landed: &Attached<ClassCourse>) -> Option<&'static str> {
         Attached::ClassOverloaded => Some("class_roster_too_large"),
         Attached::Full(_) => Some("course_full"),
         Attached::CourseGone(_) => Some("linked_course_missing"),
+        Attached::SourceGone => Some("blueprint_deleted"),
     }
 }
 
@@ -242,6 +273,14 @@ impl ClassBlueprint {
     ///
     /// Removals run first: a course leaving frees a place under the per-class
     /// course ceiling that the same edit's additions can then use.
+    ///
+    /// Takes no [`BLUEPRINT_LOCK`] lease, deliberately: holding the write lease
+    /// across its own pump would deadlock on the read lease that pump takes,
+    /// and a lease would close nothing anyway — the pump's claim asks whether
+    /// the blueprint *exists*, not what it holds, so an edit racing a pump is
+    /// only ever the retro-pump this feature is built on. Rows a racing edit
+    /// leaves behind stay reachable, because [`Self::delete`] sweeps the whole
+    /// tag rather than a list.
     pub async fn set_courses(
         self,
         courses: Vec<CourseId>,
@@ -273,7 +312,7 @@ impl ClassBlueprint {
                 None => Err(AppError::NotFound),
             };
         };
-        saved.drop_courses(&dropped, db).await?;
+        saved.drop_courses(Some(&dropped), db).await?;
         let skipped = saved.pump(by, db).await?;
         Ok((saved, skipped))
     }
@@ -282,16 +321,79 @@ impl ClassBlueprint {
     /// human attached to those classes by hand carry no `source` and are left
     /// exactly where they are — the same cut a single removal makes, applied to
     /// the whole list, because a template that is gone owns nothing.
+    ///
+    /// The row goes **first**, and the sweep that follows is by the provenance
+    /// tag rather than by the list this caller read. Sweeping first was the
+    /// mirror image of a race: a `PATCH` adding a course and pumping it while
+    /// this ran landed rows tagged with a blueprint the delete then removed,
+    /// and nothing could ever sweep them again — the grade label *is* the
+    /// record id, so only a blueprint recreated at that grade could even name
+    /// them. Never revert to sweep-first.
+    ///
+    /// Deleting first plus the pump's own in-transaction claim on this row
+    /// ([`Attached::SourceGone`]) **narrows** that window; it does not close
+    /// it. The claim is a read of `class_blueprint` in a transaction that
+    /// writes `class_course`, racing this delete's write to
+    /// `class_blueprint` — a cross-record pair `BEGIN`/`COMMIT` does not
+    /// serialize, so a pump that read the row alive can still commit its link
+    /// after the sweep has run. [`BLUEPRINT_LOCK`] is what closes it: the write
+    /// lease below spans the compare-and-set and the sweep, the read lease in
+    /// [`Self::apply_to`] spans each attach, and single-replica deployment
+    /// makes an in-process lock the whole answer.
+    ///
+    /// What is left is a **process crash** between the delete and the sweep — a
+    /// lock does not survive the process. That leaves inert `class_course` rows
+    /// tagged with a blueprint that is gone; they are still detachable one at a
+    /// time at `DELETE /classes/{id}/courses/{course}`, and every counter stays
+    /// exact because each detach is its own transaction.
+    ///
+    /// The delete is a compare-and-set on the list this caller read, like
+    /// [`Self::set_courses`]: an edit landing in between is a `409` rather than
+    /// a silent detach of somebody else's additions. Known hole, accepted: the
+    /// grade label *is* the record id and the comparison is by **content**, so
+    /// a blueprint deleted and recreated at the same grade with the same list
+    /// satisfies `WHERE courses = $held` and this call deletes the *new* row.
+    /// Content-equal is intent-equal — the end state is the one the caller
+    /// asked for — and telling the two apart needs a revision column on the
+    /// row, which nothing else here would use.
     pub async fn delete(self, db: &Database) -> Result<(), AppError> {
-        self.drop_courses(&self.courses.clone(), db).await?;
-        let gone: Option<ClassBlueprint> = db.delete(self.id.record()).await?;
-        gone.map(|_| ()).ok_or(AppError::NotFound)
+        // Held through the sweep: it must see every attach that committed
+        // before it, and no attach may commit after it.
+        let _lease = BLUEPRINT_LOCK.write().await;
+        let mut result = db
+            .query("DELETE $id WHERE courses = $held RETURN BEFORE")
+            .bind(("id", self.id.record()))
+            .bind(("held", self.courses.clone()))
+            .await?
+            .check()?;
+        if result.take::<Vec<ClassBlueprint>>(0)?.is_empty() {
+            // Matched nothing: the row is gone, or its list moved since this
+            // caller read it. Only this path pays for the read that tells them
+            // apart.
+            return match Self::read(&self.id, db).await? {
+                Some(_) => Err(AppError::Conflict(
+                    "this blueprint changed since you read it — re-read and retry",
+                )),
+                None => Err(AppError::NotFound),
+            };
+        }
+        self.drop_courses(None, db).await
     }
 
     /// Attach every course in this blueprint to `class`, skipping — never
     /// aborting on — the ones that do not fit. A course already on the class is
     /// a no-op, whoever attached it: this is what makes a pump repeatable, and
     /// what stops it re-tagging a hand-attached course as its own.
+    ///
+    /// This is the *only* place a sourced attach is made — [`Self::pump`], the
+    /// create-time and per-class pumps in [`crate::web::classes`] all come
+    /// through here — so it is where each one takes [`BLUEPRINT_LOCK`] for
+    /// reading, one course at a time. A delete landing mid-pump is then clean
+    /// by construction: the attaches that already committed are found by its
+    /// tag sweep, and the ones that have not yet started meet the deleted row
+    /// at their own in-transaction claim and answer `blueprint_deleted`. Per
+    /// course rather than per pump, because the pump's loop is unbounded and a
+    /// delete may not wait behind all of it.
     pub async fn apply_to(
         &self,
         class: &ClassGroup,
@@ -300,8 +402,10 @@ impl ClassBlueprint {
     ) -> Result<Vec<Skip>, AppError> {
         let mut skipped = Vec::new();
         for course in &self.courses {
-            let landed =
-                ClassCourse::attach_sourced(class.get_id(), course, by, Some(&self.id), db).await?;
+            let landed = {
+                let _lease = BLUEPRINT_LOCK.read().await;
+                ClassCourse::attach_sourced(class.get_id(), course, by, Some(&self.id), db).await?
+            };
             if matches!(landed, Attached::PivotGone) {
                 self.prune(course, db).await?;
             }
@@ -343,6 +447,10 @@ impl ClassBlueprint {
     /// and re-running it changes nothing. No sweep follows it either — the
     /// attachments it would sweep are exactly the ones the course's own delete
     /// already took.
+    ///
+    /// No [`BLUEPRINT_LOCK`] lease either: an `UPDATE` of a record that is gone
+    /// writes nothing, so this cannot resurrect a blueprint a delete took while
+    /// the pump around it was running.
     async fn prune(&self, course: &CourseId, db: &Database) -> Result<(), AppError> {
         db.query("UPDATE $id SET courses = array::complement(courses ?? [], [$course])")
             .bind(("id", self.id.record()))
@@ -352,8 +460,13 @@ impl ClassBlueprint {
         Ok(())
     }
 
-    /// Detach `courses` from every class *this blueprint* attached them to, and
-    /// sweep the enrollments those attachments pumped.
+    /// Detach this blueprint's attachments — the ones for `courses`, or *every*
+    /// row carrying its tag when `None` — and sweep the enrollments they
+    /// pumped.
+    ///
+    /// `None` is the delete's whole point: it asks the tag rather than a list,
+    /// so a course a racing edit added and pumped after this caller read the
+    /// row is swept too, which no snapshot of the list could ever name.
     ///
     /// `source` is the whole filter, so a row without the key — a hand attach —
     /// is never matched, and a class that acquired the same course by hand
@@ -375,26 +488,40 @@ impl ClassBlueprint {
     /// The rows are read first rather than derived from the classes at this
     /// grade: a class whose grade was edited after the pump still carries this
     /// blueprint's attachments, and only the `source` tag can find it.
-    async fn drop_courses(&self, courses: &[CourseId], db: &Database) -> Result<(), AppError> {
-        for course in courses {
-            let mut found = db
-                .query(format!(
-                    "SELECT VALUE id FROM {CLASS_COURSE_TABLE} \
-                     WHERE course = $course AND source = $blueprint"
-                ))
-                .bind(("course", course.record()))
-                .bind(("blueprint", self.id.record()))
-                .await?
-                .check()?;
-            for link in found.take::<Vec<RecordId>>(0)? {
-                detach(
-                    "$link",
-                    Axis::Course,
-                    &[("link".into(), link.into_value())],
-                    db,
-                )
-                .await?;
-            }
+    async fn drop_courses(
+        &self,
+        courses: Option<&[CourseId]>,
+        db: &Database,
+    ) -> Result<(), AppError> {
+        let named: Vec<RecordId> = courses
+            .unwrap_or_default()
+            .iter()
+            .map(CourseId::record)
+            .collect();
+        if courses.is_some() && named.is_empty() {
+            return Ok(());
+        }
+        let only = if courses.is_some() {
+            "AND course IN $courses"
+        } else {
+            ""
+        };
+        let mut found = db
+            .query(format!(
+                "SELECT VALUE id FROM {CLASS_COURSE_TABLE} WHERE source = $blueprint {only}"
+            ))
+            .bind(("blueprint", self.id.record()))
+            .bind(("courses", named))
+            .await?
+            .check()?;
+        for link in found.take::<Vec<RecordId>>(0)? {
+            detach(
+                "$link",
+                Axis::Course,
+                &[("link".into(), link.into_value())],
+                db,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -403,7 +530,8 @@ impl ClassBlueprint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::class_member::tests::{a_class, a_course};
+    use crate::constant::CLASS_COURSE_COUNT_FIELD;
+    use crate::domain::class_member::tests::{a_class, a_course, counter, rows};
 
     /// A blueprint holding `courses`, at grade "9".
     async fn a_blueprint(courses: Vec<CourseId>, db: &Database) -> ClassBlueprint {
@@ -519,6 +647,155 @@ mod tests {
         );
     }
 
+    /// The delete is a compare-and-set, and it runs *before* the sweep — so a
+    /// handle whose list moved cannot take the row, and nothing it would have
+    /// swept is touched either.
+    ///
+    /// Provoked with a stale handle rather than a concurrent request, which is
+    /// exactly the state a `PATCH` landing between the read and the delete puts
+    /// this caller in, and deterministic where two live requests are not.
+    #[tokio::test]
+    async fn a_delete_of_a_list_that_moved_is_a_409_that_writes_nothing() {
+        let db = crate::database::init_mem().await.unwrap();
+        let manager = UserId::from_key("manager");
+        let algebra = a_course("algebra", None, &db).await;
+        let physics = a_course("physics", None, &db).await;
+        let class = ClassGroup::read(&a_class("9-A", &db).await, &db)
+            .await
+            .unwrap()
+            .unwrap();
+        let stale = a_blueprint(vec![algebra.clone()], &db).await;
+        stale.apply_to(&class, &manager, &db).await.unwrap();
+
+        // The edit this caller did not see: it adds a course and pumps it into
+        // the section. (The pump is applied by hand because the helper class
+        // carries no grade for `set_courses`'s own loop to find.)
+        let (edited, _) = ClassBlueprint::read(stale.get_id(), &db)
+            .await
+            .unwrap()
+            .unwrap()
+            .set_courses(vec![algebra, physics], &manager, &db)
+            .await
+            .unwrap();
+        edited.apply_to(&class, &manager, &db).await.unwrap();
+
+        let refused = stale.delete(&db).await;
+        assert!(
+            matches!(refused, Err(AppError::Conflict(_))),
+            "a list that moved is a 409, not a silent delete: {refused:?}"
+        );
+        assert!(
+            ClassBlueprint::read(&ClassBlueprintId::from_key("9"), &db)
+                .await
+                .unwrap()
+                .is_some(),
+            "the row the caller did not read is still there"
+        );
+        assert_eq!(
+            rows("SELECT VALUE id FROM class_course", &db).await,
+            2,
+            "and neither attachment was swept — including the one this handle \
+             never knew about"
+        );
+    }
+
+    /// The lease is real: a delete cannot start while a guarded attach holds
+    /// the read side.
+    ///
+    /// That is the whole point of the lock — without it a pump could commit its
+    /// `class_course` row *after* the delete had swept past, stranding a row
+    /// tagged with a blueprint nothing can reach. Two live requests would be a
+    /// coin flip the in-memory engine lies about, so the lease is held directly
+    /// and the delete is watched not-finishing on a timeout.
+    #[tokio::test]
+    async fn a_delete_waits_for_an_attach_in_flight() {
+        let db = crate::database::init_mem().await.unwrap();
+        let manager = UserId::from_key("manager");
+        let algebra = a_course("algebra", None, &db).await;
+        let class = ClassGroup::read(&a_class("9-A", &db).await, &db)
+            .await
+            .unwrap()
+            .unwrap();
+        let blueprint = a_blueprint(vec![algebra], &db).await;
+        blueprint.apply_to(&class, &manager, &db).await.unwrap();
+
+        // Stand in for an attach mid-transaction, which is exactly the lease
+        // `apply_to` holds around one course.
+        let attaching = BLUEPRINT_LOCK.read().await;
+        let mut deleting = {
+            let db = db.clone();
+            let blueprint = blueprint.clone();
+            tokio::spawn(async move { blueprint.delete(&db).await })
+        };
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), &mut deleting)
+                .await
+                .is_err(),
+            "the delete must not run while an attach is in flight"
+        );
+        assert_eq!(
+            rows("SELECT VALUE id FROM class_blueprint", &db).await,
+            1,
+            "…and it must not have swept anything either"
+        );
+
+        drop(attaching);
+        deleting.await.unwrap().unwrap();
+        assert_eq!(
+            rows("SELECT VALUE id FROM class_blueprint", &db).await,
+            0,
+            "once the attach is done the delete goes through"
+        );
+        assert_eq!(
+            rows("SELECT VALUE id FROM class_course", &db).await,
+            0,
+            "…taking every row carrying its tag with it"
+        );
+    }
+
+    /// The other half: a pump holding a handle to a blueprint that has since
+    /// been deleted writes nothing at all, and says so with its own code.
+    ///
+    /// Without the in-transaction claim the attach would land a `class_course`
+    /// row tagged with a record that no longer exists — the delete's sweep has
+    /// already run, and the grade label *is* the id, so nothing could ever
+    /// reach that row again.
+    #[tokio::test]
+    async fn a_pump_whose_blueprint_died_attaches_nothing() {
+        let db = crate::database::init_mem().await.unwrap();
+        let manager = UserId::from_key("manager");
+        let algebra = a_course("algebra", None, &db).await;
+        let class = ClassGroup::read(&a_class("9-A", &db).await, &db)
+            .await
+            .unwrap()
+            .unwrap();
+        let stale = a_blueprint(vec![algebra], &db).await;
+        ClassBlueprint::read(stale.get_id(), &db)
+            .await
+            .unwrap()
+            .unwrap()
+            .delete(&db)
+            .await
+            .unwrap();
+
+        let skipped = stale.apply_to(&class, &manager, &db).await.unwrap();
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert_eq!(
+            skipped[0].reason, "blueprint_deleted",
+            "the template went, not the class or the course"
+        );
+        assert_eq!(
+            rows("SELECT VALUE id FROM class_course", &db).await,
+            0,
+            "a row tagged with a deleted blueprint is one nothing can sweep"
+        );
+        assert_eq!(
+            counter(CLASS_COURSE_COUNT_FIELD, class.get_id().record(), &db).await,
+            0,
+            "…and no counter moved for it"
+        );
+    }
+
     #[test]
     fn a_grade_key_must_be_addressable() {
         assert!(ClassBlueprint::grade_key("").is_err());
@@ -572,6 +849,7 @@ mod tests {
                 Attached::CourseGone("course:algebra".into()),
                 "linked_course_missing",
             ),
+            (Attached::SourceGone, "blueprint_deleted"),
         ] {
             assert_eq!(
                 skip_reason(&refusal),

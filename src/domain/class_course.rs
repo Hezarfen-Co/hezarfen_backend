@@ -118,6 +118,11 @@ impl ClassCourse {
             Attached::CourseGone(course) => Err(AppError::ConflictOwned(format!(
                 "{course} no longer exists — detach it from this class first"
             ))),
+            // This path passes no source, so the claim that answers this is
+            // never in the transaction it ran.
+            Attached::SourceGone => Err(AppError::Internal(
+                "a hand attach has no blueprint to lose".into(),
+            )),
         }
     }
 
@@ -132,7 +137,10 @@ impl ClassCourse {
     ///
     /// `source` is the provenance tag, and it is written by the same statement
     /// that writes the link, so no attachment can exist without the answer to
-    /// "may a blueprint take this back".
+    /// "may a blueprint take this back". It is also *claimed* in that
+    /// transaction ([`Attached::SourceGone`]): a blueprint deleted while this
+    /// pump ran has already swept by that tag, so a row landing afterwards
+    /// would carry a name nothing can reach.
     pub(crate) async fn attach_sourced(
         class: &ClassGroupId,
         course: &CourseId,
@@ -155,6 +163,7 @@ impl ClassCourse {
             &link,
             course.record(),
             attached_by.record(),
+            source.map(ClassBlueprintId::record),
             db,
         )
         .await

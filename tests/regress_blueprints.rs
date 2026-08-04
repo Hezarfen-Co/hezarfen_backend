@@ -641,3 +641,107 @@ async fn a_row_written_before_the_column_reads_as_hand_attached() {
         1
     );
 }
+
+/// The window the lock exists to close, made visible.
+///
+/// `ClassBlueprint::delete` removes the row and then sweeps by the provenance
+/// tag, while a pump reads that row inside the transaction that writes the link
+/// — a cross-record read-then-write the store does not serialize. A pump that
+/// passed its liveness claim and then lost the blueprint commits a
+/// `class_course` row tagged with a record nothing can reach, since the grade
+/// label *is* the id and no sweep will ever run for it again.
+///
+/// Racing two requests would be a coin flip the in-memory engine lies about, so
+/// the delete is injected by the database itself: a `DEFINE EVENT` on
+/// `class_course` fires *inside* the pump's own transaction, the instant the
+/// link row lands — which is exactly "after the guard passed, before the
+/// commit", every single time. This is a below-the-lock probe by construction
+/// (the store deletes the row, not `ClassBlueprint::delete`), so it does not
+/// test `BLUEPRINT_LOCK`; it pins the end state that lock prevents in-process,
+/// and the recovery contract that covers the one residue it cannot — a process
+/// crash between the delete and its sweep.
+#[tokio::test]
+async fn a_blueprint_lost_mid_attach_strands_a_row_that_stays_detachable() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "mgr", "manager").await;
+    let algebra = create_course(&app, &manager, "algebra").await;
+    let made = send(
+        &app,
+        "POST",
+        "/classes/blueprints",
+        Some(&manager),
+        Some(json!({ "grade": "9", "course_ids": [algebra.clone()] })),
+    )
+    .await;
+    assert_eq!(made.status, StatusCode::CREATED, "{:?}", made.body);
+    // The section comes after the template, so nothing is attached until the
+    // pump below runs.
+    let class = create_class(&app, &manager, "9-A", "9").await;
+    assert!(!attached(&class, &algebra, &db).await);
+
+    // Delete the blueprint from inside the very write that attaches on its
+    // behalf.
+    db.query(
+        "DEFINE EVENT lose_blueprint ON TABLE class_course WHEN $event = 'CREATE' \
+         THEN { DELETE type::record('class_blueprint', '9'); };",
+    )
+    .await
+    .unwrap()
+    .check()
+    .unwrap();
+
+    let pumped = send(
+        &app,
+        "POST",
+        &format!("/classes/{class}/blueprint"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(pumped.status, StatusCode::OK, "{:?}", pumped.body);
+    assert!(
+        skips(&pumped).is_empty(),
+        "the pump was told it succeeded — which is what makes the row below \
+         invisible to the caller: {:?}",
+        pumped.body
+    );
+
+    assert_eq!(
+        rows("SELECT VALUE id FROM class_blueprint", &db).await,
+        0,
+        "the injected delete really landed"
+    );
+    assert!(
+        attached(&class, &algebra, &db).await,
+        "the link committed after its blueprint was gone: this is the stranded \
+         row, tagged with a record no sweep can ever reach"
+    );
+    assert_eq!(source_of(&class, &algebra, &db).await, Some("9".into()));
+
+    // The documented recovery: a human detaches it one course at a time, and
+    // the counters come back exact.
+    let detached = send(
+        &app,
+        "DELETE",
+        &format!("/classes/{class}/courses/{algebra}"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(
+        detached.status,
+        StatusCode::NO_CONTENT,
+        "{:?}",
+        detached.body
+    );
+    assert!(!attached(&class, &algebra, &db).await);
+    assert_eq!(
+        counter(
+            &format!("SELECT VALUE (class_course_count ?? 0) FROM class_group:{class}"),
+            &db
+        )
+        .await,
+        0,
+        "a stranded row still releases its counter when it is detached"
+    );
+}

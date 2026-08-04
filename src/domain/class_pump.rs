@@ -58,12 +58,32 @@ use crate::error::AppError;
 /// transaction's write loop (see [`Axis::cap`]). It is its own marker because
 /// "this class holds too many courses" is not an answer anyone can act on when
 /// it is reported as "this class holds too many students".
+///
+/// `SOURCE_MARK` is the record that *asked* for this attach — a grade blueprint
+/// — being gone by the time the transaction runs. It is the only marker a
+/// caller opts into (only a sourced attach states the claim), and it exists
+/// because a blueprint's delete sweeps by that tag: a row landing after the
+/// sweep would carry the name of a template no sweep can ever reach again.
 const HELD_MARK: &str = "class_held";
 const GONE_MARK: &str = "class_gone";
 const CAP_MARK: &str = "class_cap";
 const OVER_MARK: &str = "class_over";
+const SOURCE_MARK: &str = "class_no_blueprint";
 const FULL_MARK: &str = "class_full:";
 const MISSING_MARK: &str = "class_no_course:";
+
+/// An in-transaction existence claim as its own two statements: read `read`
+/// into `$name`, and abort with `mark` when it matched nothing.
+///
+/// Two statements and not one string, because [`attach`] takes the `CREATE`'s
+/// result slot off the *length* of its statement list — a pair returned as one
+/// element would count as one slot and silently read the wrong result back.
+fn claim(name: &str, read: &str, mark: &str) -> Vec<String> {
+    vec![
+        format!("LET ${name} = ({read})"),
+        format!("IF array::len(${name}) = 0 {{ THROW '{mark}' }}"),
+    ]
+}
 
 /// What [`attach`] settled.
 #[derive(Debug)]
@@ -98,6 +118,12 @@ pub(crate) enum Attached<T> {
     /// a stale `class_course` link. Nothing was written, and no capacity anyone
     /// can raise will change that answer.
     CourseGone(String),
+    /// The blueprint this attach was sourced from is gone — a delete landed
+    /// between the pump reading the template and this transaction running.
+    /// Nothing was written, which is the point: a row tagged with a blueprint
+    /// that no longer exists is one nothing can ever sweep. Only a sourced
+    /// attach can be answered this.
+    SourceGone,
 }
 
 /// Which way the pump runs: the loop below needs a `(course, user)` pair per
@@ -157,13 +183,16 @@ impl Axis {
     /// class write's to touch, and a membership left pointing at a deleted user
     /// is still removable by its own route — which is exactly what a link to a
     /// deleted course was not.
-    fn pivot_claim(&self) -> String {
+    fn pivot_claim(&self) -> Vec<String> {
         match self {
-            Axis::Member => String::new(),
-            Axis::Course => format!(
-                "LET $alive = (UPDATE $pivot SET {ENROLLMENT_COUNT_FIELD} = \
-                     {ENROLLMENT_COUNT_FIELD} RETURN VALUE id);
-                 IF array::len($alive) = 0 {{ THROW '{GONE_MARK}' }};"
+            Axis::Member => Vec::new(),
+            Axis::Course => claim(
+                "alive",
+                &format!(
+                    "UPDATE $pivot SET {ENROLLMENT_COUNT_FIELD} = \
+                     {ENROLLMENT_COUNT_FIELD} RETURN VALUE id"
+                ),
+                GONE_MARK,
             ),
         }
     }
@@ -252,6 +281,11 @@ impl Axis {
 /// and re-sending the whole cascade then *sees* the row and takes the other
 /// branch. The retry converges instead of re-asking a settled question, which
 /// is the restriction's actual test.
+///
+/// `source` is the record whose behalf this attach runs on — a grade blueprint
+/// — and supplying it adds one more claim: that it is still there when the
+/// transaction runs ([`Attached::SourceGone`]). A hand attach owns itself and
+/// passes `None`.
 pub(crate) async fn attach<T: SurrealValue + Clone>(
     class: &ClassGroupId,
     axis: Axis,
@@ -259,27 +293,46 @@ pub(crate) async fn attach<T: SurrealValue + Clone>(
     row: &T,
     pivot: RecordId,
     by: RecordId,
+    source: Option<RecordId>,
     db: &Database,
 ) -> Result<Attached<T>, AppError> {
     let count_field = axis.counter();
     let pairs = axis.pairs();
-    let alive = axis.pivot_claim();
     let other = axis.other();
     let over_field = other.counter();
+    // One statement per element, because the `CREATE`'s result slot is this
+    // list's own length at the moment it is pushed. It used to be a
+    // hand-counted constant with a case per optional claim, and only the path
+    // carrying that claim would ever have paid for a miscount.
+    let mut statements = vec![
+        "BEGIN TRANSACTION".to_string(),
+        "LET $held = (SELECT VALUE id FROM $link)".to_string(),
+        format!("IF array::len($held) > 0 {{ THROW '{HELD_MARK}' }}"),
+    ];
+    if source.is_some() {
+        statements.extend(claim("source", "SELECT VALUE id FROM $guard", SOURCE_MARK));
+    }
+    statements.extend(axis.pivot_claim());
     // Read off the class row inside the transaction that claims it, so the
     // count this refuses on is the one the pair loop below would iterate.
-    let sql = format!(
-        "BEGIN TRANSACTION;
-         LET $held = (SELECT VALUE id FROM $link);
-         IF array::len($held) > 0 {{ THROW '{HELD_MARK}' }};
-         {alive}
-         LET $over = (SELECT VALUE id FROM $class WHERE ({over_field} ?? 0) > $other_cap);
-         IF array::len($over) > 0 {{ THROW '{OVER_MARK}' }};
-         LET $counted = (UPDATE $class SET {count_field} = ({count_field} ?? 0) + 1 \
-             WHERE ({count_field} ?? 0) < $class_cap RETURN VALUE id);
-         IF array::len($counted) = 0 {{ THROW '{CAP_MARK}' }};
-         CREATE $link CONTENT $row;
-         FOR $pair IN (({pairs}) ?? []) {{
+    statements.push(format!(
+        "LET $over = (SELECT VALUE id FROM $class WHERE ({over_field} ?? 0) > $other_cap)"
+    ));
+    statements.push(format!(
+        "IF array::len($over) > 0 {{ THROW '{OVER_MARK}' }}"
+    ));
+    statements.push(format!(
+        "LET $counted = (UPDATE $class SET {count_field} = ({count_field} ?? 0) + 1 \
+         WHERE ({count_field} ?? 0) < $class_cap RETURN VALUE id)"
+    ));
+    statements.push(format!(
+        "IF array::len($counted) = 0 {{ THROW '{CAP_MARK}' }}"
+    ));
+    // Taken as it is pushed: this is the slot the link row comes back out of.
+    let made = statements.len();
+    statements.push("CREATE $link CONTENT $row".to_string());
+    statements.push(format!(
+        "FOR $pair IN (({pairs}) ?? []) {{
              LET $seat_of = type::record('{ENROLLMENT_TABLE}', string::concat(
                  record::id($pair.course), '_', record::id($pair.user)));
              IF array::len((SELECT VALUE id FROM $seat_of)) = 0 {{
@@ -296,26 +349,32 @@ pub(crate) async fn attach<T: SurrealValue + Clone>(
                  CREATE $seat_of CONTENT {{ course: $pair.course, user: $pair.user, \
                      enrolled_by: $by, source: $class }};
              }};
-         }};
-         COMMIT TRANSACTION;"
-    );
+         }}"
+    ));
+    statements.push("COMMIT TRANSACTION".to_string());
+    let sql = format!("{};", statements.join(";\n"));
+    let mut bindings = vec![
+        ("class".into(), class.record().into_value()),
+        ("link".into(), link.clone().into_value()),
+        ("row".into(), row.clone().into_value()),
+        ("pivot".into(), pivot.into_value()),
+        ("by".into(), by.into_value()),
+        ("unlimited".into(), cap::UNLIMITED.into_value()),
+        ("class_cap".into(), axis.cap().into_value()),
+        ("other_cap".into(), other.cap().into_value()),
+    ];
+    if let Some(guard) = source {
+        bindings.push(("guard".into(), guard.into_value()));
+    }
     let (mut result, mut errors) = transaction_with_retry(
         db,
         &sql,
-        &[
-            ("class".into(), class.record().into_value()),
-            ("link".into(), link.clone().into_value()),
-            ("row".into(), row.clone().into_value()),
-            ("pivot".into(), pivot.into_value()),
-            ("by".into(), by.into_value()),
-            ("unlimited".into(), cap::UNLIMITED.into_value()),
-            ("class_cap".into(), axis.cap().into_value()),
-            ("other_cap".into(), other.cap().into_value()),
-        ],
+        &bindings,
         &[
             HELD_MARK,
             GONE_MARK,
             OVER_MARK,
+            SOURCE_MARK,
             CAP_MARK,
             FULL_MARK,
             MISSING_MARK,
@@ -337,6 +396,16 @@ pub(crate) async fn attach<T: SurrealValue + Clone>(
         .any(|error| error.to_string().contains(HELD_MARK))
     {
         return Ok(Attached::Duplicate);
+    }
+    // The blueprint that asked for this attach is gone, and that outranks every
+    // refusal below it: none of them is an answer anyone can act on once the
+    // template that wanted the row has been deleted — and its claim stands
+    // first in the transaction, so it aborts before they could fire anyway.
+    if errors
+        .values()
+        .any(|error| error.to_string().contains(SOURCE_MARK))
+    {
+        return Ok(Attached::SourceGone);
     }
     if errors
         .values()
@@ -381,9 +450,6 @@ pub(crate) async fn attach<T: SurrealValue + Clone>(
     if let Some(error) = errors.drain().map(|(_, error)| error).next() {
         return Err(error.into());
     }
-    // Slots count BEGIN and three LET/IF pairs: the CREATE is slot 7 — or 9 on
-    // an axis that claims its pivot with a LET/IF pair of its own.
-    let made = if alive.is_empty() { 7 } else { 9 };
     result
         .take::<Vec<T>>(made)?
         .into_iter()
