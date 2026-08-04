@@ -524,9 +524,21 @@ impl Exam {
         self.draft = draft;
         // whole-row-save-ok: the WHERE below pins every column this replaces to
         // the caller's snapshot, so no concurrent write can be reverted
-        let mut result = db
-            .query(
-                "BEGIN TRANSACTION;
+        //
+        // Sent through the retry loop, not a bare `query`: this row now has a
+        // hot writer. Every answer save touches it to tie itself to the exam
+        // ([`crate::domain::exam_answer::ExamAnswer::save`]), so a teacher
+        // flipping `allow_rejoin` mid-exam can lose a round to a student
+        // typing — and a lost round is a re-send, never the 500 a bare `?` on
+        // the conflict would have answered. Re-sending is sound because the
+        // statement is a compare-and-set: the second pass carries the same
+        // pinned snapshot, so it lands only if the row is still what the caller
+        // read, and a rival that really moved it is refused as it was before.
+        // Admissible for the loop — an `UPDATE`, an `IF`/`THROW` and a `SELECT`
+        // can never answer "already exists".
+        let (mut result, mut errors) = transaction_with_retry(
+            db,
+            "BEGIN TRANSACTION;
                  IF $redraft AND (
                      array::len((SELECT VALUE id FROM exam_attempt WHERE exam = $id LIMIT 1)) > 0
                      OR array::len((SELECT VALUE id FROM exam_result WHERE exam = $id LIMIT 1)) > 0
@@ -543,31 +555,37 @@ impl Exam {
                    AND (result_count ?? 0) = $was_results
                  RETURN AFTER;
                  COMMIT TRANSACTION;",
-            )
-            .bind(("redraft", redraft))
-            .bind(("id", self.id.record()))
-            .bind(("was_title", was.0))
-            .bind(("was_description", was.1))
-            .bind(("was_kind", was.2))
-            .bind(("was_mode", was.3))
-            .bind(("was_starts", was.4))
-            .bind(("was_ends", was.5))
-            .bind(("was_duration", was.6))
-            .bind(("was_max_attempts", was.7))
-            .bind(("was_allow_rejoin", was.8))
-            .bind(("was_allow_review", was.9))
-            .bind(("was_draft", was.10))
-            // The mark counter is pinned like every other column this write
-            // replaces, and for a sharper reason: a grade increments it, so
-            // pinning it is what makes "this exam had no marks" — the gate the
-            // handler refuses a kind change on — true at *write* time and not
-            // merely at read time. A mark landing in between refuses the save.
-            .bind(("was_results", self.result_count.unwrap_or(0)))
-            .bind(("new", self))
-            .await?;
+            &[
+                ("redraft".into(), redraft.into_value()),
+                ("id".into(), self.id.record().into_value()),
+                ("was_title".into(), was.0.into_value()),
+                ("was_description".into(), was.1.into_value()),
+                ("was_kind".into(), was.2.into_value()),
+                ("was_mode".into(), was.3.into_value()),
+                ("was_starts".into(), was.4.into_value()),
+                ("was_ends".into(), was.5.into_value()),
+                ("was_duration".into(), was.6.into_value()),
+                ("was_max_attempts".into(), was.7.into_value()),
+                ("was_allow_rejoin".into(), was.8.into_value()),
+                ("was_allow_review".into(), was.9.into_value()),
+                ("was_draft".into(), was.10.into_value()),
+                // The mark counter is pinned like every other column this write
+                // replaces, and for a sharper reason: a grade increments it, so
+                // pinning it is what makes "this exam had no marks" — the gate
+                // the handler refuses a kind change on — true at *write* time
+                // and not merely at read time. A mark landing in between
+                // refuses the save.
+                (
+                    "was_results".into(),
+                    self.result_count.unwrap_or(0).into_value(),
+                ),
+                ("new".into(), self.into_value()),
+            ],
+            &["exam_redraft"],
+        )
+        .await?;
         // An aborted transaction errors every slot; only the THROW's names the
         // marker (the [`ExamAttempt::write_unfrozen`] treatment).
-        let mut errors = result.take_errors();
         if errors
             .values()
             .any(|error| error.to_string().contains("exam_redraft"))
@@ -1014,5 +1032,138 @@ mod tests {
             grade_500, 0,
             "a raced grade must retry, not 500: {grade_500}/20 rounds, last {last_grade}"
         );
+    }
+
+    /// One choice question on `exam`, with a real subject row behind it — a
+    /// question claims a reference on its subject and is refused without one.
+    async fn question_on(exam: &Exam, db: &Database) -> crate::domain::exam_question::ExamQuestion {
+        use crate::domain::exam_question::{
+            ChoiceInput, ExamQuestion, QuestionKind, QuestionPoints, QuestionSpec, QuestionText,
+        };
+        let spec = QuestionSpec::try_new(
+            QuestionKind::try_new("choice").unwrap(),
+            Some(vec![
+                ChoiceInput {
+                    id: Some("a".into()),
+                    text: "5".into(),
+                },
+                ChoiceInput {
+                    id: Some("b".into()),
+                    text: "6".into(),
+                },
+            ]),
+            Some("b".into()),
+            &[],
+        )
+        .unwrap();
+        let subject = crate::domain::subject::Subject::create(
+            &CourseId::generate(),
+            crate::domain::subject::SubjectName::try_new("topic").unwrap(),
+            crate::domain::subject::SubjectDescription::try_new("").unwrap(),
+            db,
+        )
+        .await
+        .unwrap();
+        ExamQuestion::create(
+            exam.get_id(),
+            subject.get_id().clone(),
+            QuestionText::try_new("3 + 3?").unwrap(),
+            QuestionPoints::try_new(5).unwrap(),
+            spec,
+            db,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// The `Menu::delete` defect, one domain over: a student's answer must not
+    /// outlive the exam it belongs to. Guarding the save by *reading* the exam
+    /// would not do it — the read sees a row [`Exam::delete`] has removed but
+    /// not committed, while its `DELETE exam_answer WHERE exam = $ex` swept a
+    /// snapshot predating the save, so both commit and the answer is left
+    /// pointing at an exam that is gone. [`ExamAnswer::save`] writes the exam
+    /// row instead (its `result_count`, back unchanged), so the two transactions
+    /// touch one key and the store refuses one of them.
+    ///
+    /// The window is opened by the database, not by a lucky interleaving: a
+    /// `DEFINE EVENT` on `exam` fires *inside* the delete's own transaction the
+    /// instant the row goes, so the `SLEEP` lands exactly between the delete and
+    /// its cascade every time. Nothing in `src/` knows about it; the seam is the
+    /// schema.
+    ///
+    /// One child per round, deliberately — in the menu twin, two children in one
+    /// round hid the bug: the first writer made the delete lose and re-send, and
+    /// the re-sent sweep removed the other's row.
+    ///
+    /// Real server, and `#[ignore]`d for it: the subject *is* the store's
+    /// conflict detection, which `init_mem`'s embedded engine does not have — it
+    /// commits both writes and answers `Ok` to each, so this passes there on
+    /// broken code. Mutation-tested: putting the bare
+    /// `db.upsert(id).content(answer)` back turns it red (the exact output is in
+    /// the commit that added it).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
+    async fn an_answer_written_inside_a_delete_never_outlives_the_exam() {
+        use crate::domain::exam_answer::ExamAnswer;
+        let (db, _serialized) = crate::database::init_test_server("exam_answer_race").await;
+        // Hold the delete open for a full second after the row is gone, while
+        // its cascade still has to run.
+        db.query(
+            "DEFINE EVENT hold_the_window ON TABLE exam WHEN $event = 'DELETE' \
+             THEN { SLEEP 1s; };",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+        let (mut answers, mut swept) = (0, 0);
+        for round in 0..4 {
+            let exam = published(&db).await;
+            let question = question_on(&exam, &db).await;
+            let id = exam.get_id().clone();
+            let student = UserId::from_key(&format!("stu{round}"));
+            // The stored choice ids are minted by the create, not the ones the
+            // spec asked for — an answer must name one of *those*.
+            let pick = question.get_choices().unwrap()[1]
+                .get_id()
+                .as_str()
+                .to_string();
+
+            let drop_it = {
+                let db = db.clone();
+                tokio::spawn(async move { exam.delete(&db).await })
+            };
+            // The save starts inside the held window — the exam row is gone but
+            // uncommitted, which is exactly what an exam read believes.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let child = {
+                let (db, question, student) = (db.clone(), question.clone(), student.clone());
+                tokio::spawn(async move {
+                    ExamAnswer::save(&question, &student, 1, Some(pick), None, &db).await
+                })
+            };
+            let (drop_it, child) = (drop_it.await.unwrap(), child.await.unwrap());
+            // A 404 for the save, or a NotFound for the delete, is a correct
+            // answer — the only defect is stored state.
+            assert!(
+                !matches!(child, Err(AppError::Db(_))),
+                "round {round}: a raced save must be answered, not 500: {child:?}"
+            );
+
+            // Stored state is the whole verdict; a return value is not evidence.
+            if Exam::read(&id, &db).await.unwrap().is_none() {
+                swept += 1;
+                answers += ExamAnswer::list_for_exam(&id, &db).await.unwrap().len();
+            } else if drop_it.is_ok() {
+                panic!("round {round}: the delete reported success but the exam is still there");
+            }
+        }
+        eprintln!("Exam::delete raced by an answer save: {swept}/4 rounds deleted the exam");
+        assert!(
+            swept > 0,
+            "no round ever deleted the exam, so the window was never reached"
+        );
+        assert_eq!(answers, 0, "an answer outlived its exam");
     }
 }
