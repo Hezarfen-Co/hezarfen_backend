@@ -155,6 +155,29 @@ impl ClassResponse {
     }
 }
 
+/// A created class plus what its grade's blueprint did to it — the shape
+/// [`BlueprintPumpResponse`] already has on the other write that pumps, with the
+/// class in place of the template.
+#[derive(Serialize, ToSchema)]
+struct CreateClassResponse {
+    class: ClassResponse,
+    /// The courses the template could not put on this section, empty when it
+    /// took them all (and always empty when no template covered its grade).
+    skipped: Vec<SkipResponse>,
+    /// The grade label of the blueprint that stocked this section, or `null`
+    /// when none did. `null` with an empty `skipped` is what tells "no template
+    /// covers this grade" apart from "the template applied cleanly" — the
+    /// distinction `matched` makes on the grade-wide pumps.
+    ///
+    /// Stocking is best-effort to the end: a template that could not be read,
+    /// or a pump that faulted part-way, also reads `null` rather than turning a
+    /// section that exists into a `500` whose caller never learns its id. The
+    /// remedy is the same either way — `POST /classes/{id}/blueprint`, which is
+    /// idempotent and `404`s when there is genuinely no template.
+    #[schema(example = "9")]
+    stocked_from: Option<String>,
+}
+
 /// Every person a [`ClassResponse`] names: its homeroom teacher, plus its
 /// creator when the caller is cleared to see one. Feed this into `person_map` —
 /// an id the map is missing renders as a bare ULID, so a creator left out here
@@ -297,6 +320,12 @@ async fn classes_page(
 /// teacher's own room. `grade` is a free-text label for the year ("9", "10-A"),
 /// `term_id` links the school calendar, `teacher_id` names the homeroom teacher
 /// (sınıf öğretmeni, a teacher+ account); all optional.
+///
+/// If a blueprint covers the new class's grade, the class is **stocked from it
+/// at once** — the same best-effort pump `POST /classes/{id}/blueprint` runs, so
+/// a course that does not fit comes back in `skipped` and the class is created
+/// either way. `stocked_from` names the template that did it, and is `null` when
+/// none covered the grade.
 #[utoipa::path(
     post,
     path = "/",
@@ -304,7 +333,7 @@ async fn classes_page(
     security(("session_cookie" = [])),
     request_body = CreateClass,
     responses(
-        (status = 201, description = "Class created", body = ClassResponse),
+        (status = 201, description = "Class created, stocked from its grade's blueprint when one covers it", body = CreateClassResponse),
         (status = 400, description = "Invalid name or grade, an unknown term, or a teacher_id naming nobody or a non-teacher", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
@@ -316,7 +345,7 @@ async fn create_class(
     State(st): State<AppState>,
     RequireManager(user): RequireManager,
     Json(req): Json<CreateClass>,
-) -> Result<(StatusCode, Json<ClassResponse>), AppError> {
+) -> Result<(StatusCode, Json<CreateClassResponse>), AppError> {
     let name = ClassName::try_new(&req.name)?;
     let grade = grade_or_none(req.grade.as_deref())?;
     // Pre-flight only: `ClassGroup::create` claims a reference on the term
@@ -357,14 +386,52 @@ async fn create_class(
         }
         return Err(demoted);
     }
+    // Stocking runs **after** that rollback, never before: `ClassGroup::delete`
+    // refuses a class holding courses, so a section pumped first could not be
+    // rolled back and the `409` above would leave a half-created class standing
+    // behind a promise that nothing was created.
+    let stocked = stock_from_blueprint(&class, user.get_id(), &st.db).await;
     // The creator is the caller and the teacher was just read — no extra lookup.
     let mut named = vec![&user];
     named.extend(teacher.as_ref());
     let people = PersonRef::map_of(&named);
     Ok((
         StatusCode::CREATED,
-        Json(ClassResponse::new(&class, &people, true)),
+        Json(CreateClassResponse {
+            class: ClassResponse::new(&class, &people, true),
+            skipped: stocked
+                .iter()
+                .flat_map(|(_, skipped)| skipped.iter().map(SkipResponse::new))
+                .collect(),
+            stocked_from: stocked.map(|(grade, _)| grade),
+        }),
     ))
+}
+
+/// Stock a freshly created class from its grade's blueprint, if one covers it:
+/// the template's grade label and the pairs it could not place, or `None` when
+/// the class has no grade, no blueprint holds that grade, or the stocking could
+/// not be carried out.
+///
+/// Swallowing that last case is the deliberate one. Every other pump here may
+/// fail its whole request, because the caller can name what it asked for again —
+/// a blueprint's id *is* the grade label they sent. A class's id is a ULID this
+/// request is the only place it is ever returned from, so a `500` after the row
+/// is written loses a section that exists. Best-effort therefore runs to the end
+/// of this route: the class is reported, `stocked_from` stays `null`, and the
+/// retry is the idempotent `POST /classes/{id}/blueprint` — which is also the
+/// remedy when no template covers the grade, so the two need not be told apart.
+async fn stock_from_blueprint(
+    class: &ClassGroup,
+    by: &UserId,
+    db: &Database,
+) -> Option<(String, Vec<Skip>)> {
+    let grade = class.get_grade()?;
+    let blueprint = ClassBlueprint::read(&ClassBlueprintId::for_grade(grade), db)
+        .await
+        .ok()??;
+    let skipped = blueprint.apply_to(class, by, db).await.ok()?;
+    Some((blueprint.get_grade().as_str().to_string(), skipped))
 }
 
 /// List every class, newest first. Requires teacher+. Paged via `?limit=&offset=`

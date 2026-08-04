@@ -70,7 +70,7 @@ async fn a_class(app: &axum::Router, manager: &str, name: &str, members: &[&str]
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
-    let class = res.body["id"].as_str().unwrap().to_string();
+    let class = res.body["class"]["id"].as_str().unwrap().to_string();
     for user in members {
         let res = send(
             app,

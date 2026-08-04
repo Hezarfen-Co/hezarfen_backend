@@ -3172,7 +3172,9 @@ async fn a_class_seats_its_roster_and_gives_the_seat_back() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::CREATED);
-    let class = id_of(&res.json::<Value>().await.unwrap());
+    // `POST /classes` answers `{class, skipped, stocked_from}` — it stocks the
+    // new section from its grade's blueprint, and there is none here.
+    let class = id_of(&res.json::<Value>().await.unwrap()["class"]);
     let res = manager
         .post(format!("{base}/classes/{class}/members"))
         .json(&json!({ "user_id": student_id }))

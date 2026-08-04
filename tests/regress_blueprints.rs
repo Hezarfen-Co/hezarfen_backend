@@ -82,7 +82,10 @@ async fn create_class(app: &axum::Router, cookie: &str, name: &str, grade: &str)
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "create class {name}");
-    res.body["id"].as_str().expect("class id").to_string()
+    res.body["class"]["id"]
+        .as_str()
+        .expect("class id")
+        .to_string()
 }
 
 /// Register a student, put them in a class, and hand back their id.
@@ -302,6 +305,193 @@ async fn a_fresh_class_takes_its_grades_blueprint() {
     )
     .await;
     assert_eq!(none.status, StatusCode::NOT_FOUND);
+}
+
+/// The other direction of the retro-pump: a section created *after* the
+/// template exists is stocked by `POST /classes` itself, and a grade no
+/// template covers says so with `stocked_from: null` rather than being
+/// indistinguishable from a template that applied cleanly.
+#[tokio::test]
+async fn creating_a_class_stocks_it_from_its_grades_blueprint() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "mgr", "manager").await;
+    let algebra = create_course(&app, &manager, "algebra").await;
+    let physics = create_course(&app, &manager, "physics").await;
+    let made = send(
+        &app,
+        "POST",
+        "/classes/blueprints",
+        Some(&manager),
+        Some(json!({ "grade": "9", "course_ids": [algebra.clone(), physics.clone()] })),
+    )
+    .await;
+    assert_eq!(made.status, StatusCode::CREATED, "{:?}", made.body);
+
+    let res = send(
+        &app,
+        "POST",
+        "/classes",
+        Some(&manager),
+        Some(json!({ "name": "9-A", "grade": "9" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{:?}", res.body);
+    assert_eq!(
+        res.body["stocked_from"], "9",
+        "the create must name the template that stocked it: {:?}",
+        res.body
+    );
+    assert!(skips(&res).is_empty(), "{:?}", res.body);
+    let class = res.body["class"]["id"]
+        .as_str()
+        .expect("class id")
+        .to_string();
+
+    // Stored state, not the answer: the links are really there, and they carry
+    // the blueprint's tag, so a later edit or delete can take them back.
+    for course in [&algebra, &physics] {
+        assert!(attached(&class, course, &db).await, "{course} is attached");
+        assert_eq!(
+            source_of(&class, course, &db).await,
+            Some("9".to_string()),
+            "the blueprint must own what a create attached, exactly as a pump does"
+        );
+    }
+    assert_eq!(
+        counter(
+            &format!("SELECT VALUE (class_course_count ?? 0) FROM class_group:{class}"),
+            &db
+        )
+        .await,
+        2
+    );
+
+    // A class is empty at create, so this is the first place the enrollment
+    // rows the attachments owe can be seen: a member added now is enrolled into
+    // both courses, in real rows.
+    let student = student_in(&app, &db, &class, &manager, "ali").await;
+    for course in [&algebra, &physics] {
+        assert_eq!(
+            rows(
+                &format!(
+                    "SELECT VALUE id FROM enrollment WHERE course = course:{course} \
+                     AND user = user:{student}"
+                ),
+                &db
+            )
+            .await,
+            1,
+            "a stocked class enrolls its roster like any other"
+        );
+    }
+
+    // A grade no template covers, and a class with no grade at all: `null`,
+    // which is the one thing an empty `skipped` could never say.
+    for body in [
+        json!({ "name": "10-A", "grade": "10" }),
+        json!({ "name": "satranç", "grade": "" }),
+    ] {
+        let res = send(&app, "POST", "/classes", Some(&manager), Some(body)).await;
+        assert_eq!(res.status, StatusCode::CREATED, "{:?}", res.body);
+        assert!(
+            res.body["stocked_from"].is_null(),
+            "no template covers it: {:?}",
+            res.body
+        );
+        assert!(skips(&res).is_empty(), "{:?}", res.body);
+        let bare = res.body["class"]["id"].as_str().unwrap();
+        assert_eq!(
+            rows(
+                &format!("SELECT VALUE id FROM class_course WHERE class = class_group:{bare}"),
+                &db
+            )
+            .await,
+            0,
+            "nothing may be attached to a section no template reached"
+        );
+    }
+}
+
+/// A create whose stocking cannot place everything still creates the class: the
+/// pair that did not fit comes back in `skipped`, best-effort exactly like
+/// every other pump here.
+#[tokio::test]
+async fn a_create_reports_what_its_blueprint_could_not_stock() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "mgr", "manager").await;
+    let algebra = create_course(&app, &manager, "algebra").await;
+    let physics = create_course(&app, &manager, "physics").await;
+    let made = send(
+        &app,
+        "POST",
+        "/classes/blueprints",
+        Some(&manager),
+        Some(json!({ "grade": "9", "course_ids": [algebra.clone(), physics.clone()] })),
+    )
+    .await;
+    assert_eq!(made.status, StatusCode::CREATED, "{:?}", made.body);
+
+    // Delete a course out from under the template. Nothing carries it yet — no
+    // section exists at grade 9 — so this is the pair that cannot fit when the
+    // first one is created.
+    let dropped = send(
+        &app,
+        "DELETE",
+        &format!("/courses/{physics}"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(dropped.status, StatusCode::NO_CONTENT, "{:?}", dropped.body);
+
+    let res = send(
+        &app,
+        "POST",
+        "/classes",
+        Some(&manager),
+        Some(json!({ "name": "9-A", "grade": "9" })),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::CREATED,
+        "a pair that will not fit may not cost the class: {:?}",
+        res.body
+    );
+    assert_eq!(res.body["stocked_from"], "9");
+    assert_eq!(skips(&res).len(), 1, "{:?}", res.body);
+    assert_eq!(skips(&res)[0]["reason"], "course_deleted");
+    assert_eq!(skips(&res)[0]["course"], physics.as_str());
+    assert_eq!(skips(&res)[0]["class_name"], "9-A");
+
+    let class = res.body["class"]["id"]
+        .as_str()
+        .expect("class id")
+        .to_string();
+    assert_eq!(
+        rows(
+            &format!("SELECT VALUE id FROM class_group WHERE id = class_group:{class}"),
+            &db
+        )
+        .await,
+        1,
+        "the class is really there — the skip is a report, not a rollback"
+    );
+    assert!(
+        attached(&class, &algebra, &db).await,
+        "…and the course that did fit is on it"
+    );
+    assert_eq!(
+        rows(
+            &format!("SELECT VALUE id FROM class_course WHERE class = class_group:{class}"),
+            &db
+        )
+        .await,
+        1
+    );
+    // The dangling id is pruned by the run that found it, here as anywhere.
+    let read = send(&app, "GET", "/classes/blueprints/9", Some(&manager), None).await;
+    assert_eq!(read.body["courses"].as_array().unwrap().len(), 1);
 }
 
 /// The ruling that costs the most: editing the template reaches every section
@@ -674,9 +864,21 @@ async fn a_blueprint_lost_mid_attach_strands_a_row_that_stays_detachable() {
     )
     .await;
     assert_eq!(made.status, StatusCode::CREATED, "{:?}", made.body);
-    // The section comes after the template, so nothing is attached until the
-    // pump below runs.
-    let class = create_class(&app, &manager, "9-A", "9").await;
+    // The section has to reach grade 9 without being stocked on the way, so
+    // that the pump below is the *first* attach: a section created at the grade
+    // is stocked by its own create, and one that existed already was stocked by
+    // the template's. Moving it there afterwards is neither — a grade change is
+    // deliberately a blueprint no-op.
+    let class = create_class(&app, &manager, "9-A", "10").await;
+    let moved = send(
+        &app,
+        "PATCH",
+        &format!("/classes/{class}"),
+        Some(&manager),
+        Some(json!({ "grade": "9" })),
+    )
+    .await;
+    assert_eq!(moved.status, StatusCode::OK, "{:?}", moved.body);
     assert!(!attached(&class, &algebra, &db).await);
 
     // Delete the blueprint from inside the very write that attaches on its

@@ -25359,8 +25359,11 @@ async fn a_class_pumps_enrollments_and_guards_each_axis_separately() {
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED);
-    assert!(res.body["grade"].is_null(), "an empty grade is no grade");
-    let class = id_of(&res.body);
+    assert!(
+        res.body["class"]["grade"].is_null(),
+        "an empty grade is no grade"
+    );
+    let class = id_of(&res.body["class"]);
     assert_eq!(
         send(&app, "GET", "/classes", Some(&teacher), None)
             .await
@@ -25540,7 +25543,7 @@ async fn class_reads_are_staff_only_and_a_manager_manages_every_course() {
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
-    let class = id_of(&res.body);
+    let class = id_of(&res.body["class"]);
     // The student really is on this roster, so the 403s below are the gate
     // talking and not an empty database.
     let res = send(
@@ -25641,7 +25644,7 @@ async fn a_demotion_sweeps_the_class_membership_and_what_it_pumped() {
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
-    let class = id_of(&res.body);
+    let class = id_of(&res.body["class"]);
     let res = send(
         &app,
         "POST",
@@ -25793,8 +25796,8 @@ async fn a_term_a_class_points_at_refuses_to_delete() {
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
-    assert_eq!(res.body["term"].as_str(), Some(term.as_str()));
-    let class = id_of(&res.body);
+    assert_eq!(res.body["class"]["term"].as_str(), Some(term.as_str()));
+    let class = id_of(&res.body["class"]);
 
     let res = send(
         &app,
@@ -25885,7 +25888,7 @@ async fn a_course_that_cannot_seat_the_whole_class_seats_none_of_it() {
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
-    let class = id_of(&res.body);
+    let class = id_of(&res.body["class"]);
     for student in [&ali_id, &veli_id] {
         let res = send(
             &app,

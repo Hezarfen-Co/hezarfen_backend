@@ -2175,7 +2175,7 @@ async fn pre_class_enrollments_keep_their_absent_source() {
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
-    let class = common::id_of(&res.body);
+    let class = common::id_of(&res.body["class"]);
     let res = send(
         &app,
         "POST",
