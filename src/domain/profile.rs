@@ -5,6 +5,7 @@ use surrealdb::types::SurrealValue;
 
 use crate::constant::{MAX_BIO_LEN, MAX_DISPLAY_NAME_LEN, MAX_NAME_LEN};
 use crate::database::Database;
+use crate::domain::badge::{BadgeStat, BadgeStats};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
@@ -143,6 +144,7 @@ pub struct ProfileStats {
     pomodoro_focus_ms: i64,
     courses: i64,
     classes: i64,
+    totals: BadgeStats,
 }
 
 impl ProfileStats {
@@ -162,16 +164,29 @@ impl ProfileStats {
         self.classes
     }
 
-    /// One query, and only one: `courses` and `classes` arrive from the caller,
-    /// which already holds them as the `total` of the paged class and course
-    /// readers it ran for the profile's own blocks — re-counting them here
-    /// would be two extra reads for numbers already in hand.
+    /// The stored lifetime counters — the same numbers [`crate::domain::badge`]
+    /// decides an award from, so a profile read can check the shelf without a
+    /// second load of them.
+    pub fn get_totals(&self) -> &BadgeStats {
+        &self.totals
+    }
+
+    /// One round trip, and only one: `courses` and `classes` arrive from the
+    /// caller, which already holds them as the `total` of the paged class and
+    /// course readers it ran for the profile's own blocks — re-counting them
+    /// here would be two extra reads for numbers already in hand.
     ///
     /// The pomodoro aggregate rides the per-user index, so it is a lookup and
     /// not a scan. `finished_at != NONE` is the filter because NONE is falsy: a
     /// bare truthiness test would also drop a stint that finished at epoch. An
     /// open stint contributes to neither the count nor the sum — unfinished
     /// focus has no honest duration to add.
+    ///
+    /// The lifetime counters ride along as a second statement in the *same*
+    /// query rather than a [`BadgeStats::load`] call, which would be a second
+    /// round trip for one record lookup. It repeats that projection — `?? 0`
+    /// per column, because the columns are `option<int>` and a row predating
+    /// them carries none — so the two must move together if the shape changes.
     pub async fn load(
         user: &UserId,
         courses: i64,
@@ -179,17 +194,35 @@ impl ProfileStats {
         db: &Database,
     ) -> Result<ProfileStats, AppError> {
         let mut result = db
-            .query(
+            .query(format!(
                 "SELECT count() AS sessions, math::sum(finished_at - started_at) AS focus_ms
-                 FROM pomodoro_session WHERE user = $usr AND finished_at != NONE GROUP ALL",
-            )
+                 FROM pomodoro_session WHERE user = $usr AND finished_at != NONE GROUP ALL;
+                 SELECT ({homework_submitted} ?? 0) AS homework_submitted,
+                        ({homework_on_time} ?? 0) AS homework_on_time,
+                        ({exam_sat} ?? 0) AS exam_sat,
+                        ({pomodoro_finished} ?? 0) AS pomodoro_finished,
+                        ({pomodoro_focus_ms} ?? 0) AS pomodoro_focus_ms
+                 FROM $usr;",
+                homework_submitted = BadgeStat::HomeworkSubmitted.field(),
+                homework_on_time = BadgeStat::HomeworkOnTime.field(),
+                exam_sat = BadgeStat::ExamSat.field(),
+                pomodoro_finished = BadgeStat::PomodoroFinished.field(),
+                pomodoro_focus_ms = BadgeStat::PomodoroFocusMs.field(),
+            ))
             .bind(("usr", user.record()))
             .await?
             .check()?;
         // `GROUP ALL` yields no row at all when nothing matched — that is the
         // zero case, not a missing one.
         let row = result.take::<Vec<PomodoroTotals>>(0)?.into_iter().next();
+        // A vanished user row reads as five zeros, same as a fresh account.
+        let totals = result
+            .take::<Vec<BadgeStats>>(1)?
+            .into_iter()
+            .next()
+            .unwrap_or_default();
         Ok(ProfileStats {
+            totals,
             pomodoro_sessions: row.as_ref().map_or(0, |totals| totals.sessions),
             // Floored at zero: a stint stamped by a wall clock that stepped
             // backwards mid-session sums as negative time, and "you focused for
@@ -308,6 +341,38 @@ mod tests {
         // The passed-in counts survive untouched.
         assert_eq!(stats.get_courses(), 3);
         assert_eq!(stats.get_classes(), 1);
+        // No user row at all — the lifetime counters still read as zeros.
+        assert_eq!(stats.get_totals().get_homework_submitted(), 0);
+        assert_eq!(stats.get_totals().get_pomodoro_focus_ms(), 0);
+    }
+
+    /// The second statement of the same query: the stored counters, straight off
+    /// the user row, with the columns an older row is missing read as zero.
+    #[tokio::test]
+    async fn lifetime_totals_ride_the_same_query() {
+        let db = crate::database::init_mem().await.unwrap();
+        let user = UserId::from_key(&ulid::Ulid::new().to_string());
+        db.query(format!(
+            "CREATE $usr SET username = $name, password_hash = 'x',
+                 {} = 4, {} = 3",
+            crate::constant::HOMEWORK_SUBMITTED_TOTAL_FIELD,
+            crate::constant::EXAM_SAT_TOTAL_FIELD,
+        ))
+        .bind(("usr", user.record()))
+        .bind(("name", user.key().to_string()))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+        let totals = ProfileStats::load(&user, 0, 0, &db).await.unwrap();
+        let totals = totals.get_totals();
+        assert_eq!(totals.get_homework_submitted(), 4);
+        assert_eq!(totals.get_exam_sat(), 3);
+        // Never written on this row: absent must read as 0, not as an error.
+        assert_eq!(totals.get_homework_on_time(), 0);
+        assert_eq!(totals.get_pomodoro_finished(), 0);
+        assert_eq!(totals.get_pomodoro_focus_ms(), 0);
     }
 
     #[tokio::test]

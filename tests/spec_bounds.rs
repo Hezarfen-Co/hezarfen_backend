@@ -1045,6 +1045,40 @@ fn expectations_cover_every_annotation() {
     );
 }
 
+/// README.md quotes how many bounds this suite checks — a hand-kept copy of
+/// [`expectations`]`.len()`, and one that had already gone stale twice before
+/// anything watched it. This is that watcher.
+#[test]
+fn the_readme_states_the_real_bound_count() {
+    // Anchored on the sentence itself, not a line number or a loose digit
+    // scan: the README is 73KB and full of other numbers.
+    const ANCHOR: &str = "`tests/spec_bounds.rs` builds the OpenAPI document, reads all ";
+    let readme = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
+        .expect("read README.md");
+    let at = readme.find(ANCHOR).unwrap_or_else(|| {
+        panic!(
+            "README.md no longer contains the sentence this test reads:\n  \"{ANCHOR}…\"\n\n\
+             It states how many published bounds this suite checks ({} today). Restore that \
+             wording, or move the count and re-anchor this test on its new phrasing.",
+            expectations().len()
+        )
+    });
+    let stated: String = readme[at + ANCHOR.len()..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+
+    assert_eq!(
+        stated.parse::<usize>().ok(),
+        Some(expectations().len()),
+        "README.md says this suite checks {stated:?} published bounds, but the expectations \
+         table has {} rows.\n\nEdit README.md so that sentence reads \"reads all {} published \
+         bounds\" — the table is the truth, the README is the copy.",
+        expectations().len(),
+        expectations().len()
+    );
+}
+
 /// The three image-meta bodies — exam question images, bank template images,
 /// and pool question/solution photos — are hand-kept copies of one shape,
 /// `{content_type, size}`. The write half behind them is shared

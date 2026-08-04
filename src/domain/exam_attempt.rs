@@ -1,12 +1,12 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
-use crate::constant::EXAM_ATTEMPT_TABLE;
+use crate::constant::{EXAM_ATTEMPT_TABLE, EXAM_SAT_TOTAL_FIELD};
 use crate::database::{Database, transaction_with_retry};
 use crate::domain::exam::Exam;
 use crate::domain::exam::ExamId;
-use crate::domain::key;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
+use crate::domain::{badge, cap, key};
 use crate::error::AppError;
 
 /// The `THROW` marker the freeze gate aborts with, and the one 409 both it and
@@ -163,6 +163,11 @@ impl ExamAttempt {
     /// The composite id makes each create atomic; a concurrent double-start
     /// races on the same seq, loses to the unique id, and reads the winner's
     /// row.
+    ///
+    /// A created row rides [`cap::claim_and_create`] so the student's
+    /// `exam_sat_total` moves in the same transaction — one per sitting,
+    /// retakes included, which is exactly what the one-time backfill counted.
+    /// A lost race writes neither the row nor the increment.
     pub async fn start(
         exam: &Exam,
         user: &UserId,
@@ -192,23 +197,45 @@ impl ExamAttempt {
             finished_at: None,
             left_at: None,
         };
-        let created: Result<Option<ExamAttempt>, surrealdb::Error> =
-            db.create(attempt.id.record()).content(attempt).await;
-        match created {
-            Ok(Some(created)) => Ok((created, true)),
-            Ok(None) => Err(AppError::Internal("failed to start exam attempt".into())),
+        let id = attempt.id.record();
+        match cap::claim_and_create(
+            &user.record(),
+            EXAM_SAT_TOTAL_FIELD,
+            cap::UNLIMITED,
+            &id,
+            &attempt,
+            db,
+        )
+        .await?
+        {
+            cap::Claimed::Made(created) => {
+                if let Err(err) = badge::sync(user, db).await {
+                    tracing::warn!("failed to sync badges for {}: {err}", user.key());
+                }
+                Ok((created, true))
+            }
             // Only a still-running row proves the loss was a double-start
             // collision (the winner's fresh sitting); a terminal or missing
             // latest means the create genuinely failed — surface that instead
-            // of passing a finished sitting off as a resume.
-            Err(err) => match Self::read_latest_for_user(exam.get_id(), user, db).await? {
-                Some(existing)
-                    if existing.status(exam, Timestamp::now()) == AttemptStatus::InProgress =>
-                {
-                    Ok((existing, false))
+            // of passing a finished sitting off as a resume. The duplicate
+            // aborted the transaction, so the loser's increment went with it.
+            cap::Claimed::Duplicate => {
+                match Self::read_latest_for_user(exam.get_id(), user, db).await? {
+                    Some(existing)
+                        if existing.status(exam, Timestamp::now()) == AttemptStatus::InProgress =>
+                    {
+                        Ok((existing, false))
+                    }
+                    _ => Err(AppError::Internal("failed to start exam attempt".into())),
                 }
-                _ => Err(err.into()),
-            },
+            }
+            // Nothing caps sittings, so the conditional write can only miss by
+            // finding no user row — not a state a live session can reach, and
+            // passing it off as a resume would hand out a sitting the counter
+            // never learned about.
+            cap::Claimed::Full => Err(AppError::Internal(
+                "cannot start an exam attempt: the student's account row is missing".into(),
+            )),
         }
     }
 
@@ -519,15 +546,122 @@ mod tests {
         (exam, question)
     }
 
-    fn student() -> UserId {
-        UserId::from_key("01TESTSTUDENTAAAAAAAAAAAAA")
+    /// A real user row: the sitting counter lives on it, and the claim that
+    /// rides the attempt's create has nothing to write to without one.
+    async fn student(db: &Database) -> UserId {
+        let hash = crate::domain::user::Password::try_new("secret1")
+            .unwrap()
+            .hash_async()
+            .await
+            .unwrap();
+        crate::domain::user::User::create(
+            crate::domain::user::Username::try_new("ogrenci").unwrap(),
+            hash,
+            db,
+        )
+        .await
+        .unwrap()
+        .get_id()
+        .clone()
+    }
+
+    /// The student's lifetime sitting count, absent reading as zero.
+    async fn sat_total(user: &UserId, db: &Database) -> i64 {
+        let mut result = db
+            .query(format!(
+                "SELECT VALUE ({EXAM_SAT_TOTAL_FIELD} ?? 0) FROM $usr"
+            ))
+            .bind(("usr", user.record()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        result
+            .take::<Vec<i64>>(0)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+    }
+
+    /// The badge counter counts *sittings*, one per created row — so a start
+    /// moves it by exactly one and a resume, which creates nothing, leaves it
+    /// alone. Anything else and a seeded account and a fresh one would mean
+    /// different things by the same number.
+    #[tokio::test]
+    async fn starting_counts_one_sitting_and_resuming_counts_none() {
+        let db = init_mem().await.unwrap();
+        let (exam, _question) = open_exam_with_question(&db, 2).await;
+        let user = student(&db).await;
+        assert_eq!(sat_total(&user, &db).await, 0, "a fresh row reads as zero");
+
+        let (_, created) = ExamAttempt::start(&exam, &user, &db).await.unwrap();
+        assert!(created);
+        assert_eq!(sat_total(&user, &db).await, 1);
+
+        // Still in progress: this start returns the running sitting untouched.
+        let (_, created) = ExamAttempt::start(&exam, &user, &db).await.unwrap();
+        assert!(!created);
+        assert_eq!(
+            sat_total(&user, &db).await,
+            1,
+            "a resume writes no row, so it counts nothing"
+        );
+    }
+
+    /// The backfill counted every `seq`, retakes included — a second sitting
+    /// is a second row and moves the counter again.
+    #[tokio::test]
+    async fn a_retake_counts_as_another_sitting() {
+        let db = init_mem().await.unwrap();
+        let (exam, _question) = open_exam_with_question(&db, 3).await;
+        let user = student(&db).await;
+
+        let (first, _) = ExamAttempt::start(&exam, &user, &db).await.unwrap();
+        first.finish(&db).await.unwrap();
+        let (second, created) = ExamAttempt::start(&exam, &user, &db).await.unwrap();
+        assert!(created);
+        assert_eq!(second.get_seq(), 2);
+        assert_eq!(sat_total(&user, &db).await, 2);
+    }
+
+    /// The lost half of a double-start race. `start` can only reach that branch
+    /// by interleaving with a rival, so the claim is put to the counter
+    /// directly — the same call `start` makes, aimed at a row that already
+    /// exists. The duplicate aborts the transaction and takes its increment
+    /// with it: a sitting is never counted twice.
+    #[tokio::test]
+    async fn a_lost_start_race_never_counts_the_sitting_twice() {
+        let db = init_mem().await.unwrap();
+        let (exam, _question) = open_exam_with_question(&db, 1).await;
+        let user = student(&db).await;
+
+        let (winner, _) = ExamAttempt::start(&exam, &user, &db).await.unwrap();
+        assert_eq!(sat_total(&user, &db).await, 1);
+
+        let claimed = cap::claim_and_create(
+            &user.record(),
+            EXAM_SAT_TOTAL_FIELD,
+            cap::UNLIMITED,
+            &winner.id.record(),
+            &winner,
+            &db,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(claimed, cap::Claimed::Duplicate));
+        assert_eq!(
+            sat_total(&user, &db).await,
+            1,
+            "the loser's increment rolled back with its duplicate create"
+        );
     }
 
     #[tokio::test]
     async fn a_retake_preserves_the_prior_sittings_sheet() {
         let db = init_mem().await.unwrap();
         let (exam, question) = open_exam_with_question(&db, 2).await;
-        let user = student();
+        let user = student(&db).await;
 
         let (first, created) = ExamAttempt::start(&exam, &user, &db).await.unwrap();
         assert!(created);
@@ -565,7 +699,7 @@ mod tests {
     async fn a_lost_retake_race_cannot_touch_the_winners_sheet() {
         let db = init_mem().await.unwrap();
         let (exam, question) = open_exam_with_question(&db, 3).await;
-        let user = student();
+        let user = student(&db).await;
 
         // Sitting #1 ends; the winner starts sitting #2 and saves an answer.
         let (first, _) = ExamAttempt::start(&exam, &user, &db).await.unwrap();
@@ -618,7 +752,7 @@ mod tests {
     async fn submitting_never_reverts_a_walk_out_that_raced_it() {
         let db = init_mem().await.unwrap();
         let (exam, _question) = open_exam_with_question(&db, 1).await;
-        let user = student();
+        let user = student(&db).await;
 
         let (attempt, _) = ExamAttempt::start(&exam, &user, &db).await.unwrap();
 
@@ -661,7 +795,7 @@ mod tests {
     async fn stamping_left_never_reverts_a_submission() {
         let db = init_mem().await.unwrap();
         let (exam, _question) = open_exam_with_question(&db, 1).await;
-        let user = student();
+        let user = student(&db).await;
 
         // The student is sitting the exam.
         let (attempt, _) = ExamAttempt::start(&exam, &user, &db).await.unwrap();

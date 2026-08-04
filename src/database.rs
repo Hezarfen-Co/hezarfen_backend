@@ -581,6 +581,183 @@ mod tests {
         assert_eq!(writes(&db).await, vec![2]);
     }
 
+    /// Stale-data path for the 2026-08-04 badge counters. Every account on an
+    /// existing volume predates the columns, and a badge is decided off the
+    /// stored total — so a zero start would not lose a number, it would
+    /// permanently mis-award the student who really did the work. Boot seeds the
+    /// counters from the rows that exist, exactly once.
+    #[tokio::test]
+    async fn the_badge_counters_are_seeded_from_history_exactly_once() {
+        let db = super::init_mem().await.unwrap();
+        db.query(
+            "CREATE user:a SET username = 'a', password_hash = 'x', role = 'student';
+             CREATE user:b SET username = 'b', password_hash = 'x', role = 'student';
+             CREATE user:c SET username = 'c', password_hash = 'x', role = 'student';
+             CREATE homework:h SET course = course:c, subject = subject:s, title = 'H',
+                 due_at = 100, created_by = user:a, created_at = 1;
+             -- Three on time (the equal case counts as on time) and one whose
+             -- homework was deleted out from under it: that last one is
+             -- submitted but not on time, because the traversal yields nothing.
+             CREATE homework_submission:s1 SET homework = homework:h, user = user:a,
+                 submitted_at = 50, updated_at = 50;
+             CREATE homework_submission:s2 SET homework = homework:h, user = user:a,
+                 submitted_at = 60, updated_at = 100;
+             -- Handed in before the deadline, then edited well after it — a
+             -- `touch()` from a single file add does this. On time, because the
+             -- live path credits the hand-in and debits by `submitted_at`; if
+             -- the seed judged this one by `updated_at` a later withdrawal
+             -- would decrement a credit that was never given.
+             CREATE homework_submission:s3 SET homework = homework:h, user = user:a,
+                 submitted_at = 70, updated_at = 200;
+             CREATE homework_submission:s4 SET homework = homework:gone, user = user:a,
+                 submitted_at = 80, updated_at = 1;
+             CREATE exam_attempt:e1 SET exam = exam:x, user = user:a, seq = 1, started_at = 1;
+             CREATE exam_attempt:e2 SET exam = exam:y, user = user:a, seq = 1, started_at = 2;
+             -- Two finished stints and one still open, which counts for neither.
+             CREATE pomodoro_session:p1 SET user = user:a, started_at = 1000, finished_at = 2000;
+             CREATE pomodoro_session:p2 SET user = user:a, started_at = 5000, finished_at = 7500;
+             CREATE pomodoro_session:p3 SET user = user:a, started_at = 9000;
+             -- One real stint beside one written with a backwards clock. The
+             -- floor is per row, like the live close, so the negative one
+             -- contributes zero and the real 1000ms survives; flooring the
+             -- per-user sum instead would seed 0 and lose the real stint.
+             CREATE pomodoro_session:p4 SET user = user:c, started_at = 0, finished_at = 1000;
+             CREATE pomodoro_session:p5 SET user = user:c, started_at = 9000, finished_at = 3000;
+             DELETE migration_mark:profile_counters;",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+        // `init_mem` boots a *migrated* database, so the seed is already marked
+        // done on an empty store — which is right, and is exactly why the mark is
+        // dropped here: a volume written before the columns existed carries
+        // history and no mark at all, and that is the state under test.
+        // A write probe on the table being seeded: the event fires *inside* the
+        // UPDATE, so it counts real writes rather than trusting a re-read.
+        db.query(
+            "DEFINE TABLE user_write_probe SCHEMALESS;
+             DEFINE EVENT user_write ON user WHEN $event = 'UPDATE' THEN {
+                 UPSERT type::record('user_write_probe', 'n') SET n = (n ?? 0) + 1;
+             };",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+        super::migrate(&db).await.unwrap();
+
+        async fn counters(db: &super::Database) -> Vec<(i64, i64, i64, i64, i64)> {
+            let mut rows = db
+                .query(
+                    "SELECT VALUE [homework_submitted_total, homework_on_time_total,
+                                   exam_sat_total, pomodoro_finished_total,
+                                   pomodoro_focus_ms_total]
+                     FROM user ORDER BY id",
+                )
+                .await
+                .unwrap();
+            rows.take::<Vec<Vec<i64>>>(0)
+                .unwrap()
+                .into_iter()
+                .map(|row| (row[0], row[1], row[2], row[3], row[4]))
+                .collect()
+        }
+        let after_first = counters(&db).await;
+        // `a`, `b`, `c` by id. `b` has no history at all and reads as a fresh
+        // account; `c` keeps the 1000ms real stint the -6000ms one sits beside.
+        assert_eq!(
+            after_first,
+            vec![(4, 3, 2, 2, 3500), (0, 0, 0, 0, 0), (0, 0, 0, 2, 1000)],
+            "{after_first:?}"
+        );
+
+        // The seed also stamps each submission with the verdict it was counted
+        // under, because `due_at` is mutable: a withdrawal after the teacher
+        // moves the deadline must debit what was credited, not what the
+        // deadline says by then. Asserted through `WHERE` rather than read back
+        // as a column, so an unstamped row would show up as belonging to
+        // neither set instead of deserializing as some default.
+        async fn stamped(db: &super::Database, cond: &str) -> Vec<String> {
+            let mut rows = db
+                .query(format!(
+                    "SELECT VALUE record::id(id) FROM homework_submission
+                     WHERE {cond} ORDER BY id"
+                ))
+                .await
+                .unwrap();
+            rows.take(0).unwrap()
+        }
+        // s1/s2/s3 beat the deadline (50, 60, 70 vs 100). s4 hangs off a
+        // deleted homework, so `submitted_at <= homework.due_at` compares
+        // against NONE and lands on `false` — which is exactly what the count
+        // above credited it as, so the stamp agrees with the counter rather
+        // than leaving the row to a fallback that could later disagree.
+        assert_eq!(
+            stamped(&db, "counted_on_time = true").await,
+            ["s1", "s2", "s3"]
+        );
+        assert_eq!(stamped(&db, "counted_on_time = false").await, ["s4"]);
+
+        async fn writes(db: &super::Database) -> Vec<i64> {
+            let mut rows = db
+                .query("SELECT VALUE n FROM user_write_probe:n")
+                .await
+                .unwrap();
+            rows.take(0).unwrap()
+        }
+        let first_writes = writes(&db).await;
+        // Pinned non-zero, not just compared: "the second pass wrote nothing"
+        // would hold vacuously if the probe itself stopped firing, and then the
+        // test would pass on a seed that never ran.
+        assert!(
+            matches!(first_writes.as_slice(), [n] if *n > 0),
+            "{first_writes:?}"
+        );
+
+        // The second boot: every boot runs the backfill, and a recount here
+        // would not converge the way the counters above it do — these columns
+        // are maintained by the request path from now on, so a second pass would
+        // overwrite everything earned since. It must not write at all…
+        super::migrate(&db).await.unwrap();
+        assert_eq!(counters(&db).await, after_first);
+        assert_eq!(
+            writes(&db).await,
+            first_writes,
+            "the second pass wrote nothing"
+        );
+
+        // …and it must not *look*, either, which is the whole point of the mark:
+        // writing nothing is not the same as scanning nothing. A submission that
+        // lands after the mark is the probe — its counter stays where the request
+        // path left it, which no recomputing backfill could produce.
+        let mut mark = db
+            .query("SELECT VALUE done_at FROM migration_mark:profile_counters")
+            .await
+            .unwrap();
+        assert_eq!(
+            mark.take::<Vec<i64>>(0).unwrap().len(),
+            1,
+            "the seed marks itself finished"
+        );
+        db.query(
+            "CREATE homework_submission:late SET homework = homework:h, user = user:b,
+                 submitted_at = 90, updated_at = 90;",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+        super::migrate(&db).await.unwrap();
+        assert_eq!(
+            counters(&db).await,
+            after_first,
+            "a marked database skips the seed entirely"
+        );
+        assert_eq!(writes(&db).await, first_writes);
+    }
+
     #[tokio::test]
     async fn the_retired_claim_columns_are_dropped_off_a_live_row() {
         // Stale-data path for the 2026-07-30 removal of the chat claim queue.

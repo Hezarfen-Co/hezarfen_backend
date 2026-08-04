@@ -12,6 +12,7 @@ use crate::constant::{
     MAX_MAX_FILE_BYTES, MAX_PROFILE_CLASSES, MAX_PROFILE_COURSES, UPLOAD_BODY_OVERHEAD_BYTES,
 };
 use crate::database::Database;
+use crate::domain::badge::{self, BadgeAward};
 use crate::domain::class_group::{ClassGroup, ClassGroupId};
 use crate::domain::class_member::ClassMember;
 use crate::domain::course::Course;
@@ -689,7 +690,24 @@ struct ProfileResponse {
     /// block, the owner and manager+ see it whole. The full list is at
     /// `GET /courses/me`.
     courses: Vec<ProfileCourseRef>,
+    /// Every badge this account has earned, oldest first. Ids and stamps only —
+    /// the label and the icon are the client's, keyed by id off the `badges`
+    /// catalog at `GET /limits`.
+    badges: Vec<ProfileBadge>,
     stats: ProfileStatsResponse,
+}
+
+/// One earned badge. Permanent: once it appears here it never leaves, even if
+/// the counter behind it falls back below the threshold that earned it.
+#[derive(Serialize, ToSchema)]
+struct ProfileBadge {
+    /// A catalog id from `GET /limits` — `badges.catalog[].id`.
+    #[schema(example = "pomodoro_finished_10")]
+    id: String,
+    /// When it was *first* earned, UTC unix-milliseconds. Later syncs never
+    /// move it.
+    #[schema(example = 1_759_000_000_000_i64)]
+    earned_at: i64,
 }
 
 /// What a stored avatar is, without its bytes.
@@ -729,6 +747,14 @@ struct ProfileCourseRef {
 
 /// The motivational counters. Derived, never settable, and never `null`: an
 /// account with no rows behind a counter reads a true `0`.
+///
+/// Two kinds live here. The first four are **computed at read time** from the
+/// rows that exist right now, so deleting the rows moves them down. The five
+/// `*_total` ones are **stored lifetime counters**, incremented as the work
+/// happens and never recomputed — they can therefore outlive the rows behind
+/// them (an exam deleted by its teacher still counts as sat), which is exactly
+/// why a badge earned off them stays earned. Each is named for a `stat` of the
+/// badge catalog at `GET /limits`, plus `_total`.
 #[derive(Serialize, ToSchema)]
 struct ProfileStatsResponse {
     /// Finished pomodoro stints; an open one counts for nothing.
@@ -739,6 +765,18 @@ struct ProfileStatsResponse {
     courses: i64,
     /// Every class behind the `classes` block, not just the embedded window.
     classes: i64,
+    /// Lifetime homework hand-ins. Withdrawing a submission gives one back;
+    /// editing one moves nothing.
+    homework_submitted_total: i64,
+    /// Lifetime hand-ins made before their deadline, judged at hand-in.
+    homework_on_time_total: i64,
+    /// Lifetime exam sittings, counted once per attempt — retakes included, and
+    /// deleting the exam does not take them back.
+    exam_sat_total: i64,
+    /// Lifetime finished pomodoro stints.
+    pomodoro_finished_total: i64,
+    /// Lifetime focused milliseconds.
+    pomodoro_focus_ms_total: i64,
 }
 
 /// Build one profile as `viewer` may see it. The course block is chosen off the
@@ -796,6 +834,7 @@ async fn profile_of(
     // Both totals are the full counts, not the windowed ones — the blocks are a
     // preview, the stats are the truth.
     let stats = ProfileStats::load(id, course_total, class_total, &st.db).await?;
+    let badges = badges_of(st, id, &stats).await?;
     Ok(ProfileResponse {
         id: id.key().to_string(),
         username: user.get_username().as_str().to_string(),
@@ -828,13 +867,59 @@ async fn profile_of(
                 kind: course.get_kind().as_str().to_string(),
             })
             .collect(),
+        badges: badges
+            .iter()
+            .map(|award| ProfileBadge {
+                id: award.get_badge().to_string(),
+                earned_at: award.get_earned_at().as_millis(),
+            })
+            .collect(),
         stats: ProfileStatsResponse {
             pomodoro_sessions: stats.get_pomodoro_sessions(),
             pomodoro_focus_ms: stats.get_pomodoro_focus_ms(),
             courses: stats.get_courses(),
             classes: stats.get_classes(),
+            homework_submitted_total: stats.get_totals().get_homework_submitted(),
+            homework_on_time_total: stats.get_totals().get_homework_on_time(),
+            exam_sat_total: stats.get_totals().get_exam_sat(),
+            pomodoro_finished_total: stats.get_totals().get_pomodoro_finished(),
+            pomodoro_focus_ms_total: stats.get_totals().get_pomodoro_focus_ms(),
         },
     })
+}
+
+/// The owner's earned badges, and the backstop that keeps them honest.
+///
+/// Every write that moves a counter syncs the badges behind it, so in the
+/// steady state the earned set holds nothing the award rows do not already
+/// carry and this is one read and **no write at all**. Only a threshold crossed
+/// by a path whose sync was lost — a transient database error, which those
+/// callers log and swallow on purpose — leaves a gap, and that heals here on
+/// the next profile read of that account.
+///
+/// Nothing here revokes: [`badge::sync`] only ever adds, so a counter that has
+/// since fallen back below its threshold leaves the badge standing. The sync's
+/// own error is logged and dropped, and the awards already read are served —
+/// a decoration may not fail the profile it decorates.
+async fn badges_of(
+    st: &AppState,
+    user: &UserId,
+    stats: &ProfileStats,
+) -> Result<Vec<BadgeAward>, AppError> {
+    let awards = BadgeAward::list_for(user, &st.db).await?;
+    let complete = badge::earned(stats.get_totals())
+        .iter()
+        .all(|id| awards.iter().any(|award| award.get_badge() == *id));
+    if complete {
+        return Ok(awards);
+    }
+    if let Err(err) = badge::sync(user, &st.db).await {
+        tracing::warn!("failed to sync badges for {}: {err}", user.key());
+        return Ok(awards);
+    }
+    // Re-read so the badge just healed appears on *this* response, stamp and
+    // all, rather than only on the next one.
+    BadgeAward::list_for(user, &st.db).await
 }
 
 /// The profile gate: any authenticated account reads any profile — except a
@@ -878,7 +963,9 @@ async fn my_profile(
 }
 
 /// One user's public profile: display name, bio, avatar meta, their class and
-/// course blocks, and the motivational counters. Readable by every
+/// course blocks, the badges they have earned, and the motivational counters.
+/// Badges carry an id and the instant they were first earned; their labels and
+/// icons come from the `badges` catalog at `GET /limits`. Readable by every
 /// authenticated account — except a parent, who reads only their own and their
 /// linked students'. Never carries email, phone, or birth date; those stay on
 /// `GET /users/{id}` (admin) and `GET /auth/me`. The embedded blocks are capped
