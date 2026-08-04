@@ -239,7 +239,8 @@ impl ClassCourse {
 mod tests {
     use super::*;
     use crate::domain::class_member::ClassMember;
-    use crate::domain::class_member::tests::{a_class, a_course, counter, rows, source_of};
+    use crate::domain::class_member::tests::{a_class, a_course, counter, exists, rows, source_of};
+    use crate::domain::course::Course;
     use crate::domain::enrollment::Enrollment;
 
     /// Attaching seeds the course from the roster the class already holds.
@@ -460,5 +461,120 @@ mod tests {
         ClassMember::remove(&second, &student, &db).await.unwrap();
         assert_eq!(source_of(&algebra, &student, &db).await, None);
         assert_eq!(counter("enrollment_count", algebra.record(), &db).await, 0);
+    }
+
+    /// The restore half of the pivot claim: it bumps the course's counter to
+    /// prove the row is there and must put it back *exactly* as it found it —
+    /// absent, which the boot backfill keys on (`WHERE enrollment_count =
+    /// NONE`). An empty roster is the case that has no seat write to hide a
+    /// leftover bump behind.
+    #[tokio::test]
+    async fn the_pivot_claim_gives_the_courses_counter_back_untouched() {
+        let db = crate::database::init_mem().await.unwrap();
+        let class = a_class("9-A", &db).await;
+        let algebra = a_course("algebra", None, &db).await;
+        let absent = "SELECT VALUE id FROM course WHERE enrollment_count = NONE";
+        assert_eq!(
+            rows(absent, &db).await,
+            1,
+            "a fresh course carries no count"
+        );
+
+        ClassCourse::attach(&class, &algebra, &UserId::from_key("manager"), &db)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows(absent, &db).await,
+            1,
+            "the claim's bump must be restored to absent, not to 0"
+        );
+    }
+
+    /// The `Menu::delete` defect on the class layer: a `class_course` row must
+    /// not outlive the course it names. The attach's proof that the course is
+    /// still there is a *write* on the course row
+    /// ([`crate::domain::class_pump::Axis::pivot_claim`]), landing it on the
+    /// very key `Course::delete`'s guard writes — but only because that write
+    /// now *moves* the counter. The `count = count` this shipped with left the
+    /// document unchanged, which SurrealDB 3.2.3 elides: it entered no write
+    /// set, collided with nothing, and both callers were told OK while the link
+    /// stayed pointing at a deleted course.
+    ///
+    /// The roster is empty deliberately — that is the only shape where nothing
+    /// else in the transaction touches the course row, so the claim is the
+    /// whole guard. One child per round, for the reason the menu twin
+    /// documents: a second writer makes the delete lose and re-send, and the
+    /// re-sent sweep clears the evidence.
+    ///
+    /// The window is opened by the schema, not by a lucky interleaving: a
+    /// `DEFINE EVENT` on `course` fires inside the delete's own transaction the
+    /// instant the row goes, so the `SLEEP` lands between the delete and its
+    /// `DELETE class_course WHERE course = $course` sweep every time.
+    ///
+    /// Real server, and `#[ignore]`d for it: the subject *is* the store's
+    /// conflict detection, which `init_mem`'s embedded engine does not have —
+    /// it commits both and answers `Ok` to each, so this passes there on broken
+    /// code.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
+    async fn a_class_course_link_never_outlives_the_course() {
+        let (db, _serialized) = crate::database::init_test_server("class_course_race").await;
+        db.query(
+            "DEFINE EVENT hold_the_window ON TABLE course WHEN $event = 'DELETE' \
+             THEN { SLEEP 1s; };",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+        let manager = UserId::from_key("manager");
+        let (mut orphans, mut swept, mut miscounted) = (0, 0, 0);
+        for round in 0..4 {
+            let class = a_class(&format!("9-{round}"), &db).await;
+            let algebra = a_course(&format!("algebra{round}"), None, &db).await;
+            let course = Course::read(&algebra, &db).await.unwrap().unwrap();
+
+            let drop_it = {
+                let db = db.clone();
+                tokio::spawn(async move { course.delete(&db).await })
+            };
+            // The attach starts inside the held window — the course row is gone
+            // but uncommitted, which is exactly what a course read believes.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let child = {
+                let (db, class, algebra, manager) =
+                    (db.clone(), class.clone(), algebra.clone(), manager.clone());
+                tokio::spawn(
+                    async move { ClassCourse::attach(&class, &algebra, &manager, &db).await },
+                )
+            };
+            let (drop_it, child) = (drop_it.await.unwrap(), child.await.unwrap());
+            // A 404 for the attach, or a refusal for the delete, is a correct
+            // answer — the only defect is stored state.
+            assert!(
+                !matches!(child, Err(AppError::Db(_))),
+                "round {round}: a raced attach must be answered, not 500: {child:?}"
+            );
+
+            // Stored state is the whole verdict; a return value is not evidence.
+            if !exists(algebra.record(), &db).await {
+                swept += 1;
+                let link = ClassCourseId::composite(&class, &algebra);
+                if exists(link.record(), &db).await {
+                    orphans += 1;
+                }
+                miscounted += counter("class_course_count", class.record(), &db).await;
+            } else if matches!(drop_it, Ok(true)) {
+                panic!("round {round}: the delete reported success but the course is still there");
+            }
+        }
+        eprintln!("Course::delete raced by an attach: {swept}/4 rounds deleted the course");
+        assert!(
+            swept > 0,
+            "no round ever deleted the course, so the window was never reached"
+        );
+        assert_eq!(orphans, 0, "a class_course link outlived its course");
+        assert_eq!(miscounted, 0, "a class counts a course that is gone");
     }
 }
