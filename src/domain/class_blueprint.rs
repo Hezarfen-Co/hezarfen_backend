@@ -167,10 +167,14 @@ struct Held {
 /// blueprint asks for, so re-running a pump must report nothing — while a *hand*
 /// attach's duplicate is a genuine refusal (`duplicate`), because that call
 /// asked for the row and did not get it.
+///
+/// Always the course axis: a pump attaches courses to sections, so the two
+/// ceiling codes are read on that side ([`Attached::refusal_code`] takes the
+/// axis because they differ per axis).
 fn skip_reason(landed: &Attached<ClassCourse>) -> Option<&'static str> {
     match landed {
         Attached::Duplicate => None,
-        other => other.refusal_code(),
+        other => other.refusal_code(&Axis::Course),
     }
 }
 
@@ -1100,7 +1104,7 @@ mod tests {
         // row — the arm itself is the only thing to check for it.
         assert!(skip_reason(&Attached::Duplicate).is_none());
         assert_eq!(
-            Attached::<ClassCourse>::Duplicate.refusal_code(),
+            Attached::<ClassCourse>::Duplicate.refusal_code(&Axis::Course),
             Some("duplicate"),
             "a hand attach's duplicate is a refusal even though a pump's is not"
         );
@@ -1122,9 +1126,49 @@ mod tests {
                 "{refusal:?} must be reported as its own code, not swallowed or reworded"
             );
             assert_eq!(
-                refusal.refusal_code(),
+                refusal.refusal_code(&Axis::Course),
                 skip_reason(&refusal),
                 "{refusal:?} must read the same on a manual 409 as in a pump's skip list"
+            );
+        }
+    }
+
+    /// The two ceiling refusals mean the *opposite* ceiling on the two axes —
+    /// `ClassFull` is the axis being attached, `ClassOverloaded` the other one —
+    /// so the member add's pair must be the member add's own, and a code that
+    /// reads the same on both axes is the bug this pins: the roster being full
+    /// was published as `class_at_course_ceiling`.
+    #[test]
+    fn each_axis_names_the_ceiling_it_actually_hit() {
+        for (refusal, course_axis, member_axis) in [
+            (
+                Attached::<ClassCourse>::ClassFull,
+                "class_at_course_ceiling",
+                "class_at_roster_ceiling",
+            ),
+            (
+                Attached::ClassOverloaded,
+                "class_roster_too_large",
+                "class_course_list_too_large",
+            ),
+        ] {
+            assert_eq!(refusal.refusal_code(&Axis::Course), Some(course_axis));
+            assert_eq!(refusal.refusal_code(&Axis::Member), Some(member_axis));
+        }
+        // Every other code is axis-free, and must stay that way: they name a
+        // record, not a ceiling.
+        for refusal in [
+            Attached::<ClassCourse>::Duplicate,
+            Attached::Gone,
+            Attached::PivotGone,
+            Attached::Full("course:algebra".into()),
+            Attached::CourseGone("course:algebra".into()),
+            Attached::SourceGone,
+        ] {
+            assert_eq!(
+                refusal.refusal_code(&Axis::Course),
+                refusal.refusal_code(&Axis::Member),
+                "{refusal:?} names a record, so it must read the same on both axes"
             );
         }
     }

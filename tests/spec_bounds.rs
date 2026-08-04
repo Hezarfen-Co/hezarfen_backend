@@ -1123,27 +1123,100 @@ async fn the_image_meta_bodies_stay_the_same_shape() {
 
 /// The class refusal codes are a **published** vocabulary: a blueprint pump
 /// reports them as a skip `reason`, and the two manual attach routes answer
-/// them as the `code` on their `409`. A client branches on them, so a code the
-/// spec never names is one nobody can build against — this asserts the emitted
-/// document still spells every one of them, wherever it does it.
+/// them as the `code` on their `409`. A client branches on them *per route*,
+/// and the two ceiling codes are not the same on the two attach axes — a full
+/// roster and a full course list are different refusals — so this asserts each
+/// route's `409` names **exactly** its own set, and that the whole vocabulary
+/// is accounted for on the `SkipResponse.reason` field that documents it.
+///
+/// Anywhere-in-the-document containment was the earlier shape and could not
+/// fail: `course_full` survived as a `#[schema(example)]` and `duplicate` in
+/// prose, so a code dropped from a `409` description, moved to the wrong route
+/// or added undocumented all passed.
 #[tokio::test]
 async fn the_class_refusal_codes_stay_published() {
     let spec = spec().await;
-    let text = spec.to_string();
-    for code in [
-        "duplicate",
+
+    // Every backticked snake_case word in a description, minus the terms that
+    // are not codes — so a code added to (or moved into) a description shows up
+    // here without the test being told about it.
+    let quoted = |text: &str| -> Vec<String> {
+        text.split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|word| {
+                word.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+                    && !matches!(*word, "code" | "max_class_members" | "max_class_courses")
+            })
+            .map(str::to_string)
+            .collect()
+    };
+    let sorted = |mut codes: Vec<String>| -> Vec<String> {
+        codes.sort();
+        codes.dedup();
+        codes
+    };
+    let want = |codes: &[&str]| sorted(codes.iter().map(|c| c.to_string()).collect());
+
+    // The pump's own half, on the field that carries it. `Attached::refusal_code`
+    // answers these on the course axis, which is the only axis a pump runs.
+    let pump = [
         "class_deleted",
         "course_deleted",
         "class_at_course_ceiling",
         "class_roster_too_large",
         "course_full",
-        "linked_course_missing",
         "blueprint_deleted",
+    ];
+    // Per route, in the axis's own words: `class_at_*_ceiling` is the axis being
+    // attached, the `*_too_large` pair the other one.
+    let courses = [
+        "duplicate",
+        "class_at_course_ceiling",
+        "class_roster_too_large",
+        "course_full",
+    ];
+    let members = [
+        "duplicate",
+        "class_at_roster_ceiling",
+        "class_course_list_too_large",
+        "course_full",
+        "linked_course_missing",
+    ];
+
+    for (path, expected) in [
+        ("/classes/{id}/courses", courses.as_slice()),
+        ("/classes/{id}/members", members.as_slice()),
     ] {
-        assert!(
-            text.contains(code),
-            "the OpenAPI document no longer names the refusal code `{code}` — it is answered \
-             by `Attached::refusal_code` and must stay documented on the class routes"
+        let description = spec["paths"][path]["post"]["responses"]["409"]["description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{path} must declare a 409 with a description"));
+        assert_eq!(
+            sorted(quoted(description)),
+            want(expected),
+            "the `409` on POST {path} must name exactly the refusal codes that route \
+             answers — a client branches on them, and one it never sees documented (or \
+             one it is promised and never gets) is a branch written against nothing"
         );
     }
+
+    // …and the closed set itself, on the one field that explains all of it: the
+    // union of both routes plus the pump, so a code documented on no surface at
+    // all still fails here.
+    let reason =
+        spec["components"]["schemas"]["SkipResponse"]["properties"]["reason"]["description"]
+            .as_str()
+            .expect("SkipResponse.reason must document the code vocabulary");
+    let everything: Vec<&str> = pump
+        .iter()
+        .chain(courses.iter())
+        .chain(members.iter())
+        .copied()
+        .collect();
+    assert_eq!(
+        sorted(quoted(reason)),
+        want(&everything),
+        "`SkipResponse.reason` is where the whole closed vocabulary is written down — \
+         every code either route or a pump can answer must appear there, and nothing else"
+    );
 }

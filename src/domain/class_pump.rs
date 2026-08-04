@@ -149,14 +149,21 @@ impl<T> Attached<T> {
     /// detached before this attach can be retried. `blueprint_deleted` is a
     /// pump losing the template itself mid-run — the only refusal that says
     /// nothing about the (class, course) pair it names.
-    pub(crate) fn refusal_code(&self) -> Option<&'static str> {
+    ///
+    /// The `axis` is a parameter because two of these answers name a *different
+    /// ceiling* on each of them: [`Attached::ClassFull`] is the ceiling of the
+    /// axis being attached and [`Attached::ClassOverloaded`] the other axis's,
+    /// so a member add's "full" is a full roster where a course attach's is a
+    /// full course list ([`Axis::at_ceiling_code`]). Read blind, the same code
+    /// worded a full roster as a full course list.
+    pub(crate) fn refusal_code(&self, axis: &Axis) -> Option<&'static str> {
         match self {
             Attached::Made(_) => None,
             Attached::Duplicate => Some("duplicate"),
             Attached::Gone => Some("class_deleted"),
             Attached::PivotGone => Some("course_deleted"),
-            Attached::ClassFull => Some("class_at_course_ceiling"),
-            Attached::ClassOverloaded => Some("class_roster_too_large"),
+            Attached::ClassFull => Some(axis.at_ceiling_code()),
+            Attached::ClassOverloaded => Some(axis.other().over_ceiling_code()),
             Attached::Full(_) => Some("course_full"),
             Attached::CourseGone(_) => Some("linked_course_missing"),
             Attached::SourceGone => Some("blueprint_deleted"),
@@ -269,6 +276,28 @@ impl Axis {
         match self {
             Axis::Member => MAX_CLASS_MEMBERS,
             Axis::Course => MAX_CLASS_COURSES,
+        }
+    }
+
+    /// The refusal code for "the class is *at* this axis's ceiling"
+    /// ([`Attached::ClassFull`]), taken off the axis beside the `cap` it
+    /// reports, because that ceiling and its name are one fact.
+    fn at_ceiling_code(&self) -> &'static str {
+        match self {
+            Axis::Member => "class_at_roster_ceiling",
+            Axis::Course => "class_at_course_ceiling",
+        }
+    }
+
+    /// The refusal code for "the class stands *above* this axis's ceiling", so
+    /// the other axis's attach would run a write loop longer than a transaction
+    /// may be ([`Attached::ClassOverloaded`]). Answered off the axis that is
+    /// over, never the one being attached — the two are always different axes,
+    /// which is exactly what the blind version got wrong.
+    fn over_ceiling_code(&self) -> &'static str {
+        match self {
+            Axis::Member => "class_roster_too_large",
+            Axis::Course => "class_course_list_too_large",
         }
     }
 

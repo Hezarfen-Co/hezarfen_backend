@@ -2984,18 +2984,35 @@ the run**: it says nothing about the (section, course) pair it names, so every
 remaining section would only repeat it. It is reported once, the sections
 already stocked stay stocked, and the call still succeeds.
 
-**The manual attaches answer the same vocabulary.** A `409` from
-`POST /classes/{id}/members` or `POST /classes/{id}/courses` is
+**The manual attaches answer the same vocabulary**, each route with its own
+set. A `409` from either is
 `{"error": "<sentence>", "code": "<machine code>"}` — the prose unchanged, the
-code out of the set above plus two a pump never reports: `duplicate` (already a
-member / already attached) and `linked_course_missing` (another course already
-attached to that section no longer exists — detach it first), which only
-`POST /classes/{id}/members` can meet, since a member add is the one attach
-that walks the section's existing course links while a pump attaches a course
-it has just proved alive. One cause therefore reads the same whether a manager
-hit it by hand or a pump hit it in bulk, which is what lets a bilingual client
-branch and word it once. `code` is published on those two routes only and is simply **absent**
-from every other error body.
+code out of:
+
+| route | codes |
+| --- | --- |
+| `POST /classes/{id}/courses` | `duplicate`, `class_at_course_ceiling`, `class_roster_too_large`, `course_full` |
+| `POST /classes/{id}/members` | `duplicate`, `class_at_roster_ceiling`, `class_course_list_too_large`, `course_full`, `linked_course_missing` |
+
+The three *deleted* codes are a pump's alone: on a manual attach a deleted class
+or course is a `404`, and `blueprint_deleted` needs a blueprint nobody handed
+it. `duplicate` (already a member / already attached) is a refusal on either
+route and no skip for a pump, which asked for a row that is already in place,
+and `linked_course_missing` (another course already attached to that section no
+longer exists — detach it first) only `POST /classes/{id}/members` can meet,
+since a member add is the one attach that walks the section's existing course
+links while a pump attaches a course it has just proved alive.
+
+The **ceiling** pair differs by route because the ceiling does: a member add is
+refused by a full roster (`class_at_roster_ceiling`, the section already holds
+`max_class_members`) or by a course list longer than one add may enroll at once
+(`class_course_list_too_large`); a course attach by the mirror of both
+(`class_at_course_ceiling`, `class_roster_too_large`) — which is also why the
+pump, which only ever attaches courses, reports that second pair. One cause
+therefore reads the same whether a manager hit it by hand or a pump hit it in
+bulk, which is what lets a bilingual client branch and word it once. `code` is
+published on those two routes only and is simply **absent** from every other
+error body.
 
 **Removal spares what a human placed.** Every attachment a blueprint makes is
 tagged with it. Dropping a course from the list detaches it only where the
