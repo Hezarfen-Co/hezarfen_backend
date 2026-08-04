@@ -1618,3 +1618,106 @@ async fn a_rollback_the_guard_refuses_is_a_500_not_a_lying_409() {
         "…though the demoted teacher is off it, the undo having run first"
     );
 }
+
+// ---- the grade filter on the index -----------------------------------------
+
+/// Names of a `/classes` page, in the order it came back.
+fn names(res: &Res) -> Vec<String> {
+    common::items(&res.body)
+        .iter()
+        .map(|class| class["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// `?grade=` is the read a manager holding a blueprint's skip list needs: which
+/// sections carry the label the pump keyed on. It is the *query's* `WHERE`, so
+/// `total` counts the filtered set and a window walks that set alone — drop the
+/// predicate and every assertion below sees the unfiltered four instead.
+#[tokio::test]
+async fn the_class_index_filters_by_grade() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "mgr", "manager").await;
+    for (name, grade) in [
+        ("9-A", "9"),
+        ("9-B", "9"),
+        ("10-A", "10"),
+        // A club-shaped section: created with no grade at all, so its row
+        // carries no `grade` key.
+        ("satranc", ""),
+    ] {
+        create_class(&app, &manager, json!({ "name": name, "grade": grade })).await;
+    }
+    let list = async |query: &str| -> Res {
+        let res = send(
+            &app,
+            "GET",
+            &format!("/classes{query}"),
+            Some(&manager),
+            None,
+        )
+        .await;
+        assert_eq!(
+            res.status,
+            StatusCode::OK,
+            "GET /classes{query}: {}",
+            res.body
+        );
+        res
+    };
+
+    // Omitted: today's behaviour, every class.
+    let res = list("").await;
+    assert_eq!(total(&res.body), 4);
+    assert_eq!(names(&res).len(), 4);
+
+    // One label, matched exactly: both sections at it, and a `total` that
+    // counts only them.
+    let res = list("?grade=9").await;
+    assert_eq!(total(&res.body), 2, "total counts the filtered set");
+    assert_eq!(names(&res), ["9-B", "9-A"], "newest first, 9 only");
+    // "9" is not a prefix match, a fold, or a trim.
+    assert_eq!(names(&list("?grade=10").await), ["10-A"]);
+    for miss in ["?grade=11", "?grade=%209", "?grade=9-A"] {
+        let res = list(miss).await;
+        assert_eq!(total(&res.body), 0, "GET /classes{miss} total");
+        assert!(
+            names(&res).is_empty(),
+            "GET /classes{miss} is an empty page"
+        );
+    }
+
+    // Empty `?grade=` is *no* grade, the same reading `grade_or_none` gives a
+    // write — the sections a blueprint can never cover.
+    let res = list("?grade=").await;
+    assert_eq!((total(&res.body), names(&res)), (1, vec!["satranc".into()]));
+
+    // Filter and window compose: the window is cut from the filtered set, and
+    // `total` stays that set's size on every page of it.
+    let first = list("?grade=9&limit=1&offset=0").await;
+    assert_eq!(total(&first.body), 2);
+    assert_eq!(names(&first), ["9-B"]);
+    assert_eq!(first.body["limit"], 1);
+    let second = list("?grade=9&limit=1&offset=1").await;
+    assert_eq!(total(&second.body), 2);
+    assert_eq!(names(&second), ["9-A"], "consecutive pages are disjoint");
+    assert_eq!(second.body["offset"], 1);
+    let past = list("?grade=9&limit=1&offset=9").await;
+    assert!(names(&past).is_empty(), "past the end is an empty page");
+    assert_eq!(
+        total(&past.body),
+        2,
+        "…with the filtered total still honest"
+    );
+
+    // A label the write paths would refuse is refused here too, rather than
+    // reading as "no such grade".
+    let res = send(
+        &app,
+        "GET",
+        &format!("/classes?grade={}", "9".repeat(21)),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+}

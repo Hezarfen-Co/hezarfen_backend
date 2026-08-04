@@ -184,15 +184,32 @@ impl ClassGroup {
         Ok(db.select(id.record()).await?)
     }
 
-    /// Every class, newest first.
+    /// Every class, newest first — or one grade's, when `grade` narrows it:
+    /// `Some(Some(label))` is the sections carrying that exact label (no trim,
+    /// no case folding, matching [`ClassGroup::list_for_grade`] and the
+    /// blueprint keyed by that very string), `Some(None)` the sections carrying
+    /// no grade at all, `None` the whole list.
+    ///
+    /// The narrowing is the `WHERE`, so the `total` [`PagedList`] counts is the
+    /// filtered set and a client can page through it.
     pub async fn list_all(
+        grade: Option<Option<ClassGrade>>,
         limit: Option<i64>,
         offset: i64,
         db: &Database,
     ) -> Result<(Vec<ClassGroup>, i64), AppError> {
-        PagedList::new("class_group", "ORDER BY id DESC")
-            .run(limit, offset, db)
-            .await
+        let list = match grade {
+            None => PagedList::new("class_group", "ORDER BY id DESC"),
+            // A gradeless class stores no `grade` key at all (SurrealDB drops a
+            // key valued NONE), and an absent field reads back as NONE — so the
+            // one comparison covers both spellings.
+            Some(None) => PagedList::new("class_group WHERE grade IS NONE", "ORDER BY id DESC"),
+            Some(Some(grade)) => {
+                PagedList::new("class_group WHERE grade = $grade", "ORDER BY id DESC")
+                    .bind("grade", grade.as_str().to_string())
+            }
+        };
+        list.run(limit, offset, db).await
     }
 
     /// Write only the fields the PATCH carried — `None` means the request

@@ -11,7 +11,7 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -434,18 +434,36 @@ async fn stock_from_blueprint(
     Some((blueprint.get_grade().as_str().to_string(), skipped))
 }
 
-/// List every class, newest first. Requires teacher+. Paged via `?limit=&offset=`
-/// (omit `limit` for the full list); returns a `{items, total, limit, offset}`
-/// envelope.
+/// Filter for the class index.
+#[derive(Deserialize, IntoParams)]
+struct ClassFilter {
+    /// Narrow to the sections carrying this exact grade label — the same
+    /// spelling a blueprint is keyed by, matched verbatim (no trimming, no case
+    /// folding: a filter that normalized would disagree with the pump it exists
+    /// to debug). `?grade=` (empty) asks for the sections carrying *no* grade,
+    /// exactly as an empty `grade` on a write means no grade. Omit for every
+    /// class.
+    #[param(example = "9")]
+    grade: Option<String>,
+}
+
+/// List every class, newest first. Requires teacher+. `?grade=` narrows to one
+/// grade label, matched exactly as written — the label a blueprint is keyed by,
+/// so this is the read that shows which sections a `POST /classes/blueprints`
+/// pump covered (and `?grade=` on its own lists the sections with no grade at
+/// all). An unknown label is an empty page, not a `404`. Paged via
+/// `?limit=&offset=` (omit `limit` for the full list); returns a
+/// `{items, total, limit, offset}` envelope whose `total` counts every class
+/// under the same filter, not just this page.
 #[utoipa::path(
     get,
     path = "/",
     tag = "classes",
     security(("session_cookie" = [])),
-    params(PageParams),
+    params(ClassFilter, PageParams),
     responses(
         (status = 200, description = "A page of classes (the full list when unpaged)", body = Page<ClassResponse>),
-        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
+        (status = 400, description = "Invalid grade, limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
     ),
@@ -453,10 +471,19 @@ async fn stock_from_blueprint(
 async fn list_classes(
     State(st): State<AppState>,
     RequireTeacher(_user): RequireTeacher,
+    Query(filter): Query<ClassFilter>,
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<ClassResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let (classes, total) = ClassGroup::list_all(limit, offset, &st.db).await?;
+    // The same newtype the write paths validate against, so an over-long label
+    // is the same `400` here as on a create. `grade_or_none` folds `""` into
+    // "no grade"; the outer `Option` is what keeps *omitted* apart from it.
+    let grade = filter
+        .grade
+        .as_deref()
+        .map(|grade| grade_or_none(Some(grade)))
+        .transpose()?;
+    let (classes, total) = ClassGroup::list_all(grade, limit, offset, &st.db).await?;
     // Join people onto the page alone — the lookup shrinks with the window.
     let people = person_map(
         classes.iter().flat_map(|class| class_people(class, true)),
