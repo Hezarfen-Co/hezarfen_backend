@@ -938,9 +938,11 @@ struct SkipResponse {
     /// is reported once and never again), `class_at_course_ceiling` (the
     /// section already holds `max_class_courses`), `class_roster_too_large`
     /// (the section holds more students than one attach may enroll at once),
-    /// `course_full` (the course has no free seat for the whole section), and
+    /// `course_full` (the course has no free seat for the whole section),
     /// `linked_course_missing` (another course already attached to this
-    /// section no longer exists — detach it before retrying).
+    /// section no longer exists — detach it before retrying), and
+    /// `blueprint_deleted` (the blueprint itself was deleted while the pump
+    /// ran; nothing was attached, and there is nothing left to retry).
     #[schema(example = "course_full")]
     reason: String,
 }
@@ -1150,6 +1152,9 @@ async fn update_blueprint(
 /// blueprint made is detached with it (their pumped enrollments swept the usual
 /// way); a course a human attached to one of those classes by hand carries no
 /// blueprint tag and survives.
+///
+/// A `409` means the course list changed between this call reading the
+/// blueprint and deleting it — nothing was written; re-read and retry.
 #[utoipa::path(
     delete,
     path = "/blueprints/{grade}",
@@ -1161,6 +1166,7 @@ async fn update_blueprint(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "No blueprint for that grade", body = ErrorResponse),
+        (status = 409, description = "The course list changed since this call read it — nothing was written, re-read and retry", body = ErrorResponse),
     ),
 )]
 async fn delete_blueprint(

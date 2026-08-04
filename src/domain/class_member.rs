@@ -95,6 +95,7 @@ impl ClassMember {
             &member,
             user.record(),
             added_by.record(),
+            None,
             db,
         )
         .await?
@@ -123,6 +124,11 @@ impl ClassMember {
             Attached::CourseGone(course) => Err(AppError::ConflictOwned(format!(
                 "{course} no longer exists — detach it from this class first"
             ))),
+            // Only an attach run on a blueprint's behalf states that claim, and
+            // a membership is nobody's but its own.
+            Attached::SourceGone => Err(AppError::Internal(
+                "a class membership has no blueprint to lose".into(),
+            )),
         }
     }
 

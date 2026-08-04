@@ -847,7 +847,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/classes/blueprints`            | manager | List every grade blueprint · paged |
 | GET    | `/classes/blueprints/{grade}`    | manager | One grade's blueprint            |
 | PATCH  | `/classes/blueprints/{grade}`    | manager | Replace the course list and reconcile every section at that grade (returns `skipped`) |
-| DELETE | `/classes/blueprints/{grade}`    | manager | Delete the blueprint and detach every attachment it made |
+| DELETE | `/classes/blueprints/{grade}`    | manager | Delete the blueprint and detach every attachment it made (409 if the list changed since it was read) |
 | POST   | `/classes/{id}/blueprint`        | manager | Stock one section from its grade's blueprint (returns `skipped`) |
 | POST   | `/courses/{id}/sessions`         | teacher | `{topic?, teacher_id?, starts_at, ends_at?}` — add a lesson (course manager; teacher defaults to the caller) |
 | GET    | `/courses/{id}/sessions`         | student | List the course's sessions, most recent first (enrolled, creator, assigned teacher, or manager+) · paged |
@@ -2872,8 +2872,10 @@ actually failed: `class_deleted` (the section vanished mid-pump),
 from the template, so the template shrinks and the skip is reported once and
 never again), `class_at_course_ceiling`, `class_roster_too_large` (the section
 holds more students than one attach may enroll at once), `course_full` (no free
-seat for the whole section), and `linked_course_missing` (another course
-already attached to that section no longer exists — detach it first).
+seat for the whole section), `linked_course_missing` (another course
+already attached to that section no longer exists — detach it first), and
+`blueprint_deleted` (the template itself was deleted while the pump ran —
+nothing was attached, and there is nothing left to retry).
 
 **Removal spares what a human placed.** Every attachment a blueprint makes is
 tagged with it. Dropping a course from the list detaches it only where the
@@ -2881,6 +2883,28 @@ blueprint attached it (sweeping the enrollments it pumped, repairing to a rival
 class first exactly as a manual detach does), and a course a human attached to
 that class by hand carries no tag and is left exactly where it is. Deleting a
 blueprint applies that to its whole list.
+
+`DELETE /classes/blueprints/{grade}` removes the row **first** and then sweeps
+by that tag, rather than by the list the call read: an edit that adds a course
+and pumps it while the delete runs would otherwise leave rows tagged with a
+blueprint that no longer exists, and since the grade label *is* the record id,
+nothing could ever reach them again. The pump carries the other half of that —
+an attach whose blueprint was deleted mid-run writes nothing and is reported as
+`blueprint_deleted`. Those two narrow the window rather than close it — a pump
+that read the template alive can still commit its link after the sweep has run,
+since a read of one record and a write of another are not serialized against
+each other — so the delete and each individual attach are also serialized in
+process: the delete holds a write lease across its compare-and-set and its
+sweep, and a pump takes a read lease one course at a time, so a delete never
+waits behind a whole grade. The backend runs single-replica by decision, which
+is what makes an in-process lock the complete answer. The delete is also a
+compare-and-set on the list the call read: a `409` means somebody edited the
+template in between, and nothing was written — though a template deleted and
+recreated at the same grade with the same list satisfies that comparison, which
+is accepted, since the end state is the one the caller asked for. The remaining
+cost is a **process crash** between the delete and its sweep, which no lock
+survives: it leaves inert tagged attachments behind, still detachable one at a
+time at `DELETE /classes/{id}/courses/{course}`, with every counter exact.
 
 A blueprint names no term — the class names its own. The grade label is the
 blueprint's id, so there is one per grade (a second is a `409`), and it must be
