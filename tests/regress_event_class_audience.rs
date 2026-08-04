@@ -23,7 +23,7 @@ async fn create_class(app: &Router, cookie: &str, name: &str) -> String {
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{:?}", res.body);
-    id_of(&res.body)
+    id_of(&res.body["class"])
 }
 
 /// An event aimed at `class`, created by a teacher+.

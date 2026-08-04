@@ -49,7 +49,9 @@ other class read is teacher+, a student reads their own section at
 `GET /classes/user/{user}`). A grade can also carry a **blueprint** — the
 course list every section at that grade takes (`/classes/blueprints`), applied
 to each section best-effort, with anything a limit refuses returned in
-`skipped` and anything a human attached by hand left alone. Students read a
+`skipped` and anything a human attached by hand left alone; a section created
+afterwards at that grade is stocked by `POST /classes` itself, which reports it
+as `stocked_from`. Students read a
 per-course weighted average and
 an overall average from their mark report — each exam weighted by its **kind**
 (midterms can count double, orals once: weights are set per kind in settings,
@@ -830,7 +832,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | POST   | `/courses/{id}/enrollments`      | teacher | `{user_id}` — enroll a **student** (idempotent upsert; course manager; only students can be enrolled; `409` once a capped course is full); enrolling a class-pumped student clears the row's `source`, so a class sweep can no longer take them back |
 | GET    | `/courses/{id}/enrollments`      | teacher | List the course roster (course manager) — each row carries `source`, the class that pumped it or `null` for hand-placed · paged |
 | DELETE | `/courses/{id}/enrollments/{user}` | teacher | Unenroll (keeps recorded results; course manager) |
-| POST   | `/classes`                       | manager | `{name, grade?, term_id?, teacher_id?}` — create a class section (şube); `grade` is a free-text year label, `teacher_id` the homeroom teacher (sınıf öğretmeni, teacher+; `409` + full rollback if that account is demoted mid-request) |
+| POST   | `/classes`                       | manager | `{name, grade?, term_id?, teacher_id?}` — create a class section (şube); `grade` is a free-text year label, `teacher_id` the homeroom teacher (sınıf öğretmeni, teacher+; `409` + full rollback if that account is demoted mid-request). Stocked at once from its grade's blueprint when one covers it, so the `201` is `{class, skipped, stocked_from}` |
 | GET    | `/classes`                       | teacher | List classes, newest first · paged |
 | GET    | `/classes/me`                    | any     | The caller's own classes, newest membership first · paged; `creator` is `null` below teacher+ |
 | GET    | `/classes/user/{user}`           | teacher | Another user's classes (a parent linked to that student may read it too) · paged; `creator` is `null` below teacher+ |
@@ -2855,6 +2857,28 @@ see.
 new list (a set, not a delta) and reconciles every section at the grade,
 including the ones that existed before the blueprint did.
 
+**Creating a section stocks it.** The other direction of the same rule:
+`POST /classes` at a grade a blueprint covers runs that blueprint's pump on the
+new section itself, so a manager opening "9-D" does not have to remember a
+second call. Its `201` is therefore `{class, skipped, stocked_from}` — the class
+where the bare class object used to be, the pump's usual `skipped` list, and
+`stocked_from`, the grade label of the template that stocked it. `stocked_from`
+is `null` when **no** template covers the grade, which is what tells that apart
+from a template that applied cleanly (`skipped: []` alone reads the same either
+way — the ambiguity `matched` closes on the grade-wide pumps).
+
+Stocking is best-effort all the way to the end of that route: a template that
+could not be read, or a pump that faulted part-way, leaves `stocked_from` null
+rather than turning a class that *exists* into a `500` whose caller never learns
+its id — a class id is a ULID and `POST /classes` is the only place it is
+returned from, unlike a blueprint, whose id is the grade label the caller sent.
+The retry is `POST /classes/{id}/blueprint`, which is idempotent and is also
+what a caller runs when there is genuinely no template, so the two cases need
+no telling apart. The stocking runs **after** the homeroom-teacher rollback, and
+must: a class holding courses refuses deletion, so a section stocked first could
+not be rolled back and the `409` would leave one standing behind a promise that
+nothing was created.
+
 **Pumping is best-effort.** Each (section, course) pair is one all-or-nothing
 transaction. A pair that would breach a limit — the section is at
 `max_class_courses`, or the course has no free seat for the whole section — is
@@ -2874,7 +2898,9 @@ not match the one those sections carry, and the fix is the label, not the
 template. It counts the sections **reached**, not the ones the grade holds:
 `blueprint_deleted` ends the run, and then the number is what happened.
 `POST /classes/{id}/blueprint` has no `matched` — it pumps the one section in
-the path.
+the path — and neither has `POST /classes`, for the same reason: the one
+section it pumps is the one it just created, and `stocked_from` already says
+whether a template was found.
 
 A skip's `reason` is a **machine code**, not a sentence: the client owns the
 wording (and the language), the same id-plus-client-label shape roles and

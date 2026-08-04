@@ -590,7 +590,7 @@ async fn class_lists_are_paged() {
         )
         .await;
         assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
-        classes.push(res.body["id"].as_str().unwrap().to_string());
+        classes.push(res.body["class"]["id"].as_str().unwrap().to_string());
     }
     let class = classes[0].clone();
     for n in 0..3 {

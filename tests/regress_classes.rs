@@ -109,7 +109,7 @@ async fn a_stale_link_detaches_and_frees_its_class() {
         )
         .await;
         assert_eq!(res.status, StatusCode::CREATED);
-        res.body["id"].as_str().unwrap().to_string()
+        res.body["class"]["id"].as_str().unwrap().to_string()
     };
     let attached = send(
         &app,
@@ -185,7 +185,7 @@ async fn a_member_add_names_a_stale_link_rather_than_calling_it_full() {
             Some(json!({ "name": "9-A" })),
         )
         .await;
-        res.body["id"].as_str().unwrap().to_string()
+        res.body["class"]["id"].as_str().unwrap().to_string()
     };
     send(
         &app,
@@ -241,7 +241,7 @@ async fn a_hand_enroll_takes_the_row_off_the_class() {
             Some(json!({ "name": "9-A" })),
         )
         .await;
-        res.body["id"].as_str().unwrap().to_string()
+        res.body["class"]["id"].as_str().unwrap().to_string()
     };
     send(
         &app,
@@ -338,7 +338,7 @@ async fn a_role_change_sweeps_memberships_and_enrollments_together() {
             Some(json!({ "name": "9-A" })),
         )
         .await;
-        res.body["id"].as_str().unwrap().to_string()
+        res.body["class"]["id"].as_str().unwrap().to_string()
     };
     send(
         &app,
@@ -781,10 +781,15 @@ async fn a_class_over_the_course_ceiling_takes_no_member() {
 
 // ---- homeroom teacher (sınıf öğretmeni) ------------------------------------
 
-/// Create a class as `cookie` (asserts 201); returns the whole response body.
+/// Create a class as `cookie` (asserts 201); returns the response with its
+/// `body` narrowed to the created class — the `201` is
+/// `{class, skipped, stocked_from}` since a create stocks from its grade's
+/// blueprint, and the tests below are about the class itself. The two outer
+/// fields have their own tests (`regress_blueprints`).
 async fn create_class(app: &axum::Router, cookie: &str, body: serde_json::Value) -> Res {
-    let res = send(app, "POST", "/classes", Some(cookie), Some(body)).await;
+    let mut res = send(app, "POST", "/classes", Some(cookie), Some(body)).await;
     assert_eq!(res.status, StatusCode::CREATED, "create class");
+    res.body = res.body["class"].clone();
     res
 }
 
@@ -1412,6 +1417,57 @@ async fn a_create_whose_teacher_is_demoted_mid_write_rolls_back_whole() {
         freed.status,
         StatusCode::NO_CONTENT,
         "which is the point: the term must still be deletable"
+    );
+}
+
+/// The same rollback at a grade a **blueprint** covers, which is what pins the
+/// order of the two: a create stocks itself from its grade's template, and that
+/// stocking runs *after* this demotion check. Were it the other way round the
+/// class would hold courses by the time the rollback ran, `ClassGroup::delete`
+/// refuses one that does, and the `409` promising nothing was created would
+/// leave a stocked section standing behind it.
+#[tokio::test]
+async fn a_rolled_back_create_at_a_blueprinted_grade_leaves_nothing_behind() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "manager", "manager").await;
+    let teacher = login_as(&app, &db, "teacher", "teacher").await;
+    let teacher_id = me_id(&app, &teacher).await;
+    let course = create_course(&app, &manager, "algebra").await;
+    let made = send(
+        &app,
+        "POST",
+        "/classes/blueprints",
+        Some(&manager),
+        Some(json!({ "grade": "9", "course_ids": [course] })),
+    )
+    .await;
+    assert_eq!(made.status, StatusCode::CREATED, "{:?}", made.body);
+
+    demote_during_writes_to("class_group", "CREATE", &teacher_id, &db).await;
+    let res = send(
+        &app,
+        "POST",
+        "/classes",
+        Some(&manager),
+        Some(json!({ "name": "9-A", "grade": "9", "teacher_id": teacher_id })),
+    )
+    .await;
+
+    assert_eq!(
+        res.status,
+        StatusCode::CONFLICT,
+        "the demotion still wins over the stocking: {:?}",
+        res.body
+    );
+    assert_eq!(
+        rows("SELECT VALUE id FROM class_group", &db).await,
+        0,
+        "the rollback must still have been able to delete the class"
+    );
+    assert_eq!(
+        rows("SELECT VALUE id FROM class_course", &db).await,
+        0,
+        "…which it only can because nothing was stocked onto it first"
     );
 }
 
