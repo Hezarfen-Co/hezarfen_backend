@@ -10,6 +10,12 @@ use utoipa::ToSchema;
 pub struct ErrorResponse {
     /// Human-readable failure reason.
     pub error: String,
+    /// Machine-readable refusal code, present only where a route documents its
+    /// vocabulary (today: the two manual class-attach routes, which answer the
+    /// codes a blueprint pump reports as a skip). Absent everywhere else, so a
+    /// client branches on it where it is published and reads `error` otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
 }
 
 /// Why a newtype refused to be constructed from raw input. Always maps to `400`.
@@ -57,6 +63,12 @@ pub enum AppError {
     /// [`AppError::Conflict`].
     #[error("conflict: {0}")]
     ConflictOwned(String),
+    /// A 409 that also carries a **machine code**, so a client branches on the
+    /// cause instead of parsing the sentence (which it cannot translate). The
+    /// prose is unchanged from what the same refusal always said — `code` is
+    /// additive, and only a route that publishes its vocabulary uses this.
+    #[error("conflict: {message}")]
+    ConflictCoded { code: &'static str, message: String },
     /// A request body (file upload) over the allowed size. Owned string: the
     /// school-configured limit is only known at runtime.
     #[error("payload too large: {0}")]
@@ -145,6 +157,14 @@ impl IntoResponse for AppError {
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(json!({ "error": "request timed out — the write may or may not have applied" })),
+                )
+                    .into_response();
+            }
+            // The one conflict with a second key, so it builds its body here.
+            AppError::ConflictCoded { code, message } => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({ "error": message, "code": code })),
                 )
                     .into_response();
             }

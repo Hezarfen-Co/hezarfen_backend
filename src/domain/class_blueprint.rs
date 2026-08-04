@@ -158,36 +158,19 @@ struct Held {
     course: CourseId,
 }
 
-/// Why this attach did not land, or `None` when it did. A duplicate is not a
-/// skip: the course is already on the class, which is exactly what the
-/// blueprint asks for, and re-running a pump must therefore report nothing.
+/// Why this attach did not land, or `None` when it did — the shared vocabulary
+/// of [`Attached::refusal_code`], which is where the codes and the set they
+/// close over are documented.
 ///
-/// A machine code, not a sentence: the client owns the wording and this API
-/// only says *which* refusal it was, the shape every other enum here has
-/// (roles, course kinds, the badge catalog). The set is closed and documented
-/// on `SkipResponse.reason`.
-///
-/// Each code names the record that actually failed. The pump's two "gone"
-/// answers are a *class* delete ([`Attached::Gone`] → `class_deleted`, the
-/// class counter's claim matching nothing on a row a re-read no longer finds)
-/// and a *course* delete ([`Attached::PivotGone`] → `course_deleted`, the
-/// course's own claim matching nothing) — and telling a manager the class
-/// vanished when the course did sends them to look at a section that is
-/// standing right there. `linked_course_missing` is a third: *another* course
-/// already attached to this class no longer exists, and it must be detached
-/// before this attach can be retried. `blueprint_deleted` is the pump losing
-/// the template itself mid-run — the only skip that says nothing about the
-/// (class, course) pair it names.
+/// One divergence, and it lives here because only a pump has it: a duplicate is
+/// not a skip. The course is already on the class, which is exactly what the
+/// blueprint asks for, so re-running a pump must report nothing — while a *hand*
+/// attach's duplicate is a genuine refusal (`duplicate`), because that call
+/// asked for the row and did not get it.
 fn skip_reason(landed: &Attached<ClassCourse>) -> Option<&'static str> {
     match landed {
-        Attached::Made(_) | Attached::Duplicate => None,
-        Attached::Gone => Some("class_deleted"),
-        Attached::PivotGone => Some("course_deleted"),
-        Attached::ClassFull => Some("class_at_course_ceiling"),
-        Attached::ClassOverloaded => Some("class_roster_too_large"),
-        Attached::Full(_) => Some("course_full"),
-        Attached::CourseGone(_) => Some("linked_course_missing"),
-        Attached::SourceGone => Some("blueprint_deleted"),
+        Attached::Duplicate => None,
+        other => other.refusal_code(),
     }
 }
 
@@ -1106,11 +1089,21 @@ mod tests {
     /// vocabulary a bilingual client branches and translates on, so a reworded
     /// one is a silent contract break. A new [`Attached`] variant fails the
     /// match arm above, and this pins what the existing ones say.
+    ///
+    /// Each one is also checked against [`Attached::refusal_code`], the manual
+    /// routes' half of the same vocabulary: `duplicate` is the *only* place the
+    /// two are allowed to differ, so a second spelling of any other code cannot
+    /// drift in on either side.
     #[test]
     fn every_refusal_the_pump_can_answer_is_a_skip() {
-        // `Made` shares `Duplicate`'s arm, and building one needs a live link
-        // row — the arm itself is the only thing to check there.
+        // `Made` is the other `None` there, and building one needs a live link
+        // row — the arm itself is the only thing to check for it.
         assert!(skip_reason(&Attached::Duplicate).is_none());
+        assert_eq!(
+            Attached::<ClassCourse>::Duplicate.refusal_code(),
+            Some("duplicate"),
+            "a hand attach's duplicate is a refusal even though a pump's is not"
+        );
         for (refusal, code) in [
             (Attached::Gone, "class_deleted"),
             (Attached::PivotGone, "course_deleted"),
@@ -1127,6 +1120,11 @@ mod tests {
                 skip_reason(&refusal),
                 Some(code),
                 "{refusal:?} must be reported as its own code, not swallowed or reworded"
+            );
+            assert_eq!(
+                refusal.refusal_code(),
+                skip_reason(&refusal),
+                "{refusal:?} must read the same on a manual 409 as in a pump's skip list"
             );
         }
     }

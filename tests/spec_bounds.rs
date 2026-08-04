@@ -1120,3 +1120,30 @@ async fn the_image_meta_bodies_stay_the_same_shape() {
         );
     }
 }
+
+/// The class refusal codes are a **published** vocabulary: a blueprint pump
+/// reports them as a skip `reason`, and the two manual attach routes answer
+/// them as the `code` on their `409`. A client branches on them, so a code the
+/// spec never names is one nobody can build against — this asserts the emitted
+/// document still spells every one of them, wherever it does it.
+#[tokio::test]
+async fn the_class_refusal_codes_stay_published() {
+    let spec = spec().await;
+    let text = spec.to_string();
+    for code in [
+        "duplicate",
+        "class_deleted",
+        "course_deleted",
+        "class_at_course_ceiling",
+        "class_roster_too_large",
+        "course_full",
+        "linked_course_missing",
+        "blueprint_deleted",
+    ] {
+        assert!(
+            text.contains(code),
+            "the OpenAPI document no longer names the refusal code `{code}` — it is answered \
+             by `Attached::refusal_code` and must stay documented on the class routes"
+        );
+    }
+}

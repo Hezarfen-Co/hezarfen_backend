@@ -567,6 +567,10 @@ fn error_frame(err: &AppError, client_seq: Option<u64>) -> Value {
         AppError::Conflict(message) if *message == board_stroke::BOARD_LOCKED => "locked",
         AppError::Conflict(message) if *message == board_stroke::BOARD_CLOSED => "board_closed",
         AppError::Conflict(message) if *message == board_stroke::CANVAS_BLANK => "canvas_blank",
+        // A refusal that already carries its own code keeps it — no board path
+        // raises one today, but re-labelling one "conflict" would throw the
+        // only machine answer it has away.
+        AppError::ConflictCoded { code, .. } => code,
         // Everything else, `BOARD_MOVED` included: retryable, never terminal.
         AppError::Conflict(_) | AppError::ConflictOwned(_) => "conflict",
         AppError::Validation(_) | AppError::PayloadTooLarge(_) => "invalid",

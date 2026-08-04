@@ -126,6 +126,44 @@ pub(crate) enum Attached<T> {
     SourceGone,
 }
 
+impl<T> Attached<T> {
+    /// This refusal as a **machine code**, or `None` for the attach that
+    /// landed. The client owns the wording and the language; this only says
+    /// *which* refusal it was — the shape every other enum here has (roles,
+    /// course kinds, the badge catalog).
+    ///
+    /// The single home for that vocabulary, because both readers answer it: a
+    /// blueprint pump reports it as a skip
+    /// ([`crate::domain::class_blueprint`]) and a hand attach as the `code` on
+    /// its `409` ([`crate::error::AppError::ConflictCoded`]). Spelled once, so
+    /// one cause can never grow two codes.
+    ///
+    /// Each code names the record that actually failed. The two "gone" answers
+    /// are a *class* delete ([`Attached::Gone`] → `class_deleted`, the class
+    /// counter's claim matching nothing on a row a re-read no longer finds) and
+    /// a *course* delete ([`Attached::PivotGone`] → `course_deleted`, the
+    /// course's own claim matching nothing) — and telling a manager the class
+    /// vanished when the course did sends them to look at a section that is
+    /// standing right there. `linked_course_missing` is a third: *another*
+    /// course already attached to this class no longer exists, and it must be
+    /// detached before this attach can be retried. `blueprint_deleted` is a
+    /// pump losing the template itself mid-run — the only refusal that says
+    /// nothing about the (class, course) pair it names.
+    pub(crate) fn refusal_code(&self) -> Option<&'static str> {
+        match self {
+            Attached::Made(_) => None,
+            Attached::Duplicate => Some("duplicate"),
+            Attached::Gone => Some("class_deleted"),
+            Attached::PivotGone => Some("course_deleted"),
+            Attached::ClassFull => Some("class_at_course_ceiling"),
+            Attached::ClassOverloaded => Some("class_roster_too_large"),
+            Attached::Full(_) => Some("course_full"),
+            Attached::CourseGone(_) => Some("linked_course_missing"),
+            Attached::SourceGone => Some("blueprint_deleted"),
+        }
+    }
+}
+
 /// Which way the pump runs: the loop below needs a `(course, user)` pair per
 /// enrollment, and each caller supplies one side as a constant and reads the
 /// other off the class's *other* link table.

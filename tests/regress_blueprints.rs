@@ -664,6 +664,82 @@ async fn a_class_that_does_not_fit_is_reported_not_aborted() {
     assert_eq!(rows("SELECT VALUE id FROM enrollment", &db).await, 0);
 }
 
+/// One cause, one code, whichever door it came through: the `409` a manager's
+/// own `POST /classes/{id}/courses` answers carries the *same* machine code the
+/// pump reports as a skip for the state that class is in. The two used to be a
+/// code and an English sentence, and a bilingual client cannot translate the
+/// sentence — so this pins them equal, over HTTP, on one shared state.
+#[tokio::test]
+async fn a_manual_attach_answers_the_code_the_pump_reports() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "mgr", "manager").await;
+    // One seat, two students: neither door can put this course on this class.
+    let tight = create_capped_course(&app, &manager, "seminar", 1).await;
+    let class = create_class(&app, &manager, "9-A", "9").await;
+    student_in(&app, &db, &class, &manager, "ali").await;
+    student_in(&app, &db, &class, &manager, "veli").await;
+
+    let by_hand = send(
+        &app,
+        "POST",
+        &format!("/classes/{class}/courses"),
+        Some(&manager),
+        Some(json!({ "course_id": tight.clone() })),
+    )
+    .await;
+    assert_eq!(by_hand.status, StatusCode::CONFLICT, "{:?}", by_hand.body);
+    assert_eq!(
+        by_hand.body["code"], "course_full",
+        "the manual 409 must carry the machine code, not prose alone: {:?}",
+        by_hand.body
+    );
+    assert!(
+        by_hand.body["error"].as_str().unwrap_or_default().len() > 10,
+        "…beside the sentence it always sent — the code is additive: {:?}",
+        by_hand.body
+    );
+
+    // The same refusal through the pump, on the very same class and course.
+    let pumped = send(
+        &app,
+        "POST",
+        "/classes/blueprints",
+        Some(&manager),
+        Some(json!({ "grade": "9", "course_ids": [tight.clone()] })),
+    )
+    .await;
+    assert_eq!(pumped.status, StatusCode::CREATED, "{:?}", pumped.body);
+    let skipped = skips(&pumped);
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    assert_eq!(
+        skipped[0]["reason"], by_hand.body["code"],
+        "one cause must read the same in a skip list and on a manual 409"
+    );
+
+    // And the other end of the vocabulary: a duplicate, which *is* a refusal by
+    // hand and deliberately not a skip for the pump.
+    let roomy = create_course(&app, &manager, "algebra").await;
+    let attached = send(
+        &app,
+        "POST",
+        &format!("/classes/{class}/courses"),
+        Some(&manager),
+        Some(json!({ "course_id": roomy.clone() })),
+    )
+    .await;
+    assert_eq!(attached.status, StatusCode::CREATED, "{:?}", attached.body);
+    let again = send(
+        &app,
+        "POST",
+        &format!("/classes/{class}/courses"),
+        Some(&manager),
+        Some(json!({ "course_id": roomy })),
+    )
+    .await;
+    assert_eq!(again.status, StatusCode::CONFLICT, "{:?}", again.body);
+    assert_eq!(again.body["code"], "duplicate", "{:?}", again.body);
+}
+
 /// The provenance rule, both halves: dropping a course from the template
 /// detaches it wherever the *blueprint* attached it, and leaves it standing
 /// wherever a human did.

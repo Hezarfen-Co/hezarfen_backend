@@ -215,6 +215,13 @@ async fn a_member_add_names_a_stale_link_rather_than_calling_it_full() {
         !message.contains("full"),
         "a course that does not exist is not a full one: {message}"
     );
+    // …and it says so as a machine code too, the one a pump's skip list spells
+    // for this cause. A bilingual client branches on this, never on the words.
+    assert_eq!(
+        refused.body["code"], "linked_course_missing",
+        "the stale-link refusal must carry its machine code: {:?}",
+        refused.body
+    );
     assert_eq!(
         rows("SELECT VALUE id FROM class_member", &db).await,
         0,
@@ -646,9 +653,10 @@ async fn a_class_refuses_the_member_past_its_ceiling() {
         .expect("the place under the ceiling is still free");
     let refused = ClassMember::add(&class, &UserId::from_key("over"), &manager, &db).await;
     assert!(
-        matches!(refused, Err(AppError::ConflictOwned(ref message))
-            if message.contains(&MAX_CLASS_MEMBERS.to_string())),
-        "a full class is a 409 naming its ceiling, never a 404: {refused:?}"
+        matches!(refused, Err(AppError::ConflictCoded { code, ref message })
+            if code == "class_at_course_ceiling"
+                && message.contains(&MAX_CLASS_MEMBERS.to_string())),
+        "a full class is a 409 naming its ceiling and coded, never a 404: {refused:?}"
     );
     assert_eq!(
         counter("SELECT VALUE class_member_count ?? 0 FROM class_group", &db).await,
@@ -711,8 +719,9 @@ async fn a_class_over_the_other_axis_ceiling_attaches_nothing() {
 
     let refused = ClassCourse::attach(&class, &algebra, &manager, &db).await;
     assert!(
-        matches!(refused, Err(AppError::ConflictOwned(ref message))
-            if message.contains(&MAX_CLASS_MEMBERS.to_string())),
+        matches!(refused, Err(AppError::ConflictCoded { code, ref message })
+            if code == "class_roster_too_large"
+                && message.contains(&MAX_CLASS_MEMBERS.to_string())),
         "the refusal must name the axis that is over, not the one with room: {refused:?}"
     );
     assert_eq!(
@@ -768,8 +777,9 @@ async fn a_class_over_the_course_ceiling_takes_no_member() {
 
     let refused = ClassMember::add(&class, &UserId::from_key("ali"), &manager, &db).await;
     assert!(
-        matches!(refused, Err(AppError::ConflictOwned(ref message))
-            if message.contains(&MAX_CLASS_COURSES.to_string())),
+        matches!(refused, Err(AppError::ConflictCoded { code, ref message })
+            if code == "class_roster_too_large"
+                && message.contains(&MAX_CLASS_COURSES.to_string())),
         "the refusal must name the courses, not the roster: {refused:?}"
     );
     assert_eq!(rows("SELECT VALUE id FROM class_member", &db).await, 0);

@@ -843,10 +843,10 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/classes/{id}`                  | teacher | Get one class                   |
 | PATCH  | `/classes/{id}`                  | manager | Edit a class (`null` clears `grade`/`term_id`/`teacher_id`; `409` if the `term_id` it moves off changed since the read — nothing written, re-read and retry) |
 | DELETE | `/classes/{id}`                  | manager | Delete a class — `409` while it still holds students or courses |
-| POST   | `/classes/{id}/members`          | manager | `{user_id}` — add a **student**; enrolls them into every attached course (`409` if one is full, naming it, if one of them no longer exists — detach that link first — if already a member, or once the class holds `max_class_members`) |
+| POST   | `/classes/{id}/members`          | manager | `{user_id}` — add a **student**; enrolls them into every attached course (`409` if one is full, naming it, if one of them no longer exists — detach that link first — if already a member, or once the class holds `max_class_members`; every one of those carries a machine `code`) |
 | GET    | `/classes/{id}/members`          | teacher | List the class roster, newest added first · paged |
 | DELETE | `/classes/{id}/members/{user}`   | manager | Remove a member — sweeps only the enrollments **this class** pumped for them (one another class still claims is re-tagged to it; hand-placed rows stay) |
-| POST   | `/classes/{id}/courses`          | teacher | `{course_id}` — attach a course (that **course's** manager); enrolls the whole roster (`409` if it cannot hold them all, if already attached, or once the class holds `max_class_courses`) |
+| POST   | `/classes/{id}/courses`          | teacher | `{course_id}` — attach a course (that **course's** manager); enrolls the whole roster (`409` if it cannot hold them all, if already attached, or once the class holds `max_class_courses`; every one of those carries a machine `code`) |
 | GET    | `/classes/{id}/courses`          | teacher | List the class's attached courses, newest attached first · paged |
 | DELETE | `/classes/{id}/courses/{course}` | teacher | Detach a course (that course's manager) — the same sweep along the course axis; a link left behind by a **deleted** course detaches too, rather than `404`-ing forever |
 | POST   | `/classes/blueprints`            | manager | Create a grade's course blueprint and stock every section already at that grade (best-effort; returns `matched` + `skipped`) |
@@ -2977,13 +2977,25 @@ whole grade — the sections after the first one are not asked again — and nev
 again on a later pump), `class_at_course_ceiling`, `class_roster_too_large`
 (the section holds more students than one attach may enroll at once),
 `course_full` (no free
-seat for the whole section), `linked_course_missing` (another course
-already attached to that section no longer exists — detach it first), and
+seat for the whole section), and
 `blueprint_deleted` (the template itself was deleted while the pump ran —
 nothing was attached, and there is nothing left to retry). That last one **ends
 the run**: it says nothing about the (section, course) pair it names, so every
 remaining section would only repeat it. It is reported once, the sections
 already stocked stay stocked, and the call still succeeds.
+
+**The manual attaches answer the same vocabulary.** A `409` from
+`POST /classes/{id}/members` or `POST /classes/{id}/courses` is
+`{"error": "<sentence>", "code": "<machine code>"}` — the prose unchanged, the
+code out of the set above plus two a pump never reports: `duplicate` (already a
+member / already attached) and `linked_course_missing` (another course already
+attached to that section no longer exists — detach it first), which only
+`POST /classes/{id}/members` can meet, since a member add is the one attach
+that walks the section's existing course links while a pump attaches a course
+it has just proved alive. One cause therefore reads the same whether a manager
+hit it by hand or a pump hit it in bulk, which is what lets a bilingual client
+branch and word it once. `code` is published on those two routes only and is simply **absent**
+from every other error body.
 
 **Removal spares what a human placed.** Every attachment a blueprint makes is
 tagged with it. Dropping a course from the list detaches it only where the

@@ -726,7 +726,7 @@ async fn delete_class(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "Class not found", body = ErrorResponse),
-        (status = 409, description = "Already in this class, the class is at its student ceiling (max_class_members), one of its courses is full, or one of them no longer exists (a stale attachment — detach it)", body = ErrorResponse),
+        (status = 409, description = "Already in this class, the class is at its student ceiling (max_class_members), one of its courses is full, or one of them no longer exists (a stale attachment — detach it). The body carries a machine `code` beside the prose, out of the same closed set a blueprint pump reports: `duplicate`, `class_at_course_ceiling`, `class_roster_too_large`, `course_full`, `linked_course_missing`", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -853,7 +853,7 @@ async fn remove_member(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Class not found", body = ErrorResponse),
-        (status = 409, description = "Already attached, the class is at its course ceiling (max_class_courses), or the course cannot hold the whole class", body = ErrorResponse),
+        (status = 409, description = "Already attached, the class is at its course ceiling (max_class_courses), or the course cannot hold the whole class. The body carries a machine `code` beside the prose, out of the same closed set a blueprint pump reports: `duplicate`, `class_at_course_ceiling`, `class_roster_too_large`, `course_full`", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -1034,12 +1034,21 @@ struct SkipResponse {
     /// `class_at_course_ceiling` (the
     /// section already holds `max_class_courses`), `class_roster_too_large`
     /// (the section holds more students than one attach may enroll at once),
-    /// `course_full` (the course has no free seat for the whole section),
-    /// `linked_course_missing` (another course already attached to this
-    /// section no longer exists — detach it before retrying), and
+    /// `course_full` (the course has no free seat for the whole section), and
     /// `blueprint_deleted` (the blueprint itself was deleted while the pump
     /// ran; nothing was attached, and there is nothing left to retry — it ends
     /// the run, so it appears once however many sections were left).
+    ///
+    /// The **same vocabulary** answers the manual routes: a `409` from
+    /// `POST /classes/{id}/members` or `POST /classes/{id}/courses` carries
+    /// these codes as its `code` field, plus two a pump never reports —
+    /// `duplicate`, a refusal there (the call asked for a row and did not get
+    /// it) but not here (the course is already on the class, which is what the
+    /// blueprint asks for), and `linked_course_missing` (another course
+    /// already attached to that section no longer exists — detach it first),
+    /// which only a member add can meet: it is the one attach that walks the
+    /// section's existing course links, while a pump attaches a course it has
+    /// just proved alive.
     #[schema(example = "course_full")]
     reason: String,
 }

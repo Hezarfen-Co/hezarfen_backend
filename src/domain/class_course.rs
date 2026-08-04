@@ -93,31 +93,45 @@ impl ClassCourse {
         attached_by: &UserId,
         db: &Database,
     ) -> Result<ClassCourse, AppError> {
-        match Self::attach_sourced(class, course, attached_by, None, db).await? {
+        let landed = Self::attach_sourced(class, course, attached_by, None, db).await?;
+        // Read off the refusal, never respelled here: this route and a
+        // blueprint pump answer one vocabulary. `Made` is the only `None`, and
+        // it takes the `Ok` arm below.
+        let code = landed.refusal_code().unwrap_or_default();
+        match landed {
             Attached::Made(saved) => Ok(saved),
-            Attached::Duplicate => Err(AppError::Conflict("the course is already on this class")),
+            Attached::Duplicate => Err(AppError::ConflictCoded {
+                code,
+                message: "the course is already on this class".into(),
+            }),
             // The class or the course: either end of the link being gone is a
             // 404 on this route, and only a blueprint's skip list needs them
             // told apart.
             Attached::Gone | Attached::PivotGone => Err(AppError::NotFound),
-            Attached::ClassFull => Err(AppError::ConflictOwned(format!(
-                "this class already holds {MAX_CLASS_COURSES} courses"
-            ))),
+            Attached::ClassFull => Err(AppError::ConflictCoded {
+                code,
+                message: format!("this class already holds {MAX_CLASS_COURSES} courses"),
+            }),
             // The other axis: attaching one course enrolls the whole roster, so
             // a class over *that* ceiling cannot take a course however few it
             // carries. Only a class predating the ceiling can be here.
-            Attached::ClassOverloaded => Err(AppError::ConflictOwned(format!(
-                "this class holds more than {MAX_CLASS_MEMBERS} students — \
-                 remove some before attaching a course"
-            ))),
-            Attached::Full(full) => Err(AppError::ConflictOwned(format!(
-                "{full} cannot hold the whole class"
-            ))),
+            Attached::ClassOverloaded => Err(AppError::ConflictCoded {
+                code,
+                message: format!(
+                    "this class holds more than {MAX_CLASS_MEMBERS} students — \
+                     remove some before attaching a course"
+                ),
+            }),
+            Attached::Full(full) => Err(AppError::ConflictCoded {
+                code,
+                message: format!("{full} cannot hold the whole class"),
+            }),
             // Another of the class's links points at a deleted course. This
             // axis claims its own pivot, so it is never *this* course.
-            Attached::CourseGone(course) => Err(AppError::ConflictOwned(format!(
-                "{course} no longer exists — detach it from this class first"
-            ))),
+            Attached::CourseGone(course) => Err(AppError::ConflictCoded {
+                code,
+                message: format!("{course} no longer exists — detach it from this class first"),
+            }),
             // This path passes no source, so the claim that answers this is
             // never in the transaction it ran.
             Attached::SourceGone => Err(AppError::Internal(
@@ -250,8 +264,8 @@ mod tests {
 
         let again = ClassCourse::attach(&class, &algebra, &manager, &db).await;
         assert!(
-            matches!(again, Err(AppError::Conflict(_))),
-            "a second attach is a 409: {again:?}"
+            matches!(again, Err(AppError::ConflictCoded { code, .. }) if code == "duplicate"),
+            "a second attach is a 409 coded `duplicate`: {again:?}"
         );
     }
 
@@ -271,8 +285,9 @@ mod tests {
 
         let refused = ClassCourse::attach(&class, &tight, &manager, &db).await;
         assert!(
-            matches!(refused, Err(AppError::ConflictOwned(ref message)) if message.contains(tight.key())),
-            "the refusal must name the course: {refused:?}"
+            matches!(refused, Err(AppError::ConflictCoded { code, ref message })
+                if code == "course_full" && message.contains(tight.key())),
+            "the refusal must be coded `course_full` and name the course: {refused:?}"
         );
         assert_eq!(
             rows("SELECT VALUE id FROM enrollment", &db).await,
