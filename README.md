@@ -1311,6 +1311,10 @@ catalog — awards carrying it stop being served, no migration.
   they record a grade for a given exam sitting or homework submission — exam
   and homework alike, since grading is grading. A regrade of the same pair moves
   nothing: the counter counts work judged, not times the mark was edited.
+  **Deleting the grade gives it back** — the grader who deletes is the grader
+  who was credited, so without the refund grade → un-grade → regrade would count
+  the same work twice, then fifty times. Deleting the *exam* (or homework, or
+  course) does not: a cascade is not an un-grade.
 - **High marks.** `+1 high_mark_total` for the **student** whenever an exam
   mark lands at or above `badges.high_mark_min` (90, published at `/limits`),
   once per sitting — a retake is another sitting and can earn another. Homework
@@ -1318,14 +1322,18 @@ catalog — awards carrying it stop being served, no migration.
   status-only, so counting them would reward a teacher's habit rather than a
   student's work. The cut is compiled in rather than read from the school's
   grade bands, which are renameable display labels — `high_mark_10` has to mean
-  the same thing in every school, forever.
+  the same thing in every school, forever. Deleting the mark gives it back, on
+  the same terms as the grader's counter above.
 - **Lessons held.** `+1 lessons_held_total` for the **session's teacher**, once
-  per lesson, credited by the **first roll call taken for it**. It means "a
-  lesson whose roll call was taken", not "a lesson on the timetable" —
-  scheduling two hundred lessons and cancelling them all earns nothing. The
-  thirtieth student marked in that lesson credits nothing further (a stamp on
-  the session row is the guard), and taking one student back off the roll does
-  not un-hold the lesson.
+  per lesson, credited by the **first roll call taken at or after the lesson's
+  own `starts_at`**. It means "a lesson whose roll call was taken", not "a
+  lesson on the timetable" — scheduling two hundred lessons and cancelling them
+  all earns nothing, and neither does marking two hundred lessons that have not
+  started yet. Roll call itself is never refused early; it simply holds nothing
+  until the lesson's time comes, and the sheet touched again after the bell
+  credits then, once. The thirtieth student marked in that lesson credits
+  nothing further (a stamp on the session row is the guard), and taking one
+  student back off the roll does not un-hold the lesson.
 - **Lessons attended.** `+1 lessons_attended_total` for a **student** marked
   `present` or `late` at lesson roll call — the same cut the attendance report's
   `rate` uses, so a student's badge and their attendance rate never disagree
@@ -2620,10 +2628,11 @@ Re-marking overwrites: one row per session+user, by construction. Deleting a
 session (or its course) cascades its roll-call rows.
 
 **Roll call is also what credits two badge counters** (see "Badges"). The
-**first** mark taken for a lesson credits its teacher's `lessons_held_total`,
-once — a lesson counts as held when its roll call is taken, so one merely
-scheduled (and then cancelled) counts for nothing, and the marks after that
-first one credit nothing further. And a **student** marked `present` or `late`
+**first** mark taken for a lesson **at or after its `starts_at`** credits its
+teacher's `lessons_held_total`, once — a lesson counts as held when its roll
+call is taken during it, so one merely scheduled (and then cancelled) counts
+for nothing, marking a lesson a week early counts for nothing *yet*, and the
+marks after that first credited one count for nothing further. And a **student** marked `present` or `late`
 gains a `lessons_attended_total`, using the same cut the attendance `rate`
 below uses; correcting that mark to any other status, or clearing the row, gives
 it back. The session teacher's own presence row moves neither counter — the
