@@ -23,6 +23,29 @@ use crate::domain::timestamp::Timestamp;
 use crate::error::{AppError, ValidationError};
 use crate::validate::{validate_password, validate_username};
 
+/// One role demotion at a time, school-wide.
+///
+/// The invariant it protects is "the school always keeps an admin", and that
+/// guard is a count-then-write: read whether another admin exists, then lower
+/// this row. SurrealDB conflict-checks neither side of that pair — a
+/// `BEGIN…COMMIT` does not serialize a cross-record count against a concurrent
+/// update (write-skew, see [`crate::domain::cap`]) and a statement that only
+/// *reads* the rival's row never collides with it. So two admins demoting each
+/// other both counted the other and both committed, leaving **zero** admins and
+/// a school nobody can administer: `ensure_admin` refuses to promote an
+/// existing non-admin row on every later boot, so the only way back was hand-run
+/// SurrealQL against the volume.
+///
+/// Serializing the pair is what closes it, the same argument
+/// [`crate::domain::settings::SETTINGS_LOCK`] makes one level up: the deployment
+/// runs one replica by contract (stop-the-world upgrades), so process-wide is
+/// deployment-wide. A per-row counter (the [`crate::domain::cap`] shape) does
+/// not fit — the count being capped is over *every* user row, with no parent
+/// record to hold it and no place to seed one without a backfill.
+///
+/// **Lock order:** taken alone. Nothing is locked while it is held.
+static ADMIN_FLOOR_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Typed user record id (`user:<ulid>`).
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct UserId(RecordId);
@@ -447,6 +470,27 @@ impl User {
         Ok(result.take::<Vec<User>>(0)?)
     }
 
+    /// Would lowering `target` out of `admin` leave the school with none? Both
+    /// halves are asked of the **live** rows in one round trip: is that row an
+    /// admin right now, and does any other admin exist. It asks for one id per
+    /// half rather than a `count()` — a count over an indexed field compared
+    /// against a plan-time value answers `{count: N}` on the real server, and
+    /// neither half needs a number.
+    async fn would_orphan_admins(target: &UserId, db: &Database) -> Result<bool, AppError> {
+        let mut result = db
+            .query(
+                "SELECT VALUE id FROM user WHERE id = $usr AND role = $role;\n\
+                 SELECT VALUE id FROM user WHERE role = $role AND id != $usr LIMIT 1",
+            )
+            .bind(("role", Role::Admin))
+            .bind(("usr", target.record()))
+            .await?
+            .check()?;
+        let is_admin = !result.take::<Vec<RecordId>>(0)?.is_empty();
+        let others = !result.take::<Vec<RecordId>>(1)?.is_empty();
+        Ok(is_admin && !others)
+    }
+
     /// Case- and diacritic-insensitive fragment search over username, name,
     /// and surname. Needle and columns both go through
     /// [`crate::domain::text_fold`], so `ilker` finds `İLKER` and back —
@@ -492,6 +536,11 @@ impl User {
 
     /// Overwrite this user's role **and** shed every grant the new role may not
     /// hold, in one transaction. The caller is responsible for authorizing it.
+    ///
+    /// Refuses (`Conflict`) to lower the school's last admin, however the
+    /// request is spelled and however many demotions are in flight at once —
+    /// see [`ADMIN_FLOOR_LOCK`] for why that guard cannot live in the
+    /// transaction below.
     ///
     /// Writes *only* the `role` field of the user row (never the whole row):
     /// the row mixes admin-owned (role) and self-service (profile, preferences)
@@ -543,6 +592,22 @@ impl User {
     /// `UPDATE` and `DELETE` only, so no statement can answer "already exists"
     /// and every lost round is a plain re-send.
     pub async fn set_role(self, role: Role, db: &Database) -> Result<(User, Vec<Board>), AppError> {
+        // The admin floor, held from the count to the commit ([`ADMIN_FLOOR_LOCK`]
+        // for why a transaction cannot do this). Asked on the *live* rows rather
+        // than `self.role`, so a snapshot that predates a promotion cannot skip
+        // the check, and cheap enough to ask on every demotion: one round trip
+        // on an admin-only route.
+        let _floor = if role == Role::Admin {
+            None
+        } else {
+            let guard = ADMIN_FLOOR_LOCK.lock().await;
+            if Self::would_orphan_admins(&self.id, db).await? {
+                return Err(AppError::Conflict(
+                    "the school must keep at least one admin — promote another account first",
+                ));
+            }
+            Some(guard)
+        };
         // Built as a statement list rather than one string so the result slot
         // of the board write is *counted*, not hand-tallied against arms that
         // may or may not be in the batch. Slot 0 is `BEGIN`, as everywhere.
