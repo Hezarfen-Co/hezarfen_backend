@@ -352,9 +352,11 @@ async fn publish_slots(
 }
 
 /// List slots, earliest first. Teacher+ see their own calendar, past occurrences
-/// included; everyone else sees every slot still open in the future — the
-/// bookable calendar. A slot whose teacher has since been demoted is left out
-/// (and refused at book time). Whether a slot is already taken is not carried
+/// included; everyone else sees every slot that has not started yet — the
+/// bookable calendar, bounded exactly as booking is, so a slot already underway
+/// is left out rather than offered for a request that could only answer `409`.
+/// A slot whose teacher has since been demoted is left out too (and refused at
+/// book time). Whether a slot is already taken is not carried
 /// here: booking a taken one answers `409`. Paged via `?limit=&offset=` (omit
 /// `limit` for every slot); returns a `{items, total, limit, offset}` envelope.
 // ponytail: occupancy would be one query per slot with today's domain API; a

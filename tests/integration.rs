@@ -17434,6 +17434,19 @@ async fn a_started_slot_cannot_be_booked() {
     let upcoming = publish_slot(&app, &ali, now + HOUR_MS, now + 2 * HOUR_MS).await;
     let res = book_slot(&app, &veli, &upcoming).await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+
+    // ...and the calendar the student browses is bounded the same way: the
+    // underway slot is still a live row (the `409` above proves it), but
+    // offering it would be an entry that can only be refused.
+    let res = send(&app, "GET", "/appointments/slots", Some(&veli), None).await;
+    let offered: Vec<&str> = common::items(&res.body)
+        .iter()
+        .map(|slot| slot["id"].as_str().expect("slot id"))
+        .collect();
+    assert_eq!(offered, [upcoming.as_str()], "{}", res.body);
+    // The teacher's own calendar keeps it: past occurrences are their history.
+    let res = send(&app, "GET", "/appointments/slots", Some(&ali), None).await;
+    assert_eq!(common::total(&res.body), 2, "{}", res.body);
 }
 
 #[tokio::test]

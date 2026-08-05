@@ -396,15 +396,23 @@ impl AppointmentSlot {
         Ok(result.take::<Vec<AppointmentSlot>>(0)?)
     }
 
-    /// Every slot published from `starts_at` onwards, earliest first — the
-    /// bookable calendar a requester browses.
+    /// Every slot whose window has not opened yet, earliest first — the bookable
+    /// calendar a requester browses.
+    ///
+    /// The bound is `starts_at`, not `ends_at`, so that this window is exactly
+    /// the one [`Appointment::book`] accepts: a slot already underway is
+    /// unbookable (`cancel` could never undo the booking), and offering it would
+    /// be a calendar entry that can only answer `409`. The publish-time 60s skew
+    /// grace deliberately does not apply here either — `book` does not grant it,
+    /// and a slot published a moment after its own start is unbookable from
+    /// birth, so it belongs on nobody's calendar.
     pub async fn list_upcoming(
         from: Timestamp,
         db: &Database,
     ) -> Result<Vec<AppointmentSlot>, AppError> {
         let mut result = db
             .query(
-                "SELECT * FROM appointment_slot WHERE ends_at > $from \
+                "SELECT * FROM appointment_slot WHERE starts_at > $from \
                  ORDER BY starts_at ASC, id ASC",
             )
             .bind(("from", from.as_millis()))
