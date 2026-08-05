@@ -256,9 +256,11 @@ async fn one_appointment(
 /// `teacher` column is a historical fact no demotion rewrites, so a grant read
 /// off it has to re-read the live role or it outlives the role that earned it
 /// (see `courses::can_manage_course`, where trusting the callers instead cost
-/// exactly that). A demoted owner's outstanding bookings are not stranded: the
-/// requester still cancels their own (`cancel` is requester-only and never
-/// comes through here), and manager+ still approves, rejects or reschedules.
+/// exactly that). A demoted owner leaves nothing outstanding to strand: the
+/// demotion cancels their live bookings and deletes the slots under them
+/// ([`crate::domain::user::User::set_role`]) — which it must, since a manager+
+/// passes this gate but has no route that yields such a booking's id, and past
+/// its start the requester's own `cancel` is refused too.
 fn can_manage(slot: &AppointmentSlot, user: &User) -> bool {
     user.get_role().at_least(Role::Teacher)
         && (slot.get_teacher() == user.get_id() || user.get_role().at_least(Role::Manager))
@@ -308,7 +310,7 @@ async fn for_decision(
         (status = 201, description = "Slots published", body = Vec<SlotResponse>),
         (status = 400, description = "Invalid note, time range, times in the past, `until` missing with `repeat_weekly`, more than 52 occurrences, or a window too far ahead to shift by a week", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
+        (status = 403, description = "Requires teacher role or higher — including an account demoted while this request ran, whose calendar the demotion is withdrawing", body = ErrorResponse),
         (status = 409, description = "The window overlaps one the caller has already published, or (weekly) two occurrences overlap each other — the whole publish is refused, nothing is written", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
@@ -355,8 +357,10 @@ async fn publish_slots(
 /// included; everyone else sees every slot that has not started yet — the
 /// bookable calendar, bounded exactly as booking is, so a slot already underway
 /// is left out rather than offered for a request that could only answer `409`.
-/// A slot whose teacher has since been demoted is left out too (and refused at
-/// book time). Whether a slot is already taken is not carried
+/// A demotion below `teacher` withdraws that account's calendar outright, so
+/// there is normally nothing of theirs left to list; a slot an older build
+/// stranded is left out here too (and refused at book time). Whether a slot is
+/// already taken is not carried
 /// here: booking a taken one answers `409`. Paged via `?limit=&offset=` (omit
 /// `limit` for every slot); returns a `{items, total, limit, offset}` envelope.
 // ponytail: occupancy would be one query per slot with today's domain API; a

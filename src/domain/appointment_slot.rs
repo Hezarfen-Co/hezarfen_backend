@@ -15,15 +15,20 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
 use crate::constant::{
-    APPOINTMENT_SLOT_TABLE, MAX_APPOINTMENT_NOTE_LEN, MAX_SLOT_OCCURRENCES, MILLIS_PER_WEEK,
+    APPOINTMENT_SLOT_TABLE, MAX_APPOINTMENT_NOTE_LEN, MAX_SLOT_OCCURRENCES, MILLIS_PER_WEEK, ROLES,
 };
 use crate::database::{Database, transaction_with_retry};
 use crate::domain::appointment::{APPOINTMENT_LOCK, Appointment};
+use crate::domain::cap;
 use crate::domain::monotonic_id::next_ulid;
+use crate::domain::role::Role;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 use crate::validate::validate_optional;
+
+/// The publisher fell below `teacher` while the publish was in flight.
+const UNFIT_MARK: &str = "slot_not_staff";
 
 // Slot ids come from [`crate::domain::monotonic_id`]: a recurring publish
 // writes its whole expansion inside one millisecond, which random ULID low
@@ -197,9 +202,68 @@ impl AppointmentSlot {
             .collect()
     }
 
-    async fn insert(slot: AppointmentSlot, db: &Database) -> Result<AppointmentSlot, AppError> {
-        let created: Option<AppointmentSlot> = db.create(slot.id.record()).content(slot).await?;
-        created.ok_or_else(|| AppError::Internal("failed to create appointment slot".into()))
+    /// Write a whole publish — one occurrence or fifty-two — while the publisher
+    /// still *holds* a teaching role.
+    ///
+    /// Every row here names the teacher, so the write touches no key a demotion
+    /// touches: [`crate::domain::user::User::set_role`] sweeps the slots its own
+    /// snapshot can see, and a slot landing after that snapshot would survive it
+    /// under a role that may not publish — reachable by no route afterwards,
+    /// since the calendar hides a demoted teacher's slots and the deletes are
+    /// `teacher`-gated. So the teacher's own record is claimed beside the insert
+    /// ([`cap::role_claim`]), which is the key the demotion writes: either the
+    /// sweep sees these slots, or this write sees the new role and publishes
+    /// nothing.
+    ///
+    /// The bar is read off the hierarchy rather than spelled out, so a new role
+    /// cannot drift out of it.
+    ///
+    /// Admissible for [`transaction_with_retry`]: the claim is `SELECT`/`UPDATE`
+    /// only, and the `INSERT` carries freshly minted ULIDs on a table with no
+    /// `UNIQUE` index, so no rival can make it answer "already exists".
+    async fn insert_claimed(
+        teacher: &UserId,
+        rows: Vec<AppointmentSlot>,
+        db: &Database,
+    ) -> Result<Vec<AppointmentSlot>, AppError> {
+        let staff = ROLES
+            .iter()
+            .filter(|role| role.at_least(Role::Teacher))
+            .map(|role| format!("'{}'", role.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let held = cap::role_claim("teacher", &format!("NOT IN [{staff}]"), UNFIT_MARK);
+        let sql = format!(
+            "BEGIN TRANSACTION;\n{};\nINSERT INTO {APPOINTMENT_SLOT_TABLE} $rows;\n\
+             COMMIT TRANSACTION;",
+            held.join(";\n")
+        );
+        let (mut result, mut errors) = transaction_with_retry(
+            db,
+            &sql,
+            &[
+                ("teacher".into(), teacher.record().into_value()),
+                ("rows".into(), rows.into_value()),
+            ],
+            &[UNFIT_MARK],
+        )
+        .await?;
+        // Demoted while this ran — the same refusal `RequireTeacher` makes a
+        // moment earlier, and the only one that can arrive after it.
+        if errors
+            .values()
+            .any(|error| error.to_string().contains(UNFIT_MARK))
+        {
+            return Err(AppError::Forbidden(
+                "that account no longer holds a teaching role",
+            ));
+        }
+        if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+            return Err(error.into());
+        }
+        // BEGIN plus the claim's own statements — counted, not tallied by hand,
+        // so a statement added there cannot read back the wrong result.
+        Ok(result.take::<Vec<AppointmentSlot>>(held.len() + 1)?)
     }
 
     /// Does the teacher already have a published slot whose window collides with
@@ -274,8 +338,9 @@ impl AppointmentSlot {
                 "this time overlaps a slot you have already published".into(),
             ));
         }
-        Self::insert(
-            AppointmentSlot {
+        Self::insert_claimed(
+            teacher,
+            vec![AppointmentSlot {
                 id: AppointmentSlotId::generate(),
                 teacher: teacher.clone(),
                 starts_at,
@@ -283,10 +348,13 @@ impl AppointmentSlot {
                 note,
                 series: None,
                 created_at: Timestamp::now(),
-            },
+            }],
             db,
         )
-        .await
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| AppError::Internal("failed to create appointment slot".into()))
     }
 
     /// Publish the same weekly window repeatedly, up to `until`. Every row
@@ -344,22 +412,13 @@ impl AppointmentSlot {
                 created_at: now,
             })
             .collect();
-        // One statement, therefore one transaction: SurrealDB rolls the whole
-        // `INSERT` back on any error. The row-by-row loop this replaces did not
+        // One `INSERT`, therefore all-or-nothing: SurrealDB rolls the whole
+        // publish back on any error. The row-by-row loop this replaces did not
         // — a database error at week 7 of 10 answered 500 with six stray weeks
         // already published, a half-series nobody asked for. It is also a single
-        // round trip, so the lock is now held for two queries whatever the
+        // round trip, so the lock is held for two queries whatever the
         // occurrence count, instead of 1 + N (up to 52) sequential ones.
-        //
-        // No `BEGIN`/`COMMIT` wrapper: those consume result slots in this
-        // version, and a lone statement is already atomic — the explicit form
-        // would buy nothing but an off-by-one waiting to happen.
-        let mut result = db
-            .query("INSERT INTO appointment_slot $rows")
-            .bind(("rows", rows))
-            .await?
-            .check()?;
-        let mut created = result.take::<Vec<AppointmentSlot>>(0)?;
+        let mut created = Self::insert_claimed(teacher, rows, db).await?;
         if created.len() != windows.len() {
             return Err(AppError::Internal(format!(
                 "published {} of {} appointment slots",
@@ -820,6 +879,175 @@ mod tests {
             slots[0].clone().delete(&db).await,
             Err(AppError::NotFound)
         ));
+    }
+
+    /// The claim on the publisher's own record, asked exactly the way the race
+    /// asks it: a publish whose `RequireTeacher` snapshot predates a demotion
+    /// must not land, because the sweep in that demotion has already chosen the
+    /// slots it will take and would leave this one behind — under a role that
+    /// can neither list nor delete it.
+    ///
+    /// Both halves matter: a row that is *not there* claims nothing (every other
+    /// test here publishes for a teacher with no user row at all), and a live
+    /// teacher+ passes through untouched.
+    #[tokio::test]
+    async fn a_publish_by_someone_who_lost_the_role_is_refused() {
+        let db = crate::database::init_mem().await.unwrap();
+        // Written as a row rather than through `User` — the password hasher is
+        // private to that module, and the only column this asks about is `role`.
+        db.query("CREATE user:eski SET username = 'eski', password_hash = 'x', role = 'student'")
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        // The row says `student`, so the claim refuses — one-off and weekly
+        // alike, since both go through the same write.
+        let teacher = UserId::from_key("eski");
+        assert!(matches!(
+            AppointmentSlot::create(&teacher, at(1_000), at(2_000), None, &db).await,
+            Err(AppError::Forbidden(_))
+        ));
+        assert!(matches!(
+            AppointmentSlot::publish_weekly(
+                &teacher,
+                at(1_000),
+                at(2_000),
+                None,
+                at(1_000 + MILLIS_PER_WEEK),
+                &db,
+            )
+            .await,
+            Err(AppError::Forbidden(_))
+        ));
+        assert!(
+            AppointmentSlot::list_for_teacher(&teacher, &db)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a refused publish must write nothing"
+        );
+
+        // Promoted, the very same publish lands.
+        db.query("UPDATE user:eski SET role = 'teacher'")
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        AppointmentSlot::create(&teacher, at(1_000), at(2_000), None, &db)
+            .await
+            .unwrap();
+        assert_eq!(
+            AppointmentSlot::list_for_teacher(&teacher, &db)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// The other half of that claim: the publish that arrives *while* the
+    /// demotion is running. Its sweep has already chosen the slots it will take
+    /// ([`crate::domain::user::User::set_role`] reads them into `$slots` before
+    /// it deletes), so a row landing after that read shares no key with anything
+    /// the demotion writes and survives it — a slot owned by someone who can
+    /// neither list nor delete it, forever. The claim on the user record is what
+    /// puts the two transactions on one key.
+    ///
+    /// Real server, and `#[ignore]`d for it, like every other race here: the
+    /// subject *is* the store's conflict detection, which `init_mem`'s embedded
+    /// engine does not have — it commits both sides and answers `Ok` to each, so
+    /// this passes there on broken code.
+    ///
+    /// The window is opened by the schema rather than by a lucky interleaving: a
+    /// `DEFINE EVENT` on the sweep's own `DELETE` holds the demotion open inside
+    /// its transaction, well past the read that chose `$slots`, so the publish
+    /// lands in the middle of it every round.
+    ///
+    /// Stored state is the verdict, not the return value: whether the publish is
+    /// refused outright or swept along with the rest of the calendar, no slot may
+    /// outlive the role.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
+    async fn a_publish_landing_inside_a_demotion_never_outlives_the_role() {
+        use crate::domain::role::Role;
+        use crate::domain::user::User;
+
+        let (db, _serialized) = crate::database::init_test_server("slot_demotion_race").await;
+        let (mut raced, mut published, mut stranded) = (0, 0, 0);
+        for round in 0..4 {
+            let key = format!("t{round}");
+            let teacher = UserId::from_key(&key);
+            db.query(format!(
+                "CREATE user:{key} SET username = '{key}', password_hash = 'x', \
+                 role = '{}';",
+                Role::Teacher.as_str()
+            ))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+            // A slot for the sweep to delete — that delete is the seam.
+            AppointmentSlot::create(&teacher, at(1_000), at(2_000), None, &db)
+                .await
+                .unwrap();
+            db.query(format!(
+                "DEFINE EVENT OVERWRITE hold_the_sweep ON TABLE {APPOINTMENT_SLOT_TABLE} \
+                 WHEN $event = 'DELETE' THEN {{ IF $before.teacher = \
+                 type::record('user', '{key}') {{ SLEEP 300ms }} }};"
+            ))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+            let demoting = {
+                let db = db.clone();
+                let target = teacher.clone();
+                tokio::spawn(async move {
+                    User::read(&target, &db)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .set_role(Role::Student, &db)
+                        .await
+                })
+            };
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if !demoting.is_finished() {
+                raced += 1;
+            }
+            // The publish a `RequireTeacher` snapshot taken a moment ago allows.
+            let landed = AppointmentSlot::create(
+                &teacher,
+                at(MILLIS_PER_WEEK),
+                at(MILLIS_PER_WEEK + 1_000),
+                None,
+                &db,
+            )
+            .await;
+            let swept = demoting.await.unwrap();
+            assert!(swept.is_ok(), "round {round}: the demotion itself failed");
+            if landed.is_ok() {
+                published += 1;
+            }
+            if !AppointmentSlot::list_for_teacher(&teacher, &db)
+                .await
+                .unwrap()
+                .is_empty()
+            {
+                stranded += 1;
+            }
+        }
+        eprintln!(
+            "a publish racing a demotion: {raced}/4 rounds landed inside it, \
+             {published} publishes committed"
+        );
+        assert!(raced > 0, "no round ever reached the race");
+        assert_eq!(
+            stranded, 0,
+            "a slot survived under a role that can neither list nor delete it"
+        );
     }
 
     #[tokio::test]

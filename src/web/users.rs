@@ -410,7 +410,13 @@ async fn update_user_preferences(
 /// with the SurrealQL in the README, since the seed never promotes.
 /// Setting any non-`student` role also drops the user's course enrollments —
 /// only students enroll, so a promoted user leaves every roster. Demoting below
-/// `teacher` drops their course teaching assignments for the mirror reason.
+/// `teacher` drops their course teaching assignments for the mirror reason, and
+/// withdraws their published appointment slots, cancelling the live bookings on
+/// them: nothing could reach either afterwards — a slot is listed only on its
+/// own teacher's calendar and deleted only by a teacher+, and a booking on one
+/// is decided only by a teacher+ and cancelled only by its requester, who is
+/// refused once the window opens. The requester keeps the booking as
+/// `cancelled`, naming the ex-teacher and the reason.
 /// Demoting to `parent` additionally gives back the seats they hold on
 /// still-open event signup lists: a parent can no longer free them, and nobody
 /// else may. Seats on lists that have already closed stay as they are — that

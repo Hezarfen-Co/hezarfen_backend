@@ -5,11 +5,13 @@ use argon2::{Argon2, PasswordHasher, PasswordVerifier};
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
 use crate::constant::{
-    BOARD_TABLE, CLASS_GROUP_TABLE, CLASS_MEMBER_COUNT_FIELD, CLASS_MEMBER_TABLE, COURSE_TABLE,
-    DECOY_PASSWORD, ENROLLMENT_COUNT_FIELD, ENROLLMENT_TABLE, PARENT_LINK_TABLE,
-    REGISTRATION_COUNT_FIELD, REGISTRATION_FROZEN_GUARD, REGISTRATION_TABLE, USER_TABLE,
+    APPOINTMENT_SLOT_TABLE, APPOINTMENT_TABLE, BOARD_TABLE, CLASS_GROUP_TABLE,
+    CLASS_MEMBER_COUNT_FIELD, CLASS_MEMBER_TABLE, COURSE_TABLE, DECOY_PASSWORD,
+    ENROLLMENT_COUNT_FIELD, ENROLLMENT_TABLE, PARENT_LINK_TABLE, REGISTRATION_COUNT_FIELD,
+    REGISTRATION_FROZEN_GUARD, REGISTRATION_TABLE, USER_TABLE,
 };
 use crate::database::{Database, transaction_with_retry, write_with_retry};
+use crate::domain::appointment::AppointmentStatus;
 use crate::domain::board::Board;
 use crate::domain::field_update::FieldUpdate;
 use crate::domain::monotonic_id::next_ulid;
@@ -580,7 +582,22 @@ impl User {
     ///   can freeze, so it is deleted rather than skipped: skipped, it is
     ///   stranded forever (`unregister` 404s on the missing event).
     /// * **Below teacher** gives up course staffing and homeroom-teacher
-    ///   columns — only teacher+ may hold either.
+    ///   columns — only teacher+ may hold either — and the published
+    ///   appointment calendar, whose live bookings are cancelled in the same
+    ///   breath. Nothing else could ever reach those: a slot is listed only on
+    ///   its own teacher's calendar and deleted only by a teacher+, so after the
+    ///   demotion neither its owner nor a manager has a route that yields its
+    ///   id, and a booking on it can be neither decided (teacher+ only) nor
+    ///   cancelled once its window opens — leaving the slot's `occupied` seat
+    ///   pinned at one and the slot itself undeletable forever. The requester
+    ///   keeps the row, `cancelled`, with the teacher on `cancelled_by` and the
+    ///   reason on `cancel_reason`; the slot it pointed at is gone, so the
+    ///   booking renders without a window
+    ///   ([`crate::domain::appointment::Appointment`]'s reader already treats a
+    ///   vanished slot that way). There is no notification anywhere in
+    ///   this crate, so a settled row the person can read is the strongest
+    ///   defined end available — and the alternative, deleting it, would make a
+    ///   confirmed meeting vanish with no trace at all.
     ///
     /// The returned boards are the rooms whose roster this changed (plus those
     /// the user created, which cannot be changed and are returned so their room
@@ -667,6 +684,34 @@ impl User {
             ));
             batch.push(format!(
                 "UPDATE {CLASS_GROUP_TABLE} SET teacher = NONE WHERE teacher = $usr"
+            ));
+            // The published calendar goes too, and the bookings on it are
+            // settled first: a slot only its own teacher can list and only a
+            // teacher+ can delete is reachable by nobody once that teacher is
+            // demoted, and a live booking on one is worse — nobody can approve,
+            // reject or (past its start) cancel it, so it pins the slot's
+            // `occupied` seat forever. Cancelled rather than deleted so the
+            // person who asked is left with a settled booking they can still
+            // read, carrying who dropped it and why; the slot row (and with it
+            // the seat) goes, which is what makes this convergent.
+            batch.push(format!(
+                "LET $slots = (SELECT VALUE id FROM {APPOINTMENT_SLOT_TABLE} WHERE teacher = $usr)"
+            ));
+            batch.push(format!(
+                "UPDATE {APPOINTMENT_TABLE} SET status = '{cancelled}', cancelled_by = $usr, \
+                 cancel_reason = 'the teacher no longer holds a teaching role' \
+                 WHERE slot IN $slots AND status IN ['{pending}', '{approved}']",
+                cancelled = AppointmentStatus::Cancelled.as_str(),
+                pending = AppointmentStatus::Pending.as_str(),
+                approved = AppointmentStatus::Approved.as_str(),
+            ));
+            // Deleting the slots is also what makes a *concurrent* booking safe:
+            // `Appointment::book` claims the slot row this deletes, so the two
+            // collide in the store and the loser re-sends. A slot *published*
+            // concurrently shares no key with any of this, which is why
+            // `AppointmentSlot::insert_claimed` claims the user row instead.
+            batch.push(format!(
+                "DELETE {APPOINTMENT_SLOT_TABLE} WHERE id IN $slots"
             ));
         }
         let sql = format!("{};\nCOMMIT TRANSACTION;", batch.join(";\n"));
@@ -863,6 +908,119 @@ mod tests {
         assert!(
             boards[0].get_participants().is_empty(),
             "and carry the roster the room is about to be told about"
+        );
+    }
+
+    /// A demotion below `teacher` must take the published calendar with it and
+    /// settle the bookings on it. Nothing else can: a slot is listed only on its
+    /// own teacher's calendar (and hidden from every other reader once its owner
+    /// is demoted), deleted only by a teacher+, and a booking on one can be
+    /// decided only by a teacher+ and cancelled only by its requester — who is
+    /// refused the moment the window opens. So a slot left behind here is a row
+    /// no route can reach and a seat nothing can ever free.
+    #[tokio::test]
+    async fn a_demotion_withdraws_the_calendar_and_settles_its_bookings() {
+        use crate::domain::appointment::{Appointment, AppointmentReason};
+        use crate::domain::appointment_slot::AppointmentSlot;
+
+        let db = init_mem().await.unwrap();
+        let staff = |name: &'static str, db: Database| async move {
+            a_user(name, &db)
+                .await
+                .set_role(Role::Teacher, &db)
+                .await
+                .unwrap()
+                .0
+        };
+        let teacher = staff("ogretmen", db.clone()).await;
+        let other = staff("digerogretmen", db.clone()).await;
+        let student = a_user("ogrenci", &db).await;
+        let soon = |offset| Timestamp::from_millis(Timestamp::now().as_millis() + offset);
+        let reason = || AppointmentReason::try_new("görüşme").unwrap();
+        let slot = |owner: &User, offset: i64, db: Database| {
+            let owner = owner.get_id().clone();
+            async move {
+                AppointmentSlot::create(&owner, soon(offset), soon(offset + 60_000), None, &db)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let free = slot(&teacher, 60_000, db.clone()).await;
+        let asked = slot(&teacher, 180_000, db.clone()).await;
+        let agreed = slot(&teacher, 300_000, db.clone()).await;
+        let kept = slot(&other, 60_000, db.clone()).await;
+
+        let pending = Appointment::book(asked.get_id(), student.get_id(), reason(), &db)
+            .await
+            .unwrap();
+        let approved = Appointment::book(agreed.get_id(), student.get_id(), reason(), &db)
+            .await
+            .unwrap();
+        Appointment::approve(approved.get_id(), teacher.get_id(), &db)
+            .await
+            .unwrap();
+        let elsewhere = Appointment::book(kept.get_id(), student.get_id(), reason(), &db)
+            .await
+            .unwrap();
+
+        teacher.clone().set_role(Role::Student, &db).await.unwrap();
+
+        // The calendar is gone, the booked weeks included.
+        assert!(
+            AppointmentSlot::list_for_teacher(teacher.get_id(), &db)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        for slot in [&free, &asked, &agreed] {
+            assert!(
+                AppointmentSlot::read(slot.get_id(), &db)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "a slot only a teacher+ could reach outlived the role"
+            );
+        }
+        // Both bookings — the pending request and the confirmed meeting — ended
+        // in a state their requester can still read, saying who dropped it.
+        for booking in [&pending, &approved] {
+            let after = Appointment::read(booking.get_id(), &db)
+                .await
+                .unwrap()
+                .expect("the requester keeps the row");
+            assert_eq!(after.get_status(), AppointmentStatus::Cancelled);
+            assert_eq!(after.get_cancelled_by(), Some(teacher.get_id()));
+            assert!(after.get_cancel_reason().is_some(), "and why");
+        }
+        // The seat each held died with its slot row, so nothing is pinned: no
+        // live booking is left pointing at a slot that no longer exists.
+        let mut result = db
+            .query(
+                "SELECT VALUE id FROM appointment \
+                 WHERE status IN ['pending', 'approved'] AND slot.starts_at = NONE",
+            )
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        assert!(result.take::<Vec<RecordId>>(0).unwrap().is_empty());
+
+        // Another teacher's calendar is nobody else's business.
+        assert_eq!(
+            AppointmentSlot::list_for_teacher(other.get_id(), &db)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            Appointment::read(elsewhere.get_id(), &db)
+                .await
+                .unwrap()
+                .unwrap()
+                .get_status(),
+            AppointmentStatus::Pending
         );
     }
 
