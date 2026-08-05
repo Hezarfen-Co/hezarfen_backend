@@ -21,7 +21,7 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::constant::MAX_FEE_PLAN_ASSIGN_STUDENTS;
+use crate::constant::{MAX_FEE_PLAN_ASSIGN_STUDENTS, MAX_FEE_PLAN_ASSIGN_WRITES};
 use crate::database::Database;
 use crate::domain::fee_plan::{FeePlan, FeePlanId, FeePlanName, Installment};
 use crate::domain::fee_plan_assignment::FeePlanAssignment;
@@ -65,13 +65,22 @@ struct InstallmentBody {
     amount_minor: i64,
     /// When it falls due, unix milliseconds. **May be in the past** — a school
     /// adopting the app mid-year assigns plans whose first installments were
-    /// already due.
+    /// already due. Negative is a `400`: that is not an instant.
     #[schema(minimum = 0, example = 1_760_000_000_000_i64)]
     due_at: i64,
 }
 
 impl InstallmentBody {
     fn into_domain(self) -> Result<Installment, AppError> {
+        // A past due date is legal on purpose; a *negative* one is not an
+        // instant at all, and it would leave the charge it bills permanently
+        // `overdue` with no date a client could have meant.
+        if self.due_at < 0 {
+            return Err(AppError::Validation(ValidationError::Invalid {
+                field: "due_at",
+                reason: "must not be negative",
+            }));
+        }
         Ok(Installment::new(
             LedgerAmount::try_new(self.amount_minor)?,
             Timestamp::from_millis(self.due_at),
@@ -167,7 +176,7 @@ async fn require_plan(id: &str, db: &Database) -> Result<FeePlan, AppError> {
     request_body = CreateFeePlan,
     responses(
         (status = 201, description = "Plan created", body = FeePlanResponse),
-        (status = 400, description = "Invalid name, amount, or installment count", body = ErrorResponse),
+        (status = 400, description = "Invalid name, amount, due date, or installment count", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
@@ -263,7 +272,7 @@ async fn get_plan(
     request_body = UpdateFeePlan,
     responses(
         (status = 200, description = "The updated plan", body = FeePlanResponse),
-        (status = 400, description = "Invalid name, amount, or installment count", body = ErrorResponse),
+        (status = 400, description = "Invalid name, amount, due date, or installment count", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "No such plan", body = ErrorResponse),
@@ -365,6 +374,13 @@ struct FeePlanAssignmentResponse {
 /// never the version this request first looked at. A plan deleted while the
 /// batch is running is `rejected` from that student on — a per-student outcome
 /// like any other, so the students it already billed stay in the report.
+///
+/// One request is bounded by the **charges it would raise**, not by the head
+/// count alone: `student_ids × installments` may not exceed 3 000 (200
+/// students up to a 15-installment plan; 50 at a time on a 60-installment
+/// one). Past that the whole call is a `400` telling the caller to split the
+/// batch — nothing is written, because a money route that billed half a batch
+/// and gave up would leave a bursar guessing which families were charged.
 #[utoipa::path(
     post,
     path = "/plans/{id}/assignments",
@@ -374,7 +390,7 @@ struct FeePlanAssignmentResponse {
     request_body = AssignFeePlan,
     responses(
         (status = 200, description = "Per-student outcome, in the order sent", body = Vec<AssignmentOutcome>),
-        (status = 400, description = "Too many students named", body = ErrorResponse),
+        (status = 400, description = "Too many students named, or too many charges for one request", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "No such plan", body = ErrorResponse),
@@ -394,6 +410,23 @@ async fn assign_plan(
         }));
     }
     let plan = require_plan(&id, &st.db).await?;
+    // The student cap alone cannot see the schedule: every student named
+    // appends *every* installment, so what really bounds this request is the
+    // product. Refused whole and before anything is written — a batch this API
+    // billed only part of would leave a bursar guessing which families were
+    // charged.
+    if req
+        .student_ids
+        .len()
+        .saturating_mul(plan.get_installments().len())
+        > MAX_FEE_PLAN_ASSIGN_WRITES
+    {
+        return Err(AppError::Validation(ValidationError::Invalid {
+            field: "student_ids",
+            reason: "too many charges for one request: students × installments \
+                     may not exceed 3000, so split the batch",
+        }));
+    }
     let mut outcomes = Vec::with_capacity(req.student_ids.len());
     for student_id in req.student_ids {
         let student = UserId::from_key(&student_id);
@@ -634,7 +667,7 @@ fn request_key_of(raw: Option<&str>) -> Result<Option<PaymentRequestKey>, AppErr
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "No such ledger line", body = ErrorResponse),
-        (status = 409, description = "The charge is already paid in full, the charge was reversed (so it is no longer owed), or the request_key was used for a different amount or charge", body = ErrorResponse),
+        (status = 409, description = "The charge is already paid in full, the charge was reversed (so it is no longer owed), it already carries the most lines that may be applied to it, or the request_key was used for a different amount or charge", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -676,7 +709,7 @@ async fn record_payment(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "No such ledger line", body = ErrorResponse),
-        (status = 409, description = "The payment is already refunded in full, or the request_key was used for a different amount or payment", body = ErrorResponse),
+        (status = 409, description = "The payment is already refunded in full, it already carries the most lines that may be applied to it, or the request_key was used for a different amount or payment", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -947,7 +980,10 @@ async fn statement_response(
     Ok(Json(StatementResponse {
         student: PersonRef::resolve(&people, student),
         entries: Page::new(entries, total, limit, offset),
-        balance_minor: PaymentLedger::balance_of(student, db).await?,
+        // Folded from the very lines the rollup above walked, never re-read: a
+        // payment landing between two reads would leave one document saying
+        // both "still owed" and "already settled" about the same money.
+        balance_minor: PaymentLedger::fold_balance(lines.iter().map(PaymentLedger::folded)),
     }))
 }
 

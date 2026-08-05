@@ -193,7 +193,7 @@ impl FeePlan {
         if let Some(installments) = &installments {
             validate_installments(installments)?;
         }
-        FieldUpdate::new(self.id.record())
+        let edited = FieldUpdate::new(self.id.record())
             .set("name", name)
             .set("installments", installments)
             .guard(
@@ -201,7 +201,17 @@ impl FeePlan {
                 AppError::Conflict("an assigned plan cannot be edited"),
             )
             .run::<FeePlan>(db)
-            .await
+            .await;
+        // Still assigned or already gone: the guarded `UPDATE` cannot tell those
+        // apart either (it reports the refusal it was given), so — exactly as
+        // [`FeePlan::delete`] does — only the refusal path pays for the read
+        // that can. A plan deleted in the window since the handler read it must
+        // not be refused as "assigned": it never was.
+        if matches!(edited, Err(AppError::Conflict(_))) && Self::read(&self.id, db).await?.is_none()
+        {
+            return Err(AppError::NotFound);
+        }
+        edited
     }
 
     /// Delete the plan, but only while nobody is on it. `false` = refused,
