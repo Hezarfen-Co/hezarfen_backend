@@ -172,9 +172,17 @@ pub(crate) async fn student_marks_history(
 // marked this student (an ExamResult row proves it).
 
 /// The exam plus the per-student review gate the three self-review reads share.
-/// 404 if the exam is missing or still a draft, 403 if review is off for it,
-/// 404 until the caller has a mark on it (nothing to review yet), and 409 while
-/// the caller could still write a sitting at it.
+/// 404 if the exam is missing, still a draft, or the caller has no mark on it
+/// (nothing to review yet), 403 if review is off for it, and 409 while the
+/// caller could still write a sitting at it.
+///
+/// The mark check runs *before* the `allow_review` one, and must stay there: a
+/// caller with no mark is an outsider to this exam, and answering them 403-if-
+/// off / 404-otherwise made the status code an oracle for a flag they cannot
+/// read anywhere else (`GET /exams/{id}` refuses them at `can_view_course`
+/// before it serves `allow_review` at all). With the mark first, an outsider's
+/// answer is 404 whatever the flag says; only a caller who was marked — who
+/// therefore sat the exam, enrolled or since dropped — ever sees the 403.
 ///
 /// That last check is the one a mark alone can't make: the mark lookup reads the
 /// *latest* sitting's mark, so a mark left at seq 1 satisfies it forever — a
@@ -196,12 +204,12 @@ pub(crate) async fn reviewable_exam(
     if exam.is_draft() {
         return Err(AppError::NotFound);
     }
-    if !exam.get_allow_review() {
-        return Err(AppError::Forbidden("review not enabled for this exam"));
-    }
     ExamResult::read_for_user(exam.get_id(), user.get_id(), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
+    if !exam.get_allow_review() {
+        return Err(AppError::Forbidden("review not enabled for this exam"));
+    }
     let attempts = ExamAttempt::list_for_user(exam.get_id(), user.get_id(), &st.db).await?;
     let now = Timestamp::now();
     if attempts
@@ -278,7 +286,7 @@ async fn live_elsewhere(
     responses(
         (status = 200, description = "The caller's own sitting numbers, ascending", body = [i64]),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Review not enabled for this exam", body = ErrorResponse),
+        (status = 403, description = "Review not enabled for this exam — only a caller who already has a mark on it ever reads this, everyone else gets the `404`", body = ErrorResponse),
         (status = 404, description = "Exam not found, still a draft, or the caller has no mark on it", body = ErrorResponse),
         (status = 409, description = "The caller can still sit this exam (a sitting in progress, or an attempt left under `max_attempts` while the exam is open)", body = ErrorResponse),
     ),
@@ -321,7 +329,7 @@ pub(crate) async fn review_attempts(
         (status = 200, description = "A page of the exam's questions with `correct` (all of them when unpaged); `correct` is `null` on a question whose bank template the caller has live under an open sitting elsewhere", body = Page<QuestionResponse>),
         (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Review not enabled for this exam", body = ErrorResponse),
+        (status = 403, description = "Review not enabled for this exam — only a caller who already has a mark on it ever reads this, everyone else gets the `404`", body = ErrorResponse),
         (status = 404, description = "Exam not found, still a draft, or the caller has no mark on it", body = ErrorResponse),
         (status = 409, description = "The caller can still sit this exam (a sitting in progress, or an attempt left under `max_attempts` while the exam is open)", body = ErrorResponse),
     ),
@@ -360,7 +368,7 @@ pub(crate) async fn review_questions(
     responses(
         (status = 200, description = "That sitting's answers, judged", body = AttemptAnswersResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Review not enabled for this exam", body = ErrorResponse),
+        (status = 403, description = "Review not enabled for this exam — only a caller who already has a mark on it ever reads this, everyone else gets the `404`", body = ErrorResponse),
         (status = 404, description = "Exam not found, still a draft, or the caller has no mark on it", body = ErrorResponse),
         (status = 409, description = "The caller can still sit this exam (a sitting in progress, or an attempt left under `max_attempts` while the exam is open)", body = ErrorResponse),
     ),
@@ -393,7 +401,7 @@ pub(crate) async fn review_attempt_answers(
     responses(
         (status = 200, description = "The caller's drawing bytes", content_type = "image/*"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Review not enabled for this exam", body = ErrorResponse),
+        (status = 403, description = "Review not enabled for this exam — only a caller who already has a mark on it ever reads this, everyone else gets the `404`", body = ErrorResponse),
         (status = 404, description = "No such exam/question/drawing, a draft, or the caller has no mark on it", body = ErrorResponse),
         (status = 409, description = "The caller can still sit this exam (a sitting in progress, or an attempt left under `max_attempts` while the exam is open)", body = ErrorResponse),
     ),

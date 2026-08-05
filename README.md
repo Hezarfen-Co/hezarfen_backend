@@ -1541,6 +1541,14 @@ concurrent bookings can both read as free). The decisions:
   `teacher` decides nothing on it any more — and nothing is left for anyone
   else to decide either, since that demotion cancelled the bookings along with
   the slots. Refused
+Every slot carries its teacher's identity (id, username, display name), to a
+parent as much as to a student: **deliberate**, and not to be tightened. A
+parent's three direct routes to that identity are all shut (`GET
+/users/{id}/profile` is a `403`, `/users/search` is teacher+, `/users` is
+admin), but a conference cannot be booked off an anonymous calendar — this list
+*is* the staff directory for the booking flow, narrowed to whoever published
+bookable time. The same refs on a booking (`teacher`, `proposed_by`,
+`decided_by`) read the same way.
   (`409`) when the effective window has already started, and refused while a
   counter-proposal stands: the proposal is the teacher's own, so approving it
   here would let them confirm a time the requester never accepted.
@@ -2418,6 +2426,10 @@ construction):
   staff never sit; enrolled; window open where one exists — `open` exams start
   anytime). While the latest
   sitting runs, re-posting returns it unchanged (`200`, not `201`):
+  The mark is checked **before** the flag, so a caller who has none reads `404`
+  whichever way `allow_review` is set — an outsider (an unenrolled student, a
+  parent) never learns from the status code whether review is on for an exam
+  `GET /exams/{id}` would refuse them outright.
   reconnecting never resets the clock. Once it is submitted or expired,
   re-posting mints the next sitting (`201`) **from a blank answer sheet** —
   the previous sitting's answers are wiped — until `max_attempts` is spent

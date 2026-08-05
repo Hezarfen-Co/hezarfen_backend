@@ -218,6 +218,50 @@ async fn accepting_a_superseded_proposal_is_refused() {
     assert_eq!(res.body["ends_at"], swapped_ends_at);
 }
 
+/// Not a defect — a pin on a deliberate disclosure, so a future "tightening"
+/// fails loudly instead of silently killing the booking flow. `GET
+/// /appointments/slots` hands a parent the slot teacher's `PersonRef`, an
+/// identity all three of a parent's direct routes refuse them (`/users/{id}/
+/// profile` 403, `/users/search` teacher+, `/users` admin). It has to: you
+/// cannot choose whom to book a conference with from an anonymous calendar.
+#[tokio::test]
+async fn a_parent_reads_the_slot_teachers_identity() {
+    let (app, db) = app_and_db().await;
+    let ali = login_as(&app, &db, "ali", "teacher").await;
+    let ali_id = me_id(&app, &ali).await;
+    let veli = login_as(&app, &db, "veli", "parent").await;
+    let now = Timestamp::now().as_millis();
+
+    let res = send(
+        &app,
+        "POST",
+        "/appointments/slots",
+        Some(&ali),
+        Some(json!({ "starts_at": now + HOUR_MS, "ends_at": now + 2 * HOUR_MS })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+
+    // The parent is refused that identity everywhere it is asked for directly.
+    for uri in [
+        format!("/users/{ali_id}/profile"),
+        "/users/search?q=ali".to_string(),
+        "/users".to_string(),
+    ] {
+        let res = send(&app, "GET", &uri, Some(&veli), None).await;
+        assert_eq!(res.status, StatusCode::FORBIDDEN, "{uri}: {}", res.body);
+    }
+
+    // And gets it here anyway, on purpose: id, username, and the name they need
+    // to recognise the teacher they are booking.
+    let res = send(&app, "GET", "/appointments/slots", Some(&veli), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let teacher = &common::items(&res.body)[0]["teacher"];
+    assert_eq!(teacher["id"], ali_id.as_str(), "{}", res.body);
+    assert_eq!(teacher["username"], "ali", "{}", res.body);
+    assert!(teacher.get("display_name").is_some(), "{}", res.body);
+}
+
 /// An answer belongs to the question of *its own* POST. Two POSTs on one thread
 /// interleave across `append_user` / `append_pending_assistant`, so the rows
 /// land `userA, userB, asstA, asstB` — and "the newest user row written before
