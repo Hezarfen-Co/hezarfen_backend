@@ -964,10 +964,65 @@ pub const BACKFILL: &str = "
         completed_at = time::unix(time::now()) * 1000
         WHERE status = 'pending' AND created_at < time::unix(time::now()) * 1000 - $stale_ms;
 
+    -- The seats the sweep below spent every past boot *not* giving back: until
+    -- today it deleted those rows without touching the course's counter, so
+    -- every course it ever swept carries a phantom seat — one that denies a real
+    -- student a place, and that `Course::delete` refuses to let anyone past,
+    -- forever (its guard is `(enrollment_count ?? 0) = 0` on the course row).
+    -- This recomputes the counter for every course whose stored number disagrees
+    -- with the enrollment rows it actually has.
+    --
+    -- Counting the rows cannot read *low*. The counter has exactly one meaning —
+    -- the live enrollment rows of this course — and every writer moves it with
+    -- the row in one transaction (`Enrollment::enroll`/`remove`, `set_role`'s
+    -- demotion sweep, the class pump's attach and detach); `Course::delete` takes
+    -- the rows *and* the course together, so no cascade leaves counted rows
+    -- behind. That is what separates it from the lifetime tallies below, which
+    -- are seeded once precisely because their rows do die under them. The claims
+    -- that borrow this column as a collision device (`cap::touch_and_create`,
+    -- `Axis::pivot_claim`) bump and restore it inside their own transaction, so
+    -- no other reader ever sees the raised value — and `migrate` runs to
+    -- completion before the router is bound, one process per volume, so there is
+    -- no concurrent writer to see it from anyway.
+    --
+    -- Neither `= NONE`-guarded nor marked, for the board-stroke repair's reason:
+    -- this is not an opinion the live system maintains, it is the course's row
+    -- count, so recomputing converges instead of overwriting and the `!=` guard
+    -- writes nothing on the next boot. It runs *before* the sweep, so the two
+    -- own separate halves of the same invariant — this one clears the drift the
+    -- volume arrived with, the sweep's own decrement leaves none behind — and it
+    -- does not fight the `= NONE` seeding further down either: a pre-counter
+    -- course with rows gets the same number here that the seeding would have
+    -- given it, and one with no rows stays absent for the zero pass to fill.
+    --
+    -- Per course rather than `GROUP BY course`, because the case that matters
+    -- most forms no group: a course whose last enrollment the sweep took away has
+    -- zero rows and a counter above zero, and a grouped pass would never visit
+    -- it. `array::len` over ids rather than `count()`, because an aggregate over
+    -- an indexed field (`enrollment` is indexed on `course`) can come back as
+    -- `{ count: n }` from the server — a shape the in-memory engine never
+    -- produces and `option<int>` would refuse.
+    FOR $c IN ((SELECT VALUE id FROM course) ?? []) {
+        LET $live = array::len((SELECT VALUE id FROM enrollment WHERE course = $c));
+        UPDATE $c SET enrollment_count = $live WHERE (enrollment_count ?? 0) != $live;
+    };
+
     -- Promotion out of student now deletes the user's enrollments (2026-07-18);
     -- this sweeps rows promoted before that fix. A deleted user reads as
     -- `user.role = NONE`, which is also != 'student' — those rows go too.
-    DELETE enrollment WHERE user.role != 'student';
+    --
+    -- The course's seat goes back with the row, per course, exactly the way
+    -- `User::set_role`'s own demotion sweep releases it: the counter is the
+    -- roster's authority, so a swept row that kept its seat denies a real
+    -- student a place *and* makes the course undeletable for good
+    -- (`Course::delete` refuses on `(enrollment_count ?? 0) = 0`). Several rows
+    -- of one course each take their own turn through the loop, so the counter
+    -- comes down by exactly as many rows as went.
+    LET $swept = (DELETE enrollment WHERE user.role != 'student' RETURN BEFORE);
+    FOR $row IN ($swept ?? []) {
+        UPDATE $row.course SET enrollment_count =
+            math::max([(enrollment_count ?? 0) - 1, 0]);
+    };
 
     -- Choices gained stable ids (2026-07-24): `choices` held bare strings and
     -- `correct`/`selected`/`slot` held the option's *position*. The DDL above
@@ -1292,7 +1347,13 @@ pub const BACKFILL: &str = "
             UPDATE $row.user SET homework_on_time_total = $row.n;
         };
         UPDATE homework_submission SET counted_on_time = submitted_at <= homework.due_at;
-        FOR $row IN ((SELECT user, count() AS n FROM exam_attempt GROUP BY user) ?? []) {
+        -- `(seq ?? 1) = 1` is one row per (exam, student) pair, so this counts
+        -- *exams sat* — what the request path credits (a retake writes a higher
+        -- seq and moves nothing). Counting every row instead would seed a
+        -- pre-existing student above a new one for the same work, and above
+        -- what the live path would ever give them again.
+        FOR $row IN ((SELECT user, count() AS n FROM exam_attempt
+                      WHERE (seq ?? 1) = 1 GROUP BY user) ?? []) {
             UPDATE $row.user SET exam_sat_total = $row.n;
         };
         FOR $row IN ((SELECT user, count() AS sessions,
