@@ -383,6 +383,18 @@ impl ExamResult {
     /// Delete every sitting's mark for one (exam, user) pair. `kind` is the
     /// exam's: the marks give their references back, so a kind nothing is
     /// graded under any more can leave the settings again.
+    ///
+    /// The two badge counters come back the same way, and for a reason the
+    /// other counters do not need: [`grade`](Self::grade) credits them on the
+    /// branch that finds no row, and a deleted row *is* no row. Left standing,
+    /// ungrade-then-regrade credited a second time off one stored mark, and
+    /// looped it minted a badge from a single exam — permanently, since an
+    /// award is never revoked. Each is given back off the rows this statement
+    /// actually deleted: `marks_given_total` to each row's *own* grader (two
+    /// teachers can hold two sittings of the same pair), and `high_mark_total`
+    /// once per removed row that cleared [`HIGH_MARK_MIN`], read off the
+    /// `BEFORE` image rather than re-derived — the mark that was credited is
+    /// the mark that was stored.
     pub async fn remove(
         exam: &ExamId,
         user: &UserId,
@@ -414,6 +426,16 @@ impl ExamResult {
                          math::max([({REF_COUNT_FIELD} ?? 0) - array::len($gone), 0]);
                      UPDATE $ex SET {EXAM_RESULT_COUNT_FIELD} =
                          math::max([({EXAM_RESULT_COUNT_FIELD} ?? 0) - array::len($gone), 0]);
+                     LET $high = array::len($gone[WHERE mark >= {HIGH_MARK_MIN}]);
+                     IF $high > 0 {{
+                         UPDATE $usr SET {HIGH_MARK_TOTAL_FIELD} =
+                             math::max([({HIGH_MARK_TOTAL_FIELD} ?? 0) - $high, 0])
+                     }};
+                     FOR $row IN $gone {{
+                         LET $grader = $row.graded_by;
+                         UPDATE $grader SET {MARKS_GIVEN_TOTAL_FIELD} =
+                             math::max([({MARKS_GIVEN_TOTAL_FIELD} ?? 0) - 1, 0])
+                     }};
                  }};
                  RETURN $gone;
                  COMMIT TRANSACTION;"
@@ -700,6 +722,51 @@ mod tests {
         // …and a high-scoring retake counts as its own sitting.
         grade(&db, &exam, 3, 95, "midterm").await.unwrap();
         assert_eq!(badge_counters(&db).await, (3, 2));
+    }
+
+    /// Ungrading gives both badge counters back, so grade → ungrade → regrade
+    /// nets to one credit however often it is run. Crediting the grade without
+    /// refunding the delete let that loop mint a badge off a single exam — and
+    /// an award, once earned, is never taken back.
+    #[tokio::test]
+    async fn ungrading_gives_the_badge_counters_back() {
+        let db = init_mem().await.unwrap();
+        let exam = ExamId::from_key("01TESTEXAMUNGRADEAAAAAAAAA");
+        an_exam(&db, &exam, "midterm").await;
+        the_two_people(&db).await;
+        let student = UserId::from_key(STUDENT);
+
+        for _ in 0..3 {
+            grade(&db, &exam, 1, 95, "midterm").await.unwrap();
+            assert_eq!(badge_counters(&db).await, (1, 1));
+            ExamResult::remove(&exam, &student, "midterm", &db)
+                .await
+                .unwrap()
+                .expect("the mark was there");
+            assert_eq!(badge_counters(&db).await, (0, 0), "the loop kept a credit");
+            // The kind's reference and the exam's count come back as before.
+            assert_eq!(counters(&db, "midterm").await, (0, 0));
+        }
+
+        // Every removed sitting is refunded, and only the ones that took: the
+        // grader gets both back, the student only the mark that cleared the line.
+        grade(&db, &exam, 1, 40, "midterm").await.unwrap();
+        grade(&db, &exam, 2, 95, "midterm").await.unwrap();
+        assert_eq!(badge_counters(&db).await, (2, 1));
+        ExamResult::remove(&exam, &student, "midterm", &db)
+            .await
+            .unwrap()
+            .expect("both sittings were there");
+        assert_eq!(badge_counters(&db).await, (0, 0));
+
+        // Nothing to remove is nothing to give back — the floor holds.
+        assert!(
+            ExamResult::remove(&exam, &student, "midterm", &db)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(badge_counters(&db).await, (0, 0));
     }
 
     /// A refused mark leaves the badge counters where the other two are left.
