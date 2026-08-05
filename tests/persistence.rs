@@ -506,6 +506,140 @@ async fn stale_staff_enrollments_are_swept_on_boot() {
     );
 }
 
+/// The seat goes back with the swept row. The sweep above deletes enrollments
+/// whose holder is no longer a student, and for every boot it ever ran it kept
+/// their seats: the course stayed as full as it was, so a real student was
+/// refused a place that nobody held. Two rows of the *same* course go here,
+/// because the counter has to come down once per row and not once per course.
+///
+/// The repair pass runs *before* the sweep, so it cannot stand in for the
+/// decrement being asserted here: at that point both rows are still there and
+/// the counter already agrees with them.
+#[tokio::test]
+async fn a_swept_enrollment_gives_the_course_its_seat_back() {
+    let (app, db) = common::app_and_db().await;
+    let teacher = common::login_as(&app, &db, "teacher", "teacher").await;
+    let res = send(
+        &app,
+        "POST",
+        "/courses",
+        Some(&teacher),
+        Some(json!({ "title": "small", "description": "", "capacity": 2 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let course = common::id_of(&res.body);
+
+    for name in ["veli", "ayse"] {
+        let cookie = common::login(&app, name).await;
+        let id = me_id(&app, &cookie).await;
+        enroll(&app, &teacher, &course, &id).await;
+    }
+    // Aged the way a pre-2026-07-18 promotion left them: the role moved on the
+    // row itself, so no endpoint ever released the seat.
+    set_role(&db, "veli", "teacher").await;
+    set_role(&db, "ayse", "manager").await;
+
+    let app = reboot(&db).await;
+    let mut counter = db
+        .query("SELECT VALUE enrollment_count FROM course")
+        .await
+        .expect("read the counter")
+        .check()
+        .expect("read the counter");
+    assert_eq!(
+        counter.take::<Vec<i64>>(0).expect("enrollment_count"),
+        vec![0],
+        "both swept rows must hand their seats back"
+    );
+
+    // The user-visible half: the capacity is free again, so a real student gets
+    // the place the phantom seats were denying them.
+    let can = common::login(&app, "can").await;
+    let can_id = me_id(&app, &can).await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/courses/{course}/enrollments"),
+        Some(&teacher),
+        Some(json!({ "user_id": can_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+}
+
+/// The repair for the drift past boots already left behind: a course whose
+/// `enrollment_count` outran its roster is recounted from the rows it actually
+/// has. The symptom that makes it worth a boot pass is the delete guard —
+/// `Course::delete` refuses on `(enrollment_count ?? 0) = 0`, so a course
+/// carrying a phantom seat can never be deleted by anyone — so that is what is
+/// asserted, not just the number.
+///
+/// The second course pins the other direction: the repair recounts to the
+/// roster, never to zero, so a course with real students keeps its seats.
+#[tokio::test]
+async fn a_course_whose_count_outran_its_roster_is_repaired_and_deletable() {
+    let (app, db) = common::app_and_db().await;
+    let teacher = common::login_as(&app, &db, "teacher", "teacher").await;
+    let stranded = create_course(&app, &teacher, "stranded").await;
+    let live = create_course(&app, &teacher, "live").await;
+    let student = common::login(&app, "veli").await;
+    let student_id = me_id(&app, &student).await;
+    enroll(&app, &teacher, &live, &student_id).await;
+
+    // The state every past run of the sweep left: rows gone, seats not.
+    db.query(
+        "UPDATE type::record('course', $stranded) SET enrollment_count = 3;
+         UPDATE type::record('course', $live) SET enrollment_count = 5;",
+    )
+    .bind(("stranded", stranded.clone()))
+    .bind(("live", live.clone()))
+    .await
+    .expect("age the counters")
+    .check()
+    .expect("age the counters");
+
+    let app = reboot(&db).await;
+    let mut counters = db
+        .query("SELECT VALUE enrollment_count FROM course ORDER BY id")
+        .await
+        .expect("read the counters")
+        .check()
+        .expect("read the counters");
+    let mut stored = counters.take::<Vec<i64>>(0).expect("enrollment_count");
+    stored.sort_unstable();
+    assert_eq!(
+        stored,
+        vec![0, 1],
+        "each course is recounted from its own rows"
+    );
+
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/courses/{stranded}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::NO_CONTENT,
+        "a repaired course is deletable again: {}",
+        res.body
+    );
+    // And the one with a real student on it is still guarded.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/courses/{live}"),
+        Some(&teacher),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+}
+
 /// Exam rows written before the draft flag existed (2026-07-19) backfill to
 /// published (`draft = false`) on the next boot — an old volume's exams stay
 /// exactly as visible as they were.
