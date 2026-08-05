@@ -1351,7 +1351,8 @@ async fn delete_blueprint(
 /// A course a human attached by hand counts as carried, exactly as it does for
 /// the pump — the template asks for the course, not for the pump's tag.
 /// Deleting a course takes it out of every template naming it, so `missing`
-/// names courses that still exist.
+/// names courses that still exist — only a row written before that cascade
+/// existed can still show a dangling id.
 ///
 /// The fix for anything listed is one of two idempotent calls:
 /// `POST /classes/{id}/blueprint` for one section, or `PATCH` the blueprint

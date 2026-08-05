@@ -264,7 +264,8 @@ async fn create_menu(
 
 /// List published menus, newest day first, each with its dishes. Any
 /// authenticated user. Narrow to a date range with `?from=&to=` (inclusive,
-/// `YYYY-MM-DD`). Paged via `?limit=&offset=` (omit `limit` for the full list);
+/// `YYYY-MM-DD`, each bound held to the same real-calendar-day rule a menu's
+/// own date is). Paged via `?limit=&offset=` (omit `limit` for the full list);
 /// returns a `{items, total, limit, offset}` envelope.
 #[utoipa::path(
     get,
@@ -274,7 +275,7 @@ async fn create_menu(
     params(MenuRange, PageParams),
     responses(
         (status = 200, description = "A page of menus (the full list when unpaged)", body = Page<MenuResponse>),
-        (status = 400, description = "Malformed date bound, limit, or offset", body = ErrorResponse),
+        (status = 400, description = "Date bound that is not a real YYYY-MM-DD calendar day, or a malformed limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
     ),
 )]
@@ -815,7 +816,7 @@ async fn booking_target(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not a student booking for themselves, nor a parent booking for a linked student", body = ErrorResponse),
         (status = 404, description = "No such menu", body = ErrorResponse),
-        (status = 409, description = "The menu is full, its cutoff has passed, or the menu kept being edited while the seat was being taken", body = ErrorResponse),
+        (status = 409, description = "The menu is full, its cutoff has passed, its date is not a real calendar day so no cutoff can be worked out, or the menu kept being edited while the seat was being taken", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -943,7 +944,7 @@ async fn list_menu_bookings(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the booking's student, their parent, nor a manager", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "The cutoff has passed (students and parents only), the seat was booked again while this call ran, or the menu was too contended to free the seat", body = ErrorResponse),
+        (status = 409, description = "The cutoff has passed (students and parents only), the menu's date is not a real calendar day so no cutoff can be worked out, the seat was booked again while this call ran, or the menu was too contended to free the seat", body = ErrorResponse),
     ),
 )]
 async fn cancel_booking(
@@ -1140,7 +1141,8 @@ async fn list_menu_attendance(
 /// One student's meal-attendance history, newest mark first. Requires teacher+,
 /// or a parent linked to them — the caller's own id always passes, like the
 /// balance and ledger reads. Narrow to a date range with `?from=&to=`
-/// (inclusive `YYYY-MM-DD` bounds on the menu's day). Paged via `?limit=&offset=`.
+/// (inclusive `YYYY-MM-DD` bounds on the menu's day, each held to the same
+/// real-calendar-day rule the menu's own date is). Paged via `?limit=&offset=`.
 #[utoipa::path(
     get,
     path = "/attendance/{user}",
@@ -1149,7 +1151,7 @@ async fn list_menu_attendance(
     params(("user" = String, Path, description = "Student id"), MenuRange, PageParams),
     responses(
         (status = 200, description = "A page of marks (all of them when unpaged)", body = Page<MealAttendanceResponse>),
-        (status = 400, description = "Malformed date bound, limit, or offset", body = ErrorResponse),
+        (status = 400, description = "Date bound that is not a real YYYY-MM-DD calendar day, or a malformed limit or offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires teacher role or higher, or a parent link", body = ErrorResponse),
     ),
