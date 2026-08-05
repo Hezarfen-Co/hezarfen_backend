@@ -664,10 +664,25 @@ fn served_at(date: &MenuDate, serving_minute: Option<i64>) -> Option<Timestamp> 
 
 /// Booking and cancelling both close `cutoff.minutes` before the meal is
 /// served. `None` = the school set no cutoff, so neither ever closes.
+///
+/// A date no serving instant can be computed from **fails closed**. A menu on
+/// an impossible day (a 31st of February — refused by [`MenuDate`] now, but
+/// rows written before that rule are still on the volume) otherwise skipped the
+/// deadline entirely, silently and forever, however large the school set it:
+/// the one menu with no cutoff at all would be the one nobody meant to publish.
+/// Refusing is the only answer that keeps "the deadline binds every menu" true;
+/// the menu has to be republished on a real day to become bookable again.
 fn check_cutoff(date: &MenuDate, slot: &MenuSlot, cutoff: &MealCutoff) -> Result<(), AppError> {
-    let serving = served_at(date, cutoff.serving_minute(slot));
-    let (Some(minutes), Some(serving)) = (cutoff.minutes, serving) else {
+    // A school with no cutoff configured closes nothing anyway, so an
+    // impossible date is not refused there either — that would take the canteen
+    // offline for a deadline the school never set.
+    let Some(minutes) = cutoff.minutes else {
         return Ok(());
+    };
+    let Some(serving) = served_at(date, cutoff.serving_minute(slot)) else {
+        return Err(AppError::Conflict(
+            "the menu's date is not a real calendar day, so its cutoff cannot be worked out",
+        ));
     };
     let deadline = serving
         .as_millis()
@@ -1173,6 +1188,23 @@ mod tests {
         // A day far ahead is open; one long gone is shut.
         assert!(check_cutoff(&far, &lunch(), &cutoff(Some(60), Some(720))).is_ok());
         assert!(check_cutoff(&past, &lunch(), &cutoff(Some(60), Some(720))).is_err());
+    }
+
+    /// A menu stored on a day that does not exist has no serving instant, so no
+    /// deadline can be counted back from it — and it must therefore refuse, not
+    /// pass. `MenuDate::try_new` rejects such a date now; this is a row written
+    /// before that rule, read back off the store exactly as the domain reads it
+    /// (the column is `TYPE string`), which is the only way one can still turn
+    /// up. Passing is what let it be booked and cancelled with no cutoff ever.
+    #[test]
+    fn an_impossible_day_has_no_open_deadline() {
+        let impossible = MenuDate::from_value(Value::String("2026-02-29".into())).unwrap();
+        assert!(MenuDate::try_new(impossible.as_str()).is_err());
+        assert!(check_cutoff(&impossible, &lunch(), &cutoff(Some(60), Some(720))).is_err());
+        assert!(check_cutoff(&impossible, &lunch(), &cutoff(Some(60), None)).is_err());
+        // A school that set no cutoff closes nothing anyway, impossible day or
+        // not: refusing there would take the canteen offline for no deadline.
+        assert!(check_cutoff(&impossible, &lunch(), &cutoff(None, Some(720))).is_ok());
     }
 
     /// The instant the deadline counts back from: midnight UTC of the day plus
