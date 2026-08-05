@@ -588,6 +588,29 @@ async fn delete_exam(
             "only the course creator, an assigned teacher, or a manager/admin can delete this exam",
         ));
     }
+    // *Writer* lease of [`EXAM_LOCK`] across the whole cascade, blob names
+    // included — the lease `delete_homework` has always held, and its absence
+    // here is what made a sitting able to start inside this delete. Every other
+    // child of an exam now writes the exam row in its own transaction, so the
+    // store refuses the pair; an attempt cannot, because its claim lands on the
+    // *student's* row (`exam_sat_total`) and touches nothing this delete
+    // writes. `start_attempt` already takes the writer lease from its exam read
+    // through the insert, so this one lease is the whole ordering: a start
+    // either finishes before the sweep (which then takes its row) or reads no
+    // exam at all and is a 404. Left orphaned, that attempt kept a sitting on
+    // the student's lifetime counter and could mint a badge — awards are
+    // add-only and never revoked — for an exam that never existed.
+    //
+    // It spans the blob names too: they are collected *before* the rows go, so
+    // an image row written after that snapshot would strand its bytes on disk
+    // even though the row itself is now refused.
+    //
+    // ponytail: process-local, so it holds because the deployment is a single
+    // replica with stop-the-world deploys (two overlapping binaries would
+    // reopen it). Closing it in the store means the `cap` shape the counter
+    // work already sketched: `claim_and_create` gaining a second record to
+    // touch, so the attempt writes the exam key as every other child does.
+    let _guard = EXAM_LOCK.write().await;
     // Rows go first (the delete cascades them), blobs after — a crash in
     // between strands at worst an unreachable blob.
     let images = QuestionImage::list_for_exam(exam.get_id(), &st.db).await?;
