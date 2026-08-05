@@ -175,14 +175,18 @@ impl MenuDate {
         }
         let digits =
             |from: usize, to: usize| -> Option<u32> { value.get(from..to)?.parse::<u32>().ok() };
-        let (Some(_year), Some(month), Some(day)) = (digits(0, 4), digits(5, 7), digits(8, 10))
+        let (Some(year), Some(month), Some(day)) = (digits(0, 4), digits(5, 7), digits(8, 10))
         else {
             return Err(invalid);
         };
-        // Day count per month is not checked: the calendar rules (leap years)
-        // would be the only thing this file knows about time, and a 31st of
-        // February menu is a typo nobody can act on, not a data hazard.
-        if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        // The day has to be a **real** one, leap years and all. A 31st of
+        // February is not the harmless typo it looks: a menu is published on it
+        // and is then fully actionable — seats, charges, dishes, attendance
+        // marks — but no instant can be computed for it, so the booking and
+        // cancel cutoff has nothing to count back from and never closes at all.
+        // The month/day ranges are this check's own business, hence no separate
+        // bounds test above (`from_ymd_opt` refuses month 0 and day 32 alike).
+        if chrono::NaiveDate::from_ymd_opt(year as i32, month, day).is_none() {
             return Err(invalid);
         }
         Ok(Self(value.to_string()))
@@ -506,6 +510,17 @@ mod tests {
         assert!(MenuDate::try_new("2026-01-32").is_err());
         assert!(MenuDate::try_new("26-01-02").is_err());
         assert!(MenuDate::try_new("").is_err());
+        // A day that no calendar has. Not a harmless typo: the serving instant
+        // a menu's cutoff counts back from cannot be computed for it, so such a
+        // menu used to be bookable and cancellable with no deadline at all.
+        for impossible in ["2026-02-29", "2026-04-31", "2026-06-31", "2026-11-31"] {
+            assert!(
+                MenuDate::try_new(impossible).is_err(),
+                "{impossible} is not a real day"
+            );
+        }
+        // …and the leap day that does exist is still a menu day.
+        assert!(MenuDate::try_new("2024-02-29").is_ok());
         // Sorting the text must sort the calendar — the range filter relies on it.
         assert!(
             MenuDate::try_new("2026-01-09").unwrap() < MenuDate::try_new("2026-01-10").unwrap()

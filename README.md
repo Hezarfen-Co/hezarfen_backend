@@ -977,7 +977,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/terms/{id}`                    | student | Get one term                    |
 | PATCH  | `/terms/{id}`                    | manager | Edit a term (the merged range must stay ordered) |
 | DELETE | `/terms/{id}`                    | manager | Delete a term — `409` while any course or class still links to it |
-| POST   | `/meals/menus`                   | manager | `{date, slot, capacity?}` — publish a menu; `date` is `YYYY-MM-DD` text, `slot` must be one of the school's `meal_slots` and may not contain `/ \ ? # %` (it becomes part of the menu's URL id); `409` when that day+slot is already published |
+| POST   | `/meals/menus`                   | manager | `{date, slot, capacity?}` — publish a menu; `date` is `YYYY-MM-DD` text and must be a real calendar day (`2026-02-29` is a `400`: a menu on a day that does not exist has no serving instant, so no booking cutoff), `slot` must be one of the school's `meal_slots` and may not contain `/ \ ? # %` (it becomes part of the menu's URL id); `409` when that day+slot is already published |
 | GET    | `/meals/menus`                   | student | List menus with their dishes, newest day first · `?from=&to=` inclusive `YYYY-MM-DD` range · paged |
 | GET    | `/meals/menus/{id}`              | student | One menu with its dishes |
 | PATCH  | `/meals/menus/{id}`              | manager | `{capacity}` — the only mutable field (`null` = uncapped); `date` and `slot` are immutable |
@@ -1701,7 +1701,15 @@ The school publishes **one menu per calendar day and meal slot** (`POST
   slot" is an equality test on the school's own day, and a midnight-in-millis
   day is only unique for one timezone. Fixed-width and zero-padded, so the
   text sorts chronologically — which is what the inclusive `?from=&to=` range
-  filter and the newest-day-first ordering are built on.
+  filter and the newest-day-first ordering are built on. It must be a **real
+  calendar day**, leap years included: `2026-02-29` is a `400`, here and as a
+  `?from=&to=` bound. A menu published on a day that does not exist was not the
+  inert typo it looks — it was fully actionable (seats, charges, dishes,
+  attendance marks) while having **no booking or cancel cutoff at all**, since
+  the deadline is counted back from an instant that day has none of. Menus
+  stored on such a day before this rule refuse booking and cancelling outright
+  (`409`) whenever a cutoff is configured: a deadline that cannot be worked out
+  fails closed, and the menu has to be republished on a real day.
 - **`slot` is a snapshot**, not a link into settings. It must be one of the
   school's `meal_slots` (`GET /settings`) *when the menu is written*, and it
   is stored as text — so retiring a slot later never rewrites a menu already
