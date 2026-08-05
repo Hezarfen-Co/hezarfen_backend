@@ -79,7 +79,8 @@ watch attendance, per-student remaining time,
 sittings, walk-outs, no-shows (`absent` once the window closes), submissions,
 and marks land live on a monitor endpoint (snapshot or SSE stream). Courses also hand out
 **homework**: assigned to the whole course or a named subset (the unnamed never
-even see it), tagged with a course subject, due by a required future `due_at`
+even see it, and the named see only themselves in it), tagged with a course
+subject, due by a required future `due_at`
 — students hand in text and/or **files of any type** (same size cap, 10 per
 submission, served back only as forced downloads), editable until the teacher
 grades a status (`done`/`incomplete`/`missing`) with an optional 0–100 mark
@@ -175,7 +176,10 @@ units and a due date that may sit in the past) and **assigns** it to students,
 which appends every installment as a `charge` at once — there is no scheduler,
 and "overdue" is derived at read time. Payments are recorded against one named
 charge, refunds against one named payment, and nothing is ever edited or
-deleted: a mistake is corrected by appending the opposing line. **There is no
+deleted: a mistake is corrected by appending the opposing line. Both bulk
+operations are bounded: one assignment request may raise at most 3 000 charges
+(`400` past that, nothing written), and one ledger line may carry at most 20
+lines applied to it (`409` past that). **There is no
 online payment integration and none is planned** — no gateway, no card data,
 `method` is free text. Teachers see no money at all (see "Payments").
 
@@ -572,11 +576,17 @@ messages, which any role sends and receives (that's how a parent reaches a
 teacher). A role
 change off either end of a tie (the parent stops being a `parent`, the
 student stops being a `student`) drops the tie, exactly like promotion drops
-course enrollments. A demotion to `parent` also gives back the seats that
+course enrollments. That sweep runs once, so a tie written in the same instant
+as the role change can outlive it; a surviving row grants nothing regardless —
+every gate re-reads the student's **live** role, and the student list itself
+skips anyone who no longer holds the `student` role. A demotion to `parent` also gives back the seats that
 account holds on still-open **event signup lists** — a parent cannot reach
-`DELETE /events/{id}/register/{user}` and no one else may free a non-student's
-seat, so those seats would stay claimed forever and a capped event would answer
-"full" for good. Every other role change leaves signups alone: staff free their
+`DELETE /events/{id}/register/{user}` itself, so an unswept seat would stay
+claimed and a capped event would answer "full" for good. Two things keep that
+from happening: a registration written while the demotion runs claims the
+holder's own row, so either the sweep sees the seat or the seat sees the
+`parent` (a `403`); and a teacher+ may free a seat a `parent` holds, which is
+the way back for any seat an older build stranded. Every other role change leaves signups alone: staff free their
 own seats by hand. Seats on lists that have already closed (the event started,
 or its `ends_at`-only deadline passed) are never touched — that roster is
 history, and re-registering is refused.
@@ -597,7 +607,7 @@ still left exactly as they stand.
 | Send / read / file / delete messages     | (any)        | One-to-one, any user to any user (`parent` included — the role's one write); each party only ever touches their own copy |
 | Mark event attendance; remove attendance rows | teacher | Only users in the event's **audience** can be marked; students never mark — a teacher+ may mark anyone expected, themselves included |
 | Create events                            | teacher      | The audience (school / role / course / class / registration) is set at creation and editable later |
-| Register users onto a registration event | teacher      | Teachers place **students** (students never register themselves) and take a seat for **themselves** — never for another staff member. Unregistering mirrors the same rule |
+| Register users onto a registration event | teacher      | Teachers place **students** (students never register themselves) and take a seat for **themselves** — never for another staff member. Unregistering mirrors the same rule, plus any seat a `parent` was left holding — that account can reach no route to free it itself |
 | List an event's attendance or its roster report | teacher | Students read their own tallies via the attendance report |
 | Edit / delete an event                   | teacher      | Only the **creator**, or a `manager`+ for any event — in both cases only while still `teacher`+ |
 | View a course's sessions                 | student      | Only inside **visible** courses: enrolled, creator, assigned teacher, or `manager`+ |
@@ -640,7 +650,7 @@ still left exactly as they stand.
 | List **own** linked students             | parent       | Read-only: the list plus each student's mark/attendance/pomodoro/homework reports — a parent changes nothing, anywhere |
 | Read the school settings and the term list | student | Clients need them to render kind/status pickers, grades, and the calendar |
 | Edit school settings; create / edit / delete terms | manager | School policy (exam kinds, attendance statuses, grade bands, the note-file size limit) and the academic calendar are management's call |
-| List users; look up one user; change a user's role; edit **any** user's personal info or UI preferences; tie/untie students to a `parent` account | admin | An admin cannot change **their own** role |
+| List users; look up one user; change a user's role; edit **any** user's personal info or UI preferences; tie/untie students to a `parent` account | admin | An admin cannot change **their own** role, and nobody can demote the school's **last** admin (`409`) |
 
 ### Bootstrapping the first admin
 
@@ -661,8 +671,14 @@ startup. `compose.yaml` ships with the credentials above for local dev.
 
 That admin can then promote everyone else through `PATCH /users/{id}/role`.
 
-Manual fallback (also the recovery path if the seeded name was squatted or the
-sole admin locked themselves out): run
+The admin set cannot be emptied through the API: an admin never changes their
+own role, and a `PATCH /users/{id}/role` that would demote the last admin
+answers `409` — including when two admins demote each other at the same
+instant, since that guard is serialized school-wide rather than left to the
+database (which conflict-checks neither a cross-record count nor a read).
+
+Manual fallback (the recovery path if the seeded name was squatted, or if an
+older build already emptied the admin set): run
 
 ```surql
 UPDATE user SET role = 'admin' WHERE username = 'ada';
@@ -776,18 +792,18 @@ window filtering, before paging; negative values are a `400` naming the field.
 | POST   | `/users/me/avatar`               | student | Upload/replace own avatar: `multipart/form-data`, one `file` part, raster images only, ≤ the school's `max_file_bytes` -> `{content_type, size}` |
 | GET    | `/users/me/avatar`               | student | Own avatar bytes (`404` if there is none) — the self alias of `/users/{id}/avatar` |
 | DELETE | `/users/me/avatar`               | student | Remove own avatar (`404` if there is none) |
-| GET    | `/users/me/students`             | parent  | The caller's linked students (refs, sorted by username) · paged |
+| GET    | `/users/me/students`             | parent  | The caller's linked students (refs, sorted by username; ties whose student was promoted out are left out) · paged |
 | GET    | `/users/search`                  | teacher | `?q=<fragment>&role=<role?>` — find users by username/name fragment (pickers); refs only, no contact info · paged |
 | GET    | `/users`                         | admin   | List all users · paged          |
 | GET    | `/users/{id}/profile`            | student | Any user's public profile — a `parent` reads only their own and their linked students' (`403`) |
 | GET    | `/users/{id}/avatar`             | student | The avatar bytes (`nosniff`, `private, no-store`); same reach as the profile |
 | DELETE | `/users/{id}/avatar`             | admin   | Remove any user's avatar — the moderation path |
 | GET    | `/users/{id}`                    | admin   | Get one user                    |
-| PATCH  | `/users/{id}/role`               | admin   | `{role}` — set a user's role; promotion out of `student` drops the user's course enrollments (only students enroll), and a demotion to `parent` also frees their seats on still-open event signup lists |
+| PATCH  | `/users/{id}/role`               | admin   | `{role}` — set a user's role; promotion out of `student` drops the user's course enrollments (only students enroll), and a demotion to `parent` also frees their seats on still-open event signup lists; demoting the school's **last** admin is refused (`409`) |
 | PATCH  | `/users/{id}/profile`            | admin   | Update any user's personal info, `display_name` and `bio` included |
 | PATCH  | `/users/{id}/preferences`        | admin   | Update any user's UI preferences |
 | POST   | `/users/{id}/students`           | admin   | `{user_id}` — tie a **student** to a **parent** account `{id}` (idempotent); the tie is the parent's read grant |
-| GET    | `/users/{id}/students`           | admin   | List a parent's linked students · paged |
+| GET    | `/users/{id}/students`           | admin   | List a parent's linked students (same live-role filter as `/users/me/students`) · paged |
 | DELETE | `/users/{id}/students/{student}` | admin   | Untie a student from a parent (student data untouched) |
 | POST   | `/notes`                         | student | `{title, content?}`             |
 | GET    | `/notes`                         | student | List own notes · paged          |
@@ -812,7 +828,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/events/{id}/roster`            | teacher | Who-missed report: every expected attendee with their status (`null` = never marked) + `marked_by` · paged |
 | DELETE | `/events/{id}/attendance/{user}` | teacher | Remove a user's attendance      |
 | POST   | `/events/{id}/register`          | teacher | `{user_id?}` — seat a **student** (or yourself when omitted) on a registration event's signup list; idempotent, `409` once full or started |
-| DELETE | `/events/{id}/register/{user}`   | teacher | Free a seat (same self-or-student rule); `409` once the event started |
+| DELETE | `/events/{id}/register/{user}`   | teacher | Free a seat (self, a student, or a seat a `parent` was left holding); `409` once the event started |
 | POST   | `/appointments/slots`            | teacher | `{starts_at, ends_at, note?, repeat_weekly?, until?}` — publish availability on **own** calendar; always answers an **array** (one element for a one-off, one per weekly occurrence, ≤ 52, sharing a `series`); `400` if a weekly shift would run off the end of time; `409` if the window overlaps one the caller already published (half-open, so back-to-back is fine) — a weekly publish is all-or-nothing |
 | GET    | `/appointments/slots`            | student | Teacher+: own calendar (past included). Everyone else: the bookable calendar — slots not yet started (the same bound booking enforces), demoted teachers' slots left out · paged |
 | DELETE | `/appointments/slots/{id}`       | teacher | Withdraw one slot (its teacher, or manager+); `409` while a pending/approved booking sits on it |
@@ -908,7 +924,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/exams/{id}/students/{user}/attempts/{seq}/answers/{qid}/image` | teacher | One prior sitting's drawn-answer bytes, inline (course manager) |
 | GET    | `/exams/{id}/students/{user}/marks` | teacher | A student's full per-sitting mark history, oldest first — the latest seq is the grade-of-record (course manager) |
 | GET    | `/exams/{id}/review/questions`   | student | The exam's question list **with `correct`** — the answer key the caller checks their own sheet against (same review gate) · paged |
-| GET    | `/exams/{id}/review/attempts`    | student | The caller's **own** sitting numbers (answers ⋃ marks), ascending — only when `allow_review` is on and the caller has been marked (`403`/`404` otherwise), and `409` while the caller's latest sitting is still in progress (all four review reads share that gate) |
+| GET    | `/exams/{id}/review/attempts`    | student | The caller's **own** sitting numbers (answers ⋃ marks), ascending — only when `allow_review` is on and the caller has been marked (`403`/`404` otherwise), and `409` while the caller can still sit the exam — a sitting in progress, or one still startable under `max_attempts` (all four review reads share that gate) |
 | GET    | `/exams/{id}/review/attempts/{seq}/answers` | student | One of the caller's **own** sittings, judged: `is_correct` flags + suggested `auto_score` (same review gate) |
 | GET    | `/exams/{id}/review/attempts/{seq}/answers/{qid}/image` | student | The caller's **own** drawn-answer bytes for a sitting, inline (same review gate) |
 | GET    | `/exams/{id}/attempt/ws`         | student | **WebSocket** exam room (students only): state ticks, autosave, finish; entering clears `left_at`, leaving stamps it (see "Taking an exam") |
@@ -925,9 +941,9 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/bank-questions/{bid}/choices/{choice_id}/image` | teacher | The option picture's bytes (any teacher+) |
 | DELETE | `/bank-questions/{bid}/choices/{choice_id}/image` | teacher | Remove one option picture (**owner only**, admin bypass) |
 | POST   | `/courses/{id}/homework`         | teacher | `{title, description?, subject_id, due_at, assigned?}` — assign homework tagged with a course subject, due in the future; `assigned` names an enrolled-student subset, ≤ 200 (omit/`[]` = the whole course) (course manager) |
-| GET    | `/courses/{id}/homework`         | student | List the course's homework, newest first (enrolled, creator, assigned teacher, or manager+; students see only what they're assigned) · paged |
-| GET    | `/homework`                      | student | The caller's cross-course homework: their courses' (manager+: all; students only what they're assigned) · paged |
-| GET    | `/homework/{id}`                 | student | Get homework (course viewers; a subset homework is a `404` to students it doesn't name) |
+| GET    | `/courses/{id}/homework`         | student | List the course's homework, newest first (enrolled, creator, assigned teacher, or manager+; students see only what they're assigned, with `assigned` narrowed to themselves) · paged |
+| GET    | `/homework`                      | student | The caller's cross-course homework: their courses' (manager+: all; students only what they're assigned, with `assigned` narrowed to themselves) · paged |
+| GET    | `/homework/{id}`                 | student | Get homework (course viewers; a subset homework is a `404` to students it doesn't name, and its `assigned` list comes back narrowed to the caller for anyone without course-management rights) |
 | PATCH  | `/homework/{id}`                 | teacher | Edit title/description/`due_at`/`subject_id`/`assigned` (course manager; a newly set due date is re-checked; `409` if narrowing `assigned` would strand an existing submission or grade — the blockers are named — or if the `subject_id` it re-tags from changed since the read: nothing written, re-read and retry) |
 | DELETE | `/homework/{id}`                 | teacher | Delete homework + its submissions, files, and grades — file blobs included (course manager) |
 | POST   | `/homework/{id}/submission`      | student | `{text?}` — hand in / re-edit own work (**students only**, enrolled, assigned): text replaces whole (omit clears), `submitted_at` pins the first hand-in, `updated_at` moves; `409` once graded |
@@ -1004,10 +1020,10 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/payments/plans/{id}`           | manager | One fee plan with its schedule |
 | PATCH  | `/payments/plans/{id}`           | manager | Edit a plan's `name` and/or `installments` (the schedule replaces wholesale); `409` once anyone is on the plan |
 | DELETE | `/payments/plans/{id}`           | manager | Delete a plan; `409` once anyone is on it — its charges name it |
-| POST   | `/payments/plans/{id}/assignments` | manager | `{student_ids}` (≤ 200) — place the plan on students, appending **every** installment as a `charge` at once; replay-safe, reported per student as `assigned` / `already_assigned` / `rejected` |
+| POST   | `/payments/plans/{id}/assignments` | manager | `{student_ids}` (≤ 200, and `students × installments` ≤ 3 000 — a bigger batch is a `400` telling you to split it, with nothing written) — place the plan on students, appending **every** installment as a `charge` at once; replay-safe, reported per student as `assigned` / `already_assigned` / `rejected` |
 | GET    | `/payments/plans/{id}/assignments` | manager | Who is on this plan, newest first · paged |
-| POST   | `/payments/credits`              | manager | `{charge_id, amount_minor, method?, note?, request_key?}` — record money received against one named charge; partials are the norm, `409` past what the charge is worth (advisory) and `409` naming the reversal when the charge was reversed. A `request_key` makes the call retry-safe: a replay returns the same line, the same key for different money is a `409` |
-| POST   | `/payments/refunds`              | manager | `{credit_id, amount_minor, method?, note?, request_key?}` — hand money back against one named payment; partials allowed, capped by that credit; same `request_key` retry-safety |
+| POST   | `/payments/credits`              | manager | `{charge_id, amount_minor, method?, note?, request_key?}` — record money received against one named charge; partials are the norm, `409` past what the charge is worth (advisory), `409` naming the reversal when the charge was reversed, and `409` once the charge carries 20 applied lines. A `request_key` makes the call retry-safe: a replay returns the same line, the same key for different money is a `409` |
+| POST   | `/payments/refunds`              | manager | `{credit_id, amount_minor, method?, note?, request_key?}` — hand money back against one named payment; partials allowed, capped by that credit and by the same 20-applied-lines ceiling (`409`); same `request_key` retry-safety |
 | POST   | `/payments/reversals`            | manager | `{line_id, note?}` — undo a `charge` or a `refund` for its exact amount (`400` on any other kind); idempotent, at most one reversal per line |
 | GET    | `/payments/ledger/{user}`        | student | One student's raw lines — charges, payments, refunds, reversals — newest first · paged · own id always, otherwise manager+ or a parent link (**a teacher gets a `403`**) |
 | GET    | `/payments/statement/me`         | student | The caller's own statement: a row per charge with what it collected, what went back out, what is still owed, and whether it is `overdue`. `?limit=&offset=` pages the rows (`entries` is the envelope); `balance_minor` is the same on every page |
@@ -1103,9 +1119,11 @@ the moment it passes (register and unregister both). Signup rows survive an
 audience switch inertly and resurface if the event returns to the registration
 kind; deleting the event deletes them, in one transaction with the attendance
 rows. A demotion to `parent` sweeps that user's signups off **still-open**
-lists and hands each seat back (`PATCH /users/{id}/role`): unregistering is
-student-or-self only, so a parent's seat had no other way out. Staff free their
-own, and a closed list is never rewritten. Pre-existing hand-picked (`users`)
+lists and hands each seat back (`PATCH /users/{id}/role`), and a registration
+racing that demotion is refused rather than left behind. Unregistering is
+student-or-self, plus any seat a `parent` holds — that account can free
+nothing itself, so a seat stranded before this rule still has a door. Staff
+free their own, and a closed list is never rewritten. Pre-existing hand-picked (`users`)
 audiences convert on boot: each listed user becomes a signup row credited to
 the event's creator, and the audience becomes an uncapped registration list.
 Reading a child collection of a missing parent (`/events/{id}/attendance`,
@@ -1294,9 +1312,12 @@ catalog — awards carrying it stop being served, no migration.
   shape in which a counter ever decreases here. Editing an existing submission moves
   nothing, so the on-time verdict is fixed at the first hand-in and attaching a
   file after the deadline cannot turn an on-time submission late.
-- **Exams.** `+1 exam_sat_total` per attempt created, retakes included —
-  sitting an exam twice is two sittings. Resuming an attempt already running is
-  not a new one. Deleting an exam removes the attempt rows but does **not**
+- **Exams.** `+1 exam_sat_total` the **first** time a student sits an exam —
+  the counter is exams sat, not sittings. A **retake moves nothing**: it is the
+  same exam again, and counting it would make the whole ladder self-serve, since
+  an `open` exam with `max_attempts: 0` is a start/finish loop a student runs
+  alone with no teacher in it. Resuming an attempt already running is not a new
+  sitting either. Deleting an exam removes the attempt rows but does **not**
   decrement anyone: a teacher tidying up does not un-sit the exam.
 - **Pomodoro.** Finishing a stint is `+1 pomodoro_finished_total` and its
   duration into `pomodoro_focus_ms_total`. An open stint counts for neither —
@@ -1821,6 +1842,14 @@ teacher or manager ordering a child's lunch is a `403`.
   cancellation of somebody else's brand-new seat. Unfenced it freed that seat,
   refunded nothing (the money is keyed to the *older* attempt, already
   reversed) and burnt the new attempt's reversal id for good.
+- **A cancel decides who is asking before it looks the seat up.** An
+  unauthorised caller gets the same `403` for a booking that exists and one that
+  never did; only a caller who may cancel it ever sees a `404`. Booking ids are
+  fully derivable (`{date}_{slot}_{student}`, and both halves are readable), so
+  reading the row first made the status code answer "did this student book this
+  meal?" — the whole-school list at `GET /meals/menus/{id}/bookings`, which is
+  manager+ on purpose, handed out one student at a time to any teacher, and to
+  any peer who knew a user id.
 - **A manager+ may cancel anybody's seat.** Booking is student-and-parent
   only, and cancelling used to be the same door — which left a seat nobody on
   the API could give back the moment its student was promoted to staff or its
@@ -1853,17 +1882,33 @@ teacher or manager ordering a child's lunch is a `403`.
   at `720` closes at 10:00 UTC that morning, not at 22:00 the night before.
   **That minute is UTC**: `date` carries no timezone and the backend stores no
   school timezone — deliberately, it is a rejected feature — so a UTC+3 school
-  enters `540` (09:00 UTC) for a meal served at noon locally. A slot with no
-  `serving_minute` falls back to **midnight UTC starting the meal's day**, the
-  behaviour every booking had before the field existed; the booking is never
-  refused for want of a serving time.
+  enters `540` (09:00 UTC) for a meal served at noon locally. A slot with **no
+  `serving_minute` has no cutoff at all**: there is no instant to count a
+  deadline back from, so nothing on that slot ever closes until the school sets
+  the hour. It used to count from midnight UTC of the meal's day, and that took
+  the canteen offline the moment a school set the one cutoff knob — all three
+  shipped slots carry no serving hour, so every same-day menu was already past
+  its deadline: `POST /meals/menus/{today}/bookings` answered `409`, and the
+  seats already held could no longer be cancelled by the students and parents
+  holding them, only by a manager. The fallback was chosen to avoid exactly that
+  and caused it.
 - **The serving time is read live, not snapshotted onto the menu.** The cutoff
   minutes are already read live, so freezing the other half of the same
   deadline would make one policy edit apply and its twin not; a kitchen that
   moves lunch an hour later wants today's menus to move with it. The menu
   still snapshots the slot *name* (that is what keeps a retired slot's history
-  readable), so a menu whose slot has since left the list simply has no
-  serving time and falls back to midnight UTC.
+  readable), so a menu whose slot has since left the list simply has no serving
+  time, and therefore no cutoff.
+- **One seat may be taken at most `meal.max_booking_attempts` times** (`GET
+  /limits`, currently 10) — the first booking plus the re-bookings after a
+  cancel — and past that `POST /meals/menus/{id}/bookings` is a `409` naming
+  what happened. This bounds *storage*, not indecision: every cycle appends two
+  permanent, undeletable ledger lines (the charge and its reversal, both keyed
+  to the attempt), nothing else bounded them, and every later balance read is
+  answered over whatever is there. A seat that really must move again is the
+  canteen's to cancel. Rows already past the ceiling — an upgrade's leftovers —
+  are untouched: cancelling consults no ceiling, so such a seat and its money
+  stay reachable, and only one more re-booking is refused.
 - A menu somebody still holds a seat on **cannot be unpublished** (`409`) —
   cancel the bookings first, so nothing is left pointing at a deleted meal.
 
@@ -1937,6 +1982,15 @@ balance = SUM(credit) + SUM(reversal) - SUM(charge)
 in **minor units** (kuruş) as an `i64` — no float, no decimal, at any layer.
 A *negative* balance means the student owes the school; a positive one is
 money on account. Amounts are stored positive; the sign lives in the `kind`.
+
+Those three sums are taken **by the database, one per kind**, so a balance read
+costs the same on a statement of four lines and one of forty thousand; it used
+to decode and fold every line, which made a growing ledger a tax on every later
+read. Only the grouping moved: the signs are still applied in Rust by the one
+function the formula above is spelled in, because summing `IF kind = 'charge'
+THEN -amount` in SQL would fork that rule into a second language where nothing
+fails the day the two disagree. A stored running total was the other option and
+is a counter that can drift.
 
 - **Booking is what charges, at a price snapshot.** The menu's dishes are
   summed the moment the seat is taken and that number is frozen onto the
@@ -2043,12 +2097,18 @@ A **fee plan** (`POST /payments/plans`) is a name and 1 to 60 **installments**,
 each `{amount_minor, due_at}` — minor units (kuruş) as an integer, and unix
 milliseconds. `due_at` **may be in the past**: a school adopting the app
 mid-year assigns plans whose first installments were already due, so there is
-no future-date rule here.
+no future-date rule here. A *negative* `due_at` is a `400` — that is not an
+instant, and the charge it billed would read as overdue for ever.
 
 Writing a plan bills nobody. **Assigning it does** (`POST
 /payments/plans/{id}/assignments` with `{student_ids}`, at most 200 per call):
 that appends *every* installment as a `charge` line right away, each carrying
-its own due date. There is no scheduler, no nightly sweep, and nothing that
+its own due date. What really bounds one request is therefore the **charges it
+would raise**, not the head count: `student_ids × installments` may not exceed
+**3 000** (200 students up to a 15-installment plan; 50 at a time on a
+60-installment one). A bigger batch is refused whole with a `400` naming the
+split — nothing is written, because a money route that billed half a batch and
+gave up would leave the office guessing which families were charged. There is no scheduler, no nightly sweep, and nothing that
 wakes up when a date passes — the whole schedule is written once, and lateness
 is read off it.
 
@@ -2162,6 +2222,16 @@ account.
   desk, the outcome is an over-paid charge that is plainly visible in the
   statement, and it is undone by appending a refund. Both lines are true
   records of money that really arrived — refusing them would be the worse lie.
+- **A line carries at most 20 applied lines.** The cap above is folded one
+  query per line of the target's subtree, all of them while that single lock is
+  held, so a charge settled in a thousand pieces would stall every other
+  payment in the school behind its own arithmetic. Past 20 (payments under a
+  charge, refunds under a payment, and the reversals among them) a further
+  payment or refund against that line is a `409` — an installment settled in
+  more than twenty pieces is pathological, and a plan can always raise a fresh
+  charge. The ceiling binds **new writes only**: a line that already carries
+  more (written before the rule) still reads, still refunds through its own
+  children, and is still reversible.
 - **There is no payment gateway and no card data, ever**, and none is planned:
   nothing here talks to a bank, a PSP, or a card network. `method` is free text
   ("cash", "havale", …) describing how money that already arrived was handed
@@ -2232,10 +2302,16 @@ Two per-exam policy knobs ride along, both **live-editable** at any point:
   reads (`GET /exams/{id}/review/attempts[/{seq}/answers[/{qid}/image]]`). A
   student may review only when this is on **and** the teacher has marked them
   (an `ExamResult` row exists); own-scoped, so no student reads another's sheet.
-  All four reads are refused (`409`) while the caller's latest sitting is still
-  in progress — a mark on sitting 1 must not open the answer key to someone
-  midway through sitting 2. Submit the sitting first; an expired one reviews
-  fine.
+  All four reads are refused (`409`) while the caller can still **write** a
+  sitting at that exam — one in progress, *or* one they may still start: a mark
+  on sitting 1 must not open the answer key to someone who can post sitting 2
+  with it in hand. Review therefore opens once `max_attempts` is used up (for
+  the default `max_attempts: 1`, as soon as the single sitting is submitted or
+  expires), or the exam's `ends_at` has passed, or the exam has no `mode` at all
+  (offline-graded — nothing to sit, so the mark alone opens it). Consequence,
+  deliberate: an `open`-mode exam with `max_attempts: 0` (unlimited) never
+  closes to its students, so its review never opens — cap the attempts or give
+  the exam an end to hand the key back.
 
   That gate is *per exam*, and a second, narrower one covers what it cannot see.
   Instantiating one question bank template into two exams copies its `correct`
@@ -2588,7 +2664,11 @@ grace as every schedule field; late *submissions* are fine — a late
 like everyone else. `assigned` (at create or PATCH) instead pins a named
 subset of currently enrolled students (at most 200). The unnamed must not even
 learn a subset exists: lists omit it, and direct reads and submits answer
-`404` — the same no-leak a hidden exam draft gets. Narrowing the subset later
+`404` — the same no-leak a hidden exam draft gets. The *named* learn no more
+than that they are named: to anyone without course-management rights the
+`assigned` field comes back holding their own id alone (`null` still meaning
+the whole course), because who else was assigned is roster information and the
+roster itself is teacher+-only. Narrowing the subset later
 is refused with a `409` that names the blockers while any submission or grade
 belongs to a student the new list would strand.
 
