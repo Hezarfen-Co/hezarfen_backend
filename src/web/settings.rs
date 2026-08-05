@@ -200,8 +200,10 @@ struct UpdateSettings {
     #[schema(max_items = 20)]
     dietary_tags: Option<Vec<String>>,
     /// Minutes before a slot's `serving_minute` at which booking *and*
-    /// cancelling close, `0`–`10080` (one week). A slot with no serving time
-    /// is measured from midnight UTC of the menu's date instead. Omit to keep the current value; send `null` for
+    /// cancelling close, `0`–`10080` (one week). It binds only the slots that
+    /// carry a `serving_minute`: with no serving hour there is no instant to
+    /// count back from, so that slot's menus close at no deadline until the
+    /// hour is set. Omit to keep the current value; send `null` for
     /// no cutoff at all.
     #[serde(default, deserialize_with = "set_or_clear")]
     #[schema(value_type = Option<i64>, example = 120, minimum = 0, maximum = 10_080)]

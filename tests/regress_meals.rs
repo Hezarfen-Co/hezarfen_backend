@@ -44,6 +44,20 @@ async fn add_dish(app: &axum::Router, mgr: &str, menu: &str, price: i64) -> Stri
     id_of(&res.body)
 }
 
+/// One student's balance as the API answers it.
+async fn balance_of(app: &axum::Router, cookie: &str, student: &str) -> i64 {
+    let res = send(
+        app,
+        "GET",
+        &format!("/meals/balance/{student}"),
+        Some(cookie),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    res.body["balance_minor"].as_i64().expect("a balance")
+}
+
 /// A repeat `POST` of a seat the student already holds must replay that seat,
 /// whatever the menu costs *now*. Pricing the menu before the already-booked
 /// short circuit made it a `400` ("amount_minor must be between…") the moment
@@ -642,13 +656,18 @@ async fn a_closed_cutoff_still_lets_a_manager_free_the_seat() {
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
     let booking = id_of(&res.body);
 
-    // The school sets a deadline, and it closed on this menu long ago.
+    // The school sets a deadline, and it closed on this menu long ago. The
+    // serving hour goes with it: a slot without one has no instant for the
+    // deadline to count back from, so the cutoff would bind nobody.
     let res = send(
         &app,
         "PATCH",
         "/settings",
         Some(&admin),
-        Some(json!({ "meal_cancel_cutoff_minutes": 60 })),
+        Some(json!({
+            "meal_cancel_cutoff_minutes": 60,
+            "meal_slots": [{ "name": "lunch", "serving_minute": 720 }],
+        })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
@@ -758,4 +777,523 @@ async fn only_manager_reads_another_students_meal_money() {
             res.body
         );
     }
+}
+
+/// A booking id is fully derivable — `{date}_{slot}_{student}` — and both
+/// halves are readable by any teacher (`GET /users`, `GET /meals/menus`). The
+/// cancel read the row before it checked who was asking, so the status code
+/// answered a question the route never meant to: `403` for a seat that exists,
+/// `404` for one that does not. That is the whole-school booking list, whose
+/// own route is deliberately manager+, handed out one student at a time — and
+/// any peer holding a user id (every `PersonRef` carries one) could ask it too.
+#[tokio::test]
+async fn an_unauthorised_cancel_tells_nobody_whether_the_seat_exists() {
+    let (app, db) = app_and_db().await;
+    let mgr = login_as(&app, &db, "oracle_mgr", "manager").await;
+    let teacher = login_as(&app, &db, "oracle_teacher", "teacher").await;
+    let ali = login(&app, "oracle_ali").await;
+    let veli = login(&app, "oracle_veli").await;
+    let veli_id = me_id(&app, &veli).await;
+    let can_id = me_id(&app, &login(&app, "oracle_can").await).await;
+    let menu = publish(&app, &mgr, "2026-09-19").await;
+
+    let res = send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/bookings"),
+        Some(&ali),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let booked = id_of(&res.body);
+    // Never booked, and derived exactly as the seat that was: the menu key
+    // joined to a student key anyone can read off a response.
+    let never = format!("{menu}_{can_id}");
+
+    for (who, cookie) in [("a teacher", &teacher), ("a peer student", &veli)] {
+        let held = send(
+            &app,
+            "DELETE",
+            &format!("/meals/bookings/{booked}"),
+            Some(cookie),
+            None,
+        )
+        .await;
+        let absent = send(
+            &app,
+            "DELETE",
+            &format!("/meals/bookings/{never}"),
+            Some(cookie),
+            None,
+        )
+        .await;
+        assert_eq!(
+            held.status, absent.status,
+            "{who} can tell a held seat from an unbooked one: {} vs {}",
+            held.body, absent.body
+        );
+        assert_eq!(held.status, StatusCode::FORBIDDEN, "{}", held.body);
+    }
+
+    // The gate did not turn into a blanket 403: the student it is for still
+    // learns their own seat is gone, and still cancels the one they hold.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/meals/bookings/{menu}_{veli_id}"),
+        Some(&veli),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND, "{}", res.body);
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/meals/bookings/{booked}"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["status"], "cancelled", "{}", res.body);
+    // …and manager+, who may read the whole list anyway, still sees existence.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/meals/bookings/{never}"),
+        Some(&mgr),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND, "{}", res.body);
+}
+
+/// Two first `PATCH`es of a profile nobody ever recorded both read "no row" and
+/// both tried to `CREATE` it. The loser's create collided (on the id, and on
+/// the `dietary_profile_student` UNIQUE index behind it) and propagated as a
+/// `500` on a perfectly legitimate request. The winner's row is now written
+/// over instead, which is what the second `PATCH` was asking for anyway.
+#[tokio::test]
+async fn two_first_profile_writes_land_without_a_500() {
+    let (app, db) = app_and_db().await;
+    let mgr = login_as(&app, &db, "first_mgr", "manager").await;
+    let ali = login(&app, "first_ali").await;
+    let ali_id = me_id(&app, &ali).await;
+
+    let route = format!("/meals/profiles/{ali_id}");
+    let (one, two) = tokio::join!(
+        send(
+            &app,
+            "PATCH",
+            &route,
+            Some(&mgr),
+            Some(json!({ "tags": ["vegan"] })),
+        ),
+        send(
+            &app,
+            "PATCH",
+            &route,
+            Some(&mgr),
+            Some(json!({ "note": "fındık" })),
+        ),
+    );
+    for res in [&one, &two] {
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    }
+
+    // Stored state, never a reported win: whichever landed second, the row
+    // carries both writes — neither was dropped and neither 500'd.
+    let res = send(&app, "GET", &route, Some(&mgr), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["tags"], json!(["vegan"]), "{}", res.body);
+    assert_eq!(res.body["note"], "fındık", "{}", res.body);
+}
+
+/// A repeat `POST` of a held seat answered off the row it read a round trip
+/// earlier. A cancel committing in that gap frees the seat, refunds it and
+/// leaves the row `cancelled` — and the `201` still said `"status": "booked"`,
+/// `cancelled_at: null`, so a client trusting the answer thought it held a seat
+/// the store had given away. The stored state was right throughout; only the
+/// answer lied.
+///
+/// The cancel is injected the way `regress_roles` does it: a `DEFINE EVENT`
+/// fires inside the very write the replay makes — here the charge it replays,
+/// which is why the ledger is stripped first (a charge already there is a
+/// no-op). Fenced on `attempt = 1`, so the re-booked seat's own charge does not
+/// trip it a second time.
+#[tokio::test]
+async fn a_replayed_booking_answers_off_the_row_the_store_holds() {
+    let (app, db) = app_and_db().await;
+    let mgr = login_as(&app, &db, "stale_mgr", "manager").await;
+    let ali = login(&app, "stale_ali").await;
+    let menu = publish(&app, &mgr, "2026-09-20").await;
+    add_dish(&app, &mgr, &menu, 1_000).await;
+
+    let res = send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/bookings"),
+        Some(&ali),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let booking = id_of(&res.body);
+
+    db.query(format!(
+        "DELETE meal_ledger;
+         DEFINE EVENT cancel_inside ON TABLE meal_ledger WHEN $event = 'CREATE' THEN {{
+             UPDATE type::record('meal_booking', '{booking}') \
+                 SET status = 'cancelled', cancelled_at = 1 WHERE attempt = 1;
+         }};"
+    ))
+    .await
+    .unwrap()
+    .check()
+    .unwrap();
+
+    let res = send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/bookings"),
+        Some(&ali),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+
+    // The answer against the store, field by field — that is the whole claim.
+    let stored = send(&app, "GET", "/meals/bookings/me", Some(&ali), None).await;
+    let row = &stored.body["items"][0];
+    assert_eq!(row["id"], json!(booking), "{}", stored.body);
+    assert_eq!(
+        res.body["status"], row["status"],
+        "the answer disagrees with the row: {} vs {}",
+        res.body, stored.body
+    );
+    assert_eq!(
+        res.body["cancelled_at"], row["cancelled_at"],
+        "the answer disagrees with the row: {} vs {}",
+        res.body, stored.body
+    );
+    assert_eq!(res.body["status"], "booked", "{}", res.body);
+}
+
+/// A slot with **no serving hour** has no instant for a deadline to count back
+/// from, and the code counted from midnight UTC instead. All three shipped
+/// slots carry no serving minute, so the day a school set
+/// `meal_cancel_cutoff_minutes` — the one knob — every same-day menu was
+/// already past its deadline: today's lunch could not be booked, and the seats
+/// already held could not be given back by the students and parents holding
+/// them, only by a manager. The fallback was chosen to keep the canteen up on
+/// an upgrade and did the opposite. An unset hour is now an unenforced cutoff.
+///
+/// The existing unit test never caught it because it only ever passed a slot
+/// *with* an hour, and the `None` case was exercised against an impossible
+/// date, where the refusal comes from the date instead.
+#[tokio::test]
+async fn a_slot_with_no_serving_hour_closes_nothing() {
+    let (app, db) = app_and_db().await;
+    let admin = login_as(&app, &db, "hour_adm", "admin").await;
+    let mgr = login_as(&app, &db, "hour_mgr", "manager").await;
+    let ali = login(&app, "hour_ali").await;
+
+    // The school sets its one cutoff knob and nothing else — the shipped
+    // slots still carry no `serving_minute`, which is the whole case.
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&admin),
+        Some(json!({ "meal_cancel_cutoff_minutes": 120 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert!(
+        res.body["meal_slots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|slot| slot["serving_minute"].is_null()),
+        "the case only exists while no slot has an hour: {}",
+        res.body
+    );
+
+    // Today's menu: midnight UTC is behind us for all but the first two hours
+    // of the day, so the fallback deadline had already passed.
+    let today = hezarfen_backend::domain::timestamp::Timestamp::today_utc()
+        .format("%Y-%m-%d")
+        .to_string();
+    let menu = publish(&app, &mgr, &today).await;
+    add_dish(&app, &mgr, &menu, 1_000).await;
+
+    let res = send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/bookings"),
+        Some(&ali),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::CREATED,
+        "today's menu must still be bookable: {}",
+        res.body
+    );
+    let booking = id_of(&res.body);
+
+    // …and the student can still free the seat themselves. This half is worse
+    // than the refusal: the seat was already held and only a manager could
+    // give it back.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/meals/bookings/{booking}"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["status"], "cancelled", "{}", res.body);
+
+    // The deadline starts binding the moment the school sets the hour — on
+    // menus already published, since the slot list is read live. Midnight UTC
+    // plus two hours, minus a two-hour cutoff, is midnight: long past.
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&admin),
+        Some(json!({ "meal_slots": [{ "name": "lunch", "serving_minute": 120 }] })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/bookings"),
+        Some(&ali),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+}
+
+/// Nothing bounded how often one seat could be retaken, and every cycle
+/// appends two permanent, undeletable ledger lines (the charge and its
+/// reversal). At the API's own request ceiling that is hundreds of thousands
+/// of rows a day against one account — and every later balance read used to
+/// fold the lot. The cycle ceiling is the growth half of that fix.
+#[tokio::test]
+async fn a_seat_cannot_be_retaken_without_end() {
+    let (app, db) = app_and_db().await;
+    let mgr = login_as(&app, &db, "cycle_mgr", "manager").await;
+    let ali = login(&app, "cycle_ali").await;
+    let ali_id = me_id(&app, &ali).await;
+    let menu = publish(&app, &mgr, "2026-09-21").await;
+    add_dish(&app, &mgr, &menu, 1_000).await;
+
+    // `max_booking_attempts` is published, so a client can say why before it
+    // sends the call that fails.
+    let limits = send(&app, "GET", "/limits", Some(&ali), None).await;
+    let ceiling = limits.body["meal"]["max_booking_attempts"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("the ceiling is not published: {}", limits.body));
+
+    let seats = format!("/meals/menus/{menu}/bookings");
+    for round in 1..=ceiling {
+        let res = send(&app, "POST", &seats, Some(&ali), Some(json!({}))).await;
+        assert_eq!(
+            res.status,
+            StatusCode::CREATED,
+            "round {round}: {}",
+            res.body
+        );
+        let res = send(
+            &app,
+            "DELETE",
+            &format!("/meals/bookings/{}", id_of(&res.body)),
+            Some(&ali),
+            None,
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "round {round}: {}", res.body);
+    }
+    let res = send(&app, "POST", &seats, Some(&ali), Some(json!({}))).await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+    assert!(
+        res.body["error"].as_str().unwrap().contains("maximum"),
+        "the refusal must say what happened: {}",
+        res.body
+    );
+
+    // Stored state: the seat stayed cancelled, and the refusal wrote no line —
+    // ten cycles, twenty lines, and the balance nets to zero.
+    let res = send(&app, "GET", "/meals/bookings/me", Some(&ali), None).await;
+    assert_eq!(res.body["items"][0]["status"], "cancelled", "{}", res.body);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/meals/ledger/{ali_id}"),
+        Some(&mgr),
+        None,
+    )
+    .await;
+    assert_eq!(res.body["total"], ceiling * 2, "{}", res.body);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/meals/balance/{ali_id}"),
+        Some(&mgr),
+        None,
+    )
+    .await;
+    assert_eq!(res.body["balance_minor"], 0, "{}", res.body);
+}
+
+/// The balance is summed **per kind by the database** now, not folded line by
+/// line in this process — the reason the ledger's length stopped being a cost
+/// on every read. What must not change with it is the answer: `credits +
+/// reversals - charges`, with the signs still applied by `MealLedgerKind::sign`
+/// rather than respelled in SQL.
+#[tokio::test]
+async fn the_balance_sums_every_kind_the_same_way_it_always_did() {
+    let (app, db) = app_and_db().await;
+    let admin = login_as(&app, &db, "sum_adm", "admin").await;
+    let mgr = login_as(&app, &db, "sum_mgr", "manager").await;
+    let ali = login(&app, "sum_ali").await;
+    let ali_id = me_id(&app, &ali).await;
+
+    // Nothing at all: no rows, so the aggregate returns no groups.
+    assert_eq!(balance_of(&app, &mgr, &ali_id).await, 0);
+
+    // A credit, then two charges on different menus, then one reversal — every
+    // kind, and more than one line in two of the three groups.
+    let res = send(
+        &app,
+        "POST",
+        "/meals/credits",
+        Some(&admin),
+        Some(json!({ "student_id": ali_id, "amount_minor": 10_000 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    assert_eq!(balance_of(&app, &mgr, &ali_id).await, 10_000);
+
+    let mut bookings = Vec::new();
+    for (day, price) in [("2026-09-23", 4_500), ("2026-09-24", 1_500)] {
+        let menu = publish(&app, &mgr, day).await;
+        add_dish(&app, &mgr, &menu, price).await;
+        let res = send(
+            &app,
+            "POST",
+            &format!("/meals/menus/{menu}/bookings"),
+            Some(&ali),
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+        bookings.push(id_of(&res.body));
+    }
+    assert_eq!(
+        balance_of(&app, &mgr, &ali_id).await,
+        10_000 - 4_500 - 1_500
+    );
+
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/meals/bookings/{}", bookings[0]),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(
+        balance_of(&app, &mgr, &ali_id).await,
+        10_000 - 1_500,
+        "credit + reversal - charges"
+    );
+    // A second student's lines are somebody else's: the aggregate is scoped by
+    // `WHERE student = …` exactly as the fold was.
+    let veli = login(&app, "sum_veli").await;
+    let res = send(
+        &app,
+        "POST",
+        "/meals/credits",
+        Some(&admin),
+        Some(json!({ "student_id": me_id(&app, &veli).await, "amount_minor": 777 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    assert_eq!(
+        balance_of(&app, &mgr, &ali_id).await,
+        10_000 - 1_500,
+        "another student's credit leaked into this balance"
+    );
+}
+
+/// The stale-data half of the cycle ceiling: a live volume may already hold a
+/// seat retaken more times than the new ceiling allows. Such a row must stay
+/// **cancellable** — the ceiling binds the write that would add another cycle,
+/// nothing else. A ceiling consulted on the cancel path instead would strand
+/// exactly the seats it was meant to stop growing: the menu refuses its own
+/// delete while a seat is held, and cancelling is the only route that reverses
+/// a charge.
+#[tokio::test]
+async fn an_over_ceiling_seat_from_an_older_build_is_still_cancellable() {
+    let (app, db) = app_and_db().await;
+    let mgr = login_as(&app, &db, "old_mgr", "manager").await;
+    let ali = login(&app, "old_ali").await;
+    // A free menu: the row is aged by hand below, and a charge keyed to an
+    // attempt this test never really made would only muddy what is asserted.
+    let menu = publish(&app, &mgr, "2026-09-25").await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/bookings"),
+        Some(&ali),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let booking = id_of(&res.body);
+
+    // Aged past the ceiling, the way an older binary would have left it.
+    db.query(format!(
+        "UPDATE type::record('meal_booking', '{booking}') SET attempt = 25"
+    ))
+    .await
+    .unwrap()
+    .check()
+    .unwrap();
+
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/meals/bookings/{booking}"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::OK,
+        "an over-ceiling seat must stay freeable: {}",
+        res.body
+    );
+    assert_eq!(res.body["status"], "cancelled", "{}", res.body);
+    // …and with the seat back the menu is deletable again, which is the whole
+    // point of not letting the ceiling reach the cancel.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/meals/menus/{menu}"),
+        Some(&mgr),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
 }

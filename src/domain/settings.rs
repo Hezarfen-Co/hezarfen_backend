@@ -494,8 +494,11 @@ impl Settings {
             DEFAULT_MEAL_SLOTS
                 .map(|name| MealSlotDef {
                     name: name.to_string(),
-                    // No built-in serving time: the shipped defaults keep the
-                    // midnight-UTC cutoff until a school sets real hours.
+                    // No built-in serving time, and the backend will not guess
+                    // one: a slot with no hour has no instant for the cutoff to
+                    // count back from, so the school's `meal_cancel_cutoff_
+                    // minutes` binds none of these slots until it sets real
+                    // hours (see `check_cutoff`).
                     serving_minute: None,
                 })
                 .to_vec()

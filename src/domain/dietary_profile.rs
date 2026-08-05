@@ -156,13 +156,27 @@ impl DietaryProfile {
             let profile = Self {
                 id: DietaryProfileId::of(student),
                 student: student.clone(),
-                tags: tags.unwrap_or(DietaryTags(Vec::new())),
-                note: note.flatten(),
+                tags: tags.clone().unwrap_or(DietaryTags(Vec::new())),
+                note: note.clone().flatten(),
                 updated_by: by.clone(),
                 updated_at: Timestamp::now(),
             };
-            let created: Option<Self> = db.create(profile.id.record()).content(profile).await?;
-            return created.ok_or_else(|| AppError::Internal("failed to save the profile".into()));
+            match db.create(profile.id.record()).content(profile).await {
+                Ok(Some(created)) => return Ok(created),
+                Ok(None) => {
+                    return Err(AppError::Internal("failed to save the profile".into()));
+                }
+                // A rival first `PATCH` created the row in the round trip since
+                // the read above (the `dietary_profile_student` UNIQUE index
+                // catches the same collision), and `CREATE` leaves that row
+                // untouched — so this call is a plain field write after all,
+                // exactly as it would have been a moment later. Propagated, it
+                // was a 500 on a legitimate request. Same shape as
+                // [`MealLedger::append`](crate::domain::meal_ledger), which
+                // reads the winner back rather than failing.
+                Err(err) if err.is_already_exists() => {}
+                Err(err) => return Err(err.into()),
+            }
         }
         FieldUpdate::new(DietaryProfileId::of(student).record())
             .set("tags", tags)
