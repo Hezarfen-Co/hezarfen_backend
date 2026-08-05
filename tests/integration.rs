@@ -21769,12 +21769,18 @@ async fn meal_cutoff_closes_booking_and_cancelling_alike() {
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
     let booking = id_of(&res.body);
 
+    // The serving hour goes with the knob: a slot without one has no instant
+    // for the deadline to count back from, so the cutoff binds none of its
+    // menus (see `meal_cutoff_counts_back_from_the_slots_serving_time`).
     let res = send(
         &app,
         "PATCH",
         "/settings",
         Some(&mgr),
-        Some(json!({ "meal_cancel_cutoff_minutes": 60 })),
+        Some(json!({
+            "meal_cancel_cutoff_minutes": 60,
+            "meal_slots": [{ "name": "lunch", "serving_minute": 720 }],
+        })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
@@ -21826,8 +21832,10 @@ async fn meal_cutoff_closes_booking_and_cancelling_alike() {
 /// 23:59 UTC, with a cutoff wide enough that *midnight* of that date is already
 /// inside it. Under the old midnight rule the seat is shut; measured from the
 /// serving time it is open for another ~24 hours. Then, with no serving time on
-/// the slot, the very same menu falls back to midnight and shuts — the upgrade
-/// path for every slot written before the field existed.
+/// the slot, the very same menu closes at **nothing at all**: there is no
+/// instant left to count the deadline back from, and counting from midnight —
+/// as this did — shut every same-day menu of a school that had set the cutoff
+/// knob without serving hours, which is how all three slots ship.
 #[tokio::test]
 async fn meal_cutoff_counts_back_from_the_slots_serving_time() {
     let (app, db) = app_and_db().await;
@@ -21886,9 +21894,11 @@ async fn meal_cutoff_counts_back_from_the_slots_serving_time() {
     );
     let booking = id_of(&res.body);
 
-    // Drop the serving time from the same slot: the deadline snaps back to
-    // midnight of the menu's date, which the cutoff already covers. The slot
-    // list is read live, so the menu published under it moves with it.
+    // Drop the serving time from the same slot: there is now no instant to
+    // count the deadline back from, so this menu closes at nothing — it does
+    // *not* snap back to midnight, which used to shut the canteen of every
+    // school that set the cutoff without setting hours. The slot list is read
+    // live, so the menu published under it moves with the edit.
     let res = send(
         &app,
         "PATCH",
@@ -21916,11 +21926,12 @@ async fn meal_cutoff_counts_back_from_the_slots_serving_time() {
     .await;
     assert_eq!(
         res.status,
-        StatusCode::CONFLICT,
-        "with no serving time the cutoff falls back to midnight UTC: {}",
+        StatusCode::CREATED,
+        "an unset serving hour is an unenforced cutoff: {}",
         res.body
     );
-    // Cancelling is closed by the same fallback deadline...
+    // …and the student holding a seat can still give it back themselves,
+    // which the midnight fallback took away from them.
     let res = send(
         &app,
         "DELETE",
@@ -21929,27 +21940,28 @@ async fn meal_cutoff_counts_back_from_the_slots_serving_time() {
         None,
     )
     .await;
-    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
 
-    // ...and re-serving lunch at 23:59 opens both ends again.
+    // Serving lunch at midnight instead makes the same cutoff bite: the
+    // deadline is that instant minus the cutoff, which is already past.
     let res = send(
         &app,
         "PATCH",
         "/settings",
         Some(&mgr),
-        Some(json!({ "meal_slots": [{ "name": "lunch", "serving_minute": 1439 }] })),
+        Some(json!({ "meal_slots": [{ "name": "lunch", "serving_minute": 0 }] })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     let res = send(
         &app,
-        "DELETE",
-        &format!("/meals/bookings/{booking}"),
+        "POST",
+        &format!("/meals/menus/{menu}/bookings"),
         Some(&ali),
-        None,
+        Some(json!({})),
     )
     .await;
-    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
 }
 
 /// Who may take a seat: the student it is for, or a parent holding a link to

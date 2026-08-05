@@ -31,9 +31,10 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
 use crate::constant::{
-    CAS_UPDATE_RETRIES, MEAL_BOOKING_TABLE, MENU_SEAT_COUNT_FIELD, MENU_VERSION_FIELD,
+    CAP_WRITE_TRIES, MAX_MEAL_BOOKING_ATTEMPTS, MEAL_BOOKING_TABLE, MENU_SEAT_COUNT_FIELD,
+    MENU_VERSION_FIELD,
 };
-use crate::database::{Database, lost_the_race};
+use crate::database::{Database, backoff, lost_the_race};
 use crate::domain::cap::{self, Claimed};
 use crate::domain::meal_ledger::{LedgerAmount, MealLedger};
 use crate::domain::menu::{Menu, MenuDate, MenuId, MenuSlot};
@@ -59,6 +60,21 @@ impl MealBookingId {
 
     pub fn from_key(key: &str) -> Self {
         Self(RecordId::new(MEAL_BOOKING_TABLE, key))
+    }
+
+    /// Who the seat is for, read straight back off the key: [`Self::composite`]
+    /// joins with `_` and a ULID user key carries none, so the last segment is
+    /// always the student (a slot name may well hold one, and the menu half is
+    /// in front). `None` for a key no `composite` ever minted.
+    ///
+    /// This is what lets a cancel decide *whose* seat it is asked to free
+    /// before reading the row — the id is fully derivable from a menu and a
+    /// user id, both readable by a teacher, so a 403-or-404 answered off the
+    /// row is an existence oracle for the manager-only booking list.
+    pub fn student(&self) -> Option<UserId> {
+        self.key()
+            .rsplit_once('_')
+            .map(|(_, student)| UserId::from_key(student))
     }
 
     pub fn record(&self) -> RecordId {
@@ -181,7 +197,8 @@ impl MealBooking {
     ) -> Result<MealBooking, AppError> {
         let id = MealBookingId::composite(menu, student);
         let seats = menu.record();
-        for _ in 0..CAS_UPDATE_RETRIES {
+        for attempt in 0..CAP_WRITE_TRIES {
+            backoff(attempt).await;
             let fresh = Menu::read(menu, db).await?.ok_or(AppError::NotFound)?;
             check_cutoff(fresh.get_date(), fresh.get_slot(), cutoff)?;
             let existing: Option<MealBooking> = db.select(id.record()).await?;
@@ -200,23 +217,50 @@ impl MealBooking {
                 .filter(|row| row.status == MealBookingStatus::Booked)
             {
                 MealLedger::charge_booking(&held, booked_by, db).await?;
-                return Ok(held);
+                // Answered off a re-read, never off the row read a round trip
+                // ago: a cancel committing in that gap has freed the seat,
+                // given the money back and left the row `cancelled`, and
+                // returning `held` then reports a seat — `"status": "booked"`,
+                // `cancelled_at: null` — the store does not hold. The stored
+                // state was right all along; only the answer lied. Gone or
+                // cancelled, the decision is simply made again, exactly as
+                // `Claimed::Duplicate` below does, so the caller ends up with
+                // the seat they asked for rather than a `201` about a seat
+                // somebody already released.
+                match Self::read(&id, db).await? {
+                    Some(live) if live.status == MealBookingStatus::Booked => return Ok(live),
+                    _ => continue,
+                }
+            }
+            // The attempt is settled *here*, not by the revival's `attempt + 1`,
+            // because the charge id is (seat, attempt) and the charge has to be
+            // built before the transaction that writes it. `existing` is either
+            // absent or cancelled — a booked row returned above.
+            let attempt = existing.as_ref().map_or(1, |prior| prior.attempt + 1);
+            // A seat retaken without end is a ledger without end: each cycle
+            // appends a charge and its reversal, both permanent, and every
+            // later balance read is answered over the lot. Refused *before* the
+            // menu is priced, so the answer is the ceiling rather than whatever
+            // the pricing happens to say. A row already past the ceiling — an
+            // upgrade's leftovers — is untouched by this: cancelling consults
+            // no cap, so its seat and its money stay reachable, and only one
+            // more revival is refused.
+            if attempt > MAX_MEAL_BOOKING_ATTEMPTS {
+                return Err(AppError::Conflict(
+                    "this seat has been booked and cancelled its maximum number of times",
+                ));
             }
             // Before the seat: an unchargeable menu (dishes summing past the
             // cap) must refuse the booking outright, never leave a
             // booked-but-unbilled row behind.
             let price = MealLedger::price_snapshot(menu, db).await?;
-            // The attempt is settled *here*, not by the revival's `attempt + 1`,
-            // because the charge id is (seat, attempt) and the charge has to be
-            // built before the transaction that writes it. `existing` is either
-            // absent or cancelled — a booked row returned above.
             let fresh_row = MealBooking {
                 id: id.clone(),
                 menu: menu.clone(),
                 student: student.clone(),
                 booked_by: booked_by.clone(),
                 status: MealBookingStatus::Booked,
-                attempt: existing.map_or(1, |prior| prior.attempt + 1),
+                attempt,
                 price_minor: price,
                 cancelled_at: None,
                 created_at: Timestamp::now(),
@@ -329,7 +373,16 @@ impl MealBooking {
              RETURN SELECT * FROM ONLY $id;
              COMMIT TRANSACTION;"
         );
-        for _ in 0..CAS_UPDATE_RETRIES {
+        // Every booking on one menu contends on that menu's single counter row,
+        // which is one HTTP burst of racers on a single parent — the case
+        // `CAP_WRITE_TRIES` is sized for. Three immediate re-sends with no
+        // backoff just re-synchronized them and 409'd the fourth student.
+        // Admissible: a lost round aborts the whole transaction (nothing
+        // written, no seat, no charge), and the two `CREATE`s that could
+        // legitimately answer "already exists" are read as `Claimed::Duplicate`
+        // below *before* the conflict check, so no decision is ever re-asked.
+        for attempt in 0..CAP_WRITE_TRIES {
+            backoff(attempt).await;
             let query = db
                 .query(sql.as_str())
                 .bind(("menu", seats.clone()))
@@ -522,7 +575,14 @@ impl MealBooking {
         // Slots count BEGIN, the LET, the seat UPDATE and — when there is money
         // to give back — the IF.
         let returned = if refund.is_some() { 4 } else { 3 };
-        for _ in 0..CAS_UPDATE_RETRIES {
+        // Same burst on the same counter as the book side, so the same patience
+        // (see [`Self::claim_and_place`]) — a cancel that gave up left the seat
+        // held with the charge standing. Admissible: the round aborts having
+        // written nothing, and a re-send finds the row already `cancelled`, so
+        // the flip matches nothing, the counter moves nothing and the guarded
+        // reversal — keyed to (seat, attempt) — is not written twice.
+        for attempt in 0..CAP_WRITE_TRIES {
+            backoff(attempt).await;
             let attempted = async {
                 let query = db
                     .query(format!(
@@ -650,10 +710,11 @@ impl MealCutoff {
 /// The instant the meal is served: midnight UTC of `date` plus the slot's
 /// `serving_minute`. `date` is text with no timezone (see [`MenuDate`]) and the
 /// backend deliberately stores no school timezone, so the serving time is UTC
-/// too — a UTC+3 school enters 09:00 for a noon lunch. A slot with no serving
-/// time falls back to midnight UTC, exactly what every booking used before the
-/// field existed; refusing the booking instead would take the canteen offline
-/// on an upgrade.
+/// too — a UTC+3 school enters 09:00 for a noon lunch.
+///
+/// `None` for a date no day can be parsed out of, which is the only thing
+/// [`check_cutoff`] uses the midnight case for: a slot with no serving minute
+/// gets **no deadline at all** there, never a deadline counted from midnight.
 fn served_at(date: &MenuDate, serving_minute: Option<i64>) -> Option<Timestamp> {
     let day = chrono::NaiveDate::parse_from_str(date.as_str(), "%Y-%m-%d").ok()?;
     Some(Timestamp::from_millis(
@@ -664,6 +725,18 @@ fn served_at(date: &MenuDate, serving_minute: Option<i64>) -> Option<Timestamp> 
 
 /// Booking and cancelling both close `cutoff.minutes` before the meal is
 /// served. `None` = the school set no cutoff, so neither ever closes.
+///
+/// **A slot with no `serving_minute` closes nothing either.** There is no
+/// instant to count the deadline back from, and counting from midnight UTC —
+/// as this did — put the deadline of every same-day menu in the past the
+/// moment a school set `meal_cancel_cutoff_minutes`: today's lunch could not be
+/// booked (`409`), and the seats already held could not be cancelled by the
+/// students and parents holding them, only by a manager. All three shipped
+/// slots carry no serving minute, so setting the one cutoff knob took the
+/// canteen offline — which is precisely what the midnight fallback was chosen
+/// to avoid. An unset serving hour is now an unenforced cutoff: the school sets
+/// the hour and the deadline starts binding, on menus already published too
+/// (the slot list is read live).
 ///
 /// A date no serving instant can be computed from **fails closed**. A menu on
 /// an impossible day (a 31st of February — refused by [`MenuDate`] now, but
@@ -679,11 +752,19 @@ fn check_cutoff(date: &MenuDate, slot: &MenuSlot, cutoff: &MealCutoff) -> Result
     let Some(minutes) = cutoff.minutes else {
         return Ok(());
     };
-    let Some(serving) = served_at(date, cutoff.serving_minute(slot)) else {
+    let serving_minute = cutoff.serving_minute(slot);
+    // The impossible day is refused first, serving hour or not: it is a data
+    // defect, and "the deadline binds every menu" has to stay true for the one
+    // menu nobody meant to publish.
+    let Some(serving) = served_at(date, serving_minute) else {
         return Err(AppError::Conflict(
             "the menu's date is not a real calendar day, so its cutoff cannot be worked out",
         ));
     };
+    // No serving hour, no instant to count back from, so nothing closes.
+    if serving_minute.is_none() {
+        return Ok(());
+    }
     let deadline = serving
         .as_millis()
         .saturating_sub(minutes.saturating_mul(60_000));
@@ -1210,8 +1291,22 @@ mod tests {
         assert!(check_cutoff(&impossible, &lunch(), &cutoff(None, Some(720))).is_ok());
     }
 
+    /// A slot with no serving hour has no instant to count a deadline back
+    /// from, so nothing on it ever closes. It used to count from midnight UTC
+    /// of the menu's day, which shut every same-day menu the moment a school
+    /// set the cutoff knob — and all three shipped slots carry no hour.
+    #[test]
+    fn a_slot_without_a_serving_hour_has_no_deadline() {
+        let past = MenuDate::try_new("2000-01-01").unwrap();
+        assert!(check_cutoff(&past, &lunch(), &cutoff(Some(60), None)).is_ok());
+        // The same menu, once the school sets the hour.
+        assert!(check_cutoff(&past, &lunch(), &cutoff(Some(60), Some(720))).is_err());
+    }
+
     /// The instant the deadline counts back from: midnight UTC of the day plus
-    /// the slot's serving minute, and midnight itself when the slot has none.
+    /// the slot's serving minute. The `None` case still resolves to midnight,
+    /// but only as the date's validity probe — `check_cutoff` never counts a
+    /// deadline from it, which the case below pins.
     #[test]
     fn serving_instant_offsets_midnight_utc() {
         let day = MenuDate::try_new("1970-01-02").unwrap();
@@ -1221,8 +1316,8 @@ mod tests {
             86_400_000 + 12 * 60 * 60_000
         );
         // A slot the school no longer lists (renamed or retired after the
-        // menu snapshotted its name) resolves to no serving time, i.e. the
-        // midnight fallback rather than a refusal.
+        // menu snapshotted its name) resolves to no serving time, which
+        // `check_cutoff` reads as no deadline at all.
         assert_eq!(
             cutoff(Some(60), Some(720)).serving_minute(&lunch()),
             Some(720)

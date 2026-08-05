@@ -803,6 +803,12 @@ async fn booking_target(
 /// full or the school's `meal_cancel_cutoff_minutes` has closed the meal, and
 /// (`400`) when the menu's dishes sum past the chargeable maximum, since a seat
 /// is never handed out unbilled.
+///
+/// One seat may be taken at most `meal.max_booking_attempts` times (`GET
+/// /limits`) — the first booking plus the re-bookings after a cancel. Past that
+/// it is a `409`: every cycle appends a charge and its reversal, permanently, so
+/// the ceiling bounds the student's statement rather than their mind changing.
+/// A seat that really must move again is the canteen's to cancel.
 #[utoipa::path(
     post,
     path = "/menus/{id}/bookings",
@@ -816,7 +822,7 @@ async fn booking_target(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not a student booking for themselves, nor a parent booking for a linked student", body = ErrorResponse),
         (status = 404, description = "No such menu", body = ErrorResponse),
-        (status = 409, description = "The menu is full, its cutoff has passed, its date is not a real calendar day so no cutoff can be worked out, or the menu kept being edited while the seat was being taken", body = ErrorResponse),
+        (status = 409, description = "The menu is full, its cutoff has passed, its date is not a real calendar day so no cutoff can be worked out, the seat has been booked and cancelled its maximum number of times, or the menu kept being edited while the seat was being taken", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -933,6 +939,12 @@ async fn list_menu_bookings(
 /// ever releases the attempt this call read, so the newer seat — one this API
 /// answered `201` for and nobody here asked to free — is left alone. Send the
 /// call again to cancel the seat as it now stands.
+///
+/// **Who is asking is decided before the seat is looked up**, so an unauthorised
+/// caller gets the same `403` whether or not the booking exists. Booking ids are
+/// derivable (`{date}_{slot}_{student}`), and a `404` here would otherwise
+/// answer "did this student book this meal?" — the manager-only list at
+/// `GET /meals/menus/{id}/bookings`, one student at a time.
 #[utoipa::path(
     delete,
     path = "/bookings/{bid}",
@@ -942,8 +954,8 @@ async fn list_menu_bookings(
     responses(
         (status = 200, description = "Cancelled (also when it already was — the call is idempotent and replays the refund)", body = BookingResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Not the booking's student, their parent, nor a manager", body = ErrorResponse),
-        (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 403, description = "Not the booking's student, their parent, nor a manager — answered before the booking is read, so it is also what an unauthorised caller gets for a booking that does not exist", body = ErrorResponse),
+        (status = 404, description = "Not found (only for a caller who may cancel it)", body = ErrorResponse),
         (status = 409, description = "The cutoff has passed (students and parents only), the menu's date is not a real calendar day so no cutoff can be worked out, the seat was booked again while this call ran, or the menu was too contended to free the seat", body = ErrorResponse),
     ),
 )]
@@ -952,9 +964,7 @@ async fn cancel_booking(
     CurrentUser(user): CurrentUser,
     Path(bid): Path<String>,
 ) -> Result<Json<BookingResponse>, AppError> {
-    let booking = MealBooking::read(&MealBookingId::from_key(&bid), &st.db)
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let id = MealBookingId::from_key(&bid);
     // Manager+ may give back *any* seat. Not a convenience: `booking_target`
     // grants only students and parents, so a student promoted to staff (or a
     // parent unlinked) left a live seat nobody on the API could cancel — the
@@ -964,9 +974,20 @@ async fn cancel_booking(
     // effect of a role change.
     let staff = user.get_role().at_least(Role::Manager);
     if !staff {
+        // Decided off the *id*, before the row is read: the id is
+        // `{date}_{slot}_{student}`, and a teacher may list both the menus and
+        // the users, so authorising after the read answered 403 for a seat that
+        // exists and 404 for one that does not — an existence oracle around the
+        // deliberate manager+ gate on `GET /menus/{id}/bookings`, and one any
+        // peer holding a user id could work too. An unauthorised caller now
+        // gets the same 403 either way, and learns nothing.
+        //
         // Same door as booking: whoever may take the seat may give it back.
-        let target = booking_target(&user, Some(booking.get_student().key()), &st.db).await?;
-        if &target != booking.get_student() {
+        let student = id
+            .student()
+            .ok_or(AppError::Forbidden("not your booking"))?;
+        let target = booking_target(&user, Some(student.key()), &st.db).await?;
+        if target != student {
             return Err(AppError::Forbidden("not your booking"));
         }
     }
@@ -983,6 +1004,9 @@ async fn cancel_booking(
     };
     // Flips the row and appends the reversal for that attempt's charge in one
     // transaction; the charge itself stays.
+    let booking = MealBooking::read(&id, &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
     let cancelled = booking.cancel(&cutoff, user.get_id(), &st.db).await?;
     let items = booking_responses(std::slice::from_ref(&cancelled), &st.db).await?;
     Ok(Json(

@@ -547,17 +547,47 @@ impl MealLedger {
 
     /// The derived balance: `credits + reversals - charges`, in minor units.
     /// Negative means the student owes the school. Never stored anywhere.
-    // ponytail: folds the student's lines in-process (a few hundred a year);
-    // push it into a `math::sum` aggregate if a statement ever gets long.
+    ///
+    /// **The sum is taken per kind by the database** and only the three totals
+    /// come back, so a balance read costs the same whether the statement holds
+    /// four lines or forty thousand. It used to decode and fold every line, and
+    /// nothing bounds a statement's length but the cycle ceiling
+    /// ([`MAX_MEAL_BOOKING_ATTEMPTS`](crate::constant::MAX_MEAL_BOOKING_ATTEMPTS))
+    /// added alongside this: every book/cancel
+    /// pair appends two permanent rows, and each one was paid for again by
+    /// every later `GET /meals/balance/*`.
+    ///
+    /// **The signs stay here**, applied by the very [`MealLedgerKind::sign`]
+    /// the documented formula is spelled in. Summing `IF kind = 'charge' THEN
+    /// -amount …` in SQL would have folded the whole balance in one statement
+    /// and forked the one rule that decides what money means into a second
+    /// language, where nothing would fail the day the two disagreed. Grouping
+    /// instead keeps the aggregate ignorant of signs: it counts kinds, and
+    /// Rust still says what a kind does. A stored running total was the third
+    /// option and is a counter that can drift — a bug class this repo closes,
+    /// not one it opens.
     pub async fn balance_of(student: &UserId, db: &Database) -> Result<i64, AppError> {
-        Ok(Self::list_for_student(student, None, 0, db)
+        let totals: Vec<KindTotal> = db
+            .query(format!(
+                "SELECT kind, math::sum(amount_minor) AS total \
+                 FROM {MEAL_LEDGER_TABLE} WHERE student = $student GROUP BY kind"
+            ))
+            .bind(("student", student.record()))
             .await?
-            .0
+            .check()?
+            .take(0)?;
+        Ok(totals
             .iter()
-            .fold(0i64, |sum, line| {
-                sum + line.kind.sign() * line.amount_minor.as_minor()
-            }))
+            .fold(0i64, |sum, row| sum + row.kind.sign() * row.total))
     }
+}
+
+/// One kind's whole sum, as the `GROUP BY` in [`MealLedger::balance_of`] hands
+/// it back — at most three rows, never the lines behind them.
+#[derive(Debug, SurrealValue)]
+struct KindTotal {
+    kind: MealLedgerKind,
+    total: i64,
 }
 
 #[cfg(test)]
@@ -600,6 +630,47 @@ mod tests {
             .map(|(kind, amount)| kind.sign() * amount)
             .sum();
         assert_eq!(balance, 10_000);
+    }
+
+    /// The balance aggregate **against a real server**, and `#[ignore]`d for
+    /// it: `init_mem`'s embedded engine is not the store this runs on, and an
+    /// aggregate is exactly where the two are known to differ — a `count()`
+    /// over an indexed field comes back `{count: N}` from the server and a
+    /// bare int from memory, and `student` here *is* indexed. This asserts the
+    /// `GROUP BY` really decodes into [`KindTotal`] and folds to the
+    /// documented figure, per kind, scoped to one student.
+    #[tokio::test]
+    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
+    async fn the_balance_aggregate_decodes_on_a_real_server() {
+        let (db, _serialized) = crate::database::init_test_server("meal_balance_sum").await;
+        db.query(
+            "CREATE meal_ledger:a SET student = user:ali, kind = 'credit', \
+                 amount_minor = 10000, recorded_by = user:adm, created_at = 1;
+             CREATE meal_ledger:b SET student = user:ali, kind = 'charge', \
+                 amount_minor = 4500, recorded_by = user:adm, created_at = 2;
+             CREATE meal_ledger:c SET student = user:ali, kind = 'charge', \
+                 amount_minor = 1500, recorded_by = user:adm, created_at = 3;
+             CREATE meal_ledger:d SET student = user:ali, kind = 'reversal', \
+                 amount_minor = 4500, recorded_by = user:adm, created_at = 4;
+             CREATE meal_ledger:e SET student = user:veli, kind = 'credit', \
+                 amount_minor = 777, recorded_by = user:adm, created_at = 5;",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+        let ali = UserId::from_key("ali");
+        assert_eq!(
+            MealLedger::balance_of(&ali, &db).await.unwrap(),
+            10_000 - 4_500 - 1_500 + 4_500
+        );
+        // Somebody with no lines at all: no groups come back, not an error.
+        assert_eq!(
+            MealLedger::balance_of(&UserId::from_key("nobody"), &db)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
