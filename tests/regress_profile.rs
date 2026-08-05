@@ -1113,7 +1113,7 @@ async fn pulling_a_deadline_back_leaves_on_time_no_higher_than_submitted() {
     );
 }
 
-/// `exam_sat_total` counts sittings, not requests: re-posting a running
+/// `exam_sat_total` counts exams sat, not requests: re-posting a running
 /// attempt resumes it (`200`, same clock) and must leave the counter alone.
 #[tokio::test]
 async fn a_resumed_exam_attempt_counts_once() {

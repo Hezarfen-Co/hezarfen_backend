@@ -168,10 +168,17 @@ impl ExamAttempt {
     /// races on the same seq, loses to the unique id, and reads the winner's
     /// row.
     ///
-    /// A created row rides [`cap::claim_and_create`] so the student's
-    /// `exam_sat_total` moves in the same transaction — one per sitting,
-    /// retakes included, which is exactly what the one-time backfill counted.
-    /// A lost race writes neither the row nor the increment.
+    /// A created row rides [`cap::create_counting`] so the student's
+    /// `exam_sat_total` moves in the same transaction — but only for `seq == 1`,
+    /// because that counter is *exams sat*, not sittings. A retake is the same
+    /// exam again, and counting it made a badge a student could mint alone: an
+    /// open exam with unlimited attempts is a start/finish loop nobody else has
+    /// to touch. `seq == 1` is the whole condition and needs no extra read —
+    /// the first sitting's id is one deterministic key, so of every writer
+    /// aiming at it exactly one `CREATE` commits and the losers' increments
+    /// abort with their duplicates, while a retake computes its seq from a row
+    /// that already exists. A `SELECT` inside the transaction would be strictly
+    /// worse: SurrealDB 3.2.3 conflict-checks write sets, not read sets.
     pub async fn start(
         exam: &Exam,
         user: &UserId,
@@ -202,10 +209,11 @@ impl ExamAttempt {
             left_at: None,
         };
         let id = attempt.id.record();
-        match cap::claim_and_create(
+        let first = next_seq == 1;
+        match cap::create_counting(
             &user.record(),
             EXAM_SAT_TOTAL_FIELD,
-            cap::UNLIMITED,
+            first,
             &id,
             &attempt,
             db,
@@ -213,7 +221,8 @@ impl ExamAttempt {
         .await?
         {
             cap::Claimed::Made(created) => {
-                if let Err(err) = badge::sync(user, db).await {
+                // Only a moved counter can have crossed a threshold.
+                if first && let Err(err) = badge::sync(user, db).await {
                     tracing::warn!("failed to sync badges for {}: {err}", user.key());
                 }
                 Ok((created, true))
@@ -511,7 +520,6 @@ impl ExamAttempt {
 mod tests {
     use super::*;
     use crate::database::init_mem;
-    use crate::domain::course::CourseId;
     use crate::domain::exam::{
         ExamAttemptLimit, ExamDescription, ExamKind, ExamMode, ExamSchedule, ExamTitle,
     };
@@ -534,7 +542,7 @@ mod tests {
     /// rows to exercise the attempt lifecycle without the HTTP layer.
     async fn open_exam_with_question(db: &Database, max_attempts: i64) -> (Exam, ExamQuestion) {
         let creator = UserId::from_key("01TESTTEACHERAAAAAAAAAAAAA");
-        let course = CourseId::from_key("01TESTCOURSEAAAAAAAAAAAAAA");
+        let course = crate::domain::course::a_test_course(db).await;
         let kinds = Settings::defaults().get_exam_kinds().to_vec();
         let exam = Exam::create(
             &creator,
@@ -571,7 +579,7 @@ mod tests {
         // A real subject row, not a minted id: a question claims a reference on
         // its subject and is refused if that subject does not exist.
         let subject = crate::domain::subject::Subject::create(
-            &crate::domain::course::CourseId::generate(),
+            &crate::domain::course::a_test_course(db).await,
             crate::domain::subject::SubjectName::try_new("topic").unwrap(),
             crate::domain::subject::SubjectDescription::try_new("").unwrap(),
             db,
@@ -629,7 +637,7 @@ mod tests {
             .unwrap()
     }
 
-    /// The badge counter counts *sittings*, one per created row — so a start
+    /// The badge counter counts *exams sat*, one per first sitting — so a start
     /// moves it by exactly one and a resume, which creates nothing, leaves it
     /// alone. Anything else and a seeded account and a fresh one would mean
     /// different things by the same number.
@@ -654,10 +662,11 @@ mod tests {
         );
     }
 
-    /// The backfill counted every `seq`, retakes included — a second sitting
-    /// is a second row and moves the counter again.
+    /// A retake is the same exam again: the row lands at the next `seq` and the
+    /// counter stays where it is. Counting it is the farm — an open exam with
+    /// unlimited attempts would mint `exam_sat_25` off one exam and no teacher.
     #[tokio::test]
-    async fn a_retake_counts_as_another_sitting() {
+    async fn a_retake_writes_its_row_and_counts_nothing() {
         let db = init_mem().await.unwrap();
         let (exam, _question) = open_exam_with_question(&db, 3).await;
         let user = student(&db).await;
@@ -667,7 +676,7 @@ mod tests {
         let (second, created) = ExamAttempt::start(&exam, &user, &db).await.unwrap();
         assert!(created);
         assert_eq!(second.get_seq(), 2);
-        assert_eq!(sat_total(&user, &db).await, 2);
+        assert_eq!(sat_total(&user, &db).await, 1);
     }
 
     /// The lost half of a double-start race. `start` can only reach that branch

@@ -22,8 +22,8 @@ mod common;
 use axum::Router;
 use axum::http::StatusCode;
 use common::{
-    app_and_db, create_course, create_exam, create_session, enroll, id_of, login, login_as, me_id,
-    send, set_role,
+    app_and_db, create_course, create_exam, create_exam_with, create_session, enroll, id_of, login,
+    login_as, me_id, send, set_role,
 };
 use hezarfen_backend::constant::{BADGES, HIGH_MARK_MIN, STUDY_STREAK_LAST_DAY_FIELD};
 use hezarfen_backend::database::Database;
@@ -639,6 +639,91 @@ async fn a_profile_read_owes_nothing_the_write_site_already_paid() {
         writes().await,
         written,
         "reading a profile that owes nothing still wrote"
+    );
+}
+
+// --- exams sat -------------------------------------------------------------
+
+/// Sit `exam` as `cookie` and submit it again, `times` over: the loop a student
+/// runs with nobody else in it on an `open` exam with `max_attempts: 0`.
+async fn sit_and_finish(app: &Router, cookie: &str, exam: &str, times: usize) {
+    for round in 0..times {
+        let started = send(
+            app,
+            "POST",
+            &format!("/exams/{exam}/attempt"),
+            Some(cookie),
+            None,
+        )
+        .await;
+        assert_eq!(
+            started.status,
+            StatusCode::CREATED,
+            "round {round} did not start a new sitting: {}",
+            started.body
+        );
+        let finished = send(
+            app,
+            "POST",
+            &format!("/exams/{exam}/attempt/finish"),
+            Some(cookie),
+            None,
+        )
+        .await;
+        assert_eq!(finished.status, StatusCode::OK, "{}", finished.body);
+    }
+}
+
+/// The farm: `exam_sat_total` counts **exams sat**, not sittings. An `open`
+/// exam with unlimited attempts is a start/finish loop that needs no teacher,
+/// so counting retakes minted `exam_sat_10`/`exam_sat_25` — permanent awards —
+/// off a single exam in a couple of dozen requests. Ten sittings of one exam
+/// must be worth exactly one, and a *second* exam must still be worth another,
+/// or the fix would have frozen the counter instead of narrowing it.
+#[tokio::test]
+async fn a_retake_loop_on_one_exam_counts_one_exam_sat() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "hoca", "teacher").await;
+    let student = login(&app, "ogrenci").await;
+    let student_id = me_id(&app, &student).await;
+    let course = create_course(&app, &teacher, "Biology").await;
+    enroll(&app, &teacher, &course, &student_id).await;
+    let unlimited = json!({ "title": "Cells", "kind": "quiz", "mode": "open", "max_attempts": 0 });
+    let res = create_exam_with(&app, &teacher, &course, unlimited.clone()).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let exam = id_of(&res.body);
+
+    sit_and_finish(&app, &student, &exam, 10).await;
+
+    let mine = my_profile(&app, &student).await;
+    assert_eq!(
+        stat(&mine, "exam_sat_total"),
+        1,
+        "ten sittings of one exam are one exam sat: {mine}"
+    );
+    assert_eq!(
+        badge_ids(&mine),
+        ["exam_sat_1"],
+        "the ladder was farmed off one exam: {mine}"
+    );
+
+    // A different exam is a different fact about the student, so it still
+    // counts — and its retakes still do not.
+    let res = create_exam_with(
+        &app,
+        &teacher,
+        &course,
+        json!({ "title": "Genes", "kind": "quiz", "mode": "open", "max_attempts": 0 }),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    sit_and_finish(&app, &student, &id_of(&res.body), 3).await;
+
+    let mine = my_profile(&app, &student).await;
+    assert_eq!(
+        stat(&mine, "exam_sat_total"),
+        2,
+        "a second exam is a second exam sat: {mine}"
     );
 }
 
