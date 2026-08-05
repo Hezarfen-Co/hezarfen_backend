@@ -71,6 +71,34 @@ async fn source_of(class: &str, course: &str, db: &Database) -> Option<String> {
         .filter(|key| !key.is_empty())
 }
 
+/// Does that grade's template still name that course, in the store?
+async fn templated(grade: &str, course: &str, db: &Database) -> bool {
+    rows(
+        &format!(
+            "SELECT VALUE id FROM class_blueprint \
+             WHERE grade = '{grade}' AND course:{course} IN courses"
+        ),
+        db,
+    )
+    .await
+        == 1
+}
+
+/// The course list one grade's template hands back over HTTP, ready to be sent
+/// straight back at it — the self-heal `PATCH` a manager is told to make.
+async fn held(app: &axum::Router, cookie: &str, grade: &str) -> Vec<Value> {
+    let res = send(
+        app,
+        "GET",
+        &format!("/classes/blueprints/{grade}"),
+        Some(cookie),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{:?}", res.body);
+    res.body["courses"].as_array().unwrap().clone()
+}
+
 /// Create a class section as `cookie`; returns its id.
 async fn create_class(app: &axum::Router, cookie: &str, name: &str, grade: &str) -> String {
     let res = send(
@@ -435,6 +463,13 @@ async fn creating_a_class_stocks_it_from_its_grades_blueprint() {
 /// A create whose stocking cannot place everything still creates the class: the
 /// pair that did not fit comes back in `skipped`, best-effort exactly like
 /// every other pump here.
+///
+/// The dead course is forged in the store rather than deleted through the API,
+/// because `DELETE /courses/{id}` now takes the id out of every template naming
+/// it (see `deleting_a_course_takes_it_out_of_every_blueprint`) and would leave
+/// nothing to skip. What is left here is exactly the state that still occurs: a
+/// row written before that cascade existed, and the pump's own window — a
+/// course deleted after the pump read the list it walks.
 #[tokio::test]
 async fn a_create_reports_what_its_blueprint_could_not_stock() {
     let (app, db) = app_and_db().await;
@@ -451,18 +486,20 @@ async fn a_create_reports_what_its_blueprint_could_not_stock() {
     .await;
     assert_eq!(made.status, StatusCode::CREATED, "{:?}", made.body);
 
-    // Delete a course out from under the template. Nothing carries it yet — no
-    // section exists at grade 9 — so this is the pair that cannot fit when the
-    // first one is created.
-    let dropped = send(
-        &app,
-        "DELETE",
-        &format!("/courses/{physics}"),
-        Some(&manager),
-        None,
-    )
-    .await;
-    assert_eq!(dropped.status, StatusCode::NO_CONTENT, "{:?}", dropped.body);
+    // Take a course out from under the template, leaving its id in the list —
+    // the state the delete's own sweep no longer produces, and the one a pump
+    // meets when a course goes after it read the list. Nothing carries it yet
+    // (no section exists at grade 9), so this is the pair that cannot fit when
+    // the first one is created.
+    db.query(format!("DELETE course:{physics}"))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    assert!(
+        templated("9", &physics, &db).await,
+        "the id is still listed"
+    );
 
     let res = send(
         &app,
@@ -1234,4 +1271,150 @@ async fn a_status_read_names_the_course_a_section_is_short() {
             synced.body
         );
     }
+}
+
+/// Deleting a course takes its id out of every template holding it, in the
+/// cascade that detaches it from the sections.
+///
+/// Without that sweep the id stayed in the list forever and every doc surface
+/// lied: `PATCH`ing the template back **as it stands** is the documented
+/// self-heal, and it answered `400` ("one of these courses does not exist"),
+/// because the handler resolves the ids the *request* names — the very ones it
+/// had just read back. So the assertion that matters is not only that the store
+/// is clean but that the round trip a manager is told to make succeeds.
+#[tokio::test]
+async fn deleting_a_course_takes_it_out_of_every_blueprint() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "mgr", "manager").await;
+    let algebra = create_course(&app, &manager, "algebra").await;
+    let history = create_course(&app, &manager, "history").await;
+    // No students: the section is here so the pump has something to walk, and
+    // an empty roster is what lets the course be deleted at all (one with a
+    // student on it is a 409).
+    let class = create_class(&app, &manager, "9-A", "9").await;
+
+    let made = send(
+        &app,
+        "POST",
+        "/classes/blueprints",
+        Some(&manager),
+        Some(json!({ "grade": "9", "course_ids": [algebra.clone(), history.clone()] })),
+    )
+    .await;
+    assert_eq!(made.status, StatusCode::CREATED, "{:?}", made.body);
+    assert!(attached(&class, &history, &db).await);
+
+    let deleted = send(
+        &app,
+        "DELETE",
+        &format!("/courses/{history}"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(deleted.status, StatusCode::NO_CONTENT, "{:?}", deleted.body);
+
+    assert!(
+        !templated("9", &history, &db).await,
+        "the deleted course is out of the template"
+    );
+    assert!(
+        templated("9", &algebra, &db).await,
+        "…and nothing else is — the sweep names one course"
+    );
+    assert!(
+        !attached(&class, &history, &db).await,
+        "the section's link goes in the same cascade"
+    );
+
+    // The self-heal, made exactly as documented: read the list, send it back.
+    let courses = held(&app, &manager, "9").await;
+    assert_eq!(
+        courses.len(),
+        1,
+        "the read agrees with the store: {courses:?}"
+    );
+    let healed = send(
+        &app,
+        "PATCH",
+        "/classes/blueprints/9",
+        Some(&manager),
+        Some(json!({ "course_ids": courses })),
+    )
+    .await;
+    assert_eq!(healed.status, StatusCode::OK, "{:?}", healed.body);
+
+    // …and the status read has no phantom to report.
+    let status = send(
+        &app,
+        "GET",
+        "/classes/blueprints/9/status",
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(status.status, StatusCode::OK, "{:?}", status.body);
+    assert!(
+        missing(&status, &class).is_empty(),
+        "a course that no longer exists is not something a section is short: {:?}",
+        status.body
+    );
+}
+
+/// The case no pump could ever repair: a grade with **zero** sections.
+///
+/// The prune that used to be the only thing removing a dead id fires while
+/// walking a section, and `POST /classes/{id}/blueprint` needs a section to run
+/// against — so at a grade nothing carries, no call in the whole API could
+/// clear the id. This sweep runs off the course's own delete, which does not
+/// care whether the grade has sections.
+#[tokio::test]
+async fn a_grade_with_no_sections_still_loses_its_deleted_course() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "mgr", "manager").await;
+    let algebra = create_course(&app, &manager, "algebra").await;
+
+    let made = send(
+        &app,
+        "POST",
+        "/classes/blueprints",
+        Some(&manager),
+        Some(json!({ "grade": "11", "course_ids": [algebra.clone()] })),
+    )
+    .await;
+    assert_eq!(made.status, StatusCode::CREATED, "{:?}", made.body);
+    assert_eq!(made.body["matched"], 0, "no section carries the label");
+
+    let deleted = send(
+        &app,
+        "DELETE",
+        &format!("/courses/{algebra}"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(deleted.status, StatusCode::NO_CONTENT, "{:?}", deleted.body);
+
+    assert!(
+        !templated("11", &algebra, &db).await,
+        "no section to walk, and the id is gone anyway"
+    );
+    assert!(
+        held(&app, &manager, "11").await.is_empty(),
+        "the read agrees with the store"
+    );
+    let healed = send(
+        &app,
+        "PATCH",
+        "/classes/blueprints/11",
+        Some(&manager),
+        Some(json!({ "course_ids": [] })),
+    )
+    .await;
+    assert_eq!(
+        healed.status,
+        StatusCode::OK,
+        "the template is editable again: {:?}",
+        healed.body
+    );
 }

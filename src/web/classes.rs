@@ -1028,9 +1028,10 @@ struct SkipResponse {
     /// Why that course could not be attached to that class, as a machine code
     /// the client words itself — the same id-plus-client-label shape roles and
     /// course kinds have. The set is closed: `class_deleted` (the section was
-    /// deleted while the pump ran), `course_deleted` (the course itself is
-    /// gone; the pump also drops that dangling id from the blueprint, so this
-    /// is reported once for the whole grade and never again),
+    /// deleted while the pump ran), `course_deleted` (the course itself was
+    /// deleted while the pump ran — a course deleted before it started is
+    /// already out of the template; the pump drops that id too, so this is
+    /// reported once for the whole grade and never again),
     /// `class_at_course_ceiling` (the
     /// section already holds `max_class_courses`), `class_roster_too_large`
     /// (the section holds more students than one attach may enroll at once),
@@ -1348,9 +1349,9 @@ async fn delete_blueprint(
 /// empty `missing` everywhere is a grade fully stocked.
 ///
 /// A course a human attached by hand counts as carried, exactly as it does for
-/// the pump — the template asks for the course, not for the pump's tag. A
-/// course in the template that no longer exists reads as missing from every
-/// section; the next pump drops the dangling id from the template.
+/// the pump — the template asks for the course, not for the pump's tag.
+/// Deleting a course takes it out of every template naming it, so `missing`
+/// names courses that still exist.
 ///
 /// The fix for anything listed is one of two idempotent calls:
 /// `POST /classes/{id}/blueprint` for one section, or `PATCH` the blueprint

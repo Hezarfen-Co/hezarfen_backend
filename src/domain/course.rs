@@ -400,6 +400,21 @@ impl Course {
     /// homework-file *blobs* are the web layer's to remove — it collects
     /// their names before calling this.
     ///
+    /// The **grade blueprints** naming it are swept in that same transaction.
+    /// Nothing else can reach them — a blueprint holds its courses as a list on
+    /// its own row, not as link rows this cascade could delete — and an id left
+    /// behind is permanent rather than merely stale: the pump's own
+    /// [`crate::domain::class_blueprint::ClassBlueprint::prune`] fires only
+    /// while walking a section, so a grade with no sections can never drop one,
+    /// and every `PATCH` of that template is refused for naming a course that
+    /// does not exist, which is precisely the call documented as the repair.
+    ///
+    /// It is a table scan, deliberately unindexed: `class_blueprint` holds one
+    /// row per grade label the school uses (a dozen), a course delete is rare,
+    /// and the per-element index the `WHERE` would want
+    /// (`FIELDS courses[*]`) is the one this store answers with **no rows at
+    /// all** — the trap [`Self::list_for_teacher`] documents.
+    ///
     /// The marks going with it give their exam kinds' references back, counted
     /// per kind inside this same transaction — the mirror of `Exam::delete`.
     /// Skipping it would leave every kind the course graded under counted
@@ -442,6 +457,7 @@ impl Course {
                  UPDATE $row.class SET {CLASS_COURSE_COUNT_FIELD} = \
                      math::max([({CLASS_COURSE_COUNT_FIELD} ?? 0) - 1, 0]);
              }};
+             UPDATE class_blueprint SET courses -= $course WHERE $course IN courses;
              DELETE session_attendance WHERE course = $course;
              DELETE course_session WHERE course = $course;
              DELETE enrollment WHERE course = $course;
