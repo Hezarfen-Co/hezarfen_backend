@@ -1006,7 +1006,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | DELETE | `/payments/plans/{id}`           | manager | Delete a plan; `409` once anyone is on it — its charges name it |
 | POST   | `/payments/plans/{id}/assignments` | manager | `{student_ids}` (≤ 200) — place the plan on students, appending **every** installment as a `charge` at once; replay-safe, reported per student as `assigned` / `already_assigned` / `rejected` |
 | GET    | `/payments/plans/{id}/assignments` | manager | Who is on this plan, newest first · paged |
-| POST   | `/payments/credits`              | manager | `{charge_id, amount_minor, method?, note?, request_key?}` — record money received against one named charge; partials are the norm, `409` past what the charge is worth (advisory). A `request_key` makes the call retry-safe: a replay returns the same line, the same key for different money is a `409` |
+| POST   | `/payments/credits`              | manager | `{charge_id, amount_minor, method?, note?, request_key?}` — record money received against one named charge; partials are the norm, `409` past what the charge is worth (advisory) and `409` naming the reversal when the charge was reversed. A `request_key` makes the call retry-safe: a replay returns the same line, the same key for different money is a `409` |
 | POST   | `/payments/refunds`              | manager | `{credit_id, amount_minor, method?, note?, request_key?}` — hand money back against one named payment; partials allowed, capped by that credit; same `request_key` retry-safety |
 | POST   | `/payments/reversals`            | manager | `{line_id, note?}` — undo a `charge` or a `refund` for its exact amount (`400` on any other kind); idempotent, at most one reversal per line |
 | GET    | `/payments/ledger/{user}`        | student | One student's raw lines — charges, payments, refunds, reversals — newest first · paged · own id always, otherwise manager+ or a parent link (**a teacher gets a `403`**) |
@@ -2114,7 +2114,13 @@ account.
 - **A reversal only undoes a `charge` or a `refund`**, for its exact amount and
   nothing else (`400` on any other kind). It is keyed `<line>_r`, so a line has
   at most one reversal however often the call is retried, and the reversed line
-  itself stays on the record beside it.
+  itself stays on the record beside it. A **reversed charge is no longer owed**,
+  so it takes no payment: `POST /payments/credits` against one is a `409` naming
+  the *reversal* as the reason. It has to name it, because a reversal fills
+  exactly the room a payment would (it is a `+amount` child of the charge, which
+  is what makes the fold read as full), and a bursar told "already paid in full"
+  about a charge where not one kuruş ever arrived would go hunting for money
+  that does not exist.
 - **A refund frees the charge's room.** The cap on a payment is folded over the
   target's whole source subtree, so refunding a payment gives that charge its
   room back and the charge **can be paid again** — and reversing that refund

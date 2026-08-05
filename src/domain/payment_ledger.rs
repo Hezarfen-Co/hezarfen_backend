@@ -402,7 +402,9 @@ impl PaymentLedger {
 
     /// Money in, against one named `charge`. Partial payments are the norm, so
     /// a charge may collect several credits; together they may not exceed it
-    /// (advisory — see the module doc's accepted race).
+    /// (advisory — see the module doc's accepted race). A *reversed* charge
+    /// takes no payment either, and is refused saying so rather than claiming
+    /// it was paid.
     ///
     /// With a `request_key` the line is keyed by it (see
     /// [`PaymentLedgerId::for_request`]) and the call is retry-safe; without
@@ -423,6 +425,9 @@ impl PaymentLedger {
             PaymentLedgerKind::Credit,
             "a payment must be recorded against a charge",
             "the charge is already paid in full",
+            // A charge *is* reversible, and its reversal fills the same room a
+            // payment would, so the fold refuses the two cases identically.
+            Some("the charge was reversed, so it is no longer owed"),
             amount_minor,
             method,
             note,
@@ -452,6 +457,10 @@ impl PaymentLedger {
             PaymentLedgerKind::Refund,
             "a refund must be recorded against a payment",
             "the payment is already refunded in full",
+            // A credit is never reversed ([`PaymentLedger::reversal`] refuses
+            // it), so a full fold here can only mean the refunds, and there is
+            // no second reason to tell apart — nor a read to spend looking.
+            None,
             amount_minor,
             method,
             note,
@@ -479,6 +488,7 @@ impl PaymentLedger {
         kind: PaymentLedgerKind,
         wrong_target: &'static str,
         over: &'static str,
+        reversed: Option<&'static str>,
         amount_minor: LedgerAmount,
         method: Option<LedgerMethod>,
         note: Option<LedgerNote>,
@@ -512,6 +522,21 @@ impl PaymentLedger {
         }
         let taken = Self::applied_to(target, db).await?;
         if taken.saturating_add(amount_minor.as_minor()) > target.amount_minor.as_minor() {
+            // The fold cannot say *why* the room is gone: a reversal is a child
+            // of the line it undoes and folds in at `+amount` exactly as a
+            // payment does, so a reversed charge reads as full to the kuruş.
+            // The stored answer is the same either way — nothing may be
+            // recorded against it — but "already paid in full" told a bursar
+            // money had arrived when none ever did. The reversal's id is
+            // derived from its target's, so telling the two apart is one read,
+            // taken only on the refusal path.
+            if let Some(reversed) = reversed
+                && Self::read(&PaymentLedgerId::for_reversal(&target.id), db)
+                    .await?
+                    .is_some()
+            {
+                return Err(AppError::Conflict(reversed));
+            }
             return Err(AppError::Conflict(over));
         }
         Self::append(
