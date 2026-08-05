@@ -231,6 +231,18 @@ pub const MAX_LEDGER_AMOUNT_MINOR: i64 = 10_000_000;
 pub const MAX_LEDGER_METHOD_LEN: usize = 50;
 pub const MAX_LEDGER_NOTE_LEN: usize = 500;
 
+/// How many times one seat may be taken on one menu: the first booking plus
+/// nine re-bookings after a cancel.
+///
+/// A cap on *storage*, not on indecision. Every cycle appends two permanent,
+/// undeletable ledger lines — the charge and its reversal, both keyed to the
+/// attempt — and nothing else bounded them: at the API's own request ceiling
+/// one account could grow its statement by hundreds of thousands of rows a
+/// day, which every later balance read then answers for. Ten is far past what
+/// a family changing its mind about lunch needs, and a menu whose seat really
+/// must move again is the canteen's to cancel.
+pub const MAX_MEAL_BOOKING_ATTEMPTS: i64 = 10;
+
 /// Ceiling on the settings knob that closes booking (and cancelling) ahead of
 /// a meal — one week. The knob itself is optional: absent means no cutoff.
 pub const MAX_MEAL_CANCEL_CUTOFF_MINUTES: i64 = 7 * 24 * 60;
@@ -241,8 +253,10 @@ pub const MAX_MEAL_CANCEL_CUTOFF_MINUTES: i64 = 7 * 24 * 60;
 ///
 /// **The clock is UTC.** This backend deliberately stores no school timezone
 /// (rejected feature), so staff enter the serving time in UTC: a UTC+3 school
-/// types `540` (09:00) to mean noon locally. Optional per slot — a slot
-/// without one keeps the old behaviour, midnight UTC of the menu's date.
+/// types `540` (09:00) to mean noon locally. Optional per slot — and a slot
+/// without one has **no cutoff at all**, since there is no instant to count a
+/// deadline back from; the cutoff knob starts binding that slot the day the
+/// school sets its hour.
 pub const MAX_MEAL_SERVING_MINUTE: i64 = 24 * 60 - 1;
 
 /// The only accepted course kinds. `course`: a regular class (ders). `study`:
@@ -298,10 +312,26 @@ pub const MAX_FEE_PLAN_NAME_LEN: usize = 120;
 pub const MAX_FEE_PLAN_INSTALLMENTS: usize = 60;
 
 /// How many students one `POST /payments/plans/{id}/assignments` may name.
-/// Bulk placement is a whole class at a time, not the whole school: each named
-/// student appends every installment of the plan, so this is what bounds one
-/// request's writes.
+/// Bulk placement is a whole class at a time, not the whole school.
 pub const MAX_FEE_PLAN_ASSIGN_STUDENTS: usize = 200;
+
+/// How many charge lines one assignment request may append: the students it
+/// names times the plan's installments. The student cap alone cannot see the
+/// schedule — 200 students on a 60-installment plan is 12 000 sequential
+/// writes in one HTTP request, and nothing in the stack times a request out.
+/// Three thousand leaves the ordinary shapes whole (200 students up to a
+/// 15-installment plan, 50 students on the largest plan there is) and the
+/// refusal tells the caller to split the batch.
+pub const MAX_FEE_PLAN_ASSIGN_WRITES: usize = 3_000;
+
+/// How many lines may be applied to one ledger line — the payments under a
+/// charge, the refunds under a payment, and every reversal among them. The
+/// over-payment cap folds that whole subtree one query per line while holding
+/// the process-global payment lock, so an unbounded subtree is an unbounded
+/// stall for every other payment in the school: 2 000 one-kuruş payments make
+/// the next one issue 2 001 queries with the lock held. Twenty pieces is
+/// already a pathological way to settle a single installment.
+pub const MAX_LEDGER_APPLIED_LINES: usize = 20;
 
 /// Ceiling on the client-chosen `request_key` that makes a credit or a refund
 /// retry-safe: it becomes part of the ledger line's record id, so it is bounded
@@ -851,6 +881,14 @@ pub const FEE_PLAN_UNASSIGNED_GUARD: &str = "(assignment_count ?? 0) = 0";
 pub const NOTE_FILE_COUNT_FIELD: &str = "file_count";
 pub const SUBMISSION_FILE_COUNT_FIELD: &str = "file_count";
 pub const CHATBOT_THREAD_COUNT_FIELD: &str = "chatbot_thread_count";
+/// The column a *grant* claim moves and puts back, so its transaction writes
+/// the holder's own `user` record — the one key
+/// [`crate::domain::user::User::set_role`] writes (see
+/// [`crate::domain::cap::role_claim`]). Any `option<int>` on the row would do:
+/// the claim nets zero and never reads it, so this is an alias rather than a
+/// column of its own — a new one would mean a migration on a SCHEMAFULL table
+/// for a value nothing ever observes.
+pub const USER_ROLE_CLAIM_FIELD: &str = CHATBOT_THREAD_COUNT_FIELD;
 /// How many boards this user created, on the user row — the same per-user shape
 /// as `CHATBOT_THREAD_COUNT_FIELD`, capped at `MAX_BOARDS_PER_CREATOR`. It is
 /// what closes the "open another board" way around the two board counters
@@ -865,9 +903,13 @@ pub const USER_BOARD_COUNT_FIELD: &str = "board_count";
 /// submit/delete/submit), and a teacher un-grading gives back
 /// `MARKS_GIVEN` — with `HIGH_MARK` on the exam side, credited to the student
 /// by the same act (else one exam becomes fifty by grade/ungrade/regrade).
-/// The exam and pomodoro totals never decrease at all: there is no delete
-/// behind them but a teacher's, so sitting an exam or finishing a stint is a
-/// lifetime fact. Nothing else decrements: the cascades (an exam, a homework or
+/// The exam and pomodoro totals never decrease at all, and each earns that by
+/// counting something a repeat cannot re-earn rather than by anyone's restraint:
+/// `EXAM_SAT_TOTAL` counts *exams sat*, moving only on a student's first sitting
+/// of an exam (`seq == 1`), because retakes are a loop the student drives alone —
+/// an open exam with unlimited attempts is start/finish/start, no teacher in it —
+/// and a stint is a span of time that has to be lived through to be finished.
+/// Nothing else decrements: the cascades (an exam, a homework or
 /// a course delete, which do take the attempt and result rows with them) leave
 /// them alone, since history a teacher erased is still history the student
 /// lived. A badge already earned is never taken back either, whatever a counter
