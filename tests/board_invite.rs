@@ -546,3 +546,54 @@ async fn the_reply_carries_the_widened_roster() {
         res.body
     );
 }
+
+/// Two invites landing at once must both stick. The handler unions its group
+/// into the roster it read a moment earlier and stores the whole array back, so
+/// without a lock across that read-modify-write both calls read roster `R`, one
+/// writes `R ∪ A`, the other `R ∪ B`, and the loser's whole group is silently
+/// absent from a board its caller was told `200` with — the exact opposite of
+/// this route's "strictly additive, nothing is ever removed by it" contract.
+///
+/// Stored state is the verdict, read back off `GET /boards/{id}` rather than
+/// from either reply. (The lock is in-process, which is a real serializer here:
+/// one process, stop-the-world deploys.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_invites_landing_together_keep_both_groups() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "manager_r", "manager").await;
+    let teacher = login_as(&app, &db, "teacher_r", "teacher").await;
+    let mut ids = Vec::new();
+    for name in ["ali", "ayse", "deniz", "hakan"] {
+        let cookie = login(&app, name).await;
+        ids.push(me_id(&app, &cookie).await);
+    }
+
+    let first = a_class(&app, &manager, "9-R", &[&ids[0], &ids[1]]).await;
+    let second = a_class(&app, &manager, "9-S", &[&ids[2], &ids[3]]).await;
+    let board = a_board(&app, &teacher).await;
+
+    let both = [first, second].map(|class| {
+        let (app, teacher, board) = (app.clone(), teacher.clone(), board.clone());
+        tokio::spawn(async move {
+            invite(
+                &app,
+                &teacher,
+                &board,
+                json!({"kind": "class", "class": class}),
+            )
+            .await
+        })
+    });
+    for call in both {
+        let res = call.await.expect("invite task");
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    }
+
+    let mut expected = ids.clone();
+    expected.sort();
+    assert_eq!(
+        roster(&app, &teacher, &board).await,
+        expected,
+        "one group was dropped: an invite is additive, and both callers were told 200"
+    );
+}

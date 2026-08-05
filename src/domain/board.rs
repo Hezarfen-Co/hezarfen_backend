@@ -13,6 +13,7 @@
 //! `CONTENT` save would silently wipe both (src/constant.rs:717-722).
 
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
+use tokio::sync::Mutex;
 
 use crate::constant::{
     BOARD_TABLE, MAX_BOARD_PARTICIPANTS, MAX_BOARD_TITLE_LEN, MAX_BOARDS_PER_CREATOR,
@@ -26,6 +27,32 @@ use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 use crate::validate::validate_required;
+
+/// Serializes every **read-modify-write** of a board's `participants` array:
+/// `POST /boards/{id}/invite` (union the resolved group into the roster it just
+/// read) and the roster branch of `PATCH /boards/{id}` (which reads the current
+/// list to decide which no-longer-eligible ids survive).
+///
+/// [`Board::set_participants`] stores the whole array, so two invites that both
+/// read roster `R` write `R ∪ X` and `R ∪ Y` and the second one silently drops
+/// the first one's group — a caller told `200` with a list of people who are not
+/// on the board, against the route's own "strictly additive" contract. The
+/// database cannot refuse that: both are single well-formed writes to one field,
+/// and neither is wrong on its own.
+///
+/// A lock rather than a compare-and-set because the deployment is one process
+/// with stop-the-world deploys, so it genuinely serializes — and because the
+/// alternative answer is a `409` on a race between two calls that do not
+/// conflict in intent, which a client could only resolve by re-sending the same
+/// invite. Contended invites simply queue; the section they hold is one board
+/// read, one user-list read and one field write.
+///
+/// **A leaf**: nothing under it takes another lock. Note it does not reach the
+/// demotion sweep in [`crate::domain::user::User::set_role`], which strips ids
+/// from every roster inside the role write's own transaction — an invite that
+/// read a roster before that sweep can put a swept id back, which the boot
+/// repair and the room's own live gate both still catch.
+pub(crate) static BOARD_ROSTER_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct BoardId(RecordId);

@@ -29,7 +29,7 @@ use utoipa_axum::routes;
 
 use crate::constant::MAX_BOARD_PARTICIPANTS;
 use crate::database::Database;
-use crate::domain::board::{Board, BoardId, BoardTitle};
+use crate::domain::board::{BOARD_ROSTER_LOCK, Board, BoardId, BoardTitle};
 use crate::domain::board_stroke::BoardStroke;
 use crate::domain::class_group::{ClassGroup, ClassGroupId};
 use crate::domain::class_member::ClassMember;
@@ -540,6 +540,14 @@ async fn update_board(
     Path(id): Path<String>,
     Json(req): Json<UpdateBoard>,
 ) -> Result<Json<BoardResponse>, AppError> {
+    // A roster PATCH reads the current list (to keep the ids that stopped
+    // qualifying) before replacing it, so it is the other read-modify-write of
+    // this field and takes the same lock — one an invite could otherwise land
+    // inside. Title- and lock-only edits never touch the array and are not held.
+    let _guard = match req.participants.is_some() {
+        true => Some(BOARD_ROSTER_LOCK.lock().await),
+        false => None,
+    };
     let mut board = board_for(&id, &user, &st.db).await?;
     if req.participants.is_some() || req.locked.is_some() {
         ensure_creator(&board, &user)?;
@@ -805,6 +813,11 @@ async fn invite_board(
     Path(id): Path<String>,
     Json(req): Json<InviteSource>,
 ) -> Result<Json<BoardResponse>, AppError> {
+    // Held across the read *and* the write: this is a read-modify-write of one
+    // array, so two invites landing together would each union their group into
+    // the same roster and the second write would drop the first one's people —
+    // silently, with both callers told 200. See [`BOARD_ROSTER_LOCK`].
+    let _guard = BOARD_ROSTER_LOCK.lock().await;
     let board = board_for(&id, &user, &st.db).await?;
     ensure_creator(&board, &user)?;
     let invited = req.resolve(&user, &st.db).await?;
