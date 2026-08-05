@@ -525,6 +525,15 @@ async fn delete_course(
             "only the course creator or a manager/admin can delete this course",
         ));
     }
+    // Writer lease of [`EXAM_LOCK`], for `delete_exam`'s reason: this cascade
+    // sweeps the course's exams *and their attempts*, and an attempt is the one
+    // exam child whose write cannot collide with the sweep (its claim lands on
+    // the student's row, never the exam's). Narrower here — the delete is
+    // refused while anyone is enrolled, so a start would have to pass its
+    // enrollment gate and then have that enrollment removed under it — but the
+    // hole is the same one and so is the lease. Nothing on this path takes
+    // another lock, so it introduces no ordering pair.
+    let _guard = crate::web::exams::EXAM_LOCK.write().await;
     // Rows go first (the delete cascades them), blobs after — a crash in
     // between strands at worst an unreachable blob. The keys are read before
     // the delete because it takes their rows with it; a refused delete just
