@@ -582,7 +582,9 @@ async fn update_board(
 /// so a locked full board is recovered by unlock, clear, relock — and on a
 /// canvas that is **already blank**: the marker is a real stroke row charged to
 /// the board's lifetime cap, so a clear has to close at least one mark to be
-/// worth a row.
+/// worth a row. A board that is both locked and closed answers **closed** —
+/// here and on every stroke path alike, since there is no reopen and the pause
+/// can never lift.
 #[utoipa::path(
     post,
     path = "/{id}/clear",

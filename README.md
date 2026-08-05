@@ -3834,6 +3834,14 @@ which is exactly what a code guessed from a *substring* of the refusal did
 matches the refusal constants by value and a test pairs every one of them with
 the code its client must act on.
 
+**A closed board is never reported as `locked`.** Locking and closing are
+independent — a board may be closed while locked, in either order, and nothing
+refuses either call because of the other — and when both hold the answer is
+`board_closed` on *every* path (a stroke, a socket `clear`, `POST
+/boards/{id}/clear`). Closed outranks locked because there is no reopen: a
+pause the client is told to wait out would never lift. Unlocking such a board
+changes nothing about it; it stays permanently read-only.
+
 **Persist, then publish.** A stroke is fanned out only after its row has
 landed, so the channel can never carry a mark the database refused (a locked
 board, a full epoch, a closed board). The database is the canvas; the channel
