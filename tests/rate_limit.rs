@@ -422,15 +422,24 @@ async fn sync_round() {
     tokio::time::pause();
 }
 
-/// Two limiters of one tier, sharing `db`.
+/// One fixed wall window for every round below. The sync task reads the real
+/// clock, so without this the tests here assert about "the" shared row while a
+/// minute boundary landing between two limiters' rounds would give them a row
+/// each — a run that passes because of when it ran, which is the same
+/// accidental clock dependency that hid the epoch-roll double-charge from this
+/// suite. Rolling *between* windows is covered by the unit tests, which drive
+/// `sync_once`'s epoch directly.
+const PINNED_WINDOW: i64 = 60_000;
+
+/// Two limiters of one tier, sharing `db` and one wall window.
 fn two_replicas(max: u32, db: &Database) -> (UserRateLimiter, UserRateLimiter, DbHealth) {
     let health = DbHealth::default();
     let (a, b) = (
         UserRateLimiter::per_user_minute(max),
         UserRateLimiter::per_user_minute(max),
     );
-    a.share("test", db.clone(), health.clone());
-    b.share("test", db.clone(), health.clone());
+    a.share_pinned("test", db.clone(), health.clone(), PINNED_WINDOW);
+    b.share_pinned("test", db.clone(), health.clone(), PINNED_WINDOW);
     (a, b, health)
 }
 
