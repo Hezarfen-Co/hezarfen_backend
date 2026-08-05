@@ -893,8 +893,20 @@ pub const MIGRATION: &str = "
     -- boot loop carries no lock and no fingerprint any more (2026-07-30), so
     -- there is nowhere else for that fact to live. A database that never ran the
     -- repair holds no row and runs it; the row is written by the same query.
+    --
+    -- `fingerprint` is *which* text ran (2026-08-05), and it is what makes a
+    -- marked block correctable. Saying only 'this ran' meant an edit to a block
+    -- that was already marked could never reach a volume that had booted once:
+    -- the `exam_sat_total` correction below shipped inside one and would have
+    -- been dead on arrival on every existing database. The gate compares the
+    -- stored number against the hash of the text *this* binary would run
+    -- (`database::marked_blocks`), so an edited block runs once more and
+    -- re-stamps, and an unedited one still costs a single record read.
+    -- `option<int>`: a mark written before this column existed carries none,
+    -- which matches no fingerprint and so re-runs its block exactly once.
     DEFINE TABLE IF NOT EXISTS migration_mark SCHEMAFULL;
     DEFINE FIELD IF NOT EXISTS done_at ON migration_mark TYPE int;
+    DEFINE FIELD IF NOT EXISTS fingerprint ON migration_mark TYPE option<int>;
 ";
 
 /// Data backfills for rows written by older binaries. Runs *after* (and apart
@@ -1074,10 +1086,21 @@ pub const BACKFILL: &str = "
         };
     };
 
-    -- Per-attempt history (2026-07-24): answers, drawings, and marks written
-    -- before retakes stopped wiping belong to the student's first sitting.
-    -- They already use the bare (seq==1) record key, so only the denormalized
-    -- `seq` field needs stamping.
+    -- Per-attempt history (2026-07-24): sittings, answers, drawings, and marks
+    -- written before retakes stopped wiping belong to the student's first
+    -- sitting. They already use the bare (seq==1) record key, so only the
+    -- denormalized `seq` field needs stamping.
+    --
+    -- `exam_attempt` was left out of this list when the other three were added
+    -- and that is not a decision, it is a gap: `DEFAULT 1` fills a CREATE, never
+    -- a row stored before the column was defined, and 3.2.3 does not synthesize
+    -- it on read either — such a row comes back with no `seq` key at all, which
+    -- makes `ExamAttempt` (a non-`option` `i64`) fail to deserialize *and* makes
+    -- every later write to the row fail coercion, so finishing or leaving that
+    -- sitting 500s forever. Ungated like its siblings and for the same reason:
+    -- the cost here is the write, not a scan, and `WHERE seq = NONE` matches
+    -- nothing the moment it has converged.
+    UPDATE exam_attempt SET seq = 1 WHERE seq = NONE;
     UPDATE exam_answer SET seq = 1 WHERE seq = NONE;
     UPDATE answer_image SET seq = 1 WHERE seq = NONE;
     UPDATE exam_result SET seq = 1 WHERE seq = NONE;
@@ -1274,12 +1297,19 @@ pub const BACKFILL: &str = "
     -- statement batch, so a boot killed mid-repair writes no mark and the next
     -- one redoes the whole sweep — which is free, because the sweep is
     -- idempotent. `UPSERT`, not `CREATE`: re-marking must never be an error.
-    IF array::len((SELECT VALUE id FROM migration_mark:board_roster)) = 0 {
+    --
+    -- Editing this block is therefore safe at any time: the fingerprint gate
+    -- re-runs it once and the sweep converges on whatever it finds, exactly as
+    -- a boot killed mid-repair would. The mark buys the scan back, not
+    -- correctness.
+    IF array::len((SELECT VALUE id FROM migration_mark:board_roster
+                   WHERE fingerprint = $fp_board_roster)) = 0 {
         FOR $row IN ((SELECT id, participants FROM board WHERE array::len(participants ?? []) > 0) ?? []) {
             LET $keep = (SELECT VALUE id FROM user WHERE id IN $row.participants AND role != 'parent');
             UPDATE $row.id SET participants = $keep WHERE participants != $keep;
         };
-        UPSERT migration_mark:board_roster SET done_at = time::unix(time::now()) * 1000;
+        UPSERT migration_mark:board_roster SET done_at = time::unix(time::now()) * 1000,
+            fingerprint = $fp_board_roster;
     };
 
     -- The badge counters, seeded from the history that already exists
@@ -1336,7 +1366,22 @@ pub const BACKFILL: &str = "
     -- by the very same cut, so a submission that predates this seed debits at
     -- withdrawal exactly what the seed credited it. Absolute like every SET
     -- below, so it converges on a forced re-seed.
-    IF array::len((SELECT VALUE id FROM migration_mark:profile_counters)) = 0 {
+    --
+    -- ponytail: editing this block re-runs it (the fingerprint gate), and unlike
+    -- the board sweep above this one is only *mostly* re-runnable. Every SET is
+    -- absolute, so a re-run converges on the rows that exist — but two of the
+    -- counters are lifetime tallies the request path never decrements while the
+    -- rows behind them can be deleted (`exam_sat_total`,
+    -- `homework_submitted_total`, see the paragraph above). On a volume where a
+    -- teacher has deleted an exam or a homework since the last seed, a re-run
+    -- reads *lower* than the live count and the student's tally walks backwards
+    -- — badges already awarded are permanent, so nothing is revoked, but the
+    -- next one moves further away. Correcting this block is a deliberate trade,
+    -- not a free edit. The upgrade path, if it ever needs to be free: keep the
+    -- deleted rows' contribution on the row (a `*_retired` column the delete
+    -- bumps) so the recount can add it back.
+    IF array::len((SELECT VALUE id FROM migration_mark:profile_counters
+                   WHERE fingerprint = $fp_profile_counters)) = 0 {
         UPDATE user SET homework_submitted_total = 0, homework_on_time_total = 0,
             exam_sat_total = 0, pomodoro_finished_total = 0, pomodoro_focus_ms_total = 0;
         FOR $row IN ((SELECT user, count() AS n FROM homework_submission GROUP BY user) ?? []) {
@@ -1362,7 +1407,8 @@ pub const BACKFILL: &str = "
             UPDATE $row.user SET pomodoro_finished_total = $row.sessions,
                 pomodoro_focus_ms_total = $row.focus_ms;
         };
-        UPSERT migration_mark:profile_counters SET done_at = time::unix(time::now()) * 1000;
+        UPSERT migration_mark:profile_counters SET done_at = time::unix(time::now()) * 1000,
+            fingerprint = $fp_profile_counters;
     };
 ";
 
