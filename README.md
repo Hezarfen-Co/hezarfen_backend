@@ -408,7 +408,7 @@ drift from it**, which is enforced rather than asked for:
   and fails unless each one is either referenced by `src/web/limits.rs` or
   listed as a deliberate exclusion *with a reason*. A new constant breaks the
   suite until someone decides, consciously, whether clients need it.
-- `tests/spec_bounds.rs` builds the OpenAPI document, reads all 168 published
+- `tests/spec_bounds.rs` builds the OpenAPI document, reads all 170 published
   bounds back out of the emitted JSON, and asserts each equals its constant.
   This exists because utoipa's `#[schema(max_length = …)]` accepts a **literal
   only** — a `const` there does not compile — so the annotations are
@@ -998,7 +998,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/meals/balance/me`              | student | The caller's meal balance, minor units (negative = owes) |
 | GET    | `/meals/balance/{user}`          | student | One student's balance; own id always, otherwise **manager+** or a parent link — a teacher gets a `403`, canteen debt is family debt |
 | GET    | `/meals/ledger/{user}`           | student | That student's statement — every charge, credit, reversal — newest first · paged · same gate (manager+, parent link, or own) |
-| POST   | `/meals/credits`                 | admin   | `{student_id, amount_minor, method?, note?}` — record money received; **admin only**, appends a `credit` line; the target must be a student, or anyone already carrying ledger lines (a debt outlives a role change) |
+| POST   | `/meals/credits`                 | admin   | `{student_id, amount_minor, method?, note?, request_key?}` — record money received; **admin only**, appends a `credit` line; the target must be a student, or anyone already carrying ledger lines (a debt outlives a role change); a `request_key` makes the call retry-safe by identity (`409` on the same key for a different amount) |
 | POST   | `/payments/plans`                | manager | `{name, installments}` — write a fee plan (1–60 installments, each `{amount_minor, due_at}`; `due_at` may be in the past); bills nobody |
 | GET    | `/payments/plans`                | manager | List fee plans, newest first · paged |
 | GET    | `/payments/plans/{id}`           | manager | One fee plan with its schedule |
@@ -1998,6 +1998,18 @@ money on account. Amounts are stored positive; the sign lives in the `kind`.
   ("cash", "havale", …) and `note`, and records the admin as `recorded_by`.
   There is no payment gateway and no card data, ever. An over-credit is
   corrected with a compensating line, never a fix-up.
+- **A credit is retry-safe on request**, exactly like `POST /payments/credits`:
+  send an optional **`request_key`** (`[A-Za-z0-9-]`, 1–64 characters — no `_`,
+  the separator inside a ledger line's id) and the line is keyed
+  `<student>_k_<key>`, so a client retry after a network timeout returns the
+  line the first attempt wrote instead of crediting the money twice. Without
+  one the id is a fresh ulid and a resent request is a second credit, as a desk
+  taking the same amount twice really is — and since nothing here edits or
+  deletes a line, that doubled credit can only be corrected by a compensating
+  one. The same key with a different `amount_minor` is a `409`, never the
+  stored line: that is a client bug, and answering `201` would hide it. The
+  student is part of the id, so one office's "receipt-114" can never land on
+  another student's account.
 
 `GET /meals/balance/me` is the caller's own balance. `GET
 /meals/balance/{user}` and `GET /meals/ledger/{user}` (paged, newest line

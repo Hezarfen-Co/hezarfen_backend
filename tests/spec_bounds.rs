@@ -702,6 +702,13 @@ fn expectations() -> Vec<(&'static str, &'static str, &'static str, i64)> {
             "maxLength",
             MAX_LEDGER_NOTE_LEN as i64,
         ),
+        ("RecordCredit", "request_key", "minLength", 1),
+        (
+            "RecordCredit",
+            "request_key",
+            "maxLength",
+            MAX_PAYMENT_REQUEST_KEY_LEN as i64,
+        ),
         // --- school payments: fee plans and the payment ledger ---
         ("InstallmentBody", "amount_minor", "minimum", 1),
         (

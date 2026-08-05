@@ -38,6 +38,12 @@
 //!   depend on a "has this been billed yet?" scan: two concurrent `POST`s of
 //!   one seat can both read "no charge yet" and both append, which is how a
 //!   double-click used to bill a seat twice.
+//! - **A credit may be keyed too.** `POST /meals/credits` takes an optional
+//!   client-chosen `request_key`, which lands in the line's id
+//!   ([`MealLedgerId::for_request`]) and makes the call retry-safe by the same
+//!   identity rule: a retry after a timeout resolves the line it already wrote.
+//!   Without one, a fresh ulid is minted and a resent request is a second
+//!   credit — which nothing here can edit or delete afterwards.
 //! - **A no-show still pays.** Meal attendance has zero billing effect —
 //!   nothing in this file reads or writes it. Do not add a no-show penalty
 //!   here: the seat was reserved and the food was cooked.
@@ -58,6 +64,9 @@ use crate::domain::meal_booking::{MealBooking, MealBookingId};
 use crate::domain::menu::MenuId;
 use crate::domain::menu_dish::MenuDish;
 use crate::domain::page::PagedList;
+// The client-chosen idempotence key both ledgers take — one grammar, one
+// validator, one type, rather than a second newtype that could drift from it.
+use crate::domain::payment_ledger::PaymentRequestKey;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
@@ -102,6 +111,26 @@ impl MealLedgerId {
         Self(RecordId::new(
             MEAL_LEDGER_TABLE,
             format!("{}_{marker}{attempt}", booking.key()),
+        ))
+    }
+
+    /// The one credit a `(student, request_key)` pair may ever have. Same trick
+    /// as [`PaymentLedgerId::for_request`](crate::domain::payment_ledger::PaymentLedgerId::for_request),
+    /// scoped by the student because a credit points at no line of its own: one
+    /// office's "receipt-114" cannot land on another student's account, and a
+    /// key replayed for the wrong student cannot resolve to this line at all.
+    ///
+    /// The grammar parses uniquely because `_` joins the parts. A booking line
+    /// is `<date>_<slot>_<student>_c<n>`, whose first part carries the `-` of a
+    /// `YYYY-MM-DD` day, and an unkeyed line is a bare ULID; a credit's first
+    /// part is a student ULID (`[0-9A-Z]`) and a `request_key` is
+    /// [`crate::validate::validate_request_key`]'s `[A-Za-z0-9-]`, which cannot
+    /// spell a separator plus a marker. No key can therefore derive an id some
+    /// other line owns — a collision would hand money to the wrong row.
+    pub fn for_request(student: &UserId, key: &PaymentRequestKey) -> Self {
+        Self(RecordId::new(
+            MEAL_LEDGER_TABLE,
+            format!("{}_k_{}", student.key(), key.as_str()),
         ))
     }
 
@@ -450,17 +479,29 @@ impl MealLedger {
     }
 
     /// Money in: a payment received, or an opening balance.
+    ///
+    /// With a `request_key` the line is keyed by it (see
+    /// [`MealLedgerId::for_request`]) and the call is **retry-safe**: a client
+    /// resending the identical body after a timeout gets back the line the
+    /// first attempt wrote, not a second credit — nothing on this API can edit
+    /// or delete one, so a doubled credit is corrected only by a compensating
+    /// line. Without one the id is a fresh ulid and two identical calls are two
+    /// credits, which is what a desk taking the same amount twice really means.
     pub async fn credit(
         student: &UserId,
         amount_minor: LedgerAmount,
         method: Option<LedgerMethod>,
         note: Option<LedgerNote>,
+        request_key: Option<&PaymentRequestKey>,
         recorded_by: &UserId,
         db: &Database,
     ) -> Result<MealLedger, AppError> {
-        Self::append(
+        let line = Self::append(
             MealLedger {
-                id: MealLedgerId::generate(),
+                id: match request_key {
+                    Some(key) => MealLedgerId::for_request(student, key),
+                    None => MealLedgerId::generate(),
+                },
                 student: student.clone(),
                 kind: MealLedgerKind::Credit,
                 amount_minor,
@@ -472,7 +513,20 @@ impl MealLedger {
             },
             db,
         )
-        .await
+        .await?;
+        // A replay is answered from the stored line — but only if it is the
+        // same money. The same key for a different amount is a client bug, and
+        // handing back the old line would hide it behind a `201`. Checked on
+        // what `append` gave back rather than on a read before it: two retries
+        // arriving together both find no row, and only the id decides which
+        // one's amount is stored, so a check *before* the write would tell the
+        // loser its own amount landed.
+        if request_key.is_some() && line.amount_minor != amount_minor {
+            return Err(AppError::Conflict(
+                "this request_key was already used for a different amount",
+            ));
+        }
+        Ok(line)
     }
 
     /// A student's whole statement, newest first.
