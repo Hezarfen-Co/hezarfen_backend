@@ -388,9 +388,6 @@ async fn keyless_clients_share_one_budget_once_the_map_is_saturated() {
 // cannot resolve until the round has finished. Assertions are on admissions,
 // never on which limiter won a race: the embedded engine can drop one of two
 // concurrent writes and still answer `Ok`.
-//
-// (The `replica` spelling below is historical — renaming test items is a code
-// change, not a doc one.)
 
 use hezarfen_backend::constant::RATE_SYNC_INTERVAL_SECS;
 use hezarfen_backend::database::Database;
@@ -431,8 +428,10 @@ async fn sync_round() {
 /// `sync_once`'s epoch directly.
 const PINNED_WINDOW: i64 = 60_000;
 
-/// Two limiters of one tier, sharing `db` and one wall window.
-fn two_replicas(max: u32, db: &Database) -> (UserRateLimiter, UserRateLimiter, DbHealth) {
+/// Two limiters of one tier, sharing `db` and one wall window — the process
+/// before a restart and the process after, which is the only way one deployment
+/// runs two sets of buckets over one `rate_limit` row.
+fn two_processes(max: u32, db: &Database) -> (UserRateLimiter, UserRateLimiter, DbHealth) {
     let health = DbHealth::default();
     let (a, b) = (
         UserRateLimiter::per_user_minute(max),
@@ -451,14 +450,14 @@ fn admits(limiter: &UserRateLimiter, user: &str, tries: usize) -> usize {
 }
 
 #[tokio::test]
-async fn two_replicas_share_one_budget() {
+async fn a_restarted_process_inherits_the_windows_spend() {
     let db = shared_db().await;
-    let (a, b, _health) = two_replicas(6, &db);
+    let (a, b, _health) = two_processes(6, &db);
 
     // Each spends freely until its first sync — the accepted one-interval
     // overshoot, and the whole reason the shared row exists at all.
     let spent = admits(&a, "user:a", 6) + admits(&b, "user:a", 6);
-    assert_eq!(spent, 12, "each replica starts on its own local budget");
+    assert_eq!(spent, 12, "each process starts on its own local budget");
 
     // From the first sync on, the shared total is what binds: neither limiter
     // admits anything more in this window, whatever the interleaving was.
@@ -478,9 +477,9 @@ async fn two_replicas_share_one_budget() {
 }
 
 #[tokio::test]
-async fn a_replica_that_never_admitted_still_learns_the_budget_is_gone() {
+async fn a_process_that_never_admitted_still_learns_the_budget_is_gone() {
     let db = shared_db().await;
-    let (a, b, _health) = two_replicas(4, &db);
+    let (a, b, _health) = two_processes(4, &db);
 
     // b spends one request, so it has a bucket to sync; a spends the rest.
     assert_eq!(admits(&b, "user:a", 1), 1);
@@ -490,16 +489,16 @@ async fn a_replica_that_never_admitted_still_learns_the_budget_is_gone() {
     assert_eq!(
         admits(&b, "user:a", 3),
         0,
-        "the fleet total, not b's own count, is the cap"
+        "the shared total, not b's own count, is the cap"
     );
     // Other users are untouched by a spent bucket.
     assert_eq!(admits(&b, "user:b", 4), 4);
 }
 
 #[tokio::test]
-async fn a_down_database_leaves_each_replica_on_its_local_budget() {
+async fn a_down_database_leaves_each_process_on_its_local_budget() {
     let db = shared_db().await;
-    let (a, b, health) = two_replicas(3, &db);
+    let (a, b, health) = two_processes(3, &db);
     health.set(false);
 
     // Nothing is shared while the database is down — and nothing stalls: both
