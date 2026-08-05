@@ -16,7 +16,7 @@ use crate::database::Database;
 use crate::domain::monotonic_id::next_ulid;
 use crate::domain::note_file::FileContentType;
 use crate::domain::page::PagedList;
-use crate::domain::pool_question::PoolQuestionId;
+use crate::domain::pool_question::{PoolQuestionId, bump_question_and_write};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
@@ -130,10 +130,32 @@ impl Solution {
         self.image_size
     }
 
+    /// Offer the solution. `NotFound` = the question is gone, and nothing was
+    /// written: the create rides [`bump_question_and_write`], so the question's
+    /// existence is a *write* to its row rather than a read the handler made a
+    /// moment earlier — a bare create landing inside
+    /// [`PoolQuestion::delete`](crate::domain::pool_question::PoolQuestion::delete)'s
+    /// window was swept by nothing and left a solution no route could ever
+    /// reach or remove (every path to one goes through its question), photo
+    /// blob included.
+    ///
+    /// Re-sendable despite the `CREATE`: `$id` is a ULID minted once per call
+    /// on a table with no `UNIQUE` index, so a re-send cannot answer "already
+    /// exists" — the one thing the retry could not survive.
     pub async fn insert(self, db: &Database) -> Result<Solution, AppError> {
         // whole-row-save-ok: create of a fresh ULID row built in place by `new` — there is no prior row to clobber
-        let created: Option<Solution> = db.create(self.id.record()).content(self).await?;
-        created.ok_or_else(|| AppError::Internal("failed to create solution".into()))
+        let (question, id) = (self.question.clone(), self.id.record());
+        bump_question_and_write(
+            &question,
+            "CREATE $id CONTENT $solution",
+            vec![
+                ("id".into(), id.into_value()),
+                ("solution".into(), self.into_value()),
+            ],
+            db,
+        )
+        .await?
+        .ok_or_else(|| AppError::Internal("failed to create solution".into()))
     }
 
     /// Read a solution only if it belongs to `question` — keeps the nested
@@ -256,11 +278,28 @@ mod tests {
 
     use super::*;
 
+    /// A real question row: offering a solution moves its question's
+    /// `asked_at` (that is what keeps a solution from outliving its question),
+    /// so a minted id nothing wrote is a 404.
+    async fn question_row(db: &Database) -> PoolQuestionId {
+        use crate::domain::pool_question::{PoolQuestion, PoolQuestionBody, PoolQuestionTitle};
+        PoolQuestion::new(
+            &UserId::from_key(&Ulid::new().to_string()),
+            PoolQuestionTitle::try_new("soru").unwrap(),
+            PoolQuestionBody::try_new("neden").unwrap(),
+        )
+        .insert(db)
+        .await
+        .unwrap()
+        .get_id()
+        .clone()
+    }
+
     #[tokio::test]
     async fn rows_scope_to_their_question_and_list_oldest_first() {
         let db = crate::database::init_mem().await.unwrap();
-        let question_a = PoolQuestionId::generate();
-        let question_b = PoolQuestionId::generate();
+        let question_a = question_row(&db).await;
+        let question_b = question_row(&db).await;
         let author = UserId::from_key(&Ulid::new().to_string());
 
         // Distinct offer times so the assertion pins the real contract —
@@ -322,7 +361,7 @@ mod tests {
     #[tokio::test]
     async fn image_set_replace_clear_report_the_replaced_blob() {
         let db = crate::database::init_mem().await.unwrap();
-        let question = PoolQuestionId::generate();
+        let question = question_row(&db).await;
         let author = UserId::from_key(&Ulid::new().to_string());
         let png = FileContentType::try_new("image/png").unwrap();
 
@@ -388,7 +427,7 @@ mod tests {
     #[tokio::test]
     async fn set_body_edits_in_place() {
         let db = crate::database::init_mem().await.unwrap();
-        let question = PoolQuestionId::generate();
+        let question = question_row(&db).await;
         let author = UserId::from_key(&Ulid::new().to_string());
 
         let solution = Solution::new(
@@ -427,9 +466,9 @@ mod tests {
     #[tokio::test]
     async fn counts_for_groups_per_question() {
         let db = crate::database::init_mem().await.unwrap();
-        let two = PoolQuestionId::generate();
-        let one = PoolQuestionId::generate();
-        let none = PoolQuestionId::generate();
+        let two = question_row(&db).await;
+        let one = question_row(&db).await;
+        let none = question_row(&db).await;
         let author = UserId::from_key(&Ulid::new().to_string());
 
         for (question, bodies) in [(&two, vec!["a", "b"]), (&one, vec!["c"])] {

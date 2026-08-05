@@ -25,6 +25,72 @@ use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 use crate::validate::validate_required;
 
+/// Move the question's `asked_at` **and** run `statement` — a write to
+/// something hanging off a question — in one transaction, handing back the row
+/// it returned. `NotFound` means the question is gone and nothing was written.
+///
+/// The move is what makes the question's **existence** part of the child's own
+/// write, the way [`crate::domain::menu::bump_menu_and_write`] does for a menu:
+/// the `UPDATE` matches nothing once the row is deleted, and a delete racing
+/// this one touches the very key this transaction writes, so the two cannot
+/// both commit. Reading the question first does *not* survive that race — the
+/// read sees a row [`PoolQuestion::delete`] has removed but not committed,
+/// while its `DELETE solution WHERE question = $q` ran on a snapshot predating
+/// this insert, so both commit and the child outlives its question with neither
+/// caller told anything.
+///
+/// `asked_at` rather than a revision column because this row carries no counter
+/// to bump and must not grow one for this alone. It is put back *by captured
+/// value* in the same transaction, so nothing outside ever observes the move
+/// and the row is byte-identical afterwards (the pool lists order on it).
+/// Writing the same value would buy nothing: an `UPDATE` that leaves the
+/// document unchanged is elided and never reaches the store's write set, so it
+/// collides with nothing.
+///
+/// Admissible for [`transaction_with_retry`] as long as `statement` is: the
+/// `UPDATE`s, `SELECT`, `IF`/`THROW` and `RETURN` can never answer "already
+/// exists".
+pub(crate) async fn bump_question_and_write<T: SurrealValue>(
+    question: &PoolQuestionId,
+    statement: &str,
+    mut bindings: Vec<(String, surrealdb::types::Value)>,
+    db: &Database,
+) -> Result<Option<T>, AppError> {
+    bindings.push(("q".into(), question.record().into_value()));
+    let (mut result, mut errors) = transaction_with_retry(
+        db,
+        &format!(
+            "BEGIN TRANSACTION;
+             LET $was_asked = (SELECT VALUE asked_at FROM ONLY $q);
+             LET $bumped = (UPDATE $q SET asked_at = asked_at + 1 RETURN VALUE id);
+             IF array::len($bumped) = 0 {{ THROW 'no_question' }};
+             UPDATE $q SET asked_at = $was_asked;
+             LET $row = ({statement});
+             RETURN $row;
+             COMMIT TRANSACTION;"
+        ),
+        &bindings,
+        &["no_question"],
+    )
+    .await?;
+    // An aborted transaction errors *every* slot, most with a generic "not
+    // executed" — only the THROW's own slot names the reason.
+    if errors
+        .values()
+        .any(|error| error.to_string().contains("no_question"))
+    {
+        return Err(AppError::NotFound);
+    }
+    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+        return Err(error.into());
+    }
+    // The trailing `RETURN` is the last statement before `COMMIT`, so its slot
+    // follows the statement count rather than a hand-kept number;
+    // `num_statements` counts BEGIN and COMMIT.
+    let slot = result.num_statements().saturating_sub(2);
+    Ok(result.take::<Vec<T>>(slot)?.into_iter().next())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct PoolQuestionId(RecordId);
 
@@ -324,20 +390,28 @@ impl PoolQuestion {
     /// the removed rows — the question's *and* the swept solutions' — so the
     /// caller can take every image blob off disk (solutions carry photos too,
     /// and a row-only sweep would strand theirs forever).
+    ///
+    /// Rides the retry because a solution offer now writes this very row
+    /// ([`bump_question_and_write`]): the two contend by design, and a lost
+    /// round through a bare `check()` was a 500 for a delete that only had to
+    /// be re-sent. Admissible — a `DELETE` can never answer "already exists".
     pub async fn delete(
         id: &PoolQuestionId,
         db: &Database,
     ) -> Result<Option<(PoolQuestion, Vec<Solution>)>, AppError> {
-        let mut result = db
-            .query(
-                "BEGIN TRANSACTION;
+        let (mut result, mut errors) = transaction_with_retry(
+            db,
+            "BEGIN TRANSACTION;
                  DELETE solution WHERE question = $q RETURN BEFORE;
                  DELETE $q RETURN BEFORE;
                  COMMIT TRANSACTION;",
-            )
-            .bind(("q", id.record()))
-            .await?
-            .check()?;
+            &[("q".into(), id.record().into_value())],
+            &[],
+        )
+        .await?;
+        if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+            return Err(error.into());
+        }
         // Slots count BEGIN: the solution sweep is slot 1, the question slot 2.
         let solutions = result.take::<Vec<Solution>>(1)?;
         Ok(result
@@ -641,5 +715,95 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// The [`crate::domain::exam_answer::ExamAnswer::save`] defect, one domain
+    /// over: a solution offered inside its question's delete window must not
+    /// outlive it. Guarding the offer by *reading* the question does not do it
+    /// — the read sees a row [`PoolQuestion::delete`] has removed but not
+    /// committed, while its `DELETE solution WHERE question = $q` ran on a
+    /// snapshot predating the offer, so both commit and the solution is left
+    /// pointing at a question that is gone. Nothing can reach it after that:
+    /// every route to a solution goes through its question, so neither a
+    /// reader nor a second delete can ever clear it, and its photo stays on
+    /// disk for good. [`bump_question_and_write`] moves the question's own
+    /// `asked_at` instead, so the two transactions touch one key and the store
+    /// refuses one of them.
+    ///
+    /// The window is opened by the database, not by a lucky interleaving: a
+    /// `DEFINE EVENT` on `pool_question` fires *inside* the delete's own
+    /// transaction the instant the row goes, so the `SLEEP` lands exactly
+    /// between the delete and its cascade every time.
+    ///
+    /// Real server, and `#[ignore]`d for it: the subject *is* the store's
+    /// conflict detection, which `init_mem`'s embedded engine does not have —
+    /// it commits both writes and answers `Ok` to each, so this passes there on
+    /// broken code.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
+    async fn a_solution_offered_inside_a_delete_never_outlives_its_question() {
+        let (db, _serialized) = database::init_test_server("solution_race").await;
+        // Hold the delete open for a full second after the row is gone, while
+        // its cascade still has to run.
+        db.query(
+            "DEFINE EVENT hold_the_window ON TABLE pool_question WHEN $event = 'DELETE' \
+             THEN { SLEEP 1s; };",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+        let (mut solutions, mut swept, mut delete_500) = (0, 0, 0);
+        for round in 0..4 {
+            let asker = UserId::from_key(&Ulid::new().to_string());
+            let helper = UserId::from_key(&Ulid::new().to_string());
+            let q = question(&asker).insert(&db).await.unwrap();
+            let id = q.get_id().clone();
+
+            let drop_it = {
+                let (db, id) = (db.clone(), id.clone());
+                tokio::spawn(async move { PoolQuestion::delete(&id, &db).await })
+            };
+            // The offer starts inside the held window — the question row is
+            // gone but uncommitted, which is exactly what a read believes.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let child = {
+                let (db, id) = (db.clone(), id.clone());
+                tokio::spawn(async move {
+                    Solution::new(
+                        &id,
+                        &helper,
+                        SolutionBody::try_new("Kismi integrasyon uygula.").unwrap(),
+                    )
+                    .insert(&db)
+                    .await
+                })
+            };
+            let (drop_it, child) = (drop_it.await.unwrap(), child.await.unwrap());
+            // A 404 for the offer is a correct answer; the only defect is
+            // stored state. The delete must not 500 either — it contends with
+            // the offer by design and a lost round is re-sent, not reported.
+            assert!(
+                !matches!(child, Err(AppError::Db(_))),
+                "round {round}: a raced offer must be answered, not 500: {child:?}"
+            );
+            if matches!(drop_it, Err(AppError::Db(_))) {
+                delete_500 += 1;
+            }
+
+            // Stored state is the whole verdict; a return value is not evidence.
+            if PoolQuestion::read(&id, &db).await.unwrap().is_none() {
+                swept += 1;
+                solutions += Solution::list_for(&id, None, 0, &db).await.unwrap().0.len();
+            }
+        }
+        eprintln!("PoolQuestion::delete raced by an offer: {swept}/4 rounds deleted the question");
+        assert!(
+            swept > 0,
+            "no round ever deleted the question, so the window was never reached"
+        );
+        assert_eq!(solutions, 0, "a solution outlived its question");
+        assert_eq!(delete_500, 0, "a raced delete must retry, not 500");
     }
 }
