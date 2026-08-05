@@ -1733,3 +1733,88 @@ async fn the_class_index_filters_by_grade() {
     .await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
 }
+
+/// The heir a detach hands a shared row to is **claimed**, not merely read —
+/// and a claim that matches nothing takes the release arm.
+///
+/// Two pure reads picked that heir: the rival classes attached to the course,
+/// then the ones the student is also in. Nothing in the sweep's write set
+/// touched the class it settled on, and SurrealDB conflict-checks no read, so
+/// `DELETE /classes/{heir}/members/{user}` and
+/// `DELETE /classes/{heir}/courses/{course}` could both commit *inside* this
+/// long sweep and leave the row tagged with a class holding neither link — a
+/// class whose own 0/0 delete guard then passes, stranding an enrollment no
+/// route can reach (both ends 404 on the link rows that are gone). The claim
+/// moves a counter on the heir's own row, which is the record every one of
+/// those writers moves too, so the store settles the pair.
+///
+/// The real interleaving needs the store's conflict detection, which the
+/// in-memory engine does not have (`class_pump::tests::a_detached_row_is_never_
+/// handed_to_a_class_that_let_it_go`, `#[ignore]`d, drives it on a real
+/// server). What is deterministic here is the other half of the same claim: an
+/// heir whose class row is *gone* while its link rows survive — a state this
+/// layer really carries (`a_membership_whose_class_is_gone_is_counted_but_
+/// skipped`) — must not be handed the row either.
+#[tokio::test]
+async fn a_detach_never_hands_a_row_to_a_class_that_is_gone() {
+    let (app, db) = app_and_db().await;
+    let staff = login_as(&app, &db, "manager", "manager").await;
+    let manager = UserId::from_key(&me_id(&app, &staff).await);
+    let student = UserId::from_key("student");
+    let algebra = CourseId::from_key(&create_course(&app, &staff, "algebra").await);
+    let mut made = Vec::new();
+    for name in ["9-B", "9-A"] {
+        let class = ClassGroup::create(
+            &manager,
+            ClassName::try_new(name).unwrap(),
+            None,
+            None,
+            None,
+            &db,
+        )
+        .await
+        .unwrap();
+        let class = class.get_id().clone();
+        ClassMember::add(&class, &student, &manager, &db)
+            .await
+            .unwrap();
+        ClassCourse::attach(&class, &algebra, &manager, &db)
+            .await
+            .unwrap();
+        made.push(class);
+    }
+    let (owner, heir) = (made[0].clone(), made[1].clone());
+    assert_eq!(
+        rows(
+            &format!(
+                "SELECT VALUE id FROM enrollment WHERE source = class_group:{}",
+                owner.key()
+            ),
+            &db
+        )
+        .await,
+        1,
+        "the second attach skips the row the first wrote, so the first owns it"
+    );
+
+    // The heir's class row goes while both of its link rows stay: the state a
+    // class deleted out from under its own links leaves.
+    db.query("DELETE $c")
+        .bind(("c", heir.record()))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+    ClassCourse::detach(&owner, &algebra, &db).await.unwrap();
+    assert_eq!(
+        rows("SELECT VALUE id FROM enrollment", &db).await,
+        0,
+        "a row handed to a class that is not there is one nothing can ever sweep"
+    );
+    assert_eq!(
+        counter("SELECT VALUE enrollment_count ?? 0 FROM course", &db).await,
+        0,
+        "…and its seat must come back with it"
+    );
+}

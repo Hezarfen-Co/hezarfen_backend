@@ -15,6 +15,10 @@ mod common;
 use axum::http::StatusCode;
 use common::{Res, app_and_db, create_course, login_as, me_id, send};
 use hezarfen_backend::database::Database;
+use hezarfen_backend::domain::class_blueprint::ClassBlueprint;
+use hezarfen_backend::domain::course::CourseId;
+use hezarfen_backend::domain::user::UserId;
+use hezarfen_backend::error::AppError;
 use serde_json::{Value, json};
 
 /// One counter, re-read out of the store.
@@ -1416,5 +1420,246 @@ async fn a_grade_with_no_sections_still_loses_its_deleted_course() {
         StatusCode::OK,
         "the template is editable again: {:?}",
         healed.body
+    );
+}
+
+/// A sweep that dies half-way must be *repairable*, and the repair is the one
+/// every doc surface names: `PATCH` the template with the list it already holds.
+///
+/// The removal used to be a diff against the handle this caller read — list
+/// saved first, then `dropped = read \ wanted` detached one transaction at a
+/// time. Any failure inside that loop (a lost round, a reconnect, a liveness
+/// reject) returned 500 with the list already stored and only some links swept,
+/// and the documented repair then recomputed an *empty* diff and swept nothing:
+/// sections kept `class_course` rows for courses the template no longer held,
+/// tagged with a live blueprint, and `status` cannot even report an extra.
+///
+/// The half-swept state is forged in the store rather than provoked with a
+/// failure injection, because it is exactly what that loop leaves behind: the
+/// stored list without the course, the link rows still there.
+#[tokio::test]
+async fn a_half_swept_removal_is_finished_by_the_documented_re_patch() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "mgr", "manager").await;
+    let algebra = create_course(&app, &manager, "algebra").await;
+    let history = create_course(&app, &manager, "history").await;
+    let class = create_class(&app, &manager, "9-A", "9").await;
+    let ali = student_in(&app, &db, &class, &manager, "ali").await;
+
+    let made = send(
+        &app,
+        "POST",
+        "/classes/blueprints",
+        Some(&manager),
+        Some(json!({ "grade": "9", "course_ids": [algebra.clone(), history.clone()] })),
+    )
+    .await;
+    assert_eq!(made.status, StatusCode::CREATED, "{:?}", made.body);
+    assert!(attached(&class, &history, &db).await);
+
+    // The state a sweep that died half-way leaves: the list is stored without
+    // history, its attachment is not.
+    db.query(
+        "UPDATE type::record('class_blueprint', '9') SET courses = [type::record('course', $c)]",
+    )
+    .bind(("c", algebra.clone()))
+    .await
+    .unwrap()
+    .check()
+    .unwrap();
+
+    let courses = held(&app, &manager, "9").await;
+    assert_eq!(
+        courses.len(),
+        1,
+        "the read agrees with the store: {courses:?}"
+    );
+    let healed = send(
+        &app,
+        "PATCH",
+        "/classes/blueprints/9",
+        Some(&manager),
+        Some(json!({ "course_ids": courses })),
+    )
+    .await;
+    assert_eq!(healed.status, StatusCode::OK, "{:?}", healed.body);
+
+    assert!(
+        !attached(&class, &history, &db).await,
+        "re-sending the stored list must finish the removal it stored"
+    );
+    assert_eq!(
+        rows(
+            &format!("SELECT VALUE id FROM enrollment WHERE user = user:{ali} AND course = course:{history}"),
+            &db
+        )
+        .await,
+        0,
+        "…enrollments and all"
+    );
+    assert_eq!(
+        counter(
+            &format!("SELECT VALUE (enrollment_count ?? 0) FROM course:{history}"),
+            &db
+        )
+        .await,
+        0,
+        "…with the seat given back"
+    );
+    assert!(
+        attached(&class, &algebra, &db).await,
+        "and the course the template still holds is untouched"
+    );
+    assert_eq!(
+        rows(
+            &format!("SELECT VALUE id FROM enrollment WHERE user = user:{ali} AND course = course:{algebra}"),
+            &db
+        )
+        .await,
+        1
+    );
+}
+
+/// A course deleted between the handler's own pre-flight read and the pump that
+/// walks the list is pruned out of the stored template — and the body that
+/// pruned it must say so. It used to be rendered from the pre-prune handle, so
+/// the `201`/`200` listed a course the `GET` a moment later did not.
+///
+/// Both write routes are driven, and the window is opened by the schema rather
+/// than by a lucky interleaving: a `DEFINE EVENT` on `class_blueprint` fires
+/// inside the very transaction that stores the list, which is exactly "after
+/// the courses were resolved, before the pump runs", every single time.
+#[tokio::test]
+async fn a_course_pruned_mid_pump_is_out_of_the_body_that_pruned_it() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "mgr", "manager").await;
+    let algebra = create_course(&app, &manager, "algebra").await;
+    let history = create_course(&app, &manager, "history").await;
+    let class = create_class(&app, &manager, "9-A", "9").await;
+
+    db.query(format!(
+        "DEFINE EVENT kill_on_create ON TABLE class_blueprint WHEN $event = 'CREATE' \
+         THEN {{ DELETE type::record('course', '{algebra}'); }};"
+    ))
+    .await
+    .unwrap()
+    .check()
+    .unwrap();
+    let made = send(
+        &app,
+        "POST",
+        "/classes/blueprints",
+        Some(&manager),
+        Some(json!({ "grade": "9", "course_ids": [algebra.clone()] })),
+    )
+    .await;
+    assert_eq!(made.status, StatusCode::CREATED, "{:?}", made.body);
+    assert_eq!(skips(&made).len(), 1, "the seam fired: {:?}", made.body);
+    assert_eq!(skips(&made)[0]["reason"], "course_deleted");
+    assert!(
+        made.body["blueprint"]["courses"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "the response may not list a course this very call pruned: {:?}",
+        made.body
+    );
+    assert!(
+        held(&app, &manager, "9").await.is_empty(),
+        "…which is the read it has to agree with"
+    );
+
+    // The same window on the edit route.
+    db.query(format!(
+        "DEFINE EVENT kill_on_update ON TABLE class_blueprint WHEN $event = 'UPDATE' \
+         THEN {{ DELETE type::record('course', '{history}'); }};"
+    ))
+    .await
+    .unwrap()
+    .check()
+    .unwrap();
+    let patched = send(
+        &app,
+        "PATCH",
+        "/classes/blueprints/9",
+        Some(&manager),
+        Some(json!({ "course_ids": [history.clone()] })),
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::OK, "{:?}", patched.body);
+    assert_eq!(skips(&patched).len(), 1, "{:?}", patched.body);
+    assert!(
+        patched.body["blueprint"]["courses"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "the edit's body may not list it either: {:?}",
+        patched.body
+    );
+    assert!(held(&app, &manager, "9").await.is_empty());
+    assert!(
+        !attached(&class, &algebra, &db).await && !attached(&class, &history, &db).await,
+        "and nothing was attached for either dead course"
+    );
+}
+
+/// A template may never *name* a course that is gone, whichever write stores
+/// the list.
+///
+/// The handler's `resolve_courses` is a pure read, and a `DELETE /courses/{id}`
+/// landing between it and the write sweeps a `class_blueprint` row that does not
+/// exist yet — SurrealDB conflict-checks no read, so both commit. `prune` fires
+/// only while walking a section, so at a grade carrying none the dangling id is
+/// permanent, which is the state `a_grade_with_no_sections_still_loses_its_
+/// deleted_course` promises is unreachable.
+///
+/// Driven at the domain, with a course that is already gone: that is the exact
+/// state the losing side of the race is in when its transaction runs, and it is
+/// deterministic where two live requests are not. Over HTTP the pre-flight read
+/// answers this same `400` first, so the surface does not move.
+#[tokio::test]
+async fn a_template_write_refuses_a_course_that_is_gone() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "mgr", "manager").await;
+    let by = UserId::from_key(&me_id(&app, &manager).await);
+    let algebra = CourseId::from_key(&create_course(&app, &manager, "algebra").await);
+    let ghost = CourseId::from_key("01J8XZ0K3Q8G7X2M4N5P6R7S8T");
+
+    let refused = ClassBlueprint::create(
+        &by,
+        ClassBlueprint::grade_key("9").unwrap(),
+        vec![ghost.clone()],
+        &db,
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(AppError::Validation(_))),
+        "a course that is gone is a 400, not a template naming it: {refused:?}"
+    );
+    assert_eq!(
+        rows("SELECT VALUE id FROM class_blueprint", &db).await,
+        0,
+        "…and nothing may be stored"
+    );
+
+    let blueprint = ClassBlueprint::create(
+        &by,
+        ClassBlueprint::grade_key("9").unwrap(),
+        vec![algebra.clone()],
+        &db,
+    )
+    .await
+    .unwrap();
+    let refused = blueprint
+        .set_courses(vec![algebra.clone(), ghost], &by, &db)
+        .await;
+    assert!(
+        matches!(refused, Err(AppError::Validation(_))),
+        "the edit carries the same claim: {refused:?}"
+    );
+    assert_eq!(
+        held(&app, &manager, "9").await.len(),
+        1,
+        "…and the stored list did not move"
     );
 }

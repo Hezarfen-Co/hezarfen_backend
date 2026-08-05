@@ -14,7 +14,7 @@ use crate::domain::class_pump::{Attached, Axis, attach, detach, link_id};
 use crate::domain::page::PagedList;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
-use crate::error::AppError;
+use crate::error::{AppError, ValidationError};
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct ClassMemberId(RecordId);
@@ -109,9 +109,14 @@ impl ClassMember {
                 code,
                 message: "the student is already in this class".into(),
             }),
-            // The member axis claims no pivot, so `PivotGone` cannot arrive
-            // here; the class being gone is the only 404 this route can see.
-            Attached::Gone | Attached::PivotGone => Err(AppError::NotFound),
+            Attached::Gone => Err(AppError::NotFound),
+            // The pivot is the student: they were demoted while this ran, which
+            // is the refusal the caller's own read makes a moment earlier and
+            // the only one that can arrive after it.
+            Attached::PivotGone => Err(AppError::Validation(ValidationError::Invalid {
+                field: "user_id",
+                reason: "only students can be added to a class",
+            })),
             Attached::ClassFull => Err(AppError::ConflictCoded {
                 code,
                 message: format!("this class already holds {MAX_CLASS_MEMBERS} students"),

@@ -100,6 +100,13 @@ pub(crate) enum Attached<T> {
     /// Nothing was written. Told apart from [`Attached::Gone`] because the two
     /// send a caller to look at different records, and a report that guesses
     /// between them names the wrong one half the time.
+    ///
+    /// On the **member** axis the pivot is the student, and this means their
+    /// row is gone *or* their role no longer is `student`
+    /// ([`Axis::pivot_claim`]). Its one caller answers that as the `400` the
+    /// route's own read already answers, never as [`Attached::refusal_code`]'s
+    /// `course_deleted` — which is the course axis's word for it and would name
+    /// a record this refusal is not about.
     PivotGone,
     /// The class is at its own ceiling on this axis. Nothing was written, and
     /// it is told apart from [`Attached::Gone`] because a full class is a
@@ -232,13 +239,21 @@ impl Axis {
     /// seeds off. Both statements are inside the transaction, so an abort
     /// between them cannot leave a course counting a seat nobody took.
     ///
-    /// The member axis claims nothing: its pivot is a user, whose row is no
-    /// class write's to touch, and a membership left pointing at a deleted user
-    /// is still removable by its own route — which is exactly what a link to a
-    /// deleted course was not.
+    /// The member axis moves a counter on the *user* row for the same reason in
+    /// a different key ([`cap::role_claim`]): a role change away from `student`
+    /// sweeps this class membership and every enrollment it pumped, on a
+    /// snapshot, so a join landing after that snapshot leaves a non-student on
+    /// a roster — counted against the class's delete guard — with nothing left
+    /// to re-sweep. Its refusal is [`Attached::PivotGone`] like the course
+    /// axis's, because both mean "the row this link hangs off may no longer
+    /// carry it".
     fn pivot_claim(&self) -> Vec<String> {
         match self {
-            Axis::Member => Vec::new(),
+            Axis::Member => cap::role_claim(
+                "pivot",
+                &format!("!= '{}'", crate::domain::role::Role::Student.as_str()),
+                GONE_MARK,
+            ),
             Axis::Course => {
                 let mut claimed = vec![format!(
                     "LET $was_alive = (SELECT VALUE {ENROLLMENT_COUNT_FIELD} FROM ONLY $pivot)"
@@ -569,6 +584,25 @@ fn named_course(message: &str, mark: &str) -> Option<String> {
 /// the lowest class id among the claimants: a deterministic pick, so a repeat
 /// of the same sweep lands on the same class.
 ///
+/// That pick is then **claimed**, by the bump-and-restore
+/// [`Axis::pivot_claim`] documents, before the row is handed over. Both reads
+/// behind it are pure, and this sweep is long — one pass per enrollment row the
+/// link implies — so `DELETE /classes/{heir}/members/{user}` and
+/// `DELETE /classes/{heir}/courses/{course}` could both commit inside it, their
+/// write sets disjoint from this one, and leave the row tagged with a class
+/// holding neither link: a `class_group` whose own 0/0 delete guard then passes,
+/// stranding an enrollment nothing can ever sweep (the state the note above
+/// [`attach`] says must not exist). Every one of those writers moves a counter
+/// on the heir's own row, so moving it here too puts this transaction on the
+/// record they write and the store settles it. The field is
+/// `class_member_count` for both axes: what has to collide is the *record*, and
+/// a class whose membership or course list moved has had one of the two written
+/// either way.
+///
+/// A claim that matches nothing is an heir whose class row is gone — a stale
+/// link outliving its class — and it takes the release arm rather than tagging
+/// the row with a record no route can reach.
+///
 /// Sweeps tolerate rows that are already gone. `Course::delete` wipes a
 /// course's enrollments wholesale while the `class_member` rows survive it, so
 /// "this class has a member" and "that member has a live pumped row" are
@@ -585,6 +619,14 @@ pub(crate) async fn detach(
 ) -> Result<i64, AppError> {
     let count_field = axis.counter();
     let scope = axis.scope();
+    // Nobody is left to claim the row: it goes, and its seat with it. Written
+    // once and used from both arms below, because "the heir's claim matched
+    // nothing" is the same answer as "there was no heir".
+    let release = format!(
+        "DELETE $row.id;
+                     UPDATE $row.course SET {ENROLLMENT_COUNT_FIELD} = \
+                         math::max([({ENROLLMENT_COUNT_FIELD} ?? 0) - 1, 0]);"
+    );
     let sweep = format!(
         "FOR $row IN ((SELECT id, course, user FROM {ENROLLMENT_TABLE} \
                  WHERE {scope} AND source = $link.class) ?? []) {{
@@ -593,11 +635,17 @@ pub(crate) async fn detach(
                  LET $heir = array::first(array::sort((SELECT VALUE class \
                      FROM {CLASS_MEMBER_TABLE} WHERE user = $row.user AND class IN $rivals)));
                  IF $heir != NONE {{
-                     UPDATE $row.id SET source = $heir;
+                     LET $was_heir = (SELECT VALUE {CLASS_MEMBER_COUNT_FIELD} FROM ONLY $heir);
+                     LET $claimed = (UPDATE $heir SET {CLASS_MEMBER_COUNT_FIELD} = \
+                         ({CLASS_MEMBER_COUNT_FIELD} ?? 0) + 1 RETURN VALUE id);
+                     UPDATE $heir SET {CLASS_MEMBER_COUNT_FIELD} = $was_heir;
+                     IF array::len($claimed) > 0 {{
+                         UPDATE $row.id SET source = $heir;
+                     }} ELSE {{
+                         {release}
+                     }};
                  }} ELSE {{
-                     DELETE $row.id;
-                     UPDATE $row.course SET {ENROLLMENT_COUNT_FIELD} = \
-                         math::max([({ENROLLMENT_COUNT_FIELD} ?? 0) - 1, 0]);
+                     {release}
                  }};
              }};"
     );
@@ -713,6 +761,104 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(again, 0);
+    }
+
+    /// The heir a sweep hands a shared enrollment to must still hold *both*
+    /// links when the transaction commits — not merely when it read them.
+    ///
+    /// Two classes carry one course and one student, so the row names the first
+    /// and the second is its heir. While that first class's detach sweeps — a
+    /// pass per enrollment row, up to a full roster long — the heir drops the
+    /// student and detaches the course, both committed. Its two reads see an
+    /// heir that is already gone, and its write set (its own class, its own
+    /// link, the enrollment) touches nothing the heir's two deletes wrote: with
+    /// no read-set conflict detection, both sides commit and the row is left
+    /// tagged with a class holding neither link, which then passes its own 0/0
+    /// delete guard. The claim on the heir's counter is what puts the two
+    /// transactions on one record.
+    ///
+    /// Real server, and `#[ignore]`d for it, exactly like
+    /// [`crate::domain::class_course`]'s course-delete twin: the subject *is*
+    /// the store's conflict detection, which `init_mem`'s embedded engine does
+    /// not have — it commits both sides and answers `Ok` to each, so this passes
+    /// there on broken code.
+    ///
+    /// The window is opened by the schema rather than by a lucky interleaving: a
+    /// `DEFINE EVENT` on `class_course` scoped to the *owner's* link holds that
+    /// detach open at its first statement, so the heir's two calls land inside
+    /// its transaction every time — and the heir's own detach, on another class,
+    /// is not slowed by it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
+    async fn a_detached_row_is_never_handed_to_a_class_that_let_it_go() {
+        use crate::domain::class_course::ClassCourse;
+        use crate::domain::class_member::tests::{a_course, source_of};
+
+        let (db, _serialized) = crate::database::init_test_server("class_heir_race").await;
+        let manager = UserId::from_key("manager");
+        let student = UserId::from_key("student");
+        let (mut raced, mut stranded) = (0, 0);
+        for round in 0..4 {
+            let algebra = a_course(&format!("algebra{round}"), None, &db).await;
+            let owner = a_class(&format!("9-{round}-owner"), &db).await;
+            let heir = a_class(&format!("9-{round}-heir"), &db).await;
+            for class in [&owner, &heir] {
+                ClassMember::add(class, &student, &manager, &db)
+                    .await
+                    .unwrap();
+                ClassCourse::attach(class, &algebra, &manager, &db)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                source_of(&algebra, &student, &db).await,
+                Some(Some(owner.clone())),
+                "round {round}: the row must start out owned by the first class"
+            );
+            db.query(format!(
+                "DEFINE EVENT OVERWRITE hold_the_sweep ON TABLE {CLASS_COURSE_TABLE} \
+                 WHEN $event = 'DELETE' THEN {{ IF $before.class = \
+                 type::record('class_group', '{}') {{ SLEEP 2s }} }};",
+                owner.key()
+            ))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+            let detaching = {
+                let (db, owner, algebra) = (db.clone(), owner.clone(), algebra.clone());
+                tokio::spawn(async move { ClassCourse::detach(&owner, &algebra, &db).await })
+            };
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            assert!(
+                !detaching.is_finished(),
+                "round {round}: the sweep was over before the heir moved"
+            );
+            // The heir lets the row go, twice over, while that sweep is still
+            // choosing it.
+            ClassMember::remove(&heir, &student, &db).await.unwrap();
+            ClassCourse::detach(&heir, &algebra, &db).await.unwrap();
+            let swept = detaching.await.unwrap();
+            assert!(
+                !matches!(swept, Err(AppError::Db(_))),
+                "round {round}: a raced detach must be answered, not 500: {swept:?}"
+            );
+
+            // Stored state is the whole verdict; a return value is not evidence.
+            if swept.is_ok() {
+                raced += 1;
+            }
+            if source_of(&algebra, &student, &db).await == Some(Some(heir.clone())) {
+                stranded += 1;
+            }
+        }
+        eprintln!("a detach raced by its heir: {raced}/4 rounds swept");
+        assert!(raced > 0, "no round ever committed its sweep");
+        assert_eq!(
+            stranded, 0,
+            "an enrollment was left tagged with a class holding neither link"
+        );
     }
 
     #[test]

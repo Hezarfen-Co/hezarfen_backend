@@ -1195,7 +1195,7 @@ async fn create_blueprint(
 ) -> Result<(StatusCode, Json<BlueprintPumpResponse>), AppError> {
     let grade = ClassBlueprint::grade_key(&req.grade)?;
     let courses = resolve_courses(&req.course_ids, &st.db).await?;
-    let blueprint = ClassBlueprint::create(user.get_id(), grade, courses, &st.db).await?;
+    let mut blueprint = ClassBlueprint::create(user.get_id(), grade, courses, &st.db).await?;
     let pumped = blueprint.pump(user.get_id(), &st.db).await?;
     let body = blueprint_body(&blueprint, &pumped, &st.db).await?;
     Ok((StatusCode::CREATED, Json(body)))
