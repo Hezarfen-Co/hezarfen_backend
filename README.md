@@ -978,7 +978,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | PATCH  | `/terms/{id}`                    | manager | Edit a term (the merged range must stay ordered) |
 | DELETE | `/terms/{id}`                    | manager | Delete a term — `409` while any course or class still links to it |
 | POST   | `/meals/menus`                   | manager | `{date, slot, capacity?}` — publish a menu; `date` is `YYYY-MM-DD` text and must be a real calendar day (`2026-02-29` is a `400`: a menu on a day that does not exist has no serving instant, so no booking cutoff), `slot` must be one of the school's `meal_slots` and may not contain `/ \ ? # %` (it becomes part of the menu's URL id); `409` when that day+slot is already published |
-| GET    | `/meals/menus`                   | student | List menus with their dishes, newest day first · `?from=&to=` inclusive `YYYY-MM-DD` range · paged |
+| GET    | `/meals/menus`                   | student | List menus with their dishes, newest day first · `?from=&to=` inclusive `YYYY-MM-DD` range, each bound a real calendar day like the menu's own (`2026-02-31` is a `400`) · paged |
 | GET    | `/meals/menus/{id}`              | student | One menu with its dishes |
 | PATCH  | `/meals/menus/{id}`              | manager | `{capacity}` — the only mutable field (`null` = uncapped); `date` and `slot` are immutable |
 | DELETE | `/meals/menus/{id}`              | manager | Unpublish a menu; its dishes and its attendance marks go with it, in the same transaction; `409` while anyone still holds a seat |
@@ -988,13 +988,13 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/meals/profiles/me`             | student | The caller's own dietary profile (empty when the school recorded none) |
 | GET    | `/meals/profiles/{user}`         | student | One student's dietary profile; own id always, otherwise teacher+ or a parent link |
 | PATCH  | `/meals/profiles/{user}`         | manager | `{tags?, note?}` — record what a student may not eat (`tags` replaces the list, `"note": null` clears it); **manager+**, a student never edits their own |
-| POST   | `/meals/menus/{id}/bookings`     | student | `{student_id?}` — take a seat; a student books for themselves, a parent for a linked student; `409` when the menu is full, its cutoff has passed, or the menu was edited so often mid-booking that the price could not be pinned |
+| POST   | `/meals/menus/{id}/bookings`     | student | `{student_id?}` — take a seat; a student books for themselves, a parent for a linked student; `409` when the menu is full, its cutoff has passed, its date is not a real calendar day so no cutoff can be worked out (only a menu published before that rule), or the menu was edited so often mid-booking that the price could not be pinned |
 | GET    | `/meals/bookings/me`             | student | The caller's own bookings (seats held for them + for a parent, their currently linked children's), newest first · paged |
 | GET    | `/meals/menus/{id}/bookings`     | manager | Every booking on one menu, cancelled ones included · paged |
-| DELETE | `/meals/bookings/{bid}`          | student | Cancel a booking (status flip, the row stays) — its student or their parent, **or any manager+**, whose seat and money must stay reachable after a role change; idempotent — cancelling again is a `200` that replays the refund; `409` past the cutoff, which binds **students and parents only** — a manager+ frees a closed meal's seat, and `409` when the seat was booked again while the call ran, since only the attempt it read is ever released |
+| DELETE | `/meals/bookings/{bid}`          | student | Cancel a booking (status flip, the row stays) — its student or their parent, **or any manager+**, whose seat and money must stay reachable after a role change; idempotent — cancelling again is a `200` that replays the refund; `409` past the cutoff, which binds **students and parents only** — a manager+ frees a closed meal's seat; `409` too when the menu's date is not a real calendar day, since no cutoff can be worked out from one, and when the seat was booked again while the call ran, since only the attempt it read is ever released |
 | POST   | `/meals/menus/{id}/attendance`   | teacher | `{student_id, status}` — mark who was served (`served`/`missed`); one row per (menu, student), re-marking flips it; `404` if the menu is unpublished mid-request; **moves no money** |
 | GET    | `/meals/menus/{id}/attendance`   | teacher | Who ate off one menu · paged |
-| GET    | `/meals/attendance/{user}`       | student | One student's meal-attendance history · `?from=&to=` inclusive `YYYY-MM-DD` range over the menu's day · paged · own id always, otherwise teacher+ or a parent link |
+| GET    | `/meals/attendance/{user}`       | student | One student's meal-attendance history · `?from=&to=` inclusive `YYYY-MM-DD` range over the menu's day, each bound a real calendar day (`2026-02-31` is a `400`) · paged · own id always, otherwise teacher+ or a parent link |
 | GET    | `/meals/balance/me`              | student | The caller's meal balance, minor units (negative = owes) |
 | GET    | `/meals/balance/{user}`          | student | One student's balance; own id always, otherwise **manager+** or a parent link — a teacher gets a `403`, canteen debt is family debt |
 | GET    | `/meals/ledger/{user}`           | student | That student's statement — every charge, credit, reversal — newest first · paged · same gate (manager+, parent link, or own) |
@@ -1287,9 +1287,11 @@ catalog — awards carrying it stop being served, no migration.
 
 - **Homework.** A genuine first hand-in is `+1 homework_submitted_total`, and
   `+1 homework_on_time_total` if that hand-in beat `due_at`. **Withdrawing your
-  own submission decrements both** — the one place a counter comes down, and it
-  exists because withdrawal is student-callable: without it, submit/delete/
-  submit farms one homework into fifty. Editing an existing submission moves
+  own submission decrements both**, and it exists because withdrawal is
+  student-callable: without it, submit/delete/submit farms one homework into
+  fifty. It is the same reason the two counters below come down — the account
+  credited is the account that can delete what earned it, which is the only
+  shape in which a counter ever decreases here. Editing an existing submission moves
   nothing, so the on-time verdict is fixed at the first hand-in and attaching a
   file after the deadline cannot turn an on-time submission late.
 - **Exams.** `+1 exam_sat_total` per attempt created, retakes included —
@@ -2990,10 +2992,11 @@ at one grade, and the caller is asking about all of them.
 A course a human attached by hand **counts as carried**. The template asks for
 the course, not for the pump's tag, and a course already on the class is a no-op
 for a pump whoever attached it — a status read that disagreed would send
-managers chasing rows no pump will ever write. `missing` only ever names
-courses that **still exist**: deleting a course takes its id out of every
-template holding it (see below), so there is no dangling id left for this read
-to report.
+managers chasing rows no pump will ever write. `missing` names courses that
+**still exist**: deleting a course takes its id out of every template holding it
+(see below). Only a template row written *before* that cascade existed — an
+upgraded volume, since nothing backfills — can still report a dangling id, and
+the next pump over that grade prunes it.
 
 **Finishing a partial pump** is one of two idempotent calls, and neither needs
 any new machinery:

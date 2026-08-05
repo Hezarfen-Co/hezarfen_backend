@@ -784,10 +784,13 @@ struct ProfileStatsResponse {
     /// Lifetime focused milliseconds.
     pomodoro_focus_ms_total: i64,
     /// Lifetime grades this teacher recorded — exam sittings and homework
-    /// submissions alike, once per pair: a regrade moves nothing.
+    /// submissions alike, once per pair: a regrade moves nothing, and deleting
+    /// the grade gives it back.
     marks_given_total: i64,
-    /// Lifetime lessons this teacher held, credited at the **first roll call**
-    /// taken for one — a lesson scheduled and cancelled counts for nothing.
+    /// Lifetime lessons this teacher held, credited by the **first roll call
+    /// taken at or after the lesson's own `starts_at`** — a lesson scheduled
+    /// and cancelled counts for nothing, and neither does one marked before it
+    /// has begun.
     lessons_held_total: i64,
     /// Lifetime pool questions this teacher approved.
     pool_approved_total: i64,
@@ -799,7 +802,8 @@ struct ProfileStatsResponse {
     /// attendance moves it not at all.
     lessons_attended_total: i64,
     /// Lifetime exam marks at or above the high-mark cut published as
-    /// `badges.high_mark_min` on `GET /limits`, one per graded sitting.
+    /// `badges.high_mark_min` on `GET /limits`, one per graded sitting;
+    /// deleting the mark gives it back, like the grader's own counter.
     /// Homework marks never count — they are optional and often status-only.
     high_mark_total: i64,
     /// Longest run of consecutive study days ever held — a high-water mark, so
