@@ -829,10 +829,21 @@ struct ProfileStatsResponse {
 /// A course carries a title, and `GET /courses/{id}` hands that title only to
 /// the enrolled, the staff who run it, and manager+ — so the block is
 /// intersected with [`visible_courses`], the same catalog `GET /courses`
-/// serves. Nothing here crosses a gate the viewer would fail directly. Reading
-/// your own profile, or reading as manager+, needs no intersection: both
-/// already see the whole list. `stats.courses` stays the owner's true total —
-/// it is the motivational counter, and a magnitude names no course.
+/// serves. Reading your own profile, or reading as manager+, needs no
+/// intersection: both already see the whole list.
+///
+/// The class block answers to [`ensure_can_observe`], the gate
+/// `GET /classes/user/{id}` holds — teacher+, or a parent linked to the target
+/// — because every other `/classes` read is teacher+ and a class name and grade
+/// are exactly what those routes withhold. That gate is all-or-nothing rather
+/// than per class, so a viewer who fails it gets an empty block, not a 403: the
+/// rest of the profile is still public to them.
+///
+/// So no *named* thing here crosses a gate the viewer would fail directly. The
+/// two magnitudes deliberately do: `stats.courses` and `stats.classes` stay the
+/// owner's true totals for every reader — they are the motivational counters, a
+/// per-reader number would be meaningless, and a magnitude names no course and
+/// no class.
 async fn profile_of(
     st: &AppState,
     user: &User,
@@ -869,8 +880,14 @@ async fn profile_of(
         courses.retain(|course| readable.contains(course.get_id()));
     }
     courses.truncate(MAX_PROFILE_COURSES);
-    let (members, class_total) =
+    let (mut members, class_total) =
         ClassMember::list_for_user(id, Some(MAX_PROFILE_CLASSES as i64), 0, &st.db).await?;
+    // The window is safe to take from the database here: the class gate is
+    // all-or-nothing, so it drops the whole page or none of it — never a row
+    // out of the middle of one.
+    if viewer.get_id() != id && ensure_can_observe(viewer, id, &st.db).await.is_err() {
+        members.clear();
+    }
     let class_ids: Vec<ClassGroupId> = members.iter().map(|row| row.get_class().clone()).collect();
     let classes = ClassGroup::list_by_ids(&class_ids, &st.db).await?;
     // Both totals are the full counts, not the windowed ones — the blocks are a
@@ -1021,8 +1038,11 @@ async fn my_profile(
 /// at `max_profile_classes` / `max_profile_courses` (see `GET /limits`) — the
 /// full paged lists are `GET /classes/me` and `GET /courses/me`. The course
 /// block is also cut to what the *reader* may already see: only courses they
-/// would pass `GET /courses/{id}` on. `stats.courses` stays the owner's true
-/// total either way.
+/// would pass `GET /courses/{id}` on. The class block holds the same bar as
+/// `GET /classes/user/{id}` — teacher+, a parent linked to this student, or the
+/// owner themselves; every other reader gets an empty `classes` array rather
+/// than a 403. `stats.courses` and `stats.classes` stay the owner's true totals
+/// either way.
 #[utoipa::path(
     get,
     path = "/{id}/profile",

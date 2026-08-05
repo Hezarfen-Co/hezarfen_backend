@@ -132,7 +132,11 @@ given, lessons held and question-pool approvals for a teacher — and the
 revokes one, and permanent once earned even if the counter later falls. Contact details are deliberately not part of it — email,
 phone and birth date keep the gate they already have — and any authenticated
 account reads any profile, except a `parent`, who reads their own and their
-linked students' only (see "User profiles & avatars").
+linked students' only. The two blocks inside it are cut to what the *reader*
+already reaches elsewhere: courses to the ones they would pass
+`GET /courses/{id}` on, classes to nothing at all unless they are teacher+, a
+linked parent, or the owner — the bar `GET /classes/user/{id}` holds (see
+"User profiles & avatars").
 The **AI features live in separate projects**, so the backend also opens a
 QUIC **AI bridge** (`AI_QUIC_ADDR`, off by default): AI services dial in,
 register the capabilities they serve, and each request rides its own QUIC
@@ -646,7 +650,7 @@ still left exactly as they stand.
 | Read another user's homework report      | teacher      | Narrowed to the caller's managed courses; `manager`+ sees all; a `parent` sees a linked student's in full — statuses/marks/flags, never files |
 | Edit **own** personal info (name, surname, email, phone, birth date) | student | Every account carries the same optional info fields |
 | Edit **own** UI preferences (theme, language, accent color) | student | `null` until chosen — the client then follows the device preference |
-| Read any user's **public profile** and avatar; upload/remove **own** avatar | student | A `parent` is the exception: own and linked students' only, the link and the target's live role re-read per call. Removing *another* user's avatar is admin-only moderation |
+| Read any user's **public profile** and avatar; upload/remove **own** avatar | student | A `parent` is the exception: own and linked students' only, the link and the target's live role re-read per call. Removing *another* user's avatar is admin-only moderation. The profile's `classes` block is empty unless the reader is teacher+, a parent linked to that student, or the owner |
 | List **own** linked students             | parent       | Read-only: the list plus each student's mark/attendance/pomodoro/homework reports — a parent changes nothing, anywhere |
 | Read the school settings and the term list | student | Clients need them to render kind/status pickers, grades, and the calendar |
 | Edit school settings; create / edit / delete terms | manager | School policy (exam kinds, attendance statuses, grade bands, the note-file size limit) and the academic calendar are management's call |
@@ -795,7 +799,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/users/me/students`             | parent  | The caller's linked students (refs, sorted by username; ties whose student was promoted out are left out) · paged |
 | GET    | `/users/search`                  | teacher | `?q=<fragment>&role=<role?>` — find users by username/name fragment (pickers); refs only, no contact info · paged |
 | GET    | `/users`                         | admin   | List all users · paged          |
-| GET    | `/users/{id}/profile`            | student | Any user's public profile — a `parent` reads only their own and their linked students' (`403`) |
+| GET    | `/users/{id}/profile`            | student | Any user's public profile — a `parent` reads only their own and their linked students' (`403`); the `courses` block is cut to what the reader may read directly and the `classes` block is empty below teacher+/linked parent |
 | GET    | `/users/{id}/avatar`             | student | The avatar bytes (`nosniff`, `private, no-store`); same reach as the profile |
 | DELETE | `/users/{id}/avatar`             | admin   | Remove any user's avatar — the moderation path |
 | GET    | `/users/{id}`                    | admin   | Get one user                    |
@@ -1233,6 +1237,19 @@ gets up to 20 courses they can actually open. `stats.courses` stays the
 owner's true total on purpose — it is the motivational counter, a per-reader
 number would be meaningless, and a magnitude names no course. One consequence,
 by design: a teacher you share nothing with has an empty `courses` block.
+
+**The class block is cut the same way, at the same bar `GET /classes/user/{id}`
+holds**: teacher+, a parent linked to that student, or the owner reading their
+own profile. Every other reader — a fellow student included — gets an empty
+`classes` array, not a `403`: the rest of the profile stays public to them, but
+a class name and grade are exactly what the `/classes` routes withhold below
+teacher+ (`GET /classes/{id}` is teacher+, `GET /classes/user/{id}` is
+teacher-or-linked-parent), and a profile must not be the way around them. The
+gate is all-or-nothing rather than per class, which is the one way this block
+differs from the courses one: there is no "the class we share", so a reader
+either sees the owner's section list or sees none of it. `stats.classes`, like
+`stats.courses`, stays the owner's true total for every reader — a magnitude
+names no class.
 
 **`stats` holds sixteen numbers of two different kinds, and the difference is
 worth knowing.** `pomodoro_sessions`, `pomodoro_focus_ms`, `courses` and

@@ -14,7 +14,7 @@ use axum::Router;
 use axum::http::StatusCode;
 use common::{
     app_and_db, create_course, create_exam_with, create_homework, create_subject, enroll, id_of,
-    login, login_as, me_id, send, set_role,
+    items, login, login_as, me_id, send, set_role,
 };
 use hezarfen_backend::constant::{MAX_BIO_LEN, MAX_DISPLAY_NAME_LEN};
 use hezarfen_backend::database::Database;
@@ -777,6 +777,233 @@ async fn stats_courses_stays_the_owners_true_total() {
     let peer = profile(&s.app, &s.peer, &s.teacher_id).await;
     assert_eq!(peer.body["courses"].as_array().expect("courses").len(), 1);
     assert_eq!(peer.body["stats"]["courses"], 2);
+}
+
+// --- The class block ------------------------------------------------------
+//
+// `GET /classes/{id}` is teacher+ and `GET /classes/user/{id}` is teacher-or-
+// linked-parent, so a class's name and grade are not school-wide reads. The
+// profile's class block used to hand both to any authenticated peer — a plain
+// student sufficed. It now holds the same bar, all-or-nothing (there is no
+// "the class we share"), and the drift guard at the end compares the two
+// surfaces reader by reader rather than trusting either alone.
+
+/// A manager, a teacher, a linked parent, the student who is in the class, and
+/// a nosy fellow student who is in nothing.
+struct Section {
+    app: Router,
+    manager: String,
+    teacher: String,
+    parent: String,
+    peer: String,
+    student: String,
+    student_id: String,
+}
+
+async fn section() -> Section {
+    let (app, db) = app_and_db().await;
+    let admin = login_as(&app, &db, "chief", "admin").await;
+    let manager = login_as(&app, &db, "boss", "manager").await;
+    let teacher = login_as(&app, &db, "teach", "teacher").await;
+    let parent = login_as(&app, &db, "mom", "parent").await;
+    let parent_id = me_id(&app, &parent).await;
+    let peer = login(&app, "nosy").await;
+    let student = login(&app, "kid").await;
+    let student_id = me_id(&app, &student).await;
+
+    let class = create_class(&app, &manager, "9-A", "9").await;
+    add_member(&app, &manager, &class, &student_id).await;
+    link_student(&app, &admin, &parent_id, &student_id).await;
+
+    Section {
+        app,
+        manager,
+        teacher,
+        parent,
+        peer,
+        student,
+        student_id,
+    }
+}
+
+async fn create_class(app: &Router, manager: &str, name: &str, grade: &str) -> String {
+    let res = send(
+        app,
+        "POST",
+        "/classes",
+        Some(manager),
+        Some(json!({ "name": name, "grade": grade })),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::CREATED,
+        "create class: {}",
+        res.body
+    );
+    id_of(&res.body["class"])
+}
+
+async fn add_member(app: &Router, manager: &str, class: &str, user_id: &str) {
+    let res = send(
+        app,
+        "POST",
+        &format!("/classes/{class}/members"),
+        Some(manager),
+        Some(json!({ "user_id": user_id })),
+    )
+    .await;
+    assert!(res.status.is_success(), "add member: {}", res.body);
+}
+
+/// The class names a profile's class block hands `cookie`.
+async fn class_names(app: &Router, cookie: &str, id: &str) -> Vec<String> {
+    let res = profile(app, cookie, id).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    res.body["classes"]
+        .as_array()
+        .expect("classes array")
+        .iter()
+        .map(|class| class["name"].as_str().expect("name").to_string())
+        .collect()
+}
+
+/// The class ids off the same block, sorted — the drift guard's left half.
+async fn profile_class_ids(app: &Router, cookie: &str, id: &str) -> Vec<String> {
+    let res = profile(app, cookie, id).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let mut ids: Vec<String> = res.body["classes"]
+        .as_array()
+        .expect("classes array")
+        .iter()
+        .map(id_of)
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// The class ids the *dedicated* routes hand that same reader for that same
+/// subject — `None` when they are refused outright. Your own classes are
+/// `GET /classes/me`; anybody else's are `GET /classes/user/{id}`.
+async fn route_class_ids(app: &Router, cookie: &str, id: &str, own: bool) -> Option<Vec<String>> {
+    let path = match own {
+        true => "/classes/me".to_string(),
+        false => format!("/classes/user/{id}"),
+    };
+    let res = send(app, "GET", &path, Some(cookie), None).await;
+    if res.status == StatusCode::FORBIDDEN {
+        return None;
+    }
+    assert_eq!(res.status, StatusCode::OK, "GET {path}: {}", res.body);
+    let mut ids: Vec<String> = items(&res.body).iter().map(id_of).collect();
+    ids.sort();
+    Some(ids)
+}
+
+/// The leak this closes: a class a reader is `403`'d from at
+/// `GET /classes/user/{id}` used to arrive off that student's profile, name and
+/// grade and all, for any authenticated account. The 403 is asserted in the
+/// same test so the two answers cannot drift apart unnoticed.
+#[tokio::test]
+async fn a_profile_never_names_a_class_the_reader_is_403d_from() {
+    let s = section().await;
+
+    let direct = send(
+        &s.app,
+        "GET",
+        &format!("/classes/user/{}", s.student_id),
+        Some(&s.peer),
+        None,
+    )
+    .await;
+    assert_eq!(direct.status, StatusCode::FORBIDDEN, "{}", direct.body);
+
+    let seen = profile(&s.app, &s.peer, &s.student_id).await;
+    assert_eq!(seen.status, StatusCode::OK, "{}", seen.body);
+    assert_eq!(seen.body["classes"], json!([]));
+    assert!(
+        !seen.body.to_string().contains("9-A"),
+        "the profile leaked a class the reader cannot read: {}",
+        seen.body
+    );
+}
+
+/// The half that proves the gate is the gate and not a broken read: everyone
+/// who may ask the class routes directly still gets the block.
+#[tokio::test]
+async fn teacher_parent_manager_and_the_owner_still_read_the_class_block() {
+    let s = section().await;
+
+    assert_eq!(
+        class_names(&s.app, &s.teacher, &s.student_id).await,
+        ["9-A"]
+    );
+    assert_eq!(
+        class_names(&s.app, &s.manager, &s.student_id).await,
+        ["9-A"]
+    );
+    assert_eq!(class_names(&s.app, &s.parent, &s.student_id).await, ["9-A"]);
+    assert_eq!(
+        class_names(&s.app, &s.student, &s.student_id).await,
+        ["9-A"]
+    );
+
+    let mine = send(&s.app, "GET", "/users/me/profile", Some(&s.student), None).await;
+    assert_eq!(mine.status, StatusCode::OK, "{}", mine.body);
+    assert_eq!(mine.body["classes"][0]["name"], "9-A");
+    assert_eq!(mine.body["classes"][0]["grade"], "9");
+}
+
+/// `stats.classes` is the owner's true total, deliberately *not* the length of
+/// the gated block — the same call already made for `stats.courses`: it is the
+/// motivational counter, and a magnitude names no class.
+#[tokio::test]
+async fn stats_classes_stays_the_owners_true_total() {
+    let s = section().await;
+
+    let peer = profile(&s.app, &s.peer, &s.student_id).await;
+    assert_eq!(peer.body["classes"], json!([]));
+    assert_eq!(peer.body["stats"]["classes"], 1);
+
+    let teacher = profile(&s.app, &s.teacher, &s.student_id).await;
+    assert_eq!(teacher.body["stats"]["classes"], 1);
+}
+
+/// The forcing function: for every reader, the profile's class block must say
+/// exactly what the dedicated class route says to that same reader — an empty
+/// block where the route is a `403`, the identical id set where it is a `200`.
+/// Whichever surface moves first, this fails. (One class, so the block's
+/// `max_profile_classes` truncation cannot make the two disagree honestly.)
+#[tokio::test]
+async fn the_profile_class_block_agrees_with_the_class_route() {
+    let s = section().await;
+    let readers = [
+        ("peer", &s.peer, false),
+        ("teacher", &s.teacher, false),
+        ("manager", &s.manager, false),
+        ("parent", &s.parent, false),
+        ("owner", &s.student, true),
+    ];
+
+    let mut refused = 0;
+    let mut served = 0;
+    for (who, cookie, own) in readers {
+        let route = route_class_ids(&s.app, cookie, &s.student_id, own).await;
+        let block = profile_class_ids(&s.app, cookie, &s.student_id).await;
+        match &route {
+            None => refused += 1,
+            Some(ids) if !ids.is_empty() => served += 1,
+            Some(_) => {}
+        }
+        assert_eq!(
+            route.unwrap_or_default(),
+            block,
+            "{who}: the profile's class block and the class route disagree"
+        );
+    }
+    // Neither half may pass vacuously: somebody was refused, somebody was served.
+    assert_eq!(refused, 1, "exactly the peer is refused the class route");
+    assert_eq!(served, 4, "the other four are served a non-empty list");
 }
 
 // --- Badges ---------------------------------------------------------------
