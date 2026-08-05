@@ -129,8 +129,7 @@ impl HomeworkSubmission {
     /// keeps it to a genuine first create, so an edit moves neither counter,
     /// which is what makes the live count mean the same thing the one-time
     /// backfill seeded (one per row; on time judged against `due_at`, equal
-    /// counting as on time). Takes the whole [`Homework`] only for that
-    /// deadline — both callers already hold the row.
+    /// counting as on time).
     ///
     /// `counted_on_time` is stamped on the row from the *same* `$on_time`
     /// expression the increment adds, in the same statement block: the deadline
@@ -138,6 +137,17 @@ impl HomeworkSubmission {
     /// gave back something other than what was taken. Writing the verdict beside
     /// the counter is what keeps the two from ever disagreeing — read back by
     /// [`HomeworkSubmission::delete`], never re-derived.
+    ///
+    /// That deadline is `$was_due`, the one the gate below already read *inside
+    /// this transaction* — never the caller's [`Homework`] snapshot, which was
+    /// read before the lease and is exactly one `PATCH due_at` old in the
+    /// "teacher extends the deadline at 23:59 while the class submits" moment.
+    /// Judging on the snapshot stored a verdict the web layer's own `late` flag
+    /// (`updated_at > due_at`, re-derived live on every read) then contradicted
+    /// forever, in both directions. An in-process lock cannot fix this — it
+    /// orders two handlers, not two store transactions — so the comparison has
+    /// to live where the write does. The whole entity is still taken (both
+    /// callers hold the row, and the id comes off it); its `due_at` must not be.
     ///
     /// The first three statements are the parent gate, and they are why this
     /// write cannot outlive its homework: the id is deterministic, so nothing
@@ -174,7 +184,7 @@ impl HomeworkSubmission {
                  IF array::len($alive) = 0 {{ THROW 'no_homework' }};
                  UPDATE $hw SET due_at = $was_due;
                  LET $before = (SELECT VALUE id FROM ONLY $id);
-                 LET $on_time = $now <= $due;
+                 LET $on_time = $now <= $was_due;
                  LET $after = (UPSERT $id SET homework = $hw, user = $usr, text = $text,
                      updated_at = $now, submitted_at = submitted_at ?? $now
                      WHERE {SUBMISSION_OPEN_GUARD} RETURN AFTER);
@@ -194,7 +204,6 @@ impl HomeworkSubmission {
                 ("usr".into(), user.record().into_value()),
                 ("text".into(), text.into_value()),
                 ("now".into(), now.into_value()),
-                ("due".into(), homework.get_due_at().into_value()),
             ],
             &["no_homework"],
         )
@@ -413,6 +422,49 @@ mod tests {
         .unwrap()
         .get_id()
         .clone()
+    }
+
+    /// Move the stored deadline the way a teacher's PATCH does, leaving the
+    /// caller's `homework` snapshot untouched — the stale-snapshot shape the
+    /// handler produces when a `PATCH due_at` commits between its gate read and
+    /// its write.
+    async fn deadline_moves_to(homework: &Homework, due_at: Timestamp, db: &Database) {
+        Homework::read(homework.get_id(), db)
+            .await
+            .unwrap()
+            .expect("the homework exists")
+            .update(None, None, None, Some(due_at), None, db)
+            .await
+            .unwrap();
+    }
+
+    /// The verdict `upsert` stored on the row — what `delete` debits off.
+    /// `None` is a row from before the column existed.
+    async fn stored_verdict(id: &HomeworkSubmissionId, db: &Database) -> Option<bool> {
+        let mut result = db
+            .query("SELECT VALUE counted_on_time FROM $sub")
+            .bind(("sub", id.record()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        result
+            .take::<Vec<Option<bool>>>(0)
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .next()
+    }
+
+    /// The web layer's computed flag, exactly as `SubmissionResponse::new`
+    /// derives it (`src/web/homework.rs`): `updated_at` against the *live*
+    /// deadline, re-read here because that is what a later GET reads.
+    async fn late_flag(submission: &HomeworkSubmission, db: &Database) -> bool {
+        let live = Homework::read(submission.get_homework(), db)
+            .await
+            .unwrap()
+            .expect("the homework exists");
+        submission.get_updated_at() > live.get_due_at()
     }
 
     /// The two badge counters on a user row, absent counting as zero.
@@ -728,6 +780,65 @@ mod tests {
             .unwrap()
             .unwrap();
         kept.delete(&db).await.unwrap().unwrap();
+        assert_eq!(counters(&user, &db).await, (0, 0));
+    }
+
+    /// The stale snapshot, both directions: the teacher's `PATCH due_at` commits
+    /// between the handler's gate read and its write, so the caller's entity
+    /// carries a deadline the store no longer has. The verdict must follow the
+    /// *stored* deadline the write itself reads, because the API's `late` flag
+    /// is re-derived from that same stored value on every later read — a verdict
+    /// judged on the snapshot disagrees with it permanently, and `delete` then
+    /// gives back the wrong credit.
+    ///
+    /// Bite check: judge `$on_time` against the caller's `$due` instead of
+    /// `$was_due` and both halves fail — extended reads `(1, 0)` with a stored
+    /// `false` against a live `late = false`, pulled reads `(1, 1)` with a
+    /// stored `true` against a live `late = true`.
+    #[tokio::test]
+    async fn a_deadline_moved_under_the_caller_is_judged_by_the_stored_value() {
+        let db = crate::database::init_mem().await.unwrap();
+        let user = a_student("ogrenci", &db).await;
+
+        // Extended at 23:59: the snapshot says the deadline has passed, the
+        // store says it has not. A hand-in now is on time.
+        let extended = a_homework(Timestamp::from_millis(1), &db).await;
+        deadline_moves_to(&extended, far_future(), &db).await;
+        let landed = HomeworkSubmission::upsert(&extended, &user, None, &db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(counters(&user, &db).await, (1, 1));
+        assert_eq!(stored_verdict(landed.get_id(), &db).await, Some(true));
+        assert!(!late_flag(&landed, &db).await);
+
+        // Pulled earlier: the snapshot says there is time left, the store says
+        // the deadline is gone. The same hand-in is late.
+        let pulled = a_homework(far_future(), &db).await;
+        deadline_moves_to(&pulled, Timestamp::from_millis(1), &db).await;
+        let missed = HomeworkSubmission::upsert(&pulled, &user, None, &db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(counters(&user, &db).await, (2, 1));
+        assert_eq!(stored_verdict(missed.get_id(), &db).await, Some(false));
+        assert!(late_flag(&missed, &db).await);
+
+        // The invariant behind both: the stored verdict is the negation of the
+        // flag the web layer computes for the same submission, never its twin.
+        for submission in [&landed, &missed] {
+            assert_eq!(
+                stored_verdict(submission.get_id(), &db).await,
+                Some(!late_flag(submission, &db).await),
+                "stored verdict and the API's late flag must never disagree"
+            );
+        }
+
+        // ... and the withdrawal, which debits off the stamp, gives back exactly
+        // what each one took.
+        missed.delete(&db).await.unwrap().unwrap();
+        assert_eq!(counters(&user, &db).await, (1, 1));
+        landed.delete(&db).await.unwrap().unwrap();
         assert_eq!(counters(&user, &db).await, (0, 0));
     }
 }
