@@ -146,18 +146,21 @@ struct Bucket {
     window_start: Instant,
     /// Requests this process admitted in the current local window.
     count: u32,
-    /// How many of `count` the sync task has already folded into the shared
-    /// row. Never above `count`, so `count - pushed` is what is still ours to
-    /// report.
+    /// How many of `count` are accounted for against the *current* shared row
+    /// — folded into it, or charged to an earlier one before the wall window
+    /// rolled. Never above `count`, so `count - pushed` is what is still ours
+    /// to report.
     pushed: u32,
-    /// The stored total the last sync read back — every admit in this window,
-    /// `pushed` included. Zero until a sync lands, which is what makes an
-    /// unshared limiter behave exactly like the local-only one it replaced.
+    /// The stored total the last sync read back — every admit in this wall
+    /// window, our `pushed` share included. Zero until a sync lands, which is
+    /// what makes an unshared limiter behave exactly like the local-only one it
+    /// replaced.
     remote: u32,
-    /// The wall window (`RATE_LIMIT_TABLE` row) `pushed`/`remote` describe.
-    /// The local window rolls per client while the shared one is aligned to the
-    /// clock, so this says which shared row those two numbers came from.
-    epoch: i64,
+    /// The wall window (`RATE_LIMIT_TABLE` row) `pushed`/`remote` describe, or
+    /// `None` until the first sync. The local window rolls per client while the
+    /// shared one is aligned to the clock, so this says which shared row those
+    /// two numbers came from.
+    epoch: Option<i64>,
 }
 
 impl Bucket {
@@ -168,15 +171,22 @@ impl Bucket {
             count: 0,
             pushed: 0,
             remote: 0,
-            epoch: 0,
+            epoch: None,
         }
     }
 
-    /// Requests spent in this window as far as this process can tell: what the
-    /// shared row held at the last sync — this process's earlier life included —
-    /// plus our own admits since. Equals `count` until a sync lands.
+    /// Requests spent as far as this process can tell: what the shared row held
+    /// at the last sync — this process's earlier life included — plus our own
+    /// admits since, and never less than this local window's own count. Equals
+    /// `count` until a sync lands.
+    ///
+    /// The local floor is what a wall-window roll needs: the admits it moves
+    /// out of the shared reckoning (they belong to the row that has passed)
+    /// must not come back as fresh budget inside a local window that is still
+    /// running.
     fn spent(&self) -> u32 {
-        self.remote.saturating_add(self.count - self.pushed)
+        self.count
+            .max(self.remote.saturating_add(self.count - self.pushed))
     }
 }
 
@@ -453,12 +463,24 @@ async fn sync_once<K: Eq + Hash + Clone + std::fmt::Display>(
             .filter(|(_, b)| b.count > 0 && now.duration_since(b.window_start) < window)
             .take(RATE_SYNC_MAX_KEYS)
             .map(|(key, b)| {
-                if b.epoch != epoch {
-                    // The shared window rolled: the row this bucket is about to
-                    // write knows nothing of us, so the whole local count is
-                    // the delta and the previous total describes a dead row.
-                    b.epoch = epoch;
-                    b.pushed = 0;
+                if b.epoch != Some(epoch) {
+                    // A different shared row from the one `pushed`/`remote`
+                    // describe: that total is about a window that has passed.
+                    // What was already charged to it must not be charged again
+                    // here — every local window straddles a boundary, so
+                    // re-reporting the whole count would bill each of those
+                    // requests to two rows and spend the client's next budget
+                    // before it began. Only a bucket that has never synced owes
+                    // its whole count, having been billed nowhere yet.
+                    //
+                    // ponytail: admits between the boundary and this round land
+                    // on the old row. Ceiling: RATE_SYNC_INTERVAL_SECS of one
+                    // client's traffic, charged once either way. Upgrade path:
+                    // stamp each admit with its epoch.
+                    if b.epoch.is_some() {
+                        b.pushed = b.count;
+                    }
+                    b.epoch = Some(epoch);
                     b.remote = 0;
                 }
                 Pending {
@@ -506,7 +528,7 @@ async fn sync_once<K: Eq + Hash + Clone + std::fmt::Display>(
         };
         // The window may have rolled while the query was in flight, in which
         // case this total is about a bucket that no longer exists.
-        if bucket.epoch != epoch || bucket.window_start != p.window_start {
+        if bucket.epoch != Some(epoch) || bucket.window_start != p.window_start {
             continue;
         }
         bucket.pushed = p.counted;
@@ -822,6 +844,66 @@ mod tests {
             limiter.check(ip(1)).is_err(),
             "the flood must not have bought the exhausted bucket a fresh window"
         );
+    }
+
+    /// The wall window rolls under a live local one — every local window
+    /// straddles exactly one boundary, since both are 60s and only the shared
+    /// one is clock-aligned. Each request must land in exactly one shared row:
+    /// re-reporting the whole local count to the new row charges the client
+    /// twice and spends the next window's budget before it starts.
+    ///
+    /// `sync_once` takes the epoch, so the boundary is driven here instead of
+    /// waited for — the sharing tests in `tests/rate_limit.rs` all run inside
+    /// one real wall window (`current_epoch` reads the wall clock, which
+    /// `tokio::time::pause` does not touch), which is why this path had no
+    /// coverage at all.
+    #[tokio::test]
+    async fn a_wall_epoch_roll_charges_no_request_twice() {
+        const MAX: u32 = 5;
+        let db = crate::database::init_mem().await.expect("in-memory db");
+        let limiter = UserRateLimiter::per_user_minute(MAX);
+        let window = Duration::from_secs(60);
+        let epoch = current_epoch(window);
+        assert_eq!(window.as_millis() as i64, 60_000, "epochs are 60s apart");
+
+        // A burst early in the client's local window, folded into row `epoch`.
+        for _ in 0..MAX {
+            assert!(limiter.enforce_user("user:a").is_ok());
+        }
+        sync_once("test", &limiter.buckets, window, epoch, &db).await;
+
+        // The wall clock rolls while that local window is still running.
+        sync_once("test", &limiter.buckets, window, epoch + 60_000, &db).await;
+
+        // The local window lapses, so the client opens a fresh one — inside the
+        // *same* new wall window — and spends one request in it.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::time::resume();
+        assert_eq!(admits(&limiter, "user:a", 1), 1, "a fresh local window");
+        sync_once("test", &limiter.buckets, window, epoch + 60_000, &db).await;
+
+        let mut rows = db
+            .query("SELECT VALUE hits FROM rate_limit ORDER BY window_start")
+            .await
+            .expect("read shared counters");
+        assert_eq!(
+            rows.take::<Vec<i64>>(0).unwrap(),
+            vec![i64::from(MAX), 1],
+            "the new wall row may hold only what was admitted inside it"
+        );
+        assert_eq!(
+            admits(&limiter, "user:a", 4),
+            4,
+            "the client spent 1 of {MAX} in this window and must keep the rest"
+        );
+    }
+
+    /// How many of `tries` requests the limiter admits for `user`.
+    fn admits(limiter: &UserRateLimiter, user: &str, tries: usize) -> usize {
+        (0..tries)
+            .filter(|_| limiter.enforce_user(user).is_ok())
+            .count()
     }
 
     /// The flood above was cheap to tell apart. This one is not: every flood
