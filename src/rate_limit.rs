@@ -404,6 +404,28 @@ where
     /// limiter rather than keeping a dropped one alive (test suites build
     /// dozens).
     pub fn share(&self, tier: &'static str, db: Database, db_up: DbHealth) {
+        self.share_windowed(tier, db, db_up, None);
+    }
+
+    /// [`RateLimiter::share`] with the wall window pinned, for tests only.
+    ///
+    /// A round reads the real clock, so any assertion about *the* shared row
+    /// is otherwise a bet that the run does not cross a minute mid-round —
+    /// two limiters of one tier would then report into two rows and neither
+    /// would see the other's spend. An accidental relationship to the wall
+    /// clock is precisely what kept the epoch-roll double-charge out of
+    /// `tests/rate_limit.rs`, so the sharing tests choose their window instead.
+    pub fn share_pinned(&self, tier: &'static str, db: Database, db_up: DbHealth, epoch: i64) {
+        self.share_windowed(tier, db, db_up, Some(epoch));
+    }
+
+    fn share_windowed(
+        &self,
+        tier: &'static str,
+        db: Database,
+        db_up: DbHealth,
+        pinned: Option<i64>,
+    ) {
         if self.max == 0 {
             // The tier is off: `check` records nothing, so there is nothing to
             // share and no reason to hold a task or a table row.
@@ -424,7 +446,7 @@ where
                 if !db_up.is_up() {
                     continue;
                 }
-                let epoch = current_epoch(window);
+                let epoch = pinned.unwrap_or_else(|| current_epoch(window));
                 sync_once(tier, &buckets, window, epoch, &db).await;
                 // Piggybacked cleanup, once per window: rows for a window that
                 // has passed can never be read again.
