@@ -25,7 +25,9 @@ use common::{
     app_and_db, create_course, create_exam, create_exam_with, create_session, enroll, id_of, login,
     login_as, me_id, send, set_role,
 };
-use hezarfen_backend::constant::{BADGES, HIGH_MARK_MIN, STUDY_STREAK_LAST_DAY_FIELD};
+use hezarfen_backend::constant::{
+    BADGES, HIGH_MARK_MIN, MIN_COUNTED_POMODORO_MS, STUDY_STREAK_LAST_DAY_FIELD,
+};
 use hezarfen_backend::database::Database;
 use hezarfen_backend::domain::timestamp::Timestamp;
 use serde_json::{Value, json};
@@ -492,12 +494,32 @@ async fn a_correction_lowers_the_counter_but_never_takes_the_badge_back() {
 
 // --- the study streak ------------------------------------------------------
 
-/// Start and finish one focus stint as `cookie` (asserts both statuses).
-async fn stint(app: &Router, cookie: &str) {
+/// Start and finish one focus stint as `cookie` that *counts* (asserts both
+/// statuses, and the verdict the finish hands back).
+///
+/// The running stint is aged past `MIN_COUNTED_POMODORO_MS` in between — stored
+/// state again, never the clock, and the same reason `age_one_day` exists: a
+/// stint that instant is exactly the farm the rule refuses, and no route can
+/// make one older. The domain suite pins the rule itself; what this buys is the
+/// streak arriving on a real profile.
+async fn stint(app: &Router, db: &Database, cookie: &str, user: &str) {
     let started = send(app, "POST", "/pomodoro/start", Some(cookie), None).await;
     assert_eq!(started.status, StatusCode::CREATED, "{}", started.body);
+    db.query("UPDATE type::record('pomodoro_session', $id) SET started_at = started_at - $ms")
+        .bind(("id", format!("open_{user}")))
+        .bind(("ms", MIN_COUNTED_POMODORO_MS))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
     let finished = send(app, "POST", "/pomodoro/finish", Some(cookie), None).await;
     assert_eq!(finished.status, StatusCode::OK, "{}", finished.body);
+    assert_eq!(
+        finished.body["counted"],
+        Value::from(true),
+        "{}",
+        finished.body
+    );
 }
 
 /// Wind `user`'s streak bookkeeping back one day, so the *next* finish lands on
@@ -540,7 +562,7 @@ async fn a_finished_stint_reaches_the_profile_and_three_days_earn_the_badge() {
     let student = login(&app, "stu").await;
     let student_id = me_id(&app, &student).await;
 
-    stint(&app, &student).await;
+    stint(&app, &db, &student, &student_id).await;
 
     let first = profile_of(&app, &student, &student_id).await;
     assert_eq!(
@@ -555,7 +577,7 @@ async fn a_finished_stint_reaches_the_profile_and_three_days_earn_the_badge() {
 
     for _ in 0..2 {
         age_one_day(&db, &student_id).await;
-        stint(&app, &student).await;
+        stint(&app, &db, &student, &student_id).await;
     }
 
     let after = profile_of(&app, &student, &student_id).await;

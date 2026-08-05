@@ -90,6 +90,13 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS study_streak_longest ON user TYPE option<int>;
     DEFINE FIELD IF NOT EXISTS study_streak_current ON user TYPE option<int>;
     DEFINE FIELD IF NOT EXISTS study_streak_last_day ON user TYPE option<int>;
+    -- The counted-stint quota (2026-08-05): which UTC day the student last had
+    -- a pomodoro stint counted on, and how many counted that day. Bookkeeping
+    -- for the daily cap, read by nothing else; absent reads as no day yet,
+    -- which is what makes the first finish after this deploy open a fresh
+    -- bucket with no backfill.
+    DEFINE FIELD IF NOT EXISTS pomodoro_counted_day ON user TYPE option<int>;
+    DEFINE FIELD IF NOT EXISTS pomodoro_counted_today ON user TYPE option<int>;
     DEFINE INDEX IF NOT EXISTS user_username ON user FIELDS username UNIQUE;
 
     DEFINE TABLE IF NOT EXISTS session SCHEMAFULL;
@@ -413,6 +420,11 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS user ON pomodoro_session TYPE record<user>;
     DEFINE FIELD IF NOT EXISTS started_at ON pomodoro_session TYPE int;
     DEFINE FIELD IF NOT EXISTS finished_at ON pomodoro_session TYPE option<int>;
+    -- The verdict `finish` reached for this stint, stamped at close so a later
+    -- reader never re-derives it against thresholds that have since moved.
+    -- `option<bool>`: a running stint has no verdict yet, and a stint closed
+    -- before the rule existed carries none and cannot honestly be given one.
+    DEFINE FIELD IF NOT EXISTS counted ON pomodoro_session TYPE option<bool>;
     DEFINE INDEX IF NOT EXISTS pomodoro_session_user ON pomodoro_session FIELDS user;
 
     DEFINE TABLE IF NOT EXISTS exam SCHEMAFULL;

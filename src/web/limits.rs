@@ -333,6 +333,25 @@ struct ChatbotLimits {
     default_max_threads: i64,
 }
 
+/// What a finished pomodoro stint must be to *count* — to move the lifetime
+/// counters the badges and the study streak read. Not a validation bound:
+/// `POST /pomodoro/finish` never refuses a stint over these, it records it and
+/// answers `counted: false`. Published so a client can say what a stint is
+/// worth (and what is left of today's quota) instead of guessing why a badge
+/// did not arrive.
+#[derive(Serialize, ToSchema)]
+struct PomodoroLimits {
+    /// Shortest stint that counts, milliseconds — a stint of exactly this long
+    /// counts. Well under a conventional 25-minute pomodoro: breaking off early
+    /// is still studying. Its job is only to price a scripted round-trip out.
+    #[schema(example = 300000)]
+    min_counted_ms: i64,
+    /// How many stints count per UTC day. Every further one that day is
+    /// recorded and listed as usual, and counts nothing.
+    #[schema(example = 16)]
+    max_counted_per_day: i64,
+}
+
 /// A collaborative whiteboard: its title, its roster, and the two growth caps
 /// that decide when a canvas must be cleared and when a board is finished.
 #[derive(Serialize, ToSchema)]
@@ -430,6 +449,7 @@ struct LimitsResponse {
     meal: MealLimits,
     payment: PaymentLimits,
     chatbot: ChatbotLimits,
+    pomodoro: PomodoroLimits,
     board: BoardLimits,
     settings: SettingsLimits,
     request: RequestLimits,
@@ -586,6 +606,10 @@ impl LimitsResponse {
                 min_max_threads: MIN_MAX_CHATBOT_THREADS,
                 max_max_threads: MAX_MAX_CHATBOT_THREADS,
                 default_max_threads: DEFAULT_MAX_CHATBOT_THREADS,
+            },
+            pomodoro: PomodoroLimits {
+                min_counted_ms: MIN_COUNTED_POMODORO_MS,
+                max_counted_per_day: MAX_COUNTED_POMODORO_PER_DAY,
             },
             board: BoardLimits {
                 max_title_len: MAX_BOARD_TITLE_LEN,
