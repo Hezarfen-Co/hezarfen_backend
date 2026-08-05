@@ -497,7 +497,11 @@ async fn update_course(
 /// so a course that carries students is never dropped by accident. Once empty,
 /// it cascades the course's exams (with their results, questions, answers, and
 /// question images), its homework (with submissions, submission files, and
-/// grades), its sessions and roll call, and its subjects.
+/// grades), its sessions and roll call, and its subjects. It also detaches the
+/// course from every class that carried it and strikes its id out of every
+/// class blueprint that named it — a template holding a course nothing can
+/// resolve is a stocking run that skips it and a `PATCH` that refuses the very
+/// list the template already holds.
 #[utoipa::path(
     delete,
     path = "/{id}",
