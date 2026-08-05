@@ -333,6 +333,23 @@ fn soon() -> i64 {
     Timestamp::now().as_millis() + 3_600_000
 }
 
+/// Bring a scheduled lesson's start time back into the past, so a roll call
+/// taken now is taken *during* the lesson rather than a week ahead of it.
+///
+/// This manipulates **stored state, never the clock**, the same trick
+/// `age_one_day` uses below and for the same reason: no route can do it. Both
+/// `POST /courses/{id}/sessions` and the session PATCH refuse a start time in
+/// the past — which is what makes the counter's own gate worth having, since a
+/// client can only ever schedule *forward* into an unheld lesson.
+async fn ring_the_bell(db: &Database, session: &str) {
+    db.query("UPDATE type::record('course_session', $id) SET starts_at = 1")
+        .bind(("id", session.to_string()))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+}
+
 /// A lesson is credited to its teacher when the roll call is *taken*, once:
 /// the first student marked stamps it, and the second and third credit nothing
 /// further however many are on the roster.
@@ -357,12 +374,24 @@ async fn the_first_roll_call_credits_the_lesson_once_and_only_students_attend() 
     }
     let session = create_session(&app, &teacher, &course, soon()).await;
 
+    // The lesson is still an hour away. Opening the sheet early is allowed and
+    // the mark stands, but it holds nothing — ungated, two hundred lessons
+    // scheduled for next week would be two hundred held this afternoon.
+    roll_call(&app, &teacher, &session, &students[0].1, "present").await;
+    let early = my_profile(&app, &teacher).await;
+    assert_eq!(
+        stat(&early, "lessons_held_total"),
+        0,
+        "next week's lesson was held today: {early}"
+    );
+
+    ring_the_bell(&db, &session).await;
     roll_call(&app, &teacher, &session, &students[0].1, "present").await;
     let held = my_profile(&app, &teacher).await;
     assert_eq!(
         stat(&held, "lessons_held_total"),
         1,
-        "taking the roll call is what holds a lesson: {held}"
+        "taking the roll call during the lesson is what holds it: {held}"
     );
 
     roll_call(&app, &teacher, &session, &students[1].1, "present").await;
@@ -415,6 +444,7 @@ async fn a_correction_lowers_the_counter_but_never_takes_the_badge_back() {
     for lesson in 0..10 {
         let starts_at = soon() + lesson * 3_600_000;
         let session = create_session(&app, &teacher, &course, starts_at).await;
+        ring_the_bell(&db, &session).await;
         roll_call(&app, &teacher, &session, &student_id, "present").await;
         sessions.push(session);
     }

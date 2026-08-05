@@ -140,8 +140,34 @@ impl SessionAttendance {
     ///   conflict detection (and `transaction_with_retry` behind it) is what
     ///   keeps the stamp from being set twice.
     ///
+    ///   "Actually happened" is a clock reading, not a request count: the
+    ///   credit waits for the lesson's own `starts_at` to arrive. Roll call is
+    ///   deliberately *not* time-gated — a teacher may open the sheet early and
+    ///   is never refused — so without this a teacher could schedule two
+    ///   hundred lessons for next week, mark one student in each, and hold two
+    ///   hundred lessons this afternoon. Because the stamp is written only on
+    ///   the branch that credits, a sheet opened early and touched again after
+    ///   the bell still credits exactly once, then; a sheet never touched
+    ///   again credits never, which is the deliberate cost of not storing a
+    ///   promise the passage of time would have to redeem on its own.
+    ///
+    ///   `lessons_attended_total` is *not* gated the same way, and the
+    ///   asymmetry is on purpose: it is a delta off the row's stored status,
+    ///   which carries no record of whether the credit was ever taken, so a
+    ///   gate would refund at the correction what the early mark never
+    ///   credited — a student's real lessons eaten by someone else's farm. It
+    ///   is also nobody's self-service: only a teacher can mark a student, so
+    ///   the counter cannot be moved by the person it decorates.
+    ///
     /// Both are floored/guarded rather than trusting the column to exist: a row
     /// written before these columns carries none of them.
+    //
+    // ponytail: that asymmetry leaves a teacher able to inflate a *student's*
+    // attendance with future-dated lessons. Closing it needs the credit stamped
+    // on the roll-call row itself and refunded off that stamp — the same column
+    // the live-role note on `remove` below wants, and the shape
+    // `counted_on_time` already uses for homework. One column closes both;
+    // neither is worth it until a real complaint names one.
     pub async fn mark(
         session: &CourseSession,
         user: &UserId,
@@ -166,6 +192,7 @@ impl SessionAttendance {
                  LET $teacher = (SELECT VALUE teacher FROM ONLY $sess);
                  IF $teacher IS NONE {{ THROW 'session_missing' }};
                  LET $counted = (SELECT VALUE {LESSON_COUNTED_AT_FIELD} FROM ONLY $sess);
+                 LET $begun = ((SELECT VALUE starts_at FROM ONLY $sess) <= $stamp);
                  LET $student = ((SELECT VALUE role FROM ONLY $usr) = 'student');
                  LET $was = ((SELECT VALUE status FROM ONLY $id) IN ['present', 'late']);
                  LET $after = (UPSERT $id CONTENT $row RETURN AFTER);
@@ -173,7 +200,7 @@ impl SessionAttendance {
                      UPDATE $usr SET {LESSONS_ATTENDED_TOTAL_FIELD} =
                          math::max([({LESSONS_ATTENDED_TOTAL_FIELD} ?? 0) + $delta, 0])
                  }};
-                 IF $counted IS NONE {{
+                 IF ($counted IS NONE) AND $begun {{
                      UPDATE $sess SET {LESSON_COUNTED_AT_FIELD} = $stamp;
                      UPDATE $teacher SET {LESSONS_HELD_TOTAL_FIELD} =
                          ({LESSONS_HELD_TOTAL_FIELD} ?? 0) + 1
@@ -337,17 +364,22 @@ mod tests {
         a_user(key, Role::Teacher, db).await
     }
 
-    async fn a_session(teacher: &UserId, db: &Database) -> CourseSession {
+    async fn a_session_at(teacher: &UserId, starts_at: i64, db: &Database) -> CourseSession {
         CourseSession::create(
             &CourseId::from_key("c"),
             teacher,
             SessionTopic::try_new("limits").unwrap(),
-            Timestamp::from_millis(1),
+            Timestamp::from_millis(starts_at),
             None,
             db,
         )
         .await
         .unwrap()
+    }
+
+    /// A lesson long since begun — every test but the gate's own wants one.
+    async fn a_session(teacher: &UserId, db: &Database) -> CourseSession {
+        a_session_at(teacher, 1, db).await
     }
 
     /// A status this school allows — the four core ones plus a school-added
@@ -434,6 +466,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(held(&teacher, &db).await, 2);
+    }
+
+    /// A lesson is held when its own time comes, not when the sheet is opened.
+    /// Roll call is never refused early, so ungated a teacher could schedule
+    /// two hundred lessons for next week and hold all of them this afternoon.
+    #[tokio::test]
+    async fn a_lesson_that_has_not_started_holds_nothing_yet() {
+        let db = init_mem().await.unwrap();
+        let teacher = a_teacher("t", &db).await;
+        let student = a_student("s", &db).await;
+        let next_week =
+            a_session_at(&teacher, Timestamp::now().as_millis() + 604_800_000, &db).await;
+
+        SessionAttendance::mark(&next_week, &student, status("present"), &teacher, &db)
+            .await
+            .unwrap();
+        assert_eq!(held(&teacher, &db).await, 0, "next week's lesson, today");
+        // The mark itself stands — opening the sheet early is not an error.
+        assert_eq!(attended(&student, &db).await, 1);
+
+        // The bell rings. The same sheet, touched again, credits now — and
+        // only once: nothing backfills, so the stamp is the whole guard.
+        db.query("UPDATE $sess SET starts_at = 1")
+            .bind(("sess", next_week.get_id().record()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        for (status_value, why) in [("late", "the bell rang"), ("present", "held twice")] {
+            SessionAttendance::mark(&next_week, &student, status(status_value), &teacher, &db)
+                .await
+                .unwrap();
+            assert_eq!(held(&teacher, &db).await, 1, "{why}");
+        }
     }
 
     /// Attending lessons is a student's badge. A teacher marked present in
