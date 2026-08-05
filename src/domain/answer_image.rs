@@ -68,6 +68,16 @@ pub struct AnswerImage {
     size: i64,
 }
 
+/// What one [`AnswerImage::upsert`] transaction returns: the row it stored and
+/// the blob name it replaced. Both are arrays because SurrealDB drops an object
+/// key valued `NONE` on the way out, while an empty array survives — "nothing
+/// was replaced" has to be readable, not missing.
+#[derive(SurrealValue)]
+struct UpsertOutcome {
+    stored: Vec<AnswerImage>,
+    replaced: Vec<String>,
+}
+
 impl AnswerImage {
     /// Assemble a row (fresh blob name generated here) without persisting it.
     /// The caller writes the blob under [`Self::get_file`] first, then calls
@@ -115,7 +125,15 @@ impl AnswerImage {
 
     /// Create or replace the student's drawing for the question — the
     /// deterministic id makes this the whole "one drawing per student per
-    /// question" story.
+    /// question" story — handing back what it stored plus the blob name it
+    /// replaced, for the caller to take off disk.
+    ///
+    /// The replaced name is read *here*, inside this transaction, not by the
+    /// caller in front of it: two uploads to one (question, user, seq) both
+    /// write this row, so they contend and the loser re-reads the winner's blob
+    /// name, where two pre-reads both saw the *old* blob and left the loser's
+    /// fresh one on disk with nothing pointing at it. Same shape as
+    /// [`crate::domain::question_image::QuestionImage::upsert`].
     ///
     /// `NotFound` = the exam is gone, and the drawing was *not* written. The
     /// write moves the exam's mark counter and puts it straight back, in this
@@ -141,7 +159,7 @@ impl AnswerImage {
     /// `UPSERT`'s id is bijective with the (question, user, seq) triple this
     /// table keys — a lost round wrote nothing, and re-sending resolves onto
     /// the same row rather than colliding with it.
-    pub async fn upsert(self, db: &Database) -> Result<AnswerImage, AppError> {
+    pub async fn upsert(self, db: &Database) -> Result<(AnswerImage, Option<String>), AppError> {
         // whole-row-save-ok: self is built in place from the request, never read back, and the (question, user, seq) id is deterministic — replacing the row *is* the operation
         let (exam, id) = (self.exam.record(), self.id.record());
         let (mut result, mut errors) = transaction_with_retry(
@@ -153,8 +171,9 @@ impl AnswerImage {
                      ({EXAM_RESULT_COUNT_FIELD} ?? 0) + 1 RETURN VALUE id);
                  IF array::len($touched) = 0 {{ THROW 'no_exam' }};
                  UPDATE $ex SET {EXAM_RESULT_COUNT_FIELD} = $was;
+                 LET $replaced = (SELECT VALUE file FROM $id);
                  LET $row = (UPSERT $id CONTENT $image RETURN AFTER);
-                 RETURN $row[0];
+                 RETURN {{ stored: $row, replaced: $replaced }};
                  COMMIT TRANSACTION;"
             ),
             &[
@@ -180,11 +199,14 @@ impl AnswerImage {
         // slot follows the statement count rather than a hand-kept number;
         // `num_statements` counts BEGIN and COMMIT.
         let slot = result.num_statements().saturating_sub(2);
-        result
-            .take::<Vec<AnswerImage>>(slot)?
+        let failed = || AppError::Internal("failed to store answer image".into());
+        let outcome = result
+            .take::<Vec<UpsertOutcome>>(slot)?
             .into_iter()
             .next()
-            .ok_or_else(|| AppError::Internal("failed to store answer image".into()))
+            .ok_or_else(failed)?;
+        let stored = outcome.stored.into_iter().next().ok_or_else(failed)?;
+        Ok((stored, outcome.replaced.into_iter().next()))
     }
 
     /// The student's drawing for one question in one sitting, if any.
@@ -318,16 +340,19 @@ mod tests {
         let question = ExamQuestionId::generate();
         let user = student();
 
-        let first = AnswerImage::new(&exam, &question, &user, 1, png(), 3)
+        let (first, retired) = AnswerImage::new(&exam, &question, &user, 1, png(), 3)
             .upsert(&db)
             .await
             .unwrap();
-        let second = AnswerImage::new(&exam, &question, &user, 1, png(), 5)
+        assert_eq!(retired, None, "a first upload retires no blob");
+        let (second, retired) = AnswerImage::new(&exam, &question, &user, 1, png(), 5)
             .upsert(&db)
             .await
             .unwrap();
-        // Same (question, user, seq), same row — the replace swapped the blob.
+        // Same (question, user, seq), same row — the replace swapped the blob,
+        // and the write itself names the blob the caller must unlink.
         assert_ne!(first.get_file(), second.get_file());
+        assert_eq!(retired.as_deref(), Some(first.get_file()));
         let rows = AnswerImage::list_for_exam_user(&exam, &user, 1, &db)
             .await
             .unwrap();

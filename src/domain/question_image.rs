@@ -61,6 +61,16 @@ pub struct QuestionImage {
     size: i64,
 }
 
+/// What one [`QuestionImage::upsert`] transaction returns: the row it stored
+/// and the blob name it replaced. Both are arrays because SurrealDB drops an
+/// object key valued `NONE` on the way out, while an empty array survives —
+/// "nothing was replaced" has to be readable, not missing.
+#[derive(SurrealValue)]
+struct UpsertOutcome {
+    stored: Vec<QuestionImage>,
+    replaced: Vec<String>,
+}
+
 impl QuestionImage {
     /// Assemble a row (fresh blob name generated here) without persisting it.
     /// The caller writes the blob under [`Self::get_file`] first, then calls
@@ -104,15 +114,24 @@ impl QuestionImage {
     }
 
     /// Create or replace the slot's image row — the deterministic id makes
-    /// this the whole "one image per slot" story. Refused once the exam has an
-    /// attempt: pictures are part of the question, so they freeze with it, and
-    /// the gate is in this transaction rather than in a lock the caller held.
-    pub async fn upsert(self, db: &Database) -> Result<QuestionImage, AppError> {
+    /// this the whole "one image per slot" story — handing back what it stored
+    /// plus the blob name it replaced, for the caller to take off disk. Refused
+    /// once the exam has an attempt: pictures are part of the question, so they
+    /// freeze with it, and the gate is in this transaction rather than in a lock
+    /// the caller held.
+    ///
+    /// The replaced name is read *here*, not by the caller before it: two
+    /// uploads to one slot both write this row, so they contend and the loser
+    /// re-reads the winner's blob name, where two pre-reads both saw the *old*
+    /// blob and left the loser's fresh one orphaned on disk.
+    pub async fn upsert(self, db: &Database) -> Result<(QuestionImage, Option<String>), AppError> {
         // whole-row-save-ok: self is built in place, never read back, and the slot id is deterministic
         let (exam, id) = (self.exam.clone(), self.id.record());
         let mut result = ExamAttempt::write_unfrozen(
             &exam,
-            "UPSERT $id CONTENT $image;",
+            "LET $replaced = (SELECT VALUE file FROM $id);
+             LET $stored = (UPSERT $id CONTENT $image);
+             RETURN { stored: $stored, replaced: $replaced };",
             vec![
                 ("id".into(), id.into_value()),
                 ("image".into(), self.into_value()),
@@ -120,11 +139,18 @@ impl QuestionImage {
             db,
         )
         .await?;
-        result
-            .take::<Vec<QuestionImage>>(ExamAttempt::FROZEN_SLOT)?
+        // The trailing `RETURN` is the last statement before `COMMIT`, so its
+        // slot follows the statement count rather than a hand-kept number;
+        // `num_statements` counts BEGIN and COMMIT.
+        let slot = result.num_statements().saturating_sub(2);
+        let failed = || AppError::Internal("failed to store question image".into());
+        let outcome = result
+            .take::<Vec<UpsertOutcome>>(slot)?
             .into_iter()
             .next()
-            .ok_or_else(|| AppError::Internal("failed to store question image".into()))
+            .ok_or_else(failed)?;
+        let stored = outcome.stored.into_iter().next().ok_or_else(failed)?;
+        Ok((stored, outcome.replaced.into_iter().next()))
     }
 
     pub async fn read_slot(
@@ -275,16 +301,19 @@ mod tests {
         let question = ExamQuestionId::generate();
         let ids = choice_ids();
 
-        let first = QuestionImage::new(&exam, &question, None, png(), 3)
+        let (first, retired) = QuestionImage::new(&exam, &question, None, png(), 3)
             .upsert(&db)
             .await
             .unwrap();
-        let second = QuestionImage::new(&exam, &question, None, png(), 5)
+        assert_eq!(retired, None, "a first upload retires no blob");
+        let (second, retired) = QuestionImage::new(&exam, &question, None, png(), 5)
             .upsert(&db)
             .await
             .unwrap();
-        // Same slot, same row — the replace swapped the blob pointer.
+        // Same slot, same row — the replace swapped the blob pointer, and the
+        // write itself names the blob the caller must unlink.
         assert_ne!(first.get_file(), second.get_file());
+        assert_eq!(retired.as_deref(), Some(first.get_file()));
         let rows = QuestionImage::list_for_question(&question, &db)
             .await
             .unwrap();

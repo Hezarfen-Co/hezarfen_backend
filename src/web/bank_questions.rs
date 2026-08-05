@@ -401,9 +401,12 @@ async fn owned_question(st: &AppState, user: &User, bid: &str) -> Result<BankQue
     Ok(question)
 }
 
-/// The bank-image write tail: the slot's current row names the blob to retire,
-/// the UPSERT replaces it (the deterministic per-slot id makes it a replace),
-/// and [`store_blob`] owns the disk ordering.
+/// The bank-image write tail: the UPSERT replaces the slot's row (the
+/// deterministic per-slot id makes it a replace) and names the blob it retired
+/// *from inside its own transaction*, and [`store_blob`] owns the disk
+/// ordering. Reading the slot out here first instead would hand two uploads
+/// racing on one slot the same old blob name, leaving the loser's fresh one on
+/// disk with no row pointing at it.
 pub(crate) async fn store_image(
     st: &AppState,
     question: &BankQuestionId,
@@ -411,14 +414,9 @@ pub(crate) async fn store_image(
     content_type: FileContentType,
     data: &[u8],
 ) -> Result<BankQuestionImage, AppError> {
-    let replaced = BankQuestionImage::read_slot(question, slot, &st.db).await?;
     let image = BankQuestionImage::new(question, slot, content_type, data.len() as i64);
     let file = image.get_file().to_string();
-    store_blob(st, &file, data, || async {
-        let stored = image.upsert(&st.db).await?;
-        Ok((stored, replaced.map(|old| old.get_file().to_string())))
-    })
-    .await
+    store_blob(st, &file, data, || async { image.upsert(&st.db).await }).await
 }
 
 /// Add a template to the bank. Requires teacher+. `subject_id` is origin
@@ -729,9 +727,10 @@ async fn delete_question(
 ) -> Result<StatusCode, AppError> {
     let question = owned_question(&st, &user, &bid).await?;
     // Rows go first (the delete cascades the image rows), blobs after — a crash
-    // in between strands at worst an unreachable blob.
-    let images = BankQuestionImage::list_for_question(question.get_id(), &st.db).await?;
-    question.delete(&st.db).await?;
+    // in between strands at worst an unreachable blob. The blobs come from what
+    // the delete *swept*, never a list read before it: an upload that landed in
+    // between is swept too, and its blob would be stranded for good.
+    let (_, images) = question.delete(&st.db).await?;
     for image in &images {
         remove_blob(&st.files_path, image.get_file()).await;
     }
