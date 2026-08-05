@@ -1561,6 +1561,14 @@ re-read stays as the belt for a slot an older build stranded — such a slot
 drops out of the bookable list and booking one is refused with a `409`.
 The list does not say whether a slot is already taken — booking a taken one
 answers `409`.
+Every slot carries its teacher's identity (id, username, display name), to a
+parent as much as to a student: **deliberate**, and not to be tightened. A
+parent's three direct routes to that identity are all shut (`GET
+/users/{id}/profile` is a `403`, `/users/search` is teacher+, `/users` is
+admin), but a conference cannot be booked off an anonymous calendar — this list
+*is* the staff directory for the booking flow, narrowed to whoever published
+bookable time. The same refs on a booking (`teacher`, `proposed_by`,
+`decided_by`) read the same way.
 
 **Booking.** `POST /appointments` (`{slot, reason}` — the reason is required,
 ≤ 1000 chars) is for **students and parents only**; staff arrange between
@@ -1581,14 +1589,6 @@ concurrent bookings can both read as free). The decisions:
   `teacher` decides nothing on it any more — and nothing is left for anyone
   else to decide either, since that demotion cancelled the bookings along with
   the slots. Refused
-Every slot carries its teacher's identity (id, username, display name), to a
-parent as much as to a student: **deliberate**, and not to be tightened. A
-parent's three direct routes to that identity are all shut (`GET
-/users/{id}/profile` is a `403`, `/users/search` is teacher+, `/users` is
-admin), but a conference cannot be booked off an anonymous calendar — this list
-*is* the staff directory for the booking flow, narrowed to whoever published
-bookable time. The same refs on a booking (`teacher`, `proposed_by`,
-`decided_by`) read the same way.
   (`409`) when the effective window has already started, and refused while a
   counter-proposal stands: the proposal is the teacher's own, so approving it
   here would let them confirm a time the requester never accepted.
@@ -1846,7 +1846,25 @@ The school publishes **one menu per calendar day and meal slot** (`POST
   the deadline is counted back from an instant that day has none of. Menus
   stored on such a day before this rule refuse booking and cancelling outright
   (`409`) whenever a cutoff is configured: a deadline that cannot be worked out
-  fails closed, and the menu has to be republished on a real day.
+  fails closed, and the menu has to be republished on a real day. That day is
+  decided by **one parser**: the text is parsed by the same calendar library
+  that computes the serving instant and compared back to what came in, so the
+  two can never disagree. Hand-rolled digit parsing did disagree — `"+1"`
+  parses as `1` for an unsigned integer, so `2026-+1-01` passed the
+  calendar-day check and minted a **second** menu id for the 1st of January,
+  with its own capacity and seat counter, invisible to every `?from=&to=` read
+  (`+` sorts below `0`) and unbookable besides, since the serving-instant
+  parser refused the very same text. Anything that does not round-trip
+  identically — a sign, a missing zero — is a `400`.
+- **The day must not already be over** (`400` at `POST /meals/menus`): every
+  other create path in the app refuses a past date, and this one is the
+  expensive omission, because a published menu is a bookable one and **a
+  booking is what charges** — a menu backdated by a manager mints a real,
+  permanent ledger line for food nobody can be served. It is measured against
+  the *end* of the day, so today's menu publishes at any hour; the meal's own
+  deadline is `meal_cancel_cutoff_minutes`, a separate and optional thing. A
+  past term is a legitimate record (`/terms` exempts itself deliberately); a
+  past menu is a charge.
 - **`slot` is a snapshot**, not a link into settings. It must be one of the
   school's `meal_slots` (`GET /settings`) *when the menu is written*, and it
   is stored as text — so retiring a slot later never rewrites a menu already
@@ -2023,6 +2041,18 @@ teacher or manager ordering a child's lunch is a `403`.
   canteen's to cancel. Rows already past the ceiling — an upgrade's leftovers —
   are untouched: cancelling consults no ceiling, so such a seat and its money
   stay reachable, and only one more re-booking is refused.
+- **A menu whose day has already passed takes no booking** (`409`), whatever
+  the cutoff says. Refusing it at publish time is not enough on its own: a menu
+  published legitimately days ago, for a day that has *since* gone by, stayed
+  bookable and therefore billable forever. This is not a deadline before the
+  meal — it is the day itself being over, which no setting can make untrue, so
+  it holds with `meal_cancel_cutoff_minutes` unset and on a slot with no
+  `serving_minute` (the shipped default, and the case that must keep working
+  for **today's** menu at every hour). Nothing bypasses it, since only students
+  and their parents book at all — a manager back-entering a seat is exactly how
+  a bogus charge would be minted. **Cancelling stays open** on such a menu:
+  money already taken has to stay reversible, and that is the same reason
+  manager+ is not held to the cutoff.
 - A menu somebody still holds a seat on **cannot be unpublished** (`409`) —
   cancel the bookings first, so nothing is left pointing at a deleted meal.
 
@@ -2416,6 +2446,10 @@ Two per-exam policy knobs ride along, both **live-editable** at any point:
   reads (`GET /exams/{id}/review/attempts[/{seq}/answers[/{qid}/image]]`). A
   student may review only when this is on **and** the teacher has marked them
   (an `ExamResult` row exists); own-scoped, so no student reads another's sheet.
+  The mark is checked **before** the flag, so a caller who has none reads `404`
+  whichever way `allow_review` is set — an outsider (an unenrolled student, a
+  parent) never learns from the status code whether review is on for an exam
+  `GET /exams/{id}` would refuse them outright.
   All four reads are refused (`409`) while the caller can still **write** a
   sitting at that exam — one in progress, *or* one they may still start: a mark
   on sitting 1 must not open the answer key to someone who can post sitting 2
@@ -2466,10 +2500,6 @@ construction):
   staff never sit; enrolled; window open where one exists — `open` exams start
   anytime). While the latest
   sitting runs, re-posting returns it unchanged (`200`, not `201`):
-  The mark is checked **before** the flag, so a caller who has none reads `404`
-  whichever way `allow_review` is set — an outsider (an unenrolled student, a
-  parent) never learns from the status code whether review is on for an exam
-  `GET /exams/{id}` would refuse them outright.
   reconnecting never resets the clock. Once it is submitted or expired,
   re-posting mints the next sitting (`201`) **from a blank answer sheet** —
   the previous sitting's answers are wiped — until `max_attempts` is spent
