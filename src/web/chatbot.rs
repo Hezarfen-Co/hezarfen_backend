@@ -404,20 +404,18 @@ async fn send_message(
         return Ok(unavailable("no AI service is connected right now"));
     }
 
+    // Each create rides the thread's own row — it moves `updated_at` (the
+    // list's sort key, so this is also the activity stamp) inside its own
+    // transaction. That is what serializes a turn against `DELETE
+    // /chatbot/threads/{id}`: the read above cannot, since reads do not
+    // conflict, and a row written into the delete's window survived it as a
+    // turn under a thread that is gone. A thread deleted between the two
+    // creates therefore refuses the second one with a 404 — and the first is
+    // swept by that same delete, so the turn leaves no half of itself behind.
     let prompt =
         ChatbotMessage::append_user(thread.get_id(), user.get_id(), content, &st.db).await?;
     let answer =
         ChatbotMessage::append_pending_assistant(thread.get_id(), user.get_id(), &st.db).await?;
-    // Never fatal: both rows are already written, and failing here would strand
-    // the pending one with no task to answer it (it would only settle 300s
-    // later, by projection). `updated_at` is the list's sort key — cosmetic
-    // next to a turn that has been accepted.
-    if let Err(err) = thread.touch(&st.db).await {
-        tracing::warn!(
-            "could not stamp activity on thread {}: {err}",
-            thread.get_id().key()
-        );
-    }
 
     let message_id = answer.get_id().key().to_string();
     // Never awaited inline: the bridge round trip can outlast the request
@@ -668,12 +666,23 @@ async fn read_message(
 
 /// Read one turn only if the caller owns it *and* it belongs to the named
 /// thread — a mismatched pair is a `404`, like a foreign one.
+///
+/// The thread is re-read rather than inferred from the message's `thread_id`,
+/// and that is defence in depth for rows written by an older binary: a turn
+/// accepted into the window of its thread's delete used to survive it, and
+/// nothing sweeps such a row, so on a live volume the text of a deleted thread
+/// stayed readable through these two routes. Turns can no longer be orphaned
+/// (see [`ChatbotMessage`]'s insert), but the ones already there must read as
+/// gone. Cheap where it sits: the SSE poll loop re-reads only the message row,
+/// so this is one extra record read per polling client, not per tick of every
+/// stream.
 async fn own_message(
     thread: &str,
     message: &str,
     user: &UserId,
     db: &Database,
 ) -> Result<ChatbotMessage, AppError> {
+    own_thread(thread, user, db).await?;
     ChatbotMessage::read_for(&ChatbotMessageId::from_key(message), user, db)
         .await?
         .filter(|message| message.get_thread_id().key() == thread)
@@ -860,6 +869,13 @@ mod tests {
         // shrink it: filtering a fixed-size tail after the fact handed the
         // service a handful of unanswered prompts and nothing older.
         let db = crate::database::init_mem().await.unwrap();
+        // A real thread row: every turn is written through it, so a turn with
+        // no thread is refused.
+        db.query("CREATE chatbot_thread:c SET user_id = user:u, created_at = 0, updated_at = 0")
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
         let thread = ChatbotThreadId::from_key("c");
         let user = UserId::from_key("u");
         let say = |text: String| ChatContent::try_new(&text).unwrap();

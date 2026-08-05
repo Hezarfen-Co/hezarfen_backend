@@ -3,13 +3,13 @@
 //! threads list newest-activity-first. The turns themselves live in
 //! [`crate::domain::chatbot_message`], and deleting a thread cascades them.
 
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
+use surrealdb::types::{RecordId, RecordIdKey, SurrealValue, Value};
 
 use crate::constant::{
     CHATBOT_THREAD_COUNT_FIELD, CHATBOT_THREAD_TABLE, DEFAULT_MAX_CHATBOT_THREADS,
     MAX_CHATBOT_THREAD_TITLE_LEN, SETTINGS_KEY, SETTINGS_TABLE,
 };
-use crate::database::Database;
+use crate::database::{Database, transaction_with_retry};
 use crate::domain::cap;
 use crate::domain::monotonic_id::next_ulid;
 use crate::domain::page::PagedList;
@@ -44,6 +44,77 @@ impl ChatbotThreadId {
             _ => "",
         }
     }
+}
+
+/// Move the thread's `updated_at` **and** run `statement` — a write to a turn
+/// hanging off that thread — in one transaction, handing back the row it
+/// returned. [`AppError::NotFound`] means the thread is gone and `statement`
+/// wrote nothing.
+///
+/// The bump is what ties a turn's fate to its thread, and reading the thread
+/// first does not: [`ChatbotThread::delete`] sweeps `chatbot_message` and drops
+/// the thread in one transaction, so a create landing after that sweep but
+/// before its commit reads a thread that is still there (uncommitted) while the
+/// sweep ran on a snapshot predating the new row — both commit, and the turn
+/// outlives the thread it was deleted with, readable and deletable by nothing.
+/// Reads do not conflict; only a write that *moves* a value on a key the delete
+/// also writes does. That is the shape
+/// [`bump_menu_and_write`](crate::domain::menu::bump_menu_and_write) and
+/// [`ExamAnswer::save`](crate::domain::exam_answer::ExamAnswer::save) already
+/// use, and the sweep's ordering inside the delete stops mattering once it is
+/// in place.
+///
+/// `updated_at` is the value moved, and it doubles as the stamp the thread list
+/// sorts on — this *is* the activity touch the send path used to issue
+/// afterwards as a separate, best-effort query whose failure was only logged.
+/// It is written strictly upwards rather than to `$now`: an `UPDATE` that
+/// leaves the document unchanged is elided and never reaches the store's write
+/// set, a turn's two rows are routinely written inside one millisecond, and a
+/// write that does not happen collides with nothing. The stamp can therefore
+/// sit a few milliseconds ahead of the clock, which an ordering key does not
+/// care about.
+///
+/// Admissible for [`transaction_with_retry`] as long as `statement` is: the
+/// `UPDATE`, the `IF`/`THROW` and the `RETURN` can never answer "already
+/// exists", and neither can a `CREATE` on a freshly minted ULID on a table with
+/// no `UNIQUE` index — no rival can have aimed at it, and a lost round wrote
+/// nothing, so re-sending it is the recovery.
+pub(crate) async fn touch_and_write<T: SurrealValue>(
+    thread: &ChatbotThreadId,
+    statement: &str,
+    mut bindings: Vec<(String, Value)>,
+    db: &Database,
+) -> Result<Option<T>, AppError> {
+    bindings.push(("conv".into(), thread.record().into_value()));
+    bindings.push(("now".into(), Timestamp::now().as_millis().into_value()));
+    let (mut result, mut errors) = transaction_with_retry(
+        db,
+        &format!(
+            "BEGIN TRANSACTION;
+             LET $touched = (UPDATE $conv SET updated_at = \
+                 math::max([$now, updated_at + 1]) RETURN VALUE id);
+             IF array::len($touched) = 0 {{ THROW 'no_thread' }};
+             LET $row = ({statement});
+             RETURN $row;
+             COMMIT TRANSACTION;"
+        ),
+        &bindings,
+        &["no_thread"],
+    )
+    .await?;
+    // An aborted transaction errors *every* slot, most with a generic "not
+    // executed" — only the THROW's own slot names the reason.
+    if errors
+        .values()
+        .any(|error| error.to_string().contains("no_thread"))
+    {
+        return Err(AppError::NotFound);
+    }
+    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+        return Err(error.into());
+    }
+    // Slots count BEGIN, the LET, the IF and the second LET: the RETURN is 4.
+    Ok(result.take::<Vec<T>>(4)?.into_iter().next())
 }
 
 /// A user-chosen thread name. Required-and-bounded here; "untitled" is
@@ -188,21 +259,10 @@ impl ChatbotThread {
         Ok(thread.filter(|thread| &thread.user_id == user))
     }
 
-    /// Stamp new activity. Field-scoped: a rename may be landing concurrently,
-    /// and a whole-row save would clobber it.
-    pub async fn touch(&self, db: &Database) -> Result<ChatbotThread, AppError> {
-        let mut result = db
-            .query("UPDATE $id SET updated_at = $now RETURN AFTER")
-            .bind(("id", self.id.record()))
-            .bind(("now", Timestamp::now().as_millis()))
-            .await?
-            .check()?;
-        result
-            .take::<Vec<ChatbotThread>>(0)?
-            .into_iter()
-            .next()
-            .ok_or(AppError::NotFound)
-    }
+    // Stamping new activity is not a call of its own: it is the bump inside
+    // [`touch_and_write`], which every turn already rides, so a stamp can no
+    // longer be lost (it used to be a best-effort query after the two creates,
+    // whose failure was a `warn!`) and no turn can be written without it.
 
     /// Rename the thread (`None` clears the name back to untitled), stamping
     /// the edit as activity. Field-scoped for the same reason as
@@ -308,6 +368,155 @@ mod tests {
             (1, 1),
             "a refused create advances neither"
         );
+    }
+
+    /// A turn is written *through* its thread's row, so a thread that is gone
+    /// takes the write with it — and one that is there is stamped by it.
+    /// The race this shape exists to close is the `#[ignore]`d test below;
+    /// this one pins the logic, which the in-memory engine can answer.
+    #[tokio::test]
+    async fn a_turn_writes_its_thread_and_dies_with_it() {
+        use crate::domain::chatbot_message::{ChatContent, ChatbotMessage};
+
+        let db = a_user_capped_at(2).await;
+        let user = UserId::from_key("u");
+        let thread = ChatbotThread::create_capped(&user, None, &db)
+            .await
+            .expect("thread");
+        let opened = thread.get_updated_at().as_millis();
+
+        let say = || ChatContent::try_new("selam").unwrap();
+        ChatbotMessage::append_user(thread.get_id(), &user, say(), &db)
+            .await
+            .expect("append");
+        let stamped = ChatbotThread::read_for(thread.get_id(), &user, &db)
+            .await
+            .expect("re-read")
+            .expect("still there")
+            .get_updated_at()
+            .as_millis();
+        // Strictly upwards, never merely re-stamped: an `UPDATE` that leaves
+        // the row unchanged is elided, and both rows of a turn are routinely
+        // written inside one millisecond of the thread's own creation.
+        assert!(stamped > opened, "{stamped} !> {opened}");
+
+        let id = thread.get_id().clone();
+        thread.delete(&db).await.expect("delete");
+        let orphan = ChatbotMessage::append_user(&id, &user, say(), &db).await;
+        assert!(
+            matches!(orphan, Err(AppError::NotFound)),
+            "a turn on a deleted thread must be refused: {orphan:?}"
+        );
+        assert_eq!(
+            ChatbotMessage::list_for_thread(&id, None, 0, &db)
+                .await
+                .expect("list")
+                .1,
+            0,
+            "the refused turn wrote nothing"
+        );
+    }
+
+    /// No turn may survive the delete that swept its thread. An orphan is not
+    /// litter: nothing sweeps `chatbot_message` afterwards, and both
+    /// `GET /chatbot/threads/{id}/messages/{mid}` and its `/stream` answered
+    /// `200` with the text of a thread the user had deleted.
+    ///
+    /// The window is between [`ChatbotThread::delete`]'s sweep and its commit:
+    /// a create landing in there reads a thread that is still present
+    /// (uncommitted) while the sweep ran on a snapshot predating the new row,
+    /// so both commit. It is closed by making the create **write** the thread
+    /// row ([`touch_and_write`]) instead of reading it — the two transactions
+    /// then touch one key and the store refuses to commit both.
+    ///
+    /// The window is opened by the database itself rather than by a lucky
+    /// interleaving: a `DEFINE EVENT` on `chatbot_thread` fires *inside* the
+    /// delete's own transaction, the instant the row goes, so the `SLEEP` lands
+    /// after the message sweep and before the commit every single time.
+    ///
+    /// Real server, and `#[ignore]`d for it: the subject is the store's
+    /// conflict detection, which `init_mem`'s embedded engine does not have —
+    /// it commits both writes and answers `Ok` to each, which would fail this
+    /// test on correct code (see [`crate::database::init_test_server`]).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
+    async fn a_turn_written_inside_a_delete_never_outlives_the_thread() {
+        use crate::domain::chatbot_message::{ChatContent, ChatbotMessage};
+
+        let (db, _serialized) = crate::database::init_test_server("chat_delete_race").await;
+        db.query("CREATE user:u SET username = 'u', password_hash = 'x';")
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        // Hold the delete open for a full second after the thread row is gone,
+        // while its transaction still has to commit.
+        db.query(
+            "DEFINE EVENT hold_the_window ON TABLE chatbot_thread WHEN $event = 'DELETE' \
+             THEN { SLEEP 1s; };",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+        let user = UserId::from_key("u");
+        let (mut orphans, mut swept) = (0, 0);
+        for round in 0..4 {
+            let thread = ChatbotThread::create_capped(&user, None, &db)
+                .await
+                .expect("thread");
+            let id = thread.get_id().clone();
+
+            let drop_it = {
+                let db = db.clone();
+                tokio::spawn(async move { thread.delete(&db).await })
+            };
+            // The turn starts inside the held window — the thread row is gone
+            // but uncommitted, which is exactly what a read believes.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let turn = {
+                let (id, db, user) = (id.clone(), db.clone(), user.clone());
+                tokio::spawn(async move {
+                    ChatbotMessage::append_user(
+                        &id,
+                        &user,
+                        ChatContent::try_new("selam").unwrap(),
+                        &db,
+                    )
+                    .await
+                    .map(|_| ())
+                })
+            };
+            let (drop_it, turn) = (drop_it.await.unwrap(), turn.await.unwrap());
+            // A 404 for the turn, or a NotFound for the delete, is a correct
+            // answer — the only defect is stored state.
+            assert!(
+                !matches!(turn, Err(AppError::Db(_))),
+                "round {round}: a raced turn must be answered, not 500: {turn:?}"
+            );
+
+            // Stored state is the whole verdict; a return value is not evidence.
+            if ChatbotThread::read_for(&id, &user, &db)
+                .await
+                .unwrap()
+                .is_none()
+            {
+                swept += 1;
+                orphans += ChatbotMessage::list_for_thread(&id, None, 0, &db)
+                    .await
+                    .unwrap()
+                    .1;
+            } else if drop_it.is_ok() {
+                panic!("round {round}: the delete reported success but the thread is still there");
+            }
+        }
+        eprintln!("ChatbotThread::delete raced by a turn: {swept}/4 rounds deleted the thread");
+        assert!(
+            swept > 0,
+            "no round ever deleted the thread, so the window was never reached"
+        );
+        assert_eq!(orphans, 0, "a turn outlived its thread");
     }
 
     #[tokio::test]
