@@ -400,6 +400,17 @@ impl Course {
     /// homework-file *blobs* are the web layer's to remove — it collects
     /// their names before calling this.
     ///
+    /// **Bank templates** survive it — they are a separate, reusable library
+    /// spanning every course — so their `source_exam` and `subject` links are
+    /// cleared instead, in this same transaction, exactly as
+    /// [`crate::domain::exam::Exam::delete`] and
+    /// [`crate::domain::subject::Subject::delete`] clear them one level down.
+    /// Deleting a course must leave the bank where deleting each of its exams
+    /// and subjects by hand would have left it, or a template is left pointing
+    /// at a dead exam (permanently: nothing else ever visits that column) and
+    /// at a dead subject the next `PATCH` omitting `subject_id` writes straight
+    /// back.
+    ///
     /// The **grade blueprints** naming it are swept in that same transaction.
     /// Nothing else can reach them — a blueprint holds its courses as a list on
     /// its own row, not as link rows this cascade could delete — and an id left
@@ -461,8 +472,12 @@ impl Course {
              DELETE session_attendance WHERE course = $course;
              DELETE course_session WHERE course = $course;
              DELETE enrollment WHERE course = $course;
+             UPDATE bank_question SET subject = NONE
+                 WHERE subject IN (SELECT VALUE id FROM subject WHERE course = $course);
              DELETE subject WHERE course = $course;
              DELETE homework WHERE course = $course;
+             UPDATE bank_question SET source_exam = NONE
+                 WHERE source_exam IN (SELECT VALUE id FROM exam WHERE course = $course);
              DELETE exam WHERE course = $course;
              COMMIT TRANSACTION;"
         );
@@ -492,6 +507,125 @@ impl Course {
         }
         Ok(true)
     }
+}
+
+/// A real course row, for the tests of every child that must now prove its
+/// parent exists (`Exam`, `CourseSession`, `Subject` — see
+/// [`cap::touch_and_create`]). A minted id nothing wrote is a 404 there, the
+/// way a minted subject id already is for an exam question.
+#[cfg(test)]
+pub(crate) async fn a_test_course(db: &Database) -> CourseId {
+    Course::create(
+        &UserId::generate(),
+        CourseTitle::try_new("test course").unwrap(),
+        CourseDescription::try_new("").unwrap(),
+        CourseKind::course(),
+        None,
+        None,
+        db,
+    )
+    .await
+    .unwrap()
+    .id
+}
+
+/// The race half of "a child of a course must not survive its deletion", run
+/// for one child table: [`Course::delete`] is held open by the schema and
+/// `make` fires its create inside that window, four rounds.
+///
+/// The harness lives here, beside the cascade being raced, and each child names
+/// its own pin in its own module (`exam`, `course_session`, `subject`) — the
+/// loop, the window and the verdict are one fact about *this* delete, and three
+/// copies of it would drift into three different tests of three different
+/// things. The sequential half — a create against a course that is already gone
+/// — is `tests/regress_course_child_orphans.rs`, which needs no server.
+///
+/// The window is opened by the database rather than by a lucky interleaving: a
+/// `DEFINE EVENT` on `course` fires *inside* the delete's own transaction the
+/// instant the row goes, so the `SLEEP` lands between the delete and its
+/// `DELETE <child> WHERE course = $course` sweep every time — and a create
+/// fired into it reads a course that is still there (removed, uncommitted)
+/// while the sweep already ran on a snapshot without its row.
+///
+/// One child per round, for the reason the menu and `class_course` twins
+/// document: a second writer makes the delete lose and re-send, and the re-sent
+/// sweep clears the evidence.
+///
+/// Real server, and every caller is `#[ignore]`d for it: the subject *is* the
+/// store's conflict detection, which `init_mem`'s embedded engine does not
+/// have — it commits both sides and answers `Ok` to each, so this passes there
+/// on broken code.
+#[cfg(test)]
+pub(crate) async fn assert_no_child_outlives_a_course_delete(
+    scratch: &str,
+    table: &str,
+    make: fn(CourseId, Database) -> tokio::task::JoinHandle<Result<(), AppError>>,
+) {
+    // The guard is held for the whole test: these bursts are sub-millisecond,
+    // and a sibling race test's burst pushes a delete clean out of its window.
+    let (db, _serialized) = crate::database::init_test_server(scratch).await;
+    db.query(
+        "DEFINE EVENT hold_the_window ON TABLE course WHEN $event = 'DELETE' \
+         THEN { SLEEP 1s; };",
+    )
+    .await
+    .expect("define the window event")
+    .check()
+    .expect("check the window event");
+
+    let (mut swept, mut orphans) = (0, 0);
+    for round in 0..4 {
+        let course = a_test_course(&db).await;
+        let drop_it = {
+            let (course, db) = (course.clone(), db.clone());
+            tokio::spawn(async move {
+                Course::read(&course, &db)
+                    .await
+                    .unwrap()
+                    .expect("the course is there")
+                    .delete(&db)
+                    .await
+            })
+        };
+        // The create starts inside the held window.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let child = make(course.clone(), db.clone()).await.unwrap();
+        let dropped = drop_it.await.unwrap();
+
+        // A 404 for the create, or a refusal for the delete, is a correct
+        // answer — the only defect is stored state. Nothing may 500.
+        assert!(
+            !matches!(child, Err(AppError::Db(_))),
+            "{table} round {round}: a raced create must be answered, not 500: {child:?}"
+        );
+        assert!(
+            !matches!(dropped, Err(AppError::Db(_))),
+            "{table} round {round}: a raced delete must be answered, not 500: {dropped:?}"
+        );
+
+        // Stored state is the whole verdict; a return value is not evidence.
+        if Course::read(&course, &db).await.unwrap().is_none() {
+            swept += 1;
+            let mut left = db
+                .query(format!(
+                    "SELECT VALUE id FROM {table} WHERE course = $course"
+                ))
+                .bind(("course", course.record()))
+                .await
+                .unwrap()
+                .check()
+                .unwrap();
+            orphans += left.take::<Vec<RecordId>>(0).unwrap().len();
+        } else if matches!(dropped, Ok(true)) {
+            panic!("{table} round {round}: the delete reported success, the course is still there");
+        }
+    }
+    eprintln!("Course::delete raced by a {table} create: {swept}/4 rounds deleted the course");
+    assert!(
+        swept > 0,
+        "{table}: no round ever deleted the course, so the window was never reached"
+    );
+    assert_eq!(orphans, 0, "{table}: a child outlived its course");
 }
 
 #[cfg(test)]

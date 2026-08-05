@@ -1083,7 +1083,6 @@ mod tests {
     mod counters {
         use super::*;
         use crate::database::init_mem;
-        use crate::domain::course::CourseId;
         use crate::domain::exam::{
             Exam, ExamAttemptLimit, ExamDescription, ExamKind, ExamMode, ExamSchedule, ExamTitle,
         };
@@ -1095,7 +1094,7 @@ mod tests {
             let kinds = Settings::defaults().get_exam_kinds().to_vec();
             Exam::create(
                 &UserId::from_key("01TESTTEACHERAAAAAAAAAAAAA"),
-                &CourseId::from_key("01TESTCOURSEAAAAAAAAAAAAAA"),
+                &crate::domain::course::a_test_course(db).await,
                 ExamTitle::try_new("practice").unwrap(),
                 ExamDescription::try_new("").unwrap(),
                 ExamKind::try_new("quiz", &kinds).unwrap(),
@@ -1113,7 +1112,7 @@ mod tests {
 
         async fn a_subject(db: &Database) -> Subject {
             Subject::create(
-                &CourseId::generate(),
+                &crate::domain::course::a_test_course(db).await,
                 SubjectName::try_new("topic").unwrap(),
                 SubjectDescription::try_new("").unwrap(),
                 db,

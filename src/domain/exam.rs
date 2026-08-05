@@ -1,9 +1,11 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
 use crate::constant::{
-    EXAM_TABLE, MAX_EXAM_DESCRIPTION_LEN, MAX_EXAM_TITLE_LEN, UNLIMITED_EXAM_ATTEMPTS,
+    ENROLLMENT_COUNT_FIELD, EXAM_TABLE, MAX_EXAM_DESCRIPTION_LEN, MAX_EXAM_TITLE_LEN,
+    UNLIMITED_EXAM_ATTEMPTS,
 };
 use crate::database::{Database, transaction_with_retry};
+use crate::domain::cap;
 use crate::domain::course::CourseId;
 use crate::domain::monotonic_id::next_ulid;
 use crate::domain::settings::ExamKindDef;
@@ -421,8 +423,20 @@ impl Exam {
             draft,
             result_count: None,
         };
-        let created: Option<Exam> = db.create(exam.id.record()).content(exam).await?;
-        created.ok_or_else(|| AppError::Internal("failed to create exam".into()))
+        // The course row is *written* (bumped and put back), not read: a plain
+        // read does not survive `Course::delete`'s window, and an exam that
+        // outlives its course is unreachable for good — every route to one goes
+        // through `course_of`, which answers a 500 no delete can clear, while
+        // `GET /exams` still lists it. See [`cap::touch_and_create`].
+        cap::touch_and_create(
+            &course.record(),
+            ENROLLMENT_COUNT_FIELD,
+            &exam.id.record(),
+            &exam,
+            db,
+        )
+        .await?
+        .ok_or(AppError::NotFound)
     }
 
     pub async fn read(id: &ExamId, db: &Database) -> Result<Option<Exam>, AppError> {
@@ -678,7 +692,7 @@ pub(crate) async fn published_exam(db: &Database) -> Exam {
         .to_vec();
     Exam::create(
         &UserId::generate(),
-        &CourseId::generate(),
+        &crate::domain::course::a_test_course(db).await,
         ExamTitle::try_new("midterm").unwrap(),
         ExamDescription::try_new("").unwrap(),
         ExamKind::try_new("midterm", &allowed).unwrap(),
@@ -698,6 +712,52 @@ mod tests {
     use super::*;
 
     use crate::domain::exam::published_exam as published;
+
+    /// An exam must not outlive the course it belongs to. It is the worst of
+    /// the three children `Course::delete` used to leave behind: every exam
+    /// route funnels through `course_of`, which answers
+    /// `Internal("exam references a missing course")`, so an orphan **500s
+    /// forever** on `GET`/`PATCH`/`DELETE /exams/{id}` — undeletable — while
+    /// `Exam::list_all` still hands it to every manager+ on `GET /exams`.
+    ///
+    /// [`Exam::create`] therefore *writes* the course row rather than reading
+    /// it ([`cap::touch_and_create`]); the harness and the window it races in
+    /// are documented on
+    /// [`crate::domain::course::assert_no_child_outlives_a_course_delete`].
+    /// Mutation-tested: with the bare `db.create` this shipped with, all four
+    /// rounds orphan.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
+    async fn an_exam_never_outlives_its_course() {
+        fn make(course: CourseId, db: Database) -> tokio::task::JoinHandle<Result<(), AppError>> {
+            tokio::spawn(async move {
+                let kinds = crate::domain::settings::Settings::defaults()
+                    .get_exam_kinds()
+                    .to_vec();
+                Exam::create(
+                    &UserId::generate(),
+                    &course,
+                    ExamTitle::try_new("quiz").unwrap(),
+                    ExamDescription::try_new("").unwrap(),
+                    ExamKind::try_new("quiz", &kinds).unwrap(),
+                    ExamSchedule::try_new(None, None, None, None).unwrap(),
+                    ExamAttemptLimit::try_new(1).unwrap(),
+                    true,
+                    false,
+                    false,
+                    &db,
+                )
+                .await
+                .map(|_| ())
+            })
+        }
+        crate::domain::course::assert_no_child_outlives_a_course_delete(
+            "exam_orphan_race",
+            EXAM_TABLE,
+            make,
+        )
+        .await;
+    }
 
     fn edit(exam: &Exam) -> (ExamTitle, ExamDescription, ExamKind, ExamSchedule) {
         (
@@ -1064,7 +1124,7 @@ mod tests {
         )
         .unwrap();
         let subject = crate::domain::subject::Subject::create(
-            &CourseId::generate(),
+            &crate::domain::course::a_test_course(db).await,
             crate::domain::subject::SubjectName::try_new("topic").unwrap(),
             crate::domain::subject::SubjectDescription::try_new("").unwrap(),
             db,
@@ -1208,7 +1268,7 @@ mod tests {
             let exam = published(&db).await;
             let id = exam.get_id().clone();
             let subject = Subject::create(
-                &CourseId::generate(),
+                &crate::domain::course::a_test_course(&db).await,
                 crate::domain::subject::SubjectName::try_new("topic").unwrap(),
                 crate::domain::subject::SubjectDescription::try_new("").unwrap(),
                 &db,
