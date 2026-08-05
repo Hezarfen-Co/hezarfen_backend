@@ -791,9 +791,11 @@ async fn register(
 }
 
 /// Take a user off the signup list — the register rules mirrored: teacher+,
-/// students' seats or your own (another staff member's seat only if their
+/// students' seats or your own (another *staff* member's seat only if their
 /// account no longer exists), and only while the list is open (the event
-/// hasn't started or, ends_at-only, passed). Attendance already marked stays
+/// hasn't started or, ends_at-only, passed). A seat held by a `parent` is
+/// freeable by any teacher+ as well: no route lets that account free it
+/// itself, so a stranded seat needs a door. Attendance already marked stays
 /// recorded.
 #[utoipa::path(
     delete,
@@ -825,11 +827,15 @@ async fn unregister(
     event.registration_capacity()?;
 
     let target = UserId::from_key(&target);
-    // A deleted account's leftover seat is fair game for any teacher+; a
-    // living staff member's seat is theirs alone.
+    // A deleted account's leftover seat is fair game for any teacher+; a living
+    // staff member's seat is theirs alone. The bar is *staff*, not "a student":
+    // a parent holds no seat any route can reach — they cannot get past
+    // `RequireTeacher` to free their own — so a seat under that role is
+    // stranded, and a volume written before `Registration::register` claimed
+    // the holder's row already carries some.
     if &target != user.get_id()
         && let Some(target_user) = User::read(&target, &st.db).await?
-        && target_user.get_role() != Role::Student
+        && target_user.get_role().at_least(Role::Teacher)
     {
         return Err(AppError::Forbidden(
             "staff unregister themselves — only students' seats can be freed",

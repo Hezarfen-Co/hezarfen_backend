@@ -198,6 +198,9 @@ impl ChatbotThread {
                 "(SELECT VALUE max_chatbot_threads FROM ONLY {SETTINGS_TABLE}:{SETTINGS_KEY}) ?? $num"
             ),
             DEFAULT_MAX_CHATBOT_THREADS,
+            // No holder claim: the parent row *is* the user's, so this write
+            // already lands on the key a role change writes.
+            None,
             &thread.id.record(),
             &thread,
             db,

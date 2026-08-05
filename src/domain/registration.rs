@@ -4,7 +4,8 @@ use crate::constant::{REGISTRATION_COUNT_FIELD, REGISTRATION_TABLE};
 use crate::database::Database;
 use crate::domain::cap;
 use crate::domain::event::{Event, EventId};
-use crate::domain::user::UserId;
+use crate::domain::role::Role;
+use crate::domain::user::{User, UserId};
 use crate::error::AppError;
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
@@ -73,6 +74,15 @@ impl Registration {
     /// *lowering* the capacity can over-admit. Bound as a number instead, the
     /// snapshot below would admit every request already in flight when the
     /// lower cap landed.
+    ///
+    /// The seat is claimed on the event row, so the same statement says nothing
+    /// about the *user* it is for — and a fall to `parent` is the one demotion
+    /// whose sweep ([`crate::domain::user::User::set_role`]) can miss a seat and
+    /// leave it unfreeable: `unregister` refuses a non-student target and a
+    /// parent cannot reach the route at all. So the transaction also claims the
+    /// holder's own record ([`cap::role_claim`]), which is the key that
+    /// demotion writes: either the sweep sees this seat, or this write sees the
+    /// parent and takes it back.
     pub async fn register(
         event: &EventId,
         user: &UserId,
@@ -102,6 +112,9 @@ impl Registration {
             // what "unlimited" reads as.
             "audience.capacity ?? $num",
             cap::UNLIMITED,
+            // Staff hold their own seats, so the bar is not "still a student"
+            // but "still someone who can be taken off the list".
+            Some((&user.record(), &format!("= '{}'", Role::Parent.as_str()))),
             &registration.id.record(),
             &registration,
             db,
@@ -115,12 +128,19 @@ impl Registration {
             cap::Claimed::Duplicate => Self::read_for_user(event, user, db)
                 .await?
                 .ok_or_else(|| AppError::Internal("failed to register user".into())),
-            // Full, or the event was deleted between the read and the claim —
-            // the conditional write matches nothing either way, and only this
-            // path pays for the read that tells them apart.
+            // Full, the event was deleted between the read and the claim, or
+            // the holder fell to parent while this ran — the conditional writes
+            // match nothing (or throw) either way, and only this path pays for
+            // the reads that tell them apart.
             cap::Claimed::Full => match Event::read(event, db).await? {
-                Some(_) => Err(AppError::Conflict("the event is full")),
                 None => Err(AppError::NotFound),
+                Some(_) => match User::read(user, db).await? {
+                    Some(held) if held.get_role() == Role::Parent => Err(AppError::Forbidden(
+                        "that account was demoted to parent while this request ran — \
+                         only students can be registered for",
+                    )),
+                    _ => Err(AppError::Conflict("the event is full")),
+                },
             },
         }
     }

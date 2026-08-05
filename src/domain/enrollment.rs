@@ -6,13 +6,16 @@ use crate::domain::cap;
 use crate::domain::class_group::ClassGroupId;
 use crate::domain::course::{Course, CourseId};
 use crate::domain::page::PagedList;
+use crate::domain::role::Role;
 use crate::domain::user::UserId;
-use crate::error::AppError;
+use crate::error::{AppError, ValidationError};
 
 /// The `THROW` markers [`Enrollment::enroll`]'s claim aborts with: this pair
-/// already holds a row, and the roster is full.
+/// already holds a row, the roster is full, and the person being enrolled is no
+/// longer a student.
 const HELD_MARK: &str = "enroll_held";
 const FULL_MARK: &str = "enroll_full";
+const UNFIT_MARK: &str = "enroll_not_student";
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
 pub struct EnrollmentId(RecordId);
@@ -127,10 +130,24 @@ impl Enrollment {
         // Parenthesized `??` throughout: `n ?? 0 < cap` parses as
         // `n ?? (0 < cap)`, which is truthy for every row and would enroll past
         // the capacity.
+        //
+        // The seat is claimed on the *course*, so the student's own row is
+        // claimed beside it ([`cap::role_claim`]): a demotion's sweep runs on a
+        // snapshot, and a row landing after it would count a seat for someone
+        // who may not hold one, with nothing left to re-sweep. It rides between
+        // the duplicate gate and the seat, so "you are already in" still
+        // outranks it and it outranks a full roster.
+        let held_by = cap::role_claim(
+            "usr",
+            &format!("!= '{}'", Role::Student.as_str()),
+            UNFIT_MARK,
+        );
+        let hold = held_by.join(";\n             ");
         let sql = format!(
             "BEGIN TRANSACTION;
              LET $held = (SELECT VALUE id FROM $id);
              IF array::len($held) > 0 {{ THROW '{HELD_MARK}' }};
+             {hold};
              LET $seat = (UPDATE $course SET {ENROLLMENT_COUNT_FIELD} = \
                  ({ENROLLMENT_COUNT_FIELD} ?? 0) + 1 \
                  WHERE ({ENROLLMENT_COUNT_FIELD} ?? 0) < (capacity ?? $unlimited) \
@@ -150,9 +167,10 @@ impl Enrollment {
                 ("id".into(), enrollment.id.record().into_value()),
                 ("row".into(), enrollment.clone().into_value()),
                 ("course".into(), course.record().into_value()),
+                ("usr".into(), user.record().into_value()),
                 ("unlimited".into(), cap::UNLIMITED.into_value()),
             ],
-            &[HELD_MARK, FULL_MARK],
+            &[HELD_MARK, FULL_MARK, UNFIT_MARK],
         )
         .await?;
         // Someone placed this pair first; their row is the answer, and no seat
@@ -166,6 +184,17 @@ impl Enrollment {
                 Some(existing) => Self::disown_if_pumped(existing, db).await,
                 None => Err(AppError::Internal("failed to enroll user".into())),
             };
+        }
+        // Demoted while this ran: the same refusal the handler's own read makes
+        // a moment earlier, and the only one that can arrive after it.
+        if errors
+            .values()
+            .any(|error| error.to_string().contains(UNFIT_MARK))
+        {
+            return Err(AppError::Validation(ValidationError::Invalid {
+                field: "user_id",
+                reason: "only students can be enrolled in a course",
+            }));
         }
         // Full, or the course is gone — the conditional write matches nothing
         // either way, and only this path pays for the read that tells them
@@ -182,9 +211,11 @@ impl Enrollment {
         if let Some(error) = errors.drain().map(|(_, error)| error).next() {
             return Err(error.into());
         }
-        // Slots count BEGIN, two LETs and two IFs: the CREATE is slot 5.
+        // Slots count BEGIN, two LETs and two IFs, plus the holder claim's own
+        // statements — counted, not tallied by hand, so a statement added there
+        // cannot read back the wrong result.
         result
-            .take::<Vec<Enrollment>>(5)?
+            .take::<Vec<Enrollment>>(5 + held_by.len())?
             .into_iter()
             .next()
             .ok_or_else(|| AppError::Internal("failed to enroll user".into()))
@@ -299,6 +330,60 @@ mod tests {
         object.remove("source");
         let decoded = Enrollment::from_value(Value::Object(object)).unwrap();
         assert_eq!(decoded.get_source(), None);
+    }
+
+    /// The boot repair of `enrollment_count` **against a real server**, and
+    /// `#[ignore]`d for it: the pass counts rows off `enrollment`'s indexed
+    /// `course` field, and an aggregate over an indexed field is exactly where
+    /// the embedded engine and the server are known to differ (`count()` comes
+    /// back `{count: N}` from one and a bare int from the other, which
+    /// `option<int>` would refuse). `array::len` over ids is the spelling that
+    /// dodges it — this is what proves it on the store that bites.
+    ///
+    /// Both halves in one boot: `staff` is the row the sweep deletes (their
+    /// seat must come back), and `empty` is the course a *past* sweep already
+    /// stranded — count above zero with no rows left, so it forms no group and
+    /// only a per-course pass ever visits it. The second `migrate` pins that the
+    /// repair converges rather than overwriting: it must write nothing.
+    #[tokio::test]
+    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
+    async fn the_count_repair_recounts_on_a_real_server() {
+        let (db, _serialized) = crate::database::init_test_server("enrollment_repair").await;
+        db.query(
+            "CREATE user:t SET username = 't', password_hash = 'x', role = 'teacher';
+             CREATE user:a SET username = 'a', password_hash = 'x', role = 'student';
+             CREATE user:b SET username = 'b', password_hash = 'x', role = 'student';
+             CREATE course:live SET creator = user:t, title = 'l', description = '',
+                 enrollment_count = 9;
+             CREATE course:empty SET creator = user:t, title = 'e', description = '',
+                 enrollment_count = 4;
+             CREATE enrollment:live_a SET course = course:live, user = user:a, enrolled_by = user:t;
+             CREATE enrollment:live_b SET course = course:live, user = user:b, enrolled_by = user:t;
+             CREATE enrollment:live_t SET course = course:live, user = user:t, enrolled_by = user:t;",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+        async fn counts(db: &Database) -> Vec<i64> {
+            let mut result = db
+                .query("SELECT VALUE enrollment_count FROM course ORDER BY id")
+                .await
+                .unwrap()
+                .check()
+                .unwrap();
+            result.take::<Vec<i64>>(0).unwrap()
+        }
+
+        crate::database::migrate(db.as_ref()).await.unwrap();
+        // `course:empty` sorts before `course:live`: stranded count cleared, and
+        // the live course recounted to its two students — the teacher's row was
+        // swept and handed its seat back in the same boot.
+        assert_eq!(counts(&db).await, vec![0, 2]);
+
+        crate::database::migrate(db.as_ref()).await.unwrap();
+        assert_eq!(counts(&db).await, vec![0, 2], "the repair converges");
     }
 
     /// A pumped row that vanishes under the disown — a concurrent unenroll, or
