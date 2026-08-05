@@ -152,13 +152,16 @@ async fn ten_marks_put_the_graders_badge_on_a_profile() {
     assert_eq!(stat(&theirs, "marks_given_total"), 0, "{theirs}");
 }
 
-/// A mark is credited at the *first* grade of a sitting, so correcting one is
-/// free: the counter stays, and — the permanence rule at the stamp — the badge
-/// it already earned keeps the `earned_at` it was first given. The regrade is
-/// deliberately pushed over the high-mark line, which a re-judging
-/// implementation would mint a `high_mark` for.
+/// The *grader's* mark is credited at the first grade of a sitting, so
+/// correcting one is free: the counter stays, and — the permanence rule at the
+/// stamp — the badge it already earned keeps the `earned_at` it was first
+/// given. The *student's* high-mark counter is the one thing a regrade does
+/// move, and has to: it counts stored marks at or above the line, not first
+/// gradings, and the delete that refunds it reads the stored mark. Pinned the
+/// other way round, the pair drifted — the credit was decided by a mark the
+/// refund could no longer find.
 #[tokio::test]
-async fn a_regrade_moves_neither_the_counter_nor_the_stamp() {
+async fn a_regrade_leaves_the_grader_alone_but_walks_the_high_mark_with_it() {
     let m = marking(10).await;
     for exam in &m.exams {
         grade(&m.app, &m.teacher, exam, &m.student_id, 70).await;
@@ -186,13 +189,15 @@ async fn a_regrade_moves_neither_the_counter_nor_the_stamp() {
         Some(earned),
         "a re-sync moved a permanent stamp: {after}"
     );
+    // The sitting now *stores* a 100, so the student holds one high mark —
+    // exactly what deleting the result would refund, and nothing else.
     let theirs = my_profile(&m.app, &m.student).await;
     assert_eq!(
         stat(&theirs, "high_mark_total"),
-        0,
-        "a regrade re-judged the sitting and minted a high mark: {theirs}"
+        1,
+        "the regrade crossed the line and the counter stayed behind: {theirs}"
     );
-    assert_eq!(badge_ids(&theirs), Vec::<&str>::new(), "{theirs}");
+    assert_eq!(badge_ids(&theirs), ["high_mark_1"], "{theirs}");
 }
 
 /// The high-mark cut, from both sides of the line in one student's history:

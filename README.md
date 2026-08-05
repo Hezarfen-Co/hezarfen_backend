@@ -1340,7 +1340,14 @@ catalog — awards carrying it stop being served, no migration.
   course) does not: a cascade is not an un-grade.
 - **High marks.** `+1 high_mark_total` for the **student** whenever an exam
   mark lands at or above `badges.high_mark_min` (90, published at `/limits`),
-  once per sitting — a retake is another sitting and can earn another. Homework
+  once per sitting — a retake is another sitting and can earn another. Unlike
+  the grader's counter, a **regrade does move it**, in whichever direction it
+  crossed the line: it counts marks that are *stored* at or above the cut, not
+  first gradings, so 40 corrected to 95 earns it and 95 corrected to 40 hands it
+  straight back (a correction that stays on one side of the line moves nothing).
+  It has to work that way, because the refund below reads the stored mark — the
+  two decided off different values, and a mark walked across the line left a
+  credit no delete could find to give back. Homework
   marks never count here: a homework mark is optional and most grades are
   status-only, so counting them would reward a teacher's habit rather than a
   student's work. The cut is compiled in rather than read from the school's
