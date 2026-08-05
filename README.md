@@ -611,6 +611,17 @@ own seats by hand. Seats on lists that have already closed (the event started,
 or its `ends_at`-only deadline passed) are never touched — that roster is
 history, and re-registering is refused.
 
+A demotion to `parent` also **closes every whiteboard that account created**,
+on top of taking it off the rosters it was invited to. The whiteboard is shut to
+parents outright, so the creator is answered `404` on their own board; clear,
+lock, close and delete are the creator's alone, so every other participant is
+answered `403`; and no route lists a board the caller is not on, so not even an
+admin can find its id. Left open it is a room nobody can end while its
+participants keep drawing on it. Closed and not deleted, because the marks are
+their work too: the board, its history and its epochs stay readable, only writes
+are refused (`board_closed`), and the creator's board seat stays taken — a
+closed board is still a stored board.
+
 A demotion below `teacher` additionally **withdraws the published appointment
 calendar** and cancels the live bookings on it. Nothing else could: a slot is
 listed only on its own teacher's calendar and deleted only by a teacher+, so
@@ -625,9 +636,9 @@ booking racing it collides on the slot row the sweep deletes.
 
 The role write and every sweep it implies — class memberships and their
 counters, all enrollments and their seats, parent ties on both sides, a
-demoted parent's still-freeable event seats, whiteboard rosters, course
-staffing and homeroom-teacher columns, the appointment calendar and the
-bookings on it — commit as **one transaction**. It
+demoted parent's still-freeable event seats, whiteboard rosters and the boards
+that account created, course staffing and homeroom-teacher columns, the
+appointment calendar and the bookings on it — commit as **one transaction**. It
 either all lands or none of it does: a failure answers `500` with the account
 still holding its old role and every grant of it still standing, and the same
 `PATCH` retried applies the lot. Signup lists that have already frozen are
@@ -3725,7 +3736,15 @@ unknown to `POST` and `PATCH`. A read-modify-write client sends the writable
 fields it changed, never the whole board object back.
 
 **Roster repair.** A roster only ever holds users of at least the `student`
-role. A demotion sweeps the user off every board they were on, and the first
+role. A demotion sweeps the user off every board they were on — and **closes
+every board they created**, in the same write. A creator demoted to `parent` is
+an outsider on their own board (`404`), while clearing, locking, closing and
+deleting it are theirs alone and nothing lists a board the caller is not on: the
+room would be commandable by nobody at all, and its participants would keep
+drawing on it until the lifetime cap closed it. So the demotion closes it —
+permanently read-only, nothing deleted, every mark and every epoch still
+readable to the people who drew them, and the creator's `board_count` seat still
+taken, because the row it counts is still there. The first
 boot of this version repaired the rosters an older binary left behind —
 parents, and ids of users deleted since. On top of that, a `PATCH` may always
 send back the roster it was just served: an id already on the board that has

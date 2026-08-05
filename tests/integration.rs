@@ -25418,6 +25418,78 @@ async fn the_lifetime_cap_closes_the_board_and_it_stays_readable() {
     );
 }
 
+/// Demoting a board's **creator** to `parent` closes the room, and closes it
+/// through the ordinary role route. Without that the board is commandable by
+/// nobody: the ex-creator is 404'd off their own board (the whiteboard is shut
+/// to parents), clear/lock/close/delete are creator-only for everyone else, and
+/// no route lists a board the caller is not on — so not even an admin can find
+/// the id, while the participants keep drawing on it. Closed and not deleted:
+/// every read the board ever served, it still serves.
+#[tokio::test]
+async fn demoting_a_board_s_creator_closes_the_room_and_keeps_it_readable() {
+    let (app, db) = app_and_db().await;
+    let admin = login_as(&app, &db, "yonetici", "admin").await;
+    let ali = login(&app, "ali").await;
+    let ali_id = me_id(&app, &ali).await;
+    let veli = login(&app, "veli").await;
+    let veli_id = me_id(&app, &veli).await;
+    let board = create_board(&app, &ali, "Geometri", &[&veli_id]).await;
+    draw(&db, &board, &veli_id, 0, "{\"p\":[1]}").await.unwrap();
+
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/users/{ali_id}/role"),
+        Some(&admin),
+        Some(json!({ "role": "parent" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    let stamp = stored_board(&db, &board)
+        .await
+        .unwrap()
+        .get_closed_at()
+        .expect("the demotion must close the room its creator can no longer command");
+    // The seat stays taken: the row it counts still exists.
+    assert_eq!(stored_board_count(&db, &ali_id).await, 1);
+
+    // The participant still reads everything, and their marks are still there.
+    let res = send(&app, "GET", &format!("/boards/{board}"), Some(&veli), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["closed_at"], stamp.as_millis());
+    let res = send(
+        &app,
+        "GET",
+        &format!("/boards/{board}/history"),
+        Some(&veli),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 1, "the whole log is still served");
+    assert_eq!(stroke_rows(&db, &board).await.len(), 1);
+    let res = send(&app, "GET", "/boards", Some(&veli), None).await;
+    assert_eq!(common::total(&res.body), 1, "and it is still listed");
+
+    // But every write answers the terminal refusal, not the recoverable one.
+    let refused = draw(&db, &board, &veli_id, 0, "{\"p\":[2]}").await;
+    assert!(
+        matches!(
+            refused,
+            Err(hezarfen_backend::error::AppError::Conflict(
+                hezarfen_backend::domain::board_stroke::BOARD_CLOSED
+            ))
+        ),
+        "a closed board must refuse a stroke as closed, got {refused:?}"
+    );
+    assert_eq!(stroke_rows(&db, &board).await.len(), 1, "nothing written");
+
+    // The ex-creator is out of their own room, which is the shape that made
+    // this uncommandable in the first place.
+    let res = send(&app, "GET", &format!("/boards/{board}"), Some(&ali), None).await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND, "{}", res.body);
+}
+
 /// The per-creator cap, asserted on the stored counter — and a delete really
 /// hands the seat back, or a busy teacher's limit ratchets shut forever.
 #[tokio::test]

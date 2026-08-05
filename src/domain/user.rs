@@ -570,8 +570,11 @@ impl User {
     ///   still are: released apart, an enrollment row could be left tagged with
     ///   a class whose counters had been given back, so the class passed its
     ///   zero-zero delete guard and no sweep could ever reach the row again.
-    /// * **Parent** additionally frees event seats and comes off every
-    ///   whiteboard roster. The seat is the one thing on a signup list nothing
+    /// * **Parent** additionally frees event seats, comes off every whiteboard
+    ///   roster and has the boards they *created* closed — permanently
+    ///   read-only, rows kept, because a room whose creator is demoted is
+    ///   commandable by nobody at all (see the statement's own note). The seat
+    ///   is the one thing on a signup list nothing
     ///   else could remove: staff free their own by hand (`unregister` allows
     ///   the self case) but a parent can reach no such door, so a promotion
     ///   strands nothing and only this demotion does. A list that has already
@@ -599,9 +602,10 @@ impl User {
     ///   defined end available — and the alternative, deleting it, would make a
     ///   confirmed meeting vanish with no trace at all.
     ///
-    /// The returned boards are the rooms whose roster this changed (plus those
-    /// the user created, which cannot be changed and are returned so their room
-    /// is prompted too). Publishing to them is the caller's job: an in-process
+    /// The returned boards are the rooms whose roster this changed, plus those
+    /// the user created — whose roster is untouched but which are now closed,
+    /// and they carry that stamp because the close is written first. Publishing
+    /// to them is the caller's job: an in-process
     /// fan-out cannot sit inside a database transaction, and a room told before
     /// the commit would re-read the pre-commit state.
     ///
@@ -668,6 +672,24 @@ impl User {
                  UPDATE $signup.event SET {REGISTRATION_COUNT_FIELD} = \
                  math::max([({REGISTRATION_COUNT_FIELD} ?? 0) - array::len($freed), 0]); \
                  }}; }}"
+            ));
+            // A room whose *creator* is demoted can never be ended by anyone:
+            // the whiteboard is closed to parents outright, so the creator is
+            // 404'd off their own board, `clear`/`lock`/`close`/`delete` are
+            // creator-only for everyone else, and `Board::list_for_user` is the
+            // crate's only enumeration — no manager or admin can so much as find
+            // the id. Its participants meanwhile keep drawing (the room re-derives
+            // membership per frame and they still pass), into a board only the
+            // 50 000-stroke lifetime cap could ever retire. So the demotion
+            // retires it, with the same compare-and-set [`Board::close`] uses: an
+            // already-closed board keeps its first stamp. Closed and not deleted
+            // because the marks are the participants' work too — they keep reading
+            // the board and its whole history, and the creator's `board_count`
+            // seat stays taken, which is correct while the row it counts exists.
+            // Stamped *before* the roster strip so the strip's `RETURN AFTER`
+            // carries the closed row the caller fans out.
+            batch.push(format!(
+                "UPDATE {BOARD_TABLE} SET closed_at = $now WHERE creator = $usr AND closed_at = NONE"
             ));
             board_slot = Some(batch.len());
             batch.push(format!(
@@ -908,6 +930,78 @@ mod tests {
         assert!(
             boards[0].get_participants().is_empty(),
             "and carry the roster the room is about to be told about"
+        );
+    }
+
+    /// The half the roster strip cannot reach: the board's **creator**. Demoted,
+    /// they are 404'd off their own room, every command on it is creator-only
+    /// for everyone else, and nothing in the crate lists a board a caller is not
+    /// on — so the room could be cleared, locked, closed and deleted by nobody
+    /// while its participants kept drawing on it. The demotion closes it, and
+    /// closing is *all* it does: the roster, the row and every mark stay
+    /// readable.
+    #[tokio::test]
+    async fn a_demoted_creator_s_board_is_closed_and_still_readable() {
+        use crate::domain::board::{Board, BoardTitle};
+        use crate::domain::board_stroke::{BOARD_CLOSED, BoardStroke};
+
+        let db = init_mem().await.unwrap();
+        let creator = a_user("ogretmen", &db).await;
+        let guest = a_user("ogrenci", &db).await;
+        let board = Board::create(
+            creator.get_id(),
+            BoardTitle::try_new("Geometri").unwrap(),
+            vec![guest.get_id().clone()],
+            &db,
+        )
+        .await
+        .unwrap();
+        let mark = |epoch| {
+            let (id, author, db) = (board.get_id().clone(), guest.get_id().clone(), db.clone());
+            async move { BoardStroke::append(&id, &author, "{\"p\":[1]}", epoch, &db).await }
+        };
+        mark(0).await.unwrap();
+
+        let (creator, boards) = creator.set_role(Role::Parent, &db).await.unwrap();
+        assert_eq!(boards.len(), 1, "the room must be reported back");
+        let stamp = boards[0]
+            .get_closed_at()
+            .expect("and carry the closing stamp the room is told about");
+
+        // Stored, not merely reported — and nothing else moved.
+        let stored = Board::read(board.get_id(), &db).await.unwrap().unwrap();
+        assert_eq!(stored.get_closed_at(), Some(stamp));
+        assert_eq!(
+            stored.get_participants(),
+            [guest.get_id().clone()],
+            "closing must not empty the roster it did not touch"
+        );
+        assert_eq!(
+            BoardStroke::history(board.get_id(), None, false, None, 0, &db)
+                .await
+                .unwrap()
+                .1,
+            1,
+            "the marks the participants drew stay on disk"
+        );
+
+        // Read-only for the participants who are still on it.
+        assert!(
+            matches!(mark(0).await, Err(AppError::Conflict(BOARD_CLOSED))),
+            "a closed board must refuse every write with the terminal answer"
+        );
+
+        // The stamp is the record: a re-run of the sweep must not move it.
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        creator.set_role(Role::Parent, &db).await.unwrap();
+        assert_eq!(
+            Board::read(board.get_id(), &db)
+                .await
+                .unwrap()
+                .unwrap()
+                .get_closed_at(),
+            Some(stamp),
+            "the close is a compare-and-set, not a re-stamp"
         );
     }
 
