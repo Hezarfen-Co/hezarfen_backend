@@ -9,7 +9,7 @@ use crate::constant::{CAP_WRITE_BACKOFF_MS, CAP_WRITE_TRIES, CHATBOT_PENDING_STA
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{Password, User, Username};
 use crate::error::AppError;
-use crate::migration_sql::MIGRATION_BATCHES;
+use crate::migration_sql::{BACKFILL, MIGRATION_BATCHES};
 
 /// The shared database handle.
 ///
@@ -328,13 +328,149 @@ pub async fn migrate(db: &Surreal<Any>) -> Result<(), AppError> {
 
 /// Parameters the batches are executed with. Bound, not baked into the SQL
 /// string: a `const` cannot be interpolated into another `const`, and a
-/// hand-copied 300000 would drift silently.
-fn migration_binds() -> [(&'static str, i64); 1] {
-    [("stale_ms", CHATBOT_PENDING_STALE_SECS * 1_000)]
+/// hand-copied 300000 would drift silently. The one-time blocks' fingerprints
+/// ride along — see [`marked_blocks`]. Bound to all three batches, which is
+/// free: an unused parameter is not an error.
+fn migration_binds() -> Vec<(String, i64)> {
+    let mut binds = vec![("stale_ms".to_string(), CHATBOT_PENDING_STALE_SECS * 1_000)];
+    binds.extend(marked_blocks());
+    binds
+}
+
+/// The line every one-time block in [`BACKFILL`] opens with. The name straight
+/// after it is the block's `migration_mark` key, and `fp_<name>` is the
+/// parameter its fingerprint is bound to — so a block written in this idiom is
+/// found, hashed and bound with nothing to keep by hand. A block written any
+/// other way silently gets no fingerprint, which is what
+/// `every_one_time_block_is_fingerprinted` exists to catch.
+const MARK_GATE: &str = "IF array::len((SELECT VALUE id FROM migration_mark:";
+
+/// Every one-time block in [`BACKFILL`], as (`fp_<name>`, hash of its own SQL).
+///
+/// A `migration_mark` used to say only *that* a block had run, which made a
+/// marked block's content permanently uncorrectable: an edit to it never ran on
+/// any volume that had booted once. The mark now stores this number and the
+/// gate compares it against the number this binary computes, so an edited block
+/// runs one more time and re-stamps. There is nothing to remember to bump — the
+/// hash comes from the very string the server executes, which is the whole
+/// point: a hand-kept version is the same discipline failure in a new place.
+///
+/// Hashed from the gate through the stamp with comments and indentation
+/// dropped: every re-run costs something (the `profile_counters` block says
+/// what, in its own comment), so re-wording a comment must not trigger one.
+fn marked_blocks() -> Vec<(String, i64)> {
+    let mut blocks = Vec::new();
+    let mut rest = BACKFILL;
+    while let Some(at) = rest.find(MARK_GATE) {
+        let block = &rest[at..];
+        let name: String = block[MARK_GATE.len()..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        let stamp = format!("UPSERT migration_mark:{name}");
+        let end = block
+            .find(&stamp)
+            .and_then(|from| block[from..].find(';').map(|to| from + to + 1))
+            .unwrap_or_else(|| panic!("the `{name}` block never stamps its own mark"));
+        blocks.push((format!("fp_{name}"), block_fingerprint(&block[..end])));
+        rest = &block[end..];
+    }
+    blocks
+}
+
+/// FNV-1a over a block's statements, comments and layout dropped.
+///
+/// Hand-rolled rather than [`std::hash`]: this number is *stored*, so it has to
+/// mean the same thing after a compiler upgrade, and `DefaultHasher` promises
+/// nothing across versions — a hash that drifted on its own would re-run every
+/// one-time block on every volume.
+fn block_fingerprint(block: &str) -> i64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for line in block
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("--"))
+    {
+        for byte in line.bytes().chain(std::iter::once(b'\n')) {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    hash as i64
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// The fingerprint has to move when a *statement* moves and stay put when
+    /// prose does: a re-run is never free (see the `profile_counters` comment),
+    /// and a fingerprint that ignored an edit would put us back where this
+    /// mechanism started — a marked block nobody can correct.
+    #[test]
+    fn a_block_fingerprint_tracks_statements_not_prose() {
+        let block = "IF x = 0 {\n    -- why this runs\n    UPDATE t SET a = 1;\n};";
+        let reworded = "IF x = 0 {\n        -- why this runs, at length\n  UPDATE t SET a = 1;\n};";
+        let edited = "IF x = 0 {\n    -- why this runs\n    UPDATE t SET a = 2;\n};";
+        assert_eq!(
+            super::block_fingerprint(block),
+            super::block_fingerprint(reworded),
+            "a re-worded comment or a re-indent must not re-run a one-time block"
+        );
+        assert_ne!(
+            super::block_fingerprint(block),
+            super::block_fingerprint(edited),
+            "an edited statement must re-run its block"
+        );
+    }
+
+    /// The forcing function: a one-time block written outside the gate idiom
+    /// gets no fingerprint parameter, and its `$fp_…` would bind to nothing — a
+    /// gate that then matches every mark and skips forever. Nothing about the
+    /// compiler notices, so this does.
+    #[test]
+    fn every_one_time_block_is_fingerprinted() {
+        let blocks = super::marked_blocks();
+        let names: Vec<&str> = blocks.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["fp_board_roster", "fp_profile_counters"],
+            "{names:?}"
+        );
+        assert_ne!(blocks[0].1, blocks[1].1, "two blocks, two fingerprints");
+        // Two mentions of the mark table per block — its gate and its stamp. A
+        // third, or a block gated some other way, means a block the binder
+        // never saw.
+        assert_eq!(
+            super::BACKFILL.matches("migration_mark:").count(),
+            blocks.len() * 2,
+            "a one-time block outside the `{}…` idiom is invisible to the binder",
+            super::MARK_GATE
+        );
+        for (param, _) in &blocks {
+            assert!(
+                super::BACKFILL.contains(&format!("${param}")),
+                "nothing reads ${param}"
+            );
+        }
+    }
+
+    /// The fingerprint the mark for `name` must carry once its block has run.
+    fn expected_fingerprint(name: &str) -> i64 {
+        super::marked_blocks()
+            .into_iter()
+            .find(|(param, _)| *param == format!("fp_{name}"))
+            .unwrap_or_else(|| panic!("no one-time block named {name}"))
+            .1
+    }
+
+    async fn stamped_fingerprint(db: &super::Database, name: &str) -> Vec<Option<i64>> {
+        let mut rows = db
+            .query(format!(
+                "SELECT VALUE fingerprint FROM migration_mark:{name}"
+            ))
+            .await
+            .unwrap();
+        rows.take(0).unwrap()
+    }
 
     /// The admin seed must not be interruptible into a state no later boot can
     /// repair. `create` + `set_role` was: killed between the two writes it
@@ -562,6 +698,12 @@ mod tests {
             1,
             "the repair marks itself finished"
         );
+        // …with the fingerprint of the text it ran, which is what a later edit
+        // to this block is compared against.
+        assert_eq!(
+            stamped_fingerprint(&db, "board_roster").await,
+            vec![Some(expected_fingerprint("board_roster"))]
+        );
         db.query("CREATE board:late SET creator = user:s, title = 'E', participants = [user:p], created_at = 1")
             .await
             .unwrap()
@@ -741,6 +883,10 @@ mod tests {
             1,
             "the seed marks itself finished"
         );
+        assert_eq!(
+            stamped_fingerprint(&db, "profile_counters").await,
+            vec![Some(expected_fingerprint("profile_counters"))]
+        );
         db.query(
             "CREATE homework_submission:late SET homework = homework:h, user = user:b,
                  submitted_at = 90, updated_at = 90;",
@@ -753,9 +899,140 @@ mod tests {
         assert_eq!(
             counters(&db).await,
             after_first,
-            "a marked database skips the seed entirely"
+            "a mark carrying this binary's fingerprint skips the seed entirely"
         );
         assert_eq!(writes(&db).await, first_writes);
+    }
+
+    /// A marked block's *content* has to be correctable (2026-08-05). The mark
+    /// used to record only that the block had run, so an edit to a marked block
+    /// silently never ran on any volume that had booted once — which is how the
+    /// `exam_sat_total` seed below (fixed to count sittings, not attempts)
+    /// would have reached exactly nobody. The mark carries the fingerprint of
+    /// the text it ran, and a different fingerprint runs the block once more.
+    #[tokio::test]
+    async fn an_edited_one_time_block_runs_once_more_and_restamps() {
+        let db = super::init_mem().await.unwrap();
+        // `init_mem` migrates an empty store, so the seed is already marked
+        // done — the state every booted volume is in. History written *after*
+        // that mark is the probe: a skip has to leave it uncounted, and a
+        // re-run has to pick it up.
+        db.query(
+            "CREATE user:a SET username = 'a', password_hash = 'x', role = 'student';
+             -- One sitting, taken twice. The corrected seed counts the exam,
+             -- not the attempts, exactly as the request path credits it.
+             CREATE exam_attempt:e1 SET exam = exam:x, user = user:a, seq = 1, started_at = 1;
+             CREATE exam_attempt:e2 SET exam = exam:x, user = user:a, seq = 2, started_at = 2;
+             CREATE pomodoro_session:p1 SET user = user:a, started_at = 1000, finished_at = 2000;",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+        async fn counters(db: &super::Database) -> Vec<(i64, i64)> {
+            let mut rows = db
+                .query(
+                    // `?? 0`, parenthesized: the columns are `option<int>` and
+                    // a row the seed has not touched holds neither.
+                    "SELECT VALUE [(exam_sat_total ?? 0), (pomodoro_finished_total ?? 0)]
+                     FROM user ORDER BY id",
+                )
+                .await
+                .unwrap();
+            rows.take::<Vec<Vec<i64>>>(0)
+                .unwrap()
+                .into_iter()
+                .map(|row| (row[0], row[1]))
+                .collect()
+        }
+        let fp = expected_fingerprint("profile_counters");
+
+        // Same binary, same fingerprint: the block does not run, and the
+        // history above stays uncounted. That is the mark still doing its job.
+        super::migrate(&db).await.unwrap();
+        assert_eq!(counters(&db).await, vec![(0, 0)]);
+        assert_eq!(
+            stamped_fingerprint(&db, "profile_counters").await,
+            vec![Some(fp)]
+        );
+
+        // A write probe on the seeded table, defined now so it counts only the
+        // runs under test: the event fires *inside* the UPDATE, so "exactly
+        // once" is measured rather than inferred from the numbers.
+        db.query(
+            "DEFINE TABLE user_write_probe SCHEMALESS;
+             DEFINE EVENT user_write ON user WHEN $event = 'UPDATE' THEN {
+                 UPSERT type::record('user_write_probe', 'n') SET n = (n ?? 0) + 1;
+             };
+             -- A mark written by the binary before fingerprints existed: the
+             -- row is there, the column is not. This is the live volumes'
+             -- state, and it must run the corrected block exactly once.
+             UPDATE migration_mark:profile_counters UNSET fingerprint;",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+        assert_eq!(
+            stamped_fingerprint(&db, "profile_counters").await,
+            vec![None]
+        );
+
+        super::migrate(&db).await.unwrap();
+        // Two attempt rows, one exam: the corrected seed says one sitting, the
+        // number the request path would have given. The old text said two.
+        assert_eq!(counters(&db).await, vec![(1, 1)]);
+        assert_eq!(
+            stamped_fingerprint(&db, "profile_counters").await,
+            vec![Some(fp)]
+        );
+
+        async fn writes(db: &super::Database) -> Vec<i64> {
+            let mut rows = db
+                .query("SELECT VALUE n FROM user_write_probe:n")
+                .await
+                .unwrap();
+            rows.take(0).unwrap()
+        }
+        let one_run = writes(&db).await;
+        // Pinned non-zero, not merely compared: "it did not run twice" holds
+        // vacuously if the probe stopped firing, and the test would then pass
+        // on a mechanism that never runs anything at all.
+        assert!(matches!(one_run.as_slice(), [n] if *n > 0), "{one_run:?}");
+
+        // Once more, not on every boot: the re-run re-stamped, so the next boot
+        // is a plain skip again.
+        super::migrate(&db).await.unwrap();
+        assert_eq!(counters(&db).await, vec![(1, 1)]);
+        assert_eq!(writes(&db).await, one_run, "the re-run happened once");
+
+        // And now the edit this whole mechanism exists for: a mark whose stored
+        // fingerprint is some *other* text's. The block runs again and lands on
+        // the same numbers — every SET is absolute, so a re-run converges
+        // instead of doubling what the first pass wrote.
+        db.query("UPDATE migration_mark:profile_counters SET fingerprint = 1")
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+        super::migrate(&db).await.unwrap();
+        assert_eq!(
+            counters(&db).await,
+            vec![(1, 1)],
+            "a re-run recomputes, it does not add to what is there"
+        );
+        assert_eq!(
+            writes(&db).await,
+            vec![one_run[0] * 2],
+            "the edited block did the same work a second time, and no more"
+        );
+        assert_eq!(
+            stamped_fingerprint(&db, "profile_counters").await,
+            vec![Some(fp)]
+        );
+        super::migrate(&db).await.unwrap();
+        assert_eq!(writes(&db).await, vec![one_run[0] * 2], "and stopped again");
     }
 
     #[tokio::test]
