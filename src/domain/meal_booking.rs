@@ -200,6 +200,7 @@ impl MealBooking {
         for attempt in 0..CAP_WRITE_TRIES {
             backoff(attempt).await;
             let fresh = Menu::read(menu, db).await?.ok_or(AppError::NotFound)?;
+            check_day_not_past(fresh.get_date())?;
             check_cutoff(fresh.get_date(), fresh.get_slot(), cutoff)?;
             let existing: Option<MealBooking> = db.select(id.record()).await?;
             // The seat is already held: same attempt, same price it was taken
@@ -723,6 +724,40 @@ fn served_at(date: &MenuDate, serving_minute: Option<i64>) -> Option<Timestamp> 
     ))
 }
 
+/// A meal whose **calendar day is over** takes no more seats, whatever the
+/// school configured. The booking is what charges (attendance never moves
+/// money), so a seat taken on a day already served mints a real ledger line for
+/// food nobody can be served — the one thing no route may do.
+///
+/// Deliberately **not** part of [`check_cutoff`], and deliberately not
+/// configurable:
+///
+/// - The cutoff is a *policy* about the serving hour, and it is unenforced by
+///   design when the school sets no `meal_cancel_cutoff_minutes` or the slot no
+///   `serving_minute` (all three shipped slots carry none) — see the note there
+///   for why the canteen must not go offline over an unset hour. This is not a
+///   deadline before the meal at all: it is the day itself having passed, which
+///   no configuration can make untrue. **Today's menu is untouched by it** —
+///   with or without a serving hour, at any time of day.
+/// - It binds `book` only. Cancelling stays open on a past day, cutoff bypass
+///   or not: a cancel *reverses* a charge, and money already taken has to stay
+///   reachable (that is the same reason manager+ bypasses the cutoff in
+///   [`cancel_booking`](crate::web::meals)).
+fn check_day_not_past(date: &MenuDate) -> Result<(), AppError> {
+    // An unparsable day is left to `check_cutoff`, which fails it closed
+    // whenever a cutoff is configured: guessing "past" from text no calendar
+    // can place would shut the canteen for a school that set no deadline.
+    let Some(over) = date.day_end() else {
+        return Ok(());
+    };
+    if Timestamp::now().as_millis() >= over.as_millis() {
+        return Err(AppError::Conflict(
+            "that meal's day has passed, so its menu takes no more bookings",
+        ));
+    }
+    Ok(())
+}
+
 /// Booking and cancelling both close `cutoff.minutes` before the meal is
 /// served. `None` = the school set no cutoff, so neither ever closes.
 ///
@@ -794,12 +829,18 @@ mod tests {
         }
     }
 
-    /// A published menu on a fresh in-memory database, plus a student.
+    /// A published menu on a fresh in-memory database, plus a student. Dated
+    /// well ahead on purpose: a menu whose day has passed refuses every
+    /// booking, so a date the calendar overtakes would fail this whole module.
     async fn menu(capacity: Option<i64>) -> (Database, MenuId) {
+        menu_on("2099-09-14", capacity).await
+    }
+
+    async fn menu_on(date: &str, capacity: Option<i64>) -> (Database, MenuId) {
         let db = crate::database::init_mem().await.unwrap();
         let slots = vec![MealSlotDef::try_new("lunch", None).unwrap()];
         let menu = Menu::create(
-            MenuDate::try_new("2026-09-14").unwrap(),
+            MenuDate::try_new(date).unwrap(),
             MenuSlot::try_new("lunch", &slots).unwrap(),
             capacity,
             &UserId::generate(),
@@ -1301,6 +1342,136 @@ mod tests {
         assert!(check_cutoff(&past, &lunch(), &cutoff(Some(60), None)).is_ok());
         // The same menu, once the school sets the hour.
         assert!(check_cutoff(&past, &lunch(), &cutoff(Some(60), Some(720))).is_err());
+    }
+
+    fn today() -> String {
+        chrono::Utc::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string()
+    }
+
+    /// The day being over is not the cutoff. It binds with no
+    /// `meal_cancel_cutoff_minutes` set and no `serving_minute` on the slot —
+    /// the shipped defaults, under which the cutoff deliberately closes nothing
+    /// — and it never binds today, at any hour.
+    #[test]
+    fn the_past_day_guard_is_not_the_serving_hour_cutoff() {
+        let yesterday = (chrono::Utc::now().date_naive() - chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        assert!(check_day_not_past(&MenuDate::try_new(&yesterday).unwrap()).is_err());
+        assert!(check_day_not_past(&MenuDate::try_new(&today()).unwrap()).is_ok());
+        assert!(check_day_not_past(&MenuDate::try_new("2999-01-01").unwrap()).is_ok());
+        // Today's menu is open all day *and* carries no deadline at all under
+        // the shipped defaults — the two answers stay separate.
+        assert!(
+            check_cutoff(
+                &MenuDate::try_new(&today()).unwrap(),
+                &lunch(),
+                &cutoff(Some(60), None)
+            )
+            .is_ok()
+        );
+        // A day no calendar can place is left to the cutoff, which fails it
+        // closed when one is configured; guessing "past" here would shut the
+        // canteen for a school that set no deadline.
+        let impossible = MenuDate::from_value(Value::String("2026-02-29".into())).unwrap();
+        assert!(check_day_not_past(&impossible).is_ok());
+    }
+
+    /// The charge hole itself: a menu whose day has gone by must take no seat
+    /// and mint no ledger line, with the shipped defaults in force.
+    #[tokio::test]
+    async fn a_past_day_takes_no_seat_and_writes_no_charge() {
+        let (db, menu) = menu_on("2020-01-06", None).await;
+        let ali = UserId::generate();
+        add_dish(&menu, 4550, &db).await;
+
+        assert!(matches!(
+            MealBooking::book(&menu, &ali, &ali, &MealCutoff::default(), &db).await,
+            Err(AppError::Conflict(_))
+        ));
+        assert_eq!(seats(&menu, &db).await, 0);
+        let (lines, total) = MealLedger::list_for_student(&ali, None, 0, &db)
+            .await
+            .unwrap();
+        assert!(
+            lines.is_empty() && total == 0,
+            "a refused booking bills nothing"
+        );
+    }
+
+    /// The documented decision the past-day guard must not swallow: today's
+    /// menu, on a slot with no serving hour, books exactly as it always did —
+    /// with the cutoff knob set *and* unset.
+    #[tokio::test]
+    async fn todays_menu_still_books_without_a_serving_hour() {
+        let (db, menu) = menu_on(&today(), None).await;
+        let ali = UserId::generate();
+        MealBooking::book(&menu, &ali, &ali, &cutoff(Some(60), None), &db)
+            .await
+            .expect("an unset serving hour is an unenforced cutoff");
+        assert_eq!(seats(&menu, &db).await, 1);
+    }
+
+    /// Cancelling stays open on a day already gone — that is how money already
+    /// taken is given back, and it is the same reason manager+ bypasses the
+    /// cutoff. The guard binds `book` alone.
+    #[tokio::test]
+    async fn a_past_day_still_gives_the_seat_and_the_money_back() {
+        let (db, menu) = menu_on("2020-01-06", None).await;
+        let ali = UserId::generate();
+        add_dish(&menu, 4550, &db).await;
+        // The seat this student is holding was taken while the day was still
+        // ahead — the shape the create-side check cannot reach. A test cannot
+        // age a menu (`date` is READONLY), so the seat is placed on an
+        // already-past menu by the very transaction `book` places it with.
+        let fresh = Menu::read(&menu, &db).await.unwrap().unwrap();
+        let price = MealLedger::price_snapshot(&menu, &db).await.unwrap();
+        let row = MealBooking {
+            id: MealBookingId::composite(&menu, &ali),
+            menu: menu.clone(),
+            student: ali.clone(),
+            booked_by: ali.clone(),
+            status: MealBookingStatus::Booked,
+            attempt: 1,
+            price_minor: price,
+            cancelled_at: None,
+            created_at: Timestamp::now(),
+        };
+        let charge = MealLedger::charge_for(&row, &ali);
+        let booked = match MealBooking::claim_and_place(
+            &menu.record(),
+            cap::UNLIMITED,
+            fresh.get_version(),
+            &row,
+            price,
+            charge.as_ref(),
+            &db,
+        )
+        .await
+        .unwrap()
+        {
+            Claimed::Made(booking) => booking,
+            _ => panic!("the seat was free"),
+        };
+        assert_eq!(seats(&menu, &db).await, 1);
+
+        assert!(matches!(
+            MealBooking::book(&menu, &ali, &ali, &MealCutoff::default(), &db).await,
+            Err(AppError::Conflict(_)),
+        ));
+        let cancelled = booked
+            .cancel(&MealCutoff::default(), &ali, &db)
+            .await
+            .expect("a cancel on a past day still frees the seat");
+        assert_eq!(cancelled.get_status(), MealBookingStatus::Cancelled);
+        assert_eq!(seats(&menu, &db).await, 0);
+        let (lines, _) = MealLedger::list_for_student(&ali, None, 0, &db)
+            .await
+            .unwrap();
+        assert_eq!(lines.len(), 2, "the charge and its reversal");
     }
 
     /// The instant the deadline counts back from: midnight UTC of the day plus

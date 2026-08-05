@@ -12,7 +12,8 @@ mod common;
 use axum::http::StatusCode;
 use common::{app_and_db, id_of, login, login_as, me_id, send, set_role};
 use hezarfen_backend::domain::meal_attendance::{MealAttendance, MealAttendanceStatus};
-use hezarfen_backend::domain::menu::MenuId;
+use hezarfen_backend::domain::menu::{Menu, MenuDate, MenuId, MenuSlot};
+use hezarfen_backend::domain::settings::MealSlotDef;
 use hezarfen_backend::domain::user::UserId;
 use hezarfen_backend::error::AppError;
 use serde_json::json;
@@ -58,6 +59,92 @@ async fn balance_of(app: &axum::Router, cookie: &str, student: &str) -> i64 {
     res.body["balance_minor"].as_i64().expect("a balance")
 }
 
+/// The canteen may not mint a charge for a meal that was already served.
+/// Booking is the charge trigger, and with the *shipped defaults* — no
+/// `meal_cancel_cutoff_minutes`, no `serving_minute` on any slot — nothing
+/// refused a seat on a menu dated 2020: a manager published it, a student
+/// booked it, and the ledger carried a real charge for food nobody could eat.
+///
+/// Both halves are here because the create-side check alone does not close it:
+/// a menu published legitimately last week, for a day that has *since* passed,
+/// is still on the volume and still addressable.
+#[tokio::test]
+async fn a_menu_behind_the_calendar_is_neither_publishable_nor_bookable() {
+    let (app, db) = app_and_db().await;
+    let mgr = login_as(&app, &db, "gone_mgr", "manager").await;
+    let ali = login(&app, "gone_ali").await;
+    let ali_id = me_id(&app, &ali).await;
+
+    // Half one: the same door every other create path in the app has.
+    let res = send(
+        &app,
+        "POST",
+        "/meals/menus",
+        Some(&mgr),
+        Some(json!({ "date": "2020-01-01", "slot": "lunch" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+
+    // Today is not past — the whole day is publishable and bookable at any
+    // hour, and on a slot with no `serving_minute` (the shipped default) the
+    // cutoff still closes nothing. That decision must survive this fix.
+    let today = hezarfen_backend::domain::timestamp::Timestamp::today_utc()
+        .format("%Y-%m-%d")
+        .to_string();
+    let menu = publish(&app, &mgr, &today).await;
+    add_dish(&app, &mgr, &menu, 4_500).await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{menu}/bookings"),
+        Some(&ali),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    assert_eq!(balance_of(&app, &mgr, &ali_id).await, -4_500);
+
+    // Half two: the menu the create-side check cannot reach — published while
+    // its day was still ahead, written here as the store holds it, since no
+    // route publishes one any more.
+    let stale = Menu::create(
+        MenuDate::try_new("2020-01-02").unwrap(),
+        MenuSlot::try_new("lunch", &[MealSlotDef::try_new("lunch", None).unwrap()]).unwrap(),
+        None,
+        &UserId::from_key(&me_id(&app, &mgr).await),
+        &db,
+    )
+    .await
+    .expect("the domain still writes what the volume may hold");
+    let stale = stale.get_id().key().to_string();
+    let res = send(
+        &app,
+        "POST",
+        &format!("/meals/menus/{stale}/bookings"),
+        Some(&ali),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::CONFLICT,
+        "a meal already served takes no seat: {}",
+        res.body
+    );
+    // The refusal moved no money — the whole point of the guard.
+    assert_eq!(balance_of(&app, &mgr, &ali_id).await, -4_500);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/meals/ledger/{ali_id}"),
+        Some(&mgr),
+        None,
+    )
+    .await;
+    assert_eq!(res.body["total"], 1, "one line, today's: {}", res.body);
+}
+
 /// A repeat `POST` of a seat the student already holds must replay that seat,
 /// whatever the menu costs *now*. Pricing the menu before the already-booked
 /// short circuit made it a `400` ("amount_minor must be between…") the moment
@@ -68,7 +155,7 @@ async fn a_repeat_booking_replays_the_held_seat_however_dear_the_menu_gets() {
     let (app, db) = app_and_db().await;
     let mgr = login_as(&app, &db, "dear_mgr", "manager").await;
     let ali = login(&app, "dear_ali").await;
-    let menu = publish(&app, &mgr, "2026-09-14").await;
+    let menu = publish(&app, &mgr, "2099-09-14").await;
     add_dish(&app, &mgr, &menu, 1_000).await;
 
     let res = send(
@@ -137,7 +224,7 @@ async fn a_manager_can_cancel_the_seat_of_someone_who_is_no_longer_a_student() {
     let mgr = login_as(&app, &db, "promo_mgr", "manager").await;
     let ali = login(&app, "promo_ali").await;
     let ali_id = me_id(&app, &ali).await;
-    let menu = publish(&app, &mgr, "2026-09-15").await;
+    let menu = publish(&app, &mgr, "2099-09-15").await;
     add_dish(&app, &mgr, &menu, 4_500).await;
 
     let res = send(
@@ -200,7 +287,7 @@ async fn a_manager_can_cancel_the_seat_of_someone_who_is_no_longer_a_student() {
     assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
 
     // A classmate still cannot cancel someone else's seat.
-    let menu = publish(&app, &mgr, "2026-09-16").await;
+    let menu = publish(&app, &mgr, "2099-09-16").await;
     let veli = login(&app, "promo_veli").await;
     let res = send(
         &app,
@@ -233,7 +320,7 @@ async fn a_credit_settles_a_debt_that_outlived_the_students_role() {
     let admin = login_as(&app, &db, "credit_admin", "admin").await;
     let ali = login(&app, "credit_ali").await;
     let ali_id = me_id(&app, &ali).await;
-    let menu = publish(&app, &admin, "2026-09-17").await;
+    let menu = publish(&app, &admin, "2099-09-17").await;
     add_dish(&app, &admin, &menu, 4_500).await;
     let res = send(
         &app,
@@ -367,7 +454,7 @@ async fn a_mark_for_a_menu_that_is_gone_writes_no_row() {
     let ali = login(&app, "mark_ali").await;
     let ali_id = UserId::from_key(&me_id(&app, &ali).await);
     let mgr_id = UserId::from_key(&me_id(&app, &mgr).await);
-    let menu = MenuId::from_key(&publish(&app, &mgr, "2026-09-18").await);
+    let menu = MenuId::from_key(&publish(&app, &mgr, "2099-09-18").await);
 
     // The menu goes while the mark is on its way down.
     let res = send(
@@ -404,7 +491,7 @@ async fn a_mark_for_a_menu_that_is_gone_writes_no_row() {
 
     // Republishing that very day and slot mints the same id — and must not
     // inherit a mark for a meal nobody attended.
-    let again = publish(&app, &mgr, "2026-09-18").await;
+    let again = publish(&app, &mgr, "2099-09-18").await;
     assert_eq!(again, menu.key(), "the id is deterministic on date+slot");
     let res = send(
         &app,
@@ -448,7 +535,7 @@ async fn a_mark_for_a_menu_that_is_gone_writes_no_row() {
 async fn a_dish_write_is_refused_once_its_menu_is_gone() {
     let (app, db) = app_and_db().await;
     let mgr = login_as(&app, &db, "orphan_mgr", "manager").await;
-    let menu = publish(&app, &mgr, "2026-09-19").await;
+    let menu = publish(&app, &mgr, "2099-09-19").await;
     let dish = add_dish(&app, &mgr, &menu, 1_000).await;
 
     // The menu row alone is removed, leaving the dish exactly as a delete
@@ -480,7 +567,7 @@ async fn a_dish_write_is_refused_once_its_menu_is_gone() {
     assert_eq!(res.status, StatusCode::NOT_FOUND, "{}", res.body);
 
     // …and on a live menu both still work, at a fresh revision each time.
-    let menu = publish(&app, &mgr, "2026-09-20").await;
+    let menu = publish(&app, &mgr, "2099-09-20").await;
     let dish = add_dish(&app, &mgr, &menu, 1_000).await;
     let res = send(
         &app,
@@ -510,7 +597,7 @@ async fn a_dish_write_is_refused_once_its_menu_is_gone() {
 async fn unpublishing_takes_the_dishes_with_the_row() {
     let (app, db) = app_and_db().await;
     let mgr = login_as(&app, &db, "cascade_mgr", "manager").await;
-    let menu = publish(&app, &mgr, "2026-09-21").await;
+    let menu = publish(&app, &mgr, "2099-09-21").await;
     add_dish(&app, &mgr, &menu, 1_000).await;
     send(
         &app,
@@ -521,7 +608,7 @@ async fn unpublishing_takes_the_dishes_with_the_row() {
     )
     .await;
 
-    let again = publish(&app, &mgr, "2026-09-21").await;
+    let again = publish(&app, &mgr, "2099-09-21").await;
     assert_eq!(again, menu, "the id is deterministic on date+slot");
     let res = send(
         &app,
@@ -613,7 +700,7 @@ async fn a_slot_whose_name_would_break_the_menu_url_cannot_be_published() {
         "POST",
         "/meals/menus",
         Some(&admin),
-        Some(json!({ "date": "2026-09-22", "slot": "a/b" })),
+        Some(json!({ "date": "2099-09-22", "slot": "a/b" })),
     )
     .await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
@@ -623,7 +710,7 @@ async fn a_slot_whose_name_would_break_the_menu_url_cannot_be_published() {
         "POST",
         "/meals/menus",
         Some(&admin),
-        Some(json!({ "date": "2026-09-22", "slot": "lunch" })),
+        Some(json!({ "date": "2099-09-22", "slot": "lunch" })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
@@ -642,8 +729,13 @@ async fn a_closed_cutoff_still_lets_a_manager_free_the_seat() {
     let mgr = login_as(&app, &db, "shut_mgr", "manager").await;
     let ali = login(&app, "shut_ali").await;
     let ali_id = me_id(&app, &ali).await;
-    // A day long past — booked while the school ran no deadline at all.
-    let menu = publish(&app, &mgr, "2020-01-02").await;
+    // Today's meal, booked while the school ran no deadline at all. It cannot
+    // be a day long past any more: a menu behind the calendar takes no booking
+    // at all, since the booking is what charges.
+    let today = hezarfen_backend::domain::timestamp::Timestamp::today_utc()
+        .format("%Y-%m-%d")
+        .to_string();
+    let menu = publish(&app, &mgr, &today).await;
     add_dish(&app, &mgr, &menu, 1_000).await;
     let res = send(
         &app,
@@ -656,9 +748,10 @@ async fn a_closed_cutoff_still_lets_a_manager_free_the_seat() {
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
     let booking = id_of(&res.body);
 
-    // The school sets a deadline, and it closed on this menu long ago. The
-    // serving hour goes with it: a slot without one has no instant for the
-    // deadline to count back from, so the cutoff would bind nobody.
+    // The school sets a deadline, and it closed on this menu hours ago: lunch
+    // is served at 00:00 UTC, so the deadline was an hour before that. The
+    // serving hour has to go with the knob — a slot without one has no instant
+    // for the deadline to count back from, so the cutoff would bind nobody.
     let res = send(
         &app,
         "PATCH",
@@ -666,7 +759,7 @@ async fn a_closed_cutoff_still_lets_a_manager_free_the_seat() {
         Some(&admin),
         Some(json!({
             "meal_cancel_cutoff_minutes": 60,
-            "meal_slots": [{ "name": "lunch", "serving_minute": 720 }],
+            "meal_slots": [{ "name": "lunch", "serving_minute": 0 }],
         })),
     )
     .await;
@@ -795,7 +888,7 @@ async fn an_unauthorised_cancel_tells_nobody_whether_the_seat_exists() {
     let veli = login(&app, "oracle_veli").await;
     let veli_id = me_id(&app, &veli).await;
     let can_id = me_id(&app, &login(&app, "oracle_can").await).await;
-    let menu = publish(&app, &mgr, "2026-09-19").await;
+    let menu = publish(&app, &mgr, "2099-09-19").await;
 
     let res = send(
         &app,
@@ -927,7 +1020,7 @@ async fn a_replayed_booking_answers_off_the_row_the_store_holds() {
     let (app, db) = app_and_db().await;
     let mgr = login_as(&app, &db, "stale_mgr", "manager").await;
     let ali = login(&app, "stale_ali").await;
-    let menu = publish(&app, &mgr, "2026-09-20").await;
+    let menu = publish(&app, &mgr, "2099-09-20").await;
     add_dish(&app, &mgr, &menu, 1_000).await;
 
     let res = send(
@@ -1092,7 +1185,7 @@ async fn a_seat_cannot_be_retaken_without_end() {
     let mgr = login_as(&app, &db, "cycle_mgr", "manager").await;
     let ali = login(&app, "cycle_ali").await;
     let ali_id = me_id(&app, &ali).await;
-    let menu = publish(&app, &mgr, "2026-09-21").await;
+    let menu = publish(&app, &mgr, "2099-09-21").await;
     add_dish(&app, &mgr, &menu, 1_000).await;
 
     // `max_booking_attempts` is published, so a client can say why before it
@@ -1183,7 +1276,7 @@ async fn the_balance_sums_every_kind_the_same_way_it_always_did() {
     assert_eq!(balance_of(&app, &mgr, &ali_id).await, 10_000);
 
     let mut bookings = Vec::new();
-    for (day, price) in [("2026-09-23", 4_500), ("2026-09-24", 1_500)] {
+    for (day, price) in [("2099-09-23", 4_500), ("2099-09-24", 1_500)] {
         let menu = publish(&app, &mgr, day).await;
         add_dish(&app, &mgr, &menu, price).await;
         let res = send(
@@ -1249,7 +1342,7 @@ async fn an_over_ceiling_seat_from_an_older_build_is_still_cancellable() {
     let ali = login(&app, "old_ali").await;
     // A free menu: the row is aged by hand below, and a charge keyed to an
     // attempt this test never really made would only muddy what is asserted.
-    let menu = publish(&app, &mgr, "2026-09-25").await;
+    let menu = publish(&app, &mgr, "2099-09-25").await;
     let res = send(
         &app,
         "POST",
