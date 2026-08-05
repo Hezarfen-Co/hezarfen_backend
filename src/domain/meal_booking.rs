@@ -1344,11 +1344,12 @@ mod tests {
         assert!(check_cutoff(&past, &lunch(), &cutoff(Some(60), Some(720))).is_err());
     }
 
+    /// Through the crate's one clock ([`Timestamp::today_utc`]), never
+    /// `chrono::Utc::now` — the guard under test compares against that same
+    /// clock, and a test reading a second one is how a timezone mix gets back
+    /// in (`clippy.toml` denies it, tests included).
     fn today() -> String {
-        chrono::Utc::now()
-            .date_naive()
-            .format("%Y-%m-%d")
-            .to_string()
+        Timestamp::today_utc().format("%Y-%m-%d").to_string()
     }
 
     /// The day being over is not the cutoff. It binds with no
@@ -1357,7 +1358,9 @@ mod tests {
     /// — and it never binds today, at any hour.
     #[test]
     fn the_past_day_guard_is_not_the_serving_hour_cutoff() {
-        let yesterday = (chrono::Utc::now().date_naive() - chrono::Duration::days(1))
+        let yesterday = Timestamp::today_utc()
+            .pred_opt()
+            .expect("there is a day before today")
             .format("%Y-%m-%d")
             .to_string();
         assert!(check_day_not_past(&MenuDate::try_new(&yesterday).unwrap()).is_err());
