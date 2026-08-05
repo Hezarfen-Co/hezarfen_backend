@@ -4,8 +4,11 @@
 //! started a retake could read the answer key — and their own `is_correct` /
 //! `auto_score` flags — on the sheet they were still writing.
 //!
-//! The gate now refuses (409) while the caller's latest sitting is in progress.
-//! Deterministic: the retake is started over HTTP, no clock or race involved.
+//! The gate now refuses (409) while the caller can still *write* a sitting —
+//! one in progress, or one they may still start under `max_attempts` while the
+//! exam is open. Refusing only the in-progress case still leaked: a finished
+//! seq 1 handed out the key one `POST /attempt` before it was used.
+//! Deterministic: every sitting is started over HTTP, no clock or race involved.
 //!
 //! And its cross-exam twin: the question bank copies `correct` into every exam
 //! a template is instantiated into, so a graded exam's review used to hand out
@@ -380,8 +383,8 @@ async fn review_hides_a_question_banked_out_of_it_and_live_elsewhere() {
 }
 
 /// A student mid-retake must not be able to read the answer key or the
-/// correctness flags on any of their own sittings — but the same reads must
-/// still work before the retake starts and again once it is submitted.
+/// correctness flags on any of their own sittings — and the reads must open
+/// again once the last sitting allowed is submitted.
 #[tokio::test]
 async fn a_retake_in_progress_closes_the_students_own_review_reads() {
     let (app, db) = app_and_db().await;
@@ -447,10 +450,10 @@ async fn a_retake_in_progress_closes_the_students_own_review_reads() {
     let res = send(&app, "POST", &finish_uri, Some(&student), None).await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
 
-    // Post-finish review: unchanged, this is the behaviour being preserved.
+    // Post-finish review: still shut, because seq 2 is still on the table.
+    // Reading the key here and *then* posting the retake was the leak.
     let res = send(&app, "GET", &key_uri, Some(&student), None).await;
-    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-    assert_eq!(res.body["items"][0]["id"], question);
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
 
     // Seq 2: the retake starts and is still writable.
     let res = send(&app, "POST", &attempt_uri, Some(&student), None).await;
@@ -471,4 +474,120 @@ async fn a_retake_in_progress_closes_the_students_own_review_reads() {
         let res = send(&app, "GET", uri, Some(&student), None).await;
         assert_eq!(res.status, StatusCode::OK, "{uri}: {}", res.body);
     }
+}
+
+/// The leak the in-progress gate alone could not see: a *finished* sitting on an
+/// exam that still allows another one. The student reads the key at leisure and
+/// then posts the retake with it in hand — no sitting is open at the moment of
+/// the read, so nothing refused them. Review must stay shut until no further
+/// sitting is available, and open the moment that is true.
+#[tokio::test]
+async fn review_stays_shut_while_another_sitting_is_still_available() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "rev_left_t", "teacher").await;
+    let student = login(&app, "rev_left_s").await;
+    let student_id = me_id(&app, &student).await;
+
+    let course = create_course(&app, &teacher, "chemistry").await;
+    let subject = create_subject(&app, &teacher, &course, "bonds").await;
+    enroll(&app, &teacher, &course, &student_id).await;
+    // Unlimited sittings: no amount of finishing exhausts them.
+    let res = create_exam_with(
+        &app,
+        &teacher,
+        &course,
+        json!({
+            "title": "bond quiz", "kind": "quiz", "mode": "open",
+            "max_attempts": 0, "allow_review": true,
+        }),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let exam = id_of(&res.body);
+
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/questions"),
+        Some(&teacher),
+        Some(json!({
+            "text": "Which bond shares electrons?", "kind": "choice", "points": 10,
+            "subject_id": subject,
+            "choices": [{"id": "c0", "text": "ionic"}, {"id": "c1", "text": "covalent"}],
+            "correct": "c1",
+        })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let question = id_of(&res.body);
+    // Choice ids are re-minted server-side; the key is whatever came back.
+    let right = res.body["correct"].as_str().expect("key").to_string();
+    let wrong = res.body["choices"][0]["id"].as_str().unwrap().to_string();
+
+    let attempt_uri = format!("/exams/{exam}/attempt");
+    let finish_uri = format!("/exams/{exam}/attempt/finish");
+    let key_uri = format!("/exams/{exam}/review/questions");
+    let sheet_uri = format!("/exams/{exam}/review/attempts/1/answers");
+
+    // Seq 1: sit, answer, grade, finish. Nothing is open now.
+    let res = send(&app, "POST", &attempt_uri, Some(&student), None).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/attempt/answers"),
+        Some(&student),
+        Some(json!({ "question_id": question, "selected": wrong })),
+    )
+    .await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/exams/{exam}/results"),
+        Some(&teacher),
+        Some(json!({ "mark": 20, "user_id": student_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(&app, "POST", &finish_uri, Some(&student), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    // The leak, exactly: no sitting open, a mark in hand, seq 2 still startable.
+    for uri in [&key_uri, &sheet_uri] {
+        let res = send(&app, "GET", uri, Some(&student), None).await;
+        assert_eq!(res.status, StatusCode::CONFLICT, "{uri}: {}", res.body);
+    }
+    // And the retake really is available — that is what makes the read a leak.
+    let res = send(&app, "POST", &attempt_uri, Some(&student), None).await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    assert_eq!(res.body["attempt"], 2, "{}", res.body);
+    let res = send(&app, "POST", &finish_uri, Some(&student), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(&app, "GET", &key_uri, Some(&student), None).await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+
+    // Closing the door — lowering `max_attempts` to what the student already
+    // used blocks future starts — opens review, key included.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/exams/{exam}"),
+        Some(&teacher),
+        Some(json!({ "max_attempts": 2 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(&app, "POST", &attempt_uri, Some(&student), None).await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+    for uri in [&key_uri, &sheet_uri] {
+        let res = send(&app, "GET", uri, Some(&student), None).await;
+        assert_eq!(res.status, StatusCode::OK, "{uri}: {}", res.body);
+    }
+    let res = send(&app, "GET", &key_uri, Some(&student), None).await;
+    assert_eq!(
+        common::items(&res.body)[0]["correct"],
+        json!(right),
+        "{}",
+        res.body
+    );
 }
