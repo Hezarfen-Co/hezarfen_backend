@@ -777,6 +777,13 @@ struct ProfileCourseRef {
 ///
 /// Some are staff counters and some student ones; a role that never does the
 /// work simply reads zero, which is why no key is conditional.
+///
+/// Every number here is the **owner's** true total for every reader, never
+/// narrowed per viewer — deliberately so even where the rows behind it sit
+/// behind a gate this reader would fail (`GET /pomodoro/{id}`,
+/// `GET /marks/user/{id}`, `GET /attendance/user/{id}`). A magnitude names no
+/// course, class, lesson or exam, and a per-reader counter would make one
+/// profile read differently to different people.
 #[derive(Serialize, ToSchema)]
 struct ProfileStatsResponse {
     /// Finished pomodoro stints; an open one counts for nothing.
@@ -846,10 +853,22 @@ struct ProfileStatsResponse {
 /// rest of the profile is still public to them.
 ///
 /// So no *named* thing here crosses a gate the viewer would fail directly. The
-/// two magnitudes deliberately do: `stats.courses` and `stats.classes` stay the
-/// owner's true totals for every reader — they are the motivational counters, a
-/// per-reader number would be meaningless, and a magnitude names no course and
-/// no class.
+/// magnitudes deliberately do — **every** one of them, not just the two that
+/// count the gated blocks. `stats.courses` and `stats.classes` are the obvious
+/// pair; `pomodoro_focus_ms` and `pomodoro_focus_ms_total` are byte-identical
+/// to the `total_focus_ms` that `GET /pomodoro/{id}` serves behind
+/// [`ensure_can_observe`]; and `lessons_attended_total`,
+/// `homework_submitted_total`, `homework_on_time_total`, `exam_sat_total` and
+/// `high_mark_total` are magnitudes of the same report data that gate holds —
+/// for a reader who is exactly [`Role::Teacher`] they are in fact *wider* than
+/// the reports themselves, which [`crate::web::marks`] and
+/// [`crate::web::attendance`] narrow to the courses that teacher manages.
+///
+/// That is the decision, not an oversight: every magnitude in `stats` is the
+/// owner's true total for every reader. They are the motivational counters, a
+/// per-reader number would make one profile read differently to different
+/// people, and a magnitude names no course, no class, no lesson and no exam —
+/// the *named* things stay behind their own gates, above.
 async fn profile_of(
     st: &AppState,
     user: &User,
@@ -903,11 +922,9 @@ async fn profile_of(
     Ok(ProfileResponse {
         id: id.key().to_string(),
         username: user.get_username().as_str().to_string(),
-        display_name: user
-            .get_display_name()
-            .map(|name| name.as_str().to_string())
-            // The legal-name join lives in `PersonRef` — one spelling of it.
-            .or_else(|| PersonRef::new(user).display_name),
+        // The whole three-step resolve lives in `PersonRef` — one spelling of
+        // it, so this profile and every embedded person ref cannot disagree.
+        display_name: PersonRef::new(user).display_name,
         role: user.get_role().into(),
         bio: user.get_bio().map(|bio| bio.as_str().to_string()),
         avatar: user
@@ -1047,8 +1064,10 @@ async fn my_profile(
 /// would pass `GET /courses/{id}` on. The class block holds the same bar as
 /// `GET /classes/user/{id}` — teacher+, a parent linked to this student, or the
 /// owner themselves; every other reader gets an empty `classes` array rather
-/// than a 403. `stats.courses` and `stats.classes` stay the owner's true totals
-/// either way.
+/// than a 403. Every number in `stats` stays the owner's true total either way,
+/// including the ones whose underlying reports are gated (`/pomodoro/{id}`,
+/// `/marks/user/{id}`, `/attendance/user/{id}`): they are motivational
+/// counters, and a magnitude names no course, class, lesson or exam.
 #[utoipa::path(
     get,
     path = "/{id}/profile",

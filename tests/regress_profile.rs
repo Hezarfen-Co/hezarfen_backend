@@ -246,6 +246,91 @@ async fn display_name_falls_back_to_the_legal_name_then_null() {
     );
 }
 
+/// The embedded person refs resolve the display name in the *same* three steps
+/// the profile does — the rule has one spelling, and this asserts the two
+/// surfaces agree at every step. It shipped broken because no test had ever set
+/// a `display_name` that differs from the legal-name join: the person ref
+/// skipped the stored name outright, so anyone who chose one was still shown
+/// their legal name by every list that embeds a person.
+#[tokio::test]
+async fn embedded_person_refs_show_the_chosen_name_like_the_profile() {
+    let (app, _db) = app_and_db().await;
+    let ali = login(&app, "ali").await;
+    let ayse = login(&app, "ayse").await;
+    let ayse_id = me_id(&app, &ayse).await;
+
+    // What `ali` sees of `ayse` in a person ref, and what her own profile says.
+    let as_person_ref = async || {
+        let sent = send(&app, "GET", "/messages?folder=sent", Some(&ali), None).await;
+        assert_eq!(sent.status, StatusCode::OK, "{}", sent.body);
+        items(&sent.body)[0]["recipient"]["display_name"].clone()
+    };
+    let as_profile = async || {
+        let profile = send(
+            &app,
+            "GET",
+            &format!("/users/{ayse_id}/profile"),
+            Some(&ali),
+            None,
+        )
+        .await;
+        assert_eq!(profile.status, StatusCode::OK, "{}", profile.body);
+        profile.body["display_name"].clone()
+    };
+
+    let sent = send(
+        &app,
+        "POST",
+        "/messages",
+        Some(&ali),
+        Some(json!({ "recipient_id": ayse_id, "subject": "ödev", "body": "yarın" })),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::CREATED, "{}", sent.body);
+
+    // Neither name: `null` on both surfaces, never the username.
+    assert!(as_person_ref().await.is_null(), "nothing to show yet");
+    assert_eq!(as_person_ref().await, as_profile().await);
+
+    // Legal name only: the join, on both.
+    let res = send(
+        &app,
+        "PATCH",
+        "/users/me",
+        Some(&ayse),
+        Some(json!({ "name": "Ayşe", "surname": "Yılmaz" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(as_person_ref().await, "Ayşe Yılmaz");
+    assert_eq!(as_person_ref().await, as_profile().await);
+
+    // A chosen name wins over the legal one — the whole point of choosing it.
+    let res = send(
+        &app,
+        "PATCH",
+        "/users/me",
+        Some(&ayse),
+        Some(json!({ "display_name": "Ada" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(
+        as_person_ref().await,
+        "Ada",
+        "the legal name must not leak back through a person ref"
+    );
+    assert_eq!(
+        as_person_ref().await,
+        as_profile().await,
+        "the two surfaces resolve one rule and cannot disagree"
+    );
+    // The office record is untouched by any of this.
+    let office = send(&app, "GET", "/auth/me", Some(&ayse), None).await;
+    assert_eq!(office.body["name"], "Ayşe");
+    assert_eq!(office.body["surname"], "Yılmaz");
+}
+
 /// The read-time badge backstop, and the write it must not make.
 ///
 /// A counter is moved behind the API's back — exactly what a lost `badge::sync`
@@ -355,6 +440,10 @@ async fn fresh_stats_read_zero_on_every_field() {
             stats.get(field)
         );
     }
+    // A 17th key is a new disclosure decision, not just a new number: every
+    // magnitude here is the owner's true total for *every* reader, gate or no
+    // gate (see `profile_of`). Adding one means re-reading that paragraph and
+    // saying so in the README before this list grows.
     assert_eq!(stats.len(), 16, "an unlisted counter shipped: {stats:?}");
     assert!(mine.body["avatar"].is_null());
     assert_eq!(mine.body["classes"], json!([]));
