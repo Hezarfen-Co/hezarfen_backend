@@ -402,9 +402,12 @@ async fn update_user_preferences(
     Ok(Json(apply_preferences(user, &req, &st.db).await?))
 }
 
-/// Set a user's role. Admin only. An admin cannot change their own role — that
-/// guard keeps a sole admin from accidentally locking everyone out of role
-/// management (recover such a lockout with the SurrealQL in the README).
+/// Set a user's role. Admin only. An admin cannot change their own role, and
+/// the school's **last** admin cannot be demoted by anyone (`409`) — together
+/// those keep role management from locking everyone out, including when two
+/// admins demote each other at the same instant (the floor is serialized, see
+/// `ADMIN_FLOOR_LOCK`). A school that has already lost its admins is recovered
+/// with the SurrealQL in the README, since the seed never promotes.
 /// Setting any non-`student` role also drops the user's course enrollments —
 /// only students enroll, so a promoted user leaves every roster. Demoting below
 /// `teacher` drops their course teaching assignments for the mirror reason.
@@ -425,6 +428,7 @@ async fn update_user_preferences(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires admin, or attempted to change own role", body = ErrorResponse),
         (status = 404, description = "User not found", body = ErrorResponse),
+        (status = 409, description = "That account is the school's last admin", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -499,6 +503,12 @@ async fn students_page(
         .map(|link| link.get_student().clone())
         .collect();
     let mut students = User::list_by_ids(&ids, db).await?;
+    // The link row alone is not the grant, exactly as [`ensure_can_observe`]
+    // says: a link whose student side changed role (a sweep lost a race with
+    // `link_student`) is inert everywhere else, so it must not name a person
+    // here either. Filtered at read time rather than swept, which also makes
+    // any such row already on disk inert without a migration.
+    students.retain(|student| student.get_role() == Role::Student);
     students.sort_by(|a, b| a.get_username().as_str().cmp(b.get_username().as_str()));
     let total = students.len() as i64;
     // Paged in the web layer: the rows come from a link table and are
@@ -776,8 +786,8 @@ struct ProfileStatsResponse {
     homework_submitted_total: i64,
     /// Lifetime hand-ins made before their deadline, judged at hand-in.
     homework_on_time_total: i64,
-    /// Lifetime exam sittings, counted once per attempt — retakes included, and
-    /// deleting the exam does not take them back.
+    /// Lifetime exams sat, counted at the first sitting of each exam — a retake
+    /// moves nothing, and deleting the exam does not take one back.
     exam_sat_total: i64,
     /// Lifetime finished pomodoro stints.
     pomodoro_finished_total: i64,
