@@ -434,6 +434,77 @@ mod tests {
         );
     }
 
+    /// The stamp moves **strictly upwards**, never to the clock — the property
+    /// the whole shape rests on, since an `UPDATE` that leaves the row
+    /// unchanged is elided, never reaches the store's write set, and so
+    /// collides with the racing delete not at all.
+    ///
+    /// The test above cannot see it: it compares one append against
+    /// `create_capped`, which costs a millisecond or so on its own, and a plain
+    /// `$now` clears that. Nor can a burst of appends — each is a transaction
+    /// of its own and takes about as long, so the clock has moved on by the
+    /// time the next one reads it. Timing cannot reach the window on demand.
+    ///
+    /// So the *state* the window produces is set up directly instead: a stamp
+    /// **ahead of the clock**, which is precisely what `math::max` leaves
+    /// behind (see [`touch_and_write`]) and therefore an ordinary row, not a
+    /// contrived one. From there the two rules are told apart with no race at
+    /// all — upwards keeps climbing off the stored value, the clock drags the
+    /// stamp back down to itself. The lead is a second, far more than two
+    /// writes can burn, and the guard below fails loudly rather than vacuously
+    /// on a machine that manages to burn it.
+    #[tokio::test]
+    async fn a_stamp_ahead_of_the_clock_still_climbs() {
+        use crate::domain::chatbot_message::{ChatContent, ChatbotMessage};
+
+        const LEAD: i64 = 1_000;
+
+        let db = a_user_capped_at(1).await;
+        let user = UserId::from_key("u");
+        let thread = ChatbotThread::create_capped(&user, None, &db)
+            .await
+            .expect("thread");
+
+        let parked = Timestamp::now().as_millis() + LEAD;
+        db.query("UPDATE $id SET updated_at = $parked")
+            .bind(("id", thread.get_id().record()))
+            .bind(("parked", parked))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        for _ in 0..2 {
+            ChatbotMessage::append_user(
+                thread.get_id(),
+                &user,
+                ChatContent::try_new("selam").unwrap(),
+                &db,
+            )
+            .await
+            .expect("append");
+        }
+        let stamped = ChatbotThread::read_for(thread.get_id(), &user, &db)
+            .await
+            .expect("re-read")
+            .expect("still there")
+            .get_updated_at()
+            .as_millis();
+
+        assert!(
+            Timestamp::now().as_millis() < parked,
+            "the clock caught the {LEAD}ms lead up during two appends, so this \
+             probe proves nothing"
+        );
+        assert_eq!(
+            stamped,
+            parked + 2,
+            "two appends off a stamp of {parked} must leave {}: a stamp that \
+             follows the clock instead is one an unchanged-row UPDATE elides",
+            parked + 2
+        );
+    }
+
     /// No turn may survive the delete that swept its thread. An orphan is not
     /// litter: nothing sweeps `chatbot_message` afterwards, and both
     /// `GET /chatbot/threads/{id}/messages/{mid}` and its `/stream` answered
