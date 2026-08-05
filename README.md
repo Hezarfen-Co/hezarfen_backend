@@ -814,7 +814,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | POST   | `/events/{id}/register`          | teacher | `{user_id?}` — seat a **student** (or yourself when omitted) on a registration event's signup list; idempotent, `409` once full or started |
 | DELETE | `/events/{id}/register/{user}`   | teacher | Free a seat (same self-or-student rule); `409` once the event started |
 | POST   | `/appointments/slots`            | teacher | `{starts_at, ends_at, note?, repeat_weekly?, until?}` — publish availability on **own** calendar; always answers an **array** (one element for a one-off, one per weekly occurrence, ≤ 52, sharing a `series`); `400` if a weekly shift would run off the end of time; `409` if the window overlaps one the caller already published (half-open, so back-to-back is fine) — a weekly publish is all-or-nothing |
-| GET    | `/appointments/slots`            | student | Teacher+: own calendar (past included). Everyone else: the bookable calendar — future slots only, demoted teachers' slots left out · paged |
+| GET    | `/appointments/slots`            | student | Teacher+: own calendar (past included). Everyone else: the bookable calendar — slots not yet started (the same bound booking enforces), demoted teachers' slots left out · paged |
 | DELETE | `/appointments/slots/{id}`       | teacher | Withdraw one slot (its teacher, or manager+); `409` while a pending/approved booking sits on it |
 | DELETE | `/appointments/slots/series/{series}` | teacher | Withdraw a whole recurring publish (same rights); `409` if **any** occurrence has a live booking |
 | POST   | `/appointments`                  | student | `{slot, reason}` — book a slot; **students and parents only** (a parent books for themselves); lands `pending`, `409` if the slot's window has already started, the slot is taken, the caller is busy at that time, or its teacher is no longer staff |
@@ -1425,7 +1425,10 @@ POST /appointments/slots
 
 `GET /appointments/slots` is two lists behind one path: a teacher+ reads
 **their own** calendar, past occurrences included; everyone else reads the
-**bookable** calendar — future slots only, earliest first. A teacher demoted
+**bookable** calendar — slots that have **not started yet**, earliest first.
+That bound is `starts_at`, the same one booking enforces, so a slot already
+underway is left out rather than offered for a request that could only answer
+`409`; the 60-second publish-time skew grace does not widen it either. A teacher demoted
 after publishing leaves **inert** slots: their live role is re-read, so those
 slots drop out of the bookable list and booking one is refused with a `409`.
 The list does not say whether a slot is already taken — booking a taken one

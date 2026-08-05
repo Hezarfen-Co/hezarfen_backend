@@ -339,8 +339,10 @@ impl Appointment {
             .ok_or(AppError::NotFound)?;
         // A window that has opened is history, not a plan: `cancel` refuses to
         // call off a meeting that started, so such a booking would be stuck
-        // forever. `list_upcoming` hides these slots, but a stale id still
-        // reaches here. The publish-time 60s skew grace does not apply.
+        // forever. `list_upcoming` is bounded on this same `starts_at`, so the
+        // calendar never offers one — but a slot whose start passed while the
+        // page was open, or an id kept from an earlier read, still reaches here.
+        // The publish-time 60s skew grace does not apply on either side.
         if slot_row.get_starts_at().as_millis() <= Timestamp::now().as_millis() {
             return Err(AppError::Conflict("the slot has already started"));
         }
