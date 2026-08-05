@@ -1223,7 +1223,11 @@ link *and* the target's live role — so unlinking a student, or promoting one
 out of `student`, stops the reads at once rather than at the next login.
 
 **`display_name`** resolves in three steps: the stored `display_name`, else the
-`"name surname"` join, else `null`. It does **not** replace `name`/`surname` —
+`"name surname"` join, else `null`. Those same three steps are what **every
+embedded person ref** (`{id, username, display_name}`) shows, everywhere one
+appears — a message's sender, a course's teachers, a roster row, an exam result:
+a person who chose a display name is shown under it school-wide, which is the
+point of choosing one. It does **not** replace `name`/`surname` —
 those stay the school-office record, and an admin still edits them — and it
 deliberately does not enter the user search fold: `/users/search` finds people
 by the name the office knows them under, not by a nickname they picked this
@@ -1256,8 +1260,9 @@ own profile and a manager's read are never cut, since both already see the
 whole list, and the 20-course truncation runs *after* the filter, so a reader
 gets up to 20 courses they can actually open. `stats.courses` stays the
 owner's true total on purpose — it is the motivational counter, a per-reader
-number would be meaningless, and a magnitude names no course. One consequence,
-by design: a teacher you share nothing with has an empty `courses` block.
+number would be meaningless, and a magnitude names no course (see "every
+number in `stats`" below). One consequence, by design: a teacher you share
+nothing with has an empty `courses` block.
 
 **The class block is cut the same way, at the same bar `GET /classes/user/{id}`
 holds**: teacher+, a parent linked to that student, or the owner reading their
@@ -1271,6 +1276,21 @@ differs from the courses one: there is no "the class we share", so a reader
 either sees the owner's section list or sees none of it. `stats.classes`, like
 `stats.courses`, stays the owner's true total for every reader — a magnitude
 names no class.
+
+**Every number in `stats` is the owner's true total for every reader**, and
+that is a decision rather than an oversight. It is not only the two counters
+above: `pomodoro_focus_ms` and `pomodoro_focus_ms_total` are the same figure
+`GET /pomodoro/{id}` serves as `total_focus_ms` behind its observer gate, and
+`lessons_attended_total`, `homework_submitted_total`, `homework_on_time_total`,
+`exam_sat_total` and `high_mark_total` are magnitudes of the mark and
+attendance data that same gate holds — for a reader who is exactly a `teacher`
+they are in fact *wider* than `GET /marks/user/{id}` and
+`GET /attendance/user/{id}`, which narrow to the courses that teacher manages.
+They stay unnarrowed because they are motivational counters: a magnitude names
+no course, no class, no lesson and no exam, and a per-reader figure would make
+one profile read differently to different people, which is worse than useless
+on a number whose whole job is to say "this is how much you have done". The
+*named* things — the class and course blocks — keep their gates, above.
 
 **`stats` holds sixteen numbers of two different kinds, and the difference is
 worth knowing.** `pomodoro_sessions`, `pomodoro_focus_ms`, `courses` and

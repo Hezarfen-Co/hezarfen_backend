@@ -52,12 +52,18 @@ pub struct PersonRef {
     pub id: String,
     #[schema(example = "ada")]
     pub username: String,
-    /// `"Name Surname"` when the profile carries either; `null` otherwise.
+    /// The name to show this person under, resolved in the same three steps
+    /// `GET /users/{id}/profile` uses: the stored `display_name`, else the
+    /// `"Name Surname"` join, else `null`.
     #[schema(example = "Ada Lovelace")]
     pub display_name: Option<String>,
 }
 
 impl PersonRef {
+    /// The one spelling of the display-name resolve — `ProfileResponse` calls
+    /// this too. It was two hand-kept copies once, and the copy here forgot the
+    /// stored name, so a person who chose one was still shown their legal name
+    /// by every list that embeds a person.
     pub fn new(user: &User) -> Self {
         let full: Vec<&str> = [user.get_name(), user.get_surname()]
             .into_iter()
@@ -67,7 +73,10 @@ impl PersonRef {
         Self {
             id: user.get_id().key().to_string(),
             username: user.get_username().as_str().to_string(),
-            display_name: (!full.is_empty()).then(|| full.join(" ")),
+            display_name: user
+                .get_display_name()
+                .map(|chosen| chosen.as_str().to_string())
+                .or_else(|| (!full.is_empty()).then(|| full.join(" "))),
         }
     }
 
