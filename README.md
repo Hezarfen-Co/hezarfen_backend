@@ -3274,10 +3274,15 @@ stream torn down rather than delivering a late answer.
 
 ### TLS, auth & finding the certificate
 
-QUIC has no plaintext mode. With `AI_TLS_CERT`/`AI_TLS_KEY` unset, a
+QUIC has no plaintext mode. With `AI_TLS_CERT`/`AI_TLS_KEY` **both** unset, a
 self-signed certificate is generated at boot and its sha256 fingerprint logged
 — services pin that instead of installing a CA. The certificate authenticates
 *the backend*; the shared token in `Hello` authenticates *the service*.
+
+Setting **one** of the two (a blank value counts as unset) is a startup error,
+not a fallback to self-signing: a bridge quietly presenting a throwaway
+`localhost` certificate to services pinning the real one is a deployment that
+looks configured and answers `503` to every chatbot send.
 
 So a service does not have to be handed a file out of band, the certificate is
 published over HTTP:

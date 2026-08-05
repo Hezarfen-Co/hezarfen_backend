@@ -35,13 +35,36 @@ pub fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-/// Build the listener's TLS config from a PEM pair, or self-signed when either
-/// path is absent.
+/// Build the listener's TLS config from a PEM pair, or self-signed when *both*
+/// paths are absent.
+///
+/// Half-configured is a setup error, never a fallback: with one path set the
+/// operator plainly meant to present a real certificate, and self-signing
+/// instead would hand every dialling service a throwaway `localhost` leaf,
+/// regenerated on every boot, with nothing in the log to say so — every service
+/// pinning the real fingerprint then fails the handshake and every chatbot send
+/// degrades to a `503` with no cause visible anywhere. Note that config's
+/// `parse_optional` folds a blank variable to `None`, so `AI_TLS_KEY=""`
+/// arrives here as an absent path like any other.
 pub fn build(cert_path: Option<&str>, key_path: Option<&str>) -> Result<BridgeTls, AiError> {
     install_crypto_provider();
     let (chain, key) = match (cert_path, key_path) {
         (Some(c), Some(k)) => load_pem(c, k)?,
-        _ => self_signed()?,
+        (Some(_), None) => {
+            return Err(AiError::Setup(
+                "AI_TLS_CERT is set but AI_TLS_KEY is not — set both for a real certificate, \
+                 or neither for a self-signed development one"
+                    .into(),
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(AiError::Setup(
+                "AI_TLS_KEY is set but AI_TLS_CERT is not — set both for a real certificate, \
+                 or neither for a self-signed development one"
+                    .into(),
+            ));
+        }
+        (None, None) => self_signed()?,
     };
     let leaf = chain
         .first()
@@ -151,5 +174,20 @@ mod tests {
         // refusing to boot.
         let err = build(Some("/nonexistent/cert.pem"), Some("/nonexistent/key.pem")).unwrap_err();
         assert!(matches!(err, AiError::Setup(m) if m.contains("AI_TLS_CERT")));
+
+        // The half-*configured* case, which used to take the self-signed arm:
+        // one path set and the other absent (unset, or blank — `parse_optional`
+        // folds a blank variable to `None` before it reaches here) must name
+        // the missing variable, not quietly mint a throwaway certificate.
+        let no_key = build(Some("/nonexistent/cert.pem"), None).unwrap_err();
+        assert!(
+            matches!(&no_key, AiError::Setup(m) if m.contains("AI_TLS_KEY")),
+            "a cert with no key must name the key: {no_key}"
+        );
+        let no_cert = build(None, Some("/nonexistent/key.pem")).unwrap_err();
+        assert!(
+            matches!(&no_cert, AiError::Setup(m) if m.contains("AI_TLS_CERT")),
+            "a key with no cert must name the cert: {no_cert}"
+        );
     }
 }
