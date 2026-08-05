@@ -16,7 +16,7 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use crate::constant::{
     HOMEWORK_RESULT_TABLE, MARKS_GIVEN_TOTAL_FIELD, SUBMISSION_GRADED_FIELD, SUBMISSION_OPEN_GUARD,
 };
-use crate::database::Database;
+use crate::database::{Database, transaction_with_retry};
 use crate::domain::course::CourseId;
 use crate::domain::exam_result::Mark;
 use crate::domain::homework::HomeworkId;
@@ -262,29 +262,62 @@ impl HomeworkResult {
     /// stamp [`grade`](Self::grade) left on it is cleared in the same
     /// transaction — scoped to *this* grade's id, so it can never wipe a stamp a
     /// concurrent re-grade has just written.
+    ///
+    /// The grader's `marks_given_total` comes back with it, in that same
+    /// transaction and only when a row was really deleted. [`grade`](Self::grade)
+    /// credits on the branch that finds no row, and a deleted row *is* no row:
+    /// left standing, ungrade-then-regrade credited a second time off one
+    /// stored grade, and looped it minted a badge with no exam, no mark and no
+    /// submission behind it — permanently, since an award is never revoked.
+    /// Given back to the *removed row's own* grader, not the caller: a manager
+    /// may un-grade what a teacher graded, and the credit is the teacher's.
+    ///
+    /// Sound to re-send while the store answers "conflict, retry" — this is the
+    /// upgrade `grade` still wants, taken here because the counter above is what
+    /// makes it necessary: the grader's row is written by exam grading too, so
+    /// the delete now contends with another domain, and only `DELETE`/`UPDATE`
+    /// are in the batch, none of which can legitimately answer "already exists".
     pub async fn remove(
         homework: &HomeworkId,
         user: &UserId,
         db: &Database,
     ) -> Result<Option<HomeworkResult>, AppError> {
         let id = HomeworkResultId::composite(homework, user);
-        let mut result = db
-            .query(format!(
+        let (mut result, mut errors) = transaction_with_retry(
+            db,
+            &format!(
                 "BEGIN TRANSACTION;
-                 DELETE $id RETURN BEFORE;
+                 LET $gone = (DELETE $id RETURN BEFORE);
                  UPDATE $sub SET {SUBMISSION_GRADED_FIELD} = NONE \
                      WHERE {SUBMISSION_GRADED_FIELD} = $id;
+                 IF array::len($gone) > 0 {{
+                     LET $grader = $gone[0].graded_by;
+                     UPDATE $grader SET {MARKS_GIVEN_TOTAL_FIELD} =
+                         math::max([({MARKS_GIVEN_TOTAL_FIELD} ?? 0) - 1, 0])
+                 }};
+                 RETURN $gone;
                  COMMIT TRANSACTION;"
-            ))
-            .bind(("id", id.record()))
-            .bind((
-                "sub",
-                HomeworkSubmissionId::composite(homework, user).record(),
-            ))
-            .await?
-            .check()?;
-        // BEGIN is slot 0; the grade's DELETE is slot 1, the unstamp slot 2.
-        Ok(result.take::<Vec<HomeworkResult>>(1)?.into_iter().next())
+            ),
+            &[
+                ("id".into(), id.record().into_value()),
+                (
+                    "sub".into(),
+                    HomeworkSubmissionId::composite(homework, user)
+                        .record()
+                        .into_value(),
+                ),
+            ],
+            &[],
+        )
+        .await?;
+        if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+            return Err(error.into());
+        }
+        // The trailing `RETURN` is always the last statement before `COMMIT`, so
+        // its slot follows the statement count — the hand-kept "slot 1" this
+        // replaces was one added statement away from handing back the unstamp.
+        let slot = result.num_statements().saturating_sub(2);
+        Ok(result.take::<Vec<HomeworkResult>>(slot)?.into_iter().next())
     }
 }
 
@@ -401,6 +434,55 @@ mod tests {
             1,
             "one graded pair, one mark given"
         );
+    }
+
+    /// Un-grading gives the credit back, so grade → ungrade → regrade nets to
+    /// one however often it is run. Crediting the grade without refunding the
+    /// delete was the cheapest counter farm in the codebase — two requests per
+    /// mark given, with no exam, no mark and no submission behind them.
+    #[tokio::test]
+    async fn ungrading_gives_the_grader_credit_back() {
+        let db = crate::database::init_mem().await.unwrap();
+        let homework = HomeworkId::from_key("01TESTHWUNGRADEAAAAAAAAAAA");
+        let user = UserId::from_key("01TESTUSERAAAAAAAAAAAAAAAA");
+        let teacher = UserId::from_key("01TESTTEACHERAAAAAAAAAAAAA");
+        db.query("CREATE $usr SET username = 't', password_hash = 'x'")
+            .bind(("usr", teacher.record()))
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
+
+        for _ in 0..3 {
+            HomeworkResult::grade(
+                &homework,
+                &user,
+                HomeworkStatus::try_new("missing").unwrap(),
+                None,
+                &teacher,
+                &db,
+            )
+            .await
+            .unwrap();
+            assert_eq!(marks_given(&teacher, &db).await, 1);
+            assert!(
+                HomeworkResult::remove(&homework, &user, &db)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "the grade was there"
+            );
+            assert_eq!(marks_given(&teacher, &db).await, 0, "the loop kept one");
+        }
+
+        // Nothing to remove is nothing to give back — the floor holds.
+        assert!(
+            HomeworkResult::remove(&homework, &user, &db)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(marks_given(&teacher, &db).await, 0);
     }
 
     /// The grader's badge counter, re-read out of the store.

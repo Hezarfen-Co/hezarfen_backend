@@ -857,19 +857,30 @@ pub const CHATBOT_THREAD_COUNT_FIELD: &str = "chatbot_thread_count";
 /// below; released when a board is deleted.
 pub const USER_BOARD_COUNT_FIELD: &str = "board_count";
 /// The lifetime totals behind the badges, all on the user row. Not caps: each
-/// one counts something the student *did*. Only the two homework counters ever
-/// come down, and in exactly one case — a student withdrawing their own
-/// submission — because that route is self-service and a strictly monotonic
-/// counter would let one homework be farmed into fifty by submit/delete/submit.
-/// The exam and pomodoro totals never decrease at all: there is no student-facing
-/// delete behind them, so sitting an exam or finishing a stint is a lifetime
-/// fact. Nothing else decrements: a teacher's delete and the course cascade
-/// (which do take the attempt rows with them) leave them alone,
-/// since history a teacher erased is still history the student lived. A badge
-/// already earned is never taken back either, whatever a counter does
-/// afterwards — [`crate::domain::badge`] only ever adds award rows. Floored at
-/// zero, and absent means zero: an account older than the columns reads exactly
-/// like a fresh one.
+/// one counts something the person *did*. A counter comes down in exactly one
+/// shape, and the two cases that qualify share a reason: the account credited
+/// is the account that can delete what earned it, so a strictly monotonic
+/// counter is a farm. A student withdrawing their own submission gives the two
+/// homework counters back (else one homework becomes fifty by
+/// submit/delete/submit), and a teacher un-grading gives back
+/// `MARKS_GIVEN` — with `HIGH_MARK` on the exam side, credited to the student
+/// by the same act (else one exam becomes fifty by grade/ungrade/regrade).
+/// The exam and pomodoro totals never decrease at all: there is no delete
+/// behind them but a teacher's, so sitting an exam or finishing a stint is a
+/// lifetime fact. Nothing else decrements: the cascades (an exam, a homework or
+/// a course delete, which do take the attempt and result rows with them) leave
+/// them alone, since history a teacher erased is still history the student
+/// lived. A badge already earned is never taken back either, whatever a counter
+/// does afterwards — [`crate::domain::badge`] only ever adds award rows. Floored
+/// at zero, and absent means zero: an account older than the columns reads
+/// exactly like a fresh one.
+//
+// ponytail: that cascade ruling is also the farm's long way round — delete the
+// *exam* instead of the mark and the credit stands, so the loop still climbs,
+// at a couple of requests a point rather than two. Closing it means
+// `Exam::delete`, `Homework::delete` and `Course::delete` refunding per swept
+// row the way `ExamResult::remove` now does, which is a policy call (a course
+// delete would then have to walk every mark it drops) rather than an oversight.
 pub const HOMEWORK_SUBMITTED_TOTAL_FIELD: &str = "homework_submitted_total";
 pub const HOMEWORK_ON_TIME_TOTAL_FIELD: &str = "homework_on_time_total";
 pub const EXAM_SAT_TOTAL_FIELD: &str = "exam_sat_total";
