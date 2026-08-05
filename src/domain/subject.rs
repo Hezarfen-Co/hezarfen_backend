@@ -297,7 +297,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn a_delete_racing_a_question_never_answers_500() {
-        use crate::domain::exam::ExamId;
         use crate::domain::exam_question::{
             ExamQuestion, QuestionKind, QuestionPoints, QuestionSpec, QuestionText,
         };
@@ -307,7 +306,13 @@ mod tests {
         let (mut last_delete, mut last_question) = (String::new(), String::new());
         for round in 0..20 {
             let course = CourseId::generate();
-            let exam = ExamId::generate();
+            // A real exam row per round: a question write moves its exam's
+            // counter, so a minted id nothing wrote is a 404 and no round would
+            // reach the subject race this test is about.
+            let exam = crate::domain::exam::published_exam(&db)
+                .await
+                .get_id()
+                .clone();
             let subject = Subject::create(
                 &course,
                 SubjectName::try_new("Limits").unwrap(),

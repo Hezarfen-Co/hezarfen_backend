@@ -229,6 +229,16 @@ mod tests {
     use super::*;
     use crate::domain::exam_question::{ChoiceInput, QuestionKind, QuestionSpec};
 
+    /// A real exam row: an image write moves its exam's counter (that is what
+    /// keeps a picture from outliving its exam), so a minted id nothing wrote
+    /// is a 404.
+    async fn exam_row(db: &Database) -> ExamId {
+        crate::domain::exam::published_exam(db)
+            .await
+            .get_id()
+            .clone()
+    }
+
     fn png() -> FileContentType {
         FileContentType::try_new("image/png").unwrap()
     }
@@ -261,7 +271,7 @@ mod tests {
     #[tokio::test]
     async fn upsert_replaces_per_slot() {
         let db = crate::database::init_mem().await.unwrap();
-        let exam = ExamId::generate();
+        let exam = exam_row(&db).await;
         let question = ExamQuestionId::generate();
         let ids = choice_ids();
 
@@ -311,7 +321,7 @@ mod tests {
     #[tokio::test]
     async fn only_the_dropped_options_lose_their_pictures() {
         let db = crate::database::init_mem().await.unwrap();
-        let exam = ExamId::generate();
+        let exam = exam_row(&db).await;
         let question = ExamQuestionId::generate();
         let ids = choice_ids();
         QuestionImage::new(&exam, &question, None, png(), 1)
@@ -361,7 +371,7 @@ mod tests {
     #[tokio::test]
     async fn an_empty_keep_set_clears_every_option_picture_but_not_the_illustration() {
         let db = crate::database::init_mem().await.unwrap();
-        let exam = ExamId::generate();
+        let exam = exam_row(&db).await;
         let question = ExamQuestionId::generate();
         let ids = choice_ids();
         QuestionImage::new(&exam, &question, None, png(), 1)
@@ -391,8 +401,8 @@ mod tests {
     #[tokio::test]
     async fn exam_listing_scopes_by_exam() {
         let db = crate::database::init_mem().await.unwrap();
-        let exam_a = ExamId::generate();
-        let exam_b = ExamId::generate();
+        let exam_a = exam_row(&db).await;
+        let exam_b = exam_row(&db).await;
         QuestionImage::new(&exam_a, &ExamQuestionId::generate(), None, png(), 1)
             .upsert(&db)
             .await
