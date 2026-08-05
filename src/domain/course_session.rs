@@ -1,7 +1,8 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
-use crate::constant::{COURSE_SESSION_TABLE, MAX_SESSION_TOPIC_LEN};
+use crate::constant::{COURSE_SESSION_TABLE, ENROLLMENT_COUNT_FIELD, MAX_SESSION_TOPIC_LEN};
 use crate::database::{Database, transaction_with_retry};
+use crate::domain::cap;
 use crate::domain::course::CourseId;
 use crate::domain::field_update::FieldUpdate;
 use crate::domain::monotonic_id::next_ulid;
@@ -113,9 +114,19 @@ impl CourseSession {
             starts_at,
             ends_at,
         };
-        let created: Option<CourseSession> =
-            db.create(session.id.record()).content(session).await?;
-        created.ok_or_else(|| AppError::Internal("failed to create session".into()))
+        // The course row is *written* (bumped and put back), not read, so this
+        // collides with `Course::delete`'s cascade: a lesson that outlives its
+        // course 404s through `session_with_course` forever — unreadable,
+        // unpatchable, undeletable. See [`cap::touch_and_create`].
+        cap::touch_and_create(
+            &course.record(),
+            ENROLLMENT_COUNT_FIELD,
+            &session.id.record(),
+            &session,
+            db,
+        )
+        .await?
+        .ok_or(AppError::NotFound)
     }
 
     pub async fn read(
@@ -203,6 +214,41 @@ impl CourseSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lesson must not outlive the course it is a lesson of: an orphan 404s
+    /// forever through `session_with_course` — unreadable, unpatchable,
+    /// undeletable.
+    ///
+    /// [`CourseSession::create`] therefore *writes* the course row rather than
+    /// reading it ([`cap::touch_and_create`]); the harness and the window it
+    /// races in are documented on
+    /// [`crate::domain::course::assert_no_child_outlives_a_course_delete`].
+    /// Mutation-tested: with the bare `db.create` this shipped with, all four
+    /// rounds orphan.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
+    async fn a_session_never_outlives_its_course() {
+        fn make(course: CourseId, db: Database) -> tokio::task::JoinHandle<Result<(), AppError>> {
+            tokio::spawn(async move {
+                CourseSession::create(
+                    &course,
+                    &UserId::generate(),
+                    SessionTopic::try_new("limits").unwrap(),
+                    Timestamp::from_millis(1),
+                    None,
+                    &db,
+                )
+                .await
+                .map(|_| ())
+            })
+        }
+        crate::domain::course::assert_no_child_outlives_a_course_delete(
+            "session_orphan_race",
+            COURSE_SESSION_TABLE,
+            make,
+        )
+        .await;
+    }
 
     #[tokio::test]
     async fn topic_is_optional_but_bounded() {

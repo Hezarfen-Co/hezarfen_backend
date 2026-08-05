@@ -508,7 +508,7 @@ mod tests {
             .to_vec();
         let exam = Exam::create(
             &student(),
-            &crate::domain::course::CourseId::generate(),
+            &crate::domain::course::a_test_course(&db).await,
             ExamTitle::try_new("quiz").unwrap(),
             ExamDescription::try_new("").unwrap(),
             ExamKind::try_new("quiz", &kinds).unwrap(),

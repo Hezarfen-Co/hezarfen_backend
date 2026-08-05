@@ -1,7 +1,10 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
-use crate::constant::{MAX_SUBJECT_DESCRIPTION_LEN, MAX_SUBJECT_NAME_LEN, SUBJECT_TABLE};
+use crate::constant::{
+    ENROLLMENT_COUNT_FIELD, MAX_SUBJECT_DESCRIPTION_LEN, MAX_SUBJECT_NAME_LEN, SUBJECT_TABLE,
+};
 use crate::database::{Database, transaction_with_retry};
+use crate::domain::cap;
 use crate::domain::course::CourseId;
 use crate::domain::field_update::FieldUpdate;
 use crate::domain::monotonic_id::next_ulid;
@@ -106,8 +109,20 @@ impl Subject {
             name,
             description,
         };
-        let created: Option<Subject> = db.create(subject.id.record()).content(subject).await?;
-        created.ok_or_else(|| AppError::Internal("failed to create subject".into()))
+        // The course row is *written* (bumped and put back), not read, so this
+        // collides with `Course::delete`'s cascade: a topic that outlives its
+        // course 404s through `subject_with_course` forever, while
+        // `subject_must_exist` still accepts its id — so a bank template can be
+        // tagged with a subject nobody can reach. See [`cap::touch_and_create`].
+        cap::touch_and_create(
+            &course.record(),
+            ENROLLMENT_COUNT_FIELD,
+            &subject.id.record(),
+            &subject,
+            db,
+        )
+        .await?
+        .ok_or(AppError::NotFound)
     }
 
     pub async fn read(id: &SubjectId, db: &Database) -> Result<Option<Subject>, AppError> {
@@ -240,6 +255,40 @@ impl Subject {
 mod tests {
     use super::*;
 
+    /// A curriculum topic must not outlive its course: an orphan 404s through
+    /// `subject_with_course`, and worse than the sibling cases,
+    /// `subject_must_exist` still *accepts* its id — so a bank template can be
+    /// tagged with a subject nobody can reach.
+    ///
+    /// [`Subject::create`] therefore *writes* the course row rather than
+    /// reading it ([`cap::touch_and_create`]); the harness and the window it
+    /// races in are documented on
+    /// [`crate::domain::course::assert_no_child_outlives_a_course_delete`].
+    /// Mutation-tested: with the bare `db.create` this shipped with, all four
+    /// rounds orphan.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
+    async fn a_subject_never_outlives_its_course() {
+        fn make(course: CourseId, db: Database) -> tokio::task::JoinHandle<Result<(), AppError>> {
+            tokio::spawn(async move {
+                Subject::create(
+                    &course,
+                    SubjectName::try_new("Limits").unwrap(),
+                    SubjectDescription::try_new("").unwrap(),
+                    &db,
+                )
+                .await
+                .map(|_| ())
+            })
+        }
+        crate::domain::course::assert_no_child_outlives_a_course_delete(
+            "subject_orphan_race",
+            SUBJECT_TABLE,
+            make,
+        )
+        .await;
+    }
+
     /// A teacher entering a curriculum gets it back in the order they typed it:
     /// `list_for_course` sorts `id ASC`, so the ids minted inside one
     /// millisecond have to sort in mint order. Revert `generate` to
@@ -305,7 +354,7 @@ mod tests {
         let (mut landed, mut wiped) = (0, 0);
         let (mut last_delete, mut last_question) = (String::new(), String::new());
         for round in 0..20 {
-            let course = CourseId::generate();
+            let course = crate::domain::course::a_test_course(&db).await;
             // A real exam row per round: a question write moves its exam's
             // counter, so a minted id nothing wrote is a 404 and no round would
             // reach the subject race this test is about.
