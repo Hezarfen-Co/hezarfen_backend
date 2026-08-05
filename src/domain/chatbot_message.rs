@@ -18,7 +18,7 @@ use crate::constant::{
     STALE_ERROR_CODE,
 };
 use crate::database::Database;
-use crate::domain::chatbot_thread::ChatbotThreadId;
+use crate::domain::chatbot_thread::{ChatbotThreadId, touch_and_write};
 use crate::domain::page::PagedList;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
@@ -207,10 +207,30 @@ impl ChatbotMessage {
         self
     }
 
+    /// Write one turn *through its thread's own row* ([`touch_and_write`]),
+    /// which is what makes the thread's existence something this write writes
+    /// rather than something the caller read and then trusted: a
+    /// [`ChatbotThread::delete`](crate::domain::chatbot_thread::ChatbotThread::delete)
+    /// racing it touches the very key this transaction moves, so the two cannot
+    /// both commit and no turn is left under a thread that is gone. It also
+    /// carries the thread's activity stamp, so a turn and its `updated_at` land
+    /// together.
+    ///
+    /// [`AppError::NotFound`] = the thread is gone, and nothing was written.
     async fn insert(message: ChatbotMessage, db: &Database) -> Result<ChatbotMessage, AppError> {
-        let created: Option<ChatbotMessage> =
-            db.create(message.id.record()).content(message).await?;
-        created.ok_or_else(|| AppError::Internal("failed to create chat message".into()))
+        let thread = message.thread_id.clone();
+        let id = message.id.record();
+        touch_and_write(
+            &thread,
+            "CREATE $id CONTENT $row RETURN AFTER",
+            vec![
+                ("id".into(), id.into_value()),
+                ("row".into(), message.into_value()),
+            ],
+            db,
+        )
+        .await?
+        .ok_or_else(|| AppError::Internal("failed to create chat message".into()))
     }
 
     /// Append the user's prompt. Nothing is awaited for it, so it is born
@@ -466,6 +486,13 @@ mod tests {
         // inverted a fifth of the pairs; here every pair must read back
         // question-then-answer, from both read paths.
         let db = crate::database::init_mem().await.unwrap();
+        // A real thread row: every turn is written through it, so a turn with
+        // no thread is refused (see [`ChatbotMessage::insert`]).
+        db.query("CREATE chatbot_thread:c SET user_id = user:u, created_at = 0, updated_at = 0")
+            .await
+            .unwrap()
+            .check()
+            .unwrap();
         let thread = ChatbotThreadId::from_key("c");
         let user = UserId::from_key("u");
         const TURNS: usize = 200;
