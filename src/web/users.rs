@@ -420,7 +420,13 @@ async fn update_user_preferences(
 /// Demoting to `parent` additionally gives back the seats they hold on
 /// still-open event signup lists: a parent can no longer free them, and nobody
 /// else may. Seats on lists that have already closed stay as they are — that
-/// roster is history.
+/// roster is history. It also takes the account off every whiteboard roster and
+/// **closes every board it created** — permanently read-only, nothing deleted.
+/// A demoted creator is a `404` on their own board, the four commands that could
+/// end it are the creator's alone, and no route lists a board the caller is not
+/// on, so the room would otherwise be commandable by nobody while its
+/// participants kept drawing on it. Closed, they keep reading the board, its
+/// history and its epochs; only writes are refused.
 #[utoipa::path(
     patch,
     path = "/{id}/role",
@@ -459,9 +465,12 @@ async fn set_role(
     // ([`super::undo_if_demoted`]), so a demotion racing an assignment is caught
     // by whichever side is second.
     let (updated, boards) = user.set_role(role, &st.db).await?;
-    // Whiteboard rooms whose roster the commit above changed, prompted with the
-    // same `participants` frame the roster PATCH publishes — after the commit,
-    // because the room re-reads the database before it acts on the frame.
+    // Whiteboard rooms the commit above changed, prompted with the same frames
+    // their own routes publish — after the commit, because the room re-reads the
+    // database before it acts on a frame. A room whose creator was demoted is
+    // now closed, and its `closed` frame is what turns the open sockets
+    // read-only; told only about the roster, they would draw on until each
+    // stroke came back refused.
     for board in boards {
         st.board_hub.publish(
             board.get_id().key(),
@@ -476,6 +485,12 @@ async fn set_role(
             })
             .to_string(),
         );
+        if let Some(closed_at) = board.get_closed_at() {
+            st.board_hub.publish(
+                board.get_id().key(),
+                json!({"type": "closed", "closed_at": closed_at.as_millis()}).to_string(),
+            );
+        }
     }
     Ok(Json(UserResponse::new(&updated)))
 }
