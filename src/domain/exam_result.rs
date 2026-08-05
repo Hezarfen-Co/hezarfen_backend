@@ -203,13 +203,23 @@ impl ExamResult {
     /// both counters where they are — there is no claim to give back, and so no
     /// window in which a crash could fail to give it.
     ///
-    /// The two badge counters ride that same first-time branch: the grader's
-    /// `marks_given_total`, and — only when the mark clears
-    /// [`HIGH_MARK_MIN`] — the student's `high_mark_total`. So a regrade of a
-    /// sitting moves neither however often it is run, while a retake, being a
-    /// distinct `seq` and so a distinct row, counts on its own. They are
-    /// written field-scoped: a user row also carries admin-owned data (`role`)
-    /// that a whole-row save would revert.
+    /// The grader's `marks_given_total` rides that same first-time branch: a
+    /// regrade of a sitting moves it however often it is run, while a retake,
+    /// being a distinct `seq` and so a distinct row, counts on its own.
+    ///
+    /// The student's `high_mark_total` cannot ride it, because it is not a
+    /// count of rows but a count of rows *at or above* [`HIGH_MARK_MIN`], and a
+    /// regrade moves a mark across that line without adding or removing a row.
+    /// It moves by the difference between the mark about to be stored and the
+    /// one already there — `+1` crossing up, `-1` crossing down, nothing at all
+    /// when both sides sit on the same side of the line, so an overwrite still
+    /// costs the student's row no write unless the answer actually changed.
+    /// Decided on the first branch alone it drifted upward without bound: 95
+    /// credited, regraded to 40 (no row added, so no move), then deleted, whose
+    /// refund reads the *stored* mark and so found nothing to give back — a
+    /// counter of one over zero stored high marks, looped into a permanent
+    /// badge. Both counters are written field-scoped: a user row also carries
+    /// admin-owned data (`role`) that a whole-row save would revert.
     pub async fn grade(
         exam: &ExamId,
         user: &UserId,
@@ -239,10 +249,14 @@ impl ExamResult {
         // exam survive my claim?" check moot: the claim now sits behind this
         // gate instead of in front of it.
         //
-        // Whether the row was already there decides both counters, and it is
-        // read one statement before them inside the same transaction — read
-        // anywhere else it would be a guess about a row two graders may be
-        // writing at once.
+        // `$before` is the sitting's *previous mark*, and it answers both
+        // questions off one read: `mark` is a mandatory column on a schemafull
+        // row, so `NONE` there means no row at all — the claim branch — while a
+        // number is what the student's counter takes its difference against.
+        // Read one statement before the counters inside the same transaction:
+        // read anywhere else it would be a guess about a row two graders may be
+        // writing at once, and the difference would be taken against a mark
+        // some other round had already replaced.
         //
         // Re-sent while the store answers "conflict, retry": the gates read a
         // column an exam PATCH writes, and the counters are the ones a
@@ -255,17 +269,6 @@ impl ExamResult {
         // the index entry can only ever point at the row the id already names
         // and the write resolves onto it. A lost round aborts having written
         // nothing, counters included.
-        // Below the line the student's counter is left out of the statement
-        // list entirely, rather than added to by a zero: a low mark is most
-        // marks, and it must not write the student's row at all.
-        let high_mark = if mark.as_i64() >= HIGH_MARK_MIN {
-            format!(
-                "UPDATE $student SET {HIGH_MARK_TOTAL_FIELD} =
-                         ({HIGH_MARK_TOTAL_FIELD} ?? 0) + 1;"
-            )
-        } else {
-            String::new()
-        };
         let _guard = cap::counter_lock().await;
         let (mut written, mut errors) = transaction_with_retry(
             db,
@@ -273,7 +276,7 @@ impl ExamResult {
                 "BEGIN TRANSACTION;
                  IF (SELECT VALUE id FROM ONLY $exam) IS NONE {{ THROW 'exam_missing' }};
                  IF (SELECT VALUE draft FROM ONLY $exam) {{ THROW 'exam_draft' }};
-                 LET $before = (SELECT VALUE id FROM ONLY $id);
+                 LET $before = (SELECT VALUE mark FROM ONLY $id);
                  IF $before = NONE {{
                      LET $kind = (UPSERT $kref SET {REF_COUNT_FIELD} = ({REF_COUNT_FIELD} ?? 0) + 1
                          WHERE {REF_RETIRED_FIELD} != true RETURN VALUE id);
@@ -282,7 +285,12 @@ impl ExamResult {
                          ({EXAM_RESULT_COUNT_FIELD} ?? 0) + 1;
                      UPDATE $grader SET {MARKS_GIVEN_TOTAL_FIELD} =
                          ({MARKS_GIVEN_TOTAL_FIELD} ?? 0) + 1;
-                     {high_mark}
+                 }};
+                 LET $high = (IF $result.mark >= {HIGH_MARK_MIN} {{ 1 }} ELSE {{ 0 }})
+                     - (IF ($before ?? -1) >= {HIGH_MARK_MIN} {{ 1 }} ELSE {{ 0 }});
+                 IF $high != 0 {{
+                     UPDATE $student SET {HIGH_MARK_TOTAL_FIELD} =
+                         math::max([({HIGH_MARK_TOTAL_FIELD} ?? 0) + $high, 0])
                  }};
                  LET $after = (UPSERT $id CONTENT $result RETURN AFTER);
                  RETURN $after[0];
@@ -393,8 +401,11 @@ impl ExamResult {
     /// actually deleted: `marks_given_total` to each row's *own* grader (two
     /// teachers can hold two sittings of the same pair), and `high_mark_total`
     /// once per removed row that cleared [`HIGH_MARK_MIN`], read off the
-    /// `BEFORE` image rather than re-derived — the mark that was credited is
-    /// the mark that was stored.
+    /// `BEFORE` image rather than re-derived. That last one is why
+    /// [`grade`](Self::grade) has to move the student's counter on a *regrade*
+    /// too: this end reads the stored mark, so the other end must be decided by
+    /// the stored mark as well, or a mark walked across the line between the
+    /// two leaves a credit no delete can find to give back.
     pub async fn remove(
         exam: &ExamId,
         user: &UserId,
@@ -767,6 +778,105 @@ mod tests {
                 .is_none()
         );
         assert_eq!(badge_counters(&db).await, (0, 0));
+    }
+
+    /// A regrade walks the *same* sitting across [`HIGH_MARK_MIN`], and the
+    /// student's counter has to walk with it — the delete refunds off the mark
+    /// it finds stored, so a credit decided by a mark that is no longer there
+    /// is a credit nothing can give back. Left on the first-write branch alone,
+    /// grade-high → regrade-low → delete kept a phantom high mark every round
+    /// and looped it into a permanent badge.
+    #[tokio::test]
+    async fn a_regrade_across_the_line_moves_the_student_counter_with_it() {
+        let db = init_mem().await.unwrap();
+        let exam = ExamId::from_key("01TESTEXAMREGRADEAAAAAAAAA");
+        an_exam(&db, &exam, "midterm").await;
+        the_two_people(&db).await;
+        let student = UserId::from_key(STUDENT);
+
+        // Up across the line: no row is added, but a high mark now exists.
+        grade(&db, &exam, 1, 40, "midterm").await.unwrap();
+        assert_eq!(badge_counters(&db).await, (1, 0), "40 is under the line");
+        grade(&db, &exam, 1, 95, "midterm").await.unwrap();
+        assert_eq!(badge_counters(&db).await, (1, 1), "the regrade crossed up");
+        ExamResult::remove(&exam, &student, "midterm", &db)
+            .await
+            .unwrap()
+            .expect("the mark was there");
+        assert_eq!(badge_counters(&db).await, (0, 0));
+
+        // Down across it: the credit goes back the moment the mark does, so
+        // the delete has nothing left to refund and the counter still lands
+        // on zero rather than under it.
+        grade(&db, &exam, 1, 95, "midterm").await.unwrap();
+        assert_eq!(badge_counters(&db).await, (1, 1));
+        grade(&db, &exam, 1, 40, "midterm").await.unwrap();
+        assert_eq!(
+            badge_counters(&db).await,
+            (1, 0),
+            "the regrade crossed down"
+        );
+        ExamResult::remove(&exam, &student, "midterm", &db)
+            .await
+            .unwrap()
+            .expect("the mark was there");
+        assert_eq!(badge_counters(&db).await, (0, 0));
+
+        // Both sides of a regrade above the line: nothing crosses, nothing moves.
+        grade(&db, &exam, 1, 90, "midterm").await.unwrap();
+        grade(&db, &exam, 1, 100, "midterm").await.unwrap();
+        assert_eq!(badge_counters(&db).await, (1, 1), "90 → 100 stays one");
+
+        // The loop that minted the badge: three rounds of high → low → delete
+        // must leave the counter exactly where it started.
+        for _ in 0..3 {
+            grade(&db, &exam, 1, 95, "midterm").await.unwrap();
+            grade(&db, &exam, 1, 40, "midterm").await.unwrap();
+            ExamResult::remove(&exam, &student, "midterm", &db)
+                .await
+                .unwrap()
+                .expect("the mark was there");
+        }
+        assert_eq!(
+            badge_counters(&db).await,
+            (0, 0),
+            "the loop kept a high mark with no high mark stored"
+        );
+    }
+
+    /// The other half of the same asymmetry: a refund read off a stored mark
+    /// that was never credited eats a credit earned somewhere else. One exam
+    /// holds a genuine high mark while a second is graded low, regraded high
+    /// and deleted — the first exam's credit must still be standing.
+    #[tokio::test]
+    async fn one_exams_regrade_never_eats_another_exams_high_mark() {
+        let db = init_mem().await.unwrap();
+        let first = ExamId::from_key("01TESTEXAMSTEALONEAAAAAAAA");
+        let second = ExamId::from_key("01TESTEXAMSTEALTWOAAAAAAAA");
+        an_exam(&db, &first, "midterm").await;
+        an_exam(&db, &second, "midterm").await;
+        the_two_people(&db).await;
+        let student = UserId::from_key(STUDENT);
+
+        grade(&db, &first, 1, 95, "midterm").await.unwrap();
+        assert_eq!(
+            badge_counters(&db).await,
+            (1, 1),
+            "earned on the first exam"
+        );
+
+        grade(&db, &second, 1, 40, "midterm").await.unwrap();
+        grade(&db, &second, 1, 95, "midterm").await.unwrap();
+        assert_eq!(badge_counters(&db).await, (2, 2));
+        ExamResult::remove(&second, &student, "midterm", &db)
+            .await
+            .unwrap()
+            .expect("the mark was there");
+        assert_eq!(
+            badge_counters(&db).await,
+            (1, 1),
+            "the first exam's high mark was eaten"
+        );
     }
 
     /// A refused mark leaves the badge counters where the other two are left.
