@@ -252,6 +252,12 @@ struct MealLimits {
     max_dish_tags: usize,
     /// Upper bound for a menu's optional `capacity`; absent = uncapped.
     max_menu_capacity: i64,
+    /// How many times one student's seat on one menu may be taken — the first
+    /// booking plus the re-bookings after a cancel. Past it, `POST
+    /// /meals/menus/{id}/bookings` is a `409`: every cycle writes two
+    /// permanent ledger lines, so this bounds the statement, not the mind
+    /// changing. Only the canteen can free such a seat afterwards.
+    max_booking_attempts: i64,
     /// Dietary tags one student's profile may carry, and its kitchen note.
     max_dietary_tags: usize,
     max_dietary_note_len: usize,
@@ -291,6 +297,14 @@ struct PaymentLimits {
     max_plan_installments: usize,
     /// How many students one bulk assignment may name.
     max_assign_students: usize,
+    /// How many charge lines one bulk assignment may append — the students it
+    /// names times the plan's installments. A request past this is a `400`
+    /// telling the caller to split the batch; nothing is written.
+    max_assign_writes: usize,
+    /// How many lines may be applied to one ledger line: the payments under a
+    /// charge, the refunds under a payment, and the reversals among them. Past
+    /// it, a further payment or refund against that line is a `409`.
+    max_applied_lines: usize,
     /// Ceiling on the optional `request_key` that makes a credit or a refund
     /// retry-safe; charset `[A-Za-z0-9-]` (no `_`), at least one character.
     max_request_key_len: usize,
@@ -538,6 +552,7 @@ impl LimitsResponse {
                 max_dishes_per_menu: MAX_DISHES_PER_MENU,
                 max_dish_tags: MAX_DISH_TAGS,
                 max_menu_capacity: MAX_MENU_CAPACITY,
+                max_booking_attempts: MAX_MEAL_BOOKING_ATTEMPTS,
                 max_dietary_tags: MAX_DIETARY_TAGS,
                 max_dietary_note_len: MAX_DIETARY_NOTE_LEN,
                 max_dish_price_minor: MAX_DISH_PRICE_MINOR,
@@ -554,6 +569,8 @@ impl LimitsResponse {
                 max_plan_name_len: MAX_FEE_PLAN_NAME_LEN,
                 max_plan_installments: MAX_FEE_PLAN_INSTALLMENTS,
                 max_assign_students: MAX_FEE_PLAN_ASSIGN_STUDENTS,
+                max_assign_writes: MAX_FEE_PLAN_ASSIGN_WRITES,
+                max_applied_lines: MAX_LEDGER_APPLIED_LINES,
                 max_request_key_len: MAX_PAYMENT_REQUEST_KEY_LEN,
                 ledger_kinds: PAYMENT_LEDGER_KINDS.to_vec(),
             },
