@@ -28,6 +28,8 @@ use crate::domain::menu_dish::{
     DishDescription, DishName, DishPrice, DishTags, MenuDish, MenuDishId,
 };
 use crate::domain::parent_link::ParentLink;
+// The same idempotence key `/payments/credits` takes — one grammar, one type.
+use crate::domain::payment_ledger::PaymentRequestKey;
 use crate::domain::role::Role;
 use crate::domain::settings::Settings;
 use crate::domain::user::{User, UserId};
@@ -1389,6 +1391,13 @@ struct RecordCredit {
     method: Option<String>,
     #[schema(max_length = 500, example = "receipt 2026-114")]
     note: Option<String>,
+    /// Optional client-chosen idempotence key, `[A-Za-z0-9-]` (no `_`: it is the
+    /// separator inside a ledger line's id). Send one and a retry after a
+    /// timeout returns the **same** line instead of recording the money twice;
+    /// omit it and two identical calls are two credits. The same key sent with a
+    /// different `amount_minor` is a `409`.
+    #[schema(min_length = 1, max_length = 64, example = "receipt-2026-114")]
+    request_key: Option<String>,
 }
 
 /// Record money received from a student. **Admin only** — not manager: writing
@@ -1397,6 +1406,13 @@ struct RecordCredit {
 /// its debtor's role change, and it has to stay settleable. Appends a `credit` line;
 /// nothing in the ledger is ever edited or removed, so an over-credit is
 /// corrected by a compensating line, not by a fix-up.
+///
+/// **Retry-safe on request** — send a `request_key` and a repeat of the call (a
+/// client retry after a network timeout, which used to record the money a second
+/// time the moment the response was lost) returns the line the first attempt
+/// wrote. The same key with a different `amount_minor` is a `409`: that is a
+/// client bug, not a replay. Without a key two identical calls are two credits,
+/// as a desk taking the same amount twice really is.
 #[utoipa::path(
     post,
     path = "/credits",
@@ -1405,10 +1421,11 @@ struct RecordCredit {
     request_body = RecordCredit,
     responses(
         (status = 201, description = "Credit recorded", body = LedgerResponse),
-        (status = 400, description = "Invalid amount, method, note, or a non-student target", body = ErrorResponse),
+        (status = 400, description = "Invalid amount, method, note, request_key, or a non-student target", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires the admin role", body = ErrorResponse),
         (status = 404, description = "No such user", body = ErrorResponse),
+        (status = 409, description = "The request_key was already used for a different amount", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -1439,6 +1456,11 @@ async fn record_credit(
             reason: "only a student carries a meal balance",
         }));
     }
+    let request_key = req
+        .request_key
+        .as_deref()
+        .map(PaymentRequestKey::try_new)
+        .transpose()?;
     let line = MealLedger::credit(
         &student,
         LedgerAmount::try_new(req.amount_minor)?,
@@ -1452,6 +1474,7 @@ async fn record_credit(
             .map(LedgerNote::try_new)
             .transpose()?
             .flatten(),
+        request_key.as_ref(),
         admin.get_id(),
         &st.db,
     )

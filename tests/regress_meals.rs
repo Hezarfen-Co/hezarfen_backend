@@ -265,6 +265,82 @@ async fn a_credit_settles_a_debt_that_outlived_the_students_role() {
     assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
 }
 
+/// A credit resent after a lost response must not take the money twice. The id
+/// was a fresh ulid, so the ledger's identity-based idempotence could never
+/// bite: a proxy timing out anywhere after the commit left the client with a
+/// second credit and no route to undo it, since nothing here edits or deletes a
+/// line. A `request_key` folds into the id, exactly as it does on
+/// `POST /payments/credits`, and the same key for a different amount is a `409`
+/// rather than a `201` that hides a client bug behind a stored line.
+#[tokio::test]
+async fn a_credit_replayed_with_its_request_key_records_the_money_once() {
+    let (app, db) = app_and_db().await;
+    let admin = login_as(&app, &db, "key_admin", "admin").await;
+    let ali = login(&app, "key_ali").await;
+    let ali_id = me_id(&app, &ali).await;
+    let credit = |body: serde_json::Value| {
+        let (app, admin) = (app.clone(), admin.clone());
+        async move { send(&app, "POST", "/meals/credits", Some(&admin), Some(body)).await }
+    };
+    let body =
+        json!({ "student_id": ali_id, "amount_minor": 25_000, "request_key": "receipt-114" });
+
+    let first = credit(body.clone()).await;
+    assert_eq!(first.status, StatusCode::CREATED, "{}", first.body);
+    // The retry: same body, same line back, and no second one behind it.
+    let again = credit(body.clone()).await;
+    assert_eq!(again.status, StatusCode::CREATED, "{}", again.body);
+    assert_eq!(again.body["id"], first.body["id"]);
+
+    // The stored ledger, not the two responses: only one line ever landed.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/meals/ledger/{ali_id}"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(res.body["total"], 1, "{}", res.body);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/meals/balance/{ali_id}"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(res.body["balance_minor"], 25_000, "credited once");
+
+    // The same key for other money is a client bug, and is refused as one.
+    let res = credit(json!({
+        "student_id": ali_id, "amount_minor": 30_000, "request_key": "receipt-114"
+    }))
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+    // A key with the id separator in it cannot be spelled at all: it would let
+    // one line's key derive another's id.
+    let res = credit(json!({
+        "student_id": ali_id, "amount_minor": 30_000, "request_key": "receipt_114"
+    }))
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+
+    // …and without a key a resent request is a second credit, as before.
+    let plain = json!({ "student_id": ali_id, "amount_minor": 1_000 });
+    assert_eq!(credit(plain.clone()).await.status, StatusCode::CREATED);
+    assert_eq!(credit(plain).await.status, StatusCode::CREATED);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/meals/balance/{ali_id}"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(res.body["balance_minor"], 27_000, "{}", res.body);
+}
+
 /// A mark must not create a row for a menu that is gone. The handler reads the
 /// menu first, so this is driven below it — exactly the interleaving a mark in
 /// flight while `DELETE /meals/menus/{id}` commits produces. The stake is not
