@@ -289,20 +289,37 @@ impl ChatbotThread {
     /// Delete the thread and every turn in it — one transaction, so a crash
     /// can't orphan messages under a vanished thread. The owner's slot comes
     /// back in that same transaction, or the cap would ratchet shut.
+    ///
+    /// A turn, a rename and this delete all write the thread row (see
+    /// [`touch_and_write`]), so the store aborting one of them is ordinary
+    /// here — that collision is exactly what keeps a turn from outliving the
+    /// thread — and a lost round is re-sent rather than reported as the `500`
+    /// it used to be. Re-sending is sound: every statement is a `DELETE` or a
+    /// field-scoped `UPDATE`, none of which can ever answer "already exists"
+    /// (see [`transaction_with_retry`]). On the re-sent round the thread is
+    /// already gone, so the `RETURN` is empty and the caller gets the `404`
+    /// that is the truth.
     pub async fn delete(self, db: &Database) -> Result<ChatbotThread, AppError> {
-        let mut result = db
-            .query(
-                "BEGIN TRANSACTION;
-                 DELETE chatbot_message WHERE thread_id = $conv;
-                 LET $gone = (DELETE $conv RETURN BEFORE);
-                 UPDATE $usr SET chatbot_thread_count = math::max([(chatbot_thread_count ?? 0) - array::len($gone), 0]);
-                 RETURN $gone;
-                 COMMIT TRANSACTION;",
-            )
-            .bind(("conv", self.id.record()))
-            .bind(("usr", self.user_id.record()))
-            .await?
-            .check()?;
+        let (mut result, mut errors) = transaction_with_retry(
+            db,
+            "BEGIN TRANSACTION;
+             DELETE chatbot_message WHERE thread_id = $conv;
+             LET $gone = (DELETE $conv RETURN BEFORE);
+             UPDATE $usr SET chatbot_thread_count = math::max([(chatbot_thread_count ?? 0) - array::len($gone), 0]);
+             RETURN $gone;
+             COMMIT TRANSACTION;",
+            &[
+                ("conv".into(), self.id.record().into_value()),
+                ("usr".into(), self.user_id.record().into_value()),
+            ],
+            &[],
+        )
+        .await?;
+        if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+            return Err(error.into());
+        }
+        // Slots count BEGIN, the cascade, the LET and the UPDATE: the RETURN
+        // is slot 4.
         let deleted: Option<ChatbotThread> =
             result.take::<Vec<ChatbotThread>>(4)?.into_iter().next();
         deleted.ok_or(AppError::NotFound)
