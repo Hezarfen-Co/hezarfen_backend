@@ -1606,7 +1606,7 @@ async fn menu_seats_are_seeded_from_the_bookings_that_are_still_held() {
         "POST",
         "/meals/menus",
         Some(&mgr),
-        Some(json!({ "date": "2026-09-14", "slot": "lunch", "capacity": 2 })),
+        Some(json!({ "date": "2099-09-14", "slot": "lunch", "capacity": 2 })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
@@ -1867,7 +1867,7 @@ async fn settings_reference_counts_are_seeded_from_the_marks_and_menus_that_pred
     }
 
     // Two menus under `lunch`, none under any other slot.
-    for date in ["2026-09-21", "2026-09-22"] {
+    for date in ["2099-09-21", "2099-09-22"] {
         let res = send(
             &app,
             "POST",

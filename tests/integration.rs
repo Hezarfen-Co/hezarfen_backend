@@ -11836,7 +11836,7 @@ async fn settings_round_trip_the_food_program_knobs() {
         "POST",
         "/meals/menus",
         Some(&manager),
-        Some(json!({ "date": "2026-07-27", "slot": "lunch" })),
+        Some(json!({ "date": "2099-07-27", "slot": "lunch" })),
     )
     .await;
     assert_eq!(menu.status, StatusCode::CREATED, "{}", menu.body);
@@ -21085,7 +21085,7 @@ async fn menus_and_dishes_round_trip() {
         "POST",
         "/meals/menus",
         Some(&mgr),
-        Some(json!({ "date": "2026-09-14", "slot": "lunch", "capacity": 120 })),
+        Some(json!({ "date": "2099-09-14", "slot": "lunch", "capacity": 120 })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED);
@@ -21101,7 +21101,7 @@ async fn menus_and_dishes_round_trip() {
         "POST",
         "/meals/menus",
         Some(&mgr),
-        Some(json!({ "date": "2026-09-14", "slot": "lunch" })),
+        Some(json!({ "date": "2099-09-14", "slot": "lunch" })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CONFLICT);
@@ -21112,7 +21112,7 @@ async fn menus_and_dishes_round_trip() {
         "POST",
         "/meals/menus",
         Some(&mgr),
-        Some(json!({ "date": "2026-09-14", "slot": "breakfast" })),
+        Some(json!({ "date": "2099-09-14", "slot": "breakfast" })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED);
@@ -21170,7 +21170,7 @@ async fn menus_and_dishes_round_trip() {
     let res = send(
         &app,
         "GET",
-        "/meals/menus?from=2026-09-14&to=2026-09-14",
+        "/meals/menus?from=2099-09-14&to=2099-09-14",
         Some(&student),
         None,
     )
@@ -21180,7 +21180,7 @@ async fn menus_and_dishes_round_trip() {
     let res = send(
         &app,
         "GET",
-        "/meals/menus?from=2026-09-15",
+        "/meals/menus?from=2099-09-15",
         Some(&student),
         None,
     )
@@ -21234,7 +21234,7 @@ async fn menu_writes_are_manager_only_and_validate_against_settings() {
     let mgr = login_as(&app, &db, "meal_mgr2", "manager").await;
     let teacher = login_as(&app, &db, "meal_teacher", "teacher").await;
 
-    let body = json!({ "date": "2026-09-15", "slot": "lunch" });
+    let body = json!({ "date": "2099-09-15", "slot": "lunch" });
     let res = send(
         &app,
         "POST",
@@ -21251,7 +21251,7 @@ async fn menu_writes_are_manager_only_and_validate_against_settings() {
         "POST",
         "/meals/menus",
         Some(&mgr),
-        Some(json!({ "date": "2026-09-15", "slot": "brunch" })),
+        Some(json!({ "date": "2099-09-15", "slot": "brunch" })),
     )
     .await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST);
@@ -21338,7 +21338,7 @@ async fn meal_bookings_round_trip() {
         "POST",
         "/meals/menus",
         Some(&mgr),
-        Some(json!({ "date": "2026-09-14", "slot": "lunch", "capacity": 2 })),
+        Some(json!({ "date": "2099-09-14", "slot": "lunch", "capacity": 2 })),
     )
     .await;
     let menu = id_of(&res.body);
@@ -21499,7 +21499,7 @@ async fn meal_booking_capacity_caps_and_a_cancel_frees_a_seat() {
         "POST",
         "/meals/menus",
         Some(&mgr),
-        Some(json!({ "date": "2026-09-14", "slot": "lunch", "capacity": 2 })),
+        Some(json!({ "date": "2099-09-14", "slot": "lunch", "capacity": 2 })),
     )
     .await;
     let menu = id_of(&res.body);
@@ -21559,7 +21559,7 @@ async fn concurrent_meal_bookings_never_exceed_the_capacity() {
         "POST",
         "/meals/menus",
         Some(&mgr),
-        Some(json!({ "date": "2026-09-14", "slot": "lunch", "capacity": 3 })),
+        Some(json!({ "date": "2099-09-14", "slot": "lunch", "capacity": 3 })),
     )
     .await;
     let menu = id_of(&res.body);
@@ -21643,7 +21643,7 @@ async fn concurrent_duplicate_menu_publishes_conflict_not_500() {
                 "POST",
                 "/meals/menus",
                 Some(&mgr),
-                Some(json!({ "date": "2026-09-14", "slot": "lunch" })),
+                Some(json!({ "date": "2099-09-14", "slot": "lunch" })),
             )
             .await
             .status
@@ -21683,7 +21683,7 @@ async fn concurrent_ledger_appends_of_one_id_write_one_line_not_a_500() {
         "POST",
         "/meals/menus",
         Some(&mgr),
-        Some(json!({ "date": "2026-09-15", "slot": "lunch" })),
+        Some(json!({ "date": "2099-09-15", "slot": "lunch" })),
     )
     .await;
     let menu = id_of(&res.body);
@@ -21748,13 +21748,17 @@ async fn meal_cutoff_closes_booking_and_cancelling_alike() {
     let mgr = login_as(&app, &db, "cutoff_mgr", "manager").await;
     let ali = login(&app, "cutoff_ali").await;
 
-    // No cutoff configured yet, so a menu whose day is long gone still books.
+    // No cutoff configured yet, so today's meal books at any hour — the day
+    // being over is the *other* refusal, and today's is not over.
+    let today = hezarfen_backend::domain::timestamp::Timestamp::today_utc()
+        .format("%Y-%m-%d")
+        .to_string();
     let res = send(
         &app,
         "POST",
         "/meals/menus",
         Some(&mgr),
-        Some(json!({ "date": "2020-01-06", "slot": "lunch" })),
+        Some(json!({ "date": today, "slot": "lunch" })),
     )
     .await;
     let menu = id_of(&res.body);
@@ -21771,7 +21775,9 @@ async fn meal_cutoff_closes_booking_and_cancelling_alike() {
 
     // The serving hour goes with the knob: a slot without one has no instant
     // for the deadline to count back from, so the cutoff binds none of its
-    // menus (see `meal_cutoff_counts_back_from_the_slots_serving_time`).
+    // menus (see `meal_cutoff_counts_back_from_the_slots_serving_time`). Lunch
+    // is served at 00:00 UTC, so today's deadline passed an hour before the day
+    // began — whatever hour this test runs at.
     let res = send(
         &app,
         "PATCH",
@@ -21779,7 +21785,7 @@ async fn meal_cutoff_closes_booking_and_cancelling_alike() {
         Some(&mgr),
         Some(json!({
             "meal_cancel_cutoff_minutes": 60,
-            "meal_slots": [{ "name": "lunch", "serving_minute": 720 }],
+            "meal_slots": [{ "name": "lunch", "serving_minute": 0 }],
         })),
     )
     .await;
@@ -21994,7 +22000,7 @@ async fn meal_bookings_are_student_or_linked_parent_only() {
         "POST",
         "/meals/menus",
         Some(&mgr),
-        Some(json!({ "date": "2026-09-14", "slot": "lunch" })),
+        Some(json!({ "date": "2099-09-14", "slot": "lunch" })),
     )
     .await;
     let menu = id_of(&res.body);
@@ -22101,7 +22107,7 @@ async fn meal_booking_charges_a_price_snapshot_and_a_cancel_reverses_it() {
         "POST",
         "/meals/menus",
         Some(&mgr),
-        Some(json!({ "date": "2026-09-14", "slot": "lunch" })),
+        Some(json!({ "date": "2099-09-14", "slot": "lunch" })),
     )
     .await;
     let menu = id_of(&res.body);
@@ -22406,7 +22412,7 @@ async fn meal_attendance_never_moves_money() {
         "POST",
         "/meals/menus",
         Some(&mgr),
-        Some(json!({ "date": "2026-09-14", "slot": "lunch" })),
+        Some(json!({ "date": "2099-09-14", "slot": "lunch" })),
     )
     .await;
     let menu = id_of(&res.body);
@@ -22560,7 +22566,7 @@ async fn deleting_a_menu_takes_its_attendance_with_it() {
     let ali = login(&app, "ghost_ali").await;
     let ali_id = me_id(&app, &ali).await;
 
-    let publish = json!({ "date": "2026-10-05", "slot": "lunch" });
+    let publish = json!({ "date": "2099-10-05", "slot": "lunch" });
     let res = send(
         &app,
         "POST",
@@ -22657,7 +22663,7 @@ async fn meal_attendance_report_is_ranged_and_gated() {
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
 
     // Three days, one mark each for Ali.
-    for date in ["2026-09-01", "2026-09-15", "2026-09-30"] {
+    for date in ["2099-09-01", "2099-09-15", "2099-09-30"] {
         let res = send(
             &app,
             "POST",
@@ -22681,10 +22687,10 @@ async fn meal_attendance_report_is_ranged_and_gated() {
     // Unbounded, then each bound, then both — the window is the menu's day.
     for (query, expected) in [
         ("", 3),
-        ("?from=2026-09-15", 2),
-        ("?to=2026-09-15", 2),
-        ("?from=2026-09-10&to=2026-09-20", 1),
-        ("?from=2026-10-01", 0),
+        ("?from=2099-09-15", 2),
+        ("?to=2099-09-15", 2),
+        ("?from=2099-09-10&to=2099-09-20", 1),
+        ("?from=2099-10-01", 0),
     ] {
         let res = send(
             &app,
@@ -22870,7 +22876,7 @@ async fn dietary_profile_drives_menu_conflicts() {
         "POST",
         "/meals/menus",
         Some(&mgr),
-        Some(json!({ "date": "2026-10-05", "slot": "lunch" })),
+        Some(json!({ "date": "2099-10-05", "slot": "lunch" })),
     )
     .await;
     let menu = id_of(&res.body);
@@ -22958,7 +22964,7 @@ async fn priced_menu(tag: &str, price: i64) -> (axum::Router, String, String) {
         "POST",
         "/meals/menus",
         Some(&mgr),
-        Some(json!({ "date": "2026-09-14", "slot": "lunch" })),
+        Some(json!({ "date": "2099-09-14", "slot": "lunch" })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
@@ -23031,7 +23037,7 @@ async fn concurrent_bookings_of_one_seat_never_refuse_their_own_winner() {
         "POST",
         "/meals/menus",
         Some(&mgr),
-        Some(json!({ "date": "2026-09-14", "slot": "lunch", "capacity": 1 })),
+        Some(json!({ "date": "2099-09-14", "slot": "lunch", "capacity": 1 })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
@@ -23163,7 +23169,7 @@ async fn a_repeat_post_never_bills_a_seat_that_was_free_when_taken() {
         "POST",
         "/meals/menus",
         Some(&mgr),
-        Some(json!({ "date": "2026-09-14", "slot": "lunch" })),
+        Some(json!({ "date": "2099-09-14", "slot": "lunch" })),
     )
     .await;
     let menu = id_of(&res.body);

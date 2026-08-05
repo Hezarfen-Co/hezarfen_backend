@@ -173,20 +173,25 @@ impl MenuDate {
         if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
             return Err(invalid);
         }
-        let digits =
-            |from: usize, to: usize| -> Option<u32> { value.get(from..to)?.parse::<u32>().ok() };
-        let (Some(year), Some(month), Some(day)) = (digits(0, 4), digits(5, 7), digits(8, 10))
-        else {
+        // Parsed by **chrono** and compared back to the text it came from, so
+        // this parser and the one that computes the serving instant
+        // ([`served_at`](crate::domain::meal_booking)) agree by construction
+        // rather than by two independent checks that can drift apart. They did:
+        // a hand-rolled `"+1".parse::<u32>()` accepted a signed component (std
+        // does), `from_ymd_opt` was then handed the normalized number and said
+        // yes, and `2026-+1-01` became a *second* record id for the 1st of
+        // January — its own capacity and seat counter, invisible to every
+        // `date >= $from` range read ('+' sorts below '0'), and unbookable
+        // besides, since chrono refuses to parse it back.
+        //
+        // The round trip also keeps the day a **real** one, leap years and all
+        // (a 31st of February is fully actionable — seats, charges, dishes,
+        // marks — with no instant any cutoff can count back from), and pins the
+        // zero-padding the text ordering rests on.
+        let Ok(day) = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d") else {
             return Err(invalid);
         };
-        // The day has to be a **real** one, leap years and all. A 31st of
-        // February is not the harmless typo it looks: a menu is published on it
-        // and is then fully actionable — seats, charges, dishes, attendance
-        // marks — but no instant can be computed for it, so the booking and
-        // cancel cutoff has nothing to count back from and never closes at all.
-        // The month/day ranges are this check's own business, hence no separate
-        // bounds test above (`from_ymd_opt` refuses month 0 and day 32 alike).
-        if chrono::NaiveDate::from_ymd_opt(year as i32, month, day).is_none() {
+        if day.format("%Y-%m-%d").to_string() != value {
             return Err(invalid);
         }
         Ok(Self(value.to_string()))
@@ -194,6 +199,25 @@ impl MenuDate {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// The instant this calendar day is over: midnight UTC opening the next
+    /// one. UTC because the backend stores no school timezone, the same choice
+    /// [`served_at`](crate::domain::meal_booking) makes for the serving instant.
+    ///
+    /// This is the whole day's deadline, not the meal's: a menu for *today* is
+    /// still publishable and still bookable at any hour, whatever the slot's
+    /// serving time says — that is [`MealCutoff`](crate::domain::meal_booking::MealCutoff)'s
+    /// separate business. `None` for a day that cannot be parsed (a row written
+    /// before `try_new` rejected impossible days).
+    pub fn day_end(&self) -> Option<Timestamp> {
+        let day = chrono::NaiveDate::parse_from_str(&self.0, "%Y-%m-%d").ok()?;
+        Some(Timestamp::from_millis(
+            day.succ_opt()?
+                .and_hms_opt(0, 0, 0)?
+                .and_utc()
+                .timestamp_millis(),
+        ))
     }
 }
 
@@ -528,6 +552,59 @@ mod tests {
         assert!(
             MenuDate::try_new("2026-09-01").unwrap() < MenuDate::try_new("2026-10-01").unwrap()
         );
+    }
+
+    /// A signed component is not a calendar day, however willingly
+    /// `"+1".parse::<u32>()` reads one out of it. Accepting one minted a
+    /// *second* record id for the same day — its own capacity and seat counter
+    /// — that sorted below every `?from=` bound (`+` is 0x2B, `0` is 0x30) and
+    /// that the serving-instant parser could not read at all.
+    #[test]
+    fn date_refuses_a_signed_component() {
+        for signed in ["2026-+1-01", "2026-01-+1", "+026-01-01", "2026-01-+2"] {
+            assert!(
+                MenuDate::try_new(signed).is_err(),
+                "{signed} is not a calendar day"
+            );
+        }
+    }
+
+    /// The drift guard: whatever this accepts must be exactly what the calendar
+    /// library writes back for that day. Two parsers that merely *agree today*
+    /// are what let the signed form through — one normalized the sign away
+    /// before the other ever saw it.
+    #[test]
+    fn every_accepted_date_round_trips_through_the_calendar() {
+        for candidate in [
+            "2026-07-26",
+            "2024-02-29",
+            "2026-+1-01",
+            "2026-1-1",
+            "0001-01-01",
+            "2026-02-29",
+        ] {
+            let stored = MenuDate::try_new(candidate).ok();
+            let round_tripped = chrono::NaiveDate::parse_from_str(candidate, "%Y-%m-%d")
+                .ok()
+                .map(|day| day.format("%Y-%m-%d").to_string())
+                .filter(|text| text == candidate);
+            assert_eq!(
+                stored.map(|date| date.as_str().to_string()),
+                round_tripped,
+                "{candidate} must be stored exactly as the calendar writes it, or not at all"
+            );
+        }
+    }
+
+    /// The day is over at midnight UTC opening the next one — not at the meal's
+    /// serving hour, which is the cutoff's separate business.
+    #[test]
+    fn a_day_ends_at_the_next_midnight_utc() {
+        let day = MenuDate::try_new("1970-01-01").unwrap();
+        assert_eq!(day.day_end().unwrap().as_millis(), 86_400_000);
+        // A row written before `try_new` refused impossible days has no end.
+        let impossible = MenuDate::from_value(Value::String("2026-02-29".into())).unwrap();
+        assert!(impossible.day_end().is_none());
     }
 
     #[test]

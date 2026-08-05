@@ -38,7 +38,7 @@ use crate::state::AppState;
 
 use super::{
     CurrentUser, Page, PageParams, PersonRef, RequireAdmin, RequireManager, RequireTeacher,
-    person_map, set_or_clear,
+    check_not_past, person_map, set_or_clear,
 };
 
 pub fn routes() -> OpenApiRouter<AppState> {
@@ -234,6 +234,10 @@ async fn one_menu(
 /// Publish a menu for one day and meal slot. Requires manager+. The slot must
 /// be one the school currently serves, and a day+slot already published is a
 /// `409` — edit that menu instead of publishing a second one.
+///
+/// The day must not already be over (`400`): a published menu is a bookable
+/// one, and a booking is what charges the student. Today counts as ahead, all
+/// day long.
 #[utoipa::path(
     post,
     path = "/menus",
@@ -242,7 +246,7 @@ async fn one_menu(
     request_body = CreateMenu,
     responses(
         (status = 201, description = "Menu published", body = MenuResponse),
-        (status = 400, description = "Malformed date, unknown slot, or out-of-range capacity", body = ErrorResponse),
+        (status = 400, description = "Malformed date, a day that is already over, unknown slot, or out-of-range capacity", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 409, description = "A menu already exists for that date and slot, or the slot was removed from the settings mid-request", body = ErrorResponse),
@@ -255,6 +259,12 @@ async fn create_menu(
     Json(req): Json<CreateMenu>,
 ) -> Result<(StatusCode, Json<MenuResponse>), AppError> {
     let date = MenuDate::try_new(&req.date)?;
+    // The kitchen publishes ahead, never behind: a menu on a day already over
+    // is bookable and therefore *billable* (booking is the charge trigger), so
+    // this is the same door every other create path in the crate has. Measured
+    // against the end of the day, so today's menu is publishable all day — the
+    // meal's own deadline is `meal_cancel_cutoff_minutes`, not this.
+    check_not_past("date", date.day_end())?;
     let slot = MenuSlot::try_new(&req.slot, &Settings::load(&st.db).await?.get_meal_slots())?;
     validate_capacity(req.capacity)?;
     let menu = Menu::create(date, slot, req.capacity, user.get_id(), &st.db).await?;
@@ -800,7 +810,10 @@ async fn booking_target(
 /// `student_id`); a parent books for a linked student by naming them. Booking
 /// twice is the same seat, not a second one — and bills once, at the price the
 /// menu carried when the seat was first taken. Refused (`409`) when the menu is
-/// full or the school's `meal_cancel_cutoff_minutes` has closed the meal, and
+/// full, when its **day has already passed** (a seat taken then would bill a
+/// meal nobody can be served — and no role bypasses that, since only students
+/// and their parents book at all), or when the school's
+/// `meal_cancel_cutoff_minutes` has closed the meal, and
 /// (`400`) when the menu's dishes sum past the chargeable maximum, since a seat
 /// is never handed out unbilled.
 ///
@@ -822,7 +835,7 @@ async fn booking_target(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not a student booking for themselves, nor a parent booking for a linked student", body = ErrorResponse),
         (status = 404, description = "No such menu", body = ErrorResponse),
-        (status = 409, description = "The menu is full, its cutoff has passed, its date is not a real calendar day so no cutoff can be worked out, the seat has been booked and cancelled its maximum number of times, or the menu kept being edited while the seat was being taken", body = ErrorResponse),
+        (status = 409, description = "The menu is full, its day has already passed, its cutoff has passed, its date is not a real calendar day so no cutoff can be worked out, the seat has been booked and cancelled its maximum number of times, or the menu kept being edited while the seat was being taken", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]

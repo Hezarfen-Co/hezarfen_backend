@@ -595,10 +595,23 @@ own seats by hand. Seats on lists that have already closed (the event started,
 or its `ends_at`-only deadline passed) are never touched — that roster is
 history, and re-registering is refused.
 
+A demotion below `teacher` additionally **withdraws the published appointment
+calendar** and cancels the live bookings on it. Nothing else could: a slot is
+listed only on its own teacher's calendar and deleted only by a teacher+, so
+after the demotion no route yields its id, and a booking on it can be decided
+only by a teacher+ and cancelled only by its requester — who is refused once
+the window opens, leaving the slot's seat held for good. The requester keeps
+the booking, `cancelled`, with the ex-teacher on `cancelled_by` and the reason
+on `cancel_reason`; its slot is gone, so it renders without a window. A slot
+published while the demotion runs claims the publisher's own row, so either
+the sweep sees the slot or the publish sees the new role (a `403`), and a
+booking racing it collides on the slot row the sweep deletes.
+
 The role write and every sweep it implies — class memberships and their
 counters, all enrollments and their seats, parent ties on both sides, a
 demoted parent's still-freeable event seats, whiteboard rosters, course
-staffing and homeroom-teacher columns — commit as **one transaction**. It
+staffing and homeroom-teacher columns, the appointment calendar and the
+bookings on it — commit as **one transaction**. It
 either all lands or none of it does: a failure answers `500` with the account
 still holding its old role and every grant of it still standing, and the same
 `PATCH` retried applies the lot. Signup lists that have already frozen are
@@ -803,7 +816,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/users/{id}/avatar`             | student | The avatar bytes (`nosniff`, `private, no-store`); same reach as the profile |
 | DELETE | `/users/{id}/avatar`             | admin   | Remove any user's avatar — the moderation path |
 | GET    | `/users/{id}`                    | admin   | Get one user                    |
-| PATCH  | `/users/{id}/role`               | admin   | `{role}` — set a user's role; promotion out of `student` drops the user's course enrollments (only students enroll), and a demotion to `parent` also frees their seats on still-open event signup lists; demoting the school's **last** admin is refused (`409`) |
+| PATCH  | `/users/{id}/role`               | admin   | `{role}` — set a user's role; promotion out of `student` drops the user's course enrollments (only students enroll), a demotion below `teacher` withdraws their appointment slots and cancels the bookings on them, and a demotion to `parent` also frees their seats on still-open event signup lists; demoting the school's **last** admin is refused (`409`) |
 | PATCH  | `/users/{id}/profile`            | admin   | Update any user's personal info, `display_name` and `bio` included |
 | PATCH  | `/users/{id}/preferences`        | admin   | Update any user's UI preferences |
 | POST   | `/users/{id}/students`           | admin   | `{user_id}` — tie a **student** to a **parent** account `{id}` (idempotent); the tie is the parent's read grant |
@@ -1475,9 +1488,13 @@ POST /appointments/slots
 **bookable** calendar — slots that have **not started yet**, earliest first.
 That bound is `starts_at`, the same one booking enforces, so a slot already
 underway is left out rather than offered for a request that could only answer
-`409`; the 60-second publish-time skew grace does not widen it either. A teacher demoted
-after publishing leaves **inert** slots: their live role is re-read, so those
-slots drop out of the bookable list and booking one is refused with a `409`.
+`409`; the 60-second publish-time skew grace does not widen it either. A
+demotion below `teacher` **withdraws** that account's calendar outright, in the
+role change's own transaction, and cancels the live bookings on it (see
+`PATCH /users/{id}/role`): a slot nobody can list and nobody can delete would
+otherwise sit there forever, holding a booking nobody can settle. The live-role
+re-read stays as the belt for a slot an older build stranded — such a slot
+drops out of the bookable list and booking one is refused with a `409`.
 The list does not say whether a slot is already taken — booking a taken one
 answers `409`.
 
@@ -1497,8 +1514,9 @@ concurrent bookings can both read as free). The decisions:
 
 - `PATCH /{id}/approve` — the slot's teacher (or manager+) confirms; the
   slot's `teacher` is history, not a standing grant, so an owner demoted below
-  `teacher` decides nothing on it any more — manager+ still can, and the
-  requester can still cancel. Refused
+  `teacher` decides nothing on it any more — and nothing is left for anyone
+  else to decide either, since that demotion cancelled the bookings along with
+  the slots. Refused
   (`409`) when the effective window has already started, and refused while a
   counter-proposal stands: the proposal is the teacher's own, so approving it
   here would let them confirm a time the requester never accepted.
