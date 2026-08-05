@@ -22,16 +22,19 @@
 //! (every parent's `.content()` write is a create of a fresh row).
 //
 // ponytail: a counter can only drift if a future delete path forgets its
-// decrement, and the boot backfill seeds counters once rather than recomputing
-// them (recomputing on every boot would clobber a live peer's increments). If
-// drift is ever observed, the repair is the same GROUP BY count the backfill
-// runs, issued by hand with the field's `= NONE` guard dropped.
+// decrement, and the boot backfill seeds most counters once rather than
+// recomputing them. `enrollment_count` is the one that already drifted (the boot
+// sweep of promoted users' rows kept their seats), so it is recomputed on every
+// boot instead — see the repair in `migration_sql::BACKFILL`. That is the shape
+// to copy for any other counter drift observed: a counter whose meaning is
+// exactly "the live child rows" converges on a recompute, a lifetime tally does
+// not and must stay seeded once.
 
 use surrealdb::types::{RecordId, SurrealValue};
 use tokio::sync::Mutex;
 
-use crate::constant::{CAP_WRITE_TRIES, REF_COUNT_FIELD, REF_RETIRED_FIELD};
-use crate::database::{Database, backoff, lost_the_race};
+use crate::constant::{CAP_WRITE_TRIES, REF_COUNT_FIELD, REF_RETIRED_FIELD, USER_ROLE_CLAIM_FIELD};
+use crate::database::{Database, backoff, lost_the_race, transaction_with_retry};
 use crate::error::AppError;
 
 /// One counter writer at a time, over every counter.
@@ -160,7 +163,34 @@ pub(crate) async fn claim_and_create<T: SurrealValue + Clone>(
     content: &T,
     db: &Database,
 ) -> Result<Claimed<T>, AppError> {
-    claim_at_and_create(parent, field, "$num", cap, "", id, content, db).await
+    claim_at_and_create(parent, field, "$num", cap, "", 1, None, id, content, db).await
+}
+
+/// [`claim_and_create`] for a counter only *some* of a parent's children move:
+/// the row lands either way, and `counts` decides whether the tally follows it.
+///
+/// The one live user is `exam_sat_total`, which counts exams sat rather than
+/// sittings — a retake writes a row and moves nothing. Splitting that into
+/// "count and create" versus a bare create outside this module would put the
+/// uncounted write on a different statement to the counted one, and a
+/// deterministic child id needs the duplicate abort either way: whichever
+/// branch runs, exactly one writer's `CREATE` commits, and only that one's
+/// increment survives with it. `counts` false still writes the seat statement
+/// (`+ 0`), so a missing parent row is refused as [`Claimed::Full`] on both
+/// paths rather than silently writing a child of nobody.
+pub(crate) async fn create_counting<T: SurrealValue + Clone>(
+    parent: &RecordId,
+    field: &str,
+    counts: bool,
+    id: &RecordId,
+    content: &T,
+    db: &Database,
+) -> Result<Claimed<T>, AppError> {
+    let bump = i64::from(counts);
+    claim_at_and_create(
+        parent, field, "$num", UNLIMITED, "", bump, None, id, content, db,
+    )
+    .await
 }
 
 /// [`claim_and_create`] against a cap the *statement* reads rather than one the
@@ -177,16 +207,27 @@ pub(crate) async fn claim_and_create<T: SurrealValue + Clone>(
 /// the write that lowered it and the write that reads it contend on one record.
 ///
 /// `cap_expr` is always an in-crate SQL literal, never text from a client.
+///
+/// `holder` is the child's *other* parent when that parent is a user whose live
+/// role decides whether the row may exist at all: `(the user record, the role
+/// it may not carry)`, claimed by [`role_claim`] in this same transaction. A
+/// refusal from it arrives as [`Claimed::Full`], which already means "full, or
+/// the guard failed, or the parent is gone" — the caller re-reads to pick the
+/// message, and only on that path.
 pub(crate) async fn claim_live_and_create<T: SurrealValue + Clone>(
     parent: &RecordId,
     field: &str,
     cap_expr: &str,
     fallback: i64,
+    holder: Option<(&RecordId, &str)>,
     id: &RecordId,
     content: &T,
     db: &Database,
 ) -> Result<Claimed<T>, AppError> {
-    claim_at_and_create(parent, field, cap_expr, fallback, "", id, content, db).await
+    claim_at_and_create(
+        parent, field, cap_expr, fallback, "", 1, holder, id, content, db,
+    )
+    .await
 }
 
 /// [`claim_and_create`], but only while `guard` — an extra predicate on that
@@ -212,7 +253,7 @@ pub(crate) async fn claim_when_and_create<T: SurrealValue + Clone>(
     content: &T,
     db: &Database,
 ) -> Result<Claimed<T>, AppError> {
-    claim_at_and_create(parent, field, "$num", cap, guard, id, content, db).await
+    claim_at_and_create(parent, field, "$num", cap, guard, 1, None, id, content, db).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -222,6 +263,8 @@ async fn claim_at_and_create<T: SurrealValue + Clone>(
     cap_expr: &str,
     cap: i64,
     extra: &str,
+    bump: i64,
+    holder: Option<(&RecordId, &str)>,
     id: &RecordId,
     content: &T,
     db: &Database,
@@ -231,11 +274,23 @@ async fn claim_at_and_create<T: SurrealValue + Clone>(
     } else {
         format!(" AND ({extra})")
     };
+    // The holder's claim rides between the duplicate gate and the seat, so a
+    // caller whose row a rival placed is still told "you already have it", and
+    // a demotion outranks a full cap: `Full` on a list with room left sends
+    // nobody looking for a seat that is not the problem.
+    let held_by = holder.map_or_else(Vec::new, |(_, unfit)| {
+        role_claim("holder", unfit, FULL_MARK)
+    });
+    let hold = if held_by.is_empty() {
+        String::new()
+    } else {
+        format!("{};\n", held_by.join(";\n"))
+    };
     let sql = format!(
         "BEGIN TRANSACTION;
          LET $held = (SELECT VALUE id FROM $id);
          IF array::len($held) > 0 {{ THROW '{HELD_MARK}' }};
-         LET $seat = (UPDATE $parent SET {field} = ({field} ?? 0) + 1 \
+         {hold}LET $seat = (UPDATE $parent SET {field} = ({field} ?? 0) + $bump \
              WHERE ({field} ?? 0) < ({cap_expr}){extra} RETURN VALUE id);
          IF array::len($seat) = 0 {{ THROW '{FULL_MARK}' }};
          CREATE $id CONTENT $row;
@@ -245,13 +300,17 @@ async fn claim_at_and_create<T: SurrealValue + Clone>(
     let mut last = None;
     for attempt in 0..CAP_WRITE_TRIES {
         backoff(attempt).await;
-        let attempted = db
+        let mut query = db
             .query(sql.as_str())
             .bind(("parent", parent.clone()))
             .bind(("num", cap))
+            .bind(("bump", bump))
             .bind(("id", id.clone()))
-            .bind(("row", content.clone()))
-            .await;
+            .bind(("row", content.clone()));
+        if let Some((record, _)) = holder {
+            query = query.bind(("holder", record.clone()));
+        }
+        let attempted = query.await;
         let mut result = match attempted {
             Ok(result) => result,
             Err(err) if lost_the_race(&err) => {
@@ -289,9 +348,13 @@ async fn claim_at_and_create<T: SurrealValue + Clone>(
         if let Some(error) = errors.drain().map(|(_, error)| error).next() {
             return Err(error.into());
         }
-        // Slots count BEGIN, two LETs and two IFs: the CREATE is slot 5.
+        // Slots count BEGIN, two LETs and two IFs: the CREATE is slot 5, plus
+        // the holder claim's own statements when one is carried — counted, not
+        // tallied by hand, so a statement added there cannot read back the
+        // wrong result.
+        let slot = 5 + held_by.len();
         return result
-            .take::<Vec<T>>(5)?
+            .take::<Vec<T>>(slot)?
             .into_iter()
             .next()
             .map(Claimed::Made)
@@ -300,6 +363,134 @@ async fn claim_at_and_create<T: SurrealValue + Clone>(
     Err(last
         .map(AppError::from)
         .unwrap_or_else(|| AppError::Internal("cap counter write never ran".into())))
+}
+
+/// The marker [`touch_and_create`] aborts with: the parent row is gone.
+const GONE_MARK: &str = "cap_gone";
+
+/// Write a child of `parent` while *colliding* with anything that removes the
+/// parent — no seat spent, only the proof. `Ok(None)` = the parent is gone and
+/// nothing was written.
+///
+/// Reading the parent first and then inserting cannot promise this, and neither
+/// can a `SELECT` inside the transaction: SurrealDB 3.2.3 conflict-checks write
+/// sets, not read sets, so a create landing inside a parent delete's window
+/// reads a row that is still there (removed, uncommitted) while the delete's
+/// `DELETE <child> WHERE parent = $parent` sweep already ran on a snapshot
+/// without this row — both commit, and the child outlives its parent
+/// unreachably, because every route to it goes through the parent.
+///
+/// So the proof is a *write* on the parent's own record, which is the key the
+/// delete writes. `field` is moved — bumped and put back by captured value,
+/// `NONE` included, so the row is byte-identical afterwards — because an
+/// `UPDATE` that leaves the document unchanged is elided and never enters the
+/// write set: `SET x = x` sits on no key at all and collides with nothing
+/// (measured on 3.2.3, and the reason
+/// [`crate::domain::class_pump::Axis::pivot_claim`] and
+/// [`crate::domain::exam_answer::ExamAnswer::save`] have the same shape). Both
+/// statements are inside the transaction, so an abort between them cannot leave
+/// the counter up.
+///
+/// It lives here because it is [`claim_and_create`] with the cap removed: the
+/// same single-record conditional write on the parent, asked "are you still
+/// there?" instead of "is there room?". No [`CLAIM_LOCK`] either — the counter
+/// nets zero, so no cap depends on the order these arrive in.
+///
+/// Admissible for [`crate::database::transaction_with_retry`]: `UPDATE`s and a
+/// `CREATE` whose id is a freshly minted ULID no rival can aim at, so no
+/// statement can legitimately answer "already exists" and a lost round wrote
+/// nothing.
+pub(crate) async fn touch_and_create<T: SurrealValue + Clone>(
+    parent: &RecordId,
+    field: &str,
+    id: &RecordId,
+    content: &T,
+    db: &Database,
+) -> Result<Option<T>, AppError> {
+    let sql = format!(
+        "BEGIN TRANSACTION;
+         LET $was = (SELECT VALUE {field} FROM ONLY $parent);
+         LET $alive = (UPDATE $parent SET {field} = ({field} ?? 0) + 1 RETURN VALUE id);
+         IF array::len($alive) = 0 {{ THROW '{GONE_MARK}' }};
+         UPDATE $parent SET {field} = $was;
+         LET $made = (CREATE $id CONTENT $row RETURN AFTER);
+         RETURN $made[0];
+         COMMIT TRANSACTION;"
+    );
+    let (mut result, mut errors) = transaction_with_retry(
+        db,
+        &sql,
+        &[
+            ("parent".into(), parent.clone().into_value()),
+            ("id".into(), id.clone().into_value()),
+            ("row".into(), content.clone().into_value()),
+        ],
+        &[GONE_MARK],
+    )
+    .await?;
+    // An aborted transaction errors *every* slot, most with a generic "not
+    // executed" — only the THROW's own slot names the marker.
+    if errors
+        .values()
+        .any(|error| error.to_string().contains(GONE_MARK))
+    {
+        return Ok(None);
+    }
+    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+        return Err(error.into());
+    }
+    // The trailing `RETURN` is the last statement before `COMMIT`, so its slot
+    // follows the statement count rather than a hand-kept number;
+    // `num_statements` counts BEGIN and COMMIT.
+    let slot = result.num_statements().saturating_sub(2);
+    result
+        .take::<Vec<T>>(slot)?
+        .into_iter()
+        .next()
+        .map(Some)
+        .ok_or_else(|| AppError::Internal("the parent touch wrote no row".into()))
+}
+
+/// The statements that put a transaction's write on a **user's own record**
+/// while the role that row still carries may hold the grant being written —
+/// [`touch_and_create`]'s trick pointed at the one key
+/// [`crate::domain::user::User::set_role`] writes.
+///
+/// WHY: a demotion sheds every grant the old role implied, and it does that in
+/// the role write's own transaction — but its sweeps are *snapshots*
+/// (`DELETE <child> WHERE user = $usr`), and SurrealDB 3.2.3 conflict-checks
+/// write sets, not read sets. A seat, an enrollment or a class membership
+/// created after that snapshot therefore survives the sweep, and nothing ever
+/// re-sweeps: the grant stands forever under a role that may not hold it. Every
+/// one of those creates writes its *other* parent (the event, the course, the
+/// class), so it shares no key with the demotion and the store has nothing to
+/// settle.
+///
+/// So the counter named by [`USER_ROLE_CLAIM_FIELD`] is **moved** — bumped and
+/// put back by captured value, `NONE` included, so the row is byte-identical
+/// afterwards — because re-stating a value claims nothing: an `UPDATE` that
+/// leaves the document unchanged is elided and enters no write set. The same
+/// `UPDATE` hands back the role it found, so one statement is both the write
+/// that collides and the read that decides. Either the sweep sees this row, or
+/// this statement sees the demotion; and the caller that *loses* the conflict
+/// re-sends into a fresh transaction that reads the new role, which is what
+/// keeps the retry from turning a refusal into a success.
+///
+/// A user row that is not there claims nothing and refuses nothing: the
+/// `UPDATE` matches no key, and every caller has already answered a missing
+/// target its own way. `holder` names the binding the user record is bound to,
+/// and `unfit` is an in-crate comparison against the role that may *not* hold
+/// this grant — never text from a client.
+pub(crate) fn role_claim(holder: &str, unfit: &str, mark: &str) -> Vec<String> {
+    vec![
+        format!("LET $role_was = (SELECT VALUE {USER_ROLE_CLAIM_FIELD} FROM ONLY ${holder})"),
+        format!(
+            "LET $role_now = (UPDATE ${holder} SET {USER_ROLE_CLAIM_FIELD} = \
+             ({USER_ROLE_CLAIM_FIELD} ?? 0) + 1 RETURN VALUE role)"
+        ),
+        format!("IF array::len($role_now) > 0 AND $role_now[0] {unfit} {{ THROW '{mark}' }}"),
+        format!("UPDATE ${holder} SET {USER_ROLE_CLAIM_FIELD} = $role_was"),
+    ]
 }
 
 /// What [`claim_two_when_and_create`] settled.
@@ -1046,6 +1237,7 @@ mod tests {
             BOARD_EPOCH_STROKE_COUNT_FIELD,
             "epoch ?? $num",
             UNLIMITED,
+            None,
             &RecordId::new("board_stroke", "s1"),
             &a_stroke(),
             &db,
@@ -1072,6 +1264,7 @@ mod tests {
             BOARD_EPOCH_STROKE_COUNT_FIELD,
             "capacity ?? $num",
             UNLIMITED,
+            None,
             &RecordId::new("board_stroke", "s1"),
             &a_stroke(),
             &db,
