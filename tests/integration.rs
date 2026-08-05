@@ -23871,6 +23871,28 @@ async fn reversal_undoes_a_charge_once_and_refuses_a_payment() {
         "a replayed reversal must not append a second line"
     );
 
+    // A reversed charge is no longer owed, so it takes no money — and the
+    // refusal must say *reversed*. The reversal folds in at `+amount` exactly
+    // as a payment does, so the cap alone cannot tell the two apart, and
+    // "already paid in full" would send a bursar hunting for money that never
+    // arrived against a charge nobody ever paid a kuruş on.
+    let res = pay(&app, &mgr, &charge, 1).await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+    let message = res.body["error"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("reversed"),
+        "the refusal must name the reversal, not a payment: {message}"
+    );
+    assert!(
+        !message.contains("paid in full"),
+        "no money ever arrived on this charge: {message}"
+    );
+    assert_eq!(
+        pay_row_count(&db, "payment_ledger").await,
+        2,
+        "the refused payment must not have landed"
+    );
+
     // A mistaken payment is corrected with a refund, never a reversal.
     let (mgr2, other_id, _) = {
         let student = login(&app, "veli").await;

@@ -612,7 +612,9 @@ fn request_key_of(raw: Option<&str>) -> Result<Option<PaymentRequestKey>, AppErr
 /// Record money received against one named charge. Allocation is recorded, not
 /// inferred: a payment always says which installment it settles. Partial
 /// payments accumulate; one that would take the charge past what it is worth is
-/// a `409`.
+/// a `409`. A charge that was **reversed** takes no payment either — it is no
+/// longer owed — and that `409` says so, rather than reporting money that never
+/// arrived as "paid in full".
 ///
 /// **Retry-safe on request** — send a `request_key` and a repeat of the call
 /// (a client retry after a network timeout) returns the line the first attempt
@@ -632,7 +634,7 @@ fn request_key_of(raw: Option<&str>) -> Result<Option<PaymentRequestKey>, AppErr
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "No such ledger line", body = ErrorResponse),
-        (status = 409, description = "The charge is already paid in full, or the request_key was used for a different amount or charge", body = ErrorResponse),
+        (status = 409, description = "The charge is already paid in full, the charge was reversed (so it is no longer owed), or the request_key was used for a different amount or charge", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
