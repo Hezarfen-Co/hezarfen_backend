@@ -770,8 +770,17 @@ mod tests {
         let used_once = template("once").await.unwrap();
         let unused = template("never").await.unwrap();
 
-        let exam = ExamId::generate();
-        let other_exam = ExamId::generate();
+        // Real exam rows: instantiating a template moves the exam's counter
+        // (what keeps a question from outliving its exam), so a minted id
+        // nothing wrote is a 404.
+        let exam = crate::domain::exam::published_exam(&db)
+            .await
+            .get_id()
+            .clone();
+        let other_exam = crate::domain::exam::published_exam(&db)
+            .await
+            .get_id()
+            .clone();
         // A real subject row: an exam question claims a reference on its
         // subject, so a minted id it never wrote would be refused.
         let subject = crate::domain::subject::Subject::create(

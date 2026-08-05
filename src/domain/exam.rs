@@ -666,31 +666,38 @@ impl Exam {
     }
 }
 
+/// An unscheduled published exam — the minimum any test that writes a *child*
+/// of an exam needs, in any module: every such write moves the exam row (see
+/// [`ExamAttempt::write_unfrozen_with`](crate::domain::exam_attempt::ExamAttempt)
+/// and [`crate::domain::exam_answer::ExamAnswer::save`]), so a minted id whose
+/// row was never created is a 404 rather than a silent orphan.
+#[cfg(test)]
+pub(crate) async fn published_exam(db: &Database) -> Exam {
+    let allowed: Vec<ExamKindDef> = crate::domain::settings::Settings::defaults()
+        .get_exam_kinds()
+        .to_vec();
+    Exam::create(
+        &UserId::generate(),
+        &CourseId::generate(),
+        ExamTitle::try_new("midterm").unwrap(),
+        ExamDescription::try_new("").unwrap(),
+        ExamKind::try_new("midterm", &allowed).unwrap(),
+        ExamSchedule::try_new(None, None, None, None).unwrap(),
+        ExamAttemptLimit::try_new(1).unwrap(),
+        true,
+        false,
+        false,
+        db,
+    )
+    .await
+    .unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// An unscheduled published exam, the minimum this file's write tests need.
-    async fn published(db: &Database) -> Exam {
-        let allowed: Vec<ExamKindDef> = crate::domain::settings::Settings::defaults()
-            .get_exam_kinds()
-            .to_vec();
-        Exam::create(
-            &UserId::generate(),
-            &CourseId::generate(),
-            ExamTitle::try_new("midterm").unwrap(),
-            ExamDescription::try_new("").unwrap(),
-            ExamKind::try_new("midterm", &allowed).unwrap(),
-            ExamSchedule::try_new(None, None, None, None).unwrap(),
-            ExamAttemptLimit::try_new(1).unwrap(),
-            true,
-            false,
-            false,
-            db,
-        )
-        .await
-        .unwrap()
-    }
+    use crate::domain::exam::published_exam as published;
 
     fn edit(exam: &Exam) -> (ExamTitle, ExamDescription, ExamKind, ExamSchedule) {
         (
@@ -1165,5 +1172,186 @@ mod tests {
             "no round ever deleted the exam, so the window was never reached"
         );
         assert_eq!(answers, 0, "an answer outlived its exam");
+    }
+
+    /// The same defect on the teacher's side of the sheet, and a worse one: a
+    /// question written inside the delete window kept the reference it claimed
+    /// on its subject (the cascade's per-subject decrement counted only the
+    /// rows it could see), and [`crate::domain::subject::Subject::delete`] is
+    /// gated on that count reading zero — a subject nobody could ever delete
+    /// again, hanging off an exam nobody could ever see. The freeze gate is a
+    /// *read* of `exam_attempt` and never survived this window;
+    /// [`ExamAttempt::write_unfrozen_with`] now writes the exam row too.
+    ///
+    /// Same seam, same `#[ignore]`, same reason as the answer twin above: the
+    /// subject *is* the store's conflict detection, which the in-memory engine
+    /// does not have.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
+    async fn a_question_written_inside_a_delete_never_outlives_the_exam() {
+        use crate::domain::exam_question::{
+            ChoiceInput, ExamQuestion, QuestionKind, QuestionPoints, QuestionSpec, QuestionText,
+        };
+        use crate::domain::subject::Subject;
+        let (db, _serialized) = crate::database::init_test_server("exam_question_race").await;
+        db.query(
+            "DEFINE EVENT hold_the_window ON TABLE exam WHEN $event = 'DELETE' \
+             THEN { SLEEP 1s; };",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+        let (mut questions, mut swept, mut stuck) = (0, 0, 0);
+        for round in 0..4 {
+            let exam = published(&db).await;
+            let id = exam.get_id().clone();
+            let subject = Subject::create(
+                &CourseId::generate(),
+                crate::domain::subject::SubjectName::try_new("topic").unwrap(),
+                crate::domain::subject::SubjectDescription::try_new("").unwrap(),
+                &db,
+            )
+            .await
+            .unwrap();
+
+            let drop_it = {
+                let db = db.clone();
+                tokio::spawn(async move { exam.delete(&db).await })
+            };
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let child = {
+                let (db, exam_id, on) = (db.clone(), id.clone(), subject.get_id().clone());
+                tokio::spawn(async move {
+                    let spec = QuestionSpec::try_new(
+                        QuestionKind::try_new("choice").unwrap(),
+                        Some(vec![
+                            ChoiceInput {
+                                id: Some("a".into()),
+                                text: "5".into(),
+                            },
+                            ChoiceInput {
+                                id: Some("b".into()),
+                                text: "6".into(),
+                            },
+                        ]),
+                        Some("b".into()),
+                        &[],
+                    )
+                    .unwrap();
+                    ExamQuestion::create(
+                        &exam_id,
+                        on,
+                        QuestionText::try_new("3 + 3?").unwrap(),
+                        QuestionPoints::try_new(5).unwrap(),
+                        spec,
+                        &db,
+                    )
+                    .await
+                })
+            };
+            let (drop_it, child) = (drop_it.await.unwrap(), child.await.unwrap());
+            assert!(
+                !matches!(child, Err(AppError::Db(_))),
+                "round {round}: a raced question write must be answered, not 500: {child:?}"
+            );
+
+            if Exam::read(&id, &db).await.unwrap().is_none() {
+                swept += 1;
+                questions += ExamQuestion::list_for_exam(&id, None, 0, &db)
+                    .await
+                    .unwrap()
+                    .0
+                    .len();
+                // The subject has to be free again: a stranded reference is the
+                // half of this bug a row count alone would not catch.
+                if Subject::read(subject.get_id(), &db)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .delete(&db)
+                    .await
+                    .is_err()
+                {
+                    stuck += 1;
+                }
+            } else if drop_it.is_ok() {
+                panic!("round {round}: the delete reported success but the exam is still there");
+            }
+        }
+        eprintln!("Exam::delete raced by a question write: {swept}/4 rounds deleted the exam");
+        assert!(
+            swept > 0,
+            "no round ever deleted the exam, so the window was never reached"
+        );
+        assert_eq!(questions, 0, "a question outlived its exam");
+        assert_eq!(stuck, 0, "an orphan question left its subject undeletable");
+    }
+
+    /// A picture is written through the same freeze gate as the question it
+    /// hangs on, so it had the same hole — and one the row count does not even
+    /// show: `delete_exam` collects the blob names to unlink *before* it calls
+    /// [`Exam::delete`], so an image row landing after that snapshot strands
+    /// its bytes on disk forever as well.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
+    async fn a_picture_written_inside_a_delete_never_outlives_the_exam() {
+        use crate::domain::note_file::FileContentType;
+        use crate::domain::question_image::QuestionImage;
+        let (db, _serialized) = crate::database::init_test_server("question_image_race").await;
+        db.query(
+            "DEFINE EVENT hold_the_window ON TABLE exam WHEN $event = 'DELETE' \
+             THEN { SLEEP 1s; };",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+        let (mut images, mut swept) = (0, 0);
+        for round in 0..4 {
+            let exam = published(&db).await;
+            let question = question_on(&exam, &db).await;
+            let id = exam.get_id().clone();
+
+            let drop_it = {
+                let db = db.clone();
+                tokio::spawn(async move { exam.delete(&db).await })
+            };
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let child = {
+                let (db, exam_id, on) = (db.clone(), id.clone(), question.get_id().clone());
+                tokio::spawn(async move {
+                    QuestionImage::new(
+                        &exam_id,
+                        &on,
+                        None,
+                        FileContentType::try_new("image/png").unwrap(),
+                        3,
+                    )
+                    .upsert(&db)
+                    .await
+                })
+            };
+            let (drop_it, child) = (drop_it.await.unwrap(), child.await.unwrap());
+            assert!(
+                !matches!(child, Err(AppError::Db(_))),
+                "round {round}: a raced picture write must be answered, not 500: {child:?}"
+            );
+
+            if Exam::read(&id, &db).await.unwrap().is_none() {
+                swept += 1;
+                images += QuestionImage::list_for_exam(&id, &db).await.unwrap().len();
+            } else if drop_it.is_ok() {
+                panic!("round {round}: the delete reported success but the exam is still there");
+            }
+        }
+        eprintln!("Exam::delete raced by a picture write: {swept}/4 rounds deleted the exam");
+        assert!(
+            swept > 0,
+            "no round ever deleted the exam, so the window was never reached"
+        );
+        assert_eq!(images, 0, "a picture outlived its exam");
     }
 }

@@ -1,6 +1,6 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
-use crate::constant::{EXAM_ATTEMPT_TABLE, EXAM_SAT_TOTAL_FIELD};
+use crate::constant::{EXAM_ATTEMPT_TABLE, EXAM_RESULT_COUNT_FIELD, EXAM_SAT_TOTAL_FIELD};
 use crate::database::{Database, transaction_with_retry};
 use crate::domain::exam::Exam;
 use crate::domain::exam::ExamId;
@@ -13,6 +13,10 @@ use crate::error::AppError;
 /// the handler's pre-flight check answer with — a client cannot tell which of
 /// the two refused.
 const FROZEN_MARK: &str = "questions_frozen";
+
+/// The `THROW` marker the exam-existence touch aborts with — the exam row this
+/// write hangs off is gone, so the write is a 404 and nothing lands.
+const GONE_MARK: &str = "no_exam";
 
 pub(crate) fn frozen_error() -> AppError {
     AppError::Conflict("cannot change questions after attempts have started")
@@ -361,7 +365,34 @@ impl ExamAttempt {
     /// all once `exam` has an attempt — the freeze gate, made atomic with the
     /// write it guards instead of merely preceding it. `freeze_exam` is bound
     /// here; the caller binds the rest and reads its own results from
-    /// [`Self::FROZEN_SLOT`] onwards (`BEGIN` and the `IF` take a slot each).
+    /// [`Self::FROZEN_SLOT`] onwards.
+    ///
+    /// The same transaction *writes* the exam row — bumping its mark counter
+    /// and putting it straight back — which is what ties every child written
+    /// through here to its exam. The freeze gate only *reads* `exam_attempt`,
+    /// and a read does not survive [`Exam::delete`](crate::domain::exam::Exam::delete)'s
+    /// window: a question or picture landing after that delete removed the exam
+    /// but before it committed reads a row that is still there, while the
+    /// cascade's `DELETE exam_question WHERE exam = $ex` ran on a snapshot
+    /// predating this insert — so both commit and the child outlives the exam,
+    /// with neither caller told anything. Writing a key the delete also writes
+    /// makes the two collide and the store refuses one side. It is the shape
+    /// [`crate::domain::exam_answer::ExamAnswer::save`] and
+    /// [`crate::domain::menu::bump_menu_and_write`] already use.
+    ///
+    /// An orphan here is not merely untidy: an `exam_question` that outlives
+    /// its exam keeps the reference it claimed on its subject (the cascade's
+    /// per-subject decrement counted the rows it could see), and
+    /// [`crate::domain::subject::Subject::delete`] is gated on that count
+    /// reading zero — a subject nobody can ever delete again.
+    ///
+    /// The bump is restored *by captured value*, `NONE` included, so the row is
+    /// byte-identical afterwards: the boot backfill still finds the rows it
+    /// keys on (`WHERE result_count = NONE`) and a teacher's PATCH, which pins
+    /// that counter, is not refused because somebody added a question. Writing
+    /// the same value back would not do — an `UPDATE` that leaves the document
+    /// unchanged is elided and never reaches the store's write set, so it
+    /// collides with nothing.
     ///
     /// This replaces a process-wide `EXAM_LOCK.write()` held across the check
     /// and the write. That lock ordered the two requests but still read the
@@ -420,12 +451,18 @@ impl ExamAttempt {
             "BEGIN TRANSACTION;
              IF array::len((SELECT VALUE id FROM exam_attempt \
              WHERE exam = $freeze_exam LIMIT 1)) > 0 {{ THROW '{FROZEN_MARK}' }};
+             LET $was_results = \
+                 (SELECT VALUE {EXAM_RESULT_COUNT_FIELD} FROM ONLY $freeze_exam);
+             LET $touched = (UPDATE $freeze_exam SET {EXAM_RESULT_COUNT_FIELD} = \
+                 ({EXAM_RESULT_COUNT_FIELD} ?? 0) + 1 RETURN VALUE id);
+             IF array::len($touched) = 0 {{ THROW '{GONE_MARK}' }};
+             UPDATE $freeze_exam SET {EXAM_RESULT_COUNT_FIELD} = $was_results;
              {statements}
              COMMIT TRANSACTION;"
         );
         let mut bound = vec![("freeze_exam".into(), exam.record().into_value())];
         bound.extend(bindings);
-        let mut marks = vec![FROZEN_MARK];
+        let mut marks = vec![FROZEN_MARK, GONE_MARK];
         marks.extend(refusals.iter().map(|(marker, _)| *marker));
         let (result, mut errors) = transaction_with_retry(db, &sql, &bound, &marks).await?;
         let thrown = |marker: &str| {
@@ -435,6 +472,12 @@ impl ExamAttempt {
         };
         if thrown(FROZEN_MARK) {
             return Err(frozen_error());
+        }
+        // The exam is gone: the same 404 every one of these writes' handlers
+        // answers a missing exam with, and it outranks the callers' own gates
+        // for the freeze's reason — there is nothing left to refuse *about*.
+        if thrown(GONE_MARK) {
+            return Err(AppError::NotFound);
         }
         for (marker, refusal) in refusals {
             if thrown(marker) {
@@ -447,8 +490,10 @@ impl ExamAttempt {
         }
     }
 
-    /// The first slot a [`Self::write_unfrozen`] caller's own statements land in.
-    pub(crate) const FROZEN_SLOT: usize = 2;
+    /// The first slot a [`Self::write_unfrozen`] caller's own statements land
+    /// in: `BEGIN`, the freeze `IF`, and the exam touch's two `LET`s, `IF` and
+    /// restoring `UPDATE` take one each.
+    pub(crate) const FROZEN_SLOT: usize = 6;
 
     /// Whether anyone has started this exam — the gate that freezes `mode`
     /// edits once an attempt exists.
