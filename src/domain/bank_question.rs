@@ -14,7 +14,8 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use crate::constant::{
     BANK_QUESTION_TABLE, BANK_VISIBILITY_PRIVATE, BANK_VISIBILITY_SCHOOL, USAGE_COUNTS_SQL,
 };
-use crate::database::Database;
+use crate::database::{Database, transaction_with_retry, write_with_retry};
+use crate::domain::bank_question_image::BankQuestionImage;
 use crate::domain::exam::ExamId;
 use crate::domain::exam_question::{
     Choice, ChoiceId, QuestionKind, QuestionPoints, QuestionSpec, QuestionText,
@@ -72,6 +73,15 @@ pub struct BankQuestionId(RecordId);
 struct UsageCount {
     from_bank: BankQuestionId,
     n: i64,
+}
+
+/// What one [`BankQuestion::delete`] transaction removed — the template (an
+/// empty list once someone else deleted it first) and the image rows swept
+/// with it.
+#[derive(SurrealValue)]
+struct DeleteOutcome {
+    question: Vec<BankQuestion>,
+    images: Vec<BankQuestionImage>,
 }
 
 impl BankQuestionId {
@@ -395,6 +405,14 @@ impl BankQuestion {
     /// the `SET` writes. `choices` is compared whole: its objects carry two
     /// required string keys, so none is ever dropped for being `NONE` (the trap
     /// [`crate::domain::settings::Settings::save_if_unchanged`] works around).
+    ///
+    /// Rides [`write_with_retry`] because an image write now moves this row too
+    /// ([`crate::domain::bank_question_image::BankQuestionImage::upsert`]): an
+    /// upload landing in the same instant makes the store answer "conflict,
+    /// retry", and a bare `check()` would turn that into a 500 for an edit that
+    /// only had to be re-sent. A lost round writes nothing, and the guard is
+    /// re-evaluated on the next one, so a genuine stale merge still comes back
+    /// as `None`. Admissible: an `UPDATE` can never answer "already exists".
     pub async fn update_if_unchanged(
         self,
         subject: Option<SubjectId>,
@@ -405,40 +423,60 @@ impl BankQuestion {
         db: &Database,
     ) -> Result<Option<BankQuestion>, AppError> {
         let (kind, choices, correct) = spec.into_parts();
-        let mut result = db
-            .query(
-                "UPDATE $id SET subject = $subject, text = $text, points = $points,
-                 kind = $kind, choices = $choices, correct = $correct,
-                 visibility = $visibility
-                 WHERE subject = $was_subject AND text = $was_text
-                   AND points = $was_points AND kind = $was_kind
-                   AND choices = $was_choices AND correct = $was_correct
-                   AND visibility = $was_visibility
-                 RETURN AFTER",
-            )
-            .bind(("was_subject", self.subject.clone().map(|s| s.record())))
-            .bind(("was_text", self.text.clone()))
-            .bind(("was_points", self.points))
-            .bind(("was_kind", self.kind.clone()))
-            .bind(("was_choices", self.choices.clone()))
-            .bind(("was_correct", self.correct.clone()))
-            .bind(("was_visibility", self.visibility.clone()))
-            .bind(("id", self.id.record()))
-            .bind(("subject", subject.map(|s| s.record())))
-            .bind(("text", text))
-            .bind(("points", points))
-            .bind(("kind", kind))
-            .bind(("choices", choices))
-            .bind(("correct", correct))
-            .bind(("visibility", visibility))
-            .await?
-            .check()?;
-        Ok(result.take::<Vec<BankQuestion>>(0)?.into_iter().next())
+        let rows: Vec<BankQuestion> = write_with_retry(
+            db,
+            "UPDATE $id SET subject = $subject, text = $text, points = $points,
+             kind = $kind, choices = $choices, correct = $correct,
+             visibility = $visibility
+             WHERE subject = $was_subject AND text = $was_text
+               AND points = $was_points AND kind = $was_kind
+               AND choices = $was_choices AND correct = $was_correct
+               AND visibility = $was_visibility
+             RETURN AFTER",
+            &[
+                (
+                    "was_subject".into(),
+                    self.subject.clone().map(|s| s.record()).into_value(),
+                ),
+                ("was_text".into(), self.text.clone().into_value()),
+                ("was_points".into(), self.points.into_value()),
+                ("was_kind".into(), self.kind.clone().into_value()),
+                ("was_choices".into(), self.choices.clone().into_value()),
+                ("was_correct".into(), self.correct.clone().into_value()),
+                (
+                    "was_visibility".into(),
+                    self.visibility.clone().into_value(),
+                ),
+                ("id".into(), self.id.record().into_value()),
+                ("subject".into(), subject.map(|s| s.record()).into_value()),
+                ("text".into(), text.into_value()),
+                ("points".into(), points.into_value()),
+                ("kind".into(), kind.into_value()),
+                ("choices".into(), choices.into_value()),
+                ("correct".into(), correct.into_value()),
+                ("visibility".into(), visibility.into_value()),
+            ],
+        )
+        .await?;
+        Ok(rows.into_iter().next())
     }
 
     /// Delete the template and cascade-remove its bank images, so none points
-    /// at a missing template. Bank rows have no answers. The image *blobs* are
-    /// the web layer's to remove — it collects their names before calling this.
+    /// at a missing template. Bank rows have no answers. The image rows this
+    /// actually removed come back with it: the blobs are the web layer's to
+    /// take off disk, but only for *these* rows — an upload that committed
+    /// after the caller listed the template's images is swept here too, and a
+    /// pre-read snapshot would strand its blob for good
+    /// ([`crate::domain::note::Note::delete`]'s story, this domain over).
+    ///
+    /// Children first, in one transaction: as two queries, a failure between
+    /// them left image rows swept under a template that survived, or (the other
+    /// order) a template gone with its images still there. Rides the retry
+    /// because an image write now moves this very row
+    /// ([`crate::domain::bank_question_image::BankQuestionImage::upsert`]) — the
+    /// two contend by design, and a lost round through a bare `check()` would be
+    /// a 500 for a delete that only had to be re-sent. Admissible: no `UPDATE`
+    /// or `DELETE` in here can answer "already exists".
     ///
     /// Exam questions tied to this template keep living: only their provenance
     /// links are cleared, field-scoped (never a whole-row save — the question
@@ -446,17 +484,41 @@ impl BankQuestion {
     /// a template that no longer exists. *Both* directions point at a template,
     /// so both are cleared: `from_bank` on the questions instantiated from it,
     /// and `banked_as` on the question it was saved out of.
-    pub async fn delete(self, db: &Database) -> Result<BankQuestion, AppError> {
-        db.query(
-            "DELETE bank_question_image WHERE bank_question = $b;
+    pub async fn delete(
+        self,
+        db: &Database,
+    ) -> Result<(BankQuestion, Vec<BankQuestionImage>), AppError> {
+        let (mut result, mut errors) = transaction_with_retry(
+            db,
+            "BEGIN TRANSACTION;
+             LET $images = (DELETE bank_question_image WHERE bank_question = $b RETURN BEFORE);
              UPDATE exam_question SET from_bank = NONE WHERE from_bank = $b;
-             UPDATE exam_question SET banked_as = NONE WHERE banked_as = $b;",
+             UPDATE exam_question SET banked_as = NONE WHERE banked_as = $b;
+             LET $gone = (DELETE $b RETURN BEFORE);
+             RETURN { question: $gone, images: $images };
+             COMMIT TRANSACTION;",
+            &[("b".into(), self.id.record().into_value())],
+            &[],
         )
-        .bind(("b", self.id.record()))
-        .await?
-        .check()?;
-        let deleted: Option<BankQuestion> = db.delete(self.id.record()).await?;
-        deleted.ok_or(AppError::NotFound)
+        .await?;
+        if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+            return Err(error.into());
+        }
+        // The trailing `RETURN` is the last statement before `COMMIT`, so its
+        // slot follows the statement count rather than a hand-kept number;
+        // `num_statements` counts BEGIN and COMMIT.
+        let slot = result.num_statements().saturating_sub(2);
+        let outcome = result
+            .take::<Vec<DeleteOutcome>>(slot)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| AppError::Internal("failed to delete bank question".into()))?;
+        let question = outcome
+            .question
+            .into_iter()
+            .next()
+            .ok_or(AppError::NotFound)?;
+        Ok((question, outcome.images))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -784,7 +846,7 @@ mod tests {
         // A real subject row: an exam question claims a reference on its
         // subject, so a minted id it never wrote would be refused.
         let subject = crate::domain::subject::Subject::create(
-            &crate::domain::course::CourseId::generate(),
+            &crate::domain::course::a_test_course(&db).await,
             crate::domain::subject::SubjectName::try_new("topic").unwrap(),
             crate::domain::subject::SubjectDescription::try_new("").unwrap(),
             &db,

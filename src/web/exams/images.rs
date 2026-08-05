@@ -119,9 +119,12 @@ pub(crate) async fn ensure_question_content_visible(
     Ok(())
 }
 
-/// The image write tail, shared by both upload endpoints: the slot's current
-/// row names the blob to retire, the UPSERT replaces it (the deterministic
-/// per-slot id makes it a replace), and [`store_blob`] owns the disk ordering.
+/// The image write tail, shared by both upload endpoints: the UPSERT replaces
+/// the slot's row (the deterministic per-slot id makes it a replace) and names
+/// the blob it retired *from inside its own transaction*, and [`store_blob`]
+/// owns the disk ordering. Reading the slot out here first instead would hand
+/// two uploads racing on one slot the same old blob name, leaving the loser's
+/// fresh one on disk with no row pointing at it.
 pub(crate) async fn store_image(
     st: &AppState,
     exam: &Exam,
@@ -130,7 +133,6 @@ pub(crate) async fn store_image(
     content_type: FileContentType,
     data: &[u8],
 ) -> Result<QuestionImage, AppError> {
-    let replaced = QuestionImage::read_slot(question.get_id(), slot, &st.db).await?;
     let image = QuestionImage::new(
         exam.get_id(),
         question.get_id(),
@@ -139,11 +141,7 @@ pub(crate) async fn store_image(
         data.len() as i64,
     );
     let file = image.get_file().to_string();
-    store_blob(st, &file, data, || async {
-        let stored = image.upsert(&st.db).await?;
-        Ok((stored, replaced.map(|old| old.get_file().to_string())))
-    })
-    .await
+    store_blob(st, &file, data, || async { image.upsert(&st.db).await }).await
 }
 
 /// The stored bytes, served inline via [`crate::web::serve_inline_blob`].
@@ -395,8 +393,9 @@ pub(crate) async fn delete_choice_image(
 // content's own visibility (own sitting view / teacher grading view).
 
 /// The answer-image write tail, mirroring [`store_image`]: the deterministic
-/// per-(question, user, seq) id makes the UPSERT a replace, and [`store_blob`]
-/// owns the disk ordering.
+/// per-(question, user, seq) id makes the UPSERT a replace, the write names the
+/// blob it retired from inside its own transaction, and [`store_blob`] owns the
+/// disk ordering.
 pub(crate) async fn store_answer_image(
     st: &AppState,
     exam: &Exam,
@@ -406,7 +405,6 @@ pub(crate) async fn store_answer_image(
     content_type: FileContentType,
     data: &[u8],
 ) -> Result<AnswerImage, AppError> {
-    let replaced = AnswerImage::read(question.get_id(), user, seq, &st.db).await?;
     let image = AnswerImage::new(
         exam.get_id(),
         question.get_id(),
@@ -416,11 +414,7 @@ pub(crate) async fn store_answer_image(
         data.len() as i64,
     );
     let file = image.get_file().to_string();
-    store_blob(st, &file, data, || async {
-        let stored = image.upsert(&st.db).await?;
-        Ok((stored, replaced.map(|old| old.get_file().to_string())))
-    })
-    .await
+    store_blob(st, &file, data, || async { image.upsert(&st.db).await }).await
 }
 
 /// Attach (or replace) the caller's drawn answer to a question inside their
