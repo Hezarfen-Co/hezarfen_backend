@@ -17472,6 +17472,16 @@ async fn slot_delete_waits_for_the_booking_to_settle() {
     );
     let res = send(&app, "DELETE", &uri, Some(&ali), None).await;
     assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    // The settled booking goes with the slot, in the same transaction — it is
+    // history of a meeting that no longer exists, and a row left pointing at a
+    // deleted slot is a dangling link every read of it has to survive. The
+    // `204` alone never proved the cascade ran, so the count is read from the
+    // database (`pay_row_count` is this file's plain table count).
+    assert_eq!(
+        pay_row_count(&db, "appointment").await,
+        0,
+        "the cancelled booking {booking} outlived its slot"
+    );
     assert_eq!(
         send(&app, "DELETE", &uri, Some(&ali), None).await.status,
         StatusCode::NOT_FOUND
