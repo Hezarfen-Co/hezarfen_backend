@@ -1289,6 +1289,72 @@ mod tests {
         assert_eq!(stuck, 0, "an orphan question left its subject undeletable");
     }
 
+    /// The student's half of the same picture problem: a drawing is a bare
+    /// `UPSERT` — the exact pre-fix shape of [`ExamAnswer::save`] — so it kept
+    /// the hole the text answer just lost, blob and all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
+    async fn a_drawing_written_inside_a_delete_never_outlives_the_exam() {
+        use crate::domain::answer_image::AnswerImage;
+        use crate::domain::note_file::FileContentType;
+        let (db, _serialized) = crate::database::init_test_server("answer_image_race").await;
+        db.query(
+            "DEFINE EVENT hold_the_window ON TABLE exam WHEN $event = 'DELETE' \
+             THEN { SLEEP 1s; };",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+
+        let (mut drawings, mut swept) = (0, 0);
+        for round in 0..4 {
+            let exam = published(&db).await;
+            let question = question_on(&exam, &db).await;
+            let id = exam.get_id().clone();
+            let student = UserId::from_key(&format!("stu{round}"));
+
+            let drop_it = {
+                let db = db.clone();
+                tokio::spawn(async move { exam.delete(&db).await })
+            };
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let child = {
+                let (db, exam_id, on) = (db.clone(), id.clone(), question.get_id().clone());
+                tokio::spawn(async move {
+                    AnswerImage::new(
+                        &exam_id,
+                        &on,
+                        &student,
+                        1,
+                        FileContentType::try_new("image/png").unwrap(),
+                        3,
+                    )
+                    .upsert(&db)
+                    .await
+                })
+            };
+            let (drop_it, child) = (drop_it.await.unwrap(), child.await.unwrap());
+            assert!(
+                !matches!(child, Err(AppError::Db(_))),
+                "round {round}: a raced drawing write must be answered, not 500: {child:?}"
+            );
+
+            if Exam::read(&id, &db).await.unwrap().is_none() {
+                swept += 1;
+                drawings += AnswerImage::list_for_exam(&id, &db).await.unwrap().len();
+            } else if drop_it.is_ok() {
+                panic!("round {round}: the delete reported success but the exam is still there");
+            }
+        }
+        eprintln!("Exam::delete raced by a drawing write: {swept}/4 rounds deleted the exam");
+        assert!(
+            swept > 0,
+            "no round ever deleted the exam, so the window was never reached"
+        );
+        assert_eq!(drawings, 0, "a drawing outlived its exam");
+    }
+
     /// A picture is written through the same freeze gate as the question it
     /// hangs on, so it had the same hole — and one the row count does not even
     /// show: `delete_exam` collects the blob names to unlink *before* it calls

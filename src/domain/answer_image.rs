@@ -15,8 +15,8 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use ulid::Ulid;
 
-use crate::constant::ANSWER_IMAGE_TABLE;
-use crate::database::Database;
+use crate::constant::{ANSWER_IMAGE_TABLE, EXAM_RESULT_COUNT_FIELD};
+use crate::database::{Database, transaction_with_retry};
 use crate::domain::course::CourseId;
 use crate::domain::exam::ExamId;
 use crate::domain::exam_question::ExamQuestionId;
@@ -116,10 +116,75 @@ impl AnswerImage {
     /// Create or replace the student's drawing for the question — the
     /// deterministic id makes this the whole "one drawing per student per
     /// question" story.
+    ///
+    /// `NotFound` = the exam is gone, and the drawing was *not* written. The
+    /// write moves the exam's mark counter and puts it straight back, in this
+    /// one transaction, so the exam's existence is something this write
+    /// *writes* rather than something a gate read a moment earlier: a bare
+    /// upsert landing after [`Exam::delete`](crate::domain::exam::Exam::delete)
+    /// removed the exam but before it committed was swept by nothing — its
+    /// `DELETE answer_image WHERE exam = $ex` ran on a snapshot predating this
+    /// row — and both sides reported success. That stranded the blob as well as
+    /// the row: `delete_exam` collects the names to unlink *before* it calls
+    /// the delete, so bytes written after that snapshot stay on disk forever.
+    /// This is the shape [`crate::domain::exam_answer::ExamAnswer::save`] takes
+    /// for the text half of the same answer sheet, and for the same reason.
+    ///
+    /// The restore is by captured value, `NONE` included, so the row is
+    /// byte-identical afterwards and a teacher's PATCH — which pins that
+    /// counter — is not refused because a student drew. Writing the same value
+    /// back would buy nothing: an `UPDATE` that leaves the document unchanged
+    /// is elided and never reaches the store's write set.
+    ///
+    /// Admissible for [`transaction_with_retry`]: the `UPDATE`s, `SELECT`,
+    /// `IF`/`THROW` and `RETURN` can never answer "already exists", and the
+    /// `UPSERT`'s id is bijective with the (question, user, seq) triple this
+    /// table keys — a lost round wrote nothing, and re-sending resolves onto
+    /// the same row rather than colliding with it.
     pub async fn upsert(self, db: &Database) -> Result<AnswerImage, AppError> {
         // whole-row-save-ok: self is built in place from the request, never read back, and the (question, user, seq) id is deterministic — replacing the row *is* the operation
-        let written: Option<AnswerImage> = db.upsert(self.id.record()).content(self).await?;
-        written.ok_or_else(|| AppError::Internal("failed to store answer image".into()))
+        let (exam, id) = (self.exam.record(), self.id.record());
+        let (mut result, mut errors) = transaction_with_retry(
+            db,
+            &format!(
+                "BEGIN TRANSACTION;
+                 LET $was = (SELECT VALUE {EXAM_RESULT_COUNT_FIELD} FROM ONLY $ex);
+                 LET $touched = (UPDATE $ex SET {EXAM_RESULT_COUNT_FIELD} = \
+                     ({EXAM_RESULT_COUNT_FIELD} ?? 0) + 1 RETURN VALUE id);
+                 IF array::len($touched) = 0 {{ THROW 'no_exam' }};
+                 UPDATE $ex SET {EXAM_RESULT_COUNT_FIELD} = $was;
+                 LET $row = (UPSERT $id CONTENT $image RETURN AFTER);
+                 RETURN $row[0];
+                 COMMIT TRANSACTION;"
+            ),
+            &[
+                ("ex".into(), exam.into_value()),
+                ("id".into(), id.into_value()),
+                ("image".into(), self.into_value()),
+            ],
+            &["no_exam"],
+        )
+        .await?;
+        // An aborted transaction errors *every* slot, most with a generic "not
+        // executed" — only the THROW's own slot names the reason.
+        if errors
+            .values()
+            .any(|error| error.to_string().contains("no_exam"))
+        {
+            return Err(AppError::NotFound);
+        }
+        if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+            return Err(error.into());
+        }
+        // The trailing `RETURN` is the last statement before `COMMIT`, so its
+        // slot follows the statement count rather than a hand-kept number;
+        // `num_statements` counts BEGIN and COMMIT.
+        let slot = result.num_statements().saturating_sub(2);
+        result
+            .take::<Vec<AnswerImage>>(slot)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| AppError::Internal("failed to store answer image".into()))
     }
 
     /// The student's drawing for one question in one sitting, if any.
@@ -232,6 +297,16 @@ mod tests {
         FileContentType::try_new("image/png").unwrap()
     }
 
+    /// A real exam row: a drawing's write moves its exam's counter (that is
+    /// what keeps it from outliving the exam), so a minted id nothing wrote is
+    /// a 404.
+    async fn exam_row(db: &Database) -> ExamId {
+        crate::domain::exam::published_exam(db)
+            .await
+            .get_id()
+            .clone()
+    }
+
     fn student() -> UserId {
         UserId::from_key("01TESTSTUDENTAAAAAAAAAAAAA")
     }
@@ -239,7 +314,7 @@ mod tests {
     #[tokio::test]
     async fn upsert_replaces_within_a_sitting_but_not_across_them() {
         let db = crate::database::init_mem().await.unwrap();
-        let exam = ExamId::generate();
+        let exam = exam_row(&db).await;
         let question = ExamQuestionId::generate();
         let user = student();
 
@@ -307,8 +382,8 @@ mod tests {
     #[tokio::test]
     async fn listing_scopes_by_exam_and_user() {
         let db = crate::database::init_mem().await.unwrap();
-        let exam_a = ExamId::generate();
-        let exam_b = ExamId::generate();
+        let exam_a = exam_row(&db).await;
+        let exam_b = exam_row(&db).await;
         let user = student();
         AnswerImage::new(&exam_a, &ExamQuestionId::generate(), &user, 1, png(), 1)
             .upsert(&db)
