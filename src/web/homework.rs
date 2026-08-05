@@ -654,7 +654,6 @@ async fn submit(
     Path(id): Path<String>,
     Json(req): Json<SubmitHomework>,
 ) -> Result<(StatusCode, Json<SubmissionResponse>), AppError> {
-    let homework = gate_own_submission(&id, &user, &st.db).await?;
     // Empty text stores as "no note", so a present-but-blank row is never left.
     let text = match req.text {
         Some(ref text) if !text.is_empty() => Some(SubmissionText::try_new(text)?),
@@ -662,8 +661,14 @@ async fn submit(
     };
     // Reader lease of HOMEWORK_LOCK: no longer the freeze (that is the stamp on
     // the row, below), but still the interlock against a PATCH re-scoping this
-    // homework's audience while the submission lands under it.
+    // homework's audience while the submission lands under it. Taken *before*
+    // the gate read, as in `add_submission_file`: read first and the audience
+    // this gate approved is one committed PATCH old, so the narrowing that just
+    // passed `ensure_no_orphans` (no submission yet) is followed by the very
+    // submission it would have refused. Holding the lease across gate *and*
+    // write is what makes the PATCH wait and then see the row.
     let _guard = HOMEWORK_LOCK.read().await;
+    let homework = gate_own_submission(&id, &user, &st.db).await?;
     // The graded gate, twice over. This read answers the common case — graded
     // minutes ago, and the student who never submitted has no row to carry the
     // freeze; the upsert's own `WHERE` (the grade stamp on the row) is what
