@@ -199,24 +199,42 @@ impl BoardStroke {
         }
     }
 
+    /// The one place the module orders `closed` above `locked`, because a board
+    /// can hold both flags at once (nothing gates `/close` on the lock or the
+    /// lock on `closed_at`) and **closed outranks locked**: there is no reopen
+    /// route, so the pause never lifts and only the terminal answer is true.
+    /// Both classifiers read the precedence from here rather than keeping a
+    /// copy of it — the copies are what drifted, and a room told "the creator
+    /// has paused drawing" about a permanently read-only board waits forever.
+    ///
+    /// `None` means the board is neither: whatever refused the write, this is
+    /// not why.
+    fn state_refusal(board: &Board) -> Option<&'static str> {
+        if board.get_closed_at().is_some() {
+            Some(BOARD_CLOSED)
+        } else if board.is_locked() {
+            Some(BOARD_LOCKED)
+        } else {
+            None
+        }
+    }
+
     async fn why_refused(board: &BoardId, db: &Database) -> Result<AppError, AppError> {
         let board = Board::read(board, db).await?.ok_or(AppError::NotFound)?;
-        if board.is_locked() {
-            return Ok(AppError::Conflict(BOARD_LOCKED));
+        if let Some(refusal) = Self::state_refusal(&board) {
+            return Ok(AppError::Conflict(refusal));
         }
-        if board.get_closed_at().is_none() {
-            // Not closed yet. The lifetime counter has to say so *itself*:
-            // `FullHard` also fires when the guard failed, so a board that was
-            // locked (or a clear that moved the epoch) when the claim ran and
-            // is open again now would otherwise be stamped read-only at one
-            // stroke of a 50 000 budget — irreversibly, with no reopen.
-            if Self::total_strokes(board.get_id(), db).await? < MAX_BOARD_STROKES {
-                return Ok(AppError::Conflict(BOARD_MOVED));
-            }
-            // `Board::close` is the one-way idempotent stamp: a second append
-            // takes this branch too and leaves the first `closed_at` standing.
-            board.close(db).await?;
+        // Neither flag, so the lifetime counter has to say so *itself*:
+        // `FullHard` also fires when the guard failed, so a board that was
+        // locked (or a clear that moved the epoch) when the claim ran and is
+        // open again now would otherwise be stamped read-only at one stroke of
+        // a 50 000 budget — irreversibly, with no reopen.
+        if Self::total_strokes(board.get_id(), db).await? < MAX_BOARD_STROKES {
+            return Ok(AppError::Conflict(BOARD_MOVED));
         }
+        // `Board::close` is the one-way idempotent stamp: a second append takes
+        // this branch too and leaves the first `closed_at` standing.
+        board.close(db).await?;
         Ok(AppError::Conflict(BOARD_CLOSED))
     }
 
@@ -330,7 +348,10 @@ impl BoardStroke {
         db: &Database,
     ) -> Result<AppError, AppError> {
         let board = Board::read(board, db).await?.ok_or(AppError::NotFound)?;
-        if board.get_closed_at().is_some() {
+        let state = Self::state_refusal(&board);
+        // Terminal outranks the caller's identity: a closed board is read-only
+        // for its creator too, so "closed" is the honest answer to anyone.
+        if state == Some(BOARD_CLOSED) {
             return Ok(AppError::Conflict(BOARD_CLOSED));
         }
         if !board.is_creator(by) {
@@ -339,8 +360,8 @@ impl BoardStroke {
         // A lock pauses the *creator* too, and it is a state the caller can
         // undo — a `Conflict`, not the `Forbidden` a wrong caller gets. Unlock,
         // clear, relock is the recovery for a locked board that is also full.
-        if board.is_locked() {
-            return Ok(AppError::Conflict(BOARD_LOCKED));
+        if let Some(refusal) = state {
+            return Ok(AppError::Conflict(refusal));
         }
         Ok(AppError::Conflict(CANVAS_BLANK))
     }
@@ -735,6 +756,85 @@ mod tests {
             .unwrap();
         assert_eq!(marker.get_count(), Some(1));
         assert_eq!(reread(&board, &db).await.get_epoch(), 1);
+    }
+
+    /// Both classifiers, one board: the words a stroke is refused with and the
+    /// words the *creator's* clear is refused with. They must match — the two
+    /// used to be independent chains and drifted apart on the state below.
+    async fn both_refusals(board: &Board, db: &Database) -> (&'static str, &'static str) {
+        let stroke = match draw(board, db).await {
+            Err(AppError::Conflict(msg)) => msg,
+            other => panic!("the stroke was not refused: {other:?}"),
+        };
+        let clear = match BoardStroke::clear(board.get_id(), &user("c"), db).await {
+            Err(AppError::Conflict(msg)) => msg,
+            other => panic!("the clear was not refused: {other:?}"),
+        };
+        (stroke, clear)
+    }
+
+    /// A board that is locked *and* closed is terminal, and both paths have to
+    /// say so. Reaching the state is ungated in either direction — `set_locked`
+    /// carries no `closed_at` test and `close` carries no lock test — and the
+    /// stroke path used to test the lock first, so a permanently read-only
+    /// board answered every mark with "the creator has paused drawing" while
+    /// the same board answered a clear with the terminal words. A room told to
+    /// wait for a pause that cannot lift waits forever.
+    ///
+    /// Locking a closed board stays *allowed*: it is a no-op on a board that is
+    /// already read-only, and refusing it would break the second half of a
+    /// close-then-lock a client may legitimately send in either order.
+    #[tokio::test]
+    async fn locked_and_closed_answers_closed_whichever_came_first() {
+        for closed_first in [false, true] {
+            let db = a_db().await;
+            let board = a_board(&db).await;
+            // A mark on the canvas, so "nothing to clear" cannot be the reason.
+            draw(&board, &db).await.unwrap();
+
+            let board = if closed_first {
+                let board = board.close(&db).await.unwrap();
+                board.set_locked(true, &user("c"), &db).await.unwrap()
+            } else {
+                let board = board.set_locked(true, &user("c"), &db).await.unwrap();
+                board.close(&db).await.unwrap()
+            };
+            // Stored state: both flags really are up, and the close stamp stood.
+            let stored = reread(&board, &db).await;
+            assert!(stored.is_locked() && stored.get_closed_at().is_some());
+
+            assert_eq!(
+                both_refusals(&board, &db).await,
+                (BOARD_CLOSED, BOARD_CLOSED),
+                "closed_first = {closed_first}"
+            );
+            // And the refusals wrote nothing: one mark, no marker, epoch 0.
+            assert_eq!(rows(board.get_id(), &db).await.len(), 1);
+            assert_eq!(reread(&board, &db).await.get_epoch(), 0);
+        }
+    }
+
+    /// The other half of the same contract: a board holding *one* of the flags
+    /// keeps its own answer on both paths. A lock is recoverable, a close is
+    /// not, and collapsing either into the other is the mislabel above.
+    #[tokio::test]
+    async fn one_flag_alone_keeps_its_own_answer_on_both_paths() {
+        let db = a_db().await;
+        let locked = a_board(&db).await;
+        draw(&locked, &db).await.unwrap();
+        let locked = locked.set_locked(true, &user("c"), &db).await.unwrap();
+        assert_eq!(
+            both_refusals(&locked, &db).await,
+            (BOARD_LOCKED, BOARD_LOCKED)
+        );
+
+        let closed = a_board(&db).await;
+        draw(&closed, &db).await.unwrap();
+        let closed = closed.close(&db).await.unwrap();
+        assert_eq!(
+            both_refusals(&closed, &db).await,
+            (BOARD_CLOSED, BOARD_CLOSED)
+        );
     }
 
     /// The `next_ulid` hazard: rows minted inside one millisecond must replay
