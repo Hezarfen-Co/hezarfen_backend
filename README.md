@@ -830,7 +830,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/courses/me`                    | student | The caller's **enrolled** courses · paged |
 | GET    | `/courses/{id}`                  | student | Get course (enrolled, creator, assigned teacher, or manager+) |
 | PATCH  | `/courses/{id}`                  | teacher | Edit course incl. `kind` and `capacity` (`null` lifts the cap) (course manager; `409` if the `term_id` it moves off changed since the read — nothing written, re-read and retry) |
-| DELETE | `/courses/{id}`                  | teacher | Delete course + its exams, results, subjects, sessions, and homework (submissions, files, and grades included) (creator, or manager+ — **not** an assigned teacher; `409` while anyone is still enrolled) |
+| DELETE | `/courses/{id}`                  | teacher | Delete course + its exams, results, subjects, sessions, and homework (submissions, files, and grades included); its class attachments and its id in every grade blueprint go with it (creator, or manager+ — **not** an assigned teacher; `409` while anyone is still enrolled) |
 | POST   | `/courses/{id}/teachers`         | manager | `{user_id}` — assign a **teacher+** to run the course (idempotent; returns the course; `409` + undo if that account is demoted mid-request) |
 | DELETE | `/courses/{id}/teachers/{user}`  | manager | Unassign a teacher (`404` if they weren't assigned) |
 | POST   | `/courses/{id}/enrollments`      | teacher | `{user_id}` — enroll a **student** (idempotent upsert; course manager; only students can be enrolled; `409` once a capped course is full); enrolling a class-pumped student clears the row's `source`, so a class sweep can no longer take them back |
@@ -2946,10 +2946,10 @@ at one grade, and the caller is asking about all of them.
 A course a human attached by hand **counts as carried**. The template asks for
 the course, not for the pump's tag, and a course already on the class is a no-op
 for a pump whoever attached it — a status read that disagreed would send
-managers chasing rows no pump will ever write. A course in the template that no
-longer exists is the one deliberate piece of noise: it reads as missing from
-every section, because that is the truth about the section and this route may
-not write, so the dangling id stays until the next pump prunes it.
+managers chasing rows no pump will ever write. `missing` only ever names
+courses that **still exist**: deleting a course takes its id out of every
+template holding it (see below), so there is no dangling id left for this read
+to report.
 
 **Finishing a partial pump** is one of two idempotent calls, and neither needs
 any new machinery:
@@ -2979,10 +2979,11 @@ A skip's `reason` is a **machine code**, not a sentence: the client owns the
 wording (and the language), the same id-plus-client-label shape roles and
 course kinds have. The set is closed, and each code names the record that
 actually failed: `class_deleted` (the section vanished mid-pump),
-`course_deleted` (the course was deleted; the pump also removes the dangling id
-from the template, so the template shrinks and the skip is reported once for the
-whole grade — the sections after the first one are not asked again — and never
-again on a later pump), `class_at_course_ceiling`, `class_roster_too_large`
+`course_deleted` (the course was deleted **while the pump ran** — one deleted
+before it started is already out of the template; the pump removes that id too,
+so the skip is reported once for the whole grade — the sections after the first
+one are not asked again — and never again on a later pump),
+`class_at_course_ceiling`, `class_roster_too_large`
 (the section holds more students than one attach may enroll at once),
 `course_full` (no free
 seat for the whole section), and
@@ -3028,6 +3029,16 @@ blueprint attached it (sweeping the enrollments it pumped, repairing to a rival
 class first exactly as a manual detach does), and a course a human attached to
 that class by hand carries no tag and is left exactly where it is. Deleting a
 blueprint applies that to its whole list.
+
+**Deleting the course itself takes it out of every template naming it**, in the
+same transaction that detaches it from the sections. A template holds its
+courses as a list on its own row, so nothing else could reach them, and the id
+would otherwise be permanent rather than merely stale: the pump prunes a dead id
+only while walking a section, so a grade with no sections could never drop one,
+and `PATCH`ing the template back as it stands — the repair this section points
+at — is a `400` for naming a course that does not exist. The sweep is a scan of
+`class_blueprint`, which is deliberately unindexed: the table holds one row per
+grade label the school uses, and a course delete is rare.
 
 `DELETE /classes/blueprints/{grade}` removes the row **first** and then sweeps
 by that tag, rather than by the list the call read: an edit that adds a course

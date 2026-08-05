@@ -531,8 +531,10 @@ impl ClassBlueprint {
     /// A course id the blueprint holds but that no longer exists reads as
     /// missing from every section. It is the truth about the section, and this
     /// read cannot prune it the way a pump does ([`Self::prune`]) without
-    /// writing; the next pump — `PATCH`ing the same list back — drops the id
-    /// and this noise with it.
+    /// writing — but it is no longer a state a course delete leaves behind: the
+    /// delete's own cascade takes the id out of every template naming it, so
+    /// only a row written before that cascade existed, or one the pump's own
+    /// window ([`Self::prune`]) is about to clear, can still show it.
     ///
     /// Unpaged, like the [`ClassGroup::list_for_grade`] it is built on: the set
     /// is the şube one school runs at one grade, and the caller is asking about
@@ -575,14 +577,25 @@ impl ClassBlueprint {
 
     /// Drop a course that no longer exists out of this blueprint's list.
     ///
-    /// [`crate::domain::course::Course::delete`] takes the `class_course` links
-    /// a course had, but nothing it can reach names the blueprints holding its
-    /// id — so a deleted course stays in the list and every future pump refuses
-    /// it again, on every class, forever. A skip a manager cannot act on is
-    /// noise, so the pump that *finds* the dangling id also removes it: once
-    /// for the run that found it (later classes in the same [`Self::pump`] skip
-    /// it by its dead-course set rather than re-attempting and re-pruning it),
-    /// and never again afterwards, because the list no longer holds it.
+    /// The delete does this itself now:
+    /// [`crate::domain::course::Course::delete`] sweeps `class_blueprint` in
+    /// the same cascade that takes the course's `class_course` links, so a
+    /// template stops naming a course the instant that course goes. This used
+    /// to be the *only* thing that could remove such an id, and that was the
+    /// bug: it fires only while walking a section, so a grade with no sections
+    /// could never reach it, and the repair every doc surface pointed at
+    /// (`PATCH` the list back as it stands) is a `400` for naming a course that
+    /// does not exist. A permanent dangling id, and no call that could clear
+    /// it.
+    ///
+    /// What is left for this to do is the **window** the sweep cannot cover: a
+    /// pump walks a snapshot of the list it read, so a course deleted after
+    /// that read is still attempted, and the delete's sweep has already run
+    /// past a row it will not visit again. The skip is then reported once for
+    /// the run that found it (later classes in the same [`Self::pump`] skip it
+    /// by its dead-course set rather than re-attempting and re-pruning it), and
+    /// this write is a no-op against a list the cascade already trimmed. It
+    /// also clears ids written before that cascade existed.
     ///
     /// Not a compare-and-set, unlike [`Self::set_courses`]: "a course that does
     /// not exist is not in this list" holds for every version of the list, so
