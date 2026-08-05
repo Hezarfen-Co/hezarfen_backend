@@ -991,7 +991,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | POST   | `/meals/menus/{id}/bookings`     | student | `{student_id?}` — take a seat; a student books for themselves, a parent for a linked student; `409` when the menu is full, its cutoff has passed, or the menu was edited so often mid-booking that the price could not be pinned |
 | GET    | `/meals/bookings/me`             | student | The caller's own bookings (seats held for them + for a parent, their currently linked children's), newest first · paged |
 | GET    | `/meals/menus/{id}/bookings`     | manager | Every booking on one menu, cancelled ones included · paged |
-| DELETE | `/meals/bookings/{bid}`          | student | Cancel a booking (status flip, the row stays) — its student or their parent, **or any manager+**, whose seat and money must stay reachable after a role change; idempotent — cancelling again is a `200` that replays the refund; `409` past the cutoff, which binds **students and parents only** — a manager+ frees a closed meal's seat |
+| DELETE | `/meals/bookings/{bid}`          | student | Cancel a booking (status flip, the row stays) — its student or their parent, **or any manager+**, whose seat and money must stay reachable after a role change; idempotent — cancelling again is a `200` that replays the refund; `409` past the cutoff, which binds **students and parents only** — a manager+ frees a closed meal's seat, and `409` when the seat was booked again while the call ran, since only the attempt it read is ever released |
 | POST   | `/meals/menus/{id}/attendance`   | teacher | `{student_id, status}` — mark who was served (`served`/`missed`); one row per (menu, student), re-marking flips it; `404` if the menu is unpublished mid-request; **moves no money** |
 | GET    | `/meals/menus/{id}/attendance`   | teacher | Who ate off one menu · paged |
 | GET    | `/meals/attendance/{user}`       | student | One student's meal-attendance history · `?from=&to=` inclusive `YYYY-MM-DD` range over the menu's day · paged · own id always, otherwise teacher+ or a parent link |
@@ -1804,7 +1804,13 @@ teacher or manager ordering a child's lunch is a `403`.
   cancel cut short between the flip and the reversal (the tab closed, a proxy
   timed out) is recovered by sending it again. Refusing it as a `409` — as it
   once did — made that state permanent: no route could append the missing
-  reversal, and the student stayed billed for a seat they no longer held.
+  reversal, and the student stayed billed for a seat they no longer held. The
+  flip **only ever releases the attempt the call read** (`WHERE status =
+  'booked' AND attempt = …`, the same fence the re-booking side carries): a
+  seat taken again while the cancel was in flight is a `409`, never a silent
+  cancellation of somebody else's brand-new seat. Unfenced it freed that seat,
+  refunded nothing (the money is keyed to the *older* attempt, already
+  reversed) and burnt the new attempt's reversal id for good.
 - **A manager+ may cancel anybody's seat.** Booking is student-and-parent
   only, and cancelling used to be the same door — which left a seat nobody on
   the API could give back the moment its student was promoted to staff or its

@@ -417,14 +417,16 @@ impl MealBooking {
             .await?
             .ok_or(AppError::NotFound)?;
         check_cutoff(menu.get_date(), menu.get_slot(), cutoff)?;
-        // Lost the flip: another cancel took the seat back first. Its row is
-        // the truth — but only the attempt *this* call was cancelling may be
-        // refunded off it (see [`Self::refundable_after_lost_flip`]).
+        // Lost the flip: the row is no longer the `booked` attempt this call
+        // read — another cancel took the seat back first, or a booking took it
+        // again. Its row is the truth, but only the attempt *this* call was
+        // cancelling may be refunded off it (see
+        // [`Self::refundable_after_lost_flip`]).
         let saved = match Self::release_seat(&fresh, recorded_by, db).await? {
             Some(cancelled) => cancelled,
             None => {
                 let live = Self::read(&self.id, db).await?.ok_or(AppError::NotFound)?;
-                if !Self::refundable_after_lost_flip(&fresh, &live) {
+                if !Self::refundable_after_lost_flip(&fresh, &live)? {
                     return Ok(live);
                 }
                 live
@@ -445,8 +447,25 @@ impl MealBooking {
     /// could never be refunded afterwards. A row at another attempt is the same
     /// story one step further on: whoever cancelled attempt N appended its
     /// reversal, and this call has nothing left to heal.
-    fn refundable_after_lost_flip(seen: &MealBooking, live: &MealBooking) -> bool {
-        live.status == MealBookingStatus::Cancelled && live.attempt == seen.attempt
+    ///
+    /// A seat that is `booked` again is a **409**, not a `200`: the flip was
+    /// fenced on the attempt this call read, so the row can only be held by a
+    /// booking that landed inside this very cancel — one the API answered `201`
+    /// for and which no caller here has seen, let alone decided to free. `200`
+    /// with a `booked` row would report a cancellation that did not happen; the
+    /// client is told to look again instead, and a fresh `DELETE` then cancels
+    /// the attempt it really read. (A repeat cancel of an *unchanged* seat never
+    /// reaches here: `cancel` answers an already-cancelled row above.)
+    fn refundable_after_lost_flip(
+        seen: &MealBooking,
+        live: &MealBooking,
+    ) -> Result<bool, AppError> {
+        if live.status == MealBookingStatus::Booked {
+            return Err(AppError::Conflict(
+                "the seat was booked again while this cancellation ran",
+            ));
+        }
+        Ok(live.attempt == seen.attempt)
     }
 
     /// Flip the seat to `cancelled` and give it back to the menu's counter **in
@@ -470,9 +489,18 @@ impl MealBooking {
     /// there is no half-second anywhere in which a seat is held with no charge
     /// against it, or a charge stands with no seat behind it.
     ///
-    /// `None` = the row was not `booked` any more. Retried while the store
-    /// reports a write conflict: the menu row is contended by every booking on
-    /// it, and that contention is the cap working, not an error.
+    /// **The flip is fenced on the attempt it read**, exactly as the revival on
+    /// the book side is. `status = 'booked'` alone matches a seat somebody else
+    /// took in the round trip [`Self::cancel`] spends re-reading the menu: the
+    /// flip then cancels attempt N+1, hands its seat back, and refunds nothing
+    /// at all — the ids bound here are attempt N's, and N's reversal is already
+    /// written — so a `POST` answered `201` a moment ago loses its seat with its
+    /// charge standing, and the `(booking, N+1)` reversal id is burnt for good.
+    ///
+    /// `None` = the row was not this call's own `booked` attempt any more.
+    /// Retried while the store reports a write conflict: the menu row is
+    /// contended by every booking on it, and that contention is the cap
+    /// working, not an error.
     async fn release_seat(
         booked: &MealBooking,
         recorded_by: &UserId,
@@ -500,7 +528,8 @@ impl MealBooking {
                     .query(format!(
                         "BEGIN TRANSACTION;
                          LET $flipped = (UPDATE $id SET status = 'cancelled', \
-                             cancelled_at = $now WHERE status = 'booked' RETURN AFTER);
+                             cancelled_at = $now \
+                             WHERE status = 'booked' AND attempt = $attempt RETURN AFTER);
                          UPDATE $menu SET {MENU_SEAT_COUNT_FIELD} = math::max([\
                              ({MENU_SEAT_COUNT_FIELD} ?? 0) - array::len($flipped), 0]);
                          {reverse}
@@ -509,6 +538,7 @@ impl MealBooking {
                     ))
                     .bind(("id", booked.id.record()))
                     .bind(("menu", booked.menu.record()))
+                    .bind(("attempt", booked.attempt))
                     .bind(("now", Timestamp::now()));
                 let query = match &refund {
                     Some((charge, line)) => query
@@ -933,21 +963,25 @@ mod tests {
             .unwrap();
         let cancelled = seen.clone().cancel(&open, &ali, &db).await.unwrap();
         // The seat this cancel released: its own attempt, still cancelled.
-        assert!(MealBooking::refundable_after_lost_flip(&seen, &cancelled));
+        assert!(MealBooking::refundable_after_lost_flip(&seen, &cancelled).unwrap());
 
         // A re-book landed in the window. The row is `booked` again with a live
         // charge against it — refunding that frees money for a seat that is
-        // still held, and burns the ledger id its own cancel will need.
+        // still held, and burns the ledger id its own cancel will need. The
+        // caller is refused rather than told it cancelled something.
         let rebooked = MealBooking::book(&menu, &ali, &ali, &open, &db)
             .await
             .unwrap();
         assert_eq!(rebooked.get_attempt(), seen.get_attempt() + 1);
-        assert!(!MealBooking::refundable_after_lost_flip(&seen, &rebooked));
+        assert!(matches!(
+            MealBooking::refundable_after_lost_flip(&seen, &rebooked),
+            Err(AppError::Conflict(_))
+        ));
 
         // Re-booked *and* cancelled again: that cancel appended the reversal
         // for its own attempt, and this call has nothing left to heal.
         let later = rebooked.cancel(&open, &ali, &db).await.unwrap();
-        assert!(!MealBooking::refundable_after_lost_flip(&seen, &later));
+        assert!(!MealBooking::refundable_after_lost_flip(&seen, &later).unwrap());
 
         // And the ordinary lost race — another cancel of the same attempt got
         // there first — still replays the refund, which is what heals a cancel
@@ -956,7 +990,54 @@ mod tests {
             .await
             .unwrap();
         let freed = other.clone().cancel(&open, &veli, &db).await.unwrap();
-        assert!(MealBooking::refundable_after_lost_flip(&other, &freed));
+        assert!(MealBooking::refundable_after_lost_flip(&other, &freed).unwrap());
+    }
+
+    /// A cancel may only ever release the attempt it read. The stale handle
+    /// here is what a cancel holds across its own `Menu::read` round trip: by
+    /// the time the flip runs, that seat has been cancelled and taken again, so
+    /// the flip must refuse — unfenced it cancelled the *new* attempt, freeing a
+    /// seat the API had just answered `201` for, without refunding it (the
+    /// reversal is keyed to the stale attempt, which is already refunded) and
+    /// burning the new attempt's own reversal id for good.
+    #[tokio::test]
+    async fn a_cancel_cannot_release_an_attempt_it_never_read() {
+        let (db, menu) = menu(Some(1)).await;
+        let (ali, veli) = (UserId::generate(), UserId::generate());
+        let open = MealCutoff::default();
+        add_dish(&menu, 1_000, &db).await;
+
+        let stale = MealBooking::book(&menu, &ali, &ali, &open, &db)
+            .await
+            .unwrap();
+        stale.clone().cancel(&open, &ali, &db).await.unwrap();
+        let live = MealBooking::book(&menu, &ali, &ali, &open, &db)
+            .await
+            .unwrap();
+        assert_eq!(live.get_attempt(), stale.get_attempt() + 1);
+
+        assert!(
+            MealBooking::release_seat(&stale, &ali, &db)
+                .await
+                .unwrap()
+                .is_none(),
+            "the attempt this call read is gone, so it releases nothing"
+        );
+        // Stored state, not the returned value: the mem engine forges wins.
+        let stored = MealBooking::read(live.get_id(), &db).await.unwrap().unwrap();
+        assert_eq!(stored.get_status(), MealBookingStatus::Booked);
+        assert_eq!(stored.get_attempt(), live.get_attempt());
+        assert_eq!(seats(&menu, &db).await, 1, "and gives no seat back");
+        assert_eq!(
+            MealLedger::balance_of(&ali, &db).await.unwrap(),
+            -1_000,
+            "the live attempt's charge stands: it was never cancelled"
+        );
+        // The seat is still really held — the cap says so too.
+        assert!(matches!(
+            MealBooking::book(&menu, &veli, &veli, &open, &db).await,
+            Err(AppError::Conflict(_))
+        ));
     }
 
     /// The seat may not come back without the money. Driven against

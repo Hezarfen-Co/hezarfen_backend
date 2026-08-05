@@ -925,6 +925,11 @@ async fn list_menu_bookings(
 /// cancel that was cut short mid-flight (the tab closed, a proxy timed out) is
 /// recovered by simply sending it again — the reversal is keyed to the seat's
 /// attempt, so the money comes back exactly once however often it is retried.
+///
+/// A seat **re-booked while this call was running** is a `409`: the flip only
+/// ever releases the attempt this call read, so the newer seat — one this API
+/// answered `201` for and nobody here asked to free — is left alone. Send the
+/// call again to cancel the seat as it now stands.
 #[utoipa::path(
     delete,
     path = "/bookings/{bid}",
@@ -936,7 +941,7 @@ async fn list_menu_bookings(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the booking's student, their parent, nor a manager", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "The cutoff has passed (students and parents only), or the menu was too contended to free the seat", body = ErrorResponse),
+        (status = 409, description = "The cutoff has passed (students and parents only), the seat was booked again while this call ran, or the menu was too contended to free the seat", body = ErrorResponse),
     ),
 )]
 async fn cancel_booking(
