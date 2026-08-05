@@ -172,17 +172,43 @@ impl HomeworkResult {
         // homework mark is optional and most grades are status-only, so
         // `high_mark` is an exam-only family.
         //
-        // ponytail: this is a plain query, not `transaction_with_retry`, so a
-        // store conflict on the grader's row — another domain writing the same
-        // user row in the same instant — comes back as a 500 rather than a
-        // re-send. Rare (grading is serialised by `HOMEWORK_LOCK` and a
-        // teacher's row moves nowhere else but exam grading), and the upgrade
-        // is the shape `HomeworkSubmission::upsert` already uses: the whole
-        // transaction is re-sendable, since nothing in it can legitimately
-        // answer "already exists".
-        let mut saved = db
-            .query(format!(
+        // The first three statements are the parent gate, the twin of
+        // [`crate::domain::homework_submission::HomeworkSubmission::upsert`]'s
+        // and written the same way on purpose: the id is deterministic, so a
+        // grade landing inside a homework (or course) delete's window does not
+        // fail — it *re-creates* a result row under a homework that is gone,
+        // readable ever after at `GET /homework/{id}/result` (no existence check
+        // there) with a `marks_given_total` no ungrade can reach, because every
+        // route to the grade goes through the homework. Reading the homework
+        // first — which the web layer does, under the lease — cannot close that:
+        // the store conflict-checks write sets, not read sets. So the gate
+        // *moves* a value on the homework row (`due_at` up by one and straight
+        // back to the captured value, leaving the row byte-identical) and the
+        // cascade's delete of that same row is what refuses it. `homework` owns
+        // no counter column and is SCHEMAFULL, so `due_at` is the one `int` it
+        // already has; do not invent a second spelling.
+        //
+        // Not [`crate::domain::cap::touch_and_create`], which is the same shape
+        // for a bare `CREATE`: a grade is an UPSERT (a regrade must overwrite),
+        // and the freeze stamp and the grader's counter have to ride the same
+        // transaction, which that helper has no room for.
+        //
+        // Sound to re-send, which is what the gate needed first — a `THROW`
+        // inside a plain `db.query` would have turned every lost round into a
+        // 500. `SELECT`, `UPDATE` and the `IF`/`THROW` can never answer "already
+        // exists", and the `UPSERT`'s id is bijective with the (homework, user)
+        // pair the table keys, on a table whose only index is non-unique
+        // (`homework_result_homework`), so its index entry can only ever point
+        // at the row the id already names: it resolves onto that row instead of
+        // colliding with it. A lost round wrote nothing.
+        let (mut saved, mut errors) = transaction_with_retry(
+            db,
+            &format!(
                 "BEGIN TRANSACTION;
+                 LET $was_due = (SELECT VALUE due_at FROM ONLY $hw);
+                 LET $alive = (UPDATE $hw SET due_at = due_at + 1 RETURN VALUE id);
+                 IF array::len($alive) = 0 {{ THROW 'no_homework' }};
+                 UPDATE $hw SET due_at = $was_due;
                  LET $before = (SELECT VALUE id FROM ONLY $id);
                  LET $after = (UPSERT $id CONTENT $row RETURN AFTER);
                  UPDATE $sub SET {SUBMISSION_GRADED_FIELD} = $id \
@@ -193,17 +219,32 @@ impl HomeworkResult {
                  }};
                  RETURN $after;
                  COMMIT TRANSACTION;"
-            ))
-            .bind(("id", id.record()))
-            .bind(("sub", submission.record()))
-            .bind(("grader", graded_by.record()))
-            .bind(("row", result.into_value()))
-            .await?
-            .check()?;
+            ),
+            &[
+                ("hw".into(), homework.record().into_value()),
+                ("id".into(), id.record().into_value()),
+                ("sub".into(), submission.record().into_value()),
+                ("grader".into(), graded_by.record().into_value()),
+                ("row".into(), result.into_value()),
+            ],
+            &["no_homework"],
+        )
+        .await?;
+        // An aborted transaction errors *every* slot, most with a generic "not
+        // executed" — only the THROW's own slot names the reason.
+        if errors
+            .values()
+            .any(|error| error.to_string().contains("no_homework"))
+        {
+            return Err(AppError::NotFound);
+        }
+        if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+            return Err(error.into());
+        }
         // The trailing `RETURN` is always the last statement before `COMMIT`,
         // so its slot follows the statement count instead of a hand-kept
-        // number — which the counter statement above would otherwise have
-        // shifted, silently handing back the stamp's row.
+        // number — which the gate above would otherwise have shifted, silently
+        // handing back something else.
         let slot = saved.num_statements().saturating_sub(2);
         saved
             .take::<Vec<HomeworkResult>>(slot)?
@@ -327,6 +368,38 @@ mod tests {
     use crate::constant::HOMEWORK_STATUSES;
     use surrealdb::types::Value;
 
+    /// A real homework row (with the course and subject it needs): the grade now
+    /// carries a parent gate, so a minted id nothing wrote is a `404` here, the
+    /// same way it already is for a submission.
+    async fn a_homework(db: &Database) -> HomeworkId {
+        use crate::domain::homework::{Homework, HomeworkTitle};
+        use crate::domain::subject::{Subject, SubjectDescription, SubjectName};
+
+        let course = crate::domain::course::a_test_course(db).await;
+        let subject = Subject::create(
+            &course,
+            SubjectName::try_new("topic").unwrap(),
+            SubjectDescription::try_new("").unwrap(),
+            db,
+        )
+        .await
+        .unwrap();
+        Homework::create(
+            &course,
+            subject.get_id(),
+            HomeworkTitle::try_new("essay").unwrap(),
+            None,
+            Timestamp::from_millis(1),
+            None,
+            &UserId::from_key("teacher"),
+            db,
+        )
+        .await
+        .unwrap()
+        .get_id()
+        .clone()
+    }
+
     #[tokio::test]
     async fn status_is_held_to_the_const_and_stores_as_a_bare_string() {
         // Enforcement lives in the newtype against HOMEWORK_STATUSES (the DDL
@@ -344,7 +417,7 @@ mod tests {
     #[tokio::test]
     async fn grade_upserts_one_row_per_pair_and_remove_unfreezes() {
         let db = crate::database::init_mem().await.unwrap();
-        let homework = HomeworkId::from_key("01TESTHWAAAAAAAAAAAAAAAAAA");
+        let homework = a_homework(&db).await;
         let user = UserId::from_key("01TESTUSERAAAAAAAAAAAAAAAA");
         let teacher = UserId::from_key("01TESTTEACHERAAAAAAAAAAAAA");
 
@@ -406,7 +479,7 @@ mod tests {
     #[tokio::test]
     async fn a_first_grade_credits_the_grader_and_a_regrade_does_not() {
         let db = crate::database::init_mem().await.unwrap();
-        let homework = HomeworkId::from_key("01TESTHWBADGEAAAAAAAAAAAAA");
+        let homework = a_homework(&db).await;
         let user = UserId::from_key("01TESTUSERAAAAAAAAAAAAAAAA");
         let teacher = UserId::from_key("01TESTTEACHERAAAAAAAAAAAAA");
         // `UPDATE` writes nothing to a user row that does not exist.
@@ -443,7 +516,7 @@ mod tests {
     #[tokio::test]
     async fn ungrading_gives_the_grader_credit_back() {
         let db = crate::database::init_mem().await.unwrap();
-        let homework = HomeworkId::from_key("01TESTHWUNGRADEAAAAAAAAAAA");
+        let homework = a_homework(&db).await;
         let user = UserId::from_key("01TESTUSERAAAAAAAAAAAAAAAA");
         let teacher = UserId::from_key("01TESTTEACHERAAAAAAAAAAAAA");
         db.query("CREATE $usr SET username = 't', password_hash = 'x'")

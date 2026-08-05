@@ -535,9 +535,18 @@ async fn delete_course(
     // the student's row, never the exam's). Narrower here — the delete is
     // refused while anyone is enrolled, so a start would have to pass its
     // enrollment gate and then have that enrollment removed under it — but the
-    // hole is the same one and so is the lease. Nothing on this path takes
-    // another lock, so it introduces no ordering pair.
+    // hole is the same one and so is the lease.
     let _guard = crate::web::exams::EXAM_LOCK.write().await;
+    // And the homework half of the same cascade, for
+    // [`crate::web::homework::delete_homework`]'s reason: it sweeps the
+    // course's homework with its submissions, files and results, and grading
+    // ([`crate::domain::homework_result::HomeworkResult::grade`]) writes a
+    // result row against a homework it only *read*, which a delete committing
+    // alongside is invisible to. Without this lease the grade lands behind the
+    // sweep: an orphan `homework_result` under a vanished homework, plus a
+    // `marks_given_total` on the grader no ungrade can reach. Lock order here
+    // is EXAM_LOCK then HOMEWORK_LOCK, the only path that takes both.
+    let _homework_guard = crate::web::homework::HOMEWORK_LOCK.write().await;
     // Rows go first (the delete cascades them), blobs after — a crash in
     // between strands at worst an unreachable blob. The keys are read before
     // the delete because it takes their rows with it; a refused delete just
@@ -1119,7 +1128,8 @@ async fn create_homework_in_course(
 /// List a course's homework, newest first, paged via `?limit=&offset=` (omit
 /// `limit` for all of it). Visible to the course's enrolled users, its creator,
 /// its assigned teachers, and managers/admins — but a student sees only the
-/// homework they are assigned (whole-course ones plus subsets that name them).
+/// homework they are assigned (whole-course ones plus subsets that name them,
+/// each with its `assigned` narrowed to themselves).
 /// Returns a `{items, total, limit, offset}` envelope.
 #[utoipa::path(
     get,
@@ -1153,14 +1163,23 @@ async fn list_course_homework(
     }
     let mut homework = Homework::list_for_course(course.get_id(), &st.db).await?;
     // A student sees only the homework they are assigned; managers see all.
-    if !can_manage_course(&course, &user) {
+    let manages = can_manage_course(&course, &user);
+    if !manages {
         homework.retain(|hw| hw.student_sees(user.get_id()));
     }
     let total = homework.len() as i64;
-    // Paged in the web layer: the audience filter above is per-row Rust.
+    // Paged in the web layer: the audience filter above is per-row Rust. A
+    // subset roster goes out whole only to a manager of the course; a student
+    // sees themselves in it and no one else.
     let items = paginate(&homework, limit, offset)
         .iter()
-        .map(HomeworkResponse::new)
+        .map(|hw| {
+            if manages {
+                HomeworkResponse::new(hw)
+            } else {
+                HomeworkResponse::for_viewer(hw, user.get_id())
+            }
+        })
         .collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }

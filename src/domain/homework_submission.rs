@@ -138,6 +138,21 @@ impl HomeworkSubmission {
     /// gave back something other than what was taken. Writing the verdict beside
     /// the counter is what keeps the two from ever disagreeing — read back by
     /// [`HomeworkSubmission::delete`], never re-derived.
+    ///
+    /// The first three statements are the parent gate, and they are why this
+    /// write cannot outlive its homework: the id is deterministic, so nothing
+    /// else here would fail against a homework a cascade already removed — it
+    /// would simply re-create the row, badge counters and all, unreachable ever
+    /// after (every route to a submission goes through its homework). A *read*
+    /// of the homework does not close that, on either side of the call: the
+    /// store does no read-set conflict detection, so a delete committing
+    /// alongside is invisible to it. The gate therefore *moves* a value on the
+    /// homework row — `due_at` up by one and straight back to the captured
+    /// value, so the row is byte-identical afterwards — because only a write
+    /// collides, and `SET x = x` is elided and never reaches the write set. It
+    /// is [`crate::domain::exam_answer::ExamAnswer::save`]'s shape exactly.
+    /// `Err(NotFound)` means the homework is gone, which is the 404 the web
+    /// layer's own lookup would have answered.
     pub async fn upsert(
         homework: &Homework,
         user: &UserId,
@@ -149,11 +164,15 @@ impl HomeworkSubmission {
         let text = text.map(|text| text.as_str().to_string());
         // Sound to re-send: the UPSERT is on a deterministic id on a table with
         // no unique index, so it can never legitimately answer "already exists",
-        // and the counter UPDATE never can either.
+        // and the counter UPDATEs never can either.
         let (mut saved, mut errors) = transaction_with_retry(
             db,
             &format!(
                 "BEGIN TRANSACTION;
+                 LET $was_due = (SELECT VALUE due_at FROM ONLY $hw);
+                 LET $alive = (UPDATE $hw SET due_at = due_at + 1 RETURN VALUE id);
+                 IF array::len($alive) = 0 {{ THROW 'no_homework' }};
+                 UPDATE $hw SET due_at = $was_due;
                  LET $before = (SELECT VALUE id FROM ONLY $id);
                  LET $on_time = $now <= $due;
                  LET $after = (UPSERT $id SET homework = $hw, user = $usr, text = $text,
@@ -177,9 +196,17 @@ impl HomeworkSubmission {
                 ("now".into(), now.into_value()),
                 ("due".into(), homework.get_due_at().into_value()),
             ],
-            &[],
+            &["no_homework"],
         )
         .await?;
+        // An aborted transaction errors *every* slot, most with a generic "not
+        // executed" — only the THROW's own slot names the reason.
+        if errors
+            .values()
+            .any(|error| error.to_string().contains("no_homework"))
+        {
+            return Err(AppError::NotFound);
+        }
         if let Some(error) = errors.drain().map(|(_, error)| error).next() {
             return Err(error.into());
         }
@@ -334,14 +361,13 @@ impl HomeworkSubmission {
 mod tests {
     use super::*;
 
-    use crate::domain::course::CourseId;
     use crate::domain::homework::HomeworkTitle;
     use crate::domain::subject::{Subject, SubjectDescription, SubjectName};
 
     /// A real homework row (and the subject it must reference) due at `due_at` —
     /// `upsert` now reads the deadline off the entity, so the tests need one.
     async fn a_homework(due_at: Timestamp, db: &Database) -> Homework {
-        let course = CourseId::from_key("course");
+        let course = crate::domain::course::a_test_course(db).await;
         let subject = Subject::create(
             &course,
             SubjectName::try_new("topic").unwrap(),

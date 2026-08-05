@@ -270,7 +270,10 @@ pub struct HomeworkResponse {
     /// When the homework is due, UTC unix-milliseconds.
     #[schema(example = 1_900_000_000_000_i64)]
     pub due_at: i64,
-    /// The assigned student ids, or `null` for the whole enrolled course.
+    /// The assigned student ids, or `null` for the whole enrolled course. Only
+    /// a viewer who manages the course sees the whole subset; to anyone else it
+    /// is narrowed to their own id (the course roster is teacher+-only, so a
+    /// subset assignment must not hand out the names it lists).
     pub assigned: Option<Vec<String>>,
     /// Who assigned the homework.
     pub created_by: String,
@@ -293,6 +296,18 @@ impl HomeworkResponse {
             created_by: homework.get_created_by().key().to_string(),
             created_at: homework.get_created_at().as_millis(),
         }
+    }
+
+    /// The same homework as seen by a viewer who does *not* manage its course.
+    /// A subset roster is narrowed to `viewer` alone: they learn that they are
+    /// named — which is why the homework reached them at all — and nothing
+    /// about who else is. Whole-course (`null`) stays `null`; every read path
+    /// that uses this has already refused a viewer the subset does not name
+    /// (404), so a one-element list is never a lie.
+    pub fn for_viewer(homework: &Homework, viewer: &UserId) -> Self {
+        let mut response = Self::new(homework);
+        response.assigned = response.assigned.map(|_| vec![viewer.key().to_string()]);
+        response
     }
 }
 
