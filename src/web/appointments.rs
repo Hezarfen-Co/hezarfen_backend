@@ -363,6 +363,16 @@ async fn publish_slots(
 /// already taken is not carried
 /// here: booking a taken one answers `409`. Paged via `?limit=&offset=` (omit
 /// `limit` for every slot); returns a `{items, total, limit, offset}` envelope.
+///
+/// Each slot carries its teacher's `PersonRef` (id, username, name) to *every*
+/// authenticated caller, parents included — deliberate, and not to be
+/// "tightened". A parent's three direct routes to that identity all refuse
+/// (`GET /users/{id}/profile` 403, `/users/search` and `/users` teacher+/admin),
+/// but you cannot pick whom to book a conference with from an anonymous
+/// calendar: this list *is* the staff directory for the booking flow, scoped to
+/// people who published bookable time. Same for the `teacher` / `proposed_by` /
+/// `decided_by` refs on a booking. Pinned by
+/// `tests/regress_appointments.rs::a_parent_reads_the_slot_teachers_identity`.
 // ponytail: occupancy would be one query per slot with today's domain API; a
 // batch "live bookings for these slots" read would let the list carry it.
 #[utoipa::path(

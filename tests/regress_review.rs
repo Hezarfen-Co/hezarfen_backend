@@ -591,3 +591,101 @@ async fn review_stays_shut_while_another_sitting_is_still_available() {
         res.body
     );
 }
+
+/// The review gate consulted `allow_review` before it had established the caller
+/// has anything to review, so `GET /exams/{id}/review/attempts` answered 403 iff
+/// (the exam exists ∧ is published ∧ review is off) and 404 otherwise — a
+/// status-code oracle handing any authenticated caller, an unenrolled student or
+/// a parent, a flag `GET /exams/{id}` refuses them outright (`can_view_course`
+/// answers 403 there before `allow_review` is ever serialised). The mark check
+/// runs first now, so an outsider reads 404 whichever way the flag is set, and
+/// the flag-dependent answer is left to callers who were marked.
+#[tokio::test]
+async fn the_review_gate_does_not_leak_allow_review_to_outsiders() {
+    let (app, db) = app_and_db().await;
+    let teacher = login_as(&app, &db, "rev_flag_t", "teacher").await;
+    let student = login(&app, "rev_flag_s").await;
+    let student_id = me_id(&app, &student).await;
+    let outsider = login(&app, "rev_flag_out").await;
+    let parent = login_as(&app, &db, "rev_flag_p", "parent").await;
+
+    let course = create_course(&app, &teacher, "physics").await;
+    enroll(&app, &teacher, &course, &student_id).await;
+
+    // Two published exams, identical but for the flag under test. The student
+    // uses up their one sitting at each and is marked, so their read reaches the
+    // flag; nobody else has a mark at either.
+    let sat = async |title: &str, review: bool| {
+        let res = create_exam_with(
+            &app,
+            &teacher,
+            &course,
+            json!({ "title": title, "kind": "quiz", "mode": "open",
+                    "max_attempts": 1, "allow_review": review }),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+        let exam = id_of(&res.body);
+        let res = send(
+            &app,
+            "POST",
+            &format!("/exams/{exam}/attempt"),
+            Some(&student),
+            None,
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+        let res = send(
+            &app,
+            "POST",
+            &format!("/exams/{exam}/results"),
+            Some(&teacher),
+            Some(json!({ "mark": 50, "user_id": student_id.as_str() })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+        let res = send(
+            &app,
+            "POST",
+            &format!("/exams/{exam}/attempt/finish"),
+            Some(&student),
+            None,
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+        exam
+    };
+    let open = sat("open review", true).await;
+    let shut = sat("shut review", false).await;
+
+    let review_of = async |cookie: &str, exam: &str| {
+        send(
+            &app,
+            "GET",
+            &format!("/exams/{exam}/review/attempts"),
+            Some(cookie),
+            None,
+        )
+        .await
+        .status
+    };
+
+    // The legitimate flow, untouched: marked, sittings used up, review on.
+    assert_eq!(review_of(&student, &open).await, StatusCode::OK);
+    // And the documented refusal still bites that same student when it is off.
+    assert_eq!(review_of(&student, &shut).await, StatusCode::FORBIDDEN);
+
+    // The oracle: to a caller with no mark the two exams must be one answer —
+    // and the same answer an exam that does not exist gives.
+    let nowhere = review_of(&outsider, "01J8XZ0K3Q8G7X2M4N5P6R7S8T").await;
+    assert_eq!(nowhere, StatusCode::NOT_FOUND);
+    for (who, cookie) in [("unenrolled student", &outsider), ("parent", &parent)] {
+        let on_open = review_of(cookie, &open).await;
+        let on_shut = review_of(cookie, &shut).await;
+        assert_eq!(on_open, nowhere, "{who} reads the review-on exam apart");
+        assert_eq!(
+            on_shut, on_open,
+            "{who}: the status code still reads the flag"
+        );
+    }
+}
