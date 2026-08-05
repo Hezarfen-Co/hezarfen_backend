@@ -15,7 +15,7 @@ use crate::constant::{
     HOMEWORK_FILE_TABLE, MAX_HOMEWORK_FILES_PER_SUBMISSION, SUBMISSION_FILE_COUNT_FIELD,
     SUBMISSION_OPEN_GUARD,
 };
-use crate::database::Database;
+use crate::database::{Database, transaction_with_retry};
 use crate::domain::cap;
 use crate::domain::course::CourseId;
 use crate::domain::homework::HomeworkId;
@@ -268,9 +268,19 @@ impl HomeworkFile {
     /// stamps first (this delete is refused, `Ok(None)`) or stamps after (the
     /// file was already gone when it graded). `Err(NotFound)` still means the
     /// file row itself had vanished.
+    ///
+    /// Sound to re-send while the store answers "conflict, retry", and it has
+    /// to be: the gate writes the *submission* row, the very record an upload's
+    /// [`HomeworkFile::insert`] claims its seat on, and both handlers hold only
+    /// `HOMEWORK_LOCK.read()` — so a concurrent add and delete of two files of
+    /// one submission contend by design, and a lost round used to come back as
+    /// a 500 on a request that had written nothing. Only `UPDATE` and `DELETE`
+    /// are in the batch, and neither can legitimately answer "already exists",
+    /// which is what makes the whole of it re-sendable.
     pub async fn delete(self, db: &Database) -> Result<Option<HomeworkFile>, AppError> {
-        let mut result = db
-            .query(format!(
+        let (mut result, mut errors) = transaction_with_retry(
+            db,
+            &format!(
                 "BEGIN TRANSACTION;
                  LET $open = (UPDATE $sub SET updated_at = $now \
                      WHERE {SUBMISSION_OPEN_GUARD} RETURN VALUE id);
@@ -278,12 +288,18 @@ impl HomeworkFile {
                  UPDATE $sub SET file_count = math::max([(file_count ?? 0) - array::len($gone), 0]);
                  RETURN {{ open: array::len($open), gone: $gone }};
                  COMMIT TRANSACTION;"
-            ))
-            .bind(("id", self.id.record()))
-            .bind(("sub", self.submission.record()))
-            .bind(("now", Timestamp::now()))
-            .await?
-            .check()?;
+            ),
+            &[
+                ("id".into(), self.id.record().into_value()),
+                ("sub".into(), self.submission.record().into_value()),
+                ("now".into(), Timestamp::now().into_value()),
+            ],
+            &[],
+        )
+        .await?;
+        if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+            return Err(error.into());
+        }
         // BEGIN is slot 0, the two LETs slots 1-2 and the counter fix slot 3;
         // the RETURN is slot 4.
         let outcome: Option<DeleteOutcome> =
@@ -311,11 +327,10 @@ mod tests {
     /// A real homework row (with the subject it references): `upsert` reads the
     /// deadline off the entity now, so a bare id no longer does.
     async fn a_homework(db: &Database) -> crate::domain::homework::Homework {
-        use crate::domain::course::CourseId;
         use crate::domain::homework::{Homework, HomeworkTitle};
         use crate::domain::subject::{Subject, SubjectDescription, SubjectName};
 
-        let course = CourseId::from_key("course");
+        let course = crate::domain::course::a_test_course(db).await;
         let subject = Subject::create(
             &course,
             SubjectName::try_new("topic").unwrap(),

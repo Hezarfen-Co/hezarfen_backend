@@ -59,9 +59,13 @@ use super::{
 ///
 /// What still leases it, honestly:
 /// - Write: the homework PATCH's orphan guard ([`update_homework`]), the
-///   homework-delete cascade ([`delete_homework`]), and grade/ungrade — which
-///   read the homework itself under the lease so a concurrent delete can't
-///   leave a result row under a vanished homework.
+///   homework-delete cascade ([`delete_homework`]), and grade/ungrade — whose
+///   freeze rule (the stamp landing on a submission that may be written in the
+///   same instant) is the one thing here still resting on the two leases being
+///   mutually exclusive. The *existence* half has left: a grade now moves a
+///   value on the homework row inside its own transaction
+///   ([`crate::domain::homework_result::HomeworkResult::grade`]), so a
+///   concurrent delete refuses it rather than being read around.
 /// - Read: the student's submission/file writes, which no longer gate the
 ///   freeze but still must not land under a PATCH re-scoping the audience out
 ///   from under them.
@@ -171,7 +175,8 @@ async fn homework_with_course(id: &str, db: &Database) -> Result<(Homework, Cour
 /// paged via `?limit=&offset=` (omit `limit` for all of it). Manager+ see every
 /// course's homework; a teacher sees the homework of courses they run; a
 /// student sees only the homework they are assigned (whole-course ones plus any
-/// subset that names them). Returns a `{items, total, limit, offset}` envelope.
+/// subset that names them, each with its `assigned` narrowed to themselves).
+/// Returns a `{items, total, limit, offset}` envelope.
 #[utoipa::path(
     get,
     path = "/",
@@ -190,7 +195,11 @@ async fn list_homework(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<HomeworkResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let homework = if user.get_role().at_least(Role::Manager) {
+    // The courses this caller manages — empty for a manager+, who manages all
+    // of them, and who is told apart by this flag.
+    let manages_all = user.get_role().at_least(Role::Manager);
+    let mut managed: Vec<String> = Vec::new();
+    let homework = if manages_all {
         Homework::list_all(&st.db).await?
     } else {
         let courses = visible_courses(&user, &st.db).await?;
@@ -201,22 +210,31 @@ async fn list_homework(
         // A student sees only the homework they are assigned; a teacher who
         // manages a course sees all of its homework (the manager+ path above
         // already saw everything).
-        let managed: Vec<&str> = courses
+        managed = courses
             .iter()
             .filter(|course| can_manage_course(course, &user))
-            .map(|course| course.get_id().key())
+            .map(|course| course.get_id().key().to_string())
             .collect();
         let mut homework = Homework::list_for_courses(&ids, &st.db).await?;
         homework.retain(|hw| {
-            managed.contains(&hw.get_course().key()) || hw.student_sees(user.get_id())
+            managed.iter().any(|key| key == hw.get_course().key()) || hw.student_sees(user.get_id())
         });
         homework
     };
     let total = homework.len() as i64;
-    // Paged in the web layer: the audience filter above is per-row Rust.
+    // Paged in the web layer: the audience filter above is per-row Rust. The
+    // subset roster rides along only for the rows the caller manages — to a
+    // student it is narrowed to themselves, as it is on the single-homework
+    // read.
     let items = paginate(&homework, limit, offset)
         .iter()
-        .map(HomeworkResponse::new)
+        .map(|hw| {
+            if manages_all || managed.iter().any(|key| key == hw.get_course().key()) {
+                HomeworkResponse::new(hw)
+            } else {
+                HomeworkResponse::for_viewer(hw, user.get_id())
+            }
+        })
         .collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
@@ -225,7 +243,9 @@ async fn list_homework(
 /// enrolled users, creator, assigned teachers, and managers/admins). A student
 /// the homework is *not* assigned to gets a 404 — the same no-leak an unseen
 /// exam draft gets, so a subset assignment never reveals itself to the students
-/// left out of it.
+/// left out of it. To a caller without course-management rights the `assigned`
+/// subset comes back narrowed to their own id: being named is theirs to know,
+/// the rest of the roster is not.
 #[utoipa::path(
     get,
     path = "/{id}",
@@ -252,10 +272,17 @@ async fn get_homework(
     }
     // A student the homework is not assigned to must not even learn it exists —
     // 404, not 403, exactly like an exam draft hidden from non-managers.
-    if !can_manage_course(&course, &user) && !homework.student_sees(user.get_id()) {
+    let manages = can_manage_course(&course, &user);
+    if !manages && !homework.student_sees(user.get_id()) {
         return Err(AppError::NotFound);
     }
-    Ok(Json(HomeworkResponse::new(&homework)))
+    // ... and one it *is* assigned to must not hand them the rest of the
+    // subset: the same no-leak, one step further in.
+    Ok(Json(if manages {
+        HomeworkResponse::new(&homework)
+    } else {
+        HomeworkResponse::for_viewer(&homework, user.get_id())
+    }))
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -851,7 +878,10 @@ async fn upload_submission_file(
     Path(id): Path<String>,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<HomeworkFileResponse>), AppError> {
-    let homework = gate_own_submission(&id, &user, &st.db).await?;
+    // Pre-flight, so a caller with no business here is refused before uploading
+    // 25 MiB; the gate that *licenses the write* is the one under the lease
+    // below, because this snapshot goes stale while the body streams.
+    gate_own_submission(&id, &user, &st.db).await?;
     let limit = Settings::load(&st.db).await?.get_max_file_bytes();
     // Consume the body before taking the lock — a slow upload must not stall the
     // homework subsystem (mirrors the exam/note image uploads).
@@ -866,6 +896,14 @@ async fn upload_submission_file(
     // Taken before the cap claim inside `insert`, never after (the lock order
     // is HOMEWORK_LOCK, then the counter lock).
     let _guard = HOMEWORK_LOCK.read().await;
+    // Re-read the homework *under* the lease. Streaming the body takes as long
+    // as the client wants it to, and a homework delete (a writer) both takes
+    // and releases its lease inside that window — so the pre-flight snapshot
+    // can name a homework that no longer exists, and this handler would then
+    // auto-create a submission, credit the badge counters and write a file
+    // under it, all unreachable afterwards. A gate read before the body is a
+    // pre-flight; a gate read after it is the decision.
+    let homework = gate_own_submission(&id, &user, &st.db).await?;
     // The common-case gate; the freeze itself rides on the writes below.
     if HomeworkResult::read_for(homework.get_id(), user.get_id(), &st.db)
         .await?
