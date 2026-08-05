@@ -90,7 +90,9 @@ marks stay out of the weighted `/marks` averages. Courses also carry **lesson
 sessions** with teacher-taken roll call (students never self-mark a lesson),
 staff clock in/out on a server-stamped **work log**, students track study time
 with a server-stamped **pomodoro log** (the timer runs in the frontend; the
-backend records the focus stints, and teachers can read any student's log),
+backend records the focus stints — every one of them, though only stints of at
+least 5 minutes and at most 16 a UTC day *count* towards the badges — and
+teachers can read any student's log),
 and every user has an
 **attendance report** (event + per-course lesson tallies with rates).
 A school-wide **question pool** runs on moderation: a student asks a question
@@ -376,6 +378,7 @@ response in the same commit.
   "appointment":   { "max_note_len": 500, "max_reason_len": 1000, "max_slot_occurrences": 52 },
   "chatbot":       { "max_message_len": 8000, "max_thread_title_len": 200,
                      "min_max_message_len": 100, "…": 0 },
+  "pomodoro":      { "min_counted_ms": 300000, "max_counted_per_day": 16 },
   "board":         { "max_title_len": 200, "max_participants": 200,
                      "max_stroke_payload_len": 4096,
                      "max_epoch_strokes": 5000, "max_board_strokes": 50000,
@@ -392,6 +395,11 @@ response in the same commit.
                      "api_per_minute": 300, "chatbot_per_minute": 20 }
 }
 ```
+
+The `pomodoro` group is the one that bounds no input: `POST /pomodoro/finish`
+never refuses a stint over it, it records the stint and answers
+`counted: false`. It is published for the same reason as the rest — a client
+that has to guess what a session was worth is a client with a hard-coded copy.
 
 The `rate` group is the one part that is **not** compile-time: those tiers are
 environment-tunable, so the endpoint serves *this* server's live values (read
@@ -634,7 +642,7 @@ still left exactly as they stand.
 | Mark / remove the **session teacher's** presence row | manager | Staff presence is management's call — the teacher can't self-mark |
 | Work check-in / check-out; view **own** work log | teacher | Instants are server-stamped, never client-supplied |
 | View / correct / delete **any** staff work log entry | manager | Corrections only on closed entries |
-| Start / finish a pomodoro focus session; view **own** pomodoro log | student | **Students only** start; instants server-stamped; starting discards a dangling unfinished session |
+| Start / finish a pomodoro focus session; view **own** pomodoro log | student | **Students only** start; instants server-stamped; starting discards a dangling unfinished session; a stint moves the badge counters only if it is long enough and within the day's quota (`counted`) |
 | View **any** user's pomodoro log          | teacher      | Study oversight — same shape as `/pomodoro/me`, incl. the unpaged `total_focus_ms`; a `parent` reads their linked students' |
 | Ask into the school question pool        | student      | **Students only** (exact); born `pending` — visible to the asker + teacher+ only; the asker may attach/replace/remove one photo while pending |
 | Read the pool; offer / edit / withdraw own solutions | student | Every `approved` question is school-wide (parents stay out); a solution's author edits its body and photo anytime (solutions never freeze) and deletes it, teacher+ delete any |
@@ -998,7 +1006,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | PATCH  | `/work/entries/{id}`             | manager | `{check_in?, check_out?}` — correct a **closed** stint (`409` on open) |
 | DELETE | `/work/entries/{id}`             | manager | Delete a work entry (open or closed) |
 | POST   | `/pomodoro/start`                | student | Start a focus session (server-stamped; **students only** — a dangling unfinished session is discarded and replaced) |
-| POST   | `/pomodoro/finish`               | student | Close the running session (`409` if none running) |
+| POST   | `/pomodoro/finish`               | student | Close the running session (`409` if none running); answers `counted` — whether it moved the badge counters (≥ `pomodoro.min_counted_ms`, within the UTC day's `pomodoro.max_counted_per_day`) |
 | GET    | `/pomodoro/me`                   | student | Own pomodoro log, newest first, + unpaged `total_focus_ms` · paged |
 | GET    | `/pomodoro/{user}`               | teacher* | A user's pomodoro log, same shape · paged; *or a `parent` linked to `{user}` |
 | GET    | `/attendance/me`                 | student | Own attendance report: events + sessions + per-course tallies |
@@ -1273,7 +1281,10 @@ twelve `*_total` keys are **stored lifetime tallies**, maintained at write time
 `exam_sat_total` still counts an exam a teacher has since deleted, which is the
 point of a lifetime counter. Either kind reads a true `0` on a fresh account,
 never `null`. Only *finished* pomodoro stints count on either side — a timer
-left running is not study time. Exam averages, homework-done rates and
+left running is not study time — and on the stored side only the ones that
+**counted** (long enough, within the day's quota; see "Pomodoro" below), so
+`pomodoro_sessions` may legitimately run ahead of `pomodoro_finished_total`:
+the first is the student's whole log, the second what the badges read. Exam averages, homework-done rates and
 attendance rates are deliberately absent: those tables are indexed for their
 own reads, so a per-user aggregate over them is a full table scan, and a
 profile is far too cheap a page to pay for one — which is also why the twelve
@@ -1349,11 +1360,24 @@ catalog — awards carrying it stop being served, no migration.
   alone with no teacher in it. Resuming an attempt already running is not a new
   sitting either. Deleting an exam removes the attempt rows but does **not**
   decrement anyone: a teacher tidying up does not un-sit the exam.
-- **Pomodoro.** Finishing a stint is `+1 pomodoro_finished_total` and its
-  duration into `pomodoro_focus_ms_total`. An open stint counts for neither —
-  unfinished focus has no honest duration to add.
-- **Study streak.** Finishing a stint also extends `study_streak_total`, the
-  **longest** run of consecutive days on which the student finished one. A
+- **Pomodoro.** Finishing a stint that **counts** is `+1
+  pomodoro_finished_total` and its duration into `pomodoro_focus_ms_total`. An
+  open stint counts for neither — unfinished focus has no honest duration to
+  add. A stint counts when it ran at least `pomodoro.min_counted_ms` (5 minutes,
+  on `GET /limits`) and is within that **UTC day's**
+  `pomodoro.max_counted_per_day` (16); every further stint that day is recorded
+  and listed exactly like the others and moves nothing. Without that rule the
+  ladder was self-serve in the plainest way there is: `start`/`finish` is two
+  requests, no second person and no elapsed time, so 200 pairs — about ninety
+  seconds inside the rate limit — bought `pomodoro_finished_10`, `_50` and
+  `_200` permanently. The verdict is stamped on the stint itself and handed
+  back as `counted`, so a client can say what a session was worth instead of
+  guessing why a badge did not arrive, and a threshold moved in a later deploy
+  never re-judges an old stint.
+- **Study streak.** Finishing a stint that counts also extends
+  `study_streak_total`, the **longest** run of consecutive days on which the
+  student had one — a day bought with an instant round-trip is not a day
+  studied, so the same rule gates this counter as the two above. A
   second stint the same day extends nothing; a gap of any length starts the run
   over at 1. The badge reads the longest run ever held, never the run in
   progress, so a broken streak takes no badge away and the counter never comes
@@ -2823,9 +2847,24 @@ Logs return the usual page envelope plus `total_focus_ms`, the unpaged sum of
 every finished session's duration: `GET /pomodoro/me` for your own,
 `GET /pomodoro/{user}` for teacher+ (study oversight). Only students start
 sessions — pomodoro is the study tool, the work log is the staff timesheet.
-Finishing a stint also feeds the **study streak** behind the `study_streak`
-badges: consecutive **UTC** days on which one was finished, kept as the longest
-run ever held (see "Badges").
+A finished stint carries a `counted` verdict: whether it moved the lifetime
+counters the badges read. It counts when it ran at least
+`pomodoro.min_counted_ms` (5 minutes) and is within that **UTC day's**
+`pomodoro.max_counted_per_day` (16) — both published on `GET /limits`, both
+compiled in, so they move only with a deploy. A stint that counts for nothing
+is still recorded, still listed, and still sums into `total_focus_ms`: the rule
+bounds what *counts*, never what is kept. It exists because finishing is
+self-service — one stint is two requests, no second person and no elapsed
+time — and a badge counter moved once per round-trip is farmable, permanently,
+since a badge is never revoked. Five minutes is well under a conventional
+25-minute pomodoro on purpose (breaking off early is still studying) and four
+orders of magnitude above a scripted pair; sixteen a day is above any honest
+school day while capping the minimum-length farm at eighty minutes of real
+waiting a day.
+
+Finishing a stint that counts also feeds the **study streak** behind the
+`study_streak` badges: consecutive **UTC** days on which one was finished, kept
+as the longest run ever held (see "Badges").
 
 **Attendance reports** mirror the marks report: `GET /attendance/me` for any
 logged-in user, `GET /attendance/{user}` for teacher+ — narrowed to the

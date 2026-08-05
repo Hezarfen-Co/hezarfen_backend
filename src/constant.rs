@@ -928,6 +928,34 @@ pub const HOMEWORK_ON_TIME_TOTAL_FIELD: &str = "homework_on_time_total";
 pub const EXAM_SAT_TOTAL_FIELD: &str = "exam_sat_total";
 pub const POMODORO_FINISHED_TOTAL_FIELD: &str = "pomodoro_finished_total";
 pub const POMODORO_FOCUS_MS_TOTAL_FIELD: &str = "pomodoro_focus_ms_total";
+/// The bookkeeping behind the counted-stint rule below: which UTC day the
+/// student last had a stint counted on, and how many counted that day. Internal
+/// state like the two streak columns — no badge reads either, `/limits` names
+/// neither, no profile key serves them. The day rolls the tally back to zero.
+pub const POMODORO_COUNTED_DAY_FIELD: &str = "pomodoro_counted_day";
+pub const POMODORO_COUNTED_TODAY_FIELD: &str = "pomodoro_counted_today";
+/// What makes a finished stint *count* towards `pomodoro_finished_total` and
+/// `pomodoro_focus_ms_total` (and towards the study streak): it must have run at
+/// least this long, and it must be within the day's quota.
+///
+/// Without them the pair is the farm [`crate::domain::pool_question::PoolQuestion::approve`]
+/// reasons about from the other end: `finish` is self-service, a stint costs two
+/// requests and no second person, so a counter moved once per round-trip is
+/// farmable — 200 pairs in a minute and a half bought `pomodoro_finished_200`,
+/// permanently, since a badge is never revoked.
+///
+/// Five minutes is well under a conventional 25-minute pomodoro on purpose: a
+/// student who breaks off early still focused, and the counter should not
+/// punish that. It is four orders of magnitude above a scripted round-trip,
+/// which is the whole distance that matters — the cheat now costs the wall
+/// clock it claims. Sixteen a day is likewise above any honest school day
+/// (sixteen full pomodoros is over six hours of pure focus) while capping the
+/// minimum-length farm at eighty minutes of real waiting per day, so
+/// `pomodoro_finished_200` takes at least thirteen calendar days to buy instead
+/// of ninety seconds. Both are read `>=`/`<`, i.e. a stint of exactly the
+/// minimum counts and the sixteenth of the day counts.
+pub const MIN_COUNTED_POMODORO_MS: i64 = 300_000;
+pub const MAX_COUNTED_POMODORO_PER_DAY: i64 = 16;
 /// The staff-side and second student-side totals, same shape and same rules:
 /// lifetime, floored at zero, absent reads as zero. `MARKS_GIVEN` and
 /// `LESSONS_HELD` are what a teacher accumulates; `POOL_APPROVED` counts the

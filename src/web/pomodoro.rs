@@ -44,6 +44,13 @@ struct PomodoroResponse {
     finished_at: Option<i64>,
     /// `finished_at - started_at`; `null` while still running.
     duration_ms: Option<i64>,
+    /// Whether this stint moved the lifetime pomodoro counters (and so the
+    /// badges and the study streak): it did when it ran at least
+    /// `pomodoro.min_counted_ms` and was within that UTC day's
+    /// `pomodoro.max_counted_per_day` (both on `GET /limits`). `null` while
+    /// still running, and on stints closed before the rule existed. An
+    /// uncounted stint is kept and listed exactly like any other.
+    counted: Option<bool>,
 }
 
 impl PomodoroResponse {
@@ -56,6 +63,7 @@ impl PomodoroResponse {
             started_at,
             finished_at,
             duration_ms: finished_at.map(|done| done.saturating_sub(started_at)),
+            counted: session.get_counted(),
         }
     }
 }
@@ -134,6 +142,15 @@ async fn start(
 
 /// Finish the running pomodoro session, closing it with a server-stamped
 /// instant. `409` when nothing is running.
+///
+/// The response's `counted` says whether the stint moved the lifetime pomodoro
+/// counters — the badges and the study streak read those. It counts when it ran
+/// at least `pomodoro.min_counted_ms` and is within that UTC day's
+/// `pomodoro.max_counted_per_day` (both published on `GET /limits`); the day
+/// bucket rolls at midnight UTC. A stint that counts for nothing is still
+/// recorded, still listed, and still sums into `total_focus_ms` — only the
+/// badge counters are held to the rule, because finishing is self-service and a
+/// counter moved once per round-trip is farmable.
 #[utoipa::path(
     post,
     path = "/finish",
