@@ -77,7 +77,9 @@
 //! statement and undone by appending a refund, and both entries are true
 //! records of money that really arrived. A CAS counter row was rejected —
 //! refunding would have to decrement it, which is a stored derived balance by
-//! another name.
+//! another name. What the fold costs is also what bounds it: at most
+//! [`MAX_LEDGER_APPLIED_LINES`] lines may be applied to any one line, since
+//! every one of them is another query taken with the lock held.
 //!
 //! The `request_key` mismatch `409` rides on the same lock: it is a
 //! read-then-compare, and it is read *inside* the lock, so two first-time posts
@@ -87,7 +89,7 @@
 use surrealdb::types::{AlreadyExistsError, RecordId, RecordIdKey, SurrealValue};
 use tokio::sync::Mutex;
 
-use crate::constant::{CAS_UPDATE_RETRIES, PAYMENT_LEDGER_TABLE};
+use crate::constant::{CAS_UPDATE_RETRIES, MAX_LEDGER_APPLIED_LINES, PAYMENT_LEDGER_TABLE};
 use crate::database::{Database, lost_the_race};
 use crate::domain::fee_plan::Installment;
 use crate::domain::fee_plan_assignment::{FeePlanAssignment, FeePlanAssignmentId};
@@ -569,15 +571,34 @@ impl PaymentLedger {
     /// and a reversal of that refund puts it back once more. `-target.sign()`
     /// is what flips the reading for a credit, whose room is measured in the
     /// refunds against it.
-    // ponytail: one query per line of the subtree (a charge has a handful);
-    // fold it into one recursive statement if a statement ever gets long.
+    ///
+    /// **The subtree is bounded, and that is what makes the walk affordable.**
+    /// One query per line, all of them while [`PAYMENT_LOCK`] is held, so an
+    /// unbounded subtree stalls every other payment in the school: a charge
+    /// settled 2 000 kuruş at a time would make the next payment issue 2 001
+    /// sequential queries under the lock. Past
+    /// [`MAX_LEDGER_APPLIED_LINES`] the walk stops where it is and the write is
+    /// refused — the count is what is refused, never the money already
+    /// recorded, so a line that is *already* over the ceiling (written before
+    /// it existed) still reads, still refunds through its own children, and is
+    /// still reversible. Only a fresh line applied to *it* is turned away.
+    // ponytail: one query per line, ceiling MAX_LEDGER_APPLIED_LINES; fold the
+    // walk into one recursive statement if that ceiling ever has to rise.
     async fn applied_to(target: &PaymentLedger, db: &Database) -> Result<i64, AppError> {
         let mut total = 0i64;
+        let mut seen = 0usize;
         // The graph is a DAG by construction — a line can only point at one
         // that already existed — so the walk terminates.
         let mut pending = vec![target.id.clone()];
         while let Some(id) = pending.pop() {
             for child in Self::list_for_source(&id, db).await? {
+                seen += 1;
+                if seen >= MAX_LEDGER_APPLIED_LINES {
+                    return Err(AppError::Conflict(
+                        "this line already carries the most lines that may be applied to it; \
+                         record the rest against another",
+                    ));
+                }
                 total = total.saturating_add(child.kind.sign() * child.amount_minor.as_minor());
                 pending.push(child.id);
             }
@@ -668,17 +689,64 @@ impl PaymentLedger {
 
     /// The derived balance: `credits + reversals - charges - refunds`, in minor
     /// units. Negative means the family owes the school. Never stored anywhere.
-    // ponytail: folds the student's lines in-process (a few dozen a year); push
-    // it into a `math::sum` aggregate if a statement ever gets long.
+    ///
+    /// **The sum is taken per kind by the database** and only the four totals
+    /// come back, so a balance read costs the same whether the ledger holds
+    /// four lines or forty thousand. It used to decode and fold every row, and
+    /// a fee ledger grows by design rather than only under abuse: one
+    /// assignment appends a charge *per installment* per student (up to
+    /// [`MAX_FEE_PLAN_ASSIGN_WRITES`](crate::constant::MAX_FEE_PLAN_ASSIGN_WRITES)
+    /// in a single request), and every one of those rows was decoded again by
+    /// every later `GET /payments/balance/*`.
+    ///
+    /// **The signs stay here**, applied by the same [`PaymentLedgerKind::sign`]
+    /// the documented formula is spelled in — [`PaymentLedger::fold_balance`]
+    /// folds the grouped totals and the raw lines alike. Summing
+    /// `IF kind = 'charge' THEN -amount …` in SQL would have folded the whole
+    /// balance in one statement and forked the one rule that decides what money
+    /// means into a second language, where nothing fails the day the two
+    /// disagree. Grouping keeps the aggregate ignorant of signs. A stored
+    /// running total was the third option and is a counter that can drift — a
+    /// bug class this repo closes, not one it opens.
     pub async fn balance_of(student: &UserId, db: &Database) -> Result<i64, AppError> {
-        Ok(Self::list_for_student(student, None, 0, db)
+        let totals: Vec<KindTotal> = db
+            .query(format!(
+                "SELECT kind, math::sum(amount_minor) AS total \
+                 FROM {PAYMENT_LEDGER_TABLE} WHERE student = $student GROUP BY kind"
+            ))
+            .bind(("student", student.record()))
             .await?
-            .0
-            .iter()
-            .fold(0i64, |sum, line| {
-                sum + line.kind.sign() * line.amount_minor.as_minor()
-            }))
+            .check()?
+            .take(0)?;
+        Ok(Self::fold_balance(
+            totals.into_iter().map(|row| (row.kind, row.total)),
+        ))
     }
+
+    /// The one fold, over whatever already carries a kind and an amount: the
+    /// four grouped totals above, or the raw lines a caller has in hand. A
+    /// document that reports both a per-charge rollup and a balance must fold
+    /// both from one read — two reads straddle a payment landing between them,
+    /// and the halves then disagree about the same money in the same response.
+    pub fn fold_balance(lines: impl IntoIterator<Item = (PaymentLedgerKind, i64)>) -> i64 {
+        lines
+            .into_iter()
+            .fold(0i64, |sum, (kind, amount)| sum + kind.sign() * amount)
+    }
+
+    /// This line's contribution to that fold, as [`PaymentLedger::fold_balance`]
+    /// takes it.
+    pub fn folded(&self) -> (PaymentLedgerKind, i64) {
+        (self.kind, self.amount_minor.as_minor())
+    }
+}
+
+/// One kind's whole sum, as the `GROUP BY` in [`PaymentLedger::balance_of`]
+/// hands it back — at most four rows, never the lines behind them.
+#[derive(Debug, SurrealValue)]
+struct KindTotal {
+    kind: PaymentLedgerKind,
+    total: i64,
 }
 
 #[cfg(test)]
@@ -746,6 +814,49 @@ mod tests {
                 (PaymentLedgerKind::Charge, 10_000),
                 (PaymentLedgerKind::Reversal, 10_000),
             ]),
+            0
+        );
+    }
+
+    /// The mem engine is not the store this runs against, and an aggregate is
+    /// exactly where the two have diverged before: `count()` over an *indexed*
+    /// field compared to a plan-time value comes back `{count: N}` rather than
+    /// a plain int, and `student` is indexed on this table
+    /// (`payment_ledger_student`). So the `GROUP BY` is proved on a real
+    /// server: that it decodes into [`KindTotal`], that it folds to the
+    /// documented figure per kind, that it is scoped to one student, and that
+    /// someone with no lines at all comes back `0` rather than an error.
+    #[tokio::test]
+    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
+    async fn the_balance_aggregate_decodes_on_a_real_server() {
+        let (db, _serialized) = crate::database::init_test_server("payment_balance_sum").await;
+        db.query(
+            "CREATE payment_ledger:a SET student = user:ali, kind = 'charge', \
+                 amount_minor = 10000, recorded_by = user:adm, created_at = 1;
+             CREATE payment_ledger:b SET student = user:ali, kind = 'credit', \
+                 amount_minor = 6000, recorded_by = user:adm, created_at = 2;
+             CREATE payment_ledger:c SET student = user:ali, kind = 'refund', \
+                 amount_minor = 1000, recorded_by = user:adm, created_at = 3;
+             CREATE payment_ledger:d SET student = user:ali, kind = 'reversal', \
+                 amount_minor = 4500, recorded_by = user:adm, created_at = 4;
+             CREATE payment_ledger:e SET student = user:veli, kind = 'credit', \
+                 amount_minor = 777, recorded_by = user:adm, created_at = 5;",
+        )
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+        let ali = UserId::from_key("ali");
+        assert_eq!(
+            PaymentLedger::balance_of(&ali, &db).await.unwrap(),
+            6_000 + 4_500 - 10_000 - 1_000,
+            "credits + reversals - charges - refunds, and veli's line is not ali's"
+        );
+        // Somebody with no lines at all: no groups come back, not an error.
+        assert_eq!(
+            PaymentLedger::balance_of(&UserId::from_key("nobody"), &db)
+                .await
+                .unwrap(),
             0
         );
     }
