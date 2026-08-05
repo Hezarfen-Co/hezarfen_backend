@@ -3,7 +3,7 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue, Value};
 
 use crate::constant::{EVENT_TABLE, MAX_EVENT_DESCRIPTION_LEN, MAX_EVENT_TITLE_LEN};
-use crate::database::Database;
+use crate::database::{Database, transaction_with_retry};
 use crate::domain::class_group::ClassGroupId;
 use crate::domain::class_member::{ClassMember, ClassMemberId};
 use crate::domain::course::CourseId;
@@ -315,21 +315,36 @@ impl Event {
     /// registration or a mark that committed in between outlived its event —
     /// an orphan no read path can ever reach and no delete can ever reclaim,
     /// since every one of them is keyed on the event that is now gone.
+    ///
+    /// Re-sent while the store answers "conflict, retry", the way
+    /// [`crate::domain::course_session::CourseSession::delete`] is: now that
+    /// [`crate::domain::attendance::Attendance::mark`] writes the event row to
+    /// prove it exists, a mark landing in this window really does contend for
+    /// it — and without the retry the *delete* is the side that loses, turning
+    /// a race the store resolved correctly into a 500 (measured 4 rounds in 4).
+    /// Admissible: every statement is a `DELETE`, which can never answer
+    /// "already exists", and a lost round wrote nothing.
     pub async fn delete(self, db: &Database) -> Result<Event, AppError> {
-        let mut result = db
-            .query(
-                "BEGIN TRANSACTION;
+        let (mut result, mut errors) = transaction_with_retry(
+            db,
+            "BEGIN TRANSACTION;
                  DELETE attendance WHERE event = $ev;
                  DELETE registration WHERE event = $ev;
                  LET $gone = (DELETE $ev RETURN BEFORE);
                  RETURN $gone;
                  COMMIT TRANSACTION;",
-            )
-            .bind(("ev", self.id.record()))
-            .await?
-            .check()?;
+            &[("ev".into(), self.id.record().into_value())],
+            // No THROW of its own — an unconditional cascade.
+            &[],
+        )
+        .await?;
+        if let Some(error) = errors.drain().map(|(_, error)| error).next() {
+            return Err(error.into());
+        }
+        // Read through the trailing `RETURN`, never a hand-counted slot.
+        let slot = result.num_statements().saturating_sub(2);
         result
-            .take::<Vec<Event>>(4)?
+            .take::<Vec<Event>>(slot)?
             .into_iter()
             .next()
             .ok_or(AppError::NotFound)
