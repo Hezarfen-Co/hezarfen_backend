@@ -5,7 +5,9 @@ Note, attendance, course + weighted exam mark backend. **Rust (edition 2024) · 
 Session-cookie auth with five hierarchical roles (`parent < student < teacher
 < manager < admin`). A **`parent`** observes and changes nothing: admins tie
 students to a parent account, and the parent reads those students' mark,
-attendance, pomodoro, and homework reports — that's the whole role. Notes are per-user and carry **file attachments** (PDFs, documents,
+attendance, pomodoro, and homework reports — that's the whole role, bar the
+two things every account keeps whatever its role: **messages** and its own
+**notes**. Notes are per-user and carry **file attachments** (PDFs, documents,
 …): blobs live on disk next to the database, metadata in the database, and the
 per-file size cap is school policy in settings (`max_file_bytes`, default
 5 MiB). Any two users can **message** each other, mail-style — subject +
@@ -585,7 +587,13 @@ and homework reports in full. Student-only checks are exact (`role == student`),
 parent can never enroll, sit an exam, be graded, or land on a roll call; and
 sitting below every staff bar, they can't touch anything else either — except
 messages, which any role sends and receives (that's how a parent reaches a
-teacher). A role
+teacher), and their own **notes**, which carry no role bar at all: a note is
+private to one person, so a role change must not confiscate it. It used to.
+While the note routes required `student`, a demotion locked the owner out of
+their own notes permanently — and since nothing else in the crate reads a note
+and no route cascades one, the rows and their on-disk blobs were left
+unreachable and undeletable by everybody, without even a per-user cap to bound
+the wreckage. Ownership is now the whole check there. A role
 change off either end of a tie (the parent stops being a `parent`, the
 student stops being a `student`) drops the tie, exactly like promotion drops
 course enrollments. That sweep runs once, so a tie written in the same instant
@@ -628,7 +636,8 @@ still left exactly as they stand.
 | Action                                   | Minimum role | Notes                                         |
 |------------------------------------------|--------------|-----------------------------------------------|
 | Register / login / view own account      | (any)        | Registration always creates a `student`       |
-| View events, own notes; CRUD notes + their files | student | Everyone can read events and keep notes; note files (upload/download) are walled per owner like the notes themselves |
+| View events                              | student      | Everyone from `student` up can read events    |
+| CRUD own notes + their files             | (any)        | A note is private to its owner and has no other reader, so there is no role bar: ownership *is* the authorization, `parent` included. Note files (upload/download/delete) are walled per owner like the notes themselves — a file is only ever reached through its own note |
 | Send / read / file / delete messages     | (any)        | One-to-one, any user to any user (`parent` included — the role's one write); each party only ever touches their own copy |
 | Mark event attendance; remove attendance rows | teacher | Only users in the event's **audience** can be marked; students never mark — a teacher+ may mark anyone expected, themselves included |
 | Create events                            | teacher      | The audience (school / role / course / class / registration) is set at creation and editable later |
@@ -830,15 +839,15 @@ window filtering, before paging; negative values are a `400` naming the field.
 | POST   | `/users/{id}/students`           | admin   | `{user_id}` — tie a **student** to a **parent** account `{id}` (idempotent); the tie is the parent's read grant |
 | GET    | `/users/{id}/students`           | admin   | List a parent's linked students (same live-role filter as `/users/me/students`) · paged |
 | DELETE | `/users/{id}/students/{student}` | admin   | Untie a student from a parent (student data untouched) |
-| POST   | `/notes`                         | student | `{title, content?}`             |
-| GET    | `/notes`                         | student | List own notes · paged          |
-| GET    | `/notes/{id}`                    | student | Get own note                    |
-| PATCH  | `/notes/{id}`                    | student | `{title?, content?}`            |
-| DELETE | `/notes/{id}`                    | student | Delete own note (its files go with it) |
-| POST   | `/notes/{id}/files`              | student | Attach a file: `multipart/form-data`, one `file` part (`filename` required) — ≤ the school's `max_file_bytes`, ≤ 10 files per note |
-| GET    | `/notes/{id}/files`              | student | List a note's files (metadata: `{id, name, content_type, size}`) · paged |
-| GET    | `/notes/{id}/files/{file_id}`    | student | Download the bytes (original filename + content type in the headers) |
-| DELETE | `/notes/{id}/files/{file_id}`    | student | Delete one file                 |
+| POST   | `/notes`                         | (any)   | `{title, content?}`             |
+| GET    | `/notes`                         | (any)   | List own notes · paged          |
+| GET    | `/notes/{id}`                    | (any)   | Get own note                    |
+| PATCH  | `/notes/{id}`                    | (any)   | `{title?, content?}`            |
+| DELETE | `/notes/{id}`                    | (any)   | Delete own note (its files go with it) |
+| POST   | `/notes/{id}/files`              | (any)   | Attach a file: `multipart/form-data`, one `file` part (`filename` required) — ≤ the school's `max_file_bytes`, ≤ 10 files per note |
+| GET    | `/notes/{id}/files`              | (any)   | List a note's files (metadata: `{id, name, content_type, size}`) · paged |
+| GET    | `/notes/{id}/files/{file_id}`    | (any)   | Download the bytes (original filename + content type in the headers) |
+| DELETE | `/notes/{id}/files/{file_id}`    | (any)   | Delete one file                 |
 | POST   | `/messages`                      | student | `{recipient_id, subject, body?, label?}` — send to any user (every role incl. `parent`; not yourself); `label` is a free-text badge tag |
 | GET    | `/messages`                      | student | `?folder=inbox\|sent\|archive\|trash` (default `inbox`) `&read=` — the caller's folder, newest first; `?folder=inbox&read=false&limit=1` → `total` is the unread badge · paged |
 | PATCH  | `/messages/{id}`                 | student | `{read?, folder?}` — read flag (recipient only) and/or move **own copy** (recipient: `inbox`/`archive`/`trash`; sender: `sent`/`archive`/`trash`) |

@@ -561,6 +561,181 @@ async fn notes_crud_is_scoped_to_owner() {
     );
 }
 
+/// A demotion to `parent` must not confiscate the account's own notes. It used
+/// to: every note route required `student`, so after the demotion the owner
+/// could no longer list, read or **delete** their notes — and since nothing
+/// else in the crate reads a note and no route cascades one, the rows and their
+/// on-disk blobs were unreachable and undeletable by everybody, forever. The
+/// role bar is gone; the owner scoping that was always underneath it is now the
+/// whole authorization, so a `parent` reaches their own notes and nobody
+/// else's.
+#[tokio::test]
+async fn a_demotion_to_parent_strands_no_note_and_no_blob() {
+    let (app, db) = app_and_db().await;
+    let admin = login_as(&app, &db, "boss", "admin").await;
+    let ali = login(&app, "ali").await;
+    let ali_id = me_id(&app, &ali).await;
+
+    // A student's note with a file on it.
+    let res = send(
+        &app,
+        "POST",
+        "/notes",
+        Some(&ali),
+        Some(json!({ "title": "kept", "content": "mine" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED);
+    let note_id = id_of(&res.body);
+    let up = common::upload_file(
+        &app,
+        &ali,
+        &note_id,
+        "plan.pdf",
+        "application/pdf",
+        b"bytes",
+    )
+    .await;
+    assert_eq!(up.status, StatusCode::CREATED);
+    let file_id = id_of(&up.body);
+    let blob = common::files_dir().join(&file_id);
+    assert!(blob.exists(), "the upload must have written a blob");
+
+    // Demote through the real route, not a seeded role.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/users/{ali_id}/role"),
+        Some(&admin),
+        Some(json!({ "role": "parent" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["role"], "parent");
+
+    // Every own-scoped read still answers the owner.
+    let res = send(&app, "GET", "/notes", Some(&ali), None).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(common::items(&res.body).len(), 1);
+    assert_eq!(
+        send(&app, "GET", &format!("/notes/{note_id}"), Some(&ali), None)
+            .await
+            .body["title"],
+        "kept"
+    );
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/notes/{note_id}"),
+        Some(&ali),
+        Some(json!({ "content": "still mine" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["content"], "still mine");
+
+    // Files too: list, download the bytes, and attach another one.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/notes/{note_id}/files"),
+        Some(&ali),
+        None,
+    )
+    .await;
+    assert_eq!(common::items(&res.body).len(), 1);
+    let (status, _, bytes) = common::send_raw(
+        &app,
+        "GET",
+        &format!("/notes/{note_id}/files/{file_id}"),
+        Some(&ali),
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, b"bytes");
+    let extra =
+        common::upload_file(&app, &ali, &note_id, "more.pdf", "application/pdf", b"x").await;
+    assert_eq!(extra.status, StatusCode::CREATED);
+
+    // A different parent reaches none of it — the owner check is all that
+    // stands there now, so prove every route holds. `404`, the crate's answer
+    // for someone else's row, never `403`.
+    let veli = login_as(&app, &db, "veli", "parent").await;
+    for (method, uri) in [
+        ("GET", format!("/notes/{note_id}")),
+        ("PATCH", format!("/notes/{note_id}")),
+        ("GET", format!("/notes/{note_id}/files")),
+        ("GET", format!("/notes/{note_id}/files/{file_id}")),
+        ("DELETE", format!("/notes/{note_id}/files/{file_id}")),
+        ("DELETE", format!("/notes/{note_id}")),
+    ] {
+        let body = (method == "PATCH").then(|| json!({ "title": "stolen" }));
+        assert_eq!(
+            send(&app, method, &uri, Some(&veli), body).await.status,
+            StatusCode::NOT_FOUND,
+            "{method} {uri} must not reach another user's note"
+        );
+    }
+    assert_eq!(
+        common::upload_file(&app, &veli, &note_id, "x.pdf", "application/pdf", b"x")
+            .await
+            .status,
+        StatusCode::NOT_FOUND,
+        "a stranger must not attach a file to someone else's note"
+    );
+    assert!(common::items(&send(&app, "GET", "/notes", Some(&veli), None).await.body).is_empty());
+    // A parent's own notes work end to end, which is what makes the demoted
+    // owner's access ownership and not leftover privilege.
+    assert_eq!(
+        send(
+            &app,
+            "POST",
+            "/notes",
+            Some(&veli),
+            Some(json!({ "title": "veli's" }))
+        )
+        .await
+        .status,
+        StatusCode::CREATED
+    );
+
+    // And the demoted owner can still clear the whole thing out: one file by
+    // hand, the rest through the note's cascade — blobs included.
+    assert_eq!(
+        send(
+            &app,
+            "DELETE",
+            &format!("/notes/{note_id}/files/{file_id}"),
+            Some(&ali),
+            None
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
+    assert!(!blob.exists(), "deleting a file must unlink its blob");
+    let extra_blob = common::files_dir().join(id_of(&extra.body));
+    assert_eq!(
+        send(
+            &app,
+            "DELETE",
+            &format!("/notes/{note_id}"),
+            Some(&ali),
+            None
+        )
+        .await
+        .status,
+        StatusCode::NO_CONTENT
+    );
+    assert!(
+        !extra_blob.exists(),
+        "the note delete must take its remaining blobs with it"
+    );
+    assert!(common::items(&send(&app, "GET", "/notes", Some(&ali), None).await.body).is_empty());
+}
+
 #[tokio::test]
 async fn note_content_defaults_to_empty() {
     let app = mem_app().await;
@@ -13482,10 +13657,12 @@ async fn messages_rejected_patch_leaves_no_side_effects() {
     );
 }
 
-/// The read-only parent role must bounce off every notes surface — they were
-/// gated on bare authentication before the parent role existed.
+/// Notes carry no role bar: they are own-scoped personal data with no other
+/// reader, so the read-only `parent` keeps theirs like everybody else. The
+/// `student` bar this route family used to hold was a defect — see
+/// `a_demotion_to_parent_strands_no_note_and_no_blob`.
 #[tokio::test]
-async fn parent_role_cannot_touch_notes() {
+async fn parent_role_keeps_its_own_notes() {
     let (app, db) = app_and_db().await;
     let parent = login_as(&app, &db, "baba", "parent").await;
 
@@ -13494,12 +13671,13 @@ async fn parent_role_cannot_touch_notes() {
         "POST",
         "/notes",
         Some(&parent),
-        Some(json!({ "title": "not" })),
+        Some(json!({ "title": "mine" })),
     )
     .await;
-    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
     let res = send(&app, "GET", "/notes", Some(&parent), None).await;
-    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(common::items(&res.body).len(), 1);
 
     // Student and up keep the pen.
     let ali = login(&app, "ali").await;
