@@ -17,6 +17,8 @@
 //! It doubles as the reference implementation: `raw::Service` below is the
 //! whole client side of `hab/1` in about a hundred lines.
 
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -867,4 +869,76 @@ async fn several_raw_services_serve_one_capability_together() {
         (0..12).collect::<Vec<u64>>(),
         "every request answered once"
     );
+}
+
+// ------------------------------------------------------ capability payload --
+//
+// The frame shapes above are capability-agnostic. `chat.reply` is the one
+// capability whose *payload* is a published contract too, and the payload is
+// built by the HTTP handler — so the only way to pin it as a foreign service
+// sees it is to drive the real endpoint and read the bytes off the wire.
+
+#[tokio::test]
+async fn a_chat_request_names_the_askers_school_role() {
+    // A chat service scopes its answer by who is asking, so the payload must
+    // carry the asker's school role as a bare lowercase string — read here out
+    // of the raw frame bytes, never through the crate's own payload struct.
+    let bridge = bridge().await;
+    let service = raw::handshake(&bridge, &raw::hello("tutor", "chat.reply")).await;
+    await_workers(&bridge, 1).await;
+
+    let db = hezarfen_backend::database::init_mem()
+        .await
+        .expect("mem db");
+    let app = hezarfen_backend::build_router(hezarfen_backend::state::AppState {
+        db: db.clone(),
+        files_path: common::files_dir(),
+        cookie_secure: false,
+        rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
+        chatbot_limit: Default::default(),
+        exam_presence: Default::default(),
+        board_hub: Default::default(),
+        db_up: Default::default(),
+        ai: Some(bridge.clone()),
+    });
+    let cookie = common::login_as(&app, &db, "veli", "teacher").await;
+    let res = common::send(
+        &app,
+        "POST",
+        "/chatbot/threads",
+        Some(&cookie),
+        Some(json!({})),
+    )
+    .await;
+    let thread = common::id_of(&res.body);
+    let res = common::send(
+        &app,
+        "POST",
+        &format!("/chatbot/threads/{thread}/messages"),
+        Some(&cookie),
+        Some(json!({ "content": "ikinci yasa nedir?" })),
+    )
+    .await;
+    assert_eq!(res.status, axum::http::StatusCode::ACCEPTED, "{}", res.body);
+
+    let (request, bytes, send, _recv) = raw::take_request(&service.conn).await;
+    assert_eq!(request["capability"], "chat.reply");
+    assert_eq!(
+        raw::keys(&request["payload"]),
+        ["asker_role", "history", "message"],
+        "the documented chat request payload keys"
+    );
+    assert_eq!(request["payload"]["message"], "ikinci yasa nedir?");
+    assert_eq!(request["payload"]["asker_role"], "teacher");
+    // Byte-level: a bare `"teacher"`, not an object-wrapped or capitalised
+    // enum — a re-tagged role would still parse as JSON above.
+    let text = String::from_utf8(bytes).expect("the frame body is UTF-8 JSON");
+    assert!(text.contains(r#""asker_role":"teacher""#), "{text}");
+
+    let id = request["id"].as_str().expect("trace id").to_string();
+    raw::answer(
+        send,
+        format!(r#"{{"status":"ok","id":"{id}","payload":{{"text":"F = ma"}}}}"#).as_bytes(),
+    )
+    .await;
 }

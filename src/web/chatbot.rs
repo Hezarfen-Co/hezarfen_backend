@@ -44,6 +44,7 @@ use crate::domain::chatbot_message::{
     ChatContent, ChatbotMessage, ChatbotMessageId, MessageRole, MessageStatus,
 };
 use crate::domain::chatbot_thread::{ChatbotThread, ChatbotThreadId, ChatbotThreadTitle};
+use crate::domain::role::Role;
 use crate::domain::settings::Settings;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ErrorResponse, ValidationError};
@@ -426,11 +427,16 @@ async fn send_message(
     // interleave across the two creates above, and picking "the newest user row
     // before this answer" out of the thread then answers the *other* request's
     // question twice.
+    // The asker's role goes with the turn so the service can scope its answer.
+    // Read here, from the session's own user row (roles are re-read on every
+    // request), so it is the live role at the moment the question was asked —
+    // never a stored copy, and never anything the body could assert.
     tokio::spawn(answer_turn(
         bridge,
         st.db.clone(),
         prompt.get_id().clone(),
         answer,
+        user.get_role(),
         settings.get_chatbot_history_turns().max(0) as usize,
         reply_cap,
     ));
@@ -471,6 +477,7 @@ async fn answer_turn(
     db: Database,
     prompt_id: ChatbotMessageId,
     answer: ChatbotMessage,
+    asker_role: Role,
     history_turns: usize,
     reply_cap: usize,
 ) {
@@ -504,6 +511,7 @@ async fn answer_turn(
         &thread,
         &fresh,
         prompt.get_content().as_str().to_string(),
+        asker_role,
         history_turns,
         reply_cap,
     )
@@ -534,6 +542,7 @@ async fn fetch_reply(
     thread: &ChatbotThreadId,
     fresh: &[ChatbotMessageId; 2],
     prompt: String,
+    asker_role: Role,
     history_turns: usize,
     reply_cap: usize,
 ) -> Result<(ChatContent, bool), String> {
@@ -546,6 +555,7 @@ async fn fetch_reply(
     };
     let payload = serde_json::to_value(ChatRequestPayload {
         message: prompt,
+        asker_role: asker_role.as_str().to_string(),
         history,
     })
     .map_err(|err| {

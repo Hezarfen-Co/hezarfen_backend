@@ -3714,9 +3714,19 @@ Requests then arrive as ordinary `hab/1` `Request` frames whose `payload` is:
 
 ```json
 { "message": "and the second law?",
+  "asker_role": "student",
   "history": [ {"role":"user","content":"what is the first law?"},
                {"role":"assistant","content":"an object at rest …"} ] }
 ```
+
+`asker_role` is the **school role of the person asking** — one of `parent`,
+`student`, `teacher`, `manager`, `admin` (the same lowercase strings the rest of
+the API uses). Answer to it: a student must not be handed an answer scoped for a
+manager. It is read live from the authenticated session on every request and can
+never be set by the client — the send body carries `content` and nothing else —
+so it is safe to trust. Note it is *not* the `role` inside a `history` entry:
+that one is `user`/`assistant`, who *said* the turn. The backend does no
+role-based filtering of its own; scoping the answer is the service's job.
 
 `history` is **oldest first** (index 0 is furthest back), optional (absent or
 `[]` = a fresh thread), and **excludes** the new message — that one is
