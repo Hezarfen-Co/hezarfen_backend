@@ -40,6 +40,17 @@ pub struct ChatTurn {
 pub struct ChatRequestPayload {
     /// The user's new message. `history` does *not* contain it.
     pub message: String,
+    /// The **school role** of the person asking — `"parent"`, `"student"`,
+    /// `"teacher"`, `"manager"` or `"admin"`, the same lowercase strings the
+    /// rest of the API uses ([`Role::as_str`](crate::domain::role::Role::as_str)).
+    /// Deliberately not `role`: that name belongs to [`ChatTurn`], where it says
+    /// who *said* a turn.
+    ///
+    /// Read live from the authenticated session on every request and never
+    /// taken from the request body, so a service may answer on it: a student
+    /// must not be handed an answer scoped for a manager. Scoping the answer is
+    /// the service's job — the backend only forwards the role.
+    pub asker_role: String,
     /// The last N turns of the conversation, **oldest first** — index 0 is the
     /// furthest back, the final element is the turn immediately before
     /// `message`. Same order a model's `messages` array expects, so a service
@@ -65,12 +76,14 @@ pub struct ChatReplyPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::role::Role;
     use serde_json::json;
 
     #[test]
     fn payloads_round_trip() {
         let request = ChatRequestPayload {
             message: "and the second?".into(),
+            asker_role: Role::Student.as_str().to_string(),
             history: vec![
                 ChatTurn {
                     role: ChatRole::User,
@@ -104,6 +117,7 @@ mod tests {
         // silently breaks every one of them, so pin the encoding.
         let request = serde_json::to_value(ChatRequestPayload {
             message: "hi".into(),
+            asker_role: Role::Teacher.as_str().to_string(),
             history: vec![
                 ChatTurn {
                     role: ChatRole::User,
@@ -120,12 +134,24 @@ mod tests {
             request,
             json!({
                 "message": "hi",
+                "asker_role": "teacher",
                 "history": [
                     { "role": "user", "content": "a" },
                     { "role": "assistant", "content": "b" },
                 ],
             })
         );
+        // Every role reaches the wire as its documented lowercase slug — the
+        // one `Role::as_str` already publishes, not a second spelling.
+        for role in crate::constant::ROLES {
+            let encoded = serde_json::to_value(ChatRequestPayload {
+                message: "hi".into(),
+                asker_role: role.as_str().to_string(),
+                history: Vec::new(),
+            })
+            .unwrap();
+            assert_eq!(encoded["asker_role"], role.as_str());
+        }
         assert_eq!(
             serde_json::to_value(ChatReplyPayload { text: "ok".into() }).unwrap(),
             json!({ "text": "ok" })
@@ -137,10 +163,13 @@ mod tests {
     fn history_is_optional_on_the_wire() {
         // The smallest legal request: a first turn, from a service author who
         // never sends an empty array.
-        let bare: ChatRequestPayload = serde_json::from_value(json!({ "message": "hi" })).unwrap();
+        let bare: ChatRequestPayload =
+            serde_json::from_value(json!({ "message": "hi", "asker_role": "student" })).unwrap();
         assert!(bare.history.is_empty());
-        let empty: ChatRequestPayload =
-            serde_json::from_value(json!({ "message": "hi", "history": [] })).unwrap();
+        let empty: ChatRequestPayload = serde_json::from_value(
+            json!({ "message": "hi", "asker_role": "student", "history": [] }),
+        )
+        .unwrap();
         assert_eq!(bare, empty);
     }
 
@@ -150,6 +179,7 @@ mod tests {
         // oldest turn depends on it.
         let raw = json!({
             "message": "third",
+            "asker_role": "student",
             "history": [
                 { "role": "user", "content": "first" },
                 { "role": "assistant", "content": "second" },

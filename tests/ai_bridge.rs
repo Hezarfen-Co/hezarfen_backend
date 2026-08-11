@@ -1256,6 +1256,66 @@ async fn two_racing_turns_on_one_thread_each_answer_their_own_prompt() {
     );
 }
 
+#[tokio::test]
+async fn a_service_is_told_the_askers_own_school_role() {
+    // The service answers differently for a student than for a manager, so the
+    // role it reads must be the asker's own. Two different roles go through the
+    // real endpoint: a hardcoded slug would pass one of them and fail the other.
+    let bridge = bridge().await;
+    let service = connect_service(
+        &bridge,
+        hello("tutor", &[AI_CHAT_CAPABILITY]),
+        Behaviour::Reply("peki".into()),
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (app, db) = chat_app(&bridge).await;
+
+    for (name, role) in [("ali", "student"), ("veli", "manager")] {
+        let cookie = common::login_as(&app, &db, name, role).await;
+        let res = common::send(
+            &app,
+            "POST",
+            "/chatbot/threads",
+            Some(&cookie),
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+        let thread = common::id_of(&res.body);
+
+        // The body tries to promote itself. It must change nothing: the role is
+        // read from the session, and a send body carries only `content`.
+        let res = common::send(
+            &app,
+            "POST",
+            &format!("/chatbot/threads/{thread}/messages"),
+            Some(&cookie),
+            Some(json!({ "content": "soru", "asker_role": "admin" })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::ACCEPTED, "{}", res.body);
+        let mid = res.body["message_id"].as_str().expect("message_id");
+        assert_eq!(
+            settled(&app, &cookie, &thread, mid).await["status"],
+            "complete"
+        );
+    }
+
+    // Read as untyped JSON, the way a service in another language reads it.
+    let seen = service.seen();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].payload["asker_role"], "student");
+    assert_eq!(
+        seen[1].payload["asker_role"], "manager",
+        "the second turn was asked by a manager: {}",
+        seen[1].payload
+    );
+    // And the author role on a turn is a different key, so neither can be read
+    // for the other.
+    assert!(seen[0].payload["history"].is_array());
+}
+
 /// Every row of a thread, oldest first.
 async fn thread_rows(app: &Router, cookie: &str, thread: &str) -> Vec<Value> {
     let res = common::send(
