@@ -5,19 +5,27 @@
 //! to know its address, and scale out by opening a second connection.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use serde_json::Value;
+use tower::ServiceExt;
 use ulid::Ulid;
 
 use crate::ai::error::AiError;
 use crate::ai::protocol::{
-    Greeting, Hello, RejectCode, Request, Response, protocol_matches, read_frame, write_frame,
+    ApiRequest, ApiResponse, FrameError, Greeting, Hello, RejectCode, Request, Response,
+    protocol_matches, read_frame, write_frame,
 };
 use crate::ai::registry::{AiRegistry, WorkerSnapshot, clamp_concurrency};
 use crate::ai::tls;
-use crate::constant::{AI_HANDSHAKE_TIMEOUT_SECS, AI_PROTOCOL};
+use crate::constant::{
+    AI_HANDSHAKE_TIMEOUT_SECS, AI_MAX_FRAME_BYTES, AI_PROTOCOL, REQUEST_TIMEOUT_SECS,
+};
+use crate::database::Database;
+use crate::domain::user::{User, UserId};
+use crate::state::DbHealth;
+use crate::web::extractor::AiPrincipal;
 
 /// What the bridge needs to come up.
 #[derive(Clone, Debug)]
@@ -33,8 +41,22 @@ pub struct BridgeConfig {
     pub request_timeout: Duration,
 }
 
+/// What an api read needs to be answered: the router to dispatch into, the
+/// database the acting principal is loaded from, and the liveness flag that
+/// stands in for the HTTP db guard this path bypasses.
+struct ApiHandle {
+    router: axum::Router,
+    db: Database,
+    db_up: DbHealth,
+}
+
 struct Inner {
     registry: AiRegistry,
+    /// Armed once per process by [`crate::build_router`] (see
+    /// [`AiBridge::arm_api`]). A `OnceLock` because the router is built after the
+    /// listener is bound and never replaced afterwards: writing it costs one
+    /// store at boot and reading it is lock-free on every api read.
+    api: OnceLock<ApiHandle>,
     /// The leaf certificate this listener presents, kept so it can be shown to
     /// an operator (or pinned by an in-process client) without re-reading the
     /// PEM off disk.
@@ -77,6 +99,7 @@ impl AiBridge {
 
         let inner = Arc::new(Inner {
             registry: AiRegistry::default(),
+            api: OnceLock::new(),
             certificate: bridge_tls.leaf.clone(),
             token: config.token,
             request_timeout: config.request_timeout,
@@ -199,6 +222,18 @@ impl AiBridge {
         }
     }
 
+    /// Hand the api-read path the router it dispatches into.
+    ///
+    /// Called once by [`crate::build_router`] with the *pre-layer* service, so
+    /// a synthetic QUIC request skips the per-IP limiter, CORS and `ETag` (see
+    /// the comment there). A second call keeps the first router: the process
+    /// only ever builds one.
+    pub(crate) fn arm_api(&self, router: axum::Router, db: Database, db_up: DbHealth) {
+        if self.inner.api.set(ApiHandle { router, db, db_up }).is_err() {
+            tracing::warn!("the AI bridge api path was already armed — keeping the first router");
+        }
+    }
+
     /// Stop listening and close every service connection.
     pub fn close(&self) {
         self.inner.endpoint.close(0u32.into(), b"shutting down");
@@ -243,9 +278,227 @@ async fn serve_connection(inner: Arc<Inner>, conn: quinn::Connection, remote: So
     // Nothing more is read on it: its closure, not a heartbeat frame, is how a
     // service says goodbye, and the QUIC idle timeout covers the case where it
     // dies without saying anything.
-    let reason = conn.closed().await;
+    //
+    // Every *further* client-initiated stream is one api read. A service that
+    // opens none behaves exactly as it did before this loop existed.
+    let reason = loop {
+        tokio::select! {
+            reason = conn.closed() => break reason,
+            accepted = conn.accept_bi() => match accepted {
+                Ok((send, recv)) => {
+                    tokio::spawn(serve_api_read(Arc::clone(&inner), send, recv));
+                }
+                // The connection is going away; `closed()` has the real reason.
+                Err(_) => break conn.closed().await,
+            },
+        }
+    };
     inner.registry.remove(&worker_id);
     tracing::info!("AI service `{service}` ({worker_id}) at {remote} disconnected: {reason}");
+}
+
+/// Answer one api read on its own stream: one [`ApiRequest`] in, one
+/// [`ApiResponse`] out, then the stream is finished.
+async fn serve_api_read(
+    inner: Arc<Inner>,
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+) {
+    // Decoded as a `Value` first only so a frame that is JSON but not an
+    // `ApiRequest` still gets its `id` echoed back — that id is what the
+    // service correlates its own logs by.
+    let raw: Value = match read_frame(&mut recv).await {
+        Ok(raw) => raw,
+        Err(e) => {
+            answer(
+                &mut send,
+                refusal(String::new(), "malformed", e.to_string()),
+            )
+            .await;
+            return;
+        }
+    };
+    let id = raw
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let request: ApiRequest = match serde_json::from_value(raw) {
+        Ok(request) => request,
+        Err(e) => {
+            answer(&mut send, refusal(id, "malformed", e.to_string())).await;
+            return;
+        }
+    };
+
+    let response = match read_api(&inner, request).await {
+        Ok(response) => response,
+        Err((code, message)) => refusal(id, code, message),
+    };
+    answer(&mut send, response).await;
+}
+
+/// The bridge-level refusal this request earns *before* anything is dispatched,
+/// in the order the contract pins: the method first, then the allowlist. A
+/// refused path is never handed to the router at all.
+fn refuse_before_dispatch(method: Option<&str>, path: &str) -> Option<(&'static str, String)> {
+    match method {
+        None | Some("GET") => {}
+        Some(other) => {
+            return Some((
+                "method_not_allowed",
+                format!("the api bridge reads only — `{other}` is never dispatched"),
+            ));
+        }
+    }
+    if !crate::ai::api::path_allowed(path) {
+        return Some((
+            "path_not_allowed",
+            format!("`{path}` is not a path AI services may read"),
+        ));
+    }
+    None
+}
+
+/// Validate, dispatch into the router, and turn its answer into a frame.
+///
+/// `Err` is a bridge-level refusal (code, message). Anything the router itself
+/// answered — `401`, `403`, `404` included — comes back as
+/// [`ApiResponse::Ok`] carrying that status: the service asked and the API
+/// replied, which is not a transport failure.
+async fn read_api(
+    inner: &Inner,
+    request: ApiRequest,
+) -> Result<ApiResponse, (&'static str, String)> {
+    let ApiRequest {
+        id,
+        path,
+        query,
+        on_behalf_of,
+        method,
+    } = request;
+
+    if let Some(refusal) = refuse_before_dispatch(method.as_deref(), &path) {
+        return Err(refusal);
+    }
+
+    // Armed by `build_router`, which runs after the listener binds: a service
+    // that dials in inside that boot window is told to retry, never panicked on.
+    let api = inner.api.get().ok_or((
+        "unavailable",
+        "the api is not serving yet — retry".to_string(),
+    ))?;
+    // The outer db guard is one of the layers this path deliberately skips, so
+    // the same liveness check happens here instead: a query issued against a
+    // dead socket hangs rather than failing (see [`DbHealth`]).
+    if !api.db_up.is_up() {
+        return Err((
+            "unavailable",
+            "the database socket is down — retry".to_string(),
+        ));
+    }
+
+    // Loaded live, never trusted from the frame: a service holding a stale id
+    // must not act as a user who has since been deleted or demoted. The role
+    // itself is re-read again by the extractor on the dispatched request.
+    let user = match &on_behalf_of {
+        Some(who) => {
+            // Both the bare key (`abc`, as a REST path spells it) and the
+            // record form (`user:abc`) are accepted.
+            let key = who.strip_prefix("user:").unwrap_or(who);
+            User::read(&UserId::from_key(key), &api.db)
+                .await
+                .map_err(|e| ("unavailable", format!("could not load `{who}`: {e}")))?
+                .ok_or_else(|| ("unknown_user", format!("no user `{who}`")))?
+        }
+        None => User::ai_principal(),
+    };
+
+    let target = match query.as_deref() {
+        Some(query) if !query.is_empty() => format!("{path}?{query}"),
+        _ => path.clone(),
+    };
+    let mut dispatched = axum::http::Request::builder()
+        .method(axum::http::Method::GET)
+        .uri(&target)
+        .body(axum::body::Body::empty())
+        .map_err(|e| {
+            (
+                "malformed",
+                format!("`{target}` is not a request target: {e}"),
+            )
+        })?;
+    // An extension cannot be set from outside the process, which is what makes
+    // this principal unforgeable over HTTP (see [`AiPrincipal`]).
+    dispatched.extensions_mut().insert(AiPrincipal(user));
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(REQUEST_TIMEOUT_SECS),
+        api.router.clone().oneshot(dispatched),
+    )
+    .await
+    .map_err(|_| {
+        (
+            "unavailable",
+            format!("`{target}` did not answer within {REQUEST_TIMEOUT_SECS}s"),
+        )
+    })?
+    .expect("an axum router is infallible");
+
+    let status = response.status().as_u16();
+    let body = axum::body::to_bytes(response.into_body(), AI_MAX_FRAME_BYTES)
+        .await
+        .map_err(|e| {
+            (
+                "too_large",
+                format!("the answer to `{target}` does not fit a frame: {e}"),
+            )
+        })?;
+    let body = if body.is_empty() {
+        // `204`s and empty error bodies are a real answer, not a parse failure.
+        Value::Null
+    } else {
+        serde_json::from_slice(&body).map_err(|e| {
+            (
+                "not_json",
+                format!("`{target}` answered with a body that is not JSON: {e}"),
+            )
+        })?
+    };
+
+    Ok(ApiResponse::Ok { id, status, body })
+}
+
+fn refusal(id: String, code: &str, message: String) -> ApiResponse {
+    ApiResponse::Err {
+        id,
+        code: code.to_string(),
+        message,
+    }
+}
+
+/// Write one answer frame and finish the stream.
+///
+/// An `Ok` too big to frame is downgraded to a `too_large` refusal rather than
+/// dropped: a service that got no frame at all would wait out its own deadline
+/// to learn nothing.
+async fn answer(send: &mut quinn::SendStream, response: ApiResponse) {
+    let mut written = write_frame(send, &response).await;
+    if let (Err(FrameError::TooLarge(_)), ApiResponse::Ok { id, .. }) = (&written, &response) {
+        written = write_frame(
+            send,
+            &refusal(
+                id.clone(),
+                "too_large",
+                format!("the answer exceeds the {AI_MAX_FRAME_BYTES}-byte frame limit"),
+            ),
+        )
+        .await;
+    }
+    if let Err(e) = written {
+        tracing::warn!("could not answer an AI service's api read: {e}");
+    }
+    let _ = send.finish();
 }
 
 /// Read the `Hello`, decide, answer, and register on success.
@@ -373,7 +626,22 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::constant_time_eq;
+    use super::{constant_time_eq, refuse_before_dispatch};
+
+    #[test]
+    fn only_a_get_on_an_allowlisted_path_is_ever_dispatched() {
+        // An absent method means GET, which is the whole api the bridge offers.
+        assert!(refuse_before_dispatch(None, "/notes").is_none());
+        assert!(refuse_before_dispatch(Some("GET"), "/notes").is_none());
+
+        let code = |method, path| refuse_before_dispatch(method, path).map(|(code, _)| code);
+        assert_eq!(code(Some("DELETE"), "/notes"), Some("method_not_allowed"));
+        assert_eq!(code(Some("get"), "/notes"), Some("method_not_allowed"));
+        assert_eq!(code(None, "/users"), Some("path_not_allowed"));
+        // Order is pinned: the method is judged before the path, so a write
+        // attempt reads as a write attempt whatever it was aimed at.
+        assert_eq!(code(Some("POST"), "/nope"), Some("method_not_allowed"));
+    }
 
     #[tokio::test]
     async fn token_comparison_matches_only_exact_secrets() {

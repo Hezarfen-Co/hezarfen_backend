@@ -146,9 +146,21 @@ pub fn build_router(state: AppState) -> Router {
         );
     }
 
-    router
+    let service = router
         .merge(SwaggerUi::new("/swagger").url("/api-docs/openapi.json", api))
-        .with_state(state)
+        .with_state(state.clone());
+
+    // Hand the AI bridge the router *before* the outer layers, because a QUIC
+    // request from a service is not a browser request from an IP: it has no
+    // client address to bill the per-IP limiter (it would drain the shared
+    // unknown-client budget), and `ETag`/CORS are browser concerns. Skipping the
+    // layers means skipping the db guard too, so the bridge runs the liveness
+    // check and the request timeout itself (see `ai::server`).
+    if let Some(ai) = &state.ai {
+        ai.arm_api(service.clone(), state.db.clone(), state.db_up.clone());
+    }
+
+    service
         // Conditional-GET: revalidatable `ETag` on 200 JSON GETs, `304` on a
         // matching `If-None-Match`. Innermost, so it sees the handler's own
         // response (mutations and errors pass straight through untouched).

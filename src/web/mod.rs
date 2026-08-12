@@ -35,7 +35,9 @@ pub mod users;
 pub mod work;
 
 mod dto;
-mod extractor;
+// `pub(crate)` for `AiPrincipal`: the AI bridge injects it as an extension on
+// the requests it dispatches into the router (see `ai::server`).
+pub(crate) mod extractor;
 mod image;
 mod page;
 
