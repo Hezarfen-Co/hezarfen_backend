@@ -8,14 +8,25 @@ use crate::domain::user::User;
 use crate::error::AppError;
 use crate::state::AppState;
 
-/// Resolve the user behind the `session` cookie, or `401`. The role is read
-/// fresh from the row on every request, so a role change takes effect on the
-/// user's next call — no re-login required.
+/// A principal injected as a request extension by the AI bridge, for the
+/// synthetic requests it dispatches into the router. Extensions cannot be set
+/// from outside the process, so this is unforgeable over HTTP.
+#[derive(Clone)]
+pub(crate) struct AiPrincipal(pub User);
+
+/// Resolve the user behind the `session` cookie, or `401`. An injected
+/// [`AiPrincipal`] extension wins over the cookie. The role is read fresh from
+/// the row on every request, so a role change takes effect on the user's next
+/// call — no re-login required.
 async fn authed_user<S>(parts: &mut Parts, state: &S) -> Result<User, AppError>
 where
     S: Send + Sync,
     AppState: FromRef<S>,
 {
+    if let Some(principal) = parts.extensions.get::<AiPrincipal>() {
+        return Ok(principal.0.clone());
+    }
+
     let jar = CookieJar::from_request_parts(parts, state)
         .await
         .map_err(|_| AppError::Unauthorized)?;
