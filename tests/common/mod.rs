@@ -8,6 +8,7 @@ use std::sync::OnceLock;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode};
+use hezarfen_backend::ai::AiBridge;
 use hezarfen_backend::database::Database;
 use hezarfen_backend::rate_limit::RateLimitConfig;
 use hezarfen_backend::state::AppState;
@@ -39,6 +40,13 @@ pub fn files_dir() -> PathBuf {
 /// grant roles use the handle to seed them directly — the app's only role
 /// bootstrap path is out-of-band, exactly like production's manual SQL.
 pub async fn app_and_db() -> (Router, Database) {
+    app_with_ai(None).await
+}
+
+/// The same router, with the AI bridge wired into its state. `build_router`
+/// arms the bridge's api-read handle whenever `ai` is `Some`, so this is the
+/// bootstrap that makes a QUIC service's reads dispatch into a real router.
+pub async fn app_with_ai(ai: Option<AiBridge>) -> (Router, Database) {
     let db = database::init_mem().await.expect("in-memory db");
     let app = build_router(AppState {
         db: db.clone(),
@@ -51,7 +59,7 @@ pub async fn app_and_db() -> (Router, Database) {
         exam_presence: Default::default(),
         board_hub: Default::default(),
         db_up: Default::default(),
-        ai: None,
+        ai,
     });
     (app, db)
 }

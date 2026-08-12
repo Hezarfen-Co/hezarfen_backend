@@ -169,6 +169,19 @@ mod raw {
         let _ = send.stopped().await;
     }
 
+    /// Send one api-read frame verbatim on a fresh *client*-initiated stream
+    /// and read the single answer frame. This is the whole api-read client:
+    /// after the handshake a service opens a stream, writes an `ApiRequest`,
+    /// and reads one `ApiResponse`.
+    pub async fn api_read(conn: &quinn::Connection, body: &[u8]) -> (Value, Vec<u8>) {
+        let (mut send, mut recv) = conn.open_bi().await.expect("api-read stream");
+        send.write_all(&frame(body))
+            .await
+            .expect("write ApiRequest");
+        let _ = send.finish();
+        read_frame(&mut recv).await.expect("read ApiResponse")
+    }
+
     /// The set of top-level keys of a JSON object, sorted.
     pub fn keys(value: &Value) -> Vec<String> {
         let mut k: Vec<String> = value
@@ -941,4 +954,162 @@ async fn a_chat_request_names_the_askers_school_role() {
         format!(r#"{{"status":"ok","id":"{id}","payload":{{"text":"F = ma"}}}}"#).as_bytes(),
     )
     .await;
+}
+
+// ------------------------------------------------------------- api reads --
+//
+// The other direction: a service opens its own stream and asks the school API
+// a question. Its request and the backend's answer are a published contract in
+// exactly the same way as the frames above, so they are built and read here as
+// bytes — a renamed field or a re-tagged outcome breaks every foreign service
+// and must break this file first.
+
+/// A bridge whose api-read path is armed by a real router, plus a seeded
+/// student's id. Holding the router is what `build_router` arms, so it is
+/// returned rather than dropped.
+async fn armed(bridge: &AiBridge) -> (axum::Router, String) {
+    let (app, db) = common::app_with_ai(Some(bridge.clone())).await;
+    let cookie = common::login_as(&app, &db, "ayse", "student").await;
+    let student = common::me_id(&app, &cookie).await;
+    (app, student)
+}
+
+#[tokio::test]
+async fn the_api_request_field_names_are_the_published_literals() {
+    // Every documented field spelled out by hand: a rename of `on_behalf_of`
+    // or `query` would leave a service sending a field the backend ignores,
+    // which fails silently as "the AI answered about the wrong person".
+    let bridge = bridge().await;
+    let service = raw::handshake(&bridge, &raw::hello("tutor", "chat.reply")).await;
+    await_workers(&bridge, 1).await;
+    let (_app, student) = armed(&bridge).await;
+
+    let (answer, bytes) = raw::api_read(
+        &service.conn,
+        format!(
+            r#"{{"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","path":"/notes","query":"limit=1&offset=0","on_behalf_of":"{student}","method":"GET"}}"#
+        )
+        .as_bytes(),
+    )
+    .await;
+
+    assert_eq!(
+        raw::keys(&answer),
+        ["body", "id", "outcome", "status"],
+        "api answer shape changed: {answer}"
+    );
+    assert_eq!(answer["outcome"], "ok");
+    assert_eq!(answer["status"], 200);
+    assert_eq!(
+        answer["id"], "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "the trace id is echoed"
+    );
+    assert!(answer["body"]["items"].is_array(), "{answer}");
+    // Byte level: the tag key is `outcome` and its value a bare lowercase
+    // literal, not an object-wrapped or capitalised variant name.
+    let text = String::from_utf8(bytes).expect("the answer frame is UTF-8 JSON");
+    assert!(text.contains(r#""outcome":"ok""#), "{text}");
+    assert!(text.contains(r#""status":200"#), "{text}");
+}
+
+#[tokio::test]
+async fn only_id_and_path_are_required_of_an_api_request() {
+    // `query`, `on_behalf_of` and `method` are optional by contract: a service
+    // that sends neither must read as the service itself, over GET.
+    let bridge = bridge().await;
+    let service = raw::handshake(&bridge, &raw::hello("tutor", "chat.reply")).await;
+    await_workers(&bridge, 1).await;
+    let (_app, _student) = armed(&bridge).await;
+
+    let (answer, _) = raw::api_read(
+        &service.conn,
+        br#"{"id":"trace-1","path":"/auth/me","unknown_field":true}"#,
+    )
+    .await;
+    assert_eq!(answer["outcome"], "ok", "{answer}");
+    assert_eq!(answer["status"], 200);
+    // The synthetic principal the bridge runs as when nobody is named.
+    assert_eq!(answer["body"]["role"], "ai", "{answer}");
+}
+
+#[tokio::test]
+async fn the_api_refusal_frame_carries_exactly_the_published_keys_and_codes() {
+    // A service switches on these code literals. The `method` cases also pin
+    // the refusal *order*: a non-GET on a path that is not allowlisted either
+    // is `method_not_allowed`, because the method is judged first.
+    let bridge = bridge().await;
+    let service = raw::handshake(&bridge, &raw::hello("tutor", "chat.reply")).await;
+    await_workers(&bridge, 1).await;
+    let (_app, _student) = armed(&bridge).await;
+
+    let cases = [
+        (
+            "method_not_allowed",
+            r#"{"id":"t1","path":"/notes","method":"DELETE"}"#.to_string(),
+        ),
+        (
+            "method_not_allowed",
+            // Lowercase is not the method: the literal is exactly `GET`.
+            r#"{"id":"t2","path":"/notes","method":"get"}"#.to_string(),
+        ),
+        (
+            "path_not_allowed",
+            r#"{"id":"t3","path":"/courses"}"#.to_string(),
+        ),
+        (
+            // Order pin: both refusals apply, the method one wins.
+            "method_not_allowed",
+            r#"{"id":"t4","path":"/nope","method":"POST"}"#.to_string(),
+        ),
+        (
+            "unknown_user",
+            r#"{"id":"t5","path":"/auth/me","on_behalf_of":"nobodyatall"}"#.to_string(),
+        ),
+        ("malformed", r#"{"id":"t6","path":42}"#.to_string()),
+    ];
+
+    for (expected_code, request) in cases {
+        let (answer, _) = raw::api_read(&service.conn, request.as_bytes()).await;
+        assert_eq!(
+            raw::keys(&answer),
+            ["code", "id", "message", "outcome"],
+            "refusal shape changed for {expected_code}: {answer}"
+        );
+        assert_eq!(answer["outcome"], "err", "{answer}");
+        assert_eq!(
+            answer["code"], expected_code,
+            "refusal code spelling changed: {answer}"
+        );
+        assert!(
+            answer["message"].as_str().is_some_and(|m| !m.is_empty()),
+            "message must be a string a service can log: {answer}"
+        );
+        // Even a frame the backend could not parse into a request echoes the
+        // id, which is what the service correlates its own logs by.
+        assert!(
+            answer["id"].as_str().is_some_and(|i| i.starts_with('t')),
+            "{answer}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_api_read_answers_a_named_user_with_that_users_own_data() {
+    // The happy path a service actually uses: read an own-scoped endpoint as
+    // the student who asked. The answer must be that student's row, not the
+    // service's synthetic principal.
+    let bridge = bridge().await;
+    let service = raw::handshake(&bridge, &raw::hello("tutor", "chat.reply")).await;
+    await_workers(&bridge, 1).await;
+    let (_app, student) = armed(&bridge).await;
+
+    let (answer, _) = raw::api_read(
+        &service.conn,
+        format!(r#"{{"id":"t9","path":"/auth/me","on_behalf_of":"{student}"}}"#).as_bytes(),
+    )
+    .await;
+    assert_eq!(answer["outcome"], "ok", "{answer}");
+    assert_eq!(answer["status"], 200);
+    assert_eq!(answer["body"]["id"], student, "{answer}");
+    assert_eq!(answer["body"]["role"], "student", "{answer}");
 }

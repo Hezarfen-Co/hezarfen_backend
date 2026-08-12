@@ -1393,6 +1393,219 @@ async fn a_bad_address_fails_the_boot_rather_than_going_quiet() {
     );
 }
 
+// --------------------------------------------------------------- api read --
+//
+// The reverse direction: a registered service opens its own stream and reads
+// the school API. These drive the real router over real QUIC, so what they
+// assert is what a service actually receives — including who it is allowed to
+// be, which is the security half of the feature.
+
+use hezarfen_backend::ai::protocol::{ApiRequest, ApiResponse};
+
+/// One api read on a fresh client-initiated stream.
+async fn api_read(conn: &quinn::Connection, request: ApiRequest) -> ApiResponse {
+    let (mut send, mut recv) = conn.open_bi().await.expect("api-read stream");
+    write_frame(&mut send, &request)
+        .await
+        .expect("write ApiRequest");
+    let _ = send.finish();
+    read_frame(&mut recv).await.expect("read ApiResponse")
+}
+
+/// A `GET` of `path` as `on_behalf_of` (or as the service itself).
+fn read_of(path: &str, on_behalf_of: Option<&str>) -> ApiRequest {
+    ApiRequest {
+        id: format!("trace-{path}"),
+        path: path.to_string(),
+        query: None,
+        on_behalf_of: on_behalf_of.map(str::to_string),
+        method: None,
+    }
+}
+
+/// Unwrap an `Ok` answer into (status, body); panics on a refusal, naming it.
+fn ok_answer(answer: ApiResponse) -> (u16, Value) {
+    match answer {
+        ApiResponse::Ok { status, body, .. } => (status, body),
+        ApiResponse::Err { code, message, .. } => {
+            panic!("expected the api to answer, got refusal {code}: {message}")
+        }
+    }
+}
+
+/// A registered service plus a router armed for its reads, plus a seeded
+/// student (id and session cookie).
+async fn api_service(bridge: &AiBridge) -> (FakeService, Router, String, String) {
+    let service = connect_service(
+        bridge,
+        hello("tutor", &[AI_CHAT_CAPABILITY]),
+        Behaviour::Echo,
+    )
+    .await;
+    await_workers(bridge, 1).await;
+    let (app, db) = common::app_with_ai(Some(bridge.clone())).await;
+    let cookie = common::login_as(&app, &db, "ayse", "student").await;
+    let student = common::me_id(&app, &cookie).await;
+    (service, app, student, cookie)
+}
+
+#[tokio::test]
+async fn a_service_reading_on_behalf_of_a_student_gets_that_students_own_answer() {
+    // The entry surface, end to end: what the service reads over QUIC must be
+    // byte-for-byte the JSON that student's own browser gets from REST. A
+    // second-hand answer (the service's own principal, a stale row) would
+    // differ here rather than in whatever the model says weeks later.
+    let bridge = bridge().await;
+    let (service, app, student, cookie) = api_service(&bridge).await;
+
+    let rest = common::send(&app, "GET", "/auth/me", Some(&cookie), None).await;
+    assert_eq!(rest.status, StatusCode::OK);
+
+    let (status, body) =
+        ok_answer(api_read(&service.conn, read_of("/auth/me", Some(&student))).await);
+    assert_eq!(status, 200);
+    assert_eq!(body, rest.body, "the service read a different /auth/me");
+}
+
+#[tokio::test]
+async fn a_service_reading_as_itself_is_the_ai_principal() {
+    // With nobody named, the request runs as the synthetic `ai` principal.
+    // That principal is authenticated (the extension satisfies the extractor),
+    // so an own-scoped read succeeds and returns *its* empty data — while a
+    // role-gated read is a 403, not a 401: the caller is known, just below
+    // every human role.
+    let bridge = bridge().await;
+    let (service, _app, student, _cookie) = api_service(&bridge).await;
+
+    let (status, body) = ok_answer(api_read(&service.conn, read_of("/notes", None)).await);
+    assert_eq!(status, 200);
+    assert_eq!(
+        common::items(&body).len(),
+        0,
+        "the ai principal owns nothing"
+    );
+
+    let (status, _) =
+        ok_answer(api_read(&service.conn, read_of(&format!("/marks/{student}"), None)).await);
+    assert_eq!(
+        status, 403,
+        "reading another person's marks needs teacher+ or a parent link"
+    );
+}
+
+#[tokio::test]
+async fn a_router_status_rides_back_as_an_ok_answer_not_a_refusal() {
+    // The `Err` frame is reserved for bridge refusals. Anything the API itself
+    // answered — including a 404 — is an `Ok` carrying that status, so a
+    // service can tell "I was not allowed to ask" from "I asked and this is
+    // the answer".
+    let bridge = bridge().await;
+    let (service, _app, _student, _cookie) = api_service(&bridge).await;
+
+    let (status, _) = ok_answer(api_read(&service.conn, read_of("/notes/nosuchnote", None)).await);
+    assert_eq!(status, 404);
+}
+
+#[tokio::test]
+async fn a_dead_user_id_is_refused_rather_than_run_as_somebody() {
+    // The principal is loaded live, so a service holding an id of a user who
+    // has since been deleted is told so — never silently downgraded to the ai
+    // principal, which would answer a question about the wrong person.
+    let bridge = bridge().await;
+    let (service, _app, _student, _cookie) = api_service(&bridge).await;
+
+    match api_read(&service.conn, read_of("/auth/me", Some("ghost"))).await {
+        ApiResponse::Err { code, id, .. } => {
+            assert_eq!(code, "unknown_user");
+            assert_eq!(id, "trace-/auth/me", "the trace id comes back");
+        }
+        other => panic!("a dead id must not be dispatched: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn the_record_form_of_a_user_id_reads_the_same_as_the_bare_key() {
+    // The protocol doc spells the id `user:<key>`, REST paths spell it bare.
+    // Both are the same person; accepting only one would make the contract a
+    // trap for the first service that copies the doc example.
+    let bridge = bridge().await;
+    let (service, _app, student, _cookie) = api_service(&bridge).await;
+
+    let bare = ok_answer(api_read(&service.conn, read_of("/auth/me", Some(&student))).await);
+    let prefixed = ok_answer(
+        api_read(
+            &service.conn,
+            read_of("/auth/me", Some(&format!("user:{student}"))),
+        )
+        .await,
+    );
+    assert_eq!(bare, prefixed);
+}
+
+#[tokio::test]
+async fn the_query_field_reaches_the_route_as_a_real_query_string() {
+    // Paging is how a service reads a long list without blowing the frame cap,
+    // so `query` has to arrive at the handler rather than being dropped: two
+    // notes exist, `limit=1` must return one of them and still report the total.
+    let bridge = bridge().await;
+    let (service, app, student, cookie) = api_service(&bridge).await;
+    for title in ["ilk not", "ikinci not"] {
+        let res = common::send(
+            &app,
+            "POST",
+            "/notes",
+            Some(&cookie),
+            Some(json!({ "title": title })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    }
+
+    let mut request = read_of("/notes", Some(&student));
+    request.query = Some("limit=1&offset=0".to_string());
+    let (status, body) = ok_answer(api_read(&service.conn, request).await);
+    assert_eq!(status, 200);
+    assert_eq!(
+        common::items(&body).len(),
+        1,
+        "limit=1 was honoured: {body}"
+    );
+    assert_eq!(common::total(&body), 2, "both notes were counted: {body}");
+}
+
+#[tokio::test]
+async fn the_ai_principal_cannot_be_forged_over_http() {
+    // The whole reason the principal travels as a request *extension*: nothing
+    // arriving on the public HTTP port can set one. A caller with no cookie
+    // stays unauthenticated however it names the header.
+    use tower::ServiceExt;
+    let bridge = bridge().await;
+    let (_service, app, student, _cookie) = api_service(&bridge).await;
+
+    let spoofs = [
+        ("ai-principal", student.as_str()),
+        ("x-ai-principal", student.as_str()),
+        ("aiprincipal", student.as_str()),
+        ("on-behalf-of", student.as_str()),
+    ];
+    for (header, value) in spoofs {
+        let request = axum::http::Request::builder()
+            .uri("/auth/me")
+            .header(header, value)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.expect("router answered");
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "header `{header}` bought a session"
+        );
+    }
+    // And a cookie-less read of the same path is 401 with no header at all.
+    let res = common::send(&app, "GET", "/auth/me", None, None).await;
+    assert_eq!(res.status, StatusCode::UNAUTHORIZED);
+}
+
 #[tokio::test]
 async fn a_configured_bridge_listens_and_serves_a_real_handshake() {
     // The whole point of the wiring: what `start_bridge` returns is a live
