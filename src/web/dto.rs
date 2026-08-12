@@ -15,7 +15,7 @@ use crate::domain::subject::Subject;
 use crate::domain::user::{User, UserId};
 use crate::error::AppError;
 
-/// The five access roles, lowest to highest privilege (`parent` is a read-only
+/// The access roles, lowest to highest privilege (`parent` is a read-only
 /// observer of its linked students). The web-facing mirror of
 /// [`crate::domain::role::Role`] — it carries the serde + OpenAPI derives (which
 /// the domain type deliberately omits), so it renders as a proper `enum` in the
@@ -23,6 +23,10 @@ use crate::error::AppError;
 #[derive(Serialize, Clone, Copy, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
+    /// Internal service principal — never assignable, never stored. It appears
+    /// here only because the mapping from the domain enum is exhaustive; the
+    /// assignable set is what `GET /limits` lists, and that omits it.
+    Ai,
     Parent,
     Student,
     Teacher,
@@ -33,6 +37,7 @@ pub enum Role {
 impl From<DomainRole> for Role {
     fn from(role: DomainRole) -> Self {
         match role {
+            DomainRole::Ai => Role::Ai,
             DomainRole::Parent => Role::Parent,
             DomainRole::Student => Role::Student,
             DomainRole::Teacher => Role::Teacher,

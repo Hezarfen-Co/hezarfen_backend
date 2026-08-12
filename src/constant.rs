@@ -670,7 +670,10 @@ pub const MILLIS_PER_WEEK: i64 = 7 * MILLIS_PER_DAY;
 
 // --- enum value tables -------------------------------------------------
 
-/// Every role, lowest privilege first.
+/// Every *assignable* role, lowest privilege first. `Role::Ai` is deliberately
+/// absent: it is a service principal, so leaving it out of this table is what
+/// keeps `Role::try_from_str` (and every surface that lists roles) from ever
+/// handing it to a user.
 pub const ROLES: [Role; 5] = [
     Role::Parent,
     Role::Student,
@@ -678,6 +681,10 @@ pub const ROLES: [Role; 5] = [
     Role::Manager,
     Role::Admin,
 ];
+
+/// The record key `User::ai_principal` carries. A literal, not a ULID, so it
+/// can never collide with a minted user row — and the row is never written.
+pub const AI_PRINCIPAL_KEY: &str = "ai_service";
 
 pub const THEMES: [Theme; 2] = [Theme::Light, Theme::Dark];
 

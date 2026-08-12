@@ -3,11 +3,17 @@ use surrealdb::types::SurrealValue;
 use crate::constant::ROLES;
 use crate::error::ValidationError;
 
-/// The five access levels, in ascending order of privilege.
+/// The access levels, in ascending order of privilege.
 ///
 /// The variants are declared low-to-high, so the derived `Ord` matches the
 /// hierarchy: `Role::Admin > Role::Teacher`. That ordering is exactly what
 /// [`Role::at_least`] relies on — a higher role satisfies any lower requirement.
+///
+/// `Ai` is not a human role at all: it is the principal an out-of-process AI
+/// service carries over the QUIC bridge. It is declared first so it clears no
+/// `at_least` bar above itself, it is absent from [`ROLES`] (the assignable
+/// set) so [`Role::try_from_str`] rejects `"ai"`, and no HTTP surface can put
+/// it on a user row — the only value of it lives in `User::ai_principal`.
 ///
 /// `Parent` sits at the bottom: a read-only observer of the students linked to
 /// it (see `domain::parent_link`). It clears no `at_least` bar and fails every
@@ -21,6 +27,7 @@ use crate::error::ValidationError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, SurrealValue)]
 #[surreal(untagged, rename_all = "lowercase")]
 pub enum Role {
+    Ai,
     Parent,
     Student,
     Teacher,
@@ -32,6 +39,7 @@ impl Role {
     /// The wire/storage form. Must stay in lockstep with `rename_all = "lowercase"`.
     pub fn as_str(self) -> &'static str {
         match self {
+            Role::Ai => "ai",
             Role::Parent => "parent",
             Role::Student => "student",
             Role::Teacher => "teacher",
@@ -40,7 +48,9 @@ impl Role {
         }
     }
 
-    /// Parse a wire string into a role — the inverse of [`Role::as_str`].
+    /// Parse a wire string into a role — the inverse of [`Role::as_str`] for
+    /// the assignable roles only. It searches [`ROLES`], which excludes
+    /// [`Role::Ai`], so `"ai"` is rejected like any other unknown word.
     pub fn try_from_str(value: &str) -> Result<Self, ValidationError> {
         ROLES
             .into_iter()
@@ -87,6 +97,18 @@ mod tests {
         assert!(!Role::Teacher.at_least(Role::Manager));
         // Admin clears every bar.
         assert!(ROLES.iter().all(|&r| Role::Admin.at_least(r)));
+    }
+
+    #[tokio::test]
+    async fn ai_is_a_service_principal_no_client_can_reach() {
+        // Lowest ordinal: it satisfies no requirement a real role can be asked
+        // for, so an AI request clears nothing through the hierarchy.
+        assert!(ROLES.iter().all(|&r| !Role::Ai.at_least(r)));
+        assert!(ROLES.iter().all(|&r| r.at_least(Role::Ai)));
+        // Not assignable: absent from ROLES, so no wire string parses to it.
+        assert!(!ROLES.contains(&Role::Ai));
+        assert!(Role::try_from_str("ai").is_err());
+        assert_eq!(Role::Ai.as_str(), "ai");
     }
 
     #[tokio::test]
