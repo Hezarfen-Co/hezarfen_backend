@@ -25,6 +25,7 @@ use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
 
 use super::courses::visible_courses;
+use super::dto::AssignableRole;
 use super::dto::Role as RoleSchema;
 use super::{
     CurrentUser, Page, PageParams, PersonRef, RequireAdmin, RequireTeacher, UploadFileForm,
@@ -63,8 +64,10 @@ pub fn routes() -> OpenApiRouter<AppState> {
 #[derive(Deserialize, ToSchema)]
 struct SetRole {
     /// The role to assign. Deserialized as a string so an unknown value returns a
-    /// uniform `400`; documented as the `Role` enum so the docs list the choices.
-    #[schema(value_type = RoleSchema, example = "teacher")]
+    /// uniform `400`; documented as the `AssignableRole` enum so the docs list
+    /// exactly the choices the server accepts (the response-side `Role` also
+    /// names the `ai` service principal, which this endpoint has always refused).
+    #[schema(value_type = AssignableRole, example = "teacher")]
     role: String,
 }
 
