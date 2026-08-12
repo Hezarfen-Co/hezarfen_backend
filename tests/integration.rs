@@ -5174,6 +5174,99 @@ async fn admin_manages_roles_with_guards() {
     );
 }
 
+/// The AI service principal must never be mintable, storable, or filterable
+/// over HTTP: it is the QUIC bridge's own identity, not an account anybody can
+/// hold. `Role` carries no `serde` derive (`src/domain/role.rs:21`), so no
+/// handler can bind a role straight out of a body — every request-supplied role
+/// passes `Role::try_from_str`, which answers only with a member of
+/// `constant::ROLES` (`src/constant.rs:674`, the five human roles).
+///
+/// Grep-verified 2026-08-12, the complete set of role paths a request can reach:
+///   * `src/web/users.rs:453` — `PATCH /users/{id}/role`, the *only* path that
+///     writes `user.role` from a caller's string (`Role::try_from_str`).
+///   * `src/web/auth.rs:114` — `POST /auth/register`, hardcoded `Role::Student`
+///     (`User::create` → `create_with_role`, `src/domain/user.rs:334`).
+///   * `src/web/users.rs:231` — the user-search `?role=` filter (a read).
+///   * `src/web/events.rs:89` — a role-audience event stores a role string of
+///     its own on the event row.
+/// The only other `create_with_role` caller is the out-of-band admin bootstrap
+/// (`src/domain/user.rs:426`, hardcoded `Role::Admin`, behind no route).
+///
+/// ponytail: that funnel list is grep-verified, not machine-enforced — a *new*
+/// route writing an arbitrary role string would slip past this test. Upgrade
+/// path: derive the surface list from the emitted OpenAPI, the way the auth-gate
+/// test derives its protected-path set.
+#[tokio::test]
+async fn role_ai_is_unreachable_over_http() {
+    let (app, db) = app_and_db().await;
+    let admin = login_as(&app, &db, "boss", "admin").await;
+    let alice = login(&app, "alice").await;
+    let alice_id = me_id(&app, &alice).await;
+
+    // 1. Registration mints a student and nothing else — read back off the row,
+    //    not off the register echo.
+    let me = send(&app, "GET", "/auth/me", Some(&alice), None).await;
+    assert_eq!(me.body["role"], "student");
+
+    // 2. The one role-write funnel refuses it, and the stored role stands.
+    assert_eq!(
+        send(
+            &app,
+            "PATCH",
+            &format!("/users/{alice_id}/role"),
+            Some(&admin),
+            Some(json!({"role":"ai"}))
+        )
+        .await
+        .status,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        send(
+            &app,
+            "GET",
+            &format!("/users/{alice_id}"),
+            Some(&admin),
+            None
+        )
+        .await
+        .body["role"],
+        "student"
+    );
+
+    // 3. The search filter refuses it too — an unknown role is a 400, never an
+    //    empty page, so a caller can't probe for service accounts.
+    assert_eq!(
+        send(&app, "GET", "/users/search?q=&role=ai", Some(&admin), None)
+            .await
+            .status,
+        StatusCode::BAD_REQUEST
+    );
+
+    // 4. And an event audience, the other surface that stores a role string.
+    assert_eq!(
+        send(
+            &app,
+            "POST",
+            "/events",
+            Some(&admin),
+            Some(json!({ "title": "ai only", "audience": { "kind": "role", "role": "ai" } }))
+        )
+        .await
+        .status,
+        StatusCode::BAD_REQUEST
+    );
+
+    // 5. The published contract never names it. The exact five-role equality is
+    //    pinned in `limits_publishes_the_bounds_the_api_actually_enforces`; this
+    //    is the `ai`-specific
+    //    angle on the same array, so growing `ROLES` fails here as well.
+    let roles = send(&app, "GET", "/limits", None, None).await.body["user"]["roles"].clone();
+    let roles = roles.as_array().expect("limits user.roles array");
+    assert_eq!(roles.len(), 5, "{roles:?}");
+    assert!(!roles.iter().any(|r| r == "ai"), "{roles:?}");
+}
+
 // --- users: personal info (profile) ---------------------------------------
 
 #[tokio::test]
