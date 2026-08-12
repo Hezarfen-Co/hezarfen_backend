@@ -200,6 +200,11 @@ const EXCLUDED: &[(&str, &str)] = &[
         "MAX_ERROR_CODE_LEN",
         "bounds a code the SERVER writes from an AI service's reply; no client sends it",
     ),
+    (
+        "AI_PRINCIPAL_KEY",
+        "record key of the in-memory AI service principal; a client can neither \
+         assign nor address it",
+    ),
     ("REPLY_CHUNKS", "how the SSE stream slices an answer"),
     ("MIN_CHUNK_CHARS", "how the SSE stream slices an answer"),
 ];

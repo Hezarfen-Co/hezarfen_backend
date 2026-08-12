@@ -5,7 +5,7 @@ use argon2::{Argon2, PasswordHasher, PasswordVerifier};
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
 use crate::constant::{
-    APPOINTMENT_SLOT_TABLE, APPOINTMENT_TABLE, BOARD_TABLE, CLASS_GROUP_TABLE,
+    AI_PRINCIPAL_KEY, APPOINTMENT_SLOT_TABLE, APPOINTMENT_TABLE, BOARD_TABLE, CLASS_GROUP_TABLE,
     CLASS_MEMBER_COUNT_FIELD, CLASS_MEMBER_TABLE, COURSE_TABLE, DECOY_PASSWORD,
     ENROLLMENT_COUNT_FIELD, ENROLLMENT_TABLE, PARENT_LINK_TABLE, REGISTRATION_COUNT_FIELD,
     REGISTRATION_FROZEN_GUARD, REGISTRATION_TABLE, USER_TABLE,
@@ -256,6 +256,36 @@ pub struct User {
 }
 
 impl User {
+    /// The in-memory principal an AI service acts as over the QUIC bridge.
+    ///
+    /// Never written to the database, and never read back from one: the id key
+    /// is the literal `"ai_service"`, which no minted row can collide with
+    /// ([`UserId::generate`] only ever produces ULIDs). Every other field is
+    /// inert — the empty password hash parses as no argon2 hash, so it verifies
+    /// against nothing, and [`Role::Ai`] clears no `at_least` bar and fails
+    /// every exact `== Role::Student` / `== Role::Parent` gate.
+    pub(crate) fn ai_principal() -> User {
+        User {
+            id: UserId::from_key(AI_PRINCIPAL_KEY),
+            username: Username(AI_PRINCIPAL_KEY.to_string()),
+            password_hash: PasswordHash(String::new()),
+            role: Role::Ai,
+            name: None,
+            surname: None,
+            email: None,
+            phone: None,
+            birth_date: None,
+            theme: None,
+            language: None,
+            palette_color: None,
+            display_name: None,
+            bio: None,
+            avatar_file: None,
+            avatar_content_type: None,
+            avatar_size: None,
+        }
+    }
+
     pub fn get_id(&self) -> &UserId {
         &self.id
     }
