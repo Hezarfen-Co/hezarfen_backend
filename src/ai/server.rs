@@ -370,15 +370,7 @@ async fn read_api(
     inner: &Inner,
     request: ApiRequest,
 ) -> Result<ApiResponse, (&'static str, String)> {
-    let ApiRequest {
-        id,
-        path,
-        query,
-        on_behalf_of,
-        method,
-    } = request;
-
-    if let Some(refusal) = refuse_before_dispatch(method.as_deref(), &path) {
+    if let Some(refusal) = refuse_before_dispatch(request.method.as_deref(), &request.path) {
         return Err(refusal);
     }
 
@@ -388,6 +380,25 @@ async fn read_api(
         "unavailable",
         "the api is not serving yet — retry".to_string(),
     ))?;
+    dispatch_api(api, request).await
+}
+
+/// The half of [`read_api`] that needs only the armed handle: liveness,
+/// principal, dispatch, and framing the router's answer. Split out from the
+/// listener so the refusal codes it owns can be exercised without a QUIC
+/// endpoint (see this module's tests).
+async fn dispatch_api(
+    api: &ApiHandle,
+    request: ApiRequest,
+) -> Result<ApiResponse, (&'static str, String)> {
+    let ApiRequest {
+        id,
+        path,
+        query,
+        on_behalf_of,
+        ..
+    } = request;
+
     // The outer db guard is one of the layers this path deliberately skips, so
     // the same liveness check happens here instead: a query issued against a
     // dead socket hangs rather than failing (see [`DbHealth`]).
@@ -483,10 +494,24 @@ fn refusal(id: String, code: &str, message: String) -> ApiResponse {
 /// dropped: a service that got no frame at all would wait out its own deadline
 /// to learn nothing.
 async fn answer(send: &mut quinn::SendStream, response: ApiResponse) {
-    let mut written = write_frame(send, &response).await;
-    if let (Err(FrameError::TooLarge(_)), ApiResponse::Ok { id, .. }) = (&written, &response) {
-        written = write_frame(
-            send,
+    if let Err(e) = write_answer(send, &response).await {
+        tracing::warn!("could not answer an AI service's api read: {e}");
+    }
+    let _ = send.finish();
+}
+
+/// Frame one answer, downgrading an oversize `Ok` as above. [`write_frame`]
+/// checks the size *before* it writes a byte, so the refusal never follows a
+/// half-written frame. Generic over the writer so the downgrade can be asserted
+/// against a buffer.
+async fn write_answer<W: tokio::io::AsyncWrite + Unpin>(
+    w: &mut W,
+    response: &ApiResponse,
+) -> Result<(), FrameError> {
+    let written = write_frame(w, response).await;
+    if let (Err(FrameError::TooLarge(_)), ApiResponse::Ok { id, .. }) = (&written, response) {
+        return write_frame(
+            w,
             &refusal(
                 id.clone(),
                 "too_large",
@@ -495,10 +520,7 @@ async fn answer(send: &mut quinn::SendStream, response: ApiResponse) {
         )
         .await;
     }
-    if let Err(e) = written {
-        tracing::warn!("could not answer an AI service's api read: {e}");
-    }
-    let _ = send.finish();
+    written
 }
 
 /// Read the `Hello`, decide, answer, and register on success.
@@ -626,7 +648,121 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{constant_time_eq, refuse_before_dispatch};
+    use axum::routing::get;
+
+    use super::{
+        AI_MAX_FRAME_BYTES, ApiHandle, ApiRequest, ApiResponse, constant_time_eq,
+        refuse_before_dispatch,
+    };
+    use crate::ai::protocol::read_frame;
+
+    /// An armed handle serving `router`. The database is never touched by these
+    /// reads (nobody is named, so the principal is synthetic), but the handle
+    /// carries one exactly as the live path does.
+    async fn armed(router: axum::Router) -> ApiHandle {
+        ApiHandle {
+            router,
+            db: crate::database::init_mem().await.expect("in-memory db"),
+            db_up: Default::default(),
+        }
+    }
+
+    /// A read of `/notes` as the service itself.
+    fn read_of(path: &str) -> ApiRequest {
+        ApiRequest {
+            id: "trace-1".to_string(),
+            path: path.to_string(),
+            query: None,
+            on_behalf_of: None,
+            method: None,
+        }
+    }
+
+    /// The refusal code, or a panic naming the answer that was not one.
+    fn refused(answer: Result<ApiResponse, (&'static str, String)>) -> &'static str {
+        match answer {
+            Err((code, _)) => code,
+            Ok(other) => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_body_that_is_not_json_is_refused_as_not_json() {
+        // No allowlisted route answers text today, so this stands in for the
+        // day one does: the service is told the body was unreadable rather
+        // than handed a frame whose `body` field silently became a string.
+        let router = axum::Router::new().route("/notes", get(|| async { "plain text" }));
+        let api = armed(router).await;
+        assert_eq!(
+            refused(super::dispatch_api(&api, read_of("/notes")).await),
+            "not_json"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_body_is_a_null_answer_not_a_parse_failure() {
+        // The other side of the same branch: a `204` has nothing to parse and
+        // must not read as `not_json`.
+        let router = axum::Router::new().route(
+            "/notes",
+            get(|| async { axum::http::StatusCode::NO_CONTENT }),
+        );
+        let api = armed(router).await;
+        match super::dispatch_api(&api, read_of("/notes")).await {
+            Ok(ApiResponse::Ok { status, body, .. }) => {
+                assert_eq!(status, 204);
+                assert_eq!(body, serde_json::Value::Null);
+            }
+            other => panic!("an empty body is an Ok answer: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_router_answer_over_the_frame_cap_is_refused_as_too_large() {
+        // The read-side cap: the body is drained with a limit, so an answer
+        // that cannot fit a frame is refused instead of being buffered whole.
+        let router = axum::Router::new().route(
+            "/notes",
+            get(|| async { "x".repeat(AI_MAX_FRAME_BYTES + 1) }),
+        );
+        let api = armed(router).await;
+        assert_eq!(
+            refused(super::dispatch_api(&api, read_of("/notes")).await),
+            "too_large"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversize_ok_is_downgraded_to_a_too_large_refusal() {
+        // The write-side cap: a body that passed the read limit can still
+        // overflow once it is wrapped in its frame. The service must get a
+        // refusal it can log, never silence it waits out — and, because the
+        // size is checked before any byte is written, nothing of the oversize
+        // frame may precede it on the stream.
+        let big = ApiResponse::Ok {
+            id: "trace-1".to_string(),
+            status: 200,
+            body: serde_json::Value::String("x".repeat(AI_MAX_FRAME_BYTES)),
+        };
+        let mut wire = Vec::new();
+        super::write_answer(&mut wire, &big)
+            .await
+            .expect("the downgrade is written");
+
+        let mut rest = &wire[..];
+        match read_frame::<_, ApiResponse>(&mut rest).await {
+            Ok(ApiResponse::Err { id, code, .. }) => {
+                assert_eq!(code, "too_large");
+                assert_eq!(id, "trace-1", "the trace id survives the downgrade");
+            }
+            other => panic!("expected a too_large refusal on the wire: {other:?}"),
+        }
+        assert!(
+            rest.is_empty(),
+            "{} bytes of the oversize frame were written before the refusal",
+            rest.len()
+        );
+    }
 
     #[test]
     fn only_a_get_on_an_allowlisted_path_is_ever_dispatched() {

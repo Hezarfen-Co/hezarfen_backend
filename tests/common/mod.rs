@@ -11,7 +11,7 @@ use axum::http::{HeaderMap, Request, StatusCode};
 use hezarfen_backend::ai::AiBridge;
 use hezarfen_backend::database::Database;
 use hezarfen_backend::rate_limit::RateLimitConfig;
-use hezarfen_backend::state::AppState;
+use hezarfen_backend::state::{AppState, DbHealth};
 use hezarfen_backend::{build_router, database};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -47,6 +47,13 @@ pub async fn app_and_db() -> (Router, Database) {
 /// arms the bridge's api-read handle whenever `ai` is `Some`, so this is the
 /// bootstrap that makes a QUIC service's reads dispatch into a real router.
 pub async fn app_with_ai(ai: Option<AiBridge>) -> (Router, Database) {
+    app_with_ai_health(ai, Default::default()).await
+}
+
+/// [`app_with_ai`] with the liveness flag handed in, so a test can take the
+/// database socket down under a running app — the api-read path re-checks it in
+/// place of the HTTP db guard it bypasses.
+pub async fn app_with_ai_health(ai: Option<AiBridge>, db_up: DbHealth) -> (Router, Database) {
     let db = database::init_mem().await.expect("in-memory db");
     let app = build_router(AppState {
         db: db.clone(),
@@ -58,7 +65,7 @@ pub async fn app_with_ai(ai: Option<AiBridge>) -> (Router, Database) {
         chatbot_limit: Default::default(),
         exam_presence: Default::default(),
         board_hub: Default::default(),
-        db_up: Default::default(),
+        db_up,
         ai,
     });
     (app, db)
