@@ -11,6 +11,7 @@
 //! no head-of-line blocking — a 30-second inference on stream 7 does not delay
 //! the answer on stream 9. Connection setup happens once, not per request.
 //!
+//! * [`api`] — which REST paths a service may read back through the bridge
 //! * [`protocol`] — frames on the wire
 //! * [`chat`] — the JSON payloads carried for the `chat.reply` capability
 //! * [`server`] — the listener, handshake, and [`server::AiBridge::dispatch`]
@@ -20,6 +21,7 @@
 //! The transport is generic; the features land on top of it. So far that is
 //! the chatbot (`web::chatbot`), which routes on the `chat.reply` capability.
 
+pub mod api;
 pub mod chat;
 pub mod error;
 pub mod protocol;

@@ -600,6 +600,35 @@ pub const AI_MAX_REQUEST_TIMEOUT_SECS: u64 = 60;
 /// occupy the listener indefinitely.
 pub const AI_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
 
+/// The only REST paths an AI service may read over the bridge — deny-by-default,
+/// matched segment-wise by [`crate::ai::api`] with `{x}` standing for exactly
+/// one segment. This list *is* the services' access scope, so it is a service
+/// contract documented in `README.md`, not a tunable published at `/limits`
+/// (string arrays are exempt from that completeness gate).
+///
+/// JSON-only, and only what a study-companion needs: who the user is, their
+/// notes, their homework, and their own progress reports. Byte-serving routes
+/// (note files, submission files, avatars, question images) are left out — the
+/// frames carry JSON, and a blob has no business crossing this seam yet.
+pub const AI_API_ALLOWLIST: &[&str] = &[
+    "/auth/me",
+    "/users/me/profile",
+    "/users/{id}/profile",
+    "/notes",
+    "/notes/{id}",
+    "/homework",
+    "/homework/{id}",
+    "/homework/{id}/result",
+    "/homework/{id}/submission",
+    "/homework/report/{user}",
+    "/marks/me",
+    "/marks/{user}",
+    "/attendance/me",
+    "/attendance/{user}",
+    "/pomodoro/me",
+    "/pomodoro/{user}",
+];
+
 // --- rate limiting -----------------------------------------------------
 
 /// Default requests-per-minute-per-IP for `/auth/login` + `/auth/register`.
