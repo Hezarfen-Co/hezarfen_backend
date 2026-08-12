@@ -430,6 +430,30 @@ async fn protected_routes_require_session() {
     );
 }
 
+/// The AI allowlist is a hand-kept list of router paths, so it can only drift
+/// one way: a route is renamed and every entry naming it silently stops
+/// matching, leaving the AI services with a scope that quietly shrank. Pinning
+/// each entry to a `GET` in the emitted document makes the rename break here
+/// instead of out there.
+#[tokio::test]
+async fn ai_allowlist_entries_are_real_get_routes() {
+    let app = mem_app().await;
+    let spec = send(&app, "GET", "/api-docs/openapi.json", None, None)
+        .await
+        .body;
+    let paths = spec["paths"].as_object().expect("spec has paths");
+
+    for entry in hezarfen_backend::constant::AI_API_ALLOWLIST {
+        let item = paths
+            .get(*entry)
+            .unwrap_or_else(|| panic!("allowlisted {entry} is not a path in the OpenAPI document"));
+        assert!(
+            item.get("get").is_some(),
+            "allowlisted {entry} exists but serves no GET"
+        );
+    }
+}
+
 #[tokio::test]
 async fn garbage_cookie_is_unauthorized() {
     let app = mem_app().await;

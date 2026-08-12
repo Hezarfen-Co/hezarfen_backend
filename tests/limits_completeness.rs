@@ -103,6 +103,11 @@ const EXCLUDED: &[(&str, &str)] = &[
     ("AI_KEEPALIVE_SECS", "QUIC connection keepalive"),
     ("AI_HANDSHAKE_TIMEOUT_SECS", "AI service handshake deadline"),
     (
+        "AI_API_ALLOWLIST",
+        "the AI services' read scope; a service contract in README, and \
+         publishing it would hand every browser the map",
+    ),
+    (
         "AI_CHAT_CAPABILITY",
         "capability string an AI service declares",
     ),
