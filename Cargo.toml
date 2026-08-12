@@ -42,11 +42,14 @@ rustls-pemfile = "2.2.0"
 rustls = { version = "0.23.42", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 sha2 = "0.11.0"
 base64 = "0.23"
+# `ServiceExt::oneshot`, which is how the AI bridge dispatches a service's api
+# read into the router. Already compiled — axum depends on this exact crate and
+# feature — so declaring it here adds nothing to the build.
+tower = { version = "0.5", features = ["util"] }
 
 [dev-dependencies]
 # test-util enables tokio::time::pause/advance for the rate limiter tests.
 tokio = { version = "1", features = ["full", "test-util"] }
-tower = { version = "0.5", features = ["util"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "cookies"] }
 tempfile = "3"
 tokio-tungstenite = "0.30.0"
