@@ -16,6 +16,12 @@
 //!   opens it, writes one [`Request`], finishes its send side, and reads one
 //!   [`Response`]. The stream is then closed.
 //!
+//! * Each **api read** goes the other way: the service opens a *client-initiated*
+//!   bidirectional stream (any after the control one), writes one
+//!   [`ApiRequest`], finishes its send side, and reads one [`ApiResponse`].
+//!   That mirrors the REST API — the backend dispatches the path internally —
+//!   so a service asks for school data instead of being handed it.
+//!
 //! There is deliberately no correlation-id matching: QUIC stream IDs already
 //! multiplex concurrent requests over the one connection, independently
 //! flow-controlled, with no head-of-line blocking between them. [`Request::id`]
@@ -123,6 +129,47 @@ pub enum Response {
     Err {
         id: String,
         /// Service-defined, stable, machine-readable (`"unsupported_image"`).
+        code: String,
+        message: String,
+    },
+}
+
+/// A read of the school's own API, written by the *service* on a fresh
+/// client-initiated stream.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApiRequest {
+    /// Trace id (ULID). Not used for correlation — the stream does that.
+    pub id: String,
+    /// Path as the REST API spells it, e.g. `"/users/me"`. No host, no query.
+    pub path: String,
+    /// Query string without the leading `?`, e.g. `"limit=10&offset=0"`.
+    #[serde(default)]
+    pub query: Option<String>,
+    /// User id to execute as, for own-scoped endpoints. Absent means the
+    /// request runs as the service itself.
+    #[serde(default)]
+    pub on_behalf_of: Option<String>,
+    /// HTTP method. Absent means `GET`. Not validated here — the server
+    /// decides what it will dispatch.
+    #[serde(default)]
+    pub method: Option<String>,
+}
+
+/// The backend's single answer frame. `Err` is a bridge-level refusal (path not
+/// allowed, unknown user); an API call that ran and answered `404` is an `Ok`
+/// carrying that status, because the service asked and the API replied.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum ApiResponse {
+    Ok {
+        id: String,
+        /// HTTP status the router produced.
+        status: u16,
+        body: Value,
+    },
+    Err {
+        id: String,
+        /// Bridge-defined, stable, machine-readable (`"path_not_allowed"`).
         code: String,
         message: String,
     },
@@ -303,6 +350,55 @@ mod tests {
         })
         .unwrap();
         assert_eq!(ok["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn api_frame_tags_are_the_documented_wire_names() {
+        // Same reason as above: other-language services match these literals.
+        // The tag is `outcome`, not `status` — `status` is the HTTP code.
+        let ok = serde_json::to_value(ApiResponse::Ok {
+            id: "1".into(),
+            status: 404,
+            body: json!(null),
+        })
+        .unwrap();
+        assert_eq!(ok["outcome"], "ok");
+        assert_eq!(ok["status"], 404);
+        let err = serde_json::to_value(ApiResponse::Err {
+            id: "1".into(),
+            code: "path_not_allowed".into(),
+            message: "nope".into(),
+        })
+        .unwrap();
+        assert_eq!(err["outcome"], "err");
+        assert_eq!(err["code"], "path_not_allowed");
+    }
+
+    #[tokio::test]
+    async fn an_api_request_needs_only_an_id_and_a_path() {
+        let bare: ApiRequest = serde_json::from_value(json!({
+            "id": "01J",
+            "path": "/users/me",
+        }))
+        .unwrap();
+        assert_eq!(bare.query, None);
+        assert_eq!(bare.on_behalf_of, None);
+        assert_eq!(bare.method, None);
+
+        let full = ApiRequest {
+            id: "01J".into(),
+            path: "/notes".into(),
+            query: Some("limit=10".into()),
+            on_behalf_of: Some("user:abc".into()),
+            // Not validated at this layer — any string rides the wire.
+            method: Some("GET".into()),
+        };
+        let raw = serde_json::to_value(&full).unwrap();
+        assert_eq!(raw["path"], "/notes");
+        assert_eq!(raw["query"], "limit=10");
+        assert_eq!(raw["on_behalf_of"], "user:abc");
+        assert_eq!(raw["method"], "GET");
+        assert_eq!(serde_json::from_value::<ApiRequest>(raw).unwrap(), full);
     }
 
     #[tokio::test]
