@@ -3593,7 +3593,9 @@ not the old one) — never as who they used to be.
 Without it the principal is the internal role **`ai`**: the lowest privilege in
 the system, below `parent`. It is not a human role and is never assignable —
 `"ai"` is rejected by every role input, no account can hold it, and it is never
-stored. It appears in the OpenAPI `Role` schema as documentation only. So a
+stored. It appears in the OpenAPI *response* schema `Role` as documentation
+only — request bodies take `AssignableRole`, the five human roles, so no
+generated client or Swagger form offers it. So a
 read that needs a role answers `403` — through the `ok` envelope, with that
 status, like any other API refusal.
 

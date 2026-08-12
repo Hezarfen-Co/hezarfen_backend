@@ -5265,6 +5265,39 @@ async fn role_ai_is_unreachable_over_http() {
     let roles = roles.as_array().expect("limits user.roles array");
     assert_eq!(roles.len(), 5, "{roles:?}");
     assert!(!roles.iter().any(|r| r == "ai"), "{roles:?}");
+
+    // 6. Neither does the OpenAPI document Swagger UI renders its forms from.
+    //    The request schema once `$ref`ed the response-side `Role`, which does
+    //    name `ai` — so the try-it-out form offered a value the funnel above has
+    //    always refused with a 400. Request schemas carry the five; the response
+    //    schema keeps `ai` (a service principal really does read back as one)
+    //    and must say what it is, since utoipa emits only the *type*-level doc
+    //    comment, never a variant's.
+    let spec = send(&app, "GET", "/api-docs/openapi.json", None, None)
+        .await
+        .body;
+    let schemas = &spec["components"]["schemas"];
+    let human = json!(["parent", "student", "teacher", "manager", "admin"]);
+    assert_eq!(schemas["AssignableRole"]["enum"], human, "{schemas:?}");
+    assert_eq!(
+        spec["paths"]["/users/{id}/role"]["patch"]["requestBody"]["content"]
+            ["application/json"]["schema"]["$ref"],
+        "#/components/schemas/SetRole"
+    );
+    assert_eq!(
+        schemas["SetRole"]["properties"]["role"]["$ref"],
+        "#/components/schemas/AssignableRole"
+    );
+    let response_role = &schemas["Role"];
+    assert_eq!(
+        response_role["enum"],
+        json!(["ai", "parent", "student", "teacher", "manager", "admin"]),
+        "{response_role:?}"
+    );
+    let described = response_role["description"]
+        .as_str()
+        .expect("Role schema carries its type-level doc comment");
+    assert!(described.contains("never assignable"), "{described:?}");
 }
 
 // --- users: personal info (profile) ---------------------------------------

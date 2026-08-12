@@ -15,18 +15,39 @@ use crate::domain::subject::Subject;
 use crate::domain::user::{User, UserId};
 use crate::error::AppError;
 
-/// The access roles, lowest to highest privilege (`parent` is a read-only
-/// observer of its linked students). The web-facing mirror of
-/// [`crate::domain::role::Role`] — it carries the serde + OpenAPI derives (which
-/// the domain type deliberately omits), so it renders as a proper `enum` in the
-/// docs. Serializes to the same lowercase strings the domain stores.
+/// The access roles a response can carry, lowest to highest privilege (`parent`
+/// is a read-only observer of its linked students). `ai` is an internal service
+/// principal — the identity an out-of-process AI service carries over the QUIC
+/// bridge. It is never assignable and never stored on a user row, so it only
+/// ever appears in a response; requests take the five human roles
+/// (`AssignableRole`), which is also what `GET /limits` lists.
+///
+/// The web-facing mirror of [`crate::domain::role::Role`] — it carries the serde
+/// + OpenAPI derives (which the domain type deliberately omits), so it renders
+/// as a proper `enum` in the docs. Serializes to the same lowercase strings the
+/// domain stores.
 #[derive(Serialize, Clone, Copy, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
-    /// Internal service principal — never assignable, never stored. It appears
-    /// here only because the mapping from the domain enum is exhaustive; the
-    /// assignable set is what `GET /limits` lists, and that omits it.
     Ai,
+    Parent,
+    Student,
+    Teacher,
+    Manager,
+    Admin,
+}
+
+/// The roles a request may ask for: the five human ones, exactly
+/// [`crate::constant::ROLES`]. Documentation only — the handlers still take the
+/// role as a string and funnel it through
+/// [`crate::domain::role::Role::try_from_str`], so an unknown value is a uniform
+/// `400` rather than a deserialization error. It exists because [`Role`] (the
+/// response schema) also names `ai`, and a request schema pointed at it offered
+/// callers a value the server has always refused.
+#[derive(ToSchema)]
+#[schema(rename_all = "lowercase")]
+#[allow(dead_code)] // Nothing constructs it: the variants exist to be emitted.
+pub enum AssignableRole {
     Parent,
     Student,
     Teacher,
