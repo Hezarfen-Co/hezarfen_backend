@@ -145,6 +145,10 @@ The **AI features live in separate projects**, so the backend also opens a
 QUIC **AI bridge** (`AI_QUIC_ADDR`, off by default): AI services dial in,
 register the capabilities they serve, and each request rides its own QUIC
 stream on that one connection — no correlation ids, no head-of-line blocking.
+A service reads school data back over that same connection: it opens a stream
+of its own for a `GET` against a deny-by-default allowlist of read endpoints,
+optionally *on behalf of* a named user, so an AI feature needs no HTTP session
+and no password of its own.
 The bridge's certificate is published at `GET /ai/certificate` so a service can
 pin it before dialling (see "AI bridge (QUIC)").
 The first thing riding that bridge is the **chatbot**: every signed-in user
@@ -3501,6 +3505,101 @@ is opaque to the transport; its shape belongs to the capability.
 `deadline_ms` is when the backend gives up. A service should abandon the work
 rather than answer late. A handled failure is an `err` frame; a crash is just a
 dropped stream.
+
+### API reads (the other direction)
+
+A service usually needs school data to do its work — who asked, their notes,
+their marks. Rather than handing every service an HTTP session and a password,
+the bridge lets it read the **same REST API** back over the connection it
+already has.
+
+After the handshake the *service* may open further bidi streams, one per read:
+write one `ApiRequest`, finish the send side, read one `ApiResponse`, done.
+Same framing as every other `hab/1` frame; concurrency and correlation are the
+stream, exactly as for capability requests.
+
+```json
+{ "id": "01J...", "path": "/marks/me", "query": "limit=10&offset=0",
+  "on_behalf_of": "user:01J...", "method": "GET" }
+```
+
+`id` is a trace id, echoed back. `path` is the path alone as the REST API
+spells it — no host, and **no query string**, which travels in `query` (without
+the leading `?`). `query`, `on_behalf_of` and `method` are all optional; an
+absent `method` means `GET`, and anything else is refused.
+
+The answer is tagged by `outcome`:
+
+```json
+{ "outcome": "ok",  "id": "01J...", "status": 200, "body": { } }
+{ "outcome": "err", "id": "01J...", "code": "path_not_allowed",
+  "message": "`/users` is not a path AI services may read" }
+```
+
+**Any status the router produced rides as `ok`.** A `401`, a `403`, a `404` is
+the API answering — the service asked and got a reply — so it arrives as `ok`
+with that `status`. `err` is the *bridge* refusing, and the request then never
+reached a handler at all. A client that treats `status >= 400` as a transport
+failure has misread the contract.
+
+| `code` | Meaning |
+| ------ | ------- |
+| `malformed` | The frame was not a readable `ApiRequest`, or `path`+`query` do not form a request target |
+| `method_not_allowed` | `method` was present and was not `GET` |
+| `path_not_allowed` | `path` is not in the read scope below |
+| `unknown_user` | `on_behalf_of` names no user (deleted since the service last saw them) |
+| `unavailable` | The API is not serving yet, the database socket is down, or the read outran the request timeout — retryable |
+| `not_json` | The endpoint answered with a body that is not JSON |
+| `too_large` | The answer does not fit one frame |
+
+Refusals are decided in that order — method, then the allowlist, then the
+principal — so an unknown user on a forbidden path reports the path.
+
+#### The read scope
+
+`GET`-only and deny-by-default. A path must match one of these patterns
+exactly, segment for segment (`src/constant.rs`, `AI_API_ALLOWLIST`):
+
+```
+/auth/me                  /marks/me
+/users/me/profile         /marks/{user}
+/users/{id}/profile       /attendance/me
+/notes                    /attendance/{user}
+/notes/{id}               /pomodoro/me
+/homework                 /pomodoro/{user}
+/homework/{id}
+/homework/{id}/result
+/homework/{id}/submission
+/homework/report/{user}
+```
+
+`{x}` takes exactly one non-empty segment. There is no prefix match and no
+wildcard tail: `/notes` does not admit `/notes/{id}/files/{file_id}`. So a new
+route family is unreachable to the services until somebody adds it on purpose —
+one line in that constant, and an integration test validates every entry
+against the emitted OpenAPI paths, so a renamed route breaks the build rather
+than silently narrowing the scope.
+
+#### Who the request runs as
+
+With `on_behalf_of`, the read executes **as that user**: own-scoped endpoints
+(`/auth/me`, `/notes`, `/marks/me`) return *their* data. Both spellings are
+accepted — the bare key (`01J...`, as a REST path writes it) and the record
+form (`user:01J...`). The account is loaded live from the database on every
+request and never trusted from the frame, so a service holding a stale id acts
+as a user who has since been deleted (`unknown_user`) or demoted (the new role,
+not the old one) — never as who they used to be.
+
+Without it the principal is the internal role **`ai`**: the lowest privilege in
+the system, below `parent`. It is not a human role and is never assignable —
+`"ai"` is rejected by every role input, no account can hold it, and it is never
+stored. It appears in the OpenAPI `Role` schema as documentation only. So a
+read that needs a role answers `403` — through the `ok` envelope, with that
+status, like any other API refusal.
+
+Responses share the frame cap (8 MiB); an answer that does not fit comes back
+as `too_large` rather than a dropped stream, so a page too big is narrowed with
+`query` instead of waited out.
 
 ### Framing
 
