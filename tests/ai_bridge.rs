@@ -1507,6 +1507,39 @@ async fn a_router_status_rides_back_as_an_ok_answer_not_a_refusal() {
 }
 
 #[tokio::test]
+async fn a_down_database_socket_is_refused_as_unavailable_rather_than_parked() {
+    // This path skips the HTTP layers, the db guard among them, so it re-checks
+    // liveness itself: a query issued while the socket is down does not fail,
+    // it parks until the socket returns. A service has to be told to retry
+    // instead of waiting out its own deadline on a read nobody is running.
+    let bridge = bridge().await;
+    let service = connect_service(
+        &bridge,
+        hello("tutor", &[AI_CHAT_CAPABILITY]),
+        Behaviour::Echo,
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let health = hezarfen_backend::state::DbHealth::default();
+    let (_app, _db) = common::app_with_ai_health(Some(bridge.clone()), health.clone()).await;
+
+    health.set(false);
+    match api_read(&service.conn, read_of("/notes", None)).await {
+        ApiResponse::Err { code, id, .. } => {
+            assert_eq!(code, "unavailable");
+            assert_eq!(id, "trace-/notes", "the trace id comes back");
+        }
+        other => panic!("a read against a down database must be refused: {other:?}"),
+    }
+
+    // And that refusal is the flag's doing, not a broken bridge: the same read
+    // on the same stream-opening service answers once the socket is back.
+    health.set(true);
+    let (status, _) = ok_answer(api_read(&service.conn, read_of("/notes", None)).await);
+    assert_eq!(status, 200);
+}
+
+#[tokio::test]
 async fn a_dead_user_id_is_refused_rather_than_run_as_somebody() {
     // The principal is loaded live, so a service holding an id of a user who
     // has since been deleted is told so — never silently downgraded to the ai
