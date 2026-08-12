@@ -5280,8 +5280,8 @@ async fn role_ai_is_unreachable_over_http() {
     let human = json!(["parent", "student", "teacher", "manager", "admin"]);
     assert_eq!(schemas["AssignableRole"]["enum"], human, "{schemas:?}");
     assert_eq!(
-        spec["paths"]["/users/{id}/role"]["patch"]["requestBody"]["content"]
-            ["application/json"]["schema"]["$ref"],
+        spec["paths"]["/users/{id}/role"]["patch"]["requestBody"]["content"]["application/json"]["schema"]
+            ["$ref"],
         "#/components/schemas/SetRole"
     );
     assert_eq!(
