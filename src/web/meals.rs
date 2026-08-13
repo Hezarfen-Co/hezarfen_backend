@@ -231,9 +231,13 @@ async fn one_menu(
     )))
 }
 
-/// Publish a menu for one day and meal slot. Requires manager+. The slot must
-/// be one the school currently serves, and a day+slot already published is a
-/// `409` — edit that menu instead of publishing a second one.
+/// Publish a menu for one day and meal slot. Requires manager+. `date` is
+/// `YYYY-MM-DD` text and must be a real calendar day (`2026-02-29` is a `400`:
+/// a menu on a day that does not exist has no serving instant, so no booking
+/// cutoff). The slot must be one the school currently serves and may not
+/// contain `/ \ ? # %` (it becomes part of the menu's URL id). A day+slot
+/// already published is a `409` — edit that menu instead of publishing a
+/// second one.
 ///
 /// The day must not already be over (`400`): a published menu is a bookable
 /// one, and a booking is what charges the student. Today counts as ahead, all
@@ -934,9 +938,13 @@ async fn list_menu_bookings(
 
 /// Give the seat back. The row survives, flipped to `cancelled` — the seat is
 /// free for someone else, and the cancellation stays auditable. Only the
-/// student it is for, or their parent, may cancel it — and for them it is
-/// refused (`409`) once the school's `meal_cancel_cutoff_minutes` has closed
-/// the meal.
+/// student it is for, or their parent, **or any manager+**, may cancel it — and
+/// for the student and their parent it is refused (`409`) once the school's
+/// `meal_cancel_cutoff_minutes` has closed the meal, a cutoff a manager+ is not
+/// bound by. Idempotent: cancelling again is a `200` that replays the refund.
+/// `409` too when the menu's date is not a real calendar day, since no cutoff
+/// can be worked out from one, and when the seat was booked again while the
+/// call ran, since only the attempt it read is ever released.
 ///
 /// Manager+ may cancel anyone's booking, and is not bound by the cutoff — the
 /// seat and the money have to stay reachable when the student it was booked for
@@ -1344,7 +1352,7 @@ async fn ensure_can_read_money(
     ))
 }
 
-/// What the caller owes or has on account.
+/// What the caller owes or has on account, in minor units (negative = owes).
 #[utoipa::path(
     get,
     path = "/balance/me",

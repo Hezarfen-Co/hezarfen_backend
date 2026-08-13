@@ -344,8 +344,11 @@ async fn list_messages(
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 
-/// Ask the chatbot. Answers `202` the moment both rows are written — the
-/// answer itself lands later, in the reserved assistant row.
+/// Ask the chatbot: `{content}`, at most the school's
+/// `max_chatbot_message_len`. Answers `202 {message_id, status: "pending"}` the
+/// moment both rows are written — the answer itself lands later, in the
+/// reserved assistant row. `503` when no AI service offers `chat.reply`, and
+/// nothing is written; `429` + `Retry-After` over the per-user send limit.
 ///
 /// Order matters and is deliberate: the per-user rate limit is charged
 /// *before* anything is written, so a refused turn leaves no trace;

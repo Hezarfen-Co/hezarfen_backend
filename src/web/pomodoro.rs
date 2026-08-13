@@ -141,13 +141,14 @@ async fn start(
 }
 
 /// Finish the running pomodoro session, closing it with a server-stamped
-/// instant. `409` when nothing is running.
+/// instant (`409` when nothing is running); answers `counted` — whether it
+/// moved the badge counters (ran at least `pomodoro.min_counted_ms`, within
+/// that UTC day's `pomodoro.max_counted_per_day`).
 ///
-/// The response's `counted` says whether the stint moved the lifetime pomodoro
-/// counters — the badges and the study streak read those. It counts when it ran
-/// at least `pomodoro.min_counted_ms` and is within that UTC day's
-/// `pomodoro.max_counted_per_day` (both published on `GET /limits`); the day
-/// bucket rolls at midnight UTC. A stint that counts for nothing is still
+/// The counters `counted` speaks for are the lifetime pomodoro ones — the
+/// badges and the study streak read those. Both bounds are published on
+/// `GET /limits`; the day bucket rolls at midnight UTC. A stint that counts
+/// for nothing is still
 /// recorded, still listed, and still sums into `total_focus_ms` — only the
 /// badge counters are held to the rule, because finishing is self-service and a
 /// counter moved once per round-trip is farmable.

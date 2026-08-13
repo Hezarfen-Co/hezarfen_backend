@@ -227,7 +227,7 @@ async fn list_plans(
     Ok(Json(Page::new(items, total, limit, offset)))
 }
 
-/// One fee plan.
+/// One fee plan with its schedule.
 #[utoipa::path(
     get,
     path = "/plans/{id}",

@@ -5,7 +5,7 @@ courses, attendance, pomodoro, meals) on SurrealDB v3. Swagger UI at `/swagger`.
 
 ## Project docs — query the knowledge base, do NOT read README.md
 
-README.md is 73KB (~18k tokens). Its `##` sections live in an embedded
+README.md is ~355KB (~90k tokens). Its `##` sections live in an embedded
 SurrealDB knowledge base. Fetch only what you need:
 
 ```bash
@@ -69,13 +69,21 @@ live `ls src/` win on conflict.
   exploration out of the main context.
 - Quiet commands: `cargo test --quiet 2>&1 | tail -30`,
   `cargo build 2>&1 | tail -15`.
+- Default for a small change: the scoped suite, `cargo test --test <file>`
+  (or `cargo nextest run --test <file>`).
+- Full suite: `cargo nextest run` — runs the ~21 test binaries
+  process-per-test in parallel instead of binary-serial. This repo has zero
+  doctests, so nothing is lost vs `cargo test`, which still works as a
+  fallback.
 
 ## Conventions
 
 - No `PUT`. Routes use `GET`/`POST`/`DELETE`/`PATCH` only.
-- API contract changes move three doc surfaces together: utoipa annotations,
-  the tag descriptions in `lib.rs`, and `README.md` (intro, route table, and
-  the relevant section).
+- API contract changes move the utoipa annotations and the tag descriptions
+  in `lib.rs` by hand. README's `## Endpoints` table is GENERATED — regen with
+  `UPDATE_DOCS=1 cargo test --test doc_sync`; plain `cargo test --test
+  doc_sync` fails on drift, so the suite gates it. README prose sections stay
+  hand-written.
 - Pre-customer, so clean breaks are fine — but any validation change needs
   its stale-data impact analyzed first: existing rows may already violate the
   new rule.
