@@ -78,7 +78,7 @@ use super::{
 ///
 /// Lock order, where both are taken: `HOMEWORK_LOCK` before the counter lock in
 /// [`crate::domain::cap`], never the reverse.
-// ponytail: global RwLock, shard per-homework if write latency ever matters.
+// corner-cut: global RwLock, shard per-homework if write latency ever matters.
 pub(crate) static HOMEWORK_LOCK: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
 
 pub fn routes() -> OpenApiRouter<AppState> {

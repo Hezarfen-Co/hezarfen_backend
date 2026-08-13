@@ -32,7 +32,7 @@ use crate::error::{AppError, ValidationError};
 /// slot-removal guard: those went to conditional single-record writes
 /// ([`crate::domain::cap`]), which the store decides as this lock cannot.
 //
-// ponytail: the dish cap therefore rests on this lock alone — a dish write
+// corner-cut: the dish cap therefore rests on this lock alone — a dish write
 // added without taking it reopens the count-then-write hole silently. Closing
 // it properly is another `cap` counter (`dish_count` on the menu row) plus its
 // backfill; the ceiling is 51 dishes on a menu, not money or a seat, so it was

@@ -5192,7 +5192,7 @@ async fn admin_manages_roles_with_guards() {
 /// The only other `create_with_role` caller is the out-of-band admin bootstrap
 /// (`src/domain/user.rs:426`, hardcoded `Role::Admin`, behind no route).
 ///
-/// ponytail: that funnel list is grep-verified, not machine-enforced — a *new*
+/// corner-cut: that funnel list is grep-verified, not machine-enforced — a *new*
 /// route writing an arbitrary role string would slip past this test. Upgrade
 /// path: derive the surface list from the emitted OpenAPI, the way the auth-gate
 /// test derives its protected-path set.

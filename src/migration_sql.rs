@@ -1379,7 +1379,7 @@ pub const BACKFILL: &str = "
     -- withdrawal exactly what the seed credited it. Absolute like every SET
     -- below, so it converges on a forced re-seed.
     --
-    -- ponytail: editing this block re-runs it (the fingerprint gate), and unlike
+    -- corner-cut: editing this block re-runs it (the fingerprint gate), and unlike
     -- the board sweep above this one is only *mostly* re-runnable. Every SET is
     -- absolute, so a re-run converges on the rows that exist — but two of the
     -- counters are lifetime tallies the request path never decrements while the

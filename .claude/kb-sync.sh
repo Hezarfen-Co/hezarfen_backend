@@ -19,7 +19,7 @@ ingest() {
 }
 
 check() {
-  # ponytail: substring match on "<name>.rs" anywhere in README — a module
+  # corner-cut: substring match on "<name>.rs" anywhere in README — a module
   # mentioned outside ## Layout also counts; tighten to the section if it lies
   missing=""
   for f in src/domain/*.rs src/web/*.rs; do

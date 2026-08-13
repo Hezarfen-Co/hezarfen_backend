@@ -953,7 +953,7 @@ pub const USER_BOARD_COUNT_FIELD: &str = "board_count";
 /// at zero, and absent means zero: an account older than the columns reads
 /// exactly like a fresh one.
 //
-// ponytail: that cascade ruling is also the farm's long way round — delete the
+// corner-cut: that cascade ruling is also the farm's long way round — delete the
 // *exam* instead of the mark and the credit stands, so the loop still climbs,
 // at a couple of requests a point rather than two. Closing it means
 // `Exam::delete`, `Homework::delete` and `Course::delete` refunding per swept
