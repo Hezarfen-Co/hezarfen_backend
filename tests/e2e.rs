@@ -2468,7 +2468,7 @@ async fn a_lagged_socket_resyncs_to_exactly_what_the_database_holds() {
     // between the two ends swallowed ~1200 frames on this machine before the
     // room's writer stalled, and only then does the 256-frame channel start
     // dropping — so the count carries roughly 2x the measured margin.
-    // ponytail: a host with `net.ipv4.tcp_wmem` tuned far past the 4 MB
+    // corner-cut: a host with `net.ipv4.tcp_wmem` tuned far past the 4 MB
     // default could buffer more than this and the lag would stop being
     // forced; the test would then pass vacuously up to the resync assert,
     // which fails loudly rather than silently.

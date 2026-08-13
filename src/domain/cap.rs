@@ -21,7 +21,7 @@
 //! zero, so no Rust struct carries them and no whole-row save can clobber one
 //! (every parent's `.content()` write is a create of a fresh row).
 //
-// ponytail: a counter can only drift if a future delete path forgets its
+// corner-cut: a counter can only drift if a future delete path forgets its
 // decrement, and the boot backfill seeds most counters once rather than
 // recomputing them. `enrollment_count` is the one that already drifted (the boot
 // sweep of promoted users' rows kept their seats), so it is recomputed on every
@@ -52,7 +52,7 @@ use crate::error::AppError;
 /// 16-racer round had one more caller told it had won than the counter agreed
 /// to). The real ws server never did this in 150 rounds of the same probe.
 //
-// ponytail: one lock for every cap. Per-parent locks (a keyed map) if unrelated
+// corner-cut: one lock for every cap. Per-parent locks (a keyed map) if unrelated
 // caps ever contend measurably — the counters are already independent, this is
 // only about how many writes a process has in flight.
 static CLAIM_LOCK: Mutex<()> = Mutex::const_new(());

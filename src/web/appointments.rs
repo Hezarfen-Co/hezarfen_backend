@@ -373,7 +373,7 @@ async fn publish_slots(
 /// people who published bookable time. Same for the `teacher` / `proposed_by` /
 /// `decided_by` refs on a booking. Pinned by
 /// `tests/regress_appointments.rs::a_parent_reads_the_slot_teachers_identity`.
-// ponytail: occupancy would be one query per slot with today's domain API; a
+// corner-cut: occupancy would be one query per slot with today's domain API; a
 // batch "live bookings for these slots" read would let the list carry it.
 #[utoipa::path(
     get,

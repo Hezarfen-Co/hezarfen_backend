@@ -140,7 +140,7 @@ impl HomeworkResult {
     /// its own, and the two leases are mutually exclusive in the one process
     /// this backend runs as, so the interleaving never gets a window.
     //
-    // ponytail: that makes the freeze depend on lock discipline at the call
+    // corner-cut: that makes the freeze depend on lock discipline at the call
     // sites, not on this row. Moving a student write's lease to *after* its
     // database write — or sharding HOMEWORK_LOCK per homework — reopens the
     // window with nothing to catch it. Closing it in the domain layer needs a

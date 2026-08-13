@@ -267,7 +267,7 @@ async fn forward(
     // it published them: only the head can match, which keeps the check O(1)
     // and cannot swallow someone else's mark that happens to be next.
     //
-    // ponytail: that ordering is an unenforced coupling — the head only ever
+    // corner-cut: that ordering is an unenforced coupling — the head only ever
     // matches because `mine.push_back` immediately precedes `publish` in
     // `handle_message`, on a loop that is single-threaded per socket. Separate
     // those two lines (or publish from anywhere else) and this socket starts
@@ -289,7 +289,7 @@ async fn forward(
     // tick noticed. Re-derived against the database, never read off the frame:
     // the frame is the prompt, the row is the authority.
     //
-    // ponytail: that is one `live_board` (two reads) per forwarded frame, paid
+    // corner-cut: that is one `live_board` (two reads) per forwarded frame, paid
     // by every listening socket, where the fan-out used to be read-free — a
     // busy board now multiplies its database traffic by the size of the room.
     // The drawer's own echo is dropped above without paying it, which is the

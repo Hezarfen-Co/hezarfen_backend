@@ -178,7 +178,7 @@ impl SessionAttendance {
     /// Both are floored/guarded rather than trusting the column to exist: a row
     /// written before these columns carries none of them.
     //
-    // ponytail: that asymmetry leaves a teacher able to inflate a *student's*
+    // corner-cut: that asymmetry leaves a teacher able to inflate a *student's*
     // attendance with future-dated lessons. Closing it needs the credit stamped
     // on the roll-call row itself and refunded off that stamp — the same column
     // the live-role note on `remove` below wants, and the shape
@@ -306,7 +306,7 @@ impl SessionAttendance {
     ///
     /// Sound to re-send: neither statement can answer "already exists".
     //
-    // ponytail: both ends read the *live* role, so a student promoted between
+    // corner-cut: both ends read the *live* role, so a student promoted between
     // being marked present and having that row corrected leaves the counter one
     // high (the credit landed as a student, the refund is refused as staff).
     // Upgrade path is stamping the credit on the roll-call row itself and

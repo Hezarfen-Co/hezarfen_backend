@@ -96,7 +96,7 @@ impl Scheduled for Exam {
 /// the subject's own reference counter
 /// ([`crate::domain::subject::Subject::delete`]), which every question create,
 /// re-tag and delete moves.
-// ponytail: global RwLock, shard per-exam if save latency ever matters.
+// corner-cut: global RwLock, shard per-exam if save latency ever matters.
 pub(crate) static EXAM_LOCK: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
 
 pub fn routes() -> OpenApiRouter<AppState> {
@@ -605,7 +605,7 @@ async fn delete_exam(
     // an image row written after that snapshot would strand its bytes on disk
     // even though the row itself is now refused.
     //
-    // ponytail: process-local, so it holds because the deployment is a single
+    // corner-cut: process-local, so it holds because the deployment is a single
     // replica with stop-the-world deploys (two overlapping binaries would
     // reopen it). Closing it in the store means the `cap` shape the counter
     // work already sketched: `claim_and_create` gaining a second record to

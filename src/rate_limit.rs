@@ -290,7 +290,7 @@ impl<K: Eq + Hash> RateLimiter<K> {
 
         // Only a *new* key can grow the map, so only a new key pays for a sweep
         // — a client already in there stays one hash lookup, saturated or not.
-        // ponytail: while the map is saturated every new key still pays one
+        // corner-cut: while the map is saturated every new key still pays one
         // O(n) scan. Ceiling: it takes 10k live exhausted clients to get there
         // and the scan is the attacker's own request. Upgrade path: keep the
         // earliest `window_start` beside the map and skip the scan until then.
@@ -495,7 +495,7 @@ async fn sync_once<K: Eq + Hash + Clone + std::fmt::Display>(
                     // before it began. Only a bucket that has never synced owes
                     // its whole count, having been billed nowhere yet.
                     //
-                    // ponytail: admits between the boundary and this round land
+                    // corner-cut: admits between the boundary and this round land
                     // on the old row. Ceiling: RATE_SYNC_INTERVAL_SECS of one
                     // client's traffic, charged once either way. Upgrade path:
                     // stamp each admit with its epoch.

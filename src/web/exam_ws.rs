@@ -95,7 +95,7 @@ const ROOM: &str = "exam room";
 /// refused). The count this pairs with lives in *this* process's memory
 /// ([`crate::state::ExamPresence`]), so process-wide is exactly the right
 /// scope: there is no room state anywhere else to serialize against.
-// ponytail: global lock, per-attempt locks if room churn ever shows up in a
+// corner-cut: global lock, per-attempt locks if room churn ever shows up in a
 // profile.
 static PRESENCE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -386,7 +386,7 @@ async fn handle_message(
             // like `save_answer_checked` — and dropped before the socket
             // sends, so a slow client never stalls a writer.
             //
-            // ponytail (accepted race, reviewed): the room's sitting was
+            // corner-cut (accepted race, reviewed): the room's sitting was
             // chosen at join, before any lease, so no lock scope can help — a
             // save can land on it just after a retake made it terminal. It
             // writes a history row for the old seq; the grade of record (latest

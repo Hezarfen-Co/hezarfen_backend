@@ -245,7 +245,7 @@ impl Course {
     /// The courses `user` runs — the ones they created plus the ones a manager
     /// assigned them to. A teacher's slice of the catalog.
     ///
-    /// ponytail: unpaged full table scan, and it stays one — every profile read
+    /// corner-cut: unpaged full table scan, and it stays one — every profile read
     /// of a teacher pays it, so the ceiling is the course table's size. It
     /// cannot be indexed away on SurrealDB 3.2.3: an index on `creator` alone
     /// leaves the `OR` a `TableScan` (EXPLAIN), and the per-element index the

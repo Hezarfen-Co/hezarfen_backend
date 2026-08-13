@@ -582,7 +582,7 @@ impl PaymentLedger {
     /// recorded, so a line that is *already* over the ceiling (written before
     /// it existed) still reads, still refunds through its own children, and is
     /// still reversible. Only a fresh line applied to *it* is turned away.
-    // ponytail: one query per line, ceiling MAX_LEDGER_APPLIED_LINES; fold the
+    // corner-cut: one query per line, ceiling MAX_LEDGER_APPLIED_LINES; fold the
     // walk into one recursive statement if that ceiling ever has to rise.
     async fn applied_to(target: &PaymentLedger, db: &Database) -> Result<i64, AppError> {
         let mut total = 0i64;

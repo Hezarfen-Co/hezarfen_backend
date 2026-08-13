@@ -66,7 +66,7 @@ use crate::validate::validate_required;
 /// touch no roster, term, event seat, or exam room, and none of those touch
 /// appointments — so they cannot deadlock. Should a future path ever need two,
 /// take this one *last*.
-// ponytail: global lock; per-teacher locks if appointment traffic ever grows
+// corner-cut: global lock; per-teacher locks if appointment traffic ever grows
 // enough for the contention to matter.
 pub(crate) static APPOINTMENT_LOCK: Mutex<()> = Mutex::const_new(());
 

@@ -73,7 +73,7 @@ fn keepalive(db: Database, health: DbHealth) {
             std::time::Duration::from_secs(hezarfen_backend::constant::DB_PING_TIMEOUT_SECS);
         loop {
             interval.tick().await;
-            // ponytail: an abandoned ping stays queued in the SDK and replays
+            // corner-cut: an abandoned ping stays queued in the SDK and replays
             // when the socket heals, so a long outage lands a burst of no-op
             // `RETURN 1`s on recovery. Harmless; probe over a raw TCP dial
             // instead if that burst ever shows up in a profile.

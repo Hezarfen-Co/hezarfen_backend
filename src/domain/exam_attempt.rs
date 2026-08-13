@@ -424,7 +424,7 @@ impl ExamAttempt {
     /// `swap_remove`s errored slots, so a fixed slot read is meaningless once
     /// anything failed.
     //
-    // ponytail: the count and a concurrent `CREATE exam_attempt` are still not
+    // corner-cut: the count and a concurrent `CREATE exam_attempt` are still not
     // serialized against each other — SurrealDB does not conflict-check a
     // cross-record count (the write skew `domain::cap` exists for), so an
     // attempt landing in the same instant as an edit can still interleave
