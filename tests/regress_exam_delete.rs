@@ -90,6 +90,7 @@ async fn an_attempt_started_inside_a_delete_never_outlives_the_exam() {
         };
         // The start fires inside the held window: without the lease it reads an
         // exam row the delete has removed but not committed.
+        // race-window staging — do not convert to poll
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let sit = {
             let (app, student, exam) = (app.clone(), student.clone(), exam.clone());
