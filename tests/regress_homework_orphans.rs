@@ -146,6 +146,7 @@ async fn an_upload_inside_a_homework_delete_never_orphans() {
     };
     // The upload fires inside the held window: its gate reads a homework the
     // delete has removed but not committed.
+    // race-window staging — do not convert to poll
     tokio::time::sleep(std::time::Duration::from_millis(1_000)).await;
     let uploaded = {
         let (app, student, hw) = (app.clone(), student.clone(), hw.clone());
@@ -263,6 +264,7 @@ async fn an_upload_inside_an_audience_patch_is_refused() {
             .await
         })
     };
+    // race-window staging — do not convert to poll
     tokio::time::sleep(std::time::Duration::from_millis(1_000)).await;
     let uploaded = {
         let (app, cookie, hw) = (app.clone(), dropped_student.clone(), hw.clone());
@@ -511,6 +513,7 @@ async fn a_grade_inside_a_course_delete_never_orphans() {
             (res, started.elapsed())
         })
     };
+    // race-window staging — do not convert to poll
     tokio::time::sleep(std::time::Duration::from_millis(1_000)).await;
     // The roster empties mid-grade — the only staging in which the course
     // delete is admitted at all.
@@ -707,6 +710,7 @@ async fn a_file_add_racing_a_file_delete_never_500s() {
     };
     // The upload commits on the submission row while the delete is still
     // holding its own write of it.
+    // race-window staging — do not convert to poll
     tokio::time::sleep(std::time::Duration::from_millis(40)).await;
     let added = upload_hw_file(&app, &student, &hw).await;
     let removed = removing.await.unwrap();

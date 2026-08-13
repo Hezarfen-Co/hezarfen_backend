@@ -221,6 +221,7 @@ async fn an_attempt_started_inside_a_course_delete_never_outlives_it() {
             .await
         })
     };
+    // race-window staging — do not convert to poll
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     // The enrollment goes while the sitting is mid-write — the only staging in
     // which the delete is admitted at all. Without it this is a 409 and the

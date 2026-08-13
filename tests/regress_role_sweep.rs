@@ -108,6 +108,7 @@ async fn demote_in_the_window(
         let (student, db) = (student.clone(), db.clone());
         tokio::spawn(async move { demote(&student, to, &db).await })
     };
+    // race-window staging — do not convert to poll
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
     handle
 }

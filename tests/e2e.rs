@@ -1371,6 +1371,10 @@ async fn exam_room_close_after_a_retake_leaves_the_new_sitting_alone() {
     assert_eq!(body["attempt"], 2);
 
     // Now walk out of the stale sitting-#1 room and give the teardown time.
+    // race-window staging — do not convert to poll: sitting #1 is terminal, so
+    // the teardown stamps nothing at all (`stamp_left` writes only an
+    // in-progress sitting), and the assertion below is that *no* stamp lands on
+    // sitting #2 — a negative with no positive to wait on.
     ws.close(None).await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
