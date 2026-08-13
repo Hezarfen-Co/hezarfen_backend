@@ -19,23 +19,32 @@ ingest() {
 }
 
 check() {
+  # $2 = the single edited src file (post); empty = full sweep (session)
   # corner-cut: substring match on "<name>.rs" anywhere in README — a module
   # mentioned outside ## Layout also counts; tighten to the section if it lies
+  mods="${2:-src/domain/*.rs src/web/*.rs}"
+  # only domain/web files are ## Layout modules (lib.rs, config.rs, ... are not)
+  case "$mods" in *src/domain/*.rs|*src/web/*.rs) ;; *) mods="" ;; esac
   missing=""
-  for f in src/domain/*.rs src/web/*.rs; do
+  for f in $mods; do
     b=$(basename "$f" .rs)
     [ "$b" = mod ] && continue
     grep -q "$b\.rs" README.md || missing="$missing $b"
   done
   # Route drift: every utoipa path under a lib.rs nest prefix must appear
-  # backticked in the README ## Endpoints table.
+  # backticked in the README ## Endpoints table. Only web/ and lib.rs edits can
+  # introduce drift, so a domain-file edit skips this sweep.
   routes=""
-  while read -r prefix mod; do
-    while read -r p; do
-      full="$prefix$p"; full="${full%/}"
-      grep -qF "\`$full\`" README.md || routes="$routes $full"
-    done < <(grep -oP 'path = "\K[^"]*' "src/web/$mod.rs" 2>/dev/null)
-  done < <(grep -oP '\.nest\("\K[^"]+", web::\w+' src/lib.rs | sed 's/", web::/ /')
+  case "${2:-src/lib.rs}" in
+    *src/web/*.rs|*src/lib.rs)
+      while read -r prefix mod; do
+        while read -r p; do
+          full="$prefix$p"; full="${full%/}"
+          grep -qF "\`$full\`" README.md || routes="$routes $full"
+        done < <(grep -oP 'path = "\K[^"]*' "src/web/$mod.rs" 2>/dev/null)
+      done < <(grep -oP '\.nest\("\K[^"]+", web::\w+' src/lib.rs | sed 's/", web::/ /')
+      ;;
+  esac
   msg=""
   [ -n "$missing" ] && msg="README.md ## Layout is missing src modules:$missing."
   [ -n "$routes" ] && msg="$msg README.md ## Endpoints is missing routes:$routes."
@@ -53,7 +62,7 @@ case "$1" in
     fp=$(jq -r '.tool_input.file_path // empty' 2>/dev/null)
     case "$fp" in
       */README.md) ingest ;;
-      */src/*.rs) check PostToolUse ;;
+      */src/*.rs) check PostToolUse "$fp" ;;
     esac
     ;;
 esac
