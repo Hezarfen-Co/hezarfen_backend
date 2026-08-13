@@ -63,7 +63,9 @@ struct RegisterResponse {
     role: Role,
 }
 
-/// Register a new user account.
+/// Register a new user account: `{username, password}` in, `{username, role}`
+/// back (no `id`; new accounts are `student`). Always `201`, even if the name
+/// was already taken — see "Auth model".
 ///
 /// Answers `201` whether or not the username was free: a distinguishable
 /// "already taken" reply lets anyone unauthenticated enumerate every account in

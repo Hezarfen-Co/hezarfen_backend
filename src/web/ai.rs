@@ -47,7 +47,8 @@ pub struct BridgeCertificateResponse {
     fingerprint_sha256: String,
 }
 
-/// The AI bridge's certificate.
+/// The AI bridge's certificate (PEM + SHA-256 fingerprint) for a service to
+/// pin; `404` when the bridge is off.
 ///
 /// Public: a server certificate is presented to every peer in the TLS
 /// handshake, so publishing it discloses nothing.

@@ -287,6 +287,7 @@ struct TimeResponse {
     now: i64,
 }
 
+/// Server clock: `{now}` UTC unix-millis, for a frontend to sync against.
 #[utoipa::path(
     get,
     path = "/time",
