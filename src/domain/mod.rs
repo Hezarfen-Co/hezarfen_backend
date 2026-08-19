@@ -20,6 +20,8 @@ pub mod class_group;
 pub mod class_member;
 pub mod class_pump;
 pub mod course;
+pub mod course_note;
+pub mod course_note_file;
 pub mod course_session;
 pub mod dietary_profile;
 pub mod enrollment;

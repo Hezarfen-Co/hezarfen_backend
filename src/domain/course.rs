@@ -463,6 +463,8 @@ impl Course {
              DELETE homework_file WHERE submission IN (SELECT VALUE id FROM homework_submission WHERE homework IN (SELECT VALUE id FROM homework WHERE course = $course));
              DELETE homework_submission WHERE homework IN (SELECT VALUE id FROM homework WHERE course = $course);
              DELETE homework_result WHERE homework IN (SELECT VALUE id FROM homework WHERE course = $course);
+             DELETE course_note_file WHERE course_note IN (SELECT VALUE id FROM course_note WHERE course = $course);
+             DELETE course_note WHERE course = $course;
              LET $detached = (DELETE class_course WHERE course = $course RETURN BEFORE);
              FOR $row IN ($detached ?? []) {{
                  UPDATE $row.class SET {CLASS_COURSE_COUNT_FIELD} = \

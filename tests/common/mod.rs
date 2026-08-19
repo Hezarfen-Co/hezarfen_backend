@@ -190,12 +190,12 @@ pub fn multipart_file(filename: &str, content_type: &str, bytes: &[u8]) -> Vec<u
     body
 }
 
-/// Upload `bytes` as a file onto `note` (no assertion). Parses the JSON body
-/// like `send`.
-pub async fn upload_file(
+/// Upload `bytes` as a multipart file to `uri` (no assertion). Parses the
+/// JSON body like `send`.
+pub async fn upload_file_at(
     app: &Router,
     cookie: &str,
-    note: &str,
+    uri: &str,
     filename: &str,
     content_type: &str,
     bytes: &[u8],
@@ -203,7 +203,7 @@ pub async fn upload_file(
     let (status, _, body) = send_raw(
         app,
         "POST",
-        &format!("/notes/{note}/files"),
+        uri,
         Some(cookie),
         Some(&format!(
             "multipart/form-data; boundary={MULTIPART_BOUNDARY}"
@@ -221,6 +221,46 @@ pub async fn upload_file(
         body,
         cookie: None,
     }
+}
+
+/// Upload `bytes` as a file onto a personal `note` (no assertion).
+pub async fn upload_file(
+    app: &Router,
+    cookie: &str,
+    note: &str,
+    filename: &str,
+    content_type: &str,
+    bytes: &[u8],
+) -> Res {
+    upload_file_at(
+        app,
+        cookie,
+        &format!("/notes/{note}/files"),
+        filename,
+        content_type,
+        bytes,
+    )
+    .await
+}
+
+/// Upload `bytes` as a file onto a course `note` (no assertion).
+pub async fn upload_course_note_file(
+    app: &Router,
+    cookie: &str,
+    note: &str,
+    filename: &str,
+    content_type: &str,
+    bytes: &[u8],
+) -> Res {
+    upload_file_at(
+        app,
+        cookie,
+        &format!("/course-notes/{note}/files"),
+        filename,
+        content_type,
+        bytes,
+    )
+    .await
 }
 
 /// Register (password `secret1`) then log in; returns the session `Cookie` value.

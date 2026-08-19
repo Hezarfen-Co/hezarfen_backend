@@ -118,6 +118,30 @@ fn expectations() -> Vec<(&'static str, &'static str, &'static str, i64)> {
             MAX_NOTE_CONTENT_LEN as i64,
         ),
         (
+            "CreateCourseNote",
+            "title",
+            "maxLength",
+            MAX_NOTE_TITLE_LEN as i64,
+        ),
+        (
+            "CreateCourseNote",
+            "content",
+            "maxLength",
+            MAX_NOTE_CONTENT_LEN as i64,
+        ),
+        (
+            "UpdateCourseNote",
+            "title",
+            "maxLength",
+            MAX_NOTE_TITLE_LEN as i64,
+        ),
+        (
+            "UpdateCourseNote",
+            "content",
+            "maxLength",
+            MAX_NOTE_CONTENT_LEN as i64,
+        ),
+        (
             "SendMessage",
             "subject",
             "maxLength",

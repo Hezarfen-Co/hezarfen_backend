@@ -116,6 +116,8 @@ struct NoteLimits {
     max_content_len: usize,
     /// How many files one note may carry.
     max_files: usize,
+    /// How many files one course note may carry.
+    max_course_note_files: usize,
 }
 
 /// Uploaded-file metadata, shared by every upload route.
@@ -496,6 +498,7 @@ impl LimitsResponse {
                 max_title_len: MAX_NOTE_TITLE_LEN,
                 max_content_len: MAX_NOTE_CONTENT_LEN,
                 max_files: MAX_NOTE_FILES,
+                max_course_note_files: MAX_COURSE_NOTE_FILES,
             },
             file: FileLimits {
                 max_name_len: MAX_FILE_NAME_LEN,
