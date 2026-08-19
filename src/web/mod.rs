@@ -12,6 +12,7 @@ pub mod board_ws;
 pub mod boards;
 pub mod chatbot;
 pub mod classes;
+pub mod course_notes;
 pub mod courses;
 pub mod etag;
 pub mod events;

@@ -54,6 +54,9 @@ pub const MAX_NOTE_CONTENT_LEN: usize = 10_000;
 /// How many files one note may carry.
 pub const MAX_NOTE_FILES: usize = 10;
 
+/// How many files one course note may carry.
+pub const MAX_COURSE_NOTE_FILES: usize = 10;
+
 pub const MAX_MESSAGE_SUBJECT_LEN: usize = 200;
 pub const MAX_MESSAGE_BODY_LEN: usize = 10_000;
 /// A message's optional sender-chosen tag ("Etüt", "Sınav", …) — free text,
@@ -818,6 +821,8 @@ pub const SESSION_TABLE: &str = "session";
 pub const NOTE_TABLE: &str = "note";
 pub const MESSAGE_TABLE: &str = "message";
 pub const NOTE_FILE_TABLE: &str = "note_file";
+pub const COURSE_NOTE_TABLE: &str = "course_note";
+pub const COURSE_NOTE_FILE_TABLE: &str = "course_note_file";
 pub const EVENT_TABLE: &str = "event";
 pub const ATTENDANCE_TABLE: &str = "attendance";
 pub const REGISTRATION_TABLE: &str = "registration";
@@ -915,6 +920,7 @@ pub const FEE_PLAN_ASSIGNMENT_COUNT_FIELD: &str = "assignment_count";
 /// row and would license editing a plan a family is already being billed for.
 pub const FEE_PLAN_UNASSIGNED_GUARD: &str = "(assignment_count ?? 0) = 0";
 pub const NOTE_FILE_COUNT_FIELD: &str = "file_count";
+pub const COURSE_NOTE_FILE_COUNT_FIELD: &str = "file_count";
 pub const SUBMISSION_FILE_COUNT_FIELD: &str = "file_count";
 pub const CHATBOT_THREAD_COUNT_FIELD: &str = "chatbot_thread_count";
 /// The column a *grant* claim moves and puts back, so its transaction writes

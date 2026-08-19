@@ -8,10 +8,11 @@ use axum::http::{Request, StatusCode};
 use common::{
     app_and_db, create_course, create_exam, create_exam_with, create_homework, create_session,
     create_subject, enroll, id_of, login, login_as, me_id, mem_app, send, set_role, unenroll,
+    upload_course_note_file,
 };
 use hezarfen_backend::constant::{
-    BANK_VISIBILITY_SCHOOL, MAX_BOARD_STROKES, MAX_BOARDS_PER_CREATOR, MAX_EPOCH_STROKES,
-    MAX_FEE_PLAN_ASSIGN_STUDENTS,
+    BANK_VISIBILITY_SCHOOL, MAX_BOARD_STROKES, MAX_BOARDS_PER_CREATOR, MAX_COURSE_NOTE_FILES,
+    MAX_EPOCH_STROKES, MAX_FEE_PLAN_ASSIGN_STUDENTS,
 };
 use hezarfen_backend::domain::board::{Board, BoardId};
 use hezarfen_backend::domain::board_stroke::{BoardStroke, BoardStrokeId};
@@ -26458,4 +26459,607 @@ async fn a_course_that_cannot_seat_the_whole_class_seats_none_of_it() {
     )
     .await;
     assert_eq!(common::total(&res.body), 2, "{}", res.body);
+}
+
+// --- course notes: authz matrix over HTTP -----------------------------------
+
+/// Create a course note as `cookie` on `course` (asserts 201); returns its id.
+async fn create_course_note(app: &axum::Router, cookie: &str, course: &str, title: &str) -> String {
+    let res = send(
+        &app,
+        "POST",
+        "/course-notes",
+        Some(cookie),
+        Some(json!({ "course": course, "title": title, "content": "body" })),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::CREATED,
+        "create course note: {}",
+        res.body
+    );
+    id_of(&res.body)
+}
+
+/// (a) an assigned (not creating) teacher writes a note+file on their course;
+/// an enrolled student reads it end to end — list, get, file list, download —
+/// with byte-identical bytes and the right `Content-Disposition`.
+/// (d) the course *creator*, who was never added to the assigned-teacher
+/// list, still manages it (update + delete).
+#[tokio::test]
+async fn course_note_assigned_teacher_and_creator_manage_enrolled_student_reads() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "boss", "manager").await;
+    let creator = login_as(&app, &db, "creator_teacher", "teacher").await;
+    let assigned = login_as(&app, &db, "assigned_teacher", "teacher").await;
+    let student = login_as(&app, &db, "stu", "student").await;
+
+    let course = create_course(&app, &creator, "algebra").await;
+    let assigned_id = me_id(&app, &assigned).await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/courses/{course}/teachers"),
+        Some(&manager),
+        Some(json!({ "user_id": assigned_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    let student_id = me_id(&app, &student).await;
+    enroll(&app, &creator, &course, &student_id).await;
+
+    // (a) assigned teacher writes note + file.
+    let note = create_course_note(&app, &assigned, &course, "recap").await;
+    let bytes = b"%PDF-1.4 fake";
+    let up = upload_course_note_file(
+        &app,
+        &assigned,
+        &note,
+        "recap.pdf",
+        "application/pdf",
+        bytes,
+    )
+    .await;
+    assert_eq!(up.status, StatusCode::CREATED, "{}", up.body);
+    let file_id = id_of(&up.body);
+
+    // Enrolled student reads: list, get, file list, download.
+    let list = send(
+        &app,
+        "GET",
+        &format!("/course-notes?course={course}"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(list.status, StatusCode::OK);
+    assert_eq!(common::total(&list.body), 1);
+
+    let get = send(
+        &app,
+        "GET",
+        &format!("/course-notes/{note}"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(get.status, StatusCode::OK);
+    assert_eq!(get.body["title"], "recap");
+
+    let files = send(
+        &app,
+        "GET",
+        &format!("/course-notes/{note}/files"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(files.status, StatusCode::OK);
+    assert_eq!(common::total(&files.body), 1);
+
+    let (status, headers, body) = common::send_raw(
+        &app,
+        "GET",
+        &format!("/course-notes/{note}/files/{file_id}"),
+        Some(&student),
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, bytes);
+    assert_eq!(headers["content-type"], "application/pdf");
+    assert_eq!(
+        headers["content-disposition"],
+        "attachment; filename=\"recap.pdf\"; filename*=UTF-8''recap.pdf"
+    );
+
+    // (d) the creator, never assigned, still manages: update then delete.
+    let upd = send(
+        &app,
+        "PATCH",
+        &format!("/course-notes/{note}"),
+        Some(&creator),
+        Some(json!({ "title": "recap v2" })),
+    )
+    .await;
+    assert_eq!(upd.status, StatusCode::OK, "{}", upd.body);
+    assert_eq!(upd.body["title"], "recap v2");
+
+    let del = send(
+        &app,
+        "DELETE",
+        &format!("/course-notes/{note}"),
+        Some(&creator),
+        None,
+    )
+    .await;
+    assert_eq!(del.status, StatusCode::NO_CONTENT);
+}
+
+/// (b) everyone without a seat at the table is turned away: a teacher with no
+/// relation to the course (403 on write), an unenrolled student (403 on
+/// read), a parent (403 on read), and an unauthenticated caller (401).
+#[tokio::test]
+async fn course_note_denies_unrelated_teacher_student_parent_and_anon() {
+    let (app, db) = app_and_db().await;
+    let creator = login_as(&app, &db, "owner_teacher", "teacher").await;
+    let other_teacher = login_as(&app, &db, "other_teacher", "teacher").await;
+    let other_student = login_as(&app, &db, "other_student", "student").await;
+    let parent = login_as(&app, &db, "mom", "parent").await;
+
+    let course = create_course(&app, &creator, "geometry").await;
+    let note = create_course_note(&app, &creator, &course, "notes").await;
+
+    // Non-responsible teacher: write paths all 403.
+    let create_res = send(
+        &app,
+        "POST",
+        "/course-notes",
+        Some(&other_teacher),
+        Some(json!({ "course": course, "title": "x", "content": "y" })),
+    )
+    .await;
+    assert_eq!(
+        create_res.status,
+        StatusCode::FORBIDDEN,
+        "{}",
+        create_res.body
+    );
+
+    let upload_res =
+        upload_course_note_file(&app, &other_teacher, &note, "a.txt", "text/plain", b"x").await;
+    assert_eq!(
+        upload_res.status,
+        StatusCode::FORBIDDEN,
+        "{}",
+        upload_res.body
+    );
+
+    let delete_res = send(
+        &app,
+        "DELETE",
+        &format!("/course-notes/{note}"),
+        Some(&other_teacher),
+        None,
+    )
+    .await;
+    assert_eq!(
+        delete_res.status,
+        StatusCode::FORBIDDEN,
+        "{}",
+        delete_res.body
+    );
+
+    // Unenrolled student: read paths 403.
+    assert_eq!(
+        send(
+            &app,
+            "GET",
+            &format!("/course-notes?course={course}"),
+            Some(&other_student),
+            None,
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
+
+    // Parent: read paths 403 too.
+    assert_eq!(
+        send(
+            &app,
+            "GET",
+            &format!("/course-notes/{note}"),
+            Some(&parent),
+            None,
+        )
+        .await
+        .status,
+        StatusCode::FORBIDDEN
+    );
+
+    // Unauthenticated: 401.
+    assert_eq!(
+        send(&app, "GET", &format!("/course-notes/{note}"), None, None)
+            .await
+            .status,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        send(
+            &app,
+            "POST",
+            "/course-notes",
+            None,
+            Some(json!({ "course": course, "title": "x" })),
+        )
+        .await
+        .status,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// (c) a manager creates and deletes a note on a course they neither created
+/// nor are assigned to.
+#[tokio::test]
+async fn course_note_manager_manages_any_course() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "boss2", "manager").await;
+    let creator = login_as(&app, &db, "creator3", "teacher").await;
+    let course = create_course(&app, &creator, "chem").await;
+
+    let note = create_course_note(&app, &manager, &course, "manager note").await;
+    let del = send(
+        &app,
+        "DELETE",
+        &format!("/course-notes/{note}"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(del.status, StatusCode::NO_CONTENT);
+}
+
+/// (e) the file cap (409 past `MAX_COURSE_NOTE_FILES`) and the school's byte
+/// cap (413 over, 201 at) both apply to course-note files.
+#[tokio::test]
+async fn course_note_file_cap_and_size_limit() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "boss3", "manager").await;
+    let creator = login_as(&app, &db, "creator4", "teacher").await;
+    let course = create_course(&app, &creator, "bio").await;
+    let note = create_course_note(&app, &creator, &course, "capped").await;
+
+    for i in 0..MAX_COURSE_NOTE_FILES {
+        let res = upload_course_note_file(
+            &app,
+            &creator,
+            &note,
+            &format!("f{i}.txt"),
+            "text/plain",
+            b"x",
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED, "file {i}: {}", res.body);
+    }
+    let over = upload_course_note_file(
+        &app,
+        &creator,
+        &note,
+        "one_too_many.txt",
+        "text/plain",
+        b"x",
+    )
+    .await;
+    assert_eq!(over.status, StatusCode::CONFLICT, "{}", over.body);
+
+    // Lower the school's byte cap and check the size wall.
+    let res = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&manager),
+        Some(json!({ "max_file_bytes": 1024 })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK);
+    let note2 = create_course_note(&app, &creator, &course, "sized").await;
+    let big =
+        upload_course_note_file(&app, &creator, &note2, "big.bin", "", &vec![7u8; 1025]).await;
+    assert_eq!(big.status, StatusCode::PAYLOAD_TOO_LARGE, "{}", big.body);
+    let fits =
+        upload_course_note_file(&app, &creator, &note2, "fits.bin", "", &vec![7u8; 1024]).await;
+    assert_eq!(fits.status, StatusCode::CREATED, "{}", fits.body);
+}
+
+/// (f) deleting the course cascades its notes: a note that existed a moment
+/// ago 404s once its course is gone.
+#[tokio::test]
+async fn course_note_cascades_on_course_delete() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "boss4", "manager").await;
+    let creator = login_as(&app, &db, "creator5", "teacher").await;
+    let course = create_course(&app, &creator, "temp").await;
+    let note = create_course_note(&app, &creator, &course, "will vanish").await;
+
+    let del = send(
+        &app,
+        "DELETE",
+        &format!("/courses/{course}"),
+        Some(&creator),
+        None,
+    )
+    .await;
+    assert_eq!(del.status, StatusCode::NO_CONTENT, "{}", del.body);
+
+    let get = send(
+        &app,
+        "GET",
+        &format!("/course-notes/{note}"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(get.status, StatusCode::NOT_FOUND, "{}", get.body);
+}
+
+/// (g) a creator demoted teacher -> student mid-session loses every
+/// course-note write path and the read path too, on the note they made
+/// while still a teacher.
+#[tokio::test]
+async fn course_note_demoted_creator_loses_writes_and_reads() {
+    let (app, db) = app_and_db().await;
+    let admin = login_as(&app, &db, "probe_admin", "admin").await;
+    let creator = login_as(&app, &db, "probe_creator", "teacher").await;
+    let creator_id = me_id(&app, &creator).await;
+    let course = create_course(&app, &creator, "algebra2").await;
+    let note = create_course_note(&app, &creator, &course, "before").await;
+
+    let r = send(
+        &app,
+        "PATCH",
+        &format!("/users/{creator_id}/role"),
+        Some(&admin),
+        Some(json!({ "role": "student" })),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+
+    for (m, u, b) in [
+        (
+            "POST",
+            "/course-notes".to_string(),
+            Some(json!({ "course": course, "title": "x" })),
+        ),
+        (
+            "PATCH",
+            format!("/course-notes/{note}"),
+            Some(json!({ "title": "y" })),
+        ),
+        ("DELETE", format!("/course-notes/{note}"), None),
+    ] {
+        let res = send(&app, m, &u, Some(&creator), b).await;
+        assert_eq!(
+            res.status,
+            StatusCode::FORBIDDEN,
+            "{m} {u} -> {} {}",
+            res.status,
+            res.body
+        );
+    }
+    let up = upload_course_note_file(&app, &creator, &note, "a.txt", "text/plain", b"x").await;
+    assert_eq!(
+        up.status,
+        StatusCode::FORBIDDEN,
+        "upload -> {} {}",
+        up.status,
+        up.body
+    );
+    let read = send(
+        &app,
+        "GET",
+        &format!("/course-notes/{note}"),
+        Some(&creator),
+        None,
+    )
+    .await;
+    assert_eq!(
+        read.status,
+        StatusCode::FORBIDDEN,
+        "read -> {} {}",
+        read.status,
+        read.body
+    );
+}
+
+/// (h) a note id doesn't unlock a file that belongs to another note: mounting
+/// course A's file id under course B's note id 404s (note-scoped lookup
+/// fails before authz), straight cross-course access 403s, and course A's
+/// file survives every one of these attempts.
+#[tokio::test]
+async fn course_note_cross_course_file_is_not_reachable() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "probe_mgr", "manager").await;
+    let t_a = login_as(&app, &db, "probe_ta", "teacher").await;
+    let t_b = login_as(&app, &db, "probe_tb", "teacher").await;
+    let outsider = login_as(&app, &db, "probe_out", "student").await;
+
+    let course_a = create_course(&app, &t_a, "probeA").await;
+    let course_b = create_course(&app, &t_b, "probeB").await;
+    let note_a = create_course_note(&app, &t_a, &course_a, "na").await;
+    let note_b = create_course_note(&app, &t_b, &course_b, "nb").await;
+    let up = upload_course_note_file(&app, &t_a, &note_a, "secret.txt", "text/plain", b"top").await;
+    assert_eq!(up.status, StatusCode::CREATED, "{}", up.body);
+    let file_a = id_of(&up.body);
+
+    // teacher B mounts A's file id under his own note id (manager can view both, so
+    // the only wall left is the note-scoping in read_for).
+    for who in [&t_b, &manager] {
+        let res = send(
+            &app,
+            "GET",
+            &format!("/course-notes/{note_b}/files/{file_a}"),
+            Some(who),
+            None,
+        )
+        .await;
+        assert_eq!(
+            res.status,
+            StatusCode::NOT_FOUND,
+            "cross-note -> {} {}",
+            res.status,
+            res.body
+        );
+    }
+    // teacher B and an unenrolled student straight at A's own note.
+    for who in [&t_b, &outsider] {
+        let res = send(
+            &app,
+            "GET",
+            &format!("/course-notes/{note_a}/files/{file_a}"),
+            Some(who),
+            None,
+        )
+        .await;
+        assert_eq!(
+            res.status,
+            StatusCode::FORBIDDEN,
+            "idor -> {} {}",
+            res.status,
+            res.body
+        );
+        let res = send(
+            &app,
+            "GET",
+            &format!("/course-notes/{note_a}/files"),
+            Some(who),
+            None,
+        )
+        .await;
+        assert_eq!(
+            res.status,
+            StatusCode::FORBIDDEN,
+            "list -> {} {}",
+            res.status,
+            res.body
+        );
+    }
+    // teacher B may not patch/delete A's note or A's file.
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/course-notes/{note_a}"),
+        Some(&t_b),
+        Some(json!({ "title": "pwn" })),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::FORBIDDEN,
+        "patch -> {} {}",
+        res.status,
+        res.body
+    );
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/course-notes/{note_a}/files/{file_a}"),
+        Some(&t_b),
+        None,
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::FORBIDDEN,
+        "del file -> {} {}",
+        res.status,
+        res.body
+    );
+    // and the manager deleting through the wrong note is a 404, not a silent hit.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/course-notes/{note_b}/files/{file_a}"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::NOT_FOUND,
+        "cross del -> {} {}",
+        res.status,
+        res.body
+    );
+    // A's file survives all of it.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/course-notes/{note_a}/files"),
+        Some(&t_a),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&res.body), 1, "{}", res.body);
+}
+
+/// (i) the per-note file cap refuses without stranding a blob on disk, and
+/// deleting the course unlinks every blob it cascaded through. `integration`
+/// shares one process-wide files dir across every test in the binary (many
+/// running concurrently), so this checks the ten known blob paths by their
+/// own id rather than a directory-wide count, which would race.
+#[tokio::test]
+async fn course_note_cap_refusal_and_course_delete_leave_no_orphan_blobs() {
+    let (app, db) = app_and_db().await;
+    let creator = login_as(&app, &db, "probe_blob", "teacher").await;
+    let course = create_course(&app, &creator, "blobs").await;
+    let note = create_course_note(&app, &creator, &course, "n").await;
+
+    let mut blob_paths = Vec::new();
+    for i in 0..10 {
+        let r = upload_course_note_file(
+            &app,
+            &creator,
+            &note,
+            &format!("f{i}.txt"),
+            "text/plain",
+            b"x",
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
+        blob_paths.push(common::files_dir().join(id_of(&r.body)));
+    }
+    for p in &blob_paths {
+        assert!(p.exists(), "blob missing after upload: {p:?}");
+    }
+    let over = upload_course_note_file(&app, &creator, &note, "over.txt", "text/plain", b"x").await;
+    assert_eq!(over.status, StatusCode::CONFLICT, "{}", over.body);
+    for p in &blob_paths {
+        assert!(p.exists(), "cap refusal disturbed an existing blob: {p:?}");
+    }
+
+    let del = send(
+        &app,
+        "DELETE",
+        &format!("/courses/{course}"),
+        Some(&creator),
+        None,
+    )
+    .await;
+    assert_eq!(del.status, StatusCode::NO_CONTENT, "{}", del.body);
+    for p in &blob_paths {
+        assert!(!p.exists(), "course delete left an orphan blob: {p:?}");
+    }
+    let g = send(
+        &app,
+        "GET",
+        &format!("/course-notes/{note}"),
+        Some(&creator),
+        None,
+    )
+    .await;
+    assert_eq!(g.status, StatusCode::NOT_FOUND, "{}", g.body);
 }

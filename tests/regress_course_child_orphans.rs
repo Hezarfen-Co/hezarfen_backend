@@ -47,6 +47,8 @@ use hezarfen_backend::database::{self, Database};
 use hezarfen_backend::domain::course::{
     Course, CourseDescription, CourseId, CourseKind, CourseTitle,
 };
+use hezarfen_backend::domain::course_note::{CourseNote, CourseNoteContent, CourseNoteTitle};
+use hezarfen_backend::domain::course_note_file::{CourseNoteFile, FileContentType, FileName};
 use hezarfen_backend::domain::course_session::{CourseSession, SessionTopic};
 use hezarfen_backend::domain::exam::{
     Exam, ExamAttemptLimit, ExamDescription, ExamKind, ExamSchedule, ExamTitle,
@@ -140,6 +142,20 @@ fn make_subject(course: CourseId, db: Database) -> JoinHandle<Result<(), AppErro
     })
 }
 
+fn make_note(course: CourseId, db: Database) -> JoinHandle<Result<(), AppError>> {
+    tokio::spawn(async move {
+        CourseNote::create(
+            &course,
+            &teacher(),
+            CourseNoteTitle::try_new("plan").unwrap(),
+            CourseNoteContent::try_new("").unwrap(),
+            &db,
+        )
+        .await
+        .map(|_| ())
+    })
+}
+
 /// How many rows of `table` name `course`. Stored state, never a return value:
 /// the whole point is what the store kept.
 async fn children(table: &str, course: &CourseId, db: &Database) -> usize {
@@ -199,6 +215,11 @@ async fn a_subject_under_a_deleted_course_is_refused() {
     a_create_against_a_deleted_course_refuses("subject", make_subject).await;
 }
 
+#[tokio::test]
+async fn a_course_note_under_a_deleted_course_is_refused() {
+    a_create_against_a_deleted_course_refuses("course_note", make_note).await;
+}
+
 /// The counter the three creates borrow is *given back* — absent stays absent.
 /// A bump left behind is not a smaller bug than the orphan it prevents: the
 /// course's delete guard is `WHERE (enrollment_count ?? 0) = 0`, so a course
@@ -210,7 +231,7 @@ async fn the_creates_give_the_courses_roster_counter_back_untouched() {
     let course = a_course(&db).await;
     let absent = "SELECT VALUE id FROM course WHERE enrollment_count = NONE";
 
-    for make in [make_exam, make_session, make_subject] {
+    for make in [make_exam, make_session, make_subject, make_note] {
         make(course.clone(), db.clone()).await.unwrap().unwrap();
     }
     let mut result = db.query(absent).await.unwrap().check().unwrap();
@@ -226,5 +247,113 @@ async fn the_creates_give_the_courses_roster_counter_back_untouched() {
     assert!(
         drop_course(&course, &db).await.unwrap(),
         "a course whose children moved its roster counter can never be deleted"
+    );
+}
+
+/// The cascade half of the same contract, for a child class with two tiers: a
+/// `course_note` deleted through the course cascade must take its own
+/// `course_note_file` children with it too, not just itself.
+#[tokio::test]
+async fn a_course_note_and_its_files_never_outlive_a_course_delete() {
+    let db = database::init_mem().await.unwrap();
+    let course = a_course(&db).await;
+    let note = CourseNote::create(
+        &course,
+        &teacher(),
+        CourseNoteTitle::try_new("plan").unwrap(),
+        CourseNoteContent::try_new("body").unwrap(),
+        &db,
+    )
+    .await
+    .unwrap();
+    CourseNoteFile::new(
+        note.get_id(),
+        FileName::try_new("plan.pdf").unwrap(),
+        FileContentType::try_new("application/pdf").unwrap(),
+        3,
+    )
+    .insert(&db)
+    .await
+    .unwrap();
+
+    assert!(drop_course(&course, &db).await.unwrap(), "the course goes");
+
+    assert_eq!(
+        children("course_note", &course, &db).await,
+        0,
+        "a course_note survived its course's delete"
+    );
+    let mut result = db
+        .query("SELECT VALUE id FROM course_note_file WHERE course_note = $note")
+        .bind(("note", note.get_id().record()))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    assert_eq!(
+        result
+            .take::<Vec<surrealdb::types::RecordId>>(0)
+            .unwrap()
+            .len(),
+        0,
+        "a course_note_file survived its note's course's delete"
+    );
+}
+
+/// `CourseNoteFile::insert` already goes through `cap::claim_and_create` on
+/// the note row (unlike the bare `db.create` `CourseNote::create` shipped
+/// with) — this pins that a file upload against an already-deleted note is
+/// refused rather than left as an orphan, the same existence contract as the
+/// three creates above.
+#[tokio::test]
+async fn a_course_note_file_under_a_deleted_note_is_refused() {
+    let db = database::init_mem().await.unwrap();
+    let course = a_course(&db).await;
+    let note = CourseNote::create(
+        &course,
+        &teacher(),
+        CourseNoteTitle::try_new("plan").unwrap(),
+        CourseNoteContent::try_new("").unwrap(),
+        &db,
+    )
+    .await
+    .unwrap();
+    assert!(
+        Course::read(&course, &db)
+            .await
+            .unwrap()
+            .unwrap()
+            .delete(&db)
+            .await
+            .unwrap(),
+        "the course, and its note with it, goes"
+    );
+
+    let file = CourseNoteFile::new(
+        note.get_id(),
+        FileName::try_new("plan.pdf").unwrap(),
+        FileContentType::try_new("application/pdf").unwrap(),
+        3,
+    )
+    .insert(&db)
+    .await;
+    assert!(
+        matches!(file, Err(AppError::Conflict(_))),
+        "a file upload under a deleted note must refuse, not {file:?}"
+    );
+    let mut result = db
+        .query("SELECT VALUE id FROM course_note_file WHERE course_note = $note")
+        .bind(("note", note.get_id().record()))
+        .await
+        .unwrap()
+        .check()
+        .unwrap();
+    assert_eq!(
+        result
+            .take::<Vec<surrealdb::types::RecordId>>(0)
+            .unwrap()
+            .len(),
+        0,
+        "a refused upload left a row naming a note that is gone"
     );
 }

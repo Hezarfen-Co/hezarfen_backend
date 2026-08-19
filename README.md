@@ -430,7 +430,7 @@ drift from it**, which is enforced rather than asked for:
   and fails unless each one is either referenced by `src/web/limits.rs` or
   listed as a deliberate exclusion *with a reason*. A new constant breaks the
   suite until someone decides, consciously, whether clients need it.
-- `tests/spec_bounds.rs` builds the OpenAPI document, reads all 170 published
+- `tests/spec_bounds.rs` builds the OpenAPI document, reads all 174 published
   bounds back out of the emitted JSON, and asserts each equals its constant.
   This exists because utoipa's `#[schema(max_length = …)]` accepts a **literal
   only** — a `const` there does not compile — so the annotations are
@@ -898,6 +898,15 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/classes/{id}/members`                                          | teacher | List a class's roster, newest first, paged via `?limit=&offset=` (omit `limit` for the whole roster). Requires teacher+. Returns a `{items, total, limit, offset}` envelope. |
 | POST   | `/classes/{id}/members`                                          | manager | Put a student in a class. Requires manager+. They are enrolled into every course the class already carries, in one go: a course with no free seat refuses the whole join with a 409 naming it, and a student already enrolled by hand keeps the row they have (no second seat, and it survives their removal from the class). Adding the same student twice is a 409. |
 | DELETE | `/classes/{id}/members/{user}`                                   | manager | Take a student out of a class. Requires manager+. The enrollments the class pumped for them are swept with it — except rows another attached class still claims (re-tagged to it) and rows placed by hand (left standing). A student who was not in the class is a 404. |
+| GET    | `/course-notes`                                                  | student | List a course's notes, newest first. Visible to whoever can view the course (its enrolled users, creator, assigned teachers, and managers/admins). Paged via `?limit=&offset=`. |
+| POST   | `/course-notes`                                                  | teacher | Create a note on a course. Requires teacher+ and management rights over the course (its creator, an assigned teacher, or a manager/admin). |
+| GET    | `/course-notes/{id}`                                             | student | Fetch a single course note by id. Visible to whoever can view its course. |
+| PATCH  | `/course-notes/{id}`                                             | teacher | Update a course note's title and/or content. Omitted fields keep their value. Requires teacher+ and management rights over the course. |
+| DELETE | `/course-notes/{id}`                                             | teacher | Delete a course note, along with its files. Requires teacher+ and management rights over the course. |
+| GET    | `/course-notes/{id}/files`                                       | student | List a course note's files (metadata only), newest first. Paged via `?limit=&offset=`. |
+| POST   | `/course-notes/{id}/files`                                       | teacher | Attach a file to a course note. `multipart/form-data` with the file under a `file` field; its `filename` is required. At most 10 files per note, each at most the school's `max_file_bytes` (settings, default 5 MiB). Requires teacher+ and management rights over the course. |
+| GET    | `/course-notes/{id}/files/{file_id}`                             | student | Download a course note file's bytes. `Content-Type` is the one declared on upload; `Content-Disposition` carries the original filename. |
+| DELETE | `/course-notes/{id}/files/{file_id}`                             | teacher | Delete a course note file (row first, then its blob). Requires teacher+ and management rights over the course. |
 | GET    | `/courses`                                                       | student | List the courses visible to the caller: every course for manager+, otherwise the courses they created plus the ones they're enrolled in. Paged via `?limit=&offset=` (omit `limit` for the full list); returns a `{items, total, limit, offset}` envelope. |
 | POST   | `/courses`                                                       | teacher | Create a course owned by the current user. Requires the `teacher` role or higher. `kind` picks the flavor — `course` (a regular class, the default), `study` (a supervised study session — etüt), or `club` (a student club — kulüp); all behave identically. `capacity` caps the roster at enroll time (omit for unlimited). |
 | GET    | `/courses/me`                                                    | student | The courses the current user is enrolled in, paged via `?limit=&offset=` (omit `limit` for all of them); returns a `{items, total, limit, offset}` envelope. |
@@ -4266,6 +4275,9 @@ src/
     event.rs       EventId · EventTitle · EventDescription · Event
     attendance.rs  AttendanceId · AttendanceStatus · Attendance
     course.rs      CourseId · CourseTitle · CourseDescription · Course
+    course_note.rs CourseNoteId · CourseNoteTitle · CourseNoteContent · CourseNote
+    course_note_file.rs CourseNoteFileId · CourseNoteFile (metadata row; blob on
+                   disk under FILES_PATH; FileName/FileContentType shared with note_file.rs)
     course_session.rs CourseSessionId · SessionTopic · CourseSession (a course's lesson)
     session_attendance.rs SessionAttendanceId · SessionAttendance (roll call; one row per session+user)
     work_entry.rs  WorkEntryId · WorkEntry (staff stint; one open per user by construction)
@@ -4383,7 +4395,7 @@ src/
     etag.rs        conditional-GET middleware: ETag over a 200 JSON body,
                    If-None-Match → 304 (GET only; SSE and blobs pass through)
     auth.rs  users.rs  notes.rs  messages.rs  events.rs  appointments.rs
-    courses.rs  subjects.rs  sessions.rs  exams.rs  homework.rs  questions.rs
+    courses.rs  course_notes.rs  subjects.rs  sessions.rs  exams.rs  homework.rs  questions.rs
     bank_questions.rs  marks.rs  work.rs  pomodoro.rs  attendance.rs
     settings.rs  terms.rs  meals.rs  payments.rs  ai.rs  chatbot.rs
     boards.rs  classes.rs

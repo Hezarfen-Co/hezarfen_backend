@@ -183,6 +183,21 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS size ON note_file TYPE int;
     DEFINE INDEX IF NOT EXISTS note_file_note ON note_file FIELDS note;
 
+    DEFINE TABLE IF NOT EXISTS course_note SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS course ON course_note TYPE record<course>;
+    DEFINE FIELD IF NOT EXISTS author ON course_note TYPE record<user>;
+    DEFINE FIELD IF NOT EXISTS title ON course_note TYPE string;
+    DEFINE FIELD IF NOT EXISTS content ON course_note TYPE string;
+    DEFINE FIELD IF NOT EXISTS file_count ON course_note TYPE option<int>;
+    DEFINE INDEX IF NOT EXISTS course_note_course ON course_note FIELDS course;
+
+    DEFINE TABLE IF NOT EXISTS course_note_file SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS course_note ON course_note_file TYPE record<course_note>;
+    DEFINE FIELD IF NOT EXISTS name ON course_note_file TYPE string;
+    DEFINE FIELD IF NOT EXISTS content_type ON course_note_file TYPE string;
+    DEFINE FIELD IF NOT EXISTS size ON course_note_file TYPE int;
+    DEFINE INDEX IF NOT EXISTS course_note_file_note ON course_note_file FIELDS course_note;
+
     -- Chatbot relay (2026-07-23): a `thread` groups the turns, one
     -- `chatbot_message` is one turn. `user_id` rides on the message too so an
     -- ownership check needs no join. An assistant turn is born `pending` and

@@ -11,6 +11,7 @@ use utoipa_axum::routes;
 use crate::database::Database;
 use crate::domain::answer_image::AnswerImage;
 use crate::domain::course::{Course, CourseDescription, CourseId, CourseKind, CourseTitle};
+use crate::domain::course_note_file::CourseNoteFile;
 use crate::domain::course_session::{CourseSession, SessionTopic};
 use crate::domain::enrollment::Enrollment;
 use crate::domain::exam::{
@@ -554,6 +555,7 @@ async fn delete_course(
     let image_files = QuestionImage::file_keys_for_course(course.get_id(), &st.db).await?;
     let answer_image_files = AnswerImage::file_keys_for_course(course.get_id(), &st.db).await?;
     let homework_files = HomeworkFile::file_keys_for_course(course.get_id(), &st.db).await?;
+    let course_note_files = CourseNoteFile::file_keys_for_course(course.get_id(), &st.db).await?;
     if !course.delete(&st.db).await? {
         return Err(AppError::Conflict(
             "students are still enrolled in this course — remove them first",
@@ -563,6 +565,7 @@ async fn delete_course(
         .iter()
         .chain(&answer_image_files)
         .chain(&homework_files)
+        .chain(&course_note_files)
     {
         remove_blob(&st.files_path, file).await;
     }
