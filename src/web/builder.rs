@@ -294,7 +294,12 @@ async fn create_school(
     let username = Username::try_new(&req.admin_username)?;
     let password_hash = Password::try_new(&req.admin_password)?.hash_async().await?;
 
-    let db = st.tenants.create(&slug, &name).await?;
+    // Everything, for now: choosing a school's modules is the next lane's
+    // HTTP surface (`crate::module` is the foundation it will call).
+    let db = st
+        .tenants
+        .create(&slug, &name, crate::module::ModuleSet::all())
+        .await?;
     if let Err(err) = User::create_with_role(username, password_hash, Role::Admin, &db).await {
         // A school nobody can log into is worse than no school: take the
         // database back so the very same request can simply be retried.

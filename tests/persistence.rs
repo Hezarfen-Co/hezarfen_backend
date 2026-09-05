@@ -11,6 +11,7 @@ use axum::http::StatusCode;
 use common::{create_course, create_exam, create_subject, enroll, me_id, send, set_role};
 use hezarfen_backend::database::Database;
 use hezarfen_backend::domain::timestamp::Timestamp;
+use hezarfen_backend::module::ModuleSet;
 use hezarfen_backend::rate_limit::RateLimitConfig;
 use hezarfen_backend::state::AppState;
 use hezarfen_backend::tenant::{DEMO_SLUG, Slug, Tenants};
@@ -2369,5 +2370,76 @@ async fn pre_class_enrollments_keep_their_absent_source() {
         seats_taken(&db).await,
         vec![2],
         "and no seat was given back"
+    );
+}
+
+/// A school row written before module entitlements existed has no `modules`
+/// field at all. The control migration must read that — and only that — as
+/// "everything", because a school that predates the idea of buying modules had
+/// all of them.
+#[tokio::test]
+async fn a_school_row_without_modules_backfills_to_every_module() {
+    let db = surrealdb::engine::any::connect("memory")
+        .await
+        .expect("an in-memory control store");
+    db.use_ns("hezarfen").use_db("control").await.unwrap();
+    // The control schema as it stood before `modules`, so the row really is
+    // the shape an older binary left behind.
+    db.query(
+        "DEFINE TABLE school SCHEMAFULL;
+         DEFINE FIELD slug ON school TYPE string;
+         DEFINE FIELD name ON school TYPE string;
+         DEFINE FIELD status ON school TYPE string;
+         DEFINE FIELD created_at ON school TYPE int;
+         CREATE school:legacy SET slug = 'legacy', name = 'Legacy', \
+             status = 'active', created_at = 1;",
+    )
+    .await
+    .expect("the pre-modules control schema")
+    .check()
+    .expect("the pre-modules control schema");
+
+    database::migrate_control(&db).await.expect("a newer boot");
+
+    let stored: Vec<Vec<String>> = db
+        .query("SELECT VALUE modules FROM school:legacy")
+        .await
+        .expect("read the row back")
+        .take(0)
+        .expect("modules column");
+    assert_eq!(
+        stored.first().cloned().unwrap_or_default(),
+        ModuleSet::all().names(),
+        "a row that predates entitlements owns every module"
+    );
+}
+
+/// The other half of that rule: `[]` is a deliberate "nothing enabled", not a
+/// missing value, so a second boot must leave it alone. Widening it would hand
+/// a school modules it never bought.
+#[tokio::test]
+async fn an_empty_module_list_survives_a_second_boot() {
+    let tenants = Tenants::new_mem().await.expect("a control database");
+    let slug = Slug::try_new("bare").unwrap();
+    tenants
+        .create(&slug, "Bare School", ModuleSet::empty())
+        .await
+        .expect("a school with nothing switched on");
+
+    database::migrate_control(tenants.control())
+        .await
+        .expect("a second boot");
+
+    let stored: Vec<Vec<String>> = tenants
+        .control()
+        .query("SELECT VALUE modules FROM school:bare")
+        .await
+        .expect("read the row back")
+        .take(0)
+        .expect("modules column");
+    assert_eq!(
+        stored.first().cloned().unwrap_or_default(),
+        Vec::<String>::new(),
+        "an empty list is a decision, never a hole to fill"
     );
 }

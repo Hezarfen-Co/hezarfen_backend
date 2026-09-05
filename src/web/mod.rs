@@ -24,6 +24,7 @@ pub mod limits;
 pub mod marks;
 pub mod meals;
 pub mod messages;
+pub mod module_gate;
 pub mod notes;
 pub mod payments;
 pub mod pomodoro;

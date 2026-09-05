@@ -42,6 +42,12 @@ pub enum ValidationError {
         field: &'static str,
         reason: &'static str,
     },
+    /// A closed value set refused a name it does not contain — and says which
+    /// name, which [`ValidationError::Invalid`] cannot: its `reason` is
+    /// `&'static str`, so the offending value could only be described, never
+    /// quoted.
+    #[error("{field}: `{value}` is not a known {field}")]
+    Unknown { field: &'static str, value: String },
 }
 
 /// The single error type every fallible operation returns.
@@ -55,6 +61,11 @@ pub enum AppError {
     Unauthorized,
     #[error("forbidden: {0}")]
     Forbidden(&'static str),
+    /// The school has not bought this module. A dedicated arm because the body
+    /// carries a second key — the module's name — so a client can tell "your
+    /// school does not have this" from every other `403` without parsing prose.
+    #[error("module disabled: {0}")]
+    ModuleDisabled(crate::module::Module),
     #[error("conflict: {0}")]
     Conflict(&'static str),
     /// A 409 whose message is only known at runtime — e.g. the specific
@@ -168,6 +179,14 @@ impl IntoResponse for AppError {
                 )
                     .into_response();
             }
+            // Also carries a second key: which module was refused.
+            AppError::ModuleDisabled(module) => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "error": "module disabled", "module": module.as_str() })),
+                )
+                    .into_response();
+            }
             AppError::Validation(v) => (StatusCode::BAD_REQUEST, v.to_string()),
             AppError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
             AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".to_string()),
@@ -217,6 +236,21 @@ mod tests {
             surrealdb::types::ConnectionError::ConnectionFailed,
         );
         assert!(matches!(AppError::from(e), AppError::DbUnavailable));
+    }
+
+    /// The refusal a gated nest answers with. Both keys, and the `403` — a
+    /// client switches on `module`, so neither may drift.
+    #[tokio::test]
+    async fn a_disabled_module_is_a_403_naming_itself() {
+        use crate::module::Module;
+        let response = AppError::ModuleDisabled(Module::CourseNotes).into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "module disabled");
+        assert_eq!(body["module"], "course_notes");
     }
 
     #[test]

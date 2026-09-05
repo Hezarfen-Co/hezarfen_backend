@@ -35,7 +35,7 @@ where
         return Ok(principal.0.clone());
     }
 
-    let (_, db) = resolve_tenant(parts, state).await?;
+    let db = resolve_tenant(parts, state).await?.db;
 
     let jar = CookieJar::from_request_parts(parts, state)
         .await

@@ -50,10 +50,27 @@ pub fn routes() -> OpenApiRouter<AppState> {
         .routes(routes!(unassign_teacher))
         .routes(routes!(enroll, list_roster))
         .routes(routes!(unenroll))
-        .routes(routes!(create_exam_in_course, list_course_exams))
-        .routes(routes!(create_session_in_course, list_course_sessions))
-        .routes(routes!(create_subject_in_course, list_course_subjects))
-        .routes(routes!(create_homework_in_course, list_course_homework))
+}
+
+// The four route pairs below are mounted under `/courses` but *belong* to
+// another module, so each is split out to carry that module's gate as well as
+// the course one — see `crate::web::module_gate`. They are merged back in
+// `build_router`, so the URL space is unchanged.
+
+pub fn exam_routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new().routes(routes!(create_exam_in_course, list_course_exams))
+}
+
+pub fn session_routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new().routes(routes!(create_session_in_course, list_course_sessions))
+}
+
+pub fn subject_routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new().routes(routes!(create_subject_in_course, list_course_subjects))
+}
+
+pub fn homework_routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new().routes(routes!(create_homework_in_course, list_course_homework))
 }
 
 #[derive(Deserialize, ToSchema)]
