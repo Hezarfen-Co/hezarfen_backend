@@ -28718,6 +28718,21 @@ async fn a_disabled_module_refuses_its_nest_and_leaves_the_rest_alone() {
 /// The four route pairs mounted under `/courses` that belong to another
 /// module answer for *that* module: exams off refuses
 /// `POST /courses/{id}/exams` while the course itself stays reachable.
+/// Every module except `module` and everything that (transitively) needs it —
+/// the only shape the registry accepts now that `set_modules` validates the
+/// dependency graph itself.
+fn all_without(module: Module) -> ModuleSet {
+    let mut set = ModuleSet::all();
+    let mut pending = vec![module];
+    while let Some(next) = pending.pop() {
+        if set.contains(next) {
+            set.remove(next);
+            pending.extend(next.dependents());
+        }
+    }
+    set
+}
+
 #[tokio::test]
 async fn a_course_child_route_is_gated_by_its_own_module() {
     let (app, db, tenants) = common::app_and_tenants().await;
@@ -28725,9 +28740,10 @@ async fn a_course_child_route_is_gated_by_its_own_module() {
     let cookie = login_as(&app, &db, "ada", "admin").await;
     let course = create_course(&app, &cookie, "Fizik").await;
 
-    let mut without_exams = ModuleSet::all();
-    without_exams.remove(Module::Exams);
-    tenants.set_modules(&slug, &without_exams).await.unwrap();
+    tenants
+        .set_modules(&slug, &all_without(Module::Exams))
+        .await
+        .unwrap();
 
     // An empty body: the gate must answer before the payload is even parsed.
     let res = send(
@@ -28765,9 +28781,8 @@ async fn a_disabled_module_refuses_its_websocket_upgrade() {
     let slug = Slug::try_new(DEMO_SLUG).unwrap();
     let cookie = login_as(&app, &db, "ada", "admin").await;
 
-    let mut without = ModuleSet::all();
+    let mut without = all_without(Module::Exams);
     without.remove(Module::Boards);
-    without.remove(Module::Exams);
     tenants.set_modules(&slug, &without).await.unwrap();
 
     for (route, module) in [("/boards/x/ws", "boards"), ("/exams/x/attempt/ws", "exams")] {
@@ -28891,9 +28906,10 @@ async fn every_module_gates_its_own_nest_when_the_builder_takes_it_back() {
                 module.dependents(),
                 res.body
             );
-            let mut without = ModuleSet::all();
-            without.remove(module);
-            tenants.set_modules(&slug, &without).await.unwrap();
+            tenants
+                .set_modules(&slug, &all_without(module))
+                .await
+                .unwrap();
         }
 
         let res = send(&app, method, path, Some(&cookie), None).await;
@@ -28917,6 +28933,11 @@ async fn every_module_gates_its_own_nest_when_the_builder_takes_it_back() {
             "sell {module} back: {}",
             res.body
         );
+        // `all_without` also took the module's dependents away; restore them
+        // so the next module in the sweep starts from a fully sold school.
+        if !module.dependents().is_empty() {
+            tenants.set_modules(&slug, &ModuleSet::all()).await.unwrap();
+        }
         let res = send(&app, method, path, Some(&cookie), None).await;
         assert!(
             !is_module_disabled(&res),
@@ -28946,9 +28967,10 @@ async fn every_course_child_route_names_its_own_module() {
         // Three of the four are needed by another module (marks, attendance,
         // exams), so the builder API would `409` here — the set is written
         // directly, uniformly, since the API's own refusal is proven above.
-        let mut without = ModuleSet::all();
-        without.remove(module);
-        tenants.set_modules(&slug, &without).await.unwrap();
+        tenants
+            .set_modules(&slug, &all_without(module))
+            .await
+            .unwrap();
 
         let path = format!("/courses/{course}/{child}");
         let res = send(&app, "GET", &path, Some(&cookie), None).await;
