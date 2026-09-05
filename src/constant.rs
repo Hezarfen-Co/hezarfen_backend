@@ -535,6 +535,14 @@ pub const AI_DEFAULT_CONCURRENT_PER_WORKER: usize = 8;
 pub const AI_IDLE_TIMEOUT_SECS: u64 = 30;
 pub const AI_KEEPALIVE_SECS: u64 = 10;
 
+/// How long a blob body may make *no* progress before its stream is reset.
+/// A STALL bound, not a transfer cap: the clock is per write, so a slow peer
+/// that keeps reading streams a whole `max_file_bytes` file for as long as it
+/// takes, while a service that opens a blob stream and never reads it stops
+/// pinning a task and an open file descriptor once the QUIC stream window
+/// fills. A wall-clock deadline on the transfer could not tell the two apart.
+pub const AI_BLOB_WRITE_STALL_SECS: u64 = 30;
+
 /// The capability an AI service declares to answer chatbot turns. The bridge
 /// routes a chat request to any worker carrying it; with none registered the
 /// chat endpoints report the service as unavailable.

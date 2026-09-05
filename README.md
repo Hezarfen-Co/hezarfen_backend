@@ -3659,7 +3659,10 @@ is finished. Those bytes are *not* a frame: they carry no length prefix and the
 itself, so it is what will actually arrive rather than what a row remembers.
 On `err` nothing follows the frame at all. A read that breaks after its header
 resets the stream instead of finishing it, so a truncated file is never
-mistaken for a complete one.
+mistaken for a complete one. A body that makes no progress for 30 s — a
+service that opened the stream and then stopped reading — is reset the same
+way rather than finished; the clock is per write, not over the transfer, so a
+slow-but-reading service is never cut off.
 
 | `code` | Meaning |
 | ------ | ------- |
