@@ -5,7 +5,7 @@
 //! teacher, or manager+), reads need [`super::courses::can_view_course`]
 //! (management rights, or enrollment).
 
-use crate::web::tenant_state::State;
+use crate::web::tenant_state::{SchoolSlug, State};
 use axum::Json;
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query};
 use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
@@ -126,6 +126,7 @@ impl CourseNoteResponse {
 )]
 async fn create(
     State(st): State<AppState>,
+    SchoolSlug(school): SchoolSlug,
     RequireTeacher(user): RequireTeacher,
     Json(req): Json<CreateCourseNote>,
 ) -> Result<(StatusCode, Json<CourseNoteResponse>), AppError> {
@@ -144,7 +145,7 @@ async fn create(
     // Indexing is a background bonus, never a condition of storing the note:
     // the dispatch runs in its own task, so a slow or absent AI service cannot
     // delay or fail this 201.
-    spawn_index(&st, note.clone());
+    spawn_index(&st, &school, note.clone());
     Ok((StatusCode::CREATED, Json(CourseNoteResponse::new(&note))))
 }
 
@@ -242,6 +243,7 @@ async fn get_one(
 )]
 async fn update(
     State(st): State<AppState>,
+    SchoolSlug(school): SchoolSlug,
     RequireTeacher(user): RequireTeacher,
     Path(id): Path<String>,
     Json(req): Json<UpdateCourseNote>,
@@ -267,7 +269,7 @@ async fn update(
 
     let updated = note.update(title, content, &st.db).await?;
     // The stored index describes the old text — refresh it.
-    spawn_index(&st, updated.clone());
+    spawn_index(&st, &school, updated.clone());
     Ok(Json(CourseNoteResponse::new(&updated)))
 }
 
@@ -365,6 +367,7 @@ impl CourseNoteFileResponse {
 )]
 async fn upload_file(
     State(st): State<AppState>,
+    SchoolSlug(school): SchoolSlug,
     RequireTeacher(user): RequireTeacher,
     Path(id): Path<String>,
     mut multipart: Multipart,
@@ -395,7 +398,7 @@ async fn upload_file(
     match file.insert(&st.db).await {
         Ok(created) => {
             // The note now holds one more source than the stored index knows.
-            spawn_index(&st, note);
+            spawn_index(&st, &school, note);
             Ok((
                 StatusCode::CREATED,
                 Json(CourseNoteFileResponse::new(&created)),
@@ -520,6 +523,7 @@ async fn download_file(
 )]
 async fn delete_file(
     State(st): State<AppState>,
+    SchoolSlug(school): SchoolSlug,
     RequireTeacher(user): RequireTeacher,
     Path((id, file_id)): Path<(String, String)>,
 ) -> Result<StatusCode, AppError> {
@@ -541,7 +545,7 @@ async fn delete_file(
     RagOutput::delete_with_source(file.get_id(), &st.db).await?;
     let file = file.delete(&st.db).await?;
     remove_blob(&st.files_path, file.get_id().key()).await;
-    spawn_index(&st, note);
+    spawn_index(&st, &school, note);
     Ok(StatusCode::NO_CONTENT)
 }
 

@@ -35,8 +35,8 @@ pub fn routes() -> OpenApiRouter<AppState> {
 /// (which is a secret and is configured out of band).
 #[derive(Serialize, ToSchema)]
 pub struct BridgeCertificateResponse {
-    /// Wire protocol and ALPN the service must announce, currently `hab/1`.
-    #[schema(example = "hab/1")]
+    /// Wire protocol and ALPN the service must announce, currently `hab/2`.
+    #[schema(example = "hab/2")]
     protocol: String,
     /// The listener's leaf certificate, PEM-encoded — feed straight into a TLS
     /// client's trust store (Python: `ssl_context.load_verify_locations(cadata=...)`).

@@ -3503,18 +3503,19 @@ of the API is unaffected.
 
 ### Handshake
 
-The service connects with ALPN `hab/1`, then opens the **control stream** (the
+The service connects with ALPN `hab/2`, then opens the **control stream** (the
 first client-initiated bidi stream) and writes one `Hello`:
 
 ```json
-{ "protocol": "hab/1", "service": "ocr", "capabilities": ["ocr.extract"],
+{ "protocol": "hab/2", "service": "ocr", "capabilities": ["ocr.extract"],
   "token": "<AI_SHARED_TOKEN>", "max_concurrent": 8 }
 ```
 
-The backend answers one `Greeting` and leaves the stream open:
+`Hello` names **no school** — see "School scoping" below. The backend answers
+one `Greeting` and leaves the stream open:
 
 ```json
-{ "type": "welcome", "worker_id": "01J...", "protocol": "hab/1" }
+{ "type": "welcome", "worker_id": "01J...", "protocol": "hab/2" }
 { "type": "rejected", "code": "unauthorized", "message": "invalid token" }
 ```
 
@@ -3529,23 +3530,52 @@ timeout (30s, with a 10s keepalive) and deregistered then.
 `max_concurrent` is advisory and clamped to `1..=64` (default 8). Requests
 beyond it are refused with "busy" rather than queued.
 
+### School scoping
+
+This deployment serves many schools, one database each, and the AI fleet is
+**shared** across all of them: one connected service answers for every school.
+So the school cannot be bound at handshake time — a service pinned to one
+school would have to be run once per customer — and every *frame* names it
+instead.
+
+`school` is the school's slug, exactly as it appears in a login (`demo`), and
+it is **required** on `Request`, `ApiRequest` and `BlobRequest`. Every answer
+echoes it, refusals included, so a service can tell which of its in-flight
+streams a refusal belongs to. There is no default and no fallback: a frame
+naming no school is `malformed`.
+
+| `code` | Meaning |
+| ------ | ------- |
+| `malformed` | `school` is absent, or is not a slug at all |
+| `unknown_school` | A well-formed slug this deployment does not serve — not retryable without a config change |
+| `school_suspended` | The school exists and is switched off; worth retrying later |
+
+A read is answered out of that school's own database, `on_behalf_of` is
+resolved there too (so the same username in two schools is two different
+people, and one school's user id names nobody in another), and blob bytes come
+from that school's own directory. That is the whole point of `hab/2`: the
+previous wire version carried no school, and a service still announcing it is
+refused at the ALPN, before it can send a frame.
+
 ### Requests
 
 For each request the **backend** opens a bidi stream, writes one `Request`,
 finishes its send side, and reads one `Response`:
 
 ```json
-{ "id": "01J...", "capability": "ocr.extract", "deadline_ms": 30000,
-  "payload": { "image": "<base64>" } }
+{ "id": "01J...", "school": "demo", "capability": "ocr.extract",
+  "deadline_ms": 30000, "payload": { "image": "<base64>" } }
 ```
 
 ```json
-{ "status": "ok",  "id": "01J...", "payload": { "text": "..." } }
-{ "status": "err", "id": "01J...", "code": "unsupported_image",
-  "message": "only png and jpeg" }
+{ "status": "ok",  "id": "01J...", "school": "demo",
+  "payload": { "text": "..." } }
+{ "status": "err", "id": "01J...", "school": "demo",
+  "code": "unsupported_image", "message": "only png and jpeg" }
 ```
 
-`id` is a trace id for logs on both sides — correlation is the stream, not the
+`school` is the school the work belongs to, echoed back like `id`. `id` is a
+trace id for logs on both sides — correlation is the stream, not the
 id. It must still be echoed: an answer carrying a different id means the
 service lost track of whose work it is, and the payload is refused. `payload`
 is opaque to the transport; its shape belongs to the capability.
@@ -3563,15 +3593,17 @@ already has.
 
 After the handshake the *service* may open further bidi streams, one per read:
 write one `ApiRequest`, finish the send side, read one `ApiResponse`, done.
-Same framing as every other `hab/1` frame; concurrency and correlation are the
+Same framing as every other `hab/2` frame; concurrency and correlation are the
 stream, exactly as for capability requests.
 
 ```json
-{ "id": "01J...", "path": "/marks/me", "query": "limit=10&offset=0",
-  "on_behalf_of": "user:01J...", "method": "GET" }
+{ "id": "01J...", "school": "demo", "path": "/marks/me",
+  "query": "limit=10&offset=0", "on_behalf_of": "user:01J...",
+  "method": "GET" }
 ```
 
-`id` is a trace id, echoed back. `path` is the path alone as the REST API
+`id` is a trace id, echoed back, and so is `school` — which names the database
+the read is answered from and is required. `path` is the path alone as the REST API
 spells it — no host, and **no query string**, which travels in `query` (without
 the leading `?`). `query`, `on_behalf_of` and `method` are all optional; an
 absent `method` means `GET`, and anything else is refused.
@@ -3579,8 +3611,10 @@ absent `method` means `GET`, and anything else is refused.
 The answer is tagged by `outcome`:
 
 ```json
-{ "outcome": "ok",  "id": "01J...", "status": 200, "body": { } }
-{ "outcome": "err", "id": "01J...", "code": "path_not_allowed",
+{ "outcome": "ok",  "id": "01J...", "school": "demo", "status": 200,
+  "body": { } }
+{ "outcome": "err", "id": "01J...", "school": "demo",
+  "code": "path_not_allowed",
   "message": "`/users` is not a path AI services may read" }
 ```
 
@@ -3592,16 +3626,19 @@ failure has misread the contract.
 
 | `code` | Meaning |
 | ------ | ------- |
-| `malformed` | The frame was not a readable `ApiRequest`, or `path`+`query` do not form a request target |
+| `malformed` | The frame was not a readable `ApiRequest` (a missing `school` lands here), `school` is not a slug, or `path`+`query` do not form a request target |
 | `method_not_allowed` | `method` was present and was not `GET` |
 | `path_not_allowed` | `path` is not in the read scope below |
-| `unknown_user` | `on_behalf_of` names no user (deleted since the service last saw them) |
+| `unknown_school` | `school` is a slug this deployment does not serve |
+| `school_suspended` | That school is suspended — retryable once it is not |
+| `unknown_user` | `on_behalf_of` names no user *of that school* (deleted since the service last saw them, or an id belonging to a different school) |
 | `unavailable` | The API is not serving yet, the database socket is down, or the read outran the request timeout — retryable |
 | `not_json` | The endpoint answered with a body that is not JSON |
 | `too_large` | The answer does not fit one frame |
 
 Refusals are decided in that order — method, then the allowlist, then the
-principal — so an unknown user on a forbidden path reports the path.
+school, then the principal — so an unknown user on a forbidden path reports the
+path, and an unknown user in an unknown school reports the school.
 
 #### The read scope
 
@@ -3637,7 +3674,8 @@ With `on_behalf_of`, the read executes **as that user**: own-scoped endpoints
 (`/auth/me`, `/notes`, `/marks/me`) return *their* data. Both spellings are
 accepted — the bare key (`01J...`, as a REST path writes it) and the record
 form (`user:01J...`). The account is loaded live from the database on every
-request and never trusted from the frame, so a service holding a stale id acts
+request — from the named school's database, never the control one — and never
+trusted from the frame, so a service holding a stale id acts
 as a user who has since been deleted (`unknown_user`) or demoted (the new role,
 not the old one) — never as who they used to be.
 
@@ -3663,11 +3701,13 @@ the shape differs, and the two are told apart by the field each *requires*: an
 `ApiRequest` has `path`, a `BlobRequest` has `file`.
 
 ```json
-{ "id": "01J...", "file": "01J8XZ0K3Q8G7X2M4N5P6R7S8V",
+{ "id": "01J...", "school": "demo", "file": "01J8XZ0K3Q8G7X2M4N5P6R7S8V",
   "on_behalf_of": "user:01J..." }
 ```
 
-`file` is a `course_note_file` record key — the id `GET
+`school` names the school the file belongs to; the bytes are read from that
+school's own blob directory, so a file id is meaningless outside it. `file` is
+a `course_note_file` record key — the id `GET
 /course-notes/{id}/files` publishes and the one every `rag.index` payload
 carries in `files[].id`. `on_behalf_of` is optional on the wire but required in
 practice: without it the principal is the `ai` role, which is enrolled in
@@ -3679,9 +3719,9 @@ tag `Response` uses, not the api read's `outcome`, since a blob header carries
 no HTTP status to collide with:
 
 ```json
-{ "status": "ok",  "id": "01J...", "name": "recap.pdf",
+{ "status": "ok",  "id": "01J...", "school": "demo", "name": "recap.pdf",
   "content_type": "application/pdf", "size": 204800 }
-{ "status": "err", "id": "01J...", "code": "forbidden",
+{ "status": "err", "id": "01J...", "school": "demo", "code": "forbidden",
   "message": "`01J...` may not view the course this file belongs to" }
 ```
 
@@ -3699,9 +3739,11 @@ slow-but-reading service is never cut off.
 
 | `code` | Meaning |
 | ------ | ------- |
-| `not_found` | No `course_note_file` with that key, or its note or course is gone |
+| `malformed` | The frame was not a readable `BlobRequest`, or `school` is absent or not a slug |
+| `not_found` | No `course_note_file` with that key *in that school*, or its note or course is gone |
 | `forbidden` | The principal may not view that file's course |
-| `unknown_user` | `on_behalf_of` names no user |
+| `unknown_school` / `school_suspended` | As for an api read |
+| `unknown_user` | `on_behalf_of` names no user of that school |
 | `unavailable` | The api is not serving yet, the database socket is down, or the row's blob is missing from disk — retryable |
 
 **Course-note attachments only.** The key is looked up in `course_note_file`
@@ -3738,11 +3780,12 @@ not retryable), `Protocol` / `IdMismatch` (broken peer), `Transport`.
 ### Conformance suite
 
 `tests/ai_protocol.rs` is the wire contract, enforced on every `cargo test`. It
-speaks `hab/1` with a client that imports none of the crate's protocol types —
+speaks `hab/2` with a client that imports none of the crate's protocol types —
 frames built as byte literals, answers parsed as untyped JSON — so it fails on
 exactly the changes a service in another language would notice: a renamed
 field, a re-tagged enum, a flipped length-prefix endianness, a newly-required
-`Hello` field. (`tests/ai_bridge.rs` drives real QUIC clients too, but shares
+`Hello` field, a frame that stopped naming its school. (`tests/ai_bridge.rs`
+drives real QUIC clients too, but shares
 the Rust structs with the backend, so it cannot see those.)
 
 It is also the reference implementation: its `raw` module is the whole client
@@ -3773,7 +3816,7 @@ published over HTTP:
 
 ```
 GET /ai/certificate          # no auth; 404 when the bridge is disabled
-{ "protocol": "hab/1",
+{ "protocol": "hab/2",
   "certificate_pem": "-----BEGIN CERTIFICATE-----\n...",
   "fingerprint_sha256": "6745e8..." }
 ```
@@ -3846,7 +3889,7 @@ closes. A stream opened *after* the answer already landed still emits
 `delta`s and a `done` — the replay is deliberate, so a client that connects
 late (or reconnects) never hangs waiting for events that already happened.
 
-**The deltas are sliced by the backend from the finished answer.** `hab/1` is
+**The deltas are sliced by the backend from the finished answer.** `hab/2` is
 unary — the service returns the whole reply text, not tokens — so today the
 chunking is cosmetic pacing, not real streaming. The event shape exists now so
 that the day a service streams, it becomes a drop-in change behind an
@@ -3922,7 +3965,8 @@ fall back to the human-readable text for the rest.
 ### The `chat.reply` capability (for AI-service authors)
 
 A chat service declares `chat.reply` in its `Hello` (see "AI bridge (QUIC)").
-Requests then arrive as ordinary `hab/1` `Request` frames whose `payload` is:
+Requests then arrive as ordinary `hab/2` `Request` frames — the asker's school
+is on the frame, not in the payload — whose `payload` is:
 
 ```json
 { "message": "and the second law?",
@@ -3969,7 +4013,8 @@ context without either end having to be redeployed in lockstep.
 An indexing service declares `rag.index` in its `Hello` (see "AI bridge
 (QUIC)"). The backend dispatches one request whenever a course note is
 created, edited, or gains or loses a file — never on a read. Requests arrive
-as ordinary `hab/1` `Request` frames whose `payload` is:
+as ordinary `hab/2` `Request` frames — the note's school is on the frame, not
+in the payload — whose `payload` is:
 
 ```json
 { "course_note": "01J8XZ0K3Q8G7X2M4N5P6R7S8T",
@@ -4560,5 +4605,5 @@ db), rate-limit (both tiers, proxy-header and peer-address keying, shipped
 limits over every route, two limiters sharing one budget over one db), e2e
 (real TCP + reqwest cookie jar), persistence
 (tempfile file engine, including close + reopen), ai-bridge (real QUIC on
-loopback against a fake AI service), ai-protocol (the `hab/1` wire contract,
+loopback against a fake AI service), ai-protocol (the `hab/2` wire contract,
 driven by a client that shares no code with the backend).

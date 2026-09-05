@@ -94,6 +94,12 @@ pub async fn app_with_ai(ai: Option<AiBridge>) -> (Router, Database) {
     app_with_ai_health(ai, Default::default()).await
 }
 
+/// [`app_with_ai`] plus the registry behind it, for the suites whose subject is
+/// an AI service reading *across* schools.
+pub async fn app_with_ai_tenants(ai: Option<AiBridge>) -> (Router, Database, Tenants) {
+    app_parts(ai, Default::default()).await
+}
+
 /// [`app_with_ai`] with the liveness flag handed in, so a test can take the
 /// database socket down under a running app — the api-read path re-checks it in
 /// place of the HTTP db guard it bypasses.
@@ -148,7 +154,20 @@ pub async fn set_role(db: &Database, username: &str, role: &str) {
 /// Register (password `secret1`), promote to `role`, then log in. Returns the
 /// session `Cookie` value.
 pub async fn login_as(app: &Router, db: &Database, username: &str, role: &str) -> String {
-    let creds = json!({ "school": DEMO_SLUG, "username": username, "password": "secret1" });
+    login_as_school(app, db, DEMO_SLUG, username, role).await
+}
+
+/// [`login_as`] in a named school. `db` must be that school's own handle — the
+/// role is written where the user was created, which is what makes two schools
+/// able to hold the same username independently.
+pub async fn login_as_school(
+    app: &Router,
+    db: &Database,
+    school: &str,
+    username: &str,
+    role: &str,
+) -> String {
+    let creds = json!({ "school": school, "username": username, "password": "secret1" });
     let reg = send(app, "POST", "/auth/register", None, Some(creds.clone())).await;
     assert_eq!(reg.status, StatusCode::CREATED, "register {username}");
     set_role(db, username, role).await;

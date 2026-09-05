@@ -20,6 +20,7 @@ use crate::domain::course_note::CourseNote;
 use crate::domain::course_note_file::CourseNoteFile;
 use crate::domain::rag_output::RagOutput;
 use crate::state::AppState;
+use crate::tenant::Slug;
 
 /// The capability string routed to an indexing service. Defined once, in
 /// [`crate::constant`]; re-exported here so a reader of the payload contract
@@ -80,7 +81,11 @@ impl RagIndexPayload {
 /// Re-index `note` and replace its stored outputs with what the service
 /// answered. Silent no-op when the bridge is off or no worker offers
 /// `rag.index`.
-pub async fn index_course_note(state: &AppState, note: &CourseNote) {
+///
+/// `school` is the caller's own school: it rides the `hab/2` frame, and
+/// `state.db` — the same school's database, since the caller reached this
+/// through the shadow `State` — is where the answer is stored.
+pub async fn index_course_note(state: &AppState, school: &Slug, note: &CourseNote) {
     let Some(bridge) = state.ai.as_ref() else {
         return;
     };
@@ -107,6 +112,7 @@ pub async fn index_course_note(state: &AppState, note: &CourseNote) {
 
     let answer = match bridge
         .dispatch_with_timeout(
+            school,
             AI_RAG_INDEX_CAPABILITY,
             payload,
             std::time::Duration::from_secs(AI_RAG_INDEX_TIMEOUT_SECS),
@@ -151,10 +157,11 @@ async fn replace(
 
 /// [`index_course_note`] off the request path: the handler has already
 /// answered by the time the service is asked.
-pub fn spawn_index(state: &AppState, note: CourseNote) {
+pub fn spawn_index(state: &AppState, school: &Slug, note: CourseNote) {
     // Cheap when AI is off — the spawned task returns on the first `let else`.
     let state = state.clone();
-    tokio::spawn(async move { index_course_note(&state, &note).await });
+    let school = school.clone();
+    tokio::spawn(async move { index_course_note(&state, &school, &note).await });
 }
 
 #[cfg(test)]
