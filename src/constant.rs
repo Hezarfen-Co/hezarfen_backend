@@ -11,6 +11,9 @@ use crate::domain::role::Role;
 pub const MIN_SLUG_LEN: usize = 2;
 pub const MAX_SLUG_LEN: usize = 32;
 
+/// A school's display name — free text, unlike its slug.
+pub const MAX_SCHOOL_NAME_LEN: usize = 120;
+
 pub const MIN_USERNAME_LEN: usize = 3;
 pub const MAX_USERNAME_LEN: usize = 32;
 

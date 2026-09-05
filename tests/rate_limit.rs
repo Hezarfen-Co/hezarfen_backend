@@ -681,9 +681,12 @@ async fn every_route_enforces_the_shipped_limit_plus_one() {
     for (i, (method, path)) in routes.iter().enumerate() {
         // One unique client per route (203.0.x.x is TEST-NET-3).
         let ip = format!("203.0.{}.{}", i / 200, (i % 200) + 1);
-        // The strict tier owns the two credential endpoints; everything else
-        // runs into the catch-all api tier.
-        let limit = if path == "/auth/login" || path == "/auth/register" {
+        // The strict tier owns the credential endpoints — the school's two and
+        // the vendor's own login, which has a budget of its own so a school's
+        // brute-forcer cannot spend it; everything else runs into the catch-all
+        // api tier.
+        let limit = if ["/auth/login", "/auth/register", "/builder/login"].contains(&path.as_str())
+        {
             DEFAULT_AUTH_RATE_LIMIT
         } else {
             DEFAULT_API_RATE_LIMIT

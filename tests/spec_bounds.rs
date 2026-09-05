@@ -61,6 +61,95 @@ async fn spec() -> Value {
 /// a request DTO — the annotation is the promise, this row is the proof.
 fn expectations() -> Vec<(&'static str, &'static str, &'static str, i64)> {
     vec![
+        // --- builder (the vendor surface) ---
+        ("CreateSchool", "slug", "minLength", MIN_SLUG_LEN as i64),
+        ("CreateSchool", "slug", "maxLength", MAX_SLUG_LEN as i64),
+        ("CreateSchool", "name", "maxLength", MAX_SCHOOL_NAME_LEN as i64),
+        ("UpdateSchool", "name", "maxLength", MAX_SCHOOL_NAME_LEN as i64),
+        (
+            "CreateSchool",
+            "admin_username",
+            "minLength",
+            MIN_USERNAME_LEN as i64,
+        ),
+        (
+            "CreateSchool",
+            "admin_username",
+            "maxLength",
+            MAX_USERNAME_LEN as i64,
+        ),
+        (
+            "CreateSchool",
+            "admin_password",
+            "minLength",
+            MIN_PASSWORD_LEN as i64,
+        ),
+        (
+            "CreateSchool",
+            "admin_password",
+            "maxLength",
+            MAX_PASSWORD_LEN as i64,
+        ),
+        (
+            "BuilderCredentials",
+            "username",
+            "minLength",
+            MIN_USERNAME_LEN as i64,
+        ),
+        (
+            "BuilderCredentials",
+            "username",
+            "maxLength",
+            MAX_USERNAME_LEN as i64,
+        ),
+        (
+            "BuilderCredentials",
+            "password",
+            "minLength",
+            MIN_PASSWORD_LEN as i64,
+        ),
+        (
+            "BuilderCredentials",
+            "password",
+            "maxLength",
+            MAX_PASSWORD_LEN as i64,
+        ),
+        (
+            "AdminPassword",
+            "username",
+            "minLength",
+            MIN_USERNAME_LEN as i64,
+        ),
+        (
+            "AdminPassword",
+            "username",
+            "maxLength",
+            MAX_USERNAME_LEN as i64,
+        ),
+        (
+            "EnterSchool",
+            "username",
+            "minLength",
+            MIN_USERNAME_LEN as i64,
+        ),
+        (
+            "EnterSchool",
+            "username",
+            "maxLength",
+            MAX_USERNAME_LEN as i64,
+        ),
+        (
+            "AdminPassword",
+            "password",
+            "minLength",
+            MIN_PASSWORD_LEN as i64,
+        ),
+        (
+            "AdminPassword",
+            "password",
+            "maxLength",
+            MAX_PASSWORD_LEN as i64,
+        ),
         // --- auth / users / notes / messages ---
         ("Credentials", "school", "minLength", MIN_SLUG_LEN as i64),
         ("Credentials", "school", "maxLength", MAX_SLUG_LEN as i64),
