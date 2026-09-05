@@ -518,3 +518,174 @@ pub async fn enroll(app: &Router, cookie: &str, course: &str, user_id: &str) {
     .await;
     assert_eq!(res.status, StatusCode::OK, "enroll {user_id}");
 }
+
+// ---- remote (production) mode -------------------------------------------
+//
+// `Mode::Mem` gives every school its own embedded datastore, so cross-school
+// isolation *cannot* fail there. Production is `Mode::Remote`: one server, one
+// namespace, a database per school, isolation resting entirely on each
+// connection's `use_db` pin. The isolation probes therefore run in both modes,
+// and the remote half needs a real server — this is it.
+
+/// A throwaway `surreal start … memory` server. Owned by the deployments using
+/// it: killed as soon as the last one drops, which is what keeps both runners
+/// clean — `cargo test` (one process, many tests, one shared server) and
+/// `cargo nextest` (process per test, so the kill has to happen inside the
+/// test, not at some exit hook the harness never runs).
+pub struct RemoteServer {
+    child: std::sync::Mutex<std::process::Child>,
+    pub url: String,
+}
+
+impl Drop for RemoteServer {
+    fn drop(&mut self) {
+        let mut child = self.child.lock().expect("server lock");
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+/// The live server, if one is still held; otherwise the next call spawns a new
+/// one. A `Weak` and not the server itself: a `&'static` could never be
+/// dropped, and an un-dropped child is a leaked `surreal` per test process.
+static REMOTE: OnceLock<std::sync::Mutex<std::sync::Weak<RemoteServer>>> = OnceLock::new();
+
+const SURREAL_BIN: &str = ".surrealdb/surreal";
+const SURREAL_HINT: &str = "install it with `curl -sSf https://install.surrealdb.com | sh`, \
+     or set HEZARFEN_SKIP_REMOTE=1 to skip the production-mode isolation tests";
+
+/// The shared server, or `None` when `HEZARFEN_SKIP_REMOTE=1` says to skip.
+/// A missing binary is a **panic**: remote-mode isolation is the mode
+/// production runs in, so it must never quietly not-run.
+pub fn remote_server() -> Option<std::sync::Arc<RemoteServer>> {
+    if std::env::var("HEZARFEN_SKIP_REMOTE").as_deref() == Ok("1") {
+        eprintln!("HEZARFEN_SKIP_REMOTE=1 — remote-mode isolation NOT exercised");
+        return None;
+    }
+    let mut slot = REMOTE
+        .get_or_init(Default::default)
+        .lock()
+        .expect("remote server slot");
+    if let Some(server) = slot.upgrade() {
+        return Some(server);
+    }
+    let bin = PathBuf::from(std::env::var("HOME").expect("HOME")).join(SURREAL_BIN);
+    assert!(
+        bin.exists(),
+        "no surreal binary at {} — {SURREAL_HINT}",
+        bin.display()
+    );
+    // Pick the port by binding and releasing it: two test *processes* (nextest)
+    // each want a server of their own, and a fixed port would collide.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("a free port")
+        .local_addr()
+        .expect("the bound address")
+        .port();
+    let child = std::process::Command::new(&bin)
+        .args([
+            "start",
+            "--user",
+            "root",
+            "--pass",
+            "root",
+            "--bind",
+            &format!("127.0.0.1:{port}"),
+            "memory",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap_or_else(|err| panic!("spawn {}: {err}", bin.display()));
+    let server = std::sync::Arc::new(RemoteServer {
+        child: std::sync::Mutex::new(child),
+        url: format!("ws://127.0.0.1:{port}"),
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "surreal never listened on 127.0.0.1:{port}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    *slot = std::sync::Arc::downgrade(&server);
+    Some(server)
+}
+
+/// A deployment on the shared server: its own namespace, its own blob
+/// directory, and the server handle that must outlive both.
+pub struct RemoteDeployment {
+    pub app: Router,
+    pub tenants: Tenants,
+    /// The scratch namespace this deployment owns, so a test can name it.
+    pub ns: String,
+    /// `FILES_PATH` — one per deployment, never the shared [`files_dir`], so a
+    /// remote run's uploads cannot be counted by a memory-mode probe.
+    pub files: PathBuf,
+    _files: TempDir,
+    _server: std::sync::Arc<RemoteServer>,
+}
+
+/// The remote twin of [`app_and_tenants`]: a real control database in a
+/// namespace of its own, the named schools created in it, and the same router
+/// over the same `AppState`. `None` when the remote lane is skipped.
+pub async fn remote_deployment(schools: &[(&str, &str)]) -> Option<RemoteDeployment> {
+    let server = remote_server()?;
+    let files = tempfile::tempdir().expect("files tempdir");
+    // Unique per call: every test in a process shares one server, and a
+    // namespace collision would put two deployments on one control database.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let ns = format!(
+        "t{}x{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let cfg = hezarfen_backend::config::Config {
+        host: "127.0.0.1".into(),
+        port: 0,
+        db_url: server.url.clone(),
+        db_user: "root".into(),
+        db_pass: "root".into(),
+        db_ns: ns.clone(),
+        db_name: "control".into(),
+        files_path: files.path().display().to_string(),
+        cookie_secure: false,
+        rate_limit: RateLimitConfig::unlimited(),
+        chatbot_per_minute: 0,
+        builder_username: None,
+        builder_password: None,
+        ai_quic_addr: None,
+        ai_shared_token: None,
+        ai_tls_cert: None,
+        ai_tls_key: None,
+        ai_request_timeout_secs: 30,
+    };
+    let tenants = database::init(&cfg).await.expect("remote control database");
+    for (slug, name) in schools {
+        tenants
+            .create(&Slug::try_new(slug).expect("a school slug"), name)
+            .await
+            .unwrap_or_else(|err| panic!("create school {slug}: {err}"));
+    }
+    let app = build_router(AppState {
+        db: tenants.control().clone(),
+        tenants: tenants.clone(),
+        files_path: files.path().to_path_buf(),
+        cookie_secure: false,
+        rate_limit: RateLimitConfig::unlimited(),
+        chatbot_limit: Default::default(),
+        exam_presence: Default::default(),
+        board_hub: Default::default(),
+        db_up: Default::default(),
+        ai: None,
+    });
+    Some(RemoteDeployment {
+        app,
+        tenants,
+        ns,
+        files: files.path().to_path_buf(),
+        _files: files,
+        _server: server,
+    })
+}

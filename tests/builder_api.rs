@@ -811,8 +811,10 @@ async fn probe_drop_is_scoped_and_recreation_is_empty() {
 /// production statements against a live SurrealDB parser.
 #[tokio::test]
 async fn probe_remote_mode_database_statements_execute_for_every_accepted_slug() {
-    let tenants = Tenants::new_mem().await.expect("control db");
-    let control = tenants.control();
+    let Some(deployment) = common::remote_deployment(&[]).await else {
+        return;
+    };
+    let control = deployment.tenants.control();
     let mut broken: Vec<String> = Vec::new();
 
     for raw in [
@@ -1218,86 +1220,22 @@ async fn probe_concurrent_creates_of_one_slug_leave_one_school() {
     assert_eq!(opens, 1, "{opens} of the two admin passwords open p6race");
 }
 
-/// A `surreal start` child that dies with the test.
-struct Server(std::process::Child);
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
 /// Claim 1/2 driven against a **real remote deployment** — the mode every test
 /// above skips, and the only one where `DEFINE DATABASE` / `REMOVE DATABASE`
 /// actually run. `ata-koleji` is the slug the OpenAPI schema advertises.
 #[tokio::test]
 async fn probe_remote_deployment_creates_and_deletes_a_hyphenated_school() {
-    let bin = std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".surrealdb/surreal");
-    if !bin.exists() {
-        eprintln!("skipped: no surreal binary at {}", bin.display());
+    let Some(deployment) = common::remote_deployment(&[]).await else {
         return;
-    }
-    let port = 18441u16;
-    let _server = Server(
-        std::process::Command::new(&bin)
-            .args([
-                "start",
-                "--user",
-                "root",
-                "--pass",
-                "root",
-                "--bind",
-                &format!("127.0.0.1:{port}"),
-                "memory",
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn surreal"),
-    );
-    for _ in 0..100 {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-
-    let files = tempfile::tempdir().unwrap();
-    let cfg = hezarfen_backend::config::Config {
-        host: "127.0.0.1".into(),
-        port: 0,
-        db_url: format!("ws://127.0.0.1:{port}"),
-        db_user: "root".into(),
-        db_pass: "root".into(),
-        db_ns: "hezarfen".into(),
-        db_name: "control".into(),
-        files_path: files.path().display().to_string(),
-        cookie_secure: false,
-        rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
-        chatbot_per_minute: 0,
-        builder_username: Some(BUILDER_USER.into()),
-        builder_password: Some(BUILDER_PASS.into()),
-        ai_quic_addr: None,
-        ai_shared_token: None,
-        ai_tls_cert: None,
-        ai_tls_key: None,
-        ai_request_timeout_secs: 30,
     };
-    let tenants = hezarfen_backend::database::init(&cfg)
-        .await
-        .expect("remote deployment");
-    let app = hezarfen_backend::build_router(hezarfen_backend::state::AppState {
-        db: tenants.control().clone(),
-        tenants: tenants.clone(),
-        files_path: files.path().to_path_buf(),
-        cookie_secure: false,
-        rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
-        chatbot_limit: Default::default(),
-        exam_presence: Default::default(),
-        board_hub: Default::default(),
-        db_up: Default::default(),
-        ai: None,
-    });
+    let app = deployment.app;
+    Builder::ensure(
+        Username::try_new(BUILDER_USER).unwrap(),
+        Password::try_new(BUILDER_PASS).unwrap(),
+        deployment.tenants.control(),
+    )
+    .await
+    .expect("seed the builder");
 
     let builder = builder_login(&app).await;
     // A plain slug proves the harness itself works.
