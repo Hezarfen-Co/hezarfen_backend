@@ -590,8 +590,9 @@ the tie is the parent's whole power — they list their students
 and homework reports in full. Student-only checks are exact (`role == student`), so a
 parent can never enroll, sit an exam, be graded, or land on a roll call; and
 sitting below every staff bar, they can't touch anything else either — except
-messages, which any role sends and receives (that's how a parent reaches a
-teacher), and their own **notes**, which carry no role bar at all: a note is
+messages, which they send *upward* only — to a teacher, manager or admin,
+never to a student or another parent (the same bar a student holds, issue
+#23) — and their own **notes**, which carry no role bar at all: a note is
 private to one person, so a role change must not confiscate it. It used to.
 While the note routes required `student`, a demotion locked the owner out of
 their own notes permanently — and since nothing else in the crate reads a note
@@ -1021,7 +1022,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/meals/profiles/{user}`                                         | teacher | One student's dietary profile. Requires teacher+, or a parent link to them — the caller's own id always passes. |
 | PATCH  | `/meals/profiles/{user}`                                         | manager | Record what a student may not eat. **Manager+**, deliberately: an allergen list is a safety record the school keeps on the student's behalf, not a self-service preference — a student editing their own would let a mistyped (or removed) allergy reach the kitchen with the school's authority behind it. Omitted fields keep their value; `tags` replaces the whole list, and `"note": null` clears the note. First write creates the row. |
 | GET    | `/messages`                                                      | student | List one of the caller's folders, newest first: `inbox` (default), `sent`, `archive`, or `trash` (`?folder=`). `?read=` narrows by the read flag; `total` counts the filtered folder, so `?folder=inbox&read=false&limit=1` is a cheap unread badge. Paged via `?limit=&offset=`. |
-| POST   | `/messages`                                                      | student | Send a message to another user. Any authenticated user may write to any existing user (parents included — messaging is the one place a parent acts); only messaging yourself is refused. The send is server-stamped and lands in the recipient's inbox unread. |
+| POST   | `/messages`                                                      | student | Send a message to another user. Messaging is upward only below staff: a student or parent may write to a teacher, manager or admin (parents included — messaging is the one place a parent acts), never to another student or parent; staff write to anyone. Messaging yourself is refused. The send is server-stamped and lands in the recipient's inbox unread. |
 | PATCH  | `/messages/{id}`                                                 | student | Update the caller's view of a message: flip the read flag (recipient only) and/or move the caller's copy between folders. Each side files independently — archiving or trashing never touches the other party's copy. Filing into `archive`/`trash` records the folder left behind as the copy's `previous_folder`, so restoring is a move back to that value (`inbox`, or `sent` for the sender's copy, when it is `null`). Omitted fields change nothing. |
 | DELETE | `/messages/{id}`                                                 | student | Permanently delete the caller's copy — allowed only from the trash (`PATCH` it to `folder: "trash"` first). The other party's copy lives on; the row disappears for good once both sides have deleted theirs. |
 | GET    | `/notes`                                                         | student | List the notes owned by the current user, newest first. Paged via `?limit=&offset=` (omit `limit` for all of them); returns a `{items, total, limit, offset}` envelope. |
@@ -1093,7 +1094,7 @@ window filtering, before paging; negative values are a `400` naming the field.
 | PATCH  | `/users/me/preferences`                                          | student | Update the caller's own UI preferences: `theme` (`light`/`dark`), `language` (`tr`/`en`), and `palette_color` (accent color as `#rrggbb`). Any authenticated role. Omitted fields stay as they are; an empty string clears one back to "never chose" (the client then follows the device preference). Read them back on any user response, e.g. `GET /auth/me`. |
 | GET    | `/users/me/profile`                                              | student | The caller's own public profile — what everyone else sees of them. |
 | GET    | `/users/me/students`                                             | parent  | The students the calling parent observes, sorted by username. Requires the `parent` role. Each entry's reports live at `GET /marks/{user}`, `GET /attendance/{user}`, and `GET /pomodoro/{user}`. Paged via `?limit=&offset=`. |
-| GET    | `/users/search`                                                  | teacher | Find users by username or name — backs the pickers (enroll, grade, mark attendance). Requires teacher+. `role` narrows to one role (e.g. `role=student` for an enroll picker); a blank `q` with a `role` lists everyone in that role. Paged via `?limit=&offset=` like the other lists (omit `limit` for every match); returns a `{items, total, limit, offset}` envelope carrying only id/username/display name — no contact details. |
+| GET    | `/users/search`                                                  | student | Find users by username or name — backs the pickers (enroll, grade, mark attendance) and, for a student or parent, the one way to find the staff member they are allowed to message. Any authenticated user may ask; a caller below teacher only ever sees the roles they may message (teacher, manager, admin), in the items *and* in `total`. `role` narrows to one role (e.g. `role=student` for an enroll picker) — a student or parent naming a role they may not message is refused; a blank `q` with a `role` lists everyone in that role. Paged via `?limit=&offset=` like the other lists (omit `limit` for every match); returns a `{items, total, limit, offset}` envelope carrying only id/username/display name — no contact details. |
 | GET    | `/users/{id}`                                                    | admin   | Fetch one user with their role and personal info. Admin only. |
 | GET    | `/users/{id}/avatar`                                             | student | The avatar bytes. Same reach as the profile itself: every authenticated account, except a parent, who is limited to their own and their linked students'. |
 | DELETE | `/users/{id}/avatar`                                             | admin   | Remove any user's avatar. Admin only — the moderation path: an offensive picture is a school problem, and no route deletes the account it hangs on. |
@@ -1581,8 +1582,9 @@ answers `409`.
 Every slot carries its teacher's identity (id, username, display name), to a
 parent as much as to a student: **deliberate**, and not to be tightened. A
 parent's three direct routes to that identity are all shut (`GET
-/users/{id}/profile` is a `403`, `/users/search` is teacher+, `/users` is
-admin), but a conference cannot be booked off an anonymous calendar — this list
+/users/{id}/profile` is a `403`, `/users` is admin, and `/users/search` names
+staff but not *which* of them holds office hours), but a conference cannot be
+booked off an anonymous calendar — this list
 *is* the staff directory for the booking flow, narrowed to whoever published
 bookable time. The same refs on a booking (`teacher`, `proposed_by`,
 `decided_by`) read the same way.
@@ -1701,9 +1703,14 @@ too — they may still decide any booking by id.
 ## Messaging
 
 One-to-one, mail-style (subject + body + an optional free-text `label` the UI
-renders as a badge — "Etüt", "Sınav"; no threads): any user writes to any
-user — student to teacher, parent to teacher, teacher to student; only
-messaging yourself is refused. A single stored message serves both parties,
+renders as a badge — "Etüt", "Sınav"; no threads). Writing is **upward only
+below staff**: a student or parent may write to a teacher, manager or admin
+(student to teacher, parent to teacher), never to another student or parent —
+that is a `403`. Staff write to anyone, in any direction (teacher to student).
+Messaging yourself is refused, and only new sends are gated: student↔student
+rows sent before the rule stay readable and filable. `GET /users/search` is
+how a student or parent finds the staff member to write to — it shows them
+staff and nobody else (issue #24). A single stored message serves both parties,
 but each **owns their copy independently**: the recipient's moves through
 `inbox` → `archive`/`trash` and carries the `read` flag (the sender sees it
 as a read receipt); the sender's moves through `sent` → `archive`/`trash`. Filing or
@@ -3125,7 +3132,8 @@ newest first, and `total` counts the memberships the window was cut from.
 Both of them hide one field: **`creator` is `null` below teacher+**. A class is
 created by manager+ only, so shipping the creator to a student (or to their
 linked parent) would hand out an office account's username and real name — an
-identity `GET /users` (admin-only) and `/users/search` (teacher+) both withhold.
+identity `GET /users` (admin-only) withholds outright, and one `/users/search`
+hands a student only as the messaging directory — never as class metadata.
 The homeroom teacher is *not* hidden: naming them is the point of the read. On
 every staff-facing route (`GET /classes`, `/classes/{id}`, and the create/edit
 responses) `creator` is populated exactly as before.

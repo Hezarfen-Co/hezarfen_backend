@@ -284,8 +284,20 @@ async fn full_user_journey() {
         .unwrap();
     assert!(found["items"].as_array().unwrap().is_empty());
 
-    let res = veli
+    // A student may search since #24 — and sees staff only: ali the teacher
+    // comes back, another student never would.
+    let found: Value = veli
         .get(format!("{base}/users/search?q=ali"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(found["items"].as_array().unwrap().len(), 1);
+    assert_eq!(found["items"][0]["username"], "ali");
+    let res = veli
+        .get(format!("{base}/users/search?q=vel&role=student"))
         .send()
         .await
         .unwrap();
