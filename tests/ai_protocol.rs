@@ -1,4 +1,4 @@
-//! Wire-contract tests for the AI bridge — the regression net for `hab/1`.
+//! Wire-contract tests for the AI bridge — the regression net for `hab/2`.
 //!
 //! # Why this file exists separately from `ai_bridge.rs`
 //!
@@ -15,7 +15,7 @@
 //! in a service repo.
 //!
 //! It doubles as the reference implementation: `raw::Service` below is the
-//! whole client side of `hab/1` in about a hundred lines.
+//! whole client side of `hab/2` in about a hundred lines.
 
 mod common;
 
@@ -23,18 +23,23 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hezarfen_backend::ai::{AiBridge, AiError, BridgeConfig};
+use hezarfen_backend::tenant::{SchoolStatus, Slug, Tenants};
 use serde_json::{Value, json};
 
 const TOKEN: &str = "shared-ai-token";
 
+/// The school every frame in this suite names. A literal for the same reason
+/// `PROTOCOL` is one: a service spells the slug out, it is not a Rust constant.
+const SCHOOL: &str = "demo";
+
 /// The protocol identifier this suite pins. Deliberately a literal, not
 /// `AI_PROTOCOL`: importing the constant would let a rename sail through, and
 /// the whole point is that the string is a published contract.
-const PROTOCOL: &str = "hab/1";
+const PROTOCOL: &str = "hab/2";
 
 // ------------------------------------------------------------------- raw --
 
-/// A minimal `hab/1` client with no dependency on the crate's protocol types.
+/// A minimal `hab/2` client with no dependency on the crate's protocol types.
 mod raw {
     use super::*;
 
@@ -252,7 +257,8 @@ fn dispatch(
 ) -> tokio::task::JoinHandle<Result<Value, AiError>> {
     let bridge = bridge.clone();
     let capability = capability.to_string();
-    tokio::spawn(async move { bridge.dispatch(&capability, payload).await })
+    let school = hezarfen_backend::tenant::Slug::try_new(SCHOOL).expect("the demo slug");
+    tokio::spawn(async move { bridge.dispatch(&school, &capability, payload).await })
 }
 
 // ------------------------------------------------------- framing contract --
@@ -385,7 +391,7 @@ async fn the_rejection_frame_carries_exactly_the_published_keys_and_codes() {
     // variant is a breaking change and must fail here.
     let bridge = bridge().await;
 
-    let cases: [(&str, Vec<u8>); 4] = [
+    let cases: [(&str, Vec<u8>); 5] = [
         (
             "unauthorized",
             format!(
@@ -397,6 +403,16 @@ async fn the_rejection_frame_carries_exactly_the_published_keys_and_codes() {
             "unsupported_protocol",
             format!(
                 r#"{{"protocol":"hab/99","service":"s","capabilities":["c"],"token":"{TOKEN}"}}"#
+            )
+            .into_bytes(),
+        ),
+        // The immediate predecessor, named on purpose: `hab/1` frames carry no
+        // school, so a service still speaking it must be turned away here
+        // rather than reaching a path that would have to guess one.
+        (
+            "unsupported_protocol",
+            format!(
+                r#"{{"protocol":"hab/1","service":"s","capabilities":["c"],"token":"{TOKEN}"}}"#
             )
             .into_bytes(),
         ),
@@ -491,12 +507,20 @@ async fn a_foreign_alpn_is_refused_at_the_tls_handshake() {
     // The version gate: an incompatible service must be stopped before it can
     // send a frame this backend would misparse.
     let bridge = bridge().await;
-    let endpoint = raw::endpoint_with_alpn(&bridge, b"hab/99");
-    let result = endpoint
-        .connect(bridge.local_addr().unwrap(), "localhost")
-        .unwrap()
-        .await;
-    assert!(result.is_err(), "ALPN hab/99 must not connect");
+    // `hab/1` included by name: the version gate is the *first* line of defence
+    // against a service whose frames name no school, ahead of the Hello check.
+    for alpn in [b"hab/99".as_slice(), b"hab/1".as_slice()] {
+        let endpoint = raw::endpoint_with_alpn(&bridge, alpn);
+        let result = endpoint
+            .connect(bridge.local_addr().unwrap(), "localhost")
+            .unwrap()
+            .await;
+        assert!(
+            result.is_err(),
+            "ALPN {} must not connect",
+            String::from_utf8_lossy(alpn)
+        );
+    }
     assert!(bridge.workers().is_empty());
 }
 
@@ -516,7 +540,7 @@ async fn the_request_frame_carries_exactly_the_published_keys() {
 
     assert_eq!(
         raw::keys(&request),
-        ["capability", "deadline_ms", "id", "payload"],
+        ["capability", "deadline_ms", "id", "payload", "school"],
         "request shape changed: {request}"
     );
     assert_eq!(request["capability"], "ocr.extract");
@@ -529,7 +553,7 @@ async fn the_request_frame_carries_exactly_the_published_keys() {
     let id = request["id"].as_str().unwrap().to_string();
     raw::answer(
         send,
-        format!(r#"{{"status":"ok","id":"{id}","payload":{{"text":"hi"}}}}"#).as_bytes(),
+        format!(r#"{{"status":"ok","id":"{id}","school":"{SCHOOL}","payload":{{"text":"hi"}}}}"#).as_bytes(),
     )
     .await;
     let answer = call.await.unwrap().expect("dispatch succeeded");
@@ -562,7 +586,7 @@ async fn a_payload_of_any_json_shape_survives_unchanged() {
         assert_eq!(request["payload"], payload, "payload mutated in flight");
 
         let id = request["id"].as_str().unwrap();
-        let echo = json!({ "status": "ok", "id": id, "payload": payload });
+        let echo = json!({ "status": "ok", "id": id, "school": SCHOOL, "payload": payload });
         raw::answer(send, &serde_json::to_vec(&echo).unwrap()).await;
         assert_eq!(
             call.await.unwrap().unwrap(),
@@ -585,7 +609,7 @@ async fn the_response_tags_are_the_published_literals() {
     let id = request["id"].as_str().unwrap().to_string();
     raw::answer(
         send,
-        format!(r#"{{"status":"ok","id":"{id}","payload":42}}"#).as_bytes(),
+        format!(r#"{{"status":"ok","id":"{id}","school":"{SCHOOL}","payload":42}}"#).as_bytes(),
     )
     .await;
     assert_eq!(ok.await.unwrap().unwrap(), json!(42));
@@ -595,7 +619,7 @@ async fn the_response_tags_are_the_published_literals() {
     let id = request["id"].as_str().unwrap().to_string();
     raw::answer(
         send,
-        format!(r#"{{"status":"err","id":"{id}","code":"bad_input","message":"nope"}}"#).as_bytes(),
+        format!(r#"{{"status":"err","id":"{id}","school":"{SCHOOL}","code":"bad_input","message":"nope"}}"#).as_bytes(),
     )
     .await;
     match err.await.unwrap() {
@@ -611,7 +635,7 @@ async fn the_response_tags_are_the_published_literals() {
     let id = request["id"].as_str().unwrap().to_string();
     raw::answer(
         send,
-        format!(r#"{{"status":"success","id":"{id}","payload":1}}"#).as_bytes(),
+        format!(r#"{{"status":"success","id":"{id}","school":"{SCHOOL}","payload":1}}"#).as_bytes(),
     )
     .await;
     assert!(
@@ -634,7 +658,7 @@ async fn a_response_may_carry_unknown_fields() {
     raw::answer(
         send,
         format!(
-            r#"{{"status":"ok","id":"{id}","payload":{{"text":"x"}},"took_ms":91,"model":"v2"}}"#
+            r#"{{"status":"ok","id":"{id}","school":"{SCHOOL}","payload":{{"text":"x"}},"took_ms":91,"model":"v2"}}"#
         )
         .as_bytes(),
     )
@@ -690,7 +714,7 @@ async fn each_request_gets_its_own_stream_and_answers_may_come_back_in_any_order
         let n = request["payload"]["n"].clone();
         raw::answer(
             send,
-            format!(r#"{{"status":"ok","id":"{id}","payload":{{"n":{n}}}}}"#).as_bytes(),
+            format!(r#"{{"status":"ok","id":"{id}","school":"{SCHOOL}","payload":{{"n":{n}}}}}"#).as_bytes(),
         )
         .await;
     }
@@ -720,7 +744,7 @@ async fn request_ids_are_unique_per_request() {
         assert!(seen.insert(id.clone()), "id {id} was reused");
         raw::answer(
             send,
-            format!(r#"{{"status":"ok","id":"{id}","payload":1}}"#).as_bytes(),
+            format!(r#"{{"status":"ok","id":"{id}","school":"{SCHOOL}","payload":1}}"#).as_bytes(),
         )
         .await;
         call.await.unwrap().unwrap();
@@ -752,7 +776,7 @@ async fn the_control_stream_carries_no_frames_after_the_welcome() {
     let id = request["id"].as_str().unwrap().to_string();
     raw::answer(
         send,
-        format!(r#"{{"status":"ok","id":"{id}","payload":1}}"#).as_bytes(),
+        format!(r#"{{"status":"ok","id":"{id}","school":"{SCHOOL}","payload":1}}"#).as_bytes(),
     )
     .await;
     call.await
@@ -774,7 +798,13 @@ async fn closing_the_control_stream_deregisters_the_service() {
     await_workers(&bridge, 0).await;
 
     assert!(matches!(
-        bridge.dispatch("ocr.extract", json!(null)).await,
+        bridge
+            .dispatch(
+                &hezarfen_backend::tenant::Slug::try_new(SCHOOL).unwrap(),
+                "ocr.extract",
+                json!(null)
+            )
+            .await,
         Err(AiError::NoWorker(_))
     ));
 }
@@ -811,7 +841,7 @@ async fn a_service_that_drops_a_request_stream_fails_that_request_only() {
     let id = request["id"].as_str().unwrap().to_string();
     raw::answer(
         send,
-        format!(r#"{{"status":"ok","id":"{id}","payload":"ok"}}"#).as_bytes(),
+        format!(r#"{{"status":"ok","id":"{id}","school":"{SCHOOL}","payload":"ok"}}"#).as_bytes(),
     )
     .await;
     assert_eq!(next.await.unwrap().unwrap(), json!("ok"));
@@ -882,7 +912,7 @@ async fn several_raw_services_serve_one_capability_together() {
                 let n = request["payload"]["n"].clone();
                 raw::answer(
                     send,
-                    format!(r#"{{"status":"ok","id":"{id}","payload":{n}}}"#).as_bytes(),
+                    format!(r#"{{"status":"ok","id":"{id}","school":"{SCHOOL}","payload":{n}}}"#).as_bytes(),
                 )
                 .await;
             }
@@ -976,7 +1006,7 @@ async fn a_chat_request_names_the_askers_school_role() {
     let id = request["id"].as_str().expect("trace id").to_string();
     raw::answer(
         send,
-        format!(r#"{{"status":"ok","id":"{id}","payload":{{"text":"F = ma"}}}}"#).as_bytes(),
+        format!(r#"{{"status":"ok","id":"{id}","school":"{SCHOOL}","payload":{{"text":"F = ma"}}}}"#).as_bytes(),
     )
     .await;
 }
@@ -1012,7 +1042,7 @@ async fn the_api_request_field_names_are_the_published_literals() {
     let (answer, bytes) = raw::api_read(
         &service.conn,
         format!(
-            r#"{{"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","path":"/notes","query":"limit=1&offset=0","on_behalf_of":"{student}","method":"GET"}}"#
+            r#"{{"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","school":"{SCHOOL}","path":"/notes","query":"limit=1&offset=0","on_behalf_of":"{student}","method":"GET"}}"#
         )
         .as_bytes(),
     )
@@ -1020,7 +1050,7 @@ async fn the_api_request_field_names_are_the_published_literals() {
 
     assert_eq!(
         raw::keys(&answer),
-        ["body", "id", "outcome", "status"],
+        ["body", "id", "outcome", "school", "status"],
         "api answer shape changed: {answer}"
     );
     assert_eq!(answer["outcome"], "ok");
@@ -1048,7 +1078,7 @@ async fn only_id_and_path_are_required_of_an_api_request() {
 
     let (answer, _) = raw::api_read(
         &service.conn,
-        br#"{"id":"trace-1","path":"/auth/me","unknown_field":true}"#,
+        br#"{"id":"trace-1","school":"demo","path":"/auth/me","unknown_field":true}"#,
     )
     .await;
     assert_eq!(answer["outcome"], "ok", "{answer}");
@@ -1070,34 +1100,47 @@ async fn the_api_refusal_frame_carries_exactly_the_published_keys_and_codes() {
     let cases = [
         (
             "method_not_allowed",
-            r#"{"id":"t1","path":"/notes","method":"DELETE"}"#.to_string(),
+            r#"{"id":"t1","school":"demo","path":"/notes","method":"DELETE"}"#.to_string(),
         ),
         (
             "method_not_allowed",
             // Lowercase is not the method: the literal is exactly `GET`.
-            r#"{"id":"t2","path":"/notes","method":"get"}"#.to_string(),
+            r#"{"id":"t2","school":"demo","path":"/notes","method":"get"}"#.to_string(),
         ),
         (
             "path_not_allowed",
-            r#"{"id":"t3","path":"/courses"}"#.to_string(),
+            r#"{"id":"t3","school":"demo","path":"/courses"}"#.to_string(),
         ),
         (
             // Order pin: both refusals apply, the method one wins.
             "method_not_allowed",
-            r#"{"id":"t4","path":"/nope","method":"POST"}"#.to_string(),
+            r#"{"id":"t4","school":"demo","path":"/nope","method":"POST"}"#.to_string(),
         ),
         (
             "unknown_user",
-            r#"{"id":"t5","path":"/auth/me","on_behalf_of":"nobodyatall"}"#.to_string(),
+            r#"{"id":"t5","school":"demo","path":"/auth/me","on_behalf_of":"nobodyatall"}"#.to_string(),
         ),
-        ("malformed", r#"{"id":"t6","path":42}"#.to_string()),
+        ("malformed", r#"{"id":"t6","school":"demo","path":42}"#.to_string()),
+        // A frame that names no school at all: required, never defaulted.
+        ("malformed", r#"{"id":"t7","path":"/auth/me"}"#.to_string()),
+        // A string that is no slug — the service's own bug, not a missing
+        // customer, so it is `malformed` rather than `unknown_school`.
+        (
+            "malformed",
+            r#"{"id":"t8","school":"NOT A SLUG","path":"/auth/me"}"#.to_string(),
+        ),
+        // A well-formed slug this deployment does not serve.
+        (
+            "unknown_school",
+            r#"{"id":"t9","school":"nope","path":"/auth/me"}"#.to_string(),
+        ),
     ];
 
     for (expected_code, request) in cases {
         let (answer, _) = raw::api_read(&service.conn, request.as_bytes()).await;
         assert_eq!(
             raw::keys(&answer),
-            ["code", "id", "message", "outcome"],
+            ["code", "id", "message", "outcome", "school"],
             "refusal shape changed for {expected_code}: {answer}"
         );
         assert_eq!(answer["outcome"], "err", "{answer}");
@@ -1130,13 +1173,156 @@ async fn an_api_read_answers_a_named_user_with_that_users_own_data() {
 
     let (answer, _) = raw::api_read(
         &service.conn,
-        format!(r#"{{"id":"t9","path":"/auth/me","on_behalf_of":"{student}"}}"#).as_bytes(),
+        format!(r#"{{"id":"tme","school":"{SCHOOL}","path":"/auth/me","on_behalf_of":"{student}"}}"#)
+            .as_bytes(),
     )
     .await;
     assert_eq!(answer["outcome"], "ok", "{answer}");
     assert_eq!(answer["status"], 200);
     assert_eq!(answer["body"]["id"], student, "{answer}");
     assert_eq!(answer["body"]["role"], "student", "{answer}");
+}
+
+// --------------------------------------------------------------- tenancy --
+//
+// `hab/2`'s whole reason for existing: one shared fleet of services, every
+// frame naming the school it means. These drive that through the raw client,
+// because the refusal codes and the school echo are published contract exactly
+// like the frame keys above.
+
+/// An armed bridge over a deployment with a *second* school, `beta`, holding a
+/// user of the same name as the demo school's. Returns the router (holding it
+/// is what keeps the bridge armed), the registry, and the two ids of `ayse`.
+async fn two_schools(bridge: &AiBridge) -> (axum::Router, Tenants, String, String) {
+    let (app, demo_db, tenants) = common::app_with_ai_tenants(Some(bridge.clone())).await;
+    let beta_db = tenants
+        .create(&Slug::try_new("beta").unwrap(), "Beta College")
+        .await
+        .expect("a second school");
+
+    let demo_cookie = common::login_as(&app, &demo_db, "ayse", "student").await;
+    let beta_cookie = common::login_as_school(&app, &beta_db, "beta", "ayse", "student").await;
+    let demo_ayse = common::me_id(&app, &demo_cookie).await;
+    let beta_ayse = common::me_id(&app, &beta_cookie).await;
+    assert_ne!(demo_ayse, beta_ayse, "two schools, two separate `ayse` rows");
+    (app, tenants, demo_ayse, beta_ayse)
+}
+
+#[tokio::test]
+async fn an_api_read_answers_out_of_the_school_the_frame_named() {
+    // The isolation the field buys, proved both ways with one username: each
+    // school's `ayse` is reachable in her own school and *nowhere else*. A
+    // bridge that resolved the principal against the wrong database would
+    // answer one of the cross reads with a user instead of `unknown_user`.
+    let bridge = bridge().await;
+    let service = raw::handshake(&bridge, &raw::hello("tutor", "chat.reply")).await;
+    await_workers(&bridge, 1).await;
+    let (_app, _tenants, demo_ayse, beta_ayse) = two_schools(&bridge).await;
+
+    for (school, who) in [("demo", &demo_ayse), ("beta", &beta_ayse)] {
+        let (answer, _) = raw::api_read(
+            &service.conn,
+            format!(r#"{{"id":"t-own","school":"{school}","path":"/auth/me","on_behalf_of":"{who}"}}"#)
+                .as_bytes(),
+        )
+        .await;
+        assert_eq!(answer["outcome"], "ok", "{answer}");
+        assert_eq!(answer["school"], school, "the school is echoed: {answer}");
+        assert_eq!(answer["body"]["id"], who.as_str(), "{answer}");
+        assert_eq!(answer["body"]["username"], "ayse");
+    }
+
+    // And crossed over: the other school's id names nobody here.
+    for (school, who) in [("demo", &beta_ayse), ("beta", &demo_ayse)] {
+        let (answer, _) = raw::api_read(
+            &service.conn,
+            format!(
+                r#"{{"id":"t-cross","school":"{school}","path":"/auth/me","on_behalf_of":"{who}"}}"#
+            )
+            .as_bytes(),
+        )
+        .await;
+        assert_eq!(
+            answer["code"], "unknown_user",
+            "a user id from another school resolved in `{school}`: {answer}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_suspended_school_is_refused_with_its_own_code() {
+    // Distinct from `unknown_school` on purpose: this deployment does serve
+    // `beta`, it is switched off — the one refusal here worth retrying later.
+    let bridge = bridge().await;
+    let service = raw::handshake(&bridge, &raw::hello("tutor", "chat.reply")).await;
+    await_workers(&bridge, 1).await;
+    let (_app, tenants, _demo_ayse, beta_ayse) = two_schools(&bridge).await;
+
+    let read = format!(
+        r#"{{"id":"t-susp","school":"beta","path":"/auth/me","on_behalf_of":"{beta_ayse}"}}"#
+    );
+    let (answer, _) = raw::api_read(&service.conn, read.as_bytes()).await;
+    assert_eq!(answer["outcome"], "ok", "the school starts out active");
+
+    tenants
+        .set_status(&Slug::try_new("beta").unwrap(), SchoolStatus::Suspended)
+        .await
+        .expect("suspend beta");
+
+    let (answer, _) = raw::api_read(&service.conn, read.as_bytes()).await;
+    assert_eq!(answer["outcome"], "err", "{answer}");
+    assert_eq!(answer["code"], "school_suspended", "{answer}");
+    assert_eq!(answer["school"], "beta", "the refusal names the school back");
+    assert_eq!(answer["id"], "t-susp");
+
+    // The demo school is untouched by its neighbour's suspension.
+    let (answer, _) = raw::api_read(
+        &service.conn,
+        br#"{"id":"t-neighbour","school":"demo","path":"/auth/me"}"#,
+    )
+    .await;
+    assert_eq!(answer["outcome"], "ok", "{answer}");
+}
+
+#[tokio::test]
+async fn a_blob_read_names_its_school_too() {
+    // The blob path resolves the school independently of the api path, and its
+    // refusals are the same three codes — so it gets the same proof.
+    let bridge = bridge().await;
+    let service = raw::handshake(&bridge, &raw::hello("indexer", "rag.index")).await;
+    await_workers(&bridge, 1).await;
+    let (_app, student, file, uploaded) = armed_with_file(&bridge).await;
+
+    let (header, _, body) = raw::blob_read(
+        &service.conn,
+        format!(r#"{{"id":"t-b1","school":"{SCHOOL}","file":"{file}","on_behalf_of":"{student}"}}"#)
+            .as_bytes(),
+    )
+    .await;
+    assert_eq!(header["status"], "ok", "{header}");
+    assert_eq!(body.len(), uploaded.len());
+
+    for (school, code) in [("nope", "unknown_school"), ("NOT A SLUG", "malformed")] {
+        let (header, _, body) = raw::blob_read(
+            &service.conn,
+            format!(
+                r#"{{"id":"t-b2","school":"{school}","file":"{file}","on_behalf_of":"{student}"}}"#
+            )
+            .as_bytes(),
+        )
+        .await;
+        assert_eq!(header["status"], "err", "{header}");
+        assert_eq!(header["code"], code, "{header}");
+        assert!(body.is_empty(), "a refused blob stream carries no bytes");
+    }
+
+    // And with no school named at all the frame does not parse.
+    let (header, _, _) = raw::blob_read(
+        &service.conn,
+        format!(r#"{{"id":"t-b3","file":"{file}","on_behalf_of":"{student}"}}"#).as_bytes(),
+    )
+    .await;
+    assert_eq!(header["code"], "malformed", "{header}");
 }
 
 // --------------------------------------------------- blob stream contract --
@@ -1198,7 +1384,7 @@ async fn the_blob_header_frame_carries_exactly_the_published_keys_then_size_byte
     let (header, bytes, body) = raw::blob_read(
         &service.conn,
         format!(
-            r#"{{"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","file":"{file}","on_behalf_of":"{student}"}}"#
+            r#"{{"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","school":"{SCHOOL}","file":"{file}","on_behalf_of":"{student}"}}"#
         )
         .as_bytes(),
     )
@@ -1206,7 +1392,7 @@ async fn the_blob_header_frame_carries_exactly_the_published_keys_then_size_byte
 
     assert_eq!(
         raw::keys(&header),
-        ["content_type", "id", "name", "size", "status"],
+        ["content_type", "id", "name", "school", "size", "status"],
         "blob header shape changed: {header}"
     );
     assert_eq!(header["status"], "ok");
@@ -1241,12 +1427,15 @@ async fn a_blob_refusal_frame_carries_exactly_the_published_keys_and_no_bytes() 
 
     let (header, _, body) = raw::blob_read(
         &service.conn,
-        format!(r#"{{"id":"t-blob","file":"01NOSUCHFILE","on_behalf_of":"{student}"}}"#).as_bytes(),
+        format!(
+            r#"{{"id":"t-blob","school":"{SCHOOL}","file":"01NOSUCHFILE","on_behalf_of":"{student}"}}"#
+        )
+        .as_bytes(),
     )
     .await;
     assert_eq!(
         raw::keys(&header),
-        ["code", "id", "message", "status"],
+        ["code", "id", "message", "school", "status"],
         "blob refusal shape changed: {header}"
     );
     assert_eq!(header["status"], "err");
@@ -1270,7 +1459,8 @@ async fn an_api_read_still_answers_on_the_shared_client_stream_path() {
 
     let (answer, _) = raw::api_read(
         &service.conn,
-        format!(r#"{{"id":"t-api","path":"/auth/me","on_behalf_of":"{student}"}}"#).as_bytes(),
+        format!(r#"{{"id":"t-api","school":"{SCHOOL}","path":"/auth/me","on_behalf_of":"{student}"}}"#)
+            .as_bytes(),
     )
     .await;
     assert_eq!(answer["outcome"], "ok", "{answer}");
@@ -1282,7 +1472,7 @@ async fn an_api_read_still_answers_on_the_shared_client_stream_path() {
     let (answer, _) = raw::api_read(
         &service.conn,
         format!(
-            r#"{{"id":"t-both","path":"/auth/me","file":"{file}","on_behalf_of":"{student}"}}"#
+            r#"{{"id":"t-both","school":"{SCHOOL}","path":"/auth/me","file":"{file}","on_behalf_of":"{student}"}}"#
         )
         .as_bytes(),
     )
@@ -1291,7 +1481,7 @@ async fn an_api_read_still_answers_on_the_shared_client_stream_path() {
     assert_eq!(answer["status"], 200);
 
     // Neither shape: still the api read's refusal, with its `outcome` tag.
-    let (answer, _) = raw::api_read(&service.conn, br#"{"id":"t-neither"}"#).await;
+    let (answer, _) = raw::api_read(&service.conn, br#"{"id":"t-neither","school":"demo"}"#).await;
     assert_eq!(answer["outcome"], "err", "{answer}");
     assert_eq!(answer["code"], "malformed");
     assert_eq!(answer["id"], "t-neither");

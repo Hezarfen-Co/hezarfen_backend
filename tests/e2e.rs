@@ -1797,6 +1797,7 @@ async fn chat_service(text: &str) -> ChatService {
                 };
                 let response = AiResponse::Ok {
                     id: request.id.clone(),
+                    school: request.school.clone(),
                     payload: json!({ "text": answer }),
                 };
                 let _ = write_frame(&mut send, &response).await;
