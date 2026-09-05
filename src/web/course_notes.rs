@@ -23,7 +23,7 @@ use crate::domain::course_note::{CourseNote, CourseNoteContent, CourseNoteId, Co
 use crate::domain::course_note_file::{
     CourseNoteFile, CourseNoteFileId, FileContentType, FileName,
 };
-use crate::domain::rag_output::RagOutput;
+use crate::domain::rag_output::{RagOutput, RagOutputId};
 use crate::domain::settings::Settings;
 use crate::error::{AppError, ErrorResponse};
 use crate::state::AppState;
@@ -48,6 +48,8 @@ pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(create, list))
         .routes(routes!(get_one, update, delete_one))
+        .routes(routes!(list_rag))
+        .routes(routes!(delete_rag))
         .merge(files)
 }
 
@@ -528,5 +530,113 @@ async fn delete_file(
     // re-index then rebuilds from what is left, if a service is connected.
     RagOutput::delete_with_source(file.get_id(), &st.db).await?;
     spawn_index(&st, note);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// One AI service output stored against a course note. `payload` is the
+/// service's own shape — the backend stores and serves it unread.
+#[derive(Serialize, ToSchema)]
+struct RagOutputResponse {
+    id: String,
+    course_note: String,
+    course: String,
+    /// The note's file attachments the output was built from.
+    sources: Vec<String>,
+    /// The service's answer, verbatim.
+    #[schema(value_type = Object)]
+    payload: serde_json::Value,
+    /// When the backend stored it, epoch milliseconds.
+    #[schema(example = 1_735_689_600_000i64)]
+    generated_at: i64,
+}
+
+impl RagOutputResponse {
+    fn new(output: &RagOutput) -> Self {
+        Self {
+            id: output.get_id().key().to_string(),
+            course_note: output.get_course_note().key().to_string(),
+            course: output.get_course().key().to_string(),
+            sources: output
+                .get_sources()
+                .iter()
+                .map(|file| file.key().to_string())
+                .collect(),
+            payload: output.get_payload().clone(),
+            generated_at: output.get_generated_at().as_millis(),
+        }
+    }
+}
+
+/// List a course note's AI outputs, newest first. Visible to whoever can view
+/// the course. Paged via `?limit=&offset=`.
+#[utoipa::path(
+    get,
+    path = "/{id}/rag",
+    tag = "course-notes",
+    security(("session_cookie" = [])),
+    params(("id" = String, Path, description = "Course note id"), PageParams),
+    responses(
+        (status = 200, description = "A page of the note's stored AI outputs", body = Page<RagOutputResponse>),
+        (status = 400, description = "Invalid limit or offset", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not enrolled in the course, not its creator or an assigned teacher, and not a manager/admin", body = ErrorResponse),
+        (status = 404, description = "Note not found", body = ErrorResponse),
+    ),
+)]
+async fn list_rag(
+    State(st): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    Path(id): Path<String>,
+    Query(page): Query<PageParams>,
+) -> Result<Json<Page<RagOutputResponse>>, AppError> {
+    let (limit, offset) = page.resolve()?;
+    let (note, course) = note_with_course(&id, &st.db).await?;
+    if !can_view_course(&course, &user, &st.db).await? {
+        return Err(AppError::Forbidden(
+            "only enrolled users, the course creator, an assigned teacher, or a manager/admin can view this course note's AI outputs",
+        ));
+    }
+    let (outputs, total) = RagOutput::list_for(note.get_id(), limit, offset, &st.db).await?;
+    let items = outputs.iter().map(RagOutputResponse::new).collect();
+    Ok(Json(Page::new(items, total, limit, offset)))
+}
+
+/// Delete one stored AI output. Requires teacher+ and management rights over
+/// the course. Dropping an output does not stop the next note or file change
+/// from regenerating one.
+#[utoipa::path(
+    delete,
+    path = "/{id}/rag/{output_id}",
+    tag = "course-notes",
+    security(("session_cookie" = [])),
+    params(
+        ("id" = String, Path, description = "Course note id"),
+        ("output_id" = String, Path, description = "AI output id"),
+    ),
+    responses(
+        (status = 204, description = "Deleted"),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 404, description = "Note or output not found", body = ErrorResponse),
+    ),
+)]
+async fn delete_rag(
+    State(st): State<AppState>,
+    RequireTeacher(user): RequireTeacher,
+    Path((id, output_id)): Path<(String, String)>,
+) -> Result<StatusCode, AppError> {
+    let (note, course) = note_with_course(&id, &st.db).await?;
+    if !can_manage_course(&course, &user) {
+        return Err(AppError::Forbidden(
+            "only the course creator, an assigned teacher, or a manager/admin can delete this course note's AI outputs",
+        ));
+    }
+    // Scoped to the note in the path, like `CourseNoteFile::read_for`: an
+    // output of another note is a 404 here, never a cross-note delete.
+    let output = RagOutput::read(&RagOutputId::from_key(&output_id), &st.db)
+        .await?
+        .filter(|output| output.get_course_note() == note.get_id())
+        .ok_or(AppError::NotFound)?;
+    RagOutput::delete(output.get_id(), &st.db).await?;
     Ok(StatusCode::NO_CONTENT)
 }
