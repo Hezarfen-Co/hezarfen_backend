@@ -20,7 +20,7 @@
 
 use std::time::Duration;
 
-use crate::web::tenant_state::{SchoolSlug, State};
+use crate::web::tenant_state::{SchoolSlug, State, TenantExt};
 use axum::Json;
 use axum::extract::{Path, Query};
 use axum::http::StatusCode;
@@ -438,8 +438,14 @@ async fn send_message(
     // request), so it is the live role at the moment the question was asked —
     // never a stored copy, and never anything the body could assert.
     tokio::spawn(answer_turn(
+        // The school and its database travel together — they are the pair the
+        // request was already resolved into, and one without the other is how
+        // an answer lands in the wrong school.
+        TenantExt {
+            slug,
+            db: st.db.clone(),
+        },
         bridge,
-        st.db.clone(),
         prompt.get_id().clone(),
         answer,
         user.get_role(),
@@ -479,14 +485,15 @@ fn unavailable(message: &str) -> Response {
 ///
 /// Every path settles: a row left `pending` would show as a spinner forever.
 async fn answer_turn(
+    tenant: TenantExt,
     bridge: AiBridge,
-    db: Database,
     prompt_id: ChatbotMessageId,
     answer: ChatbotMessage,
     asker_role: Role,
     history_turns: usize,
     reply_cap: usize,
 ) {
+    let db = tenant.db.clone();
     let answer_id = answer.get_id().clone();
     let thread = answer.get_thread_id().clone();
     // This request's own question, read back by id — the text is already
@@ -513,7 +520,7 @@ async fn answer_turn(
     let fresh = [prompt.get_id().clone(), answer_id.clone()];
     let settled = match fetch_reply(
         &bridge,
-        &db,
+        &tenant,
         &thread,
         &fresh,
         prompt.get_content().as_str().to_string(),
@@ -544,7 +551,7 @@ async fn answer_turn(
 /// The bridge round trip, with every failure mapped to a stable code.
 async fn fetch_reply(
     bridge: &AiBridge,
-    db: &Database,
+    tenant: &TenantExt,
     thread: &ChatbotThreadId,
     fresh: &[ChatbotMessageId; 2],
     prompt: String,
@@ -552,6 +559,7 @@ async fn fetch_reply(
     history_turns: usize,
     reply_cap: usize,
 ) -> Result<(ChatContent, bool), String> {
+    let db = &tenant.db;
     let history = match history_for(db, thread, fresh, history_turns).await {
         Ok(history) => history,
         Err(err) => {
@@ -570,7 +578,7 @@ async fn fetch_reply(
     })?;
 
     let raw = bridge
-        .dispatch(AI_CHAT_CAPABILITY, payload)
+        .dispatch(&tenant.slug, AI_CHAT_CAPABILITY, payload)
         .await
         .map_err(failure_code)?;
     let reply: ChatReplyPayload = serde_json::from_value(raw).map_err(|err| {
@@ -822,7 +830,7 @@ async fn send_error(tx: &EventSender, code: &str, message: &str) {
 
 /// Cut a finished answer into a handful of `delta` chunks.
 ///
-/// Fake streaming: `hab/1` is unary, so the whole text is already in hand and
+/// Fake streaming: `hab/2` is unary, so the whole text is already in hand and
 /// this only lets the UI paint it progressively instead of in one jump. The
 /// day the protocol grows chunk frames, this is the single function that goes
 /// away — nothing else in the stream knows where a chunk came from.

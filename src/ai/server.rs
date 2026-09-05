@@ -24,6 +24,7 @@ use crate::constant::{
     REQUEST_TIMEOUT_SECS,
 };
 use crate::database::Database;
+use crate::error::AppError;
 use crate::domain::course::Course;
 use crate::domain::course_note::CourseNote;
 use crate::domain::course_note_file::{CourseNoteFile, CourseNoteFileId};
@@ -50,40 +51,52 @@ pub struct BridgeConfig {
 }
 
 /// What an api read needs to be answered: the router to dispatch into, the
-/// school the acting principal is loaded from, and the liveness flag that
+/// registry every school is resolved through, and the liveness flag that
 /// stands in for the HTTP db guard this path bypasses.
+///
+/// Deployment-wide, not per-school: `hab/2` frames name their own school, so
+/// one bridge (and one AI fleet) serves every school here.
 struct ApiHandle {
     router: axum::Router,
     tenants: Tenants,
-    /// The one school this bridge serves.
-    ///
-    /// corner-cut: `hab/1` frames carry no school, so the reverse api-read path
-    /// is pinned to [`crate::tenant::DEMO_SLUG`] — a deployment whose schools
-    /// are named anything else answers `unavailable` to every service read.
-    /// The upgrade is `hab/2`: put the school on `Hello`/`ApiRequest` and
-    /// resolve it per request. Nothing else about the bridge is single-school —
-    /// the outbound chatbot dispatch never touches a database.
-    slug: Slug,
     db_up: DbHealth,
-    /// Where uploaded blobs live — the deployment root; the school's own
+    /// Where uploaded blobs live — the deployment root; a school's own
     /// directory is [`school_files_path`] of it.
     files_path: std::path::PathBuf,
 }
 
 impl ApiHandle {
-    /// The school database this bridge reads, or the refusal a service gets.
-    async fn db(&self) -> Result<Database, (&'static str, String)> {
-        self.tenants.get(&self.slug).await.map_err(|err| {
-            (
+    /// Resolve the slug a frame named into that school's database, or the
+    /// refusal the service gets.
+    ///
+    /// The three codes are distinct on purpose: `malformed` is the service's
+    /// own bug (that string is no slug), `unknown_school` means the deployment
+    /// has no such customer, and `school_suspended` means it has one that is
+    /// switched off — a service that retries the first two forever learns
+    /// nothing, while the third is worth retrying later.
+    async fn school(&self, school: &str) -> Result<(Slug, Database), (&'static str, String)> {
+        let slug = Slug::try_new(school)
+            .map_err(|err| ("malformed", format!("`{school}` is not a school slug: {err}")))?;
+        let db = self.tenants.get(&slug).await.map_err(|err| match err {
+            AppError::Unauthorized => (
+                "unknown_school",
+                format!("this deployment serves no `{slug}` school"),
+            ),
+            AppError::Forbidden(_) => (
+                "school_suspended",
+                format!("the `{slug}` school is suspended"),
+            ),
+            other => (
                 "unavailable",
-                format!("the `{}` school is not reachable: {err}", self.slug),
-            )
-        })
+                format!("the `{slug}` school is not reachable: {other}"),
+            ),
+        })?;
+        Ok((slug, db))
     }
 
-    /// That school's blob directory.
-    fn files_dir(&self) -> std::path::PathBuf {
-        school_files_path(&self.files_path, &self.slug)
+    /// One school's blob directory.
+    fn files_dir(&self, slug: &Slug) -> std::path::PathBuf {
+        school_files_path(&self.files_path, slug)
     }
 }
 
@@ -188,8 +201,13 @@ impl AiBridge {
     /// Each call takes a fresh QUIC bidirectional stream, so concurrent calls
     /// over the same connection neither block nor interleave: the stream *is*
     /// the correlation, and a slow one cannot stall a fast one.
-    pub async fn dispatch(&self, capability: &str, payload: Value) -> Result<Value, AiError> {
-        self.dispatch_with_timeout(capability, payload, self.inner.request_timeout)
+    pub async fn dispatch(
+        &self,
+        school: &Slug,
+        capability: &str,
+        payload: Value,
+    ) -> Result<Value, AiError> {
+        self.dispatch_with_timeout(school, capability, payload, self.inner.request_timeout)
             .await
     }
 
@@ -198,6 +216,7 @@ impl AiBridge {
     /// generation).
     pub async fn dispatch_with_timeout(
         &self,
+        school: &Slug,
         capability: &str,
         payload: Value,
         timeout: Duration,
@@ -210,6 +229,7 @@ impl AiBridge {
         let deadline_ms = timeout.as_millis().min(u64::MAX as u128) as u64;
         let request = Request {
             id: id.clone(),
+            school: school.as_str().to_string(),
             capability: capability.to_string(),
             deadline_ms,
             payload,
@@ -248,6 +268,7 @@ impl AiBridge {
                 id: got,
                 code,
                 message,
+                ..
             } if got == id => Err(AiError::Remote { code, message }),
             // A mismatched id means the service is not tracking which stream it
             // is on. Nothing here depends on the id for correlation, but the
@@ -278,7 +299,6 @@ impl AiBridge {
             .set(ApiHandle {
                 router,
                 tenants,
-                slug: Slug::try_new(crate::tenant::DEMO_SLUG).expect("the demo slug is a slug"),
                 db_up,
                 files_path,
             })
@@ -369,17 +389,16 @@ async fn serve_client_stream(
         Err(e) => {
             answer(
                 &mut send,
-                refusal(String::new(), "malformed", e.to_string()),
+                refusal(String::new(), String::new(), "malformed", e.to_string()),
             )
             .await;
             return;
         }
     };
-    let id = raw
-        .get("id")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
+    let id = string_field(&raw, "id");
+    // Echoed verbatim on a refusal, before it is known to be a slug at all:
+    // it is how the service tells which of its in-flight reads was refused.
+    let school = string_field(&raw, "school");
     // Routed on the shape's required field rather than by parsing one and
     // falling back to the other: that fallback cloned the whole `Value` on
     // every api read. `path` still wins when a frame carries both.
@@ -387,9 +406,9 @@ async fn serve_client_stream(
         let response = match serde_json::from_value::<ApiRequest>(raw) {
             Ok(request) => match read_api(&inner, request).await {
                 Ok(response) => response,
-                Err((code, message)) => refusal(id, code, message),
+                Err((code, message)) => refusal(id, school, code, message),
             },
-            Err(e) => refusal(id, "malformed", e.to_string()),
+            Err(e) => refusal(id, school, "malformed", e.to_string()),
         };
         answer(&mut send, response).await;
         return;
@@ -397,7 +416,7 @@ async fn serve_client_stream(
     if raw.get("file").is_some() {
         match serde_json::from_value::<BlobRequest>(raw) {
             Ok(request) => serve_blob(&inner, &mut send, request).await,
-            Err(e) => answer(&mut send, refusal(id, "malformed", e.to_string())).await,
+            Err(e) => answer(&mut send, refusal(id, school, "malformed", e.to_string())).await,
         }
         return;
     }
@@ -406,7 +425,16 @@ async fn serve_client_stream(
     let api_err = serde_json::from_value::<ApiRequest>(raw)
         .err()
         .map_or_else(String::new, |e| e.to_string());
-    answer(&mut send, refusal(id, "malformed", api_err)).await;
+    answer(&mut send, refusal(id, school, "malformed", api_err)).await;
+}
+
+/// One string field of a raw frame, or the empty string. Used for the fields a
+/// refusal echoes back before the frame has been proved to be anything.
+fn string_field(raw: &Value, name: &str) -> String {
+    raw.get(name)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// Answer one blob read: the [`BlobResponse`] header frame, then — on `Ok` —
@@ -417,6 +445,7 @@ async fn serve_client_stream(
 /// because such a thing does not fit a frame.
 async fn serve_blob(inner: &Inner, send: &mut quinn::SendStream, request: BlobRequest) {
     let id = request.id.clone();
+    let school = request.school.clone();
     match open_blob(inner, request).await {
         Ok((header, mut file)) => {
             if let Err(e) = write_frame(send, &header).await {
@@ -433,6 +462,7 @@ async fn serve_blob(inner: &Inner, send: &mut quinn::SendStream, request: BlobRe
         Err((code, message)) => {
             let refused = BlobResponse::Err {
                 id,
+                school,
                 code: code.to_string(),
                 message,
             };
@@ -497,8 +527,8 @@ async fn open_blob(
             "the database socket is down — retry".to_string(),
         ));
     }
-    let db = api.db().await?;
-    let user = principal(api, request.on_behalf_of.as_deref()).await?;
+    let (slug, db) = api.school(&request.school).await?;
+    let user = principal(&db, request.on_behalf_of.as_deref()).await?;
 
     let missing = || {
         (
@@ -534,7 +564,7 @@ async fn open_blob(
 
     // The row exists but its blob does not: server-side damage (a lost volume
     // path), exactly as `download_file` reads it — not the service's `404`.
-    let path = blob_path(&api.files_dir(), file.get_id().key());
+    let path = blob_path(&api.files_dir(&slug), file.get_id().key());
     let handle = tokio::fs::File::open(&path).await.map_err(|e| {
         (
             "unavailable",
@@ -555,6 +585,7 @@ async fn open_blob(
     Ok((
         BlobResponse::Ok {
             id: request.id,
+            school: request.school,
             name: file.get_name().as_str().to_string(),
             content_type: file.get_content_type().as_str().to_string(),
             size,
@@ -565,20 +596,18 @@ async fn open_blob(
 
 /// Who a client-initiated read runs as.
 ///
-/// Loaded live, never trusted from the frame: a service holding a stale id must
-/// not act as a user who has since been deleted or demoted. With nobody named
-/// the principal is the synthetic `ai` role.
-async fn principal(
-    api: &ApiHandle,
-    on_behalf_of: Option<&str>,
-) -> Result<User, (&'static str, String)> {
+/// Loaded live out of the *school's own* database — never the control one and
+/// never trusted from the frame: a service holding a stale id must not act as a
+/// user who has since been deleted or demoted, nor as a same-named user of
+/// another school. With nobody named the principal is the synthetic `ai` role.
+async fn principal(db: &Database, on_behalf_of: Option<&str>) -> Result<User, (&'static str, String)> {
     let Some(who) = on_behalf_of else {
         return Ok(User::ai_principal());
     };
     // Both the bare key (`abc`, as a REST path spells it) and the record form
     // (`user:abc`) are accepted.
     let key = who.strip_prefix("user:").unwrap_or(who);
-    User::read(&UserId::from_key(key), &api.db().await?)
+    User::read(&UserId::from_key(key), db)
         .await
         .map_err(|e| ("unavailable", format!("could not load `{who}`: {e}")))?
         .ok_or_else(|| ("unknown_user", format!("no user `{who}`")))
@@ -639,6 +668,7 @@ async fn dispatch_api(
 ) -> Result<ApiResponse, (&'static str, String)> {
     let ApiRequest {
         id,
+        school,
         path,
         query,
         on_behalf_of,
@@ -655,10 +685,13 @@ async fn dispatch_api(
         ));
     }
 
+    // The school comes off the frame, so this is where a service naming a
+    // stranger's slug (or a suspended school's) is stopped — before a row of
+    // anyone's data is read.
+    let (slug, db) = api.school(&school).await?;
     // The role itself is re-read again by the extractor on the dispatched
     // request; see [`principal`] for why it is never taken from the frame.
-    let db = api.db().await?;
-    let user = principal(api, on_behalf_of.as_deref()).await?;
+    let user = principal(&db, on_behalf_of.as_deref()).await?;
 
     let target = match query.as_deref() {
         Some(query) if !query.is_empty() => format!("{path}?{query}"),
@@ -679,10 +712,7 @@ async fn dispatch_api(
     dispatched.extensions_mut().insert(AiPrincipal(user));
     // The dispatched request carries no cookie, so the school is handed over
     // in the extension the shadow `State` reads first.
-    dispatched.extensions_mut().insert(TenantExt {
-        slug: api.slug.clone(),
-        db,
-    });
+    dispatched.extensions_mut().insert(TenantExt { slug, db });
 
     let response = tokio::time::timeout(
         Duration::from_secs(REQUEST_TIMEOUT_SECS),
@@ -718,12 +748,18 @@ async fn dispatch_api(
         })?
     };
 
-    Ok(ApiResponse::Ok { id, status, body })
+    Ok(ApiResponse::Ok {
+        id,
+        school,
+        status,
+        body,
+    })
 }
 
-fn refusal(id: String, code: &str, message: String) -> ApiResponse {
+fn refusal(id: String, school: String, code: &str, message: String) -> ApiResponse {
     ApiResponse::Err {
         id,
+        school,
         code: code.to_string(),
         message,
     }
@@ -750,11 +786,13 @@ async fn write_answer<W: tokio::io::AsyncWrite + Unpin>(
     response: &ApiResponse,
 ) -> Result<(), FrameError> {
     let written = write_frame(w, response).await;
-    if let (Err(FrameError::TooLarge(_)), ApiResponse::Ok { id, .. }) = (&written, response) {
+    if let (Err(FrameError::TooLarge(_)), ApiResponse::Ok { id, school, .. }) = (&written, response)
+    {
         return write_frame(
             w,
             &refusal(
                 id.clone(),
+                school.clone(),
                 "too_large",
                 format!("the answer exceeds the {AI_MAX_FRAME_BYTES}-byte frame limit"),
             ),
@@ -896,7 +934,7 @@ mod tests {
         refuse_before_dispatch,
     };
     use crate::ai::protocol::read_frame;
-    use crate::tenant::Slug;
+    use crate::tenant::DEMO_SLUG;
 
     /// An armed handle serving `router`. The database is never touched by these
     /// reads (nobody is named, so the principal is synthetic), but the handle
@@ -907,7 +945,6 @@ mod tests {
             tenants: crate::database::init_mem_tenants()
                 .await
                 .expect("in-memory deployment"),
-            slug: Slug::try_new(crate::tenant::DEMO_SLUG).unwrap(),
             db_up: Default::default(),
             files_path: std::env::temp_dir(),
         }
@@ -917,6 +954,7 @@ mod tests {
     fn read_of(path: &str) -> ApiRequest {
         ApiRequest {
             id: "trace-1".to_string(),
+            school: DEMO_SLUG.to_string(),
             path: path.to_string(),
             query: None,
             on_behalf_of: None,
@@ -987,6 +1025,7 @@ mod tests {
         // frame may precede it on the stream.
         let big = ApiResponse::Ok {
             id: "trace-1".to_string(),
+            school: DEMO_SLUG.to_string(),
             status: 200,
             body: serde_json::Value::String("x".repeat(AI_MAX_FRAME_BYTES)),
         };
