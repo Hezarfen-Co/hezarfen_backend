@@ -73,6 +73,16 @@ mod tests {
     }
 
     #[test]
+    fn course_notes_are_readable_but_their_blobs_are_not() {
+        assert!(path_allowed("/course-notes"));
+        assert!(path_allowed("/course-notes/note123"));
+        // The listing of a note's files is JSON; the bytes behind one are not.
+        assert!(path_allowed("/course-notes/note123/files"));
+        assert!(!path_allowed("/course-notes/note123/files/f1"));
+        assert!(!path_allowed("/course-notes/"));
+    }
+
+    #[test]
     fn trailing_slash_is_a_different_path() {
         assert!(!path_allowed("/notes/"));
         assert!(!path_allowed("/auth/me/"));

@@ -3586,6 +3586,9 @@ exactly, segment for segment (`src/constant.rs`, `AI_API_ALLOWLIST`):
 /homework/{id}/result
 /homework/{id}/submission
 /homework/report/{user}
+/course-notes
+/course-notes/{id}
+/course-notes/{id}/files
 ```
 
 `{x}` takes exactly one non-empty segment. There is no prefix match and no
