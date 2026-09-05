@@ -28776,3 +28776,400 @@ async fn a_disabled_module_refuses_its_websocket_upgrade() {
         assert_eq!(res.body["module"], module, "{route}");
     }
 }
+
+// --- module entitlements: the full sweep ---------------------------------
+//
+// The foundation tests above prove the mechanism on one nest; these prove it
+// holds for *every* module, driven through the vendor's own surface, plus the
+// coverage test that fails when a future nest is mounted ungated.
+
+use hezarfen_backend::domain::builder::Builder;
+
+const SWEEP_BUILDER_USER: &str = "operator";
+const SWEEP_BUILDER_PASS: &str = "secret1";
+
+/// A deployment with a builder account, so the sweep can sell and take back
+/// modules by the same path production does (mirrors `tests/builder_api.rs`).
+async fn sweep_deployment() -> (axum::Router, hezarfen_backend::database::Database, Tenants) {
+    let (app, db, tenants) = common::app_and_tenants().await;
+    Builder::ensure(
+        Username::try_new(SWEEP_BUILDER_USER).unwrap(),
+        Password::try_new(SWEEP_BUILDER_PASS).unwrap(),
+        tenants.control(),
+    )
+    .await
+    .expect("seed the builder");
+    (app, db, tenants)
+}
+
+async fn sweep_builder_login(app: &axum::Router) -> String {
+    let res = send(
+        app,
+        "POST",
+        "/builder/login",
+        None,
+        Some(json!({ "username": SWEEP_BUILDER_USER, "password": SWEEP_BUILDER_PASS })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "builder login: {}", res.body);
+    res.cookie.expect("builder cookie")
+}
+
+fn is_module_disabled(res: &common::Res) -> bool {
+    res.status == StatusCode::FORBIDDEN && res.body["error"] == "module disabled"
+}
+
+/// One route per module that exists and lives in that module's nest — the
+/// probe the sweep drives. GET list routes wherever the nest has one; the
+/// status when the module is *on* is irrelevant (a `{id}` route may 400 or
+/// 404), only "not the module refusal" is.
+const MODULE_ROUTES: [(Module, &str, &str); 21] = [
+    (Module::Chatbot, "GET", "/chatbot/threads"),
+    (Module::Notes, "GET", "/notes"),
+    (Module::Messages, "GET", "/messages"),
+    (Module::Events, "GET", "/events"),
+    (Module::Appointments, "GET", "/appointments/slots"),
+    (Module::Courses, "GET", "/courses"),
+    (Module::CourseNotes, "GET", "/course-notes"),
+    (Module::Classes, "GET", "/classes"),
+    // No list route of its own: sessions are listed under a course.
+    (Module::Sessions, "GET", "/sessions/nope"),
+    (Module::Exams, "GET", "/exams"),
+    (Module::Marks, "GET", "/marks/me"),
+    (Module::Meals, "GET", "/meals/menus"),
+    (Module::Payments, "GET", "/payments/plans"),
+    (Module::Work, "GET", "/work/me"),
+    (Module::Pomodoro, "GET", "/pomodoro/me"),
+    (Module::Questions, "GET", "/questions"),
+    (Module::BankQuestions, "GET", "/bank-questions"),
+    (Module::Attendance, "GET", "/attendance/me"),
+    // Same as sessions: a subject is reached by id or through its course.
+    (Module::Subjects, "GET", "/subjects/nope"),
+    (Module::Homework, "GET", "/homework"),
+    (Module::Boards, "GET", "/boards"),
+];
+
+/// Every one of the 21 modules, one at a time: on → not refused, taken back →
+/// `403 {"error":"module disabled","module":"<name>"}` on the *same* school
+/// cookie, sold back → not refused again.
+#[tokio::test]
+async fn every_module_gates_its_own_nest_when_the_builder_takes_it_back() {
+    let (app, db, tenants) = sweep_deployment().await;
+    let slug = Slug::try_new(DEMO_SLUG).unwrap();
+    let cookie = login_as(&app, &db, "ada", "admin").await;
+    let builder = sweep_builder_login(&app).await;
+
+    for (module, method, path) in MODULE_ROUTES {
+        let res = send(&app, method, path, Some(&cookie), None).await;
+        assert!(
+            !is_module_disabled(&res),
+            "{module} is enabled, so {method} {path} must not be the module refusal: {} {}",
+            res.status,
+            res.body
+        );
+
+        let one = format!("/schools/{DEMO_SLUG}/modules/{module}");
+        if module.dependents().is_empty() {
+            let res = send(&app, "DELETE", &one, Some(&builder), None).await;
+            assert_eq!(
+                res.status,
+                StatusCode::OK,
+                "take back {module}: {}",
+                res.body
+            );
+        } else {
+            // The five modules something else structurally needs. This sweep
+            // leaves every *other* module on, so the builder API rightly
+            // refuses (`409 "<m> is required by …"`) — asserted here rather
+            // than worked around, then the entitlement is written through the
+            // registry call the API itself ends in.
+            let res = send(&app, "DELETE", &one, Some(&builder), None).await;
+            assert_eq!(
+                res.status,
+                StatusCode::CONFLICT,
+                "{module} has dependents {:?}, so the API must refuse: {}",
+                module.dependents(),
+                res.body
+            );
+            let mut without = ModuleSet::all();
+            without.remove(module);
+            tenants.set_modules(&slug, &without).await.unwrap();
+        }
+
+        let res = send(&app, method, path, Some(&cookie), None).await;
+        assert_eq!(
+            res.status,
+            StatusCode::FORBIDDEN,
+            "{method} {path}: {}",
+            res.body
+        );
+        assert_eq!(
+            res.body,
+            json!({ "error": "module disabled", "module": module.as_str() }),
+            "the refusal body is contract, for {module}"
+        );
+
+        // Sold back through the API in every case: enabling never conflicts.
+        let res = send(&app, "POST", &one, Some(&builder), None).await;
+        assert_eq!(
+            res.status,
+            StatusCode::OK,
+            "sell {module} back: {}",
+            res.body
+        );
+        let res = send(&app, method, path, Some(&cookie), None).await;
+        assert!(
+            !is_module_disabled(&res),
+            "{module} is back on: {} {}",
+            res.status,
+            res.body
+        );
+    }
+}
+
+/// All four foreign-module route pairs under `/courses`, not just the one the
+/// foundation test drives: each answers for its *own* module while `courses`
+/// stays on.
+#[tokio::test]
+async fn every_course_child_route_names_its_own_module() {
+    let (app, db, tenants) = common::app_and_tenants().await;
+    let slug = Slug::try_new(DEMO_SLUG).unwrap();
+    let cookie = login_as(&app, &db, "ada", "admin").await;
+    let course = create_course(&app, &cookie, "Fizik").await;
+
+    for (module, child) in [
+        (Module::Exams, "exams"),
+        (Module::Sessions, "sessions"),
+        (Module::Subjects, "subjects"),
+        (Module::Homework, "homework"),
+    ] {
+        // Three of the four are needed by another module (marks, attendance,
+        // exams), so the builder API would `409` here — the set is written
+        // directly, uniformly, since the API's own refusal is proven above.
+        let mut without = ModuleSet::all();
+        without.remove(module);
+        tenants.set_modules(&slug, &without).await.unwrap();
+
+        let path = format!("/courses/{course}/{child}");
+        let res = send(&app, "GET", &path, Some(&cookie), None).await;
+        assert_eq!(res.status, StatusCode::FORBIDDEN, "{path}: {}", res.body);
+        assert_eq!(
+            res.body,
+            json!({ "error": "module disabled", "module": module.as_str() }),
+            "{path} answers for its own module"
+        );
+
+        let res = send(
+            &app,
+            "GET",
+            &format!("/courses/{course}"),
+            Some(&cookie),
+            None,
+        )
+        .await;
+        assert_eq!(
+            res.status,
+            StatusCode::OK,
+            "courses stays on while {module} is off: {}",
+            res.body
+        );
+
+        tenants.set_modules(&slug, &ModuleSet::all()).await.unwrap();
+    }
+}
+
+/// A school that bought nothing is still a school: it logs in, reads itself,
+/// and can be told what it has — none of that lives behind a module.
+#[tokio::test]
+async fn a_school_with_no_modules_can_still_use_the_core_routes() {
+    let (app, _db, _tenants) = sweep_deployment().await;
+    let builder = sweep_builder_login(&app).await;
+
+    let res = send(
+        &app,
+        "POST",
+        "/schools",
+        Some(&builder),
+        Some(json!({
+            "slug": "bare",
+            "name": "Bare School",
+            "admin_username": "admin",
+            "admin_password": "secret1",
+            "modules": [],
+        })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    assert_eq!(res.body["modules"], json!([]));
+
+    let res = send(
+        &app,
+        "POST",
+        "/auth/login",
+        None,
+        Some(json!({ "school": "bare", "username": "admin", "password": "secret1" })),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::OK,
+        "a bare school still logs in: {}",
+        res.body
+    );
+    let cookie = res.cookie.expect("session cookie");
+
+    for route in [
+        "/auth/me",
+        "/limits",
+        "/settings",
+        "/terms",
+        "/users/me/profile",
+    ] {
+        let res = send(&app, "GET", route, Some(&cookie), None).await;
+        assert_eq!(res.status, StatusCode::OK, "{route}: {}", res.body);
+    }
+
+    let res = send(&app, "GET", "/modules", Some(&cookie), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body, json!({ "enabled": [] }));
+}
+
+// --- module entitlements: coverage ---------------------------------------
+
+/// Route prefixes that are deliberately ungated, each with the reason it is —
+/// a nest here is one no school can be sold or refused.
+const CORE_PREFIXES: [(&str, &str); 12] = [
+    ("/", "the health mirror at the root"),
+    ("/health", "liveness, read before any school is resolved"),
+    ("/time", "the server clock, a deploy constant"),
+    ("/limits", "deploy-time constants, needed to draw any form"),
+    (
+        "/modules",
+        "the entitlement lookup itself; gating it is circular",
+    ),
+    ("/ai", "the AI bridge's own surface, not a school's nest"),
+    (
+        "/auth",
+        "the door: a school must log in before anything is refused",
+    ),
+    (
+        "/users",
+        "identity and profiles, part of being a school at all",
+    ),
+    ("/settings", "the school's own settings"),
+    (
+        "/terms",
+        "the academic calendar every other module hangs off",
+    ),
+    (
+        "/builder",
+        "the vendor principal, which is not a school user",
+    ),
+    ("/schools", "the vendor's registry surface, same principal"),
+];
+
+/// Every module's nest prefix. Written down rather than derived: the point is
+/// to catch a nest that was mounted without a gate, and a derived list would
+/// be derived from the same code it is checking.
+const MODULE_PREFIXES: [(Module, &str); 21] = [
+    (Module::Chatbot, "/chatbot"),
+    (Module::Notes, "/notes"),
+    (Module::Messages, "/messages"),
+    (Module::Events, "/events"),
+    (Module::Appointments, "/appointments"),
+    (Module::Courses, "/courses"),
+    (Module::CourseNotes, "/course-notes"),
+    (Module::Classes, "/classes"),
+    (Module::Sessions, "/sessions"),
+    (Module::Exams, "/exams"),
+    (Module::Marks, "/marks"),
+    (Module::Meals, "/meals"),
+    (Module::Payments, "/payments"),
+    (Module::Work, "/work"),
+    (Module::Pomodoro, "/pomodoro"),
+    (Module::Questions, "/questions"),
+    (Module::BankQuestions, "/bank-questions"),
+    (Module::Attendance, "/attendance"),
+    (Module::Subjects, "/subjects"),
+    (Module::Homework, "/homework"),
+    (Module::Boards, "/boards"),
+];
+
+/// `path` is inside `prefix` — segment-wise, so `/course-notes` is not inside
+/// `/courses` and `/` is only ever itself.
+fn under(path: &str, prefix: &str) -> bool {
+    if prefix == "/" {
+        return path == "/";
+    }
+    path == prefix || path.starts_with(&format!("{prefix}/"))
+}
+
+/// The published surface is exactly: the ungated core, plus the 21 gated
+/// nests. A nest added to `build_router` without a gate matches neither list
+/// and fails here by name — which is the only way an ungated nest is ever
+/// noticed, since nothing else in the suite knows a new route exists.
+///
+/// corner-cut: it reads the OpenAPI document, so it sees only routes mounted
+/// with `.routes(routes!(…))` — a bare `.route()` is invisible to it. Every
+/// nest in `build_router` is documented today, so the ceiling is an
+/// undocumented route — which is already against this repo's convention.
+#[tokio::test]
+async fn every_published_route_is_either_core_or_inside_a_gated_module_nest() {
+    let app = mem_app().await;
+    let spec = send(&app, "GET", "/api-docs/openapi.json", None, None).await;
+    assert_eq!(spec.status, StatusCode::OK);
+    let paths = spec.body["paths"].as_object().expect("the spec has paths");
+    assert!(
+        paths.len() > 100,
+        "the whole spec, not a stub: {}",
+        paths.len()
+    );
+
+    let mut ungated = Vec::new();
+    for path in paths.keys() {
+        let core: Vec<&str> = CORE_PREFIXES
+            .iter()
+            .filter(|(prefix, _)| under(path, prefix))
+            .map(|(prefix, _)| *prefix)
+            .collect();
+        let gated: Vec<&str> = MODULE_PREFIXES
+            .iter()
+            .filter(|(_, prefix)| under(path, prefix))
+            .map(|(_, prefix)| *prefix)
+            .collect();
+        match core.len() + gated.len() {
+            1 => {}
+            0 => ungated.push(format!(
+                "{path}: in no core prefix and no gated module nest — mount it under a module (and gate it), or add it to CORE_PREFIXES with its reason"
+            )),
+            _ => ungated.push(format!("{path}: ambiguous, matches {core:?} and {gated:?}")),
+        }
+    }
+    assert!(
+        ungated.is_empty(),
+        "ungated routes:\n{}",
+        ungated.join("\n")
+    );
+}
+
+/// The catalog a client draws the switchboard from lists every module the
+/// server can refuse — a module missing here is one nobody can buy.
+#[tokio::test]
+async fn the_catalog_lists_every_module() {
+    let app = mem_app().await;
+    let res = send(&app, "GET", "/modules/catalog", None, None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let listed: Vec<&str> = res.body["modules"]
+        .as_array()
+        .expect("modules")
+        .iter()
+        .map(|m| m["module"].as_str().expect("name"))
+        .collect();
+    assert_eq!(listed.len(), Module::ALL.len());
+    for module in Module::ALL {
+        assert!(
+            listed.contains(&module.as_str()),
+            "{module} is not for sale"
+        );
+    }
+}
