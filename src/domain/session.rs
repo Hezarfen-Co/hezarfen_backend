@@ -93,6 +93,17 @@ impl Session {
         Ok(())
     }
 
+    /// Revoke every session a user holds. The other half of a password reset:
+    /// the new credential means nothing while a cookie minted under the old one
+    /// still authenticates.
+    pub async fn delete_by_user(user: &UserId, db: &Database) -> Result<(), AppError> {
+        db.query("DELETE session WHERE user = $usr")
+            .bind(("usr", user.record()))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
     /// Delete every session whose expiry is in the past, returning how many were
     /// removed. Expired sessions are already rejected at auth, but nothing else
     /// deletes their rows — without this sweep the `session` table grows forever.

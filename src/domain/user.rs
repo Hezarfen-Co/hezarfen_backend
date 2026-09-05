@@ -370,7 +370,7 @@ impl User {
     /// or a cancelled future), and the row left behind is an ordinary student
     /// account that [`User::ensure_admin`] must then refuse to touch — a
     /// deployment with no admin and no way for a later boot to repair it.
-    async fn create_with_role(
+    pub async fn create_with_role(
         username: Username,
         password_hash: PasswordHash,
         role: Role,
@@ -887,6 +887,29 @@ impl User {
             "UPDATE $u SET avatar_file = NONE, avatar_content_type = NONE, \
              avatar_size = NONE RETURN BEFORE",
             &[("u".into(), id.record().into_value())],
+        )
+        .await?;
+        Ok(rows.into_iter().next())
+    }
+
+    /// Replace a user's password hash — the builder's admin-password reset
+    /// (`POST /schools/{slug}/admin-password`). Only the credential is
+    /// rewritten; revoking the sessions minted under the old one is the
+    /// caller's second half
+    /// ([`crate::domain::session::Session::delete_by_user`]), because a reset
+    /// that leaves a stolen cookie working resets nothing.
+    pub async fn set_password_hash(
+        id: &UserId,
+        password_hash: PasswordHash,
+        db: &Database,
+    ) -> Result<Option<User>, AppError> {
+        let rows: Vec<User> = write_with_retry(
+            db,
+            "UPDATE $u SET password_hash = $hash RETURN AFTER",
+            &[
+                ("u".into(), id.record().into_value()),
+                ("hash".into(), password_hash.into_value()),
+            ],
         )
         .await?;
         Ok(rows.into_iter().next())

@@ -96,6 +96,9 @@ fn attr_str<'a>(attr: &'a str, key: &str) -> Option<&'a str> {
 /// ("any logged-in user").
 fn extractor_floor(params: &str) -> &'static str {
     for (ty, role) in [
+        // Not a school role at all: the deployment's vendor, whose cookie is
+        // `401` on every school surface (see `web::builder`).
+        ("RequireBuilder", "builder"),
         ("RequireAdmin", "admin"),
         ("RequireManager", "manager"),
         ("RequireTeacher", "teacher"),

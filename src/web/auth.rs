@@ -199,18 +199,29 @@ async fn login(
     let session = Session::create(user.get_id(), &db).await?;
     // `<slug>.<token>`: the cookie carries the school, so every later request
     // finds its database without a second lookup path that could disagree.
-    let cookie = Cookie::build(("session", format!("{school}.{}", session.token().as_str())))
+    let cookie = session_cookie(
+        format!("{school}.{}", session.token().as_str()),
+        st.cookie_secure,
+    );
+
+    Ok((jar.add(cookie), Json(UserResponse::new(&user))))
+}
+
+/// The `session` cookie, however it was earned. Shared by school login and the
+/// builder surface (`web::builder`) so the two can never drift apart on path,
+/// flags or lifetime — the value is the only difference between them
+/// (`<slug>.<token>` against `builder.<token>`).
+pub(crate) fn session_cookie(value: String, secure: bool) -> Cookie<'static> {
+    Cookie::build(("session", value))
         .path("/")
         .http_only(true)
-        .secure(st.cookie_secure)
+        .secure(secure)
         // Lax is part of the CORS defense: it keeps this cookie off cross-site
         // requests. Before relaxing toward SameSite=None, first make sure
         // `cors_layer` (lib.rs) can never mirror origins with credentials on.
         .same_site(SameSite::Lax)
         .max_age(time::Duration::days(SESSION_DURATION_DAYS))
-        .build();
-
-    Ok((jar.add(cookie), Json(UserResponse::new(&user))))
+        .build()
 }
 
 /// Log out: revoke the current session (if any) and clear the cookie.

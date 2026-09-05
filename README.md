@@ -430,7 +430,7 @@ drift from it**, which is enforced rather than asked for:
   and fails unless each one is either referenced by `src/web/limits.rs` or
   listed as a deliberate exclusion *with a reason*. A new constant breaks the
   suite until someone decides, consciously, whether clients need it.
-- `tests/spec_bounds.rs` builds the OpenAPI document, reads all 176 published
+- `tests/spec_bounds.rs` builds the OpenAPI document, reads all 194 published
   bounds back out of the emitted JSON, and asserts each equals its constant.
   This exists because utoipa's `#[schema(max_length = …)]` accepts a **literal
   only** — a `const` there does not compile — so the annotations are
@@ -741,7 +741,9 @@ against the SurrealDB server — e.g.
 ## Endpoints
 
 `Auth` is the minimum role; `no` means no session required, `student` means any
-logged-in user.
+logged-in user. `builder` is not a school role: it means the deployment's
+vendor account (see the `builder` tag), whose cookie is refused on every other
+endpoint here exactly as a school's cookie is refused on its.
 
 A course is a regular taught course (kind `course`, the default), an *etüt* (kind
 `study` — a supervised study session), or a *kulüp* (kind `club` — a student
@@ -871,6 +873,9 @@ window filtering, before paging; negative values are a `400` naming the field.
 | POST   | `/boards/{id}/invite`                                            | student | Invite a whole roster at once — creator only, and additive: everyone the source names is **added** to the invite list, nobody is ever removed by it. Re-inviting the same source is therefore how a board is topped up after the class gained a student, and it is idempotent when nothing changed. |
 | GET    | `/boards/{id}/strokes`                                           | student | The live canvas: the current epoch's strokes, oldest first, paged via `?limit=&offset=`. This is what a client draws to catch up — earlier epochs are still stored, and read through `/history`. Drawn marks only: a `clear` marker never appears here, exactly as it never appears on the board room's socket. Read `/history` or `/epochs` for the markers. |
 | GET    | `/boards/{id}/ws`                                                | student | **WebSocket** board room: a `join` replays the current epoch, every accepted stroke fans out to the other participants (see "Collaborative whiteboard") |
+| POST   | `/builder/login`                                                 | no      | Log in as the deployment's builder. Sets a `session` cookie (`builder.<token>`) that works on this surface and nowhere else. |
+| POST   | `/builder/logout`                                                | no      | Log out a builder: revoke the session (if any) and clear the cookie. Idempotent — answers `204` either way. |
+| GET    | `/builder/me`                                                    | builder | The current builder. |
 | GET    | `/chatbot/threads`                                               | student | The caller's own threads, most recently active first. Paged via `?limit=&offset=`. Nobody — no teacher, no admin — reads anyone else's. |
 | POST   | `/chatbot/threads`                                               | student | Start a new chatbot thread, optionally named. Every authenticated role may chat, parents included. A user may keep up to the school's `max_chatbot_threads` threads; at the cap the request is refused (409) until an old thread is deleted — the cap is storage protection, not a usage quota (that is the per-minute message limit). |
 | PATCH  | `/chatbot/threads/{id}`                                          | student | Rename a thread, or clear its name (`title: null`). Owner only; someone else's thread is a `404`, never a `403`. The edit counts as activity, so the thread moves to the top of the list — renaming is how a user files a thread, and a rename that left it buried would be useless. |
@@ -1070,6 +1075,13 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/questions/{id}/solutions/{sid}/image`                          | student | The solution photo's bytes. Access follows the question the solution hangs on — in practice school-wide, since solutions exist only on approved questions. |
 | POST   | `/questions/{id}/solutions/{sid}/image`                          | student | Attach (or replace) the solution's photo. Author only — and at any time, since solutions are never frozen. `multipart/form-data` with the image under a `file` field; the declared content type must be `image/png`, `image/jpeg`, `image/webp`, or `image/gif` (rasters only — no SVG), the bytes at most the school's `max_file_bytes` (settings). |
 | DELETE | `/questions/{id}/solutions/{sid}/image`                          | student | Remove the solution's photo. Author only, anytime — solutions are never frozen. |
+| GET    | `/schools`                                                       | builder | Every school this deployment serves, newest first. Paged via `?limit=&offset=` (omit `limit` for the full list). |
+| POST   | `/schools`                                                       | builder | Create a school: its registry row, its database, its schema, and its first admin account — one call, or none of it. |
+| GET    | `/schools/{slug}`                                                | builder | One school by slug. |
+| PATCH  | `/schools/{slug}`                                                | builder | Rename a school and/or flip it between `active` and `suspended`. Omitted fields keep their value. The slug itself is immutable — it names a database and a directory. |
+| DELETE | `/schools/{slug}`                                                | builder | Delete a school: its database, its registry row, and its uploaded files. Irreversible — suspension is the reversible door. |
+| POST   | `/schools/{slug}/admin-password`                                 | builder | Reset an admin's password inside a school — the "we are locked out" call. Every session that account held is revoked with it, so a stolen cookie does not survive the reset. Works on a suspended school. |
+| POST   | `/schools/{slug}/enter`                                          | builder | Enter a school as one of its admins — support access, with the school's own session cookie (`<slug>.<token>`) and no builder power inside it. |
 | GET    | `/sessions/{id}`                                                 | student | Fetch a single session by id. Visible to its course's enrolled users, the session's teacher, the course's own teachers, and managers/admins. |
 | PATCH  | `/sessions/{id}`                                                 | teacher | Update a session. Requires teacher+ with course-management rights. Omitted fields keep their value; an explicit `null` clears `ends_at`. |
 | DELETE | `/sessions/{id}`                                                 | teacher | Delete a session and its roll-call rows. Requires teacher+ with course-management rights. |
