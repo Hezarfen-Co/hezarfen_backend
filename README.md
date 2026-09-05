@@ -1085,6 +1085,8 @@ window filtering, before paging; negative values are a `400` naming the field.
 | GET    | `/terms/{id}`                                                    | student | Fetch a single term by id. |
 | PATCH  | `/terms/{id}`                                                    | manager | Update a term. Requires manager+. Omitted fields keep their value; the merged range must stay ordered. |
 | DELETE | `/terms/{id}`                                                    | manager | Delete a term. Requires manager+. Refused with a 409 while any course still links to it — unlink those courses (`PATCH /courses/{id}` with `"term_id": null`) or delete them first, so a term is never dropped out from under the calendar its courses hang on. |
+| POST   | `/terms/{id}/archive`                                            | manager | Archive a term. Requires manager+. An archived term is frozen: it takes no edits, no delete, and no new course or class link. Idempotent — archiving an already-archived term answers `200` with the stamp it already had. |
+| POST   | `/terms/{id}/unarchive`                                          | manager | Re-open an archived term. Requires manager+. Idempotent the same way as archiving: an already-open term answers `200`. |
 | GET    | `/time`                                                          | no      | Server clock: `{now}` UTC unix-millis, for a frontend to sync against. |
 | GET    | `/users`                                                         | admin   | List every user with their role, newest first. Admin only. Paged: pass `?limit=&offset=` to take a window (omit `limit` for the whole list); the response is a `{items, total, limit, offset}` envelope where `total` counts every user. |
 | PATCH  | `/users/me`                                                      | student | Update the caller's own personal info: name, surname, email, phone, birth date, plus the public-profile pair `display_name` and `bio` (both readable school-wide at `GET /users/{id}/profile`, unlike the contact fields). Any authenticated role. Omitted fields stay as they are; an empty string clears a field. |
@@ -1845,6 +1847,29 @@ it — unlink them (`PATCH /courses/{id}` or `PATCH /classes/{id}` with
 under them. Term dates may lie in the past,
 deliberately: a school adopting the app mid-year backfills its calendar —
 unlike exam/lesson/event times, which reject backdating.
+
+A finished year is closed with `POST /terms/{id}/archive` and reopened with
+`POST /terms/{id}/unarchive` (manager+). Both are idempotent: archiving an
+already-archived term answers `200` with the original `archived_at` stamp, and
+unarchiving an open one answers `200` as well. While a term is archived it is
+read-only — `PATCH`/`DELETE /terms/{id}` are refused, a new course or class may
+not link to it, and every write to a course or class already on it, or to
+anything hanging off them, is refused too: enrollment, teacher assignment,
+class membership and homeroom, class↔course attach/detach and blueprint apply,
+sessions and roll call, subjects, exams with their questions, images, attempts
+and answers (the exam-room WebSocket door and its `finish` frame included),
+marks and grading, homework and submissions, course notes and files. Each
+refusal is a `409` with `code: "term_archived"` and the message "this term is
+archived — past years are read-only". Reads stay open throughout, so a past
+year is still browsable, and unarchiving restores writes. Deliberately outside
+the freeze: personal notes, messages, pomodoro, meals, payments, boards,
+appointments, the chatbot, the question pool/bank, events (an event only aims
+an audience at a course), class blueprint templates, and the staff work log.
+Also exempt are the system integrity sweeps — role demotion stripping homeroom
+teachers and course teacher assignments, subject delete clearing bank-question
+links — which keep the store consistent rather than edit a past year. The
+guard is a pre-flight read of the term row, so an archive and a write landing
+in the same instant is an accepted race; see `## Concurrency model`.
 
 What stays fixed is deliberate too: the four roles, the `0`–`100` mark scale,
 validation bounds, and the UTC time policy are invariants, not preferences
@@ -4192,7 +4217,7 @@ database itself decides the winner. Three tiers:
    per (plan, student) — the seat and the row
    are claimed in one transaction (`cap::claim_and_create`), so a duplicate
    `CREATE` rolls its own seat back instead of costing a stranger their place.
-3. **Two accepted races**, reviewed and deliberately left open:
+3. **Three accepted races**, reviewed and deliberately left open:
    - *Attempt-seq late save* — an exam-room socket writes into the sitting it
      joined with, a choice made before any lock is taken, so a save racing a
      retake can stamp an answer onto the just-terminal previous sitting.
@@ -4201,6 +4226,10 @@ database itself decides the winner. Three tiers:
    - *Approved-overlap* — two approvals landing in the same instant can
      double-book a teacher. Damage: one overlapping half-hour, visible to both
      parties, fixable by cancelling either side.
+   - *Archive-vs-write* — the archived-term guard is a pre-flight read on the
+     term row, so an archive committing in the same instant as a write already
+     in flight lets that one write through. Damage: one write on a
+     just-archived term; nothing corrupts, and every later write is refused.
 
 In-process locks remain, and they are a *second* line, never the guarantee:
 `PRESENCE_LOCK` guards in-process socket state (there is no row to conditional

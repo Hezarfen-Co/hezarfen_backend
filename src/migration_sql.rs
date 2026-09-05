@@ -288,6 +288,10 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS name ON term TYPE string;
     DEFINE FIELD IF NOT EXISTS starts_at ON term TYPE int;
     DEFINE FIELD IF NOT EXISTS ends_at ON term TYPE int;
+    -- When the term was archived; absent = open. `option<int>` and no
+    -- BACKFILL: every term that exists predates archiving and is open, which
+    -- is exactly what an absent stamp already means.
+    DEFINE FIELD IF NOT EXISTS archived_at ON term TYPE option<int>;
     -- Courses still linking this term, the stored delete guard that closes
     -- write-skew between concurrent request tasks (see `crate::domain::cap`).
     -- Absent reads as zero, so no Rust struct needs it.

@@ -3314,3 +3314,370 @@ async fn a_demoted_participant_stops_reading_the_canvas_at_once() {
     );
     board_draw(&mut ali, "{\"p\":[5,6]}").await;
 }
+
+/// A manager archives an academic year and the whole year turns read-only from
+/// the user's seat: every write into its structure answers `409 term_archived`,
+/// every read still answers, the live exam room's door refuses the upgrade with
+/// a real HTTP 409 (before the WebSocket handshake completes), and unarchiving
+/// reopens all of it. The two archive routes are discoverable in the served
+/// OpenAPI document Swagger renders.
+#[tokio::test]
+async fn a_manager_archived_year_refuses_every_write_and_answers_every_read() {
+    let (base, db) = spawn_server().await;
+    let mudur = client();
+    let ogrenci = client();
+    let kaan = client();
+    register(&mudur, &base, "mudur").await;
+    register(&ogrenci, &base, "ogrenci").await;
+    register(&kaan, &base, "kaan").await;
+    promote(&db, "mudur", "manager").await;
+    login(&mudur, &base, "mudur").await;
+    login(&ogrenci, &base, "ogrenci").await;
+    login(&kaan, &base, "kaan").await;
+
+    let json_of = async |res: reqwest::Response| res.json::<Value>().await.unwrap();
+    let student_id =
+        json_of(ogrenci.get(format!("{base}/auth/me")).send().await.unwrap()).await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+    let kaan_id = json_of(kaan.get(format!("{base}/auth/me")).send().await.unwrap()).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let now = json_of(mudur.get(format!("{base}/time")).send().await.unwrap()).await["now"]
+        .as_i64()
+        .unwrap();
+
+    // --- a year's worth of structure, all hanging off one term -------------
+    let res = mudur
+        .post(format!("{base}/terms"))
+        .json(&json!({ "name": "2026 Fall", "starts_at": now - 86_400_000, "ends_at": now + 86_400_000 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let term: Value = res.json().await.unwrap();
+    let term_id = term["id"].as_str().unwrap().to_string();
+    assert!(
+        term["archived_at"].is_null(),
+        "a fresh term is open: {term}"
+    );
+
+    let res = mudur
+        .post(format!("{base}/courses"))
+        .json(&json!({ "title": "algebra", "term_id": term_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let course_id = json_of(res).await["id"].as_str().unwrap().to_string();
+
+    let subject_id = json_of(
+        mudur
+            .post(format!("{base}/courses/{course_id}/subjects"))
+            .json(&json!({ "name": "arithmetic" }))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let exam: Value = json_of(
+        mudur
+            .post(format!("{base}/courses/{course_id}/exams"))
+            .json(&json!({ "title": "midterm", "kind": "quiz", "mode": "open", "max_attempts": 2 }))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    let exam_id = exam["id"].as_str().unwrap().to_string();
+    let question: Value = json_of(
+        mudur
+            .post(format!("{base}/exams/{exam_id}/questions"))
+            .json(
+                &json!({ "subject_id": subject_id, "text": "2 + 2?", "kind": "choice",
+                           "points": 10,
+                           "choices": [{"id": "a", "text": "3"}, {"id": "b", "text": "4"}],
+                           "correct": "b" }),
+            )
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    let question_id = question["id"].as_str().unwrap().to_string();
+    let opts = choice_ids(&question);
+
+    let res = mudur
+        .post(format!("{base}/courses/{course_id}/sessions"))
+        .json(&json!({ "starts_at": now + 3_600_000 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let session_id = json_of(res).await["id"].as_str().unwrap().to_string();
+
+    let res = mudur
+        .post(format!("{base}/courses/{course_id}/homework"))
+        .json(
+            &json!({ "title": "read ch3", "subject_id": subject_id, "due_at": now + 604_800_000 }),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let homework_id = json_of(res).await["id"].as_str().unwrap().to_string();
+
+    let res = mudur
+        .post(format!("{base}/course-notes"))
+        .json(&json!({ "course": course_id, "title": "recap", "content": "quadratics" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let note_id = json_of(res).await["id"].as_str().unwrap().to_string();
+
+    let res = mudur
+        .post(format!("{base}/classes"))
+        .json(&json!({ "name": "9-A", "grade": "9", "term_id": term_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let class_id = json_of(res).await["class"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let res = mudur
+        .post(format!("{base}/courses/{course_id}/enrollments"))
+        .json(&json!({ "user_id": student_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // The student is mid-sitting when the year closes: a live attempt whose
+    // room door is about to be walled.
+    let res = ogrenci
+        .post(format!("{base}/exams/{exam_id}/attempt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED, "start the live sitting");
+    let student_cookie = raw_session_cookie(&base, "ogrenci").await;
+
+    // --- archive ----------------------------------------------------------
+    let res = mudur
+        .post(format!("{base}/terms/{term_id}/archive"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let archived: Value = res.json().await.unwrap();
+    let stamp = archived["archived_at"].as_i64().expect("archived_at stamp");
+
+    // Idempotent: a second archive answers 200 with the stamp it already had.
+    let res = mudur
+        .post(format!("{base}/terms/{term_id}/archive"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        json_of(res).await["archived_at"].as_i64(),
+        Some(stamp),
+        "re-archiving must not move the stamp"
+    );
+
+    // --- every write into the closed year is a 409 `term_archived` ---------
+    let refusals: Vec<(&str, reqwest::Response)> = vec![
+        (
+            "PATCH /terms/{id}",
+            mudur
+                .patch(format!("{base}/terms/{term_id}"))
+                .json(&json!({ "name": "renamed" }))
+                .send()
+                .await
+                .unwrap(),
+        ),
+        (
+            "PATCH /courses/{id}",
+            mudur
+                .patch(format!("{base}/courses/{course_id}"))
+                .json(&json!({ "title": "renamed" }))
+                .send()
+                .await
+                .unwrap(),
+        ),
+        (
+            "POST /courses/{id}/enrollments",
+            mudur
+                .post(format!("{base}/courses/{course_id}/enrollments"))
+                .json(&json!({ "user_id": kaan_id }))
+                .send()
+                .await
+                .unwrap(),
+        ),
+        (
+            "POST /sessions/{id}/attendance",
+            mudur
+                .post(format!("{base}/sessions/{session_id}/attendance"))
+                .json(&json!({ "status": "present", "user_id": student_id }))
+                .send()
+                .await
+                .unwrap(),
+        ),
+        (
+            "PATCH /exams/{id}",
+            mudur
+                .patch(format!("{base}/exams/{exam_id}"))
+                .json(&json!({ "title": "renamed" }))
+                .send()
+                .await
+                .unwrap(),
+        ),
+        (
+            "POST /exams/{id}/attempt/answers",
+            ogrenci
+                .post(format!("{base}/exams/{exam_id}/attempt/answers"))
+                .json(&json!({ "question_id": question_id, "selected": opts[1] }))
+                .send()
+                .await
+                .unwrap(),
+        ),
+        (
+            "POST /homework/{id}/results",
+            mudur
+                .post(format!("{base}/homework/{homework_id}/results"))
+                .json(&json!({ "user": student_id, "status": "done", "mark": 90 }))
+                .send()
+                .await
+                .unwrap(),
+        ),
+        (
+            "PATCH /course-notes/{id}",
+            mudur
+                .patch(format!("{base}/course-notes/{note_id}"))
+                .json(&json!({ "title": "renamed" }))
+                .send()
+                .await
+                .unwrap(),
+        ),
+        (
+            "POST /classes/{id}/members",
+            mudur
+                .post(format!("{base}/classes/{class_id}/members"))
+                .json(&json!({ "user_id": kaan_id }))
+                .send()
+                .await
+                .unwrap(),
+        ),
+    ];
+    for (what, res) in refusals {
+        let status = res.status();
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(status, StatusCode::CONFLICT, "{what} status: {body}");
+        assert_eq!(body["code"], "term_archived", "{what} code: {body}");
+    }
+
+    // --- every read still answers -----------------------------------------
+    for url in [
+        format!("{base}/terms/{term_id}"),
+        format!("{base}/courses/{course_id}"),
+        format!("{base}/exams/{exam_id}"),
+        format!("{base}/sessions/{session_id}"),
+        format!("{base}/homework/{homework_id}"),
+        format!("{base}/course-notes/{note_id}"),
+        format!("{base}/classes/{class_id}"),
+    ] {
+        let res = mudur.get(&url).send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "read stays open: {url}");
+    }
+
+    // --- the exam room's door: refused before the upgrade ------------------
+    let refused = ws_open(&base, &exam_id, Some(&student_cookie))
+        .await
+        .expect_err("an archived year's room must refuse the handshake");
+    assert_eq!(refused, 409, "the room door answers a real HTTP 409");
+
+    // --- unarchive reopens the year ---------------------------------------
+    let res = mudur
+        .post(format!("{base}/terms/{term_id}/unarchive"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let reopened: Value = res.json().await.unwrap();
+    assert!(
+        reopened["archived_at"].is_null(),
+        "unarchive clears the stamp: {reopened}"
+    );
+
+    // A write that was refused a moment ago now lands.
+    let res = mudur
+        .patch(format!("{base}/courses/{course_id}"))
+        .json(&json!({ "title": "algebra II" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "the reopened year takes writes"
+    );
+
+    // The room door opens again, and the live sitting is still there.
+    let mut ws = ws_open(&base, &exam_id, Some(&student_cookie))
+        .await
+        .expect("the reopened year's room");
+    let state = ws_next_frame(&mut ws).await.expect("connect state frame");
+    assert_eq!(state["type"], "state", "{state}");
+
+    // Archive under the open socket: `finish` comes back as an error frame
+    // carrying the archived refusal instead of submitting the sheet.
+    let res = mudur
+        .post(format!("{base}/terms/{term_id}/archive"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    ws_send(&mut ws, json!({ "type": "finish" })).await;
+    let error = ws_frame_of_type(&mut ws, "error").await;
+    assert!(
+        error["message"].as_str().unwrap().contains("archived"),
+        "the room's finish refusal names the archived year: {error}"
+    );
+
+    // Reopen once more and the same frame submits the sitting.
+    let res = mudur
+        .post(format!("{base}/terms/{term_id}/unarchive"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    ws_send(&mut ws, json!({ "type": "finish" })).await;
+    let finished = ws_frame_of_type(&mut ws, "finished").await;
+    assert!(finished["finished_at"].as_i64().is_some(), "{finished}");
+
+    // --- discoverable in the document Swagger renders ----------------------
+    let spec: Value = json_of(
+        mudur
+            .get(format!("{base}/api-docs/openapi.json"))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    for path in ["/terms/{id}/archive", "/terms/{id}/unarchive"] {
+        assert!(
+            spec["paths"][path]["post"].is_object(),
+            "{path} must be a documented POST in the served spec"
+        );
+    }
+}

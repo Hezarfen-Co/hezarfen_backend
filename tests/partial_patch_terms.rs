@@ -110,3 +110,150 @@ async fn concurrent_range_patches_never_invert_the_term() {
         );
     }
 }
+
+/// Archiving a term freezes it: the term itself takes no PATCH or DELETE, and
+/// no new course or class may link it. Reads stay open — a past year is
+/// read-only, not hidden.
+#[tokio::test]
+async fn an_archived_term_is_frozen_for_writes_and_open_for_reads() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "archive_manager", "manager").await;
+    let teacher = login_as(&app, &db, "archive_teacher", "teacher").await;
+    let student = login_as(&app, &db, "archive_student", "student").await;
+
+    let created = send(
+        &app,
+        "POST",
+        "/terms",
+        Some(&manager),
+        Some(json!({
+            "name": "2024",
+            "starts_at": 1_700_000_000_000_i64,
+            "ends_at": 1_710_000_000_000_i64,
+        })),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED);
+    assert!(created.body["archived_at"].is_null(), "born open");
+    let id = id_of(&created.body);
+    let uri = format!("/terms/{id}");
+    let archive = format!("/terms/{id}/archive");
+
+    // Only manager+ may flip it.
+    for (who, cookie) in [("teacher", &teacher), ("student", &student)] {
+        let res = send(&app, "POST", &archive, Some(cookie), None).await;
+        assert_eq!(res.status, StatusCode::FORBIDDEN, "{who} archive");
+    }
+
+    let archived = send(&app, "POST", &archive, Some(&manager), None).await;
+    assert_eq!(archived.status, StatusCode::OK);
+    let stamp = archived.body["archived_at"].as_i64().expect("archived_at");
+
+    // Idempotent: a repeat keeps the original stamp, the year is not re-dated.
+    let again = send(&app, "POST", &archive, Some(&manager), None).await;
+    assert_eq!(again.status, StatusCode::OK);
+    assert_eq!(
+        again.body["archived_at"].as_i64(),
+        Some(stamp),
+        "re-stamped"
+    );
+
+    // Frozen: edit and delete both refuse with the coded 409.
+    for (method, body) in [
+        ("PATCH", Some(json!({ "name": "renamed" }))),
+        ("DELETE", None),
+    ] {
+        let res = send(&app, method, &uri, Some(&manager), body).await;
+        assert_eq!(
+            res.status,
+            StatusCode::CONFLICT,
+            "{method} on archived term"
+        );
+        assert_eq!(res.body["code"], "term_archived", "{method} code");
+    }
+
+    // No new structure may be hung on a past year — one refusal per link site.
+    let new_course = send(
+        &app,
+        "POST",
+        "/courses",
+        Some(&manager),
+        Some(json!({ "title": "algebra", "term_id": id })),
+    )
+    .await;
+    assert_eq!(new_course.status, StatusCode::CONFLICT, "course link");
+    assert_eq!(new_course.body["code"], "term_archived");
+    let new_class = send(
+        &app,
+        "POST",
+        "/classes",
+        Some(&manager),
+        Some(json!({ "name": "9-A", "term_id": id })),
+    )
+    .await;
+    assert_eq!(new_class.status, StatusCode::CONFLICT, "class link");
+    assert_eq!(new_class.body["code"], "term_archived");
+
+    // Reads keep working and carry the stamp, single and listed.
+    let one = send(&app, "GET", &uri, Some(&student), None).await;
+    assert_eq!(one.status, StatusCode::OK);
+    assert_eq!(one.body["archived_at"].as_i64(), Some(stamp));
+    let listed = send(&app, "GET", "/terms", Some(&student), None).await;
+    assert_eq!(listed.status, StatusCode::OK);
+    let row = listed.body["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|row| row["id"] == id.as_str())
+        .expect("the archived term is still listed");
+    assert_eq!(row["archived_at"].as_i64(), Some(stamp));
+
+    // Re-opening thaws it, and is idempotent too.
+    let unarchive = format!("/terms/{id}/unarchive");
+    let reopened = send(&app, "POST", &unarchive, Some(&manager), None).await;
+    assert_eq!(reopened.status, StatusCode::OK);
+    assert!(reopened.body["archived_at"].is_null(), "reopened");
+    let twice = send(&app, "POST", &unarchive, Some(&manager), None).await;
+    assert_eq!(twice.status, StatusCode::OK);
+    assert!(twice.body["archived_at"].is_null());
+    let patched = send(
+        &app,
+        "PATCH",
+        &uri,
+        Some(&manager),
+        Some(json!({ "name": "renamed" })),
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::OK, "open again, edits land");
+
+    // An id nobody minted is a 404 on both flips, not a 409.
+    for route in ["/terms/nope/archive", "/terms/nope/unarchive"] {
+        let res = send(&app, "POST", route, Some(&manager), None).await;
+        assert_eq!(res.status, StatusCode::NOT_FOUND, "{route}");
+    }
+}
+
+/// A term row written before `archived_at` existed has no such column. It must
+/// still decode — as an open term — or the migration would have needed a
+/// backfill it deliberately does not have.
+#[tokio::test]
+async fn a_pre_migration_term_row_still_decodes_as_open() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "archive_legacy_manager", "manager").await;
+
+    db.query("CREATE term:legacy SET name = 'old', starts_at = 100, ends_at = 200")
+        .await
+        .expect("legacy term query")
+        .check()
+        .expect("legacy term check");
+
+    let res = send(&app, "GET", "/terms/legacy", Some(&manager), None).await;
+    assert_eq!(res.status, StatusCode::OK, "pre-migration row must decode");
+    assert_eq!(res.body["name"], "old");
+    assert!(res.body["archived_at"].is_null(), "absent = open");
+
+    // And it is still writable, archiving included.
+    let archived = send(&app, "POST", "/terms/legacy/archive", Some(&manager), None).await;
+    assert_eq!(archived.status, StatusCode::OK);
+    assert!(archived.body["archived_at"].as_i64().is_some());
+}
