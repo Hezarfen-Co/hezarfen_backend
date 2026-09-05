@@ -536,11 +536,14 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(bare.on_behalf_of, None);
-        assert!(serde_json::from_value::<BlobRequest>(json!({ "id": "01J", "school": "demo" }))
-            .is_err());
+        assert!(
+            serde_json::from_value::<BlobRequest>(json!({ "id": "01J", "school": "demo" }))
+                .is_err()
+        );
         // The school is required here too.
         assert!(
-            serde_json::from_value::<BlobRequest>(json!({ "id": "01J", "file": "01FILE" })).is_err()
+            serde_json::from_value::<BlobRequest>(json!({ "id": "01J", "file": "01FILE" }))
+                .is_err()
         );
         // And the two shapes never parse as each other.
         assert!(

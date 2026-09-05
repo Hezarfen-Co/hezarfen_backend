@@ -164,7 +164,10 @@ async fn creating_a_school_seeds_an_admin_who_can_log_in() {
     );
     let me = send(&app, "GET", "/auth/me", Some(&cookie), None).await;
     assert_eq!(me.status, StatusCode::OK);
-    assert_eq!(me.body["role"], "admin", "the seed is an admin, not a student");
+    assert_eq!(
+        me.body["role"], "admin",
+        "the seed is an admin, not a student"
+    );
 
     // The slug is the identity: a second school may not take it.
     assert_eq!(
@@ -187,9 +190,15 @@ async fn creating_a_school_seeds_an_admin_who_can_log_in() {
         );
         // …and nothing was left behind by the refusal.
         assert_eq!(
-            send(&app, "GET", &format!("/schools/{bad}"), Some(&builder), None)
-                .await
-                .status,
+            send(
+                &app,
+                "GET",
+                &format!("/schools/{bad}"),
+                Some(&builder),
+                None
+            )
+            .await
+            .status,
             StatusCode::NOT_FOUND,
             "slug {bad:?} left a school behind"
         );
@@ -220,7 +229,9 @@ async fn a_suspension_closes_the_school_and_a_resume_reopens_it() {
     let (app, _db, _tenants) = deployment().await;
     let builder = builder_login(&app).await;
     assert_eq!(
-        create_school(&app, &builder, "beta", "secret1").await.status,
+        create_school(&app, &builder, "beta", "secret1")
+            .await
+            .status,
         StatusCode::CREATED
     );
 
@@ -302,7 +313,9 @@ async fn a_suspension_closes_the_school_and_a_resume_reopens_it() {
         "a suspended school refuses login"
     );
     assert_eq!(
-        send(&app, "GET", "/auth/me", Some(&live), None).await.status,
+        send(&app, "GET", "/auth/me", Some(&live), None)
+            .await
+            .status,
         StatusCode::FORBIDDEN,
         "…and the cookie it had already issued, on its very next call"
     );
@@ -336,7 +349,9 @@ async fn a_suspension_closes_the_school_and_a_resume_reopens_it() {
     )
     .await;
     assert_eq!(
-        send(&app, "GET", "/auth/me", Some(&live), None).await.status,
+        send(&app, "GET", "/auth/me", Some(&live), None)
+            .await
+            .status,
         StatusCode::OK,
         "resuming restores the very same session"
     );
@@ -374,7 +389,11 @@ async fn resetting_an_admin_password_revokes_the_old_credential_and_its_sessions
         .unwrap();
     hezarfen_backend::domain::user::User::create(
         Username::try_new("veli").unwrap(),
-        Password::try_new("secret1").unwrap().hash_async().await.unwrap(),
+        Password::try_new("secret1")
+            .unwrap()
+            .hash_async()
+            .await
+            .unwrap(),
         &gamma_db,
     )
     .await
@@ -632,8 +651,8 @@ async fn probe_hostile_slug_segments_never_delete_anything() {
         "Demo",
         "control",
         "builder",
-        "%C4%B1demo",              // dotless i, non-ascii
-        "d%E2%80%8Bemo",           // zero-width space
+        "%C4%B1demo",    // dotless i, non-ascii
+        "d%E2%80%8Bemo", // zero-width space
         "de%20mo",
         "a",
         "-lead",
@@ -675,12 +694,25 @@ async fn probe_hostile_slug_segments_never_delete_anything() {
     // Also the empty segment, which is a different route shape entirely.
     for method in ["GET", "DELETE", "PATCH"] {
         let res = send(&app, method, "/schools/", Some(&builder), None).await;
-        assert!(!res.status.is_success() || method == "GET", "{method} /schools/ -> {}", res.status);
+        assert!(
+            !res.status.is_success() || method == "GET",
+            "{method} /schools/ -> {}",
+            res.status
+        );
     }
 
-    assert!(keep_dir.join("keep.bin").exists(), "a bystander school lost its bytes");
-    assert!(root_canary.exists(), "the FILES_PATH root canary was deleted");
-    assert!(outside_file.exists(), "a file outside FILES_PATH was deleted");
+    assert!(
+        keep_dir.join("keep.bin").exists(),
+        "a bystander school lost its bytes"
+    );
+    assert!(
+        root_canary.exists(),
+        "the FILES_PATH root canary was deleted"
+    );
+    assert!(
+        outside_file.exists(),
+        "a file outside FILES_PATH was deleted"
+    );
     assert!(
         files_dir().exists() && outside.path().exists(),
         "a directory root was removed"
@@ -784,7 +816,14 @@ async fn probe_remote_mode_database_statements_execute_for_every_accepted_slug()
     let mut broken: Vec<String> = Vec::new();
 
     for raw in [
-        "demo", "abc", "ata-koleji", "x-y", "trail-", "2024school", "12345", "a1",
+        "demo",
+        "abc",
+        "ata-koleji",
+        "x-y",
+        "trail-",
+        "2024school",
+        "12345",
+        "a1",
     ] {
         let Ok(slug) = Slug::try_new(raw) else {
             continue;
@@ -820,8 +859,23 @@ async fn probe_remote_mode_database_statements_execute_for_every_accepted_slug()
 #[tokio::test]
 async fn probe_slug_accept_set_and_published_reserved_list() {
     for bad in [
-        "control", "builder", "Demo", "DEMO", "..", "", "a", "-lead", "de mo", "de.mo", "de_mo",
-        "demo/", "demo\\", "٢٣demo", "démo", "demo\u{200b}", "demo\n",
+        "control",
+        "builder",
+        "Demo",
+        "DEMO",
+        "..",
+        "",
+        "a",
+        "-lead",
+        "de mo",
+        "de.mo",
+        "de_mo",
+        "demo/",
+        "demo\\",
+        "٢٣demo",
+        "démo",
+        "demo\u{200b}",
+        "demo\n",
         // 33 characters
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     ] {
@@ -831,7 +885,10 @@ async fn probe_slug_accept_set_and_published_reserved_list() {
         );
     }
     for good in ["ab", "demo", "a1", "2024", "ata-koleji"] {
-        assert!(Slug::try_new(good).is_ok(), "Slug::try_new rejected {good:?}");
+        assert!(
+            Slug::try_new(good).is_ok(),
+            "Slug::try_new rejected {good:?}"
+        );
     }
     // Documented boundary: a trailing hyphen IS accepted today.
     assert!(
@@ -971,7 +1028,9 @@ async fn probe_admin_targets_and_reset_revokes_all_sessions() {
     assert_eq!(reset.status, StatusCode::NO_CONTENT);
     for (n, cookie) in [(1, &s1), (2, &s2)] {
         assert_eq!(
-            send(&app, "GET", "/auth/me", Some(cookie), None).await.status,
+            send(&app, "GET", "/auth/me", Some(cookie), None)
+                .await
+                .status,
             StatusCode::UNAUTHORIZED,
             "session {n} survived the password reset"
         );
@@ -1036,9 +1095,7 @@ async fn probe_builder_session_hygiene() {
     let builder = builder_login(&app).await;
     let student = login(&app, "veli").await;
 
-    let builder_token = builder
-        .trim_start_matches("session=builder.")
-        .to_string();
+    let builder_token = builder.trim_start_matches("session=builder.").to_string();
     let student_token = cookie_token(&student).to_string();
 
     // The builder's own token, worn as a school cookie.
@@ -1116,7 +1173,9 @@ async fn probe_builder_session_hygiene() {
     );
     // Logout is idempotent and safe without a cookie.
     assert_eq!(
-        send(&app, "POST", "/builder/logout", None, None).await.status,
+        send(&app, "POST", "/builder/logout", None, None)
+            .await
+            .status,
         StatusCode::NO_CONTENT
     );
 }
@@ -1283,7 +1342,11 @@ async fn probe_remote_deployment_creates_and_deletes_a_hyphenated_school() {
         login.status,
     );
     assert_eq!(retry.status, StatusCode::CONFLICT, "a made school is taken");
-    assert_eq!(login.status, StatusCode::OK, "the admin logs into the hyphenated school");
+    assert_eq!(
+        login.status,
+        StatusCode::OK,
+        "the admin logs into the hyphenated school"
+    );
     assert_eq!(deleted.status, StatusCode::NO_CONTENT);
     assert!(!listed(&after_delete.body));
     assert_eq!(

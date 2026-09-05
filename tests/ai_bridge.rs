@@ -332,7 +332,11 @@ async fn concurrent_requests_share_one_connection_without_blocking_each_other() 
 
     let calls = (0..N).map(|i| {
         let bridge = bridge.clone();
-        tokio::spawn(async move { bridge.dispatch(&demo(), "ocr.extract", json!({ "n": i })).await })
+        tokio::spawn(async move {
+            bridge
+                .dispatch(&demo(), "ocr.extract", json!({ "n": i }))
+                .await
+        })
     });
     let answers = futures_util::future::join_all(calls).await;
 
@@ -356,8 +360,14 @@ async fn requests_route_to_the_service_declaring_the_capability() {
     let grader = connect_service(&bridge, hello("grader", &["grade.essay"]), Behaviour::Echo).await;
     await_workers(&bridge, 2).await;
 
-    bridge.dispatch(&demo(), "grade.essay", json!("text")).await.unwrap();
-    bridge.dispatch(&demo(), "ocr.extract", json!("png")).await.unwrap();
+    bridge
+        .dispatch(&demo(), "grade.essay", json!("text"))
+        .await
+        .unwrap();
+    bridge
+        .dispatch(&demo(), "ocr.extract", json!("png"))
+        .await
+        .unwrap();
 
     assert_eq!(ocr.seen().len(), 1, "ocr only saw its own capability");
     assert_eq!(ocr.seen()[0].capability, "ocr.extract");
@@ -572,7 +582,12 @@ async fn a_silent_service_times_out_and_gives_the_slot_back() {
     // An abandoned request must not leak the worker's capacity.
     assert_eq!(bridge.workers()[0].inflight, 0);
     // And the worker is immediately usable again.
-    assert!(bridge.dispatch(&demo(), "ocr.extract", json!(null)).await.is_err());
+    assert!(
+        bridge
+            .dispatch(&demo(), "ocr.extract", json!(null))
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -593,7 +608,12 @@ async fn a_per_call_timeout_overrides_the_default() {
     ));
     // ...but a capability known to be slow can ask for more.
     let answer = bridge
-        .dispatch_with_timeout(&demo(), "ocr.extract", json!("slow"), Duration::from_secs(5))
+        .dispatch_with_timeout(
+            &demo(),
+            "ocr.extract",
+            json!("slow"),
+            Duration::from_secs(5),
+        )
         .await
         .expect("the longer deadline held");
     assert_eq!(answer["echo"], "slow");
@@ -667,7 +687,10 @@ async fn a_disconnected_service_is_deregistered() {
     let bridge = bridge().await;
     let service = connect_service(&bridge, hello("ocr", &["ocr.extract"]), Behaviour::Echo).await;
     await_workers(&bridge, 1).await;
-    bridge.dispatch(&demo(), "ocr.extract", json!(null)).await.unwrap();
+    bridge
+        .dispatch(&demo(), "ocr.extract", json!(null))
+        .await
+        .unwrap();
 
     service.conn.close(0u32.into(), b"service shutting down");
     drop(service);
@@ -715,7 +738,10 @@ async fn losing_one_service_leaves_the_other_serving() {
     await_workers(&bridge, 1).await;
 
     for _ in 0..4 {
-        bridge.dispatch(&demo(), "ocr.extract", json!("x")).await.unwrap();
+        bridge
+            .dispatch(&demo(), "ocr.extract", json!("x"))
+            .await
+            .unwrap();
     }
     assert_eq!(
         survivor.seen().len(),
@@ -1795,7 +1821,10 @@ async fn a_course_note_is_indexed_and_its_output_stored_with_its_sources() {
     // The service saw the note itself, under the documented capability.
     let seen = service.seen();
     assert_eq!(seen[0].capability, AI_RAG_INDEX_CAPABILITY);
-    assert_eq!(seen[0].school, DEMO_SLUG, "the frame names the caller's school");
+    assert_eq!(
+        seen[0].school, DEMO_SLUG,
+        "the frame names the caller's school"
+    );
     assert_eq!(seen[0].payload["course_note"], note);
     assert_eq!(seen[0].payload["title"], "Bölüm 3");
     assert_eq!(seen[0].payload["content"], "özet");

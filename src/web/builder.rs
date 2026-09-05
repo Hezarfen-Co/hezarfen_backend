@@ -206,11 +206,7 @@ async fn builder_login(
     let password = Password::try_new(&req.password).map_err(|_| AppError::Unauthorized)?;
     let builder = match Builder::find_by_username(req.username.trim(), control).await? {
         Some(builder) => {
-            if !builder
-                .get_password_hash()
-                .verify_async(&password)
-                .await
-            {
+            if !builder.get_password_hash().verify_async(&password).await {
                 return Err(AppError::Unauthorized);
             }
             builder
@@ -401,14 +397,18 @@ async fn update_school(
     let control = st.tenants.control();
     // An empty patch on an unknown school is still a 404, so the existence
     // check is not left to whichever field happened to be present.
-    School::read(&slug, control).await?.ok_or(AppError::NotFound)?;
+    School::read(&slug, control)
+        .await?
+        .ok_or(AppError::NotFound)?;
     if let Some(name) = name {
         School::update_name(&slug, &name, control).await?;
     }
     if let Some(status) = status {
         st.tenants.set_status(&slug, status).await?;
     }
-    let school = School::read(&slug, control).await?.ok_or(AppError::NotFound)?;
+    let school = School::read(&slug, control)
+        .await?
+        .ok_or(AppError::NotFound)?;
     Ok(Json(SchoolResponse::new(&school)))
 }
 
@@ -445,7 +445,10 @@ async fn delete_school(
     if let Err(err) = tokio::fs::remove_dir_all(&dir).await
         && err.kind() != std::io::ErrorKind::NotFound
     {
-        tracing::warn!("failed to remove the files of {slug} at {}: {err}", dir.display());
+        tracing::warn!(
+            "failed to remove the files of {slug} at {}: {err}",
+            dir.display()
+        );
     }
     Ok(StatusCode::NO_CONTENT)
 }

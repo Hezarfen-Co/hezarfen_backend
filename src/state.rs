@@ -173,7 +173,9 @@ impl BoardHub {
     pub fn publish(&self, slug: &Slug, board: &str, frame: String) {
         let sender = {
             let boards = self.0.lock().expect("board hub lock");
-            boards.get(&scoped_key(slug, board)).map(|room| room.0.clone())
+            boards
+                .get(&scoped_key(slug, board))
+                .map(|room| room.0.clone())
         };
         if let Some(sender) = sender {
             let _ = sender.send(frame);
@@ -239,7 +241,10 @@ mod tests {
         let mut in_b = hub.subscribe(&b, "board-1");
 
         hub.publish(&a, "board-1", "alpha stroke".to_string());
-        assert_eq!(in_a.recv().await.expect("alpha's own stroke"), "alpha stroke");
+        assert_eq!(
+            in_a.recv().await.expect("alpha's own stroke"),
+            "alpha stroke"
+        );
         assert!(
             in_b.try_recv().is_err(),
             "beta's board must not hear alpha's stroke"

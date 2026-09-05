@@ -553,7 +553,8 @@ async fn the_request_frame_carries_exactly_the_published_keys() {
     let id = request["id"].as_str().unwrap().to_string();
     raw::answer(
         send,
-        format!(r#"{{"status":"ok","id":"{id}","school":"{SCHOOL}","payload":{{"text":"hi"}}}}"#).as_bytes(),
+        format!(r#"{{"status":"ok","id":"{id}","school":"{SCHOOL}","payload":{{"text":"hi"}}}}"#)
+            .as_bytes(),
     )
     .await;
     let answer = call.await.unwrap().expect("dispatch succeeded");
@@ -714,7 +715,8 @@ async fn each_request_gets_its_own_stream_and_answers_may_come_back_in_any_order
         let n = request["payload"]["n"].clone();
         raw::answer(
             send,
-            format!(r#"{{"status":"ok","id":"{id}","school":"{SCHOOL}","payload":{{"n":{n}}}}}"#).as_bytes(),
+            format!(r#"{{"status":"ok","id":"{id}","school":"{SCHOOL}","payload":{{"n":{n}}}}}"#)
+                .as_bytes(),
         )
         .await;
     }
@@ -912,7 +914,8 @@ async fn several_raw_services_serve_one_capability_together() {
                 let n = request["payload"]["n"].clone();
                 raw::answer(
                     send,
-                    format!(r#"{{"status":"ok","id":"{id}","school":"{SCHOOL}","payload":{n}}}"#).as_bytes(),
+                    format!(r#"{{"status":"ok","id":"{id}","school":"{SCHOOL}","payload":{n}}}"#)
+                        .as_bytes(),
                 )
                 .await;
             }
@@ -1006,7 +1009,10 @@ async fn a_chat_request_names_the_askers_school_role() {
     let id = request["id"].as_str().expect("trace id").to_string();
     raw::answer(
         send,
-        format!(r#"{{"status":"ok","id":"{id}","school":"{SCHOOL}","payload":{{"text":"F = ma"}}}}"#).as_bytes(),
+        format!(
+            r#"{{"status":"ok","id":"{id}","school":"{SCHOOL}","payload":{{"text":"F = ma"}}}}"#
+        )
+        .as_bytes(),
     )
     .await;
 }
@@ -1118,9 +1124,13 @@ async fn the_api_refusal_frame_carries_exactly_the_published_keys_and_codes() {
         ),
         (
             "unknown_user",
-            r#"{"id":"t5","school":"demo","path":"/auth/me","on_behalf_of":"nobodyatall"}"#.to_string(),
+            r#"{"id":"t5","school":"demo","path":"/auth/me","on_behalf_of":"nobodyatall"}"#
+                .to_string(),
         ),
-        ("malformed", r#"{"id":"t6","school":"demo","path":42}"#.to_string()),
+        (
+            "malformed",
+            r#"{"id":"t6","school":"demo","path":42}"#.to_string(),
+        ),
         // A frame that names no school at all: required, never defaulted.
         ("malformed", r#"{"id":"t7","path":"/auth/me"}"#.to_string()),
         // A string that is no slug — the service's own bug, not a missing
@@ -1173,8 +1183,10 @@ async fn an_api_read_answers_a_named_user_with_that_users_own_data() {
 
     let (answer, _) = raw::api_read(
         &service.conn,
-        format!(r#"{{"id":"tme","school":"{SCHOOL}","path":"/auth/me","on_behalf_of":"{student}"}}"#)
-            .as_bytes(),
+        format!(
+            r#"{{"id":"tme","school":"{SCHOOL}","path":"/auth/me","on_behalf_of":"{student}"}}"#
+        )
+        .as_bytes(),
     )
     .await;
     assert_eq!(answer["outcome"], "ok", "{answer}");
@@ -1204,7 +1216,10 @@ async fn two_schools(bridge: &AiBridge) -> (axum::Router, Tenants, String, Strin
     let beta_cookie = common::login_as_school(&app, &beta_db, "beta", "ayse", "student").await;
     let demo_ayse = common::me_id(&app, &demo_cookie).await;
     let beta_ayse = common::me_id(&app, &beta_cookie).await;
-    assert_ne!(demo_ayse, beta_ayse, "two schools, two separate `ayse` rows");
+    assert_ne!(
+        demo_ayse, beta_ayse,
+        "two schools, two separate `ayse` rows"
+    );
     (app, tenants, demo_ayse, beta_ayse)
 }
 
@@ -1222,8 +1237,10 @@ async fn an_api_read_answers_out_of_the_school_the_frame_named() {
     for (school, who) in [("demo", &demo_ayse), ("beta", &beta_ayse)] {
         let (answer, _) = raw::api_read(
             &service.conn,
-            format!(r#"{{"id":"t-own","school":"{school}","path":"/auth/me","on_behalf_of":"{who}"}}"#)
-                .as_bytes(),
+            format!(
+                r#"{{"id":"t-own","school":"{school}","path":"/auth/me","on_behalf_of":"{who}"}}"#
+            )
+            .as_bytes(),
         )
         .await;
         assert_eq!(answer["outcome"], "ok", "{answer}");
@@ -1272,7 +1289,10 @@ async fn a_suspended_school_is_refused_with_its_own_code() {
     let (answer, _) = raw::api_read(&service.conn, read.as_bytes()).await;
     assert_eq!(answer["outcome"], "err", "{answer}");
     assert_eq!(answer["code"], "school_suspended", "{answer}");
-    assert_eq!(answer["school"], "beta", "the refusal names the school back");
+    assert_eq!(
+        answer["school"], "beta",
+        "the refusal names the school back"
+    );
     assert_eq!(answer["id"], "t-susp");
 
     // The demo school is untouched by its neighbour's suspension.
@@ -1295,8 +1315,10 @@ async fn a_blob_read_names_its_school_too() {
 
     let (header, _, body) = raw::blob_read(
         &service.conn,
-        format!(r#"{{"id":"t-b1","school":"{SCHOOL}","file":"{file}","on_behalf_of":"{student}"}}"#)
-            .as_bytes(),
+        format!(
+            r#"{{"id":"t-b1","school":"{SCHOOL}","file":"{file}","on_behalf_of":"{student}"}}"#
+        )
+        .as_bytes(),
     )
     .await;
     assert_eq!(header["status"], "ok", "{header}");
@@ -1459,8 +1481,10 @@ async fn an_api_read_still_answers_on_the_shared_client_stream_path() {
 
     let (answer, _) = raw::api_read(
         &service.conn,
-        format!(r#"{{"id":"t-api","school":"{SCHOOL}","path":"/auth/me","on_behalf_of":"{student}"}}"#)
-            .as_bytes(),
+        format!(
+            r#"{{"id":"t-api","school":"{SCHOOL}","path":"/auth/me","on_behalf_of":"{student}"}}"#
+        )
+        .as_bytes(),
     )
     .await;
     assert_eq!(answer["outcome"], "ok", "{answer}");
