@@ -102,6 +102,15 @@ impl std::fmt::Display for Slug {
 /// [`Tenants::get`] refuses before any handler runs, and login is no exception.
 ///
 /// Stored as a bare lowercase string, like [`crate::domain::role::Role`].
+/// A school slug as a SurrealQL identifier. A database name cannot be bound
+/// as a parameter, so it is interpolated — and it MUST be backtick-quoted: an
+/// unquoted `ata-koleji` parses as a subtraction, `2024school` as a duration,
+/// `12345` as a number (SurrealDB 3.2). The `Slug` charset (`[a-z0-9-]`) can
+/// never contain a backtick, so the quoting cannot be escaped from.
+pub fn quoted_ident(slug: &Slug) -> String {
+    format!("`{}`", slug.as_str())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, SurrealValue, Serialize)]
 #[surreal(untagged, rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
@@ -364,12 +373,37 @@ impl Tenants {
             Err(err) => return Err(err.into()),
         }
 
+        // Everything past the registry row rolls that row back on failure:
+        // the row is what makes the slug "taken", and a slug taken by a
+        // school that never came to exist is wedged for good (found by the
+        // delete-path verifier: `ata-koleji` failed `DEFINE DATABASE` unquoted
+        // and could then be neither re-created nor deleted).
+        let db = match self.bring_up(slug).await {
+            Ok(db) => db,
+            Err(err) => {
+                let _ = self
+                    .control
+                    .query("DELETE $id")
+                    .bind(("id", SchoolId::from_slug(slug).record()))
+                    .await;
+                return Err(err);
+            }
+        };
+        self.cache
+            .write()
+            .expect("tenant cache lock")
+            .insert(slug.as_str().to_string(), db.clone());
+        Ok(db)
+    }
+
+    /// Define (remote) or mint (memory) the school's database and apply the
+    /// school schema to it. Split out of [`Tenants::create`] so one `?` chain
+    /// can be rolled back as a unit.
+    async fn bring_up(&self, slug: &Slug) -> Result<Database, AppError> {
         let db = match &*self.mode {
             Mode::Remote { .. } => {
-                // `slug` is `Slug`-validated, so this interpolation carries only
-                // `[a-z0-9-]` — SurrealQL cannot bind a database name.
                 self.control
-                    .query(format!("DEFINE DATABASE IF NOT EXISTS {slug}"))
+                    .query(format!("DEFINE DATABASE IF NOT EXISTS {}", quoted_ident(slug)))
                     .await?
                     .check()?;
                 self.connect(slug).await?
@@ -377,10 +411,6 @@ impl Tenants {
             Mode::Mem => self.connect(slug).await?,
         };
         migrate(&db).await?;
-        self.cache
-            .write()
-            .expect("tenant cache lock")
-            .insert(slug.as_str().to_string(), db.clone());
         Ok(db)
     }
 
@@ -409,9 +439,8 @@ impl Tenants {
     /// what [`SchoolStatus::Suspended`] is for.
     pub async fn drop(&self, slug: &Slug) -> Result<(), AppError> {
         if let Mode::Remote { .. } = &*self.mode {
-            // Interpolation, not a bind: see `create`.
             self.control
-                .query(format!("REMOVE DATABASE IF EXISTS {slug}"))
+                .query(format!("REMOVE DATABASE IF EXISTS {}", quoted_ident(slug)))
                 .await?
                 .check()?;
         }
