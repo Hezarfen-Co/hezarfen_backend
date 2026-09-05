@@ -44,11 +44,14 @@ pub struct RagIndexPayload {
     /// — the backend keys the stored answer itself.
     pub course_note: String,
     pub course: String,
+    /// The note author's user id — who a service reads the file bytes
+    /// `on_behalf_of` on the blob stream, since the note's own teacher can
+    /// always view its course and the `ai` principal never can.
+    pub author: String,
     pub title: String,
     pub content: String,
-    /// Attachment **metadata only** — file bytes are deliberately not on the
-    /// wire (open with the service owner: today a service that wants them must
-    /// read them out of band).
+    /// Attachment **metadata only** — the bytes ride their own QUIC stream
+    /// (one `BlobRequest` per `files[].id`), never a JSON frame.
     #[serde(default)]
     pub files: Vec<RagFile>,
 }
@@ -58,6 +61,7 @@ impl RagIndexPayload {
         Self {
             course_note: note.get_id().key().to_string(),
             course: note.get_course().key().to_string(),
+            author: note.get_author().key().to_string(),
             title: note.get_title().as_str().to_string(),
             content: note.get_content().as_str().to_string(),
             files: files
@@ -165,6 +169,7 @@ mod tests {
         let payload = serde_json::to_value(RagIndexPayload {
             course_note: "01NOTE".into(),
             course: "01COURSE".into(),
+            author: "01AUTHOR".into(),
             title: "Chapter 3".into(),
             content: "quadratics".into(),
             files: vec![RagFile {
@@ -180,6 +185,7 @@ mod tests {
             json!({
                 "course_note": "01NOTE",
                 "course": "01COURSE",
+                "author": "01AUTHOR",
                 "title": "Chapter 3",
                 "content": "quadratics",
                 "files": [{
@@ -194,7 +200,8 @@ mod tests {
         // A note with no attachments is the common case — `files` is optional
         // on the wire, so a minimal service need not send it back or expect it.
         let bare: RagIndexPayload = serde_json::from_value(json!({
-            "course_note": "01NOTE", "course": "01COURSE", "title": "t", "content": "c",
+            "course_note": "01NOTE", "course": "01COURSE", "author": "01AUTHOR",
+            "title": "t", "content": "c",
         }))
         .unwrap();
         assert!(bare.files.is_empty());

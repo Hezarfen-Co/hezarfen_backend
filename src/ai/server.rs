@@ -14,8 +14,8 @@ use ulid::Ulid;
 
 use crate::ai::error::AiError;
 use crate::ai::protocol::{
-    ApiRequest, ApiResponse, FrameError, Greeting, Hello, RejectCode, Request, Response,
-    protocol_matches, read_frame, write_frame,
+    ApiRequest, ApiResponse, BlobRequest, BlobResponse, FrameError, Greeting, Hello, RejectCode,
+    Request, Response, protocol_matches, read_frame, write_frame,
 };
 use crate::ai::registry::{AiRegistry, WorkerSnapshot, clamp_concurrency};
 use crate::ai::tls;
@@ -23,8 +23,13 @@ use crate::constant::{
     AI_HANDSHAKE_TIMEOUT_SECS, AI_MAX_FRAME_BYTES, AI_PROTOCOL, REQUEST_TIMEOUT_SECS,
 };
 use crate::database::Database;
+use crate::domain::course::Course;
+use crate::domain::course_note::CourseNote;
+use crate::domain::course_note_file::{CourseNoteFile, CourseNoteFileId};
 use crate::domain::user::{User, UserId};
 use crate::state::DbHealth;
+use crate::web::blob_path;
+use crate::web::courses::can_view_course;
 use crate::web::extractor::AiPrincipal;
 
 /// What the bridge needs to come up.
@@ -48,6 +53,9 @@ struct ApiHandle {
     router: axum::Router,
     db: Database,
     db_up: DbHealth,
+    /// Where course-note blobs live, for the byte stream — the same directory
+    /// `GET /course-notes/{id}/files/{file_id}` serves from.
+    files_path: std::path::PathBuf,
 }
 
 struct Inner {
@@ -228,8 +236,24 @@ impl AiBridge {
     /// a synthetic QUIC request skips the per-IP limiter, CORS and `ETag` (see
     /// the comment there). A second call keeps the first router: the process
     /// only ever builds one.
-    pub(crate) fn arm_api(&self, router: axum::Router, db: Database, db_up: DbHealth) {
-        if self.inner.api.set(ApiHandle { router, db, db_up }).is_err() {
+    pub(crate) fn arm_api(
+        &self,
+        router: axum::Router,
+        db: Database,
+        db_up: DbHealth,
+        files_path: std::path::PathBuf,
+    ) {
+        if self
+            .inner
+            .api
+            .set(ApiHandle {
+                router,
+                db,
+                db_up,
+                files_path,
+            })
+            .is_err()
+        {
             tracing::warn!("the AI bridge api path was already armed — keeping the first router");
         }
     }
@@ -279,14 +303,15 @@ async fn serve_connection(inner: Arc<Inner>, conn: quinn::Connection, remote: So
     // service says goodbye, and the QUIC idle timeout covers the case where it
     // dies without saying anything.
     //
-    // Every *further* client-initiated stream is one api read. A service that
-    // opens none behaves exactly as it did before this loop existed.
+    // Every *further* client-initiated stream is one api read or one blob
+    // read. A service that opens none behaves exactly as it did before this
+    // loop existed.
     let reason = loop {
         tokio::select! {
             reason = conn.closed() => break reason,
             accepted = conn.accept_bi() => match accepted {
                 Ok((send, recv)) => {
-                    tokio::spawn(serve_api_read(Arc::clone(&inner), send, recv));
+                    tokio::spawn(serve_client_stream(Arc::clone(&inner), send, recv));
                 }
                 // The connection is going away; `closed()` has the real reason.
                 Err(_) => break conn.closed().await,
@@ -297,9 +322,11 @@ async fn serve_connection(inner: Arc<Inner>, conn: quinn::Connection, remote: So
     tracing::info!("AI service `{service}` ({worker_id}) at {remote} disconnected: {reason}");
 }
 
-/// Answer one api read on its own stream: one [`ApiRequest`] in, one
-/// [`ApiResponse`] out, then the stream is finished.
-async fn serve_api_read(
+/// Answer one client-initiated stream. Two shapes ride this path and are told
+/// apart by the field each requires: an [`ApiRequest`] has `path`, a
+/// [`BlobRequest`] has `file`. The api read is tried first, so every frame that
+/// parsed as one before still does, byte for byte.
+async fn serve_client_stream(
     inner: Arc<Inner>,
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
@@ -323,19 +350,167 @@ async fn serve_api_read(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let request: ApiRequest = match serde_json::from_value(raw) {
-        Ok(request) => request,
-        Err(e) => {
-            answer(&mut send, refusal(id, "malformed", e.to_string())).await;
+    let api_err = match serde_json::from_value::<ApiRequest>(raw.clone()) {
+        Ok(request) => {
+            let response = match read_api(&inner, request).await {
+                Ok(response) => response,
+                Err((code, message)) => refusal(id, code, message),
+            };
+            answer(&mut send, response).await;
             return;
         }
+        Err(e) => e,
     };
+    if let Ok(request) = serde_json::from_value::<BlobRequest>(raw) {
+        serve_blob(&inner, &mut send, request).await;
+        return;
+    }
+    // Neither shape. Reported as the api-read refusal it has always been —
+    // `path` is the field a frame this far off most likely meant to carry.
+    answer(&mut send, refusal(id, "malformed", api_err.to_string())).await;
+}
 
-    let response = match read_api(&inner, request).await {
-        Ok(response) => response,
-        Err((code, message)) => refusal(id, code, message),
+/// Answer one blob read: the [`BlobResponse`] header frame, then — on `Ok` —
+/// exactly `size` raw bytes copied straight off disk, then FIN.
+///
+/// The bytes are streamed rather than buffered: a course-note attachment can
+/// be the school's whole `max_file_bytes`, and this path exists precisely
+/// because such a thing does not fit a frame.
+async fn serve_blob(inner: &Inner, send: &mut quinn::SendStream, request: BlobRequest) {
+    let id = request.id.clone();
+    match open_blob(inner, request).await {
+        Ok((header, mut file)) => {
+            if let Err(e) = write_frame(send, &header).await {
+                tracing::warn!("could not answer an AI service's blob read {id}: {e}");
+            } else if let Err(e) = tokio::io::copy(&mut file, send).await {
+                // The header already promised `size` bytes, so a short body
+                // would read as a silently truncated file. Reset instead: the
+                // service sees a broken stream and can ask again.
+                tracing::warn!("blob read {id} failed after its header: {e}");
+                let _ = send.reset(1u32.into());
+                return;
+            }
+        }
+        Err((code, message)) => {
+            let refused = BlobResponse::Err {
+                id,
+                code: code.to_string(),
+                message,
+            };
+            if let Err(e) = write_frame(send, &refused).await {
+                tracing::warn!("could not refuse an AI service's blob read: {e}");
+            }
+        }
+    }
+    let _ = send.finish();
+}
+
+/// Resolve, authorize and open one blob. `Err` is the refusal that becomes a
+/// [`BlobResponse::Err`] code.
+///
+/// Scope is course-note attachments and nothing else: the id is looked up in
+/// `course_note_file` alone, so a personal note's file id reads as `not_found`
+/// rather than reaching another table's row. Authorization is the very guard
+/// `download_file` applies over HTTP — [`can_view_course`] on the note's own
+/// course — so the bridge widens who may ask, never what may be read.
+async fn open_blob(
+    inner: &Inner,
+    request: BlobRequest,
+) -> Result<(BlobResponse, tokio::fs::File), (&'static str, String)> {
+    let api = inner.api.get().ok_or((
+        "unavailable",
+        "the api is not serving yet — retry".to_string(),
+    ))?;
+    if !api.db_up.is_up() {
+        return Err((
+            "unavailable",
+            "the database socket is down — retry".to_string(),
+        ));
+    }
+    let user = principal(api, request.on_behalf_of.as_deref()).await?;
+
+    let missing = || {
+        (
+            "not_found",
+            format!("no course note file `{}`", request.file),
+        )
     };
-    answer(&mut send, response).await;
+    let unavailable = |e: crate::error::AppError| ("unavailable", e.to_string());
+    let file = CourseNoteFile::read(&CourseNoteFileId::from_key(&request.file), &api.db)
+        .await
+        .map_err(unavailable)?
+        .ok_or_else(missing)?;
+    let note = CourseNote::read(file.get_course_note(), &api.db)
+        .await
+        .map_err(unavailable)?
+        .ok_or_else(missing)?;
+    let course = Course::read(note.get_course(), &api.db)
+        .await
+        .map_err(unavailable)?
+        .ok_or_else(missing)?;
+    if !can_view_course(&course, &user, &api.db)
+        .await
+        .map_err(unavailable)?
+    {
+        return Err((
+            "forbidden",
+            format!(
+                "`{}` may not view the course this file belongs to",
+                user.get_id().key()
+            ),
+        ));
+    }
+
+    // The row exists but its blob does not: server-side damage (a lost volume
+    // path), exactly as `download_file` reads it — not the service's `404`.
+    let path = blob_path(&api.files_path, file.get_id().key());
+    let handle = tokio::fs::File::open(&path).await.map_err(|e| {
+        (
+            "unavailable",
+            format!(
+                "missing blob for course note file {}: {e}",
+                file.get_id().key()
+            ),
+        )
+    })?;
+    // The header's `size` is what will actually be copied, so it is taken from
+    // the file on disk rather than the row's column: a service reading exactly
+    // `size` bytes must never over- or under-read.
+    let size = handle
+        .metadata()
+        .await
+        .map_err(|e| ("unavailable", format!("could not stat the blob: {e}")))?
+        .len();
+    Ok((
+        BlobResponse::Ok {
+            id: request.id,
+            name: file.get_name().as_str().to_string(),
+            content_type: file.get_content_type().as_str().to_string(),
+            size,
+        },
+        handle,
+    ))
+}
+
+/// Who a client-initiated read runs as.
+///
+/// Loaded live, never trusted from the frame: a service holding a stale id must
+/// not act as a user who has since been deleted or demoted. With nobody named
+/// the principal is the synthetic `ai` role.
+async fn principal(
+    api: &ApiHandle,
+    on_behalf_of: Option<&str>,
+) -> Result<User, (&'static str, String)> {
+    let Some(who) = on_behalf_of else {
+        return Ok(User::ai_principal());
+    };
+    // Both the bare key (`abc`, as a REST path spells it) and the record form
+    // (`user:abc`) are accepted.
+    let key = who.strip_prefix("user:").unwrap_or(who);
+    User::read(&UserId::from_key(key), &api.db)
+        .await
+        .map_err(|e| ("unavailable", format!("could not load `{who}`: {e}")))?
+        .ok_or_else(|| ("unknown_user", format!("no user `{who}`")))
 }
 
 /// The bridge-level refusal this request earns *before* anything is dispatched,
@@ -409,21 +584,9 @@ async fn dispatch_api(
         ));
     }
 
-    // Loaded live, never trusted from the frame: a service holding a stale id
-    // must not act as a user who has since been deleted or demoted. The role
-    // itself is re-read again by the extractor on the dispatched request.
-    let user = match &on_behalf_of {
-        Some(who) => {
-            // Both the bare key (`abc`, as a REST path spells it) and the
-            // record form (`user:abc`) are accepted.
-            let key = who.strip_prefix("user:").unwrap_or(who);
-            User::read(&UserId::from_key(key), &api.db)
-                .await
-                .map_err(|e| ("unavailable", format!("could not load `{who}`: {e}")))?
-                .ok_or_else(|| ("unknown_user", format!("no user `{who}`")))?
-        }
-        None => User::ai_principal(),
-    };
+    // The role itself is re-read again by the extractor on the dispatched
+    // request; see [`principal`] for why it is never taken from the frame.
+    let user = principal(api, on_behalf_of.as_deref()).await?;
 
     let target = match query.as_deref() {
         Some(query) if !query.is_empty() => format!("{path}?{query}"),
@@ -664,6 +827,7 @@ mod tests {
             router,
             db: crate::database::init_mem().await.expect("in-memory db"),
             db_up: Default::default(),
+            files_path: std::env::temp_dir(),
         }
     }
 

@@ -182,6 +182,26 @@ mod raw {
         read_frame(&mut recv).await.expect("read ApiResponse")
     }
 
+    /// Send one frame verbatim on a fresh *client*-initiated stream, read the
+    /// single answer frame, and then read whatever raw bytes followed it. That
+    /// is the whole blob client: one `BlobRequest`, one header frame, then
+    /// exactly `size` bytes and EOF.
+    pub async fn blob_read(conn: &quinn::Connection, body: &[u8]) -> (Value, Vec<u8>, Vec<u8>) {
+        let (mut send, mut recv) = conn.open_bi().await.expect("blob stream");
+        send.write_all(&frame(body))
+            .await
+            .expect("write BlobRequest");
+        let _ = send.finish();
+        let (header, bytes) = read_frame(&mut recv).await.expect("read BlobResponse");
+        // Deliberately asks for more than the header promised: a stream that
+        // wrote one byte too many would show up here, not as a silent pass.
+        let body = recv
+            .read_to_end(16 * 1024 * 1024)
+            .await
+            .expect("read to EOF after the header");
+        (header, bytes, body)
+    }
+
     /// The set of top-level keys of a JSON object, sorted.
     pub fn keys(value: &Value) -> Vec<String> {
         let mut k: Vec<String> = value
@@ -1112,4 +1132,162 @@ async fn an_api_read_answers_a_named_user_with_that_users_own_data() {
     assert_eq!(answer["status"], 200);
     assert_eq!(answer["body"]["id"], student, "{answer}");
     assert_eq!(answer["body"]["role"], "student", "{answer}");
+}
+
+// --------------------------------------------------- blob stream contract --
+//
+// The bytes behind a course-note attachment, which no JSON frame can carry.
+// The header frame is a published contract exactly like the ones above, and
+// the `size`-then-EOF rule is what a foreign service implements by hand — so
+// both are asserted here as bytes.
+
+/// An armed router plus an uploaded course-note file: its id, and the bytes
+/// that were uploaded, read back by a service that must receive them verbatim.
+async fn armed_with_file(bridge: &AiBridge) -> (axum::Router, String, String, Vec<u8>) {
+    let (app, db) = common::app_with_ai(Some(bridge.clone())).await;
+    let student_cookie = common::login_as(&app, &db, "ayse", "student").await;
+    let student = common::me_id(&app, &student_cookie).await;
+    let teacher = common::login_as(&app, &db, "hoca", "teacher").await;
+    let course = common::create_course(&app, &teacher, "Physics").await;
+    common::enroll(&app, &teacher, &course, &student).await;
+
+    let res = common::send(
+        &app,
+        "POST",
+        "/course-notes",
+        Some(&teacher),
+        Some(json!({ "course": course, "title": "Newton", "content": "F = ma" })),
+    )
+    .await;
+    assert_eq!(res.status, 201, "{}", res.body);
+    let note = common::id_of(&res.body);
+
+    // Larger than one QUIC datagram, so the answer is a genuine multi-write
+    // stream rather than something that happened to fit beside the header.
+    let uploaded: Vec<u8> = (0..200 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let res = common::upload_file_at(
+        &app,
+        &teacher,
+        &format!("/course-notes/{note}/files"),
+        "recap.pdf",
+        "application/pdf",
+        &uploaded,
+    )
+    .await;
+    assert_eq!(res.status, 201, "{}", res.body);
+    let file = common::id_of(&res.body);
+    (app, student, file, uploaded)
+}
+
+#[tokio::test]
+async fn the_blob_header_frame_carries_exactly_the_published_keys_then_size_bytes() {
+    // Every documented field spelled out by hand, and the byte rule with it: a
+    // service reads the header, then exactly `size` raw bytes, then EOF. A
+    // length prefix sneaking in front of the body, or one byte too many after
+    // it, would leave a foreign service parsing garbage.
+    let bridge = bridge().await;
+    let service = raw::handshake(&bridge, &raw::hello("indexer", "rag.index")).await;
+    await_workers(&bridge, 1).await;
+    let (_app, student, file, uploaded) = armed_with_file(&bridge).await;
+
+    let (header, bytes, body) = raw::blob_read(
+        &service.conn,
+        format!(
+            r#"{{"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","file":"{file}","on_behalf_of":"{student}"}}"#
+        )
+        .as_bytes(),
+    )
+    .await;
+
+    assert_eq!(
+        raw::keys(&header),
+        ["content_type", "id", "name", "size", "status"],
+        "blob header shape changed: {header}"
+    );
+    assert_eq!(header["status"], "ok");
+    assert_eq!(
+        header["id"], "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "the trace id is echoed"
+    );
+    assert_eq!(header["name"], "recap.pdf");
+    assert_eq!(header["content_type"], "application/pdf");
+    assert_eq!(header["size"], uploaded.len(), "{header}");
+
+    // Byte level: the tag key is `status` with a bare lowercase literal, and
+    // `size` is a JSON number, not a string a service would have to parse.
+    let text = String::from_utf8(bytes).expect("the header frame is UTF-8 JSON");
+    assert!(text.contains(r#""status":"ok""#), "{text}");
+    assert!(
+        text.contains(&format!(r#""size":{}"#, uploaded.len())),
+        "{text}"
+    );
+
+    // The body is raw: no four-byte length prefix, exactly `size` bytes, EOF.
+    assert_eq!(body.len(), uploaded.len(), "`size` bytes then EOF");
+    assert!(body == uploaded, "the bytes differ from what was uploaded");
+}
+
+#[tokio::test]
+async fn a_blob_refusal_frame_carries_exactly_the_published_keys_and_no_bytes() {
+    let bridge = bridge().await;
+    let service = raw::handshake(&bridge, &raw::hello("indexer", "rag.index")).await;
+    await_workers(&bridge, 1).await;
+    let (_app, student, _file, _uploaded) = armed_with_file(&bridge).await;
+
+    let (header, _, body) = raw::blob_read(
+        &service.conn,
+        format!(r#"{{"id":"t-blob","file":"01NOSUCHFILE","on_behalf_of":"{student}"}}"#).as_bytes(),
+    )
+    .await;
+    assert_eq!(
+        raw::keys(&header),
+        ["code", "id", "message", "status"],
+        "blob refusal shape changed: {header}"
+    );
+    assert_eq!(header["status"], "err");
+    assert_eq!(header["code"], "not_found");
+    assert_eq!(header["id"], "t-blob");
+    assert!(body.is_empty(), "a refusal is followed by nothing at all");
+}
+
+#[tokio::test]
+async fn an_api_read_still_answers_on_the_shared_client_stream_path() {
+    // The discriminator guard. Both request shapes now arrive on the same
+    // client-initiated streams and are told apart by their required field —
+    // `path` for an api read, `file` for a blob. An api read must keep
+    // answering exactly as it did before the blob shape existed, and a frame
+    // that is neither must still be the api read's `malformed` refusal rather
+    // than a silent hang.
+    let bridge = bridge().await;
+    let service = raw::handshake(&bridge, &raw::hello("indexer", "rag.index")).await;
+    await_workers(&bridge, 1).await;
+    let (_app, student, file, _uploaded) = armed_with_file(&bridge).await;
+
+    let (answer, _) = raw::api_read(
+        &service.conn,
+        format!(r#"{{"id":"t-api","path":"/auth/me","on_behalf_of":"{student}"}}"#).as_bytes(),
+    )
+    .await;
+    assert_eq!(answer["outcome"], "ok", "{answer}");
+    assert_eq!(answer["status"], 200);
+    assert_eq!(answer["body"]["id"], student, "{answer}");
+
+    // `path` wins over `file`: a frame carrying both is the api read it has
+    // always been, so nothing that parsed before is re-routed now.
+    let (answer, _) = raw::api_read(
+        &service.conn,
+        format!(
+            r#"{{"id":"t-both","path":"/auth/me","file":"{file}","on_behalf_of":"{student}"}}"#
+        )
+        .as_bytes(),
+    )
+    .await;
+    assert_eq!(answer["outcome"], "ok", "{answer}");
+    assert_eq!(answer["status"], 200);
+
+    // Neither shape: still the api read's refusal, with its `outcome` tag.
+    let (answer, _) = raw::api_read(&service.conn, br#"{"id":"t-neither"}"#).await;
+    assert_eq!(answer["outcome"], "err", "{answer}");
+    assert_eq!(answer["code"], "malformed");
+    assert_eq!(answer["id"], "t-neither");
 }

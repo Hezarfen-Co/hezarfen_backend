@@ -22,6 +22,17 @@
 //!   That mirrors the REST API — the backend dispatches the path internally —
 //!   so a service asks for school data instead of being handed it.
 //!
+//! * Each **blob read** goes the same way as an api read, on its own
+//!   client-initiated bidirectional stream: the service writes one
+//!   [`BlobRequest`], finishes its send side, and reads one [`BlobResponse`]
+//!   header frame. On [`BlobResponse::Ok`] exactly `size` **raw** bytes follow
+//!   the header — not a frame, so [`AI_MAX_FRAME_BYTES`] does not bound them —
+//!   and then the stream is finished. That is how a service gets a course
+//!   note's file bytes, which no JSON frame could carry.
+//!
+//!   The two client-initiated request shapes are told apart by their required
+//!   field: an [`ApiRequest`] has `path`, a [`BlobRequest`] has `file`.
+//!
 //! There is deliberately no correlation-id matching: QUIC stream IDs already
 //! multiplex concurrent requests over the one connection, independently
 //! flow-controlled, with no head-of-line blocking between them. [`Request::id`]
@@ -170,6 +181,43 @@ pub enum ApiResponse {
     Err {
         id: String,
         /// Bridge-defined, stable, machine-readable (`"path_not_allowed"`).
+        code: String,
+        message: String,
+    },
+}
+
+/// A read of one course-note file's *bytes*, written by the *service* on a
+/// fresh client-initiated stream. Distinguished from an [`ApiRequest`] by its
+/// required `file` field.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BlobRequest {
+    /// Trace id (ULID). Not used for correlation — the stream does that.
+    pub id: String,
+    /// The `course_note_file` record key, as `GET /course-notes/{id}/files`
+    /// and the `rag.index` payload both publish it.
+    pub file: String,
+    /// User id to read as. Absent means the service itself, which can view no
+    /// course and so always earns `forbidden`.
+    #[serde(default)]
+    pub on_behalf_of: Option<String>,
+}
+
+/// The header frame that opens (or refuses) a blob stream. On `Ok` exactly
+/// `size` raw bytes follow it, then FIN; on `Err` the stream is finished with
+/// nothing after the frame.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum BlobResponse {
+    Ok {
+        id: String,
+        name: String,
+        content_type: String,
+        /// Exactly how many raw bytes follow this frame.
+        size: u64,
+    },
+    Err {
+        id: String,
+        /// Bridge-defined, stable, machine-readable (`"not_found"`).
         code: String,
         message: String,
     },
@@ -399,6 +447,43 @@ mod tests {
         assert_eq!(raw["on_behalf_of"], "user:abc");
         assert_eq!(raw["method"], "GET");
         assert_eq!(serde_json::from_value::<ApiRequest>(raw).unwrap(), full);
+    }
+
+    #[tokio::test]
+    async fn blob_frame_tags_are_the_documented_wire_names() {
+        // Same reason as above: other-language services match these literals.
+        // The tag is `status` (as on `Response`), not `outcome` — a blob header
+        // carries no HTTP status for it to collide with.
+        let ok = serde_json::to_value(BlobResponse::Ok {
+            id: "1".into(),
+            name: "recap.pdf".into(),
+            content_type: "application/pdf".into(),
+            size: 204_800,
+        })
+        .unwrap();
+        assert_eq!(ok["status"], "ok");
+        assert_eq!(ok["size"], 204_800);
+        let err = serde_json::to_value(BlobResponse::Err {
+            id: "1".into(),
+            code: "not_found".into(),
+            message: "nope".into(),
+        })
+        .unwrap();
+        assert_eq!(err["status"], "err");
+        assert_eq!(err["code"], "not_found");
+
+        // `file` is what tells a blob request apart from an api read, so it is
+        // required; `on_behalf_of` is the only optional field.
+        let bare: BlobRequest = serde_json::from_value(json!({
+            "id": "01J", "file": "01FILE",
+        }))
+        .unwrap();
+        assert_eq!(bare.on_behalf_of, None);
+        assert!(serde_json::from_value::<BlobRequest>(json!({ "id": "01J" })).is_err());
+        // And the two shapes never parse as each other.
+        assert!(
+            serde_json::from_value::<ApiRequest>(json!({ "id": "01J", "file": "01FILE" })).is_err()
+        );
     }
 
     #[tokio::test]

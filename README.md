@@ -3621,6 +3621,63 @@ Responses share the frame cap (8 MiB); an answer that does not fit comes back
 as `too_large` rather than a dropped stream, so a page too big is narrowed with
 `query` instead of waited out.
 
+### Blob reads (course-note file bytes)
+
+A PDF cannot ride a JSON frame, so an indexing service pulls a course note's
+attachment over a **raw byte stream** instead. Same direction and same framing
+as an api read — the service opens a bidi stream and writes one frame — only
+the shape differs, and the two are told apart by the field each *requires*: an
+`ApiRequest` has `path`, a `BlobRequest` has `file`.
+
+```json
+{ "id": "01J...", "file": "01J8XZ0K3Q8G7X2M4N5P6R7S8V",
+  "on_behalf_of": "user:01J..." }
+```
+
+`file` is a `course_note_file` record key — the id `GET
+/course-notes/{id}/files` publishes and the one every `rag.index` payload
+carries in `files[].id`. `on_behalf_of` is optional on the wire but required in
+practice: without it the principal is the `ai` role, which is enrolled in
+nothing and can view no course, so every read is `forbidden`. Send the note's
+`author` (the `rag.index` payload carries it) or the student who asked.
+
+The backend answers with **one header frame**, tagged by `status` — the same
+tag `Response` uses, not the api read's `outcome`, since a blob header carries
+no HTTP status to collide with:
+
+```json
+{ "status": "ok",  "id": "01J...", "name": "recap.pdf",
+  "content_type": "application/pdf", "size": 204800 }
+{ "status": "err", "id": "01J...", "code": "forbidden",
+  "message": "`01J...` may not view the course this file belongs to" }
+```
+
+On `ok`, **exactly `size` raw bytes follow the header frame**, then the stream
+is finished. Those bytes are *not* a frame: they carry no length prefix and the
+8 MiB frame cap does not apply to them, which is the whole point — read
+`size` bytes and then expect EOF. `size` is measured off the stored blob
+itself, so it is what will actually arrive rather than what a row remembers.
+On `err` nothing follows the frame at all. A read that breaks after its header
+resets the stream instead of finishing it, so a truncated file is never
+mistaken for a complete one.
+
+| `code` | Meaning |
+| ------ | ------- |
+| `not_found` | No `course_note_file` with that key, or its note or course is gone |
+| `forbidden` | The principal may not view that file's course |
+| `unknown_user` | `on_behalf_of` names no user |
+| `unavailable` | The api is not serving yet, the database socket is down, or the row's blob is missing from disk — retryable |
+
+**Course-note attachments only.** The key is looked up in `course_note_file`
+and in no other table, so a personal note's file id (`/notes/{id}/files`) is
+`not_found` here rather than a different table's row: personal notes have no
+reader but their owner, and this stream does not become one.
+
+Authorization is the very guard `GET /course-notes/{id}/files/{file_id}`
+applies — course management rights or enrollment. The bridge widens *who may
+ask*, never *what may be read*: the file's note, and that note's course, are
+loaded and gated exactly as they are over HTTP.
+
 ### Framing
 
 `u32` big-endian byte length, then that many bytes of JSON. One frame per
@@ -3881,15 +3938,18 @@ as ordinary `hab/1` `Request` frames whose `payload` is:
 ```json
 { "course_note": "01J8XZ0K3Q8G7X2M4N5P6R7S8T",
   "course": "01J8XZ0K3Q8G7X2M4N5P6R7S8U",
+  "author": "01J8XZ0K3Q8G7X2M4N5P6R7S8W",
   "title": "Chapter 3 recap",
   "content": "Covered quadratics; homework due Friday",
   "files": [ {"id":"01J8…","name":"recap.pdf",
               "content_type":"application/pdf","size":24576} ] }
 ```
 
-`files` is attachment **metadata only** — file bytes are deliberately not on
-the wire, so a service that needs them reads them out of band. It is optional
-(absent or `[]` = a note with no attachments).
+`files` is attachment **metadata only**; the bytes ride their own QUIC stream
+(see "Blob reads" above — one `BlobRequest` per `files[].id`), never a JSON
+frame. It is optional (absent or `[]` = a note with no attachments). `author`
+is the note's own teacher: a service reads the bytes `on_behalf_of` them,
+since the `ai` principal can view no course.
 
 The answer is a `Response::Ok` whose payload is **any JSON object**: its shape
 belongs to the service, and the backend stores it verbatim against the note

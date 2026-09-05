@@ -1825,7 +1825,18 @@ async fn deleting_a_course_note_takes_its_rag_outputs_with_it() {
 /// A registered service, a router, and a course the seeded student is
 /// enrolled in (plus one they are not) with a teacher's note in each.
 /// Returns (service, student id, note id, enrolled course, foreign course).
-async fn course_notes_fixture(bridge: &AiBridge) -> (FakeService, String, String, String, String) {
+async fn course_notes_fixture(
+    bridge: &AiBridge,
+) -> (
+    FakeService,
+    String,
+    String,
+    String,
+    String,
+    Router,
+    Database,
+    String,
+) {
     let service = connect_service(
         bridge,
         hello("tutor", &[AI_CHAT_CAPABILITY]),
@@ -1854,7 +1865,7 @@ async fn course_notes_fixture(bridge: &AiBridge) -> (FakeService, String, String
     assert_eq!(res.status, StatusCode::CREATED, "teacher creates the note");
     let note = common::id_of(&res.body);
 
-    (service, student, note, course, foreign)
+    (service, student, note, course, foreign, app, db, teacher)
 }
 
 #[tokio::test]
@@ -1862,7 +1873,8 @@ async fn a_service_reads_a_course_note_on_behalf_of_an_enrolled_student() {
     // The point of #27: a study companion answering about a lesson needs the
     // teacher's own material, read with the student's reach and no wider.
     let bridge = bridge().await;
-    let (service, student, note, course, _foreign) = course_notes_fixture(&bridge).await;
+    let (service, student, note, course, _foreign, _app, _db, _teacher) =
+        course_notes_fixture(&bridge).await;
 
     let request = ApiRequest {
         id: "trace-course-notes".into(),
@@ -1888,7 +1900,8 @@ async fn a_course_the_student_is_not_in_is_refused_by_the_handler() {
     // The bridge widens the scope, never the reach: the handler's own guard
     // is what answers, and it rides back as an `Ok` carrying that status.
     let bridge = bridge().await;
-    let (service, student, _note, _course, foreign) = course_notes_fixture(&bridge).await;
+    let (service, student, _note, _course, foreign, _app, _db, _teacher) =
+        course_notes_fixture(&bridge).await;
 
     let request = ApiRequest {
         id: "trace-foreign-course".into(),
@@ -1906,7 +1919,8 @@ async fn writing_a_course_note_is_refused_before_dispatch() {
     // Read scope means read: the allowlist admits the path, the method gate
     // still refuses, and nothing reaches the router.
     let bridge = bridge().await;
-    let (service, _student, _note, _course, _foreign) = course_notes_fixture(&bridge).await;
+    let (service, _student, _note, _course, _foreign, _app, _db, _teacher) =
+        course_notes_fixture(&bridge).await;
 
     let request = ApiRequest {
         id: "trace-post".into(),
@@ -1926,11 +1940,217 @@ async fn a_course_note_file_download_stays_out_of_the_read_scope() {
     // The listing of a note's files is JSON and allowed; the bytes behind one
     // are not — frames carry JSON under an 8 MiB cap.
     let bridge = bridge().await;
-    let (service, student, note, _course, _foreign) = course_notes_fixture(&bridge).await;
+    let (service, student, note, _course, _foreign, _app, _db, _teacher) =
+        course_notes_fixture(&bridge).await;
 
     let path = format!("/course-notes/{note}/files/somefile");
     match api_read(&service.conn, read_of(&path, Some(&student))).await {
         ApiResponse::Err { code, .. } => assert_eq!(code, "path_not_allowed"),
         ApiResponse::Ok { status, .. } => panic!("a blob route was dispatched, answering {status}"),
+    }
+}
+
+// -------------------------------------------------------------- blob read --
+//
+// The third stream shape: a service pulls a course-note attachment's raw
+// bytes, which no JSON frame could carry. The header frame is authorized by
+// the very guard the HTTP download carries, so these drive the real upload
+// route and then read the bytes back over real QUIC.
+
+use hezarfen_backend::ai::protocol::{BlobRequest, BlobResponse};
+
+/// 200 KiB of deterministic pseudo-random bytes — well past one QUIC datagram,
+/// so a passing read proves the copy really streamed rather than fitting in a
+/// single write.
+fn blob_bytes() -> Vec<u8> {
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    (0..200 * 1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect()
+}
+
+/// One blob read on a fresh client-initiated stream: the header frame, then
+/// everything that followed it up to EOF.
+async fn blob_read(conn: &quinn::Connection, request: BlobRequest) -> (BlobResponse, Vec<u8>) {
+    let (mut send, mut recv) = conn.open_bi().await.expect("blob stream");
+    write_frame(&mut send, &request)
+        .await
+        .expect("write BlobRequest");
+    let _ = send.finish();
+    let header: BlobResponse = read_frame(&mut recv).await.expect("read BlobResponse");
+    let bytes = recv
+        .read_to_end(16 * 1024 * 1024)
+        .await
+        .expect("read the blob body to EOF");
+    (header, bytes)
+}
+
+fn blob_of(file: &str, on_behalf_of: Option<&str>) -> BlobRequest {
+    BlobRequest {
+        id: format!("trace-blob-{file}"),
+        file: file.to_string(),
+        on_behalf_of: on_behalf_of.map(str::to_string),
+    }
+}
+
+/// The refusal code of a header that must be one; panics on an `Ok`.
+fn blob_refusal(header: BlobResponse) -> String {
+    match header {
+        BlobResponse::Err { code, .. } => code,
+        BlobResponse::Ok { name, size, .. } => {
+            panic!("expected a refusal, got {size} bytes of `{name}`")
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_service_streams_a_course_note_file_on_behalf_of_an_enrolled_student() {
+    // The whole point of the slice: the service can index the PDF, not just
+    // its filename. The bytes must come back identical to what was uploaded
+    // through the ordinary multipart route, and `size` must be exactly how
+    // many of them arrive — a service reads that count and then expects EOF.
+    let bridge = bridge().await;
+    let (service, student, note, _course, _foreign, app, _db, teacher) =
+        course_notes_fixture(&bridge).await;
+
+    let uploaded = blob_bytes();
+    let res = common::upload_file_at(
+        &app,
+        &teacher,
+        &format!("/course-notes/{note}/files"),
+        "recap.pdf",
+        "application/pdf",
+        &uploaded,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let file = common::id_of(&res.body);
+
+    let (header, bytes) = blob_read(&service.conn, blob_of(&file, Some(&student))).await;
+    let BlobResponse::Ok {
+        id,
+        name,
+        content_type,
+        size,
+    } = header
+    else {
+        panic!("the enrolled student was refused: {}", blob_refusal(header));
+    };
+    assert_eq!(id, format!("trace-blob-{file}"), "the trace id is echoed");
+    assert_eq!(name, "recap.pdf");
+    assert_eq!(content_type, "application/pdf");
+    assert_eq!(size as usize, uploaded.len(), "the promised byte count");
+    assert_eq!(bytes.len(), size as usize, "exactly `size` bytes, then FIN");
+    assert!(bytes == uploaded, "the bytes differ from what was uploaded");
+}
+
+#[tokio::test]
+async fn a_student_outside_the_course_is_refused_the_bytes() {
+    // The bridge widens who may ask, never what may be read: the file's own
+    // course-view guard answers, exactly as it does over HTTP.
+    let bridge = bridge().await;
+    let (service, _student, note, _course, _foreign, app, db, teacher) =
+        course_notes_fixture(&bridge).await;
+
+    let res = common::upload_file_at(
+        &app,
+        &teacher,
+        &format!("/course-notes/{note}/files"),
+        "recap.pdf",
+        "application/pdf",
+        b"gizli",
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let file = common::id_of(&res.body);
+
+    let outsider_cookie = common::login_as(&app, &db, "veli", "student").await;
+    let outsider = common::me_id(&app, &outsider_cookie).await;
+    let (header, bytes) = blob_read(&service.conn, blob_of(&file, Some(&outsider))).await;
+    assert_eq!(blob_refusal(header), "forbidden");
+    assert!(bytes.is_empty(), "a refusal is followed by nothing at all");
+}
+
+#[tokio::test]
+async fn a_service_reading_the_bytes_as_itself_is_forbidden() {
+    // Without `on_behalf_of` the principal is the `ai` role, which is enrolled
+    // in nothing and manages nothing — so it can view no course, and the blob
+    // stream grants it no reach the api read would not.
+    let bridge = bridge().await;
+    let (service, _student, note, _course, _foreign, app, _db, teacher) =
+        course_notes_fixture(&bridge).await;
+
+    let res = common::upload_file_at(
+        &app,
+        &teacher,
+        &format!("/course-notes/{note}/files"),
+        "recap.pdf",
+        "application/pdf",
+        b"gizli",
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let file = common::id_of(&res.body);
+
+    let (header, _) = blob_read(&service.conn, blob_of(&file, None)).await;
+    assert_eq!(blob_refusal(header), "forbidden");
+}
+
+#[tokio::test]
+async fn an_unknown_file_key_is_not_found_rather_than_a_dropped_stream() {
+    let bridge = bridge().await;
+    let (service, student, _note, _course, _foreign, _app, _db, _teacher) =
+        course_notes_fixture(&bridge).await;
+
+    let (header, _) = blob_read(&service.conn, blob_of("01NOSUCHFILE", Some(&student))).await;
+    assert_eq!(blob_refusal(header), "not_found");
+}
+
+#[tokio::test]
+async fn a_personal_notes_file_is_invisible_to_the_blob_stream() {
+    // Scope is course-note attachments and nothing else. A personal note has
+    // no reader but its owner, and the id is looked up in `course_note_file`
+    // alone — so the owner's own id does not open it either: `not_found`, not
+    // `forbidden`, because no such course-note file exists.
+    let bridge = bridge().await;
+    let (service, student, _note, _course, _foreign, app, db, _teacher) =
+        course_notes_fixture(&bridge).await;
+
+    let owner = common::login_as(&app, &db, "kemal", "student").await;
+    let owner_id = common::me_id(&app, &owner).await;
+    let res = common::send(
+        &app,
+        "POST",
+        "/notes",
+        Some(&owner),
+        Some(json!({ "title": "özel", "content": "kimseye yok" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let personal = common::id_of(&res.body);
+    let res = common::upload_file(
+        &app,
+        &owner,
+        &personal,
+        "gizli.pdf",
+        "application/pdf",
+        b"ozel",
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let personal_file = common::id_of(&res.body);
+
+    for who in [&student, &owner_id] {
+        let (header, _) = blob_read(&service.conn, blob_of(&personal_file, Some(who))).await;
+        assert_eq!(
+            blob_refusal(header),
+            "not_found",
+            "a personal note's file must not be reachable as a course-note file"
+        );
     }
 }
