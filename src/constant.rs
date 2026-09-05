@@ -610,7 +610,8 @@ pub const AI_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
 /// (string arrays are exempt from that completeness gate).
 ///
 /// JSON-only, and only what a study-companion needs: who the user is, their
-/// notes, their homework, and their own progress reports. Byte-serving routes
+/// notes, their course's notes, their homework, and their own progress reports.
+/// Byte-serving routes
 /// (note files, submission files, avatars, question images) are left out — the
 /// frames carry JSON, and a blob has no business crossing this seam yet.
 pub const AI_API_ALLOWLIST: &[&str] = &[
@@ -619,6 +620,9 @@ pub const AI_API_ALLOWLIST: &[&str] = &[
     "/users/{id}/profile",
     "/notes",
     "/notes/{id}",
+    "/course-notes",
+    "/course-notes/{id}",
+    "/course-notes/{id}/files",
     "/homework",
     "/homework/{id}",
     "/homework/{id}/result",
