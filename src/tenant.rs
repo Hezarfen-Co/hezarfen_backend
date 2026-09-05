@@ -98,10 +98,6 @@ impl std::fmt::Display for Slug {
     }
 }
 
-/// Whether a school may be reached at all. Suspension is immediate and total:
-/// [`Tenants::get`] refuses before any handler runs, and login is no exception.
-///
-/// Stored as a bare lowercase string, like [`crate::domain::role::Role`].
 /// A school slug as a SurrealQL identifier. A database name cannot be bound
 /// as a parameter, so it is interpolated — and it MUST be backtick-quoted: an
 /// unquoted `ata-koleji` parses as a subtraction, `2024school` as a duration,
@@ -111,6 +107,10 @@ pub fn quoted_ident(slug: &Slug) -> String {
     format!("`{}`", slug.as_str())
 }
 
+/// Whether a school may be reached at all. Suspension is immediate and total:
+/// [`Tenants::get`] refuses before any handler runs, and login is no exception.
+///
+/// Stored as a bare lowercase string, like [`crate::domain::role::Role`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, SurrealValue, Serialize)]
 #[surreal(untagged, rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
@@ -403,7 +403,10 @@ impl Tenants {
         let db = match &*self.mode {
             Mode::Remote { .. } => {
                 self.control
-                    .query(format!("DEFINE DATABASE IF NOT EXISTS {}", quoted_ident(slug)))
+                    .query(format!(
+                        "DEFINE DATABASE IF NOT EXISTS {}",
+                        quoted_ident(slug)
+                    ))
                     .await?
                     .check()?;
                 self.connect(slug).await?
