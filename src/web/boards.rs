@@ -18,7 +18,7 @@
 //! mid-session keeps drawing over an already-open socket until the room hears
 //! about it, so a roster change *must* fan out.
 
-use crate::web::tenant_state::State;
+use crate::web::tenant_state::{SchoolSlug, State};
 use axum::Json;
 use axum::extract::{Path, Query};
 use axum::http::StatusCode;
@@ -41,6 +41,7 @@ use crate::domain::role::Role;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
+use crate::tenant::Slug;
 
 use super::courses::can_manage_course;
 use super::{CurrentUser, Page, PageParams, RequireStudent, paginate, set_or_clear};
@@ -161,8 +162,8 @@ async fn resolve_participants(
 
 /// Push one frame to whoever is in the room right now. An empty room is the
 /// normal case, not a failure.
-fn fan_out(st: &AppState, board: &BoardId, frame: serde_json::Value) {
-    st.board_hub.publish(board.key(), frame.to_string());
+fn fan_out(st: &AppState, slug: &Slug, board: &BoardId, frame: serde_json::Value) {
+    st.board_hub.publish(slug, board.key(), frame.to_string());
 }
 
 /// The roster frame every path that changes the invite list must publish. A
@@ -537,6 +538,7 @@ struct UpdateBoard {
 )]
 async fn update_board(
     State(st): State<AppState>,
+    SchoolSlug(slug): SchoolSlug,
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
     Json(req): Json<UpdateBoard>,
@@ -561,12 +563,13 @@ async fn update_board(
         let participants =
             resolve_participants(participants, board.get_participants(), &st.db).await?;
         board = board.set_participants(participants, &st.db).await?;
-        fan_out(&st, board.get_id(), participants_frame(&board));
+        fan_out(&st, &slug, board.get_id(), participants_frame(&board));
     }
     if let Some(locked) = req.locked {
         board = board.set_locked(locked, user.get_id(), &st.db).await?;
         fan_out(
             &st,
+            &slug,
             board.get_id(),
             json!({"type": "locked", "locked": locked, "by": user.get_id().key()}),
         );
@@ -602,6 +605,7 @@ async fn update_board(
 )]
 async fn clear_board(
     State(st): State<AppState>,
+    SchoolSlug(slug): SchoolSlug,
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<StrokeResponse>), AppError> {
@@ -612,6 +616,7 @@ async fn clear_board(
     // next one.
     fan_out(
         &st,
+        &slug,
         board.get_id(),
         json!({
             "type": "cleared",
@@ -642,6 +647,7 @@ async fn clear_board(
 )]
 async fn close_board(
     State(st): State<AppState>,
+    SchoolSlug(slug): SchoolSlug,
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<BoardResponse>, AppError> {
@@ -650,6 +656,7 @@ async fn close_board(
     let board = board.close(&st.db).await?;
     fan_out(
         &st,
+        &slug,
         board.get_id(),
         json!({
             "type": "closed",
@@ -812,6 +819,7 @@ impl InviteSource {
 )]
 async fn invite_board(
     State(st): State<AppState>,
+    SchoolSlug(slug): SchoolSlug,
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
     Json(req): Json<InviteSource>,
@@ -852,7 +860,7 @@ async fn invite_board(
     // branch that has to prove the two lists are equal, and a re-invite that
     // added nobody is the idempotent case, not the hot path.
     let board = board.set_participants(roster, &st.db).await?;
-    fan_out(&st, board.get_id(), participants_frame(&board));
+    fan_out(&st, &slug, board.get_id(), participants_frame(&board));
     Ok(Json(BoardResponse::new(&board)))
 }
 
@@ -875,6 +883,7 @@ async fn invite_board(
 )]
 async fn delete_board(
     State(st): State<AppState>,
+    SchoolSlug(slug): SchoolSlug,
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
@@ -884,7 +893,7 @@ async fn delete_board(
     board.delete(&st.db).await?;
     // Told after the row is gone: a room that acts on this and then re-reads
     // must find nothing, not a board about to disappear.
-    fan_out(&st, &id, json!({"type": "deleted"}));
+    fan_out(&st, &slug, &id, json!({"type": "deleted"}));
     Ok(StatusCode::NO_CONTENT)
 }
 
