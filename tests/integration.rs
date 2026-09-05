@@ -28,6 +28,7 @@ use hezarfen_backend::domain::rag_output::RagOutput;
 use hezarfen_backend::domain::session::Session;
 use hezarfen_backend::domain::timestamp::Timestamp;
 use hezarfen_backend::domain::user::{Password, User, UserId, Username};
+use hezarfen_backend::module::ModuleSet;
 use hezarfen_backend::state::AppState;
 use serde_json::json;
 use tower::ServiceExt;
@@ -27374,7 +27375,7 @@ async fn two_schools() -> (
     let (app, db_a, tenants) = common::app_and_tenants().await;
     let slug_b = Slug::try_new("beta").expect("slug");
     let db_b = tenants
-        .create(&slug_b, "Beta Koleji")
+        .create(&slug_b, "Beta Koleji", ModuleSet::all())
         .await
         .expect("school B");
     (app, db_a, db_b, tenants)
@@ -28646,4 +28647,127 @@ async fn remote_probe_a_suspended_school_reconnects_with_its_rows_intact() {
         "the same cookie and the same note after a resume: {}",
         res.body
     );
+}
+
+// --- module entitlements -------------------------------------------------
+//
+// Foundation-level only: one nest proves the gate, one child route proves the
+// `/courses` exceptions, and the two WebSocket nests prove an upgrade is
+// refused like any other GET. The full per-module sweep is a later lane.
+
+use hezarfen_backend::module::Module;
+
+/// Turning a module off refuses **its** nest and nothing else — with the same
+/// cookie, and with the URL space untouched (an unmatched path inside the
+/// disabled nest is still a `404`, which is what `route_layer` buys).
+#[tokio::test]
+async fn a_disabled_module_refuses_its_nest_and_leaves_the_rest_alone() {
+    let (app, db, tenants) = common::app_and_tenants().await;
+    let slug = Slug::try_new(DEMO_SLUG).unwrap();
+    let cookie = login_as(&app, &db, "ada", "admin").await;
+
+    let res = send(&app, "GET", "/meals/menus", Some(&cookie), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    let mut without_meals = ModuleSet::all();
+    without_meals.remove(Module::Meals);
+    tenants
+        .set_modules(&slug, &without_meals)
+        .await
+        .expect("take the meals module back");
+
+    let res = send(&app, "GET", "/meals/menus", Some(&cookie), None).await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+    assert_eq!(
+        res.body,
+        json!({ "error": "module disabled", "module": "meals" }),
+        "the refusal body is contract"
+    );
+
+    for route in ["/auth/me", "/limits", "/settings"] {
+        let res = send(&app, "GET", route, Some(&cookie), None).await;
+        assert_eq!(res.status, StatusCode::OK, "{route}: {}", res.body);
+    }
+
+    let res = send(&app, "GET", "/meals/does-not-exist", Some(&cookie), None).await;
+    assert_eq!(
+        res.status,
+        StatusCode::NOT_FOUND,
+        "a disabled module must not swallow the 404: {}",
+        res.body
+    );
+
+    tenants
+        .set_modules(&slug, &ModuleSet::all())
+        .await
+        .expect("sell it back");
+    let res = send(&app, "GET", "/meals/menus", Some(&cookie), None).await;
+    assert_eq!(
+        res.status,
+        StatusCode::OK,
+        "the very same cookie after re-enabling: {}",
+        res.body
+    );
+}
+
+/// The four route pairs mounted under `/courses` that belong to another
+/// module answer for *that* module: exams off refuses
+/// `POST /courses/{id}/exams` while the course itself stays reachable.
+#[tokio::test]
+async fn a_course_child_route_is_gated_by_its_own_module() {
+    let (app, db, tenants) = common::app_and_tenants().await;
+    let slug = Slug::try_new(DEMO_SLUG).unwrap();
+    let cookie = login_as(&app, &db, "ada", "admin").await;
+    let course = create_course(&app, &cookie, "Fizik").await;
+
+    let mut without_exams = ModuleSet::all();
+    without_exams.remove(Module::Exams);
+    tenants.set_modules(&slug, &without_exams).await.unwrap();
+
+    // An empty body: the gate must answer before the payload is even parsed.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/courses/{course}/exams"),
+        Some(&cookie),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+    assert_eq!(res.body["module"], "exams");
+
+    let res = send(
+        &app,
+        "GET",
+        &format!("/courses/{course}"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::OK,
+        "courses itself is still enabled: {}",
+        res.body
+    );
+}
+
+/// A WebSocket upgrade is a `GET` inside its nest, so it is gated by
+/// construction — proven for both rooms rather than assumed.
+#[tokio::test]
+async fn a_disabled_module_refuses_its_websocket_upgrade() {
+    let (app, db, tenants) = common::app_and_tenants().await;
+    let slug = Slug::try_new(DEMO_SLUG).unwrap();
+    let cookie = login_as(&app, &db, "ada", "admin").await;
+
+    let mut without = ModuleSet::all();
+    without.remove(Module::Boards);
+    without.remove(Module::Exams);
+    tenants.set_modules(&slug, &without).await.unwrap();
+
+    for (route, module) in [("/boards/x/ws", "boards"), ("/exams/x/attempt/ws", "exams")] {
+        let res = send(&app, "GET", route, Some(&cookie), None).await;
+        assert_eq!(res.status, StatusCode::FORBIDDEN, "{route}: {}", res.body);
+        assert_eq!(res.body["module"], module, "{route}");
+    }
 }

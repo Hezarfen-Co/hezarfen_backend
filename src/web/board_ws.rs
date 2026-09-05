@@ -581,6 +581,8 @@ fn error_frame(err: &AppError, client_seq: Option<u64>) -> Value {
         AppError::Conflict(_) | AppError::ConflictOwned(_) => "conflict",
         AppError::Validation(_) | AppError::PayloadTooLarge(_) => "invalid",
         AppError::NotFound => "not_found",
+        // See `room::public_message`: the gate refuses the upgrade first.
+        AppError::ModuleDisabled(_) => "module_disabled",
         AppError::Unauthorized => "unauthorized",
         AppError::TooManyRequests { .. } => "too_many_requests",
         AppError::DbUnavailable | AppError::DbTimeout | AppError::Db(_) | AppError::Internal(_) => {

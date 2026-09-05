@@ -20,7 +20,7 @@
 
 use std::time::Duration;
 
-use crate::web::tenant_state::{SchoolSlug, State, TenantExt};
+use crate::web::tenant_state::{ResolvedTenant, SchoolSlug, State, TenantExt};
 use axum::Json;
 use axum::extract::{Path, Query};
 use axum::http::StatusCode;
@@ -378,6 +378,7 @@ async fn list_messages(
 async fn send_message(
     State(st): State<AppState>,
     SchoolSlug(slug): SchoolSlug,
+    tenant: ResolvedTenant,
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
     Json(req): Json<SendChatbotMessage>,
@@ -444,6 +445,7 @@ async fn send_message(
         TenantExt {
             slug,
             db: st.db.clone(),
+            modules: tenant.modules,
         },
         bridge,
         prompt.get_id().clone(),

@@ -19,8 +19,21 @@ use axum_extra::extract::CookieJar;
 
 use crate::database::Database;
 use crate::error::AppError;
+use crate::module::ModuleSet;
 use crate::state::AppState;
 use crate::tenant::Slug;
+
+/// Everything one registry read tells us about the school behind a request:
+/// its handle and what it has bought. Cached in the request's extensions by
+/// [`resolve_tenant`], so a request that needs the school twice (the shadow
+/// [`State`] *and* [`crate::web::CurrentUser`], which is most of them) reads
+/// the registry once.
+#[derive(Clone)]
+pub struct ResolvedTenant {
+    pub slug: Slug,
+    pub db: Database,
+    pub modules: ModuleSet,
+}
 
 /// The school a request has already been resolved into, injected as a request
 /// extension by an in-process caller that has no cookie — today only the AI
@@ -31,6 +44,7 @@ use crate::tenant::Slug;
 pub struct TenantExt {
     pub slug: Slug,
     pub db: Database,
+    pub modules: ModuleSet,
 }
 
 /// Split a `session` cookie into its school part and its token. `builder` in
@@ -52,13 +66,20 @@ pub fn split_cookie(value: &str) -> Option<(&str, &str)> {
 pub(crate) async fn resolve_tenant<S>(
     parts: &mut Parts,
     state: &S,
-) -> Result<(Slug, Database), AppError>
+) -> Result<ResolvedTenant, AppError>
 where
     S: Send + Sync,
     AppState: FromRef<S>,
 {
+    if let Some(tenant) = parts.extensions.get::<ResolvedTenant>() {
+        return Ok(tenant.clone());
+    }
     if let Some(tenant) = parts.extensions.get::<TenantExt>() {
-        return Ok((tenant.slug.clone(), tenant.db.clone()));
+        return Ok(ResolvedTenant {
+            slug: tenant.slug.clone(),
+            db: tenant.db.clone(),
+            modules: tenant.modules.clone(),
+        });
     }
     let jar = CookieJar::from_request_parts(parts, state)
         .await
@@ -71,8 +92,12 @@ where
     let slug = Slug::try_new(prefix).map_err(|_| AppError::Unauthorized)?;
 
     let app = AppState::from_ref(state);
-    let db = app.tenants.get(&slug).await?;
-    Ok((slug, db))
+    let resolved = app.tenants.resolve(&slug).await?;
+    // Memoized on the request, not just returned: the next extractor on this
+    // same request (and the module gate ahead of both) reuses this verdict
+    // instead of re-reading the registry row.
+    parts.extensions.insert(resolved.clone());
+    Ok(resolved)
 }
 
 /// The application state, narrowed to the caller's school. Drop-in for
@@ -91,13 +116,28 @@ where
     type Rejection = AppError;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let (slug, db) = resolve_tenant(parts, state).await?;
+        let tenant = resolve_tenant(parts, state).await?;
         let app = AppState::from_ref(state);
         Ok(State(AppState {
-            db,
-            files_path: school_files_path(&app.files_path, &slug),
+            db: tenant.db,
+            files_path: school_files_path(&app.files_path, &tenant.slug),
             ..app
         }))
+    }
+}
+
+/// The resolved school itself, for a handler that must carry it somewhere the
+/// request does not reach — today the chatbot's detached answer task, which
+/// hands it back to the bridge as a [`TenantExt`].
+impl<S> FromRequestParts<S> for ResolvedTenant
+where
+    S: Send + Sync,
+    AppState: FromRef<S>,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        resolve_tenant(parts, state).await
     }
 }
 
@@ -113,7 +153,7 @@ where
     type Rejection = AppError;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        Ok(SchoolSlug(resolve_tenant(parts, state).await?.0))
+        Ok(SchoolSlug(resolve_tenant(parts, state).await?.slug))
     }
 }
 
@@ -288,6 +328,51 @@ mod tests {
             StatusCode::OK,
             "un-suspending must restore the very same session"
         );
+    }
+
+    /// One request, one registry read. Measured by making the registry answer
+    /// *differently* the second time: the school is suspended between the two
+    /// extractor calls on the same request, so a second read would refuse. It
+    /// still passes — the verdict came from the memoized extension.
+    #[tokio::test]
+    async fn a_request_resolves_its_school_exactly_once() {
+        let tenants = init_mem_tenants().await.expect("in-memory deployment");
+        let demo = Slug::try_new(DEMO_SLUG).unwrap();
+        let state = AppState {
+            db: tenants.control().clone(),
+            tenants: tenants.clone(),
+            files_path: std::env::temp_dir(),
+            cookie_secure: false,
+            rate_limit: crate::rate_limit::RateLimitConfig::unlimited(),
+            chatbot_limit: Default::default(),
+            exam_presence: Default::default(),
+            board_hub: Default::default(),
+            db_up: Default::default(),
+            ai: None,
+        };
+        let request = Request::builder()
+            .uri("/school")
+            .header("cookie", format!("session={DEMO_SLUG}.whatever"))
+            .body(Body::empty())
+            .unwrap();
+        let (mut parts, _) = request.into_parts();
+
+        resolve_tenant(&mut parts, &state)
+            .await
+            .expect("the first resolve reads the registry");
+        assert!(
+            parts.extensions.get::<ResolvedTenant>().is_some(),
+            "the first resolve must memoize its verdict on the request"
+        );
+
+        tenants
+            .set_status(&demo, crate::tenant::SchoolStatus::Suspended)
+            .await
+            .unwrap();
+        let second = resolve_tenant(&mut parts, &state)
+            .await
+            .expect("a second read would have seen the suspension and refused");
+        assert_eq!(second.slug, demo);
     }
 
     #[test]

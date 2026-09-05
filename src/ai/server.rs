@@ -29,12 +29,13 @@ use crate::domain::course_note::CourseNote;
 use crate::domain::course_note_file::{CourseNoteFile, CourseNoteFileId};
 use crate::domain::user::{User, UserId};
 use crate::error::AppError;
+use crate::module::Module;
 use crate::state::DbHealth;
 use crate::tenant::{Slug, Tenants};
 use crate::web::blob_path;
 use crate::web::courses::can_view_course;
 use crate::web::extractor::AiPrincipal;
-use crate::web::tenant_state::{TenantExt, school_files_path};
+use crate::web::tenant_state::{ResolvedTenant, TenantExt, school_files_path};
 
 /// What the bridge needs to come up.
 #[derive(Clone, Debug)]
@@ -74,14 +75,14 @@ impl ApiHandle {
     /// has no such customer, and `school_suspended` means it has one that is
     /// switched off — a service that retries the first two forever learns
     /// nothing, while the third is worth retrying later.
-    async fn school(&self, school: &str) -> Result<(Slug, Database), (&'static str, String)> {
+    async fn school(&self, school: &str) -> Result<ResolvedTenant, (&'static str, String)> {
         let slug = Slug::try_new(school).map_err(|err| {
             (
                 "malformed",
                 format!("`{school}` is not a school slug: {err}"),
             )
         })?;
-        let db = self.tenants.get(&slug).await.map_err(|err| match err {
+        self.tenants.resolve(&slug).await.map_err(|err| match err {
             AppError::Unauthorized => (
                 "unknown_school",
                 format!("this deployment serves no `{slug}` school"),
@@ -94,8 +95,7 @@ impl ApiHandle {
                 "unavailable",
                 format!("the `{slug}` school is not reachable: {other}"),
             ),
-        })?;
-        Ok((slug, db))
+        })
     }
 
     /// One school's blob directory.
@@ -531,7 +531,16 @@ async fn open_blob(
             "the database socket is down — retry".to_string(),
         ));
     }
-    let (slug, db) = api.school(&request.school).await?;
+    let tenant = api.school(&request.school).await?;
+    let (slug, db) = (tenant.slug, tenant.db);
+    // This stream bypasses the router, so it also bypasses the route_layer the
+    // module gate is — the entitlement is checked here by hand instead.
+    if !tenant.modules.contains(Module::CourseNotes) {
+        return Err((
+            "module_disabled",
+            format!("the `{slug}` school has no `course_notes` module"),
+        ));
+    }
     let user = principal(&db, request.on_behalf_of.as_deref()).await?;
 
     let missing = || {
@@ -695,7 +704,8 @@ async fn dispatch_api(
     // The school comes off the frame, so this is where a service naming a
     // stranger's slug (or a suspended school's) is stopped — before a row of
     // anyone's data is read.
-    let (slug, db) = api.school(&school).await?;
+    let tenant = api.school(&school).await?;
+    let db = tenant.db.clone();
     // The role itself is re-read again by the extractor on the dispatched
     // request; see [`principal`] for why it is never taken from the frame.
     let user = principal(&db, on_behalf_of.as_deref()).await?;
@@ -719,7 +729,13 @@ async fn dispatch_api(
     dispatched.extensions_mut().insert(AiPrincipal(user));
     // The dispatched request carries no cookie, so the school is handed over
     // in the extension the shadow `State` reads first.
-    dispatched.extensions_mut().insert(TenantExt { slug, db });
+    // Carries the school's entitlements too, so the router's module gate
+    // refuses a disabled nest on this path exactly as it does over HTTP.
+    dispatched.extensions_mut().insert(TenantExt {
+        slug: tenant.slug,
+        db,
+        modules: tenant.modules,
+    });
 
     let response = tokio::time::timeout(
         Duration::from_secs(REQUEST_TIMEOUT_SECS),

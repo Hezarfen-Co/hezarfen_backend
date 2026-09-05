@@ -10,6 +10,7 @@ use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode};
 use hezarfen_backend::ai::AiBridge;
 use hezarfen_backend::database::Database;
+use hezarfen_backend::module::ModuleSet;
 use hezarfen_backend::rate_limit::RateLimitConfig;
 use hezarfen_backend::state::{AppState, DbHealth};
 use hezarfen_backend::tenant::{DEMO_SLUG, Slug, Tenants};
@@ -664,7 +665,11 @@ pub async fn remote_deployment(schools: &[(&str, &str)]) -> Option<RemoteDeploym
     let tenants = database::init(&cfg).await.expect("remote control database");
     for (slug, name) in schools {
         tenants
-            .create(&Slug::try_new(slug).expect("a school slug"), name)
+            .create(
+                &Slug::try_new(slug).expect("a school slug"),
+                name,
+                ModuleSet::all(),
+            )
             .await
             .unwrap_or_else(|err| panic!("create school {slug}: {err}"));
     }

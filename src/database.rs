@@ -273,7 +273,9 @@ pub async fn init_mem_tenants() -> Result<Tenants, AppError> {
     let tenants = Tenants::new_mem().await?;
     let demo = crate::tenant::Slug::try_new(crate::tenant::DEMO_SLUG)
         .map_err(|err| AppError::Internal(format!("the demo slug is a slug: {err}")))?;
-    tenants.create(&demo, "Demo School").await?;
+    tenants
+        .create(&demo, "Demo School", crate::module::ModuleSet::all())
+        .await?;
     Ok(tenants)
 }
 
@@ -374,11 +376,16 @@ pub async fn migrate(db: &Surreal<Any>) -> Result<(), AppError> {
 }
 
 /// Apply the **control** schema (schools, builders, the shared rate-limit
-/// window). Idempotent, like [`migrate`], and takes no bound parameters —
-/// nothing in the control batch is data-driven.
+/// window). Idempotent, like [`migrate`].
 pub async fn migrate_control(db: &Surreal<Any>) -> Result<(), AppError> {
+    // The one data-driven parameter in this batch: the module list a school
+    // written before entitlements existed is backfilled to.
+    let all_modules = crate::module::ModuleSet::all().names();
     for sql in CONTROL_MIGRATION_BATCHES {
-        db.query(sql).await?.check()?;
+        db.query(sql)
+            .bind(("all_modules", all_modules.clone()))
+            .await?
+            .check()?;
     }
     Ok(())
 }

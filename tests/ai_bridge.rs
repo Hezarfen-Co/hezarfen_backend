@@ -18,6 +18,7 @@ use hezarfen_backend::ai::protocol::{
 };
 use hezarfen_backend::ai::{AiBridge, AiError, BridgeConfig};
 use hezarfen_backend::constant::{AI_ALPN, AI_MAX_CONCURRENT_PER_WORKER, AI_PROTOCOL};
+use hezarfen_backend::module::ModuleSet;
 use hezarfen_backend::tenant::{DEMO_SLUG, Slug};
 use serde_json::{Value, json};
 
@@ -1772,7 +1773,10 @@ async fn an_index_dispatch_names_the_notes_own_school_and_stores_the_answer_ther
 
     let (app, demo_db, tenants) = common::app_with_ai_tenants(Some(bridge.clone())).await;
     let beta = Slug::try_new("beta").unwrap();
-    let beta_db = tenants.create(&beta, "Beta College").await.expect("beta");
+    let beta_db = tenants
+        .create(&beta, "Beta College", ModuleSet::all())
+        .await
+        .expect("beta");
 
     let cookie = common::login_as_school(&app, &beta_db, "beta", "ogretmen", "teacher").await;
     let course = common::create_course(&app, &cookie, "fizik").await;

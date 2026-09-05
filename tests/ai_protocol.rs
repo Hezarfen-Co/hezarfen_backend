@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hezarfen_backend::ai::{AiBridge, AiError, BridgeConfig};
+use hezarfen_backend::module::ModuleSet;
 use hezarfen_backend::tenant::{SchoolStatus, Slug, Tenants};
 use serde_json::{Value, json};
 
@@ -1208,7 +1209,11 @@ async fn an_api_read_answers_a_named_user_with_that_users_own_data() {
 async fn two_schools(bridge: &AiBridge) -> (axum::Router, Tenants, String, String) {
     let (app, demo_db, tenants) = common::app_with_ai_tenants(Some(bridge.clone())).await;
     let beta_db = tenants
-        .create(&Slug::try_new("beta").unwrap(), "Beta College")
+        .create(
+            &Slug::try_new("beta").unwrap(),
+            "Beta College",
+            ModuleSet::all(),
+        )
         .await
         .expect("a second school");
 

@@ -5,6 +5,7 @@ pub mod database;
 pub mod domain;
 pub mod error;
 pub mod migration_sql;
+pub mod module;
 pub mod rate_limit;
 pub mod state;
 pub mod tenant;
@@ -27,8 +28,10 @@ use utoipa_axum::routes;
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::error::AppError;
+use crate::module::Module;
 use crate::rate_limit::RateLimiter;
 use crate::state::AppState;
+use crate::web::module_gate::gate;
 
 /// Top-level OpenAPI document. Per-path operations and schemas are collected
 /// automatically from the `#[utoipa::path]`-annotated handlers via `utoipa-axum`.
@@ -88,6 +91,33 @@ impl Modify for SecurityAddon {
     }
 }
 
+/// `/courses` and the four foreign-module route pairs mounted inside it. The
+/// children carry their own module's gate *and*, through the outer one applied
+/// here, the course gate — so either module being off refuses them.
+fn courses_router(state: &AppState) -> OpenApiRouter<AppState> {
+    let children = gate(web::courses::exam_routes(), state, Module::Exams)
+        .merge(gate(
+            web::courses::session_routes(),
+            state,
+            Module::Sessions,
+        ))
+        .merge(gate(
+            web::courses::subject_routes(),
+            state,
+            Module::Subjects,
+        ))
+        .merge(gate(
+            web::courses::homework_routes(),
+            state,
+            Module::Homework,
+        ));
+    gate(
+        web::courses::routes().merge(children),
+        state,
+        Module::Courses,
+    )
+}
+
 /// Assemble the full application router. Shared by `main` and the test suites.
 ///
 /// Also serves interactive docs: Swagger UI at `/swagger`, raw spec at
@@ -101,30 +131,75 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/ai", web::ai::routes())
         .nest("/auth", web::auth::routes(&state))
         .merge(web::builder::routes(&state))
-        .nest("/chatbot", web::chatbot::routes())
+        .nest(
+            "/chatbot",
+            gate(web::chatbot::routes(), &state, Module::Chatbot),
+        )
         .nest("/users", web::users::routes())
-        .nest("/notes", web::notes::routes())
-        .nest("/messages", web::messages::routes())
-        .nest("/events", web::events::routes())
-        .nest("/appointments", web::appointments::routes())
-        .nest("/courses", web::courses::routes())
-        .nest("/course-notes", web::course_notes::routes())
-        .nest("/classes", web::classes::routes())
-        .nest("/sessions", web::sessions::routes())
-        .nest("/exams", web::exams::routes())
-        .nest("/marks", web::marks::routes())
-        .nest("/meals", web::meals::routes())
-        .nest("/payments", web::payments::routes())
-        .nest("/work", web::work::routes())
-        .nest("/pomodoro", web::pomodoro::routes())
-        .nest("/questions", web::questions::routes())
-        .nest("/bank-questions", web::bank_questions::routes())
-        .nest("/attendance", web::attendance::routes())
+        .nest("/notes", gate(web::notes::routes(), &state, Module::Notes))
+        .nest(
+            "/messages",
+            gate(web::messages::routes(), &state, Module::Messages),
+        )
+        .nest(
+            "/events",
+            gate(web::events::routes(), &state, Module::Events),
+        )
+        .nest(
+            "/appointments",
+            gate(web::appointments::routes(), &state, Module::Appointments),
+        )
+        .nest("/courses", courses_router(&state))
+        .nest(
+            "/course-notes",
+            gate(web::course_notes::routes(), &state, Module::CourseNotes),
+        )
+        .nest(
+            "/classes",
+            gate(web::classes::routes(), &state, Module::Classes),
+        )
+        .nest(
+            "/sessions",
+            gate(web::sessions::routes(), &state, Module::Sessions),
+        )
+        .nest("/exams", gate(web::exams::routes(), &state, Module::Exams))
+        .nest("/marks", gate(web::marks::routes(), &state, Module::Marks))
+        .nest("/meals", gate(web::meals::routes(), &state, Module::Meals))
+        .nest(
+            "/payments",
+            gate(web::payments::routes(), &state, Module::Payments),
+        )
+        .nest("/work", gate(web::work::routes(), &state, Module::Work))
+        .nest(
+            "/pomodoro",
+            gate(web::pomodoro::routes(), &state, Module::Pomodoro),
+        )
+        .nest(
+            "/questions",
+            gate(web::questions::routes(), &state, Module::Questions),
+        )
+        .nest(
+            "/bank-questions",
+            gate(web::bank_questions::routes(), &state, Module::BankQuestions),
+        )
+        .nest(
+            "/attendance",
+            gate(web::attendance::routes(), &state, Module::Attendance),
+        )
         .nest("/settings", web::settings::routes())
-        .nest("/subjects", web::subjects::routes())
-        .nest("/homework", web::homework::routes())
+        .nest(
+            "/subjects",
+            gate(web::subjects::routes(), &state, Module::Subjects),
+        )
+        .nest(
+            "/homework",
+            gate(web::homework::routes(), &state, Module::Homework),
+        )
         .nest("/terms", web::terms::routes())
-        .nest("/boards", web::boards::routes())
+        .nest(
+            "/boards",
+            gate(web::boards::routes(), &state, Module::Boards),
+        )
         .split_for_parts();
 
     // Catch-all per-IP limit over every route (Swagger included). Kept inside

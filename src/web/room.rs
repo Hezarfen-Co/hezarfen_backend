@@ -91,6 +91,10 @@ pub(crate) fn public_message(err: &AppError, room: &str) -> String {
             message.clone()
         }
         AppError::PayloadTooLarge(message) => message.clone(),
+        // Unreachable in practice: the module gate refuses the upgrade before
+        // a socket exists. Spelled out anyway so a new refusal never falls
+        // into "internal server error" by default.
+        AppError::ModuleDisabled(module) => format!("module disabled: {module}"),
         AppError::TooManyRequests { .. } => "too many requests".to_string(),
         AppError::DbUnavailable => {
             tracing::warn!("{room}: database reconnecting");

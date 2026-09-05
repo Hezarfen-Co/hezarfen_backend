@@ -3816,6 +3816,7 @@ slow-but-reading service is never cut off.
 | `not_found` | No `course_note_file` with that key *in that school*, or its note or course is gone |
 | `forbidden` | The principal may not view that file's course |
 | `unknown_school` / `school_suspended` | As for an api read |
+| `module_disabled` | That school has no `course_notes` module — this stream bypasses the router, so it checks the entitlement itself |
 | `unknown_user` | `on_behalf_of` names no user of that school |
 | `unavailable` | The api is not serving yet, the database socket is down, or the row's blob is missing from disk — retryable |
 
@@ -4502,6 +4503,8 @@ src/
   migration_sql.rs the three boot batches as SurrealQL text (PRE_REPAIR,
                    MIGRATION, BACKFILL) + MIGRATION_BATCHES, the only list of them,
                    and CONTROL_MIGRATION_BATCHES for the control database
+  module.rs        Module (one router nest a school may buy) · Package ·
+                   ModuleSet: dependency edges, validation, stored names
   rate_limit.rs    fixed-window limiter: per-IP tiers + middleware, per-user chat tier
   state.rs         AppState { db, tenants, files_path, cookie_secure, rate_limit,
                    chatbot_limit, exam_presence, board_hub, db_up, ai }
@@ -4660,7 +4663,10 @@ src/
     tenant_state.rs State<AppState>: the shadow of axum's State that resolves the
                    caller's school from the `<slug>.<token>` cookie, so every
                    handler that imports it is school-scoped by construction
-                   (TenantExt · SchoolSlug · split_cookie)
+                   (ResolvedTenant · TenantExt · SchoolSlug · split_cookie)
+    module_gate.rs one route_layer per nest: a module the school has not bought
+                   answers 403 {error, module} on every route in it, while an
+                   unmatched path inside it still 404s
     builder.rs     the vendor surface: /builder/login|logout|me and /schools/*
                    (create · list · rename/suspend · delete · admin-password · enter)
     image.rs       the halves every image upload shares: the `file` part under the

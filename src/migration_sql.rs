@@ -1477,6 +1477,14 @@ pub const CONTROL_MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS name ON school TYPE string;
     DEFINE FIELD IF NOT EXISTS status ON school TYPE string;
     DEFINE FIELD IF NOT EXISTS created_at ON school TYPE int;
+    -- Which product modules this school has bought (see `crate::module`). The
+    -- names are bound from `Module::ALL`, never spelled here, so a new module
+    -- cannot be forgotten in this string.
+    DEFINE FIELD IF NOT EXISTS modules ON school TYPE array<string> DEFAULT [];
+    -- Only `NONE` — a row written before the field existed, which predates the
+    -- idea of buying modules and so had all of them. An empty array is a
+    -- deliberate \"nothing enabled\" and must never be re-widened by a boot.
+    UPDATE school SET modules = $all_modules WHERE modules = NONE;
     -- Redundant with the `school:<slug>` id, and kept anyway: the id is the
     -- fast path, the index is what makes a second row on the same slug
     -- impossible if a future write ever mints an id some other way.

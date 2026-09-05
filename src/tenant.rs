@@ -33,6 +33,8 @@ use crate::database::{Database, lost_the_race, migrate, migrate_control};
 use crate::domain::page::PagedList;
 use crate::domain::timestamp::Timestamp;
 use crate::error::{AppError, ValidationError};
+use crate::module::ModuleSet;
+use crate::web::tenant_state::ResolvedTenant;
 
 pub(crate) const SCHOOL_TABLE: &str = "school";
 
@@ -169,6 +171,11 @@ pub struct School {
     name: String,
     status: SchoolStatus,
     created_at: Timestamp,
+    /// Which product modules this school has bought, as their stored names.
+    /// Kept as strings rather than a [`ModuleSet`] so a name this binary does
+    /// not know (an older deploy reading a newer row) is data to ignore, not a
+    /// deserialization failure that would lock the school out entirely.
+    modules: Vec<String>,
 }
 
 impl School {
@@ -190,6 +197,23 @@ impl School {
 
     pub fn created_at(&self) -> Timestamp {
         self.created_at
+    }
+
+    /// The stored names as modules. An unknown name is dropped with a warning
+    /// — see the field's comment: a school must never become unreachable
+    /// because of a word this binary has not heard of.
+    pub fn modules(&self) -> ModuleSet {
+        let mut set = ModuleSet::empty();
+        for name in &self.modules {
+            match crate::module::Module::try_from_str(name) {
+                Ok(module) => set.insert(module),
+                Err(_) => tracing::warn!(
+                    "school {} has an unknown module `{name}` — ignoring it",
+                    self.slug
+                ),
+            }
+        }
+        set
     }
 
     pub async fn read(slug: &Slug, control: &Database) -> Result<Option<School>, AppError> {
@@ -296,6 +320,7 @@ impl Tenants {
             name: name.to_string(),
             status: SchoolStatus::Active,
             created_at: Timestamp::now(),
+            modules: ModuleSet::all().names(),
         };
         let _: Option<School> = tenants
             .control
@@ -326,13 +351,24 @@ impl Tenants {
     /// if it ever shows up in a profile — the eviction in [`Tenants::set_status`]
     /// is already there to make a cached decision safe.
     pub async fn get(&self, slug: &Slug) -> Result<Database, AppError> {
+        Ok(self.resolve(slug).await?.db)
+    }
+
+    /// [`Tenants::get`] plus what that one registry read already knew: the
+    /// school's module entitlements. Same verdicts, same single read — a
+    /// caller that needs both must never pay for two.
+    pub async fn resolve(&self, slug: &Slug) -> Result<ResolvedTenant, AppError> {
         match School::read(slug, &self.control).await? {
             None => Err(AppError::Unauthorized),
             Some(school) if school.status == SchoolStatus::Suspended => {
                 self.evict(slug);
                 Err(AppError::Forbidden("school is suspended"))
             }
-            Some(_) => self.handle(slug).await,
+            Some(school) => Ok(ResolvedTenant {
+                slug: slug.clone(),
+                db: self.handle(slug).await?,
+                modules: school.modules(),
+            }),
         }
     }
 
@@ -349,13 +385,19 @@ impl Tenants {
     /// Register a school and bring its database into being: registry row first
     /// (so a lost race is a `409` and not a half-made database), then
     /// `DEFINE DATABASE`, then the school schema.
-    pub async fn create(&self, slug: &Slug, name: &str) -> Result<Database, AppError> {
+    pub async fn create(
+        &self,
+        slug: &Slug,
+        name: &str,
+        modules: ModuleSet,
+    ) -> Result<Database, AppError> {
         let school = School {
             id: SchoolId::from_slug(slug),
             slug: slug.clone(),
             name: name.to_string(),
             status: SchoolStatus::Active,
             created_at: Timestamp::now(),
+            modules: modules.names(),
         };
         let created: Result<Option<School>, surrealdb::Error> = self
             .control
@@ -433,6 +475,25 @@ impl Tenants {
         }
         if status == SchoolStatus::Suspended {
             self.evict(slug);
+        }
+        Ok(())
+    }
+
+    /// Sell (or take back) modules. Mirrors [`Tenants::set_status`] minus the
+    /// eviction: entitlements are read off the registry row on every request,
+    /// so a change takes effect on the next call and no cached handle carries a
+    /// stale answer.
+    pub async fn set_modules(&self, slug: &Slug, modules: &ModuleSet) -> Result<(), AppError> {
+        let updated: Vec<School> = self
+            .control
+            .query("UPDATE $id SET modules = $modules RETURN AFTER")
+            .bind(("id", SchoolId::from_slug(slug).record()))
+            .bind(("modules", modules.names()))
+            .await?
+            .check()?
+            .take(0)?;
+        if updated.is_empty() {
+            return Err(AppError::NotFound);
         }
         Ok(())
     }
@@ -580,8 +641,8 @@ mod tests {
     async fn two_schools_do_not_see_each_others_rows() {
         let tenants = Tenants::new_mem().await.unwrap();
         let (a, b) = (slug("alpha"), slug("beta"));
-        let one = tenants.create(&a, "Alpha").await.unwrap();
-        let two = tenants.create(&b, "Beta").await.unwrap();
+        let one = tenants.create(&a, "Alpha", ModuleSet::all()).await.unwrap();
+        let two = tenants.create(&b, "Beta", ModuleSet::all()).await.unwrap();
 
         one.query("CREATE user SET username = 'ada', password_hash = 'x', role = 'student'")
             .await
@@ -596,7 +657,7 @@ mod tests {
         );
         // A second `create` on a taken slug is a conflict, not a second school.
         assert!(matches!(
-            tenants.create(&a, "Alpha again").await,
+            tenants.create(&a, "Alpha again", ModuleSet::all()).await,
             Err(AppError::Conflict(_))
         ));
     }
@@ -605,7 +666,7 @@ mod tests {
     async fn suspending_refuses_the_school_and_the_handle_it_already_had() {
         let tenants = Tenants::new_mem().await.unwrap();
         let s = slug("alpha");
-        tenants.create(&s, "Alpha").await.unwrap();
+        tenants.create(&s, "Alpha", ModuleSet::all()).await.unwrap();
         // Cached by the first resolve; the suspension must beat the cache.
         tenants.get(&s).await.expect("active school resolves");
 
@@ -638,7 +699,7 @@ mod tests {
     async fn dropping_a_school_takes_its_rows_with_it() {
         let tenants = Tenants::new_mem().await.unwrap();
         let s = slug("alpha");
-        let db = tenants.create(&s, "Alpha").await.unwrap();
+        let db = tenants.create(&s, "Alpha", ModuleSet::all()).await.unwrap();
         db.query("CREATE user SET username = 'ada', password_hash = 'x', role = 'student'")
             .await
             .unwrap()
@@ -649,7 +710,10 @@ mod tests {
         tenants.drop(&s).await.unwrap();
         assert!(matches!(tenants.get(&s).await, Err(AppError::Unauthorized)));
 
-        let fresh = tenants.create(&s, "Alpha reborn").await.unwrap();
+        let fresh = tenants
+            .create(&s, "Alpha reborn", ModuleSet::all())
+            .await
+            .unwrap();
         assert_eq!(
             count(&fresh, "user").await,
             0,
@@ -660,8 +724,14 @@ mod tests {
     #[tokio::test]
     async fn the_registry_lists_and_renames() {
         let tenants = Tenants::new_mem().await.unwrap();
-        tenants.create(&slug("alpha"), "Alpha").await.unwrap();
-        tenants.create(&slug("beta"), "Beta").await.unwrap();
+        tenants
+            .create(&slug("alpha"), "Alpha", ModuleSet::all())
+            .await
+            .unwrap();
+        tenants
+            .create(&slug("beta"), "Beta", ModuleSet::all())
+            .await
+            .unwrap();
 
         let (rows, total) = School::list(None, 0, tenants.control()).await.unwrap();
         assert_eq!(total, 2);
