@@ -1819,3 +1819,118 @@ async fn deleting_a_course_note_takes_its_rag_outputs_with_it() {
     assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
     assert!(outputs(&db, &note).await.is_empty());
 }
+
+// ------------------------------------------------------- course notes read --
+
+/// A registered service, a router, and a course the seeded student is
+/// enrolled in (plus one they are not) with a teacher's note in each.
+/// Returns (service, student id, note id, enrolled course, foreign course).
+async fn course_notes_fixture(bridge: &AiBridge) -> (FakeService, String, String, String, String) {
+    let service = connect_service(
+        bridge,
+        hello("tutor", &[AI_CHAT_CAPABILITY]),
+        Behaviour::Echo,
+    )
+    .await;
+    await_workers(bridge, 1).await;
+    let (app, db) = common::app_with_ai(Some(bridge.clone())).await;
+
+    let student_cookie = common::login_as(&app, &db, "ayse", "student").await;
+    let student = common::me_id(&app, &student_cookie).await;
+    let teacher = common::login_as(&app, &db, "hoca", "teacher").await;
+
+    let course = common::create_course(&app, &teacher, "Physics").await;
+    common::enroll(&app, &teacher, &course, &student).await;
+    let foreign = common::create_course(&app, &teacher, "Chemistry").await;
+
+    let res = common::send(
+        &app,
+        "POST",
+        "/course-notes",
+        Some(&teacher),
+        Some(json!({ "course": course, "title": "Newton", "content": "F = ma" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "teacher creates the note");
+    let note = common::id_of(&res.body);
+
+    (service, student, note, course, foreign)
+}
+
+#[tokio::test]
+async fn a_service_reads_a_course_note_on_behalf_of_an_enrolled_student() {
+    // The point of #27: a study companion answering about a lesson needs the
+    // teacher's own material, read with the student's reach and no wider.
+    let bridge = bridge().await;
+    let (service, student, note, course, _foreign) = course_notes_fixture(&bridge).await;
+
+    let request = ApiRequest {
+        id: "trace-course-notes".into(),
+        path: "/course-notes".into(),
+        query: Some(format!("course={course}")),
+        on_behalf_of: Some(student),
+        method: None,
+    };
+    let (status, body) = ok_answer(api_read(&service.conn, request).await);
+    assert_eq!(status, 200);
+    let items = common::items(&body);
+    assert_eq!(
+        items.len(),
+        1,
+        "the enrolled student sees the course's note"
+    );
+    assert_eq!(items[0]["id"], note);
+    assert_eq!(items[0]["title"], "Newton");
+}
+
+#[tokio::test]
+async fn a_course_the_student_is_not_in_is_refused_by_the_handler() {
+    // The bridge widens the scope, never the reach: the handler's own guard
+    // is what answers, and it rides back as an `Ok` carrying that status.
+    let bridge = bridge().await;
+    let (service, student, _note, _course, foreign) = course_notes_fixture(&bridge).await;
+
+    let request = ApiRequest {
+        id: "trace-foreign-course".into(),
+        path: "/course-notes".into(),
+        query: Some(format!("course={foreign}")),
+        on_behalf_of: Some(student),
+        method: None,
+    };
+    let (status, _) = ok_answer(api_read(&service.conn, request).await);
+    assert_eq!(status, 403, "not enrolled: the course-view guard forbids");
+}
+
+#[tokio::test]
+async fn writing_a_course_note_is_refused_before_dispatch() {
+    // Read scope means read: the allowlist admits the path, the method gate
+    // still refuses, and nothing reaches the router.
+    let bridge = bridge().await;
+    let (service, _student, _note, _course, _foreign) = course_notes_fixture(&bridge).await;
+
+    let request = ApiRequest {
+        id: "trace-post".into(),
+        path: "/course-notes".into(),
+        query: None,
+        on_behalf_of: None,
+        method: Some("POST".into()),
+    };
+    match api_read(&service.conn, request).await {
+        ApiResponse::Err { code, .. } => assert_eq!(code, "method_not_allowed"),
+        ApiResponse::Ok { status, .. } => panic!("a POST was dispatched, answering {status}"),
+    }
+}
+
+#[tokio::test]
+async fn a_course_note_file_download_stays_out_of_the_read_scope() {
+    // The listing of a note's files is JSON and allowed; the bytes behind one
+    // are not — frames carry JSON under an 8 MiB cap.
+    let bridge = bridge().await;
+    let (service, student, note, _course, _foreign) = course_notes_fixture(&bridge).await;
+
+    let path = format!("/course-notes/{note}/files/somefile");
+    match api_read(&service.conn, read_of(&path, Some(&student))).await {
+        ApiResponse::Err { code, .. } => assert_eq!(code, "path_not_allowed"),
+        ApiResponse::Ok { status, .. } => panic!("a blob route was dispatched, answering {status}"),
+    }
+}
