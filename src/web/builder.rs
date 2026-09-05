@@ -30,7 +30,8 @@ use crate::domain::builder::{Builder, BuilderSession};
 use crate::domain::role::Role;
 use crate::domain::session::Session;
 use crate::domain::user::{Password, PasswordHash, User, Username};
-use crate::error::{AppError, ErrorResponse};
+use crate::error::{AppError, ErrorResponse, ValidationError};
+use crate::module::{Module, ModuleSet, Package};
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::state::AppState;
 use crate::tenant::{School, SchoolStatus, Slug};
@@ -38,6 +39,7 @@ use crate::validate::validate_required;
 use crate::web::tenant_state::school_files_path;
 
 use super::auth::session_cookie;
+use super::modules::ModulesResponse;
 use super::{BUILDER_COOKIE_PREFIX, Page, PageParams, RequireBuilder, UserResponse};
 
 pub fn routes(state: &AppState) -> OpenApiRouter<AppState> {
@@ -57,6 +59,8 @@ pub fn routes(state: &AppState) -> OpenApiRouter<AppState> {
         .routes(routes!(builder_me))
         .routes(routes!(create_school, list_schools))
         .routes(routes!(get_school, update_school, delete_school))
+        .routes(routes!(list_school_modules, patch_school_modules))
+        .routes(routes!(enable_school_module, disable_school_module))
         .routes(routes!(reset_admin_password))
         .routes(routes!(enter_school))
 }
@@ -99,6 +103,10 @@ struct SchoolResponse {
     status: String,
     /// Registered at, UTC unix-milliseconds.
     created_at: i64,
+    /// The modules this school has bought, sorted by name. The other half of
+    /// the catalog is on `GET /schools/{slug}/modules`.
+    #[schema(example = json!(["courses", "meals", "notes"]))]
+    modules: Vec<String>,
 }
 
 impl SchoolResponse {
@@ -108,6 +116,7 @@ impl SchoolResponse {
             name: school.name().to_string(),
             status: school.status().as_str().to_string(),
             created_at: school.created_at().as_millis(),
+            modules: school.modules().names(),
         }
     }
 }
@@ -126,6 +135,12 @@ struct CreateSchool {
     admin_username: String,
     #[schema(example = "correct horse battery", min_length = 6, max_length = 128)]
     admin_password: String,
+    /// What the school buys. Omitted sells it everything — the deployment's
+    /// whole catalog, which `GET /modules/catalog` publishes. A set that
+    /// switches a module on without what it structurally needs is refused
+    /// before anything is created.
+    #[schema(example = json!(["courses", "subjects", "exams"]))]
+    modules: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -135,6 +150,44 @@ struct UpdateSchool {
     /// `active` or `suspended`.
     #[schema(example = "suspended")]
     status: Option<String>,
+}
+
+/// One side of a [`patch_school_modules`] request is a list of modules, a list
+/// of packages, or both — a package is only a name for its modules, so the two
+/// are expanded into the same set.
+#[derive(Deserialize, ToSchema)]
+struct PatchModules {
+    /// Module names to switch on.
+    #[schema(example = json!(["exams", "subjects"]))]
+    enable: Option<Vec<String>>,
+    /// Module names to switch off.
+    #[schema(example = json!(["payments"]))]
+    disable: Option<Vec<String>>,
+    /// Package names to switch on, every module in them.
+    #[schema(example = json!(["academics"]))]
+    enable_packages: Option<Vec<String>>,
+    /// Package names to switch off, every module in them.
+    #[schema(example = json!(["ai"]))]
+    disable_packages: Option<Vec<String>>,
+}
+
+impl PatchModules {
+    /// The modules one direction asks for. An unknown name in either list is a
+    /// `400` naming it rather than a silent drop — the same rule
+    /// [`ModuleSet::from_names`] keeps.
+    fn side(
+        &self,
+        modules: Option<&[String]>,
+        packages: Option<&[String]>,
+    ) -> Result<ModuleSet, AppError> {
+        let mut set = ModuleSet::from_names(modules.unwrap_or_default())?;
+        for name in packages.unwrap_or_default() {
+            for module in Package::try_from_str(name)?.modules() {
+                set.insert(module);
+            }
+        }
+        Ok(set)
+    }
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -275,9 +328,9 @@ async fn builder_me(RequireBuilder(builder): RequireBuilder) -> Json<BuilderResp
     request_body = CreateSchool,
     responses(
         (status = 201, description = "School created, with its first admin", body = SchoolResponse),
-        (status = 400, description = "Invalid slug, name, or admin credentials", body = ErrorResponse),
+        (status = 400, description = "Invalid slug, name, admin credentials, or module name", body = ErrorResponse, example = json!({"error": "module: `kantin` is not a known module"})),
         (status = 401, description = "Not authenticated as a builder", body = ErrorResponse),
-        (status = 409, description = "That slug is already taken", body = ErrorResponse),
+        (status = 409, description = "That slug is already taken, or the module set is unsatisfiable", body = ErrorResponse, example = json!({"error": "conflict: exams requires subjects, which is not enabled"})),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -294,12 +347,15 @@ async fn create_school(
     let username = Username::try_new(&req.admin_username)?;
     let password_hash = Password::try_new(&req.admin_password)?.hash_async().await?;
 
-    // Everything, for now: choosing a school's modules is the next lane's
-    // HTTP surface (`crate::module` is the foundation it will call).
-    let db = st
-        .tenants
-        .create(&slug, &name, crate::module::ModuleSet::all())
-        .await?;
+    let modules = match req.modules.as_deref() {
+        Some(names) => ModuleSet::from_names(names)?,
+        None => ModuleSet::all(),
+    };
+    // Before `create`, so an unsatisfiable set is a refusal and not a school
+    // that has to be deleted again.
+    modules.validate()?;
+
+    let db = st.tenants.create(&slug, &name, modules).await?;
     if let Err(err) = User::create_with_role(username, password_hash, Role::Admin, &db).await {
         // A school nobody can log into is worse than no school: take the
         // database back so the very same request can simply be retried.
@@ -456,6 +512,214 @@ async fn delete_school(
         );
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// A module named in a path segment. Unknown → `404`, the same verdict an
+/// unknown slug gets: the segment names nothing this deployment sells, so
+/// there is no resource to act on. Inside a *body* the same name is a `400`
+/// instead — a bad field, not a bad address.
+fn path_module(raw: &str) -> Result<Module, AppError> {
+    Module::try_from_str(raw).map_err(|_| AppError::NotFound)
+}
+
+/// A school's entitlements, off the registry row. Deliberately not
+/// [`Tenants::resolve`]: that one is the school's own door and refuses a
+/// suspended school, and every route here keeps working on one.
+async fn school_modules(
+    slug: &Slug,
+    control: &crate::database::Database,
+) -> Result<ModuleSet, AppError> {
+    Ok(School::read(slug, control)
+        .await?
+        .ok_or(AppError::NotFound)?
+        .modules())
+}
+
+/// Refuse taking `module` back while something the school still has needs it,
+/// naming every such module — the reverse direction of
+/// [`ModuleSet::validate`], which speaks for the modules that are on.
+fn refuse_if_needed(module: Module, set: &ModuleSet) -> Result<(), AppError> {
+    let needed_by: Vec<String> = module
+        .dependents()
+        .into_iter()
+        .filter(|dependent| set.contains(*dependent))
+        .map(|dependent| dependent.as_str().to_string())
+        .collect();
+    if needed_by.is_empty() {
+        return Ok(());
+    }
+    Err(AppError::ConflictOwned(format!(
+        "{module} is required by {}",
+        needed_by.join(", ")
+    )))
+}
+
+/// Write a school's new set and answer with it. One write, or none — every
+/// caller here has already decided.
+async fn store_modules(
+    st: &AppState,
+    slug: &Slug,
+    modules: ModuleSet,
+) -> Result<Json<ModulesResponse>, AppError> {
+    st.tenants.set_modules(slug, &modules).await?;
+    Ok(Json(ModulesResponse::new(&modules)))
+}
+
+/// What a school has bought, and what is left to sell it. Works on a suspended
+/// school — entitlements are the vendor's ledger, not one of the school's doors.
+#[utoipa::path(
+    get,
+    path = "/schools/{slug}/modules",
+    tag = "builder",
+    security(("session_cookie" = [])),
+    params(("slug" = String, Path, description = "School slug")),
+    responses(
+        (status = 200, description = "The school's enabled and disabled modules", body = ModulesResponse),
+        (status = 401, description = "Not authenticated as a builder", body = ErrorResponse),
+        (status = 404, description = "No such school", body = ErrorResponse),
+    ),
+)]
+async fn list_school_modules(
+    State(st): State<AppState>,
+    RequireBuilder(_builder): RequireBuilder,
+    Path(slug): Path<String>,
+) -> Result<Json<ModulesResponse>, AppError> {
+    let modules = school_modules(&path_slug(&slug)?, st.tenants.control()).await?;
+    Ok(Json(ModulesResponse::new(&modules)))
+}
+
+/// Sell a school one module. Idempotent: a module it already has is a `200`
+/// with the unchanged set. Refused while what the module structurally needs is
+/// off — enable those in the same `PATCH` instead.
+#[utoipa::path(
+    post,
+    path = "/schools/{slug}/modules/{module}",
+    tag = "builder",
+    security(("session_cookie" = [])),
+    params(
+        ("slug" = String, Path, description = "School slug"),
+        ("module" = String, Path, description = "Module name, as `GET /modules/catalog` publishes it"),
+    ),
+    responses(
+        (status = 200, description = "The school's modules after the change", body = ModulesResponse),
+        (status = 401, description = "Not authenticated as a builder", body = ErrorResponse),
+        (status = 404, description = "No such school, or no such module", body = ErrorResponse, example = json!({"error": "not found"})),
+        (status = 409, description = "That module needs another this school does not have", body = ErrorResponse, example = json!({"error": "conflict: exams requires subjects, which is not enabled"})),
+    ),
+)]
+async fn enable_school_module(
+    State(st): State<AppState>,
+    RequireBuilder(_builder): RequireBuilder,
+    Path((slug, module)): Path<(String, String)>,
+) -> Result<Json<ModulesResponse>, AppError> {
+    let slug = path_slug(&slug)?;
+    let module = path_module(&module)?;
+    let mut modules = school_modules(&slug, st.tenants.control()).await?;
+    if modules.contains(module) {
+        return Ok(Json(ModulesResponse::new(&modules)));
+    }
+    modules.insert(module);
+    modules.validate()?;
+    store_modules(&st, &slug, modules).await
+}
+
+/// Take one module back. Idempotent, and refused while a module the school
+/// still has depends on it — the mirror of the enable direction.
+///
+/// The school's data is untouched: a disabled module's rows stay put and come
+/// back with it. Only its routes stop answering.
+#[utoipa::path(
+    delete,
+    path = "/schools/{slug}/modules/{module}",
+    tag = "builder",
+    security(("session_cookie" = [])),
+    params(
+        ("slug" = String, Path, description = "School slug"),
+        ("module" = String, Path, description = "Module name, as `GET /modules/catalog` publishes it"),
+    ),
+    responses(
+        (status = 200, description = "The school's modules after the change", body = ModulesResponse),
+        (status = 401, description = "Not authenticated as a builder", body = ErrorResponse),
+        (status = 404, description = "No such school, or no such module", body = ErrorResponse, example = json!({"error": "not found"})),
+        (status = 409, description = "Another module the school has requires this one", body = ErrorResponse, example = json!({"error": "conflict: courses is required by exams, subjects"})),
+    ),
+)]
+async fn disable_school_module(
+    State(st): State<AppState>,
+    RequireBuilder(_builder): RequireBuilder,
+    Path((slug, module)): Path<(String, String)>,
+) -> Result<Json<ModulesResponse>, AppError> {
+    let slug = path_slug(&slug)?;
+    let module = path_module(&module)?;
+    let mut modules = school_modules(&slug, st.tenants.control()).await?;
+    if !modules.contains(module) {
+        return Ok(Json(ModulesResponse::new(&modules)));
+    }
+    refuse_if_needed(module, &modules)?;
+    modules.remove(module);
+    store_modules(&st, &slug, modules).await
+}
+
+/// Re-sell a school's whole shelf in one call: any mix of modules and packages,
+/// in either direction. Every list is optional and an empty body is a no-op.
+///
+/// The four lists are expanded into one resulting set, which is then checked
+/// once — so a `PATCH` that enables `exams` and `subjects` together is fine
+/// where two single calls would refuse the first, and a `409` names every
+/// violation at once instead of one per round trip. Nothing is written unless
+/// the whole request is accepted.
+#[utoipa::path(
+    patch,
+    path = "/schools/{slug}/modules",
+    tag = "builder",
+    security(("session_cookie" = [])),
+    params(("slug" = String, Path, description = "School slug")),
+    request_body = PatchModules,
+    responses(
+        (status = 200, description = "The school's modules after the change", body = ModulesResponse),
+        (status = 400, description = "An unknown module or package name, or one asked for in both directions", body = ErrorResponse, example = json!({"error": "package: `kantin` is not a known package"})),
+        (status = 401, description = "Not authenticated as a builder", body = ErrorResponse),
+        (status = 404, description = "No such school", body = ErrorResponse),
+        (status = 409, description = "The resulting set breaks a dependency", body = ErrorResponse, example = json!({"error": "conflict: marks requires exams, which is not enabled"})),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
+    ),
+)]
+async fn patch_school_modules(
+    State(st): State<AppState>,
+    RequireBuilder(_builder): RequireBuilder,
+    Path(slug): Path<String>,
+    Json(req): Json<PatchModules>,
+) -> Result<Json<ModulesResponse>, AppError> {
+    let slug = path_slug(&slug)?;
+    let enable = req.side(req.enable.as_deref(), req.enable_packages.as_deref())?;
+    let disable = req.side(req.disable.as_deref(), req.disable_packages.as_deref())?;
+    // A name pulled both ways has no defensible resolution, and picking one
+    // silently would sell (or unsell) a module the caller also asked for the
+    // opposite of.
+    if let Some(module) = enable.iter().find(|module| disable.contains(*module)) {
+        return Err(ValidationError::Contradictory {
+            field: "module",
+            value: module.as_str().to_string(),
+        }
+        .into());
+    }
+
+    let current = school_modules(&slug, st.tenants.control()).await?;
+    let mut result = current.clone();
+    for module in enable.iter() {
+        result.insert(module);
+    }
+    for module in disable.iter() {
+        result.remove(module);
+    }
+    // One check for both directions: a disable that strands a dependent shows
+    // up here as that dependent missing its requirement.
+    result.validate()?;
+
+    if result == current {
+        return Ok(Json(ModulesResponse::new(&current)));
+    }
+    store_modules(&st, &slug, result).await
 }
 
 /// Reset an admin's password inside a school — the "we are locked out" call.

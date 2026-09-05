@@ -1293,3 +1293,467 @@ async fn probe_remote_deployment_creates_and_deletes_a_hyphenated_school() {
         "a deleted school is unknown at login"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Module entitlements: the vendor's shelf. Every assertion here is about the
+// same two things — the set a school ends up with, and the fact that a refused
+// request leaves it exactly as it was.
+// ---------------------------------------------------------------------------
+
+/// The `enabled` list of a modules response, as owned strings.
+fn enabled(body: &Value) -> Vec<String> {
+    body["enabled"]
+        .as_array()
+        .expect("enabled list")
+        .iter()
+        .map(|v| v.as_str().expect("module name").to_string())
+        .collect()
+}
+
+async fn school_modules(app: &Router, cookie: &str, slug: &str) -> Res {
+    send(
+        app,
+        "GET",
+        &format!("/schools/{slug}/modules"),
+        Some(cookie),
+        None,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_school_starts_with_everything_and_one_module_toggles_back_and_forth() {
+    let (app, _db, _tenants) = deployment().await;
+    let builder = builder_login(&app).await;
+
+    let listed = school_modules(&app, &builder, DEMO_SLUG).await;
+    assert_eq!(listed.status, StatusCode::OK, "{:?}", listed.body);
+    assert_eq!(enabled(&listed.body).len(), 21, "{:?}", listed.body);
+    assert_eq!(
+        listed.body["disabled"].as_array().expect("disabled"),
+        &[] as &[Value]
+    );
+
+    let off = send(
+        &app,
+        "DELETE",
+        &format!("/schools/{DEMO_SLUG}/modules/notes"),
+        Some(&builder),
+        None,
+    )
+    .await;
+    assert_eq!(off.status, StatusCode::OK, "{:?}", off.body);
+    assert_eq!(off.body["disabled"], json!(["notes"]));
+    assert!(!enabled(&off.body).contains(&"notes".to_string()));
+    assert_eq!(
+        school_modules(&app, &builder, DEMO_SLUG).await.body,
+        off.body,
+        "the GET must show what the DELETE answered"
+    );
+
+    // Idempotent both ways: taking back what is already gone changes nothing.
+    let again = send(
+        &app,
+        "DELETE",
+        &format!("/schools/{DEMO_SLUG}/modules/notes"),
+        Some(&builder),
+        None,
+    )
+    .await;
+    assert_eq!(again.status, StatusCode::OK);
+    assert_eq!(again.body, off.body);
+
+    let on = send(
+        &app,
+        "POST",
+        &format!("/schools/{DEMO_SLUG}/modules/notes"),
+        Some(&builder),
+        None,
+    )
+    .await;
+    assert_eq!(on.status, StatusCode::OK, "{:?}", on.body);
+    assert_eq!(on.body, listed.body, "back to the full shelf");
+    let once_more = send(
+        &app,
+        "POST",
+        &format!("/schools/{DEMO_SLUG}/modules/notes"),
+        Some(&builder),
+        None,
+    )
+    .await;
+    assert_eq!(once_more.status, StatusCode::OK);
+    assert_eq!(once_more.body, listed.body);
+
+    // A name nobody sells addresses nothing.
+    let ghost = send(
+        &app,
+        "POST",
+        &format!("/schools/{DEMO_SLUG}/modules/kantin"),
+        Some(&builder),
+        None,
+    )
+    .await;
+    assert_eq!(ghost.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_dependency_is_named_whichever_direction_breaks_it() {
+    let (app, _db, _tenants) = deployment().await;
+    let builder = builder_login(&app).await;
+
+    // Enabling: a lone school that bought only notes cannot take exams alone.
+    let created = send(
+        &app,
+        "POST",
+        "/schools",
+        Some(&builder),
+        Some(json!({
+            "slug": "lone",
+            "name": "Lone",
+            "admin_username": "admin",
+            "admin_password": "secret1",
+            "modules": ["notes"],
+        })),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
+    let refused = send(
+        &app,
+        "POST",
+        "/schools/lone/modules/exams",
+        Some(&builder),
+        None,
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::CONFLICT, "{:?}", refused.body);
+    let message = refused.body["error"].as_str().expect("error message");
+    assert!(message.contains("courses"), "{message}");
+    assert!(message.contains("subjects"), "names every miss: {message}");
+    assert_eq!(
+        enabled(&school_modules(&app, &builder, "lone").await.body),
+        ["notes"]
+    );
+
+    // Disabling: what is still needed says so, by name.
+    let held = send(
+        &app,
+        "DELETE",
+        &format!("/schools/{DEMO_SLUG}/modules/exams"),
+        Some(&builder),
+        None,
+    )
+    .await;
+    assert_eq!(held.status, StatusCode::CONFLICT, "{:?}", held.body);
+    assert_eq!(held.body["error"], json!("exams is required by marks"));
+
+    let courses = send(
+        &app,
+        "DELETE",
+        &format!("/schools/{DEMO_SLUG}/modules/courses"),
+        Some(&builder),
+        None,
+    )
+    .await;
+    assert_eq!(courses.status, StatusCode::CONFLICT);
+    let message = courses.body["error"].as_str().expect("error message");
+    for dependent in [
+        "course_notes",
+        "classes",
+        "sessions",
+        "exams",
+        "subjects",
+        "homework",
+    ] {
+        assert!(
+            message.contains(dependent),
+            "{dependent} missing from {message}"
+        );
+    }
+    assert_eq!(
+        enabled(&school_modules(&app, &builder, DEMO_SLUG).await.body).len(),
+        21
+    );
+}
+
+#[tokio::test]
+async fn a_batch_is_all_or_nothing_and_packages_round_trip() {
+    let (app, _db, _tenants) = deployment().await;
+    let builder = builder_login(&app).await;
+    let before = school_modules(&app, &builder, DEMO_SLUG).await.body.clone();
+
+    // One bad name in a list voids the whole request.
+    for (body, field) in [
+        (
+            json!({ "enable": ["notes"], "disable": ["kantin"] }),
+            "module",
+        ),
+        (json!({ "enable_packages": ["kantin"] }), "package"),
+    ] {
+        let bad = send(
+            &app,
+            "PATCH",
+            &format!("/schools/{DEMO_SLUG}/modules"),
+            Some(&builder),
+            Some(body),
+        )
+        .await;
+        assert_eq!(bad.status, StatusCode::BAD_REQUEST, "{:?}", bad.body);
+        let message = bad.body["error"].as_str().expect("error message");
+        assert!(
+            message.contains("kantin") && message.contains(field),
+            "{message}"
+        );
+        assert_eq!(school_modules(&app, &builder, DEMO_SLUG).await.body, before);
+    }
+
+    // A name pulled both ways at once has no answer.
+    let both = send(
+        &app,
+        "PATCH",
+        &format!("/schools/{DEMO_SLUG}/modules"),
+        Some(&builder),
+        Some(json!({ "enable": ["meals"], "disable": ["meals"] })),
+    )
+    .await;
+    assert_eq!(both.status, StatusCode::BAD_REQUEST, "{:?}", both.body);
+    assert!(
+        both.body["error"]
+            .as_str()
+            .expect("error")
+            .contains("meals"),
+        "{:?}",
+        both.body
+    );
+    assert_eq!(school_modules(&app, &builder, DEMO_SLUG).await.body, before);
+
+    // A resulting set that breaks a dependency is refused as a whole.
+    let orphaned = send(
+        &app,
+        "PATCH",
+        &format!("/schools/{DEMO_SLUG}/modules"),
+        Some(&builder),
+        Some(json!({ "disable": ["exams"] })),
+    )
+    .await;
+    assert_eq!(orphaned.status, StatusCode::CONFLICT, "{:?}", orphaned.body);
+    assert!(
+        orphaned.body["error"]
+            .as_str()
+            .expect("error")
+            .contains("marks requires exams"),
+        "{:?}",
+        orphaned.body
+    );
+    assert_eq!(school_modules(&app, &builder, DEMO_SLUG).await.body, before);
+
+    // An empty body is a no-op, not an error.
+    let empty = send(
+        &app,
+        "PATCH",
+        &format!("/schools/{DEMO_SLUG}/modules"),
+        Some(&builder),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(empty.status, StatusCode::OK);
+    assert_eq!(empty.body, before);
+
+    // A whole package off and back on again, each in one call.
+    let sold_back = send(
+        &app,
+        "PATCH",
+        &format!("/schools/{DEMO_SLUG}/modules"),
+        Some(&builder),
+        Some(json!({ "disable_packages": ["academics"] })),
+    )
+    .await;
+    assert_eq!(sold_back.status, StatusCode::OK, "{:?}", sold_back.body);
+    assert_eq!(
+        enabled(&sold_back.body),
+        [
+            "appointments",
+            "boards",
+            "chatbot",
+            "events",
+            "meals",
+            "messages",
+            "notes",
+            "payments",
+            "pomodoro",
+            "questions",
+            "work"
+        ]
+    );
+    assert_eq!(
+        school_modules(&app, &builder, DEMO_SLUG).await.body,
+        sold_back.body
+    );
+
+    let resold = send(
+        &app,
+        "PATCH",
+        &format!("/schools/{DEMO_SLUG}/modules"),
+        Some(&builder),
+        Some(json!({ "enable_packages": ["academics"] })),
+    )
+    .await;
+    assert_eq!(resold.status, StatusCode::OK, "{:?}", resold.body);
+    assert_eq!(resold.body, before, "the shelf came back exactly as it was");
+}
+
+/// The entitlement surface is the vendor's alone, and what it writes is read on
+/// the school's very next request — no re-login, same cookie.
+#[tokio::test]
+async fn only_a_builder_sells_modules_and_the_school_feels_it_at_once() {
+    let (app, _db, _tenants) = deployment().await;
+    let builder = builder_login(&app).await;
+    let student = login(&app, "ali").await;
+
+    for (method, uri) in [
+        ("GET", format!("/schools/{DEMO_SLUG}/modules")),
+        ("POST", format!("/schools/{DEMO_SLUG}/modules/notes")),
+        ("DELETE", format!("/schools/{DEMO_SLUG}/modules/notes")),
+        ("PATCH", format!("/schools/{DEMO_SLUG}/modules")),
+    ] {
+        let body = (method == "PATCH").then(|| json!({}));
+        let res = send(&app, method, &uri, Some(&student), body).await;
+        assert_eq!(
+            res.status,
+            StatusCode::UNAUTHORIZED,
+            "a school cookie reached {method} {uri}"
+        );
+    }
+
+    let menus = send(&app, "GET", "/meals/menus", Some(&student), None).await;
+    assert_eq!(menus.status, StatusCode::OK, "{:?}", menus.body);
+
+    let off = send(
+        &app,
+        "DELETE",
+        &format!("/schools/{DEMO_SLUG}/modules/meals"),
+        Some(&builder),
+        None,
+    )
+    .await;
+    assert_eq!(off.status, StatusCode::OK, "{:?}", off.body);
+
+    let refused = send(&app, "GET", "/meals/menus", Some(&student), None).await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN, "{:?}", refused.body);
+    assert_eq!(refused.body["module"], "meals");
+
+    let on = send(
+        &app,
+        "POST",
+        &format!("/schools/{DEMO_SLUG}/modules/meals"),
+        Some(&builder),
+        None,
+    )
+    .await;
+    assert_eq!(on.status, StatusCode::OK, "{:?}", on.body);
+    assert_eq!(
+        send(&app, "GET", "/meals/menus", Some(&student), None)
+            .await
+            .status,
+        StatusCode::OK,
+        "the same cookie works again the moment the module is back"
+    );
+}
+
+/// A school is sold its shelf as it is created, and an unsatisfiable order
+/// creates nothing at all.
+#[tokio::test]
+async fn a_school_is_created_with_the_modules_it_bought() {
+    let (app, _db, _tenants) = deployment().await;
+    let builder = builder_login(&app).await;
+
+    let created = send(
+        &app,
+        "POST",
+        "/schools",
+        Some(&builder),
+        Some(json!({
+            "slug": "notes-only",
+            "name": "Notes Only",
+            "admin_username": "admin",
+            "admin_password": "secret1",
+            "modules": ["notes"],
+        })),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
+    assert_eq!(created.body["modules"], json!(["notes"]));
+    let read = send(&app, "GET", "/schools/notes-only", Some(&builder), None).await;
+    assert_eq!(read.body["modules"], json!(["notes"]));
+    assert_eq!(
+        enabled(&school_modules(&app, &builder, "notes-only").await.body),
+        ["notes"]
+    );
+
+    for (body, status) in [
+        (json!({ "modules": ["kantin"] }), StatusCode::BAD_REQUEST),
+        (json!({ "modules": ["exams"] }), StatusCode::CONFLICT),
+    ] {
+        let mut request = json!({
+            "slug": "doomed",
+            "name": "Doomed",
+            "admin_username": "admin",
+            "admin_password": "secret1",
+        });
+        request["modules"] = body["modules"].clone();
+        let res = send(&app, "POST", "/schools", Some(&builder), Some(request)).await;
+        assert_eq!(res.status, status, "{:?}", res.body);
+        assert_eq!(
+            send(&app, "GET", "/schools/doomed", Some(&builder), None)
+                .await
+                .status,
+            StatusCode::NOT_FOUND,
+            "a refused order must not leave a school behind"
+        );
+    }
+
+    // Omitted still means everything.
+    let full = create_school(&app, &builder, "full-shelf", "secret1").await;
+    assert_eq!(full.status, StatusCode::CREATED, "{:?}", full.body);
+    assert_eq!(full.body["modules"].as_array().expect("modules").len(), 21);
+}
+
+/// The catalog is the client's map of the product, and `/modules` is where a
+/// school user reads its own square of it.
+#[tokio::test]
+async fn the_catalog_is_public_and_a_school_user_reads_its_own_set() {
+    let (app, _db, _tenants) = deployment().await;
+
+    let catalog = send(&app, "GET", "/modules/catalog", None, None).await;
+    assert_eq!(catalog.status, StatusCode::OK, "{:?}", catalog.body);
+    let modules = catalog.body["modules"].as_array().expect("modules").clone();
+    assert_eq!(modules.len(), 21);
+    let names: Vec<&str> = modules
+        .iter()
+        .map(|m| m["module"].as_str().expect("module name"))
+        .collect();
+    assert!(names.windows(2).all(|w| w[0] < w[1]), "sorted: {names:?}");
+    let packages = catalog.body["packages"].as_array().expect("packages");
+    assert_eq!(packages.len(), 4);
+    for module in &modules {
+        assert!(
+            packages.iter().any(|p| p["package"] == module["package"]),
+            "{} is sold in a package nobody lists",
+            module["module"]
+        );
+        for needed in module["requires"].as_array().expect("requires") {
+            assert!(
+                names.contains(&needed.as_str().expect("requirement name")),
+                "{module:?} requires something the catalog does not sell"
+            );
+        }
+    }
+
+    let student = login(&app, "ali").await;
+    let mine = send(&app, "GET", "/modules", Some(&student), None).await;
+    assert_eq!(mine.status, StatusCode::OK, "{:?}", mine.body);
+    assert_eq!(enabled(&mine.body), names);
+    assert_eq!(
+        send(&app, "GET", "/modules", None, None).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+}

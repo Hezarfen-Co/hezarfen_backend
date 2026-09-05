@@ -349,6 +349,11 @@ const PUBLIC: &[(&str, &str)] = &[
     ("GET", "/health"),
     ("GET", "/time"),
     ("GET", "/limits"),
+    // The deployment's product catalog: which modules exist, what each needs,
+    // how they are packaged. Deploy-constant and identical for every school —
+    // public for the same reason `/limits` is. What one school *bought* is
+    // `GET /modules`, which is behind a session.
+    ("GET", "/modules/catalog"),
     ("POST", "/auth/register"),
     ("POST", "/auth/login"),
     // Idempotent: revokes the session if there is one, `204` either way.
@@ -383,7 +388,7 @@ async fn protected_routes_require_session() {
     /// Floor on the number of protected operations swept. It only ever goes
     /// up: raise it when routes are added. Without it, deleting a route family
     /// would delete its own coverage and still pass.
-    const MIN_PROTECTED: usize = 263;
+    const MIN_PROTECTED: usize = 268;
 
     let app = mem_app().await;
     let spec = send(&app, "GET", "/api-docs/openapi.json", None, None)
