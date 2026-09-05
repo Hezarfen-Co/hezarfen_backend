@@ -409,3 +409,124 @@ async fn an_event_mark_writes_its_event_and_is_refused_once_it_is_gone() {
         "no orphan row was written"
     );
 }
+
+/// #22, session half: a course sitting in an archived term is a past year —
+/// its sessions and their roll call are read-only. The guard runs *after* the
+/// authorization check (403 before 409, so a stranger never learns a term's
+/// state) and off the `course` the shared session loader already returns, not
+/// inside that loader — reads go through it too, and reads stay open.
+#[tokio::test]
+async fn an_archived_term_freezes_its_sessions_and_roll_call() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "arch_sess_manager", "manager").await;
+    let ali = login(&app, "arch_sess_ali").await;
+    let ali_id = me_id(&app, &ali).await;
+
+    let term = send(
+        &app,
+        "POST",
+        "/terms",
+        Some(&manager),
+        Some(json!({
+            "name": "2023",
+            "starts_at": 1_600_000_000_000_i64,
+            "ends_at": 1_610_000_000_000_i64,
+        })),
+    )
+    .await;
+    assert_eq!(term.status, StatusCode::CREATED, "{}", term.body);
+    let term_id = common::id_of(&term.body);
+
+    let course = send(
+        &app,
+        "POST",
+        "/courses",
+        Some(&manager),
+        Some(json!({ "title": "Tarih", "term_id": term_id })),
+    )
+    .await;
+    assert_eq!(course.status, StatusCode::CREATED, "{}", course.body);
+    let course_id = common::id_of(&course.body);
+    enroll(&app, &manager, &course_id, &ali_id).await;
+    let session = create_session(&app, &manager, &course_id, soon()).await;
+    // A roll-call row exists before the freeze, so the delete route reaches the
+    // guard rather than a 404 for a missing row.
+    let marked = send(
+        &app,
+        "POST",
+        &format!("/sessions/{session}/attendance"),
+        Some(&manager),
+        Some(json!({ "status": "present", "user_id": ali_id })),
+    )
+    .await;
+    assert_eq!(marked.status, StatusCode::OK, "{}", marked.body);
+
+    let archived = send(
+        &app,
+        "POST",
+        &format!("/terms/{term_id}/archive"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(archived.status, StatusCode::OK, "{}", archived.body);
+
+    // Every write on the session and its roll call refuses with the coded 409.
+    let writes: [(&str, String, Option<serde_json::Value>); 4] = [
+        (
+            "PATCH",
+            format!("/sessions/{session}"),
+            Some(json!({ "topic": "yeni" })),
+        ),
+        (
+            "POST",
+            format!("/sessions/{session}/attendance"),
+            Some(json!({ "status": "absent", "user_id": ali_id })),
+        ),
+        (
+            "DELETE",
+            format!("/sessions/{session}/attendance/{ali_id}"),
+            None,
+        ),
+        ("DELETE", format!("/sessions/{session}"), None),
+    ];
+    for (method, uri, body) in writes {
+        let res = send(&app, method, &uri, Some(&manager), body).await;
+        assert_eq!(
+            res.status,
+            StatusCode::CONFLICT,
+            "{method} {uri}: {}",
+            res.body
+        );
+        assert_eq!(res.body["code"], "term_archived", "{method} {uri}");
+    }
+
+    // Reads stay open — a past year is read-only, not hidden.
+    for uri in [
+        format!("/sessions/{session}"),
+        format!("/sessions/{session}/attendance"),
+    ] {
+        let res = send(&app, "GET", &uri, Some(&manager), None).await;
+        assert_eq!(res.status, StatusCode::OK, "GET {uri}: {}", res.body);
+    }
+
+    // Re-opening the year thaws the writes again.
+    let reopened = send(
+        &app,
+        "POST",
+        &format!("/terms/{term_id}/unarchive"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(reopened.status, StatusCode::OK, "{}", reopened.body);
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/sessions/{session}"),
+        Some(&manager),
+        Some(json!({ "topic": "yeni" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+}

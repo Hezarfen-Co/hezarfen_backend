@@ -7,7 +7,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::database::Database;
-use crate::domain::term::{Term, TermId, TermName};
+use crate::domain::term::{self, Term, TermId, TermName};
 use crate::domain::timestamp::Timestamp;
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::state::AppState;
@@ -18,6 +18,8 @@ pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
         .routes(routes!(create_term, list_terms))
         .routes(routes!(get_term, update_term, delete_term))
+        .routes(routes!(archive_term))
+        .routes(routes!(unarchive_term))
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -50,6 +52,8 @@ struct TermResponse {
     starts_at: i64,
     /// Term end, UTC unix-milliseconds.
     ends_at: i64,
+    /// Archived at, UTC unix-millis; null while the term is open.
+    archived_at: Option<i64>,
 }
 
 impl TermResponse {
@@ -59,13 +63,17 @@ impl TermResponse {
             name: term.get_name().as_str().to_string(),
             starts_at: term.get_starts_at().as_millis(),
             ends_at: term.get_ends_at().as_millis(),
+            archived_at: term.get_archived_at().map(|at| at.as_millis()),
         }
     }
 }
 
 /// Turn an optional request-supplied term id into a validated reference —
-/// `None` stays `None`, an unknown id is a `400` naming the field. Shared by
-/// the course create/update handlers.
+/// `None` stays `None`, an unknown id is a `400` naming the field, and an
+/// *archived* one is a `409 term_archived`. That last refusal is here rather
+/// than in each handler because this is the single spot every new link to a
+/// term passes through — course create/update and class create/update alike:
+/// past years take no new structure.
 pub(crate) async fn resolve_term(
     id: Option<&str>,
     db: &Database,
@@ -79,6 +87,9 @@ pub(crate) async fn resolve_term(
             field: "term_id",
             reason: "term does not exist",
         }))?;
+    if term.is_archived() {
+        return Err(term::archived_error());
+    }
     Ok(Some(term.get_id().clone()))
 }
 
@@ -177,6 +188,7 @@ async fn get_term(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 409, description = "The term is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -193,6 +205,9 @@ async fn update_term(
     let term = Term::read(&TermId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
+    if term.is_archived() {
+        return Err(term::archived_error());
+    }
     // Pre-flight only: the range check is re-made inside the UPDATE's `WHERE`
     // (`Term::update`), so a concurrent move of the end this PATCH omits cannot
     // slip an inverted range past this snapshot.
@@ -220,7 +235,7 @@ async fn update_term(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "Courses are still linked to this term", body = ErrorResponse),
+        (status = 409, description = "Courses are still linked to this term, or the term is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn delete_term(
@@ -231,10 +246,68 @@ async fn delete_term(
     let term = Term::read(&TermId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
+    if term.is_archived() {
+        return Err(term::archived_error());
+    }
     if !term.delete(&st.db).await? {
         return Err(AppError::Conflict(
             "courses are still linked to this term — unlink them first",
         ));
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Archive a term. Requires manager+. An archived term is frozen: it takes no
+/// edits, no delete, and no new course or class link. Idempotent — archiving an
+/// already-archived term answers `200` with the stamp it already had.
+#[utoipa::path(
+    post,
+    path = "/{id}/archive",
+    tag = "terms",
+    security(("session_cookie" = [])),
+    params(("id" = String, Path, description = "Term id")),
+    responses(
+        (status = 200, description = "The archived term", body = TermResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
+        (status = 404, description = "Not found", body = ErrorResponse),
+    ),
+)]
+async fn archive_term(
+    State(st): State<AppState>,
+    RequireManager(_user): RequireManager,
+    Path(id): Path<String>,
+) -> Result<Json<TermResponse>, AppError> {
+    let term = Term::read(&TermId::from_key(&id), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let archived = term.archive(&st.db).await?;
+    Ok(Json(TermResponse::new(&archived)))
+}
+
+/// Re-open an archived term. Requires manager+. Idempotent the same way as
+/// archiving: an already-open term answers `200`.
+#[utoipa::path(
+    post,
+    path = "/{id}/unarchive",
+    tag = "terms",
+    security(("session_cookie" = [])),
+    params(("id" = String, Path, description = "Term id")),
+    responses(
+        (status = 200, description = "The re-opened term", body = TermResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
+        (status = 404, description = "Not found", body = ErrorResponse),
+    ),
+)]
+async fn unarchive_term(
+    State(st): State<AppState>,
+    RequireManager(_user): RequireManager,
+    Path(id): Path<String>,
+) -> Result<Json<TermResponse>, AppError> {
+    let term = Term::read(&TermId::from_key(&id), &st.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let reopened = term.unarchive(&st.db).await?;
+    Ok(Json(TermResponse::new(&reopened)))
 }

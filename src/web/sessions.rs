@@ -193,6 +193,7 @@ async fn get_session(
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
+        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn update_session(
@@ -217,6 +218,7 @@ async fn update_session(
             "only the course creator, an assigned teacher, or a manager/admin can edit this session",
         ));
     }
+    course.require_open(&st.db).await?;
 
     let topic = req
         .topic
@@ -260,6 +262,7 @@ async fn update_session(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn delete_session(
@@ -273,6 +276,7 @@ async fn delete_session(
             "only the course creator, an assigned teacher, or a manager/admin can delete this session",
         ));
     }
+    course.require_open(&st.db).await?;
     session.delete(&st.db).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -298,6 +302,7 @@ async fn delete_session(
         (status = 403, description = "Not the session teacher or a course manager; or marking the teacher without manager+", body = ErrorResponse),
         (status = 404, description = "Session not found", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
+        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn mark_roll_call(
@@ -312,6 +317,7 @@ async fn mark_roll_call(
             "only the session's teacher or a course manager can take roll call",
         ));
     }
+    course.require_open(&st.db).await?;
 
     let school = Settings::load(&st.db).await?;
     let status = AttendanceStatus::try_new(&req.status, school.get_attendance_statuses())?;
@@ -437,6 +443,7 @@ async fn list_roll_call(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the session teacher or a course manager; or removing a staff row without manager+", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn remove_roll_call(
@@ -450,6 +457,7 @@ async fn remove_roll_call(
             "only the session's teacher or a course manager can take roll call",
         ));
     }
+    course.require_open(&st.db).await?;
     let target = UserId::from_key(&target);
     // A staff row is management's to remove, keyed on the *target's live role*
     // rather than on `is_teacher`: reassigning a session's teacher used to hand

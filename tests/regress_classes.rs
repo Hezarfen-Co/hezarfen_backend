@@ -1818,3 +1818,188 @@ async fn a_detach_never_hands_a_row_to_a_class_that_is_gone() {
         "…and its seat must come back with it"
     );
 }
+
+/// #22. A class on an archived term is read-only: every write axis it has —
+/// the class itself, its roster, its attachments and the blueprint pump —
+/// answers the coded 409, while every read stays open. The term the *course*
+/// sits on holds the same bar from the other side, and re-opening the year
+/// thaws all of it.
+#[tokio::test]
+async fn an_archived_term_freezes_every_class_write_and_no_read() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "arch_manager", "manager").await;
+    let student = login_as(&app, &db, "arch_student", "student").await;
+    let other = login_as(&app, &db, "arch_other", "student").await;
+    let student_id = me_id(&app, &student).await;
+    let other_id = me_id(&app, &other).await;
+
+    let term = send(
+        &app,
+        "POST",
+        "/terms",
+        Some(&manager),
+        Some(json!({
+            "name": "2024",
+            "starts_at": 1_700_000_000_000_i64,
+            "ends_at": 1_710_000_000_000_i64,
+        })),
+    )
+    .await;
+    assert_eq!(term.status, StatusCode::CREATED);
+    let term_id = common::id_of(&term.body);
+
+    // A course on that same year, and one on no year at all — the second is
+    // what proves a refusal came from the *class's* side.
+    let dated = send(
+        &app,
+        "POST",
+        "/courses",
+        Some(&manager),
+        Some(json!({ "title": "algebra", "term_id": term_id })),
+    )
+    .await;
+    assert_eq!(dated.status, StatusCode::CREATED);
+    let dated = common::id_of(&dated.body);
+    let open_course = create_course(&app, &manager, "geometry").await;
+
+    let class = create_class(
+        &app,
+        &manager,
+        json!({ "name": "9-A", "grade": "9", "term_id": term_id }),
+    )
+    .await;
+    let class = common::id_of(&class.body);
+
+    // Everything the frozen state must already hold: an attachment, a member,
+    // and a blueprint at this grade for the pump to try.
+    let attached = send(
+        &app,
+        "POST",
+        &format!("/classes/{class}/courses"),
+        Some(&manager),
+        Some(json!({ "course_id": dated })),
+    )
+    .await;
+    assert_eq!(attached.status, StatusCode::CREATED, "attach while open");
+    let joined = send(
+        &app,
+        "POST",
+        &format!("/classes/{class}/members"),
+        Some(&manager),
+        Some(json!({ "user_id": student_id })),
+    )
+    .await;
+    assert_eq!(joined.status, StatusCode::CREATED, "member while open");
+    let blueprint = send(
+        &app,
+        "POST",
+        "/classes/blueprints",
+        Some(&manager),
+        Some(json!({ "grade": "9", "course_ids": [dated] })),
+    )
+    .await;
+    assert_eq!(blueprint.status, StatusCode::CREATED, "blueprint");
+
+    let archived = send(
+        &app,
+        "POST",
+        &format!("/terms/{term_id}/archive"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(archived.status, StatusCode::OK);
+
+    // One refusal per write route, each 409 with the machine code — never a
+    // bare 409, which a client cannot tell from a capacity conflict.
+    let writes: Vec<(&str, String, Option<serde_json::Value>)> = vec![
+        (
+            "PATCH",
+            format!("/classes/{class}"),
+            Some(json!({ "name": "9-B" })),
+        ),
+        (
+            "POST",
+            format!("/classes/{class}/members"),
+            Some(json!({ "user_id": other_id })),
+        ),
+        (
+            "DELETE",
+            format!("/classes/{class}/members/{student_id}"),
+            None,
+        ),
+        (
+            "POST",
+            format!("/classes/{class}/courses"),
+            // An *open* course: the class's own term is the refusal.
+            Some(json!({ "course_id": open_course })),
+        ),
+        ("DELETE", format!("/classes/{class}/courses/{dated}"), None),
+        ("POST", format!("/classes/{class}/blueprint"), None),
+        ("DELETE", format!("/classes/{class}"), None),
+    ];
+    for (method, uri, body) in writes {
+        let res = send(&app, method, &uri, Some(&manager), body).await;
+        assert_eq!(res.status, StatusCode::CONFLICT, "{method} {uri}");
+        assert_eq!(res.body["code"], "term_archived", "{method} {uri} code");
+    }
+
+    // Reads are untouched — a past year is read-only, not hidden.
+    for uri in [
+        format!("/classes/{class}"),
+        format!("/classes/{class}/members"),
+        format!("/classes/{class}/courses"),
+    ] {
+        let res = send(&app, "GET", &uri, Some(&manager), None).await;
+        assert_eq!(res.status, StatusCode::OK, "GET {uri}");
+    }
+    let members = send(
+        &app,
+        "GET",
+        &format!("/classes/{class}/members"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(total(&members.body), 1, "no write landed");
+
+    // The other side of the attach: an open class may not take a course whose
+    // own term is archived.
+    let open_class = create_class(&app, &manager, json!({ "name": "10-A" })).await;
+    let open_class = common::id_of(&open_class.body);
+    let cross = send(
+        &app,
+        "POST",
+        &format!("/classes/{open_class}/courses"),
+        Some(&manager),
+        Some(json!({ "course_id": dated })),
+    )
+    .await;
+    assert_eq!(
+        cross.status,
+        StatusCode::CONFLICT,
+        "open class, past course"
+    );
+    assert_eq!(cross.body["code"], "term_archived");
+
+    // Re-opening the year thaws the whole set; one write is enough to show it.
+    let reopened = send(
+        &app,
+        "POST",
+        &format!("/terms/{term_id}/unarchive"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(reopened.status, StatusCode::OK);
+    let patched = send(
+        &app,
+        "PATCH",
+        &format!("/classes/{class}"),
+        Some(&manager),
+        Some(json!({ "name": "9-B" })),
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::OK, "thawed");
+    assert_eq!(patched.body["name"], "9-B");
+}

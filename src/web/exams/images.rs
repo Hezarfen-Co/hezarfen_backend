@@ -81,7 +81,10 @@ pub(crate) async fn images_by_question(
 // own visibility (author side and sitting side alike).
 
 /// The exam, provided the caller may author its questions — the shared front
-/// half of every image write.
+/// half of every image write. The archived-term refusal lives here rather than
+/// in each caller: all four question-image writes (upload/delete of a question
+/// illustration and of a choice picture) come through this one door, and none
+/// of the reads do.
 pub(crate) async fn image_managed_exam(
     st: &AppState,
     user: &User,
@@ -96,6 +99,7 @@ pub(crate) async fn image_managed_exam(
             "only the course creator, an assigned teacher, or a manager/admin can manage question images",
         ));
     }
+    course.require_open(&st.db).await?;
     Ok(exam)
 }
 
@@ -175,7 +179,7 @@ pub(crate) async fn serve_image(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "No such exam, or no such question in it", body = ErrorResponse),
-        (status = 409, description = "Attempts have started — questions are frozen", body = ErrorResponse),
+        (status = 409, description = "Attempts have started — questions are frozen, or this course's term is archived — past years are read-only", body = ErrorResponse),
         (status = 413, description = "Image exceeds the school's size limit", body = ErrorResponse),
     ),
 )]
@@ -249,7 +253,7 @@ pub(crate) async fn get_question_image(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "No such exam, question, or image", body = ErrorResponse),
-        (status = 409, description = "Attempts have started — questions are frozen", body = ErrorResponse),
+        (status = 409, description = "Attempts have started — questions are frozen, or this course's term is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 pub(crate) async fn delete_question_image(
@@ -292,7 +296,7 @@ pub(crate) async fn delete_question_image(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "No such exam, or no such question in it", body = ErrorResponse),
-        (status = 409, description = "Attempts have started — questions are frozen", body = ErrorResponse),
+        (status = 409, description = "Attempts have started — questions are frozen, or this course's term is archived — past years are read-only", body = ErrorResponse),
         (status = 413, description = "Image exceeds the school's size limit", body = ErrorResponse),
     ),
 )]
@@ -363,7 +367,7 @@ pub(crate) async fn get_choice_image(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "No such exam, question, or image", body = ErrorResponse),
-        (status = 409, description = "Attempts have started — questions are frozen", body = ErrorResponse),
+        (status = 409, description = "Attempts have started — questions are frozen, or this course's term is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 pub(crate) async fn delete_choice_image(
@@ -440,7 +444,7 @@ pub(crate) async fn store_answer_image(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not a student, or not enrolled in the exam's course", body = ErrorResponse),
         (status = 404, description = "No such exam, question, or attempt", body = ErrorResponse),
-        (status = 409, description = "Attempt already submitted, time is up, or rejoin is closed", body = ErrorResponse),
+        (status = 409, description = "Attempt already submitted, time is up, rejoin is closed, or this course's term is archived — past years are read-only", body = ErrorResponse),
         (status = 413, description = "Image exceeds the school's size limit", body = ErrorResponse),
     ),
 )]
@@ -454,6 +458,9 @@ pub(crate) async fn upload_answer_image(
         .await?
         .ok_or(AppError::NotFound)?;
     ensure_student(&user)?;
+    // Before the body is read: an archived term refuses the upload without
+    // making the client push its bytes first.
+    course_of(&exam, &st.db).await?.require_open(&st.db).await?;
     // The body is consumed before the lock — a client's slow upload must not
     // stall the exam subsystem (mirrors the question-image upload).
     let ImageUpload { content_type, data } = read_image_upload(&st, &mut multipart).await?;
@@ -521,7 +528,7 @@ pub(crate) async fn upload_answer_image(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not a student, or not enrolled in the exam's course", body = ErrorResponse),
         (status = 404, description = "No such exam, question, attempt, or drawing", body = ErrorResponse),
-        (status = 409, description = "Attempt already submitted, time is up, or rejoin is closed", body = ErrorResponse),
+        (status = 409, description = "Attempt already submitted, time is up, rejoin is closed, or this course's term is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 pub(crate) async fn delete_answer_image(
@@ -533,6 +540,7 @@ pub(crate) async fn delete_answer_image(
         .await?
         .ok_or(AppError::NotFound)?;
     ensure_student(&user)?;
+    course_of(&exam, &st.db).await?.require_open(&st.db).await?;
     let _guard = EXAM_LOCK.read().await;
     let attempt = writable_attempt(&exam, user.get_id(), &st.db).await?;
     ensure_student_now(attempt.get_user(), &st.db).await?;

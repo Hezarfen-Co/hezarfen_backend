@@ -22,8 +22,8 @@ mod common;
 
 use axum::http::StatusCode;
 use common::{
-    app_and_db, create_course, create_homework, create_homework_with, create_subject, enroll,
-    id_of, items, login_as, me_id, multipart_file, send, send_raw, unenroll,
+    Res, app_and_db, create_course, create_homework, create_homework_with, create_subject, enroll,
+    id_of, items, login_as, me_id, multipart_file, send, send_raw, unenroll, upload_file_at,
 };
 use hezarfen_backend::database::Database;
 use serde_json::{Value, json};
@@ -740,5 +740,267 @@ async fn a_file_add_racing_a_file_delete_never_500s() {
         counted.first().copied().unwrap_or(0),
         files as i64,
         "the seat counter drifted from the rows"
+    );
+}
+
+/// An archived term freezes every homework write under its courses (#22): the
+/// teacher's edit/delete/grade/un-grade and the student's submit, withdraw,
+/// file add and file remove all answer `409 term_archived`, while the reads
+/// stay open — a past year is browsable, not editable. The student wall sits
+/// *after* the audience check, so a student the homework never named still
+/// gets the 404 it always did: the archive must not turn a subset assignment
+/// into a "this exists" signal.
+#[tokio::test]
+async fn an_archived_term_freezes_every_homework_write() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "mudur_arsiv", "manager").await;
+    let teacher = login_as(&app, &db, "ogretmen_arsiv", "teacher").await;
+
+    let res = send(
+        &app,
+        "POST",
+        "/terms",
+        Some(&manager),
+        Some(json!({
+            "name": "2025 Guz",
+            "starts_at": 1_600_000_000_000_i64,
+            "ends_at": 1_610_000_000_000_i64,
+        })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "create term");
+    let term = id_of(&res.body);
+
+    let res = send(
+        &app,
+        "POST",
+        "/courses",
+        Some(&teacher),
+        Some(json!({ "title": "tarih", "term_id": term })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "create course in term");
+    let course = id_of(&res.body);
+    let subject = create_subject(&app, &teacher, &course, "konu").await;
+
+    let student = login_as(&app, &db, "ogrenci_arsiv", "student").await;
+    let student_id = me_id(&app, &student).await;
+    let outsider = login_as(&app, &db, "ogrenci_disarida", "student").await;
+    let outsider_id = me_id(&app, &outsider).await;
+    enroll(&app, &teacher, &course, &student_id).await;
+    enroll(&app, &teacher, &course, &outsider_id).await;
+
+    // A subset assignment: the outsider is enrolled but not named, so their
+    // 404 is the one the archive must leave alone.
+    let res = create_homework_with(
+        &app,
+        &teacher,
+        &course,
+        json!({
+            "title": "odev",
+            "subject_id": subject,
+            "due_at": far_future(),
+            "assigned": [student_id],
+        }),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "create homework");
+    let hw = id_of(&res.body);
+
+    // Everything the student owns exists *before* the archive.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/homework/{hw}/submission"),
+        Some(&student),
+        Some(json!({ "text": "hazir" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "submit before archiving");
+    let res = upload_file_at(
+        &app,
+        &student,
+        &format!("/homework/{hw}/submission/files"),
+        "odev.pdf",
+        "application/pdf",
+        b"homework bytes",
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "upload before archiving");
+    let file = id_of(&res.body);
+
+    let res = send(
+        &app,
+        "POST",
+        &format!("/terms/{term}/archive"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "archive the term");
+
+    let frozen = |res: Res, what: &str| {
+        assert_eq!(res.status, StatusCode::CONFLICT, "{what} after archiving");
+        assert_eq!(
+            res.body["code"], "term_archived",
+            "{what} carries the machine-readable code: {:?}",
+            res.body
+        );
+    };
+
+    frozen(
+        send(
+            &app,
+            "PATCH",
+            &format!("/homework/{hw}"),
+            Some(&teacher),
+            Some(json!({ "title": "yeni" })),
+        )
+        .await,
+        "PATCH /homework/{id}",
+    );
+    frozen(
+        send(
+            &app,
+            "POST",
+            &format!("/homework/{hw}/results"),
+            Some(&teacher),
+            Some(json!({ "user": student_id, "status": "done" })),
+        )
+        .await,
+        "POST /homework/{id}/results",
+    );
+    frozen(
+        send(
+            &app,
+            "DELETE",
+            &format!("/homework/{hw}/results/{student_id}"),
+            Some(&teacher),
+            None,
+        )
+        .await,
+        "DELETE /homework/{id}/results/{user}",
+    );
+    frozen(
+        send(
+            &app,
+            "POST",
+            &format!("/homework/{hw}/submission"),
+            Some(&student),
+            Some(json!({ "text": "tekrar" })),
+        )
+        .await,
+        "POST /homework/{id}/submission",
+    );
+    frozen(
+        upload_file_at(
+            &app,
+            &student,
+            &format!("/homework/{hw}/submission/files"),
+            "yeni.pdf",
+            "application/pdf",
+            b"more bytes",
+        )
+        .await,
+        "POST /homework/{id}/submission/files",
+    );
+    frozen(
+        send(
+            &app,
+            "DELETE",
+            &format!("/homework/{hw}/submission/files/{file}"),
+            Some(&student),
+            None,
+        )
+        .await,
+        "DELETE /homework/{id}/submission/files/{fid}",
+    );
+    frozen(
+        send(
+            &app,
+            "DELETE",
+            &format!("/homework/{hw}/submission"),
+            Some(&student),
+            None,
+        )
+        .await,
+        "DELETE /homework/{id}/submission",
+    );
+    // The delete goes last: the seven refusals above must have left the rows
+    // it needs standing.
+    frozen(
+        send(
+            &app,
+            "DELETE",
+            &format!("/homework/{hw}"),
+            Some(&teacher),
+            None,
+        )
+        .await,
+        "DELETE /homework/{id}",
+    );
+
+    // The past year still reads: the homework and the student's own file.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/homework/{hw}"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "GET /homework/{{id}} archived");
+    let (status, _, bytes) = send_raw(
+        &app,
+        "GET",
+        &format!("/homework/{hw}/submission/files/{file}"),
+        Some(&student),
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "download own file while archived");
+    assert_eq!(bytes, b"homework bytes", "the stored bytes come back");
+
+    // Not in the audience: still a 404, never the 409 that would admit the
+    // homework exists.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/homework/{hw}/submission"),
+        Some(&outsider),
+        Some(json!({ "text": "benim mi" })),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::NOT_FOUND,
+        "an unnamed student sees no homework, archived or not: {:?}",
+        res.body
+    );
+
+    // Re-opening the year hands the writes back.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/terms/{term}/unarchive"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "unarchive the term");
+    let res = send(
+        &app,
+        "POST",
+        &format!("/homework/{hw}/results"),
+        Some(&teacher),
+        Some(json!({ "user": student_id, "status": "done" })),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::OK,
+        "grading works again: {:?}",
+        res.body
     );
 }

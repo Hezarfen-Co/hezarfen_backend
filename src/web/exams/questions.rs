@@ -200,7 +200,7 @@ pub(crate) fn choice_slot(question: &ExamQuestion, choice_id: &str) -> Result<Ch
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
-        (status = 409, description = "Attempts have started — questions are frozen", body = ErrorResponse),
+        (status = 409, description = "Attempts have started — questions are frozen, or this course's term is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -219,6 +219,7 @@ pub(crate) async fn create_question(
             "only the course creator, an assigned teacher, or a manager/admin can author questions",
         ));
     }
+    course.require_open(&st.db).await?;
     // No lease: the subject check below is only a pre-flight for the message,
     // and the insert takes the subject's reference counter in the same breath —
     // a subject delete lands either wholly before it (400) or is refused. The
@@ -338,7 +339,7 @@ pub(crate) async fn question_page(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "No such exam, or no such question in it", body = ErrorResponse),
-        (status = 409, description = "Attempts have started — questions are frozen, or the subject the question was read on changed since — nothing was written, re-read and retry", body = ErrorResponse),
+        (status = 409, description = "Attempts have started — questions are frozen, the subject the question was read on changed since — nothing was written, re-read and retry — or this course's term is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -357,6 +358,7 @@ pub(crate) async fn update_question(
             "only the course creator, an assigned teacher, or a manager/admin can edit questions",
         ));
     }
+    course.require_open(&st.db).await?;
     // No lease — see `create_question`; a re-tag moves the subject's reference
     // counter, and the freeze gate rides in the update's transaction.
     ensure_questions_editable(exam.get_id(), &st.db).await?;
@@ -427,7 +429,7 @@ pub(crate) async fn update_question(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "No such exam, or no such question in it", body = ErrorResponse),
-        (status = 409, description = "Attempts have started — questions are frozen", body = ErrorResponse),
+        (status = 409, description = "Attempts have started — questions are frozen, or this course's term is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 pub(crate) async fn delete_question(
@@ -444,6 +446,7 @@ pub(crate) async fn delete_question(
             "only the course creator, an assigned teacher, or a manager/admin can delete questions",
         ));
     }
+    course.require_open(&st.db).await?;
     // No lock: the freeze gate is part of the delete's own transaction, and
     // this path checks no subject. The pre-flight below is the fast 409.
     ensure_questions_editable(exam.get_id(), &st.db).await?;
@@ -496,7 +499,7 @@ pub(crate) struct InstantiateFromBank {
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "No such exam, or no bank template the caller may see", body = ErrorResponse),
-        (status = 409, description = "Attempts have started — questions are frozen", body = ErrorResponse),
+        (status = 409, description = "Attempts have started — questions are frozen, or this course's term is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -515,6 +518,7 @@ pub(crate) async fn question_from_bank(
             "only the course creator, an assigned teacher, or a manager/admin can author questions",
         ));
     }
+    course.require_open(&st.db).await?;
     // No lease — same reasoning as `create_question`. The freeze gate rides in
     // the insert's transaction.
     ensure_questions_editable(exam.get_id(), &st.db).await?;
@@ -628,7 +632,7 @@ pub(crate) async fn question_from_bank(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "No such exam, no such question in it, or no bank template the caller may see", body = ErrorResponse),
-        (status = 409, description = "Attempts have started — questions are frozen, or the question's subject was re-tagged since the caller read it — nothing was written, re-read and retry", body = ErrorResponse),
+        (status = 409, description = "Attempts have started — questions are frozen, the question's subject was re-tagged since the caller read it — nothing was written, re-read and retry — or this course's term is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 pub(crate) async fn question_refresh_from_bank(
@@ -645,6 +649,7 @@ pub(crate) async fn question_refresh_from_bank(
             "only the course creator, an assigned teacher, or a manager/admin can edit questions",
         ));
     }
+    course.require_open(&st.db).await?;
     // No lock: the question keeps its own subject here, so there is nothing to
     // pair with a subject delete, and the freeze gate rides in the overwrite's
     // transaction.
@@ -752,6 +757,7 @@ pub(crate) async fn question_refresh_from_bank(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "No such exam, or no such question in it", body = ErrorResponse),
+        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 pub(crate) async fn question_to_bank(
@@ -768,6 +774,7 @@ pub(crate) async fn question_to_bank(
             "only the course creator, an assigned teacher, or a manager/admin can save questions to the bank",
         ));
     }
+    course.require_open(&st.db).await?;
     // No lease: `BANK_LOCK` is gone with the subject delete's writer lease, and
     // a template left holding a deleted subject reads as an empty
     // `subject_name` either way (see [`crate::web::bank_questions`]).
