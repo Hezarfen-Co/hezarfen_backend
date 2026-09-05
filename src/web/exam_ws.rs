@@ -56,7 +56,7 @@
 
 use std::time::Duration;
 
-use crate::web::tenant_state::State;
+use crate::web::tenant_state::{SchoolSlug, State};
 use axum::extract::Path;
 use axum::extract::ws::{WebSocket, WebSocketUpgrade};
 use axum::response::Response;
@@ -73,6 +73,7 @@ use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 use crate::state::AppState;
+use crate::tenant::Slug;
 use crate::validate::validate_required;
 use crate::web::CurrentUser;
 use crate::web::exams::{
@@ -138,6 +139,7 @@ enum ClientMessage {
 /// dying socket's teardown stamp a student who was already reconnecting.
 pub async fn attempt_ws(
     State(st): State<AppState>,
+    SchoolSlug(slug): SchoolSlug,
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
     ws: WebSocketUpgrade,
@@ -153,13 +155,20 @@ pub async fn attempt_ws(
     course_of(&exam, &st.db).await?.require_open(&st.db).await?;
 
     let user_id = user.get_id().clone();
-    Ok(ws.on_upgrade(move |socket| room(socket, st, exam, attempt, user_id)))
+    Ok(ws.on_upgrade(move |socket| room(socket, st, slug, exam, attempt, user_id)))
 }
 
 /// The room loop: state ticks out, answer/finish/ping in, until the socket
 /// closes or the room's sitting reaches a terminal state. The room is bound
 /// to the attempt it was opened for — `attempt` — and to no later sitting.
-async fn room(mut socket: WebSocket, st: AppState, exam: Exam, attempt: ExamAttempt, user: UserId) {
+async fn room(
+    mut socket: WebSocket,
+    st: AppState,
+    slug: Slug,
+    exam: Exam,
+    attempt: ExamAttempt,
+    user: UserId,
+) {
     let exam_id = exam.get_id().clone();
     let attempt_id = attempt.get_id().clone();
     // Join critical section: this socket counts as presence in the sitting's
@@ -171,7 +180,7 @@ async fn room(mut socket: WebSocket, st: AppState, exam: Exam, attempt: ExamAtte
     // failed clear leaves the stamp for the next join or the teacher's door.
     {
         let _guard = PRESENCE_LOCK.lock().await;
-        st.exam_presence.enter(attempt_id.key());
+        st.exam_presence.enter(&slug, attempt_id.key());
         if let Err(err) = attempt.set_left(None, &st.db).await {
             tracing::warn!("exam room could not clear left_at on join: {err}");
         }
@@ -211,7 +220,7 @@ async fn room(mut socket: WebSocket, st: AppState, exam: Exam, attempt: ExamAtte
     // superseded by a retake is terminal) need no stamp. Best-effort: a
     // failed stamp only means it goes unrecorded.
     let _guard = PRESENCE_LOCK.lock().await;
-    if st.exam_presence.leave(attempt_id.key()) {
+    if st.exam_presence.leave(&slug, attempt_id.key()) {
         stamp_left(&exam_id, &attempt_id, &st.db).await;
     }
 }

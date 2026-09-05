@@ -20,7 +20,7 @@
 
 use std::time::Duration;
 
-use crate::web::tenant_state::State;
+use crate::web::tenant_state::{SchoolSlug, State};
 use axum::Json;
 use axum::extract::{Path, Query};
 use axum::http::StatusCode;
@@ -49,7 +49,7 @@ use crate::domain::role::Role;
 use crate::domain::settings::Settings;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ErrorResponse, ValidationError};
-use crate::state::AppState;
+use crate::state::{AppState, scoped_key};
 
 use super::{CurrentUser, Page, PageParams};
 
@@ -377,12 +377,14 @@ async fn list_messages(
 )]
 async fn send_message(
     State(st): State<AppState>,
+    SchoolSlug(slug): SchoolSlug,
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
     Json(req): Json<SendChatbotMessage>,
 ) -> Result<Response, AppError> {
     // Charged first: a rejected turn must cost nothing and leave no row.
-    st.chatbot_limit.enforce_user(user.get_id().key())?;
+    st.chatbot_limit
+        .enforce_user(&scoped_key(&slug, user.get_id().key()))?;
 
     let thread = own_thread(&id, user.get_id(), &st.db).await?;
     let settings = Settings::load(&st.db).await?;

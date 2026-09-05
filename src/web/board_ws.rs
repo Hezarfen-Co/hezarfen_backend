@@ -58,7 +58,7 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use crate::web::tenant_state::State;
+use crate::web::tenant_state::{SchoolSlug, State};
 use axum::extract::Path;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::Response;
@@ -75,6 +75,7 @@ use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
 use crate::error::AppError;
 use crate::state::AppState;
+use crate::tenant::Slug;
 use crate::web::CurrentUser;
 use crate::web::room::{self, Incoming, RoomClosed, send, with_client_seq};
 
@@ -118,6 +119,7 @@ enum ClientMessage {
 /// every action already re-reads through.
 pub async fn board_ws(
     State(st): State<AppState>,
+    SchoolSlug(slug): SchoolSlug,
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
     ws: WebSocketUpgrade,
@@ -136,18 +138,18 @@ pub async fn board_ws(
     }
     let board_id = board.get_id().clone();
     let user_id = user.get_id().clone();
-    Ok(ws.on_upgrade(move |socket| room(socket, st, board_id, user_id)))
+    Ok(ws.on_upgrade(move |socket| room(socket, st, slug, board_id, user_id)))
 }
 
 /// The room loop: the board's frames out, draw/clear/lock/ping in, until the
 /// socket closes or the board ends (closed, deleted, or the caller taken off
 /// it).
-async fn room(mut socket: WebSocket, st: AppState, board: BoardId, user: UserId) {
+async fn room(mut socket: WebSocket, st: AppState, slug: Slug, board: BoardId, user: UserId) {
     // Subscribe *before* anything is read out of the database: a stroke that
     // lands between a replay's read and this subscribe would otherwise be lost
     // outright, whereas one delivered twice is deduplicated by its id at the
     // client (which a resync forces anyway).
-    let mut feed = st.board_hub.subscribe(board.key());
+    let mut feed = st.board_hub.subscribe(&slug, board.key());
     // The ids this socket drew, in the order they were published. The hub has
     // no idea who is listening, so the room filters its own strokes back out
     // here — a client that had to ignore the echo of every mark it just drew
@@ -176,7 +178,7 @@ async fn room(mut socket: WebSocket, st: AppState, board: BoardId, user: UserId)
             },
             incoming = socket.recv() => match room::classify(incoming) {
                 Incoming::Text(text) => {
-                    handle_message(&mut socket, text.as_str(), &board, &user, &mut mine, &st).await
+                    handle_message(&mut socket, text.as_str(), &slug, &board, &user, &mut mine, &st).await
                 }
                 Incoming::Gone => Err(RoomClosed),
                 Incoming::Ignore => Ok(()),
@@ -187,7 +189,7 @@ async fn room(mut socket: WebSocket, st: AppState, board: BoardId, user: UserId)
         }
     }
     room::close(&mut socket).await;
-    st.board_hub.leave(board.key());
+    st.board_hub.leave(&slug, board.key());
 }
 
 type Step = Result<(), RoomClosed>;
@@ -395,6 +397,7 @@ fn stroke_body(stroke: &BoardStroke) -> Value {
 async fn handle_message(
     socket: &mut WebSocket,
     text: &str,
+    slug: &Slug,
     board: &BoardId,
     user: &UserId,
     mine: &mut VecDeque<String>,
@@ -468,7 +471,7 @@ async fn handle_message(
                     fanned["type"] = json!("stroke");
                     fanned["epoch"] = json!(stroke.get_epoch());
                     mine.push_back(stroke.get_id().key().to_string());
-                    st.board_hub.publish(board.key(), fanned.to_string());
+                    st.board_hub.publish(slug, board.key(), fanned.to_string());
                     let mut frame = json!({ "type": "saved", "id": stroke.get_id().key() });
                     with_client_seq(&mut frame, client_seq);
                     send(socket, frame).await
@@ -491,6 +494,7 @@ async fn handle_message(
                 // canvas is the next one. Same shape as `POST /boards/{id}/clear`.
                 Ok(marker) => {
                     st.board_hub.publish(
+                        slug,
                         board.key(),
                         json!({
                             "type": "cleared",
@@ -509,6 +513,7 @@ async fn handle_message(
             Some(live) => match live.set_locked(locked, user, &st.db).await {
                 Ok(_) => {
                     st.board_hub.publish(
+                        slug,
                         board.key(),
                         json!({ "type": "locked", "locked": locked, "by": user.key() }).to_string(),
                     );

@@ -1,4 +1,4 @@
-use crate::web::tenant_state::State;
+use crate::web::tenant_state::{SchoolSlug, State};
 use axum::Json;
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query};
 use axum::http::StatusCode;
@@ -463,6 +463,7 @@ async fn update_user_preferences(
 )]
 async fn set_role(
     State(st): State<AppState>,
+    SchoolSlug(slug): SchoolSlug,
     RequireAdmin(admin): RequireAdmin,
     Path(id): Path<String>,
     Json(req): Json<SetRole>,
@@ -490,6 +491,7 @@ async fn set_role(
     // stroke came back refused.
     for board in boards {
         st.board_hub.publish(
+            &slug,
             board.get_id().key(),
             json!({
                 "type": "participants",
@@ -504,6 +506,7 @@ async fn set_role(
         );
         if let Some(closed_at) = board.get_closed_at() {
             st.board_hub.publish(
+                &slug,
                 board.get_id().key(),
                 json!({"type": "closed", "closed_at": closed_at.as_millis()}).to_string(),
             );
