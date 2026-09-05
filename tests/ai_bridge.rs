@@ -2524,11 +2524,12 @@ async fn a_school_without_course_notes_cannot_reach_the_rag_dispatch_at_all() {
 }
 
 #[tokio::test]
-async fn indexing_follows_course_notes_not_chatbot() {
-    // `rag.index` is the course-notes module's own background refresh, not part
-    // of the chatbot the `ai` package sells: a school that bought course notes
-    // and no chatbot still gets its notes indexed. Pinned because the two are
-    // easy to confuse — both go out over the same bridge.
+async fn a_school_without_the_ai_package_dispatches_no_index_and_stores_no_output() {
+    // The product rule: `chatbot` is the `ai` package, and a school that did
+    // not buy it sends *nothing* to an AI service — course-note indexing
+    // included, even though the notes themselves keep working. The note is
+    // created (201), the service never hears about it, and no `rag_output`
+    // row appears; selling `chatbot` back makes the very next note index.
     let bridge = bridge().await;
     let service = connect_service(
         &bridge,
@@ -2540,9 +2541,50 @@ async fn indexing_follows_course_notes_not_chatbot() {
     let (app, db, tenants) = common::app_with_ai_tenants(Some(bridge.clone())).await;
     demo_without(&tenants, &[Module::Chatbot]).await;
 
+    // `course_note` asserts the 201 itself: course notes stay fully usable.
+    let (_cookie, note) = course_note(&app, &db).await;
+    // The dispatch is fire-and-forget, so give a frame that should never exist
+    // time to arrive before saying it did not.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        service.seen().is_empty(),
+        "a school without the `ai` package still dispatched: {:?}",
+        service.seen()
+    );
+    assert!(
+        outputs(&db, &note).await.is_empty(),
+        "no rag_output row may be written for a school without `chatbot`"
+    );
+
+    // Sold back: the next note indexes, so the module is the only thing that
+    // was ever stopping it.
+    demo_without(&tenants, &[]).await;
     let (_cookie, note) = course_note(&app, &db).await;
     let stored = await_outputs(&db, &note).await;
     assert_eq!(stored.len(), 1);
     assert_eq!(stored[0].get_payload()["summary"], "x");
     assert_eq!(service.seen()[0].capability, AI_RAG_INDEX_CAPABILITY);
+}
+
+#[tokio::test]
+async fn a_blob_read_is_refused_module_disabled_when_the_school_has_no_chatbot() {
+    // File bytes are the largest thing the backend would hand an AI service,
+    // so the same `ai`-package rule holds on the blob stream: `course_notes`
+    // on, `chatbot` off, and the stream still refuses.
+    let bridge = bridge().await;
+    let (service, student, file, uploaded, tenants) = blob_fixture(&bridge).await;
+
+    demo_without(&tenants, &[Module::Chatbot]).await;
+    let (header, bytes) = blob_read(&service.conn, blob_of(&file, Some(&student))).await;
+    assert_eq!(blob_refusal(header), "module_disabled");
+    assert!(bytes.is_empty(), "a refusal is followed by nothing at all");
+
+    demo_without(&tenants, &[]).await;
+    let (header, bytes) = blob_read(&service.conn, blob_of(&file, Some(&student))).await;
+    assert!(
+        matches!(header, BlobResponse::Ok { .. }),
+        "the module is back: {}",
+        blob_refusal(header)
+    );
+    assert!(bytes == uploaded, "the bytes differ from what was uploaded");
 }

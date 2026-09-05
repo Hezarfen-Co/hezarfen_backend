@@ -391,6 +391,10 @@ impl Tenants {
         name: &str,
         modules: ModuleSet,
     ) -> Result<Database, AppError> {
+        // Defense in depth: the builder API validates first (its message names
+        // every violation at once), but the registry refuses an unsatisfiable
+        // set too, so no future caller can persist one.
+        modules.validate()?;
         let school = School {
             id: SchoolId::from_slug(slug),
             slug: slug.clone(),
@@ -484,6 +488,7 @@ impl Tenants {
     /// so a change takes effect on the next call and no cached handle carries a
     /// stale answer.
     pub async fn set_modules(&self, slug: &Slug, modules: &ModuleSet) -> Result<(), AppError> {
+        modules.validate()?;
         let updated: Vec<School> = self
             .control
             .query("UPDATE $id SET modules = $modules RETURN AFTER")
@@ -750,5 +755,38 @@ mod tests {
             School::update_name(&slug("ghost"), "Nope", tenants.control()).await,
             Err(AppError::NotFound)
         ));
+    }
+    /// The builder API validates a set before it calls here (its message names
+    /// every violation at once), but the registry is the last gate: no caller,
+    /// present or future, may persist a set a school could not run on.
+    #[tokio::test]
+    async fn the_registry_refuses_an_unsatisfiable_set_on_create_and_on_sale() {
+        let tenants = Tenants::new_mem().await.unwrap();
+        let s = slug("alpha");
+        let mut lone = ModuleSet::empty();
+        lone.insert(crate::module::Module::Exams);
+
+        assert!(
+            matches!(
+                tenants.create(&s, "Alpha", lone.clone()).await,
+                Err(AppError::ConflictOwned(_))
+            ),
+            "exams alone is unsatisfiable, so the school must not come into being"
+        );
+        assert!(
+            matches!(tenants.get(&s).await, Err(AppError::Unauthorized)),
+            "a refused create leaves no registry row behind"
+        );
+
+        tenants.create(&s, "Alpha", ModuleSet::all()).await.unwrap();
+        assert!(matches!(
+            tenants.set_modules(&s, &lone).await,
+            Err(AppError::ConflictOwned(_))
+        ));
+        assert_eq!(
+            tenants.resolve(&s).await.unwrap().modules,
+            ModuleSet::all(),
+            "the refused sale must not have touched the row"
+        );
     }
 }

@@ -19,8 +19,9 @@ use crate::database::Database;
 use crate::domain::course_note::CourseNote;
 use crate::domain::course_note_file::CourseNoteFile;
 use crate::domain::rag_output::RagOutput;
+use crate::module::Module;
 use crate::state::AppState;
-use crate::tenant::Slug;
+use crate::web::tenant_state::ResolvedTenant;
 
 /// The capability string routed to an indexing service. Defined once, in
 /// [`crate::constant`]; re-exported here so a reader of the payload contract
@@ -82,10 +83,24 @@ impl RagIndexPayload {
 /// answered. Silent no-op when the bridge is off or no worker offers
 /// `rag.index`.
 ///
-/// `school` is the caller's own school: it rides the `hab/2` frame, and
+/// `tenant` is the caller's own school: its slug rides the `hab/2` frame, and
 /// `state.db` — the same school's database, since the caller reached this
 /// through the shadow `State` — is where the answer is stored.
-pub async fn index_course_note(state: &AppState, school: &Slug, note: &CourseNote) {
+///
+/// A school that did not buy the `ai` package sends **nothing** to an AI
+/// service: no dispatch, no `rag_output` row. That is `Module::Chatbot`, the
+/// package's only module, so it gates every outbound dispatch and not just the
+/// `/chatbot` nest.
+pub async fn index_course_note(state: &AppState, tenant: &ResolvedTenant, note: &CourseNote) {
+    if !tenant.modules.contains(Module::Chatbot) {
+        tracing::debug!(
+            "skipping rag.index for course note {}: the `{}` school has no `chatbot` module",
+            note.get_id().key(),
+            tenant.slug
+        );
+        return;
+    }
+    let school = &tenant.slug;
     let Some(bridge) = state.ai.as_ref() else {
         return;
     };
@@ -157,11 +172,11 @@ async fn replace(
 
 /// [`index_course_note`] off the request path: the handler has already
 /// answered by the time the service is asked.
-pub fn spawn_index(state: &AppState, school: &Slug, note: CourseNote) {
+pub fn spawn_index(state: &AppState, tenant: &ResolvedTenant, note: CourseNote) {
     // Cheap when AI is off — the spawned task returns on the first `let else`.
     let state = state.clone();
-    let school = school.clone();
-    tokio::spawn(async move { index_course_note(&state, &school, &note).await });
+    let tenant = tenant.clone();
+    tokio::spawn(async move { index_course_note(&state, &tenant, &note).await });
 }
 
 #[cfg(test)]

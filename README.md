@@ -426,9 +426,13 @@ suspension.
 
 **The AI bridge obeys the same entitlements.** An api-read frame is dispatched
 into the router carrying the school's module set, so a read into a disabled
-nest comes back as that same `403` body. The blob stream is the one surface
-that bypasses the router, so it checks `course_notes` by hand and refuses with
-code `module_disabled` when the school does not have it.
+nest comes back as that same `403` body. Beyond that, `chatbot` — the `ai`
+package's only module — gates every *outbound* dispatch, not just the
+`/chatbot` nest: a school that did not buy `ai` sends no data to an AI service
+at all. Course-note indexing (`rag.index`) is a silent no-op for it — the note
+is stored, nothing is dispatched and no `rag_output` row appears — and the blob
+stream, the one surface that bypasses the router, checks `course_notes` **and**
+`chatbot` by hand and refuses with code `module_disabled` when either is off.
 
 A walk-through — the vendor takes `meals` away and gives it back:
 
@@ -3942,7 +3946,7 @@ slow-but-reading service is never cut off.
 | `not_found` | No `course_note_file` with that key *in that school*, or its note or course is gone |
 | `forbidden` | The principal may not view that file's course |
 | `unknown_school` / `school_suspended` | As for an api read |
-| `module_disabled` | That school has no `course_notes` module — this stream bypasses the router, so it checks the entitlement itself |
+| `module_disabled` | That school has no `course_notes` module, or no `chatbot` module (the `ai` package: without it a school sends nothing to an AI service) — this stream bypasses the router, so it checks both entitlements itself |
 | `unknown_user` | `on_behalf_of` names no user of that school |
 | `unavailable` | The api is not serving yet, the database socket is down, or the row's blob is missing from disk — retryable |
 
