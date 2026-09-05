@@ -321,6 +321,124 @@ its uploaded files. Irreversible on purpose: suspension is the reversible door.
 **AI frames name the school.** One AI service serves the whole deployment, so
 every `hab/2` frame carries a `school` field — see "AI bridge (QUIC)".
 
+### Modules
+
+A **module** is one router nest (`/meals`, `/exams`, `/boards`, …) sold as a
+unit: the thing a school buys and the thing the router refuses are the same
+thing, so there is no per-route entitlement list to keep in step with the
+routes. A school's set is stored on its registry row, defaults to everything on
+`POST /schools` (pass `modules` there to sell less), and is the vendor's to
+change afterwards.
+
+There are 21 modules, bundled into four packages. A package is only a name for
+a set of modules — entitlement is always stored per module, so re-packaging
+never migrates a school's row. `requires` is structural, never commercial:
+every edge below is a stored `record<…>` reference into the other module's data
+(or a report that reads it), which is why a set that breaks one is refused.
+
+| Module | Package | Requires |
+| --- | --- | --- |
+| `attendance` | `academics` | `events`, `sessions` |
+| `bank_questions` | `academics` | — |
+| `classes` | `academics` | `courses` |
+| `course_notes` | `academics` | `courses` |
+| `courses` | `academics` | — |
+| `exams` | `academics` | `courses`, `subjects` |
+| `homework` | `academics` | `courses`, `subjects` |
+| `marks` | `academics` | `exams` |
+| `sessions` | `academics` | `courses` |
+| `subjects` | `academics` | `courses` |
+| `appointments` | `communication` | — |
+| `boards` | `communication` | — |
+| `events` | `communication` | — |
+| `messages` | `communication` | — |
+| `notes` | `communication` | — |
+| `questions` | `communication` | — |
+| `meals` | `operations` | — |
+| `payments` | `operations` | — |
+| `pomodoro` | `operations` | — |
+| `work` | `operations` | — |
+| `chatbot` | `ai` | — |
+
+`GET /modules/catalog` publishes exactly this table (unauthenticated and
+deploy-constant, like `GET /limits`), and `GET /modules` answers any signed-in
+user with their own school's enabled set — so a client hides a nest the school
+never bought instead of discovering it as a `403`. Both are ungated on purpose:
+an entitlement lookup a disabled module could switch off would be unusable
+exactly when it is needed.
+
+**The dependency rule.** A module may not be on without what it requires, and
+may not be taken back while something the school still has requires it. Both
+refusals are `409` and both name *every* violation at once, so a caller fixing
+a set does not discover the problems one round trip at a time:
+
+```json
+{"error": "conflict: exams requires courses, which is not enabled; exams requires subjects, which is not enabled"}
+{"error": "conflict: courses is required by exams, subjects"}
+```
+
+**Selling.** `GET /schools/{slug}/modules` returns both halves (`enabled` +
+`disabled`, each sorted — together they are the whole catalog).
+`POST|DELETE /schools/{slug}/modules/{module}` moves one module and is
+idempotent: a module the school already has (or already lacks) is a `200` with
+the unchanged set. An unknown module name in the path is a `404`, the same
+verdict an unknown school gets.
+
+`PATCH /schools/{slug}/modules` re-sells the whole shelf in one call, with any
+mix of the four optional lists `enable`, `disable`, `enable_packages`,
+`disable_packages` (a package expands to its modules). The lists are folded
+into **one** resulting set, which is validated **once** and written **once or
+not at all** — so a `PATCH` enabling `exams` and `subjects` together succeeds
+where two single calls would refuse the first, and a rejected request leaves the
+row untouched. An empty body, or a set equal to the current one, is a no-op
+`200`. An unknown module or package name is a `400`, and so is a name pulled
+both ways at once — picking a side silently would sell (or unsell) a module the
+caller also asked for the opposite of:
+
+```json
+{"error": "module: `kantin` is not a known module"}
+{"error": "module: `meals` is asked for in both directions at once"}
+```
+
+**What a disabled module looks like from inside the school.** Every route in
+its nest answers:
+
+```json
+{"error": "module disabled", "module": "meals"}
+```
+
+with `403`. The gate is a `route_layer`, so a path that does not exist inside a
+disabled nest is still a `404` — a disabled module is a refusal on the routes
+that exist, not a wall around a URL space. The four child routes under
+`/courses/{id}` that belong elsewhere (`/exams`, `/sessions`, `/subjects`,
+`/homework`) carry the child module's gate as well as the `courses` one, so
+either being off refuses. Nothing is deleted: a disabled module's rows stay put
+and come back untouched when it is re-enabled.
+
+**Core is never gated.** Auth, users, settings, terms, `GET /limits`, the
+module lookups themselves, AI discovery and the whole builder surface answer
+whatever a school has bought — they are how a school logs in, is configured and
+is fixed.
+
+**A change takes effect on the school user's next request**, with the same
+cookie and no re-login: the registry row is read on every request, exactly like
+suspension.
+
+**The AI bridge obeys the same entitlements.** An api-read frame is dispatched
+into the router carrying the school's module set, so a read into a disabled
+nest comes back as that same `403` body. The blob stream is the one surface
+that bypasses the router, so it checks `course_notes` by hand and refuses with
+code `module_disabled` when the school does not have it.
+
+A walk-through — the vendor takes `meals` away and gives it back:
+
+```bash
+curl -c v.txt -X POST localhost:6060/builder/login -H 'content-type: application/json' -d '{"username":"builder","password":"correct horse battery"}'
+curl -b v.txt -X DELETE localhost:6060/schools/demo/modules/meals      # 200, meals now in "disabled"
+curl -b s.txt localhost:6060/meals/menus                               # 403 {"error":"module disabled","module":"meals"}
+curl -b v.txt -X POST localhost:6060/schools/demo/modules/meals        # 200, and the student's next call works again
+```
+
 ## Auth model
 
 Login sets an `HttpOnly`, `SameSite=Lax` `session` cookie (7-day expiry, stored
@@ -800,7 +918,9 @@ slug), not the control one — e.g.
 `Auth` is the minimum role; `no` means no session required, `student` means any
 logged-in user. `builder` is not a school role: it means the deployment's
 vendor account (see the `builder` tag), whose cookie is refused on every other
-endpoint here exactly as a school's cookie is refused on its.
+endpoint here exactly as a school's cookie is refused on its. The table lists
+every route this deployment serves; a route in a module the school has not
+bought answers `403 {"error": "module disabled", …}` instead — see "Modules".
 
 A course is a regular taught course (kind `course`, the default), an *etüt* (kind
 `study` — a supervised study session), or a *kulüp* (kind `club` — a student
