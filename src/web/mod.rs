@@ -10,6 +10,7 @@ pub mod auth;
 pub mod bank_questions;
 pub mod board_ws;
 pub mod boards;
+pub mod builder;
 pub mod chatbot;
 pub mod classes;
 pub mod course_notes;

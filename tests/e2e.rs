@@ -25,6 +25,16 @@ async fn spawn_server_with_ai(ai: Option<hezarfen_backend::ai::AiBridge>) -> (St
         .get(&Slug::try_new(DEMO_SLUG).unwrap())
         .await
         .expect("the demo school");
+    // The deployment's operator, seeded exactly as `main` does from
+    // `BUILDER_USERNAME`/`BUILDER_PASSWORD`, so the vendor surface is drivable
+    // over real TCP here too.
+    hezarfen_backend::domain::builder::Builder::ensure(
+        hezarfen_backend::domain::user::Username::try_new("operator").unwrap(),
+        hezarfen_backend::domain::user::Password::try_new("secret1").unwrap(),
+        tenants.control(),
+    )
+    .await
+    .expect("seed the builder");
     let app = build_router(AppState {
         db: tenants.control().clone(),
         tenants,
@@ -3688,4 +3698,70 @@ async fn a_manager_archived_year_refuses_every_write_and_answers_every_read() {
             "{path} must be a documented POST in the served spec"
         );
     }
+}
+
+/// The vendor surface over real TCP, with a browser's cookie jar: the builder
+/// logs in, brings a school into being, and the admin that call seeded logs
+/// into it — the whole onboarding path, end to end.
+#[tokio::test]
+async fn a_builder_creates_a_school_over_tcp_and_its_admin_logs_in() {
+    let (base, _db) = spawn_server().await;
+    let vendor = client();
+
+    let res = vendor
+        .post(format!("{base}/builder/login"))
+        .json(&json!({ "username": "operator", "password": "secret1" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.json::<Value>().await.unwrap()["username"], "operator");
+
+    let res = vendor
+        .post(format!("{base}/schools"))
+        .json(&json!({
+            "slug": "tcp-koleji",
+            "name": "TCP Koleji",
+            "admin_username": "admin",
+            "admin_password": "secret1",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let school = res.json::<Value>().await.unwrap();
+    assert_eq!(school["slug"], "tcp-koleji");
+    assert_eq!(school["status"], "active");
+
+    // A separate jar: the school admin is a different principal on the wire.
+    let admin = client();
+    let res = admin
+        .post(format!("{base}/auth/login"))
+        .json(&json!({ "school": "tcp-koleji", "username": "admin", "password": "secret1" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "the seeded admin logs in");
+
+    let me = admin
+        .get(format!("{base}/auth/me"))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(me["username"], "admin");
+    assert_eq!(me["role"], "admin");
+
+    // The builder's own cookie is not a school cookie, over TCP either.
+    assert_eq!(
+        vendor
+            .get(format!("{base}/auth/me"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
 }

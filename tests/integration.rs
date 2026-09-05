@@ -355,6 +355,12 @@ const PUBLIC: &[(&str, &str)] = &[
     // A server certificate is handed to every peer in the TLS handshake, so
     // publishing it discloses nothing (see the module doc in `web/ai.rs`).
     ("GET", "/ai/certificate"),
+    // The vendor's own credential endpoint: the door a builder session comes
+    // out of, behind the same strict per-IP tier `/auth/login` sits behind.
+    ("POST", "/builder/login"),
+    // Idempotent, like `/auth/logout`: revokes the builder session if there is
+    // one, `204` either way.
+    ("POST", "/builder/logout"),
 ];
 
 /// Router paths that carry no OpenAPI operation, so the derived sweep below
@@ -376,7 +382,7 @@ async fn protected_routes_require_session() {
     /// Floor on the number of protected operations swept. It only ever goes
     /// up: raise it when routes are added. Without it, deleting a route family
     /// would delete its own coverage and still pass.
-    const MIN_PROTECTED: usize = 255;
+    const MIN_PROTECTED: usize = 263;
 
     let app = mem_app().await;
     let spec = send(&app, "GET", "/api-docs/openapi.json", None, None)
