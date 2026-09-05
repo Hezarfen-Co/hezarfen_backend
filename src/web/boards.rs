@@ -18,8 +18,9 @@
 //! mid-session keeps drawing over an already-open socket until the room hears
 //! about it, so a roster change *must* fan out.
 
+use crate::web::tenant_state::State;
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::json;

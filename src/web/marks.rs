@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
+use crate::web::tenant_state::State;
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::Path;
 use serde::Serialize;
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;

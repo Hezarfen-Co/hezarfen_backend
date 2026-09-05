@@ -9,8 +9,9 @@
 //! Money only ever *appends* here (see [`MealLedger`]): booking charges a price
 //! snapshot, cancelling reverses it, and recording a payment is admin-only.
 
+use crate::web::tenant_state::State;
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};

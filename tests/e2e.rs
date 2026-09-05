@@ -4,6 +4,7 @@
 use hezarfen_backend::database::Database;
 use hezarfen_backend::rate_limit::RateLimitConfig;
 use hezarfen_backend::state::AppState;
+use hezarfen_backend::tenant::{DEMO_SLUG, Slug};
 use hezarfen_backend::{build_router, database};
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
@@ -17,9 +18,16 @@ async fn spawn_server() -> (String, Database) {
 
 /// [`spawn_server`], with the AI bridge the chatbot relays through wired in.
 async fn spawn_server_with_ai(ai: Option<hezarfen_backend::ai::AiBridge>) -> (String, Database) {
-    let db = database::init_mem().await.expect("in-memory db");
+    let tenants = database::init_mem_tenants()
+        .await
+        .expect("in-memory deployment");
+    let db = tenants
+        .get(&Slug::try_new(DEMO_SLUG).unwrap())
+        .await
+        .expect("the demo school");
     let app = build_router(AppState {
-        db: db.clone(),
+        db: tenants.control().clone(),
+        tenants,
         // Kept (not auto-deleted) so the directory outlives this helper;
         // it's under the OS temp dir, reclaimed like any other temp file.
         files_path: tempfile::tempdir().expect("files dir").keep(),
@@ -67,7 +75,7 @@ fn client() -> Client {
 async fn register(client: &Client, base: &str, user: &str) -> reqwest::Response {
     client
         .post(format!("{base}/auth/register"))
-        .json(&json!({ "username": user, "password": "secret1" }))
+        .json(&json!({ "school": "demo", "username": user, "password": "secret1" }))
         .send()
         .await
         .unwrap()
@@ -76,7 +84,7 @@ async fn register(client: &Client, base: &str, user: &str) -> reqwest::Response 
 async fn login(client: &Client, base: &str, user: &str) {
     let res = client
         .post(format!("{base}/auth/login"))
-        .json(&json!({ "username": user, "password": "secret1" }))
+        .json(&json!({ "school": "demo", "username": user, "password": "secret1" }))
         .send()
         .await
         .unwrap();
@@ -422,7 +430,7 @@ async fn attendance_rollup_across_users() {
 async fn raw_session_cookie(base: &str, user: &str) -> String {
     let res = Client::new()
         .post(format!("{base}/auth/login"))
-        .json(&json!({ "username": user, "password": "secret1" }))
+        .json(&json!({ "school": "demo", "username": user, "password": "secret1" }))
         .send()
         .await
         .unwrap();

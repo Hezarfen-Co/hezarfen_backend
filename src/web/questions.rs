@@ -8,8 +8,9 @@
 //! opposite: unmoderated, so their author may edit the body and attach,
 //! replace, or drop one photo at any time — moderation there is delete-only.
 
+use crate::web::tenant_state::State;
 use axum::Json;
-use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Query};
 use axum::http::StatusCode;
 use axum::response::Response;
 use serde::{Deserialize, Serialize};

@@ -19,17 +19,21 @@ async fn main() -> anyhow::Result<()> {
     // Hash the login decoy now, so the first unknown-username login is not the
     // one request that pays for it (see `PasswordHash::prewarm_decoy`).
     hezarfen_backend::domain::user::PasswordHash::prewarm_decoy();
-    // Connects, migrates the schema and seeds the admin — all of it idempotent
-    // and unconditional on every boot.
-    let db = database::init(&cfg).await?;
+    // Connects to the control database, migrates it and seeds the builder —
+    // all of it idempotent and unconditional on every boot. School databases
+    // come up lazily, one connection each, on first use.
+    let tenants = database::init(&cfg).await?;
     let db_up = DbHealth::default();
-    keepalive(db.clone(), db_up.clone());
+    // The control connection is the one every request touches (the school
+    // lookup rides it), so it is the socket worth watching.
+    keepalive(tenants.control().clone(), db_up.clone());
     tokio::fs::create_dir_all(&cfg.files_path)
         .await
         .with_context(|| format!("failed to create the files directory {}", cfg.files_path))?;
     let ai = hezarfen_backend::ai::start_bridge(&cfg).await?;
     let app = build_router(AppState {
-        db,
+        db: tenants.control().clone(),
+        tenants,
         files_path: cfg.files_path.clone().into(),
         cookie_secure: cfg.cookie_secure,
         rate_limit: cfg.rate_limit.clone(),

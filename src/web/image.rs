@@ -62,6 +62,7 @@ pub(crate) async fn store_blob<T, Fut>(
 where
     Fut: Future<Output = Result<(T, Option<String>), AppError>>,
 {
+    crate::web::ensure_files_dir(&st.files_path).await?;
     let path = blob_path(&st.files_path, file);
     tokio::fs::write(&path, data)
         .await

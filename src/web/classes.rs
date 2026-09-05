@@ -7,8 +7,9 @@
 //! and its roster are the office's (manager+), while attaching a course writes
 //! *that course's* roster and takes the same right enrolling into it does.
 
+use crate::web::tenant_state::State;
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};

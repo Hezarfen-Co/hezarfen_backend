@@ -8,11 +8,19 @@ use tokio::sync::broadcast;
 use crate::ai::AiBridge;
 use crate::database::Database;
 use crate::rate_limit::{RateLimitConfig, UserRateLimiter};
+use crate::tenant::Tenants;
 
 /// Shared application state handed to every handler.
 #[derive(Clone)]
 pub struct AppState {
+    /// The database this request works in. At the router's root this is the
+    /// **control** database; `crate::web::tenant_state::State` swaps in the
+    /// caller's school before any handler that shadows `State` sees it.
     pub db: Database,
+    /// The school registry and its connections. Always the deployment-wide
+    /// one — it is never narrowed per request, so a handler can still reach
+    /// another school's handle deliberately.
+    pub tenants: Tenants,
     /// Directory holding uploaded note-file blobs, one file per
     /// `note_file` row, named by the row's key
     /// (from [`crate::config::Config::files_path`]).

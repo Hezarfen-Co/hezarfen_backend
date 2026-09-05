@@ -816,11 +816,10 @@ async fn the_alpn_and_the_protocol_id_are_the_same_string() {
 /// (status, body).
 async fn fetch_certificate(ai: Option<AiBridge>) -> (axum::http::StatusCode, Value) {
     use tower::ServiceExt;
-    let db = hezarfen_backend::database::init_mem()
-        .await
-        .expect("mem db");
+    let (tenants, _db) = common::mem_deployment().await;
     let app = hezarfen_backend::build_router(hezarfen_backend::state::AppState {
-        db,
+        db: tenants.control().clone(),
+        tenants,
         files_path: std::env::temp_dir(),
         cookie_secure: false,
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
@@ -950,11 +949,10 @@ use surrealdb::types::RecordId;
 
 /// A router wired to `bridge`, plus a handle to its in-memory database.
 async fn chat_app(bridge: &AiBridge) -> (Router, Database) {
-    let db = hezarfen_backend::database::init_mem()
-        .await
-        .expect("mem db");
+    let (tenants, db) = common::mem_deployment().await;
     let app = hezarfen_backend::build_router(hezarfen_backend::state::AppState {
-        db: db.clone(),
+        db: tenants.control().clone(),
+        tenants,
         files_path: common::files_dir(),
         cookie_secure: false,
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),

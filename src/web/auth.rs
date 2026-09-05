@@ -10,15 +10,18 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::constant::{RESERVED_USERNAMES, SESSION_DURATION_DAYS};
+use crate::domain::builder::BuilderSession;
 use crate::domain::role::Role as DomainRole;
 use crate::domain::session::Session;
 use crate::domain::user::{Password, PasswordHash, User, Username};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::state::AppState;
+use crate::tenant::Slug;
 
 use super::dto::Role;
-use super::{CurrentUser, UserResponse};
+use super::tenant_state::split_cookie;
+use super::{BUILDER_COOKIE_PREFIX, CurrentUser, UserResponse};
 
 pub fn routes(state: &AppState) -> OpenApiRouter<AppState> {
     // Strict per-IP limit on the two credential endpoints only — the
@@ -44,6 +47,11 @@ pub fn routes(state: &AppState) -> OpenApiRouter<AppState> {
 
 #[derive(Deserialize, ToSchema)]
 struct Credentials {
+    /// The school's slug — the name in front of the dot in the session cookie.
+    /// One backend serves many schools, so a username only identifies an
+    /// account together with this.
+    #[schema(example = "demo", min_length = 2, max_length = 32)]
+    school: String,
     #[schema(example = "ada", min_length = 3, max_length = 32)]
     username: String,
     #[schema(example = "correct horse battery", min_length = 6, max_length = 128)]
@@ -63,7 +71,7 @@ struct RegisterResponse {
     role: Role,
 }
 
-/// Register a new user account: `{username, password}` in, `{username, role}`
+/// Register a new user account: `{school, username, password}` in, `{username, role}`
 /// back (no `id`; new accounts are `student`). Always `201`, even if the name
 /// was already taken — see "Auth model".
 ///
@@ -83,6 +91,8 @@ struct RegisterResponse {
     responses(
         (status = 201, description = "Account created, or the username was already taken — deliberately indistinguishable. Carries no `id`: on the taken path there is no row to name, so log in to learn who you are", body = RegisterResponse),
         (status = 400, description = "Invalid username or password", body = ErrorResponse),
+        (status = 401, description = "No such school — deliberately the same answer a bad credential gets", body = ErrorResponse),
+        (status = 403, description = "The school is suspended", body = ErrorResponse),
         (status = 429, description = "Too many attempts from this address; see Retry-After", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
@@ -91,6 +101,12 @@ async fn register(
     State(st): State<AppState>,
     Json(req): Json<Credentials>,
 ) -> Result<(StatusCode, Json<RegisterResponse>), AppError> {
+    // The school first: a registration into a school that does not exist, or
+    // one that is suspended, must not reach the (expensive) hashing path — and
+    // an unknown school answers `401` here for the same anti-enumeration reason
+    // login does, rather than confirming which schools this deployment serves.
+    let school = Slug::try_new(&req.school).map_err(|_| AppError::Unauthorized)?;
+    let db = st.tenants.get(&school).await?;
     let username = Username::try_new(&req.username)?;
     // Registration-level policy, not a `Username` invariant: these names read
     // as staff and invite impersonation, but the `ADMIN_USERNAME` bootstrap
@@ -115,7 +131,7 @@ async fn register(
         username: username.as_str().to_string(),
         role: DomainRole::Student.into(),
     };
-    match User::create(username, password_hash, &st.db).await {
+    match User::create(username, password_hash, &db).await {
         Ok(_) => {}
         // Taken. Log the real reason server-side; the caller gets the same 201
         // and the same body, because telling the two apart is the whole thing
@@ -128,7 +144,8 @@ async fn register(
     Ok((StatusCode::CREATED, Json(body)))
 }
 
-/// Log in with username + password. Sets a `session` cookie on success.
+/// Log in with school + username + password. Sets a `session` cookie
+/// (`<school>.<token>`) on success.
 #[utoipa::path(
     post,
     path = "/login",
@@ -136,7 +153,8 @@ async fn register(
     request_body = Credentials,
     responses(
         (status = 200, description = "Logged in; session cookie set", body = UserResponse),
-        (status = 401, description = "Bad credentials", body = ErrorResponse),
+        (status = 401, description = "Bad credentials, or no such school — deliberately indistinguishable", body = ErrorResponse),
+        (status = 403, description = "The school is suspended", body = ErrorResponse),
         (status = 429, description = "Too many attempts from this address; see Retry-After", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
@@ -146,10 +164,17 @@ async fn login(
     jar: CookieJar,
     Json(req): Json<Credentials>,
 ) -> Result<(CookieJar, Json<UserResponse>), AppError> {
+    // Resolved *before* the argon2 work: a login aimed at a school that does
+    // not exist is a bad credential (`401`, indistinguishable from a bad
+    // password — the school list is not public), and a suspended school is
+    // `403` for every request including this one, so neither should buy an
+    // attacker a hash.
+    let school = Slug::try_new(&req.school).map_err(|_| AppError::Unauthorized)?;
+    let db = st.tenants.get(&school).await?;
     let password = Password::try_new(&req.password).map_err(|_| AppError::Unauthorized)?;
     // Usernames are stored trimmed (see `Username::try_new`); trim the lookup
     // the same way so a padded login attempt matches the canonical name.
-    let user = match User::find_by_username(req.username.trim(), &st.db).await? {
+    let user = match User::find_by_username(req.username.trim(), &db).await? {
         // Verification is `.await`ed so argon2 runs on the blocking pool instead
         // of stalling an async worker; that rules out a match guard, which
         // cannot await.
@@ -169,10 +194,12 @@ async fn login(
     };
 
     // The caller is genuine; opportunistically drop any expired session rows.
-    let _ = Session::purge_expired(&st.db).await;
+    let _ = Session::purge_expired(&db).await;
 
-    let session = Session::create(user.get_id(), &st.db).await?;
-    let cookie = Cookie::build(("session", session.token().as_str().to_string()))
+    let session = Session::create(user.get_id(), &db).await?;
+    // `<slug>.<token>`: the cookie carries the school, so every later request
+    // finds its database without a second lookup path that could disagree.
+    let cookie = Cookie::build(("session", format!("{school}.{}", session.token().as_str())))
         .path("/")
         .http_only(true)
         .secure(st.cookie_secure)
@@ -198,8 +225,17 @@ async fn logout(
     State(st): State<AppState>,
     jar: CookieJar,
 ) -> Result<(CookieJar, StatusCode), AppError> {
-    if let Some(cookie) = jar.get("session") {
-        Session::delete_by_token(cookie.value(), &st.db).await?;
+    // Best-effort: the cookie names its own school, so a logout resolves that
+    // school and deletes the row there. A cookie naming a school that is gone
+    // or suspended still clears below — logging out must never fail.
+    if let Some((prefix, token)) = jar.get("session").and_then(|c| split_cookie(c.value())) {
+        if prefix == BUILDER_COOKIE_PREFIX {
+            BuilderSession::delete_by_token(token, &st.db).await?;
+        } else if let Ok(slug) = Slug::try_new(prefix)
+            && let Ok(db) = st.tenants.get(&slug).await
+        {
+            Session::delete_by_token(token, &db).await?;
+        }
     }
     let jar = jar.remove(Cookie::build(("session", "")).path("/").build());
     Ok((jar, StatusCode::NO_CONTENT))

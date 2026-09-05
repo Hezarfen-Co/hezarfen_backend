@@ -12,13 +12,13 @@ use serde_json::json;
 #[tokio::test]
 async fn duplicate_register_is_indistinguishable_from_a_fresh_one() {
     let (app, db) = app_and_db().await;
-    let taken = json!({ "username": "ada", "password": "secret1" });
+    let taken = json!({ "school": "demo", "username": "ada", "password": "secret1" });
 
     let first = send(&app, "POST", "/auth/register", None, Some(taken.clone())).await;
     assert_eq!(first.status, StatusCode::CREATED);
 
     // Same username again, different password: still 201, same body shape.
-    let dup_creds = json!({ "username": "ada", "password": "attacker" });
+    let dup_creds = json!({ "school": "demo", "username": "ada", "password": "attacker" });
     let started = Instant::now();
     let dup = send(
         &app,
@@ -35,7 +35,7 @@ async fn duplicate_register_is_indistinguishable_from_a_fresh_one() {
         "POST",
         "/auth/register",
         None,
-        Some(json!({ "username": "grace", "password": "secret1" })),
+        Some(json!({ "school": "demo", "username": "grace", "password": "secret1" })),
     )
     .await;
 
@@ -122,7 +122,7 @@ async fn the_taken_body_equals_the_fresh_body_for_the_same_username() {
         "POST",
         "/auth/register",
         None,
-        Some(json!({ "username": "ada", "password": "secret1" })),
+        Some(json!({ "school": "demo", "username": "ada", "password": "secret1" })),
     )
     .await;
     let taken = send(
@@ -130,7 +130,7 @@ async fn the_taken_body_equals_the_fresh_body_for_the_same_username() {
         "POST",
         "/auth/register",
         None,
-        Some(json!({ "username": "ada", "password": "another1" })),
+        Some(json!({ "school": "demo", "username": "ada", "password": "another1" })),
     )
     .await;
 

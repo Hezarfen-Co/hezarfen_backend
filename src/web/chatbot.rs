@@ -20,8 +20,9 @@
 
 use std::time::Duration;
 
+use crate::web::tenant_state::State;
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};

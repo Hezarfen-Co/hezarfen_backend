@@ -7,6 +7,7 @@ pub mod error;
 pub mod migration_sql;
 pub mod rate_limit;
 pub mod state;
+pub mod tenant;
 pub mod validate;
 pub mod web;
 
@@ -161,7 +162,7 @@ pub fn build_router(state: AppState) -> Router {
     if let Some(ai) = &state.ai {
         ai.arm_api(
             service.clone(),
-            state.db.clone(),
+            state.tenants.clone(),
             state.db_up.clone(),
             state.files_path.clone(),
         );

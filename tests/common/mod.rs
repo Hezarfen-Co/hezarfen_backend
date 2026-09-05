@@ -12,6 +12,7 @@ use hezarfen_backend::ai::AiBridge;
 use hezarfen_backend::database::Database;
 use hezarfen_backend::rate_limit::RateLimitConfig;
 use hezarfen_backend::state::{AppState, DbHealth};
+use hezarfen_backend::tenant::{DEMO_SLUG, Slug, Tenants};
 use hezarfen_backend::{build_router, database};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -43,6 +44,49 @@ pub async fn app_and_db() -> (Router, Database) {
     app_with_ai(None).await
 }
 
+/// [`app_and_db`] plus the registry behind it, for the suites whose subject is
+/// tenancy itself (a second school, a suspension, the builder surface).
+pub async fn app_and_tenants() -> (Router, Database, Tenants) {
+    let (app, db, tenants) = app_parts(None, Default::default()).await;
+    (app, db, tenants)
+}
+
+/// Where the demo school's blobs land: one directory per school under
+/// `FILES_PATH`, created on the school's first upload.
+pub fn blob_dir() -> PathBuf {
+    let dir = files_dir().join(DEMO_SLUG);
+    std::fs::create_dir_all(&dir).expect("blob dir");
+    dir
+}
+
+/// The raw session token out of a `session=<school>.<token>` cookie value —
+/// what a test needs when it writes a session row by hand.
+pub fn cookie_token(cookie: &str) -> &str {
+    cookie
+        .trim_start_matches("session=")
+        .split_once('.')
+        .expect("a session cookie carries its school")
+        .1
+}
+
+/// An in-memory deployment: the registry, plus the demo school's handle. For
+/// the suites that build their own `AppState` instead of using [`app_and_db`].
+pub async fn mem_deployment() -> (Tenants, Database) {
+    let tenants = database::init_mem_tenants()
+        .await
+        .expect("in-memory deployment");
+    let db = demo_db(&tenants).await;
+    (tenants, db)
+}
+
+/// The demo school's handle out of a registry.
+pub async fn demo_db(tenants: &Tenants) -> Database {
+    tenants
+        .get(&Slug::try_new(DEMO_SLUG).expect("the demo slug"))
+        .await
+        .expect("the demo school resolves")
+}
+
 /// The same router, with the AI bridge wired into its state. `build_router`
 /// arms the bridge's api-read handle whenever `ai` is `Some`, so this is the
 /// bootstrap that makes a QUIC service's reads dispatch into a real router.
@@ -54,9 +98,22 @@ pub async fn app_with_ai(ai: Option<AiBridge>) -> (Router, Database) {
 /// database socket down under a running app — the api-read path re-checks it in
 /// place of the HTTP db guard it bypasses.
 pub async fn app_with_ai_health(ai: Option<AiBridge>, db_up: DbHealth) -> (Router, Database) {
-    let db = database::init_mem().await.expect("in-memory db");
+    let (app, db, _) = app_parts(ai, db_up).await;
+    (app, db)
+}
+
+/// The one bootstrap: an in-memory deployment (control database + the demo
+/// school), a router over it, and the demo school's handle — which is what
+/// every suite means by "the database", since that is where users and rows
+/// live.
+async fn app_parts(ai: Option<AiBridge>, db_up: DbHealth) -> (Router, Database, Tenants) {
+    let tenants = database::init_mem_tenants()
+        .await
+        .expect("in-memory deployment");
+    let db = demo_db(&tenants).await;
     let app = build_router(AppState {
-        db: db.clone(),
+        db: tenants.control().clone(),
+        tenants: tenants.clone(),
         files_path: files_dir(),
         cookie_secure: false,
         // Off, so suites hammering the API never trip a limit; the dedicated
@@ -68,7 +125,7 @@ pub async fn app_with_ai_health(ai: Option<AiBridge>, db_up: DbHealth) -> (Route
         db_up,
         ai,
     });
-    (app, db)
+    (app, db, tenants)
 }
 
 /// A router backed by a fresh in-memory database.
@@ -91,7 +148,7 @@ pub async fn set_role(db: &Database, username: &str, role: &str) {
 /// Register (password `secret1`), promote to `role`, then log in. Returns the
 /// session `Cookie` value.
 pub async fn login_as(app: &Router, db: &Database, username: &str, role: &str) -> String {
-    let creds = json!({ "username": username, "password": "secret1" });
+    let creds = json!({ "school": DEMO_SLUG, "username": username, "password": "secret1" });
     let reg = send(app, "POST", "/auth/register", None, Some(creds.clone())).await;
     assert_eq!(reg.status, StatusCode::CREATED, "register {username}");
     set_role(db, username, role).await;
@@ -265,7 +322,7 @@ pub async fn upload_course_note_file(
 
 /// Register (password `secret1`) then log in; returns the session `Cookie` value.
 pub async fn login(app: &Router, username: &str) -> String {
-    let creds = json!({ "username": username, "password": "secret1" });
+    let creds = json!({ "school": DEMO_SLUG, "username": username, "password": "secret1" });
     let reg = send(app, "POST", "/auth/register", None, Some(creds.clone())).await;
     assert_eq!(reg.status, StatusCode::CREATED, "register {username}");
     let res = send(app, "POST", "/auth/login", None, Some(creds)).await;

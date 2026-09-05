@@ -1,5 +1,5 @@
+use crate::web::tenant_state::State;
 use axum::Json;
-use axum::extract::State;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
