@@ -1316,7 +1316,7 @@ async fn a_blob_read_names_its_school_too() {
     let bridge = bridge().await;
     let service = raw::handshake(&bridge, &raw::hello("indexer", "rag.index")).await;
     await_workers(&bridge, 1).await;
-    let (_app, student, file, uploaded) = armed_with_file(&bridge).await;
+    let (_app, student, file, uploaded, _tenants) = armed_with_file(&bridge).await;
 
     let (header, _, body) = raw::blob_read(
         &service.conn,
@@ -1361,8 +1361,8 @@ async fn a_blob_read_names_its_school_too() {
 
 /// An armed router plus an uploaded course-note file: its id, and the bytes
 /// that were uploaded, read back by a service that must receive them verbatim.
-async fn armed_with_file(bridge: &AiBridge) -> (axum::Router, String, String, Vec<u8>) {
-    let (app, db) = common::app_with_ai(Some(bridge.clone())).await;
+async fn armed_with_file(bridge: &AiBridge) -> (axum::Router, String, String, Vec<u8>, Tenants) {
+    let (app, db, tenants) = common::app_with_ai_tenants(Some(bridge.clone())).await;
     let student_cookie = common::login_as(&app, &db, "ayse", "student").await;
     let student = common::me_id(&app, &student_cookie).await;
     let teacher = common::login_as(&app, &db, "hoca", "teacher").await;
@@ -1394,7 +1394,7 @@ async fn armed_with_file(bridge: &AiBridge) -> (axum::Router, String, String, Ve
     .await;
     assert_eq!(res.status, 201, "{}", res.body);
     let file = common::id_of(&res.body);
-    (app, student, file, uploaded)
+    (app, student, file, uploaded, tenants)
 }
 
 #[tokio::test]
@@ -1406,7 +1406,7 @@ async fn the_blob_header_frame_carries_exactly_the_published_keys_then_size_byte
     let bridge = bridge().await;
     let service = raw::handshake(&bridge, &raw::hello("indexer", "rag.index")).await;
     await_workers(&bridge, 1).await;
-    let (_app, student, file, uploaded) = armed_with_file(&bridge).await;
+    let (_app, student, file, uploaded, _tenants) = armed_with_file(&bridge).await;
 
     let (header, bytes, body) = raw::blob_read(
         &service.conn,
@@ -1450,7 +1450,7 @@ async fn a_blob_refusal_frame_carries_exactly_the_published_keys_and_no_bytes() 
     let bridge = bridge().await;
     let service = raw::handshake(&bridge, &raw::hello("indexer", "rag.index")).await;
     await_workers(&bridge, 1).await;
-    let (_app, student, _file, _uploaded) = armed_with_file(&bridge).await;
+    let (_app, student, file, _uploaded, tenants) = armed_with_file(&bridge).await;
 
     let (header, _, body) = raw::blob_read(
         &service.conn,
@@ -1469,6 +1469,34 @@ async fn a_blob_refusal_frame_carries_exactly_the_published_keys_and_no_bytes() 
     assert_eq!(header["code"], "not_found");
     assert_eq!(header["id"], "t-blob");
     assert!(body.is_empty(), "a refusal is followed by nothing at all");
+
+    // The entitlement refusal is the same published shape, under the code the
+    // README's refusal table names. It is checked on this stream by hand — the
+    // router's module gate cannot reach here — so it is a wire contract too.
+    let mut modules = ModuleSet::all();
+    modules.remove(hezarfen_backend::module::Module::CourseNotes);
+    tenants
+        .set_modules(&Slug::try_new(SCHOOL).unwrap(), &modules)
+        .await
+        .expect("take course_notes off the demo school");
+
+    let (header, _, body) = raw::blob_read(
+        &service.conn,
+        format!(
+            r#"{{"id":"t-mod","school":"{SCHOOL}","file":"{file}","on_behalf_of":"{student}"}}"#
+        )
+        .as_bytes(),
+    )
+    .await;
+    assert_eq!(
+        raw::keys(&header),
+        ["code", "id", "message", "school", "status"],
+        "blob refusal shape changed: {header}"
+    );
+    assert_eq!(header["code"], "module_disabled", "{header}");
+    assert_eq!(header["school"], SCHOOL, "{header}");
+    assert_eq!(header["id"], "t-mod");
+    assert!(body.is_empty(), "a refused blob stream carries no bytes");
 }
 
 #[tokio::test]
@@ -1482,7 +1510,7 @@ async fn an_api_read_still_answers_on_the_shared_client_stream_path() {
     let bridge = bridge().await;
     let service = raw::handshake(&bridge, &raw::hello("indexer", "rag.index")).await;
     await_workers(&bridge, 1).await;
-    let (_app, student, file, _uploaded) = armed_with_file(&bridge).await;
+    let (_app, student, file, _uploaded, _tenants) = armed_with_file(&bridge).await;
 
     let (answer, _) = raw::api_read(
         &service.conn,
