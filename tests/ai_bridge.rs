@@ -18,6 +18,7 @@ use hezarfen_backend::ai::protocol::{
 };
 use hezarfen_backend::ai::{AiBridge, AiError, BridgeConfig};
 use hezarfen_backend::constant::{AI_ALPN, AI_MAX_CONCURRENT_PER_WORKER, AI_PROTOCOL};
+use hezarfen_backend::tenant::{DEMO_SLUG, Slug};
 use serde_json::{Value, json};
 
 const TOKEN: &str = "shared-ai-token";
@@ -66,6 +67,11 @@ fn client_endpoint(bridge: &AiBridge) -> quinn::Endpoint {
         quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("client bind");
     endpoint.set_default_client_config(config);
     endpoint
+}
+
+/// The demo school, which every dispatch in this suite is made on behalf of.
+fn demo() -> Slug {
+    Slug::try_new(DEMO_SLUG).expect("the demo slug")
 }
 
 fn hello(service: &str, capabilities: &[&str]) -> Hello {
@@ -188,10 +194,12 @@ fn serve(conn: quinn::Connection, behaviour: Behaviour, seen: Arc<Mutex<Vec<Requ
                     }
                     Behaviour::Answer(payload) => Some(Response::Ok {
                         id: request.id.clone(),
+                        school: request.school.clone(),
                         payload,
                     }),
                     Behaviour::Reply(text) => Some(Response::Ok {
                         id: request.id.clone(),
+                        school: request.school.clone(),
                         payload: json!({ "text": text }),
                     }),
                     Behaviour::EchoPrompt => {
@@ -200,16 +208,19 @@ fn serve(conn: quinn::Connection, behaviour: Behaviour, seen: Arc<Mutex<Vec<Requ
                             .unwrap_or("<no message>");
                         Some(Response::Ok {
                             id: request.id.clone(),
+                            school: request.school.clone(),
                             payload: json!({ "text": format!("cevap::{asked}") }),
                         })
                     }
                     Behaviour::Fail { code, message } => Some(Response::Err {
                         id: request.id.clone(),
+                        school: request.school.clone(),
                         code,
                         message,
                     }),
                     Behaviour::WrongId => Some(Response::Ok {
                         id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+                        school: request.school.clone(),
                         payload: json!("from some other request"),
                     }),
                     Behaviour::Garbage => {
@@ -241,6 +252,7 @@ fn serve(conn: quinn::Connection, behaviour: Behaviour, seen: Arc<Mutex<Vec<Requ
 fn echo(request: &Request) -> Response {
     Response::Ok {
         id: request.id.clone(),
+        school: request.school.clone(),
         payload: json!({ "echo": request.payload, "capability": request.capability }),
     }
 }
@@ -285,7 +297,7 @@ async fn a_service_registers_and_a_request_round_trips() {
     assert!(bridge.has_capability("ocr.extract"));
 
     let answer = bridge
-        .dispatch("ocr.extract", json!({ "image": "abc" }))
+        .dispatch(&demo(), "ocr.extract", json!({ "image": "abc" }))
         .await
         .expect("the service answered");
     assert_eq!(answer["echo"]["image"], "abc");
@@ -320,7 +332,7 @@ async fn concurrent_requests_share_one_connection_without_blocking_each_other() 
 
     let calls = (0..N).map(|i| {
         let bridge = bridge.clone();
-        tokio::spawn(async move { bridge.dispatch("ocr.extract", json!({ "n": i })).await })
+        tokio::spawn(async move { bridge.dispatch(&demo(), "ocr.extract", json!({ "n": i })).await })
     });
     let answers = futures_util::future::join_all(calls).await;
 
@@ -344,8 +356,8 @@ async fn requests_route_to_the_service_declaring_the_capability() {
     let grader = connect_service(&bridge, hello("grader", &["grade.essay"]), Behaviour::Echo).await;
     await_workers(&bridge, 2).await;
 
-    bridge.dispatch("grade.essay", json!("text")).await.unwrap();
-    bridge.dispatch("ocr.extract", json!("png")).await.unwrap();
+    bridge.dispatch(&demo(), "grade.essay", json!("text")).await.unwrap();
+    bridge.dispatch(&demo(), "ocr.extract", json!("png")).await.unwrap();
 
     assert_eq!(ocr.seen().len(), 1, "ocr only saw its own capability");
     assert_eq!(ocr.seen()[0].capability, "ocr.extract");
@@ -401,7 +413,7 @@ async fn a_bad_token_is_rejected_and_never_registers() {
     );
     assert!(bridge.workers().is_empty());
     assert!(matches!(
-        bridge.dispatch("ocr.extract", json!(null)).await,
+        bridge.dispatch(&demo(), "ocr.extract", json!(null)).await,
         Err(AiError::NoWorker(_))
     ));
 }
@@ -502,7 +514,7 @@ async fn an_unknown_capability_fails_fast_instead_of_waiting() {
     await_workers(&bridge, 1).await;
 
     let err = bridge
-        .dispatch("grade.essay", json!(null))
+        .dispatch(&demo(), "grade.essay", json!(null))
         .await
         .expect_err("nothing serves that capability");
     assert!(
@@ -527,7 +539,7 @@ async fn a_service_error_frame_surfaces_as_a_remote_error() {
     await_workers(&bridge, 1).await;
 
     let err = bridge
-        .dispatch("ocr.extract", json!({ "image": "x" }))
+        .dispatch(&demo(), "ocr.extract", json!({ "image": "x" }))
         .await
         .unwrap_err();
     match &err {
@@ -550,7 +562,7 @@ async fn a_silent_service_times_out_and_gives_the_slot_back() {
     await_workers(&bridge, 1).await;
 
     let err = bridge
-        .dispatch("ocr.extract", json!(null))
+        .dispatch(&demo(), "ocr.extract", json!(null))
         .await
         .unwrap_err();
     assert!(matches!(err, AiError::Timeout(300)), "{err}");
@@ -560,7 +572,7 @@ async fn a_silent_service_times_out_and_gives_the_slot_back() {
     // An abandoned request must not leak the worker's capacity.
     assert_eq!(bridge.workers()[0].inflight, 0);
     // And the worker is immediately usable again.
-    assert!(bridge.dispatch("ocr.extract", json!(null)).await.is_err());
+    assert!(bridge.dispatch(&demo(), "ocr.extract", json!(null)).await.is_err());
 }
 
 #[tokio::test]
@@ -576,12 +588,12 @@ async fn a_per_call_timeout_overrides_the_default() {
 
     // The default deadline is too short for this service...
     assert!(matches!(
-        bridge.dispatch("ocr.extract", json!(null)).await,
+        bridge.dispatch(&demo(), "ocr.extract", json!(null)).await,
         Err(AiError::Timeout(100))
     ));
     // ...but a capability known to be slow can ask for more.
     let answer = bridge
-        .dispatch_with_timeout("ocr.extract", json!("slow"), Duration::from_secs(5))
+        .dispatch_with_timeout(&demo(), "ocr.extract", json!("slow"), Duration::from_secs(5))
         .await
         .expect("the longer deadline held");
     assert_eq!(answer["echo"], "slow");
@@ -597,12 +609,12 @@ async fn a_full_worker_reports_busy_rather_than_queueing() {
 
     let hog = {
         let bridge = bridge.clone();
-        tokio::spawn(async move { bridge.dispatch("ocr.extract", json!(null)).await })
+        tokio::spawn(async move { bridge.dispatch(&demo(), "ocr.extract", json!(null)).await })
     };
     await_inflight(&bridge, 1).await;
 
     let err = bridge
-        .dispatch("ocr.extract", json!(null))
+        .dispatch(&demo(), "ocr.extract", json!(null))
         .await
         .unwrap_err();
     assert!(
@@ -626,7 +638,7 @@ async fn an_answer_carrying_the_wrong_trace_id_is_refused() {
     await_workers(&bridge, 1).await;
 
     let err = bridge
-        .dispatch("ocr.extract", json!(null))
+        .dispatch(&demo(), "ocr.extract", json!(null))
         .await
         .unwrap_err();
     assert!(matches!(err, AiError::IdMismatch { .. }), "{err}");
@@ -641,7 +653,7 @@ async fn a_malformed_answer_is_a_protocol_error_not_a_hang() {
     await_workers(&bridge, 1).await;
 
     let err = bridge
-        .dispatch("ocr.extract", json!(null))
+        .dispatch(&demo(), "ocr.extract", json!(null))
         .await
         .unwrap_err();
     assert!(matches!(err, AiError::Protocol(_)), "{err}");
@@ -655,7 +667,7 @@ async fn a_disconnected_service_is_deregistered() {
     let bridge = bridge().await;
     let service = connect_service(&bridge, hello("ocr", &["ocr.extract"]), Behaviour::Echo).await;
     await_workers(&bridge, 1).await;
-    bridge.dispatch("ocr.extract", json!(null)).await.unwrap();
+    bridge.dispatch(&demo(), "ocr.extract", json!(null)).await.unwrap();
 
     service.conn.close(0u32.into(), b"service shutting down");
     drop(service);
@@ -663,7 +675,7 @@ async fn a_disconnected_service_is_deregistered() {
 
     assert!(!bridge.has_capability("ocr.extract"));
     let err = bridge
-        .dispatch("ocr.extract", json!(null))
+        .dispatch(&demo(), "ocr.extract", json!(null))
         .await
         .unwrap_err();
     assert!(matches!(err, AiError::NoWorker(_)), "{err}");
@@ -683,7 +695,7 @@ async fn a_service_that_reconnects_serves_again() {
     let second = connect_service(&bridge, hello("ocr", &["ocr.extract"]), Behaviour::Echo).await;
     await_workers(&bridge, 1).await;
     let answer = bridge
-        .dispatch("ocr.extract", json!("again"))
+        .dispatch(&demo(), "ocr.extract", json!("again"))
         .await
         .unwrap();
     assert_eq!(answer["echo"], "again");
@@ -703,7 +715,7 @@ async fn losing_one_service_leaves_the_other_serving() {
     await_workers(&bridge, 1).await;
 
     for _ in 0..4 {
-        bridge.dispatch("ocr.extract", json!("x")).await.unwrap();
+        bridge.dispatch(&demo(), "ocr.extract", json!("x")).await.unwrap();
     }
     assert_eq!(
         survivor.seen().len(),
@@ -794,7 +806,7 @@ async fn a_large_payload_survives_the_round_trip_intact() {
 
     let blob: String = std::iter::repeat_n('x', 512 * 1024).collect();
     let answer = bridge
-        .dispatch("ocr.extract", json!({ "image": blob }))
+        .dispatch(&demo(), "ocr.extract", json!({ "image": blob }))
         .await
         .expect("a multi-packet frame round-trips");
     let echoed = answer["echo"]["image"].as_str().expect("string came back");
@@ -1418,8 +1430,14 @@ async fn api_read(conn: &quinn::Connection, request: ApiRequest) -> ApiResponse 
 
 /// A `GET` of `path` as `on_behalf_of` (or as the service itself).
 fn read_of(path: &str, on_behalf_of: Option<&str>) -> ApiRequest {
+    read_of_school(DEMO_SLUG, path, on_behalf_of)
+}
+
+/// The same, naming the school explicitly — the tenancy tests below.
+fn read_of_school(school: &str, path: &str, on_behalf_of: Option<&str>) -> ApiRequest {
     ApiRequest {
         id: format!("trace-{path}"),
+        school: school.to_string(),
         path: path.to_string(),
         query: None,
         on_behalf_of: on_behalf_of.map(str::to_string),
@@ -1711,6 +1729,52 @@ async fn course_note(app: &Router, db: &Database) -> (String, String) {
 }
 
 #[tokio::test]
+async fn an_index_dispatch_names_the_notes_own_school_and_stores_the_answer_there() {
+    // The outbound half of `hab/2`, end to end and across two schools: the
+    // frame the service receives names the school whose teacher wrote the note,
+    // and the answer is stored in *that* school's database — not the control
+    // one, and not the neighbour's. A bridge that carried no school could only
+    // have guessed, and this is the test that would catch the guess.
+    let bridge = bridge().await;
+    let service = connect_service(
+        &bridge,
+        hello("indexer", &[AI_RAG_INDEX_CAPABILITY]),
+        Behaviour::Answer(json!({ "summary": "beta" })),
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+
+    let (app, demo_db, tenants) = common::app_with_ai_tenants(Some(bridge.clone())).await;
+    let beta = Slug::try_new("beta").unwrap();
+    let beta_db = tenants.create(&beta, "Beta College").await.expect("beta");
+
+    let cookie = common::login_as_school(&app, &beta_db, "beta", "ogretmen", "teacher").await;
+    let course = common::create_course(&app, &cookie, "fizik").await;
+    let res = common::send(
+        &app,
+        "POST",
+        "/course-notes",
+        Some(&cookie),
+        Some(json!({ "course": course, "title": "Bölüm 3", "content": "özet" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let note = common::id_of(&res.body);
+
+    let stored = await_outputs(&beta_db, &note).await;
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].get_payload()["summary"], "beta");
+    assert!(
+        outputs(&demo_db, &note).await.is_empty(),
+        "the neighbouring school must hold no row for beta's note"
+    );
+
+    let seen = service.seen();
+    assert_eq!(seen[0].school, "beta", "the frame named the wrong school");
+    assert_eq!(seen[0].payload["course_note"], note);
+}
+
+#[tokio::test]
 async fn a_course_note_is_indexed_and_its_output_stored_with_its_sources() {
     let bridge = bridge().await;
     let service = connect_service(
@@ -1731,6 +1795,7 @@ async fn a_course_note_is_indexed_and_its_output_stored_with_its_sources() {
     // The service saw the note itself, under the documented capability.
     let seen = service.seen();
     assert_eq!(seen[0].capability, AI_RAG_INDEX_CAPABILITY);
+    assert_eq!(seen[0].school, DEMO_SLUG, "the frame names the caller's school");
     assert_eq!(seen[0].payload["course_note"], note);
     assert_eq!(seen[0].payload["title"], "Bölüm 3");
     assert_eq!(seen[0].payload["content"], "özet");
@@ -1876,6 +1941,7 @@ async fn a_service_reads_a_course_note_on_behalf_of_an_enrolled_student() {
 
     let request = ApiRequest {
         id: "trace-course-notes".into(),
+        school: DEMO_SLUG.into(),
         path: "/course-notes".into(),
         query: Some(format!("course={course}")),
         on_behalf_of: Some(student),
@@ -1903,6 +1969,7 @@ async fn a_course_the_student_is_not_in_is_refused_by_the_handler() {
 
     let request = ApiRequest {
         id: "trace-foreign-course".into(),
+        school: DEMO_SLUG.into(),
         path: "/course-notes".into(),
         query: Some(format!("course={foreign}")),
         on_behalf_of: Some(student),
@@ -1922,6 +1989,7 @@ async fn writing_a_course_note_is_refused_before_dispatch() {
 
     let request = ApiRequest {
         id: "trace-post".into(),
+        school: DEMO_SLUG.into(),
         path: "/course-notes".into(),
         query: None,
         on_behalf_of: None,
@@ -1990,8 +2058,14 @@ async fn blob_read(conn: &quinn::Connection, request: BlobRequest) -> (BlobRespo
 }
 
 fn blob_of(file: &str, on_behalf_of: Option<&str>) -> BlobRequest {
+    blob_of_school(DEMO_SLUG, file, on_behalf_of)
+}
+
+/// The same, naming the school explicitly.
+fn blob_of_school(school: &str, file: &str, on_behalf_of: Option<&str>) -> BlobRequest {
     BlobRequest {
         id: format!("trace-blob-{file}"),
+        school: school.to_string(),
         file: file.to_string(),
         on_behalf_of: on_behalf_of.map(str::to_string),
     }
@@ -2033,6 +2107,7 @@ async fn a_service_streams_a_course_note_file_on_behalf_of_an_enrolled_student()
     let (header, bytes) = blob_read(&service.conn, blob_of(&file, Some(&student))).await;
     let BlobResponse::Ok {
         id,
+        school,
         name,
         content_type,
         size,
@@ -2041,6 +2116,7 @@ async fn a_service_streams_a_course_note_file_on_behalf_of_an_enrolled_student()
         panic!("the enrolled student was refused: {}", blob_refusal(header));
     };
     assert_eq!(id, format!("trace-blob-{file}"), "the trace id is echoed");
+    assert_eq!(school, DEMO_SLUG, "the school is echoed too");
     assert_eq!(name, "recap.pdf");
     assert_eq!(content_type, "application/pdf");
     assert_eq!(size as usize, uploaded.len(), "the promised byte count");

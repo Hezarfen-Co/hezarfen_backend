@@ -514,8 +514,8 @@ pub const MAX_PAGE_LIMIT: i64 = 500;
 /// and used as the QUIC ALPN. Bump both together on a breaking frame change:
 /// ALPN mismatch rejects an old service at the TLS handshake, before it can
 /// send a frame we would misparse.
-pub const AI_PROTOCOL: &str = "hab/1";
-pub const AI_ALPN: &[u8] = b"hab/1";
+pub const AI_PROTOCOL: &str = "hab/2";
+pub const AI_ALPN: &[u8] = b"hab/2";
 
 /// Hard ceiling on one AI-bridge frame. Checked against the length prefix
 /// before the body buffer is allocated. Generous because a payload may carry a

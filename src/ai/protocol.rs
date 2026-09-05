@@ -1,4 +1,4 @@
-//! Wire format for the AI bridge ("hab/1" — hezarfen ai bridge).
+//! Wire format for the AI bridge ("hab/2" — hezarfen ai bridge).
 //!
 //! # Shape
 //!
@@ -33,6 +33,19 @@
 //!   The two client-initiated request shapes are told apart by their required
 //!   field: an [`ApiRequest`] has `path`, a [`BlobRequest`] has `file`.
 //!
+//! # School scoping
+//!
+//! Every request frame names its school by slug, and every answer echoes it:
+//! [`Request::school`], [`ApiRequest::school`], [`BlobRequest::school`] and
+//! their responses. The AI fleet is *shared* across the deployment — one
+//! service serves every school — so the school cannot be bound once at
+//! handshake time and [`Hello`] deliberately carries none: a service pinned to
+//! one school would have to be run once per customer. A frame without a
+//! `school` is `malformed`, an unknown slug is `unknown_school`, a suspended
+//! one `school_suspended`; there is no default and no fallback, because a read
+//! answered out of the wrong school's database is the one failure this field
+//! exists to make impossible.
+//!
 //! There is deliberately no correlation-id matching: QUIC stream IDs already
 //! multiplex concurrent requests over the one connection, independently
 //! flow-controlled, with no head-of-line blocking between them. [`Request::id`]
@@ -65,6 +78,10 @@ pub enum FrameError {
 }
 
 /// The service's opening frame on the control stream.
+///
+/// Carries **no** school on purpose: the fleet is shared, so one connection
+/// serves every school on the deployment and each frame names its own (see
+/// this module's "School scoping").
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Hello {
     /// Must equal [`crate::constant::AI_PROTOCOL`]; anything else is rejected
@@ -118,6 +135,9 @@ pub enum RejectCode {
 pub struct Request {
     /// Trace id (ULID). Not used for correlation — the stream does that.
     pub id: String,
+    /// Slug of the school this work belongs to. Required — see this module's
+    /// "School scoping".
+    pub school: String,
     /// Which capability from the worker's [`Hello::capabilities`] to invoke.
     pub capability: String,
     /// How long the backend will wait before abandoning the stream. The
@@ -135,10 +155,14 @@ pub struct Request {
 pub enum Response {
     Ok {
         id: String,
+        /// Echo of [`Request::school`].
+        school: String,
         payload: Value,
     },
     Err {
         id: String,
+        /// Echo of [`Request::school`].
+        school: String,
         /// Service-defined, stable, machine-readable (`"unsupported_image"`).
         code: String,
         message: String,
@@ -151,6 +175,9 @@ pub enum Response {
 pub struct ApiRequest {
     /// Trace id (ULID). Not used for correlation — the stream does that.
     pub id: String,
+    /// Slug of the school to read. Required — see this module's "School
+    /// scoping"; the answer comes out of that school's own database.
+    pub school: String,
     /// Path as the REST API spells it, e.g. `"/users/me"`. No host, no query.
     pub path: String,
     /// Query string without the leading `?`, e.g. `"limit=10&offset=0"`.
@@ -174,13 +201,20 @@ pub struct ApiRequest {
 pub enum ApiResponse {
     Ok {
         id: String,
+        /// Echo of [`ApiRequest::school`].
+        school: String,
         /// HTTP status the router produced.
         status: u16,
         body: Value,
     },
     Err {
         id: String,
-        /// Bridge-defined, stable, machine-readable (`"path_not_allowed"`).
+        /// Echo of the school the frame named — as sent, even when it named no
+        /// school a slug could be made of, so a service can tell which of its
+        /// in-flight reads was refused.
+        school: String,
+        /// Bridge-defined, stable, machine-readable (`"path_not_allowed"`,
+        /// `"unknown_school"`, `"school_suspended"`).
         code: String,
         message: String,
     },
@@ -193,6 +227,9 @@ pub enum ApiResponse {
 pub struct BlobRequest {
     /// Trace id (ULID). Not used for correlation — the stream does that.
     pub id: String,
+    /// Slug of the school the file belongs to. Required — see this module's
+    /// "School scoping"; the bytes come out of that school's blob directory.
+    pub school: String,
     /// The `course_note_file` record key, as `GET /course-notes/{id}/files`
     /// and the `rag.index` payload both publish it.
     pub file: String,
@@ -210,6 +247,8 @@ pub struct BlobRequest {
 pub enum BlobResponse {
     Ok {
         id: String,
+        /// Echo of [`BlobRequest::school`].
+        school: String,
         name: String,
         content_type: String,
         /// Exactly how many raw bytes follow this frame.
@@ -217,6 +256,8 @@ pub enum BlobResponse {
     },
     Err {
         id: String,
+        /// Echo of the school the frame named, as sent.
+        school: String,
         /// Bridge-defined, stable, machine-readable (`"not_found"`).
         code: String,
         message: String,
@@ -313,10 +354,12 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(64 * 1024);
         let a = Response::Ok {
             id: "a".into(),
+            school: "demo".into(),
             payload: json!({ "n": 1 }),
         };
         let b = Response::Err {
             id: "b".into(),
+            school: "demo".into(),
             code: "bad_input".into(),
             message: "nope".into(),
         };
@@ -394,6 +437,7 @@ mod tests {
         assert_eq!(rejected["code"], "unauthorized");
         let ok = serde_json::to_value(Response::Ok {
             id: "1".into(),
+            school: "demo".into(),
             payload: json!(null),
         })
         .unwrap();
@@ -406,6 +450,7 @@ mod tests {
         // The tag is `outcome`, not `status` — `status` is the HTTP code.
         let ok = serde_json::to_value(ApiResponse::Ok {
             id: "1".into(),
+            school: "demo".into(),
             status: 404,
             body: json!(null),
         })
@@ -414,6 +459,7 @@ mod tests {
         assert_eq!(ok["status"], 404);
         let err = serde_json::to_value(ApiResponse::Err {
             id: "1".into(),
+            school: "demo".into(),
             code: "path_not_allowed".into(),
             message: "nope".into(),
         })
@@ -423,18 +469,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_api_request_needs_only_an_id_and_a_path() {
+    async fn an_api_request_needs_only_an_id_a_school_and_a_path() {
         let bare: ApiRequest = serde_json::from_value(json!({
             "id": "01J",
+            "school": "demo",
             "path": "/users/me",
         }))
         .unwrap();
         assert_eq!(bare.query, None);
         assert_eq!(bare.on_behalf_of, None);
         assert_eq!(bare.method, None);
+        // The school is required, not defaulted: a frame that names none has
+        // no school to fall back on and must not parse.
+        assert!(
+            serde_json::from_value::<ApiRequest>(json!({ "id": "01J", "path": "/users/me" }))
+                .is_err()
+        );
 
         let full = ApiRequest {
             id: "01J".into(),
+            school: "demo".into(),
             path: "/notes".into(),
             query: Some("limit=10".into()),
             on_behalf_of: Some("user:abc".into()),
@@ -442,6 +496,7 @@ mod tests {
             method: Some("GET".into()),
         };
         let raw = serde_json::to_value(&full).unwrap();
+        assert_eq!(raw["school"], "demo");
         assert_eq!(raw["path"], "/notes");
         assert_eq!(raw["query"], "limit=10");
         assert_eq!(raw["on_behalf_of"], "user:abc");
@@ -456,6 +511,7 @@ mod tests {
         // carries no HTTP status for it to collide with.
         let ok = serde_json::to_value(BlobResponse::Ok {
             id: "1".into(),
+            school: "demo".into(),
             name: "recap.pdf".into(),
             content_type: "application/pdf".into(),
             size: 204_800,
@@ -465,6 +521,7 @@ mod tests {
         assert_eq!(ok["size"], 204_800);
         let err = serde_json::to_value(BlobResponse::Err {
             id: "1".into(),
+            school: "demo".into(),
             code: "not_found".into(),
             message: "nope".into(),
         })
@@ -475,14 +532,22 @@ mod tests {
         // `file` is what tells a blob request apart from an api read, so it is
         // required; `on_behalf_of` is the only optional field.
         let bare: BlobRequest = serde_json::from_value(json!({
-            "id": "01J", "file": "01FILE",
+            "id": "01J", "school": "demo", "file": "01FILE",
         }))
         .unwrap();
         assert_eq!(bare.on_behalf_of, None);
-        assert!(serde_json::from_value::<BlobRequest>(json!({ "id": "01J" })).is_err());
+        assert!(serde_json::from_value::<BlobRequest>(json!({ "id": "01J", "school": "demo" }))
+            .is_err());
+        // The school is required here too.
+        assert!(
+            serde_json::from_value::<BlobRequest>(json!({ "id": "01J", "file": "01FILE" })).is_err()
+        );
         // And the two shapes never parse as each other.
         assert!(
-            serde_json::from_value::<ApiRequest>(json!({ "id": "01J", "file": "01FILE" })).is_err()
+            serde_json::from_value::<ApiRequest>(json!({
+                "id": "01J", "school": "demo", "file": "01FILE",
+            }))
+            .is_err()
         );
     }
 
