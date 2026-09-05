@@ -47,7 +47,7 @@ async fn upload_avatar(
 /// by every app in this binary, so a payload no other test writes is the only
 /// concurrency-safe way to count one test's own blobs.
 fn blobs_holding(bytes: &[u8]) -> usize {
-    std::fs::read_dir(common::files_dir())
+    std::fs::read_dir(common::blob_dir())
         .expect("files dir")
         .filter_map(|entry| std::fs::read(entry.expect("dir entry").path()).ok())
         .filter(|found| found == bytes)

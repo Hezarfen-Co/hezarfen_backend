@@ -35,6 +35,8 @@ pub mod terms;
 pub mod users;
 pub mod work;
 
+pub mod tenant_state;
+
 mod dto;
 // `pub(crate)` for `AiPrincipal`: the AI bridge injects it as an extension on
 // the requests it dispatches into the router (see `ai::server`).
@@ -46,7 +48,10 @@ pub use dto::{
     CourseResponse, ExamResponse, HomeworkResponse, PersonRef, SessionResponse, SubjectResponse,
     UserResponse, course_people, person_map,
 };
-pub use extractor::{CurrentUser, RequireAdmin, RequireManager, RequireStudent, RequireTeacher};
+pub use extractor::{
+    BUILDER_COOKIE_PREFIX, CurrentUser, RequireAdmin, RequireBuilder, RequireManager,
+    RequireStudent, RequireTeacher,
+};
 pub(crate) use image::{ImageUpload, read_image_upload, store_blob};
 pub use page::{Page, PageParams, Scheduled, WindowParams, paginate};
 
@@ -185,6 +190,20 @@ pub(crate) fn check_not_past(
 /// named by the row's server-generated key.
 pub(crate) fn blob_path(files_path: &FsPath, key: &str) -> PathBuf {
     files_path.join(key)
+}
+
+/// Make sure a school's blob directory exists before writing into it.
+///
+/// `FILES_PATH` is the deployment root and `main` creates only that; each
+/// school's subdirectory appears the first time that school stores a file, so
+/// nothing has to be provisioned when a school is created.
+pub(crate) async fn ensure_files_dir(files_path: &FsPath) -> Result<(), AppError> {
+    tokio::fs::create_dir_all(files_path).await.map_err(|err| {
+        AppError::Internal(format!(
+            "failed to create the files directory {}: {err}",
+            files_path.display()
+        ))
+    })
 }
 
 /// Best-effort blob removal after its row is gone. Failure only strands an

@@ -17,6 +17,9 @@ pub struct Config {
     pub db_user: String,
     pub db_pass: String,
     pub db_ns: String,
+    /// The **control** database inside `db_ns` (`DB_DATABASE`): the school
+    /// registry and the builder accounts. Every school gets a database of its
+    /// own, named by its slug.
     pub db_name: String,
     /// Directory for uploaded note-file blobs (`FILES_PATH`).
     pub files_path: String,
@@ -31,11 +34,13 @@ pub struct Config {
     /// [`RateLimitConfig`], which is the per-IP middleware bundle: this tier is
     /// keyed by user and is enforced inside the handler.
     pub chatbot_per_minute: u32,
-    /// Startup admin seed (`ADMIN_USERNAME` + `ADMIN_PASSWORD`). When both are
-    /// set, an admin account with these credentials is created at boot if the
-    /// username doesn't exist yet. Blank values count as unset.
-    pub admin_username: Option<String>,
-    pub admin_password: Option<String>,
+    /// Startup builder seed (`BUILDER_USERNAME` + `BUILDER_PASSWORD`). When
+    /// both are set, a builder account with these credentials is created in the
+    /// control database at boot if the username doesn't exist yet. Blank values
+    /// count as unset. A builder manages schools; it is not a user of any of
+    /// them.
+    pub builder_username: Option<String>,
+    pub builder_password: Option<String>,
     /// AI bridge listen address (`AI_QUIC_ADDR`, e.g. `0.0.0.0:8090`). Unset
     /// leaves the bridge off entirely: the API runs exactly as before and any
     /// AI-backed feature reports that no service is connected.
@@ -62,7 +67,7 @@ impl Config {
             db_user: env::var("DB_USER").unwrap_or_else(|_| "root".into()),
             db_pass: env::var("DB_PASS").unwrap_or_else(|_| "root".into()),
             db_ns: env::var("DB_NAMESPACE").unwrap_or_else(|_| "hezarfen".into()),
-            db_name: env::var("DB_DATABASE").unwrap_or_else(|_| "hezarfen".into()),
+            db_name: env::var("DB_DATABASE").unwrap_or_else(|_| "control".into()),
             files_path: env::var("FILES_PATH").unwrap_or_else(|_| "./data/files".into()),
             cookie_secure: parse_flag(env::var("COOKIE_SECURE").ok()),
             rate_limit: RateLimitConfig {
@@ -80,8 +85,8 @@ impl Config {
                 env::var("RATE_LIMIT_CHATBOT_PER_MINUTE").ok(),
                 DEFAULT_CHATBOT_RATE_LIMIT,
             ),
-            admin_username: parse_optional(env::var("ADMIN_USERNAME").ok()),
-            admin_password: parse_optional(env::var("ADMIN_PASSWORD").ok()),
+            builder_username: parse_optional(env::var("BUILDER_USERNAME").ok()),
+            builder_password: parse_optional(env::var("BUILDER_PASSWORD").ok()),
             ai_quic_addr: parse_optional(env::var("AI_QUIC_ADDR").ok()),
             ai_shared_token: parse_optional(env::var("AI_SHARED_TOKEN").ok()),
             ai_tls_cert: parse_optional(env::var("AI_TLS_CERT").ok()),

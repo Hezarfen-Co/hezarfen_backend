@@ -2,11 +2,14 @@ use axum::extract::{FromRef, FromRequestParts};
 use axum::http::request::Parts;
 use axum_extra::extract::CookieJar;
 
+use crate::database::Database;
+use crate::domain::builder::{Builder, BuilderSession};
 use crate::domain::role::Role;
 use crate::domain::session::Session;
 use crate::domain::user::User;
 use crate::error::AppError;
 use crate::state::AppState;
+use crate::web::tenant_state::{resolve_tenant, split_cookie};
 
 /// A principal injected as a request extension by the AI bridge, for the
 /// synthetic requests it dispatches into the router. Extensions cannot be set
@@ -18,6 +21,11 @@ pub(crate) struct AiPrincipal(pub User);
 /// [`AiPrincipal`] extension wins over the cookie. The role is read fresh from
 /// the row on every request, so a role change takes effect on the user's next
 /// call — no re-login required.
+///
+/// The school is resolved by the very helper `State<AppState>` uses
+/// ([`resolve_tenant`]), so the principal and the rows a handler then reads can
+/// never come from two different databases. A `builder.<token>` cookie names no
+/// school and so cannot reach here at all.
 async fn authed_user<S>(parts: &mut Parts, state: &S) -> Result<User, AppError>
 where
     S: Send + Sync,
@@ -27,24 +35,22 @@ where
         return Ok(principal.0.clone());
     }
 
+    let (_, db) = resolve_tenant(parts, state).await?;
+
     let jar = CookieJar::from_request_parts(parts, state)
         .await
         .map_err(|_| AppError::Unauthorized)?;
-    let token = jar
-        .get("session")
-        .map(|cookie| cookie.value().to_owned())
-        .ok_or(AppError::Unauthorized)?;
+    let cookie = jar.get("session").ok_or(AppError::Unauthorized)?;
+    let (_, token) = split_cookie(cookie.value()).ok_or(AppError::Unauthorized)?;
 
-    let app = AppState::from_ref(state);
-
-    let session = Session::find_by_token(&token, &app.db)
+    let session = Session::find_by_token(token, &db)
         .await?
         .ok_or(AppError::Unauthorized)?;
     if session.is_expired() {
         return Err(AppError::Unauthorized);
     }
 
-    User::read(session.user(), &app.db)
+    User::read(session.user(), &db)
         .await?
         .ok_or(AppError::Unauthorized)
 }
@@ -144,3 +150,45 @@ where
         Ok(RequireAdmin(user))
     }
 }
+
+/// The deployment operator behind a `builder.<token>` cookie, resolved against
+/// the **control** database. Any school cookie is `401` here, and this cookie
+/// is `401` on every school surface (`resolve_tenant` refuses the `builder`
+/// prefix as a slug) — the two principals share a cookie name and nothing else.
+pub struct RequireBuilder(pub Builder);
+
+impl<S> FromRequestParts<S> for RequireBuilder
+where
+    S: Send + Sync,
+    AppState: FromRef<S>,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let jar = CookieJar::from_request_parts(parts, state)
+            .await
+            .map_err(|_| AppError::Unauthorized)?;
+        let cookie = jar.get("session").ok_or(AppError::Unauthorized)?;
+        let (prefix, token) = split_cookie(cookie.value()).ok_or(AppError::Unauthorized)?;
+        if prefix != BUILDER_COOKIE_PREFIX {
+            return Err(AppError::Unauthorized);
+        }
+
+        let control: Database = AppState::from_ref(state).tenants.control().clone();
+        let session = BuilderSession::find_by_token(token, &control)
+            .await?
+            .ok_or(AppError::Unauthorized)?;
+        if session.is_expired() {
+            return Err(AppError::Unauthorized);
+        }
+        Ok(RequireBuilder(
+            Builder::read(session.builder(), &control)
+                .await?
+                .ok_or(AppError::Unauthorized)?,
+        ))
+    }
+}
+
+/// The cookie prefix a builder session carries in place of a school slug.
+/// `Slug::try_new` reserves this word, so it can never also name a school.
+pub const BUILDER_COOKIE_PREFIX: &str = "builder";

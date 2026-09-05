@@ -29,9 +29,11 @@ use crate::domain::course_note::CourseNote;
 use crate::domain::course_note_file::{CourseNoteFile, CourseNoteFileId};
 use crate::domain::user::{User, UserId};
 use crate::state::DbHealth;
+use crate::tenant::{Slug, Tenants};
 use crate::web::blob_path;
 use crate::web::courses::can_view_course;
 use crate::web::extractor::AiPrincipal;
+use crate::web::tenant_state::{TenantExt, school_files_path};
 
 /// What the bridge needs to come up.
 #[derive(Clone, Debug)]
@@ -48,15 +50,41 @@ pub struct BridgeConfig {
 }
 
 /// What an api read needs to be answered: the router to dispatch into, the
-/// database the acting principal is loaded from, and the liveness flag that
+/// school the acting principal is loaded from, and the liveness flag that
 /// stands in for the HTTP db guard this path bypasses.
 struct ApiHandle {
     router: axum::Router,
-    db: Database,
+    tenants: Tenants,
+    /// The one school this bridge serves.
+    ///
+    /// corner-cut: `hab/1` frames carry no school, so the reverse api-read path
+    /// is pinned to [`crate::tenant::DEMO_SLUG`] — a deployment whose schools
+    /// are named anything else answers `unavailable` to every service read.
+    /// The upgrade is `hab/2`: put the school on `Hello`/`ApiRequest` and
+    /// resolve it per request. Nothing else about the bridge is single-school —
+    /// the outbound chatbot dispatch never touches a database.
+    slug: Slug,
     db_up: DbHealth,
-    /// Where course-note blobs live, for the byte stream — the same directory
-    /// `GET /course-notes/{id}/files/{file_id}` serves from.
+    /// Where uploaded blobs live — the deployment root; the school's own
+    /// directory is [`school_files_path`] of it.
     files_path: std::path::PathBuf,
+}
+
+impl ApiHandle {
+    /// The school database this bridge reads, or the refusal a service gets.
+    async fn db(&self) -> Result<Database, (&'static str, String)> {
+        self.tenants.get(&self.slug).await.map_err(|err| {
+            (
+                "unavailable",
+                format!("the `{}` school is not reachable: {err}", self.slug),
+            )
+        })
+    }
+
+    /// That school's blob directory.
+    fn files_dir(&self) -> std::path::PathBuf {
+        school_files_path(&self.files_path, &self.slug)
+    }
 }
 
 struct Inner {
@@ -240,7 +268,7 @@ impl AiBridge {
     pub(crate) fn arm_api(
         &self,
         router: axum::Router,
-        db: Database,
+        tenants: Tenants,
         db_up: DbHealth,
         files_path: std::path::PathBuf,
     ) {
@@ -249,7 +277,8 @@ impl AiBridge {
             .api
             .set(ApiHandle {
                 router,
-                db,
+                tenants,
+                slug: Slug::try_new(crate::tenant::DEMO_SLUG).expect("the demo slug is a slug"),
                 db_up,
                 files_path,
             })
@@ -468,6 +497,7 @@ async fn open_blob(
             "the database socket is down — retry".to_string(),
         ));
     }
+    let db = api.db().await?;
     let user = principal(api, request.on_behalf_of.as_deref()).await?;
 
     let missing = || {
@@ -477,19 +507,19 @@ async fn open_blob(
         )
     };
     let unavailable = |e: crate::error::AppError| ("unavailable", e.to_string());
-    let file = CourseNoteFile::read(&CourseNoteFileId::from_key(&request.file), &api.db)
+    let file = CourseNoteFile::read(&CourseNoteFileId::from_key(&request.file), &db)
         .await
         .map_err(unavailable)?
         .ok_or_else(missing)?;
-    let note = CourseNote::read(file.get_course_note(), &api.db)
+    let note = CourseNote::read(file.get_course_note(), &db)
         .await
         .map_err(unavailable)?
         .ok_or_else(missing)?;
-    let course = Course::read(note.get_course(), &api.db)
+    let course = Course::read(note.get_course(), &db)
         .await
         .map_err(unavailable)?
         .ok_or_else(missing)?;
-    if !can_view_course(&course, &user, &api.db)
+    if !can_view_course(&course, &user, &db)
         .await
         .map_err(unavailable)?
     {
@@ -504,7 +534,7 @@ async fn open_blob(
 
     // The row exists but its blob does not: server-side damage (a lost volume
     // path), exactly as `download_file` reads it — not the service's `404`.
-    let path = blob_path(&api.files_path, file.get_id().key());
+    let path = blob_path(&api.files_dir(), file.get_id().key());
     let handle = tokio::fs::File::open(&path).await.map_err(|e| {
         (
             "unavailable",
@@ -548,7 +578,7 @@ async fn principal(
     // Both the bare key (`abc`, as a REST path spells it) and the record form
     // (`user:abc`) are accepted.
     let key = who.strip_prefix("user:").unwrap_or(who);
-    User::read(&UserId::from_key(key), &api.db)
+    User::read(&UserId::from_key(key), &api.db().await?)
         .await
         .map_err(|e| ("unavailable", format!("could not load `{who}`: {e}")))?
         .ok_or_else(|| ("unknown_user", format!("no user `{who}`")))
@@ -627,6 +657,7 @@ async fn dispatch_api(
 
     // The role itself is re-read again by the extractor on the dispatched
     // request; see [`principal`] for why it is never taken from the frame.
+    let db = api.db().await?;
     let user = principal(api, on_behalf_of.as_deref()).await?;
 
     let target = match query.as_deref() {
@@ -646,6 +677,12 @@ async fn dispatch_api(
     // An extension cannot be set from outside the process, which is what makes
     // this principal unforgeable over HTTP (see [`AiPrincipal`]).
     dispatched.extensions_mut().insert(AiPrincipal(user));
+    // The dispatched request carries no cookie, so the school is handed over
+    // in the extension the shadow `State` reads first.
+    dispatched.extensions_mut().insert(TenantExt {
+        slug: api.slug.clone(),
+        db,
+    });
 
     let response = tokio::time::timeout(
         Duration::from_secs(REQUEST_TIMEOUT_SECS),
@@ -859,6 +896,7 @@ mod tests {
         refuse_before_dispatch,
     };
     use crate::ai::protocol::read_frame;
+    use crate::tenant::Slug;
 
     /// An armed handle serving `router`. The database is never touched by these
     /// reads (nobody is named, so the principal is synthetic), but the handle
@@ -866,7 +904,10 @@ mod tests {
     async fn armed(router: axum::Router) -> ApiHandle {
         ApiHandle {
             router,
-            db: crate::database::init_mem().await.expect("in-memory db"),
+            tenants: crate::database::init_mem_tenants()
+                .await
+                .expect("in-memory deployment"),
+            slug: Slug::try_new(crate::tenant::DEMO_SLUG).unwrap(),
             db_up: Default::default(),
             files_path: std::env::temp_dir(),
         }

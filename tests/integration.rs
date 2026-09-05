@@ -10,6 +10,7 @@ use common::{
     create_subject, enroll, id_of, login, login_as, me_id, mem_app, send, set_role, unenroll,
     upload_course_note_file,
 };
+use hezarfen_backend::build_router;
 use hezarfen_backend::constant::{
     BANK_VISIBILITY_SCHOOL, MAX_BOARD_STROKES, MAX_BOARDS_PER_CREATOR, MAX_COURSE_NOTE_FILES,
     MAX_EPOCH_STROKES, MAX_FEE_PLAN_ASSIGN_STUDENTS,
@@ -28,7 +29,6 @@ use hezarfen_backend::domain::session::Session;
 use hezarfen_backend::domain::timestamp::Timestamp;
 use hezarfen_backend::domain::user::{Password, User, UserId, Username};
 use hezarfen_backend::state::AppState;
-use hezarfen_backend::{build_router, database};
 use serde_json::json;
 use tower::ServiceExt;
 
@@ -150,7 +150,8 @@ async fn limits_publishes_the_bounds_the_api_actually_enforces() {
     let max = res.body["user"]["max_username_len"]
         .as_u64()
         .expect("max_username_len is an integer") as usize;
-    let too_long = json!({ "username": "a".repeat(max + 1), "password": "secret1" });
+    let too_long =
+        json!({ "school": "demo", "username": "a".repeat(max + 1), "password": "secret1" });
     let res = send(&app, "POST", "/auth/register", None, Some(too_long)).await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST);
 }
@@ -162,8 +163,10 @@ async fn limits_still_answers_while_the_database_is_down() {
     // row, so the outage guard must let it through — otherwise the client
     // falls back to the hard-coded copy this endpoint exists to remove.
     let db_up = hezarfen_backend::state::DbHealth::default();
+    let (tenants, _db) = common::mem_deployment().await;
     let app = build_router(AppState {
-        db: database::init_mem().await.expect("in-memory db"),
+        db: tenants.control().clone(),
+        tenants,
         files_path: tempfile::tempdir().expect("files dir").keep(),
         cookie_secure: false,
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
@@ -190,25 +193,25 @@ async fn register_validates_input() {
     let app = mem_app().await;
 
     // Password too short -> 400.
-    let short = json!({ "username": "bob", "password": "123" });
+    let short = json!({ "school": "demo", "username": "bob", "password": "123" });
     let res = send(&app, "POST", "/auth/register", None, Some(short)).await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST);
 
     // Blank username -> 400.
-    let blank = json!({ "username": "   ", "password": "secret1" });
+    let blank = json!({ "school": "demo", "username": "   ", "password": "secret1" });
     let res = send(&app, "POST", "/auth/register", None, Some(blank)).await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST);
 
     // Uppercase anywhere in the username -> 400.
     for bad in ["Bob", "bOb", "BOB"] {
-        let upper = json!({ "username": bad, "password": "secret1" });
+        let upper = json!({ "school": "demo", "username": bad, "password": "secret1" });
         let res = send(&app, "POST", "/auth/register", None, Some(upper)).await;
         assert_eq!(res.status, StatusCode::BAD_REQUEST, "{bad} accepted");
     }
 
     // Username must start and end with a letter or digit -> 400.
     for bad in ["-bob", "bob-", "_bob", "bob_", ".bob"] {
-        let edge = json!({ "username": bad, "password": "secret1" });
+        let edge = json!({ "school": "demo", "username": bad, "password": "secret1" });
         let res = send(&app, "POST", "/auth/register", None, Some(edge)).await;
         assert_eq!(res.status, StatusCode::BAD_REQUEST, "{bad} accepted");
     }
@@ -223,26 +226,26 @@ async fn register_validates_input() {
         "a/b",
         "a\"b",
     ] {
-        let ugly = json!({ "username": bad, "password": "secret1" });
+        let ugly = json!({ "school": "demo", "username": bad, "password": "secret1" });
         let res = send(&app, "POST", "/auth/register", None, Some(ugly)).await;
         assert_eq!(res.status, StatusCode::BAD_REQUEST, "{bad:?} accepted");
     }
 
     // Consecutive separators -> 400.
     for bad in ["a--b", "a..b", "a__b", "a.-b"] {
-        let doubled = json!({ "username": bad, "password": "secret1" });
+        let doubled = json!({ "school": "demo", "username": bad, "password": "secret1" });
         let res = send(&app, "POST", "/auth/register", None, Some(doubled)).await;
         assert_eq!(res.status, StatusCode::BAD_REQUEST, "{bad} accepted");
     }
 
     // Single separators between alphanumerics are fine -> 201.
-    let dotted = json!({ "username": "ali.k_1-b", "password": "secret1" });
+    let dotted = json!({ "school": "demo", "username": "ali.k_1-b", "password": "secret1" });
     let res = send(&app, "POST", "/auth/register", None, Some(dotted)).await;
     assert_eq!(res.status, StatusCode::CREATED);
     assert_eq!(res.body["username"], "ali.k_1-b");
 
     // Valid -> 201, no password echoed back, defaults to the student role.
-    let ok = json!({ "username": "bob", "password": "secret1" });
+    let ok = json!({ "school": "demo", "username": "bob", "password": "secret1" });
     let res = send(&app, "POST", "/auth/register", None, Some(ok.clone())).await;
     assert_eq!(res.status, StatusCode::CREATED);
     assert_eq!(res.body["username"], "bob");
@@ -253,7 +256,7 @@ async fn register_validates_input() {
     // deliberately indistinguishable — see tests/auth_enumeration.rs), but the
     // write is still rejected: the original password keeps working and the
     // second one never becomes valid.
-    let dup = json!({ "username": "bob", "password": "hijack1" });
+    let dup = json!({ "school": "demo", "username": "bob", "password": "hijack1" });
     let res = send(&app, "POST", "/auth/register", None, Some(dup.clone())).await;
     assert_eq!(res.status, StatusCode::CREATED);
     let res = send(&app, "POST", "/auth/login", None, Some(ok)).await;
@@ -284,7 +287,7 @@ async fn register_rejects_reserved_usernames() {
         "moderator",
         "staff",
     ] {
-        let creds = json!({ "username": name, "password": "secret1" });
+        let creds = json!({ "school": "demo", "username": name, "password": "secret1" });
         let res = send(&app, "POST", "/auth/register", None, Some(creds)).await;
         assert_eq!(res.status, StatusCode::BAD_REQUEST, "{name} accepted");
         let msg = res.body["error"].as_str().unwrap_or_default();
@@ -298,7 +301,7 @@ async fn register_rejects_reserved_usernames() {
     // (created through `ensure_admin`, not `/auth/register`) still logs in.
     // Covered by the admin bootstrap tests; here just prove a reserved name
     // is not permanently poisoned for login by the register-level check.
-    let creds = json!({ "username": "admin", "password": "wrong" });
+    let creds = json!({ "school": "demo", "username": "admin", "password": "wrong" });
     let res = send(&app, "POST", "/auth/login", None, Some(creds)).await;
     assert_eq!(res.status, StatusCode::UNAUTHORIZED); // bad credentials, not "reserved"
 }
@@ -311,7 +314,7 @@ async fn login_rejects_bad_credentials() {
         "POST",
         "/auth/register",
         None,
-        Some(json!({ "username": "kate", "password": "secret1" })),
+        Some(json!({ "school": "demo", "username": "kate", "password": "secret1" })),
     )
     .await;
 
@@ -321,7 +324,7 @@ async fn login_rejects_bad_credentials() {
         "POST",
         "/auth/login",
         None,
-        Some(json!({ "username": "kate", "password": "wrong" })),
+        Some(json!({ "school": "demo", "username": "kate", "password": "wrong" })),
     )
     .await;
     assert_eq!(res.status, StatusCode::UNAUTHORIZED);
@@ -332,7 +335,7 @@ async fn login_rejects_bad_credentials() {
         "POST",
         "/auth/login",
         None,
-        Some(json!({ "username": "ghost", "password": "secret1" })),
+        Some(json!({ "school": "demo", "username": "ghost", "password": "secret1" })),
     )
     .await;
     assert_eq!(res.status, StatusCode::UNAUTHORIZED);
@@ -627,7 +630,7 @@ async fn a_demotion_to_parent_strands_no_note_and_no_blob() {
     .await;
     assert_eq!(up.status, StatusCode::CREATED);
     let file_id = id_of(&up.body);
-    let blob = common::files_dir().join(&file_id);
+    let blob = common::blob_dir().join(&file_id);
     assert!(blob.exists(), "the upload must have written a blob");
 
     // Demote through the real route, not a seeded role.
@@ -745,7 +748,7 @@ async fn a_demotion_to_parent_strands_no_note_and_no_blob() {
         StatusCode::NO_CONTENT
     );
     assert!(!blob.exists(), "deleting a file must unlink its blob");
-    let extra_blob = common::files_dir().join(id_of(&extra.body));
+    let extra_blob = common::blob_dir().join(id_of(&extra.body));
     assert_eq!(
         send(
             &app,
@@ -959,7 +962,7 @@ async fn note_files_upload_download_delete_roundtrip() {
         StatusCode::NOT_FOUND
     );
     assert!(
-        !common::files_dir().join(&file_id).exists(),
+        !common::blob_dir().join(&file_id).exists(),
         "blob must be unlinked with its row"
     );
 }
@@ -1238,13 +1241,13 @@ async fn malformed_json_bodies_answer_422_across_every_extractor_shape() {
         (
             "/auth/register",
             None,
-            r#"{"username": 5, "password": "secret1"}"#,
+            r#"{"school": "demo", "username": 5, "password": "secret1"}"#,
             "plain Json, type mismatch",
         ),
         (
             "/auth/register",
             None,
-            r#"{"username": "veli"}"#,
+            r#"{"school": "demo", "username": "veli"}"#,
             "plain Json, missing required field",
         ),
         (
@@ -1288,7 +1291,7 @@ async fn malformed_json_bodies_answer_422_across_every_extractor_shape() {
     for (body, why) in [
         ("not json at all", "unparseable JSON"),
         (
-            r#"{"username": "a", "password": "secret1"}"#,
+            r#"{"school": "demo", "username": "a", "password": "secret1"}"#,
             "well-typed value refused by a domain rule",
         ),
     ] {
@@ -1397,7 +1400,7 @@ async fn deleting_a_note_removes_its_files() {
     let left: Vec<serde_json::Value> = rows.take(0).unwrap();
     assert!(left.is_empty(), "note_file rows must cascade: {left:?}");
     assert!(
-        !common::files_dir().join(&file_id).exists(),
+        !common::blob_dir().join(&file_id).exists(),
         "blob must be unlinked when its note dies"
     );
 }
@@ -5924,7 +5927,7 @@ async fn expired_session_is_unauthorized_before_any_purge() {
             user = (SELECT VALUE user FROM ONLY session WHERE token = $live LIMIT 1), \
             token = 'stale-token', expires_at = 1",
     )
-    .bind(("live", ali.trim_start_matches("session=").to_string()))
+    .bind(("live", common::cookie_token(&ali).to_string()))
     .await
     .unwrap()
     .check()
@@ -5959,7 +5962,9 @@ async fn padded_usernames_are_canonicalized_not_distinct_accounts() {
         "POST",
         "/auth/register",
         None,
-        Some(json!({ "username": "ali", "password": "secret1" })),
+        Some(
+            json!({ "school": "demo", "school": "demo", "username": "ali", "password": "secret1" }),
+        ),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED);
@@ -5974,7 +5979,7 @@ async fn padded_usernames_are_canonicalized_not_distinct_accounts() {
             "POST",
             "/auth/register",
             None,
-            Some(json!({ "username": spoof, "password": "spoof1" })),
+            Some(json!({ "school": "demo", "username": spoof, "password": "spoof1" })),
         )
         .await;
         assert_eq!(res.status, StatusCode::CREATED, "{spoof:?}");
@@ -6008,7 +6013,7 @@ async fn padded_usernames_are_canonicalized_not_distinct_accounts() {
             "POST",
             "/auth/login",
             None,
-            Some(json!({ "username": attempt, "password": "secret1" })),
+            Some(json!({ "school": "demo", "username": attempt, "password": "secret1" })),
         )
         .await;
         assert_eq!(res.status, StatusCode::OK, "login as {attempt:?}");
@@ -6017,7 +6022,7 @@ async fn padded_usernames_are_canonicalized_not_distinct_accounts() {
             "POST",
             "/auth/login",
             None,
-            Some(json!({ "username": attempt, "password": "spoof1" })),
+            Some(json!({ "school": "demo", "username": attempt, "password": "spoof1" })),
         )
         .await;
         assert_eq!(
@@ -6033,7 +6038,7 @@ async fn padded_usernames_are_canonicalized_not_distinct_accounts() {
         "POST",
         "/auth/register",
         None,
-        Some(json!({ "username": " veli ", "password": "secret1" })),
+        Some(json!({ "school": "demo", "username": " veli ", "password": "secret1" })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED);
@@ -6046,7 +6051,7 @@ async fn padded_usernames_are_canonicalized_not_distinct_accounts() {
             "POST",
             "/auth/login",
             None,
-            Some(json!({ "username": attempt, "password": "secret1" })),
+            Some(json!({ "school": "demo", "username": attempt, "password": "secret1" })),
         )
         .await;
         assert_eq!(res.status, StatusCode::OK, "login as {attempt:?}");
@@ -6340,7 +6345,7 @@ async fn concurrent_duplicate_registrations_conflict_not_500() {
                 "POST",
                 "/auth/register",
                 None,
-                Some(json!({ "username": "dup", "password": "secret1" })),
+                Some(json!({ "school": "demo", "username": "dup", "password": "secret1" })),
             )
             .await
             .status
@@ -6378,7 +6383,7 @@ async fn concurrent_duplicate_registrations_conflict_not_500() {
         "POST",
         "/auth/register",
         None,
-        Some(json!({ "username": "dup", "password": "hijack1" })),
+        Some(json!({ "school": "demo", "username": "dup", "password": "hijack1" })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED);
@@ -6387,7 +6392,7 @@ async fn concurrent_duplicate_registrations_conflict_not_500() {
         "POST",
         "/auth/login",
         None,
-        Some(json!({ "username": "dup", "password": "secret1" })),
+        Some(json!({ "school": "demo", "username": "dup", "password": "secret1" })),
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "the winning password broke");
@@ -6396,7 +6401,7 @@ async fn concurrent_duplicate_registrations_conflict_not_500() {
         "POST",
         "/auth/login",
         None,
-        Some(json!({ "username": "dup", "password": "hijack1" })),
+        Some(json!({ "school": "demo", "username": "dup", "password": "hijack1" })),
     )
     .await;
     assert_eq!(
@@ -6465,7 +6470,7 @@ async fn child_lists_of_missing_parents_are_404() {
 #[tokio::test]
 async fn session_cookie_secure_attribute_follows_config() {
     async fn login_set_cookie(app: &axum::Router) -> String {
-        let creds = json!({ "username": "ada", "password": "secret1" });
+        let creds = json!({ "school": "demo", "username": "ada", "password": "secret1" });
         assert_eq!(
             send(app, "POST", "/auth/register", None, Some(creds.clone()))
                 .await
@@ -6507,9 +6512,10 @@ async fn session_cookie_secure_attribute_follows_config() {
     );
 
     // With the flag on: Secure present.
-    let db = database::init_mem().await.unwrap();
+    let (tenants, _db) = common::mem_deployment().await;
     let app = build_router(AppState {
-        db,
+        db: tenants.control().clone(),
+        tenants,
         files_path: common::files_dir(),
         cookie_secure: true,
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
@@ -6546,10 +6552,11 @@ async fn db_down_refuses_before_touching_the_database() {
         ids.len()
     }
 
-    let db = database::init_mem().await.unwrap();
+    let (tenants, db) = common::mem_deployment().await;
     let db_up = hezarfen_backend::state::DbHealth::default();
     let app = build_router(AppState {
-        db: db.clone(),
+        db: tenants.control().clone(),
+        tenants,
         files_path: common::files_dir(),
         cookie_secure: false,
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
@@ -6570,7 +6577,8 @@ async fn db_down_refuses_before_touching_the_database() {
                 .uri("/auth/register")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    json!({"username": "gulsah", "password": "sifre12345"}).to_string(),
+                    json!({"school": "demo", "username": "gulsah", "password": "sifre12345"})
+                        .to_string(),
                 ))
                 .unwrap(),
         )
@@ -6594,7 +6602,8 @@ async fn db_down_refuses_before_touching_the_database() {
                 .uri("/auth/register")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    json!({"username": "kerem", "password": "sifre12345"}).to_string(),
+                    json!({"school": "demo", "username": "kerem", "password": "sifre12345"})
+                        .to_string(),
                 ))
                 .unwrap(),
         )
@@ -6621,7 +6630,8 @@ async fn db_down_refuses_before_touching_the_database() {
                 .uri("/auth/register")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    json!({"username": "kerem", "password": "sifre12345"}).to_string(),
+                    json!({"school": "demo", "username": "kerem", "password": "sifre12345"})
+                        .to_string(),
                 ))
                 .unwrap(),
         )
@@ -6814,7 +6824,7 @@ async fn admin_seed_creates_working_admin() {
     let password = Password::try_new("secret1").unwrap();
     User::ensure_admin(username, password, &db).await.unwrap();
 
-    let creds = json!({ "username": "root", "password": "secret1" });
+    let creds = json!({ "school": "demo", "username": "root", "password": "secret1" });
     let res = send(&app, "POST", "/auth/login", None, Some(creds)).await;
     assert_eq!(res.status, StatusCode::OK);
     assert_eq!(res.body["role"], "admin");
@@ -6836,7 +6846,7 @@ async fn admin_seed_is_idempotent() {
     }
 
     let cookie = {
-        let creds = json!({ "username": "root", "password": "secret1" });
+        let creds = json!({ "school": "demo", "username": "root", "password": "secret1" });
         let res = send(&app, "POST", "/auth/login", None, Some(creds)).await;
         assert_eq!(res.status, StatusCode::OK);
         res.cookie.expect("session cookie")
@@ -6863,7 +6873,7 @@ async fn admin_seed_refuses_existing_non_admin() {
     assert_eq!(res.status, StatusCode::FORBIDDEN, "must not be promoted");
 
     // ...and the original password still logs in (nothing was overwritten).
-    let creds = json!({ "username": "squatter", "password": "secret1" });
+    let creds = json!({ "school": "demo", "username": "squatter", "password": "secret1" });
     let res = send(&app, "POST", "/auth/login", None, Some(creds)).await;
     assert_eq!(res.status, StatusCode::OK);
     assert_eq!(res.body["role"], "student");
@@ -12450,7 +12460,7 @@ async fn question_images_author_serve_and_cascade() {
     assert_eq!(keys_before.len(), keys_after.len(), "replace adds no row");
     for stale in keys_before.iter().filter(|k| !keys_after.contains(k)) {
         assert!(
-            !common::files_dir().join(stale).exists(),
+            !common::blob_dir().join(stale).exists(),
             "replaced blob lingers on disk"
         );
     }
@@ -12530,7 +12540,7 @@ async fn question_images_author_serve_and_cascade() {
     );
     for key in &keys {
         assert!(
-            !common::files_dir().join(key).exists(),
+            !common::blob_dir().join(key).exists(),
             "blob {key} survived the exam delete"
         );
     }
@@ -12698,7 +12708,7 @@ async fn student_answer_images_serve_and_cascade() {
     // seq-1 answer-image row *and* its on-disk blob survive the new sitting.
     let pre = answer_image_blob_keys(&db).await;
     assert_eq!(pre.len(), 1);
-    assert!(common::files_dir().join(&pre[0]).exists());
+    assert!(common::blob_dir().join(&pre[0]).exists());
     let res = send(
         &app,
         "POST",
@@ -12724,7 +12734,7 @@ async fn student_answer_images_serve_and_cascade() {
         "the retake kept the prior sitting's answer-image row (history)"
     );
     assert!(
-        common::files_dir().join(&pre[0]).exists(),
+        common::blob_dir().join(&pre[0]).exists(),
         "the retake kept the prior sitting's answer-image blob on disk"
     );
 
@@ -12749,7 +12759,7 @@ async fn student_answer_images_serve_and_cascade() {
     );
     for key in &keys {
         assert!(
-            !common::files_dir().join(key).exists(),
+            !common::blob_dir().join(key).exists(),
             "answer-image blob {key} survived the exam delete"
         );
     }
@@ -12963,7 +12973,7 @@ async fn question_image_edits_follow_the_choices() {
     assert_eq!(dropped.len(), 1, "only the removed option's blob may go");
     for key in dropped {
         assert!(
-            !common::files_dir().join(key).exists(),
+            !common::blob_dir().join(key).exists(),
             "dropped option blob lingers"
         );
     }
@@ -13028,7 +13038,7 @@ async fn question_image_edits_follow_the_choices() {
     assert!(image_blob_keys(&db).await.is_empty());
     for key in &keys {
         assert!(
-            !common::files_dir().join(key).exists(),
+            !common::blob_dir().join(key).exists(),
             "blob {key} survived the question delete"
         );
     }
@@ -15685,7 +15695,7 @@ async fn homework_files_roundtrip_and_scope() {
     let res = send(&app, "DELETE", &file_uri, Some(&w.ali), None).await;
     assert_eq!(res.status, StatusCode::NO_CONTENT);
     assert!(
-        !common::files_dir().join(&keys[0]).exists(),
+        !common::blob_dir().join(&keys[0]).exists(),
         "blob must be unlinked with its row"
     );
     let res = send(
@@ -16026,7 +16036,7 @@ async fn homework_gc_removes_rows_and_blobs() {
     let keys = homework_blob_keys(&db).await;
     assert_eq!(keys.len(), 3);
     for key in &keys {
-        assert!(common::files_dir().join(key).exists(), "blob {key} on disk");
+        assert!(common::blob_dir().join(key).exists(), "blob {key} on disk");
     }
 
     // Withdrawing a submission takes its file rows and blobs.
@@ -16043,7 +16053,7 @@ async fn homework_gc_removes_rows_and_blobs() {
     assert_eq!(remaining.len(), 2);
     for gone in keys.iter().filter(|key| !remaining.contains(key)) {
         assert!(
-            !common::files_dir().join(gone).exists(),
+            !common::blob_dir().join(gone).exists(),
             "withdrawn blob {gone} must be unlinked"
         );
     }
@@ -16065,7 +16075,7 @@ async fn homework_gc_removes_rows_and_blobs() {
     assert_eq!(hw_row_count(&db, "homework").await, 1, "hw2 remains");
     for key in &remaining {
         assert!(
-            !common::files_dir().join(key).exists(),
+            !common::blob_dir().join(key).exists(),
             "blob {key} must die with the homework"
         );
     }
@@ -16102,7 +16112,7 @@ async fn homework_gc_removes_rows_and_blobs() {
     }
     for key in &keys {
         assert!(
-            !common::files_dir().join(key).exists(),
+            !common::blob_dir().join(key).exists(),
             "blob {key} must die with the course"
         );
     }
@@ -16482,9 +16492,10 @@ async fn chat_app_limited(
     ai: Option<AiBridge>,
     chatbot_limit: hezarfen_backend::rate_limit::UserRateLimiter,
 ) -> (axum::Router, Database) {
-    let db = database::init_mem().await.expect("in-memory db");
+    let (tenants, db) = common::mem_deployment().await;
     let app = build_router(AppState {
-        db: db.clone(),
+        db: tenants.control().clone(),
+        tenants,
         files_path: common::files_dir(),
         cookie_secure: false,
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
@@ -20048,7 +20059,7 @@ async fn bank_instantiate_rolls_back_on_missing_source_blob() {
     // unreadable source mid-flight.
     let src_keys = bank_image_blob_keys(&db).await;
     assert_eq!(src_keys.len(), 2);
-    tokio::fs::remove_file(common::files_dir().join(&src_keys[0]))
+    tokio::fs::remove_file(common::blob_dir().join(&src_keys[0]))
         .await
         .unwrap();
 
@@ -20105,7 +20116,7 @@ async fn bank_instantiate_rolls_back_on_missing_source_blob() {
         "source bank rows changed"
     );
     assert!(
-        common::files_dir().join(&src_keys[1]).exists(),
+        common::blob_dir().join(&src_keys[1]).exists(),
         "surviving source blob vanished"
     );
 }
@@ -24478,7 +24489,9 @@ async fn the_statement_reports_overdue_and_its_rollup_matches_the_balance() {
         "POST",
         "/auth/login",
         None,
-        Some(json!({ "username": "ali", "password": "secret1" })),
+        Some(
+            json!({ "school": "demo", "school": "demo", "username": "ali", "password": "secret1" }),
+        ),
     )
     .await
     .cookie
@@ -27171,7 +27184,7 @@ async fn course_note_cap_refusal_and_course_delete_leave_no_orphan_blobs() {
         )
         .await;
         assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
-        blob_paths.push(common::files_dir().join(id_of(&r.body)));
+        blob_paths.push(common::blob_dir().join(id_of(&r.body)));
     }
     for p in &blob_paths {
         assert!(p.exists(), "blob missing after upload: {p:?}");

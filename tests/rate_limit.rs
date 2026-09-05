@@ -18,9 +18,12 @@ use tower::ServiceExt;
 
 /// App with the given limits, backed by a fresh in-memory database.
 async fn app_with(rate_limit: RateLimitConfig) -> Router {
-    let db = database::init_mem().await.expect("in-memory db");
+    let tenants = database::init_mem_tenants()
+        .await
+        .expect("in-memory deployment");
     build_router(AppState {
-        db,
+        db: tenants.control().clone(),
+        tenants,
         files_path: tempfile::tempdir().expect("files dir").keep(),
         cookie_secure: false,
         rate_limit,
@@ -68,7 +71,7 @@ async fn send_as(
 }
 
 fn bad_login() -> Option<Value> {
-    Some(json!({ "username": "ghost", "password": "wrong-pass" }))
+    Some(json!({ "school": "demo", "username": "ghost", "password": "wrong-pass" }))
 }
 
 fn auth_only(per_minute: u32) -> RateLimitConfig {
@@ -103,7 +106,7 @@ async fn login_attempts_hit_the_auth_limit() {
 #[tokio::test]
 async fn register_and_login_share_the_auth_bucket() {
     let app = app_with(auth_only(2)).await;
-    let creds = json!({ "username": "ada", "password": "secret1" });
+    let creds = json!({ "school": "demo", "username": "ada", "password": "secret1" });
 
     let (status, _, _) = send_as(
         &app,
@@ -530,9 +533,12 @@ async fn a_down_database_leaves_each_process_on_its_local_budget() {
 
 /// Boot the app on a real TCP port, `ConnectInfo` wired exactly like `main`.
 async fn spawn_server(rate_limit: RateLimitConfig) -> String {
-    let db = database::init_mem().await.expect("in-memory db");
+    let tenants = database::init_mem_tenants()
+        .await
+        .expect("in-memory deployment");
     let app = build_router(AppState {
-        db,
+        db: tenants.control().clone(),
+        tenants,
         files_path: tempfile::tempdir().expect("files dir").keep(),
         cookie_secure: false,
         rate_limit,
@@ -571,7 +577,7 @@ async fn real_connections_are_keyed_by_peer_address() {
         let res = client
             .post(format!("{base}/auth/login"))
             .header("x-forwarded-for", spoof)
-            .json(&json!({ "username": "ghost", "password": "wrong-pass" }))
+            .json(&json!({ "school": "demo", "username": "ghost", "password": "wrong-pass" }))
             .send()
             .await
             .unwrap();
@@ -581,7 +587,7 @@ async fn real_connections_are_keyed_by_peer_address() {
     let res = client
         .post(format!("{base}/auth/login"))
         .header("x-forwarded-for", "3.3.3.3")
-        .json(&json!({ "username": "ghost", "password": "wrong-pass" }))
+        .json(&json!({ "school": "demo", "username": "ghost", "password": "wrong-pass" }))
         .send()
         .await
         .unwrap();

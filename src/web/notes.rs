@@ -1,5 +1,6 @@
+use crate::web::tenant_state::State;
 use axum::Json;
-use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Query};
 use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -283,6 +284,7 @@ async fn upload_file(
     // the row insert fails, take the fresh blob back out.
     let file = NoteFile::new(note.get_id(), name, content_type, upload.data.len() as i64);
     let path = blob_path(&st.files_path, file.get_id().key());
+    crate::web::ensure_files_dir(&st.files_path).await?;
     tokio::fs::write(&path, &upload.data)
         .await
         .map_err(|err| AppError::Internal(format!("failed to store the file blob: {err}")))?;

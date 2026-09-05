@@ -154,7 +154,7 @@ async fn handler_owned_etag_passes_through_and_never_304s() {
 #[tokio::test]
 async fn mutations_are_never_etagged() {
     let app = mem_app().await;
-    let creds = serde_json::json!({ "username": "ann", "password": "secret1" });
+    let creds = serde_json::json!({ "school": "demo", "username": "ann", "password": "secret1" });
     let res = app
         .clone()
         .oneshot(

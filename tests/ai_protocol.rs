@@ -920,11 +920,16 @@ async fn a_chat_request_names_the_askers_school_role() {
     let service = raw::handshake(&bridge, &raw::hello("tutor", "chat.reply")).await;
     await_workers(&bridge, 1).await;
 
-    let db = hezarfen_backend::database::init_mem()
+    let tenants = hezarfen_backend::database::init_mem_tenants()
         .await
-        .expect("mem db");
+        .expect("in-memory deployment");
+    let db = tenants
+        .get(&hezarfen_backend::tenant::Slug::try_new(hezarfen_backend::tenant::DEMO_SLUG).unwrap())
+        .await
+        .expect("the demo school");
     let app = hezarfen_backend::build_router(hezarfen_backend::state::AppState {
-        db: db.clone(),
+        db: tenants.control().clone(),
+        tenants,
         files_path: common::files_dir(),
         cookie_secure: false,
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),

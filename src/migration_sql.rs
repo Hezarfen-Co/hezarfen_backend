@@ -1461,6 +1461,48 @@ pub const BACKFILL: &str = "
     };
 ";
 
+/// The **control** database's schema — the one database per deployment that
+/// knows which schools exist and who may create them. Everything else lives in
+/// a school database, whose schema is [`MIGRATION_BATCHES`] and is applied
+/// per school by [`crate::tenant::Tenants::create`].
+///
+/// The `rate_limit` copy is deliberate: the shared per-IP window
+/// (`crate::rate_limit::RateLimiter::share`) is billed against the control
+/// handle, because the limiter runs in front of the router — before any cookie
+/// has named a school. One budget per deployment is also the honest one for an
+/// unauthenticated brute-forcer, who has not picked a school yet either.
+pub const CONTROL_MIGRATION: &str = "
+    DEFINE TABLE IF NOT EXISTS school SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS slug ON school TYPE string;
+    DEFINE FIELD IF NOT EXISTS name ON school TYPE string;
+    DEFINE FIELD IF NOT EXISTS status ON school TYPE string;
+    DEFINE FIELD IF NOT EXISTS created_at ON school TYPE int;
+    -- Redundant with the `school:<slug>` id, and kept anyway: the id is the
+    -- fast path, the index is what makes a second row on the same slug
+    -- impossible if a future write ever mints an id some other way.
+    DEFINE INDEX IF NOT EXISTS school_slug ON school FIELDS slug UNIQUE;
+
+    DEFINE TABLE IF NOT EXISTS builder SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS username ON builder TYPE string;
+    DEFINE FIELD IF NOT EXISTS password_hash ON builder TYPE string;
+    DEFINE INDEX IF NOT EXISTS builder_username ON builder FIELDS username UNIQUE;
+
+    DEFINE TABLE IF NOT EXISTS builder_session SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS builder ON builder_session TYPE record<builder>;
+    DEFINE FIELD IF NOT EXISTS token ON builder_session TYPE string;
+    DEFINE FIELD IF NOT EXISTS created_at ON builder_session TYPE int;
+    DEFINE FIELD IF NOT EXISTS expires_at ON builder_session TYPE int;
+    DEFINE INDEX IF NOT EXISTS builder_session_token ON builder_session FIELDS token UNIQUE;
+    DEFINE INDEX IF NOT EXISTS builder_session_expires ON builder_session FIELDS expires_at;
+
+    -- Verbatim from `MIGRATION`; see the note above this constant.
+    DEFINE TABLE IF NOT EXISTS rate_limit SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS hits ON rate_limit TYPE int DEFAULT 0;
+    DEFINE FIELD IF NOT EXISTS window_start ON rate_limit TYPE int;
+";
+
+pub const CONTROL_MIGRATION_BATCHES: [&str; 1] = [CONTROL_MIGRATION];
+
 /// The migration batches, in the order a boot applies them — and the *only*
 /// list of them. [`crate::database::migrate`] runs exactly these. They stay
 /// three separate queries: statements in one batch see the schema as it stood

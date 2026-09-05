@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
+use crate::web::tenant_state::State;
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -1415,6 +1416,7 @@ mod tests {
         let course = course(&manager, &db).await;
         let st = AppState {
             db: db.clone(),
+            tenants: crate::database::init_mem_tenants().await.unwrap(),
             files_path: std::env::temp_dir(),
             cookie_secure: false,
             rate_limit: crate::rate_limit::RateLimitConfig::unlimited(),

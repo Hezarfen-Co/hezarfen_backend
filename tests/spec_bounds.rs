@@ -24,9 +24,12 @@ use tower::ServiceExt;
 
 /// The emitted OpenAPI document, as the server serves it.
 async fn spec() -> Value {
-    let db = database::init_mem().await.expect("in-memory db");
+    let tenants = database::init_mem_tenants()
+        .await
+        .expect("in-memory deployment");
     let app = build_router(AppState {
-        db,
+        db: tenants.control().clone(),
+        tenants,
         files_path: tempfile::tempdir().expect("files dir").keep(),
         cookie_secure: false,
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
@@ -59,6 +62,8 @@ async fn spec() -> Value {
 fn expectations() -> Vec<(&'static str, &'static str, &'static str, i64)> {
     vec![
         // --- auth / users / notes / messages ---
+        ("Credentials", "school", "minLength", MIN_SLUG_LEN as i64),
+        ("Credentials", "school", "maxLength", MAX_SLUG_LEN as i64),
         (
             "Credentials",
             "username",

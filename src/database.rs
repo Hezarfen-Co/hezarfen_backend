@@ -6,10 +6,12 @@ use surrealdb::opt::auth::Root;
 
 use crate::config::Config;
 use crate::constant::{CAP_WRITE_BACKOFF_MS, CAP_WRITE_TRIES, CHATBOT_PENDING_STALE_SECS};
+use crate::domain::builder::Builder;
 use crate::domain::timestamp::Timestamp;
-use crate::domain::user::{Password, User, Username};
+use crate::domain::user::{Password, Username};
 use crate::error::AppError;
-use crate::migration_sql::{BACKFILL, MIGRATION_BATCHES};
+use crate::migration_sql::{BACKFILL, CONTROL_MIGRATION_BATCHES, MIGRATION_BATCHES};
+use crate::tenant::Tenants;
 
 /// The shared database handle.
 ///
@@ -27,14 +29,14 @@ use crate::migration_sql::{BACKFILL, MIGRATION_BATCHES};
 /// Cloning the `Arc` shares the single session established at boot instead.
 pub type Database = std::sync::Arc<Surreal<Any>>;
 
-/// Connect to the SurrealDB server, sign in as root, apply the schema and seed
-/// the admin. One process, one database, stop-the-world deploys — so all of it
-/// runs unconditionally on every boot.
-pub async fn init(cfg: &Config) -> Result<Database, AppError> {
+/// Connect to the **control** database, sign in as root, apply the control
+/// schema and seed the builder account. School databases are brought up
+/// separately, one per school, by [`crate::tenant::Tenants`].
+pub async fn init(cfg: &Config) -> Result<Tenants, AppError> {
     // Validated before the connection, not after: half a credential pair is a
     // deployment mistake, and reporting it only after a successful dial buries
     // it under an outage that isn't one.
-    let admin = admin_credentials(cfg)?;
+    let builder = builder_credentials(cfg)?;
     let db = connect_with_retry(cfg).await;
     db.signin(Root {
         username: cfg.db_user.clone(),
@@ -45,27 +47,28 @@ pub async fn init(cfg: &Config) -> Result<Database, AppError> {
         .use_db(cfg.db_name.clone())
         .await?;
     let db = std::sync::Arc::new(db);
-    migrate(&db).await?;
-    if let Some((username, password)) = admin {
-        User::ensure_admin(username, password, &db).await?;
+    migrate_control(&db).await?;
+    if let Some((username, password)) = builder {
+        Builder::ensure(username, password, &db).await?;
     }
-    Ok(db)
+    Ok(Tenants::new_remote(db, cfg))
 }
 
-/// The `ADMIN_USERNAME` / `ADMIN_PASSWORD` bootstrap pair, if configured.
+/// The `BUILDER_USERNAME` / `BUILDER_PASSWORD` bootstrap pair, if configured.
 /// Both-or-neither: half a pair aborts startup rather than silently running
-/// without the seed.
-fn admin_credentials(cfg: &Config) -> Result<Option<(Username, Password)>, AppError> {
-    match (&cfg.admin_username, &cfg.admin_password) {
+/// without the seed — and without a builder, a fresh deployment has nobody who
+/// can create the first school.
+fn builder_credentials(cfg: &Config) -> Result<Option<(Username, Password)>, AppError> {
+    match (&cfg.builder_username, &cfg.builder_password) {
         (Some(username), Some(password)) => Ok(Some((
             Username::try_new(username)
-                .map_err(|err| AppError::Internal(format!("invalid ADMIN_USERNAME: {err}")))?,
+                .map_err(|err| AppError::Internal(format!("invalid BUILDER_USERNAME: {err}")))?,
             Password::try_new(password)
-                .map_err(|err| AppError::Internal(format!("invalid ADMIN_PASSWORD: {err}")))?,
+                .map_err(|err| AppError::Internal(format!("invalid BUILDER_PASSWORD: {err}")))?,
         ))),
         (None, None) => Ok(None),
         _ => Err(AppError::Internal(
-            "ADMIN_USERNAME and ADMIN_PASSWORD must be set together".into(),
+            "BUILDER_USERNAME and BUILDER_PASSWORD must be set together".into(),
         )),
     }
 }
@@ -254,12 +257,24 @@ async fn connect_with_retry(cfg: &Config) -> Surreal<Any> {
     }
 }
 
-/// A fresh in-memory database with the schema applied. For tests.
+/// A fresh in-memory **school** database with the school schema applied. For
+/// the unit tests whose subject is one school's own rows; a test that needs the
+/// whole app (control database included) wants [`init_mem_tenants`].
 pub async fn init_mem() -> Result<Database, AppError> {
     let db = surrealdb::engine::any::connect("memory").await?;
     db.use_ns("hezarfen").use_db("hezarfen").await?;
     migrate(&db).await?;
     Ok(std::sync::Arc::new(db))
+}
+
+/// A fresh in-memory deployment: an empty control database plus one school,
+/// [`crate::tenant::DEMO_SLUG`]. The bootstrap every router-level test uses.
+pub async fn init_mem_tenants() -> Result<Tenants, AppError> {
+    let tenants = Tenants::new_mem().await?;
+    let demo = crate::tenant::Slug::try_new(crate::tenant::DEMO_SLUG)
+        .map_err(|err| AppError::Internal(format!("the demo slug is a slug: {err}")))?;
+    tenants.create(&demo, "Demo School").await?;
+    Ok(tenants)
 }
 
 /// A handle on a **real** SurrealDB server, in a scratch namespace of its own
@@ -322,6 +337,16 @@ pub async fn migrate(db: &Surreal<Any>) -> Result<(), AppError> {
             query = query.bind((name, value));
         }
         query.await?.check()?;
+    }
+    Ok(())
+}
+
+/// Apply the **control** schema (schools, builders, the shared rate-limit
+/// window). Idempotent, like [`migrate`], and takes no bound parameters —
+/// nothing in the control batch is data-driven.
+pub async fn migrate_control(db: &Surreal<Any>) -> Result<(), AppError> {
+    for sql in CONTROL_MIGRATION_BATCHES {
+        db.query(sql).await?.check()?;
     }
     Ok(())
 }

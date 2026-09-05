@@ -196,7 +196,8 @@ async fn a_promotion_keeps_the_signup_the_promoted_user_can_still_free() {
         "/auth/login",
         None,
         Some(json!({
-            "username": "ali", "password": "secret1"
+            "school": "demo",
+            "school": "demo", "username": "ali", "password": "secret1"
         })),
     )
     .await

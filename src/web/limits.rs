@@ -29,6 +29,14 @@ pub fn routes() -> OpenApiRouter<AppState> {
 /// Account fields: credentials, profile, and the closed role set.
 #[derive(Serialize, ToSchema)]
 struct UserLimits {
+    /// The school slug the login and registration forms ask for, in front of
+    /// the dot in the session cookie. Lowercase `a-z`, `0-9` and `-`, starting
+    /// with a letter or digit.
+    min_slug_len: usize,
+    max_slug_len: usize,
+    /// Slugs no school may take — they name the builder cookie prefix and the
+    /// control database.
+    reserved_slugs: Vec<&'static str>,
     min_username_len: usize,
     max_username_len: usize,
     /// Separators allowed inside a username — never at the edges, never doubled.
@@ -462,6 +470,9 @@ impl LimitsResponse {
     fn new(st: &AppState) -> Self {
         Self {
             user: UserLimits {
+                min_slug_len: MIN_SLUG_LEN,
+                max_slug_len: MAX_SLUG_LEN,
+                reserved_slugs: crate::tenant::RESERVED_SLUGS.to_vec(),
                 min_username_len: MIN_USERNAME_LEN,
                 max_username_len: MAX_USERNAME_LEN,
                 username_separators: USERNAME_SEPARATORS.iter().map(char::to_string).collect(),

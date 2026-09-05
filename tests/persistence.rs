@@ -13,6 +13,7 @@ use hezarfen_backend::database::Database;
 use hezarfen_backend::domain::timestamp::Timestamp;
 use hezarfen_backend::rate_limit::RateLimitConfig;
 use hezarfen_backend::state::AppState;
+use hezarfen_backend::tenant::{DEMO_SLUG, Slug, Tenants};
 use hezarfen_backend::{build_router, database};
 use serde_json::json;
 
@@ -20,8 +21,18 @@ use serde_json::json;
 /// a fresh router over it.
 async fn reboot(db: &Database) -> Router {
     database::migrate(db).await.expect("re-migration");
+    // A new process: a new control database and a new connection cache, over
+    // the school store the old one left behind.
+    let tenants = Tenants::new_mem_adopting(
+        &Slug::try_new(DEMO_SLUG).unwrap(),
+        "Demo School",
+        db.clone(),
+    )
+    .await
+    .expect("adopt the demo school");
     build_router(AppState {
-        db: db.clone(),
+        db: tenants.control().clone(),
+        tenants,
         files_path: common::files_dir(),
         cookie_secure: false,
         rate_limit: RateLimitConfig::unlimited(),
@@ -40,7 +51,7 @@ async fn reboot(db: &Database) -> Router {
 async fn settings_and_terms_survive_remigration() {
     let (app, db) = common::app_and_db().await;
 
-    let creds = json!({ "username": "boss", "password": "secret1" });
+    let creds = json!({ "school": "demo", "username": "boss", "password": "secret1" });
     send(&app, "POST", "/auth/register", None, Some(creds.clone())).await;
     set_role(&db, "boss", "manager").await;
     let cookie = send(&app, "POST", "/auth/login", None, Some(creds.clone()))
@@ -119,7 +130,7 @@ async fn settings_and_terms_survive_remigration() {
 #[tokio::test]
 async fn legacy_events_backfill_to_school_audience() {
     let (app, db) = common::app_and_db().await;
-    let creds = json!({ "username": "ali", "password": "secret1" });
+    let creds = json!({ "school": "demo", "username": "ali", "password": "secret1" });
 
     // A normal event — then strip its audience the way an old binary's schema
     // would have left it: drop the column definitions so SCHEMAFULL stops
@@ -196,7 +207,7 @@ async fn legacy_events_backfill_to_school_audience() {
 #[tokio::test]
 async fn legacy_users_audiences_convert_to_registrations() {
     let (app, db) = common::app_and_db().await;
-    let creds = json!({ "username": "ali", "password": "secret1" });
+    let creds = json!({ "school": "demo", "username": "ali", "password": "secret1" });
 
     // A registration-audience event — then rewrite it into the shape an old
     // binary left behind: restore the `audience.users` column definition and
@@ -212,7 +223,7 @@ async fn legacy_users_audiences_convert_to_registrations() {
         .await
         .cookie
         .unwrap();
-    let student = json!({ "username": "veli", "password": "secret1" });
+    let student = json!({ "school": "demo", "username": "veli", "password": "secret1" });
     assert_eq!(
         send(&app, "POST", "/auth/register", None, Some(student.clone()))
             .await
@@ -294,7 +305,7 @@ async fn legacy_users_audiences_convert_to_registrations() {
 #[tokio::test]
 async fn legacy_subjectless_questions_are_destroyed_on_boot() {
     let (app, db) = common::app_and_db().await;
-    let creds = json!({ "username": "ali", "password": "secret1" });
+    let creds = json!({ "school": "demo", "username": "ali", "password": "secret1" });
 
     // A full exam — course, subject, open exam, one answered question — then
     // strip the question's subject the way an old binary's schema would have
@@ -310,7 +321,7 @@ async fn legacy_subjectless_questions_are_destroyed_on_boot() {
         .await
         .cookie
         .unwrap();
-    let student = json!({ "username": "veli", "password": "secret1" });
+    let student = json!({ "school": "demo", "username": "veli", "password": "secret1" });
     assert_eq!(
         send(&app, "POST", "/auth/register", None, Some(student.clone()))
             .await
@@ -434,7 +445,7 @@ async fn legacy_subjectless_questions_are_destroyed_on_boot() {
 #[tokio::test]
 async fn stale_staff_enrollments_are_swept_on_boot() {
     let (app, db) = common::app_and_db().await;
-    let creds = json!({ "username": "ali", "password": "secret1" });
+    let creds = json!({ "school": "demo", "username": "ali", "password": "secret1" });
 
     // A course with three enrolled students, then age two rows the way a
     // pre-fix binary could have — flip one student to teacher directly in the
@@ -454,7 +465,7 @@ async fn stale_staff_enrollments_are_swept_on_boot() {
 
     let mut ids = Vec::new();
     for name in ["veli", "ayse", "can"] {
-        let student = json!({ "username": name, "password": "secret1" });
+        let student = json!({ "school": "demo", "username": name, "password": "secret1" });
         assert_eq!(
             send(&app, "POST", "/auth/register", None, Some(student.clone()))
                 .await
@@ -646,8 +657,8 @@ async fn a_course_whose_count_outran_its_roster_is_repaired_and_deletable() {
 #[tokio::test]
 async fn legacy_exams_backfill_to_published() {
     let (app, db) = common::app_and_db().await;
-    let teacher_creds = json!({ "username": "ali", "password": "secret1" });
-    let student_creds = json!({ "username": "ayse", "password": "secret1" });
+    let teacher_creds = json!({ "school": "demo", "username": "ali", "password": "secret1" });
+    let student_creds = json!({ "school": "demo", "username": "ayse", "password": "secret1" });
 
     // A normal exam — then strip `draft` the way an old binary's schema would
     // have left it.
@@ -732,8 +743,8 @@ async fn appointments_survive_remigration() {
     const PROPOSED_END: i64 = START + 8_000_003;
 
     let (app, db) = common::app_and_db().await;
-    let teacher_creds = json!({ "username": "ali", "password": "secret1" });
-    let student_creds = json!({ "username": "ayse", "password": "secret1" });
+    let teacher_creds = json!({ "school": "demo", "username": "ali", "password": "secret1" });
+    let student_creds = json!({ "school": "demo", "username": "ayse", "password": "secret1" });
     for creds in [&teacher_creds, &student_creds] {
         assert_eq!(
             send(&app, "POST", "/auth/register", None, Some((*creds).clone()))
@@ -879,8 +890,8 @@ async fn appointments_survive_remigration() {
 #[tokio::test]
 async fn attempt_history_survives_remigration() {
     let (app, db) = common::app_and_db().await;
-    let teacher_creds = json!({ "username": "ali", "password": "secret1" });
-    let student_creds = json!({ "username": "ayse", "password": "secret1" });
+    let teacher_creds = json!({ "school": "demo", "username": "ali", "password": "secret1" });
+    let student_creds = json!({ "school": "demo", "username": "ayse", "password": "secret1" });
     for creds in [&teacher_creds, &student_creds] {
         assert_eq!(
             send(&app, "POST", "/auth/register", None, Some((*creds).clone()))
@@ -1164,7 +1175,7 @@ async fn legacy_chat_turns_backfill_to_untruncated() {
     use hezarfen_backend::domain::user::UserId;
 
     let (app, db) = common::app_and_db().await;
-    let creds = json!({ "username": "ali", "password": "secret1" });
+    let creds = json!({ "school": "demo", "username": "ali", "password": "secret1" });
     assert_eq!(
         send(&app, "POST", "/auth/register", None, Some(creds.clone()))
             .await
@@ -1244,7 +1255,7 @@ async fn legacy_chat_turns_backfill_to_untruncated() {
 async fn settings_slots_without_a_serving_minute_still_patch() {
     let (app, db) = common::app_and_db().await;
 
-    let creds = json!({ "username": "boss", "password": "secret1" });
+    let creds = json!({ "school": "demo", "username": "boss", "password": "secret1" });
     send(&app, "POST", "/auth/register", None, Some(creds.clone())).await;
     set_role(&db, "boss", "manager").await;
     let cookie = send(&app, "POST", "/auth/login", None, Some(creds.clone()))
@@ -1948,8 +1959,8 @@ async fn settings_reference_counts_are_seeded_from_the_marks_and_menus_that_pred
 #[tokio::test]
 async fn fee_plans_and_their_charges_survive_remigration() {
     let (app, db) = common::app_and_db().await;
-    let manager_creds = json!({ "username": "ali", "password": "secret1" });
-    let student_creds = json!({ "username": "ayse", "password": "secret1" });
+    let manager_creds = json!({ "school": "demo", "username": "ali", "password": "secret1" });
+    let student_creds = json!({ "school": "demo", "username": "ayse", "password": "secret1" });
     for creds in [&manager_creds, &student_creds] {
         assert_eq!(
             send(&app, "POST", "/auth/register", None, Some((*creds).clone()))
@@ -2102,7 +2113,7 @@ async fn a_user_row_without_palette_color_still_reads_and_patches() {
 #[tokio::test]
 async fn boards_and_their_strokes_survive_remigration() {
     let (app, db) = common::app_and_db().await;
-    let creds = json!({ "username": "ali", "password": "secret1" });
+    let creds = json!({ "school": "demo", "username": "ali", "password": "secret1" });
     let cookie = common::login(&app, "ali").await;
     let veli = common::login(&app, "veli").await;
     let ali_id = me_id(&app, &cookie).await;

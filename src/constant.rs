@@ -5,6 +5,12 @@ use crate::domain::message::Folder;
 use crate::domain::preferences::{Language, Theme};
 use crate::domain::role::Role;
 
+/// A school slug's length bounds — the name in front of the dot in the session
+/// cookie, which is also the school's database name and its blob directory
+/// (see [`crate::tenant::Slug`]).
+pub const MIN_SLUG_LEN: usize = 2;
+pub const MAX_SLUG_LEN: usize = 32;
+
 pub const MIN_USERNAME_LEN: usize = 3;
 pub const MAX_USERNAME_LEN: usize = 32;
 

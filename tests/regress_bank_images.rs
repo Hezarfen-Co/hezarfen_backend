@@ -27,6 +27,7 @@ mod common;
 use axum::Router;
 use axum::http::StatusCode;
 use common::{create_course, create_subject, id_of, login_as, send};
+use hezarfen_backend::build_router;
 use hezarfen_backend::database::Database;
 use hezarfen_backend::domain::bank_question::BankQuestionId;
 use hezarfen_backend::domain::bank_question_image::BankQuestionImage;
@@ -34,7 +35,6 @@ use hezarfen_backend::domain::note_file::FileContentType;
 use hezarfen_backend::error::AppError;
 use hezarfen_backend::rate_limit::RateLimitConfig;
 use hezarfen_backend::state::AppState;
-use hezarfen_backend::{build_router, database};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -43,10 +43,11 @@ const BOUNDARY: &str = "multipart/form-data; boundary=hezarfen-test-boundary";
 /// A router over a fresh in-memory database, with a blob directory nothing else
 /// writes to — so `blobs()` counts this test's files and no one else's.
 async fn mem_app() -> (Router, Database, TempDir) {
-    let db = database::init_mem().await.expect("in-memory db");
+    let (tenants, db) = common::mem_deployment().await;
     let files = tempfile::tempdir().expect("files tempdir");
     let app = build_router(AppState {
-        db: db.clone(),
+        db: tenants.control().clone(),
+        tenants,
         files_path: files.path().to_path_buf(),
         cookie_secure: false,
         rate_limit: RateLimitConfig::unlimited(),
@@ -61,7 +62,12 @@ async fn mem_app() -> (Router, Database, TempDir) {
 
 /// Every blob file currently on disk, by name.
 fn blobs(files: &TempDir) -> Vec<String> {
-    let mut names: Vec<String> = std::fs::read_dir(files.path())
+    // Blobs live under the school's own subdirectory of `FILES_PATH`.
+    let dir = files.path().join(hezarfen_backend::tenant::DEMO_SLUG);
+    if !dir.exists() {
+        return Vec::new();
+    }
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
         .expect("read the blob dir")
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect();

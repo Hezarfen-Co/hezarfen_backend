@@ -1,5 +1,6 @@
+use crate::web::tenant_state::State;
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::Path;
 use axum::http::StatusCode;
 use serde::Deserialize;
 use utoipa::ToSchema;

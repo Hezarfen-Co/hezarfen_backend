@@ -430,7 +430,7 @@ drift from it**, which is enforced rather than asked for:
   and fails unless each one is either referenced by `src/web/limits.rs` or
   listed as a deliberate exclusion *with a reason*. A new constant breaks the
   suite until someone decides, consciously, whether clients need it.
-- `tests/spec_bounds.rs` builds the OpenAPI document, reads all 174 published
+- `tests/spec_bounds.rs` builds the OpenAPI document, reads all 176 published
   bounds back out of the emitted JSON, and asserts each equals its constant.
   This exists because utoipa's `#[schema(max_length = …)]` accepts a **literal
   only** — a `const` there does not compile — so the annotations are
@@ -844,10 +844,10 @@ window filtering, before paging; negative values are a `400` naming the field.
 | PATCH  | `/appointments/{id}/reschedule/decline`                          | student | Refuse the teacher's counter-proposal. The requester's call alone, and it **cancels the booking**: the proposal replaced the time that was asked for, so there is nothing left to fall back to — book another slot instead. The slot frees up, and the original request stays readable as `cancelled` with the refused proposal still on it. Declining is a cancel, so it answers to the same deadline: `409` once the meeting's effective window has started. |
 | GET    | `/attendance/me`                                                 | student | The current user's attendance report: event tallies, lesson roll-call tallies, and a per-course breakdown with attendance rates. |
 | GET    | `/attendance/{user}`                                             | teacher | Any user's attendance report. Requires teacher+, or a parent tied to the target student. Managers, admins, and parents see every course; a teacher sees the event tallies plus only the roll-call blocks of the target's courses they manage. |
-| POST   | `/auth/login`                                                    | no      | Log in with username + password. Sets a `session` cookie on success. |
+| POST   | `/auth/login`                                                    | no      | Log in with school + username + password. Sets a `session` cookie (`<school>.<token>`) on success. |
 | POST   | `/auth/logout`                                                   | no      | Log out: revoke the current session (if any) and clear the cookie. Idempotent — no session required; answers `204` either way. |
 | GET    | `/auth/me`                                                       | student | Return the currently authenticated user. |
-| POST   | `/auth/register`                                                 | no      | Register a new user account: `{username, password}` in, `{username, role}` back (no `id`; new accounts are `student`). Always `201`, even if the name was already taken — see "Auth model". |
+| POST   | `/auth/register`                                                 | no      | Register a new user account: `{school, username, password}` in, `{username, role}` back (no `id`; new accounts are `student`). Always `201`, even if the name was already taken — see "Auth model". |
 | GET    | `/bank-questions`                                                | teacher | The bank the caller may see — their own templates plus the ones published to the school (admins see every one), **newest first**. `?subject=` narrows to one origin subject; `?owner=` to one owner (a user id, or `me` for the caller); `?q=` to a case-insensitive fragment of the question text; `?visibility=private\|school` to one shelf — it narrows what the caller may already see and never widens it, so `private` is "my drafts" and `school` the published library. Paged via `?limit=&offset=` (omit `limit` for all of them); returns a `{items, total, limit, offset}` envelope, where `total` counts every match under the same filters, not just this page. Each item carries the resolved `subject_name`/`owner_name` so a client needn't look them up per row, plus `used_count` — how many exam questions were copied out of that template (one grouped query for the page, not one per row). |
 | POST   | `/bank-questions`                                                | teacher | Add a template to the bank. Requires teacher+. `subject_id` is origin metadata (any subject — the same-course rule lives at instantiate time), so it need only exist (an unknown subject is a `400`). `choice` templates carry 2–10 `choices` plus `correct` naming one of them by id; `text` templates carry neither. The caller becomes the owner. |
 | GET    | `/bank-questions/{bid}`                                          | teacher | One template by id. Visible ones only: a `private` template belonging to someone else is a 404, not a 403 — a 403 would confirm it exists. |
@@ -4376,11 +4376,16 @@ src/
   constant.rs      validation limits
   validate.rs      field validators (used by every newtype's try_new)
   error.rs         ValidationError + AppError -> HTTP responses
-  database.rs      SurrealDB server connect (ws) + SCHEMAFULL migration
+  database.rs      SurrealDB server connect (ws) + SCHEMAFULL migration; init()
+                   brings up the control database, migrate() a school's
+  tenant.rs        Slug · SchoolStatus · School · Tenants: one database per
+                   school inside one namespace, plus the control database that
+                   registers them (DEMO_SLUG is the in-memory test school)
   migration_sql.rs the three boot batches as SurrealQL text (PRE_REPAIR,
-                   MIGRATION, BACKFILL) + MIGRATION_BATCHES, the only list of them
+                   MIGRATION, BACKFILL) + MIGRATION_BATCHES, the only list of them,
+                   and CONTROL_MIGRATION_BATCHES for the control database
   rate_limit.rs    fixed-window limiter: per-IP tiers + middleware, per-user chat tier
-  state.rs         AppState { db, files_path, cookie_secure, rate_limit,
+  state.rs         AppState { db, tenants, files_path, cookie_secure, rate_limit,
                    chatbot_limit, exam_presence, board_hub, db_up, ai }
   ai/              QUIC bridge to the out-of-process AI services
                    (see "AI bridge (QUIC)"; the HTTP half is web/ai.rs)
@@ -4409,6 +4414,8 @@ src/
     text_fold.rs   case- and diacritic-insensitive folding for search, shared by
                    the Rust needle and the SurrealQL column (Turkish İ/ı, ü, ö…)
     session.rs     SessionId · SessionToken · Session (7-day expiry)
+    builder.rs     BuilderId · Builder · BuilderSession: the deployment operator
+                   who creates and suspends schools, in the control database
     timestamp.rs   Timestamp (unix-millisecond instant)
     note.rs        NoteId · NoteTitle · NoteContent · Note
     note_file.rs   NoteFileId · FileName · FileContentType · NoteFile (metadata row;
@@ -4524,7 +4531,12 @@ src/
                    row per homework+user — its existence freezes the submission)
   web/             axum layer: DTOs (serde + OpenAPI schemas) + handlers +
                    auth extractors
+    tenant_state.rs State<AppState>: the shadow of axum's State that resolves the
+                   caller's school from the `<slug>.<token>` cookie, so every
+                   handler that imports it is school-scoped by construction
+                   (TenantExt · SchoolSlug · split_cookie)
     extractor.rs   CurrentUser · RequireTeacher · RequireManager · RequireAdmin
+                   · RequireBuilder (the control-database principal)
     dto.rs         shared UserResponse · CourseResponse · ExamResponse · SessionResponse schemas
     exam_ws.rs     the student exam-room WebSocket (state ticks, autosave, finish)
     board_ws.rs    the collaborative board room WebSocket (join replay, strokes
