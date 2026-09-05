@@ -2443,3 +2443,237 @@ async fn an_empty_module_list_survives_a_second_boot() {
         "an empty list is a decision, never a hole to fill"
     );
 }
+
+// ===================== REFUTE probes (verifier, 2026-09-06) =====================
+
+/// The stored `modules` column of one school, straight off the control store.
+async fn raw_modules(control: &Database, slug: &str) -> Option<Vec<String>> {
+    let rows: Vec<serde_json::Value> = control
+        .query(format!(
+            "SELECT VALUE modules FROM type::record('school', '{slug}')"
+        ))
+        .await
+        .expect("raw read")
+        .check()
+        .expect("raw check")
+        .take(0)
+        .expect("modules column");
+    match rows.into_iter().next() {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_array()
+                .unwrap_or_else(|| panic!("modules is not an array: {value}"))
+                .iter()
+                .map(|v| v.as_str().expect("module name").to_string())
+                .collect(),
+        ),
+    }
+}
+
+/// P3: two more boots over rows an older binary could have left behind. An
+/// empty set is a decision and must survive; a narrowed one must not widen; a
+/// row from before the field existed is the only one that backfills.
+#[tokio::test]
+async fn probe_control_migration_is_idempotent_over_aged_rows() {
+    let tenants = Tenants::new_mem().await.expect("control store");
+    let control = tenants.control().clone();
+
+    let mut narrowed = ModuleSet::empty();
+    narrowed.insert(hezarfen_backend::module::Module::Notes);
+    narrowed.insert(hezarfen_backend::module::Module::Courses);
+    narrowed.insert(hezarfen_backend::module::Module::Subjects);
+
+    tenants
+        .create(
+            &Slug::try_new("empty").unwrap(),
+            "Empty",
+            ModuleSet::empty(),
+        )
+        .await
+        .expect("empty school");
+    tenants
+        .create(
+            &Slug::try_new("narrow").unwrap(),
+            "Narrow",
+            narrowed.clone(),
+        )
+        .await
+        .expect("narrow school");
+    tenants
+        .create(&Slug::try_new("aged").unwrap(), "Aged", ModuleSet::all())
+        .await
+        .expect("aged school");
+
+    // (c) a row from before the field existed.
+    let unset = control
+        .query("UPDATE type::record('school', 'aged') UNSET modules")
+        .await
+        .expect("unset send")
+        .check();
+    let unset_worked = match unset {
+        Err(err) => {
+            println!("PROBE UNSET modules refused by the schema: {err}");
+            false
+        }
+        Ok(_) => {
+            let now = raw_modules(&control, "aged").await;
+            println!("PROBE after UNSET, aged.modules = {now:?}");
+            now.is_none() || now.as_ref().is_some_and(|m| m.is_empty())
+        }
+    };
+
+    for boot in 1..=2 {
+        database::migrate_control(&control)
+            .await
+            .unwrap_or_else(|e| panic!("boot {boot}: {e}"));
+    }
+
+    assert_eq!(
+        raw_modules(&control, "empty").await,
+        Some(vec![]),
+        "an empty set was re-widened by a boot"
+    );
+    assert_eq!(
+        raw_modules(&control, "narrow").await,
+        Some(narrowed.names()),
+        "a narrowed set moved across two boots"
+    );
+    if unset_worked {
+        let aged = raw_modules(&control, "aged").await;
+        println!("PROBE aged after two boots = {aged:?}");
+        assert_eq!(
+            aged.map(|m| m.len()),
+            Some(21),
+            "a pre-entitlement row was not backfilled to the whole catalog"
+        );
+    } else {
+        println!(
+            "PROBE UNMEASURED(c): the SCHEMAFULL control table would not let a row \
+             lose its `modules` field, so the NONE backfill path was not exercised here"
+        );
+    }
+}
+
+/// P3b: a stored name this binary does not know is ignored on read and does not
+/// lock the school out.
+#[tokio::test]
+async fn probe_an_unknown_stored_module_name_is_ignored() {
+    let tenants = Tenants::new_mem().await.expect("control store");
+    let control = tenants.control().clone();
+    let slug = Slug::try_new("weird").unwrap();
+    tenants
+        .create(&slug, "Weird", ModuleSet::all())
+        .await
+        .expect("school");
+    control
+        .query("UPDATE type::record('school', 'weird') SET modules += ['zzz']")
+        .await
+        .expect("send")
+        .check()
+        .expect("store an unknown name");
+    assert!(
+        raw_modules(&control, "weird")
+            .await
+            .expect("row")
+            .contains(&"zzz".to_string()),
+        "the unknown name did not land, so the probe proves nothing"
+    );
+
+    let resolved = tenants
+        .resolve(&slug)
+        .await
+        .expect("the school still resolves");
+    assert_eq!(
+        resolved.modules,
+        ModuleSet::all(),
+        "an unknown stored name changed the parsed set"
+    );
+
+    let app = build_router(AppState {
+        db: control.clone(),
+        tenants: tenants.clone(),
+        files_path: common::files_dir(),
+        cookie_secure: false,
+        rate_limit: RateLimitConfig::unlimited(),
+        chatbot_limit: Default::default(),
+        exam_presence: Default::default(),
+        board_hub: Default::default(),
+        db_up: Default::default(),
+        ai: None,
+    });
+    let creds = json!({ "school": "weird", "username": "ada", "password": "secret1" });
+    let reg = send(&app, "POST", "/auth/register", None, Some(creds.clone())).await;
+    assert_eq!(reg.status, StatusCode::CREATED, "{:?}", reg.body);
+    let login = send(&app, "POST", "/auth/login", None, Some(creds)).await;
+    assert_eq!(
+        login.status,
+        StatusCode::OK,
+        "login broke on an unknown stored module: {:?}",
+        login.body
+    );
+    let cookie = login.cookie.expect("cookie");
+    let mine = send(&app, "GET", "/modules", Some(&cookie), None).await;
+    assert_eq!(mine.status, StatusCode::OK, "{:?}", mine.body);
+    assert_eq!(mine.body["enabled"].as_array().map(|a| a.len()), Some(21));
+}
+
+/// P3c: the real pre-entitlement row — one written by a binary whose control
+/// schema had no `modules` field at all. `UNSET` cannot make one (the
+/// SCHEMAFULL type refuses `NONE`), so the old schema is rebuilt by hand.
+#[tokio::test]
+async fn probe_a_row_written_before_the_field_existed_backfills_once() {
+    let control: Database = std::sync::Arc::new(
+        surrealdb::engine::any::connect("mem://")
+            .await
+            .expect("mem control store"),
+    );
+    control.use_ns("hezarfen").use_db("control").await.unwrap();
+    // The control schema as it stood at 9c7bb06: no `modules` field.
+    control
+        .query(
+            "DEFINE TABLE school SCHEMAFULL;
+             DEFINE FIELD slug ON school TYPE string;
+             DEFINE FIELD name ON school TYPE string;
+             DEFINE FIELD status ON school TYPE string;
+             DEFINE FIELD created_at ON school TYPE int;
+             CREATE school:old SET slug = 'old', name = 'Old', status = 'active',
+                 created_at = 1;",
+        )
+        .await
+        .expect("old schema")
+        .check()
+        .expect("old schema check");
+    assert_eq!(
+        raw_modules(&control, "old").await,
+        None,
+        "the aged row must start with no modules field at all"
+    );
+
+    for boot in 1..=2 {
+        database::migrate_control(&control)
+            .await
+            .unwrap_or_else(|e| panic!("boot {boot}: {e}"));
+        let after = raw_modules(&control, "old").await;
+        println!("PROBE boot {boot}: old.modules = {after:?}");
+        assert_eq!(
+            after.as_ref().map(|m| m.len()),
+            Some(21),
+            "boot {boot} left a pre-entitlement row at {after:?} instead of the whole catalog"
+        );
+    }
+
+    // And a deliberately empty row alongside it is not widened by those boots.
+    control
+        .query("CREATE school:none SET slug = 'none', name = 'None', status = 'active', created_at = 1, modules = [];")
+        .await
+        .expect("empty row")
+        .check()
+        .expect("empty row check");
+    database::migrate_control(&control).await.expect("boot 3");
+    assert_eq!(
+        raw_modules(&control, "none").await,
+        Some(vec![]),
+        "a deliberate empty set was re-widened"
+    );
+}
