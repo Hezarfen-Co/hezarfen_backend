@@ -112,6 +112,15 @@ const EXCLUDED: &[(&str, &str)] = &[
         "capability string an AI service declares",
     ),
     (
+        "AI_RAG_INDEX_CAPABILITY",
+        "capability string an AI service declares",
+    ),
+    (
+        "AI_RAG_INDEX_TIMEOUT_SECS",
+        "deadline on a background course-note indexing round trip; no client \
+         waits on it",
+    ),
+    (
         "CHAT_STREAM_POLL_MS",
         "server-side poll cadence behind the SSE stream",
     ),

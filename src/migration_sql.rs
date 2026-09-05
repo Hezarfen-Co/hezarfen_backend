@@ -198,6 +198,20 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS size ON course_note_file TYPE int;
     DEFINE INDEX IF NOT EXISTS course_note_file_note ON course_note_file FIELDS course_note;
 
+    -- What an AI service produced for a course note (rag.index, 2026-09-05).
+    -- Derived and disposable: the note is the source of truth, so the rows
+    -- cascade from the note AND from any attachment they were built from.
+    -- `payload` is FLEXIBLE because its shape belongs to the service, not to
+    -- this schema — SCHEMAFULL would otherwise strip every key inside it.
+    DEFINE TABLE IF NOT EXISTS rag_output SCHEMAFULL;
+    DEFINE FIELD IF NOT EXISTS course_note ON rag_output TYPE record<course_note>;
+    DEFINE FIELD IF NOT EXISTS course ON rag_output TYPE record<course>;
+    DEFINE FIELD IF NOT EXISTS sources ON rag_output TYPE array<record<course_note_file>>;
+    DEFINE FIELD IF NOT EXISTS payload ON rag_output TYPE object FLEXIBLE;
+    DEFINE FIELD IF NOT EXISTS generated_at ON rag_output TYPE int;
+    DEFINE INDEX IF NOT EXISTS rag_output_note ON rag_output FIELDS course_note;
+    DEFINE INDEX IF NOT EXISTS rag_output_course ON rag_output FIELDS course;
+
     -- Chatbot relay (2026-07-23): a `thread` groups the turns, one
     -- `chatbot_message` is one turn. `user_id` rides on the message too so an
     -- ownership check needs no join. An assistant turn is born `pending` and

@@ -14,23 +14,27 @@
 //! * [`api`] — which REST paths a service may read back through the bridge
 //! * [`protocol`] — frames on the wire
 //! * [`chat`] — the JSON payloads carried for the `chat.reply` capability
+//! * [`rag`] — the `rag.index` payloads, and the course-note dispatch behind them
 //! * [`server`] — the listener, handshake, and [`server::AiBridge::dispatch`]
 //! * [`registry`] — who is connected here, and who gets the next request
 //! * [`tls`] — the listener's certificate
 //!
 //! The transport is generic; the features land on top of it. So far that is
-//! the chatbot (`web::chatbot`), which routes on the `chat.reply` capability.
+//! the chatbot (`web::chatbot`), which routes on the `chat.reply` capability,
+//! and course-note indexing (`web::course_notes`), which routes on `rag.index`.
 
 pub mod api;
 pub mod chat;
 pub mod error;
 pub mod protocol;
+pub mod rag;
 pub mod registry;
 pub mod server;
 pub mod tls;
 
 pub use chat::{ChatReplyPayload, ChatRequestPayload, ChatRole, ChatTurn};
 pub use error::AiError;
+pub use rag::{RagFile, RagIndexPayload};
 pub use registry::{AiRegistry, WorkerSnapshot};
 pub use server::{AiBridge, BridgeConfig};
 

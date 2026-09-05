@@ -540,6 +540,18 @@ pub const AI_KEEPALIVE_SECS: u64 = 10;
 /// chat endpoints report the service as unavailable.
 pub const AI_CHAT_CAPABILITY: &str = "chat.reply";
 
+/// The capability an AI service declares to index a course note for retrieval.
+/// The backend dispatches on it after a note (or one of its files) changes;
+/// with no worker carrying it the trigger is a silent no-op — indexing is a
+/// bonus on top of the note, never a condition of storing one.
+pub const AI_RAG_INDEX_CAPABILITY: &str = "rag.index";
+
+/// Deadline on one `rag.index` round trip. Longer than a chat turn
+/// ([`AI_DEFAULT_REQUEST_TIMEOUT_SECS`]): chunking and embedding a note with
+/// ten attachments is batch work, and nobody is waiting on it — the dispatch
+/// is fire-and-forget, off the HTTP request path.
+pub const AI_RAG_INDEX_TIMEOUT_SECS: u64 = 120;
+
 /// Hard ceiling on one chat message's characters — the newtype bound, above
 /// which no school setting can reach. Sized for a pasted question with its
 /// working, well under [`AI_MAX_FRAME_BYTES`] once history rides along.
@@ -823,6 +835,7 @@ pub const MESSAGE_TABLE: &str = "message";
 pub const NOTE_FILE_TABLE: &str = "note_file";
 pub const COURSE_NOTE_TABLE: &str = "course_note";
 pub const COURSE_NOTE_FILE_TABLE: &str = "course_note_file";
+pub const RAG_OUTPUT_TABLE: &str = "rag_output";
 pub const EVENT_TABLE: &str = "event";
 pub const ATTENDANCE_TABLE: &str = "attendance";
 pub const REGISTRATION_TABLE: &str = "registration";
