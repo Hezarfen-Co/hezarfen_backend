@@ -535,11 +535,15 @@ async fn open_blob(
     let (slug, db) = (tenant.slug, tenant.db);
     // This stream bypasses the router, so it also bypasses the route_layer the
     // module gate is — the entitlement is checked here by hand instead.
-    if !tenant.modules.contains(Module::CourseNotes) {
-        return Err((
-            "module_disabled",
-            format!("the `{slug}` school has no `course_notes` module"),
-        ));
+    // `chatbot` too: a school that did not buy the `ai` package sends no data
+    // to an AI service, and these bytes are the largest thing it would send.
+    for module in [Module::CourseNotes, Module::Chatbot] {
+        if !tenant.modules.contains(module) {
+            return Err((
+                "module_disabled",
+                format!("the `{slug}` school has no `{module}` module"),
+            ));
+        }
     }
     let user = principal(&db, request.on_behalf_of.as_deref()).await?;
 

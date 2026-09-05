@@ -24,6 +24,10 @@ use crate::error::{AppError, ValidationError};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Module {
+    /// The `ai` package's module — and the switch on **every outbound AI
+    /// dispatch**, not just the `/chatbot` nest: a school without it sends no
+    /// data to an AI service at all (rag indexing is a silent no-op, the blob
+    /// stream refuses `module_disabled`).
     Chatbot,
     Notes,
     Messages,
