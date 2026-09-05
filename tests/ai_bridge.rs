@@ -2315,3 +2315,234 @@ async fn a_body_nobody_reads_is_reset_rather_than_left_streaming_forever() {
         "expected a reset, got {err:?}"
     );
 }
+
+// ------------------------------------------------------ module entitlements --
+//
+// A school that never bought a module must be refused on both halves of the
+// bridge: the api read, where the router's `route_layer` gate answers and the
+// refusal rides back as an ordinary `Ok` status, and the blob stream, which
+// bypasses the router entirely and checks `Module::CourseNotes` by hand.
+
+use hezarfen_backend::module::Module;
+use hezarfen_backend::tenant::Tenants;
+
+/// Take `off` away from the demo school. Entitlements are read off the registry
+/// row per request, so this lands on the very next frame — no reconnect, no
+/// cached handle to go stale.
+async fn demo_without(tenants: &Tenants, off: &[Module]) {
+    let mut modules = ModuleSet::all();
+    for module in off {
+        modules.remove(*module);
+    }
+    modules.validate().expect("the narrowed set is satisfiable");
+    tenants
+        .set_modules(&demo(), &modules)
+        .await
+        .expect("narrow the demo school");
+}
+
+/// The body `AppError::ModuleDisabled` renders — the same JSON a browser gets.
+fn module_disabled_body(module: Module) -> Value {
+    json!({ "error": "module disabled", "module": module.as_str() })
+}
+
+#[tokio::test]
+async fn an_api_read_of_a_disabled_module_is_the_gates_own_403_not_a_transport_refusal() {
+    // The gate is a router layer and the bridge dispatches through the router,
+    // so the entitlement holds on this seam for free — but only if the tenant
+    // the dispatch carries is the real one. A service must see the school's own
+    // 403, not `unavailable` and not a dropped stream; and two unrelated
+    // modules prove the gate is generic rather than a special case for one.
+    let bridge = bridge().await;
+    let service = connect_service(
+        &bridge,
+        hello("tutor", &[AI_CHAT_CAPABILITY]),
+        Behaviour::Echo,
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (app, db, tenants) = common::app_with_ai_tenants(Some(bridge.clone())).await;
+    let cookie = common::login_as(&app, &db, "ayse", "student").await;
+    let student = common::me_id(&app, &cookie).await;
+
+    for (module, path) in [(Module::Notes, "/notes"), (Module::Homework, "/homework")] {
+        let request = read_of(path, Some(&student));
+        let (status, _) = ok_answer(api_read(&service.conn, request.clone()).await);
+        assert_eq!(status, 200, "{path} answers while `{module}` is on");
+
+        demo_without(&tenants, &[module]).await;
+        let (status, body) = ok_answer(api_read(&service.conn, request.clone()).await);
+        assert_eq!(status, 403, "{path} with `{module}` off: {body}");
+        assert_eq!(body, module_disabled_body(module), "{path}");
+
+        // Sold back, and the very next frame answers again: the entitlement is
+        // the only thing that changed.
+        demo_without(&tenants, &[]).await;
+        let (status, _) = ok_answer(api_read(&service.conn, request).await);
+        assert_eq!(status, 200, "{path} answers once `{module}` is back");
+    }
+}
+
+/// A school with a course note and one attachment, plus the registry behind it:
+/// (service, student id, file id, uploaded bytes, tenants).
+async fn blob_fixture(bridge: &AiBridge) -> (FakeService, String, String, Vec<u8>, Tenants) {
+    let service = connect_service(
+        bridge,
+        hello("indexer", &[AI_RAG_INDEX_CAPABILITY]),
+        Behaviour::Echo,
+    )
+    .await;
+    await_workers(bridge, 1).await;
+    let (app, db, tenants) = common::app_with_ai_tenants(Some(bridge.clone())).await;
+
+    let student_cookie = common::login_as(&app, &db, "ayse", "student").await;
+    let student = common::me_id(&app, &student_cookie).await;
+    let teacher = common::login_as(&app, &db, "hoca", "teacher").await;
+    let course = common::create_course(&app, &teacher, "Physics").await;
+    common::enroll(&app, &teacher, &course, &student).await;
+
+    let res = common::send(
+        &app,
+        "POST",
+        "/course-notes",
+        Some(&teacher),
+        Some(json!({ "course": course, "title": "Newton", "content": "F = ma" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let note = common::id_of(&res.body);
+
+    let uploaded = blob_bytes(64 * 1024);
+    let res = common::upload_file_at(
+        &app,
+        &teacher,
+        &format!("/course-notes/{note}/files"),
+        "recap.pdf",
+        "application/pdf",
+        &uploaded,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    (
+        service,
+        student,
+        common::id_of(&res.body),
+        uploaded,
+        tenants,
+    )
+}
+
+#[tokio::test]
+async fn a_blob_read_is_refused_module_disabled_when_the_school_has_no_course_notes() {
+    // The one surface the router's gate cannot reach. A refusal here must be
+    // the header frame and *nothing after it*: a service reads `size` bytes on
+    // an `Ok`, so a refusal followed by bytes would be read as a file.
+    let bridge = bridge().await;
+    let (service, student, file, uploaded, tenants) = blob_fixture(&bridge).await;
+
+    let (header, bytes) = blob_read(&service.conn, blob_of(&file, Some(&student))).await;
+    assert!(
+        matches!(header, BlobResponse::Ok { .. }),
+        "the module is on: {}",
+        blob_refusal(header)
+    );
+    assert_eq!(bytes.len(), uploaded.len());
+
+    demo_without(&tenants, &[Module::CourseNotes]).await;
+    let (header, bytes) = blob_read(&service.conn, blob_of(&file, Some(&student))).await;
+    assert_eq!(blob_refusal(header), "module_disabled");
+    assert!(bytes.is_empty(), "a refusal is followed by nothing at all");
+
+    // Sold back: the same request streams the same bytes as before.
+    demo_without(&tenants, &[]).await;
+    let (header, bytes) = blob_read(&service.conn, blob_of(&file, Some(&student))).await;
+    assert!(
+        matches!(header, BlobResponse::Ok { .. }),
+        "the module is back: {}",
+        blob_refusal(header)
+    );
+    assert!(bytes == uploaded, "the bytes differ from what was uploaded");
+}
+
+#[test]
+fn course_notes_without_courses_is_unsellable_so_the_blob_path_never_sees_it() {
+    // The blob stream checks `course_notes` alone. That is enough *because* the
+    // set it reads can never hold `course_notes` without `courses` — the
+    // dependency is refused before a school is ever narrowed to it, so nobody
+    // has to check the parent module on this path.
+    let mut broken = ModuleSet::all();
+    broken.remove(Module::Courses);
+    let err = broken
+        .validate()
+        .expect_err("course_notes cannot stand without courses");
+    assert!(
+        err.to_string()
+            .contains("course_notes requires courses, which is not enabled"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn a_school_without_course_notes_cannot_reach_the_rag_dispatch_at_all() {
+    // The write-back of `rag_output` has exactly four triggers, all of them
+    // `/course-notes` handlers (`spawn_index` in `web::course_notes`), so the
+    // nest's gate is the whole answer: no create, no dispatch, no row. This
+    // pins that there is no second, ungated way in.
+    let bridge = bridge().await;
+    let service = connect_service(
+        &bridge,
+        hello("indexer", &[AI_RAG_INDEX_CAPABILITY]),
+        Behaviour::Answer(json!({ "summary": "x" })),
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (app, db, tenants) = common::app_with_ai_tenants(Some(bridge.clone())).await;
+
+    let teacher = common::login_as(&app, &db, "ogretmen", "teacher").await;
+    let course = common::create_course(&app, &teacher, "fizik").await;
+    demo_without(&tenants, &[Module::CourseNotes]).await;
+
+    let res = common::send(
+        &app,
+        "POST",
+        "/course-notes",
+        Some(&teacher),
+        Some(json!({ "course": course, "title": "Bölüm 3", "content": "özet" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+    assert_eq!(res.body, module_disabled_body(Module::CourseNotes));
+
+    // Nothing was sent to the indexer. The dispatch is fire-and-forget, so give
+    // a frame that should never exist time to arrive before saying it did not.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        service.seen().is_empty(),
+        "a gated handler still dispatched to an AI service: {:?}",
+        service.seen()
+    );
+}
+
+#[tokio::test]
+async fn indexing_follows_course_notes_not_chatbot() {
+    // `rag.index` is the course-notes module's own background refresh, not part
+    // of the chatbot the `ai` package sells: a school that bought course notes
+    // and no chatbot still gets its notes indexed. Pinned because the two are
+    // easy to confuse — both go out over the same bridge.
+    let bridge = bridge().await;
+    let service = connect_service(
+        &bridge,
+        hello("indexer", &[AI_RAG_INDEX_CAPABILITY]),
+        Behaviour::Answer(json!({ "summary": "x" })),
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (app, db, tenants) = common::app_with_ai_tenants(Some(bridge.clone())).await;
+    demo_without(&tenants, &[Module::Chatbot]).await;
+
+    let (_cookie, note) = course_note(&app, &db).await;
+    let stored = await_outputs(&db, &note).await;
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].get_payload()["summary"], "x");
+    assert_eq!(service.seen()[0].capability, AI_RAG_INDEX_CAPABILITY);
+}
