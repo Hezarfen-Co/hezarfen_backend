@@ -131,16 +131,17 @@ pub async fn index_course_note(state: &AppState, note: &CourseNote) {
     }
 }
 
-/// Swap the note's outputs for the fresh one. Delete-then-create, not an
-/// update: the previous output belongs to a previous version of the note.
+/// Swap the note's outputs for the fresh one. Create-then-drop-older, not an
+/// update: the previous output belongs to a previous version of the note, and
+/// this order is what makes two concurrent index tasks converge on one row
+/// ([`RagOutput::replace_for_note`]).
 async fn replace(
     db: &Database,
     note: &CourseNote,
     sources: Vec<crate::domain::course_note_file::CourseNoteFileId>,
     payload: serde_json::Value,
 ) -> Result<(), crate::error::AppError> {
-    RagOutput::delete_for_note(note.get_id(), db).await?;
-    RagOutput::create(note.get_id(), note.get_course(), sources, payload, db).await?;
+    RagOutput::replace_for_note(note.get_id(), note.get_course(), sources, payload, db).await?;
     Ok(())
 }
 

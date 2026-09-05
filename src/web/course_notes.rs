@@ -292,16 +292,16 @@ async fn delete_one(
             "only the course creator, an assigned teacher, or a manager/admin can delete this course note",
         ));
     }
-    let note_id = &note.get_id().clone();
+    // Derived rows first, outside the note's own cascade transaction: they are
+    // disposable, so failing here leaves the note intact and the 500 truthful,
+    // whereas dropping them after the note would strand every blob on an error
+    // — and if the note delete then fails, the next change regenerates them.
+    RagOutput::delete_for_note(note.get_id(), &st.db).await?;
     // Rows go first (the note delete cascades them), blobs after: a crash in
     // between strands at worst an unreachable blob, never a row whose blob is
     // already gone. The files to unlink come from the delete itself, not a
     // pre-read list — an upload that landed in between is in the cascade too.
     let (_, files) = note.delete(&st.db).await?;
-    // Derived rows go with their note. Not part of the note's own cascade
-    // transaction on purpose: an index is disposable, and failing the delete
-    // over one would leave the caller unable to remove their note at all.
-    RagOutput::delete_for_note(note_id, &st.db).await?;
     for file in &files {
         remove_blob(&st.files_path, file.get_id().key()).await;
     }
@@ -523,12 +523,13 @@ async fn delete_file(
         CourseNoteFile::read_for(&CourseNoteFileId::from_key(&file_id), note.get_id(), &st.db)
             .await?
             .ok_or(AppError::NotFound)?;
+    // Drop every output built from this file before the file itself, so a
+    // stale index cannot outlive its source in a deployment with no AI service
+    // at all, and a failure here leaves the file whole instead of stranding its
+    // blob; the re-index rebuilds from what is left, if a service is connected.
+    RagOutput::delete_with_source(file.get_id(), &st.db).await?;
     let file = file.delete(&st.db).await?;
     remove_blob(&st.files_path, file.get_id().key()).await;
-    // Drop every output built from this file first, so a stale index cannot
-    // outlive its source in a deployment with no AI service at all; the
-    // re-index then rebuilds from what is left, if a service is connected.
-    RagOutput::delete_with_source(file.get_id(), &st.db).await?;
     spawn_index(&st, note);
     Ok(StatusCode::NO_CONTENT)
 }

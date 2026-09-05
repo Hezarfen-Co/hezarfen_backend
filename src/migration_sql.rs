@@ -210,7 +210,11 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS payload ON rag_output TYPE object FLEXIBLE;
     DEFINE FIELD IF NOT EXISTS generated_at ON rag_output TYPE int;
     DEFINE INDEX IF NOT EXISTS rag_output_note ON rag_output FIELDS course_note;
-    DEFINE INDEX IF NOT EXISTS rag_output_course ON rag_output FIELDS course;
+    -- Retire the course index: nothing queries rag_output by course.
+    REMOVE INDEX IF EXISTS rag_output_course ON rag_output;
+    -- Indexed per element, so the source cascade's `sources CONTAINS $file`
+    -- is a lookup rather than a table scan.
+    DEFINE INDEX IF NOT EXISTS rag_output_source ON rag_output FIELDS sources;
 
     -- Chatbot relay (2026-07-23): a `thread` groups the turns, one
     -- `chatbot_message` is one turn. `user_id` rides on the message too so an
