@@ -1757,3 +1757,399 @@ async fn the_catalog_is_public_and_a_school_user_reads_its_own_set() {
         StatusCode::UNAUTHORIZED
     );
 }
+
+// ===================== REFUTE probes (verifier, 2026-09-06) =====================
+// Appended by an adversarial verification pass. These probe the module
+// entitlement package's stated invariants; they touch no src/.
+
+/// P1: a school that bought nothing can still reach every ungated surface.
+#[tokio::test]
+async fn probe_a_module_less_school_still_works() {
+    let (app, _db, _tenants) = deployment().await;
+    let builder = builder_login(&app).await;
+    let created = send(
+        &app,
+        "POST",
+        "/schools",
+        Some(&builder),
+        Some(json!({
+            "slug": "bare",
+            "name": "Bare School",
+            "admin_username": "admin",
+            "admin_password": "secret1",
+            "modules": [],
+        })),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{:?}", created.body);
+    assert_eq!(created.body["modules"], json!([]));
+
+    let login = school_login(&app, "bare", "admin", "secret1").await;
+    assert_eq!(login.status, StatusCode::OK, "login: {:?}", login.body);
+    let cookie = login.cookie.expect("session cookie");
+
+    for path in [
+        "/auth/me",
+        "/limits",
+        "/settings",
+        "/terms",
+        "/users/me/profile",
+        "/modules",
+        "/modules/catalog",
+    ] {
+        let res = send(&app, "GET", path, Some(&cookie), None).await;
+        assert_eq!(
+            res.status,
+            StatusCode::OK,
+            "GET {path} on a module-less school -> {} {:?}",
+            res.status,
+            res.body
+        );
+    }
+    let mine = send(&app, "GET", "/modules", Some(&cookie), None).await;
+    assert_eq!(mine.body["enabled"], json!([]));
+
+    let prefs = send(
+        &app,
+        "PATCH",
+        "/users/me/preferences",
+        Some(&cookie),
+        Some(json!({ "theme": "dark" })),
+    )
+    .await;
+    assert_eq!(
+        prefs.status,
+        StatusCode::OK,
+        "PATCH /users/me/preferences -> {:?}",
+        prefs.body
+    );
+}
+
+/// P1b: the same, reached by narrowing a full school with `disable_packages`.
+#[tokio::test]
+async fn probe_narrowing_every_package_away_leaves_the_school_usable() {
+    let (app, db, _tenants) = deployment().await;
+    let builder = builder_login(&app).await;
+    let cookie = login_as(&app, &db, "boss", "admin").await;
+
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/schools/{DEMO_SLUG}/modules"),
+        Some(&builder),
+        Some(json!({
+            "disable_packages": ["academics", "communication", "operations", "ai"],
+        })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{:?}", res.body);
+    assert_eq!(res.body["enabled"], json!([]), "{:?}", res.body);
+
+    for path in [
+        "/auth/me",
+        "/limits",
+        "/settings",
+        "/terms",
+        "/users/me/profile",
+        "/modules",
+    ] {
+        let r = send(&app, "GET", path, Some(&cookie), None).await;
+        assert_eq!(
+            r.status,
+            StatusCode::OK,
+            "GET {path} -> {} {:?}",
+            r.status,
+            r.body
+        );
+    }
+    assert_eq!(
+        send(&app, "GET", "/modules", Some(&cookie), None)
+            .await
+            .body["enabled"],
+        json!([])
+    );
+}
+
+/// P2: a fully-enabled school must never meet `module disabled` anywhere.
+#[tokio::test]
+async fn probe_no_route_refuses_a_module_a_school_has() {
+    let (app, db, _tenants) = deployment().await;
+    let cookie = login_as(&app, &db, "boss", "admin").await;
+
+    let spec = send(&app, "GET", "/api-docs/openapi.json", None, None).await;
+    assert_eq!(spec.status, StatusCode::OK, "openapi spec");
+    let paths = spec.body["paths"].as_object().expect("paths object");
+    assert!(paths.len() > 50, "only {} paths in the spec", paths.len());
+
+    let mut refused = Vec::new();
+    let mut swept = 0usize;
+    for path in paths.keys() {
+        if !paths[path].get("get").is_some() {
+            continue;
+        }
+        let concrete = path
+            .split('/')
+            .map(|seg| {
+                if seg.starts_with('{') && seg.ends_with('}') {
+                    "x"
+                } else {
+                    seg
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("/");
+        let res = send(&app, "GET", &concrete, Some(&cookie), None).await;
+        swept += 1;
+        if res.body.get("error").and_then(|e| e.as_str()) == Some("module disabled") {
+            refused.push(format!("{concrete} -> {} {:?}", res.status, res.body));
+        }
+    }
+    assert!(swept > 50, "only {swept} GET routes swept");
+    assert!(
+        refused.is_empty(),
+        "{} of {swept} GET routes answered `module disabled` on a fully enabled school: {:#?}",
+        refused.len(),
+        refused
+    );
+}
+
+/// P6: the gate must not answer before authentication — no cookie means no
+/// school, so nothing about a school's shelf may leak.
+#[tokio::test]
+async fn probe_gate_ordering_versus_auth() {
+    let (app, _db, _tenants) = deployment().await;
+    let builder = builder_login(&app).await;
+    let off = send(
+        &app,
+        "DELETE",
+        &format!("/schools/{DEMO_SLUG}/modules/meals"),
+        Some(&builder),
+        None,
+    )
+    .await;
+    assert_eq!(off.status, StatusCode::OK, "{:?}", off.body);
+
+    let anon = send(&app, "GET", "/meals/menus", None, None).await;
+    assert_eq!(
+        anon.status,
+        StatusCode::UNAUTHORIZED,
+        "cookie-less request to a disabled nest -> {} {:?}",
+        anon.status,
+        anon.body
+    );
+    assert_ne!(
+        anon.body.get("error").and_then(|e| e.as_str()),
+        Some("module disabled"),
+        "a cookie-less caller learned a school's entitlements: {:?}",
+        anon.body
+    );
+
+    let as_builder = send(&app, "GET", "/meals/menus", Some(&builder), None).await;
+    assert_eq!(
+        as_builder.status,
+        StatusCode::UNAUTHORIZED,
+        "builder cookie inside a school nest -> {} {:?}",
+        as_builder.status,
+        as_builder.body
+    );
+}
+
+/// P7: one school's disabled module says nothing about another's.
+#[tokio::test]
+async fn probe_disabling_in_one_school_leaves_the_other_alone() {
+    let (app, _db, tenants) = deployment().await;
+    let builder = builder_login(&app).await;
+    for slug in ["alpha", "beta"] {
+        let res = create_school(&app, &builder, slug, "secret1").await;
+        assert_eq!(res.status, StatusCode::CREATED, "{slug}: {:?}", res.body);
+    }
+    let alpha_db = tenants
+        .get(&hezarfen_backend::tenant::Slug::try_new("alpha").unwrap())
+        .await
+        .unwrap();
+    let beta_db = tenants
+        .get(&hezarfen_backend::tenant::Slug::try_new("beta").unwrap())
+        .await
+        .unwrap();
+    let alpha = login_as_school(&app, &alpha_db, "alpha", "ada", "manager").await;
+    let beta = login_as_school(&app, &beta_db, "beta", "ada", "manager").await;
+
+    let off = send(
+        &app,
+        "DELETE",
+        "/schools/alpha/modules/meals",
+        Some(&builder),
+        None,
+    )
+    .await;
+    assert_eq!(off.status, StatusCode::OK, "{:?}", off.body);
+
+    let a = send(&app, "GET", "/meals/menus", Some(&alpha), None).await;
+    assert_eq!(a.status, StatusCode::FORBIDDEN, "{:?}", a.body);
+    assert_eq!(a.body["module"], "meals");
+    let b = send(&app, "GET", "/meals/menus", Some(&beta), None).await;
+    assert_eq!(
+        b.status,
+        StatusCode::OK,
+        "school B lost meals with school A: {} {:?}",
+        b.status,
+        b.body
+    );
+}
+
+/// P5: a contradictory batch is a refusal that writes nothing — checked on the
+/// registry row itself, not through the API's own read.
+#[tokio::test]
+async fn probe_a_refused_batch_leaves_the_row_byte_identical() {
+    let (app, _db, tenants) = deployment().await;
+    let builder = builder_login(&app).await;
+
+    async fn raw_row(tenants: &Tenants) -> Vec<String> {
+        tenants
+            .control()
+            .query(format!(
+                "SELECT VALUE modules FROM type::record('school', '{DEMO_SLUG}')"
+            ))
+            .await
+            .expect("raw read")
+            .check()
+            .expect("raw check")
+            .take::<Vec<Vec<String>>>(0)
+            .expect("modules column")
+            .remove(0)
+    }
+
+    let before = raw_row(&tenants).await;
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/schools/{DEMO_SLUG}/modules"),
+        Some(&builder),
+        Some(json!({ "enable": ["exams"], "disable": ["courses"] })),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::CONFLICT,
+        "enable exams + disable courses -> {} {:?}",
+        res.status,
+        res.body
+    );
+    let after = raw_row(&tenants).await;
+    assert_eq!(before, after, "the refused batch moved the stored row");
+}
+
+/// P4 (attempt): count the control database's reads for one gated request by
+/// counting the SDK's own tracing spans. Prints the figure; asserts only that
+/// the instrumentation saw *something*, so a zero is reported as UNMEASURED
+/// rather than as a passing measurement.
+#[tokio::test]
+async fn probe_registry_reads_per_request() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[derive(Clone)]
+    struct Counter(Arc<AtomicUsize>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Counter {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if attrs.metadata().target().starts_with("surrealdb") {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target().starts_with("surrealdb") {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    let count = Arc::new(AtomicUsize::new(0));
+    let subscriber = tracing_subscriber::registry().with(Counter(count.clone()));
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let (app, db, _tenants) = deployment().await;
+    let cookie = login_as(&app, &db, "boss", "admin").await;
+    count.store(0, Ordering::Relaxed);
+    let res = send(&app, "GET", "/notes", Some(&cookie), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{:?}", res.body);
+    let seen = count.load(Ordering::Relaxed);
+    println!("PROBE surrealdb spans/events for GET /notes = {seen}");
+    assert!(
+        seen > 0,
+        "UNMEASURED: the surrealdb SDK emitted no tracing spans, so per-request \
+         registry reads cannot be counted this way"
+    );
+}
+
+/// P8: the four foreign route pairs mounted under `/courses` carry both gates,
+/// and a disabled nest still `404`s an unmatched path inside it.
+#[tokio::test]
+async fn probe_child_gates_under_courses_and_the_404_inside_a_disabled_nest() {
+    let (app, db, _tenants) = deployment().await;
+    let builder = builder_login(&app).await;
+    let cookie = login_as(&app, &db, "boss", "admin").await;
+
+    // Exams off, courses still on: the child pair must refuse as `exams`.
+    for module in ["marks", "exams"] {
+        let off = send(
+            &app,
+            "DELETE",
+            &format!("/schools/{DEMO_SLUG}/modules/{module}"),
+            Some(&builder),
+            None,
+        )
+        .await;
+        assert_eq!(off.status, StatusCode::OK, "{module}: {:?}", off.body);
+    }
+    let child = send(&app, "GET", "/courses/x/exams", Some(&cookie), None).await;
+    assert_eq!(
+        child.status,
+        StatusCode::FORBIDDEN,
+        "/courses/x/exams with exams off -> {} {:?}",
+        child.status,
+        child.body
+    );
+    assert_eq!(child.body["module"], "exams", "{:?}", child.body);
+    // …while the course routes themselves keep answering.
+    let parent = send(&app, "GET", "/courses", Some(&cookie), None).await;
+    assert_eq!(parent.status, StatusCode::OK, "{:?}", parent.body);
+    // A sibling child pair whose own module is still on is untouched.
+    let sibling = send(&app, "GET", "/courses/x/subjects", Some(&cookie), None).await;
+    assert_ne!(
+        sibling.status,
+        StatusCode::FORBIDDEN,
+        "/courses/x/subjects lost its own gate: {:?}",
+        sibling.body
+    );
+
+    // A disabled nest is a refusal on the routes that exist, not a wall.
+    let off = send(
+        &app,
+        "DELETE",
+        &format!("/schools/{DEMO_SLUG}/modules/meals"),
+        Some(&builder),
+        None,
+    )
+    .await;
+    assert_eq!(off.status, StatusCode::OK, "{:?}", off.body);
+    let ghost = send(&app, "GET", "/meals/no-such-route", Some(&cookie), None).await;
+    assert_eq!(
+        ghost.status,
+        StatusCode::NOT_FOUND,
+        "an unmatched path inside a disabled nest -> {} {:?}",
+        ghost.status,
+        ghost.body
+    );
+    let real = send(&app, "GET", "/meals/menus", Some(&cookie), None).await;
+    assert_eq!(real.status, StatusCode::FORBIDDEN, "{:?}", real.body);
+}
