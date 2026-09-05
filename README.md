@@ -271,11 +271,63 @@ podman build -t hezarfen-backend .
 podman run -d --name hezarfen -p 8080:8080 -v hezarfen-data:/data hezarfen-backend
 ```
 
+## Multi-school (SaaS)
+
+One deployment serves many schools. Every school gets a SurrealDB **database**
+of its own inside the one namespace (`DB_NAMESPACE`, default `hezarfen`),
+named by its slug, next to a **control** database (`DB_DATABASE`, default
+`control`) that holds the school registry, the builder accounts and the shared
+rate-limit window. Isolation is the store's, not the handlers': a school
+database sees only its own rows, so no query carries a `WHERE school = ...`
+somebody could forget.
+
+**Slugs.** 2-32 characters of `a-z`, `0-9` and `-`, starting with a letter or
+digit (`MIN_SLUG_LEN`/`MAX_SLUG_LEN`); `builder` and `control` are reserved and
+refused. A slug names the school's database, its blob directory and its cookie
+prefix, so it is immutable once taken — a rename changes the display name only.
+
+**Cookies.** A school session is `session=<slug>.<token>`, the vendor's is
+`session=builder.<token>`, split at the *first* dot so a token can never be
+read as a slug. Neither cookie is accepted on the other's surface (`401` both
+ways), and a cookie with no dot names no school and is refused everywhere.
+
+**How a request finds its school.** Every school-scoped handler takes the
+tenancy `State` (`web::tenant_state`), which reads the cookie's prefix, looks
+the school up in the registry, and hands the handler a connection pinned to
+that database plus `FILES_PATH/<slug>/` as its blob directory. The AI bridge is
+the one caller with no cookie: it injects the school as a request extension
+instead, which nothing outside the process can forge. In-process state is keyed
+by school too — the exam presence map and the whiteboard hub — so two schools
+never share a room.
+
+**Suspension is immediate and total** for a school's own users: the registry
+row is read on every request, so the next call after the switch answers `403`,
+live session or not, `POST /auth/login` included. The builder surface keeps
+working on a suspended school — that is how it comes back — except
+`POST /schools/{slug}/enter`, which is one of the school's own doors.
+
+**The builder lifecycle.** `BUILDER_USERNAME` + `BUILDER_PASSWORD` seed the
+operator account at boot (both or neither; half a pair aborts startup, and an
+existing account is never rewritten). From there: `POST /builder/login` →
+`POST /schools` (registry row, database, schema and the school's first admin —
+one call or none of it) → that admin logs in at `POST /auth/login` naming the
+school → `PATCH /schools/{slug}` renames, suspends or resumes →
+`POST /schools/{slug}/admin-password` re-keys a locked-out admin and revokes
+every session it held → `POST /schools/{slug}/enter` mints an ordinary school
+session for one of its admins (support access, no builder power inside) →
+`DELETE /schools/{slug}` destroys the school's database, its registry row and
+its uploaded files. Irreversible on purpose: suspension is the reversible door.
+
+**AI frames name the school.** One AI service serves the whole deployment, so
+every `hab/2` frame carries a `school` field — see "AI bridge (QUIC)".
+
 ## Auth model
 
 Login sets an `HttpOnly`, `SameSite=Lax` `session` cookie (7-day expiry, stored
-server-side). Send it back on later requests. Every endpoint below whose `Auth`
-column names a role requires a valid session; the ones marked `no` (`/health`,
+server-side); its value is `<school-slug>.<token>`, so `POST /auth/login` and
+`POST /auth/register` name the school alongside the username (see
+"Multi-school (SaaS)"). Send the cookie back on later requests. Every endpoint
+below whose `Auth` column names a role requires a valid session; the ones marked `no` (`/health`,
 the docs pages, `register` / `login` / `logout`) don't (`logout` is idempotent —
 it clears the session if one is present). Set `COOKIE_SECURE=true` when serving
 behind TLS to add the cookie's `Secure` attribute.
@@ -705,19 +757,22 @@ still left exactly as they stand.
 ### Bootstrapping the first admin
 
 There is no self-service path to `admin` — registration always creates a
-`student`. The first admin comes from the startup seed: set both
+`student`. A school's first admin is created *with* the school: the builder
+posts `POST /schools` with `{slug, name, admin_username, admin_password}` and
+that account lands inside the new school's database holding `admin`. The
+builder itself comes from the startup seed: set both
 
 ```sh
-ADMIN_USERNAME=admin
-ADMIN_PASSWORD=admin123   # local-dev default used by compose.yaml; change it
+BUILDER_USERNAME=builder
+BUILDER_PASSWORD=builder123   # local-dev default used by compose.yaml; change it
 ```
 
-and on boot the account is created with the `admin` role **if the username
-doesn't exist yet**. The seed is idempotent and deliberately conservative: it
-never promotes or rewrites an existing account (if the name is taken by a
-non-admin it logs a warning and leaves it alone — promoting someone else's
-account would be an escalation). Setting only one of the two variables aborts
-startup. `compose.yaml` ships with the credentials above for local dev.
+and on boot the builder account is created in the control database **if the
+username doesn't exist yet**. The seed is idempotent and deliberately
+conservative: it never rewrites an existing account, so changing the password
+here does not re-key a live builder. Setting only one of the two aborts
+startup. `compose.yaml` ships with the credentials above for local dev. See
+"Multi-school (SaaS)" for the rest of the lifecycle.
 
 That admin can then promote everyone else through `PATCH /users/{id}/role`.
 
@@ -727,15 +782,17 @@ answers `409` — including when two admins demote each other at the same
 instant, since that guard is serialized school-wide rather than left to the
 database (which conflict-checks neither a cross-record count nor a read).
 
-Manual fallback (the recovery path if the seeded name was squatted, or if an
-older build already emptied the admin set): run
+A locked-out school is the builder's `POST /schools/{slug}/admin-password`,
+which re-keys an admin that still exists. Manual fallback (the recovery path
+if an older build already emptied a school's admin set): run
 
 ```surql
 UPDATE user SET role = 'admin' WHERE username = 'ada';
 ```
 
-against the SurrealDB server — e.g.
-`surreal sql --conn ws://127.0.0.1:8000 --user root --pass root --ns hezarfen --db hezarfen`
+against the SurrealDB server, with `--db` naming the **school's** database (its
+slug), not the control one — e.g.
+`surreal sql --conn ws://127.0.0.1:8000 --user root --pass root --ns hezarfen --db demo`
 (in the container setup, `podman exec -it hezarfen-surrealdb /surreal sql ...`).
 
 ## Endpoints
@@ -1221,8 +1278,8 @@ future. Names allow unicode; usernames are strict: lowercase letters and
 digits plus non-consecutive interior `.`, `_`, `-` separators, starting and
 ending with a letter or digit (3–32 chars). Staff-looking names (`admin`,
 `administrator`, `root`, `support`, `system`, `moderator`, `staff`) are
-rejected at `/auth/register` only — the `ADMIN_USERNAME` bootstrap may still
-seed them. `display_name` (≤ 50) and `bio` (≤ 500) ride the same two patches
+rejected at `/auth/register` only — the admin account a builder names when
+creating a school may still take one. `display_name` (≤ 50) and `bio` (≤ 500) ride the same two patches
 under the same rules, `""` clearing either (see "User profiles & avatars").
 UI preferences (`theme`: `light`/`dark`, `language`: `tr`/`en`,
 `palette_color`: an accent color as `#` plus exactly 6 hex digits) ride on the
@@ -1888,9 +1945,10 @@ in the same instant is an accepted race; see `## Concurrency model`.
 What stays fixed is deliberate too: the four roles, the `0`–`100` mark scale,
 validation bounds, and the UTC time policy are invariants, not preferences
 (rename role labels in the frontend if a school says "principal" instead of
-"manager"). Deployment knobs (ports, rate limits, admin seed, CORS) remain
-environment variables — the model is **one school per deployment**, which
-keeps every school's data physically isolated.
+"manager"). Deployment knobs (ports, rate limits, the builder seed, CORS) remain
+environment variables — they belong to the deployment, not to a school. One
+deployment serves many schools, each in its own database (see "Multi-school
+(SaaS)"), which keeps every school's data physically isolated.
 
 ## Food program: menus, dishes, bookings, attendance & the ledger
 
@@ -3426,11 +3484,14 @@ non-empty and contain none of `/ \ ? # %`.
 BASE=http://127.0.0.1:8080
 JAR=/tmp/hz.cookies
 
+# SCHOOL is the slug a builder gave this school (see "Multi-school (SaaS)").
+SCHOOL=demo
+
 curl -s $BASE/auth/register -H 'content-type: application/json' \
-  -d '{"username":"ali","password":"secret1"}'
+  -d '{"school":"'$SCHOOL'","username":"ali","password":"secret1"}'
 
 curl -s -c $JAR $BASE/auth/login -H 'content-type: application/json' \
-  -d '{"username":"ali","password":"secret1"}'
+  -d '{"school":"'$SCHOOL'","username":"ali","password":"secret1"}'
 
 # notes
 curl -s -b $JAR $BASE/notes -H 'content-type: application/json' \
@@ -4452,6 +4513,10 @@ src/
     tls.rs         listener certificate (PEM or self-signed) + fingerprint
     error.rs       AiError
     chat.rs        the `chat.reply` payload contract (ChatRequestPayload/ChatReplyPayload)
+    rag.rs         the `rag.index` payload contract + spawn_index: a course note
+                   changed, so its stored output is refreshed in a background task
+    api.rs         AI_API_ALLOWLIST: the exact REST paths an AI service may read
+                   (deny-by-default, segment-for-segment, no wildcard tail)
   domain/          validated newtypes + entities (derive SurrealValue),
                    each owning its persistence
     user.rs        UserId · Username · Password · PasswordHash · User (has role)
@@ -4470,6 +4535,8 @@ src/
                    one transaction, for children with a deterministic id
     text_fold.rs   case- and diacritic-insensitive folding for search, shared by
                    the Rust needle and the SurrealQL column (Turkish İ/ı, ü, ö…)
+    page.rs        PagedList: one paged SELECT — the window and its `total`, both
+                   done by the database rather than by slicing a full scan
     session.rs     SessionId · SessionToken · Session (7-day expiry)
     builder.rs     BuilderId · Builder · BuilderSession: the deployment operator
                    who creates and suspends schools, in the control database
@@ -4483,6 +4550,8 @@ src/
     course_note.rs CourseNoteId · CourseNoteTitle · CourseNoteContent · CourseNote
     course_note_file.rs CourseNoteFileId · CourseNoteFile (metadata row; blob on
                    disk under FILES_PATH; FileName/FileContentType shared with note_file.rs)
+    rag_output.rs  RagOutputId · RagOutput (what an AI service produced for a
+                   course note; derived, disposable, cascaded from note and file)
     course_session.rs CourseSessionId · SessionTopic · CourseSession (a course's lesson)
     session_attendance.rs SessionAttendanceId · SessionAttendance (roll call; one row per session+user)
     work_entry.rs  WorkEntryId · WorkEntry (staff stint; one open per user by construction)
@@ -4592,6 +4661,10 @@ src/
                    caller's school from the `<slug>.<token>` cookie, so every
                    handler that imports it is school-scoped by construction
                    (TenantExt · SchoolSlug · split_cookie)
+    builder.rs     the vendor surface: /builder/login|logout|me and /schools/*
+                   (create · list · rename/suspend · delete · admin-password · enter)
+    image.rs       the halves every image upload shares: the `file` part under the
+                   raster allowlist and the school's size cap, and the blob-first write
     extractor.rs   CurrentUser · RequireTeacher · RequireManager · RequireAdmin
                    · RequireBuilder (the control-database principal)
     dto.rs         shared UserResponse · CourseResponse · ExamResponse · SessionResponse schemas
@@ -4605,7 +4678,9 @@ src/
     etag.rs        conditional-GET middleware: ETag over a 200 JSON body,
                    If-None-Match → 304 (GET only; SSE and blobs pass through)
     auth.rs  users.rs  notes.rs  messages.rs  events.rs  appointments.rs
-    courses.rs  course_notes.rs  subjects.rs  sessions.rs  exams.rs  homework.rs  questions.rs
+    courses.rs  course_notes.rs  subjects.rs  sessions.rs  homework.rs  questions.rs
+    exams/         mod.rs (exam CRUD + grading) · questions.rs · attempts.rs ·
+                   images.rs · review.rs (prior sittings)
     bank_questions.rs  marks.rs  work.rs  pomodoro.rs  attendance.rs
     settings.rs  terms.rs  meals.rs  payments.rs  ai.rs  chatbot.rs
     boards.rs  classes.rs
