@@ -127,6 +127,8 @@ enum Behaviour {
     Echo,
     /// Answer after a delay — a slow model.
     SlowEcho(Duration),
+    /// Answer with a fixed payload, whatever the request.
+    Answer(Value),
     /// Answer a chatbot turn with a fixed reply text (`{"text": ...}`).
     Reply(String),
     /// Answer a chatbot turn with `cevap::<the prompt it was given>`. The reply
@@ -184,6 +186,10 @@ fn serve(conn: quinn::Connection, behaviour: Behaviour, seen: Arc<Mutex<Vec<Requ
                         barrier.wait().await;
                         Some(echo(&request))
                     }
+                    Behaviour::Answer(payload) => Some(Response::Ok {
+                        id: request.id.clone(),
+                        payload,
+                    }),
                     Behaviour::Reply(text) => Some(Response::Ok {
                         id: request.id.clone(),
                         payload: json!({ "text": text }),
@@ -1655,4 +1661,161 @@ async fn a_configured_bridge_listens_and_serves_a_real_handshake() {
     .await;
     await_workers(&bridge, 1).await;
     assert_eq!(bridge.workers().len(), 1);
+}
+
+// ------------------------------------------------------- course-note rag --
+//
+// The `rag.index` dispatch end to end: a real course-note handler, a real QUIC
+// round trip, and a fake service standing in for the indexer. These pin the
+// three rules the feature rests on — the handler never waits on the service,
+// no service means no rows and no failure, and a deleted note takes its
+// outputs with it.
+
+use hezarfen_backend::constant::AI_RAG_INDEX_CAPABILITY;
+use hezarfen_backend::domain::course_note::CourseNoteId;
+use hezarfen_backend::domain::rag_output::RagOutput;
+
+/// Every stored output of `note`, newest first.
+async fn outputs(db: &Database, note: &str) -> Vec<RagOutput> {
+    RagOutput::list_for(&CourseNoteId::from_key(note), None, 0, db)
+        .await
+        .expect("list rag outputs")
+        .0
+}
+
+/// Poll until `note` has stored outputs. Bounded polling rather than a sleep
+/// sized to the dispatch: it is fire-and-forget, so it lands when it lands.
+async fn await_outputs(db: &Database, note: &str) -> Vec<RagOutput> {
+    for _ in 0..500 {
+        let stored = outputs(db, note).await;
+        if !stored.is_empty() {
+            return stored;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("no rag_output row ever landed for course note {note}");
+}
+
+/// A teacher with a course and one note on it: (cookie, note id).
+async fn course_note(app: &Router, db: &Database) -> (String, String) {
+    let cookie = common::login_as(app, db, "ogretmen", "teacher").await;
+    let course = common::create_course(app, &cookie, "fizik").await;
+    let res = common::send(
+        app,
+        "POST",
+        "/course-notes",
+        Some(&cookie),
+        Some(json!({ "course": course, "title": "Bölüm 3", "content": "özet" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    (cookie, common::id_of(&res.body))
+}
+
+#[tokio::test]
+async fn a_course_note_is_indexed_and_its_output_stored_with_its_sources() {
+    let bridge = bridge().await;
+    let service = connect_service(
+        &bridge,
+        hello("indexer", &[AI_RAG_INDEX_CAPABILITY]),
+        Behaviour::Answer(json!({ "summary": "x" })),
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (app, db) = common::app_with_ai(Some(bridge.clone())).await;
+
+    let (cookie, note) = course_note(&app, &db).await;
+    let stored = await_outputs(&db, &note).await;
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].get_payload()["summary"], "x");
+    assert!(stored[0].get_sources().is_empty(), "the note had no files");
+
+    // The service saw the note itself, under the documented capability.
+    let seen = service.seen();
+    assert_eq!(seen[0].capability, AI_RAG_INDEX_CAPABILITY);
+    assert_eq!(seen[0].payload["course_note"], note);
+    assert_eq!(seen[0].payload["title"], "Bölüm 3");
+    assert_eq!(seen[0].payload["content"], "özet");
+    assert_eq!(seen[0].payload["files"], json!([]));
+
+    // Attaching a file re-indexes, and the fresh output cites it — one row,
+    // not two: a re-index replaces, it does not accumulate.
+    let file = common::upload_course_note_file(
+        &app,
+        &cookie,
+        &note,
+        "recap.pdf",
+        "application/pdf",
+        b"pdf bytes",
+    )
+    .await;
+    assert_eq!(file.status, StatusCode::CREATED, "{}", file.body);
+    let file_id = common::id_of(&file.body);
+    for _ in 0..500 {
+        let stored = outputs(&db, &note).await;
+        if stored.len() == 1 && stored[0].get_sources().len() == 1 {
+            assert_eq!(stored[0].get_sources()[0].key(), file_id);
+            // File CONTENT is deliberately not on the wire — metadata only.
+            let seen = service.seen();
+            let last = &seen[seen.len() - 1].payload["files"][0];
+            assert_eq!(last["id"], file_id);
+            assert_eq!(last["name"], "recap.pdf");
+            assert_eq!(last["size"], 9);
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!(
+        "the upload never re-indexed: {:?}",
+        outputs(&db, &note).await
+    );
+}
+
+#[tokio::test]
+async fn with_no_indexing_service_a_note_is_still_created_and_stores_nothing() {
+    // A worker is connected, just not one carrying `rag.index` — the trigger
+    // is a silent no-op, never a failed or slowed 201.
+    let bridge = bridge().await;
+    let service = connect_service(
+        &bridge,
+        hello("tutor", &[AI_CHAT_CAPABILITY]),
+        Behaviour::Echo,
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (app, db) = common::app_with_ai(Some(bridge.clone())).await;
+
+    let (_, note) = course_note(&app, &db).await;
+    // Long enough that a dispatch would have landed (the chat round trips in
+    // this suite settle in milliseconds).
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(outputs(&db, &note).await.is_empty());
+    assert!(service.seen().is_empty(), "nothing was dispatched");
+}
+
+#[tokio::test]
+async fn deleting_a_course_note_takes_its_rag_outputs_with_it() {
+    let bridge = bridge().await;
+    let _service = connect_service(
+        &bridge,
+        hello("indexer", &[AI_RAG_INDEX_CAPABILITY]),
+        Behaviour::Answer(json!({ "summary": "x" })),
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    let (app, db) = common::app_with_ai(Some(bridge.clone())).await;
+
+    let (cookie, note) = course_note(&app, &db).await;
+    await_outputs(&db, &note).await;
+
+    let res = common::send(
+        &app,
+        "DELETE",
+        &format!("/course-notes/{note}"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    assert!(outputs(&db, &note).await.is_empty());
 }

@@ -3866,6 +3866,42 @@ as the message's `error_code`.
 add fields (a model name, token counts) and a future backend may send more
 context without either end having to be redeployed in lockstep.
 
+### The `rag.index` capability (for AI-service authors)
+
+An indexing service declares `rag.index` in its `Hello` (see "AI bridge
+(QUIC)"). The backend dispatches one request whenever a course note is
+created, edited, or gains or loses a file — never on a read. Requests arrive
+as ordinary `hab/1` `Request` frames whose `payload` is:
+
+```json
+{ "course_note": "01J8XZ0K3Q8G7X2M4N5P6R7S8T",
+  "course": "01J8XZ0K3Q8G7X2M4N5P6R7S8U",
+  "title": "Chapter 3 recap",
+  "content": "Covered quadratics; homework due Friday",
+  "files": [ {"id":"01J8…","name":"recap.pdf",
+              "content_type":"application/pdf","size":24576} ] }
+```
+
+`files` is attachment **metadata only** — file bytes are deliberately not on
+the wire, so a service that needs them reads them out of band. It is optional
+(absent or `[]` = a note with no attachments).
+
+The answer is a `Response::Ok` whose payload is **any JSON object**: its shape
+belongs to the service, and the backend stores it verbatim against the note
+(one `rag_output` row, replacing whatever was stored before). A non-object
+payload is dropped with a warning. Failures reuse the existing
+`Response::Err {code, message}`.
+
+Nothing about this is on a user's request path: the dispatch is
+fire-and-forget, so a course-note write answers before the service is asked
+and never fails, waits, or 503s because of it. With no worker carrying
+`rag.index` the trigger is a silent no-op — notes are stored exactly as
+before, just unindexed. Rows are derived data: deleting the note, or a file an
+output was built from, deletes the output too, service or no service.
+
+**Unknown extra keys are ignored on both sides, on purpose** — same rule as
+`chat.reply`.
+
 ## Collaborative whiteboard
 
 A board is a shared canvas whose membership is an **ad-hoc invite list**: the

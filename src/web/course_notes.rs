@@ -15,6 +15,7 @@ use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use crate::ai::rag::spawn_index;
 use crate::constant::{MAX_MAX_FILE_BYTES, UPLOAD_BODY_OVERHEAD_BYTES};
 use crate::database::Database;
 use crate::domain::course::{Course, CourseId};
@@ -22,6 +23,7 @@ use crate::domain::course_note::{CourseNote, CourseNoteContent, CourseNoteId, Co
 use crate::domain::course_note_file::{
     CourseNoteFile, CourseNoteFileId, FileContentType, FileName,
 };
+use crate::domain::rag_output::RagOutput;
 use crate::domain::settings::Settings;
 use crate::error::{AppError, ErrorResponse};
 use crate::state::AppState;
@@ -134,6 +136,10 @@ async fn create(
     let title = CourseNoteTitle::try_new(&req.title)?;
     let content = CourseNoteContent::try_new(&req.content.unwrap_or_default())?;
     let note = CourseNote::create(course.get_id(), user.get_id(), title, content, &st.db).await?;
+    // Indexing is a background bonus, never a condition of storing the note:
+    // the dispatch runs in its own task, so a slow or absent AI service cannot
+    // delay or fail this 201.
+    spawn_index(&st, note.clone());
     Ok((StatusCode::CREATED, Json(CourseNoteResponse::new(&note))))
 }
 
@@ -253,6 +259,8 @@ async fn update(
         .transpose()?;
 
     let updated = note.update(title, content, &st.db).await?;
+    // The stored index describes the old text — refresh it.
+    spawn_index(&st, updated.clone());
     Ok(Json(CourseNoteResponse::new(&updated)))
 }
 
@@ -282,11 +290,16 @@ async fn delete_one(
             "only the course creator, an assigned teacher, or a manager/admin can delete this course note",
         ));
     }
+    let note_id = &note.get_id().clone();
     // Rows go first (the note delete cascades them), blobs after: a crash in
     // between strands at worst an unreachable blob, never a row whose blob is
     // already gone. The files to unlink come from the delete itself, not a
     // pre-read list — an upload that landed in between is in the cascade too.
     let (_, files) = note.delete(&st.db).await?;
+    // Derived rows go with their note. Not part of the note's own cascade
+    // transaction on purpose: an index is disposable, and failing the delete
+    // over one would leave the caller unable to remove their note at all.
+    RagOutput::delete_for_note(note_id, &st.db).await?;
     for file in &files {
         remove_blob(&st.files_path, file.get_id().key()).await;
     }
@@ -369,10 +382,14 @@ async fn upload_file(
         .await
         .map_err(|err| AppError::Internal(format!("failed to store the file blob: {err}")))?;
     match file.insert(&st.db).await {
-        Ok(created) => Ok((
-            StatusCode::CREATED,
-            Json(CourseNoteFileResponse::new(&created)),
-        )),
+        Ok(created) => {
+            // The note now holds one more source than the stored index knows.
+            spawn_index(&st, note);
+            Ok((
+                StatusCode::CREATED,
+                Json(CourseNoteFileResponse::new(&created)),
+            ))
+        }
         Err(err) => {
             let _ = tokio::fs::remove_file(&path).await;
             Err(err)
@@ -506,5 +523,10 @@ async fn delete_file(
             .ok_or(AppError::NotFound)?;
     let file = file.delete(&st.db).await?;
     remove_blob(&st.files_path, file.get_id().key()).await;
+    // Drop every output built from this file first, so a stale index cannot
+    // outlive its source in a deployment with no AI service at all; the
+    // re-index then rebuilds from what is left, if a service is connected.
+    RagOutput::delete_with_source(file.get_id(), &st.db).await?;
+    spawn_index(&st, note);
     Ok(StatusCode::NO_CONTENT)
 }
