@@ -1089,6 +1089,8 @@ window filtering, before paging; negative values are a `400` naming the field.
 | POST   | `/messages`                                                      | student | Send a message to another user. Messaging is upward only below staff: a student or parent may write to a teacher, manager or admin (parents included — messaging is the one place a parent acts), never to another student or parent; staff write to anyone. Messaging yourself is refused. The send is server-stamped and lands in the recipient's inbox unread. |
 | PATCH  | `/messages/{id}`                                                 | student | Update the caller's view of a message: flip the read flag (recipient only) and/or move the caller's copy between folders. Each side files independently — archiving or trashing never touches the other party's copy. Filing into `archive`/`trash` records the folder left behind as the copy's `previous_folder`, so restoring is a move back to that value (`inbox`, or `sent` for the sender's copy, when it is `null`). Omitted fields change nothing. |
 | DELETE | `/messages/{id}`                                                 | student | Permanently delete the caller's copy — allowed only from the trash (`PATCH` it to `folder: "trash"` first). The other party's copy lives on; the row disappears for good once both sides have deleted theirs. |
+| GET    | `/modules`                                                       | student | What the caller's school has switched on. Any logged-in user may read it — it is what the client needs to draw its own navigation, not a privileged fact. |
+| GET    | `/modules/catalog`                                               | no      | Every module this deployment can sell, what each one requires, and the packages they are bundled in. Unauthenticated and deploy-constant, like `GET /limits`: fetch once, cache for the session. |
 | GET    | `/notes`                                                         | student | List the notes owned by the current user, newest first. Paged via `?limit=&offset=` (omit `limit` for all of them); returns a `{items, total, limit, offset}` envelope. |
 | POST   | `/notes`                                                         | student | Create a note owned by the current user. |
 | GET    | `/notes/{id}`                                                    | student | Fetch a single note by id (must be owned by the current user). |
@@ -1139,6 +1141,10 @@ window filtering, before paging; negative values are a `400` naming the field.
 | DELETE | `/schools/{slug}`                                                | builder | Delete a school: its database, its registry row, and its uploaded files. Irreversible — suspension is the reversible door. |
 | POST   | `/schools/{slug}/admin-password`                                 | builder | Reset an admin's password inside a school — the "we are locked out" call. Every session that account held is revoked with it, so a stolen cookie does not survive the reset. Works on a suspended school. |
 | POST   | `/schools/{slug}/enter`                                          | builder | Enter a school as one of its admins — support access, with the school's own session cookie (`<slug>.<token>`) and no builder power inside it. |
+| GET    | `/schools/{slug}/modules`                                        | builder | What a school has bought, and what is left to sell it. Works on a suspended school — entitlements are the vendor's ledger, not one of the school's doors. |
+| PATCH  | `/schools/{slug}/modules`                                        | builder | Re-sell a school's whole shelf in one call: any mix of modules and packages, in either direction. Every list is optional and an empty body is a no-op. |
+| POST   | `/schools/{slug}/modules/{module}`                               | builder | Sell a school one module. Idempotent: a module it already has is a `200` with the unchanged set. Refused while what the module structurally needs is off — enable those in the same `PATCH` instead. |
+| DELETE | `/schools/{slug}/modules/{module}`                               | builder | Take one module back. Idempotent, and refused while a module the school still has depends on it — the mirror of the enable direction. |
 | GET    | `/sessions/{id}`                                                 | student | Fetch a single session by id. Visible to its course's enrolled users, the session's teacher, the course's own teachers, and managers/admins. |
 | PATCH  | `/sessions/{id}`                                                 | teacher | Update a session. Requires teacher+ with course-management rights. Omitted fields keep their value; an explicit `null` clears `ends_at`. |
 | DELETE | `/sessions/{id}`                                                 | teacher | Delete a session and its roll-call rows. Requires teacher+ with course-management rights. |
@@ -4667,8 +4673,12 @@ src/
     module_gate.rs one route_layer per nest: a module the school has not bought
                    answers 403 {error, module} on every route in it, while an
                    unmatched path inside it still 404s
+    modules.rs     GET /modules/catalog (public: every sellable module, its
+                   package, what it requires) and GET /modules (the caller's
+                   school's own enabled set) — both ungated
     builder.rs     the vendor surface: /builder/login|logout|me and /schools/*
-                   (create · list · rename/suspend · delete · admin-password · enter)
+                   (create · list · rename/suspend · delete · admin-password ·
+                   enter · modules: list/enable/disable/batch PATCH)
     image.rs       the halves every image upload shares: the `file` part under the
                    raster allowlist and the school's size cap, and the blob-first write
     extractor.rs   CurrentUser · RequireTeacher · RequireManager · RequireAdmin

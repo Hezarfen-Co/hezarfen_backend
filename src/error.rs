@@ -48,6 +48,12 @@ pub enum ValidationError {
     /// quoted.
     #[error("{field}: `{value}` is not a known {field}")]
     Unknown { field: &'static str, value: String },
+    /// One request asked for a name in two opposite directions at once — a
+    /// batch that contradicts itself. Names the value, like
+    /// [`ValidationError::Unknown`], because "one of your lists overlaps" would
+    /// leave the caller diffing them by hand.
+    #[error("{field}: `{value}` is asked for in both directions at once")]
+    Contradictory { field: &'static str, value: String },
 }
 
 /// The single error type every fallible operation returns.
