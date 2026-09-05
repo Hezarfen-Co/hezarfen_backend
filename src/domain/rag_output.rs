@@ -231,7 +231,7 @@ mod tests {
             .unwrap();
         assert_eq!(read.get_payload()["summary"], "x");
         assert_eq!(read.get_payload()["chunks"][0]["text"], "y");
-        assert_eq!(read.get_sources(), &[file.clone()]);
+        assert_eq!(read.get_sources(), std::slice::from_ref(&file));
         assert_eq!(read.get_course(), note.get_course());
 
         let untouched = RagOutput::create(
