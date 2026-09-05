@@ -20,7 +20,8 @@ use crate::ai::protocol::{
 use crate::ai::registry::{AiRegistry, WorkerSnapshot, clamp_concurrency};
 use crate::ai::tls;
 use crate::constant::{
-    AI_HANDSHAKE_TIMEOUT_SECS, AI_MAX_FRAME_BYTES, AI_PROTOCOL, REQUEST_TIMEOUT_SECS,
+    AI_BLOB_WRITE_STALL_SECS, AI_HANDSHAKE_TIMEOUT_SECS, AI_MAX_FRAME_BYTES, AI_PROTOCOL,
+    REQUEST_TIMEOUT_SECS,
 };
 use crate::database::Database;
 use crate::domain::course::Course;
@@ -350,24 +351,33 @@ async fn serve_client_stream(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let api_err = match serde_json::from_value::<ApiRequest>(raw.clone()) {
-        Ok(request) => {
-            let response = match read_api(&inner, request).await {
+    // Routed on the shape's required field rather than by parsing one and
+    // falling back to the other: that fallback cloned the whole `Value` on
+    // every api read. `path` still wins when a frame carries both.
+    if raw.get("path").is_some() {
+        let response = match serde_json::from_value::<ApiRequest>(raw) {
+            Ok(request) => match read_api(&inner, request).await {
                 Ok(response) => response,
                 Err((code, message)) => refusal(id, code, message),
-            };
-            answer(&mut send, response).await;
-            return;
+            },
+            Err(e) => refusal(id, "malformed", e.to_string()),
+        };
+        answer(&mut send, response).await;
+        return;
+    }
+    if raw.get("file").is_some() {
+        match serde_json::from_value::<BlobRequest>(raw) {
+            Ok(request) => serve_blob(&inner, &mut send, request).await,
+            Err(e) => answer(&mut send, refusal(id, "malformed", e.to_string())).await,
         }
-        Err(e) => e,
-    };
-    if let Ok(request) = serde_json::from_value::<BlobRequest>(raw) {
-        serve_blob(&inner, &mut send, request).await;
         return;
     }
     // Neither shape. Reported as the api-read refusal it has always been —
     // `path` is the field a frame this far off most likely meant to carry.
-    answer(&mut send, refusal(id, "malformed", api_err.to_string())).await;
+    let api_err = serde_json::from_value::<ApiRequest>(raw)
+        .err()
+        .map_or_else(String::new, |e| e.to_string());
+    answer(&mut send, refusal(id, "malformed", api_err)).await;
 }
 
 /// Answer one blob read: the [`BlobResponse`] header frame, then — on `Ok` —
@@ -382,7 +392,7 @@ async fn serve_blob(inner: &Inner, send: &mut quinn::SendStream, request: BlobRe
         Ok((header, mut file)) => {
             if let Err(e) = write_frame(send, &header).await {
                 tracing::warn!("could not answer an AI service's blob read {id}: {e}");
-            } else if let Err(e) = tokio::io::copy(&mut file, send).await {
+            } else if let Err(e) = write_blob_body(&mut file, send).await {
                 // The header already promised `size` bytes, so a short body
                 // would read as a silently truncated file. Reset instead: the
                 // service sees a broken stream and can ask again.
@@ -403,6 +413,37 @@ async fn serve_blob(inner: &Inner, send: &mut quinn::SendStream, request: BlobRe
         }
     }
     let _ = send.finish();
+}
+
+/// Copy the blob to the stream, one 64 KiB chunk at a time, giving each write
+/// [`AI_BLOB_WRITE_STALL_SECS`] to make progress.
+///
+/// The deadline is per write, not over the transfer: a service that reads
+/// slowly keeps getting fresh time, while one that opens the stream and never
+/// reads blocks on the QUIC stream window and is cut loose instead of parking
+/// this task and the open file for the connection's life.
+async fn write_blob_body(
+    file: &mut tokio::fs::File,
+    send: &mut quinn::SendStream,
+) -> std::io::Result<()> {
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = tokio::io::AsyncReadExt::read(file, &mut buf).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        tokio::time::timeout(
+            Duration::from_secs(AI_BLOB_WRITE_STALL_SECS),
+            send.write_all(&buf[..n]),
+        )
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("no progress for {AI_BLOB_WRITE_STALL_SECS}s"),
+            )
+        })??;
+    }
 }
 
 /// Resolve, authorize and open one blob. `Err` is the refusal that becomes a

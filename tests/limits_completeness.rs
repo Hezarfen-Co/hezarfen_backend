@@ -101,6 +101,10 @@ const EXCLUDED: &[(&str, &str)] = &[
     ),
     ("AI_IDLE_TIMEOUT_SECS", "QUIC connection idle timeout"),
     ("AI_KEEPALIVE_SECS", "QUIC connection keepalive"),
+    (
+        "AI_BLOB_WRITE_STALL_SECS",
+        "how long a blob body may stall before its QUIC stream is reset",
+    ),
     ("AI_HANDSHAKE_TIMEOUT_SECS", "AI service handshake deadline"),
     (
         "AI_API_ALLOWLIST",

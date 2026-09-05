@@ -1958,13 +1958,14 @@ async fn a_course_note_file_download_stays_out_of_the_read_scope() {
 // route and then read the bytes back over real QUIC.
 
 use hezarfen_backend::ai::protocol::{BlobRequest, BlobResponse};
+use hezarfen_backend::constant::AI_BLOB_WRITE_STALL_SECS;
 
-/// 200 KiB of deterministic pseudo-random bytes — well past one QUIC datagram,
-/// so a passing read proves the copy really streamed rather than fitting in a
-/// single write.
-fn blob_bytes() -> Vec<u8> {
+/// `len` bytes of deterministic pseudo-random data. The default 200 KiB is
+/// well past one QUIC datagram, so a passing read proves the copy really
+/// streamed rather than fitting in a single write.
+fn blob_bytes(len: usize) -> Vec<u8> {
     let mut state = 0x2545_F491_4F6C_DD1Du64;
-    (0..200 * 1024)
+    (0..len)
         .map(|_| {
             state ^= state << 13;
             state ^= state >> 7;
@@ -2018,7 +2019,7 @@ async fn a_service_streams_a_course_note_file_on_behalf_of_an_enrolled_student()
     let (service, student, note, _course, _foreign, app, _db, teacher) =
         course_notes_fixture(&bridge).await;
 
-    let uploaded = blob_bytes();
+    let uploaded = blob_bytes(200 * 1024);
     let res = common::upload_file_at(
         &app,
         &teacher,
@@ -2153,4 +2154,57 @@ async fn a_personal_notes_file_is_invisible_to_the_blob_stream() {
             "a personal note's file must not be reachable as a course-note file"
         );
     }
+}
+
+#[tokio::test]
+async fn a_body_nobody_reads_is_reset_rather_than_left_streaming_forever() {
+    // A service that opens a blob stream and then never reads it used to park
+    // the copy task and an open file descriptor for the connection's whole
+    // life: past the QUIC stream window nothing drains and the copy had no
+    // deadline. The bound is per write, so this is the only shape it cuts — a
+    // slow-but-reading service keeps earning fresh time.
+    //
+    // Spends ~AI_BLOB_WRITE_STALL_SECS of wall clock by construction: the
+    // stall itself is what is under test, so there is nothing to poll for.
+    let bridge = bridge().await;
+    let (service, student, note, _course, _foreign, app, _db, teacher) =
+        course_notes_fixture(&bridge).await;
+
+    // Past quinn's default 1.25 MiB stream receive window and under the
+    // default `max_file_bytes` (5 MiB), so the server blocks mid-body.
+    let uploaded = blob_bytes(3 * 1024 * 1024);
+    let res = common::upload_file_at(
+        &app,
+        &teacher,
+        &format!("/course-notes/{note}/files"),
+        "big.pdf",
+        "application/pdf",
+        &uploaded,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let file = common::id_of(&res.body);
+
+    let (mut send, mut recv) = service.conn.open_bi().await.expect("blob stream");
+    write_frame(&mut send, &blob_of(&file, Some(&student)))
+        .await
+        .expect("write BlobRequest");
+    let _ = send.finish();
+    let header: BlobResponse = read_frame(&mut recv).await.expect("read BlobResponse");
+    assert!(
+        matches!(header, BlobResponse::Ok { .. }),
+        "the read was authorized: {}",
+        blob_refusal(header)
+    );
+
+    // Nothing is read off `recv` until well past the stall bound.
+    tokio::time::sleep(Duration::from_secs(AI_BLOB_WRITE_STALL_SECS + 3)).await;
+    let err = tokio::time::timeout(Duration::from_secs(5), recv.read_to_end(8 * 1024 * 1024))
+        .await
+        .expect("the stream must already be resolved, not still parked")
+        .expect_err("a stalled body must never FIN");
+    assert!(
+        matches!(err, quinn::ReadToEndError::Read(quinn::ReadError::Reset(_))),
+        "expected a reset, got {err:?}"
+    );
 }
