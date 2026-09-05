@@ -27357,3 +27357,984 @@ async fn course_note_rag_outputs_read_and_delete() {
     .await;
     assert_eq!(common::total(&list.body), 0, "{}", list.body);
 }
+
+// =========================================================================
+// Multi-school isolation probes (REFUTE lane B). Two schools, same usernames.
+// =========================================================================
+
+use hezarfen_backend::tenant::{DEMO_SLUG, SchoolStatus, Slug, Tenants};
+
+/// Demo (school A) plus a second school "beta" (school B), and the registry.
+async fn two_schools() -> (
+    axum::Router,
+    hezarfen_backend::database::Database,
+    hezarfen_backend::database::Database,
+    Tenants,
+) {
+    let (app, db_a, tenants) = common::app_and_tenants().await;
+    let slug_b = Slug::try_new("beta").expect("slug");
+    let db_b = tenants
+        .create(&slug_b, "Beta Koleji")
+        .await
+        .expect("school B");
+    (app, db_a, db_b, tenants)
+}
+
+/// Every list surface that takes no path parameter — the sweep target.
+const LIST_ROUTES: [&str; 19] = [
+    "/users",
+    "/notes",
+    "/messages",
+    "/events",
+    "/appointments",
+    "/appointments/slots",
+    "/courses",
+    "/courses/me",
+    "/classes",
+    "/exams",
+    "/meals/menus",
+    "/payments/plans",
+    "/work/me",
+    "/pomodoro/me",
+    "/questions",
+    "/bank-questions",
+    "/terms",
+    "/boards",
+    "/chatbot/threads",
+];
+
+/// Fill school B with one row of as many kinds as a single admin can mint.
+async fn seed_school_b(app: &axum::Router, cookie: &str) -> serde_json::Value {
+    let course = create_course(app, cookie, "B Course").await;
+    let subject = create_subject(app, cookie, &course, "B Subject").await;
+    let exam = create_exam(app, cookie, &course, "B Exam", "quiz").await;
+    let note = send(
+        app,
+        "POST",
+        "/notes",
+        Some(cookie),
+        Some(json!({ "title": "b-note", "content": "secret of B" })),
+    )
+    .await;
+    assert_eq!(note.status, StatusCode::CREATED, "{}", note.body);
+    let event = send(
+        app,
+        "POST",
+        "/events",
+        Some(cookie),
+        Some(json!({ "title": "b-event", "description": "B only" })),
+    )
+    .await;
+    assert_eq!(event.status, StatusCode::CREATED, "{}", event.body);
+    let class = send(
+        app,
+        "POST",
+        "/classes",
+        Some(cookie),
+        Some(json!({ "name": "9-B" })),
+    )
+    .await;
+    assert_eq!(class.status, StatusCode::CREATED, "{}", class.body);
+    let board = send(
+        app,
+        "POST",
+        "/boards",
+        Some(cookie),
+        Some(json!({ "title": "b-board", "participants": [] })),
+    )
+    .await;
+    assert_eq!(board.status, StatusCode::CREATED, "{}", board.body);
+    let course_note = send(
+        app,
+        "POST",
+        "/course-notes",
+        Some(cookie),
+        Some(json!({ "course": course, "title": "b-cnote", "content": "body" })),
+    )
+    .await;
+    assert_eq!(
+        course_note.status,
+        StatusCode::CREATED,
+        "{}",
+        course_note.body
+    );
+    let bank = send(
+        app,
+        "POST",
+        "/bank-questions",
+        Some(cookie),
+        Some(
+            json!({ "subject_id": subject, "text": "B?", "kind": "choice", "points": 10,
+                     "choices": [{"id": "c0", "text": "3"}, {"id": "c1", "text": "4"}],
+                     "correct": "c1" }),
+        ),
+    )
+    .await;
+    assert_eq!(bank.status, StatusCode::CREATED, "{}", bank.body);
+    let thread = send(
+        app,
+        "POST",
+        "/chatbot/threads",
+        Some(cookie),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(thread.status, StatusCode::CREATED, "{}", thread.body);
+
+    let idf = |what: &str, v: &serde_json::Value| -> String {
+        v["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{what} response has no id: {v}"))
+            .to_string()
+    };
+    json!({
+        "course": course,
+        "subject": subject,
+        "exam": exam,
+        "note": idf("note", &note.body),
+        "event": idf("event", &event.body),
+        "class": idf("class", &class.body["class"]),
+        "board": idf("board", &board.body),
+        "course_note": idf("course_note", &course_note.body),
+        "bank": idf("bank", &bank.body),
+        "thread": idf("thread", &thread.body),
+    })
+}
+
+/// Invariant 1, read side: with A's cookie every list surface answers with A's
+/// own rows only — the totals do not move when B fills up.
+#[tokio::test]
+async fn probe_cross_school_lists_show_only_own_rows() {
+    let (app, db_a, db_b, _tenants) = two_schools().await;
+    let a = common::login_as_school(&app, &db_a, DEMO_SLUG, "ada", "admin").await;
+    let b = common::login_as_school(&app, &db_b, "beta", "boran", "admin").await;
+
+    let mut before = Vec::new();
+    for route in LIST_ROUTES {
+        let res = send(&app, "GET", route, Some(&a), None).await;
+        assert_eq!(res.status, StatusCode::OK, "GET {route} as A: {}", res.body);
+        before.push(common::total(&res.body));
+    }
+
+    let ids = seed_school_b(&app, &b).await;
+
+    for (i, route) in LIST_ROUTES.iter().enumerate() {
+        let res = send(&app, "GET", route, Some(&a), None).await;
+        assert_eq!(res.status, StatusCode::OK, "GET {route} as A: {}", res.body);
+        assert_eq!(
+            common::total(&res.body),
+            before[i],
+            "GET {route} under A's cookie moved after B created rows: {}",
+            res.body
+        );
+        let dump = res.body.to_string();
+        for key in [
+            "secret of B",
+            "b-note",
+            "b-event",
+            "9-B",
+            "b-board",
+            "B Course",
+        ] {
+            assert!(!dump.contains(key), "GET {route} leaked B's {key}: {dump}");
+        }
+    }
+    // and B still sees its own.
+    let res = send(&app, "GET", "/notes", Some(&b), None).await;
+    assert_eq!(common::total(&res.body), 1, "{}", res.body);
+    assert!(ids["note"].is_string());
+}
+
+/// Invariant 1, id side: a record minted in B is a 404 under A's cookie on
+/// every verb — never a 200, never a 500.
+#[tokio::test]
+async fn probe_cross_school_ids_are_not_found_under_the_other_cookie() {
+    let (app, db_a, db_b, _t) = two_schools().await;
+    let a = common::login_as_school(&app, &db_a, DEMO_SLUG, "ada", "admin").await;
+    let b = common::login_as_school(&app, &db_b, "beta", "boran", "admin").await;
+    let ids = seed_school_b(&app, &b).await;
+    let s = |k: &str| ids[k].as_str().unwrap().to_string();
+
+    let targets: Vec<(String, serde_json::Value)> = vec![
+        (format!("/notes/{}", s("note")), json!({ "title": "x" })),
+        (format!("/events/{}", s("event")), json!({ "title": "x" })),
+        (format!("/courses/{}", s("course")), json!({ "title": "x" })),
+        (format!("/exams/{}", s("exam")), json!({ "title": "x" })),
+        (
+            format!("/subjects/{}", s("subject")),
+            json!({ "name": "x" }),
+        ),
+        (format!("/classes/{}", s("class")), json!({ "name": "x" })),
+        (format!("/boards/{}", s("board")), json!({ "title": "x" })),
+        (
+            format!("/course-notes/{}", s("course_note")),
+            json!({ "title": "x" }),
+        ),
+        (
+            format!("/bank-questions/{}", s("bank")),
+            json!({ "text": "x" }),
+        ),
+    ];
+
+    for (uri, patch) in targets {
+        for (method, body) in [
+            ("GET", None),
+            ("PATCH", Some(patch.clone())),
+            ("DELETE", None),
+        ] {
+            let res = send(&app, method, &uri, Some(&a), body).await;
+            assert_ne!(
+                res.status,
+                StatusCode::OK,
+                "{method} {uri} under A returned 200 for a row that lives in B: {}",
+                res.body
+            );
+            assert_ne!(
+                res.status,
+                StatusCode::NO_CONTENT,
+                "{method} {uri} under A deleted/updated a row that lives in B"
+            );
+            assert!(
+                !res.status.is_server_error(),
+                "{method} {uri} under A: {} {}",
+                res.status,
+                res.body
+            );
+        }
+    }
+
+    // The one list surface that takes its scope from a query parameter: B's
+    // course id under A's cookie must not open B's notes.
+    let res = send(
+        &app,
+        "GET",
+        &format!("/course-notes?course={}", s("course")),
+        Some(&a),
+        None,
+    )
+    .await;
+    assert_ne!(
+        res.status,
+        StatusCode::OK,
+        "GET /course-notes?course=<B course> under A's cookie: {}",
+        res.body
+    );
+    assert!(!res.status.is_server_error(), "{} {}", res.status, res.body);
+
+    // B's rows survived every one of A's attempts.
+    for (uri, _) in [
+        (format!("/notes/{}", s("note")), ()),
+        (format!("/courses/{}", s("course")), ()),
+        (format!("/boards/{}", s("board")), ()),
+    ] {
+        let res = send(&app, "GET", &uri, Some(&b), None).await;
+        assert_eq!(
+            res.status,
+            StatusCode::OK,
+            "B still owns {uri}: {}",
+            res.body
+        );
+    }
+}
+
+/// Invariant 1, body side: an id from B carried in a request *body* under A's
+/// cookie must be refused, never silently linked.
+#[tokio::test]
+async fn probe_cross_school_ids_in_bodies_are_refused() {
+    let (app, db_a, db_b, _t) = two_schools().await;
+    let a_admin = common::login_as_school(&app, &db_a, DEMO_SLUG, "ada", "admin").await;
+    let a_student = common::login_as_school(&app, &db_a, DEMO_SLUG, "ali", "student").await;
+    let a_parent = common::login_as_school(&app, &db_a, DEMO_SLUG, "veli", "parent").await;
+    let b_admin = common::login_as_school(&app, &db_b, "beta", "boran", "admin").await;
+    common::login_as_school(&app, &db_b, "beta", "bstudent", "student").await;
+
+    let b_user = {
+        let res = send(&app, "GET", "/users", Some(&b_admin), None).await;
+        assert_eq!(res.status, StatusCode::OK);
+        id_of(&common::items(&res.body)[0])
+    };
+    let a_parent_id = common::me_id(&app, &a_parent).await;
+    let a_course = create_course(&app, &a_admin, "A Course").await;
+    let a_board = {
+        let res = send(
+            &app,
+            "POST",
+            "/boards",
+            Some(&a_admin),
+            Some(json!({ "title": "a-board", "participants": [] })),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+        id_of(&res.body)
+    };
+
+    let cases: Vec<(&str, String, &str, serde_json::Value)> = vec![
+        (
+            "message to a B recipient",
+            "/messages".into(),
+            &a_student,
+            json!({ "recipient_id": b_user, "subject": "hi", "body": "cross" }),
+        ),
+        (
+            "enroll a B user into an A course",
+            format!("/courses/{a_course}/enrollments"),
+            &a_admin,
+            json!({ "user_id": b_user }),
+        ),
+        (
+            "assign a B user as an A course teacher",
+            format!("/courses/{a_course}/teachers"),
+            &a_admin,
+            json!({ "user_id": b_user }),
+        ),
+        (
+            "link a B student to an A parent",
+            format!("/users/{a_parent_id}/students"),
+            &a_admin,
+            json!({ "user_id": b_user }),
+        ),
+        (
+            "invite a B user onto an A board",
+            format!("/boards/{a_board}/invite"),
+            &a_admin,
+            json!({ "participants": [b_user] }),
+        ),
+        (
+            "create an A board with a B participant",
+            "/boards".into(),
+            &a_admin,
+            json!({ "title": "x", "participants": [b_user] }),
+        ),
+    ];
+
+    for (what, uri, cookie, body) in cases {
+        let res = send(&app, "POST", &uri, Some(cookie), Some(body)).await;
+        assert!(
+            res.status.is_client_error(),
+            "{what}: POST {uri} answered {} (expected a 4xx refusal): {}",
+            res.status,
+            res.body
+        );
+        assert!(
+            !res.body.to_string().contains(&b_user),
+            "{what}: POST {uri} echoed B's user id back: {}",
+            res.body
+        );
+    }
+}
+
+/// Invariant 2: a suspended school is refused everywhere, and a resume brings
+/// the *same* cookie back to life.
+#[tokio::test]
+async fn probe_suspension_blocks_login_and_a_live_cookie_then_resume_restores_it() {
+    let (app, _db_a, db_b, tenants) = two_schools().await;
+    let slug_b = Slug::try_new("beta").unwrap();
+    let b = common::login_as_school(&app, &db_b, "beta", "boran", "admin").await;
+
+    // Alive first.
+    let res = send(&app, "GET", "/auth/me", Some(&b), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    tenants
+        .set_status(&slug_b, SchoolStatus::Suspended)
+        .await
+        .expect("suspend");
+
+    // The already-issued cookie, on the very next request.
+    for route in ["/auth/me", "/users", "/notes", "/courses", "/settings"] {
+        let res = send(&app, "GET", route, Some(&b), None).await;
+        assert_eq!(
+            res.status,
+            StatusCode::FORBIDDEN,
+            "GET {route} with a suspended school's live cookie: {} {}",
+            res.status,
+            res.body
+        );
+    }
+    // A write too.
+    let res = send(
+        &app,
+        "POST",
+        "/notes",
+        Some(&b),
+        Some(json!({ "title": "t", "content": "c" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+
+    // Login is no exception.
+    let res = send(
+        &app,
+        "POST",
+        "/auth/login",
+        None,
+        Some(json!({ "school": "beta", "username": "boran", "password": "secret1" })),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::FORBIDDEN,
+        "login into a suspended school: {}",
+        res.body
+    );
+
+    // Register into it is refused too.
+    let res = send(
+        &app,
+        "POST",
+        "/auth/register",
+        None,
+        Some(json!({ "school": "beta", "username": "newcomer", "password": "secret1" })),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::FORBIDDEN,
+        "register into a suspended school: {}",
+        res.body
+    );
+
+    // Resume: the same cookie works again — the session rows were not deleted.
+    tenants
+        .set_status(&slug_b, SchoolStatus::Active)
+        .await
+        .expect("resume");
+    let res = send(&app, "GET", "/auth/me", Some(&b), None).await;
+    assert_eq!(
+        res.status,
+        StatusCode::OK,
+        "the same cookie after a resume: {}",
+        res.body
+    );
+    assert_eq!(res.body["username"], "boran");
+}
+
+/// Invariant 3: no cookie is usable as another kind of cookie. The last case —
+/// a real token from school A presented under school B's prefix — is the one
+/// that would be a full takeover.
+#[tokio::test]
+async fn probe_cookie_confusion_is_impossible_both_ways() {
+    let (app, db_a, db_b, tenants) = two_schools().await;
+    let a = common::login_as_school(&app, &db_a, DEMO_SLUG, "ada", "admin").await;
+    let b = common::login_as_school(&app, &db_b, "beta", "boran", "admin").await;
+    let token_a = common::cookie_token(&a).to_string();
+
+    hezarfen_backend::domain::builder::Builder::ensure(
+        Username::try_new("operator").unwrap(),
+        Password::try_new("secret1").unwrap(),
+        tenants.control(),
+    )
+    .await
+    .expect("seed the builder");
+    let res = send(
+        &app,
+        "POST",
+        "/builder/login",
+        None,
+        Some(json!({ "username": "operator", "password": "secret1" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let builder_cookie = res.cookie.expect("builder cookie");
+    let builder_token = common::cookie_token(&builder_cookie).to_string();
+
+    // (1) builder cookie on a school surface.
+    for route in ["/auth/me", "/users", "/notes"] {
+        let res = send(&app, "GET", route, Some(&builder_cookie), None).await;
+        assert_eq!(
+            res.status,
+            StatusCode::UNAUTHORIZED,
+            "builder cookie on GET {route}: {} {}",
+            res.status,
+            res.body
+        );
+    }
+    // (2) school cookie on the builder surface.
+    for cookie in [&a, &b] {
+        for route in ["/builder/me", "/schools"] {
+            let res = send(&app, "GET", route, Some(cookie), None).await;
+            assert_eq!(
+                res.status,
+                StatusCode::UNAUTHORIZED,
+                "school cookie on GET {route}: {} {}",
+                res.status,
+                res.body
+            );
+        }
+    }
+    // (3) bare token, no dot.
+    for raw in [
+        format!("session={token_a}"),
+        format!("session={builder_token}"),
+        "session=.".to_string(),
+        format!("session=.{token_a}"),
+        format!("session={token_a}."),
+    ] {
+        for route in ["/auth/me", "/builder/me"] {
+            let res = send(&app, "GET", route, Some(&raw), None).await;
+            assert_eq!(
+                res.status,
+                StatusCode::UNAUTHORIZED,
+                "{raw} on GET {route}: {} {}",
+                res.status,
+                res.body
+            );
+        }
+    }
+    // (4) a builder token wearing a school prefix.
+    for raw in [
+        format!("session=demo.{builder_token}"),
+        format!("session=beta.{builder_token}"),
+    ] {
+        let res = send(&app, "GET", "/auth/me", Some(&raw), None).await;
+        assert_eq!(
+            res.status,
+            StatusCode::UNAUTHORIZED,
+            "{raw} on /auth/me: {} {}",
+            res.status,
+            res.body
+        );
+    }
+    // (5) THE one: A's live token under B's prefix, and B's under A's.
+    let token_b = common::cookie_token(&b).to_string();
+    for (raw, whose) in [
+        (format!("session=beta.{token_a}"), "A's token under B"),
+        (format!("session=demo.{token_b}"), "B's token under A"),
+    ] {
+        for route in ["/auth/me", "/users", "/notes", "/settings"] {
+            let res = send(&app, "GET", route, Some(&raw), None).await;
+            assert_eq!(
+                res.status,
+                StatusCode::UNAUTHORIZED,
+                "{whose} on GET {route}: {} {}",
+                res.status,
+                res.body
+            );
+        }
+    }
+    // (6) a school cookie naming a school that does not exist.
+    let res = send(
+        &app,
+        "GET",
+        "/auth/me",
+        Some(&format!("session=nosuchschool.{token_a}")),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::UNAUTHORIZED, "{}", res.body);
+}
+
+/// Invariant 4: `POST /auth/register` names its school, registers into that one
+/// only, and an unknown school is indistinguishable from a bad credential.
+#[tokio::test]
+async fn probe_register_is_scoped_to_the_named_school() {
+    let (app, db_a, db_b, _t) = two_schools().await;
+
+    // Missing `school` is a 4xx, not a silent default.
+    let res = send(
+        &app,
+        "POST",
+        "/auth/register",
+        None,
+        Some(json!({ "username": "noschool", "password": "secret1" })),
+    )
+    .await;
+    assert!(
+        res.status.is_client_error(),
+        "register with no school: {} {}",
+        res.status,
+        res.body
+    );
+
+    // The same username in both schools, independently.
+    for (slug, db) in [(DEMO_SLUG, &db_a), ("beta", &db_b)] {
+        let res = send(
+            &app,
+            "POST",
+            "/auth/register",
+            None,
+            Some(json!({ "school": slug, "username": "ayse", "password": "secret1" })),
+        )
+        .await;
+        assert_eq!(
+            res.status,
+            StatusCode::CREATED,
+            "register into {slug}: {}",
+            res.body
+        );
+        let found: Vec<String> = db
+            .query("SELECT VALUE username FROM user WHERE username = 'ayse'")
+            .await
+            .unwrap()
+            .take(0)
+            .unwrap();
+        assert_eq!(
+            found,
+            vec!["ayse".to_string()],
+            "exactly one 'ayse' in {slug}"
+        );
+    }
+
+    // Unknown school: same 401 and same body as a bad credential — no
+    // enumeration of the customer list.
+    let unknown = send(
+        &app,
+        "POST",
+        "/auth/login",
+        None,
+        Some(json!({ "school": "not-a-school", "username": "ayse", "password": "secret1" })),
+    )
+    .await;
+    let bad_pass = send(
+        &app,
+        "POST",
+        "/auth/login",
+        None,
+        Some(json!({ "school": DEMO_SLUG, "username": "ayse", "password": "wrongpw1" })),
+    )
+    .await;
+    assert_eq!(unknown.status, StatusCode::UNAUTHORIZED, "{}", unknown.body);
+    assert_eq!(unknown.status, bad_pass.status, "status differs");
+    assert_eq!(
+        unknown.body, bad_pass.body,
+        "an unknown school answers differently from a bad password: {} vs {}",
+        unknown.body, bad_pass.body
+    );
+
+    // Register against an unknown school: same treatment.
+    let reg_unknown = send(
+        &app,
+        "POST",
+        "/auth/register",
+        None,
+        Some(json!({ "school": "not-a-school", "username": "zeynep", "password": "secret1" })),
+    )
+    .await;
+    assert_eq!(
+        reg_unknown.status,
+        StatusCode::UNAUTHORIZED,
+        "register into an unknown school: {} {}",
+        reg_unknown.status,
+        reg_unknown.body
+    );
+}
+
+/// Invariant 5: an upload under A lands under `FILES_PATH/A/` and is a 404
+/// under B's cookie even with the exact ids.
+#[tokio::test]
+async fn probe_uploaded_files_are_school_scoped() {
+    let (app, db_a, db_b, _t) = two_schools().await;
+    let a = common::login_as_school(&app, &db_a, DEMO_SLUG, "ali", "student").await;
+    let b = common::login_as_school(&app, &db_b, "beta", "ali", "student").await;
+
+    let note = send(
+        &app,
+        "POST",
+        "/notes",
+        Some(&a),
+        Some(json!({ "title": "n", "content": "c" })),
+    )
+    .await;
+    assert_eq!(note.status, StatusCode::CREATED, "{}", note.body);
+    let note_id = id_of(&note.body);
+
+    let up = common::upload_file(&app, &a, &note_id, "a.txt", "text/plain", b"A-ONLY-BYTES").await;
+    assert_eq!(up.status, StatusCode::CREATED, "{}", up.body);
+    let file_id = id_of(&up.body);
+
+    // It landed under the school's own directory, and nowhere else.
+    let a_dir = common::files_dir().join(DEMO_SLUG);
+    let b_dir = common::files_dir().join("beta");
+    let count = |dir: &std::path::Path| {
+        std::fs::read_dir(dir)
+            .map(|it| it.count())
+            .unwrap_or_default()
+    };
+    assert!(count(&a_dir) >= 1, "A's blob directory {a_dir:?} is empty");
+    assert_eq!(
+        count(&b_dir),
+        0,
+        "B's blob directory {b_dir:?} is not empty"
+    );
+
+    // A reads it back.
+    let uri = format!("/notes/{note_id}/files/{file_id}");
+    let (status, _, bytes) = common::send_raw(&app, "GET", &uri, Some(&a), None, Vec::new()).await;
+    assert_eq!(status, StatusCode::OK, "A reads its own file");
+    assert_eq!(bytes, b"A-ONLY-BYTES");
+
+    // B, with the exact ids, gets nothing — and no 500.
+    let (status, _, bytes) = common::send_raw(&app, "GET", &uri, Some(&b), None, Vec::new()).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "B read A's file: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert!(!bytes.windows(12).any(|w| w == b"A-ONLY-BYTES"));
+
+    let (status, _, _) = common::send_raw(&app, "DELETE", &uri, Some(&b), None, Vec::new()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "B deleted A's file");
+    let (status, _, _) = common::send_raw(&app, "GET", &uri, Some(&a), None, Vec::new()).await;
+    assert_eq!(status, StatusCode::OK, "A's file survived B's DELETE");
+}
+
+/// Invariant 1, the leak that would be invisible from the API: no school row
+/// may land in the **control** database, and the search + settings surfaces
+/// (which are not paged lists) stay inside the caller's school.
+#[tokio::test]
+async fn probe_school_rows_never_reach_the_control_database() {
+    let (app, db_a, db_b, tenants) = two_schools().await;
+    let a = common::login_as_school(&app, &db_a, DEMO_SLUG, "ada", "admin").await;
+    let b = common::login_as_school(&app, &db_b, "beta", "boran", "admin").await;
+    common::login_as_school(&app, &db_b, "beta", "bstudent", "student").await;
+    let ids = seed_school_b(&app, &b).await;
+    assert!(ids["course"].is_string());
+
+    // Nothing a school writes may appear in the control database.
+    let control = tenants.control();
+    for table in [
+        "user",
+        "session",
+        "note",
+        "course",
+        "event",
+        "message",
+        "class_group",
+        "board",
+        "course_note",
+        "bank_question",
+        "chatbot_thread",
+        "exam",
+    ] {
+        let rows: Vec<surrealdb::types::RecordId> = control
+            .query(format!("SELECT VALUE id FROM {table}"))
+            .await
+            .expect("control query")
+            .take(0)
+            .unwrap_or_default();
+        assert!(
+            rows.is_empty(),
+            "the control database holds {} `{table}` row(s): {rows:?}",
+            rows.len()
+        );
+    }
+    // And the control database does hold the two schools.
+    let schools: Vec<String> = control
+        .query("SELECT VALUE slug FROM school ORDER BY slug")
+        .await
+        .unwrap()
+        .take(0)
+        .unwrap();
+    assert_eq!(schools, vec!["beta".to_string(), "demo".to_string()]);
+
+    // User search never crosses the wall.
+    for (cookie, forbidden) in [(&a, "boran"), (&b, "ada")] {
+        for q in ["b", "a", "boran", "ada", "bstudent"] {
+            let res = send(
+                &app,
+                "GET",
+                &format!("/users/search?q={q}"),
+                Some(cookie),
+                None,
+            )
+            .await;
+            assert_eq!(res.status, StatusCode::OK, "search {q}: {}", res.body);
+            assert!(
+                !res.body.to_string().contains(forbidden),
+                "GET /users/search?q={q} returned the other school's `{forbidden}`: {}",
+                res.body
+            );
+        }
+    }
+
+    // Settings are the school's own: moving A's leaves B's alone.
+    let before = send(&app, "GET", "/settings", Some(&b), None).await;
+    assert_eq!(before.status, StatusCode::OK, "{}", before.body);
+    let patched = send(
+        &app,
+        "PATCH",
+        "/settings",
+        Some(&a),
+        Some(json!({ "max_file_bytes": 4096 })),
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::OK, "{}", patched.body);
+    assert_eq!(patched.body["max_file_bytes"], 4096);
+    let after = send(&app, "GET", "/settings", Some(&b), None).await;
+    assert_eq!(
+        after.body, before.body,
+        "A's settings PATCH moved B's settings"
+    );
+
+    // A cookie prefix that is not a well-formed slug is a 401, never a lookup.
+    for prefix in ["DEMO", "Demo", "de mo", "de/mo", "..", "demo%2e", "control"] {
+        let raw = format!("session={prefix}.{}", common::cookie_token(&a));
+        let res = send(&app, "GET", "/auth/me", Some(&raw), None).await;
+        assert_eq!(
+            res.status,
+            StatusCode::UNAUTHORIZED,
+            "prefix `{prefix}`: {} {}",
+            res.status,
+            res.body
+        );
+    }
+}
+
+/// Invariant 1 on the path production actually uses: `Mode::Remote`, where every
+/// school is a *database inside one namespace on one server* and isolation rests
+/// entirely on each connection's `use_db` pin — unlike `Mode::Mem`, where a
+/// school is its own embedded datastore and isolation cannot fail.
+///
+/// Skipped unless `HEZARFEN_REMOTE_DB` names a live SurrealDB (e.g.
+/// `surreal start --user root --pass root memory --bind 127.0.0.1:8123`), since
+/// this suite must stay runnable with no server.
+#[tokio::test]
+async fn probe_remote_mode_keeps_two_schools_apart() {
+    let Ok(url) = std::env::var("HEZARFEN_REMOTE_DB") else {
+        eprintln!("HEZARFEN_REMOTE_DB unset — remote-mode isolation NOT exercised");
+        return;
+    };
+    let ns = format!(
+        "probe_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let cfg = hezarfen_backend::config::Config {
+        host: "127.0.0.1".into(),
+        port: 0,
+        db_url: url,
+        db_user: "root".into(),
+        db_pass: "root".into(),
+        db_ns: ns.clone(),
+        db_name: "control".into(),
+        files_path: common::files_dir().to_string_lossy().into_owned(),
+        cookie_secure: false,
+        rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
+        chatbot_per_minute: 0,
+        builder_username: None,
+        builder_password: None,
+        ai_quic_addr: None,
+        ai_shared_token: None,
+        ai_tls_cert: None,
+        ai_tls_key: None,
+        ai_request_timeout_secs: 30,
+    };
+    let tenants = hezarfen_backend::database::init(&cfg)
+        .await
+        .expect("remote control database");
+
+    // Two schools, one with a slug that is not a bare identifier.
+    let slug_a = Slug::try_new("ata-koleji").unwrap();
+    let slug_b = Slug::try_new("2024school").unwrap();
+    tenants
+        .create(&slug_a, "Ata")
+        .await
+        .expect("school ata-koleji");
+    tenants
+        .create(&slug_b, "2024")
+        .await
+        .expect("school 2024school");
+
+    let app = build_router(AppState {
+        db: tenants.control().clone(),
+        tenants: tenants.clone(),
+        files_path: common::files_dir(),
+        cookie_secure: false,
+        rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
+        chatbot_limit: Default::default(),
+        exam_presence: Default::default(),
+        board_hub: Default::default(),
+        db_up: Default::default(),
+        ai: None,
+    });
+
+    // The same username in both schools, over the real router.
+    let mut cookies = Vec::new();
+    for slug in [&slug_a, &slug_b] {
+        let creds = json!({ "school": slug.as_str(), "username": "ada", "password": "secret1" });
+        let reg = send(&app, "POST", "/auth/register", None, Some(creds.clone())).await;
+        assert_eq!(
+            reg.status,
+            StatusCode::CREATED,
+            "register in {slug}: {}",
+            reg.body
+        );
+        let db = tenants.get(slug).await.unwrap();
+        common::set_role(&db, "ada", "admin").await;
+        let res = send(&app, "POST", "/auth/login", None, Some(creds)).await;
+        assert_eq!(res.status, StatusCode::OK, "login in {slug}: {}", res.body);
+        cookies.push(res.cookie.expect("cookie"));
+    }
+    let (a, b) = (cookies[0].clone(), cookies[1].clone());
+
+    // B fills up; A must not see a single row of it.
+    let ids = seed_school_b(&app, &b).await;
+    for route in LIST_ROUTES {
+        let res = send(&app, "GET", route, Some(&a), None).await;
+        assert_eq!(res.status, StatusCode::OK, "GET {route} as A: {}", res.body);
+        let dump = res.body.to_string();
+        for key in [
+            "secret of B",
+            "b-note",
+            "b-event",
+            "9-B",
+            "b-board",
+            "B Course",
+        ] {
+            assert!(!dump.contains(key), "GET {route} leaked B's {key}: {dump}");
+        }
+    }
+    // Each school sees exactly its own user, and only one.
+    for cookie in [&a, &b] {
+        let res = send(&app, "GET", "/users", Some(cookie), None).await;
+        assert_eq!(common::total(&res.body), 1, "{}", res.body);
+    }
+    // A row minted in B is a 404 under A on every verb.
+    for key in ["note", "course", "board", "event", "class"] {
+        let id = ids[key].as_str().unwrap();
+        let uri = match key {
+            "note" => format!("/notes/{id}"),
+            "course" => format!("/courses/{id}"),
+            "board" => format!("/boards/{id}"),
+            "event" => format!("/events/{id}"),
+            _ => format!("/classes/{id}"),
+        };
+        for method in ["GET", "DELETE"] {
+            let res = send(&app, method, &uri, Some(&a), None).await;
+            assert_ne!(
+                res.status,
+                StatusCode::OK,
+                "{method} {uri} as A: {}",
+                res.body
+            );
+            assert_ne!(res.status, StatusCode::NO_CONTENT, "{method} {uri} as A");
+            assert!(
+                !res.status.is_server_error(),
+                "{method} {uri}: {} {}",
+                res.status,
+                res.body
+            );
+        }
+        let res = send(&app, "GET", &uri, Some(&b), None).await;
+        assert_eq!(
+            res.status,
+            StatusCode::OK,
+            "B still owns {uri}: {}",
+            res.body
+        );
+    }
+
+    // A's token under B's prefix stays a 401 on a real server too.
+    let raw = format!("session={}.{}", slug_b, common::cookie_token(&a));
+    let res = send(&app, "GET", "/auth/me", Some(&raw), None).await;
+    assert_eq!(res.status, StatusCode::UNAUTHORIZED, "{}", res.body);
+
+    // Clean up after ourselves: the whole scratch namespace.
+    let _ = tenants
+        .control()
+        .query(format!("REMOVE NAMESPACE IF EXISTS `{ns}`"))
+        .await;
+}

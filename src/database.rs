@@ -298,6 +298,38 @@ pub async fn init_mem_tenants() -> Result<Tenants, AppError> {
 /// in (measured 4 runs in 4 at 3 of 6 failing their own "the race was reached"
 /// guard). Serialized, the plain documented command works.
 #[cfg(test)]
+mod builder_seed_tests {
+    use super::builder_credentials;
+    use crate::config::Config;
+
+    fn cfg(username: Option<&str>, password: Option<&str>) -> Config {
+        let mut cfg = Config::from_env();
+        cfg.builder_username = username.map(str::to_string);
+        cfg.builder_password = password.map(str::to_string);
+        cfg
+    }
+
+    #[tokio::test]
+    async fn the_builder_seed_is_both_or_neither() {
+        assert!(builder_credentials(&cfg(None, None)).unwrap().is_none());
+        assert!(
+            builder_credentials(&cfg(Some("builder"), Some("secret1")))
+                .unwrap()
+                .is_some()
+        );
+        // Half a pair aborts startup: a deployment with no builder has nobody
+        // who can create the first school, and a silent run would hide that.
+        assert!(builder_credentials(&cfg(Some("builder"), None)).is_err());
+        assert!(builder_credentials(&cfg(None, Some("secret1"))).is_err());
+        // A pair that is set but invalid aborts too, naming the variable.
+        match builder_credentials(&cfg(Some("!"), Some("secret1"))) {
+            Err(err) => assert!(err.to_string().contains("BUILDER_USERNAME"), "{err}"),
+            Ok(_) => panic!("an invalid BUILDER_USERNAME must abort startup"),
+        }
+    }
+}
+
+#[cfg(test)]
 pub(crate) static RACE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]

@@ -3766,3 +3766,122 @@ async fn a_builder_creates_a_school_over_tcp_and_its_admin_logs_in() {
         StatusCode::UNAUTHORIZED
     );
 }
+
+// ---- multi-school: suspension refuses sockets too (REFUTE lane B) -----------
+
+/// Open a board room, optionally authenticated. Same shape as [`ws_open`].
+async fn board_ws_open(base: &str, board_id: &str, cookie: Option<&str>) -> Result<WsStream, u16> {
+    let url = format!("{}/boards/{board_id}/ws", base.replace("http://", "ws://"));
+    let mut request = url.into_client_request().unwrap();
+    if let Some(cookie) = cookie {
+        request
+            .headers_mut()
+            .insert("cookie", cookie.parse().unwrap());
+    }
+    match connect_async(request).await {
+        Ok((ws, _)) => Ok(ws),
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            Err(response.status().as_u16())
+        }
+        Err(other) => panic!("unexpected handshake failure: {other}"),
+    }
+}
+
+/// Invariant 2, socket half: after the vendor suspends a school over the real
+/// builder API, its live cookies stop opening WebSockets — both the whiteboard
+/// room and the exam room — and start working again on a resume.
+#[tokio::test]
+async fn probe_a_suspended_school_refuses_websocket_upgrades() {
+    let (base, db) = spawn_server().await;
+
+    let teacher = client();
+    register(&teacher, &base, "hoca").await;
+    promote(&db, "hoca", "teacher").await;
+    login(&teacher, &base, "hoca").await;
+    let cookie = raw_session_cookie(&base, "hoca").await;
+
+    let res = teacher
+        .post(format!("{base}/boards"))
+        .json(&json!({ "title": "room", "participants": [] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let board = res.json::<Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Alive: the socket opens.
+    let ws = board_ws_open(&base, &board, Some(&cookie)).await;
+    assert!(ws.is_ok(), "board socket before suspension: {:?}", ws.err());
+    drop(ws);
+
+    // The vendor suspends the school through its own API.
+    let vendor = client();
+    let res = vendor
+        .post(format!("{base}/builder/login"))
+        .json(&json!({ "username": "operator", "password": "secret1" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let res = vendor
+        .patch(format!("{base}/schools/demo"))
+        .json(&json!({ "status": "suspended" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "suspend demo");
+    assert_eq!(res.json::<Value>().await.unwrap()["status"], "suspended");
+
+    // The very next HTTP request on the already-issued cookie.
+    assert_eq!(
+        teacher
+            .get(format!("{base}/auth/me"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN,
+        "a live cookie after suspension"
+    );
+
+    // The whiteboard socket is refused before the upgrade.
+    assert_eq!(
+        board_ws_open(&base, &board, Some(&cookie)).await.err(),
+        Some(403),
+        "the board socket opened for a suspended school"
+    );
+    // So is the exam room, on any id.
+    assert_eq!(
+        ws_open(&base, "01J8XZ0K3Q8G7X2M4N5P6R7S8T", Some(&cookie))
+            .await
+            .err(),
+        Some(403),
+        "the exam socket opened for a suspended school"
+    );
+
+    // Resume: the same cookie, the same socket.
+    let res = vendor
+        .patch(format!("{base}/schools/demo"))
+        .json(&json!({ "status": "active" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "resume demo");
+    assert_eq!(
+        teacher
+            .get(format!("{base}/auth/me"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK,
+        "the same cookie after a resume"
+    );
+    assert!(
+        board_ws_open(&base, &board, Some(&cookie)).await.is_ok(),
+        "the board socket after a resume"
+    );
+}
