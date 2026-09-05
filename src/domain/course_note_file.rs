@@ -84,6 +84,10 @@ impl CourseNoteFile {
         &self.id
     }
 
+    pub fn get_course_note(&self) -> &CourseNoteId {
+        &self.course_note
+    }
+
     pub fn get_name(&self) -> &FileName {
         &self.name
     }
@@ -123,6 +127,17 @@ impl CourseNoteFile {
                 "failed to create course note file".into(),
             )),
         }
+    }
+
+    /// Read a file's row by id alone, for the callers that have no note in
+    /// hand yet and reach the note *through* the file (the AI bridge's blob
+    /// stream). A key from any other table simply reads as `None`, which is
+    /// what keeps a personal note's file id unreachable here.
+    pub async fn read(
+        id: &CourseNoteFileId,
+        db: &Database,
+    ) -> Result<Option<CourseNoteFile>, AppError> {
+        Ok(db.select(id.record()).await?)
     }
 
     /// Read a file's row only if it belongs to `note` — callers have already

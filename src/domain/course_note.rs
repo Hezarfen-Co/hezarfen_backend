@@ -97,6 +97,10 @@ impl CourseNote {
         &self.course
     }
 
+    pub fn get_author(&self) -> &UserId {
+        &self.author
+    }
+
     pub fn get_title(&self) -> &CourseNoteTitle {
         &self.title
     }
