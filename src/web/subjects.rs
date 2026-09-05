@@ -125,6 +125,7 @@ async fn get_subject(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -140,6 +141,7 @@ async fn update_subject(
             "only the course creator, an assigned teacher, or a manager/admin can edit this subject",
         ));
     }
+    course.require_open(&st.db).await?;
 
     // Only what the request actually carried is validated and written — an
     // omitted field stays `None` so the save never re-sends this snapshot's
@@ -176,7 +178,7 @@ async fn update_subject(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "Exam questions or homework still reference this subject", body = ErrorResponse),
+        (status = 409, description = "Exam questions or homework still reference this subject, or this course's term is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn delete_subject(
@@ -190,6 +192,7 @@ async fn delete_subject(
             "only the course creator, an assigned teacher, or a manager/admin can delete this subject",
         ));
     }
+    course.require_open(&st.db).await?;
     // No locks: the two checks *are* the delete's `WHERE`, decided against the
     // subject's own reference counters inside one statement. This used to be
     // three process-wide locks (the only site that held more than one) around

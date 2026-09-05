@@ -157,10 +157,11 @@ impl MessageResponse {
     }
 }
 
-/// Send a message to another user. Any authenticated user may write to any
-/// existing user (parents included — messaging is the one place a parent
-/// acts); only messaging yourself is refused. The send is server-stamped and
-/// lands in the recipient's inbox unread.
+/// Send a message to another user. Messaging is upward only below staff: a
+/// student or parent may write to a teacher, manager or admin (parents
+/// included — messaging is the one place a parent acts), never to another
+/// student or parent; staff write to anyone. Messaging yourself is refused.
+/// The send is server-stamped and lands in the recipient's inbox unread.
 #[utoipa::path(
     post,
     path = "/",
@@ -171,6 +172,7 @@ impl MessageResponse {
         (status = 201, description = "Message sent", body = MessageResponse),
         (status = 400, description = "Invalid subject or body, or the recipient is yourself", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "A student or parent wrote to someone who is not staff", body = ErrorResponse),
         (status = 404, description = "No such recipient", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
@@ -197,6 +199,11 @@ async fn send_message(
     let recipient = User::read(&UserId::from_key(&req.recipient_id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
+    if !user.get_role().may_message(recipient.get_role()) {
+        return Err(AppError::Forbidden(
+            "students and parents may only message staff (teacher or higher)",
+        ));
+    }
 
     let message = Message::send(
         user.get_id(),

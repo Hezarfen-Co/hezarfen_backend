@@ -11063,6 +11063,76 @@ async fn attendance_report_tallies_events_and_sessions_per_course() {
     assert_eq!(res.status, StatusCode::NOT_FOUND);
 }
 
+/// Issue #24: a student or parent needs a way to find the teacher they are
+/// allowed to write to, so `/users/search` is no longer teacher+ — but below
+/// staff it shows staff *only*, in the items and in `total` alike (the
+/// restriction is in the query, not a post-filter over one page).
+#[tokio::test]
+async fn search_below_staff_sees_only_staff() {
+    let (app, db) = app_and_db().await;
+    // Both match `q=ay`: one student, one teacher.
+    let ayse = login(&app, "ayse").await;
+    let _ayhan = login_as(&app, &db, "ayhan", "teacher").await;
+    let anne = login_as(&app, &db, "anne", "parent").await;
+    let mudur = login_as(&app, &db, "mudur", "manager").await;
+
+    for (who, cookie) in [("student", &ayse), ("parent", &anne)] {
+        let res = send(&app, "GET", "/users/search?q=ay", Some(cookie), None).await;
+        assert_eq!(res.status, StatusCode::OK, "{who}: {}", res.body);
+        let items = common::items(&res.body);
+        assert_eq!(
+            items.len(),
+            1,
+            "{who} must see only the teacher: {}",
+            res.body
+        );
+        assert_eq!(items[0]["username"], "ayhan", "{who}");
+        assert_eq!(
+            res.body["total"], 1,
+            "{who}: total counts the visible set only"
+        );
+        // Only the picker fields, as before — never contact details.
+        assert!(items[0].get("email").is_none(), "{who}");
+
+        // Naming a role they may not message is a refusal, not an empty page.
+        let res = send(
+            &app,
+            "GET",
+            "/users/search?q=ay&role=student",
+            Some(cookie),
+            None,
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::FORBIDDEN, "{who}: {}", res.body);
+        // A staff role they may message filters as usual.
+        let res = send(
+            &app,
+            "GET",
+            "/users/search?q=ay&role=teacher",
+            Some(cookie),
+            None,
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::OK, "{who}: {}", res.body);
+        assert_eq!(common::items(&res.body).len(), 1, "{who}");
+    }
+
+    // Staff keep the unrestricted picker: the student is back in the results.
+    let res = send(&app, "GET", "/users/search?q=ay", Some(&mudur), None).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.body["total"], 2, "{}", res.body);
+    let res = send(
+        &app,
+        "GET",
+        "/users/search?q=ay&role=student",
+        Some(&mudur),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(common::items(&res.body)[0]["username"], "ayse");
+}
+
 // --- users: search matching semantics --------------------------------------
 
 /// The search fragment is matched with literal `CONTAINS` semantics — never
@@ -13337,8 +13407,12 @@ async fn parent_observes_linked_students_and_nothing_else() {
     )
     .await;
     assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+    // Search is open to a parent since #24, but only onto staff: the linked
+    // student is a match by name and still must not come back.
     let res = send(&app, "GET", "/users/search?q=ali", Some(&parent), None).await;
-    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(common::items(&res.body).len(), 0, "{}", res.body);
+    assert_eq!(res.body["total"], 0);
 }
 
 /// A role change off either end of a tie sweeps it, exactly like promotion
@@ -13675,6 +13749,57 @@ async fn messages_remember_the_folder_a_filed_copy_came_from() {
     assert_eq!(origins, vec![None], "the deleted side keeps no origin");
 }
 
+/// Issue #23: messaging is upward only below staff. A student or parent writes
+/// to teacher+ and to nobody else; staff write in any direction.
+#[tokio::test]
+async fn messages_from_below_staff_go_upward_only() {
+    let (app, db) = app_and_db().await;
+    let ali = login(&app, "ali").await; // student
+    let ali_id = me_id(&app, &ali).await;
+    let veli = login(&app, "veli").await; // student
+    let veli_id = me_id(&app, &veli).await;
+    let anne = login_as(&app, &db, "anne", "parent").await;
+    let hoca = login_as(&app, &db, "hoca", "teacher").await;
+    let hoca_id = me_id(&app, &hoca).await;
+    let mudur = login_as(&app, &db, "mudur", "manager").await;
+
+    let write = async |from: &str, to: &str| {
+        send(
+            &app,
+            "POST",
+            "/messages",
+            Some(from),
+            Some(json!({ "recipient_id": to, "subject": "selam" })),
+        )
+        .await
+    };
+
+    // Sideways and downward from below staff: refused, with the rule spelled out.
+    let res = write(&ali, &veli_id).await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+    assert!(
+        res.body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("staff"),
+        "{}",
+        res.body
+    );
+    assert_eq!(write(&anne, &ali_id).await.status, StatusCode::FORBIDDEN);
+
+    // Upward: allowed for both.
+    assert_eq!(write(&ali, &hoca_id).await.status, StatusCode::CREATED);
+    assert_eq!(write(&anne, &hoca_id).await.status, StatusCode::CREATED);
+
+    // Staff write anywhere — down to a student, sideways to a colleague.
+    assert_eq!(write(&hoca, &ali_id).await.status, StatusCode::CREATED);
+    assert_eq!(write(&mudur, &hoca_id).await.status, StatusCode::CREATED);
+
+    // The refused sends left nothing behind.
+    let inbox = send(&app, "GET", "/messages", Some(&veli), None).await;
+    assert_eq!(common::items(&inbox.body).len(), 0, "{}", inbox.body);
+}
+
 #[tokio::test]
 async fn messages_guard_parties_recipients_and_folders() {
     let (app, db) = app_and_db().await;
@@ -13682,6 +13807,8 @@ async fn messages_guard_parties_recipients_and_folders() {
     let ali_id = me_id(&app, &ali).await;
     let veli = login(&app, "veli").await;
     let parent = login_as(&app, &db, "anne", "parent").await;
+    let hoca = login_as(&app, &db, "hoca", "teacher").await;
+    let hoca_id = me_id(&app, &hoca).await;
 
     // Sending to yourself or to nobody fails.
     let res = send(
@@ -13703,13 +13830,23 @@ async fn messages_guard_parties_recipients_and_folders() {
     .await;
     assert_eq!(res.status, StatusCode::NOT_FOUND);
 
-    // A parent writes like anyone else — messaging is the role's one pen.
+    // A parent writes — messaging is the role's one pen — but upward only: to
+    // the teacher, not to the student.
     let res = send(
         &app,
         "POST",
         "/messages",
         Some(&parent),
         Some(json!({ "recipient_id": ali_id, "subject": "görüşme", "body": "uygun mu?" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+    let res = send(
+        &app,
+        "POST",
+        "/messages",
+        Some(&parent),
+        Some(json!({ "recipient_id": hoca_id, "subject": "görüşme", "body": "uygun mu?" })),
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED);

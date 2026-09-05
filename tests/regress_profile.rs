@@ -254,8 +254,10 @@ async fn display_name_falls_back_to_the_legal_name_then_null() {
 /// their legal name by every list that embeds a person.
 #[tokio::test]
 async fn embedded_person_refs_show_the_chosen_name_like_the_profile() {
-    let (app, _db) = app_and_db().await;
-    let ali = login(&app, "ali").await;
+    let (app, db) = app_and_db().await;
+    // The sender is staff: messaging is upward-only below teacher, and this
+    // test needs a send that lands, not the role rule.
+    let ali = login_as(&app, &db, "ali", "teacher").await;
     let ayse = login(&app, "ayse").await;
     let ayse_id = me_id(&app, &ayse).await;
 

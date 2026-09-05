@@ -264,7 +264,7 @@ struct ExamStatisticsResponse {
 
 /// The course an exam belongs to. A dangling reference means the course-delete
 /// cascade was violated — surface it loudly as a 500, not a user-facing 404.
-async fn course_of(exam: &Exam, db: &Database) -> Result<Course, AppError> {
+pub(crate) async fn course_of(exam: &Exam, db: &Database) -> Result<Course, AppError> {
     Course::read(exam.get_course(), db)
         .await?
         .ok_or_else(|| AppError::Internal("exam references a missing course".into()))
@@ -399,7 +399,7 @@ async fn get_exam(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "Mode change after attempts started, re-drafting an exam that has attempts or results, a kind change on an exam that already carries marks, or the exam kept changing under concurrent edits", body = ErrorResponse),
+        (status = 409, description = "Mode change after attempts started, re-drafting an exam that has attempts or results, a kind change on an exam that already carries marks, the exam kept changing under concurrent edits, or this course's term is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -432,6 +432,7 @@ async fn update_exam(
                 "only the course creator, an assigned teacher, or a manager/admin can edit this exam",
             ));
         }
+        course.require_open(&st.db).await?;
 
         let title = match req.title {
             Some(ref title) => ExamTitle::try_new(title)?,
@@ -572,6 +573,7 @@ async fn update_exam(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn delete_exam(
@@ -588,6 +590,7 @@ async fn delete_exam(
             "only the course creator, an assigned teacher, or a manager/admin can delete this exam",
         ));
     }
+    course.require_open(&st.db).await?;
     // *Writer* lease of [`EXAM_LOCK`] across the whole cascade, blob names
     // included — the lease `delete_homework` has always held, and its absence
     // here is what made a sitting able to start inside this delete. Every other
@@ -645,7 +648,7 @@ async fn delete_exam(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin), or attempted to grade yourself", body = ErrorResponse),
         (status = 404, description = "Exam not found", body = ErrorResponse),
-        (status = 409, description = "The exam is a draft, or its kind has been removed from the school's settings", body = ErrorResponse),
+        (status = 409, description = "The exam is a draft, its kind has been removed from the school's settings, or this course's term is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -671,6 +674,7 @@ async fn grade(
             "only the course creator, an assigned teacher, or a manager/admin can grade this exam",
         ));
     }
+    course.require_open(&st.db).await?;
     // Pre-flight: `ExamResult::grade` re-makes this check inside the mark's own
     // transaction, so a re-draft landing after this read cannot leave a mark on
     // a hidden exam.
@@ -860,6 +864,7 @@ async fn my_result(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn remove_result(
@@ -876,6 +881,7 @@ async fn remove_result(
             "only the course creator, an assigned teacher, or a manager/admin can remove results",
         ));
     }
+    course.require_open(&st.db).await?;
     let removed = ExamResult::remove(
         exam.get_id(),
         &UserId::from_key(&target),

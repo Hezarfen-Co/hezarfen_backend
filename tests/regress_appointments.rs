@@ -221,9 +221,10 @@ async fn accepting_a_superseded_proposal_is_refused() {
 /// Not a defect — a pin on a deliberate disclosure, so a future "tightening"
 /// fails loudly instead of silently killing the booking flow. `GET
 /// /appointments/slots` hands a parent the slot teacher's `PersonRef`, an
-/// identity all three of a parent's direct routes refuse them (`/users/{id}/
-/// profile` 403, `/users/search` teacher+, `/users` admin). It has to: you
-/// cannot choose whom to book a conference with from an anonymous calendar.
+/// identity a parent's direct routes still refuse them (`/users/{id}/profile`
+/// 403, `/users` admin) — `/users/search` names staff since #24, but never says
+/// which of them published bookable time. It has to: you cannot choose whom to
+/// book a conference with from an anonymous calendar.
 #[tokio::test]
 async fn a_parent_reads_the_slot_teachers_identity() {
     let (app, db) = app_and_db().await;
@@ -243,11 +244,7 @@ async fn a_parent_reads_the_slot_teachers_identity() {
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
 
     // The parent is refused that identity everywhere it is asked for directly.
-    for uri in [
-        format!("/users/{ali_id}/profile"),
-        "/users/search?q=ali".to_string(),
-        "/users".to_string(),
-    ] {
+    for uri in [format!("/users/{ali_id}/profile"), "/users".to_string()] {
         let res = send(&app, "GET", &uri, Some(&veli), None).await;
         assert_eq!(res.status, StatusCode::FORBIDDEN, "{uri}: {}", res.body);
     }

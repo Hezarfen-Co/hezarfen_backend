@@ -43,6 +43,10 @@
 //! `RACE_LOCK` that serializes them, and a hand-copied bootstrap here would
 //! drift out of the real one silently.
 
+mod common;
+
+use axum::http::StatusCode;
+use common::{app_and_db, id_of, login_as, send, upload_course_note_file};
 use hezarfen_backend::database::{self, Database};
 use hezarfen_backend::domain::course::{
     Course, CourseDescription, CourseId, CourseKind, CourseTitle,
@@ -58,6 +62,7 @@ use hezarfen_backend::domain::subject::{Subject, SubjectDescription, SubjectName
 use hezarfen_backend::domain::timestamp::Timestamp;
 use hezarfen_backend::domain::user::UserId;
 use hezarfen_backend::error::AppError;
+use serde_json::json;
 use tokio::task::JoinHandle;
 
 fn teacher() -> UserId {
@@ -356,4 +361,174 @@ async fn a_course_note_file_under_a_deleted_note_is_refused() {
         0,
         "a refused upload left a row naming a note that is gone"
     );
+}
+
+/// #22, the course's own children over HTTP: a course in an archived term is a
+/// past year, so its subjects and course notes (and note files) refuse every
+/// write with the coded 409 while all their reads keep answering. The guard
+/// sits in each write handler after its authorization check — 403 before 409 —
+/// on the `course` the shared loaders already hand back, never inside those
+/// loaders, which the read handlers share.
+#[tokio::test]
+async fn an_archived_term_freezes_a_course_s_subjects_and_notes() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "arch_child_manager", "manager").await;
+
+    let term = send(
+        &app,
+        "POST",
+        "/terms",
+        Some(&manager),
+        Some(json!({
+            "name": "2022",
+            "starts_at": 1_500_000_000_000_i64,
+            "ends_at": 1_510_000_000_000_i64,
+        })),
+    )
+    .await;
+    assert_eq!(term.status, StatusCode::CREATED, "{}", term.body);
+    let term_id = id_of(&term.body);
+
+    let course = send(
+        &app,
+        "POST",
+        "/courses",
+        Some(&manager),
+        Some(json!({ "title": "Fizik", "term_id": term_id })),
+    )
+    .await;
+    assert_eq!(course.status, StatusCode::CREATED, "{}", course.body);
+    let course_id = id_of(&course.body);
+
+    let subject = send(
+        &app,
+        "POST",
+        &format!("/courses/{course_id}/subjects"),
+        Some(&manager),
+        Some(json!({ "name": "Optik" })),
+    )
+    .await;
+    assert_eq!(subject.status, StatusCode::CREATED, "{}", subject.body);
+    let subject_id = id_of(&subject.body);
+
+    let note = send(
+        &app,
+        "POST",
+        "/course-notes",
+        Some(&manager),
+        Some(json!({ "course": course_id, "title": "Ders 1" })),
+    )
+    .await;
+    assert_eq!(note.status, StatusCode::CREATED, "{}", note.body);
+    let note_id = id_of(&note.body);
+
+    let file = upload_course_note_file(
+        &app,
+        &manager,
+        &note_id,
+        "plan.pdf",
+        "application/pdf",
+        b"pdf bytes",
+    )
+    .await;
+    assert_eq!(file.status, StatusCode::CREATED, "{}", file.body);
+    let file_id = id_of(&file.body);
+
+    let archived = send(
+        &app,
+        "POST",
+        &format!("/terms/{term_id}/archive"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(archived.status, StatusCode::OK, "{}", archived.body);
+
+    let writes: [(&str, String, Option<serde_json::Value>); 5] = [
+        (
+            "PATCH",
+            format!("/subjects/{subject_id}"),
+            Some(json!({ "name": "Akustik" })),
+        ),
+        ("DELETE", format!("/subjects/{subject_id}"), None),
+        (
+            "POST",
+            "/course-notes".to_string(),
+            Some(json!({ "course": course_id, "title": "Ders 2" })),
+        ),
+        (
+            "PATCH",
+            format!("/course-notes/{note_id}"),
+            Some(json!({ "title": "Ders 1a" })),
+        ),
+        (
+            "DELETE",
+            format!("/course-notes/{note_id}/files/{file_id}"),
+            None,
+        ),
+    ];
+    for (method, uri, body) in writes {
+        let res = send(&app, method, &uri, Some(&manager), body).await;
+        assert_eq!(
+            res.status,
+            StatusCode::CONFLICT,
+            "{method} {uri}: {}",
+            res.body
+        );
+        assert_eq!(res.body["code"], "term_archived", "{method} {uri}");
+    }
+    // The multipart upload refuses too, and before its body is buffered.
+    let refused = upload_course_note_file(
+        &app,
+        &manager,
+        &note_id,
+        "more.pdf",
+        "application/pdf",
+        b"more bytes",
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::CONFLICT, "{}", refused.body);
+    assert_eq!(refused.body["code"], "term_archived");
+    // Deleting the note itself is a write as well (it cascades its files).
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/course-notes/{note_id}"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
+    assert_eq!(res.body["code"], "term_archived");
+
+    // Reads all stay open.
+    for uri in [
+        format!("/subjects/{subject_id}"),
+        format!("/course-notes/{note_id}"),
+        format!("/course-notes/{note_id}/files"),
+        format!("/course-notes/{note_id}/files/{file_id}"),
+    ] {
+        let res = send(&app, "GET", &uri, Some(&manager), None).await;
+        assert_eq!(res.status, StatusCode::OK, "GET {uri}: {}", res.body);
+    }
+
+    // Re-opening the year thaws them.
+    let reopened = send(
+        &app,
+        "POST",
+        &format!("/terms/{term_id}/unarchive"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(reopened.status, StatusCode::OK, "{}", reopened.body);
+    let res = send(
+        &app,
+        "PATCH",
+        &format!("/subjects/{subject_id}"),
+        Some(&manager),
+        Some(json!({ "name": "Akustik" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
 }

@@ -125,6 +125,16 @@ impl ClassGroup {
         self.term.as_ref()
     }
 
+    /// Refuse the write when this class's term is archived — a pre-flight guard,
+    /// accepted race (see README concurrency model): a term archived after this
+    /// read still lets the write through.
+    pub async fn require_open(&self, db: &Database) -> Result<(), AppError> {
+        match self.get_term() {
+            None => Ok(()),
+            Some(term) => term::Term::require_open(term, db).await,
+        }
+    }
+
     /// The homeroom teacher (sınıf öğretmeni), if one is assigned.
     pub fn get_teacher(&self) -> Option<&UserId> {
         self.teacher.as_ref()
