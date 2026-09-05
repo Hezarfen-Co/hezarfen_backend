@@ -18,8 +18,12 @@ use hezarfen_backend::domain::board::{Board, BoardId};
 use hezarfen_backend::domain::board_stroke::{BoardStroke, BoardStrokeId};
 use hezarfen_backend::domain::chatbot_message::ChatbotMessage;
 use hezarfen_backend::domain::chatbot_thread::ChatbotThreadId;
+use hezarfen_backend::domain::course::CourseId;
+use hezarfen_backend::domain::course_note::CourseNoteId;
+use hezarfen_backend::domain::course_note_file::CourseNoteFileId;
 use hezarfen_backend::domain::exam::ExamId;
 use hezarfen_backend::domain::exam_attempt::ExamAttempt;
+use hezarfen_backend::domain::rag_output::RagOutput;
 use hezarfen_backend::domain::session::Session;
 use hezarfen_backend::domain::timestamp::Timestamp;
 use hezarfen_backend::domain::user::{Password, User, UserId, Username};
@@ -27062,4 +27066,138 @@ async fn course_note_cap_refusal_and_course_delete_leave_no_orphan_blobs() {
     )
     .await;
     assert_eq!(g.status, StatusCode::NOT_FOUND, "{}", g.body);
+}
+
+/// The stored AI outputs of a course note over HTTP: readable by anyone who
+/// can view the course, deletable only by whoever can manage it, and scoped
+/// to the note in the path (an output of a sibling note is a 404, not a
+/// cross-note delete). No AI service runs in tests, so the rows are inserted
+/// through the domain directly.
+#[tokio::test]
+async fn course_note_rag_outputs_read_and_delete() {
+    let (app, db) = app_and_db().await;
+    let creator = login_as(&app, &db, "rag_teacher", "teacher").await;
+    let outsider = login_as(&app, &db, "rag_other_teacher", "teacher").await;
+    let student = login_as(&app, &db, "rag_student", "student").await;
+    let stranger = login_as(&app, &db, "rag_stranger", "student").await;
+
+    let course = create_course(&app, &creator, "chemistry").await;
+    let student_id = me_id(&app, &student).await;
+    enroll(&app, &creator, &course, &student_id).await;
+
+    let note = create_course_note(&app, &creator, &course, "indexed").await;
+    let sibling = create_course_note(&app, &creator, &course, "also indexed").await;
+    let up =
+        upload_course_note_file(&app, &creator, &note, "src.pdf", "application/pdf", b"x").await;
+    assert_eq!(up.status, StatusCode::CREATED, "{}", up.body);
+    let file_id = id_of(&up.body);
+
+    let output = RagOutput::create(
+        &CourseNoteId::from_key(&note),
+        &CourseId::from_key(&course),
+        vec![CourseNoteFileId::from_key(&file_id)],
+        json!({ "summary": "acids and bases" }),
+        &db,
+    )
+    .await
+    .unwrap();
+    let output_id = output.get_id().key().to_string();
+    let sibling_output = RagOutput::create(
+        &CourseNoteId::from_key(&sibling),
+        &CourseId::from_key(&course),
+        Vec::new(),
+        json!({ "summary": "other" }),
+        &db,
+    )
+    .await
+    .unwrap();
+    let sibling_output_id = sibling_output.get_id().key().to_string();
+
+    // (1) an enrolled student reads the output, sources and payload included.
+    let list = send(
+        &app,
+        "GET",
+        &format!("/course-notes/{note}/rag"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(list.status, StatusCode::OK, "{}", list.body);
+    assert_eq!(common::total(&list.body), 1, "{}", list.body);
+    let item = &list.body["items"][0];
+    assert_eq!(item["id"], output_id);
+    assert_eq!(item["course_note"], note);
+    assert_eq!(item["course"], course);
+    assert_eq!(item["sources"][0], file_id);
+    assert_eq!(item["payload"]["summary"], "acids and bases");
+    assert!(item["generated_at"].as_i64().unwrap() > 0, "{}", list.body);
+
+    // (2) a student with no seat in the course gets the same refusal the note
+    // itself gives them: 403, not a 404.
+    for path in [
+        format!("/course-notes/{note}"),
+        format!("/course-notes/{note}/rag"),
+    ] {
+        let res = send(&app, "GET", &path, Some(&stranger), None).await;
+        assert_eq!(res.status, StatusCode::FORBIDDEN, "{path}: {}", res.body);
+    }
+
+    // (3) reading is not deleting.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/course-notes/{note}/rag/{output_id}"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+
+    // (5) a teacher who does not manage this course cannot either.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/course-notes/{note}/rag/{output_id}"),
+        Some(&outsider),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+
+    // (6) a sibling note's output is not reachable under this note.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/course-notes/{note}/rag/{sibling_output_id}"),
+        Some(&creator),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND, "{}", res.body);
+    assert!(
+        RagOutput::read(sibling_output.get_id(), &db)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // (4) the managing teacher deletes, and the note's page empties.
+    let res = send(
+        &app,
+        "DELETE",
+        &format!("/course-notes/{note}/rag/{output_id}"),
+        Some(&creator),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    let list = send(
+        &app,
+        "GET",
+        &format!("/course-notes/{note}/rag"),
+        Some(&student),
+        None,
+    )
+    .await;
+    assert_eq!(common::total(&list.body), 0, "{}", list.body);
 }
