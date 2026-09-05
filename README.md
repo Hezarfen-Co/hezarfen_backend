@@ -4694,3 +4694,12 @@ limits over every route, two limiters sharing one budget over one db), e2e
 (tempfile file engine, including close + reopen), ai-bridge (real QUIC on
 loopback against a fake AI service), ai-protocol (the `hab/2` wire contract,
 driven by a client that shares no code with the backend).
+
+The cross-school isolation probes run twice: once in memory mode, once against
+a **real** SurrealDB, because production is remote mode and there a school is a
+database inside one namespace rather than its own datastore. So `cargo test`
+starts a throwaway `surreal start … memory` server on a free port, taken from
+`~/.surrealdb/surreal`, and kills it when the last test using it finishes. A
+missing binary is a hard failure, not a skip — install it with
+`curl -sSf https://install.surrealdb.com | sh`, or set `HEZARFEN_SKIP_REMOTE=1`
+to skip the remote half deliberately.

@@ -27380,6 +27380,19 @@ async fn two_schools() -> (
     (app, db_a, db_b, tenants)
 }
 
+/// The same two schools for a remote deployment: [`common::remote_deployment`]
+/// creates them itself, since there is no `init_mem_tenants` to seed a demo.
+const TWO_SCHOOLS: &[(&str, &str)] = &[(DEMO_SLUG, "Demo School"), ("beta", "Beta Koleji")];
+
+/// One school's handle out of the registry — the one lookup that works in both
+/// modes, where `two_schools()`'s return values are memory-mode only.
+async fn school_db(tenants: &Tenants, slug: &str) -> hezarfen_backend::database::Database {
+    tenants
+        .get(&Slug::try_new(slug).expect("a school slug"))
+        .await
+        .unwrap_or_else(|err| panic!("the {slug} handle: {err}"))
+}
+
 /// Every list surface that takes no path parameter — the sweep target.
 const LIST_ROUTES: [&str; 19] = [
     "/users",
@@ -27505,21 +27518,37 @@ async fn seed_school_b(app: &axum::Router, cookie: &str) -> serde_json::Value {
 /// own rows only — the totals do not move when B fills up.
 #[tokio::test]
 async fn probe_cross_school_lists_show_only_own_rows() {
-    let (app, db_a, db_b, _tenants) = two_schools().await;
-    let a = common::login_as_school(&app, &db_a, DEMO_SLUG, "ada", "admin").await;
-    let b = common::login_as_school(&app, &db_b, "beta", "boran", "admin").await;
+    let (app, _db_a, _db_b, tenants) = two_schools().await;
+    probe_cross_school_lists_show_only_own_rows_on(&app, &tenants).await;
+}
+
+/// [`probe_cross_school_lists_show_only_own_rows`] on a **real remote deployment** — production's `Mode::Remote`,
+/// where isolation rests on each connection's `use_db` pin.
+#[tokio::test]
+async fn remote_probe_cross_school_lists_show_only_own_rows() {
+    let Some(d) = common::remote_deployment(TWO_SCHOOLS).await else {
+        return;
+    };
+    probe_cross_school_lists_show_only_own_rows_on(&d.app, &d.tenants).await;
+}
+
+async fn probe_cross_school_lists_show_only_own_rows_on(app: &axum::Router, tenants: &Tenants) {
+    let db_a = school_db(tenants, DEMO_SLUG).await;
+    let db_b = school_db(tenants, "beta").await;
+    let a = common::login_as_school(app, &db_a, DEMO_SLUG, "ada", "admin").await;
+    let b = common::login_as_school(app, &db_b, "beta", "boran", "admin").await;
 
     let mut before = Vec::new();
     for route in LIST_ROUTES {
-        let res = send(&app, "GET", route, Some(&a), None).await;
+        let res = send(app, "GET", route, Some(&a), None).await;
         assert_eq!(res.status, StatusCode::OK, "GET {route} as A: {}", res.body);
         before.push(common::total(&res.body));
     }
 
-    let ids = seed_school_b(&app, &b).await;
+    let ids = seed_school_b(app, &b).await;
 
     for (i, route) in LIST_ROUTES.iter().enumerate() {
-        let res = send(&app, "GET", route, Some(&a), None).await;
+        let res = send(app, "GET", route, Some(&a), None).await;
         assert_eq!(res.status, StatusCode::OK, "GET {route} as A: {}", res.body);
         assert_eq!(
             common::total(&res.body),
@@ -27540,7 +27569,7 @@ async fn probe_cross_school_lists_show_only_own_rows() {
         }
     }
     // and B still sees its own.
-    let res = send(&app, "GET", "/notes", Some(&b), None).await;
+    let res = send(app, "GET", "/notes", Some(&b), None).await;
     assert_eq!(common::total(&res.body), 1, "{}", res.body);
     assert!(ids["note"].is_string());
 }
@@ -27549,10 +27578,29 @@ async fn probe_cross_school_lists_show_only_own_rows() {
 /// every verb — never a 200, never a 500.
 #[tokio::test]
 async fn probe_cross_school_ids_are_not_found_under_the_other_cookie() {
-    let (app, db_a, db_b, _t) = two_schools().await;
-    let a = common::login_as_school(&app, &db_a, DEMO_SLUG, "ada", "admin").await;
-    let b = common::login_as_school(&app, &db_b, "beta", "boran", "admin").await;
-    let ids = seed_school_b(&app, &b).await;
+    let (app, _db_a, _db_b, tenants) = two_schools().await;
+    probe_cross_school_ids_are_not_found_under_the_other_cookie_on(&app, &tenants).await;
+}
+
+/// [`probe_cross_school_ids_are_not_found_under_the_other_cookie`] on a **real remote deployment** — production's `Mode::Remote`,
+/// where isolation rests on each connection's `use_db` pin.
+#[tokio::test]
+async fn remote_probe_cross_school_ids_are_not_found_under_the_other_cookie() {
+    let Some(d) = common::remote_deployment(TWO_SCHOOLS).await else {
+        return;
+    };
+    probe_cross_school_ids_are_not_found_under_the_other_cookie_on(&d.app, &d.tenants).await;
+}
+
+async fn probe_cross_school_ids_are_not_found_under_the_other_cookie_on(
+    app: &axum::Router,
+    tenants: &Tenants,
+) {
+    let db_a = school_db(tenants, DEMO_SLUG).await;
+    let db_b = school_db(tenants, "beta").await;
+    let a = common::login_as_school(app, &db_a, DEMO_SLUG, "ada", "admin").await;
+    let b = common::login_as_school(app, &db_b, "beta", "boran", "admin").await;
+    let ids = seed_school_b(app, &b).await;
     let s = |k: &str| ids[k].as_str().unwrap().to_string();
 
     let targets: Vec<(String, serde_json::Value)> = vec![
@@ -27582,7 +27630,7 @@ async fn probe_cross_school_ids_are_not_found_under_the_other_cookie() {
             ("PATCH", Some(patch.clone())),
             ("DELETE", None),
         ] {
-            let res = send(&app, method, &uri, Some(&a), body).await;
+            let res = send(app, method, &uri, Some(&a), body).await;
             assert_ne!(
                 res.status,
                 StatusCode::OK,
@@ -27606,7 +27654,7 @@ async fn probe_cross_school_ids_are_not_found_under_the_other_cookie() {
     // The one list surface that takes its scope from a query parameter: B's
     // course id under A's cookie must not open B's notes.
     let res = send(
-        &app,
+        app,
         "GET",
         &format!("/course-notes?course={}", s("course")),
         Some(&a),
@@ -27627,7 +27675,7 @@ async fn probe_cross_school_ids_are_not_found_under_the_other_cookie() {
         (format!("/courses/{}", s("course")), ()),
         (format!("/boards/{}", s("board")), ()),
     ] {
-        let res = send(&app, "GET", &uri, Some(&b), None).await;
+        let res = send(app, "GET", &uri, Some(&b), None).await;
         assert_eq!(
             res.status,
             StatusCode::OK,
@@ -27641,23 +27689,39 @@ async fn probe_cross_school_ids_are_not_found_under_the_other_cookie() {
 /// cookie must be refused, never silently linked.
 #[tokio::test]
 async fn probe_cross_school_ids_in_bodies_are_refused() {
-    let (app, db_a, db_b, _t) = two_schools().await;
-    let a_admin = common::login_as_school(&app, &db_a, DEMO_SLUG, "ada", "admin").await;
-    let a_student = common::login_as_school(&app, &db_a, DEMO_SLUG, "ali", "student").await;
-    let a_parent = common::login_as_school(&app, &db_a, DEMO_SLUG, "veli", "parent").await;
-    let b_admin = common::login_as_school(&app, &db_b, "beta", "boran", "admin").await;
-    common::login_as_school(&app, &db_b, "beta", "bstudent", "student").await;
+    let (app, _db_a, _db_b, tenants) = two_schools().await;
+    probe_cross_school_ids_in_bodies_are_refused_on(&app, &tenants).await;
+}
+
+/// [`probe_cross_school_ids_in_bodies_are_refused`] on a **real remote deployment** — production's `Mode::Remote`,
+/// where isolation rests on each connection's `use_db` pin.
+#[tokio::test]
+async fn remote_probe_cross_school_ids_in_bodies_are_refused() {
+    let Some(d) = common::remote_deployment(TWO_SCHOOLS).await else {
+        return;
+    };
+    probe_cross_school_ids_in_bodies_are_refused_on(&d.app, &d.tenants).await;
+}
+
+async fn probe_cross_school_ids_in_bodies_are_refused_on(app: &axum::Router, tenants: &Tenants) {
+    let db_a = school_db(tenants, DEMO_SLUG).await;
+    let db_b = school_db(tenants, "beta").await;
+    let a_admin = common::login_as_school(app, &db_a, DEMO_SLUG, "ada", "admin").await;
+    let a_student = common::login_as_school(app, &db_a, DEMO_SLUG, "ali", "student").await;
+    let a_parent = common::login_as_school(app, &db_a, DEMO_SLUG, "veli", "parent").await;
+    let b_admin = common::login_as_school(app, &db_b, "beta", "boran", "admin").await;
+    common::login_as_school(app, &db_b, "beta", "bstudent", "student").await;
 
     let b_user = {
-        let res = send(&app, "GET", "/users", Some(&b_admin), None).await;
+        let res = send(app, "GET", "/users", Some(&b_admin), None).await;
         assert_eq!(res.status, StatusCode::OK);
         id_of(&common::items(&res.body)[0])
     };
-    let a_parent_id = common::me_id(&app, &a_parent).await;
-    let a_course = create_course(&app, &a_admin, "A Course").await;
+    let a_parent_id = common::me_id(app, &a_parent).await;
+    let a_course = create_course(app, &a_admin, "A Course").await;
     let a_board = {
         let res = send(
-            &app,
+            app,
             "POST",
             "/boards",
             Some(&a_admin),
@@ -27708,7 +27772,7 @@ async fn probe_cross_school_ids_in_bodies_are_refused() {
     ];
 
     for (what, uri, cookie, body) in cases {
-        let res = send(&app, "POST", &uri, Some(cookie), Some(body)).await;
+        let res = send(app, "POST", &uri, Some(cookie), Some(body)).await;
         assert!(
             res.status.is_client_error(),
             "{what}: POST {uri} answered {} (expected a 4xx refusal): {}",
@@ -27727,12 +27791,32 @@ async fn probe_cross_school_ids_in_bodies_are_refused() {
 /// the *same* cookie back to life.
 #[tokio::test]
 async fn probe_suspension_blocks_login_and_a_live_cookie_then_resume_restores_it() {
-    let (app, _db_a, db_b, tenants) = two_schools().await;
+    let (app, _db_a, _db_b, tenants) = two_schools().await;
+    probe_suspension_blocks_login_and_a_live_cookie_then_resume_restores_it_on(&app, &tenants)
+        .await;
+}
+
+/// [`probe_suspension_blocks_login_and_a_live_cookie_then_resume_restores_it`] on a **real remote deployment** — production's `Mode::Remote`,
+/// where isolation rests on each connection's `use_db` pin.
+#[tokio::test]
+async fn remote_probe_suspension_blocks_login_and_a_live_cookie_then_resume_restores_it() {
+    let Some(d) = common::remote_deployment(TWO_SCHOOLS).await else {
+        return;
+    };
+    probe_suspension_blocks_login_and_a_live_cookie_then_resume_restores_it_on(&d.app, &d.tenants)
+        .await;
+}
+
+async fn probe_suspension_blocks_login_and_a_live_cookie_then_resume_restores_it_on(
+    app: &axum::Router,
+    tenants: &Tenants,
+) {
+    let db_b = school_db(tenants, "beta").await;
     let slug_b = Slug::try_new("beta").unwrap();
-    let b = common::login_as_school(&app, &db_b, "beta", "boran", "admin").await;
+    let b = common::login_as_school(app, &db_b, "beta", "boran", "admin").await;
 
     // Alive first.
-    let res = send(&app, "GET", "/auth/me", Some(&b), None).await;
+    let res = send(app, "GET", "/auth/me", Some(&b), None).await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
 
     tenants
@@ -27742,7 +27826,7 @@ async fn probe_suspension_blocks_login_and_a_live_cookie_then_resume_restores_it
 
     // The already-issued cookie, on the very next request.
     for route in ["/auth/me", "/users", "/notes", "/courses", "/settings"] {
-        let res = send(&app, "GET", route, Some(&b), None).await;
+        let res = send(app, "GET", route, Some(&b), None).await;
         assert_eq!(
             res.status,
             StatusCode::FORBIDDEN,
@@ -27753,7 +27837,7 @@ async fn probe_suspension_blocks_login_and_a_live_cookie_then_resume_restores_it
     }
     // A write too.
     let res = send(
-        &app,
+        app,
         "POST",
         "/notes",
         Some(&b),
@@ -27764,7 +27848,7 @@ async fn probe_suspension_blocks_login_and_a_live_cookie_then_resume_restores_it
 
     // Login is no exception.
     let res = send(
-        &app,
+        app,
         "POST",
         "/auth/login",
         None,
@@ -27780,7 +27864,7 @@ async fn probe_suspension_blocks_login_and_a_live_cookie_then_resume_restores_it
 
     // Register into it is refused too.
     let res = send(
-        &app,
+        app,
         "POST",
         "/auth/register",
         None,
@@ -27799,7 +27883,7 @@ async fn probe_suspension_blocks_login_and_a_live_cookie_then_resume_restores_it
         .set_status(&slug_b, SchoolStatus::Active)
         .await
         .expect("resume");
-    let res = send(&app, "GET", "/auth/me", Some(&b), None).await;
+    let res = send(app, "GET", "/auth/me", Some(&b), None).await;
     assert_eq!(
         res.status,
         StatusCode::OK,
@@ -27814,9 +27898,25 @@ async fn probe_suspension_blocks_login_and_a_live_cookie_then_resume_restores_it
 /// that would be a full takeover.
 #[tokio::test]
 async fn probe_cookie_confusion_is_impossible_both_ways() {
-    let (app, db_a, db_b, tenants) = two_schools().await;
-    let a = common::login_as_school(&app, &db_a, DEMO_SLUG, "ada", "admin").await;
-    let b = common::login_as_school(&app, &db_b, "beta", "boran", "admin").await;
+    let (app, _db_a, _db_b, tenants) = two_schools().await;
+    probe_cookie_confusion_is_impossible_both_ways_on(&app, &tenants).await;
+}
+
+/// [`probe_cookie_confusion_is_impossible_both_ways`] on a **real remote deployment** — production's `Mode::Remote`,
+/// where isolation rests on each connection's `use_db` pin.
+#[tokio::test]
+async fn remote_probe_cookie_confusion_is_impossible_both_ways() {
+    let Some(d) = common::remote_deployment(TWO_SCHOOLS).await else {
+        return;
+    };
+    probe_cookie_confusion_is_impossible_both_ways_on(&d.app, &d.tenants).await;
+}
+
+async fn probe_cookie_confusion_is_impossible_both_ways_on(app: &axum::Router, tenants: &Tenants) {
+    let db_a = school_db(tenants, DEMO_SLUG).await;
+    let db_b = school_db(tenants, "beta").await;
+    let a = common::login_as_school(app, &db_a, DEMO_SLUG, "ada", "admin").await;
+    let b = common::login_as_school(app, &db_b, "beta", "boran", "admin").await;
     let token_a = common::cookie_token(&a).to_string();
 
     hezarfen_backend::domain::builder::Builder::ensure(
@@ -27827,7 +27927,7 @@ async fn probe_cookie_confusion_is_impossible_both_ways() {
     .await
     .expect("seed the builder");
     let res = send(
-        &app,
+        app,
         "POST",
         "/builder/login",
         None,
@@ -27840,7 +27940,7 @@ async fn probe_cookie_confusion_is_impossible_both_ways() {
 
     // (1) builder cookie on a school surface.
     for route in ["/auth/me", "/users", "/notes"] {
-        let res = send(&app, "GET", route, Some(&builder_cookie), None).await;
+        let res = send(app, "GET", route, Some(&builder_cookie), None).await;
         assert_eq!(
             res.status,
             StatusCode::UNAUTHORIZED,
@@ -27852,7 +27952,7 @@ async fn probe_cookie_confusion_is_impossible_both_ways() {
     // (2) school cookie on the builder surface.
     for cookie in [&a, &b] {
         for route in ["/builder/me", "/schools"] {
-            let res = send(&app, "GET", route, Some(cookie), None).await;
+            let res = send(app, "GET", route, Some(cookie), None).await;
             assert_eq!(
                 res.status,
                 StatusCode::UNAUTHORIZED,
@@ -27871,7 +27971,7 @@ async fn probe_cookie_confusion_is_impossible_both_ways() {
         format!("session={token_a}."),
     ] {
         for route in ["/auth/me", "/builder/me"] {
-            let res = send(&app, "GET", route, Some(&raw), None).await;
+            let res = send(app, "GET", route, Some(&raw), None).await;
             assert_eq!(
                 res.status,
                 StatusCode::UNAUTHORIZED,
@@ -27886,7 +27986,7 @@ async fn probe_cookie_confusion_is_impossible_both_ways() {
         format!("session=demo.{builder_token}"),
         format!("session=beta.{builder_token}"),
     ] {
-        let res = send(&app, "GET", "/auth/me", Some(&raw), None).await;
+        let res = send(app, "GET", "/auth/me", Some(&raw), None).await;
         assert_eq!(
             res.status,
             StatusCode::UNAUTHORIZED,
@@ -27902,7 +28002,7 @@ async fn probe_cookie_confusion_is_impossible_both_ways() {
         (format!("session=demo.{token_b}"), "B's token under A"),
     ] {
         for route in ["/auth/me", "/users", "/notes", "/settings"] {
-            let res = send(&app, "GET", route, Some(&raw), None).await;
+            let res = send(app, "GET", route, Some(&raw), None).await;
             assert_eq!(
                 res.status,
                 StatusCode::UNAUTHORIZED,
@@ -27914,7 +28014,7 @@ async fn probe_cookie_confusion_is_impossible_both_ways() {
     }
     // (6) a school cookie naming a school that does not exist.
     let res = send(
-        &app,
+        app,
         "GET",
         "/auth/me",
         Some(&format!("session=nosuchschool.{token_a}")),
@@ -27928,11 +28028,27 @@ async fn probe_cookie_confusion_is_impossible_both_ways() {
 /// only, and an unknown school is indistinguishable from a bad credential.
 #[tokio::test]
 async fn probe_register_is_scoped_to_the_named_school() {
-    let (app, db_a, db_b, _t) = two_schools().await;
+    let (app, _db_a, _db_b, tenants) = two_schools().await;
+    probe_register_is_scoped_to_the_named_school_on(&app, &tenants).await;
+}
+
+/// [`probe_register_is_scoped_to_the_named_school`] on a **real remote deployment** — production's `Mode::Remote`,
+/// where isolation rests on each connection's `use_db` pin.
+#[tokio::test]
+async fn remote_probe_register_is_scoped_to_the_named_school() {
+    let Some(d) = common::remote_deployment(TWO_SCHOOLS).await else {
+        return;
+    };
+    probe_register_is_scoped_to_the_named_school_on(&d.app, &d.tenants).await;
+}
+
+async fn probe_register_is_scoped_to_the_named_school_on(app: &axum::Router, tenants: &Tenants) {
+    let db_a = school_db(tenants, DEMO_SLUG).await;
+    let db_b = school_db(tenants, "beta").await;
 
     // Missing `school` is a 4xx, not a silent default.
     let res = send(
-        &app,
+        app,
         "POST",
         "/auth/register",
         None,
@@ -27949,7 +28065,7 @@ async fn probe_register_is_scoped_to_the_named_school() {
     // The same username in both schools, independently.
     for (slug, db) in [(DEMO_SLUG, &db_a), ("beta", &db_b)] {
         let res = send(
-            &app,
+            app,
             "POST",
             "/auth/register",
             None,
@@ -27978,7 +28094,7 @@ async fn probe_register_is_scoped_to_the_named_school() {
     // Unknown school: same 401 and same body as a bad credential — no
     // enumeration of the customer list.
     let unknown = send(
-        &app,
+        app,
         "POST",
         "/auth/login",
         None,
@@ -27986,7 +28102,7 @@ async fn probe_register_is_scoped_to_the_named_school() {
     )
     .await;
     let bad_pass = send(
-        &app,
+        app,
         "POST",
         "/auth/login",
         None,
@@ -28003,7 +28119,7 @@ async fn probe_register_is_scoped_to_the_named_school() {
 
     // Register against an unknown school: same treatment.
     let reg_unknown = send(
-        &app,
+        app,
         "POST",
         "/auth/register",
         None,
@@ -28023,12 +28139,32 @@ async fn probe_register_is_scoped_to_the_named_school() {
 /// under B's cookie even with the exact ids.
 #[tokio::test]
 async fn probe_uploaded_files_are_school_scoped() {
-    let (app, db_a, db_b, _t) = two_schools().await;
-    let a = common::login_as_school(&app, &db_a, DEMO_SLUG, "ali", "student").await;
-    let b = common::login_as_school(&app, &db_b, "beta", "ali", "student").await;
+    let (app, _db_a, _db_b, tenants) = two_schools().await;
+    probe_uploaded_files_are_school_scoped_on(&app, &tenants, common::files_dir().as_path()).await;
+}
+
+/// [`probe_uploaded_files_are_school_scoped`] on a **real remote deployment** — production's `Mode::Remote`,
+/// where isolation rests on each connection's `use_db` pin.
+#[tokio::test]
+async fn remote_probe_uploaded_files_are_school_scoped() {
+    let Some(d) = common::remote_deployment(TWO_SCHOOLS).await else {
+        return;
+    };
+    probe_uploaded_files_are_school_scoped_on(&d.app, &d.tenants, &d.files).await;
+}
+
+async fn probe_uploaded_files_are_school_scoped_on(
+    app: &axum::Router,
+    tenants: &Tenants,
+    files: &std::path::Path,
+) {
+    let db_a = school_db(tenants, DEMO_SLUG).await;
+    let db_b = school_db(tenants, "beta").await;
+    let a = common::login_as_school(app, &db_a, DEMO_SLUG, "ali", "student").await;
+    let b = common::login_as_school(app, &db_b, "beta", "ali", "student").await;
 
     let note = send(
-        &app,
+        app,
         "POST",
         "/notes",
         Some(&a),
@@ -28038,13 +28174,13 @@ async fn probe_uploaded_files_are_school_scoped() {
     assert_eq!(note.status, StatusCode::CREATED, "{}", note.body);
     let note_id = id_of(&note.body);
 
-    let up = common::upload_file(&app, &a, &note_id, "a.txt", "text/plain", b"A-ONLY-BYTES").await;
+    let up = common::upload_file(app, &a, &note_id, "a.txt", "text/plain", b"A-ONLY-BYTES").await;
     assert_eq!(up.status, StatusCode::CREATED, "{}", up.body);
     let file_id = id_of(&up.body);
 
     // It landed under the school's own directory, and nowhere else.
-    let a_dir = common::files_dir().join(DEMO_SLUG);
-    let b_dir = common::files_dir().join("beta");
+    let a_dir = files.join(DEMO_SLUG);
+    let b_dir = files.join("beta");
     let count = |dir: &std::path::Path| {
         std::fs::read_dir(dir)
             .map(|it| it.count())
@@ -28059,12 +28195,12 @@ async fn probe_uploaded_files_are_school_scoped() {
 
     // A reads it back.
     let uri = format!("/notes/{note_id}/files/{file_id}");
-    let (status, _, bytes) = common::send_raw(&app, "GET", &uri, Some(&a), None, Vec::new()).await;
+    let (status, _, bytes) = common::send_raw(app, "GET", &uri, Some(&a), None, Vec::new()).await;
     assert_eq!(status, StatusCode::OK, "A reads its own file");
     assert_eq!(bytes, b"A-ONLY-BYTES");
 
     // B, with the exact ids, gets nothing — and no 500.
-    let (status, _, bytes) = common::send_raw(&app, "GET", &uri, Some(&b), None, Vec::new()).await;
+    let (status, _, bytes) = common::send_raw(app, "GET", &uri, Some(&b), None, Vec::new()).await;
     assert_eq!(
         status,
         StatusCode::NOT_FOUND,
@@ -28073,9 +28209,9 @@ async fn probe_uploaded_files_are_school_scoped() {
     );
     assert!(!bytes.windows(12).any(|w| w == b"A-ONLY-BYTES"));
 
-    let (status, _, _) = common::send_raw(&app, "DELETE", &uri, Some(&b), None, Vec::new()).await;
+    let (status, _, _) = common::send_raw(app, "DELETE", &uri, Some(&b), None, Vec::new()).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "B deleted A's file");
-    let (status, _, _) = common::send_raw(&app, "GET", &uri, Some(&a), None, Vec::new()).await;
+    let (status, _, _) = common::send_raw(app, "GET", &uri, Some(&a), None, Vec::new()).await;
     assert_eq!(status, StatusCode::OK, "A's file survived B's DELETE");
 }
 
@@ -28084,11 +28220,30 @@ async fn probe_uploaded_files_are_school_scoped() {
 /// (which are not paged lists) stay inside the caller's school.
 #[tokio::test]
 async fn probe_school_rows_never_reach_the_control_database() {
-    let (app, db_a, db_b, tenants) = two_schools().await;
-    let a = common::login_as_school(&app, &db_a, DEMO_SLUG, "ada", "admin").await;
-    let b = common::login_as_school(&app, &db_b, "beta", "boran", "admin").await;
-    common::login_as_school(&app, &db_b, "beta", "bstudent", "student").await;
-    let ids = seed_school_b(&app, &b).await;
+    let (app, _db_a, _db_b, tenants) = two_schools().await;
+    probe_school_rows_never_reach_the_control_database_on(&app, &tenants).await;
+}
+
+/// [`probe_school_rows_never_reach_the_control_database`] on a **real remote deployment** — production's `Mode::Remote`,
+/// where isolation rests on each connection's `use_db` pin.
+#[tokio::test]
+async fn remote_probe_school_rows_never_reach_the_control_database() {
+    let Some(d) = common::remote_deployment(TWO_SCHOOLS).await else {
+        return;
+    };
+    probe_school_rows_never_reach_the_control_database_on(&d.app, &d.tenants).await;
+}
+
+async fn probe_school_rows_never_reach_the_control_database_on(
+    app: &axum::Router,
+    tenants: &Tenants,
+) {
+    let db_a = school_db(tenants, DEMO_SLUG).await;
+    let db_b = school_db(tenants, "beta").await;
+    let a = common::login_as_school(app, &db_a, DEMO_SLUG, "ada", "admin").await;
+    let b = common::login_as_school(app, &db_b, "beta", "boran", "admin").await;
+    common::login_as_school(app, &db_b, "beta", "bstudent", "student").await;
+    let ids = seed_school_b(app, &b).await;
     assert!(ids["course"].is_string());
 
     // Nothing a school writes may appear in the control database.
@@ -28132,7 +28287,7 @@ async fn probe_school_rows_never_reach_the_control_database() {
     for (cookie, forbidden) in [(&a, "boran"), (&b, "ada")] {
         for q in ["b", "a", "boran", "ada", "bstudent"] {
             let res = send(
-                &app,
+                app,
                 "GET",
                 &format!("/users/search?q={q}"),
                 Some(cookie),
@@ -28149,10 +28304,10 @@ async fn probe_school_rows_never_reach_the_control_database() {
     }
 
     // Settings are the school's own: moving A's leaves B's alone.
-    let before = send(&app, "GET", "/settings", Some(&b), None).await;
+    let before = send(app, "GET", "/settings", Some(&b), None).await;
     assert_eq!(before.status, StatusCode::OK, "{}", before.body);
     let patched = send(
-        &app,
+        app,
         "PATCH",
         "/settings",
         Some(&a),
@@ -28161,7 +28316,7 @@ async fn probe_school_rows_never_reach_the_control_database() {
     .await;
     assert_eq!(patched.status, StatusCode::OK, "{}", patched.body);
     assert_eq!(patched.body["max_file_bytes"], 4096);
-    let after = send(&app, "GET", "/settings", Some(&b), None).await;
+    let after = send(app, "GET", "/settings", Some(&b), None).await;
     assert_eq!(
         after.body, before.body,
         "A's settings PATCH moved B's settings"
@@ -28170,7 +28325,7 @@ async fn probe_school_rows_never_reach_the_control_database() {
     // A cookie prefix that is not a well-formed slug is a 401, never a lookup.
     for prefix in ["DEMO", "Demo", "de mo", "de/mo", "..", "demo%2e", "control"] {
         let raw = format!("session={prefix}.{}", common::cookie_token(&a));
-        let res = send(&app, "GET", "/auth/me", Some(&raw), None).await;
+        let res = send(app, "GET", "/auth/me", Some(&raw), None).await;
         assert_eq!(
             res.status,
             StatusCode::UNAUTHORIZED,
@@ -28186,76 +28341,23 @@ async fn probe_school_rows_never_reach_the_control_database() {
 /// entirely on each connection's `use_db` pin — unlike `Mode::Mem`, where a
 /// school is its own embedded datastore and isolation cannot fail.
 ///
-/// Skipped unless `HEZARFEN_REMOTE_DB` names a live SurrealDB (e.g.
-/// `surreal start --user root --pass root memory --bind 127.0.0.1:8123`), since
-/// this suite must stay runnable with no server.
+/// The two slugs are the ones that are not bare identifiers: `ata-koleji` parses
+/// as a subtraction unquoted, `2024school` as a duration.
 #[tokio::test]
-async fn probe_remote_mode_keeps_two_schools_apart() {
-    let Ok(url) = std::env::var("HEZARFEN_REMOTE_DB") else {
-        eprintln!("HEZARFEN_REMOTE_DB unset — remote-mode isolation NOT exercised");
+async fn remote_probe_remote_mode_keeps_two_schools_apart() {
+    let Some(d) = common::remote_deployment(&[("ata-koleji", "Ata"), ("2024school", "2024")]).await
+    else {
         return;
     };
-    let ns = format!(
-        "probe_{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-    let cfg = hezarfen_backend::config::Config {
-        host: "127.0.0.1".into(),
-        port: 0,
-        db_url: url,
-        db_user: "root".into(),
-        db_pass: "root".into(),
-        db_ns: ns.clone(),
-        db_name: "control".into(),
-        files_path: common::files_dir().to_string_lossy().into_owned(),
-        cookie_secure: false,
-        rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
-        chatbot_per_minute: 0,
-        builder_username: None,
-        builder_password: None,
-        ai_quic_addr: None,
-        ai_shared_token: None,
-        ai_tls_cert: None,
-        ai_tls_key: None,
-        ai_request_timeout_secs: 30,
-    };
-    let tenants = hezarfen_backend::database::init(&cfg)
-        .await
-        .expect("remote control database");
-
-    // Two schools, one with a slug that is not a bare identifier.
+    let (app, tenants) = (&d.app, &d.tenants);
     let slug_a = Slug::try_new("ata-koleji").unwrap();
     let slug_b = Slug::try_new("2024school").unwrap();
-    tenants
-        .create(&slug_a, "Ata")
-        .await
-        .expect("school ata-koleji");
-    tenants
-        .create(&slug_b, "2024")
-        .await
-        .expect("school 2024school");
-
-    let app = build_router(AppState {
-        db: tenants.control().clone(),
-        tenants: tenants.clone(),
-        files_path: common::files_dir(),
-        cookie_secure: false,
-        rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
-        chatbot_limit: Default::default(),
-        exam_presence: Default::default(),
-        board_hub: Default::default(),
-        db_up: Default::default(),
-        ai: None,
-    });
 
     // The same username in both schools, over the real router.
     let mut cookies = Vec::new();
     for slug in [&slug_a, &slug_b] {
         let creds = json!({ "school": slug.as_str(), "username": "ada", "password": "secret1" });
-        let reg = send(&app, "POST", "/auth/register", None, Some(creds.clone())).await;
+        let reg = send(app, "POST", "/auth/register", None, Some(creds.clone())).await;
         assert_eq!(
             reg.status,
             StatusCode::CREATED,
@@ -28264,16 +28366,16 @@ async fn probe_remote_mode_keeps_two_schools_apart() {
         );
         let db = tenants.get(slug).await.unwrap();
         common::set_role(&db, "ada", "admin").await;
-        let res = send(&app, "POST", "/auth/login", None, Some(creds)).await;
+        let res = send(app, "POST", "/auth/login", None, Some(creds)).await;
         assert_eq!(res.status, StatusCode::OK, "login in {slug}: {}", res.body);
         cookies.push(res.cookie.expect("cookie"));
     }
     let (a, b) = (cookies[0].clone(), cookies[1].clone());
 
     // B fills up; A must not see a single row of it.
-    let ids = seed_school_b(&app, &b).await;
+    let ids = seed_school_b(app, &b).await;
     for route in LIST_ROUTES {
-        let res = send(&app, "GET", route, Some(&a), None).await;
+        let res = send(app, "GET", route, Some(&a), None).await;
         assert_eq!(res.status, StatusCode::OK, "GET {route} as A: {}", res.body);
         let dump = res.body.to_string();
         for key in [
@@ -28289,7 +28391,7 @@ async fn probe_remote_mode_keeps_two_schools_apart() {
     }
     // Each school sees exactly its own user, and only one.
     for cookie in [&a, &b] {
-        let res = send(&app, "GET", "/users", Some(cookie), None).await;
+        let res = send(app, "GET", "/users", Some(cookie), None).await;
         assert_eq!(common::total(&res.body), 1, "{}", res.body);
     }
     // A row minted in B is a 404 under A on every verb.
@@ -28303,7 +28405,7 @@ async fn probe_remote_mode_keeps_two_schools_apart() {
             _ => format!("/classes/{id}"),
         };
         for method in ["GET", "DELETE"] {
-            let res = send(&app, method, &uri, Some(&a), None).await;
+            let res = send(app, method, &uri, Some(&a), None).await;
             assert_ne!(
                 res.status,
                 StatusCode::OK,
@@ -28318,7 +28420,7 @@ async fn probe_remote_mode_keeps_two_schools_apart() {
                 res.body
             );
         }
-        let res = send(&app, "GET", &uri, Some(&b), None).await;
+        let res = send(app, "GET", &uri, Some(&b), None).await;
         assert_eq!(
             res.status,
             StatusCode::OK,
@@ -28329,12 +28431,219 @@ async fn probe_remote_mode_keeps_two_schools_apart() {
 
     // A's token under B's prefix stays a 401 on a real server too.
     let raw = format!("session={}.{}", slug_b, common::cookie_token(&a));
-    let res = send(&app, "GET", "/auth/me", Some(&raw), None).await;
+    let res = send(app, "GET", "/auth/me", Some(&raw), None).await;
     assert_eq!(res.status, StatusCode::UNAUTHORIZED, "{}", res.body);
+}
 
-    // Clean up after ourselves: the whole scratch namespace.
-    let _ = tenants
+// -------------------------------------------------------------------------
+// Remote-only invariants: things `Mode::Mem` cannot even express, because a
+// memory-mode school is its own datastore rather than a database on a server.
+// -------------------------------------------------------------------------
+
+/// The namespace's database list, out of `INFO FOR NS` on the control handle.
+async fn namespace_databases(tenants: &Tenants) -> Vec<String> {
+    let mut info = tenants
         .control()
-        .query(format!("REMOVE NAMESPACE IF EXISTS `{ns}`"))
-        .await;
+        .query("INFO FOR NS")
+        .await
+        .expect("INFO FOR NS");
+    let info: serde_json::Value = info
+        .take::<Option<serde_json::Value>>(0)
+        .expect("INFO FOR NS row")
+        .expect("INFO FOR NS is never empty");
+    let mut names: Vec<String> = info["databases"]
+        .as_object()
+        .unwrap_or_else(|| panic!("INFO FOR NS has no databases map: {info}"))
+        .keys()
+        .cloned()
+        .collect();
+    names.sort();
+    names
+}
+
+/// Remote-only: a school **is** a database, so the namespace must hold exactly
+/// the created schools plus `control` — and `DELETE /schools/{slug}` must
+/// `REMOVE DATABASE`, not merely delete the registry row.
+#[tokio::test]
+async fn remote_probe_a_school_is_a_database_and_delete_removes_it() {
+    let Some(d) = common::remote_deployment(TWO_SCHOOLS).await else {
+        return;
+    };
+    assert_eq!(
+        namespace_databases(&d.tenants).await,
+        vec![
+            "beta".to_string(),
+            "control".to_string(),
+            "demo".to_string()
+        ],
+        "the namespace holds exactly the two schools and the control database"
+    );
+
+    hezarfen_backend::domain::builder::Builder::ensure(
+        Username::try_new("operator").unwrap(),
+        Password::try_new("secret1").unwrap(),
+        d.tenants.control(),
+    )
+    .await
+    .expect("seed the builder");
+    let res = send(
+        &d.app,
+        "POST",
+        "/builder/login",
+        None,
+        Some(json!({ "username": "operator", "password": "secret1" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let builder = res.cookie.expect("builder cookie");
+
+    let res = send(&d.app, "DELETE", "/schools/beta", Some(&builder), None).await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    assert_eq!(
+        namespace_databases(&d.tenants).await,
+        vec!["control".to_string(), "demo".to_string()],
+        "DELETE /schools/beta left beta's database standing"
+    );
+}
+
+/// Remote-only: raw SQL on a school's own handle sees that school's rows and
+/// no others — the `use_db` pin, checked under the API rather than through it.
+#[tokio::test]
+async fn remote_probe_raw_sql_on_a_school_handle_counts_only_its_own_rows() {
+    let Some(d) = common::remote_deployment(TWO_SCHOOLS).await else {
+        return;
+    };
+    // Different counts, so a leak cannot hide behind equal numbers.
+    for (slug, users) in [
+        (DEMO_SLUG, ["ada", "ali", "ayse"].as_slice()),
+        ("beta", &["boran"]),
+    ] {
+        for username in users {
+            let res = send(
+                &d.app,
+                "POST",
+                "/auth/register",
+                None,
+                Some(json!({ "school": slug, "username": username, "password": "secret1" })),
+            )
+            .await;
+            assert_eq!(
+                res.status,
+                StatusCode::CREATED,
+                "{slug}/{username}: {}",
+                res.body
+            );
+        }
+    }
+
+    let count = async |db: &hezarfen_backend::database::Database| -> i64 {
+        db.query("SELECT count() FROM user GROUP ALL")
+            .await
+            .expect("count query")
+            .take::<Vec<serde_json::Value>>(0)
+            .expect("count row")
+            .first()
+            .and_then(|row| row["count"].as_i64())
+            .unwrap_or_default()
+    };
+    let db_a = school_db(&d.tenants, DEMO_SLUG).await;
+    let db_b = school_db(&d.tenants, "beta").await;
+    assert_eq!(count(&db_a).await, 3, "demo's own users");
+    assert_eq!(count(&db_b).await, 1, "beta's own users");
+}
+
+/// Remote-only: one namespace, so the *same record id string* exists in both
+/// databases' address space. Selected on the other school's handle it must
+/// still find nothing — record ids are not global.
+#[tokio::test]
+async fn remote_probe_a_record_id_minted_in_one_school_is_absent_in_the_other() {
+    let Some(d) = common::remote_deployment(TWO_SCHOOLS).await else {
+        return;
+    };
+    let res = send(
+        &d.app,
+        "POST",
+        "/auth/register",
+        None,
+        Some(json!({ "school": DEMO_SLUG, "username": "ada", "password": "secret1" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+
+    let db_a = school_db(&d.tenants, DEMO_SLUG).await;
+    let db_b = school_db(&d.tenants, "beta").await;
+    let id: surrealdb::types::RecordId = db_a
+        .query("SELECT VALUE id FROM user LIMIT 1")
+        .await
+        .expect("A's user id")
+        .take::<Vec<surrealdb::types::RecordId>>(0)
+        .expect("id row")
+        .pop()
+        .expect("A minted exactly one user");
+
+    let mine: Option<serde_json::Value> = db_a.select(id.clone()).await.expect("select in A");
+    assert!(mine.is_some(), "{id:?} is A's own row");
+    let theirs: Option<serde_json::Value> = db_b.select(id.clone()).await.expect("select in B");
+    assert!(
+        theirs.is_none(),
+        "{id:?} — minted in demo — resolved on beta's handle: {theirs:?}"
+    );
+}
+
+/// Remote-only: eviction really drops the socket here (in memory mode the
+/// cached handle *is* the store, so it is never dropped). A suspend/resume must
+/// therefore reconnect and find the school's rows exactly as they were.
+#[tokio::test]
+async fn remote_probe_a_suspended_school_reconnects_with_its_rows_intact() {
+    let Some(d) = common::remote_deployment(TWO_SCHOOLS).await else {
+        return;
+    };
+    let slug = Slug::try_new(DEMO_SLUG).unwrap();
+    let db = school_db(&d.tenants, DEMO_SLUG).await;
+    let cookie = common::login_as_school(&d.app, &db, DEMO_SLUG, "ada", "admin").await;
+    let note = send(
+        &d.app,
+        "POST",
+        "/notes",
+        Some(&cookie),
+        Some(json!({ "title": "before", "content": "kept" })),
+    )
+    .await;
+    assert_eq!(note.status, StatusCode::CREATED, "{}", note.body);
+    let note_id = id_of(&note.body);
+
+    d.tenants
+        .set_status(&slug, SchoolStatus::Suspended)
+        .await
+        .expect("suspend");
+    let res = send(&d.app, "GET", "/auth/me", Some(&cookie), None).await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+    d.tenants
+        .set_status(&slug, SchoolStatus::Active)
+        .await
+        .expect("resume");
+
+    // A fresh connection (the old one was evicted) onto the same database.
+    let reconnected = school_db(&d.tenants, DEMO_SLUG).await;
+    let titles: Vec<String> = reconnected
+        .query("SELECT VALUE title FROM note")
+        .await
+        .expect("notes after the resume")
+        .take(0)
+        .expect("title rows");
+    assert_eq!(titles, vec!["before".to_string()], "the rows survived");
+    let res = send(
+        &d.app,
+        "GET",
+        &format!("/notes/{note_id}"),
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::OK,
+        "the same cookie and the same note after a resume: {}",
+        res.body
+    );
 }
