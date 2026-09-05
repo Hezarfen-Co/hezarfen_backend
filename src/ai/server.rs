@@ -24,11 +24,11 @@ use crate::constant::{
     REQUEST_TIMEOUT_SECS,
 };
 use crate::database::Database;
-use crate::error::AppError;
 use crate::domain::course::Course;
 use crate::domain::course_note::CourseNote;
 use crate::domain::course_note_file::{CourseNoteFile, CourseNoteFileId};
 use crate::domain::user::{User, UserId};
+use crate::error::AppError;
 use crate::state::DbHealth;
 use crate::tenant::{Slug, Tenants};
 use crate::web::blob_path;
@@ -75,8 +75,12 @@ impl ApiHandle {
     /// switched off — a service that retries the first two forever learns
     /// nothing, while the third is worth retrying later.
     async fn school(&self, school: &str) -> Result<(Slug, Database), (&'static str, String)> {
-        let slug = Slug::try_new(school)
-            .map_err(|err| ("malformed", format!("`{school}` is not a school slug: {err}")))?;
+        let slug = Slug::try_new(school).map_err(|err| {
+            (
+                "malformed",
+                format!("`{school}` is not a school slug: {err}"),
+            )
+        })?;
         let db = self.tenants.get(&slug).await.map_err(|err| match err {
             AppError::Unauthorized => (
                 "unknown_school",
@@ -600,7 +604,10 @@ async fn open_blob(
 /// never trusted from the frame: a service holding a stale id must not act as a
 /// user who has since been deleted or demoted, nor as a same-named user of
 /// another school. With nobody named the principal is the synthetic `ai` role.
-async fn principal(db: &Database, on_behalf_of: Option<&str>) -> Result<User, (&'static str, String)> {
+async fn principal(
+    db: &Database,
+    on_behalf_of: Option<&str>,
+) -> Result<User, (&'static str, String)> {
     let Some(who) = on_behalf_of else {
         return Ok(User::ai_principal());
     };

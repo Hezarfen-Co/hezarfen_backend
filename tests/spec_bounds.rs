@@ -64,8 +64,18 @@ fn expectations() -> Vec<(&'static str, &'static str, &'static str, i64)> {
         // --- builder (the vendor surface) ---
         ("CreateSchool", "slug", "minLength", MIN_SLUG_LEN as i64),
         ("CreateSchool", "slug", "maxLength", MAX_SLUG_LEN as i64),
-        ("CreateSchool", "name", "maxLength", MAX_SCHOOL_NAME_LEN as i64),
-        ("UpdateSchool", "name", "maxLength", MAX_SCHOOL_NAME_LEN as i64),
+        (
+            "CreateSchool",
+            "name",
+            "maxLength",
+            MAX_SCHOOL_NAME_LEN as i64,
+        ),
+        (
+            "UpdateSchool",
+            "name",
+            "maxLength",
+            MAX_SCHOOL_NAME_LEN as i64,
+        ),
         (
             "CreateSchool",
             "admin_username",
