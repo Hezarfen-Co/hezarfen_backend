@@ -1206,6 +1206,7 @@ async fn the_class_refusal_codes_stay_published() {
         "class_at_course_ceiling",
         "class_roster_too_large",
         "course_full",
+        "term_archived",
     ];
     let members = [
         "duplicate",
@@ -1213,7 +1214,12 @@ async fn the_class_refusal_codes_stay_published() {
         "class_course_list_too_large",
         "course_full",
         "linked_course_missing",
+        "term_archived",
     ];
+    // `term_archived` refuses the whole request up front (the class's or the
+    // course's term is archived), so no pump ever *skips* an item for it —
+    // it belongs on the two routes' 409s, never in `SkipResponse.reason`.
+    let whole_request = ["term_archived"];
 
     for (path, expected) in [
         ("/classes/{id}/courses", courses.as_slice()),
@@ -1251,6 +1257,7 @@ async fn the_class_refusal_codes_stay_published() {
         .chain(courses.iter())
         .chain(members.iter())
         .copied()
+        .filter(|code| !whole_request.contains(code))
         .collect();
     assert_eq!(
         sorted(quoted(reason)),

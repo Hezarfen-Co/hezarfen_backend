@@ -119,6 +119,7 @@ impl CourseNoteResponse {
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
+        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -135,6 +136,7 @@ async fn create(
             "only the course creator, an assigned teacher, or a manager/admin can add a course note",
         ));
     }
+    course.require_open(&st.db).await?;
     let title = CourseNoteTitle::try_new(&req.title)?;
     let content = CourseNoteContent::try_new(&req.content.unwrap_or_default())?;
     let note = CourseNote::create(course.get_id(), user.get_id(), title, content, &st.db).await?;
@@ -233,6 +235,7 @@ async fn get_one(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -248,6 +251,7 @@ async fn update(
             "only the course creator, an assigned teacher, or a manager/admin can edit this course note",
         ));
     }
+    course.require_open(&st.db).await?;
 
     let title = req
         .title
@@ -279,6 +283,7 @@ async fn update(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn delete_one(
@@ -292,6 +297,7 @@ async fn delete_one(
             "only the course creator, an assigned teacher, or a manager/admin can delete this course note",
         ));
     }
+    course.require_open(&st.db).await?;
     // Derived rows first, outside the note's own cascade transaction: they are
     // disposable, so failing here leaves the note intact and the 500 truthful,
     // whereas dropping them after the note would strand every blob on an error
@@ -352,7 +358,7 @@ impl CourseNoteFileResponse {
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Note not found", body = ErrorResponse),
-        (status = 409, description = "The note already holds the maximum number of files", body = ErrorResponse),
+        (status = 409, description = "The note already holds the maximum number of files, or this course's term is archived — past years are read-only", body = ErrorResponse),
         (status = 413, description = "File exceeds the school's size limit", body = ErrorResponse),
     ),
 )]
@@ -368,6 +374,7 @@ async fn upload_file(
             "only the course creator, an assigned teacher, or a manager/admin can add a file to this course note",
         ));
     }
+    course.require_open(&st.db).await?;
     // The 10-file cap is enforced inside `CourseNoteFile::insert` (count and
     // create under one lock) — checking it here too would just race.
     let limit = Settings::load(&st.db).await?.get_max_file_bytes();
@@ -506,6 +513,7 @@ async fn download_file(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Note or file not found", body = ErrorResponse),
+        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn delete_file(
@@ -519,6 +527,7 @@ async fn delete_file(
             "only the course creator, an assigned teacher, or a manager/admin can delete this course note's files",
         ));
     }
+    course.require_open(&st.db).await?;
     let file =
         CourseNoteFile::read_for(&CourseNoteFileId::from_key(&file_id), note.get_id(), &st.db)
             .await?
@@ -618,6 +627,7 @@ async fn list_rag(
         (status = 204, description = "Deleted"),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
+        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
         (status = 404, description = "Note or output not found", body = ErrorResponse),
     ),
 )]
@@ -632,6 +642,7 @@ async fn delete_rag(
             "only the course creator, an assigned teacher, or a manager/admin can delete this course note's AI outputs",
         ));
     }
+    course.require_open(&st.db).await?;
     // Scoped to the note in the path, like `CourseNoteFile::read_for`: an
     // output of another note is a 404 here, never a cross-note delete.
     let output = RagOutput::read(&RagOutputId::from_key(&output_id), &st.db)

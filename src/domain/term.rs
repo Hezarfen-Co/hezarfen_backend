@@ -56,6 +56,15 @@ pub fn gone_error() -> AppError {
     })
 }
 
+/// The refusal every write against archived structure gets, coded so a client
+/// can tell it from the other 409s on the same route.
+pub fn archived_error() -> AppError {
+    AppError::ConflictCoded {
+        code: "term_archived",
+        message: "this term is archived — past years are read-only".into(),
+    }
+}
+
 /// What a PATCH's `term` field owes the refcounts: the term to claim, and the
 /// one to give back. Covers all three moves — set (none→some), move
 /// (some→other) and clear (some→none) — and moves nothing for a PATCH that
@@ -96,6 +105,11 @@ pub struct Term {
     name: TermName,
     starts_at: Timestamp,
     ends_at: Timestamp,
+    /// When a manager archived this term; `None` = open. `#[surreal(default)]`
+    /// for the same reason `BankQuestion::subject` has one: rows written before
+    /// the column existed still decode, as open terms.
+    #[surreal(default)]
+    archived_at: Option<Timestamp>,
 }
 
 impl Term {
@@ -115,6 +129,14 @@ impl Term {
         self.ends_at
     }
 
+    pub fn get_archived_at(&self) -> Option<Timestamp> {
+        self.archived_at
+    }
+
+    pub fn is_archived(&self) -> bool {
+        self.archived_at.is_some()
+    }
+
     pub async fn create(
         name: TermName,
         starts_at: Timestamp,
@@ -126,6 +148,7 @@ impl Term {
             name,
             starts_at,
             ends_at,
+            archived_at: None,
         };
         let created: Option<Term> = db.create(term.id.record()).content(term).await?;
         created.ok_or_else(|| AppError::Internal("failed to create term".into()))
@@ -198,6 +221,58 @@ impl Term {
         match Self::read(&self.id, db).await? {
             Some(_) => Ok(false),
             None => Err(AppError::NotFound),
+        }
+    }
+
+    /// Freeze the term. Idempotent by construction: the `WHERE` only matches an
+    /// open row, so a repeat archive writes nothing and answers with the
+    /// *original* stamp — the year is not re-dated by a double click.
+    pub async fn archive(self, db: &Database) -> Result<Term, AppError> {
+        self.stamp(
+            "UPDATE $term SET archived_at = $now WHERE archived_at = NONE RETURN AFTER",
+            Some(Timestamp::now()),
+            db,
+        )
+        .await
+    }
+
+    /// Re-open the term; idempotent the same way.
+    pub async fn unarchive(self, db: &Database) -> Result<Term, AppError> {
+        self.stamp(
+            "UPDATE $term SET archived_at = NONE WHERE archived_at != NONE RETURN AFTER",
+            None,
+            db,
+        )
+        .await
+    }
+
+    /// One conditional write, through [`write_with_retry`] like every other
+    /// guarded single statement here; an empty result is the no-op case, and
+    /// only that path pays for the read that reports the stored row.
+    async fn stamp(
+        self,
+        sql: &str,
+        now: Option<Timestamp>,
+        db: &Database,
+    ) -> Result<Term, AppError> {
+        let mut bindings = vec![("term".into(), self.id.record().into_value())];
+        if let Some(now) = now {
+            bindings.push(("now".into(), now.as_millis().into_value()));
+        }
+        let written: Vec<Term> = write_with_retry(db, sql, &bindings).await?;
+        if let Some(term) = written.into_iter().next() {
+            return Ok(term);
+        }
+        Self::read(&self.id, db).await?.ok_or(AppError::NotFound)
+    }
+
+    /// Refuse when the named term is archived. A missing row is `Ok(())`: a
+    /// dangling link is not this guard's error, and the caller that cares
+    /// already answers it (see [`gone_error`]).
+    pub async fn require_open(id: &TermId, db: &Database) -> Result<(), AppError> {
+        match Self::read(id, db).await? {
+            Some(term) if term.is_archived() => Err(archived_error()),
+            _ => Ok(()),
         }
     }
 }

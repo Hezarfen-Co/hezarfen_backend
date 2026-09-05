@@ -28,9 +28,8 @@ use super::courses::visible_courses;
 use super::dto::AssignableRole;
 use super::dto::Role as RoleSchema;
 use super::{
-    CurrentUser, Page, PageParams, PersonRef, RequireAdmin, RequireTeacher, UploadFileForm,
-    UserResponse, ensure_can_observe, paginate, read_image_upload, remove_blob, serve_inline_blob,
-    store_blob,
+    CurrentUser, Page, PageParams, PersonRef, RequireAdmin, UploadFileForm, UserResponse,
+    ensure_can_observe, paginate, read_image_upload, remove_blob, serve_inline_blob, store_blob,
 };
 
 pub fn routes() -> OpenApiRouter<AppState> {
@@ -197,8 +196,12 @@ struct SearchUsers {
 }
 
 /// Find users by username or name — backs the pickers (enroll, grade, mark
-/// attendance). Requires teacher+. `role` narrows to one role (e.g.
-/// `role=student` for an enroll picker); a blank `q` with a `role` lists
+/// attendance) and, for a student or parent, the one way to find the staff
+/// member they are allowed to message. Any authenticated user may ask; a
+/// caller below teacher only ever sees the roles they may message (teacher,
+/// manager, admin), in the items *and* in `total`. `role` narrows to one role
+/// (e.g. `role=student` for an enroll picker) — a student or parent naming a
+/// role they may not message is refused; a blank `q` with a `role` lists
 /// everyone in that role. Paged via `?limit=&offset=` like the other lists
 /// (omit `limit` for every match); returns a `{items, total, limit, offset}`
 /// envelope carrying only id/username/display name — no contact details.
@@ -212,12 +215,12 @@ struct SearchUsers {
         (status = 200, description = "A page of matching users (all matches when unpaged)", body = Page<PersonRef>),
         (status = 400, description = "Blank query without a role, unknown role, or invalid limit/offset", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
+        (status = 403, description = "A student or parent asked for a role they may not message", body = ErrorResponse),
     ),
 )]
 async fn search_users(
     State(st): State<AppState>,
-    _teacher: RequireTeacher,
+    CurrentUser(user): CurrentUser,
     Query(req): Query<SearchUsers>,
 ) -> Result<Json<Page<PersonRef>>, AppError> {
     if req.q.trim().is_empty() && req.role.is_none() {
@@ -232,7 +235,17 @@ async fn search_users(
     }
     .resolve()?;
     let role = req.role.as_deref().map(Role::try_from_str).transpose()?;
-    let (users, total) = User::search(&req.q, role, limit, offset, &st.db).await?;
+    // Below staff the caller may only see whom they may write to. Asking for a
+    // role outside that set is a refusal, not a silently empty page.
+    let allowed = user.get_role().messageable_roles();
+    if let (Some(allowed), Some(role)) = (allowed, role)
+        && !allowed.contains(&role)
+    {
+        return Err(AppError::Forbidden(
+            "students and parents may only search staff (teacher or higher)",
+        ));
+    }
+    let (users, total) = User::search(&req.q, role, allowed, limit, offset, &st.db).await?;
     let items = users.iter().map(PersonRef::new).collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }

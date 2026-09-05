@@ -328,7 +328,7 @@ struct UpdateHomework {
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "Narrowing the assigned list would orphan an existing submission or result, or the subject this update re-tags from changed since the caller read it — nothing was written, re-read and retry", body = ErrorResponse),
+        (status = 409, description = "Narrowing the assigned list would orphan an existing submission or result, or the subject this update re-tags from changed since the caller read it — nothing was written, re-read and retry; or this course's term is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -344,6 +344,7 @@ async fn update_homework(
             "only the course creator, an assigned teacher, or a manager/admin can edit this homework",
         ));
     }
+    course.require_open(&st.db).await?;
 
     // Writer lease of [`HOMEWORK_LOCK`]: `ensure_no_orphans` below reads the
     // live submissions and results, and the row write depends on what it saw —
@@ -449,6 +450,7 @@ async fn ensure_no_orphans(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn delete_homework(
@@ -462,6 +464,7 @@ async fn delete_homework(
             "only the course creator, an assigned teacher, or a manager/admin can delete this homework",
         ));
     }
+    course.require_open(&st.db).await?;
     let _guard = HOMEWORK_LOCK.write().await;
     let blob_keys = HomeworkFile::file_keys_for_homework(homework.get_id(), &st.db).await?;
     homework.delete(&st.db).await?;
@@ -510,6 +513,20 @@ async fn gate_own_submission(id: &str, user: &User, db: &Database) -> Result<Hom
         return Err(AppError::NotFound);
     }
     Ok(homework)
+}
+
+/// The term wall of the student side: an archived term makes past years
+/// read-only. Deliberately *not* inside [`gate_own_submission`] — that gate
+/// also fronts the download read, and an archived year is still browsable. So
+/// every student *write* calls this right after the gate, which keeps the
+/// order that matters: a student the homework never named is refused by the
+/// audience check with a 404 and never learns the homework exists. A course
+/// that vanished under us is the gates' own business, not this one's.
+async fn require_open_term(homework: &Homework, db: &Database) -> Result<(), AppError> {
+    if let Some(course) = Course::read(homework.get_course(), db).await? {
+        course.require_open(db).await?;
+    }
+    Ok(())
 }
 
 /// One file attached to a submission — metadata only; the bytes download
@@ -644,7 +661,7 @@ struct SubmitHomework {
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not a student, or not enrolled in the homework's course", body = ErrorResponse),
         (status = 404, description = "No such homework (or a subset assignment the caller is not part of)", body = ErrorResponse),
-        (status = 409, description = "The homework has been graded — the submission is frozen until the grade is removed", body = ErrorResponse),
+        (status = 409, description = "The homework has been graded — the submission is frozen until the grade is removed, or this course's term is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -669,6 +686,7 @@ async fn submit(
     // write is what makes the PATCH wait and then see the row.
     let _guard = HOMEWORK_LOCK.read().await;
     let homework = gate_own_submission(&id, &user, &st.db).await?;
+    require_open_term(&homework, &st.db).await?;
     // The graded gate, twice over. This read answers the common case — graded
     // minutes ago, and the student who never submitted has no row to carry the
     // freeze; the upsert's own `WHERE` (the grade stamp on the row) is what
@@ -766,7 +784,7 @@ async fn get_submission(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not a student, or not enrolled in the homework's course", body = ErrorResponse),
         (status = 404, description = "No such homework, a subset assignment the caller is not part of, or nothing submitted yet", body = ErrorResponse),
-        (status = 409, description = "The homework has been graded — the submission is frozen until the grade is removed", body = ErrorResponse),
+        (status = 409, description = "The homework has been graded — the submission is frozen until the grade is removed, or this course's term is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn delete_submission(
@@ -775,6 +793,7 @@ async fn delete_submission(
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
     let homework = gate_own_submission(&id, &user, &st.db).await?;
+    require_open_term(&homework, &st.db).await?;
     // Reader lease as in `submit` — the audience interlock, not the freeze.
     let _guard = HOMEWORK_LOCK.read().await;
     if HomeworkResult::read_for(homework.get_id(), user.get_id(), &st.db)
@@ -873,7 +892,7 @@ async fn serve_download(st: &AppState, file: &HomeworkFile) -> Result<Response, 
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not a student, or not enrolled in the homework's course", body = ErrorResponse),
         (status = 404, description = "No such homework (or a subset assignment the caller is not part of)", body = ErrorResponse),
-        (status = 409, description = "The homework has been graded, or the submission already holds the maximum of 10 files", body = ErrorResponse),
+        (status = 409, description = "The homework has been graded, or the submission already holds the maximum of 10 files, or this course's term is archived — past years are read-only", body = ErrorResponse),
         (status = 413, description = "File exceeds the school's size limit", body = ErrorResponse),
     ),
 )]
@@ -886,7 +905,8 @@ async fn upload_submission_file(
     // Pre-flight, so a caller with no business here is refused before uploading
     // 25 MiB; the gate that *licenses the write* is the one under the lease
     // below, because this snapshot goes stale while the body streams.
-    gate_own_submission(&id, &user, &st.db).await?;
+    let preflight = gate_own_submission(&id, &user, &st.db).await?;
+    require_open_term(&preflight, &st.db).await?;
     let limit = Settings::load(&st.db).await?.get_max_file_bytes();
     // Consume the body before taking the lock — a slow upload must not stall the
     // homework subsystem (mirrors the exam/note image uploads).
@@ -909,6 +929,8 @@ async fn upload_submission_file(
     // under it, all unreachable afterwards. A gate read before the body is a
     // pre-flight; a gate read after it is the decision.
     let homework = gate_own_submission(&id, &user, &st.db).await?;
+    // Re-walled too: the term can be archived while the body streams.
+    require_open_term(&homework, &st.db).await?;
     // The common-case gate; the freeze itself rides on the writes below.
     if HomeworkResult::read_for(homework.get_id(), user.get_id(), &st.db)
         .await?
@@ -1029,7 +1051,7 @@ async fn download_submission_file(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not a student, or not enrolled in the homework's course", body = ErrorResponse),
         (status = 404, description = "No such homework or file (or a subset assignment the caller is not part of)", body = ErrorResponse),
-        (status = 409, description = "The homework has been graded — the submission is frozen until the grade is removed", body = ErrorResponse),
+        (status = 409, description = "The homework has been graded — the submission is frozen until the grade is removed, or this course's term is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn delete_submission_file(
@@ -1038,6 +1060,7 @@ async fn delete_submission_file(
     Path((id, fid)): Path<(String, String)>,
 ) -> Result<StatusCode, AppError> {
     let homework = gate_own_submission(&id, &user, &st.db).await?;
+    require_open_term(&homework, &st.db).await?;
     const GRADED: AppError = AppError::Conflict(
         "this homework has been graded — ask the teacher to remove the grade before deleting files",
     );
@@ -1100,6 +1123,7 @@ struct GradeHomework {
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin), or attempted to grade yourself", body = ErrorResponse),
         (status = 404, description = "Homework not found", body = ErrorResponse),
+        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -1121,6 +1145,7 @@ async fn grade_homework(
             "only the course creator, an assigned teacher, or a manager/admin can grade this homework",
         ));
     }
+    course.require_open(&st.db).await?;
 
     let status = HomeworkStatus::try_new(&req.status)?;
     let mark = req.mark.map(Mark::try_new).transpose()?;
@@ -1202,6 +1227,7 @@ async fn grade_homework(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "No such homework, or no grade for this user", body = ErrorResponse),
+        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn remove_homework_result(
@@ -1219,6 +1245,7 @@ async fn remove_homework_result(
             "only the course creator, an assigned teacher, or a manager/admin can remove grades",
         ));
     }
+    course.require_open(&st.db).await?;
     let removed =
         HomeworkResult::remove(homework.get_id(), &UserId::from_key(&target), &st.db).await?;
     if removed.is_none() {

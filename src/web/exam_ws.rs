@@ -75,8 +75,8 @@ use crate::state::AppState;
 use crate::validate::validate_required;
 use crate::web::CurrentUser;
 use crate::web::exams::{
-    EXAM_LOCK, check_rejoin, ensure_enrolled, ensure_sittable, ensure_student, save_answer_in,
-    writable_attempt,
+    EXAM_LOCK, check_rejoin, course_of, ensure_enrolled, ensure_sittable, ensure_student,
+    save_answer_in, writable_attempt,
 };
 use crate::web::room::{self, Incoming, RoomClosed, send, with_client_seq};
 
@@ -126,7 +126,8 @@ enum ClientMessage {
 /// unknown or draft exam (404), unscheduled with no mode (409), not a student
 /// (403), not enrolled (403), no attempt yet (404 — `POST /exams/{id}/attempt`
 /// first), submitted or expired (409), left the room while rejoin is closed
-/// (409).
+/// (409), the course's term archived (409 `term_archived` — a past year's room
+/// is read-only, and the room's whole purpose is writing).
 ///
 /// The rejoin gate here is a read-only fast-fail for a proper 409; the
 /// authoritative clear of `left_at` happens inside the room task, under
@@ -148,6 +149,7 @@ pub async fn attempt_ws(
     ensure_enrolled(&exam, user.get_id(), &st.db).await?;
     let attempt = writable_attempt(&exam, user.get_id(), &st.db).await?;
     check_rejoin(&exam, &attempt)?;
+    course_of(&exam, &st.db).await?.require_open(&st.db).await?;
 
     let user_id = user.get_id().clone();
     Ok(ws.on_upgrade(move |socket| room(socket, st, exam, attempt, user_id)))
@@ -441,10 +443,18 @@ async fn handle_message(
             // Submit the room's own sitting — a stale room must not submit a
             // retake it never hosted.
             let finished = match Exam::read(exam_id, db).await {
-                Ok(Some(exam)) => match writable_room_attempt(&exam, attempt_id, user, db).await {
-                    Ok(attempt) => attempt.finish(db).await,
-                    Err(err) => Err(err),
-                },
+                Ok(Some(exam)) => {
+                    // Its own archived-term gate: `finish` is the one
+                    // sitting-side write that does not go through
+                    // `save_answer_in`, and the refusal leaves the room by the
+                    // same error frame as every other conflict.
+                    async {
+                        let attempt = writable_room_attempt(&exam, attempt_id, user, db).await?;
+                        course_of(&exam, db).await?.require_open(db).await?;
+                        attempt.finish(db).await
+                    }
+                    .await
+                }
                 Ok(None) => Err(AppError::NotFound),
                 Err(err) => Err(err),
             };

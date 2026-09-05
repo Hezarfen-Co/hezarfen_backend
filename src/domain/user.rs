@@ -527,7 +527,11 @@ impl User {
     /// and surname. Needle and columns both go through
     /// [`crate::domain::text_fold`], so `ilker` finds `İLKER` and back —
     /// backs the user pickers. `role` narrows to one role (e.g. only students
-    /// for an enroll picker); `None` searches everyone. A blank `query`
+    /// for an enroll picker); `None` searches everyone. `allowed_roles`
+    /// narrows the *visible* set (the roles a non-staff caller may message —
+    /// see [`Role::messageable_roles`]); it is part of the query, not a
+    /// post-filter, so `total` counts only what the caller may see. A blank
+    /// `query`
     /// matches everyone, so blank + `role` is a role-scoped listing. Returns
     /// every match, ordered by username; the HTTP layer pages the result like
     /// any other list (no built-in cap — an over-broad fragment is windowed
@@ -535,6 +539,7 @@ impl User {
     pub async fn search(
         query: &str,
         role: Option<Role>,
+        allowed_roles: Option<&[Role]>,
         limit: Option<i64>,
         offset: i64,
         db: &Database,
@@ -553,6 +558,9 @@ impl User {
         if role.is_some() {
             clauses.push("role = $role");
         }
+        if allowed_roles.is_some() {
+            clauses.push("role IN $allowed");
+        }
         let where_clause = if clauses.is_empty() {
             "true".to_string()
         } else {
@@ -562,6 +570,9 @@ impl User {
             .bind("q", needle);
         if let Some(role) = role {
             list = list.bind("role", role);
+        }
+        if let Some(allowed) = allowed_roles {
+            list = list.bind("allowed", allowed.to_vec());
         }
         list.run(limit, offset, db).await
     }

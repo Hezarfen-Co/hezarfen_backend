@@ -156,7 +156,7 @@ pub(crate) async fn attempts_used(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not a student, or not enrolled in the exam's course", body = ErrorResponse),
         (status = 404, description = "Exam not found (drafts are invisible here)", body = ErrorResponse),
-        (status = 409, description = "Unscheduled (offline-graded) exam, outside the window, or no attempts remaining", body = ErrorResponse),
+        (status = 409, description = "Unscheduled (offline-graded) exam, outside the window, no attempts remaining, or this course's term is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 pub(crate) async fn start_attempt(
@@ -180,6 +180,7 @@ pub(crate) async fn start_attempt(
     ensure_sittable(&exam)?;
     ensure_student(&user)?;
     ensure_enrolled(&exam, user.get_id(), &st.db).await?;
+    course_of(&exam, &st.db).await?.require_open(&st.db).await?;
     let now = Timestamp::now();
     if let Some(starts_at) = exam.get_starts_at()
         && now < starts_at
@@ -283,7 +284,7 @@ pub(crate) async fn my_attempt(
         (status = 200, description = "Attempt submitted", body = AttemptResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 404, description = "No such exam, or no attempt to finish", body = ErrorResponse),
-        (status = 409, description = "Already submitted, or the deadline passed", body = ErrorResponse),
+        (status = 409, description = "Already submitted, the deadline passed, or this course's term is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 pub(crate) async fn finish_attempt(
@@ -306,6 +307,7 @@ pub(crate) async fn finish_attempt(
     {
         return Err(AppError::Conflict("time is up — the attempt has expired"));
     }
+    course_of(&exam, &st.db).await?.require_open(&st.db).await?;
 
     // Deliberately no rejoin check: a student locked out of the room may
     // still submit what they saved — finishing answers nothing new.
@@ -679,7 +681,13 @@ pub(crate) async fn save_answer_checked(
 /// The tail of the answer write path, given the sitting to write in: the
 /// student wall and the enrollment wall (a promotion out of `student` or an
 /// unenrollment closes the sheet, mid-exam included), the rejoin gate, the
-/// question lookup, and the upsert.
+/// archived-term gate, the question lookup, and the upsert.
+///
+/// The archived-term refusal sits here because this is the single funnel every
+/// answer write passes: REST `POST /exams/{id}/attempt/answers` (via
+/// [`save_answer_checked`]) *and* every `answer` frame of the exam-room
+/// WebSocket ([`crate::web::exam_ws`]). The answer-image writes are the only
+/// answer-side writes outside it, and carry their own guard.
 pub(crate) async fn save_answer_in(
     exam: &Exam,
     attempt: &ExamAttempt,
@@ -691,6 +699,7 @@ pub(crate) async fn save_answer_in(
     ensure_student_now(attempt.get_user(), db).await?;
     ensure_enrolled(exam, attempt.get_user(), db).await?;
     check_rejoin(exam, attempt)?;
+    course_of(exam, db).await?.require_open(db).await?;
     let question = question_of_exam(exam.get_id(), question_id, db).await?;
     ExamAnswer::save(
         &question,
@@ -849,7 +858,7 @@ pub(crate) async fn attempt_questions(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not a student, or not enrolled in the exam's course", body = ErrorResponse),
         (status = 404, description = "No such exam, question, or attempt", body = ErrorResponse),
-        (status = 409, description = "Attempt already submitted, time is up, or rejoin is closed", body = ErrorResponse),
+        (status = 409, description = "Attempt already submitted, time is up, rejoin is closed, or this course's term is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]

@@ -261,3 +261,179 @@ async fn an_attempt_started_inside_a_course_delete_never_outlives_it() {
         "a sitting outlived the course it was sat under"
     );
 }
+
+/// An archived term freezes the courses hanging off it: every write route under
+/// `/courses/{id}` answers `409 term_archived`, while every read stays open —
+/// past years are a read-only archive, not a hidden one. The guard sits *after*
+/// each handler's authz check, so a caller who may not write still gets its
+/// `403` rather than being told about the term.
+#[tokio::test]
+async fn an_archived_terms_courses_take_no_writes_but_still_read() {
+    let (app, db) = app_and_db().await;
+    let manager = login_as(&app, &db, "arsiv_ders_mudur", "manager").await;
+    let student = login_as(&app, &db, "arsiv_ders_ogrenci", "student").await;
+    let student_id = me_id(&app, &student).await;
+    let teacher = login_as(&app, &db, "arsiv_ders_ogretmen", "teacher").await;
+    let teacher_id = me_id(&app, &teacher).await;
+
+    let res = send(
+        &app,
+        "POST",
+        "/terms",
+        Some(&manager),
+        Some(json!({
+            "name": "2019 güz",
+            "starts_at": 1_780_000_000_000_i64,
+            "ends_at": 1_790_000_000_000_i64,
+        })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let term = id_of(&res.body);
+
+    let res = send(
+        &app,
+        "POST",
+        "/courses",
+        Some(&manager),
+        Some(json!({ "title": "Coğrafya", "term_id": term })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
+    let course = id_of(&res.body);
+    // Both the roster and an assigned teacher have to exist *before* the
+    // archive: the routes that remove them are themselves frozen.
+    enroll(&app, &manager, &course, &student_id).await;
+    let subject = create_subject(&app, &manager, &course, "Iklim").await;
+    let res = send(
+        &app,
+        "POST",
+        &format!("/courses/{course}/teachers"),
+        Some(&manager),
+        Some(json!({ "user_id": teacher_id })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    let res = send(
+        &app,
+        "POST",
+        &format!("/terms/{term}/archive"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+
+    let due = 1_900_000_000_000_i64;
+    let writes: Vec<(&str, String, Option<serde_json::Value>)> = vec![
+        (
+            "PATCH",
+            format!("/courses/{course}"),
+            Some(json!({ "title": "Yeni" })),
+        ),
+        ("DELETE", format!("/courses/{course}"), None),
+        (
+            "POST",
+            format!("/courses/{course}/teachers"),
+            Some(json!({ "user_id": teacher_id })),
+        ),
+        (
+            "DELETE",
+            format!("/courses/{course}/teachers/{teacher_id}"),
+            None,
+        ),
+        (
+            "POST",
+            format!("/courses/{course}/enrollments"),
+            Some(json!({ "user_id": student_id })),
+        ),
+        (
+            "DELETE",
+            format!("/courses/{course}/enrollments/{student_id}"),
+            None,
+        ),
+        (
+            "POST",
+            format!("/courses/{course}/exams"),
+            Some(json!({ "title": "Vize", "kind": "midterm" })),
+        ),
+        (
+            "POST",
+            format!("/courses/{course}/subjects"),
+            Some(json!({ "name": "Erozyon" })),
+        ),
+        (
+            "POST",
+            format!("/courses/{course}/homework"),
+            Some(json!({ "title": "Ödev", "subject_id": subject, "due_at": due })),
+        ),
+        (
+            "POST",
+            format!("/courses/{course}/sessions"),
+            Some(json!({ "starts_at": due })),
+        ),
+    ];
+    for (method, uri, body) in &writes {
+        let res = send(&app, method, uri, Some(&manager), body.clone()).await;
+        assert_eq!(
+            (res.status, res.body["code"].clone()),
+            (StatusCode::CONFLICT, json!("term_archived")),
+            "{method} {uri} must be frozen by the archive: {}",
+            res.body
+        );
+    }
+
+    for uri in [
+        format!("/courses/{course}"),
+        format!("/courses/{course}/enrollments"),
+        format!("/courses/{course}/exams"),
+        format!("/courses/{course}/subjects"),
+        format!("/courses/{course}/homework"),
+        format!("/courses/{course}/sessions"),
+    ] {
+        let res = send(&app, "GET", &uri, Some(&manager), None).await;
+        assert_eq!(
+            res.status,
+            StatusCode::OK,
+            "GET {uri} must stay readable: {}",
+            res.body
+        );
+    }
+
+    // A student who cannot write here is still told *that* first — the 403 has
+    // to precede the 409, or the archive leaks course structure to outsiders.
+    let res = send(
+        &app,
+        "POST",
+        &format!("/courses/{course}/subjects"),
+        Some(&student),
+        Some(json!({ "name": "Sızıntı" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
+
+    let res = send(
+        &app,
+        "POST",
+        &format!("/terms/{term}/unarchive"),
+        Some(&manager),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let res = send(
+        &app,
+        "POST",
+        &format!("/courses/{course}/subjects"),
+        Some(&manager),
+        Some(json!({ "name": "Erozyon" })),
+    )
+    .await;
+    assert_eq!(
+        res.status,
+        StatusCode::CREATED,
+        "the unarchive must give the writes back: {}",
+        res.body
+    );
+}

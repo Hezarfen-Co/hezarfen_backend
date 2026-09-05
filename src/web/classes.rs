@@ -338,7 +338,7 @@ async fn classes_page(
         (status = 400, description = "Invalid name or grade, an unknown term, or a teacher_id naming nobody or a non-teacher", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
-        (status = 409, description = "The named homeroom teacher was demoted below teacher while the request ran — the class was rolled back, nothing was created", body = ErrorResponse),
+        (status = 409, description = "The named homeroom teacher was demoted below teacher while the request ran (the class was rolled back, nothing was created), or the named term is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -537,7 +537,7 @@ async fn get_class(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "The term this update moves the class off changed since the caller read it (nothing was written, re-read and retry), or the named homeroom teacher was demoted below teacher while the request ran (the assignment was undone)", body = ErrorResponse),
+        (status = 409, description = "The term this update moves the class off changed since the caller read it (nothing was written, re-read and retry), the named homeroom teacher was demoted below teacher while the request ran (the assignment was undone), or the class's own term — or the named one — is archived: past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -548,6 +548,9 @@ async fn update_class(
     Json(req): Json<UpdateClass>,
 ) -> Result<Json<ClassResponse>, AppError> {
     let class = class_or_404(&id, &st.db).await?;
+    // The class's *current* term, so a move off an archived year is refused
+    // too; `resolve_term` below holds the other end (the term moved onto).
+    class.require_open(&st.db).await?;
 
     // Only what the request actually carried is validated and written — an
     // omitted field stays `None` so the save never re-sends this snapshot's
@@ -689,7 +692,7 @@ async fn classes_of(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "Students or courses are still on this class", body = ErrorResponse),
+        (status = 409, description = "Students or courses are still on this class, or its term is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn delete_class(
@@ -698,6 +701,7 @@ async fn delete_class(
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
     let class = class_or_404(&id, &st.db).await?;
+    class.require_open(&st.db).await?;
     if !class.delete(&st.db).await? {
         return Err(AppError::Conflict(
             "this class still holds students or courses — remove its members and detach its courses first",
@@ -726,7 +730,7 @@ async fn delete_class(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "Class not found", body = ErrorResponse),
-        (status = 409, description = "Already in this class, the class is at its student ceiling (max_class_members), it carries more courses than one add may enroll at once, one of its courses is full, or one of them no longer exists (a stale attachment — detach it). The body carries a machine `code` beside the prose, and this route answers exactly these: `duplicate`, `class_at_roster_ceiling`, `class_course_list_too_large`, `course_full`, `linked_course_missing`", body = ErrorResponse),
+        (status = 409, description = "Already in this class, the class is at its student ceiling (max_class_members), it carries more courses than one add may enroll at once, one of its courses is full, or one of them no longer exists (a stale attachment — detach it). The body carries a machine `code` beside the prose, and this route answers exactly these: `duplicate`, `class_at_roster_ceiling`, `class_course_list_too_large`, `course_full`, `linked_course_missing`, `term_archived` (the class sits on an archived term — past years are read-only)", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -737,6 +741,7 @@ async fn add_member(
     Json(req): Json<AddMember>,
 ) -> Result<(StatusCode, Json<ClassMemberResponse>), AppError> {
     let class = class_or_404(&id, &st.db).await?;
+    class.require_open(&st.db).await?;
 
     let target = UserId::from_key(&req.user_id);
     let Some(target_user) = User::read(&target, &st.db).await? else {
@@ -820,6 +825,7 @@ async fn list_members(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "Class not found, or that student was not in it", body = ErrorResponse),
+        (status = 409, description = "The class's (or course's) term is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn remove_member(
@@ -828,6 +834,7 @@ async fn remove_member(
     Path((id, target)): Path<(String, String)>,
 ) -> Result<StatusCode, AppError> {
     let class = class_or_404(&id, &st.db).await?;
+    class.require_open(&st.db).await?;
     ClassMember::remove(class.get_id(), &UserId::from_key(&target), &st.db).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -853,7 +860,7 @@ async fn remove_member(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Class not found", body = ErrorResponse),
-        (status = 409, description = "Already attached, the class is at its course ceiling (max_class_courses), it holds more students than one attach may enroll at once, or the course cannot hold the whole class. The body carries a machine `code` beside the prose, and this route answers exactly these: `duplicate`, `class_at_course_ceiling`, `class_roster_too_large`, `course_full`", body = ErrorResponse),
+        (status = 409, description = "Already attached, the class is at its course ceiling (max_class_courses), it holds more students than one attach may enroll at once, or the course cannot hold the whole class. The body carries a machine `code` beside the prose, and this route answers exactly these: `duplicate`, `class_at_course_ceiling`, `class_roster_too_large`, `course_full`, `term_archived` (the class's or the course's term is archived — past years are read-only)", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -875,6 +882,9 @@ async fn attach_course(
             "only the course creator, an assigned teacher, or a manager/admin can attach this course to a class",
         ));
     }
+    // Both ends: neither a class nor a course on a past year takes a new link.
+    class.require_open(&st.db).await?;
+    course.require_open(&st.db).await?;
 
     let link = ClassCourse::attach(class.get_id(), course.get_id(), user.get_id(), &st.db).await?;
     let people = PersonRef::map_of(&[&user]);
@@ -939,6 +949,7 @@ async fn list_class_courses(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Class not found, or that course was not attached — a course row that is gone does not refuse the detach, it is the reason for it", body = ErrorResponse),
+        (status = 409, description = "The class's (or course's) term is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn detach_course(
@@ -954,12 +965,19 @@ async fn detach_course(
     // route answered 404 forever — which also left the class undeletable, its
     // attachment counter counting a row nothing could sweep. There is no roster
     // left to protect, and the caller is already teacher+.
-    if let Some(course) = Course::read(&course, &st.db).await?
-        && !can_manage_course(&course, &user)
+    let row = Course::read(&course, &st.db).await?;
+    if let Some(row) = row.as_ref()
+        && !can_manage_course(row, &user)
     {
         return Err(AppError::Forbidden(
             "only the course creator, an assigned teacher, or a manager/admin can detach this course from a class",
         ));
+    }
+    // Both ends, and only what is still there: a link whose course row is gone
+    // has no term to read, and sweeping it is the whole point of the route.
+    class.require_open(&st.db).await?;
+    if let Some(row) = row.as_ref() {
+        row.require_open(&st.db).await?;
     }
     ClassCourse::detach(class.get_id(), &course, &st.db).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -1419,6 +1437,7 @@ async fn blueprint_status(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "Class not found, or no blueprint covers its grade", body = ErrorResponse),
+        (status = 409, description = "The class's (or course's) term is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn apply_blueprint(
@@ -1429,6 +1448,15 @@ async fn apply_blueprint(
     let class = class_or_404(&id, &st.db).await?;
     let grade = class.get_grade().ok_or(AppError::NotFound)?;
     let blueprint = blueprint_or_404(grade.as_str(), &st.db).await?;
+    // The pump writes both ends, so both are guarded — the class, and every
+    // course the template would attach. A course the template names that is
+    // already gone is the pump's own `skipped` business, not a term refusal.
+    class.require_open(&st.db).await?;
+    for id in blueprint.get_courses() {
+        if let Some(course) = Course::read(id, &st.db).await? {
+            course.require_open(&st.db).await?;
+        }
+    }
     let skipped = blueprint.apply_to(&class, user.get_id(), &st.db).await?;
     Ok(Json(ApplyResponse {
         skipped: skipped.iter().map(SkipResponse::new).collect(),

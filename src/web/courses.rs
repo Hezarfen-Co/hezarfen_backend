@@ -293,6 +293,7 @@ fn check_capacity(capacity: Option<i64>) -> Result<(), AppError> {
         (status = 400, description = "Invalid fields, kind, or capacity", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires teacher role or higher", body = ErrorResponse),
+        (status = 409, description = "The named term is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -445,7 +446,7 @@ async fn get_course(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "The term this update moves the course off changed since the caller read it — nothing was written, re-read and retry", body = ErrorResponse),
+        (status = 409, description = "The term this update moves the course off changed since the caller read it (nothing was written, re-read and retry), or this course's term (or the named one) is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -463,6 +464,7 @@ async fn update_course(
             "only the course creator, an assigned teacher, or a manager/admin can edit this course",
         ));
     }
+    course.require_open(&st.db).await?;
 
     // Only what the request actually carried is validated and written — an
     // omitted field stays `None` so the save never re-sends this snapshot's
@@ -514,7 +516,7 @@ async fn update_course(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
-        (status = 409, description = "Students are still enrolled in this course", body = ErrorResponse),
+        (status = 409, description = "Students are still enrolled in this course, or this course's term is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn delete_course(
@@ -530,6 +532,7 @@ async fn delete_course(
             "only the course creator or a manager/admin can delete this course",
         ));
     }
+    course.require_open(&st.db).await?;
     // Writer lease of [`EXAM_LOCK`], for `delete_exam`'s reason: this cascade
     // sweeps the course's exams *and their attempts*, and an attempt is the one
     // exam child whose write cannot collide with the sweep (its claim lands on
@@ -593,7 +596,7 @@ async fn delete_course(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
-        (status = 409, description = "That user was demoted below teacher while the request ran — the assignment was undone", body = ErrorResponse),
+        (status = 409, description = "That user was demoted below teacher while the request ran — the assignment was undone; or this course's term is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -606,6 +609,7 @@ async fn assign_teacher(
     let course = Course::read(&CourseId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
+    course.require_open(&st.db).await?;
 
     let target = UserId::from_key(&req.user_id);
     let Some(target_user) = User::read(&target, &st.db).await? else {
@@ -650,6 +654,7 @@ async fn assign_teacher(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires manager role or higher", body = ErrorResponse),
         (status = 404, description = "Course not found, or that user was not assigned to it", body = ErrorResponse),
+        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn unassign_teacher(
@@ -660,6 +665,7 @@ async fn unassign_teacher(
     let course = Course::read(&CourseId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
+    course.require_open(&st.db).await?;
     let removed = course
         .unassign_teacher(&UserId::from_key(&target), &st.db)
         .await?;
@@ -692,7 +698,7 @@ async fn unassign_teacher(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
-        (status = 409, description = "The course is full", body = ErrorResponse),
+        (status = 409, description = "The course is full, or this course's term is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -710,6 +716,7 @@ async fn enroll(
             "only the course creator, an assigned teacher, or a manager/admin can enroll users",
         ));
     }
+    course.require_open(&st.db).await?;
 
     let target = UserId::from_key(&req.user_id);
     let Some(target_user) = User::read(&target, &st.db).await? else {
@@ -800,6 +807,7 @@ async fn list_roster(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Not found", body = ErrorResponse),
+        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
     ),
 )]
 async fn unenroll(
@@ -815,6 +823,7 @@ async fn unenroll(
             "only the course creator, an assigned teacher, or a manager/admin can unenroll users",
         ));
     }
+    course.require_open(&st.db).await?;
     let removed = Enrollment::remove(course.get_id(), &UserId::from_key(&target), &st.db).await?;
     if removed.is_none() {
         return Err(AppError::NotFound);
@@ -847,6 +856,7 @@ async fn unenroll(
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
+        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -864,6 +874,7 @@ async fn create_exam_in_course(
             "only the course creator, an assigned teacher, or a manager/admin can add exams to this course",
         ));
     }
+    course.require_open(&st.db).await?;
 
     let title = ExamTitle::try_new(&req.title)?;
     let description = ExamDescription::try_new(&req.description.unwrap_or_default())?;
@@ -976,6 +987,7 @@ struct CreateSubject {
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
+        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -993,6 +1005,7 @@ async fn create_subject_in_course(
             "only the course creator, an assigned teacher, or a manager/admin can add subjects to this course",
         ));
     }
+    course.require_open(&st.db).await?;
 
     let name = SubjectName::try_new(&req.name)?;
     let description = SubjectDescription::try_new(&req.description.unwrap_or_default())?;
@@ -1084,6 +1097,7 @@ struct CreateHomework {
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
+        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -1101,6 +1115,7 @@ async fn create_homework_in_course(
             "only the course creator, an assigned teacher, or a manager/admin can add homework to this course",
         ));
     }
+    course.require_open(&st.db).await?;
 
     let title = HomeworkTitle::try_new(&req.title)?;
     let description = match req.description.as_deref() {
@@ -1220,6 +1235,7 @@ struct CreateSessionInCourse {
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Not the course creator or an assigned teacher (and not a manager/admin)", body = ErrorResponse),
         (status = 404, description = "Course not found", body = ErrorResponse),
+        (status = 409, description = "This course's term is archived — past years are read-only", body = ErrorResponse),
         (status = 422, description = "The body does not fit this request: a field has the wrong type, or a required field is missing"),
     ),
 )]
@@ -1237,6 +1253,7 @@ async fn create_session_in_course(
             "only the course creator, an assigned teacher, or a manager/admin can add sessions to this course",
         ));
     }
+    course.require_open(&st.db).await?;
 
     let topic = SessionTopic::try_new(&req.topic.unwrap_or_default())?;
     let teacher = resolve_session_teacher(req.teacher_id.as_deref(), &user, &st.db).await?;

@@ -65,6 +65,28 @@ impl Role {
     pub fn at_least(self, min: Role) -> bool {
         self >= min
     }
+
+    /// May `self` open a message thread with `recipient`? Messaging is upward
+    /// only for the two roles below staff: a `Student` or `Parent` writes to
+    /// teachers and above, never sideways or down (issue #23). Staff
+    /// (`Teacher`+) write to anyone. [`Role::Ai`] is a service principal with
+    /// no mailbox, so it neither sends nor receives.
+    pub fn may_message(self, recipient: Role) -> bool {
+        if self == Role::Ai || recipient == Role::Ai {
+            return false;
+        }
+        self.at_least(Role::Teacher) || recipient.at_least(Role::Teacher)
+    }
+
+    /// The roles `self` is allowed to write to, when that set is narrower than
+    /// "everyone" — `None` means unrestricted. Backs the `/users/search`
+    /// restriction, which must land in the query so `total` stays right.
+    pub fn messageable_roles(self) -> Option<&'static [Role]> {
+        match self.at_least(Role::Teacher) {
+            true => None,
+            false => Some(&[Role::Teacher, Role::Manager, Role::Admin]),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -109,6 +131,31 @@ mod tests {
         assert!(!ROLES.contains(&Role::Ai));
         assert!(Role::try_from_str("ai").is_err());
         assert_eq!(Role::Ai.as_str(), "ai");
+    }
+
+    #[tokio::test]
+    async fn messaging_is_upward_only_below_staff() {
+        // Sideways and downward writes from the two non-staff roles: refused.
+        for sender in [Role::Student, Role::Parent] {
+            for recipient in [Role::Student, Role::Parent] {
+                assert!(!sender.may_message(recipient));
+            }
+            for staff in [Role::Teacher, Role::Manager, Role::Admin] {
+                assert!(sender.may_message(staff));
+            }
+            assert_eq!(
+                sender.messageable_roles(),
+                Some(&[Role::Teacher, Role::Manager, Role::Admin][..])
+            );
+        }
+        // Staff write to anyone, in any direction, and are unrestricted in search.
+        for sender in [Role::Teacher, Role::Manager, Role::Admin] {
+            assert!(ROLES.iter().all(|&r| sender.may_message(r)));
+            assert_eq!(sender.messageable_roles(), None);
+        }
+        // The service principal has no mailbox in either direction.
+        assert!(ROLES.iter().all(|&r| !Role::Ai.may_message(r)));
+        assert!(ROLES.iter().all(|&r| !r.may_message(Role::Ai)));
     }
 
     #[tokio::test]
