@@ -146,6 +146,27 @@ impl RagOutput {
         Ok(())
     }
 
+    /// Newest-wins replace, without a lock: store `payload` first, then drop
+    /// this note's older rows. Two concurrent index tasks can interleave in any
+    /// order and still leave exactly one row — the newest — because ids come
+    /// from the process-wide monotonic generator, so "older" is `id <` the row
+    /// just written and the loser's row is always below the winner's.
+    pub async fn replace_for_note(
+        note: &CourseNoteId,
+        course: &CourseId,
+        sources: Vec<CourseNoteFileId>,
+        payload: Value,
+        db: &Database,
+    ) -> Result<RagOutput, AppError> {
+        let created = Self::create(note, course, sources, payload, db).await?;
+        db.query("DELETE rag_output WHERE course_note = $note AND id < $new")
+            .bind(("note", note.record()))
+            .bind(("new", created.id.record()))
+            .await?
+            .check()?;
+        Ok(created)
+    }
+
     /// Cascade: every output built from `file`. Runs on a file delete even
     /// with no AI service connected, so a stale output cannot survive its
     /// source.
@@ -153,7 +174,7 @@ impl RagOutput {
         file: &CourseNoteFileId,
         db: &Database,
     ) -> Result<(), AppError> {
-        db.query("DELETE rag_output WHERE $file IN sources")
+        db.query("DELETE rag_output WHERE sources CONTAINS $file")
             .bind(("file", file.record()))
             .await?
             .check()?;
@@ -205,6 +226,51 @@ mod tests {
         .unwrap()
         .get_id()
         .clone()
+    }
+
+    /// Replace converges on one row — the newest — even when an earlier
+    /// interleaving already left two rows behind for the note.
+    #[tokio::test]
+    async fn replace_keeps_only_the_newest_output() {
+        let db = crate::database::init_mem().await.unwrap();
+        let note = note_of(&db, "a").await;
+        let stale = RagOutput::create(
+            note.get_id(),
+            note.get_course(),
+            Vec::new(),
+            json!({ "n": 1 }),
+            &db,
+        )
+        .await
+        .unwrap();
+        // The race this fixes: a second row for the same note.
+        RagOutput::create(
+            note.get_id(),
+            note.get_course(),
+            Vec::new(),
+            json!({ "n": 2 }),
+            &db,
+        )
+        .await
+        .unwrap();
+
+        let fresh = RagOutput::replace_for_note(
+            note.get_id(),
+            note.get_course(),
+            Vec::new(),
+            json!({ "n": 3 }),
+            &db,
+        )
+        .await
+        .unwrap();
+
+        let rows = RagOutput::list_for(note.get_id(), None, 0, &db)
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_id(), fresh.get_id());
+        assert!(fresh.get_id().key() > stale.get_id().key());
     }
 
     /// The payload survives the round trip unread, and both cascades take only
