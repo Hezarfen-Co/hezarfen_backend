@@ -6,10 +6,12 @@
 
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use opentelemetry::KeyValue;
 use serde_json::Value;
 use tower::ServiceExt;
+use tracing::Instrument;
 use ulid::Ulid;
 
 use crate::ai::error::AiError;
@@ -31,6 +33,7 @@ use crate::domain::user::{User, UserId};
 use crate::error::AppError;
 use crate::module::Module;
 use crate::state::DbHealth;
+use crate::telemetry::Metrics;
 use crate::tenant::{Slug, Tenants};
 use crate::web::blob_path;
 use crate::web::courses::can_view_course;
@@ -118,6 +121,34 @@ struct Inner {
     token: String,
     request_timeout: Duration,
     endpoint: quinn::Endpoint,
+    /// Filled by [`AiBridge::arm_api`], for the same reason `api` is: the
+    /// process's instruments are built with the router, after the listener is
+    /// bound.
+    metrics: OnceLock<Metrics>,
+}
+
+impl Inner {
+    /// The instruments to record into. A service that dials in during the boot
+    /// window gets the noop set, which — with no OTLP endpoint configured — is
+    /// exactly what the armed one is anyway.
+    fn metrics(&self) -> &Metrics {
+        self.metrics.get_or_init(Metrics::noop)
+    }
+
+    /// How many services are connected right now, as the gauge sees it.
+    fn record_worker_count(&self) {
+        self.metrics()
+            .ai_workers
+            .record(self.registry.snapshot().len() as u64, &[]);
+    }
+}
+
+/// Count one refused handshake. `reason` comes from a fixed vocabulary —
+/// never a message — so the metric's label cardinality stays bounded.
+fn handshake_failed(metrics: &Metrics, reason: &'static str) {
+    metrics
+        .ai_handshake_failures_total
+        .add(1, &[KeyValue::new("reason", reason)]);
 }
 
 /// Handle to a running bridge. Cheap to clone; every clone shares one listener
@@ -158,6 +189,7 @@ impl AiBridge {
             token: config.token,
             request_timeout: config.request_timeout,
             endpoint,
+            metrics: OnceLock::new(),
         });
         tracing::info!(
             "AI bridge listening on {bound} (protocol {AI_PROTOCOL}, cert sha256 {fingerprint})"
@@ -239,49 +271,82 @@ impl AiBridge {
             payload,
         };
 
-        let call = async {
-            let (mut send, mut recv) =
-                lease.conn().open_bi().await.map_err(|e| {
+        // The span names the capability, the worker, the school slug and this
+        // call's own id — never the payload, which is the user's own text.
+        let span = tracing::info_span!(
+            "ai.request",
+            "ai.capability" = capability,
+            "ai.worker.id" = %lease.worker().id,
+            school = school.as_str(),
+            "ai.request.id" = %id,
+            otel.status_code = tracing::field::Empty,
+        );
+        let metrics = self.inner.metrics();
+        let attrs = [KeyValue::new("capability", capability.to_string())];
+        metrics.ai_requests_inflight.add(1, &attrs);
+        let started = Instant::now();
+
+        let outcome = async {
+            let call = async {
+                let (mut send, mut recv) = lease.conn().open_bi().await.map_err(|e| {
                     AiError::Transport(format!("could not open a request stream: {e}"))
                 })?;
-            write_frame(&mut send, &request).await?;
-            // FIN tells the service the request is complete — it can start work
-            // without waiting to see whether more bytes follow.
-            send.finish()
-                .map_err(|e| AiError::Transport(format!("could not finish the request: {e}")))?;
-            let response: Response = read_frame(&mut recv).await?;
-            Ok::<_, AiError>(response)
-        };
+                write_frame(&mut send, &request).await?;
+                // FIN tells the service the request is complete — it can start
+                // work without waiting to see whether more bytes follow.
+                send.finish().map_err(|e| {
+                    AiError::Transport(format!("could not finish the request: {e}"))
+                })?;
+                let response: Response = read_frame(&mut recv).await?;
+                Ok::<_, AiError>(response)
+            };
 
-        let response = match tokio::time::timeout(timeout, call).await {
-            Err(_) => {
-                tracing::warn!(
-                    "AI request {id} for `{capability}` timed out after {deadline_ms}ms on worker {}",
-                    lease.worker().id
-                );
-                return Err(AiError::Timeout(deadline_ms));
-            }
-            Ok(result) => result?,
-        };
+            let response = match tokio::time::timeout(timeout, call).await {
+                Err(_) => {
+                    metrics.ai_request_timeouts_total.add(1, &attrs);
+                    tracing::warn!(
+                        "ai.request.id" = %id,
+                        capability,
+                        "ai.worker.id" = %lease.worker().id,
+                        deadline_ms,
+                        "AI request timed out"
+                    );
+                    return Err(AiError::Timeout(deadline_ms));
+                }
+                Ok(result) => result?,
+            };
 
-        match response {
-            Response::Ok {
-                id: got, payload, ..
-            } if got == id => Ok(payload),
-            Response::Err {
-                id: got,
-                code,
-                message,
-                ..
-            } if got == id => Err(AiError::Remote { code, message }),
-            // A mismatched id means the service is not tracking which stream it
-            // is on. Nothing here depends on the id for correlation, but the
-            // answer's *content* now belongs to some other request, so it must
-            // not be handed back as this one's result.
-            Response::Ok { id: got, .. } | Response::Err { id: got, .. } => {
-                Err(AiError::IdMismatch { expected: id, got })
+            match response {
+                Response::Ok {
+                    id: got, payload, ..
+                } if got == id => Ok(payload),
+                Response::Err {
+                    id: got,
+                    code,
+                    message,
+                    ..
+                } if got == id => Err(AiError::Remote { code, message }),
+                // A mismatched id means the service is not tracking which
+                // stream it is on. Nothing here depends on the id for
+                // correlation, but the answer's *content* now belongs to some
+                // other request, so it must not be handed back as this one's
+                // result.
+                Response::Ok { id: got, .. } | Response::Err { id: got, .. } => {
+                    Err(AiError::IdMismatch { expected: id, got })
+                }
             }
         }
+        .instrument(span.clone())
+        .await;
+
+        metrics.ai_requests_inflight.add(-1, &attrs);
+        metrics
+            .ai_request_duration
+            .record(started.elapsed().as_secs_f64(), &attrs);
+        if outcome.is_err() {
+            span.record("otel.status_code", "ERROR");
+        }
+        outcome
     }
 
     /// Hand the api-read path the router it dispatches into.
@@ -296,7 +361,11 @@ impl AiBridge {
         tenants: Tenants,
         db_up: DbHealth,
         files_path: std::path::PathBuf,
+        metrics: Metrics,
     ) {
+        // Not warned about on a second call: the instruments are the same
+        // process-global ones either way, so re-arming changes nothing.
+        let _ = self.inner.metrics.set(metrics);
         if self
             .inner
             .api
@@ -323,10 +392,12 @@ async fn accept_loop(inner: Arc<Inner>) {
     while let Some(incoming) = inner.endpoint.accept().await {
         let inner = Arc::clone(&inner);
         tokio::spawn(async move {
-            let remote = incoming.remote_address();
             match incoming.await {
-                Ok(conn) => serve_connection(inner, conn, remote).await,
-                Err(e) => tracing::warn!("AI service handshake from {remote} failed: {e}"),
+                Ok(conn) => serve_connection(inner, conn).await,
+                Err(e) => {
+                    handshake_failed(inner.metrics(), "transport");
+                    tracing::warn!(error = %e, "an AI service's QUIC handshake failed");
+                }
             }
         });
     }
@@ -335,10 +406,10 @@ async fn accept_loop(inner: Arc<Inner>) {
 
 /// Run one service connection: handshake, register, wait for it to die,
 /// deregister.
-async fn serve_connection(inner: Arc<Inner>, conn: quinn::Connection, remote: SocketAddr) {
+async fn serve_connection(inner: Arc<Inner>, conn: quinn::Connection) {
     let handshake = tokio::time::timeout(
         Duration::from_secs(AI_HANDSHAKE_TIMEOUT_SECS),
-        register(&inner, &conn, remote),
+        register(&inner, &conn),
     )
     .await;
 
@@ -346,7 +417,8 @@ async fn serve_connection(inner: Arc<Inner>, conn: quinn::Connection, remote: So
         Ok(Ok(registered)) => registered,
         Ok(Err(())) => return,
         Err(_) => {
-            tracing::warn!("AI service at {remote} did not complete its handshake in time");
+            handshake_failed(inner.metrics(), "timeout");
+            tracing::warn!("an AI service did not complete its handshake in time");
             conn.close(2u32.into(), b"handshake timeout");
             return;
         }
@@ -373,7 +445,13 @@ async fn serve_connection(inner: Arc<Inner>, conn: quinn::Connection, remote: So
         }
     };
     inner.registry.remove(&worker_id);
-    tracing::info!("AI service `{service}` ({worker_id}) at {remote} disconnected: {reason}");
+    inner.record_worker_count();
+    tracing::info!(
+        "worker.id" = %worker_id,
+        service = %service,
+        reason = %reason,
+        "AI service disconnected"
+    );
 }
 
 /// Answer one client-initiated stream. Two shapes ride this path and are told
@@ -675,7 +753,7 @@ async fn read_api(
         "unavailable",
         "the api is not serving yet — retry".to_string(),
     ))?;
-    dispatch_api(api, request).await
+    dispatch_api(api, inner.metrics(), request).await
 }
 
 /// The half of [`read_api`] that needs only the armed handle: liveness,
@@ -684,6 +762,7 @@ async fn read_api(
 /// endpoint (see this module's tests).
 async fn dispatch_api(
     api: &ApiHandle,
+    metrics: &Metrics,
     request: ApiRequest,
 ) -> Result<ApiResponse, (&'static str, String)> {
     let ApiRequest {
@@ -741,12 +820,32 @@ async fn dispatch_api(
         modules: tenant.modules,
     });
 
+    // This dispatch skips every layer, so it also skips the request span and
+    // the request metrics the HTTP edge records — they are recorded here
+    // instead, off the route *template* the allowlist matched. The concrete
+    // path holds record ids and never reaches a span or a label.
+    let route = crate::ai::api::route_template(&path).unwrap_or("unmatched");
+    let otel_name = format!("GET {route}");
+    let span = tracing::info_span!(
+        "http.request",
+        otel.name = %otel_name,
+        "http.request.method" = "GET",
+        "http.route" = route,
+        school = school.as_str(),
+        "ai.origin" = true,
+        "http.response.status_code" = tracing::field::Empty,
+    );
+    metrics.request_started("GET");
+    let started = Instant::now();
+
     let response = tokio::time::timeout(
         Duration::from_secs(REQUEST_TIMEOUT_SECS),
         api.router.clone().oneshot(dispatched),
     )
+    .instrument(span.clone())
     .await
     .map_err(|_| {
+        metrics.request_finished("GET", route, 504, Some(&school), started.elapsed());
         (
             "unavailable",
             format!("`{target}` did not answer within {REQUEST_TIMEOUT_SECS}s"),
@@ -755,6 +854,10 @@ async fn dispatch_api(
     .expect("an axum router is infallible");
 
     let status = response.status().as_u16();
+    // Recorded as soon as the router has answered: what follows is bridge
+    // framing, not the HTTP request the caller made.
+    metrics.request_finished("GET", route, status, Some(&school), started.elapsed());
+    span.record("http.response.status_code", i64::from(status));
     let body = axum::body::to_bytes(response.into_body(), AI_MAX_FRAME_BYTES)
         .await
         .map_err(|e| {
@@ -837,12 +940,12 @@ type Control = (quinn::SendStream, quinn::RecvStream);
 async fn register(
     inner: &Inner,
     conn: &quinn::Connection,
-    remote: SocketAddr,
 ) -> Result<(String, String, Control), ()> {
     let (mut send, mut recv) = match conn.accept_bi().await {
         Ok(streams) => streams,
         Err(e) => {
-            tracing::warn!("AI service at {remote} opened no control stream: {e}");
+            handshake_failed(inner.metrics(), "no_control_stream");
+            tracing::warn!(error = %e, "an AI service opened no control stream");
             return Err(());
         }
     };
@@ -850,7 +953,8 @@ async fn register(
     let hello: Hello = match read_frame(&mut recv).await {
         Ok(hello) => hello,
         Err(e) => {
-            tracing::warn!("AI service at {remote} sent an unreadable Hello: {e}");
+            handshake_failed(inner.metrics(), "malformed_hello");
+            tracing::warn!(error = %e, "an AI service sent an unreadable Hello");
             refuse(&mut send, conn, RejectCode::Malformed, &e.to_string()).await;
             return Err(());
         }
@@ -861,25 +965,27 @@ async fn register(
             "this backend speaks {AI_PROTOCOL}, the service announced {}",
             hello.protocol
         );
-        tracing::warn!(
-            "AI service `{}` at {remote} rejected: {message}",
-            hello.service
-        );
+        handshake_failed(inner.metrics(), "bad_version");
+        tracing::warn!(service = %hello.service, reason = "bad_version", "AI service rejected: {message}");
         refuse(&mut send, conn, RejectCode::UnsupportedProtocol, &message).await;
         return Err(());
     }
     if !constant_time_eq(hello.token.as_bytes(), inner.token.as_bytes()) {
+        handshake_failed(inner.metrics(), "bad_token");
         tracing::warn!(
-            "AI service `{}` at {remote} rejected: bad shared token",
-            hello.service
+            service = %hello.service,
+            reason = "bad_token",
+            "AI service rejected: bad shared token"
         );
         refuse(&mut send, conn, RejectCode::Unauthorized, "invalid token").await;
         return Err(());
     }
     if hello.capabilities.is_empty() {
+        handshake_failed(inner.metrics(), "bad_capabilities");
         tracing::warn!(
-            "AI service `{}` at {remote} rejected: declared no capabilities",
-            hello.service
+            service = %hello.service,
+            reason = "bad_capabilities",
+            "AI service rejected: declared no capabilities"
         );
         refuse(
             &mut send,
@@ -898,10 +1004,8 @@ async fn register(
         protocol: AI_PROTOCOL.to_string(),
     };
     if let Err(e) = write_frame(&mut send, &greeting).await {
-        tracing::warn!(
-            "could not welcome AI service `{}` at {remote}: {e}",
-            hello.service
-        );
+        handshake_failed(inner.metrics(), "welcome_failed");
+        tracing::warn!(service = %hello.service, error = %e, "could not welcome an AI service");
         return Err(());
     }
 
@@ -914,10 +1018,13 @@ async fn register(
         max_concurrent,
         conn.clone(),
     );
+    inner.record_worker_count();
     tracing::info!(
-        "AI service `{}` ({worker_id}) at {remote} registered: {:?}, max_concurrent {max_concurrent}",
-        hello.service,
-        hello.capabilities
+        "worker.id" = %worker_id,
+        service = %hello.service,
+        capabilities = hello.capabilities.len(),
+        max_concurrent,
+        "AI service registered"
     );
     Ok((worker_id, hello.service, (send, recv)))
 }
@@ -957,7 +1064,7 @@ mod tests {
     use axum::routing::get;
 
     use super::{
-        AI_MAX_FRAME_BYTES, ApiHandle, ApiRequest, ApiResponse, constant_time_eq,
+        AI_MAX_FRAME_BYTES, ApiHandle, ApiRequest, ApiResponse, Metrics, constant_time_eq,
         refuse_before_dispatch,
     };
     use crate::ai::protocol::read_frame;
@@ -1005,7 +1112,7 @@ mod tests {
         let router = axum::Router::new().route("/notes", get(|| async { "plain text" }));
         let api = armed(router).await;
         assert_eq!(
-            refused(super::dispatch_api(&api, read_of("/notes")).await),
+            refused(super::dispatch_api(&api, &Metrics::noop(), read_of("/notes")).await),
             "not_json"
         );
     }
@@ -1019,7 +1126,7 @@ mod tests {
             get(|| async { axum::http::StatusCode::NO_CONTENT }),
         );
         let api = armed(router).await;
-        match super::dispatch_api(&api, read_of("/notes")).await {
+        match super::dispatch_api(&api, &Metrics::noop(), read_of("/notes")).await {
             Ok(ApiResponse::Ok { status, body, .. }) => {
                 assert_eq!(status, 204);
                 assert_eq!(body, serde_json::Value::Null);
@@ -1038,7 +1145,7 @@ mod tests {
         );
         let api = armed(router).await;
         assert_eq!(
-            refused(super::dispatch_api(&api, read_of("/notes")).await),
+            refused(super::dispatch_api(&api, &Metrics::noop(), read_of("/notes")).await),
             "too_large"
         );
     }
