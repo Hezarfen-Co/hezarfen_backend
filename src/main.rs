@@ -82,26 +82,52 @@ fn keepalive(db: Database, health: DbHealth) {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let ping_timeout =
             std::time::Duration::from_secs(hezarfen_backend::constant::DB_PING_TIMEOUT_SECS);
+        let metrics = hezarfen_backend::telemetry::Metrics::global();
+        // The transitions are what an operator is paged about; a line per tick
+        // would bury them. `None` until the first verdict, so that one always
+        // announces itself.
+        let mut was_up: Option<bool> = None;
+        let mut down_since: Option<tokio::time::Instant> = None;
         loop {
             interval.tick().await;
             // corner-cut: an abandoned ping stays queued in the SDK and replays
             // when the socket heals, so a long outage lands a burst of no-op
             // `RETURN 1`s on recovery. Harmless; probe over a raw TCP dial
             // instead if that burst ever shows up in a profile.
-            match tokio::time::timeout(ping_timeout, db.query("RETURN 1")).await {
+            let started = tokio::time::Instant::now();
+            let outcome = tokio::time::timeout(ping_timeout, db.query("RETURN 1")).await;
+            let elapsed = started.elapsed();
+            metrics.db_ping_duration.record(elapsed.as_secs_f64(), &[]);
+            let up = match &outcome {
                 Ok(Ok(_)) => {
-                    health.set(true);
                     tracing::debug!("database keepalive ping ok");
+                    true
                 }
                 Ok(Err(err)) => {
-                    health.set(false);
                     tracing::debug!("database keepalive ping failed: {err}");
+                    false
                 }
                 Err(_) => {
-                    health.set(false);
                     tracing::debug!("database keepalive ping timed out");
+                    false
                 }
+            };
+            health.set(up);
+            metrics.db_up.record(u64::from(up), &[]);
+            match (was_up, up) {
+                (Some(true) | None, false) => {
+                    down_since = Some(started);
+                    tracing::warn!("database is down: the keepalive ping did not answer");
+                }
+                (Some(false), true) => {
+                    let outage_secs = down_since
+                        .take()
+                        .map_or(0.0, |since| since.elapsed().as_secs_f64());
+                    tracing::warn!(outage_secs, "database is back");
+                }
+                _ => {}
             }
+            was_up = Some(up);
         }
     });
 }

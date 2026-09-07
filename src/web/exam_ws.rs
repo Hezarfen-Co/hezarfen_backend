@@ -171,6 +171,9 @@ async fn room(
 ) {
     let exam_id = exam.get_id().clone();
     let attempt_id = attempt.get_id().clone();
+    // The exam, not the attempt: an attempt names one student, and telemetry
+    // never names a person.
+    let _connected = room::Connected::open(&st.metrics, "exam_room", slug.as_str(), exam_id.key());
     // Join critical section: this socket counts as presence in the sitting's
     // room until it closes, and joining clears the walk-out marker — one
     // atomic step under PRESENCE_LOCK, so a dying socket's teardown either

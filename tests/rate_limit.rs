@@ -715,3 +715,62 @@ async fn every_route_enforces_the_shipped_limit_plus_one() {
         );
     }
 }
+
+/// A refusal is not only a status: an operator watching a tier needs the
+/// count. Installs a real meter provider, drives the api tier to its `429` and
+/// reads the counter back out of an in-memory exporter.
+///
+/// It shares the process with the rest of this binary, so the assertion is "at
+/// least one, tagged api" rather than an exact total — another test refusing
+/// concurrently is data on the same series.
+#[tokio::test]
+async fn a_rejection_is_counted_under_its_tier() {
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+    use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
+
+    let exporter = InMemoryMetricExporter::default();
+    let provider = SdkMeterProvider::builder()
+        .with_reader(PeriodicReader::builder(exporter.clone()).build())
+        .build();
+    opentelemetry::global::set_meter_provider(provider.clone());
+
+    let app = app_with(RateLimitConfig {
+        auth_per_minute: 0,
+        api_per_minute: 2,
+        trust_proxy: true,
+    })
+    .await;
+    for _ in 0..2 {
+        let (status, _, _) = send_as(&app, "9.9.9.9", "GET", "/health", None).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let (status, _, _) = send_as(&app, "9.9.9.9", "GET", "/health", None).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "the tier is spent");
+
+    provider.force_flush().expect("flush");
+    let mut api_rejections = 0u64;
+    for rm in exporter.get_finished_metrics().expect("exported metrics") {
+        for scope in rm.scope_metrics() {
+            for metric in scope.metrics() {
+                if metric.name() != "rate_limit_rejections_total" {
+                    continue;
+                }
+                let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() else {
+                    panic!("a counter must export as a u64 sum");
+                };
+                for point in sum.data_points() {
+                    if point
+                        .attributes()
+                        .any(|kv| kv.key.as_str() == "tier" && kv.value.as_str() == "api")
+                    {
+                        api_rejections = api_rejections.max(point.value());
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        api_rejections >= 1,
+        "the 429 must show up on rate_limit_rejections_total{{tier=\"api\"}}"
+    );
+}
