@@ -119,6 +119,9 @@ const HTTP_DURATION_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0,
 ];
 
+/// The handle [`init`] published, read by [`Metrics::global`].
+static GLOBAL: OnceLock<Metrics> = OnceLock::new();
+
 /// Every instrument this process publishes, declared once at boot and cloned
 /// into whatever needs them. With no OTLP endpoint configured the global meter
 /// provider is the SDK's noop, so each instrument is a cheap empty shell and
@@ -161,7 +164,13 @@ impl Metrics {
     /// Declare every instrument against the global meter provider — the noop
     /// one unless [`init`] installed an OTLP pipeline first.
     pub fn new() -> Self {
-        let meter = global::meter(SCOPE);
+        Self::from_meter(global::meter(SCOPE))
+    }
+
+    /// The same instruments against a caller-supplied meter. Exists for tests
+    /// that want to read their own recordings back without claiming the
+    /// process-global meter provider, which the whole test binary shares.
+    pub fn from_meter(meter: opentelemetry::metrics::Meter) -> Self {
         Self {
             http_server_request_duration: meter
                 .f64_histogram("http.server.request.duration")
@@ -230,6 +239,19 @@ impl Metrics {
     /// in tests, where nothing calls [`init`].
     pub fn noop() -> Self {
         Self::new()
+    }
+
+    /// The process's instruments, for the call sites that exist before (or
+    /// outside) [`crate::state::AppState`] — the rate limiter, built while the
+    /// state is still being assembled, the keepalive task and the tenant cache.
+    ///
+    /// [`init`] publishes the handle it built; before that (every test suite,
+    /// which never calls `init`) each call declares instruments against
+    /// whatever meter provider is installed, so a test that installs its own
+    /// provider first still sees what these call sites record. Only reached on
+    /// a rejection or a cache change, never per request.
+    pub fn global() -> Self {
+        GLOBAL.get().cloned().unwrap_or_else(Self::new)
     }
 
     /// Count one request in; the returned guard value must be handed back to
@@ -323,7 +345,7 @@ pub fn init(cfg: &TelemetryConfig) -> Result<(TelemetryGuard, Metrics), Telemetr
                 meter: None,
                 logger: None,
             },
-            Metrics::new(),
+            publish(Metrics::new()),
         ));
     };
 
@@ -371,8 +393,15 @@ pub fn init(cfg: &TelemetryConfig) -> Result<(TelemetryGuard, Metrics), Telemetr
             meter: Some(meter_provider),
             logger: Some(logger_provider),
         },
-        Metrics::new(),
+        publish(Metrics::new()),
     ))
+}
+
+/// Hand the freshly built instruments to [`Metrics::global`]. A second `init`
+/// (only tests do that) keeps the first set rather than swapping it mid-flight.
+fn publish(metrics: Metrics) -> Metrics {
+    let _ = GLOBAL.set(metrics.clone());
+    metrics
 }
 
 /// Which OTLP wire transport to use, from the standard
