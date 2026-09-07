@@ -2590,3 +2590,153 @@ async fn a_blob_read_is_refused_module_disabled_when_the_school_has_no_chatbot()
     );
     assert!(bytes == uploaded, "the bytes differ from what was uploaded");
 }
+
+// ------------------------------------------------------------- telemetry --
+
+/// Attribute keys telemetry may never leave the process with — the list
+/// `tests/telemetry.rs` fixes for the HTTP edge, applied to the bridge's own
+/// spans. A prompt, a message or a user id showing up here is the failure this
+/// guards against.
+const FORBIDDEN: &[&str] = &[
+    "url.path",
+    "url.full",
+    "url.query",
+    "client.address",
+    "network.peer.address",
+    "user_agent.original",
+    "user.id",
+    "user.name",
+    "enduser.id",
+    "cookie",
+    "http.request.body",
+    "http.response.body",
+];
+
+/// The bridge's own observability, asserted end to end over real QUIC: one
+/// dispatched request must produce an `ai.request` span naming the capability
+/// and nothing about the caller, and one refused handshake must reach the
+/// failure counter under a stable `reason`.
+///
+/// The only test in this binary that installs a subscriber — `tracing`'s
+/// global default can be set once per process — so both assertions live in it
+/// rather than in a test each. Everything is filtered by a capability no other
+/// test uses, since the other tests keep dispatching into the same exporters.
+#[tokio::test]
+async fn a_dispatch_is_traced_by_capability_and_a_refused_handshake_is_counted() {
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+    use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
+    use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let span_exporter = InMemorySpanExporter::default();
+    let tracer_provider = SdkTracerProvider::builder()
+        .with_simple_exporter(span_exporter.clone())
+        .build();
+    let metric_exporter = InMemoryMetricExporter::default();
+    let meter_provider = SdkMeterProvider::builder()
+        .with_reader(PeriodicReader::builder(metric_exporter.clone()).build())
+        .build();
+    // Installed before the bridge exists: its instruments are taken from
+    // whatever meter provider is global when it first records.
+    opentelemetry::global::set_meter_provider(meter_provider.clone());
+    tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(tracer_provider.tracer("test")))
+        .init();
+
+    let bridge = bridge().await;
+    let _service = connect_service(
+        &bridge,
+        hello("probe", &["telemetry.probe"]),
+        Behaviour::Echo,
+    )
+    .await;
+    await_workers(&bridge, 1).await;
+    bridge
+        .dispatch(&demo(), "telemetry.probe", json!({ "image": "abc" }))
+        .await
+        .expect("the service answered");
+
+    // A refusal on its own connection, for the handshake counter.
+    let mut wrong = hello("probe", &["telemetry.probe"]);
+    wrong.token = "not-the-token".into();
+    let (_endpoint, _conn, _send, _recv, greeting) = shake_hands(&bridge, wrong).await;
+    assert!(
+        matches!(greeting, Greeting::Rejected { .. }),
+        "{greeting:?}"
+    );
+
+    tracer_provider.force_flush().expect("flush spans");
+    let spans = span_exporter.get_finished_spans().expect("exported spans");
+    let attrs_of = |span: &opentelemetry_sdk::trace::SpanData| -> Vec<(String, String)> {
+        span.attributes
+            .iter()
+            .map(|kv| (kv.key.to_string(), kv.value.to_string()))
+            .collect()
+    };
+    let request = spans
+        .iter()
+        .find(|s| {
+            s.name == "ai.request"
+                && attrs_of(s)
+                    .contains(&("ai.capability".to_string(), "telemetry.probe".to_string()))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "no ai.request span named the probe capability: {:?}",
+                spans.iter().map(|s| s.name.to_string()).collect::<Vec<_>>()
+            )
+        });
+    let attrs = attrs_of(request);
+    assert!(
+        attrs.contains(&("school".to_string(), DEMO_SLUG.to_string())),
+        "the span names the school slug: {attrs:?}"
+    );
+    assert!(
+        attrs
+            .iter()
+            .any(|(k, v)| k == "ai.worker.id" && !v.is_empty()),
+        "{attrs:?}"
+    );
+    assert!(
+        attrs
+            .iter()
+            .any(|(k, v)| k == "ai.request.id" && !v.is_empty()),
+        "{attrs:?}"
+    );
+    for span in &spans {
+        for (key, _) in attrs_of(span) {
+            assert!(
+                !FORBIDDEN.contains(&key.as_str()),
+                "span {:?} carries {key:?}, which may never leave this process",
+                span.name
+            );
+        }
+    }
+
+    meter_provider.force_flush().expect("flush metrics");
+    let mut refused = 0u64;
+    for resource in metric_exporter.get_finished_metrics().expect("metrics") {
+        for scope in resource.scope_metrics() {
+            for metric in scope.metrics() {
+                if metric.name() != "ai_handshake_failures_total" {
+                    continue;
+                }
+                if let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() {
+                    for point in sum.data_points() {
+                        if point.attributes().any(|kv| {
+                            kv.key.as_str() == "reason" && kv.value.to_string() == "bad_token"
+                        }) {
+                            refused += point.value();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        refused >= 1,
+        "the refused handshake must be counted under reason=bad_token"
+    );
+}

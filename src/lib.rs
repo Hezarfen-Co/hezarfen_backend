@@ -247,6 +247,7 @@ pub fn build_router(state: AppState) -> Router {
             state.tenants.clone(),
             state.db_up.clone(),
             state.files_path.clone(),
+            metrics.clone(),
         );
     }
 
