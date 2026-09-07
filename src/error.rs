@@ -145,8 +145,84 @@ impl From<argon2::password_hash::Error> for AppError {
     }
 }
 
+impl AppError {
+    /// The stable, snake_case name of this refusal's *class* — the value of the
+    /// `error.type` attribute on the span and on `errors_total`. It is a
+    /// dashboard's grouping key, so it never carries anything from the request:
+    /// no field name, no id, no message. Rename an arm freely; never rename one
+    /// of these strings.
+    fn class(&self) -> &'static str {
+        match self {
+            AppError::Validation(_) => "validation",
+            AppError::NotFound => "not_found",
+            AppError::Unauthorized => "unauthorized",
+            AppError::Forbidden(_) => "forbidden",
+            AppError::ModuleDisabled(_) => "module_disabled",
+            AppError::Conflict(_) | AppError::ConflictOwned(_) => "conflict",
+            AppError::ConflictCoded { .. } => "conflict_coded",
+            AppError::PayloadTooLarge(_) => "payload_too_large",
+            AppError::TooManyRequests { .. } => "too_many_requests",
+            AppError::Db(_) => "db",
+            AppError::DbUnavailable => "db_unavailable",
+            AppError::DbTimeout => "db_timeout",
+            AppError::Internal(_) => "internal",
+        }
+    }
+
+    /// What a `5xx` log line says beyond its class — the underlying error, which
+    /// the arm's own `Display` hides (`AppError::Db` renders as "database
+    /// error", keeping the SDK's text out of the response body). `None` for
+    /// everything the caller caused: a `4xx` is not an incident and its message
+    /// is derived from what was sent.
+    fn detail(&self) -> Option<String> {
+        match self {
+            AppError::Db(e) => Some(e.to_string()),
+            AppError::Internal(m) => Some(m.clone()),
+            AppError::DbTimeout => Some("the write may or may not have applied".to_owned()),
+            _ => None,
+        }
+    }
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        let class = self.class();
+        let detail = self.detail();
+        let response = self.render();
+        let status = response.status();
+
+        // The request span carries the class; the route is already on the span
+        // and on every metric `measure` records, so the counter needs only the
+        // class and the status.
+        tracing::Span::current().record("error.type", class);
+        crate::telemetry::Metrics::global().errors_total.add(
+            1,
+            &[
+                opentelemetry::KeyValue::new("error.type", class),
+                opentelemetry::KeyValue::new(
+                    "http.response.status_code",
+                    i64::from(status.as_u16()),
+                ),
+            ],
+        );
+        let detail = detail.as_deref().unwrap_or("");
+        match status.as_u16() {
+            // Expected under load or during a reconnect: worth a line, not a page.
+            429 | 503 if class != "db_timeout" => {
+                tracing::warn!(error.type = class, "refused the request");
+            }
+            500..=599 => tracing::error!(error.type = class, "{detail}"),
+            // The caller's fault, and the loudest thing in the log if it were
+            // any higher: a bad request is not an incident.
+            _ => tracing::debug!(error.type = class, "refused the request"),
+        }
+        response
+    }
+}
+
+impl AppError {
+    /// The wire response, byte for byte what each arm has always answered.
+    fn render(self) -> Response {
         let (status, message) = match &self {
             // The one arm with an extra header, so it builds its response here.
             AppError::TooManyRequests { retry_after_secs } => {
@@ -159,7 +235,6 @@ impl IntoResponse for AppError {
             }
             // Also carries a header: retry in a second, the reconnect is quick.
             AppError::DbUnavailable => {
-                tracing::warn!("database reconnecting — refusing the query with 503");
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     [(header::RETRY_AFTER, "1")],
@@ -170,7 +245,6 @@ impl IntoResponse for AppError {
             // Same 503, but no Retry-After: the query may still be queued and
             // land later, so a blind retry is not advertised as safe.
             AppError::DbTimeout => {
-                tracing::error!("request timed out waiting on the database");
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(json!({ "error": "request timed out — the write may or may not have applied" })),
@@ -200,20 +274,14 @@ impl IntoResponse for AppError {
             AppError::Conflict(m) => (StatusCode::CONFLICT, m.to_string()),
             AppError::ConflictOwned(m) => (StatusCode::CONFLICT, m.clone()),
             AppError::PayloadTooLarge(m) => (StatusCode::PAYLOAD_TOO_LARGE, m.clone()),
-            AppError::Db(e) => {
-                tracing::error!("database error: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "database error".to_string(),
-                )
-            }
-            AppError::Internal(m) => {
-                tracing::error!("internal error: {m}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal server error".to_string(),
-                )
-            }
+            AppError::Db(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "database error".to_string(),
+            ),
+            AppError::Internal(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal server error".to_string(),
+            ),
         };
         (status, Json(json!({ "error": message }))).into_response()
     }

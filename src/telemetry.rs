@@ -29,6 +29,9 @@ use tracing_subscriber::{EnvFilter, Layer};
 /// Instrumentation scope name — the OTLP `scope.name` on every metric below.
 const SCOPE: &str = "hezarfen_backend";
 
+/// The process's instruments, published by [`init`] (see [`Metrics::global`]).
+static GLOBAL: OnceLock<Metrics> = OnceLock::new();
+
 /// How stdout logs are rendered.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LogFormat {
@@ -131,7 +134,7 @@ pub struct Metrics {
     http_server_request_duration: Histogram<f64>,
     /// Requests currently in flight (attrs: `http.request.method`).
     http_server_active_requests: UpDownCounter<i64>,
-    /// Error responses, by kind (attrs: `error.type`, `http.route`).
+    /// Error responses, by kind (attrs: `error.type`, `http.response.status_code`).
     pub errors_total: Counter<u64>,
     /// Panics caught by the panic layer.
     pub panics_total: Counter<u64>,
@@ -232,6 +235,16 @@ impl Metrics {
         Self::new()
     }
 
+    /// The process's instruments, for the few call sites that have no
+    /// `AppState` to read them from — [`crate::error::AppError::into_response`]
+    /// (axum hands it nothing) and the panic hook (which runs outside any
+    /// request). [`init`] publishes the real handle here; before that, and in
+    /// tests, this builds a noop one against the noop meter provider, so
+    /// recording is always safe.
+    pub fn global() -> Self {
+        GLOBAL.get_or_init(Self::new).clone()
+    }
+
     /// Count one request in; the returned guard value must be handed back to
     /// [`Metrics::request_finished`].
     pub fn request_started(&self, method: &str) {
@@ -301,6 +314,7 @@ impl SchoolSlot {
 /// Install the subscriber and, when an OTLP endpoint is configured, the export
 /// pipelines. Call once, before anything logs.
 pub fn init(cfg: &TelemetryConfig) -> Result<(TelemetryGuard, Metrics), TelemetryError> {
+    install_panic_hook();
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,hezarfen_backend=debug"));
     let fmt_layer = match cfg.log_format {
@@ -323,7 +337,7 @@ pub fn init(cfg: &TelemetryConfig) -> Result<(TelemetryGuard, Metrics), Telemetr
                 meter: None,
                 logger: None,
             },
-            Metrics::new(),
+            publish(Metrics::new()),
         ));
     };
 
@@ -371,8 +385,44 @@ pub fn init(cfg: &TelemetryConfig) -> Result<(TelemetryGuard, Metrics), Telemetr
             meter: Some(meter_provider),
             logger: Some(logger_provider),
         },
-        Metrics::new(),
+        publish(Metrics::new()),
     ))
+}
+
+/// Hand the instruments to [`Metrics::global`]. A second [`init`] (there is
+/// none in production) keeps the first set rather than swapping under callers.
+fn publish(metrics: Metrics) -> Metrics {
+    let _ = GLOBAL.set(metrics.clone());
+    metrics
+}
+
+/// Report a panic anywhere in the process — worker task, background job, or a
+/// request handler on its way to the `catch-panic` layer — as one `error!` with
+/// the standard `exception.*` fields, and count it.
+///
+/// Installed once; the previous hook still runs, so the default "thread
+/// panicked at ..." line stays in stdout logs.
+pub fn install_panic_hook() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let payload = info.payload();
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_owned())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "panic".to_owned());
+            Metrics::global().panics_total.add(1, &[]);
+            tracing::error!(
+                exception.type = "panic",
+                exception.message = %message,
+                exception.stacktrace = %std::backtrace::Backtrace::force_capture(),
+                "a task panicked"
+            );
+            previous(info);
+        }));
+    });
 }
 
 /// Which OTLP wire transport to use, from the standard
