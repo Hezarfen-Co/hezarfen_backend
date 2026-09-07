@@ -19,7 +19,7 @@ use std::sync::{Arc, OnceLock};
 use opentelemetry::metrics::{Counter, Gauge, Histogram, UpDownCounter};
 use opentelemetry::{KeyValue, global};
 use opentelemetry_sdk::Resource;
-use opentelemetry_sdk::logs::SdkLoggerProvider;
+use opentelemetry_sdk::logs::{LogProcessor, SdkLogRecord, SdkLoggerProvider};
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing_subscriber::layer::SubscriberExt;
@@ -365,6 +365,9 @@ pub fn init(cfg: &TelemetryConfig) -> Result<(TelemetryGuard, Metrics), Telemetr
         .build();
     let logger_provider = SdkLoggerProvider::builder()
         .with_resource(resource)
+        // Registered before the exporter: processors run in registration order,
+        // so the stamp lands before the batch processor clones the record.
+        .with_log_processor(StampTimestamp)
         .with_batch_exporter(protocol.log_exporter()?)
         .build();
 
@@ -396,6 +399,37 @@ pub fn init(cfg: &TelemetryConfig) -> Result<(TelemetryGuard, Metrics), Telemetr
         },
         publish(Metrics::new()),
     ))
+}
+
+/// Gives every log record the `timestamp` the appender never sets.
+///
+/// `opentelemetry-appender-tracing` 0.32 leaves `timestamp` empty and the SDK
+/// fills only `observed_timestamp`, so collectors render the event as
+/// 1970-01-01 and anything ordering on `timestamp` sorts it first forever. The
+/// two differ only by the queueing delay inside this process, so copying the
+/// observed time across is the honest value. No clock is read here — that would
+/// invent a time the record does not have (and `SystemTime::now` is banned; see
+/// clippy.toml).
+#[derive(Debug)]
+struct StampTimestamp;
+
+impl LogProcessor for StampTimestamp {
+    fn emit(&self, data: &mut SdkLogRecord, _scope: &opentelemetry::InstrumentationScope) {
+        use opentelemetry::logs::LogRecord as _;
+        if data.timestamp().is_none()
+            && let Some(observed) = data.observed_timestamp()
+        {
+            data.set_timestamp(observed);
+        }
+    }
+
+    fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+        Ok(())
+    }
+
+    fn shutdown(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+        Ok(())
+    }
 }
 
 /// Hand the instruments to [`Metrics::global`]. A second [`init`] (there is
@@ -517,7 +551,10 @@ fn resource() -> Resource {
 
 #[cfg(test)]
 mod tests {
-    use super::{LogFormat, TelemetryError};
+    use opentelemetry::logs::{LogRecord as _, Logger as _, LoggerProvider as _};
+    use opentelemetry_sdk::logs::{InMemoryLogExporter, SdkLoggerProvider};
+
+    use super::{LogFormat, StampTimestamp, TelemetryError};
 
     #[tokio::test]
     async fn log_format_parses_the_two_spellings_and_rejects_the_rest() {
@@ -538,5 +575,28 @@ mod tests {
         // receives pretty lines fails at the far end, hours later.
         let err = LogFormat::parse(Some("logfmt".into())).unwrap_err();
         assert!(matches!(err, TelemetryError::LogFormat(v) if v == "logfmt"));
+    }
+
+    #[tokio::test]
+    async fn a_record_without_a_timestamp_is_stamped_with_its_observed_time() {
+        let exporter = InMemoryLogExporter::default();
+        let provider = SdkLoggerProvider::builder()
+            .with_log_processor(StampTimestamp)
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let logger = provider.logger("test");
+
+        // What the tracing appender hands the SDK: no `timestamp` at all.
+        let mut record = logger.create_log_record();
+        record.set_body("hello".into());
+        logger.emit(record);
+        provider.force_flush().unwrap();
+
+        let logs = exporter.get_emitted_logs().unwrap();
+        assert_eq!(logs.len(), 1);
+        let exported = &logs[0].record;
+        // Not 1970, and not a freshly invented clock read either.
+        assert!(exported.timestamp().is_some());
+        assert_eq!(exported.timestamp(), exported.observed_timestamp());
     }
 }
