@@ -6,9 +6,12 @@
 //! identity, no client address, no URL path (which holds record ids), no
 //! request or response bodies, and no headers or cookies. What may leave: the
 //! route *template* (`/notes/{id}`), the HTTP method, the status code, the
-//! school slug and a random per-request id. Every attribute added anywhere in
-//! this crate must fit that list — see the guard test in `tests/telemetry.rs`,
-//! which fails the build if a forbidden key ever shows up on a span.
+//! school slug, a random per-request id, and the id of a non-user resource
+//! (an exam room, a board) when an event is about that resource — never a
+//! user, session or attempt id, which name a person. Every attribute or event
+//! field added anywhere in this crate must fit that list — see the guard test
+//! in `tests/telemetry.rs`, which fails the build if a forbidden key ever
+//! shows up on a span or an exported log record.
 //!
 //! Export is off unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set (the same
 //! "off unless configured" shape as `AI_QUIC_ADDR`). With it unset the process
@@ -248,8 +251,9 @@ impl Metrics {
     /// [`init`] publishes the handle it built; before that (every test suite,
     /// which never calls `init`) each call declares instruments against
     /// whatever meter provider is installed, so a test that installs its own
-    /// provider first still sees what these call sites record. Only reached on
-    /// a rejection or a cache change, never per request.
+    /// provider first still sees what these call sites record. Reached on
+    /// error responses, panics, rate-limit rejections and tenant-cache changes
+    /// — never on the success path of a request.
     pub fn global() -> Self {
         GLOBAL.get().cloned().unwrap_or_else(Self::new)
     }
