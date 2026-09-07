@@ -283,7 +283,7 @@ impl AiBridge {
         );
         let metrics = self.inner.metrics();
         let attrs = [KeyValue::new("capability", capability.to_string())];
-        metrics.ai_requests_inflight.add(1, &attrs);
+        let _in_flight = InFlight::started(metrics, &attrs);
         let started = Instant::now();
 
         let outcome = async {
@@ -339,7 +339,6 @@ impl AiBridge {
         .instrument(span.clone())
         .await;
 
-        metrics.ai_requests_inflight.add(-1, &attrs);
         metrics
             .ai_request_duration
             .record(started.elapsed().as_secs_f64(), &attrs);
@@ -1057,6 +1056,30 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         return false;
     }
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// One dispatched-and-unanswered AI request, counted for as long as it lives.
+///
+/// `AiBridge::send`'s future is dropped whenever its caller goes away (an HTTP
+/// client disconnecting, an outer timeout), and a decrement written after the
+/// `.await` is skipped on exactly those paths — leaking the gauge upwards for
+/// the process's whole life. `Drop` covers every exit.
+struct InFlight<'a> {
+    metrics: &'a Metrics,
+    attrs: &'a [KeyValue],
+}
+
+impl<'a> InFlight<'a> {
+    fn started(metrics: &'a Metrics, attrs: &'a [KeyValue]) -> Self {
+        metrics.ai_requests_inflight.add(1, attrs);
+        Self { metrics, attrs }
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.metrics.ai_requests_inflight.add(-1, self.attrs);
+    }
 }
 
 #[cfg(test)]

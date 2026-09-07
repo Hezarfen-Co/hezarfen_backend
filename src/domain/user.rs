@@ -438,7 +438,6 @@ impl User {
             Some(user) if user.role == Role::Admin => Ok(()),
             Some(_) => {
                 tracing::warn!(
-                    username = username.as_str(),
                     "ADMIN_USERNAME names an existing non-admin account; refusing to promote it. \
                      Grant the role through an existing admin or the manual SurrealQL path."
                 );
@@ -452,10 +451,11 @@ impl User {
                 // is no marker that could tell such a row apart from a stranger
                 // who registered the name first, so the hole cannot be healed
                 // later; it has to be impossible to open.
-                let admin =
-                    Self::create_with_role(username, password.hash_async().await?, Role::Admin, db)
-                        .await?;
-                tracing::info!(username = admin.username.as_str(), "seeded admin account");
+                Self::create_with_role(username, password.hash_async().await?, Role::Admin, db)
+                    .await?;
+                // No `username` field: with OTLP on every event is exported as a
+                // log record, so an account name here leaves the process.
+                tracing::info!("seeded the admin account named by ADMIN_USERNAME");
                 Ok(())
             }
         }

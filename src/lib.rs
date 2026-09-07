@@ -297,7 +297,36 @@ pub fn build_router(state: AppState) -> Router {
             HeaderName::from_static(REQUEST_ID_HEADER),
             MakeRequestUuid,
         ))
+        // Above `SetRequestIdLayer`, which keeps a caller-supplied id verbatim:
+        // an unusable one is dropped here so the layer below mints a UUID.
+        .layer(axum::middleware::from_fn(drop_unusable_request_id))
 }
+
+/// Refuse a caller-supplied `x-request-id` that is not a short, boring token.
+///
+/// The id lands on `http.request.id` of every span, so anything a client can
+/// put there it can export: free text (personal data) and unbounded cardinality
+/// both. Accepting only `[A-Za-z0-9._-]{1,64}` keeps the useful case — a
+/// gateway correlating its own request id with ours — and mints a UUID for
+/// everything else.
+async fn drop_unusable_request_id(mut req: Request, next: Next) -> Response {
+    let usable = req.headers().get(REQUEST_ID_HEADER).is_some_and(|value| {
+        value.to_str().is_ok_and(|id| {
+            !id.is_empty()
+                && id.len() <= MAX_REQUEST_ID_LEN
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        })
+    });
+    if !usable {
+        req.headers_mut().remove(REQUEST_ID_HEADER);
+    }
+    next.run(req).await
+}
+
+/// The longest caller-supplied request id we will carry.
+const MAX_REQUEST_ID_LEN: usize = 64;
 
 /// The header carrying the per-request id, in and out.
 const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -377,17 +406,61 @@ async fn measure(metrics: crate::telemetry::Metrics, mut req: Request, next: Nex
         .to_owned();
     let school = SchoolSlot::default();
     req.extensions_mut().insert(school.clone());
-    metrics.request_started(&method);
-    let started = std::time::Instant::now();
+    let mut in_flight = InFlight::started(&metrics, method, route, school);
     let res = next.run(req).await;
-    metrics.request_finished(
-        &method,
-        &route,
-        res.status().as_u16(),
-        school.get(),
-        started.elapsed(),
-    );
+    in_flight.status = res.status().as_u16();
     res
+}
+
+/// The in-flight accounting for one request, closed by `Drop`.
+///
+/// A dropped request future — the client disconnected, an outer timeout fired —
+/// never returns from `next.run`, so a decrement written after the `.await`
+/// leaks the gauge upwards for the process's whole life. Same shape as
+/// [`web::room::Connected`]: `Drop` is the only placement every exit passes
+/// through.
+struct InFlight<'a> {
+    metrics: &'a crate::telemetry::Metrics,
+    method: String,
+    route: String,
+    school: SchoolSlot,
+    started: std::time::Instant,
+    /// The answer's status, or `499` ("client closed request") while there is
+    /// no answer — which is what a cancelled request is recorded as.
+    status: u16,
+}
+
+impl<'a> InFlight<'a> {
+    fn started(
+        metrics: &'a crate::telemetry::Metrics,
+        method: String,
+        route: String,
+        school: SchoolSlot,
+    ) -> Self {
+        metrics.request_started(&method);
+        Self {
+            metrics,
+            method,
+            route,
+            school,
+            started: std::time::Instant::now(),
+            status: 499,
+        }
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        // `request_finished` owns both halves — the decrement and the duration
+        // sample — so a cancelled request lands here too, under `499`.
+        self.metrics.request_finished(
+            &self.method,
+            &self.route,
+            self.status,
+            self.school.get(),
+            self.started.elapsed(),
+        );
+    }
 }
 
 /// Refuse work the database cannot currently do, and cap how long any request

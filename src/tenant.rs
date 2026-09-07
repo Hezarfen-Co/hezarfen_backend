@@ -328,11 +328,12 @@ impl Tenants {
             .create(school.id.record())
             .content(school)
             .await?;
-        tenants
-            .cache
-            .write()
-            .expect("tenant cache lock")
-            .insert(slug.as_str().to_string(), db);
+        let size = {
+            let mut cache = tenants.cache.write().expect("tenant cache lock");
+            cache.insert(slug.as_str().to_string(), db);
+            cache.len()
+        };
+        Self::report_size(size);
         Ok(tenants)
     }
 
@@ -436,10 +437,12 @@ impl Tenants {
                 return Err(err);
             }
         };
-        self.cache
-            .write()
-            .expect("tenant cache lock")
-            .insert(slug.as_str().to_string(), db.clone());
+        let size = {
+            let mut cache = self.cache.write().expect("tenant cache lock");
+            cache.insert(slug.as_str().to_string(), db.clone());
+            cache.len()
+        };
+        Self::report_size(size);
         Ok(db)
     }
 

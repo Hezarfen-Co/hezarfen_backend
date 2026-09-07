@@ -53,6 +53,8 @@ impl Connected {
         metrics
             .ws_connections
             .add(1, &[opentelemetry::KeyValue::new("kind", kind)]);
+        // `id` is a resource id (exam, board) and `school` a slug — both are
+        // allowed on telemetry. A user id never is.
         tracing::info!(kind, school, id, "websocket opened");
         Self {
             metrics: metrics.clone(),
