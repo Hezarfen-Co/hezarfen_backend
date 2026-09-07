@@ -6,9 +6,9 @@ mod common;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use common::{
-    app_and_db, create_course, create_exam, create_exam_with, create_homework, create_session,
-    create_subject, enroll, id_of, login, login_as, me_id, mem_app, send, set_role, unenroll,
-    upload_course_note_file,
+    app_and_db, app_with_ai_health, create_course, create_exam, create_exam_with, create_homework,
+    create_session, create_subject, enroll, id_of, login, login_as, me_id, mem_app, send, set_role,
+    unenroll, upload_course_note_file,
 };
 use hezarfen_backend::build_router;
 use hezarfen_backend::constant::{
@@ -29,7 +29,7 @@ use hezarfen_backend::domain::session::Session;
 use hezarfen_backend::domain::timestamp::Timestamp;
 use hezarfen_backend::domain::user::{Password, User, UserId, Username};
 use hezarfen_backend::module::ModuleSet;
-use hezarfen_backend::state::AppState;
+use hezarfen_backend::state::{AppState, DbHealth};
 use serde_json::json;
 use tower::ServiceExt;
 
@@ -41,6 +41,34 @@ async fn health_reports_ok() {
     let res = send(&app, "GET", "/health", None, None).await;
     assert_eq!(res.status, StatusCode::OK);
     assert_eq!(res.body["status"], "ok");
+    assert_eq!(res.body["db"], "up");
+    // No `AI_QUIC_ADDR` in the suites, so the bridge is off — which is a
+    // configuration, not a fault: the status stays `ok`.
+    assert_eq!(res.body["ai"]["enabled"], false);
+    assert_eq!(res.body["ai"]["workers"], 0);
+}
+
+/// The probe must survive the outage it reports. `db_guard` refuses everything
+/// else with a generic 503 while the socket is down; `/health` (and `/`) answer
+/// their own 503 that names the database, or the probe is useless exactly when
+/// it is needed.
+#[tokio::test]
+async fn health_reports_the_database_down_instead_of_being_refused() {
+    let db_up = DbHealth::default();
+    let (app, _db) = app_with_ai_health(None, db_up.clone()).await;
+
+    db_up.set(false);
+    for path in ["/health", "/"] {
+        let res = send(&app, "GET", path, None, None).await;
+        assert_eq!(res.status, StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        assert_eq!(res.body["status"], "degraded", "{path}");
+        assert_eq!(res.body["db"], "down", "{path}");
+    }
+
+    db_up.set(true);
+    let res = send(&app, "GET", "/health", None, None).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["db"], "up");
 }
 
 #[tokio::test]

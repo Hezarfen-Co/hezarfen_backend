@@ -109,3 +109,104 @@ async fn the_request_span_names_the_route_and_nothing_about_the_caller() {
         }
     }
 }
+
+/// The class of a refusal, on the span: `error.type` is the grouping key a
+/// dashboard slices errors by, so it must be the stable name of the *kind* of
+/// refusal (`not_found`) and never the status code or anything from the URL.
+///
+/// Own subscriber, scoped to this thread with `set_default` rather than
+/// `init` — the process-global slot belongs to the guard test above, and a
+/// second `init` in this binary would panic.
+#[tokio::test]
+async fn a_refusal_records_its_class_on_the_span() {
+    let exporter = InMemorySpanExporter::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let (app, db) = common::app_and_db().await;
+    let cookie = common::login_as(&app, &db, "classteacher", "teacher").await;
+    let (status, _, _) = send_raw(
+        &app,
+        "GET",
+        "/notes/nosuchnote",
+        Some(&cookie),
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, 404);
+    provider.force_flush().expect("flush");
+
+    let spans = exporter.get_finished_spans().expect("exported spans");
+    let span = spans
+        .iter()
+        .find(|s| s.name == "GET /notes/{id}")
+        .unwrap_or_else(|| panic!("the note span, got {:?}", names(&spans)));
+    assert_eq!(attr(span, "error.type").as_deref(), Some("not_found"));
+    // A 404 is the caller's mistake, not ours: the span is not marked failed.
+    assert_eq!(attr(span, "otel.status_code"), None);
+}
+
+/// A panicking handler answers the same 500 body every other internal error
+/// answers, and its span says `panic` — not `500`, which is already there as
+/// the status code.
+///
+/// Built from the two layers `build_router` wires (`lib.rs`: the
+/// `CatchPanicLayer::custom(panic_response)` at :303 inside the `TraceLayer`
+/// at :310) rather than driven through the real router, because no route in
+/// the API panics and `Router::route` on an already-layered router adds a
+/// route *outside* those layers — the assembled stack cannot be given a
+/// panicking endpoint from a test without a test-only route in `build_router`.
+#[tokio::test]
+async fn a_panicking_handler_is_a_500_with_the_standard_body_and_a_panic_span() {
+    let exporter = InMemorySpanExporter::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let app: axum::Router = axum::Router::new()
+        .route("/boom", axum::routing::get(boom))
+        .layer(tower_http::catch_panic::CatchPanicLayer::custom(
+            hezarfen_backend::panic_response,
+        ))
+        .layer(
+            tower_http::trace::TraceLayer::new_for_http()
+                .make_span_with(hezarfen_backend::request_span),
+        );
+
+    let (status, _, body) = send_raw(&app, "GET", "/boom", None, None, Vec::new()).await;
+    assert_eq!(status, 500);
+    // Byte-identical to `AppError::Internal`'s body: a panic is not a special
+    // wire shape a client has to learn.
+    assert_eq!(body, br#"{"error":"internal server error"}"#);
+    provider.force_flush().expect("flush");
+
+    let spans = exporter.get_finished_spans().expect("exported spans");
+    let span = spans
+        .iter()
+        .find(|s| s.name == "GET /boom")
+        .unwrap_or_else(|| panic!("the panicking span, got {:?}", names(&spans)));
+    assert_eq!(attr(span, "error.type").as_deref(), Some("panic"));
+}
+
+async fn boom() -> &'static str {
+    panic!("handler exploded")
+}
+
+fn names(spans: &[opentelemetry_sdk::trace::SpanData]) -> Vec<String> {
+    spans.iter().map(|s| s.name.to_string()).collect()
+}
+
+fn attr(span: &opentelemetry_sdk::trace::SpanData, key: &str) -> Option<String> {
+    span.attributes
+        .iter()
+        .find(|kv| kv.key.as_str() == key)
+        .map(|kv| kv.value.to_string())
+}

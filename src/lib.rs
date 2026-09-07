@@ -47,7 +47,7 @@ use crate::web::module_gate::gate;
     ),
     modifiers(&SecurityAddon),
     tags(
-        (name = "meta", description = "Liveness, the authoritative clock, and the validation contract. `GET /limits` publishes every fixed bound the API enforces — field lengths, numeric ranges, closed value sets (roles, course kinds, exam and question kinds, homework statuses, image content types) — so a client validates against the server's own constants instead of a hard-coded copy that drifts. Unauthenticated, because the registration form needs the username and password bounds before a session exists, and the values change only with a deploy: fetch once, cache for the session. Two refusals split that contract: every JSON-bodied operation answers `422` when the request never became the type the handler asked for (a wrong-typed field, a missing required one), and that one is a plain-text deserializer diagnostic rather than the `{error}` envelope, so it is read by a human and not parsed by a client; `400` carries the usual `{error}` and means either non-JSON bytes or a well-typed value that broke a rule published here. Multipart upload routes have no JSON body and so answer `400`, never `422`. School-adjustable policy lives on `GET /settings`; what `/limits` carries for those knobs is the fixed range a manager may set them within. Its `rate` group is the exception to \"fixed\": those tiers are environment-tunable, so the endpoint serves the running server's live values (`0` = tier off). `GET /modules/catalog` is the same kind of contract for the product's shape: every sellable module, the package it is sold in, and the modules it structurally requires — unauthenticated and deploy-constant, since it is identical for every school. What one school actually bought is `GET /modules` (any logged-in user), the cheap way to hide a nest the school does not have instead of discovering it as a `403`. Those tiers are per client; a server whose client table is saturated by a flood meters otherwise-unknown callers against one shared budget instead, so an unfamiliar client can briefly see a `429` it did not itself earn — always with a `Retry-After`, never longer than the window"),
+        (name = "meta", description = "Liveness, the authoritative clock, and the validation contract. `GET /health` (and its `/` mirror) reports what the process can currently do — `{status, db, ai}` — answering `503` with a body that names the failing dependency rather than a bare refusal, and it keeps answering while the database is down. `GET /limits` publishes every fixed bound the API enforces — field lengths, numeric ranges, closed value sets (roles, course kinds, exam and question kinds, homework statuses, image content types) — so a client validates against the server's own constants instead of a hard-coded copy that drifts. Unauthenticated, because the registration form needs the username and password bounds before a session exists, and the values change only with a deploy: fetch once, cache for the session. Two refusals split that contract: every JSON-bodied operation answers `422` when the request never became the type the handler asked for (a wrong-typed field, a missing required one), and that one is a plain-text deserializer diagnostic rather than the `{error}` envelope, so it is read by a human and not parsed by a client; `400` carries the usual `{error}` and means either non-JSON bytes or a well-typed value that broke a rule published here. Multipart upload routes have no JSON body and so answer `400`, never `422`. School-adjustable policy lives on `GET /settings`; what `/limits` carries for those knobs is the fixed range a manager may set them within. Its `rate` group is the exception to \"fixed\": those tiers are environment-tunable, so the endpoint serves the running server's live values (`0` = tier off). `GET /modules/catalog` is the same kind of contract for the product's shape: every sellable module, the package it is sold in, and the modules it structurally requires — unauthenticated and deploy-constant, since it is identical for every school. What one school actually bought is `GET /modules` (any logged-in user), the cheap way to hide a nest the school does not have instead of discovering it as a `403`. Those tiers are per client; a server whose client table is saturated by a flood meters otherwise-unknown callers against one shared budget instead, so an unfamiliar client can briefly see a `429` it did not itself earn — always with a `Retry-After`, never longer than the window"),
         (name = "ai", description = "AI-bridge discovery. The AI features run as separate services that dial IN to this backend over QUIC (protocol/ALPN `hab/2`, address `AI_QUIC_ADDR`) and register the capabilities they serve; each request then rides its own QUIC bidirectional stream on that one connection. `GET /ai/certificate` publishes the bridge listener's certificate (PEM + SHA-256 fingerprint) so a service can pin it before dialling — public, because a server certificate is presented to every peer during the TLS handshake anyway, while the shared token that actually authenticates a service (`AI_SHARED_TOKEN`) is configured out of band. With **both** `AI_TLS_CERT` and `AI_TLS_KEY` unset the bridge self-signs afresh at each boot, so a service must re-fetch this on every reconnect, not only at startup; setting just one of the two (a blank value counts as unset) fails the boot instead of quietly self-signing, since a bridge presenting a throwaway `localhost` leaf to services pinning the real one looks configured and answers `503` to every send. Every frame in either direction names the school it belongs to (`school`, the slug), so one fleet of services serves every school on the deployment and a read is answered out of that school's own database — an unknown slug is `unknown_school`, a suspended one `school_suspended`. Traffic also runs the other way on that same connection: a connected service opens streams of its own to **read this API back** (one `ApiRequest`/`ApiResponse` frame pair per stream, no HTTP session and no password of its own) — `GET` only, against a deny-by-default allowlist of read endpoints (identity, profiles, notes, course notes, homework, marks, attendance, pomodoro), optionally `on_behalf_of` a named user, whose account is re-read live per request so a stale id acts as the demoted or deleted user and never as who they were. Without that field the principal is the internal role `ai`, the lowest privilege here and not assignable to anyone — it appears in the `Role` schema as documentation only, no account can hold it, and a read that needs a role simply answers `403`. A connected service also pulls **file bytes** the same way, on its own stream: one `BlobRequest` naming a `course_note_file` id, one header frame, then exactly `size` raw bytes and FIN — no frame cap, because a PDF fits in no frame. That stream reaches course-note attachments and nothing else, behind the very guard `GET /course-notes/{id}/files/{file_id}` applies, and `on_behalf_of` is required in practice there since the `ai` role can view no course. Nothing on this HTTP surface changes: the allowlisted endpoints are the ones documented here, reached with the same guards. `404` when the bridge is disabled (`AI_QUIC_ADDR` unset). See the README's \"AI bridge (QUIC)\" section for the frame-level protocol"),
         (name = "builder", description = "The vendor surface: one deployment, many schools. A **builder** is the operator who owns the deployment — not a user of any school, and holding no role in one. It logs in at `POST /builder/login` and gets a `session` cookie prefixed `builder.` instead of a school slug; that cookie works here and is `401` everywhere else, exactly as a school cookie is `401` here. `POST /schools` creates a school's database, schema and first admin in one call; `PATCH /schools/{slug}` renames it or flips it between `active` and `suspended` (a suspension is immediate and total for that school's users — every request including login answers `403`, live session or not); `DELETE /schools/{slug}` destroys its data and its uploaded files for good. `POST /schools/{slug}/admin-password` is the lockout fix: it re-keys a named admin of that school and revokes every session that account held. `POST /schools/{slug}/enter` mints an ordinary school session for one of its admins (support access) — the only route here refused on a suspended school, so a suspension really does close every door into it. It is also where a school's **entitlements** are sold: `GET /schools/{slug}/modules` lists what it has and what is left, `POST`/`DELETE /schools/{slug}/modules/{module}` flips one (idempotently), and `PATCH /schools/{slug}/modules` re-sells the whole shelf in one atomic write — modules and packages, both directions, expanded into a single resulting set that is checked once, so a `409` names every broken dependency at once and nothing is written unless the request is accepted whole. A change lands on the school's very next request, live cookies included: a disabled module answers `403 {error, module}` on every route in its nest. The catalog itself (`GET /modules/catalog`) and a school user's own set (`GET /modules`) are on the `meta` tag."),
         (name = "auth", description = "Registration, login, session lifecycle. Both bodies name the **school**: `{school, username, password}`, since one deployment serves many schools and a username identifies an account only inside one of them; login sets a `session` cookie valued `<slug>.<token>` (see the `builder` tag). `POST /auth/register` answers `201` whether or not the username was free, and the two bodies are byte-identical: it returns only `{username, role}` — the echoed name and the `student` role every fresh account gets — and deliberately **no `id`**, since on the taken path there is no row to name (log in to learn your id). A deliberate anti-enumeration measure, since the route is unauthenticated and a `409` would let anyone harvest the school's user list. The accepted cost is that a caller who collides gets no distinct error and simply cannot log in with that password; do not \"fix\" this back to a `409`"),
@@ -271,6 +271,14 @@ pub fn build_router(state: AppState) -> Router {
             let metrics = metrics.clone();
             async move { measure(metrics, req, next).await }
         }))
+        // Inside the trace layer, so the span it stamps `error.type = panic` on
+        // is the request's own; outside everything else, so a panic anywhere in
+        // a handler still answers the standard 500 body instead of dropping the
+        // connection. The panic itself is logged and counted by the process
+        // hook (see [`telemetry::install_panic_hook`]).
+        .layer(tower_http::catch_panic::CatchPanicLayer::custom(
+            panic_response,
+        ))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(request_span)
@@ -299,7 +307,7 @@ const REQUEST_ID_HEADER: &str = "x-request-id";
 /// address, the user agent, any header or cookie, and anything about who is
 /// calling. The route template and the method are what a builder needs to see
 /// which endpoint is slow; see [`crate::telemetry`] for the rule.
-fn request_span(req: &Request<axum::body::Body>) -> tracing::Span {
+pub fn request_span(req: &Request<axum::body::Body>) -> tracing::Span {
     let method = req.method().as_str();
     let route = req
         .extensions()
@@ -328,6 +336,20 @@ fn request_span(req: &Request<axum::body::Body>) -> tracing::Span {
     )
 }
 
+/// The response a panicking handler gets, byte-identical to
+/// [`AppError::Internal`]'s: a caller learns nothing about our stack trace, and
+/// a client parsing `{"error": ...}` is not surprised by the one 500 that used
+/// to be a dropped connection. Runs inside the trace layer, so the class lands
+/// on the request's span.
+pub fn panic_response(_panic: Box<dyn std::any::Any + Send + 'static>) -> Response {
+    tracing::Span::current().record("error.type", "panic");
+    (
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": "internal server error" })),
+    )
+        .into_response()
+}
+
 /// Stamp the outcome onto the request span. A `5xx` is our fault, so it also
 /// marks the span itself as failed; a `4xx` is the caller's and does not.
 fn record_response<B>(res: &Response<B>, _latency: std::time::Duration, span: &tracing::Span) {
@@ -335,7 +357,10 @@ fn record_response<B>(res: &Response<B>, _latency: std::time::Duration, span: &t
     span.record("http.response.status_code", status.as_u16());
     if status.is_server_error() {
         span.record("otel.status_code", "ERROR");
-        span.record("error.type", status.as_str());
+        // `error.type` is NOT set here: whatever produced the 5xx —
+        // [`AppError::into_response`] or [`panic_response`] — has already
+        // recorded its class, and the status code would overwrite it with a
+        // number that is already on the span.
     }
 }
 
@@ -387,7 +412,11 @@ async fn db_guard(health: state::DbHealth, req: Request, next: Next) -> Response
     // pure own-goal: a frontend booting into a degraded backend is exactly
     // when it needs the validation contract, and answering `503` would push it
     // back to the hard-coded copy this endpoint exists to delete.
-    if req.uri().path() == "/limits" {
+    // `/health` and its `/` mirror are exempt for the same reason and one
+    // more: refusing them with the guard's own 503 would replace the probe's
+    // answer ("degraded, the database is down") with a generic body that names
+    // nothing. They read the keepalive's verdict and touch no database.
+    if matches!(req.uri().path(), "/limits" | "/health" | "/") {
         return next.run(req).await;
     }
     if !health.is_up() {
@@ -451,15 +480,63 @@ pub fn cors_layer(allowlist: Vec<HeaderValue>) -> CorsLayer {
     }
 }
 
-/// Liveness probe.
+/// What the process can currently do, for a load balancer and a status page.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+struct HealthResponse {
+    /// `ok` when every dependency the API needs is answering, `degraded` when
+    /// one is not (today: the database).
+    #[schema(example = "ok")]
+    status: &'static str,
+    /// Did the database socket answer its last keepalive ping?
+    #[schema(example = "up")]
+    db: &'static str,
+    /// The optional AI bridge (see the `ai` tag).
+    ai: AiHealth,
+}
+
+/// The AI bridge's side of [`HealthResponse`]. `enabled: false` is a
+/// deployment without `AI_QUIC_ADDR`, not a fault — the core API has never
+/// needed the bridge — so it never degrades the status.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+struct AiHealth {
+    enabled: bool,
+    /// AI services currently registered on the bridge; `0` when it is off.
+    workers: usize,
+}
+
+/// Health probe: the database verdict and the AI bridge, `503` when degraded.
+///
+/// Answers even while the database is down — it reads the keepalive's verdict
+/// and touches nothing — which is the whole point: a probe that 503s with an
+/// empty body says "down" without saying what is down.
 #[utoipa::path(
     get,
     path = "/health",
     tag = "meta",
-    responses((status = 200, description = "Service is up")),
+    responses(
+        (status = 200, description = "Every dependency is answering", body = HealthResponse),
+        (status = 503, description = "The database is down; the body says so", body = HealthResponse),
+    ),
 )]
-async fn health() -> Json<serde_json::Value> {
-    Json(json!({ "status": "ok" }))
+async fn health(axum::extract::State(state): axum::extract::State<AppState>) -> Response {
+    let up = state.db_up.is_up();
+    let status = if up {
+        axum::http::StatusCode::OK
+    } else {
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(HealthResponse {
+            status: if up { "ok" } else { "degraded" },
+            db: if up { "up" } else { "down" },
+            ai: AiHealth {
+                enabled: state.ai.is_some(),
+                workers: state.ai.as_ref().map_or(0, |ai| ai.workers().len()),
+            },
+        }),
+    )
+        .into_response()
 }
 
 /// The server's current time. All API timestamps are UTC unix-milliseconds
