@@ -2707,11 +2707,8 @@ dependencies = [
  "async-trait",
  "bytes",
  "http",
- "http-body-util",
- "hyper",
- "hyper-util",
  "opentelemetry",
- "tokio",
+ "reqwest",
 ]
 
 [[package]]
@@ -2726,6 +2723,7 @@ dependencies = [
  "opentelemetry-proto",
  "opentelemetry_sdk",
  "prost",
+ "reqwest",
  "thiserror",
  "tokio",
  "tonic",
@@ -3479,7 +3477,9 @@ dependencies = [
  "bytes",
  "cookie",
  "cookie_store",
+ "futures-channel",
  "futures-core",
+ "futures-util",
  "http",
  "http-body",
  "http-body-util",

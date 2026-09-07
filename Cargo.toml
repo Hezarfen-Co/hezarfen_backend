@@ -51,7 +51,7 @@ tracing-opentelemetry = "0.33.0"
 opentelemetry-semantic-conventions = "0.32.1"
 uuid = { version = "1.26.0", features = ["v4"] }
 opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["trace", "metrics", "logs", "grpc-tonic", "http-proto", "hyper-client", "internal-logs"] }
+opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["trace", "metrics", "logs", "grpc-tonic", "http-proto", "reqwest-blocking-client", "internal-logs"] }
 opentelemetry-appender-tracing = "0.32.0"
 
 [dev-dependencies]
