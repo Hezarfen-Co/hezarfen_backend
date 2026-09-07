@@ -1,0 +1,20 @@
+# Temps ships a broken runtime image: ghcr.io/gotempsh/temps:* is alpine/musl
+# but the binary inside is glibc-linked, so it dies with "exec container
+# process (missing dynamic library?) /usr/local/bin/temps". Their supported
+# path is building the whole thing from source. Rebasing the same pinned
+# artifact onto debian-slim gives a runnable image in seconds instead.
+# Delete this file and use the upstream image directly once it executes.
+FROM ghcr.io/gotempsh/temps:0.1.0-nightly.20260906.48c2396e AS artifacts
+
+FROM docker.io/library/debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates tzdata wget \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=artifacts /usr/local/bin/temps /usr/local/bin/temps
+RUN useradd --uid 1000 --create-home temps \
+    && mkdir -p /app/data \
+    && chown -R temps:temps /app
+USER temps
+WORKDIR /app
+ENTRYPOINT ["/usr/local/bin/temps"]
+CMD ["serve"]
