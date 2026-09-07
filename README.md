@@ -240,22 +240,20 @@ container so the published port works. Production knobs (`COOKIE_SECURE`,
 means dev mirror mode without credentials; a cookie-using browser frontend
 must be allowlisted explicitly. Works with `docker compose` too.
 
-Three more services make up the telemetry sink: `temps` (UI and API on
-`127.0.0.1:3000`, OTLP ingest on `127.0.0.1:9000`) with its TimescaleDB and
-ClickHouse stores. Its image is built locally from
-`observability/Containerfile.temps` — the published one is tagged alpine but
-ships a glibc binary that cannot exec. Temps refuses to start its console
-without a container socket, so `systemctl --user start podman.socket` first.
-Log in at http://127.0.0.1:3000 as `admin@hezarfen.local` with the password in
-`observability/temps-admin-password`, then mint an ingest key (Settings → API
-Keys, or `podman exec hezarfen-temps temps api-key --name <name>`) and note the
-project id shown on the project page. Uncomment the backend's
-`OTEL_EXPORTER_OTLP_ENDPOINT` (`http://temps:9000/api/otel`),
-`OTEL_EXPORTER_OTLP_PROTOCOL` (`http/protobuf` — Temps has no gRPC listener)
-and `OTEL_EXPORTER_OTLP_HEADERS`
-(`Authorization=Bearer <key>,X-Temps-Project-Id=<id>`), and traces, metrics and
-logs start landing. Signals are kept 90 days
-(`TEMPS_OTEL_RETENTION_DAYS`).
+One more service is the telemetry sink: `openobserve`, a single Rust binary
+that stores logs, metrics and traces itself — no sidecar databases and no
+container socket. Its UI, search API and OTLP/HTTP ingest share
+`127.0.0.1:5080`; OTLP/gRPC listens on `127.0.0.1:5081`. Log in at
+http://127.0.0.1:5080 as the `ZO_ROOT_USER_EMAIL`/`ZO_ROOT_USER_PASSWORD` pair
+set on the service (`admin@hezarfen.local` / `Hezarfen_dev1!` for local dev —
+OpenObserve rejects a weaker password at boot). Retention is per stream in
+days, defaulted globally to 90 by `ZO_COMPACT_DATA_RETENTION_DAYS`. Uncomment
+the backend's `OTEL_EXPORTER_OTLP_ENDPOINT` (`http://openobserve:5081`) and
+`OTEL_EXPORTER_OTLP_HEADERS` (`Authorization=Basic <base64 email:password>`
+plus `organization=default,stream-name=default`), and traces, metrics and logs
+start landing; the commented OTLP/HTTP variant uses
+`http://openobserve:5080/api/default` with `OTEL_EXPORTER_OTLP_PROTOCOL:
+http/protobuf` instead.
 
 The backend survives the database going away, at boot and at runtime.
 

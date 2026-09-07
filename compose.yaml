@@ -58,16 +58,18 @@ services:
       # RATE_LIMIT_AUTH_PER_MINUTE: "10"
       # RATE_LIMIT_API_PER_MINUTE: "300"
       # TRUST_PROXY: "true"
-      # Telemetry — export traces, metrics and logs to Temps over OTLP/HTTP.
-      # Uncomment once a Temps project exists: create the project in the UI at
-      # http://127.0.0.1:3000, mint an API key (tk_...) under Settings > API
-      # Keys, and put its numeric project id in the header. OTLP/HTTP protobuf
-      # only — Temps has no gRPC port, and the ingest path is /api/otel/v1/*,
-      # so the endpoint carries the /api/otel prefix.
-      # OTEL_EXPORTER_OTLP_ENDPOINT: http://temps:9000/api/otel
-      # OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
-      # OTEL_EXPORTER_OTLP_HEADERS: "Authorization=Bearer tk_xxx,X-Temps-Project-Id=1"
+      # Telemetry — export traces, metrics and logs to OpenObserve over OTLP.
+      # The Authorization value is base64("<ZO_ROOT_USER_EMAIL>:<password>");
+      # for the local-dev pair above that is the string below. gRPC carries the
+      # organization and the target stream as metadata headers.
+      # OTEL_EXPORTER_OTLP_ENDPOINT: http://openobserve:5081
+      # OTEL_EXPORTER_OTLP_HEADERS: "Authorization=Basic YWRtaW5AaGV6YXJmZW4ubG9jYWw6SGV6YXJmZW5fZGV2MSE=,organization=default,stream-name=default"
       # OTEL_SERVICE_NAME: hezarfen-backend
+      # OTLP/HTTP instead: the org goes in the path (the SDK appends
+      # /v1/{traces,metrics,logs}) and only Authorization is needed.
+      # OTEL_EXPORTER_OTLP_ENDPOINT: http://openobserve:5080/api/default
+      # OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      # OTEL_EXPORTER_OTLP_HEADERS: "Authorization=Basic YWRtaW5AaGV6YXJmZW4ubG9jYWw6SGV6YXJmZW5fZGV2MSE="
       # AI bridge — the AI services dial IN over QUIC. Unset means off; a
       # bad address or a missing token fails the boot rather than leaving a
       # silently dead feature. Listening with no service connected is fine:
@@ -91,123 +93,45 @@ services:
       start_period: 10s
 
   # ── Telemetry sink ────────────────────────────────────────────────────────
-  # Temps is the only telemetry sink (no Grafana/Jaeger/Loki). It stores
-  # metadata in TimescaleDB and the OTLP signals themselves in ClickHouse, so
-  # both come along. Neither database is published to the host; only the Temps
-  # API/UI (3000) and its public ingest listener (9000) are, on loopback.
-  temps-postgres:
-    image: docker.io/gotempsh/timescaledb-walg:pg18
-    container_name: hezarfen-temps-postgres
+  # OpenObserve is the only telemetry sink (no Grafana/Jaeger/Loki): one Rust
+  # binary, its own storage, no container socket and no sidecar databases. It
+  # speaks OTLP itself — HTTP on 5080 (also the UI and the search API), gRPC on
+  # 5081. Both are published on loopback only.
+  openobserve:
+    image: docker.io/openobserve/openobserve:v1.0.0-rc2
+    container_name: hezarfen-openobserve
     environment:
-      POSTGRES_DB: temps
-      POSTGRES_USER: temps
-      # Local-dev credential, same status as the root/root above. Never leaves
-      # the compose network — the port is not published.
-      POSTGRES_PASSWORD: temps_local_dev
-      TIMESCALEDB_TELEMETRY: off
-    volumes:
-      # Spilo/timescaledb-ha initialises its cluster here, not in the stock
-      # postgres image's /var/lib/postgresql/data. Mounting the wrong path
-      # loses everything on every recreation.
-      - temps-postgres-data:/home/postgres/pgdata/data
-    restart: unless-stopped
-    healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "PGPASSWORD=$$POSTGRES_PASSWORD psql -h 127.0.0.1 -U temps -d temps -tAc 'SELECT 1' | grep -qx 1",
-        ]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 30s
-
-  temps-clickhouse:
-    image: docker.io/clickhouse/clickhouse-server:26.7.5.10-alpine
-    container_name: hezarfen-temps-clickhouse
-    environment:
-      CLICKHOUSE_DB: temps
-      CLICKHOUSE_USER: temps
-      CLICKHOUSE_PASSWORD: temps_local_dev
-    volumes:
-      - temps-clickhouse-data:/var/lib/clickhouse
-    ulimits:
-      nofile:
-        soft: 262144
-        hard: 262144
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "clickhouse-client", "--user", "temps", "--database", "temps", "--query", "SELECT 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 20s
-
-  temps:
-    # Built locally from the pinned upstream artifact — see
-    # observability/Containerfile.temps for why the published image can't run.
-    build:
-      context: ./observability
-      dockerfile: Containerfile.temps
-    image: localhost/hezarfen-temps:0.1.0-nightly.20260906.48c2396e
-    container_name: hezarfen-temps
-    environment:
-      TEMPS_DATABASE_URL: postgresql://temps:temps_local_dev@temps-postgres:5432/temps
-      # UI + API on 3000, public ingest (OTLP among it) on 9000.
-      TEMPS_ADDRESS: 0.0.0.0:3000
-      TEMPS_CONSOLE_ADDRESS: 0.0.0.0:9000
-      TEMPS_DATA_DIR: /app/data
-      TEMPS_LOG_LEVEL: info
-      TEMPS_CLICKHOUSE_URL: http://temps-clickhouse:8123
-      TEMPS_CLICKHOUSE_DATABASE: temps
-      TEMPS_CLICKHOUSE_USER: temps
-      TEMPS_CLICKHOUSE_PASSWORD: temps_local_dev
-      # Signal retention. 90 is also Temps' own default (the spans table's
-      # `retention_days` column defaults to 90 and the TTL is derived from it),
-      # set here so the number is in the file rather than only in Temps' own
-      # settings row, which the console can change.
-      TEMPS_OTEL_RETENTION_DAYS: "90"
-      # First-boot admin, created once. The password is mounted from a file so
-      # it stays out of argv; change observability/temps-admin-password before
-      # this is reachable from anywhere but your machine.
-      TEMPS_ADMIN_EMAIL: admin@hezarfen.local
-      TEMPS_ADMIN_PASSWORD_FILE: /run/temps/admin_password
-      TEMPS_EXECUTION_ENV: docker
+      # First-boot root account, created once. Local-dev credentials, same
+      # status as the root/root above — change them before this is reachable
+      # from anywhere but your machine. OpenObserve enforces a password policy
+      # (8-128 chars, upper + lower + digit + special) and panics on boot
+      # otherwise, hence the shape of this one.
+      ZO_ROOT_USER_EMAIL: admin@hezarfen.local
+      ZO_ROOT_USER_PASSWORD: Hezarfen_dev1!
+      ZO_DATA_DIR: /data
+      # Retention is per stream in days; this is the global default applied to
+      # streams that don't override it (upstream default is 3650).
+      ZO_COMPACT_DATA_RETENTION_DAYS: "90"
     ports:
-      - "127.0.0.1:3000:3000"
-      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:5080:5080"
+      - "127.0.0.1:5081:5081"
     volumes:
-      - temps-data:/app/data
-      - ./observability/temps-admin-password:/run/temps/admin_password:ro
-      # Temps refuses to start its console (UI + OTLP ingest) without a
-      # container socket. Podman's API is Docker-compatible; start it with
-      # `systemctl --user start podman.socket`. Running as root inside the
-      # container is what makes the rootless socket readable (container root
-      # maps to your host user) — same reasoning as surrealdb above.
-      - ${XDG_RUNTIME_DIR:-/run/user/1000}/podman/podman.sock:/var/run/docker.sock
-    user: "0"
-    # SELinux blocks reading the podman socket from inside the container
-    # ("Permission denied", which Temps reports as "Socket not found").
-    # Relabelling the socket itself would break podman, so the label is
-    # dropped for this container only.
-    security_opt:
-      - label=disable
-    depends_on:
-      temps-postgres:
-        condition: service_healthy
-      temps-clickhouse:
-        condition: service_healthy
+      - openobserve-data:/data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:9000/readyz"]
+      # corner-cut: the image is distroless (only /openobserve, no shell and no
+      # HTTP client), so the container cannot probe its own /healthz. `node
+      # list` is the closest in-image liveness signal — it succeeds only once
+      # the node has registered itself in the cluster registry, which happens
+      # after the server starts. Ceiling: it does not prove the HTTP listener
+      # answers; from the host that is `curl -fsS http://127.0.0.1:5080/healthz`.
+      test: ["CMD", "/openobserve", "node", "list"]
       interval: 30s
       timeout: 5s
-      retries: 3
-      start_period: 40s
+      retries: 5
+      start_period: 10s
 
 volumes:
   hezarfen-data:
   surreal-data:
-  temps-postgres-data:
-  temps-clickhouse-data:
-  temps-data:
+  openobserve-data:
