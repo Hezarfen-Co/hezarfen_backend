@@ -18,12 +18,21 @@ use crate::constant::AI_API_ALLOWLIST;
 /// field, so a `?` here means the caller built the request wrong and the
 /// request is refused rather than silently matched on its prefix.
 pub fn path_allowed(path: &str) -> bool {
+    route_template(path).is_some()
+}
+
+/// The allowlist pattern this path matched — the route *template*
+/// (`/notes/{id}`), never the concrete path, which carries record ids. This is
+/// what the bridge puts on a span or a metric label; see [`crate::telemetry`]
+/// for why the concrete path may never leave the process.
+pub fn route_template(path: &str) -> Option<&'static str> {
     if !path.starts_with('/') || path.contains('?') {
-        return false;
+        return None;
     }
     AI_API_ALLOWLIST
         .iter()
-        .any(|pattern| pattern_matches(pattern, path))
+        .copied()
+        .find(|pattern| pattern_matches(pattern, path))
 }
 
 /// One `/`-separated pattern against one path. A literal segment must be
@@ -94,6 +103,17 @@ mod tests {
         assert!(!path_allowed("/notes//"));
         assert!(!path_allowed("//notes"));
         assert!(!path_allowed("/users//profile"));
+    }
+
+    #[test]
+    fn the_template_is_the_pattern_not_the_path() {
+        assert_eq!(route_template("/notes/note123"), Some("/notes/{id}"));
+        assert_eq!(route_template("/auth/me"), Some("/auth/me"));
+        assert_eq!(
+            route_template("/users/user456/profile"),
+            Some("/users/{id}/profile")
+        );
+        assert_eq!(route_template("/users"), None);
     }
 
     #[test]
