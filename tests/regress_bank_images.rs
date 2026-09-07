@@ -56,6 +56,7 @@ async fn mem_app() -> (Router, Database, TempDir) {
         board_hub: Default::default(),
         db_up: Default::default(),
         ai: None,
+        metrics: hezarfen_backend::telemetry::Metrics::noop(),
     });
     (app, db, files)
 }

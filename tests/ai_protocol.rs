@@ -972,6 +972,7 @@ async fn a_chat_request_names_the_askers_school_role() {
         board_hub: Default::default(),
         db_up: Default::default(),
         ai: Some(bridge.clone()),
+        metrics: hezarfen_backend::telemetry::Metrics::noop(),
     });
     let cookie = common::login_as(&app, &db, "veli", "teacher").await;
     let res = common::send(

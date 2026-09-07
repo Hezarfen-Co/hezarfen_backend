@@ -50,6 +50,7 @@ async fn spawn_server_with_ai(ai: Option<hezarfen_backend::ai::AiBridge>) -> (St
         board_hub: Default::default(),
         db_up: Default::default(),
         ai,
+        metrics: hezarfen_backend::telemetry::Metrics::noop(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

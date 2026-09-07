@@ -8,18 +8,20 @@ pub mod migration_sql;
 pub mod module;
 pub mod rate_limit;
 pub mod state;
+pub mod telemetry;
 pub mod tenant;
 pub mod validate;
 pub mod web;
 
-use axum::extract::Request;
-use axum::http::{HeaderValue, Method, header};
+use axum::extract::{MatchedPath, Request};
+use axum::http::{HeaderName, HeaderValue, Method, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::json;
 use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
 use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
 use utoipa::{Modify, OpenApi};
@@ -31,6 +33,7 @@ use crate::error::AppError;
 use crate::module::Module;
 use crate::rate_limit::RateLimiter;
 use crate::state::AppState;
+use crate::telemetry::SchoolSlot;
 use crate::web::module_gate::gate;
 
 /// Top-level OpenAPI document. Per-path operations and schemas are collected
@@ -219,6 +222,7 @@ pub fn build_router(state: AppState) -> Router {
         .share("chatbot", state.db.clone(), state.db_up.clone());
 
     let db_up = state.db_up.clone();
+    let metrics = state.metrics.clone();
 
     let cors_allowlist = cors_allowlist_from_env();
     if state.cookie_secure && cors_allowlist.is_empty() {
@@ -260,7 +264,104 @@ pub fn build_router(state: AppState) -> Router {
             async move { limiter.enforce(req, next).await }
         }))
         .layer(cors_layer(cors_allowlist))
-        .layer(TraceLayer::new_for_http())
+        // Request duration and in-flight count. Sits inside the trace layer so
+        // it measures the same request the span describes, and outside CORS so
+        // a preflight is counted like anything else.
+        .layer(middleware::from_fn(move |req: Request, next: Next| {
+            let metrics = metrics.clone();
+            async move { measure(metrics, req, next).await }
+        }))
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(request_span)
+                .on_request(())
+                .on_response(record_response)
+                .on_failure(tower_http::trace::DefaultOnFailure::new().level(tracing::Level::WARN)),
+        )
+        // Copy the id onto the response, so a caller reporting a problem can
+        // name the exact request without us needing their IP or their URL.
+        .layer(PropagateRequestIdLayer::new(HeaderName::from_static(
+            REQUEST_ID_HEADER,
+        )))
+        // Outermost: every request has an id from here inward, its own or ours.
+        .layer(SetRequestIdLayer::new(
+            HeaderName::from_static(REQUEST_ID_HEADER),
+            MakeRequestUuid,
+        ))
+}
+
+/// The header carrying the per-request id, in and out.
+const REQUEST_ID_HEADER: &str = "x-request-id";
+
+/// The span every request gets.
+///
+/// Deliberately *not* on it: the URL path (it carries record ids), the client
+/// address, the user agent, any header or cookie, and anything about who is
+/// calling. The route template and the method are what a builder needs to see
+/// which endpoint is slow; see [`crate::telemetry`] for the rule.
+fn request_span(req: &Request<axum::body::Body>) -> tracing::Span {
+    let method = req.method().as_str();
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map_or("unmatched", MatchedPath::as_str);
+    let request_id = req
+        .headers()
+        .get(REQUEST_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    tracing::info_span!(
+        "http.request",
+        // Consumed by the OpenTelemetry layer, not exported as attributes:
+        // this is how a span gets a name computed at runtime.
+        otel.name = %format_args!("{method} {route}"),
+        otel.kind = "server",
+        otel.status_code = tracing::field::Empty,
+        http.request.method = %method,
+        http.route = %route,
+        http.request.id = %request_id,
+        // Filled in by `web::tenant_state::resolve_tenant` once the cookie has
+        // named a school; a builder request has none and leaves it empty.
+        school = tracing::field::Empty,
+        http.response.status_code = tracing::field::Empty,
+        error.type = tracing::field::Empty,
+    )
+}
+
+/// Stamp the outcome onto the request span. A `5xx` is our fault, so it also
+/// marks the span itself as failed; a `4xx` is the caller's and does not.
+fn record_response<B>(res: &Response<B>, _latency: std::time::Duration, span: &tracing::Span) {
+    let status = res.status();
+    span.record("http.response.status_code", status.as_u16());
+    if status.is_server_error() {
+        span.record("otel.status_code", "ERROR");
+        span.record("error.type", status.as_str());
+    }
+}
+
+/// Count the request in and out and record its duration. The school slug is
+/// the only caller-derived attribute, and it is only known after the handler's
+/// extractor filled the slot (see [`SchoolSlot`]).
+async fn measure(metrics: crate::telemetry::Metrics, mut req: Request, next: Next) -> Response {
+    let method = req.method().as_str().to_owned();
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map_or("unmatched", MatchedPath::as_str)
+        .to_owned();
+    let school = SchoolSlot::default();
+    req.extensions_mut().insert(school.clone());
+    metrics.request_started(&method);
+    let started = std::time::Instant::now();
+    let res = next.run(req).await;
+    metrics.request_finished(
+        &method,
+        &route,
+        res.status().as_u16(),
+        school.get(),
+        started.elapsed(),
+    );
+    res
 }
 
 /// Refuse work the database cannot currently do, and cap how long any request

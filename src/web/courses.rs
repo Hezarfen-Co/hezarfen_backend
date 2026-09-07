@@ -1442,6 +1442,7 @@ mod tests {
             board_hub: Default::default(),
             db_up: Default::default(),
             ai: None,
+            metrics: crate::telemetry::Metrics::noop(),
         };
 
         let (status, Json(session)) = create_session_in_course(

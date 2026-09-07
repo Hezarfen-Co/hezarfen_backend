@@ -131,6 +131,7 @@ async fn app_parts(ai: Option<AiBridge>, db_up: DbHealth) -> (Router, Database, 
         board_hub: Default::default(),
         db_up,
         ai,
+        metrics: hezarfen_backend::telemetry::Metrics::noop(),
     });
     (app, db, tenants)
 }
@@ -684,6 +685,7 @@ pub async fn remote_deployment(schools: &[(&str, &str)]) -> Option<RemoteDeploym
         board_hub: Default::default(),
         db_up: Default::default(),
         ai: None,
+        metrics: hezarfen_backend::telemetry::Metrics::noop(),
     });
     Some(RemoteDeployment {
         app,

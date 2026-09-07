@@ -42,6 +42,7 @@ async fn reboot(db: &Database) -> Router {
         board_hub: Default::default(),
         db_up: Default::default(),
         ai: None,
+        metrics: hezarfen_backend::telemetry::Metrics::noop(),
     })
 }
 
@@ -2601,6 +2602,7 @@ async fn probe_an_unknown_stored_module_name_is_ignored() {
         board_hub: Default::default(),
         db_up: Default::default(),
         ai: None,
+        metrics: hezarfen_backend::telemetry::Metrics::noop(),
     });
     let creds = json!({ "school": "weird", "username": "ada", "password": "secret1" });
     let reg = send(&app, "POST", "/auth/register", None, Some(creds.clone())).await;

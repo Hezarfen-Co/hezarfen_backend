@@ -32,6 +32,7 @@ async fn app_with(rate_limit: RateLimitConfig) -> Router {
         board_hub: Default::default(),
         db_up: Default::default(),
         ai: None,
+        metrics: hezarfen_backend::telemetry::Metrics::noop(),
     })
 }
 
@@ -547,6 +548,7 @@ async fn spawn_server(rate_limit: RateLimitConfig) -> String {
         board_hub: Default::default(),
         db_up: Default::default(),
         ai: None,
+        metrics: hezarfen_backend::telemetry::Metrics::noop(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
