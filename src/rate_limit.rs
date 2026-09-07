@@ -80,7 +80,7 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use axum::extract::{ConnectInfo, Request};
@@ -100,6 +100,7 @@ use crate::database::Database;
 use crate::domain::timestamp::Timestamp;
 use crate::error::AppError;
 use crate::state::DbHealth;
+use crate::telemetry::Metrics;
 
 /// Per-IP rate-limit knobs, sourced from the environment (see `.env.example`) and
 /// carried in [`crate::state::AppState`]. A `0` limit disables that tier.
@@ -136,6 +137,12 @@ pub struct RateLimiter<K = IpAddr> {
     /// Only meaningful for the IP tiers; the keyed tiers never look at it.
     trust_proxy: bool,
     buckets: Arc<Mutex<HashMap<K, Bucket>>>,
+    /// What this tier is called in telemetry (`api`, `auth`, `chatbot`,
+    /// `builder`). Named by [`RateLimiter::share`], which is where the tier's
+    /// name already lives — the constructors take a number and nothing else,
+    /// and every tier the router builds is shared. Shared with the clones, so
+    /// the middleware's clone sees the name too.
+    tier: Arc<OnceLock<&'static str>>,
     /// The single bucket every client shares once the map is saturated and no
     /// eviction is allowed (see the module docs). Local only: it is keyless, so
     /// it is never synced to the shared table.
@@ -191,6 +198,21 @@ impl Bucket {
 }
 
 impl<K> RateLimiter<K> {
+    /// This tier's telemetry name, or `unnamed` for a limiter nobody shared
+    /// (tests build those; the router shares every tier it wires).
+    fn tier(&self) -> &'static str {
+        self.tier.get().copied().unwrap_or("unnamed")
+    }
+
+    /// One refusal, counted for the operator. Deliberately *only* a counter:
+    /// a log line per rejection is a flood amplifier, and the only fields
+    /// worth having (who, from where) are the ones telemetry may not carry.
+    fn count_rejection(&self) {
+        Metrics::global()
+            .rate_limit_rejections_total
+            .add(1, &[opentelemetry::KeyValue::new("tier", self.tier())]);
+    }
+
     /// Requests allowed per window, `0` meaning the tier is off. Read by
     /// `GET /limits` so a client learns its own budget instead of discovering
     /// it by getting a `429`.
@@ -223,7 +245,7 @@ impl UserRateLimiter {
     /// once the user is over the cap. The handler-side twin of [`RateLimiter::enforce`].
     pub fn enforce_user(&self, user_id: &str) -> Result<(), AppError> {
         self.check(user_id.to_string()).map_err(|retry_after_secs| {
-            tracing::warn!(%user_id, retry_after_secs, "per-user rate limit exceeded");
+            tracing::warn!(retry_after_secs, "per-user rate limit exceeded");
             AppError::TooManyRequests { retry_after_secs }
         })
     }
@@ -243,7 +265,7 @@ impl RateLimiter<IpAddr> {
         match self.check(ip) {
             Ok(()) => Ok(next.run(req).await),
             Err(retry_after_secs) => {
-                tracing::warn!(%ip, retry_after_secs, "rate limit exceeded");
+                tracing::warn!(retry_after_secs, "rate limit exceeded");
                 Err(AppError::TooManyRequests { retry_after_secs })
             }
         }
@@ -258,6 +280,7 @@ impl<K: Eq + Hash> RateLimiter<K> {
             window: Duration::from_secs(60),
             trust_proxy,
             buckets: Arc::new(Mutex::new(HashMap::new())),
+            tier: Arc::new(OnceLock::new()),
             overflow: Arc::new(Mutex::new(Bucket::opened_at(Instant::now()))),
         }
     }
@@ -278,9 +301,16 @@ impl<K: Eq + Hash> RateLimiter<K> {
         Err((remaining.as_secs_f64().ceil() as u64).max(1))
     }
 
+    /// [`RateLimiter::check_key`], counting whatever it refuses. Every tier's
+    /// rejections pass through here — both `enforce` paths and the overflow
+    /// budget — so the counter cannot miss one.
+    fn check(&self, key: K) -> Result<(), u64> {
+        self.check_key(key).inspect_err(|_| self.count_rejection())
+    }
+
     /// Count one request from `key`. `Err` carries the whole seconds (rounded
     /// up, at least 1) until the window resets — the `Retry-After` value.
-    fn check(&self, key: K) -> Result<(), u64> {
+    fn check_key(&self, key: K) -> Result<(), u64> {
         if self.max == 0 {
             return Ok(());
         }
@@ -426,6 +456,9 @@ where
         db_up: DbHealth,
         pinned: Option<i64>,
     ) {
+        // Before the early return: a disabled tier still wants its name, so a
+        // limiter turned on later reports under it.
+        let _ = self.tier.set(tier);
         if self.max == 0 {
             // The tier is off: `check` records nothing, so there is nothing to
             // share and no reason to hold a task or a table row.
@@ -533,7 +566,7 @@ async fn sync_once<K: Eq + Hash + Clone + std::fmt::Display>(
     let mut response = match with_deadline(query).await {
         Ok(response) => response,
         Err(err) => {
-            tracing::warn!(%err, "rate-limit sync failed; counting locally until it recovers");
+            tracing::warn!(%err, tier, "rate-limit sync failed; counting locally until it recovers");
             return;
         }
     };

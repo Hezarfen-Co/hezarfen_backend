@@ -164,7 +164,13 @@ impl Metrics {
     /// Declare every instrument against the global meter provider — the noop
     /// one unless [`init`] installed an OTLP pipeline first.
     pub fn new() -> Self {
-        let meter = global::meter(SCOPE);
+        Self::from_meter(global::meter(SCOPE))
+    }
+
+    /// The same instruments against a caller-supplied meter. Exists for tests
+    /// that want to read their own recordings back without claiming the
+    /// process-global meter provider, which the whole test binary shares.
+    pub fn from_meter(meter: opentelemetry::metrics::Meter) -> Self {
         Self {
             http_server_request_duration: meter
                 .f64_histogram("http.server.request.duration")
@@ -235,14 +241,17 @@ impl Metrics {
         Self::new()
     }
 
-    /// The process's instruments, for the few call sites that have no
-    /// `AppState` to read them from — [`crate::error::AppError::into_response`]
-    /// (axum hands it nothing) and the panic hook (which runs outside any
-    /// request). [`init`] publishes the real handle here; before that, and in
-    /// tests, this builds a noop one against the noop meter provider, so
-    /// recording is always safe.
+    /// The process's instruments, for the call sites that exist before (or
+    /// outside) [`crate::state::AppState`] — the rate limiter, built while the
+    /// state is still being assembled, the keepalive task and the tenant cache.
+    ///
+    /// [`init`] publishes the handle it built; before that (every test suite,
+    /// which never calls `init`) each call declares instruments against
+    /// whatever meter provider is installed, so a test that installs its own
+    /// provider first still sees what these call sites record. Only reached on
+    /// a rejection or a cache change, never per request.
     pub fn global() -> Self {
-        GLOBAL.get_or_init(Self::new).clone()
+        GLOBAL.get().cloned().unwrap_or_else(Self::new)
     }
 
     /// Count one request in; the returned guard value must be handed back to
