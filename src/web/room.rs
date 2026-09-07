@@ -29,18 +29,52 @@ use axum::extract::ws::{Message, Utf8Bytes, WebSocket};
 use serde_json::{Value, json};
 
 use crate::error::AppError;
+use crate::telemetry::Metrics;
 
-/// Errors that end a room: the peer went away, or the room reached a terminal
-/// state and its closing frame was sent.
-pub(crate) struct RoomClosed;
+/// Counts one open socket for as long as it lives.
+///
+/// A room has several ways out — a break out of the `select!`, an early
+/// return, a panic — and a decrement written at any one of them is a leaked
+/// gauge at the others, drifting upwards for the process's whole life. `Drop`
+/// is the only placement that covers every exit, so the guard is created at
+/// the top of a room loop and nothing else touches the counter.
+pub(crate) struct Connected {
+    metrics: Metrics,
+    kind: &'static str,
+    school: String,
+    id: String,
+}
 
-/// Send one JSON frame. A failed send means the peer is gone, which ends the
-/// room — every caller propagates it with `?`.
-pub(crate) async fn send(socket: &mut WebSocket, frame: Value) -> Result<(), RoomClosed> {
-    socket
-        .send(Message::Text(frame.to_string().into()))
-        .await
-        .map_err(|_| RoomClosed)
+impl Connected {
+    /// `kind` is the room's telemetry name (`exam_room`, `board`), `id` a
+    /// **resource** id — the exam, the board — and never the person on the
+    /// socket, which telemetry may not carry.
+    pub(crate) fn open(metrics: &Metrics, kind: &'static str, school: &str, id: &str) -> Self {
+        metrics
+            .ws_connections
+            .add(1, &[opentelemetry::KeyValue::new("kind", kind)]);
+        tracing::info!(kind, school, id, "websocket opened");
+        Self {
+            metrics: metrics.clone(),
+            kind,
+            school: school.to_string(),
+            id: id.to_string(),
+        }
+    }
+}
+
+impl Drop for Connected {
+    fn drop(&mut self) {
+        self.metrics
+            .ws_connections
+            .add(-1, &[opentelemetry::KeyValue::new("kind", self.kind)]);
+        tracing::info!(
+            kind = self.kind,
+            school = self.school,
+            id = self.id,
+            "websocket closed"
+        );
+    }
 }
 
 /// The best-effort closing handshake a room ends with — a bare TCP teardown
@@ -108,5 +142,74 @@ pub(crate) fn public_message(err: &AppError, room: &str) -> String {
             tracing::error!("{room} error: {err}");
             "internal server error".to_string()
         }
+    }
+}
+
+/// Errors that end a room: the peer went away, or the room reached a terminal
+/// state and its closing frame was sent.
+pub(crate) struct RoomClosed;
+
+/// Send one JSON frame. A failed send means the peer is gone, which ends the
+/// room — every caller propagates it with `?`.
+pub(crate) async fn send(socket: &mut WebSocket, frame: Value) -> Result<(), RoomClosed> {
+    socket
+        .send(Message::Text(frame.to_string().into()))
+        .await
+        .map_err(|_| RoomClosed)
+}
+
+#[cfg(test)]
+mod tests {
+    use opentelemetry::metrics::MeterProvider as _;
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+    use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
+
+    use super::Connected;
+    use crate::telemetry::Metrics;
+
+    /// The guard is the whole reason the gauge balances: every exit from a
+    /// room drops it, including the ones that never reach the loop's end. Read
+    /// back through a meter of this test's own, so the assertion is about what
+    /// was really recorded and no other test in this binary can perturb it.
+    #[test]
+    fn every_open_socket_is_counted_out_again() {
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_reader(PeriodicReader::builder(exporter.clone()).build())
+            .build();
+        let metrics = Metrics::from_meter(provider.meter("test"));
+
+        let guard = Connected::open(&metrics, "exam_room", "demo", "exam_abc");
+        drop(guard);
+        provider.force_flush().expect("flush");
+
+        let mut sum_value = None;
+        for rm in exporter.get_finished_metrics().expect("metrics") {
+            for scope in rm.scope_metrics() {
+                for metric in scope.metrics() {
+                    if metric.name() != "ws_connections" {
+                        continue;
+                    }
+                    let AggregatedMetrics::I64(MetricData::Sum(sum)) = metric.data() else {
+                        panic!("an up-down counter must export as an i64 sum");
+                    };
+                    for point in sum.data_points() {
+                        assert!(
+                            point
+                                .attributes()
+                                .any(|kv| kv.key.as_str() == "kind"
+                                    && kv.value.as_str() == "exam_room"),
+                            "the only series here is the exam room's"
+                        );
+                        sum_value = Some(point.value());
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            sum_value,
+            Some(0),
+            "a socket opened and dropped leaves the gauge where it started"
+        );
     }
 }

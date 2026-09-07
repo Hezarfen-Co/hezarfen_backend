@@ -149,6 +149,7 @@ async fn room(mut socket: WebSocket, st: AppState, slug: Slug, board: BoardId, u
     // lands between a replay's read and this subscribe would otherwise be lost
     // outright, whereas one delivered twice is deduplicated by its id at the
     // client (which a resync forces anyway).
+    let _connected = room::Connected::open(&st.metrics, "board", slug.as_str(), board.key());
     let mut feed = st.board_hub.subscribe(&slug, board.key());
     // The ids this socket drew, in the order they were published. The hub has
     // no idea who is listening, so the room filters its own strokes back out

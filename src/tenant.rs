@@ -34,6 +34,7 @@ use crate::domain::page::PagedList;
 use crate::domain::timestamp::Timestamp;
 use crate::error::{AppError, ValidationError};
 use crate::module::ModuleSet;
+use crate::telemetry::Metrics;
 use crate::web::tenant_state::ResolvedTenant;
 
 pub(crate) const SCHOOL_TABLE: &str = "school";
@@ -538,10 +539,14 @@ impl Tenants {
     }
 
     fn forget(&self, slug: &Slug) {
-        self.cache
-            .write()
-            .expect("tenant cache lock")
-            .remove(slug.as_str());
+        let (removed, size) = {
+            let mut cache = self.cache.write().expect("tenant cache lock");
+            (cache.remove(slug.as_str()).is_some(), cache.len())
+        };
+        if removed {
+            tracing::info!(school = %slug, "tenant connection evicted");
+            Self::report_size(size);
+        }
     }
 
     /// The cached handle, or a freshly dialled one.
@@ -562,13 +567,21 @@ impl Tenants {
         }
         // Losing the race here is harmless — both handles are equivalent — but
         // the winner is kept so two requests never diverge onto two sessions.
-        Ok(self
-            .cache
-            .write()
-            .expect("tenant cache lock")
-            .entry(slug.as_str().to_string())
-            .or_insert(db)
-            .clone())
+        let (db, size) = {
+            let mut cache = self.cache.write().expect("tenant cache lock");
+            let db = cache.entry(slug.as_str().to_string()).or_insert(db).clone();
+            (db, cache.len())
+        };
+        tracing::info!(school = %slug, "tenant connection opened");
+        Self::report_size(size);
+        Ok(db)
+    }
+
+    /// Publish how many schools the cache holds. Called after every insert and
+    /// every eviction, which are the only two things that move it — a gauge
+    /// sampled anywhere else would report a number nobody can act on.
+    fn report_size(size: usize) {
+        Metrics::global().tenant_cache_size.record(size as u64, &[]);
     }
 
     /// One new connection, pinned to `slug`'s database for its lifetime.
