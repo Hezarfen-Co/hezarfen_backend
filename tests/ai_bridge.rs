@@ -867,6 +867,7 @@ async fn fetch_certificate(ai: Option<AiBridge>) -> (axum::http::StatusCode, Val
         board_hub: Default::default(),
         db_up: Default::default(),
         ai,
+        metrics: hezarfen_backend::telemetry::Metrics::noop(),
     });
     let response = app
         .oneshot(
@@ -1000,6 +1001,7 @@ async fn chat_app(bridge: &AiBridge) -> (Router, Database) {
         board_hub: Default::default(),
         db_up: Default::default(),
         ai: Some(bridge.clone()),
+        metrics: hezarfen_backend::telemetry::Metrics::noop(),
     });
     (app, db)
 }

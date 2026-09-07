@@ -47,6 +47,10 @@ pub struct AppState {
     /// — handlers must degrade rather than fail, since the core API has never
     /// needed the bridge to work.
     pub ai: Option<AiBridge>,
+    /// The process's metric instruments (see [`crate::telemetry::Metrics`]).
+    /// Noop unless `OTEL_EXPORTER_OTLP_ENDPOINT` configured an exporter, so
+    /// recording into one is always safe and always cheap.
+    pub metrics: crate::telemetry::Metrics,
 }
 
 /// Last known state of the database WebSocket, published by the keepalive task

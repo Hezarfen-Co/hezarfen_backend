@@ -38,6 +38,7 @@ async fn spec() -> Value {
         board_hub: Default::default(),
         db_up: Default::default(),
         ai: None,
+        metrics: hezarfen_backend::telemetry::Metrics::noop(),
     });
     let res = app
         .oneshot(

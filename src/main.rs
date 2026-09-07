@@ -8,12 +8,18 @@ use hezarfen_backend::{build_router, database};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,hezarfen_backend=debug".into()),
-        )
-        .init();
+    let telemetry_cfg = hezarfen_backend::config::telemetry_from_env()?;
+    // Held until after graceful shutdown: dropping the guard flushes whatever
+    // the exporters still have buffered.
+    let (_telemetry, metrics) = hezarfen_backend::telemetry::init(&telemetry_cfg)?;
+    match telemetry_cfg.otlp_endpoint.as_deref() {
+        Some(endpoint) => {
+            tracing::info!("exporting OpenTelemetry traces/metrics/logs to {endpoint}")
+        }
+        None => tracing::info!(
+            "OpenTelemetry export is off (set OTEL_EXPORTER_OTLP_ENDPOINT to turn it on)"
+        ),
+    }
 
     let cfg = Config::from_env();
     // Hash the login decoy now, so the first unknown-username login is not the
@@ -42,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
         board_hub: Default::default(),
         db_up,
         ai,
+        metrics,
     });
 
     let addr = format!("{}:{}", cfg.host, cfg.port);

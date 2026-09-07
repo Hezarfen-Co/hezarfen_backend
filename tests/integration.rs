@@ -176,6 +176,7 @@ async fn limits_still_answers_while_the_database_is_down() {
         board_hub: Default::default(),
         db_up: db_up.clone(),
         ai: None,
+        metrics: hezarfen_backend::telemetry::Metrics::noop(),
     });
     db_up.set(false);
 
@@ -6536,6 +6537,7 @@ async fn session_cookie_secure_attribute_follows_config() {
         board_hub: Default::default(),
         db_up: Default::default(),
         ai: None,
+        metrics: hezarfen_backend::telemetry::Metrics::noop(),
     });
     let secure = login_set_cookie(&app).await;
     assert!(
@@ -6577,6 +6579,7 @@ async fn db_down_refuses_before_touching_the_database() {
         board_hub: Default::default(),
         db_up: db_up.clone(),
         ai: None,
+        metrics: hezarfen_backend::telemetry::Metrics::noop(),
     });
 
     // Healthy: a login against the seeded user reaches the handler as usual.
@@ -16516,6 +16519,7 @@ async fn chat_app_limited(
         board_hub: Default::default(),
         db_up: Default::default(),
         ai,
+        metrics: hezarfen_backend::telemetry::Metrics::noop(),
     });
     (app, db)
 }

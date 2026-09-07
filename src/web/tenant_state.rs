@@ -93,6 +93,13 @@ where
 
     let app = AppState::from_ref(state);
     let resolved = app.tenants.resolve(&slug).await?;
+    // The one caller-derived label telemetry is allowed to carry: which school,
+    // never which user. The span field and the metric slot are set together so
+    // a trace and its latency sample agree.
+    tracing::Span::current().record("school", slug.as_str());
+    if let Some(slot) = parts.extensions.get::<crate::telemetry::SchoolSlot>() {
+        slot.set(slug.as_str());
+    }
     // Memoized on the request, not just returned: the next extractor on this
     // same request (and the module gate ahead of both) reuses this verdict
     // instead of re-reading the registry row.
@@ -238,6 +245,7 @@ mod tests {
             board_hub: Default::default(),
             db_up: Default::default(),
             ai: None,
+            metrics: crate::telemetry::Metrics::noop(),
         };
         let app = Router::new()
             .route("/school", get(school_surface))
@@ -349,6 +357,7 @@ mod tests {
             board_hub: Default::default(),
             db_up: Default::default(),
             ai: None,
+            metrics: crate::telemetry::Metrics::noop(),
         };
         let request = Request::builder()
             .uri("/school")

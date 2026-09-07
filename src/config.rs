@@ -5,6 +5,7 @@ use crate::constant::{
     DEFAULT_AUTH_RATE_LIMIT, DEFAULT_CHATBOT_RATE_LIMIT,
 };
 use crate::rate_limit::RateLimitConfig;
+use crate::telemetry::{LogFormat, TelemetryConfig, TelemetryError};
 
 /// Runtime configuration, sourced from environment variables (see `.env.example`).
 #[derive(Clone, Debug)]
@@ -97,6 +98,24 @@ impl Config {
             ),
         }
     }
+}
+
+/// Telemetry settings, read before [`Config::from_env`] because the logger has
+/// to exist before anything else can complain.
+///
+/// Only two variables are ours. Endpoint, headers, protocol, sampler and
+/// service name are read by the OpenTelemetry SDK from its own standard
+/// variables (documented in `.env.example`) — parsing them here would create a
+/// second source of truth that could disagree with the exporter.
+///
+/// Fallible where the rest of the config is not: a `LOG_FORMAT` we do not
+/// render is worth refusing to boot over, since the operator would otherwise
+/// discover it when they came looking for logs they never got.
+pub fn telemetry_from_env() -> Result<TelemetryConfig, TelemetryError> {
+    Ok(TelemetryConfig {
+        otlp_endpoint: parse_optional(env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok()),
+        log_format: LogFormat::parse(env::var("LOG_FORMAT").ok())?,
+    })
 }
 
 /// Treat an unset or blank variable as absent.
