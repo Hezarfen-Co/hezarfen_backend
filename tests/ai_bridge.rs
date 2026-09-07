@@ -2593,25 +2593,6 @@ async fn a_blob_read_is_refused_module_disabled_when_the_school_has_no_chatbot()
 
 // ------------------------------------------------------------- telemetry --
 
-/// Attribute keys telemetry may never leave the process with — the list
-/// `tests/telemetry.rs` fixes for the HTTP edge, applied to the bridge's own
-/// spans. A prompt, a message or a user id showing up here is the failure this
-/// guards against.
-const FORBIDDEN: &[&str] = &[
-    "url.path",
-    "url.full",
-    "url.query",
-    "client.address",
-    "network.peer.address",
-    "user_agent.original",
-    "user.id",
-    "user.name",
-    "enduser.id",
-    "cookie",
-    "http.request.body",
-    "http.response.body",
-];
-
 /// The bridge's own observability, asserted end to end over real QUIC: one
 /// dispatched request must produce an `ai.request` span naming the capability
 /// and nothing about the caller, and one refused handshake must reach the
@@ -2708,7 +2689,7 @@ async fn a_dispatch_is_traced_by_capability_and_a_refused_handshake_is_counted()
     for span in &spans {
         for (key, _) in attrs_of(span) {
             assert!(
-                !FORBIDDEN.contains(&key.as_str()),
+                !common::is_forbidden_key(&key),
                 "span {:?} carries {key:?}, which may never leave this process",
                 span.name
             );

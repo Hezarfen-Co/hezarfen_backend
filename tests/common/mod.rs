@@ -13,6 +13,7 @@ use hezarfen_backend::database::Database;
 use hezarfen_backend::module::ModuleSet;
 use hezarfen_backend::rate_limit::RateLimitConfig;
 use hezarfen_backend::state::{AppState, DbHealth};
+use hezarfen_backend::telemetry::Metrics;
 use hezarfen_backend::tenant::{DEMO_SLUG, Slug, Tenants};
 use hezarfen_backend::{build_router, database};
 use serde_json::{Value, json};
@@ -48,7 +49,7 @@ pub async fn app_and_db() -> (Router, Database) {
 /// [`app_and_db`] plus the registry behind it, for the suites whose subject is
 /// tenancy itself (a second school, a suspension, the builder surface).
 pub async fn app_and_tenants() -> (Router, Database, Tenants) {
-    let (app, db, tenants) = app_parts(None, Default::default()).await;
+    let (app, db, tenants) = app_parts(None, Default::default(), Metrics::noop()).await;
     (app, db, tenants)
 }
 
@@ -98,14 +99,14 @@ pub async fn app_with_ai(ai: Option<AiBridge>) -> (Router, Database) {
 /// [`app_with_ai`] plus the registry behind it, for the suites whose subject is
 /// an AI service reading *across* schools.
 pub async fn app_with_ai_tenants(ai: Option<AiBridge>) -> (Router, Database, Tenants) {
-    app_parts(ai, Default::default()).await
+    app_parts(ai, Default::default(), Metrics::noop()).await
 }
 
 /// [`app_with_ai`] with the liveness flag handed in, so a test can take the
 /// database socket down under a running app — the api-read path re-checks it in
 /// place of the HTTP db guard it bypasses.
 pub async fn app_with_ai_health(ai: Option<AiBridge>, db_up: DbHealth) -> (Router, Database) {
-    let (app, db, _) = app_parts(ai, db_up).await;
+    let (app, db, _) = app_parts(ai, db_up, Metrics::noop()).await;
     (app, db)
 }
 
@@ -113,7 +114,11 @@ pub async fn app_with_ai_health(ai: Option<AiBridge>, db_up: DbHealth) -> (Route
 /// school), a router over it, and the demo school's handle — which is what
 /// every suite means by "the database", since that is where users and rows
 /// live.
-async fn app_parts(ai: Option<AiBridge>, db_up: DbHealth) -> (Router, Database, Tenants) {
+async fn app_parts(
+    ai: Option<AiBridge>,
+    db_up: DbHealth,
+    metrics: hezarfen_backend::telemetry::Metrics,
+) -> (Router, Database, Tenants) {
     let tenants = database::init_mem_tenants()
         .await
         .expect("in-memory deployment");
@@ -131,9 +136,48 @@ async fn app_parts(ai: Option<AiBridge>, db_up: DbHealth) -> (Router, Database, 
         board_hub: Default::default(),
         db_up,
         ai,
-        metrics: hezarfen_backend::telemetry::Metrics::noop(),
+        metrics,
     });
     (app, db, tenants)
+}
+
+/// The same router with the caller's instruments, so a test can read back what
+/// the HTTP edge recorded without touching the process-global meter provider.
+pub async fn app_with_metrics(metrics: Metrics) -> (Router, Database) {
+    let (app, db, _) = app_parts(None, Default::default(), metrics).await;
+    (app, db)
+}
+
+/// Attribute keys that would carry personal data out of the process. KVKK
+/// analysis fixed this list: telemetry names the school and the route, never
+/// the person, their address, or what they sent. Shared so the HTTP edge
+/// (`telemetry.rs`) and the AI bridge (`ai_bridge.rs`) are held to one list.
+///
+/// `server.address` is deliberately absent: that is our own bind address, not
+/// a caller's.
+pub const FORBIDDEN_TELEMETRY_KEYS: &[&str] = &[
+    "url.path",
+    "url.full",
+    "url.query",
+    "client.address",
+    "network.peer.address",
+    "user_agent.original",
+    "user.id",
+    "user.name",
+    "username",
+    "email",
+    "enduser.id",
+    "cookie",
+    "http.request.body",
+    "http.response.body",
+];
+
+/// [`FORBIDDEN_TELEMETRY_KEYS`] plus the two header prefixes — any captured
+/// request or response header is personal data by default.
+pub fn is_forbidden_key(key: &str) -> bool {
+    FORBIDDEN_TELEMETRY_KEYS.contains(&key)
+        || key.starts_with("http.request.header.")
+        || key.starts_with("http.response.header.")
 }
 
 /// A router backed by a fresh in-memory database.
@@ -685,7 +729,7 @@ pub async fn remote_deployment(schools: &[(&str, &str)]) -> Option<RemoteDeploym
         board_hub: Default::default(),
         db_up: Default::default(),
         ai: None,
-        metrics: hezarfen_backend::telemetry::Metrics::noop(),
+        metrics: Metrics::noop(),
     });
     Some(RemoteDeployment {
         app,

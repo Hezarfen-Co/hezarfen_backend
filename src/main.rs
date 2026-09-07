@@ -115,6 +115,10 @@ fn keepalive(db: Database, health: DbHealth) {
             health.set(up);
             metrics.db_up.record(u64::from(up), &[]);
             match (was_up, up) {
+                // The first verdict announces itself either way, so an operator
+                // reading the log can tell "healthy since boot" from "we never
+                // logged anything yet".
+                (None, true) => tracing::info!(db_up = true, "database reachable"),
                 (Some(true) | None, false) => {
                     down_since = Some(started);
                     tracing::warn!("database is down: the keepalive ping did not answer");

@@ -108,10 +108,9 @@ impl Builder {
             .content(builder.clone())
             .await?;
         created.ok_or_else(|| AppError::Internal("failed to create the builder account".into()))?;
-        tracing::info!(
-            username = builder.username.as_str(),
-            "seeded builder account"
-        );
+        // The account name stays out of the event: exported log records must
+        // name no person (see `telemetry`).
+        tracing::info!("seeded the builder account named by BUILDER_USERNAME");
         Ok(())
     }
 }
