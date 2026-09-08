@@ -175,10 +175,8 @@ impl BoardStroke {
         let guard = format!("{BOARD_OPEN_GUARD} AND epoch = {epoch}");
         match cap::claim_two_when_and_create(
             &board.record(),
-            BOARD_EPOCH_STROKE_COUNT_FIELD,
-            MAX_EPOCH_STROKES,
-            BOARD_TOTAL_STROKE_COUNT_FIELD,
-            MAX_BOARD_STROKES,
+            (BOARD_EPOCH_STROKE_COUNT_FIELD, MAX_EPOCH_STROKES),
+            (BOARD_TOTAL_STROKE_COUNT_FIELD, MAX_BOARD_STROKES),
             &guard,
             &stroke.id.record(),
             &stroke,

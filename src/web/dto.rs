@@ -22,10 +22,10 @@ use crate::error::AppError;
 /// ever appears in a response; requests take the five human roles
 /// (`AssignableRole`), which is also what `GET /limits` lists.
 ///
-/// The web-facing mirror of [`crate::domain::role::Role`] — it carries the serde
-/// + OpenAPI derives (which the domain type deliberately omits), so it renders
-/// as a proper `enum` in the docs. Serializes to the same lowercase strings the
-/// domain stores.
+/// The web-facing mirror of [`crate::domain::role::Role`] — it carries the
+/// serde + OpenAPI derives (which the domain type deliberately omits), so it
+/// renders as a proper `enum` in the docs. Serializes to the same lowercase
+/// strings the domain stores.
 #[derive(Serialize, Clone, Copy, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {

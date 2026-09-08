@@ -157,8 +157,12 @@ impl ExamPresence {
 /// The inner mutex only guards the map (never held across an await — keep it
 /// that way): every method locks, mutates or clones out, and drops the guard
 /// before the caller can await anything.
+/// What [`BoardHub`] holds: one channel per scoped board key, with the number
+/// of sockets currently on it.
+type BoardRooms = HashMap<String, (broadcast::Sender<String>, usize)>;
+
 #[derive(Clone, Default)]
-pub struct BoardHub(Arc<Mutex<HashMap<String, (broadcast::Sender<String>, usize)>>>);
+pub struct BoardHub(Arc<Mutex<BoardRooms>>);
 
 impl BoardHub {
     /// Count one socket into `board` and hand back its stream of other

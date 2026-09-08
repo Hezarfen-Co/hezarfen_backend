@@ -1206,7 +1206,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .get_courses(),
-            &[algebra.clone()],
+            std::slice::from_ref(&algebra),
             "and the list is pruned to the course that still exists"
         );
         for class in [&a, &b] {

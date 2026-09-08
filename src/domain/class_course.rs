@@ -179,8 +179,7 @@ impl ClassCourse {
         attach(
             class,
             Axis::Course,
-            &link.id.record(),
-            &link,
+            (&link.id.record(), &link),
             course.record(),
             attached_by.record(),
             source.map(ClassBlueprintId::record),
