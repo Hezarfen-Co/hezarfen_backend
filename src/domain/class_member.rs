@@ -91,8 +91,7 @@ impl ClassMember {
         let landed = attach(
             class,
             Axis::Member,
-            &member.id.record(),
-            &member,
+            (&member.id.record(), &member),
             user.record(),
             added_by.record(),
             None,

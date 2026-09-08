@@ -115,8 +115,7 @@ impl Registration {
             // Staff hold their own seats, so the bar is not "still a student"
             // but "still someone who can be taken off the list".
             Some((&user.record(), &format!("= '{}'", Role::Parent.as_str()))),
-            &registration.id.record(),
-            &registration,
+            (&registration.id.record(), &registration),
             db,
         )
         .await?

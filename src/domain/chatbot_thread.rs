@@ -201,8 +201,7 @@ impl ChatbotThread {
             // No holder claim: the parent row *is* the user's, so this write
             // already lands on the key a role change writes.
             None,
-            &thread.id.record(),
-            &thread,
+            (&thread.id.record(), &thread),
             db,
         )
         .await?

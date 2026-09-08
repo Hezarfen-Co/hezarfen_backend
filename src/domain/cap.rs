@@ -220,10 +220,10 @@ pub(crate) async fn claim_live_and_create<T: SurrealValue + Clone>(
     cap_expr: &str,
     fallback: i64,
     holder: Option<(&RecordId, &str)>,
-    id: &RecordId,
-    content: &T,
+    new: (&RecordId, &T),
     db: &Database,
 ) -> Result<Claimed<T>, AppError> {
+    let (id, content) = new;
     claim_at_and_create(
         parent, field, cap_expr, fallback, "", 1, holder, id, content, db,
     )
@@ -542,15 +542,15 @@ pub(crate) enum ClaimedTwo<T> {
 /// never text from a client.
 pub(crate) async fn claim_two_when_and_create<T: SurrealValue + Clone>(
     parent: &RecordId,
-    soft_field: &str,
-    soft_cap: i64,
-    hard_field: &str,
-    hard_cap: i64,
+    soft: (&str, i64),
+    hard: (&str, i64),
     guard: &str,
     id: &RecordId,
     content: &T,
     db: &Database,
 ) -> Result<ClaimedTwo<T>, AppError> {
+    let (soft_field, soft_cap) = soft;
+    let (hard_field, hard_cap) = hard;
     // Parenthesized `??` throughout: `n ?? 0 < $cap` parses as `n ?? (0 < $cap)`,
     // which is truthy for every row and would claim past the cap.
     let sql = format!(
@@ -957,10 +957,8 @@ mod tests {
     async fn claim(db: &Database, caps: [i64; 2], key: &str) -> ClaimedTwo<Stroke> {
         claim_two_when_and_create(
             &RecordId::new("board", "b"),
-            BOARD_EPOCH_STROKE_COUNT_FIELD,
-            caps[0],
-            BOARD_TOTAL_STROKE_COUNT_FIELD,
-            caps[1],
+            (BOARD_EPOCH_STROKE_COUNT_FIELD, caps[0]),
+            (BOARD_TOTAL_STROKE_COUNT_FIELD, caps[1]),
             BOARD_OPEN_GUARD,
             &RecordId::new("board_stroke", key),
             &a_stroke(),
@@ -1238,8 +1236,7 @@ mod tests {
             "epoch ?? $num",
             UNLIMITED,
             None,
-            &RecordId::new("board_stroke", "s1"),
-            &a_stroke(),
+            (&RecordId::new("board_stroke", "s1"), &a_stroke()),
             &db,
         )
         .await
@@ -1265,8 +1262,7 @@ mod tests {
             "capacity ?? $num",
             UNLIMITED,
             None,
-            &RecordId::new("board_stroke", "s1"),
-            &a_stroke(),
+            (&RecordId::new("board_stroke", "s1"), &a_stroke()),
             &db,
         )
         .await

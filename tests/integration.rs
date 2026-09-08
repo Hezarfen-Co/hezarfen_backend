@@ -26664,7 +26664,7 @@ async fn a_course_that_cannot_seat_the_whole_class_seats_none_of_it() {
 /// Create a course note as `cookie` on `course` (asserts 201); returns its id.
 async fn create_course_note(app: &axum::Router, cookie: &str, course: &str, title: &str) -> String {
     let res = send(
-        &app,
+        app,
         "POST",
         "/course-notes",
         Some(cookie),

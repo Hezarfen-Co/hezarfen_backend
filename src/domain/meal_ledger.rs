@@ -592,7 +592,6 @@ struct KindTotal {
 
 #[cfg(test)]
 mod tests {
-    use surrealdb::types::SurrealValue as _;
     use surrealdb::types::Value;
 
     use super::*;

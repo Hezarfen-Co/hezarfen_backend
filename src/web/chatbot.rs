@@ -527,8 +527,7 @@ async fn answer_turn(
         &fresh,
         prompt.get_content().as_str().to_string(),
         asker_role,
-        history_turns,
-        reply_cap,
+        (history_turns, reply_cap),
     )
     .await
     {
@@ -558,9 +557,9 @@ async fn fetch_reply(
     fresh: &[ChatbotMessageId; 2],
     prompt: String,
     asker_role: Role,
-    history_turns: usize,
-    reply_cap: usize,
+    caps: (usize, usize),
 ) -> Result<(ChatContent, bool), String> {
+    let (history_turns, reply_cap) = caps;
     let db = &tenant.db;
     let history = match history_for(db, thread, fresh, history_turns).await {
         Ok(history) => history,

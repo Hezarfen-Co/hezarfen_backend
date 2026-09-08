@@ -811,7 +811,6 @@ fn check_cutoff(date: &MenuDate, slot: &MenuSlot, cutoff: &MealCutoff) -> Result
 
 #[cfg(test)]
 mod tests {
-    use surrealdb::types::SurrealValue as _;
     use surrealdb::types::Value;
 
     use super::*;

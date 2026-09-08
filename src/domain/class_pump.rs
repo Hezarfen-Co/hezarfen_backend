@@ -388,13 +388,13 @@ impl Axis {
 pub(crate) async fn attach<T: SurrealValue + Clone>(
     class: &ClassGroupId,
     axis: Axis,
-    link: &RecordId,
-    row: &T,
+    new: (&RecordId, &T),
     pivot: RecordId,
     by: RecordId,
     source: Option<RecordId>,
     db: &Database,
 ) -> Result<Attached<T>, AppError> {
+    let (link, row) = new;
     let count_field = axis.counter();
     let pairs = axis.pairs();
     let other = axis.other();
