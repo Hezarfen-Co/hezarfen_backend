@@ -442,6 +442,10 @@ struct RequestLimits {
     schedule_past_grace_ms: i64,
     /// Ceiling on how long one request may take before it is aborted.
     request_timeout_secs: u64,
+    /// Longest `x-request-id` header the server keeps. A longer one — or one
+    /// carrying anything outside `[A-Za-z0-9._-]` — is replaced by a
+    /// server-minted UUID, so the caller loses correlation on its own id.
+    max_request_id_len: usize,
 }
 
 /// Every fixed limit the API enforces, grouped by the resource it applies to.
@@ -658,6 +662,7 @@ impl LimitsResponse {
                 max_page_limit: MAX_PAGE_LIMIT,
                 schedule_past_grace_ms: SCHEDULE_PAST_GRACE_MS,
                 request_timeout_secs: REQUEST_TIMEOUT_SECS,
+                max_request_id_len: MAX_REQUEST_ID_LEN,
             },
         }
     }

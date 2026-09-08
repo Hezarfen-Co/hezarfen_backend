@@ -585,7 +585,7 @@ response in the same commit.
                      "max_grade_bands": 20, "max_grade_label_len": 20,
                      "required_attendance_statuses": ["present", "absent", "late", "excused"] },
   "request":       { "max_page_limit": 500, "schedule_past_grace_ms": 60000,
-                     "request_timeout_secs": 30 },
+                     "request_timeout_secs": 30, "max_request_id_len": 64 },
   "rate":          { "window_secs": 60, "auth_per_minute": 10,
                      "api_per_minute": 300, "chatbot_per_minute": 20 }
 }

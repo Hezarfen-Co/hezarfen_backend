@@ -29,6 +29,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 use utoipa_swagger_ui::SwaggerUi;
 
+use crate::constant::MAX_REQUEST_ID_LEN;
 use crate::error::AppError;
 use crate::module::Module;
 use crate::rate_limit::RateLimiter;
@@ -324,9 +325,6 @@ async fn drop_unusable_request_id(mut req: Request, next: Next) -> Response {
     }
     next.run(req).await
 }
-
-/// The longest caller-supplied request id we will carry.
-const MAX_REQUEST_ID_LEN: usize = 64;
 
 /// The header carrying the per-request id, in and out.
 const REQUEST_ID_HEADER: &str = "x-request-id";

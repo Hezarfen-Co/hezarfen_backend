@@ -435,6 +435,16 @@ pub const DB_PING_TIMEOUT_SECS: u64 = 2;
 /// Generous enough not to clip a legitimate slow upload at `max_file_bytes`.
 pub const REQUEST_TIMEOUT_SECS: u64 = 30;
 
+/// The longest caller-supplied `x-request-id` header the server will carry.
+///
+/// The id lands on `http.request.id` of every span, so anything a client puts
+/// there it can export: free text and unbounded cardinality both. A header
+/// longer than this (or one carrying anything outside `[A-Za-z0-9._-]`) is
+/// dropped and a UUID minted in its place — the request still succeeds, it
+/// just stops being correlatable by the caller's own id, which is exactly why
+/// a client needs to know the bound.
+pub const MAX_REQUEST_ID_LEN: usize = 64;
+
 /// Backoff ceiling for the boot connection retry. The database is usually a
 /// sibling container coming up in parallel, so the first attempts fail; the
 /// process retries forever rather than exiting, because exiting turns a
