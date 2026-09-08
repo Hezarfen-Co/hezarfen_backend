@@ -2043,39 +2043,56 @@ async fn probe_a_refused_batch_leaves_the_row_byte_identical() {
 /// counting the SDK's own tracing spans. Prints the figure; asserts only that
 /// the instrumentation saw *something*, so a zero is reported as UNMEASURED
 /// rather than as a passing measurement.
+///
+/// The subscriber is **global**, not `set_default`'s thread-local one, because
+/// a thread-local subscriber cannot measure this reliably: `tracing` caches a
+/// callsite's interest process-wide the first time any thread reaches it, and
+/// with tests running in parallel that thread is usually a sibling with no
+/// subscriber — the SurrealDB callsites are then disabled for the whole
+/// process before this test ever asks, and the count is 0 (measured: 0 in 7 of
+/// 8 runs against noisy siblings; a global subscriber counted on 6 of 6).
+/// Global is safe here because this subscriber only counts: it stores nothing,
+/// prints nothing, and its `enabled` refuses every callsite that is not a
+/// SurrealDB one on *this* test's thread, so a sibling test neither pays for it
+/// nor lands in the figure.
 #[tokio::test]
 async fn probe_registry_reads_per_request() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tracing_subscriber::layer::SubscriberExt;
+    use tracing::span;
 
-    #[derive(Clone)]
-    struct Counter(Arc<AtomicUsize>);
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Counter {
-        fn on_new_span(
-            &self,
-            attrs: &tracing::span::Attributes<'_>,
-            _id: &tracing::Id,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            if attrs.metadata().target().starts_with("surrealdb") {
-                self.0.fetch_add(1, Ordering::Relaxed);
-            }
+    struct Counter {
+        thread: std::thread::ThreadId,
+        count: Arc<AtomicUsize>,
+    }
+    impl tracing::Subscriber for Counter {
+        // Never `always`/`never`: those are cached per callsite, and this
+        // subscriber's answer depends on which thread is asking.
+        fn register_callsite(&self, _: &tracing::Metadata<'_>) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
         }
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            if event.metadata().target().starts_with("surrealdb") {
-                self.0.fetch_add(1, Ordering::Relaxed);
-            }
+        fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+            meta.target().starts_with("surrealdb") && std::thread::current().id() == self.thread
         }
+        fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+            self.count.fetch_add(1, Ordering::Relaxed);
+            span::Id::from_u64(1)
+        }
+        fn event(&self, _: &tracing::Event<'_>) {
+            self.count.fetch_add(1, Ordering::Relaxed);
+        }
+        fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+        fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+        fn enter(&self, _: &span::Id) {}
+        fn exit(&self, _: &span::Id) {}
     }
 
     let count = Arc::new(AtomicUsize::new(0));
-    let subscriber = tracing_subscriber::registry().with(Counter(count.clone()));
-    let _guard = tracing::subscriber::set_default(subscriber);
+    tracing::subscriber::set_global_default(Counter {
+        thread: std::thread::current().id(),
+        count: count.clone(),
+    })
+    .expect("no other test in this binary installs a global subscriber");
 
     let (app, db, _tenants) = deployment().await;
     let cookie = login_as(&app, &db, "boss", "admin").await;
