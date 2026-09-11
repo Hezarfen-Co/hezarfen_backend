@@ -349,13 +349,13 @@ mod tests {
         )
         .await
         .unwrap();
-        let question = ExamQuestion::create(
+        let question = crate::db::exam_question::create(
+            db,
             exam.get_id(),
             subject.get_id().clone(),
             crate::domain::exam_question::QuestionText::try_new("3 + 3?").unwrap(),
             QuestionPoints::try_new(5).unwrap(),
             spec,
-            db,
         )
         .await
         .unwrap();

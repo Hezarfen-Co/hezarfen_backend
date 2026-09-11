@@ -9625,8 +9625,8 @@ async fn live_monitor_tracks_answer_progress() {
 
 #[tokio::test]
 async fn questions_and_answers_cascade_with_deletes() {
+    use hezarfen_backend::db::exam_question;
     use hezarfen_backend::domain::exam_answer::ExamAnswer;
-    use hezarfen_backend::domain::exam_question::ExamQuestion;
 
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "qc_t", "teacher").await;
@@ -9677,7 +9677,7 @@ async fn questions_and_answers_cascade_with_deletes() {
     }
     let exam_id = ExamId::from_key(&exam);
     assert_eq!(
-        ExamQuestion::list_for_exam(&exam_id, None, 0, &db)
+        exam_question::list_for_exam(&db, &exam_id, None, 0)
             .await
             .unwrap()
             .0
@@ -9693,10 +9693,10 @@ async fn questions_and_answers_cascade_with_deletes() {
     );
 
     // Deleting one question takes its answers with it. The freeze gate now
-    // lives inside `ExamQuestion::delete`'s own transaction (not in a lock the
+    // lives inside `db::exam_question::delete`'s own transaction (not in a lock the
     // handler held), so the attempt has to go first for the cascade to be
     // exercised at all — that refusal is asserted here before it is cleared.
-    let frozen = ExamQuestion::list_for_exam(&exam_id, None, 0, &db)
+    let frozen = exam_question::list_for_exam(&db, &exam_id, None, 0)
         .await
         .unwrap()
         .0
@@ -9704,7 +9704,7 @@ async fn questions_and_answers_cascade_with_deletes() {
         .next()
         .unwrap();
     assert!(
-        matches!(frozen.delete(&db).await, Err(err) if err.to_string().contains("after attempts")),
+        matches!(exam_question::delete(&db, frozen).await, Err(err) if err.to_string().contains("after attempts")),
         "the gate must refuse a question delete while an attempt exists"
     );
     db.query("DELETE exam_attempt WHERE exam = $ex")
@@ -9713,16 +9713,16 @@ async fn questions_and_answers_cascade_with_deletes() {
         .unwrap()
         .check()
         .unwrap();
-    let question = ExamQuestion::list_for_exam(&exam_id, None, 0, &db)
+    let question = exam_question::list_for_exam(&db, &exam_id, None, 0)
         .await
         .unwrap()
         .0
         .into_iter()
         .next()
         .unwrap();
-    question.delete(&db).await.unwrap();
+    exam_question::delete(&db, question).await.unwrap();
     assert_eq!(
-        ExamQuestion::list_for_exam(&exam_id, None, 0, &db)
+        exam_question::list_for_exam(&db, &exam_id, None, 0)
             .await
             .unwrap()
             .0
@@ -9749,7 +9749,7 @@ async fn questions_and_answers_cascade_with_deletes() {
     .await;
     assert_eq!(res.status, StatusCode::NO_CONTENT);
     assert!(
-        ExamQuestion::list_for_exam(&exam_id, None, 0, &db)
+        exam_question::list_for_exam(&db, &exam_id, None, 0)
             .await
             .unwrap()
             .0
@@ -9813,7 +9813,7 @@ async fn questions_and_answers_cascade_with_deletes() {
     assert_eq!(res.status, StatusCode::NO_CONTENT);
     let exam2_id = ExamId::from_key(&exam2);
     assert!(
-        ExamQuestion::list_for_exam(&exam2_id, None, 0, &db)
+        exam_question::list_for_exam(&db, &exam2_id, None, 0)
             .await
             .unwrap()
             .0
@@ -20592,8 +20592,9 @@ async fn to_bank_links_the_question_at_the_new_template() {
 /// domain level: HTTP offers no way to interleave inside the handler.
 #[tokio::test]
 async fn linking_the_banked_template_does_not_clobber_a_concurrent_edit() {
+    use hezarfen_backend::db::exam_question;
     use hezarfen_backend::domain::bank_question::BankQuestionId;
-    use hezarfen_backend::domain::exam_question::{ExamQuestion, ExamQuestionId};
+    use hezarfen_backend::domain::exam_question::ExamQuestionId;
 
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "bclob_t", "teacher").await;
@@ -20619,7 +20620,7 @@ async fn linking_the_banked_template_does_not_clobber_a_concurrent_edit() {
     let bid = id_of(&res.body);
 
     // The handler's read, then someone else's edit lands mid-window.
-    let stale = ExamQuestion::read(&ExamQuestionId::from_key(&qid), &db)
+    let stale = exam_question::read(&db, &ExamQuestionId::from_key(&qid))
         .await
         .unwrap()
         .expect("question exists");
@@ -20633,8 +20634,7 @@ async fn linking_the_banked_template_does_not_clobber_a_concurrent_edit() {
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
 
-    stale
-        .link_banked_as(BankQuestionId::from_key(&bid), &db)
+    exam_question::link_banked_as(&db, stale, BankQuestionId::from_key(&bid))
         .await
         .expect("link written");
 
@@ -21287,9 +21287,7 @@ async fn refreshing_a_question_recopies_its_template() {
 #[tokio::test]
 async fn a_course_patch_does_not_clobber_a_concurrent_teacher_assignment() {
     use hezarfen_backend::db::course;
-    use hezarfen_backend::domain::course::{
-        CourseDescription, CourseId, CourseKind, CourseTitle,
-    };
+    use hezarfen_backend::domain::course::{CourseDescription, CourseId, CourseKind, CourseTitle};
 
     let (app, db) = app_and_db().await;
     let owner = login_as(&app, &db, "cclob_o", "teacher").await;
