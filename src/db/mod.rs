@@ -9,6 +9,7 @@ pub mod course_session;
 pub mod exam_attempt;
 pub mod exam_question;
 pub mod field_update;
+pub mod meal_booking;
 pub mod note;
 pub mod page;
 pub mod payment_ledger;
