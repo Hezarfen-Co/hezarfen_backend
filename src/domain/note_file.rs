@@ -13,9 +13,9 @@ use crate::constant::{
 };
 use crate::database::Database;
 use crate::db::cap;
+use crate::db::page::PagedList;
 use crate::domain::monotonic_id::next_ulid;
 use crate::domain::note::NoteId;
-use crate::db::page::PagedList;
 use crate::error::{AppError, ValidationError};
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
@@ -279,11 +279,11 @@ mod tests {
         // note does not exist has no slot to take (a 409, like a full note).
         let owner = crate::domain::user::UserId::generate();
         let note_of = async |title: &str| {
-            crate::domain::note::Note::create(
+            crate::db::note::create(
+                &db,
                 &owner,
                 crate::domain::note::NoteTitle::try_new(title).unwrap(),
                 crate::domain::note::NoteContent::try_new("body").unwrap(),
-                &db,
             )
             .await
             .unwrap()
@@ -326,11 +326,11 @@ mod tests {
     #[tokio::test]
     async fn counter_tracks_stored_rows() {
         let db = crate::database::init_mem().await.unwrap();
-        let note = crate::domain::note::Note::create(
+        let note = crate::db::note::create(
+            &db,
             &crate::domain::user::UserId::generate(),
             crate::domain::note::NoteTitle::try_new("a").unwrap(),
             crate::domain::note::NoteContent::try_new("body").unwrap(),
-            &db,
         )
         .await
         .unwrap()

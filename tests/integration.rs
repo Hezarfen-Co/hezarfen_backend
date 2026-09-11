@@ -15,6 +15,7 @@ use hezarfen_backend::constant::{
     BANK_VISIBILITY_SCHOOL, MAX_BOARD_STROKES, MAX_BOARDS_PER_CREATOR, MAX_COURSE_NOTE_FILES,
     MAX_EPOCH_STROKES, MAX_FEE_PLAN_ASSIGN_STUDENTS,
 };
+use hezarfen_backend::db::session;
 use hezarfen_backend::domain::board::{Board, BoardId};
 use hezarfen_backend::domain::board_stroke::{BoardStroke, BoardStrokeId};
 use hezarfen_backend::domain::chatbot_message::ChatbotMessage;
@@ -25,7 +26,6 @@ use hezarfen_backend::domain::course_note_file::CourseNoteFileId;
 use hezarfen_backend::domain::exam::ExamId;
 use hezarfen_backend::domain::exam_attempt::ExamAttempt;
 use hezarfen_backend::domain::rag_output::RagOutput;
-use hezarfen_backend::domain::session::Session;
 use hezarfen_backend::domain::timestamp::Timestamp;
 use hezarfen_backend::domain::user::{Password, User, UserId, Username};
 use hezarfen_backend::module::ModuleSet;
@@ -5932,7 +5932,7 @@ async fn login_purges_expired_sessions() {
         .check()
         .unwrap();
     assert!(
-        Session::find_by_token("expired-token", &db)
+        session::find_by_token(&db, "expired-token")
             .await
             .unwrap()
             .is_some()
@@ -5941,7 +5941,7 @@ async fn login_purges_expired_sessions() {
     // A later successful login sweeps expired rows...
     login(&app, "veli").await;
     assert!(
-        Session::find_by_token("expired-token", &db)
+        session::find_by_token(&db, "expired-token")
             .await
             .unwrap()
             .is_none(),
@@ -5976,7 +5976,7 @@ async fn expired_session_is_unauthorized_before_any_purge() {
 
     // Row exists, but the clock says no.
     assert!(
-        Session::find_by_token("stale-token", &db)
+        session::find_by_token(&db, "stale-token")
             .await
             .unwrap()
             .is_some()

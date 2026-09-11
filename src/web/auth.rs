@@ -12,10 +12,10 @@ use utoipa_axum::routes;
 use crate::constant::{RESERVED_USERNAMES, SESSION_DURATION_DAYS};
 use crate::domain::builder::BuilderSession;
 use crate::domain::role::Role as DomainRole;
-use crate::domain::session::Session;
 use crate::domain::user::{Password, PasswordHash, User, Username};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
+use crate::service;
 use crate::state::AppState;
 use crate::tenant::Slug;
 
@@ -194,9 +194,9 @@ async fn login(
     };
 
     // The caller is genuine; opportunistically drop any expired session rows.
-    let _ = Session::purge_expired(&db).await;
+    let _ = service::session::purge_expired(&db).await;
 
-    let session = Session::create(user.get_id(), &db).await?;
+    let session = service::session::create(&db, user.get_id()).await?;
     // `<slug>.<token>`: the cookie carries the school, so every later request
     // finds its database without a second lookup path that could disagree.
     let cookie = session_cookie(
@@ -245,7 +245,7 @@ async fn logout(
         } else if let Ok(slug) = Slug::try_new(prefix)
             && let Ok(db) = st.tenants.get(&slug).await
         {
-            Session::delete_by_token(token, &db).await?;
+            service::session::delete_by_token(&db, token).await?;
         }
     }
     let jar = jar.remove(Cookie::build(("session", "")).path("/").build());

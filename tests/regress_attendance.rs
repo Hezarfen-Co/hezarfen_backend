@@ -13,11 +13,11 @@ mod common;
 use axum::http::StatusCode;
 use common::{app_and_db, create_course, create_session, enroll, login, login_as, me_id, send};
 use hezarfen_backend::database::Database;
+use hezarfen_backend::db::settings;
 use hezarfen_backend::domain::attendance::{Attendance, AttendanceStatus};
 use hezarfen_backend::domain::course_session::{CourseSession, CourseSessionId};
 use hezarfen_backend::domain::event::EventId;
 use hezarfen_backend::domain::session_attendance::SessionAttendance;
-use hezarfen_backend::domain::settings::Settings;
 use hezarfen_backend::domain::timestamp::Timestamp;
 use hezarfen_backend::domain::user::UserId;
 use hezarfen_backend::error::AppError;
@@ -223,7 +223,7 @@ async fn a_mark_against_a_deleted_session_is_refused_and_stores_nothing() {
     );
 
     // Then the mark arrives, still believing in its snapshot.
-    let school = Settings::load(&db).await.unwrap();
+    let school = settings::load(&db).await.unwrap();
     let status = AttendanceStatus::try_new("present", school.get_attendance_statuses()).unwrap();
     let marked = SessionAttendance::mark(
         &snapshot,
@@ -392,7 +392,7 @@ async fn an_event_mark_writes_its_event_and_is_refused_once_it_is_gone() {
     );
 
     // And the mark that arrives after it is refused rather than stored.
-    let school = Settings::load(&db).await.unwrap();
+    let school = settings::load(&db).await.unwrap();
     let status = AttendanceStatus::try_new("present", school.get_attendance_statuses()).unwrap();
     let marked =
         Attendance::mark(&EventId::from_key(&event), &ali_ref, status, &hoca_ref, &db).await;

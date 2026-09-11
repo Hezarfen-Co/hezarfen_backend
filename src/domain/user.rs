@@ -11,12 +11,12 @@ use crate::constant::{
     REGISTRATION_FROZEN_GUARD, REGISTRATION_TABLE, USER_TABLE,
 };
 use crate::database::{Database, transaction_with_retry, write_with_retry};
+use crate::db::field_update::FieldUpdate;
+use crate::db::page::PagedList;
 use crate::domain::appointment::AppointmentStatus;
 use crate::domain::board::Board;
-use crate::db::field_update::FieldUpdate;
 use crate::domain::monotonic_id::next_ulid;
 use crate::domain::note_file::FileContentType;
-use crate::db::page::PagedList;
 use crate::domain::preferences::{Language, PaletteColor, Theme};
 use crate::domain::profile::{Bio, BirthDate, DisplayName, Email, PersonName, Phone};
 use crate::domain::role::Role;
@@ -39,7 +39,7 @@ use crate::validate::{validate_password, validate_username};
 /// SurrealQL against the volume.
 ///
 /// Serializing the pair is what closes it, the same argument
-/// [`crate::domain::settings::SETTINGS_LOCK`] makes one level up: the deployment
+/// [`crate::service::settings::SETTINGS_LOCK`] makes one level up: the deployment
 /// runs one process by contract (stop-the-world upgrades), so process-wide is
 /// deployment-wide. A per-row counter (the [`crate::db::cap`] shape) does
 /// not fit — the count being capped is over *every* user row, with no parent
@@ -896,7 +896,7 @@ impl User {
     /// (`POST /schools/{slug}/admin-password`). Only the credential is
     /// rewritten; revoking the sessions minted under the old one is the
     /// caller's second half
-    /// ([`crate::domain::session::Session::delete_by_user`]), because a reset
+    /// ([`crate::db::session::delete_by_user`]), because a reset
     /// that leaves a stolen cookie working resets nothing.
     pub async fn set_password_hash(
         id: &UserId,

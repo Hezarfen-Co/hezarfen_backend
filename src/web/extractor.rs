@@ -5,9 +5,9 @@ use axum_extra::extract::CookieJar;
 use crate::database::Database;
 use crate::domain::builder::{Builder, BuilderSession};
 use crate::domain::role::Role;
-use crate::domain::session::Session;
 use crate::domain::user::User;
 use crate::error::AppError;
+use crate::service;
 use crate::state::AppState;
 use crate::web::tenant_state::{resolve_tenant, split_cookie};
 
@@ -43,7 +43,7 @@ where
     let cookie = jar.get("session").ok_or(AppError::Unauthorized)?;
     let (_, token) = split_cookie(cookie.value()).ok_or(AppError::Unauthorized)?;
 
-    let session = Session::find_by_token(token, &db)
+    let session = service::session::find_by_token(&db, token)
         .await?
         .ok_or(AppError::Unauthorized)?;
     if session.is_expired() {

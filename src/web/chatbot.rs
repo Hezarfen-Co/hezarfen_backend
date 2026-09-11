@@ -49,6 +49,7 @@ use crate::domain::role::Role;
 use crate::domain::settings::Settings;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ErrorResponse, ValidationError};
+use crate::service;
 use crate::state::{AppState, scoped_key};
 
 use super::{CurrentUser, Page, PageParams};
@@ -388,7 +389,7 @@ async fn send_message(
         .enforce_user(&scoped_key(&slug, user.get_id().key()))?;
 
     let thread = own_thread(&id, user.get_id(), &st.db).await?;
-    let settings = Settings::load(&st.db).await?;
+    let settings = service::settings::load(&st.db).await?;
     let reply_cap = content_cap(&settings);
     let length = req.content.chars().count();
     if length > reply_cap {

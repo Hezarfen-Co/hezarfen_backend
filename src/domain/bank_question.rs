@@ -404,7 +404,7 @@ impl BankQuestion {
     /// Every field the merge re-states is in the guard, which is the same list
     /// the `SET` writes. `choices` is compared whole: its objects carry two
     /// required string keys, so none is ever dropped for being `NONE` (the trap
-    /// [`crate::domain::settings::Settings::save_if_unchanged`] works around).
+    /// [`crate::db::settings::save_if_unchanged`] works around).
     ///
     /// Rides [`write_with_retry`] because an image write now moves this row too
     /// ([`crate::domain::bank_question_image::BankQuestionImage::upsert`]): an
@@ -467,7 +467,7 @@ impl BankQuestion {
     /// take off disk, but only for *these* rows — an upload that committed
     /// after the caller listed the template's images is swept here too, and a
     /// pre-read snapshot would strand its blob for good
-    /// ([`crate::domain::note::Note::delete`]'s story, this domain over).
+    /// ([`crate::db::note::delete`]'s story, this domain over).
     ///
     /// Children first, in one transaction: as two queries, a failure between
     /// them left image rows swept under a template that survived, or (the other

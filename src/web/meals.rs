@@ -32,9 +32,9 @@ use crate::domain::parent_link::ParentLink;
 // The same idempotence key `/payments/credits` takes — one grammar, one type.
 use crate::domain::payment_ledger::PaymentRequestKey;
 use crate::domain::role::Role;
-use crate::domain::settings::Settings;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
+use crate::service;
 use crate::state::AppState;
 
 use super::{
@@ -270,7 +270,10 @@ async fn create_menu(
     // against the end of the day, so today's menu is publishable all day — the
     // meal's own deadline is `meal_cancel_cutoff_minutes`, not this.
     check_not_past("date", date.day_end())?;
-    let slot = MenuSlot::try_new(&req.slot, &Settings::load(&st.db).await?.get_meal_slots())?;
+    let slot = MenuSlot::try_new(
+        &req.slot,
+        &service::settings::load(&st.db).await?.get_meal_slots(),
+    )?;
     validate_capacity(req.capacity)?;
     let menu = Menu::create(date, slot, req.capacity, user.get_id(), &st.db).await?;
     let body = one_menu(&menu, user.get_id(), &st.db).await?;
@@ -431,7 +434,10 @@ async fn add_dish(
         .transpose()?
         .flatten();
     let price = DishPrice::try_new(req.price_minor)?;
-    let tags = DishTags::try_new(&req.tags, &Settings::load(&st.db).await?.get_dietary_tags())?;
+    let tags = DishTags::try_new(
+        &req.tags,
+        &service::settings::load(&st.db).await?.get_dietary_tags(),
+    )?;
     // Dish writes take [`MENU_LOCK`] for the dish cap alone: count-then-write
     // is write-skew, so the count and the insert have to be one step. The
     // *price* no longer needs it — a dish write moves the menu's revision, and
@@ -499,7 +505,7 @@ async fn update_dish(
     let tags = match &req.tags {
         Some(tags) => Some(DishTags::try_new(
             tags,
-            &Settings::load(&st.db).await?.get_dietary_tags(),
+            &service::settings::load(&st.db).await?.get_dietary_tags(),
         )?),
         None => None,
     };
@@ -684,7 +690,7 @@ async fn update_profile(
     let tags = match &req.tags {
         Some(tags) => Some(DietaryTags::try_new(
             tags,
-            &Settings::load(&st.db).await?.get_dietary_tags(),
+            &service::settings::load(&st.db).await?.get_dietary_tags(),
         )?),
         None => None,
     };
@@ -764,7 +770,9 @@ async fn booking_responses(
 /// live on every call, so a serving time corrected today moves the deadline of
 /// menus already published for it.
 async fn meal_cutoff(db: &Database) -> Result<MealCutoff, AppError> {
-    Ok(MealCutoff::from_settings(&Settings::load(db).await?))
+    Ok(MealCutoff::from_settings(
+        &service::settings::load(db).await?,
+    ))
 }
 
 /// Whose seat is this? A student books only for themselves; a parent only for

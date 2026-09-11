@@ -38,11 +38,11 @@ use crate::constant::{
     CLASS_BLUEPRINT_TABLE, CLASS_COURSE_TABLE, ENROLLMENT_COUNT_FIELD, MAX_CLASS_COURSES,
 };
 use crate::database::{Database, transaction_with_retry};
+use crate::db::page::PagedList;
 use crate::domain::class_course::ClassCourse;
 use crate::domain::class_group::{ClassGrade, ClassGroup, ClassGroupId};
 use crate::domain::class_pump::{Attached, Axis, detach};
 use crate::domain::course::CourseId;
-use crate::db::page::PagedList;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 
@@ -76,7 +76,7 @@ use crate::error::{AppError, ValidationError};
 ///
 /// In-process is deployment-wide here: one process by contract, with
 /// stop-the-world upgrades — the same argument
-/// [`crate::domain::settings::SETTINGS_LOCK`] makes. No other lock is taken
+/// [`crate::service::settings::SETTINGS_LOCK`] makes. No other lock is taken
 /// under it, so it has no ordering rule to break.
 pub(crate) static BLUEPRINT_LOCK: RwLock<()> = RwLock::const_new(());
 

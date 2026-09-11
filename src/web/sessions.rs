@@ -17,10 +17,10 @@ use crate::domain::course_session::{CourseSession, CourseSessionId, SessionTopic
 use crate::domain::enrollment::Enrollment;
 use crate::domain::role::Role;
 use crate::domain::session_attendance::SessionAttendance;
-use crate::domain::settings::Settings;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
+use crate::service;
 use crate::state::AppState;
 
 use super::courses::{can_manage_course, can_view_course};
@@ -320,7 +320,7 @@ async fn mark_roll_call(
     }
     course.require_open(&st.db).await?;
 
-    let school = Settings::load(&st.db).await?;
+    let school = service::settings::load(&st.db).await?;
     let status = AttendanceStatus::try_new(&req.status, school.get_attendance_statuses())?;
     let target = UserId::from_key(&req.user_id);
 

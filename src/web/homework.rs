@@ -30,10 +30,10 @@ use crate::domain::homework_submission::{
 };
 use crate::domain::note_file::{FileContentType, FileName};
 use crate::domain::role::Role;
-use crate::domain::settings::Settings;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
+use crate::service;
 use crate::state::AppState;
 
 use super::courses::{can_manage_course, can_view_course, visible_courses};
@@ -908,7 +908,7 @@ async fn upload_submission_file(
     // below, because this snapshot goes stale while the body streams.
     let preflight = gate_own_submission(&id, &user, &st.db).await?;
     require_open_term(&preflight, &st.db).await?;
-    let limit = Settings::load(&st.db).await?.get_max_file_bytes();
+    let limit = service::settings::load(&st.db).await?.get_max_file_bytes();
     // Consume the body before taking the lock — a slow upload must not stall the
     // homework subsystem (mirrors the exam/note image uploads).
     let upload = read_upload(&mut multipart, limit).await?;

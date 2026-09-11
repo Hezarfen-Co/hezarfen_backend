@@ -181,8 +181,8 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::database::init_mem_tenants;
+    use crate::db::session;
     use crate::domain::builder::{Builder, BuilderSession};
-    use crate::domain::session::Session;
     use crate::domain::user::{Password, User, Username};
     use crate::tenant::DEMO_SLUG;
     use crate::web::{CurrentUser, RequireBuilder};
@@ -215,7 +215,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let session = Session::create(user.get_id(), &school).await.unwrap();
+        let session = session::create(&school, user.get_id()).await.unwrap();
         let school_cookie = format!("session={DEMO_SLUG}.{}", session.token().as_str());
 
         Builder::ensure(
