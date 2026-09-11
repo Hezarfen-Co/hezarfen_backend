@@ -16,7 +16,7 @@ use crate::database::Database;
 use crate::domain::badge::{self, BadgeAward};
 use crate::domain::class_group::{ClassGroup, ClassGroupId};
 use crate::domain::class_member::ClassMember;
-use crate::domain::course::Course;
+
 use crate::domain::parent_link::ParentLink;
 use crate::domain::preferences::{Language, PaletteColor, Theme};
 use crate::domain::profile::{Bio, BirthDate, DisplayName, Email, PersonName, Phone, ProfileStats};
@@ -926,14 +926,14 @@ async fn profile_of(
     let (mut courses, course_total) = match user.get_role().at_least(Role::Teacher) {
         // The teacher read is unpaged, so the total is what came back.
         true => {
-            let courses = Course::list_for_teacher(id, &st.db).await?;
+            let courses = crate::service::course::list_for_teacher(&st.db, id).await?;
             let total = courses.len() as i64;
             (courses, total)
         }
         // Unfiltered readers can take the window from the database.
         false => {
             let window = readable.is_none().then_some(MAX_PROFILE_COURSES as i64);
-            Course::list_enrolled(id, window, 0, &st.db).await?
+            crate::service::course::list_enrolled(&st.db, id, window, 0).await?
         }
     };
     if let Some(readable) = &readable {

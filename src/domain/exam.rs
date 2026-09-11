@@ -692,7 +692,7 @@ pub(crate) async fn published_exam(db: &Database) -> Exam {
         .to_vec();
     Exam::create(
         &UserId::generate(),
-        &crate::domain::course::a_test_course(db).await,
+        &crate::db::course::a_test_course(db).await,
         ExamTitle::try_new("midterm").unwrap(),
         ExamDescription::try_new("").unwrap(),
         ExamKind::try_new("midterm", &allowed).unwrap(),
@@ -723,7 +723,7 @@ mod tests {
     /// [`Exam::create`] therefore *writes* the course row rather than reading
     /// it ([`cap::touch_and_create`]); the harness and the window it races in
     /// are documented on
-    /// [`crate::domain::course::assert_no_child_outlives_a_course_delete`].
+    /// [`crate::db::course::assert_no_child_outlives_a_course_delete`].
     /// Mutation-tested: with the bare `db.create` this shipped with, all four
     /// rounds orphan.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -751,11 +751,9 @@ mod tests {
                 .map(|_| ())
             })
         }
-        crate::domain::course::assert_no_child_outlives_a_course_delete(
-            "exam_orphan_race",
-            EXAM_TABLE,
-            make,
-        )
+        crate::db::course::assert_no_child_outlives_a_course_delete("exam_orphan_race",
+        EXAM_TABLE,
+        make,)
         .await;
     }
 
@@ -968,7 +966,7 @@ mod tests {
 
     /// GUARD, not a retry measurement — read the last paragraph before
     /// trusting this test with the retry. See
-    /// [`crate::domain::course::Course::delete`]'s race test for why the rate is
+    /// [`crate::db::course::delete`]'s race test for why the rate is
     /// counted rather than asserted per round.
     ///
     /// This site has no `THROW` marker at all: it ends `.check()?`, which
@@ -995,7 +993,7 @@ mod tests {
     /// attempt — the grades serialize behind `cap`'s claim lock, so they mostly
     /// queue rather than collide. So this guards the status codes and the
     /// cascade (marks either survive whole or are swept whole, never a 500).
-    /// The retry is measured on [`crate::domain::course::Course::delete`].
+    /// The retry is measured on [`crate::db::course::delete`].
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn a_delete_racing_a_mark_never_answers_500() {
@@ -1011,7 +1009,7 @@ mod tests {
             // A burst of marks and a delete held back by a sweeping beat: this
             // site has no guard to lose to, so a single racer released with it
             // simply finishes on one side of it. Same recipe as
-            // [`crate::domain::course::Course::delete`]'s race test.
+            // [`crate::db::course::delete`]'s race test.
             let drop_it = {
                 let (exam, db) = (exam.clone(), db.clone());
                 // A wide sweep, not the 0-3ms the other three use: each grade
@@ -1124,7 +1122,7 @@ mod tests {
         )
         .unwrap();
         let subject = crate::domain::subject::Subject::create(
-            &crate::domain::course::a_test_course(db).await,
+            &crate::db::course::a_test_course(db).await,
             crate::domain::subject::SubjectName::try_new("topic").unwrap(),
             crate::domain::subject::SubjectDescription::try_new("").unwrap(),
             db,
@@ -1268,7 +1266,7 @@ mod tests {
             let exam = published(&db).await;
             let id = exam.get_id().clone();
             let subject = Subject::create(
-                &crate::domain::course::a_test_course(&db).await,
+                &crate::db::course::a_test_course(&db).await,
                 crate::domain::subject::SubjectName::try_new("topic").unwrap(),
                 crate::domain::subject::SubjectDescription::try_new("").unwrap(),
                 &db,

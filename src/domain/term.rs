@@ -193,7 +193,7 @@ impl Term {
     /// nothing here unlinks or cascades. `false` = refused, nothing was written.
     ///
     /// The roster of linking courses is the term's own `course_count`
-    /// refcount, claimed by [`crate::domain::course::Course::create`] and
+    /// refcount, claimed by [`crate::db::course::create`] and
     /// `update` *before* they write a link, so the check and the delete are one
     /// conditional write on one record: a course write racing this either
     /// claims first (and the delete is refused) or finds the row gone (and is
@@ -363,7 +363,7 @@ mod tests {
 
     /// GUARD, not a retry measurement — read the last paragraph before
     /// trusting this test with the retry. See
-    /// [`crate::domain::course::Course::delete`]'s race test for why the rate is
+    /// [`crate::db::course::delete`]'s race test for why the rate is
     /// counted rather than asserted per round.
     ///
     /// One conditional `DELETE … RETURN BEFORE` and a bare `.check()?`: no
@@ -372,7 +372,7 @@ mod tests {
     /// through. A store answering "conflict, retry" therefore comes out as a
     /// 500 instead of the 404 or 409 the request owes.
     ///
-    /// The racer is [`crate::domain::course::Course::create`] against this
+    /// The racer is [`crate::db::course::create`] against this
     /// term: it claims `course_count` on the term row before it writes the
     /// link, which is the same record and the same column the guard reads. Both
     /// sides are swept across each other sub-millisecond, exactly as in
@@ -388,11 +388,11 @@ mod tests {
     /// conflicts in 100 raced rounds, green with the retry loop cut to a single
     /// attempt. A status-code guard, then: a raced delete answers 409 or 404 and
     /// never 500, and a course that got linked survives it. The retry is
-    /// measured on [`crate::domain::course::Course::delete`].
+    /// measured on [`crate::db::course::delete`].
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn a_delete_racing_a_course_create_never_answers_500() {
-        use crate::domain::course::{Course, CourseDescription, CourseKind, CourseTitle};
+        use crate::domain::course::{CourseDescription, CourseKind, CourseTitle};
         use crate::domain::user::UserId;
         let (db, _serialized) = crate::database::init_test_server("term_delete_race").await;
         let (mut delete_500, mut create_500) = (0, 0);
@@ -433,14 +433,14 @@ mod tests {
                     };
                     tokio::spawn(async move {
                         tokio::time::sleep(head_start).await;
-                        Course::create(
+                        crate::db::course::create(
+                            &db,
                             &UserId::from_key("teacher"),
                             CourseTitle::try_new("algebra").unwrap(),
                             CourseDescription::try_new("").unwrap(),
                             CourseKind::course(),
                             Some(id),
                             None,
-                            &db,
                         )
                         .await
                     })
@@ -461,7 +461,10 @@ mod tests {
                     last_create = format!("{make:?}");
                 }
                 if let Ok(course) = &make
-                    && Course::read(course.get_id(), &db).await.unwrap().is_some()
+                    && crate::db::course::read(&db, course.get_id())
+                        .await
+                        .unwrap()
+                        .is_some()
                 {
                     landed = true;
                 }

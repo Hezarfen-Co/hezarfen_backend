@@ -225,19 +225,19 @@ mod tests {
     /// been taken, which is the row whose blob used to leak.
     #[tokio::test]
     async fn delete_returns_the_attachment_rows_it_removed() {
-        use crate::domain::course::{Course, CourseDescription, CourseKind, CourseTitle};
+        use crate::domain::course::{CourseDescription, CourseKind, CourseTitle};
         use crate::domain::course_note_file::{FileContentType, FileName};
 
         let db = crate::database::init_mem().await.unwrap();
         let creator = crate::domain::user::UserId::generate();
-        let course = Course::create(
+        let course = crate::db::course::create(
+            &db,
             &creator,
             CourseTitle::try_new("Math").unwrap(),
             CourseDescription::try_new("").unwrap(),
             CourseKind::try_new("course").unwrap(),
             None,
             None,
-            &db,
         )
         .await
         .unwrap();

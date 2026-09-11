@@ -10,9 +10,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::database::Database;
-use crate::domain::answer_image::AnswerImage;
 use crate::domain::course::{Course, CourseDescription, CourseId, CourseKind, CourseTitle};
-use crate::domain::course_note_file::CourseNoteFile;
 use crate::domain::course_session::{CourseSession, SessionTopic};
 use crate::domain::enrollment::Enrollment;
 use crate::domain::exam::{
@@ -20,8 +18,6 @@ use crate::domain::exam::{
     ExamTitle,
 };
 use crate::domain::homework::{Homework, HomeworkTitle};
-use crate::domain::homework_file::HomeworkFile;
-use crate::domain::question_image::QuestionImage;
 use crate::domain::role::Role;
 use crate::domain::subject::{Subject, SubjectDescription, SubjectName};
 use crate::domain::timestamp::Timestamp;
@@ -262,14 +258,14 @@ pub(crate) async fn can_view_course(
 /// visible only the way it is to any other student: by enrollment.
 pub(crate) async fn visible_courses(user: &User, db: &Database) -> Result<Vec<Course>, AppError> {
     if user.get_role().at_least(Role::Manager) {
-        return Course::list_all(db).await;
+        return service::course::list_all(db).await;
     }
     let mut courses = if user.get_role().at_least(Role::Teacher) {
-        Course::list_for_teacher(user.get_id(), db).await?
+        service::course::list_for_teacher(db, user.get_id()).await?
     } else {
         Vec::new()
     };
-    for course in Course::list_enrolled(user.get_id(), None, 0, db).await?.0 {
+    for course in service::course::list_enrolled(db, user.get_id(), None, 0).await?.0 {
         if !courses
             .iter()
             .any(|known| known.get_id() == course.get_id())
@@ -326,19 +322,19 @@ async fn create_course(
         Some(ref kind) => CourseKind::try_new(kind)?,
         None => CourseKind::course(),
     };
-    // Pre-flight only: [`Course::create`] claims a reference on the term before
+    // Pre-flight only: the create itself claims a reference on the term before
     // it writes the link, and a term deleted in between fails that claim with
     // this very error — so an unknown id reads the same whichever side wins.
     let term = resolve_term(req.term_id.as_deref(), &st.db).await?;
     check_capacity(req.capacity)?;
-    let course = Course::create(
+    let course = service::course::create(
+        &st.db,
         user.get_id(),
         title,
         description,
         kind,
         term,
         req.capacity,
-        &st.db,
     )
     .await?;
     // The creator is the caller — already loaded, no extra lookup.
@@ -405,7 +401,7 @@ async fn my_courses(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<CourseResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let (courses, total) = Course::list_enrolled(user.get_id(), limit, offset, &st.db).await?;
+    let (courses, total) = service::course::list_enrolled(&st.db, user.get_id(), limit, offset).await?;
     let people = person_map(courses.iter().flat_map(course_people), &st.db).await?;
     let items = courses
         .iter()
@@ -436,7 +432,7 @@ async fn get_course(
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<CourseResponse>, AppError> {
-    let course = Course::read(&CourseId::from_key(&id), &st.db)
+    let course = service::course::read(&st.db, &CourseId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     if !can_view_course(&course, &user, &st.db).await? {
@@ -474,7 +470,7 @@ async fn update_course(
     Path(id): Path<String>,
     Json(req): Json<UpdateCourse>,
 ) -> Result<Json<CourseResponse>, AppError> {
-    let course = Course::read(&CourseId::from_key(&id), &st.db)
+    let course = service::course::read(&st.db, &CourseId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     if !can_manage_course(&course, &user) {
@@ -482,7 +478,7 @@ async fn update_course(
             "only the course creator, an assigned teacher, or a manager/admin can edit this course",
         ));
     }
-    course.require_open(&st.db).await?;
+    service::course::require_open(&st.db, &course).await?;
 
     // Only what the request actually carried is validated and written — an
     // omitted field stays `None` so the save never re-sends this snapshot's
@@ -505,9 +501,8 @@ async fn update_course(
     check_capacity(req.capacity.flatten())?;
     let capacity = req.capacity;
 
-    let updated = course
-        .update(title, description, kind, term, capacity, &st.db)
-        .await?;
+    let updated =
+        service::course::update(&st.db, course, title, description, kind, term, capacity).await?;
     let people = person_map(course_people(&updated), &st.db).await?;
     Ok(Json(CourseResponse::new(&updated, &people)))
 }
@@ -542,7 +537,7 @@ async fn delete_course(
     RequireTeacher(user): RequireTeacher,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    let course = Course::read(&CourseId::from_key(&id), &st.db)
+    let course = service::course::read(&st.db, &CourseId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     if !owns_course(&course, &user) {
@@ -550,43 +545,21 @@ async fn delete_course(
             "only the course creator or a manager/admin can delete this course",
         ));
     }
-    course.require_open(&st.db).await?;
-    // Writer lease of [`EXAM_LOCK`], for `delete_exam`'s reason: this cascade
-    // sweeps the course's exams *and their attempts*, and an attempt is the one
-    // exam child whose write cannot collide with the sweep (its claim lands on
-    // the student's row, never the exam's). Narrower here — the delete is
-    // refused while anyone is enrolled, so a start would have to pass its
-    // enrollment gate and then have that enrollment removed under it — but the
-    // hole is the same one and so is the lease.
-    let _guard = crate::web::exams::EXAM_LOCK.write().await;
-    // And the homework half of the same cascade, for
-    // [`crate::web::homework::delete_homework`]'s reason: it sweeps the
-    // course's homework with its submissions, files and results, and grading
-    // ([`crate::domain::homework_result::HomeworkResult::grade`]) writes a
-    // result row against a homework it only *read*, which a delete committing
-    // alongside is invisible to. Without this lease the grade lands behind the
-    // sweep: an orphan `homework_result` under a vanished homework, plus a
-    // `marks_given_total` on the grader no ungrade can reach. Lock order here
-    // is EXAM_LOCK then HOMEWORK_LOCK, the only path that takes both.
-    let _homework_guard = crate::web::homework::HOMEWORK_LOCK.write().await;
-    // Rows go first (the delete cascades them), blobs after — a crash in
-    // between strands at worst an unreachable blob. The keys are read before
-    // the delete because it takes their rows with it; a refused delete just
-    // drops them unused.
-    let image_files = QuestionImage::file_keys_for_course(course.get_id(), &st.db).await?;
-    let answer_image_files = AnswerImage::file_keys_for_course(course.get_id(), &st.db).await?;
-    let homework_files = HomeworkFile::file_keys_for_course(course.get_id(), &st.db).await?;
-    let course_note_files = CourseNoteFile::file_keys_for_course(course.get_id(), &st.db).await?;
-    if !course.delete(&st.db).await? {
+    // The workflow — archived-term gate, EXAM_LOCK and HOMEWORK_LOCK writer
+    // leases, blob-key collection, cascade — is [`service::course::delete`]'s.
+    // Blob unlinking stays here because only the web layer knows `files_path`.
+    let outcome = service::course::delete(&st.db, &course).await?;
+    if !outcome.deleted {
         return Err(AppError::Conflict(
             "students are still enrolled in this course — remove them first",
         ));
     }
-    for file in image_files
+    for file in outcome
+        .image_files
         .iter()
-        .chain(&answer_image_files)
-        .chain(&homework_files)
-        .chain(&course_note_files)
+        .chain(&outcome.answer_image_files)
+        .chain(&outcome.homework_files)
+        .chain(&outcome.course_note_files)
     {
         remove_blob(&st.files_path, file).await;
     }
@@ -624,29 +597,11 @@ async fn assign_teacher(
     Path(id): Path<String>,
     Json(req): Json<AssignTeacher>,
 ) -> Result<Json<CourseResponse>, AppError> {
-    let course = Course::read(&CourseId::from_key(&id), &st.db)
+    let course = service::course::read(&st.db, &CourseId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
-    course.require_open(&st.db).await?;
-
     let target = UserId::from_key(&req.user_id);
-    let Some(target_user) = User::read(&target, &st.db).await? else {
-        return Err(AppError::Validation(ValidationError::Invalid {
-            field: "user_id",
-            reason: "target user does not exist",
-        }));
-    };
-    // Assignment hands out course-management rights, which every gate behind
-    // it re-checks against the `teacher` bar — assigning anyone below it would
-    // write a row that can never be used.
-    if !target_user.get_role().at_least(Role::Teacher) {
-        return Err(AppError::Validation(ValidationError::Invalid {
-            field: "user_id",
-            reason: "assigned teacher must hold the teacher role or higher",
-        }));
-    }
-
-    let updated = course.assign_teacher(&target, &st.db).await?;
+    let updated = service::course::assign_teacher(&st.db, &course, &target).await?;
     // The row is written; a demotion that raced the bar above swept the list
     // before this assignment was in it, and nothing re-sweeps (see
     // [`super::undo_if_demoted`]).
@@ -680,13 +635,11 @@ async fn unassign_teacher(
     RequireManager(_manager): RequireManager,
     Path((id, target)): Path<(String, String)>,
 ) -> Result<StatusCode, AppError> {
-    let course = Course::read(&CourseId::from_key(&id), &st.db)
+    let course = service::course::read(&st.db, &CourseId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
-    course.require_open(&st.db).await?;
-    let removed = course
-        .unassign_teacher(&UserId::from_key(&target), &st.db)
-        .await?;
+    let removed =
+        service::course::unassign_teacher(&st.db, &course, &UserId::from_key(&target)).await?;
     if removed.is_none() {
         return Err(AppError::NotFound);
     }
@@ -726,7 +679,7 @@ async fn enroll(
     Path(id): Path<String>,
     Json(req): Json<EnrollUser>,
 ) -> Result<Json<EnrollmentResponse>, AppError> {
-    let course = Course::read(&CourseId::from_key(&id), &st.db)
+    let course = service::course::read(&st.db, &CourseId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     if !can_manage_course(&course, &user) {
@@ -734,7 +687,7 @@ async fn enroll(
             "only the course creator, an assigned teacher, or a manager/admin can enroll users",
         ));
     }
-    course.require_open(&st.db).await?;
+    service::course::require_open(&st.db, &course).await?;
 
     let target = UserId::from_key(&req.user_id);
     let Some(target_user) = User::read(&target, &st.db).await? else {
@@ -785,7 +738,7 @@ async fn list_roster(
 ) -> Result<Json<Page<EnrollmentResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
     // Course must exist — a missing course is a 404, not an empty roster.
-    let course = Course::read(&CourseId::from_key(&id), &st.db)
+    let course = service::course::read(&st.db, &CourseId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     if !can_manage_course(&course, &user) {
@@ -833,7 +786,7 @@ async fn unenroll(
     RequireTeacher(user): RequireTeacher,
     Path((id, target)): Path<(String, String)>,
 ) -> Result<StatusCode, AppError> {
-    let course = Course::read(&CourseId::from_key(&id), &st.db)
+    let course = service::course::read(&st.db, &CourseId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     if !can_manage_course(&course, &user) {
@@ -841,7 +794,7 @@ async fn unenroll(
             "only the course creator, an assigned teacher, or a manager/admin can unenroll users",
         ));
     }
-    course.require_open(&st.db).await?;
+    service::course::require_open(&st.db, &course).await?;
     let removed = Enrollment::remove(course.get_id(), &UserId::from_key(&target), &st.db).await?;
     if removed.is_none() {
         return Err(AppError::NotFound);
@@ -884,7 +837,7 @@ async fn create_exam_in_course(
     Path(id): Path<String>,
     Json(req): Json<CreateExamInCourse>,
 ) -> Result<(StatusCode, Json<ExamResponse>), AppError> {
-    let course = Course::read(&CourseId::from_key(&id), &st.db)
+    let course = service::course::read(&st.db, &CourseId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     if !can_manage_course(&course, &user) {
@@ -892,7 +845,7 @@ async fn create_exam_in_course(
             "only the course creator, an assigned teacher, or a manager/admin can add exams to this course",
         ));
     }
-    course.require_open(&st.db).await?;
+    service::course::require_open(&st.db, &course).await?;
 
     let title = ExamTitle::try_new(&req.title)?;
     let description = ExamDescription::try_new(&req.description.unwrap_or_default())?;
@@ -955,7 +908,7 @@ async fn list_course_exams(
 ) -> Result<Json<Page<ExamResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
     // Course must exist — a missing course is a 404, not an empty exam list.
-    let course = Course::read(&CourseId::from_key(&id), &st.db)
+    let course = service::course::read(&st.db, &CourseId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     if !can_view_course(&course, &user, &st.db).await? {
@@ -1015,7 +968,7 @@ async fn create_subject_in_course(
     Path(id): Path<String>,
     Json(req): Json<CreateSubject>,
 ) -> Result<(StatusCode, Json<SubjectResponse>), AppError> {
-    let course = Course::read(&CourseId::from_key(&id), &st.db)
+    let course = service::course::read(&st.db, &CourseId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     if !can_manage_course(&course, &user) {
@@ -1023,7 +976,7 @@ async fn create_subject_in_course(
             "only the course creator, an assigned teacher, or a manager/admin can add subjects to this course",
         ));
     }
-    course.require_open(&st.db).await?;
+    service::course::require_open(&st.db, &course).await?;
 
     let name = SubjectName::try_new(&req.name)?;
     let description = SubjectDescription::try_new(&req.description.unwrap_or_default())?;
@@ -1057,7 +1010,7 @@ async fn list_course_subjects(
 ) -> Result<Json<Page<SubjectResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
     // Course must exist — a missing course is a 404, not an empty list.
-    let course = Course::read(&CourseId::from_key(&id), &st.db)
+    let course = service::course::read(&st.db, &CourseId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     if !can_view_course(&course, &user, &st.db).await? {
@@ -1125,7 +1078,7 @@ async fn create_homework_in_course(
     Path(id): Path<String>,
     Json(req): Json<CreateHomework>,
 ) -> Result<(StatusCode, Json<HomeworkResponse>), AppError> {
-    let course = Course::read(&CourseId::from_key(&id), &st.db)
+    let course = service::course::read(&st.db, &CourseId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     if !can_manage_course(&course, &user) {
@@ -1133,7 +1086,7 @@ async fn create_homework_in_course(
             "only the course creator, an assigned teacher, or a manager/admin can add homework to this course",
         ));
     }
-    course.require_open(&st.db).await?;
+    service::course::require_open(&st.db, &course).await?;
 
     let title = HomeworkTitle::try_new(&req.title)?;
     let description = match req.description.as_deref() {
@@ -1189,7 +1142,7 @@ async fn list_course_homework(
 ) -> Result<Json<Page<HomeworkResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
     // Course must exist — a missing course is a 404, not an empty homework list.
-    let course = Course::read(&CourseId::from_key(&id), &st.db)
+    let course = service::course::read(&st.db, &CourseId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     if !can_view_course(&course, &user, &st.db).await? {
@@ -1263,7 +1216,7 @@ async fn create_session_in_course(
     Path(id): Path<String>,
     Json(req): Json<CreateSessionInCourse>,
 ) -> Result<(StatusCode, Json<SessionResponse>), AppError> {
-    let course = Course::read(&CourseId::from_key(&id), &st.db)
+    let course = service::course::read(&st.db, &CourseId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     if !can_manage_course(&course, &user) {
@@ -1271,7 +1224,7 @@ async fn create_session_in_course(
             "only the course creator, an assigned teacher, or a manager/admin can add sessions to this course",
         ));
     }
-    course.require_open(&st.db).await?;
+    service::course::require_open(&st.db, &course).await?;
 
     let topic = SessionTopic::try_new(&req.topic.unwrap_or_default())?;
     let teacher = resolve_session_teacher(req.teacher_id.as_deref(), &user, &st.db).await?;
@@ -1323,7 +1276,7 @@ async fn list_course_sessions(
 ) -> Result<Json<Page<SessionResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
     // Course must exist — a missing course is a 404, not an empty list.
-    let course = Course::read(&CourseId::from_key(&id), &st.db)
+    let course = service::course::read(&st.db, &CourseId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     if !can_view_course(&course, &user, &st.db).await? {
@@ -1363,14 +1316,14 @@ mod tests {
 
     /// A course `creator` made, with nobody assigned.
     async fn course(creator: &User, db: &Database) -> Course {
-        Course::create(
+        service::course::create(
+            db,
             creator.get_id(),
             CourseTitle::try_new("Matematik").unwrap(),
             CourseDescription::try_new("").unwrap(),
             CourseKind::try_new("course").unwrap(),
             None,
             None,
-            db,
         )
         .await
         .unwrap()
@@ -1406,11 +1359,13 @@ mod tests {
         let db = init_mem().await.unwrap();
         let creator = user("creator", Role::Teacher, &db).await;
         let assigned = user("assigned", Role::Teacher, &db).await;
-        let course = course(&creator, &db)
-            .await
-            .assign_teacher(assigned.get_id(), &db)
-            .await
-            .unwrap();
+        let course = service::course::assign_teacher(
+            &db,
+            &course(&creator, &db).await,
+            assigned.get_id(),
+        )
+        .await
+        .unwrap();
         // Still teacher+: untouched by the floor.
         assert!(can_manage_course(&course, &assigned));
         // ...but never an owner, assigned or not.

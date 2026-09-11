@@ -266,7 +266,7 @@ struct ExamStatisticsResponse {
 /// The course an exam belongs to. A dangling reference means the course-delete
 /// cascade was violated — surface it loudly as a 500, not a user-facing 404.
 pub(crate) async fn course_of(exam: &Exam, db: &Database) -> Result<Course, AppError> {
-    Course::read(exam.get_course(), db)
+    crate::service::course::read(db, exam.get_course())
         .await?
         .ok_or_else(|| AppError::Internal("exam references a missing course".into()))
 }
@@ -433,7 +433,7 @@ async fn update_exam(
                 "only the course creator, an assigned teacher, or a manager/admin can edit this exam",
             ));
         }
-        course.require_open(&st.db).await?;
+        crate::service::course::require_open(&st.db, &course).await?;
 
         let title = match req.title {
             Some(ref title) => ExamTitle::try_new(title)?,
@@ -591,7 +591,7 @@ async fn delete_exam(
             "only the course creator, an assigned teacher, or a manager/admin can delete this exam",
         ));
     }
-    course.require_open(&st.db).await?;
+    crate::service::course::require_open(&st.db, &course).await?;
     // *Writer* lease of [`EXAM_LOCK`] across the whole cascade, blob names
     // included — the lease `delete_homework` has always held, and its absence
     // here is what made a sitting able to start inside this delete. Every other
@@ -676,7 +676,7 @@ async fn grade(
             "only the course creator, an assigned teacher, or a manager/admin can grade this exam",
         ));
     }
-    course.require_open(&st.db).await?;
+    crate::service::course::require_open(&st.db, &course).await?;
     // Pre-flight: `ExamResult::grade` re-makes this check inside the mark's own
     // transaction, so a re-draft landing after this read cannot leave a mark on
     // a hidden exam.
@@ -883,7 +883,7 @@ async fn remove_result(
             "only the course creator, an assigned teacher, or a manager/admin can remove results",
         ));
     }
-    course.require_open(&st.db).await?;
+    crate::service::course::require_open(&st.db, &course).await?;
     let removed = ExamResult::remove(
         exam.get_id(),
         &UserId::from_key(&target),

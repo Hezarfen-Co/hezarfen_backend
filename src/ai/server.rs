@@ -26,7 +26,7 @@ use crate::constant::{
     REQUEST_TIMEOUT_SECS,
 };
 use crate::database::Database;
-use crate::domain::course::Course;
+
 use crate::domain::course_note::CourseNote;
 use crate::domain::course_note_file::{CourseNoteFile, CourseNoteFileId};
 use crate::domain::user::{User, UserId};
@@ -639,7 +639,7 @@ async fn open_blob(
         .await
         .map_err(unavailable)?
         .ok_or_else(missing)?;
-    let course = Course::read(note.get_course(), &db)
+    let course = crate::service::course::read(&db, note.get_course())
         .await
         .map_err(unavailable)?
         .ok_or_else(missing)?;

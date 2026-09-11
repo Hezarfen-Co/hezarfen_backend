@@ -122,7 +122,7 @@ async fn session_with_course(id: &str, db: &Database) -> Result<(CourseSession, 
     let session = CourseSession::read(&CourseSessionId::from_key(id), db)
         .await?
         .ok_or(AppError::NotFound)?;
-    let course = Course::read(session.get_course(), db)
+    let course = crate::service::course::read(db, session.get_course())
         .await?
         .ok_or(AppError::NotFound)?;
     Ok((session, course))
@@ -219,7 +219,7 @@ async fn update_session(
             "only the course creator, an assigned teacher, or a manager/admin can edit this session",
         ));
     }
-    course.require_open(&st.db).await?;
+    crate::service::course::require_open(&st.db, &course).await?;
 
     let topic = req
         .topic
@@ -277,7 +277,7 @@ async fn delete_session(
             "only the course creator, an assigned teacher, or a manager/admin can delete this session",
         ));
     }
-    course.require_open(&st.db).await?;
+    crate::service::course::require_open(&st.db, &course).await?;
     session.delete(&st.db).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -318,7 +318,7 @@ async fn mark_roll_call(
             "only the session's teacher or a course manager can take roll call",
         ));
     }
-    course.require_open(&st.db).await?;
+    crate::service::course::require_open(&st.db, &course).await?;
 
     let school = service::settings::load(&st.db).await?;
     let status = AttendanceStatus::try_new(&req.status, school.get_attendance_statuses())?;
@@ -458,7 +458,7 @@ async fn remove_roll_call(
             "only the session's teacher or a course manager can take roll call",
         ));
     }
-    course.require_open(&st.db).await?;
+    crate::service::course::require_open(&st.db, &course).await?;
     let target = UserId::from_key(&target);
     // A staff row is management's to remove, keyed on the *target's live role*
     // rather than on `is_teacher`: reassigning a session's teacher used to hand

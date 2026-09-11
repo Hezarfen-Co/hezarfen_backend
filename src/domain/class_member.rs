@@ -217,7 +217,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::domain::class_course::ClassCourse;
     use crate::domain::class_group::{ClassGroup, ClassName};
-    use crate::domain::course::{Course, CourseDescription, CourseId, CourseKind, CourseTitle};
+    use crate::domain::course::{CourseDescription, CourseId, CourseKind, CourseTitle};
     use crate::domain::enrollment::Enrollment;
 
     pub(crate) async fn a_class(name: &str, db: &Database) -> ClassGroupId {
@@ -236,14 +236,14 @@ pub(crate) mod tests {
     }
 
     pub(crate) async fn a_course(title: &str, capacity: Option<i64>, db: &Database) -> CourseId {
-        Course::create(
+        crate::db::course::create(
+            db,
             &UserId::from_key("manager"),
             CourseTitle::try_new(title).unwrap(),
             CourseDescription::try_new("").unwrap(),
             CourseKind::course(),
             None,
             capacity,
-            db,
         )
         .await
         .unwrap()

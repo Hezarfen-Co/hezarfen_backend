@@ -86,7 +86,7 @@ pub async fn update(
 /// row pointing at nothing.
 ///
 /// Children first, in one transaction, the way
-/// [`crate::domain::course::Course::delete`] does it: as two queries, an
+/// [`crate::db::course::delete`] does it: as two queries, an
 /// upload that committed in between kept its row while the note went, and
 /// nothing could ever list or delete it again.
 pub async fn delete(db: &Database, note: Note) -> Result<(Note, Vec<NoteFile>), AppError> {
