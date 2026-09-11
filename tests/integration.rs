@@ -22181,7 +22181,7 @@ async fn concurrent_duplicate_menu_publishes_conflict_not_500() {
 /// writers before they can ever collide.
 #[tokio::test]
 async fn concurrent_ledger_appends_of_one_id_write_one_line_not_a_500() {
-    use hezarfen_backend::domain::meal_booking::{MealBooking, MealBookingId};
+    use hezarfen_backend::domain::meal_booking::MealBookingId;
     use hezarfen_backend::domain::meal_ledger::MealLedger;
 
     let (app, db) = app_and_db().await;
@@ -22218,10 +22218,13 @@ async fn concurrent_ledger_appends_of_one_id_write_one_line_not_a_500() {
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
-    let booking = MealBooking::read(&MealBookingId::from_key(&id_of(&res.body)), &db)
-        .await
-        .expect("read the booking")
-        .expect("the booking exists");
+    let booking = hezarfen_backend::service::meal_booking::read(
+        &db,
+        &MealBookingId::from_key(&id_of(&res.body)),
+    )
+    .await
+    .expect("read the booking")
+    .expect("the booking exists");
     let student = booking.get_student().clone();
     assert_eq!(
         MealLedger::balance_of(&student, &db).await.unwrap(),
