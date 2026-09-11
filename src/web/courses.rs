@@ -239,7 +239,7 @@ pub(crate) async fn can_view_course(
         return Ok(true);
     }
     Ok(
-        Enrollment::read_for_user(course.get_id(), user.get_id(), db)
+        service::enrollment::read_for_user(db, course.get_id(), user.get_id())
             .await?
             .is_some(),
     )
@@ -693,25 +693,9 @@ async fn enroll(
     service::course::require_open(&st.db, &course).await?;
 
     let target = UserId::from_key(&req.user_id);
-    let Some(target_user) = User::read(&target, &st.db).await? else {
-        return Err(AppError::Validation(ValidationError::Invalid {
-            field: "user_id",
-            reason: "target user does not exist",
-        }));
-    };
-
-    // Enrollment is student membership: it gates sitting exams, being graded,
-    // and appearing on a lesson roster — all student-only. Staff run courses,
-    // they don't enroll in them.
-    if target_user.get_role() != Role::Student {
-        return Err(AppError::Validation(ValidationError::Invalid {
-            field: "user_id",
-            reason: "only students can be enrolled in a course",
-        }));
-    }
-
-    let enrollment = Enrollment::enroll(course.get_id(), &target, user.get_id(), &st.db).await?;
-    let people = PersonRef::map_of(&[&target_user, &user]);
+    let enrollment =
+        service::enrollment::enroll(&st.db, course.get_id(), &target, user.get_id()).await?;
+    let people = person_map([target, user.get_id().clone()], &st.db).await?;
     Ok(Json(EnrollmentResponse::new(&enrollment, &people)))
 }
 
@@ -749,7 +733,8 @@ async fn list_roster(
             "only the course creator, an assigned teacher, or a manager/admin can list the roster",
         ));
     }
-    let (rows, total) = Enrollment::list_for_course(course.get_id(), limit, offset, &st.db).await?;
+    let (rows, total) =
+        service::enrollment::list_for_course(&st.db, course.get_id(), limit, offset).await?;
     // Join people onto the page alone — the lookup shrinks with the window.
     let people = person_map(
         rows.iter()
@@ -798,10 +783,7 @@ async fn unenroll(
         ));
     }
     service::course::require_open(&st.db, &course).await?;
-    let removed = Enrollment::remove(course.get_id(), &UserId::from_key(&target), &st.db).await?;
-    if removed.is_none() {
-        return Err(AppError::NotFound);
-    }
+    service::enrollment::unenroll(&st.db, course.get_id(), &UserId::from_key(&target)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

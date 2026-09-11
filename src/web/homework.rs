@@ -20,7 +20,7 @@ use crate::constant::{MAX_HOMEWORK_ASSIGNED, MAX_MAX_FILE_BYTES, UPLOAD_BODY_OVE
 use crate::database::Database;
 use crate::domain::badge;
 use crate::domain::course::{Course, CourseId};
-use crate::domain::enrollment::Enrollment;
+
 use crate::domain::exam_result::Mark;
 use crate::domain::homework::{Homework, HomeworkDescription, HomeworkId, HomeworkTitle};
 use crate::domain::homework_file::{HomeworkFile, HomeworkFileId};
@@ -135,7 +135,7 @@ pub(crate) async fn resolve_assigned(
     let mut users = Vec::with_capacity(keys.len());
     for key in keys {
         let user = UserId::from_key(&key);
-        if Enrollment::read_for_user(course, &user, db)
+        if service::enrollment::read_for_user(db, course, &user)
             .await?
             .is_none()
         {
@@ -480,7 +480,10 @@ async fn delete_homework(
 /// Submitting is course content, so leaving the course closes it; re-checked on
 /// every submission and file write, so an unenrollment mid-task bites the next.
 async fn ensure_enrolled(course: &CourseId, user: &UserId, db: &Database) -> Result<(), AppError> {
-    if Enrollment::read_for_user(course, user, db).await?.is_none() {
+    if service::enrollment::read_for_user(db, course, user)
+        .await?
+        .is_none()
+    {
         return Err(AppError::Forbidden(
             "you are not enrolled in this homework's course",
         ));
@@ -1177,7 +1180,7 @@ async fn grade_homework(
     }
 
     // ... enrolled in the homework's course ...
-    if Enrollment::read_for_user(homework.get_course(), &target, &st.db)
+    if service::enrollment::read_for_user(&st.db, homework.get_course(), &target)
         .await?
         .is_none()
     {
@@ -1355,12 +1358,13 @@ async fn list_homework_submissions(
     }
     let submissions = HomeworkSubmission::list_for_homework(homework.get_id(), &st.db).await?;
     let results = HomeworkResult::list_for_homework(homework.get_id(), &st.db).await?;
-    let enrolled: Vec<String> = Enrollment::list_for_course(course.get_id(), None, 0, &st.db)
-        .await?
-        .0
-        .iter()
-        .map(|enrollment| enrollment.get_user().key().to_string())
-        .collect();
+    let enrolled: Vec<String> =
+        service::enrollment::list_for_course(&st.db, course.get_id(), None, 0)
+            .await?
+            .0
+            .iter()
+            .map(|enrollment| enrollment.get_user().key().to_string())
+            .collect();
     // The audience: the assigned subset as stored, or — whole-course — whoever
     // is enrolled right now. Anyone outside it who still owns a submission or
     // grade is appended rather than dropped: their stale rows are exactly what

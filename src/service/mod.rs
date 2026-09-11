@@ -6,6 +6,7 @@ pub mod appointment_slot;
 pub mod class_blueprint;
 pub mod course;
 pub mod course_session;
+pub mod enrollment;
 pub mod exam_attempt;
 pub mod exam_question;
 pub mod meal_booking;

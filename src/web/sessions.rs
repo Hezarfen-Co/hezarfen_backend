@@ -14,7 +14,7 @@ use crate::domain::attendance::AttendanceStatus;
 use crate::domain::badge;
 use crate::domain::course::Course;
 use crate::domain::course_session::{CourseSession, CourseSessionId, SessionTopic};
-use crate::domain::enrollment::Enrollment;
+
 use crate::domain::role::Role;
 use crate::domain::session_attendance::SessionAttendance;
 use crate::domain::timestamp::Timestamp;
@@ -321,7 +321,7 @@ async fn mark_roll_call(
                 reason: "only students can be marked present in a lesson",
             }));
         }
-        if Enrollment::read_for_user(session.get_course(), &target, &st.db)
+        if service::enrollment::read_for_user(&st.db, session.get_course(), &target)
             .await?
             .is_none()
         {

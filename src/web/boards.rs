@@ -35,7 +35,6 @@ use crate::domain::board_stroke::BoardStroke;
 use crate::domain::class_group::{ClassGroup, ClassGroupId};
 use crate::domain::class_member::ClassMember;
 use crate::domain::course::CourseId;
-use crate::domain::enrollment::Enrollment;
 use crate::domain::event::{Event, EventId};
 use crate::domain::role::Role;
 use crate::domain::user::{User, UserId};
@@ -753,12 +752,14 @@ impl InviteSource {
                         "only the course creator, an assigned teacher, or a manager/admin can invite its roster",
                     ));
                 }
-                Ok(Enrollment::list_for_course(course.get_id(), None, 0, db)
-                    .await?
-                    .0
-                    .iter()
-                    .map(|enrollment| enrollment.get_user().clone())
-                    .collect())
+                Ok(
+                    crate::service::enrollment::list_for_course(db, course.get_id(), None, 0)
+                        .await?
+                        .0
+                        .iter()
+                        .map(|enrollment| enrollment.get_user().clone())
+                        .collect(),
+                )
             }
             InviteSource::Event { event } => {
                 if !user.get_role().at_least(Role::Teacher) {
