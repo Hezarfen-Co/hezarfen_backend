@@ -939,7 +939,7 @@ async fn profile_of(
     let classes = ClassGroup::list_by_ids(&class_ids, &st.db).await?;
     // Both totals are the full counts, not the windowed ones — the blocks are a
     // preview, the stats are the truth.
-    let stats = ProfileStats::load(id, course_total, class_total, &st.db).await?;
+    let stats = crate::service::profile::load(&st.db, id, course_total, class_total).await?;
     let badges = badges_of(st, id, &stats).await?;
     Ok(ProfileResponse {
         id: id.key().to_string(),
@@ -1017,20 +1017,20 @@ async fn badges_of(
     user: &UserId,
     stats: &ProfileStats,
 ) -> Result<Vec<BadgeAward>, AppError> {
-    let awards = BadgeAward::list_for(user, &st.db).await?;
+    let awards = crate::service::badge::list_for(&st.db, user).await?;
     let complete = badge::earned(stats.get_totals())
         .iter()
         .all(|id| awards.iter().any(|award| award.get_badge() == *id));
     if complete {
         return Ok(awards);
     }
-    if let Err(err) = badge::sync(user, &st.db).await {
+    if let Err(err) = crate::service::badge::sync(&st.db, user).await {
         tracing::warn!("failed to sync badges for {}: {err}", user.key());
         return Ok(awards);
     }
     // Re-read so the badge just healed appears on *this* response, stamp and
     // all, rather than only on the next one.
-    BadgeAward::list_for(user, &st.db).await
+    crate::service::badge::list_for(&st.db, user).await
 }
 
 /// The profile gate: any authenticated account reads any profile — except a

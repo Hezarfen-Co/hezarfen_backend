@@ -663,7 +663,7 @@ mod tests {
         // Every one of them is still the student's own history.
         assert_eq!(list_for_user(&db, &user).await.unwrap().len(), 200);
         assert!(
-            badge::BadgeAward::list_for(&user, &db)
+            crate::db::badge::list_for(&db, &user)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -734,7 +734,7 @@ mod tests {
         assert_eq!(closed.get_finished_at().unwrap().as_millis(), started);
 
         // And the stat that sums these stays non-negative.
-        let stats = crate::domain::profile::ProfileStats::load(&user, 0, 0, &db)
+        let stats = crate::db::profile::load(&db, &user, 0, 0)
             .await
             .unwrap();
         assert_eq!(stats.get_pomodoro_sessions(), 1);
