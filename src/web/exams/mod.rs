@@ -13,7 +13,6 @@ use utoipa_axum::routes;
 use crate::constant::{MAX_MAX_FILE_BYTES, UPLOAD_BODY_OVERHEAD_BYTES};
 use crate::database::Database;
 use crate::domain::answer_image::AnswerImage;
-use crate::domain::badge;
 use crate::domain::bank_question::{BankQuestion, BankQuestionId};
 use crate::domain::bank_question_image::BankQuestionImage;
 
@@ -32,7 +31,7 @@ use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::service;
-use crate::service::exam_attempt::{EXAM_LOCK, course_of, read_latest_for_user};
+use crate::service::exam_attempt::course_of;
 use crate::state::AppState;
 
 use super::bank_questions::BankQuestionResponse;
@@ -525,12 +524,7 @@ async fn grade(
     Json(req): Json<GradeResult>,
 ) -> Result<Json<ExamResultResponse>, AppError> {
     let exam_id = ExamId::from_key(&id);
-    // Reader lease of [`EXAM_LOCK`] from the exam read through the result
-    // write: the draft gate below must be judged against the same row the
-    // mark lands under, or a concurrent re-draft (a writer, which checks for
-    // results) could slip between them and leave a mark on a hidden exam.
-    let _guard = EXAM_LOCK.read().await;
-    // Exam must exist.
+    // Exam must exist, and only a course manager may grade it.
     let exam = service::exam::read(&st.db, &exam_id)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -540,92 +534,18 @@ async fn grade(
             "only the course creator, an assigned teacher, or a manager/admin can grade this exam",
         ));
     }
-    crate::service::course::require_open(&st.db, &course).await?;
-    // Pre-flight: `ExamResult::grade` re-makes this check inside the mark's own
-    // transaction, so a re-draft landing after this read cannot leave a mark on
-    // a hidden exam.
-    if exam.is_draft() {
-        return Err(crate::domain::exam_result::draft_error());
-    }
-    // The exam's kind must still be one the school offers. `kind_ref`'s retired
-    // bit is what actually refuses the mark inside `ExamResult::grade`, and it
-    // is a *different record* from the list — a settings PATCH moves both, so
-    // anything that leaves them disagreeing (a rolled-back retirement, a hand
-    // edit) would otherwise reopen grading under a kind nobody lists, which is
-    // also a mark that averages at weight 1 forever. Both gates, same answer;
-    // this one is a read, the counter's is the one that survives a race.
-    let kind = exam.get_kind().as_str();
-    if !service::settings::load(&st.db)
-        .await?
-        .get_exam_kinds()
-        .iter()
-        .any(|offered| offered.get_name() == kind)
-    {
-        return Err(crate::domain::exam_result::retired_kind_error(kind));
-    }
-
-    let mark = Mark::try_new(req.mark)?;
     let target = UserId::from_key(&req.user_id);
-
-    // Grading never targets oneself — no grader, whatever their role, may
-    // write their own mark.
-    if &target == teacher.get_id() {
-        return Err(AppError::Forbidden("grading yourself is not allowed"));
-    }
-
-    // Target user must exist.
-    let Some(target_user) = crate::service::user::read(&st.db, &target).await? else {
-        return Err(AppError::Validation(ValidationError::Invalid {
-            field: "user_id",
-            reason: "target user does not exist",
-        }));
-    };
-
-    // Only students carry marks — the grade system is theirs alone. A stale
-    // enrollment left behind by a promotion can't reopen grading for staff.
-    if target_user.get_role() != Role::Student {
-        return Err(AppError::Validation(ValidationError::Invalid {
-            field: "user_id",
-            reason: "only students can be graded",
-        }));
-    }
-
-    // ... and be enrolled in the exam's course.
-    if service::enrollment::read_for_user(&st.db, exam.get_course(), &target)
+    // The workflow — the *reader* lease of [`EXAM_LOCK`] from the exam read
+    // through the result write (so a concurrent re-draft cannot slip a mark
+    // onto a hidden exam), the draft and kind pre-flights, the
+    // grader/target walls, the sitting resolution, the mark's own
+    // transaction, and the badge sync — is
+    // [`crate::service::exam_result::grade`]'s.
+    let result =
+        service::exam_result::grade(&st.db, &exam_id, teacher.get_id(), &target, req.mark).await?;
+    let target_user = service::user::read(&st.db, &target)
         .await?
-        .is_none()
-    {
-        return Err(AppError::Validation(ValidationError::Invalid {
-            field: "user_id",
-            reason: "target user is not enrolled in this course",
-        }));
-    }
-
-    // The mark lands on the student's current sitting; the latest seq is the
-    // grade-of-record. An offline-graded exam has no sitting — grade its base
-    // seq (1).
-    let seq = read_latest_for_user(&st.db, &exam_id, &target)
-        .await?
-        .map_or(1, |a| a.get_seq());
-    let result = ExamResult::grade(
-        &exam_id,
-        &target,
-        seq,
-        mark,
-        teacher.get_id(),
-        exam.get_kind().as_str(),
-        &st.db,
-    )
-    .await?;
-    // Both sides of the grade moved a counter — the grader's `marks_given`,
-    // the student's `high_mark` — so both are brought up to date. A badge is a
-    // decoration on top of the mark: losing one to a transient database error
-    // must never fail the grading, and the next counter move heals it.
-    for person in [teacher.get_id(), &target] {
-        if let Err(err) = badge::sync(person, &st.db).await {
-            tracing::warn!("failed to sync badges for {}: {err}", person.key());
-        }
-    }
+        .ok_or(AppError::NotFound)?;
     let people = PersonRef::map_of(&[&target_user, &teacher]);
     Ok(Json(ExamResultResponse::new(&result, &people)))
 }
@@ -665,7 +585,7 @@ async fn list_results(
             "only the course creator, an assigned teacher, or a manager/admin can list results",
         ));
     }
-    let results = ExamResult::list_for_exam(exam.get_id(), &st.db).await?;
+    let results = service::exam_result::list_for_exam(&st.db, exam.get_id()).await?;
     let total = results.len() as i64;
     // Join people onto the page alone — the lookup shrinks with the window.
     // Paged in the web layer: the list is deduped to the latest mark per
@@ -703,7 +623,7 @@ async fn my_result(
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<ExamResultResponse>, AppError> {
-    let result = ExamResult::read_for_user(&ExamId::from_key(&id), user.get_id(), &st.db)
+    let result = service::exam_result::read_for_user(&st.db, &ExamId::from_key(&id), user.get_id())
         .await?
         .ok_or(AppError::NotFound)?;
     let people = person_map(
@@ -747,14 +667,9 @@ async fn remove_result(
             "only the course creator, an assigned teacher, or a manager/admin can remove results",
         ));
     }
-    crate::service::course::require_open(&st.db, &course).await?;
-    let removed = ExamResult::remove(
-        exam.get_id(),
-        &UserId::from_key(&target),
-        exam.get_kind().as_str(),
-        &st.db,
-    )
-    .await?;
+    // The archived-term gate and the refunding delete are
+    // [`crate::service::exam_result::remove`]'s.
+    let removed = service::exam_result::remove(&st.db, &exam, &UserId::from_key(&target)).await?;
     if removed.is_none() {
         return Err(AppError::NotFound);
     }
@@ -791,7 +706,7 @@ async fn exam_statistics(
             "only the course creator, an assigned teacher, or a manager/admin can view statistics",
         ));
     }
-    let results = ExamResult::list_for_exam(exam.get_id(), &st.db).await?;
+    let results = service::exam_result::list_for_exam(&st.db, exam.get_id()).await?;
 
     let marks: Vec<i64> = results.iter().map(|r| r.get_mark().as_i64()).collect();
     let average =

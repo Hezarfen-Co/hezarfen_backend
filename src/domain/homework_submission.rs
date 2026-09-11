@@ -124,7 +124,7 @@ impl HomeworkSubmission {
     /// transaction, and the order is load-bearing: the increment sits *after*
     /// the UPSERT and is conditional on it having matched a row, because a
     /// frozen row makes that `WHERE` match nothing **silently** (unlike
-    /// [`crate::domain::exam_result::ExamResult::grade`], which `THROW`s) — put
+    /// [`crate::db::exam_result::grade`], which `THROW`s) — put
     /// first, it would count a submission the freeze refused. `$before = NONE`
     /// keeps it to a genuine first create, so an edit moves neither counter,
     /// which is what makes the live count mean the same thing the one-time
@@ -160,7 +160,7 @@ impl HomeworkSubmission {
     /// homework row — `due_at` up by one and straight back to the captured
     /// value, so the row is byte-identical afterwards — because only a write
     /// collides, and `SET x = x` is elided and never reaches the write set. It
-    /// is [`crate::domain::exam_answer::ExamAnswer::save`]'s shape exactly.
+    /// is [`crate::db::exam_answer::save`]'s shape exactly.
     /// `Err(NotFound)` means the homework is gone, which is the 404 the web
     /// layer's own lookup would have answered.
     pub async fn upsert(

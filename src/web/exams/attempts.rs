@@ -102,7 +102,7 @@ pub(crate) async fn attempt_progress(
     seq: i64,
     db: &Database,
 ) -> Result<(u64, u64), AppError> {
-    let answered = ExamAnswer::list_for_exam_user(exam, user, seq, db)
+    let answered = crate::service::exam_answer::list_for_exam_user(db, exam, user, seq)
         .await?
         .len() as u64;
     let question_count = crate::service::exam_question::list_for_exam(db, exam, None, 0)
@@ -142,7 +142,7 @@ pub(crate) async fn start_attempt(
 ) -> Result<(StatusCode, Json<AttemptResponse>), AppError> {
     let (exam, attempt, created) =
         exam_attempt::start_attempt(&st.db, &ExamId::from_key(&id), &user).await?;
-    let mark = ExamResult::read_for_user(exam.get_id(), user.get_id(), &st.db)
+    let mark = crate::service::exam_result::read_for_user(&st.db, exam.get_id(), user.get_id())
         .await?
         .map(|r| r.get_mark());
     let (answered, question_count) =
@@ -195,7 +195,7 @@ pub(crate) async fn my_attempt(
     let attempt = exam_attempt::read_latest_for_user(&st.db, exam.get_id(), user.get_id())
         .await?
         .ok_or(AppError::NotFound)?;
-    let mark = ExamResult::read_for_user(exam.get_id(), user.get_id(), &st.db)
+    let mark = crate::service::exam_result::read_for_user(&st.db, exam.get_id(), user.get_id())
         .await?
         .map(|r| r.get_mark());
     let (answered, question_count) =
@@ -239,7 +239,7 @@ pub(crate) async fn finish_attempt(
         .await?
         .ok_or(AppError::NotFound)?;
     let finished = exam_attempt::finish_attempt(&st.db, &exam, user.get_id()).await?;
-    let mark = ExamResult::read_for_user(exam.get_id(), user.get_id(), &st.db)
+    let mark = crate::service::exam_result::read_for_user(&st.db, exam.get_id(), user.get_id())
         .await?
         .map(|r| r.get_mark());
     let (answered, question_count) =
@@ -347,7 +347,7 @@ pub(crate) async fn live_snapshot(
             }
         }
     }
-    let marks: HashMap<String, i64> = ExamResult::list_for_exam(exam.get_id(), db)
+    let marks: HashMap<String, i64> = crate::service::exam_result::list_for_exam(db, exam.get_id())
         .await?
         .iter()
         .map(|result| {
@@ -367,7 +367,7 @@ pub(crate) async fn live_snapshot(
     // seq to their latest attempt — or a re-sitting student's count would
     // double up their prior attempts.
     let mut progress: HashMap<String, (u64, i64)> = HashMap::new();
-    for answer in ExamAnswer::list_for_exam(exam.get_id(), db).await? {
+    for answer in crate::service::exam_answer::list_for_exam(db, exam.get_id()).await? {
         let key = answer.get_user().key().to_string();
         if attempts.get(&key).map(ExamAttempt::get_seq) != Some(answer.get_seq()) {
             continue;
@@ -588,13 +588,13 @@ pub(crate) async fn attempt_questions(
         crate::service::exam_question::list_for_exam(&st.db, exam.get_id(), None, 0).await?;
     let images = images_by_question(exam.get_id(), &st.db).await?;
     let answers: HashMap<String, ExamAnswer> =
-        ExamAnswer::list_for_exam_user(exam.get_id(), user.get_id(), seq, &st.db)
+        crate::service::exam_answer::list_for_exam_user(&st.db, exam.get_id(), user.get_id(), seq)
             .await?
             .into_iter()
             .map(|answer| (answer.get_question().key().to_string(), answer))
             .collect();
     let answer_images: HashMap<String, AnswerImage> =
-        AnswerImage::list_for_exam_user(exam.get_id(), user.get_id(), seq, &st.db)
+        crate::service::answer_image::list_for_exam_user(&st.db, exam.get_id(), user.get_id(), seq)
             .await?
             .into_iter()
             .map(|image| (image.get_question().key().to_string(), image))
@@ -748,9 +748,10 @@ pub(crate) async fn answer_sheet(
     let (mut questions, _) =
         crate::service::exam_question::list_for_exam(db, exam.get_id(), None, 0).await?;
     questions.retain(|question| !hidden.contains(question.get_id().key()));
-    let answers = ExamAnswer::list_for_exam_user(exam.get_id(), target, seq, db).await?;
+    let answers =
+        crate::service::exam_answer::list_for_exam_user(db, exam.get_id(), target, seq).await?;
     let answer_images: HashMap<String, AnswerImage> =
-        AnswerImage::list_for_exam_user(exam.get_id(), target, seq, db)
+        crate::service::answer_image::list_for_exam_user(db, exam.get_id(), target, seq)
             .await?
             .into_iter()
             .map(|image| (image.get_question().key().to_string(), image))

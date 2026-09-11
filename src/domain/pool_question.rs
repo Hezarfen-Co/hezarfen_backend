@@ -717,7 +717,7 @@ mod tests {
         );
     }
 
-    /// The [`crate::domain::exam_answer::ExamAnswer::save`] defect, one domain
+    /// The [`crate::db::exam_answer::save`] defect, one domain
     /// over: a solution offered inside its question's delete window must not
     /// outlive it. Guarding the offer by *reading* the question does not do it
     /// — the read sees a row [`PoolQuestion::delete`] has removed but not
