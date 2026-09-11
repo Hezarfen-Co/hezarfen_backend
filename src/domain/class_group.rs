@@ -17,10 +17,10 @@ use crate::constant::{
     MAX_CLASS_NAME_LEN, TERM_CLASS_COUNT_FIELD,
 };
 use crate::database::{Database, transaction_with_retry};
-use crate::domain::cap;
-use crate::domain::field_update::FieldUpdate;
+use crate::db::cap;
+use crate::db::field_update::FieldUpdate;
 use crate::domain::monotonic_id::next_ulid;
-use crate::domain::page::PagedList;
+use crate::db::page::PagedList;
 use crate::domain::term::{self, TermId};
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
@@ -87,7 +87,7 @@ impl ClassGrade {
 
 /// One class. `creator` is who made it; the two refcounts behind the delete
 /// guard are database-side columns only, so no whole-row save can clobber one
-/// (see [`crate::domain::cap`]).
+/// (see [`crate::db::cap`]).
 ///
 /// `teacher` is the section's homeroom teacher (sınıf öğretmeni): optional, not
 /// refcounted, and merely a label pointing at a teacher-or-higher account — the
@@ -415,7 +415,7 @@ mod tests {
     }
 
     /// The stored counter, re-read — never off a return value, which the
-    /// in-memory engine forges wins on (see [`crate::domain::cap`]).
+    /// in-memory engine forges wins on (see [`crate::db::cap`]).
     async fn stored_count(sql: &str, db: &Database) -> i64 {
         let mut result = db.query(sql).await.unwrap().check().unwrap();
         result

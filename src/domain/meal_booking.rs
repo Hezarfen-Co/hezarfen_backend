@@ -35,10 +35,10 @@ use crate::constant::{
     MENU_VERSION_FIELD,
 };
 use crate::database::{Database, backoff, lost_the_race};
-use crate::domain::cap::{self, Claimed};
+use crate::db::cap::{self, Claimed};
 use crate::domain::meal_ledger::{LedgerAmount, MealLedger};
 use crate::domain::menu::{Menu, MenuDate, MenuId, MenuSlot};
-use crate::domain::page::PagedList;
+use crate::db::page::PagedList;
 use crate::domain::settings::{MealSlotDef, Settings};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;

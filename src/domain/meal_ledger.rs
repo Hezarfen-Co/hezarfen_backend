@@ -63,7 +63,7 @@ use crate::database::{Database, lost_the_race};
 use crate::domain::meal_booking::{MealBooking, MealBookingId};
 use crate::domain::menu::MenuId;
 use crate::domain::menu_dish::MenuDish;
-use crate::domain::page::PagedList;
+use crate::db::page::PagedList;
 // The client-chosen idempotence key both ledgers take — one grammar, one
 // validator, one type, rather than a second newtype that could drift from it.
 use crate::domain::payment_ledger::PaymentRequestKey;

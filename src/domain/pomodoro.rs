@@ -497,7 +497,7 @@ mod tests {
     /// contention on one user row.
     ///
     /// Multi-threaded and off the embedded engine for the reason
-    /// [`crate::domain::cap`] spells out: the in-memory engine does not
+    /// [`crate::db::cap`] spells out: the in-memory engine does not
     /// conflict-check two concurrent writes to one record, so it would answer
     /// `Ok` to a write it dropped and *forge* the integrity failure this test
     /// exists to catch.

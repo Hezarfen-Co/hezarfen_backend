@@ -30,7 +30,7 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use crate::config::Config;
 use crate::constant::{MAX_SLUG_LEN, MIN_SLUG_LEN};
 use crate::database::{Database, lost_the_race, migrate, migrate_control};
-use crate::domain::page::PagedList;
+use crate::db::page::PagedList;
 use crate::domain::timestamp::Timestamp;
 use crate::error::{AppError, ValidationError};
 use crate::module::ModuleSet;

@@ -10,9 +10,9 @@ use crate::constant::{
     MAX_CHATBOT_THREAD_TITLE_LEN, SETTINGS_KEY, SETTINGS_TABLE,
 };
 use crate::database::{Database, transaction_with_retry};
-use crate::domain::cap;
+use crate::db::cap;
 use crate::domain::monotonic_id::next_ulid;
-use crate::domain::page::PagedList;
+use crate::db::page::PagedList;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};

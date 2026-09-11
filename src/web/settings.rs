@@ -9,7 +9,7 @@ use surrealdb::types::RecordId;
 
 use crate::constant::CAS_UPDATE_RETRIES;
 use crate::database::Database;
-use crate::domain::cap;
+use crate::db::cap;
 use crate::domain::exam_result::kind_ref;
 use crate::domain::menu::slot_ref;
 use crate::domain::settings::{ExamKindDef, GradeBand, MealSlotDef, SETTINGS_LOCK, Settings};

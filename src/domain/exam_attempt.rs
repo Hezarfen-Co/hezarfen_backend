@@ -6,7 +6,8 @@ use crate::domain::exam::Exam;
 use crate::domain::exam::ExamId;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
-use crate::domain::{badge, cap, key};
+use crate::db::cap;
+use crate::domain::{badge, key};
 use crate::error::AppError;
 
 /// The `THROW` marker the freeze gate aborts with, and the one 409 both it and
@@ -426,7 +427,7 @@ impl ExamAttempt {
     //
     // corner-cut: the count and a concurrent `CREATE exam_attempt` are still not
     // serialized against each other — SurrealDB does not conflict-check a
-    // cross-record count (the write skew `domain::cap` exists for), so an
+    // cross-record count (the write skew `db::cap` exists for), so an
     // attempt landing in the same instant as an edit can still interleave
     // either way. The mutex this replaces closed that inside one process only,
     // and there are two, so nothing is lost. Closing it properly means the

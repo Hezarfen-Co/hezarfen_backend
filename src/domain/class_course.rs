@@ -12,7 +12,7 @@ use crate::domain::class_blueprint::ClassBlueprintId;
 use crate::domain::class_group::ClassGroupId;
 use crate::domain::class_pump::{Attached, Axis, attach, detach, link_id};
 use crate::domain::course::CourseId;
-use crate::domain::page::PagedList;
+use crate::db::page::PagedList;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;

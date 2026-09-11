@@ -4565,7 +4565,7 @@ losing races at one process. Every invariant is therefore guarded where the
 database itself decides the winner. Three tiers:
 
 1. **Single-row conditional writes** — compare-and-set (`save_if_unchanged`),
-   `UPDATE … WHERE`, stored counters (`domain::cap`). A single-record write is
+   `UPDATE … WHERE`, stored counters (`db::cap`). A single-record write is
    atomic, so of N concurrent tasks exactly the allowed number get a non-empty
    result: the database decides the winner, the loser retries
    (`CAS_UPDATE_RETRIES`) or gets a 409.

@@ -18,8 +18,8 @@ use crate::constant::{
     MENU_VERSION_FIELD, REF_COUNT_FIELD, SLOT_REF_TABLE,
 };
 use crate::database::{Database, transaction_with_retry, write_with_retry};
-use crate::domain::cap;
-use crate::domain::page::PagedList;
+use crate::db::cap;
+use crate::db::page::PagedList;
 use crate::domain::settings::MealSlotDef;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
@@ -30,7 +30,7 @@ use crate::error::{AppError, ValidationError};
 /// conflict-check). Publishing no longer needs it — the day+slot *is* the
 /// record id — and neither does a booking, a menu delete, or the settings
 /// slot-removal guard: those went to conditional single-record writes
-/// ([`crate::domain::cap`]), which the store decides as this lock cannot.
+/// ([`crate::db::cap`]), which the store decides as this lock cannot.
 //
 // corner-cut: the dish cap therefore rests on this lock alone — a dish write
 // added without taking it reopens the count-then-write hole silently. Closing
@@ -49,7 +49,7 @@ pub(crate) static MENU_LOCK: Mutex<()> = Mutex::const_new(());
 
 /// The reference counter for one meal slot — how many menus are published under
 /// that name, and whether the school has retired it (see
-/// [`crate::domain::cap`]). The mirror of
+/// [`crate::db::cap`]). The mirror of
 /// [`kind_ref`](crate::domain::exam_result::kind_ref) for exam kinds: the slot
 /// is snapshotted text on the menu, so this row is the only place the two
 /// tables' relationship is a single record concurrent writes can contend on.

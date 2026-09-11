@@ -72,7 +72,7 @@ impl Scheduled for Exam {
 }
 
 /// Serializes the exam subsystem's cross-record check-then-writes, which
-/// `BEGIN…COMMIT` cannot (write skew) — the reasoning in [`crate::domain::cap`].
+/// `BEGIN…COMMIT` cannot (write skew) — the reasoning in [`crate::db::cap`].
 /// It orders requests, but only around what it wraps — every invariant that
 /// could be moved into the database itself has been, so a gap between a read
 /// and its write is decided by the store. What is left here needs a

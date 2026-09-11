@@ -14,7 +14,7 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
 use crate::constant::{DIETARY_PROFILE_TABLE, MAX_DIETARY_NOTE_LEN, MAX_DIETARY_TAGS};
 use crate::database::Database;
-use crate::domain::field_update::FieldUpdate;
+use crate::db::field_update::FieldUpdate;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};

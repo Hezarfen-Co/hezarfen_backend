@@ -13,10 +13,10 @@ use crate::constant::{
 use crate::database::{Database, transaction_with_retry, write_with_retry};
 use crate::domain::appointment::AppointmentStatus;
 use crate::domain::board::Board;
-use crate::domain::field_update::FieldUpdate;
+use crate::db::field_update::FieldUpdate;
 use crate::domain::monotonic_id::next_ulid;
 use crate::domain::note_file::FileContentType;
-use crate::domain::page::PagedList;
+use crate::db::page::PagedList;
 use crate::domain::preferences::{Language, PaletteColor, Theme};
 use crate::domain::profile::{Bio, BirthDate, DisplayName, Email, PersonName, Phone};
 use crate::domain::role::Role;
@@ -31,7 +31,7 @@ use crate::validate::{validate_password, validate_username};
 /// guard is a count-then-write: read whether another admin exists, then lower
 /// this row. SurrealDB conflict-checks neither side of that pair — a
 /// `BEGIN…COMMIT` does not serialize a cross-record count against a concurrent
-/// update (write-skew, see [`crate::domain::cap`]) and a statement that only
+/// update (write-skew, see [`crate::db::cap`]) and a statement that only
 /// *reads* the rival's row never collides with it. So two admins demoting each
 /// other both counted the other and both committed, leaving **zero** admins and
 /// a school nobody can administer: `ensure_admin` refuses to promote an
@@ -41,7 +41,7 @@ use crate::validate::{validate_password, validate_username};
 /// Serializing the pair is what closes it, the same argument
 /// [`crate::domain::settings::SETTINGS_LOCK`] makes one level up: the deployment
 /// runs one process by contract (stop-the-world upgrades), so process-wide is
-/// deployment-wide. A per-row counter (the [`crate::domain::cap`] shape) does
+/// deployment-wide. A per-row counter (the [`crate::db::cap`] shape) does
 /// not fit — the count being capped is over *every* user row, with no parent
 /// record to hold it and no place to seed one without a backfill.
 ///

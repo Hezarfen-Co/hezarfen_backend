@@ -18,7 +18,7 @@
 //! a direction flag would be one function containing two, so the seam stays
 //! where the SQL puts it.
 //!
-//! Everything here writes counters the way [`crate::domain::cap`] does — a
+//! Everything here writes counters the way [`crate::db::cap`] does — a
 //! single-record conditional `UPDATE`, never a count-then-write — and every
 //! `??` is parenthesized, because `n ?? 0 < $cap` parses as `n ?? (0 < $cap)`
 //! and is truthy for every row.
@@ -30,7 +30,7 @@ use crate::constant::{
     ENROLLMENT_COUNT_FIELD, ENROLLMENT_TABLE, MAX_CLASS_COURSES, MAX_CLASS_MEMBERS,
 };
 use crate::database::{Database, transaction_with_retry};
-use crate::domain::cap;
+use crate::db::cap;
 use crate::domain::class_group::{ClassGroup, ClassGroupId};
 use crate::error::AppError;
 

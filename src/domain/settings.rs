@@ -46,7 +46,7 @@ use crate::error::{AppError, ValidationError};
 /// So the pair is serialized instead. Every writer of the singleton goes
 /// through `PATCH /settings`, and the deployment runs one process by contract
 /// (stop-the-world upgrades), so process-wide is deployment-wide here — the
-/// same argument [`crate::domain::cap`]'s own lock makes for `retire_name`'s
+/// same argument [`crate::db::cap`]'s own lock makes for `retire_name`'s
 /// two statements, one level up. The compare-and-set stays: it is what keeps a
 /// crashed or rolled-back attempt from writing a list nobody merged.
 ///

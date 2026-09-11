@@ -7,7 +7,7 @@ use crate::constant::{
     KIND_REF_TABLE, MARKS_GIVEN_TOTAL_FIELD, REF_COUNT_FIELD, REF_RETIRED_FIELD,
 };
 use crate::database::{Database, transaction_with_retry};
-use crate::domain::cap;
+use crate::db::cap;
 use crate::domain::course::CourseId;
 use crate::domain::exam::ExamId;
 use crate::domain::key;
@@ -23,7 +23,7 @@ pub(crate) fn draft_error() -> AppError {
 
 /// The reference counter for one exam kind — how many marks are written under
 /// that name, and whether the school has retired it (see
-/// [`crate::domain::cap`]). Keyed by the name itself: the kind is snapshotted
+/// [`crate::db::cap`]). Keyed by the name itself: the kind is snapshotted
 /// text on the exam, and this row is what makes "a kind nothing is graded under
 /// may be removed" a decision the database takes, not a count a concurrent mark
 /// can invalidate.

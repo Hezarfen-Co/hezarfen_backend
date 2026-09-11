@@ -147,7 +147,7 @@ pub(crate) async fn undo_if_demoted(target: &UserId, db: &Database) -> Result<()
 /// If both ends are present, `ends_at` must not precede `starts_at`. Shared by
 /// everything that carries a time range (events, course sessions). The PATCH
 /// paths re-check this at write time via
-/// [`crate::domain::field_update::FieldUpdate::ordered`], which answers with the
+/// [`crate::db::field_update::FieldUpdate::ordered`], which answers with the
 /// same error — this is the pre-flight, that is the race closer.
 pub(crate) fn check_time_range(
     starts_at: Option<Timestamp>,
@@ -405,7 +405,7 @@ mod tests {
     /// refuse; with the account still staff it must undo nothing at all.
     ///
     /// Asserted on stored state, never on a return value: the in-memory engine
-    /// forges those (see [`crate::domain::cap`]).
+    /// forges those (see [`crate::db::cap`]).
     #[tokio::test]
     async fn undo_if_demoted_repairs_both_assignments_or_neither() {
         use crate::domain::class_group::{ClassGroup, ClassName};

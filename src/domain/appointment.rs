@@ -5,7 +5,7 @@
 //! Two *cross-record* invariants live here, guarded very differently:
 //!
 //! - **One live booking per slot** — the `occupied` counter on the slot row, a
-//!   [`cap`](crate::domain::cap) of one. Booking claims it *with* the booking
+//!   [`cap`](crate::db::cap) of one. Booking claims it *with* the booking
 //!   row ([`claim_and_create`](cap::claim_and_create));
 //!   rejecting or cancelling gives it back in the *same transaction* as the
 //!   status flip, so the slot frees itself with nothing to sweep. Both are
@@ -41,8 +41,8 @@ use crate::constant::{
 };
 use crate::database::{Database, lost_the_race};
 use crate::domain::appointment_slot::{AppointmentSlot, AppointmentSlotId};
-use crate::domain::cap;
-use crate::domain::page::PagedList;
+use crate::db::cap;
+use crate::db::page::PagedList;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};

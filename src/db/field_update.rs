@@ -25,7 +25,7 @@
 use surrealdb::types::{RecordId, SurrealValue, Value};
 
 use crate::database::{Database, transaction_with_retry, write_with_retry};
-use crate::domain::cap;
+use crate::db::cap;
 use crate::error::AppError;
 
 /// The `THROW` markers [`FieldUpdate::refcount`]'s transaction aborts with: the
@@ -131,7 +131,7 @@ impl FieldUpdate {
     /// count is what a delete guard reads, so the stranded one makes its parent
     /// undeletable forever. `refused` is the answer when the claimed row is gone
     /// (the conditional write doubles as the existence check, as in
-    /// [`crate::domain::cap`]); the transaction then aborts, so the release and
+    /// [`crate::db::cap`]); the transaction then aborts, so the release and
     /// the row write never happened either.
     ///
     /// Only ever called alongside a `.set()` of the very column that carries the

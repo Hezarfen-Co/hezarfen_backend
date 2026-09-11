@@ -19,9 +19,9 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
 use crate::constant::{FEE_PLAN_ASSIGNMENT_COUNT_FIELD, FEE_PLAN_ASSIGNMENT_TABLE};
 use crate::database::Database;
-use crate::domain::cap::{self, Claimed};
+use crate::db::cap::{self, Claimed};
 use crate::domain::fee_plan::{FeePlan, FeePlanId};
-use crate::domain::page::PagedList;
+use crate::db::page::PagedList;
 use crate::domain::payment_ledger::PaymentLedger;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;

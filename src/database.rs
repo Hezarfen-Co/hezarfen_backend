@@ -283,7 +283,7 @@ pub async fn init_mem_tenants() -> Result<Tenants, AppError> {
 /// that is dropped and re-made on every call. For the tests whose subject is
 /// the store's own conflict detection, which [`init_mem`]'s embedded engine
 /// does not have: it drops one of two concurrent writes to a record and answers
-/// `Ok` to both (see [`crate::domain::cap`]), which *forges* the very
+/// `Ok` to both (see [`crate::db::cap`]), which *forges* the very
 /// integrity failure those tests exist to catch — measured 2026-07-30 at 2
 /// failed runs in 36 on `memory`, against 0 in 10 000 rounds here.
 ///

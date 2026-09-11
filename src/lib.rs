@@ -2,6 +2,7 @@ pub mod ai;
 pub mod config;
 pub mod constant;
 pub mod database;
+pub mod db;
 pub mod domain;
 pub mod error;
 pub mod migration_sql;

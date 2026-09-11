@@ -3,7 +3,7 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use crate::constant::{ATTENDANCE_TABLE, REGISTRATION_COUNT_FIELD};
 use crate::database::{Database, transaction_with_retry};
 use crate::domain::event::EventId;
-use crate::domain::page::PagedList;
+use crate::db::page::PagedList;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 

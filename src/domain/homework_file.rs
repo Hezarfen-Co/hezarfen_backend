@@ -16,7 +16,7 @@ use crate::constant::{
     SUBMISSION_OPEN_GUARD,
 };
 use crate::database::{Database, transaction_with_retry};
-use crate::domain::cap;
+use crate::db::cap;
 use crate::domain::course::CourseId;
 use crate::domain::homework::HomeworkId;
 use crate::domain::homework_submission::{HomeworkSubmission, HomeworkSubmissionId};

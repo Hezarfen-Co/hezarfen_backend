@@ -2,10 +2,10 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
 use crate::constant::{ENROLLMENT_COUNT_FIELD, ENROLLMENT_TABLE};
 use crate::database::{Database, transaction_with_retry};
-use crate::domain::cap;
+use crate::db::cap;
 use crate::domain::class_group::ClassGroupId;
 use crate::domain::course::{Course, CourseId};
-use crate::domain::page::PagedList;
+use crate::db::page::PagedList;
 use crate::domain::role::Role;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};

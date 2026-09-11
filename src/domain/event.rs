@@ -8,7 +8,7 @@ use crate::domain::class_group::ClassGroupId;
 use crate::domain::class_member::{ClassMember, ClassMemberId};
 use crate::domain::course::CourseId;
 use crate::domain::enrollment::Enrollment;
-use crate::domain::field_update::FieldUpdate;
+use crate::db::field_update::FieldUpdate;
 use crate::domain::monotonic_id::next_ulid;
 use crate::domain::registration::Registration;
 use crate::domain::role::Role;

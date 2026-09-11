@@ -20,9 +20,9 @@ use crate::constant::{
     FEE_PLAN_TABLE, FEE_PLAN_UNASSIGNED_GUARD, MAX_FEE_PLAN_INSTALLMENTS, MAX_FEE_PLAN_NAME_LEN,
 };
 use crate::database::{Database, write_with_retry};
-use crate::domain::field_update::FieldUpdate;
+use crate::db::field_update::FieldUpdate;
 use crate::domain::monotonic_id::next_ulid;
-use crate::domain::page::PagedList;
+use crate::db::page::PagedList;
 use crate::domain::payment_ledger::LedgerAmount;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
