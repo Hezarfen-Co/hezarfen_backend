@@ -280,7 +280,6 @@ mod tests {
     use super::*;
     use crate::constant::DEFAULT_ATTENDANCE_STATUSES;
     use crate::database::init_mem;
-    use crate::domain::badge::BadgeStats;
     use crate::domain::course_session::SessionTopic;
     use crate::domain::role::Role;
 
@@ -339,14 +338,14 @@ mod tests {
 
     /// The two counters as the badge rules read them, off the stored row.
     async fn attended(user: &UserId, db: &Database) -> i64 {
-        BadgeStats::load(user, db)
+        crate::db::badge::load(db, user)
             .await
             .unwrap()
             .get_lessons_attended()
     }
 
     async fn held(user: &UserId, db: &Database) -> i64 {
-        BadgeStats::load(user, db).await.unwrap().get_lessons_held()
+        crate::db::badge::load(db, user).await.unwrap().get_lessons_held()
     }
 
     /// The whole transition table in one pass: an upsert may only move the
