@@ -459,7 +459,6 @@ mod tests {
     #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn a_publish_landing_inside_a_demotion_never_outlives_the_role() {
         use crate::domain::role::Role;
-        use crate::domain::user::User;
 
         let (db, _serialized) = crate::database::init_test_server("slot_demotion_race").await;
         let (mut raced, mut published, mut stranded) = (0, 0, 0);
@@ -493,12 +492,7 @@ mod tests {
                 let db = db.clone();
                 let target = teacher.clone();
                 tokio::spawn(async move {
-                    User::read(&target, &db)
-                        .await
-                        .unwrap()
-                        .unwrap()
-                        .set_role(Role::Student, &db)
-                        .await
+                    crate::service::user::set_role(&db, &target, Role::Student).await
                 })
             };
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
