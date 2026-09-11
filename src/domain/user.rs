@@ -1078,8 +1078,9 @@ mod tests {
     /// no route can reach and a seat nothing can ever free.
     #[tokio::test]
     async fn a_demotion_withdraws_the_calendar_and_settles_its_bookings() {
-        use crate::domain::appointment::{Appointment, AppointmentReason};
+        use crate::domain::appointment::AppointmentReason;
         use crate::domain::appointment_slot::AppointmentSlot;
+        use crate::service::appointment;
 
         let db = init_mem().await.unwrap();
         let staff = |name: &'static str, db: Database| async move {
@@ -1109,16 +1110,16 @@ mod tests {
         let agreed = slot(&teacher, 300_000, db.clone()).await;
         let kept = slot(&other, 60_000, db.clone()).await;
 
-        let pending = Appointment::book(asked.get_id(), student.get_id(), reason(), &db)
+        let pending = appointment::book(&db, asked.get_id(), student.get_id(), reason())
             .await
             .unwrap();
-        let approved = Appointment::book(agreed.get_id(), student.get_id(), reason(), &db)
+        let approved = appointment::book(&db, agreed.get_id(), student.get_id(), reason())
             .await
             .unwrap();
-        Appointment::approve(approved.get_id(), teacher.get_id(), &db)
+        appointment::approve(&db, approved.get_id(), teacher.get_id())
             .await
             .unwrap();
-        let elsewhere = Appointment::book(kept.get_id(), student.get_id(), reason(), &db)
+        let elsewhere = appointment::book(&db, kept.get_id(), student.get_id(), reason())
             .await
             .unwrap();
 
@@ -1143,7 +1144,7 @@ mod tests {
         // Both bookings — the pending request and the confirmed meeting — ended
         // in a state their requester can still read, saying who dropped it.
         for booking in [&pending, &approved] {
-            let after = Appointment::read(booking.get_id(), &db)
+            let after = appointment::read(&db, booking.get_id())
                 .await
                 .unwrap()
                 .expect("the requester keeps the row");
@@ -1173,7 +1174,7 @@ mod tests {
             1
         );
         assert_eq!(
-            Appointment::read(elsewhere.get_id(), &db)
+            appointment::read(&db, elsewhere.get_id())
                 .await
                 .unwrap()
                 .unwrap()

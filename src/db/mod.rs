@@ -1,5 +1,6 @@
 //! The only layer that executes queries.
 
+pub mod appointment;
 pub mod cap;
 pub mod field_update;
 pub mod note;

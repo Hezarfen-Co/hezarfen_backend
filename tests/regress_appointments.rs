@@ -337,7 +337,7 @@ async fn an_answer_resolves_its_own_prompt_across_an_interleave() {
 // The store property behind `APPOINTMENT_LOCK`.
 // ---------------------------------------------------------------------------
 
-/// The overlap check exactly as [`Appointment::conflicts`] asks it, then the
+/// The overlap check exactly as [`crate::db::appointment::conflicts`] asks it, then the
 /// approval it authorizes — one `BEGIN…COMMIT`, with a `SLEEP` between the two
 /// so both racers read before either writes. Deterministic: the window is wide
 /// enough that no scheduling jitter can order the read of one after the write
@@ -438,7 +438,7 @@ async fn pending_at(
 /// counter or a compare-and-set on.
 ///
 /// Which is why every approving path takes
-/// `domain::appointment::APPOINTMENT_LOCK`, an in-process mutex — it is the
+/// `service::appointment::APPOINTMENT_LOCK`, an in-process mutex — it is the
 /// *only* thing preventing a double-booked teacher today, and this test is what
 /// that claim rests on. The lock is bypassed here on purpose: the racing
 /// approvals are sent as raw transactions, so what is measured is the store.
