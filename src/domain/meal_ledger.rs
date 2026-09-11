@@ -49,27 +49,25 @@
 //!   here: the seat was reserved and the food was cooked.
 //!
 //! Money is `i64` minor units (kuruş) end to end. No float, no decimal, ever.
+//!
+//! The writes and the SUM/balance reads live in [`crate::db::meal_ledger`];
+//! the charge/reversal and credit workflows in
+//! [`crate::service::meal_ledger`].
 
 use std::sync::LazyLock;
 
-use surrealdb::types::{AlreadyExistsError, RecordId, RecordIdKey, SurrealValue};
+use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use ulid::Generator;
 
 use crate::constant::{
-    CAS_UPDATE_RETRIES, MAX_LEDGER_AMOUNT_MINOR, MAX_LEDGER_METHOD_LEN, MAX_LEDGER_NOTE_LEN,
-    MEAL_LEDGER_TABLE,
+    MAX_LEDGER_AMOUNT_MINOR, MAX_LEDGER_METHOD_LEN, MAX_LEDGER_NOTE_LEN, MEAL_LEDGER_TABLE,
 };
-use crate::database::{Database, lost_the_race};
-use crate::domain::meal_booking::{MealBooking, MealBookingId};
-use crate::domain::menu::MenuId;
-use crate::domain::menu_dish::MenuDish;
-use crate::db::page::PagedList;
 // The client-chosen idempotence key both ledgers take — one grammar, one
 // validator, one type, rather than a second newtype that could drift from it.
 use crate::domain::payment_ledger::PaymentRequestKey;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
-use crate::error::{AppError, ValidationError};
+use crate::error::ValidationError;
 use crate::validate::validate_optional;
 
 /// Mints ledger ids in write order — `Ulid::new()`'s random low bits sort
@@ -95,13 +93,18 @@ impl MealLedgerId {
     }
 
     /// The one line a booking attempt may ever write of this `kind` — a
-    /// deterministic id, exactly like [`MealBookingId::composite`]. Two racing
+    /// deterministic id, exactly like [`MealBookingId::composite`](crate::domain::meal_booking::MealBookingId::composite).
+    /// Two racing
     /// `POST`s of one seat derive the *same* id and so cannot become two
     /// charges: idempotence rests on identity, never on a scan that a
     /// concurrent writer can slip past. The `attempt` counter is what keeps a
     /// re-book after a cancel a genuinely fresh charge. Booking keys are
     /// `<ulid>_<ulid>`, so the `c`/`r` marker keeps the two kinds apart.
-    pub fn for_attempt(booking: &MealBookingId, attempt: i64, kind: MealLedgerKind) -> Self {
+    pub fn for_attempt(
+        booking: &crate::domain::meal_booking::MealBookingId,
+        attempt: i64,
+        kind: MealLedgerKind,
+    ) -> Self {
         let marker = match kind {
             MealLedgerKind::Charge => 'c',
             MealLedgerKind::Reversal => 'r',
@@ -143,17 +146,6 @@ impl MealLedgerId {
     }
 }
 
-/// Did this `CREATE` fail *only* because the row is already there? Matched on
-/// the SDK's typed `AlreadyExists`/`Record` detail — never on the message text
-/// and never on "any database error", because swallowing a real fault in money
-/// code would be far worse than the 500 it saves.
-fn is_duplicate_record(error: &surrealdb::Error) -> bool {
-    matches!(
-        error.already_exists_details(),
-        Some(AlreadyExistsError::Record { .. })
-    )
-}
-
 /// The bare key of a record id — how every id leaves this API.
 fn key_of(record: &RecordId) -> &str {
     match &record.key {
@@ -184,7 +176,7 @@ impl MealLedgerKind {
 
     /// How the line folds into the balance: a charge is the only thing that
     /// takes money away. This is the *single* place the sign convention lives.
-    fn sign(self) -> i64 {
+    pub(crate) fn sign(self) -> i64 {
         match self {
             MealLedgerKind::Charge => -1,
             MealLedgerKind::Credit | MealLedgerKind::Reversal => 1,
@@ -249,17 +241,17 @@ impl LedgerNote {
 
 #[derive(Debug, Clone, SurrealValue)]
 pub struct MealLedger {
-    id: MealLedgerId,
-    student: UserId,
-    kind: MealLedgerKind,
-    amount_minor: LedgerAmount,
+    pub(crate) id: MealLedgerId,
+    pub(crate) student: UserId,
+    pub(crate) kind: MealLedgerKind,
+    pub(crate) amount_minor: LedgerAmount,
     /// What caused the line: a charge points at its `meal_booking`, a reversal
     /// at the `meal_ledger` charge it undoes. Untyped, hence a bare `RecordId`.
-    source: Option<RecordId>,
-    method: Option<LedgerMethod>,
-    note: Option<LedgerNote>,
-    recorded_by: UserId,
-    created_at: Timestamp,
+    pub(crate) source: Option<RecordId>,
+    pub(crate) method: Option<LedgerMethod>,
+    pub(crate) note: Option<LedgerNote>,
+    pub(crate) recorded_by: UserId,
+    pub(crate) created_at: Timestamp,
 }
 
 impl MealLedger {
@@ -300,95 +292,6 @@ impl MealLedger {
         self.created_at
     }
 
-    /// The only writer: one `CREATE`, no update path anywhere in this module.
-    ///
-    /// A line whose id already exists is left exactly as it is — the row wins,
-    /// the write is dropped. That is what makes a deterministic id (see
-    /// [`MealLedgerId::for_attempt`]) an idempotence key: replaying the same
-    /// append is a no-op, never a second line and never an edit of the first.
-    /// The point read is on the id itself, so unlike a scan it cannot miss a
-    /// row a concurrent writer just made — but it is only a fast path. The
-    /// guarantee is `CREATE`'s own: on an existing id it *errors* and leaves
-    /// the row untouched, so the writer that lost the race reads back the
-    /// winner's line instead of failing the request with a 500.
-    ///
-    /// A *write conflict* is the same race decided one layer down — two
-    /// appends of one id arriving together are no longer serialized by a
-    /// process-wide lock, so the store aborts one as retryable instead of
-    /// answering it "already exists". Both are read back the same way, and a
-    /// conflict that turns out to have written nothing is simply tried again;
-    /// no path here can write a second line, since the id is the key.
-    async fn append(row: MealLedger, db: &Database) -> Result<MealLedger, AppError> {
-        if let Some(existing) = Self::read(&row.id, db).await? {
-            return Ok(existing);
-        }
-        let id = row.id.clone();
-        for _ in 0..CAS_UPDATE_RETRIES {
-            match db.create(id.record()).content(row.clone()).await {
-                Ok(Some(created)) => return Ok(created),
-                Ok(None) => break,
-                Err(e) if is_duplicate_record(&e) || lost_the_race(&e) => {
-                    if let Some(existing) = Self::read(&id, db).await? {
-                        return Ok(existing);
-                    }
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-        Err(AppError::Internal("failed to write the ledger line".into()))
-    }
-
-    pub async fn read(id: &MealLedgerId, db: &Database) -> Result<Option<MealLedger>, AppError> {
-        Ok(db.select(id.record()).await?)
-    }
-
-    /// What a seat on `menu` costs *right now*: the sum of its dishes. `None`
-    /// when the menu is free (or empty) — a zero line is noise, not history.
-    ///
-    /// Called before the seat is taken so an unchargeable menu (one summing
-    /// past `MAX_LEDGER_AMOUNT_MINOR`) refuses the booking outright instead of
-    /// leaving a booked-but-unbilled row behind.
-    pub async fn price_snapshot(
-        menu: &MenuId,
-        db: &Database,
-    ) -> Result<Option<LedgerAmount>, AppError> {
-        let total = MenuDish::list_for_menu(menu, db)
-            .await?
-            .iter()
-            .fold(0i64, |sum, dish| {
-                sum.saturating_add(dish.get_price_minor().as_minor())
-            });
-        if total == 0 {
-            return Ok(None);
-        }
-        Ok(Some(LedgerAmount::try_new(total)?))
-    }
-
-    /// Bill `booking`'s current attempt at the price frozen onto it when that
-    /// attempt took the seat.
-    ///
-    /// The price comes off the *booking row*, never off the menu as it stands
-    /// now: a seat taken while the menu was free carries `None` forever, so
-    /// "was free" is a recorded fact and a later dish never bills a seat
-    /// retroactively. Called from
-    /// [`book`](crate::service::meal_booking::book) alone, right after the seat
-    /// was claimed, so the seat and its money move together.
-    ///
-    /// Replaying it is free: the id is `(booking, attempt)`, so a duplicate
-    /// `POST` writes nothing, and an attempt whose charge failed the first time
-    /// self-heals on the next `POST` of the same seat.
-    pub async fn charge_booking(
-        booking: &MealBooking,
-        recorded_by: &UserId,
-        db: &Database,
-    ) -> Result<(), AppError> {
-        let Some(line) = Self::charge_for(booking, recorded_by) else {
-            return Ok(());
-        };
-        Self::append(line, db).await?;
-        Ok(())
-    }
-
     /// The charge `booking`'s current attempt owes — the line
     /// [`claim_and_place`](crate::db::meal_booking::claim_and_place) appends inside the very transaction that
     /// takes the seat. `None` when the menu was free, which owes no line.
@@ -397,7 +300,10 @@ impl MealLedger {
     /// the caller that writes in one transaction has to make it there. Note the
     /// attempt has to be settled *before* the SQL runs, which is why the claim
     /// mints the number itself rather than letting the revival increment it.
-    pub(crate) fn charge_for(booking: &MealBooking, recorded_by: &UserId) -> Option<MealLedger> {
+    pub(crate) fn charge_for(
+        booking: &crate::domain::meal_booking::MealBooking,
+        recorded_by: &UserId,
+    ) -> Option<MealLedger> {
         let amount = booking.get_price_minor()?;
         Some(MealLedger {
             id: MealLedgerId::for_attempt(
@@ -416,34 +322,6 @@ impl MealLedger {
         })
     }
 
-    /// Give the money back for a cancelled `booking`: a new `reversal` line for
-    /// the charge's exact amount, pointing at it. The charge is never touched.
-    /// A booking that was never billed (a free menu) reverses nothing, and
-    /// neither does one whose charge never landed — the reversal is keyed to
-    /// the very charge it undoes, so it can only exist alongside it.
-    ///
-    /// Keyed by `(booking, attempt)` like the charge, so a retried cancel
-    /// refunds once. The line normally lands *inside* the flip's own
-    /// transaction
-    /// ([`release_seat`](crate::db::meal_booking::release_seat)); this path is what heals a
-    /// seat flipped before that was true, and it is why
-    /// [`cancel`](crate::service::meal_booking::cancel) replays it on an already-cancelled row instead
-    /// of refusing it. Nothing else on the API can append the missing line.
-    pub async fn reverse_booking(
-        booking: &MealBooking,
-        recorded_by: &UserId,
-        db: &Database,
-    ) -> Result<(), AppError> {
-        let Some((charge, line)) = Self::reversal_for(booking, recorded_by) else {
-            return Ok(());
-        };
-        if Self::read(&charge, db).await?.is_none() {
-            return Ok(());
-        }
-        Self::append(line, db).await?;
-        Ok(())
-    }
-
     /// The refund `booking`'s current attempt owes, as `(the charge it undoes,
     /// the reversal line)` — the two ids
     /// [`release_seat`](crate::db::meal_booking::release_seat) needs to
@@ -454,7 +332,7 @@ impl MealLedger {
     /// read, and the caller that writes in one transaction has to make it there
     /// rather than a round trip earlier.
     pub(crate) fn reversal_for(
-        booking: &MealBooking,
+        booking: &crate::domain::meal_booking::MealBooking,
         recorded_by: &UserId,
     ) -> Option<(MealLedgerId, MealLedger)> {
         let amount = booking.get_price_minor()?;
@@ -480,117 +358,6 @@ impl MealLedger {
         };
         Some((charge, line))
     }
-
-    /// Money in: a payment received, or an opening balance.
-    ///
-    /// With a `request_key` the line is keyed by it (see
-    /// [`MealLedgerId::for_request`]) and the call is **retry-safe**: a client
-    /// resending the identical body after a timeout gets back the line the
-    /// first attempt wrote, not a second credit — nothing on this API can edit
-    /// or delete one, so a doubled credit is corrected only by a compensating
-    /// line. Without one the id is a fresh ulid and two identical calls are two
-    /// credits, which is what a desk taking the same amount twice really means.
-    pub async fn credit(
-        student: &UserId,
-        amount_minor: LedgerAmount,
-        method: Option<LedgerMethod>,
-        note: Option<LedgerNote>,
-        request_key: Option<&PaymentRequestKey>,
-        recorded_by: &UserId,
-        db: &Database,
-    ) -> Result<MealLedger, AppError> {
-        let line = Self::append(
-            MealLedger {
-                id: match request_key {
-                    Some(key) => MealLedgerId::for_request(student, key),
-                    None => MealLedgerId::generate(),
-                },
-                student: student.clone(),
-                kind: MealLedgerKind::Credit,
-                amount_minor,
-                source: None,
-                method,
-                note,
-                recorded_by: recorded_by.clone(),
-                created_at: Timestamp::now(),
-            },
-            db,
-        )
-        .await?;
-        // A replay is answered from the stored line — but only if it is the
-        // same money. The same key for a different amount is a client bug, and
-        // handing back the old line would hide it behind a `201`. Checked on
-        // what `append` gave back rather than on a read before it: two retries
-        // arriving together both find no row, and only the id decides which
-        // one's amount is stored, so a check *before* the write would tell the
-        // loser its own amount landed.
-        if request_key.is_some() && line.amount_minor != amount_minor {
-            return Err(AppError::Conflict(
-                "this request_key was already used for a different amount",
-            ));
-        }
-        Ok(line)
-    }
-
-    /// A student's whole statement, newest first.
-    pub async fn list_for_student(
-        student: &UserId,
-        limit: Option<i64>,
-        offset: i64,
-        db: &Database,
-    ) -> Result<(Vec<MealLedger>, i64), AppError> {
-        PagedList::new(
-            "meal_ledger WHERE student = $student",
-            "ORDER BY created_at DESC, id DESC",
-        )
-        .bind("student", student.record())
-        .run(limit, offset, db)
-        .await
-    }
-
-    /// The derived balance: `credits + reversals - charges`, in minor units.
-    /// Negative means the student owes the school. Never stored anywhere.
-    ///
-    /// **The sum is taken per kind by the database** and only the three totals
-    /// come back, so a balance read costs the same whether the statement holds
-    /// four lines or forty thousand. It used to decode and fold every line, and
-    /// nothing bounds a statement's length but the cycle ceiling
-    /// ([`MAX_MEAL_BOOKING_ATTEMPTS`](crate::constant::MAX_MEAL_BOOKING_ATTEMPTS))
-    /// added alongside this: every book/cancel
-    /// pair appends two permanent rows, and each one was paid for again by
-    /// every later `GET /meals/balance/*`.
-    ///
-    /// **The signs stay here**, applied by the very [`MealLedgerKind::sign`]
-    /// the documented formula is spelled in. Summing `IF kind = 'charge' THEN
-    /// -amount …` in SQL would have folded the whole balance in one statement
-    /// and forked the one rule that decides what money means into a second
-    /// language, where nothing would fail the day the two disagreed. Grouping
-    /// instead keeps the aggregate ignorant of signs: it counts kinds, and
-    /// Rust still says what a kind does. A stored running total was the third
-    /// option and is a counter that can drift — a bug class this repo closes,
-    /// not one it opens.
-    pub async fn balance_of(student: &UserId, db: &Database) -> Result<i64, AppError> {
-        let totals: Vec<KindTotal> = db
-            .query(format!(
-                "SELECT kind, math::sum(amount_minor) AS total \
-                 FROM {MEAL_LEDGER_TABLE} WHERE student = $student GROUP BY kind"
-            ))
-            .bind(("student", student.record()))
-            .await?
-            .check()?
-            .take(0)?;
-        Ok(totals
-            .iter()
-            .fold(0i64, |sum, row| sum + row.kind.sign() * row.total))
-    }
-}
-
-/// One kind's whole sum, as the `GROUP BY` in [`MealLedger::balance_of`] hands
-/// it back — at most three rows, never the lines behind them.
-#[derive(Debug, SurrealValue)]
-struct KindTotal {
-    kind: MealLedgerKind,
-    total: i64,
 }
 
 #[cfg(test)]
@@ -632,47 +399,6 @@ mod tests {
             .map(|(kind, amount)| kind.sign() * amount)
             .sum();
         assert_eq!(balance, 10_000);
-    }
-
-    /// The balance aggregate **against a real server**, and `#[ignore]`d for
-    /// it: `init_mem`'s embedded engine is not the store this runs on, and an
-    /// aggregate is exactly where the two are known to differ — a `count()`
-    /// over an indexed field comes back `{count: N}` from the server and a
-    /// bare int from memory, and `student` here *is* indexed. This asserts the
-    /// `GROUP BY` really decodes into [`KindTotal`] and folds to the
-    /// documented figure, per kind, scoped to one student.
-    #[tokio::test]
-    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
-    async fn the_balance_aggregate_decodes_on_a_real_server() {
-        let (db, _serialized) = crate::database::init_test_server("meal_balance_sum").await;
-        db.query(
-            "CREATE meal_ledger:a SET student = user:ali, kind = 'credit', \
-                 amount_minor = 10000, recorded_by = user:adm, created_at = 1;
-             CREATE meal_ledger:b SET student = user:ali, kind = 'charge', \
-                 amount_minor = 4500, recorded_by = user:adm, created_at = 2;
-             CREATE meal_ledger:c SET student = user:ali, kind = 'charge', \
-                 amount_minor = 1500, recorded_by = user:adm, created_at = 3;
-             CREATE meal_ledger:d SET student = user:ali, kind = 'reversal', \
-                 amount_minor = 4500, recorded_by = user:adm, created_at = 4;
-             CREATE meal_ledger:e SET student = user:veli, kind = 'credit', \
-                 amount_minor = 777, recorded_by = user:adm, created_at = 5;",
-        )
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
-        let ali = UserId::from_key("ali");
-        assert_eq!(
-            MealLedger::balance_of(&ali, &db).await.unwrap(),
-            10_000 - 4_500 - 1_500 + 4_500
-        );
-        // Somebody with no lines at all: no groups come back, not an error.
-        assert_eq!(
-            MealLedger::balance_of(&UserId::from_key("nobody"), &db)
-                .await
-                .unwrap(),
-            0
-        );
     }
 
     #[test]
