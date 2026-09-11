@@ -2,8 +2,8 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
 use crate::constant::{ATTENDANCE_TABLE, REGISTRATION_COUNT_FIELD};
 use crate::database::{Database, transaction_with_retry};
-use crate::domain::event::EventId;
 use crate::db::page::PagedList;
+use crate::domain::event::EventId;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 
@@ -101,7 +101,7 @@ impl Attendance {
     /// Reading the event here would not have closed it either: SurrealDB 3.2.3
     /// conflict-checks write sets, not read sets, so the proof has to *move* a
     /// value on the event row. It is the bump-and-restore of
-    /// [`crate::domain::exam_answer::ExamAnswer::save`], on the counter the
+    /// [`crate::db::exam_answer::save`], on the counter the
     /// event already carries: matching nothing is the existence gate, writing
     /// the key the delete removes is the collision, and the restore is by
     /// captured value (`NONE` included) so no seat is spent or freed.

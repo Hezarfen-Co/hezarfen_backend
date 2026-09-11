@@ -60,7 +60,7 @@ impl ChatbotThreadId {
 /// Reads do not conflict; only a write that *moves* a value on a key the delete
 /// also writes does. That is the shape
 /// [`bump_menu_and_write`](crate::domain::menu::bump_menu_and_write) and
-/// [`ExamAnswer::save`](crate::domain::exam_answer::ExamAnswer::save) already
+/// [`ExamAnswer::save`](crate::db::exam_answer::save) already
 /// use, and the sweep's ordering inside the delete stops mattering once it is
 /// in place.
 ///

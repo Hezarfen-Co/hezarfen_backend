@@ -69,7 +69,7 @@ pub(crate) async fn images_by_question(
     db: &Database,
 ) -> Result<HashMap<String, Vec<QuestionImage>>, AppError> {
     let mut buckets: HashMap<String, Vec<QuestionImage>> = HashMap::new();
-    for image in QuestionImage::list_for_exam(exam, db).await? {
+    for image in crate::service::question_image::list_for_exam(db, exam).await? {
         buckets
             .entry(image.get_question().key().to_string())
             .or_default()
@@ -151,7 +151,10 @@ pub(crate) async fn store_image(
         data.len() as i64,
     );
     let file = image.get_file().to_string();
-    store_blob(st, &file, data, || async { image.upsert(&st.db).await }).await
+    store_blob(st, &file, data, || async {
+        crate::service::question_image::upsert(&st.db, image).await
+    })
+    .await
 }
 
 /// The stored bytes, served inline via [`crate::web::serve_inline_blob`].
@@ -237,7 +240,7 @@ pub(crate) async fn get_question_image(
         .ok_or(AppError::NotFound)?;
     ensure_question_content_visible(&st, &exam, &user).await?;
     let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
-    let image = QuestionImage::read_slot(question.get_id(), None, &st.db)
+    let image = crate::service::question_image::read_slot(&st.db, question.get_id(), None)
         .await?
         .ok_or(AppError::NotFound)?;
     serve_image(&st, &image).await
@@ -270,10 +273,10 @@ pub(crate) async fn delete_question_image(
     let exam = image_managed_exam(&st, &user, &id).await?;
     ensure_questions_editable(exam.get_id(), &st.db).await?;
     let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
-    let image = QuestionImage::read_slot(question.get_id(), None, &st.db)
+    let image = crate::service::question_image::read_slot(&st.db, question.get_id(), None)
         .await?
         .ok_or(AppError::NotFound)?;
-    let image = image.delete(&st.db).await?;
+    let image = crate::service::question_image::delete(&st.db, image).await?;
     remove_blob(&st.files_path, image.get_file()).await;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -350,7 +353,7 @@ pub(crate) async fn get_choice_image(
     ensure_question_content_visible(&st, &exam, &user).await?;
     let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
     let slot = choice_slot(&question, &choice_id)?;
-    let image = QuestionImage::read_slot(question.get_id(), Some(&slot), &st.db)
+    let image = crate::service::question_image::read_slot(&st.db, question.get_id(), Some(&slot))
         .await?
         .ok_or(AppError::NotFound)?;
     serve_image(&st, &image).await
@@ -385,10 +388,10 @@ pub(crate) async fn delete_choice_image(
     ensure_questions_editable(exam.get_id(), &st.db).await?;
     let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
     let slot = choice_slot(&question, &choice_id)?;
-    let image = QuestionImage::read_slot(question.get_id(), Some(&slot), &st.db)
+    let image = crate::service::question_image::read_slot(&st.db, question.get_id(), Some(&slot))
         .await?
         .ok_or(AppError::NotFound)?;
-    let image = image.delete(&st.db).await?;
+    let image = crate::service::question_image::delete(&st.db, image).await?;
     remove_blob(&st.files_path, image.get_file()).await;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -424,7 +427,10 @@ pub(crate) async fn store_answer_image(
         data.len() as i64,
     );
     let file = image.get_file().to_string();
-    store_blob(st, &file, data, || async { image.upsert(&st.db).await }).await
+    store_blob(st, &file, data, || async {
+        crate::service::answer_image::upsert(&st.db, image).await
+    })
+    .await
 }
 
 /// Attach (or replace) the caller's drawn answer to a question inside their
@@ -498,17 +504,17 @@ pub(crate) async fn upload_answer_image(
     // UI only offers drawing on text questions), so they are skipped. Removing
     // the drawing later grooms this blank row away (see `delete_answer_image`).
     if question.get_kind().as_str() != "choice"
-        && ExamAnswer::read(question.get_id(), user.get_id(), seq, &st.db)
+        && crate::service::exam_answer::read(&st.db, question.get_id(), user.get_id(), seq)
             .await?
             .is_none()
     {
-        ExamAnswer::save(
+        crate::service::exam_answer::save(
+            &st.db,
             &question,
             user.get_id(),
             seq,
             None,
             Some(String::new()),
-            &st.db,
         )
         .await?;
     }
@@ -554,19 +560,22 @@ pub(crate) async fn delete_answer_image(
     check_rejoin(&exam, &attempt)?;
     let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
     let seq = attempt.get_seq();
-    let image = AnswerImage::read(question.get_id(), user.get_id(), seq, &st.db)
+    let image = crate::service::answer_image::read(&st.db, question.get_id(), user.get_id(), seq)
         .await?
         .ok_or(AppError::NotFound)?;
-    let image = image.delete(&st.db).await?;
+    let image = crate::service::answer_image::delete(&st.db, image).await?;
     remove_blob(&st.files_path, image.get_file()).await;
     // If the drawing was the whole answer (blank text, no choice — the row the
     // upload created for a drawing-only answer), drop it too so it stops counting
     // as answered. A typed answer keeps its row.
-    if let Some(answer) = ExamAnswer::read(question.get_id(), user.get_id(), seq, &st.db).await? {
+    if let Some(answer) =
+        crate::service::exam_answer::read(&st.db, question.get_id(), user.get_id(), seq).await?
+    {
         let blank = answer.get_selected().is_none()
             && answer.get_text().is_none_or(|t| t.as_str().is_empty());
         if blank {
-            ExamAnswer::delete(question.get_id(), user.get_id(), seq, &st.db).await?;
+            crate::service::exam_answer::delete(&st.db, question.get_id(), user.get_id(), seq)
+                .await?;
         }
     }
     Ok(StatusCode::NO_CONTENT)
@@ -605,7 +614,7 @@ pub(crate) async fn get_answer_image(
         .await?
         .ok_or(AppError::NotFound)?
         .get_seq();
-    let image = AnswerImage::read(question.get_id(), user.get_id(), seq, &st.db)
+    let image = crate::service::answer_image::read(&st.db, question.get_id(), user.get_id(), seq)
         .await?
         .ok_or(AppError::NotFound)?;
     crate::web::serve_inline_blob(&st.files_path, image.get_file(), image.get_content_type()).await
@@ -652,7 +661,7 @@ pub(crate) async fn get_student_answer_image(
         .await?
         .ok_or(AppError::NotFound)?
         .get_seq();
-    let image = AnswerImage::read(question.get_id(), &target, seq, &st.db)
+    let image = crate::service::answer_image::read(&st.db, question.get_id(), &target, seq)
         .await?
         .ok_or(AppError::NotFound)?;
     crate::web::serve_inline_blob(&st.files_path, image.get_file(), image.get_content_type()).await

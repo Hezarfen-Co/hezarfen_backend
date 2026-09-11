@@ -106,7 +106,7 @@ impl SessionAttendance {
     /// route 404ing on the vanished session while the attendance report went
     /// on counting it. A deleted session reads NONE, which is falsy, so the
     /// gate is written as an explicit `IS NONE` (see
-    /// [`crate::domain::exam_result::ExamResult::grade`]). It reads the
+    /// [`crate::db::exam_result::grade`]). It reads the
     /// session's `teacher` — required on every row, so NONE means "no row" just
     /// as `id` did — because the counter below needs that teacher anyway, and
     /// one read serves both.
@@ -115,7 +115,7 @@ impl SessionAttendance {
     /// sets, not read sets, so that gate alone only closes the *sequential*
     /// order (delete committed, then the mark arrives). To make the two really
     /// collide, this transaction also *writes* the session row, unconditionally
-    /// — the bump-and-restore of [`crate::domain::exam_answer::ExamAnswer::save`]
+    /// — the bump-and-restore of [`crate::db::exam_answer::save`]
     /// on the one column this write already owns, [`LESSON_COUNTED_AT_FIELD`].
     /// Unconditional is the whole point: the credit branch below writes that
     /// column already, but it fires only for the first roll call of a lesson

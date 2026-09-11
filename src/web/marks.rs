@@ -11,7 +11,6 @@ use utoipa_axum::routes;
 use crate::database::Database;
 
 use crate::domain::exam::Exam;
-use crate::domain::exam_result::ExamResult;
 use crate::domain::role::Role;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse};
@@ -110,7 +109,8 @@ async fn build_report(
         let exams = crate::service::exam::list_for_course(db, course.get_id()).await?;
         let by_key: HashMap<&str, &Exam> = exams.iter().map(|e| (e.get_id().key(), e)).collect();
 
-        let results = ExamResult::list_for_user_in_course(course.get_id(), user, db).await?;
+        let results =
+            crate::service::exam_result::list_for_user_in_course(db, course.get_id(), user).await?;
         let mut entries = Vec::with_capacity(results.len());
         let mut pairs = Vec::with_capacity(results.len());
         for result in &results {
