@@ -22,14 +22,14 @@ use axum::http::StatusCode;
 use common::{app_and_db, login_as, me_id, send};
 use hezarfen_backend::database::Database;
 use hezarfen_backend::db::enrollment;
-use hezarfen_backend::domain::class_group::{ClassGroup, ClassGroupId, ClassName};
-use hezarfen_backend::domain::class_member::ClassMember;
+use hezarfen_backend::domain::class_group::{ClassGroupId, ClassName};
 use hezarfen_backend::domain::course::CourseId;
 use hezarfen_backend::domain::event::EventId;
 use hezarfen_backend::domain::role::Role;
 use hezarfen_backend::domain::timestamp::Timestamp;
 use hezarfen_backend::domain::user::UserId;
 use hezarfen_backend::service::registration;
+use hezarfen_backend::service::{class_group, class_member};
 use serde_json::json;
 
 /// How many rows `sql` selects ids for.
@@ -321,13 +321,13 @@ async fn a_class(db: &Database) -> ClassGroupId {
 }
 
 async fn a_class_named(name: &str, db: &Database) -> ClassGroupId {
-    ClassGroup::create(
+    class_group::create(
+        db,
         &UserId::from_key("manager"),
         ClassName::try_new(name).unwrap(),
         None,
         None,
         None,
-        db,
     )
     .await
     .unwrap()
@@ -342,7 +342,7 @@ async fn a_membership_is_refused_once_the_student_is_demoted() {
     let class = a_class(&db).await;
     demote(&student, Role::Parent, &db).await;
 
-    let refused = ClassMember::add(&class, &student, &UserId::from_key("manager"), &db).await;
+    let refused = class_member::add(&db, &class, &student, &UserId::from_key("manager")).await;
     assert!(
         refused.is_err(),
         "only students belong to a class: {refused:?}"
@@ -363,13 +363,13 @@ async fn a_membership_never_survives_the_demotion_it_raced() {
     let class = a_class(&db).await;
     // The bait: a membership the sweep will delete, which holds it open.
     let earlier = a_class_named("9-B", &db).await;
-    ClassMember::add(&earlier, &student, &UserId::from_key("manager"), &db)
+    class_member::add(&db, &earlier, &student, &UserId::from_key("manager"))
         .await
         .unwrap();
     hold_the_sweep("class_member", &db).await;
 
     let demoting = demote_in_the_window(&student, Role::Parent, &db).await;
-    let joined = ClassMember::add(&class, &student, &UserId::from_key("manager"), &db).await;
+    let joined = class_member::add(&db, &class, &student, &UserId::from_key("manager")).await;
     still_running(&demoting);
     demoting.await.unwrap();
 

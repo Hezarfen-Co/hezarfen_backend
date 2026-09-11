@@ -31,7 +31,8 @@ use crate::constant::{
 };
 use crate::database::{Database, transaction_with_retry};
 use crate::db::cap;
-use crate::domain::class_group::{ClassGroup, ClassGroupId};
+use crate::db::class_group;
+use crate::domain::class_group::ClassGroupId;
 use crate::error::AppError;
 
 /// The `THROW` markers [`attach`] aborts with. `FULL_MARK` and `MISSING_MARK`
@@ -386,13 +387,13 @@ impl Axis {
 /// transaction runs ([`Attached::SourceGone`]). A hand attach owns itself and
 /// passes `None`.
 pub(crate) async fn attach<T: SurrealValue + Clone>(
+    db: &Database,
     class: &ClassGroupId,
     axis: Axis,
     new: (&RecordId, &T),
     pivot: RecordId,
     by: RecordId,
     source: Option<RecordId>,
-    db: &Database,
 ) -> Result<Attached<T>, AppError> {
     let (link, row) = new;
     let count_field = axis.counter();
@@ -527,7 +528,7 @@ pub(crate) async fn attach<T: SurrealValue + Clone>(
         .values()
         .any(|error| error.to_string().contains(CAP_MARK))
     {
-        return Ok(match ClassGroup::read(class, db).await? {
+        return Ok(match class_group::read(db, class).await? {
             Some(_) => Attached::ClassFull,
             None => Attached::Gone,
         });
@@ -612,10 +613,10 @@ fn named_course(message: &str, mark: &str) -> Option<String> {
 /// the cascade can answer "already exists" and every lost round is a plain
 /// re-send.
 pub(crate) async fn detach(
+    db: &Database,
     links: &str,
     axis: Axis,
     bindings: &[(String, Value)],
-    db: &Database,
 ) -> Result<i64, AppError> {
     let count_field = axis.counter();
     let scope = axis.scope();
@@ -680,11 +681,11 @@ pub(crate) fn link_id(table: &str, class: &ClassGroupId, other: &str) -> RecordI
 mod tests {
     use super::*;
     use crate::constant::{CLASS_MEMBER_COUNT_FIELD, CLASS_MEMBER_TABLE};
+    use crate::db::class_member::tests::{a_class, counter, rows};
     use crate::domain::class_group::ClassGroupId;
-    use crate::domain::class_member::ClassMember;
-    use crate::domain::class_member::tests::{a_class, counter, rows};
     use crate::domain::user::UserId;
     use crate::error::AppError;
+    use crate::service::{class_course, class_member};
 
     /// The class counter is claimed conditionally, so a class that is not there
     /// stops the cascade before anything is written — rather than leaving a
@@ -695,11 +696,11 @@ mod tests {
         let db = crate::database::init_mem().await.unwrap();
         let ghost = ClassGroupId::from_key("01J8XZ0K3Q8G7X2M4N5P6R7S8T");
 
-        let refused = ClassMember::add(
+        let refused = class_member::add(
+            &db,
             &ghost,
             &UserId::from_key("student"),
             &UserId::from_key("manager"),
-            &db,
         )
         .await;
         assert!(
@@ -725,16 +726,16 @@ mod tests {
             a_class("club", &db).await,
         ];
         for class in &classes {
-            ClassMember::add(class, &student, &manager, &db)
+            class_member::add(&db, class, &student, &manager)
                 .await
                 .unwrap();
         }
 
         let gone = detach(
+            &db,
             &format!("{CLASS_MEMBER_TABLE} WHERE user = $usr"),
             Axis::Member,
             &[("usr".into(), student.record().into_value())],
-            &db,
         )
         .await
         .unwrap();
@@ -753,10 +754,10 @@ mod tests {
         // And a run that unlinks nothing answers zero, which is what turns a
         // single-pair detach into a 404 instead of a silent success.
         let again = detach(
+            &db,
             &format!("{CLASS_MEMBER_TABLE} WHERE user = $usr"),
             Axis::Member,
             &[("usr".into(), student.record().into_value())],
-            &db,
         )
         .await
         .unwrap();
@@ -791,8 +792,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn a_detached_row_is_never_handed_to_a_class_that_let_it_go() {
-        use crate::domain::class_course::ClassCourse;
-        use crate::domain::class_member::tests::{a_course, source_of};
+        use crate::db::class_member::tests::{a_course, source_of};
 
         let (db, _serialized) = crate::database::init_test_server("class_heir_race").await;
         let manager = UserId::from_key("manager");
@@ -803,10 +803,10 @@ mod tests {
             let owner = a_class(&format!("9-{round}-owner"), &db).await;
             let heir = a_class(&format!("9-{round}-heir"), &db).await;
             for class in [&owner, &heir] {
-                ClassMember::add(class, &student, &manager, &db)
+                class_member::add(&db, class, &student, &manager)
                     .await
                     .unwrap();
-                ClassCourse::attach(class, &algebra, &manager, &db)
+                class_course::attach(&db, class, &algebra, &manager)
                     .await
                     .unwrap();
             }
@@ -828,7 +828,7 @@ mod tests {
 
             let detaching = {
                 let (db, owner, algebra) = (db.clone(), owner.clone(), algebra.clone());
-                tokio::spawn(async move { ClassCourse::detach(&owner, &algebra, &db).await })
+                tokio::spawn(async move { class_course::detach(&db, &owner, &algebra).await })
             };
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             assert!(
@@ -837,8 +837,8 @@ mod tests {
             );
             // The heir lets the row go, twice over, while that sweep is still
             // choosing it.
-            ClassMember::remove(&heir, &student, &db).await.unwrap();
-            ClassCourse::detach(&heir, &algebra, &db).await.unwrap();
+            class_member::remove(&db, &heir, &student).await.unwrap();
+            class_course::detach(&db, &heir, &algebra).await.unwrap();
             let swept = detaching.await.unwrap();
             assert!(
                 !matches!(swept, Err(AppError::Db(_))),

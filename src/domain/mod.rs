@@ -18,7 +18,6 @@ pub mod class_blueprint;
 pub mod class_course;
 pub mod class_group;
 pub mod class_member;
-pub mod class_pump;
 pub mod course;
 pub mod course_note;
 pub mod course_note_file;
