@@ -122,7 +122,7 @@ impl ParentLink {
 
     // Both role-change sweeps (the observed student leaving `student`, the
     // observing parent leaving `parent`) live in
-    // [`crate::domain::user::User::set_role`]: they commit with the role write
+    // [`crate::service::user::set_role`]: they commit with the role write
     // itself, so there is no window where a link outlives the role that
     // justified it.
 }

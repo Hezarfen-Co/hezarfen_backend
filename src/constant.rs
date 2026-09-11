@@ -969,7 +969,7 @@ pub const SUBMISSION_FILE_COUNT_FIELD: &str = "file_count";
 pub const CHATBOT_THREAD_COUNT_FIELD: &str = "chatbot_thread_count";
 /// The column a *grant* claim moves and puts back, so its transaction writes
 /// the holder's own `user` record — the one key
-/// [`crate::domain::user::User::set_role`] writes (see
+/// [`crate::service::user::set_role`] writes (see
 /// [`crate::db::cap::role_claim`]). Any `option<int>` on the row would do:
 /// the claim nets zero and never reads it, so this is an alias rather than a
 /// column of its own — a new one would mean a migration on a SCHEMAFULL table
@@ -1202,7 +1202,7 @@ pub const BOARD_OPEN_GUARD: &str = "locked = false AND closed_at = NONE";
 /// an `event` row.
 ///
 /// This is `Event::registration_capacity`'s `Conflict` arm re-spelled in
-/// SurrealQL, because the role cascade (`User::set_role`) frees a demoted
+/// SurrealQL, because the role cascade (`service::user::set_role`) frees a demoted
 /// parent's seats *inside* its transaction and cannot call Rust from there. The
 /// audience conjunct is what keeps it that arm and only that arm: an event that
 /// takes no registrations is refused earlier, by the `Validation` arm, so a

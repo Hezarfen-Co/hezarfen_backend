@@ -225,7 +225,7 @@ fn path_slug(raw: &str) -> Result<Slug, AppError> {
 /// below admin → `409`, the repo's verdict for "the row exists, its state
 /// refuses this".
 async fn school_admin(username: &str, db: &crate::database::Database) -> Result<User, AppError> {
-    let user = User::find_by_username(username.trim(), db)
+    let user = crate::service::user::find_by_username(db, username.trim())
         .await?
         .ok_or(AppError::NotFound)?;
     if user.get_role() != Role::Admin {
@@ -356,7 +356,9 @@ async fn create_school(
     modules.validate()?;
 
     let db = st.tenants.create(&slug, &name, modules).await?;
-    if let Err(err) = User::create_with_role(username, password_hash, Role::Admin, &db).await {
+    if let Err(err) =
+        crate::service::user::create_with_role(&db, username, password_hash, Role::Admin).await
+    {
         // A school nobody can log into is worse than no school: take the
         // database back so the very same request can simply be retried.
         if let Err(cleanup) = st.tenants.drop(&slug).await {
@@ -754,7 +756,7 @@ async fn reset_admin_password(
     let user = school_admin(&req.username, &db).await?;
     let password_hash = Password::try_new(&req.password)?.hash_async().await?;
 
-    User::set_password_hash(user.get_id(), password_hash, &db)
+    crate::service::user::set_password_hash(&db, user.get_id(), password_hash)
         .await?
         .ok_or(AppError::NotFound)?;
     // The other half: the new password means nothing while a cookie minted

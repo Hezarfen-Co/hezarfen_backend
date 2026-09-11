@@ -207,7 +207,7 @@ impl AppointmentSlot {
     /// still *holds* a teaching role.
     ///
     /// Every row here names the teacher, so the write touches no key a demotion
-    /// touches: [`crate::domain::user::User::set_role`] sweeps the slots its own
+    /// touches: [`crate::service::user::set_role`] sweeps the slots its own
     /// snapshot can see, and a slot landing after that snapshot would survive it
     /// under a role that may not publish — reachable by no route afterwards,
     /// since the calendar hides a demoted teacher's slots and the deletes are
@@ -951,7 +951,7 @@ mod tests {
 
     /// The other half of that claim: the publish that arrives *while* the
     /// demotion is running. Its sweep has already chosen the slots it will take
-    /// ([`crate::domain::user::User::set_role`] reads them into `$slots` before
+    /// ([`crate::service::user::set_role`] reads them into `$slots` before
     /// it deletes), so a row landing after that read shares no key with anything
     /// the demotion writes and survives it — a slot owned by someone who can
     /// neither list nor delete it, forever. The claim on the user record is what
@@ -974,7 +974,6 @@ mod tests {
     #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn a_publish_landing_inside_a_demotion_never_outlives_the_role() {
         use crate::domain::role::Role;
-        use crate::domain::user::User;
 
         let (db, _serialized) = crate::database::init_test_server("slot_demotion_race").await;
         let (mut raced, mut published, mut stranded) = (0, 0, 0);
@@ -1008,12 +1007,11 @@ mod tests {
                 let db = db.clone();
                 let target = teacher.clone();
                 tokio::spawn(async move {
-                    User::read(&target, &db)
+                    crate::db::user::read(&db, &target)
                         .await
                         .unwrap()
-                        .unwrap()
-                        .set_role(Role::Student, &db)
-                        .await
+                        .expect("the account is there");
+                    crate::service::user::set_role(&db, &target, Role::Student).await
                 })
             };
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;

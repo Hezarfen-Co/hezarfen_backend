@@ -8,7 +8,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::domain::timestamp::Timestamp;
-use crate::domain::user::{User, UserId};
+use crate::domain::user::UserId;
 use crate::domain::work_entry::{WorkEntry, WorkEntryId, out_before_in_error};
 use crate::error::{AppError, ErrorResponse};
 use crate::state::AppState;
@@ -159,7 +159,7 @@ async fn user_work(
     let (limit, offset) = page.resolve()?;
     let target = UserId::from_key(&user);
     // User must exist — a missing user is a 404, not an empty log.
-    User::read(&target, &st.db)
+    crate::service::user::read(&st.db, &target)
         .await?
         .ok_or(AppError::NotFound)?;
     let (entries, total) = WorkEntry::list_for_user(&target, limit, offset, &st.db).await?;

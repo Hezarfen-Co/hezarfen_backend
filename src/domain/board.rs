@@ -48,7 +48,7 @@ use crate::validate::validate_required;
 /// read, one user-list read and one field write.
 ///
 /// **A leaf**: nothing under it takes another lock. Note it does not reach the
-/// demotion sweep in [`crate::domain::user::User::set_role`], which strips ids
+/// demotion sweep in [`crate::service::user::set_role`], which strips ids
 /// from every roster inside the role write's own transaction — an invite that
 /// read a roster before that sweep can put a swept id back, which the boot
 /// repair and the room's own live gate both still catch.
@@ -310,7 +310,7 @@ impl Board {
 
     // The demotion sweep — stripping a user off every roster they are listed
     // on, deleting nothing, and handing the affected rooms back so the caller
-    // can prompt them — lives in [`crate::domain::user::User::set_role`], where
+    // can prompt them — lives in [`crate::service::user::set_role`], where
     // it commits with the role write that invalidates the membership.
 
     /// Retire the board: permanently read-only, history still readable.

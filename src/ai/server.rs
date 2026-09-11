@@ -704,7 +704,7 @@ async fn principal(
     // Both the bare key (`abc`, as a REST path spells it) and the record form
     // (`user:abc`) are accepted.
     let key = who.strip_prefix("user:").unwrap_or(who);
-    User::read(&UserId::from_key(key), db)
+    crate::db::user::read(db, &UserId::from_key(key))
         .await
         .map_err(|e| ("unavailable", format!("could not load `{who}`: {e}")))?
         .ok_or_else(|| ("unknown_user", format!("no user `{who}`")))
