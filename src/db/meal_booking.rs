@@ -46,7 +46,7 @@ pub async fn list_for_menu(
 /// parent whose link was revoked (by an unlink or by the student-side role
 /// sweep) would otherwise keep a live view of the child's seat, watching
 /// cancellations made long after the link died — exactly what
-/// [`ensure_can_observe`](crate::web::ensure_can_observe) refuses. The
+/// [`ensure_can_observe`](crate::service::parent_link::ensure_can_observe) refuses. The
 /// caller re-derives the list from the links on every read, so the view
 /// dies with the link.
 pub async fn list_for_students(

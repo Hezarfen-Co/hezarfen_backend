@@ -26,10 +26,10 @@ use hezarfen_backend::domain::class_group::{ClassGroup, ClassGroupId, ClassName}
 use hezarfen_backend::domain::class_member::ClassMember;
 use hezarfen_backend::domain::course::CourseId;
 use hezarfen_backend::domain::event::EventId;
-use hezarfen_backend::domain::registration::Registration;
 use hezarfen_backend::domain::role::Role;
 use hezarfen_backend::domain::timestamp::Timestamp;
 use hezarfen_backend::domain::user::UserId;
+use hezarfen_backend::service::registration;
 use serde_json::json;
 
 /// How many rows `sql` selects ids for.
@@ -165,7 +165,7 @@ async fn a_seat_is_refused_once_the_holder_is_a_parent() {
     let event = a_registration_event(&app, &teacher, 1).await;
     demote(&student, Role::Parent, &db).await;
 
-    let refused = Registration::register(&event, &student, &UserId::from_key("staff"), &db).await;
+    let refused = registration::register(&db, &event, &student, &UserId::from_key("staff")).await;
     assert!(
         refused.is_err(),
         "a parent may not be given a seat: {refused:?}"
@@ -190,7 +190,7 @@ async fn a_seat_never_survives_the_demotion_it_raced() {
     let event = a_registration_event(&app, &teacher, 1).await;
     // The bait: a seat the sweep will delete, which is what holds it open.
     let earlier = a_registration_event(&app, &teacher, 1).await;
-    Registration::register(&earlier, &student, &UserId::from_key("staff"), &db)
+    registration::register(&db, &earlier, &student, &UserId::from_key("staff"))
         .await
         .unwrap();
     hold_the_sweep("registration", &db).await;
@@ -198,7 +198,7 @@ async fn a_seat_never_survives_the_demotion_it_raced() {
     // The seat is written inside the held window: past the sweep's snapshot,
     // before the commit.
     let demoting = demote_in_the_window(&student, Role::Parent, &db).await;
-    let seat = Registration::register(&event, &student, &UserId::from_key("staff"), &db).await;
+    let seat = registration::register(&db, &event, &student, &UserId::from_key("staff")).await;
     still_running(&demoting);
     demoting.await.unwrap();
 
@@ -226,7 +226,7 @@ async fn a_stranded_parent_seat_is_freeable_by_a_teacher() {
     let (app, db) = app_and_db().await;
     let (teacher, student) = a_school(&app, &db).await;
     let event = a_registration_event(&app, &teacher, 1).await;
-    Registration::register(&event, &student, &UserId::from_key("staff"), &db)
+    registration::register(&db, &event, &student, &UserId::from_key("staff"))
         .await
         .unwrap();
     // The state the old race left: the seat stands, the account is a parent,

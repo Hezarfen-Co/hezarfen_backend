@@ -17,20 +17,20 @@ use crate::domain::badge::{self, BadgeAward};
 use crate::domain::class_group::{ClassGroup, ClassGroupId};
 use crate::domain::class_member::ClassMember;
 
-use crate::domain::parent_link::ParentLink;
 use crate::domain::preferences::{Language, PaletteColor, Theme};
 use crate::domain::profile::{Bio, BirthDate, DisplayName, Email, PersonName, Phone, ProfileStats};
 use crate::domain::role::Role;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
+use crate::service::parent_link::ensure_can_observe;
 use crate::state::AppState;
 
 use super::courses::visible_courses;
 use super::dto::AssignableRole;
 use super::dto::Role as RoleSchema;
 use super::{
-    CurrentUser, Page, PageParams, PersonRef, RequireAdmin, UploadFileForm, UserResponse,
-    ensure_can_observe, paginate, read_image_upload, remove_blob, serve_inline_blob, store_blob,
+    CurrentUser, Page, PageParams, PersonRef, RequireAdmin, UploadFileForm, UserResponse, paginate,
+    read_image_upload, remove_blob, serve_inline_blob, store_blob,
 };
 
 pub fn routes() -> OpenApiRouter<AppState> {
@@ -174,14 +174,9 @@ async fn apply_preferences(
     let theme = merge_field(req.theme.as_deref(), Theme::try_from_str)?;
     let language = merge_field(req.language.as_deref(), Language::try_from_str)?;
     let palette_color = merge_field(req.palette_color.as_deref(), PaletteColor::try_from_str)?;
-    let updated = crate::service::user::set_preferences(
-        db,
-        user.get_id(),
-        theme,
-        language,
-        palette_color,
-    )
-    .await?;
+    let updated =
+        crate::service::user::set_preferences(db, user.get_id(), theme, language, palette_color)
+            .await?;
     Ok(UserResponse::new(&updated))
 }
 
@@ -541,7 +536,7 @@ async fn students_page(
     db: &Database,
 ) -> Result<Page<PersonRef>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let links = ParentLink::list_for_parent(parent, db).await?;
+    let links = crate::service::parent_link::list_for_parent(db, parent).await?;
     let ids: Vec<UserId> = links
         .iter()
         .map(|link| link.get_student().clone())
@@ -593,30 +588,13 @@ async fn link_student(
     Path(id): Path<String>,
     Json(req): Json<LinkStudent>,
 ) -> Result<Json<ParentLinkResponse>, AppError> {
-    let parent = crate::service::user::read(&st.db, &UserId::from_key(&id))
-        .await?
-        .ok_or(AppError::NotFound)?;
-    if parent.get_role() != Role::Parent {
-        return Err(AppError::Validation(ValidationError::Invalid {
-            field: "id",
-            reason: "students can only be tied to a parent account",
-        }));
-    }
-    let Some(student) =
-        crate::service::user::read(&st.db, &UserId::from_key(&req.user_id)).await?
-    else {
-        return Err(AppError::Validation(ValidationError::Invalid {
-            field: "user_id",
-            reason: "target user does not exist",
-        }));
-    };
-    if student.get_role() != Role::Student {
-        return Err(AppError::Validation(ValidationError::Invalid {
-            field: "user_id",
-            reason: "only students can be tied to a parent",
-        }));
-    }
-    let link = ParentLink::link(parent.get_id(), student.get_id(), admin.get_id(), &st.db).await?;
+    let (link, parent, student) = crate::service::parent_link::link(
+        &st.db,
+        &UserId::from_key(&id),
+        &UserId::from_key(&req.user_id),
+        admin.get_id(),
+    )
+    .await?;
     let people = PersonRef::map_of(&[&parent, &student, &admin]);
     Ok(Json(ParentLinkResponse {
         parent: PersonRef::resolve(&people, link.get_parent()),
@@ -678,9 +656,13 @@ async fn unlink_student(
     _admin: RequireAdmin,
     Path((id, student)): Path<(String, String)>,
 ) -> Result<StatusCode, AppError> {
-    if ParentLink::remove(&UserId::from_key(&id), &UserId::from_key(&student), &st.db)
-        .await?
-        .is_none()
+    if crate::service::parent_link::remove(
+        &st.db,
+        &UserId::from_key(&id),
+        &UserId::from_key(&student),
+    )
+    .await?
+    .is_none()
     {
         return Err(AppError::NotFound);
     }
@@ -1070,7 +1052,9 @@ async fn ensure_may_read_profile(
 async fn readable_profile_user(st: &AppState, caller: &User, id: &str) -> Result<User, AppError> {
     let target = UserId::from_key(id);
     ensure_may_read_profile(caller, &target, &st.db).await?;
-    crate::service::user::read(&st.db, &target).await?.ok_or(AppError::NotFound)
+    crate::service::user::read(&st.db, &target)
+        .await?
+        .ok_or(AppError::NotFound)
 }
 
 /// The caller's own public profile — what everyone else sees of them.
@@ -1165,7 +1149,15 @@ async fn upload_my_avatar(
 
     let file = ulid::Ulid::new().to_string();
     store_blob(&st, &file, &upload.data, || async {
-        match crate::service::user::set_avatar(&st.db, user.get_id(), &file, &upload.content_type, size).await? {
+        match crate::service::user::set_avatar(
+            &st.db,
+            user.get_id(),
+            &file,
+            &upload.content_type,
+            size,
+        )
+        .await?
+        {
             // Row written; the picture this one replaced comes off disk.
             Some(before) => Ok(((), before.get_avatar_file().map(str::to_string))),
             // The account went away mid-upload — the fresh blob is an orphan.

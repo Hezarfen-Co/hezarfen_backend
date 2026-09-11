@@ -16,10 +16,11 @@ use crate::domain::role::Role;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse};
 use crate::service;
+use crate::service::parent_link::ensure_can_observe;
 use crate::state::AppState;
 
 use super::courses::can_manage_course;
-use super::{CourseResponse, CurrentUser, course_people, ensure_can_observe, person_map};
+use super::{CourseResponse, CurrentUser, course_people, person_map};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
