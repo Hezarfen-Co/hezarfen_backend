@@ -273,7 +273,7 @@ pub async fn unassign_everywhere(db: &Database, user: &UserId) -> Result<(), App
 /// Nothing else can reach them — a blueprint holds its courses as a list on
 /// its own row, not as link rows this cascade could delete — and an id left
 /// behind is permanent rather than merely stale: the pump's own
-/// [`crate::domain::class_blueprint::ClassBlueprint::prune`] fires only
+/// [`crate::db::class_blueprint::prune`] fires only
 /// while walking a section, so a grade with no sections can never drop one,
 /// and every `PATCH` of that template is refused for naming a course that
 /// does not exist, which is precisely the call documented as the repair.
