@@ -263,7 +263,7 @@ mod tests {
     /// [`Subject::create`] therefore *writes* the course row rather than
     /// reading it ([`cap::touch_and_create`]); the harness and the window it
     /// races in are documented on
-    /// [`crate::domain::course::assert_no_child_outlives_a_course_delete`].
+    /// [`crate::db::course::assert_no_child_outlives_a_course_delete`].
     /// Mutation-tested: with the bare `db.create` this shipped with, all four
     /// rounds orphan.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -281,11 +281,9 @@ mod tests {
                 .map(|_| ())
             })
         }
-        crate::domain::course::assert_no_child_outlives_a_course_delete(
-            "subject_orphan_race",
-            SUBJECT_TABLE,
-            make,
-        )
+        crate::db::course::assert_no_child_outlives_a_course_delete("subject_orphan_race",
+        SUBJECT_TABLE,
+        make,)
         .await;
     }
 
@@ -320,7 +318,7 @@ mod tests {
 
     /// GUARD, not a retry measurement — read the last paragraph before
     /// trusting this test with the retry. See
-    /// [`crate::domain::course::Course::delete`]'s race test for why the rate
+    /// [`crate::db::course::delete`]'s race test for why the rate
     /// is counted rather than asserted per round, and why this needs the real
     /// server and a multi-threaded runtime.
     ///
@@ -341,7 +339,7 @@ mod tests {
     /// racers all failed to open the window (they only move which side wins).
     /// So this is a status-code-and-cascade guard: a raced delete answers 409 or
     /// 404 and never 500, and a landed question survives it. The retry itself is
-    /// measured on [`crate::domain::course::Course::delete`], whose cascade is
+    /// measured on [`crate::db::course::delete`], whose cascade is
     /// long enough to lose a round (1-2 of 20, red under the same mutation).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
@@ -354,7 +352,7 @@ mod tests {
         let (mut landed, mut wiped) = (0, 0);
         let (mut last_delete, mut last_question) = (String::new(), String::new());
         for round in 0..20 {
-            let course = crate::domain::course::a_test_course(&db).await;
+            let course = crate::db::course::a_test_course(&db).await;
             // A real exam row per round: a question write moves its exam's
             // counter, so a minted id nothing wrote is a 404 and no round would
             // reach the subject race this test is about.

@@ -180,7 +180,7 @@ pub(crate) async fn start_attempt(
     ensure_sittable(&exam)?;
     ensure_student(&user)?;
     ensure_enrolled(&exam, user.get_id(), &st.db).await?;
-    course_of(&exam, &st.db).await?.require_open(&st.db).await?;
+    crate::service::course::require_open(&st.db, &course_of(&exam, &st.db).await?).await?;
     let now = Timestamp::now();
     if let Some(starts_at) = exam.get_starts_at()
         && now < starts_at
@@ -307,7 +307,7 @@ pub(crate) async fn finish_attempt(
     {
         return Err(AppError::Conflict("time is up — the attempt has expired"));
     }
-    course_of(&exam, &st.db).await?.require_open(&st.db).await?;
+    crate::service::course::require_open(&st.db, &course_of(&exam, &st.db).await?).await?;
 
     // Deliberately no rejoin check: a student locked out of the room may
     // still submit what they saved — finishing answers nothing new.
@@ -699,7 +699,7 @@ pub(crate) async fn save_answer_in(
     ensure_student_now(attempt.get_user(), db).await?;
     ensure_enrolled(exam, attempt.get_user(), db).await?;
     check_rejoin(exam, attempt)?;
-    course_of(exam, db).await?.require_open(db).await?;
+    crate::service::course::require_open(db, &course_of(exam, db).await?).await?;
     let question = question_of_exam(exam.get_id(), question_id, db).await?;
     ExamAnswer::save(
         &question,

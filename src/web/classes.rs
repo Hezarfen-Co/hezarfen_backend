@@ -21,7 +21,7 @@ use crate::domain::class_blueprint::{ClassBlueprint, ClassBlueprintId, Pumped, S
 use crate::domain::class_course::ClassCourse;
 use crate::domain::class_group::{ClassGrade, ClassGroup, ClassGroupId, ClassName};
 use crate::domain::class_member::ClassMember;
-use crate::domain::course::{Course, CourseId};
+use crate::domain::course::CourseId;
 use crate::domain::role::Role;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
@@ -872,7 +872,9 @@ async fn attach_course(
     Json(req): Json<AttachCourse>,
 ) -> Result<(StatusCode, Json<ClassCourseResponse>), AppError> {
     let class = class_or_404(&id, &st.db).await?;
-    let Some(course) = Course::read(&CourseId::from_key(&req.course_id), &st.db).await? else {
+    let Some(course) = crate::service::course::read(&st.db, &CourseId::from_key(&req.course_id))
+        .await?
+    else {
         return Err(AppError::Validation(ValidationError::Invalid {
             field: "course_id",
             reason: "course does not exist",
@@ -885,7 +887,7 @@ async fn attach_course(
     }
     // Both ends: neither a class nor a course on a past year takes a new link.
     class.require_open(&st.db).await?;
-    course.require_open(&st.db).await?;
+    crate::service::course::require_open(&st.db, &course).await?;
 
     let link = ClassCourse::attach(class.get_id(), course.get_id(), user.get_id(), &st.db).await?;
     let people = PersonRef::map_of(&[&user]);
@@ -966,7 +968,7 @@ async fn detach_course(
     // route answered 404 forever — which also left the class undeletable, its
     // attachment counter counting a row nothing could sweep. There is no roster
     // left to protect, and the caller is already teacher+.
-    let row = Course::read(&course, &st.db).await?;
+    let row = crate::service::course::read(&st.db, &course).await?;
     if let Some(row) = row.as_ref()
         && !can_manage_course(row, &user)
     {
@@ -978,7 +980,7 @@ async fn detach_course(
     // has no term to read, and sweeping it is the whole point of the route.
     class.require_open(&st.db).await?;
     if let Some(row) = row.as_ref() {
-        row.require_open(&st.db).await?;
+        crate::service::course::require_open(&st.db, row).await?;
     }
     ClassCourse::detach(class.get_id(), &course, &st.db).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -1150,7 +1152,7 @@ async fn resolve_courses(ids: &[String], db: &Database) -> Result<Vec<CourseId>,
     let mut courses = Vec::with_capacity(ids.len());
     for id in ids {
         let course = CourseId::from_key(id);
-        if Course::read(&course, db).await?.is_none() {
+        if crate::service::course::read(db, &course).await?.is_none() {
             return Err(AppError::Validation(ValidationError::Invalid {
                 field: "course_ids",
                 reason: "one of these courses does not exist",
@@ -1454,8 +1456,8 @@ async fn apply_blueprint(
     // already gone is the pump's own `skipped` business, not a term refusal.
     class.require_open(&st.db).await?;
     for id in blueprint.get_courses() {
-        if let Some(course) = Course::read(id, &st.db).await? {
-            course.require_open(&st.db).await?;
+        if let Some(course) = crate::service::course::read(&st.db, id).await? {
+            crate::service::course::require_open(&st.db, &course).await?;
         }
     }
     let skipped = blueprint.apply_to(&class, user.get_id(), &st.db).await?;

@@ -60,7 +60,7 @@ async fn note_with_course(id: &str, db: &Database) -> Result<(CourseNote, Course
     let note = CourseNote::read(&CourseNoteId::from_key(id), db)
         .await?
         .ok_or(AppError::NotFound)?;
-    let course = Course::read(note.get_course(), db)
+    let course = crate::service::course::read(db, note.get_course())
         .await?
         .ok_or(AppError::NotFound)?;
     Ok((note, course))
@@ -130,7 +130,7 @@ async fn create(
     RequireTeacher(user): RequireTeacher,
     Json(req): Json<CreateCourseNote>,
 ) -> Result<(StatusCode, Json<CourseNoteResponse>), AppError> {
-    let course = Course::read(&CourseId::from_key(&req.course), &st.db)
+    let course = crate::service::course::read(&st.db, &CourseId::from_key(&req.course))
         .await?
         .ok_or(AppError::NotFound)?;
     if !can_manage_course(&course, &user) {
@@ -138,7 +138,7 @@ async fn create(
             "only the course creator, an assigned teacher, or a manager/admin can add a course note",
         ));
     }
-    course.require_open(&st.db).await?;
+    crate::service::course::require_open(&st.db, &course).await?;
     let title = CourseNoteTitle::try_new(&req.title)?;
     let content = CourseNoteContent::try_new(&req.content.unwrap_or_default())?;
     let note = CourseNote::create(course.get_id(), user.get_id(), title, content, &st.db).await?;
@@ -179,7 +179,7 @@ async fn list(
     Query(filter): Query<CourseFilter>,
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<CourseNoteResponse>>, AppError> {
-    let course = Course::read(&CourseId::from_key(&filter.course), &st.db)
+    let course = crate::service::course::read(&st.db, &CourseId::from_key(&filter.course))
         .await?
         .ok_or(AppError::NotFound)?;
     if !can_view_course(&course, &user, &st.db).await? {
@@ -254,7 +254,7 @@ async fn update(
             "only the course creator, an assigned teacher, or a manager/admin can edit this course note",
         ));
     }
-    course.require_open(&st.db).await?;
+    crate::service::course::require_open(&st.db, &course).await?;
 
     let title = req
         .title
@@ -300,7 +300,7 @@ async fn delete_one(
             "only the course creator, an assigned teacher, or a manager/admin can delete this course note",
         ));
     }
-    course.require_open(&st.db).await?;
+    crate::service::course::require_open(&st.db, &course).await?;
     // Derived rows first, outside the note's own cascade transaction: they are
     // disposable, so failing here leaves the note intact and the 500 truthful,
     // whereas dropping them after the note would strand every blob on an error
@@ -378,7 +378,7 @@ async fn upload_file(
             "only the course creator, an assigned teacher, or a manager/admin can add a file to this course note",
         ));
     }
-    course.require_open(&st.db).await?;
+    crate::service::course::require_open(&st.db, &course).await?;
     // The 10-file cap is enforced inside `CourseNoteFile::insert` (count and
     // create under one lock) — checking it here too would just race.
     let limit = service::settings::load(&st.db).await?.get_max_file_bytes();
@@ -533,7 +533,7 @@ async fn delete_file(
             "only the course creator, an assigned teacher, or a manager/admin can delete this course note's files",
         ));
     }
-    course.require_open(&st.db).await?;
+    crate::service::course::require_open(&st.db, &course).await?;
     let file =
         CourseNoteFile::read_for(&CourseNoteFileId::from_key(&file_id), note.get_id(), &st.db)
             .await?
@@ -648,7 +648,7 @@ async fn delete_rag(
             "only the course creator, an assigned teacher, or a manager/admin can delete this course note's AI outputs",
         ));
     }
-    course.require_open(&st.db).await?;
+    crate::service::course::require_open(&st.db, &course).await?;
     // Scoped to the note in the path, like `CourseNoteFile::read_for`: an
     // output of another note is a 404 here, never a cross-note delete.
     let output = RagOutput::read(&RagOutputId::from_key(&output_id), &st.db)

@@ -330,7 +330,7 @@ mod tests {
         use crate::domain::homework::{Homework, HomeworkTitle};
         use crate::domain::subject::{Subject, SubjectDescription, SubjectName};
 
-        let course = crate::domain::course::a_test_course(db).await;
+        let course = crate::db::course::a_test_course(db).await;
         let subject = Subject::create(
             &course,
             SubjectName::try_new("topic").unwrap(),

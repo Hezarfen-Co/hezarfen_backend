@@ -27,18 +27,22 @@ use common::{
     app_and_db, create_course, create_exam, create_exam_with, create_subject, enroll, id_of, login,
     login_as, me_id, send, unenroll,
 };
-use hezarfen_backend::domain::course::{Course, CourseId};
+use hezarfen_backend::db::course;
+use hezarfen_backend::domain::course::CourseId;
 use hezarfen_backend::domain::exam::ExamId;
 use hezarfen_backend::domain::exam_attempt::ExamAttempt;
 use serde_json::json;
 
 /// Delete `course` the way the handler would, minus its `EXAM_LOCK` lease.
 async fn drop_course(db: &hezarfen_backend::database::Database, course: &str) {
-    let row = Course::read(&CourseId::from_key(course), db)
+    let row = course::read(db, &CourseId::from_key(course))
         .await
         .expect("read the course")
         .expect("the course exists");
-    assert!(row.delete(db).await.expect("delete the course"), "refused");
+    assert!(
+        course::delete(db, row).await.expect("delete the course"),
+        "refused"
+    );
 }
 
 /// A bank template outlives the course it was saved out of — it is a separate,

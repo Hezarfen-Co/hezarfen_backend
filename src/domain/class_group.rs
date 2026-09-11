@@ -146,7 +146,7 @@ impl ClassGroup {
 
     /// Create the class, claiming a reference on the term it links (if any) in
     /// the *same transaction* as the row, exactly as
-    /// [`crate::domain::course::Course::create`] does: the claim is a
+    /// [`crate::db::course::create`] does: the claim is a
     /// conditional write on the term row, so it fails when the term is already
     /// gone, it makes the term undeletable the instant this link exists, and no
     /// crash can leave either half without the other.
@@ -230,7 +230,7 @@ impl ClassGroup {
     ///
     /// A term move claims the new term and releases the old one inside the very
     /// transaction that moves the link, exactly as in
-    /// [`crate::domain::course::Course::update`]: both counters and the link
+    /// [`crate::db::course::update`]: both counters and the link
     /// commit together, so no crash can strand a count on a term nothing links.
     pub async fn update(
         self,
@@ -301,7 +301,7 @@ impl ClassGroup {
 
     /// Strip `user` from every class they were the homeroom teacher of — the
     /// sweep for a user demoted below `teacher`, who may no longer hold one.
-    /// The mirror of [`crate::domain::course::Course::unassign_everywhere`];
+    /// The mirror of [`crate::db::course::unassign_everywhere`];
     /// nothing is counted on this column, so there is no reference to give back.
     pub async fn unassign_everywhere(user: &UserId, db: &Database) -> Result<(), AppError> {
         db.query("UPDATE class_group SET teacher = NONE WHERE teacher = $usr")
@@ -677,7 +677,7 @@ mod tests {
     }
 
     /// The class mirror of
-    /// [`crate::domain::course::Course`]'s move tests: a term move carries both
+    /// [`crate::db::course`]'s move tests: a term move carries both
     /// counters with the link, and a move to a term that is gone rolls the
     /// release back with the abort (the transaction releases before it claims,
     /// so the old count would be 0 if the abort did not undo it).
@@ -794,24 +794,24 @@ mod tests {
         assert_eq!(count_on(to.get_id(), &db).await, 1, "still one seat");
     }
 
-    /// [`crate::domain::course::Course::delete`]'s class sweep: deleting a course
+    /// [`crate::db::course::delete`]'s class sweep: deleting a course
     /// takes its `class_course` attachments with it and gives each class its
     /// count back, or the classes would be undeletable forever over rows that
     /// point at nothing.
     #[tokio::test]
     async fn deleting_a_course_sweeps_its_class_attachments() {
-        use crate::domain::course::{Course, CourseDescription, CourseKind, CourseTitle};
+        use crate::domain::course::{CourseDescription, CourseKind, CourseTitle};
 
         let db = crate::database::init_mem().await.unwrap();
         let manager = UserId::from_key("manager");
-        let course = Course::create(
+        let course = crate::db::course::create(
+            &db,
             &manager,
             CourseTitle::try_new("algebra").unwrap(),
             CourseDescription::try_new("").unwrap(),
             CourseKind::course(),
             None,
             None,
-            &db,
         )
         .await
         .unwrap();
@@ -828,7 +828,7 @@ mod tests {
         .check()
         .unwrap();
 
-        assert!(course.delete(&db).await.unwrap());
+        assert!(crate::db::course::delete(&db, course).await.unwrap());
         assert_eq!(
             rows("SELECT VALUE id FROM class_course", &db).await,
             0,

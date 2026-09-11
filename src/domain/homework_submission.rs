@@ -376,7 +376,7 @@ mod tests {
     /// A real homework row (and the subject it must reference) due at `due_at` —
     /// `upsert` now reads the deadline off the entity, so the tests need one.
     async fn a_homework(due_at: Timestamp, db: &Database) -> Homework {
-        let course = crate::domain::course::a_test_course(db).await;
+        let course = crate::db::course::a_test_course(db).await;
         let subject = Subject::create(
             &course,
             SubjectName::try_new("topic").unwrap(),

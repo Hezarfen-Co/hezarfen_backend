@@ -9,7 +9,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::database::Database;
-use crate::domain::course::Course;
+
 use crate::domain::exam::Exam;
 use crate::domain::exam_result::ExamResult;
 use crate::domain::role::Role;
@@ -96,7 +96,7 @@ async fn build_report(
     viewer: Option<&User>,
     db: &Database,
 ) -> Result<MarksReport, AppError> {
-    let (mut courses, _) = Course::list_enrolled(user, None, 0, db).await?;
+    let (mut courses, _) = crate::service::course::list_enrolled(db, user, None, 0).await?;
     if let Some(viewer) = viewer {
         courses.retain(|course| can_manage_course(course, viewer));
     }

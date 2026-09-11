@@ -422,7 +422,7 @@ mod tests {
 
     async fn a_subject(name: &str, db: &Database) -> Subject {
         Subject::create(
-            &crate::domain::course::a_test_course(db).await,
+            &crate::db::course::a_test_course(db).await,
             SubjectName::try_new(name).unwrap(),
             SubjectDescription::try_new("").unwrap(),
             db,

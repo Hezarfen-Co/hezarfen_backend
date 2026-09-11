@@ -239,7 +239,6 @@ mod tests {
     use super::*;
     use crate::domain::class_member::ClassMember;
     use crate::domain::class_member::tests::{a_class, a_course, counter, exists, rows, source_of};
-    use crate::domain::course::Course;
     use crate::domain::enrollment::Enrollment;
 
     /// Attaching seeds the course from the roster the class already holds.
@@ -532,11 +531,14 @@ mod tests {
         for round in 0..4 {
             let class = a_class(&format!("9-{round}"), &db).await;
             let algebra = a_course(&format!("algebra{round}"), None, &db).await;
-            let course = Course::read(&algebra, &db).await.unwrap().unwrap();
+            let course = crate::db::course::read(&db, &algebra)
+                .await
+                .unwrap()
+                .unwrap();
 
             let drop_it = {
                 let db = db.clone();
-                tokio::spawn(async move { course.delete(&db).await })
+                tokio::spawn(async move { crate::db::course::delete(&db, course).await })
             };
             // The attach starts inside the held window — the course row is gone
             // but uncommitted, which is exactly what a course read believes.
