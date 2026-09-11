@@ -15,12 +15,13 @@ mod common;
 use axum::http::StatusCode;
 use common::{app_and_db, id_of, login, login_as, me_id, send};
 use hezarfen_backend::constant::{MAX_FEE_PLAN_ASSIGN_WRITES, MAX_LEDGER_APPLIED_LINES};
-use hezarfen_backend::domain::fee_plan::{FeePlan, FeePlanName, Installment};
-use hezarfen_backend::domain::fee_plan_assignment::FeePlanAssignment;
+use hezarfen_backend::db::fee_plan;
+use hezarfen_backend::domain::fee_plan::{FeePlanName, Installment};
 use hezarfen_backend::domain::payment_ledger::LedgerAmount;
 use hezarfen_backend::domain::timestamp::Timestamp;
 use hezarfen_backend::domain::user::UserId;
 use hezarfen_backend::error::AppError;
+use hezarfen_backend::service::fee_plan_assignment;
 use serde_json::{Value, json};
 
 /// A plan of `installments`, as the manager writes it.
@@ -220,7 +221,7 @@ async fn a_negative_due_date_is_refused_on_both_write_paths() {
 /// deleted, and only then does the guarded `UPDATE` run. It matched nothing —
 /// because the row is gone, not because anyone is on the plan — and the answer
 /// was `409 "an assigned plan cannot be edited"` about a plan that never was.
-/// `FeePlan::delete` already pays for the read that tells the two apart on its
+/// `db::fee_plan::delete` already pays for the read that tells the two apart on its
 /// refusal path; the edit now does too, and a genuinely assigned plan is still
 /// the `409` it always was.
 #[tokio::test]
@@ -233,22 +234,29 @@ async fn editing_a_plan_deleted_since_it_was_read_is_a_404_not_a_409() {
             Timestamp::from_millis(1_000),
         )]
     };
-    let plan = FeePlan::create(
+    let plan = fee_plan::create(
+        &db,
         FeePlanName::try_new("Yearly").unwrap(),
         one(),
         &manager,
-        &db,
     )
     .await
     .unwrap();
 
     // The handler's snapshot, taken before the delete lands.
-    let read = FeePlan::read(plan.get_id(), &db).await.unwrap().unwrap();
-    assert!(plan.delete(&db).await.unwrap(), "nobody is on it");
-    let refused = read
-        .update(Some(FeePlanName::try_new("Renamed").unwrap()), None, &db)
-        .await
-        .unwrap_err();
+    let read = fee_plan::read(&db, plan.get_id()).await.unwrap().unwrap();
+    assert!(
+        fee_plan::delete(&db, plan).await.unwrap(),
+        "nobody is on it"
+    );
+    let refused = fee_plan::update(
+        &db,
+        read,
+        Some(FeePlanName::try_new("Renamed").unwrap()),
+        None,
+    )
+    .await
+    .unwrap_err();
     assert!(
         matches!(refused, AppError::NotFound),
         "a plan that is gone is a 404, not an assigned-plan 409: {refused}"
@@ -256,27 +264,30 @@ async fn editing_a_plan_deleted_since_it_was_read_is_a_404_not_a_409() {
 
     // The genuine refusal is untouched: a plan somebody is actually on still
     // answers 409, and its schedule is not edited.
-    let plan = FeePlan::create(
+    let plan = fee_plan::create(
+        &db,
         FeePlanName::try_new("Yearly").unwrap(),
         one(),
         &manager,
-        &db,
     )
     .await
     .unwrap();
-    FeePlanAssignment::assign(&plan, &UserId::from_key("del_stu"), &manager, &db)
+    fee_plan_assignment::assign(&db, &plan, &UserId::from_key("del_stu"), &manager)
         .await
         .unwrap();
-    let refused = plan
-        .clone()
-        .update(Some(FeePlanName::try_new("Renamed").unwrap()), None, &db)
-        .await
-        .unwrap_err();
+    let refused = fee_plan::update(
+        &db,
+        plan.clone(),
+        Some(FeePlanName::try_new("Renamed").unwrap()),
+        None,
+    )
+    .await
+    .unwrap_err();
     assert!(
         matches!(refused, AppError::Conflict(_)),
         "an assigned plan is still refused as assigned: {refused}"
     );
-    let stored = FeePlan::read(plan.get_id(), &db).await.unwrap().unwrap();
+    let stored = fee_plan::read(&db, plan.get_id()).await.unwrap().unwrap();
     assert_eq!(stored.get_name().as_str(), "Yearly", "nothing was written");
 }
 

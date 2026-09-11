@@ -348,23 +348,23 @@ mod tests {
 
     /// Raise one charge of `amount` on a fresh student, and hand it back.
     async fn one_charge(amount: i64, db: &Database) -> (PaymentLedger, UserId, UserId) {
-        use crate::domain::fee_plan::{FeePlan, FeePlanName, Installment};
-        use crate::domain::fee_plan_assignment::FeePlanAssignment;
+        use crate::db::fee_plan;
+        use crate::domain::fee_plan::{FeePlanName, Installment};
 
         let manager = UserId::from_key("mgr1");
         let student = UserId::from_key("stu1");
-        let plan = FeePlan::create(
+        let plan = fee_plan::create(
+            db,
             FeePlanName::try_new("Yearly").unwrap(),
             vec![Installment::new(
                 LedgerAmount::try_new(amount).unwrap(),
                 Timestamp::from_millis(1_000),
             )],
             &manager,
-            db,
         )
         .await
         .unwrap();
-        FeePlanAssignment::assign(&plan, &student, &manager, db)
+        crate::service::fee_plan_assignment::assign(db, &plan, &student, &manager)
             .await
             .unwrap();
         let (lines, _) = payment_ledger::list_for_student(db, &student, None, 0)
@@ -546,24 +546,24 @@ mod tests {
     /// reversal may point at a line of the wrong kind.
     #[tokio::test]
     async fn payments_are_capped_by_the_line_they_target() {
-        use crate::domain::fee_plan::{FeePlan, FeePlanName, Installment};
-        use crate::domain::fee_plan_assignment::FeePlanAssignment;
+        use crate::db::fee_plan;
+        use crate::domain::fee_plan::{FeePlanName, Installment};
 
         let db = crate::database::init_mem().await.unwrap();
         let manager = UserId::from_key("mgr1");
         let student = UserId::from_key("stu1");
-        let plan = FeePlan::create(
+        let plan = fee_plan::create(
+            &db,
             FeePlanName::try_new("Yearly").unwrap(),
             vec![Installment::new(
                 LedgerAmount::try_new(10_000).unwrap(),
                 Timestamp::from_millis(1_000),
             )],
             &manager,
-            &db,
         )
         .await
         .unwrap();
-        FeePlanAssignment::assign(&plan, &student, &manager, &db)
+        crate::service::fee_plan_assignment::assign(&db, &plan, &student, &manager)
             .await
             .unwrap();
         let (charges, _) = payment_ledger::list_for_student(&db, &student, None, 0)
