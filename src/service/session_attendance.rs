@@ -10,7 +10,6 @@
 use crate::database::Database;
 use crate::db::session_attendance;
 use crate::domain::attendance::AttendanceStatus;
-use crate::domain::badge;
 use crate::domain::course_session::CourseSession;
 use crate::domain::role::Role;
 use crate::domain::session_attendance::SessionAttendance;
@@ -81,7 +80,7 @@ pub async fn mark(
 
     let attendance = session_attendance::mark(db, session, target, status, marker.get_id()).await?;
     for who in [target, session.get_teacher()] {
-        if let Err(err) = badge::sync(who, db).await {
+        if let Err(err) = crate::db::badge::sync(db, who).await {
             tracing::warn!("failed to sync badges for {}: {err}", who.key());
         }
     }
