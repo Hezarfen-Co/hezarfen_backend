@@ -51,7 +51,7 @@ use hezarfen_backend::database::{self, Database};
 use hezarfen_backend::db::course;
 use hezarfen_backend::db::course_session as db_course_session;
 use hezarfen_backend::domain::course::{CourseDescription, CourseId, CourseKind, CourseTitle};
-use hezarfen_backend::domain::course_note::{CourseNote, CourseNoteContent, CourseNoteTitle};
+use hezarfen_backend::domain::course_note::{CourseNoteContent, CourseNoteTitle};
 use hezarfen_backend::domain::course_note_file::{CourseNoteFile, FileContentType, FileName};
 use hezarfen_backend::domain::course_session::SessionTopic;
 use hezarfen_backend::domain::exam::{
@@ -151,12 +151,12 @@ fn make_subject(course: CourseId, db: Database) -> JoinHandle<Result<(), AppErro
 
 fn make_note(course: CourseId, db: Database) -> JoinHandle<Result<(), AppError>> {
     tokio::spawn(async move {
-        CourseNote::create(
+        hezarfen_backend::db::course_note::create(
+            &db,
             &course,
             &teacher(),
             CourseNoteTitle::try_new("plan").unwrap(),
             CourseNoteContent::try_new("").unwrap(),
-            &db,
         )
         .await
         .map(|_| ())
@@ -264,22 +264,24 @@ async fn the_creates_give_the_courses_roster_counter_back_untouched() {
 async fn a_course_note_and_its_files_never_outlive_a_course_delete() {
     let db = database::init_mem().await.unwrap();
     let course = a_course(&db).await;
-    let note = CourseNote::create(
+    let note = hezarfen_backend::db::course_note::create(
+        &db,
         &course,
         &teacher(),
         CourseNoteTitle::try_new("plan").unwrap(),
         CourseNoteContent::try_new("body").unwrap(),
-        &db,
     )
     .await
     .unwrap();
-    CourseNoteFile::new(
-        note.get_id(),
-        FileName::try_new("plan.pdf").unwrap(),
-        FileContentType::try_new("application/pdf").unwrap(),
-        3,
+    hezarfen_backend::db::course_note_file::insert(
+        &db,
+        CourseNoteFile::new(
+            note.get_id(),
+            FileName::try_new("plan.pdf").unwrap(),
+            FileContentType::try_new("application/pdf").unwrap(),
+            3,
+        ),
     )
-    .insert(&db)
     .await
     .unwrap();
 
@@ -316,12 +318,12 @@ async fn a_course_note_and_its_files_never_outlive_a_course_delete() {
 async fn a_course_note_file_under_a_deleted_note_is_refused() {
     let db = database::init_mem().await.unwrap();
     let course = a_course(&db).await;
-    let note = CourseNote::create(
+    let note = hezarfen_backend::db::course_note::create(
+        &db,
         &course,
         &teacher(),
         CourseNoteTitle::try_new("plan").unwrap(),
         CourseNoteContent::try_new("").unwrap(),
-        &db,
     )
     .await
     .unwrap();
@@ -332,13 +334,15 @@ async fn a_course_note_file_under_a_deleted_note_is_refused() {
         "the course, and its note with it, goes"
     );
 
-    let file = CourseNoteFile::new(
-        note.get_id(),
-        FileName::try_new("plan.pdf").unwrap(),
-        FileContentType::try_new("application/pdf").unwrap(),
-        3,
+    let file = hezarfen_backend::db::course_note_file::insert(
+        &db,
+        CourseNoteFile::new(
+            note.get_id(),
+            FileName::try_new("plan.pdf").unwrap(),
+            FileContentType::try_new("application/pdf").unwrap(),
+            3,
+        ),
     )
-    .insert(&db)
     .await;
     assert!(
         matches!(file, Err(AppError::Conflict(_))),

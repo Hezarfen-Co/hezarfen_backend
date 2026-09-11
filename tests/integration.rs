@@ -24974,12 +24974,12 @@ async fn draw(
     epoch: i64,
     payload: &str,
 ) -> Result<BoardStroke, hezarfen_backend::error::AppError> {
-    BoardStroke::append(
+    hezarfen_backend::db::board_stroke::append(
+        db,
         &BoardId::from_key(board),
         &UserId::from_key(author),
         payload,
         epoch,
-        db,
     )
     .await
 }
@@ -24987,7 +24987,9 @@ async fn draw(
 /// The board row as the store holds it — never the response body, which cannot
 /// prove a counter moved (src/domain/cap.rs:44-49).
 async fn stored_board(db: &Database, board: &str) -> Option<Board> {
-    Board::read(&BoardId::from_key(board), db).await.unwrap()
+    hezarfen_backend::db::board::read(db, &BoardId::from_key(board))
+        .await
+        .unwrap()
 }
 
 /// Every stroke row of a board, oldest first, straight out of the table.

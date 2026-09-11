@@ -7,7 +7,6 @@ mod common;
 use axum::http::StatusCode;
 use common::{app_and_db, items, login, me_id, send};
 use hezarfen_backend::domain::board::BoardId;
-use hezarfen_backend::domain::board_stroke::BoardStroke;
 use hezarfen_backend::domain::user::UserId;
 use serde_json::json;
 
@@ -38,12 +37,12 @@ async fn a_strokes_page_never_carries_a_clear_marker() {
     let board = a_board(&app, &ali).await;
 
     for n in 0..2 {
-        BoardStroke::append(
+        hezarfen_backend::db::board_stroke::append(
+            &db,
             &BoardId::from_key(&board),
             &UserId::from_key(&ali_id),
             &format!("{{\"p\":[0,{n}]}}"),
             0,
-            &db,
         )
         .await
         .expect("append");
@@ -120,12 +119,12 @@ async fn a_locked_board_refuses_the_creator_s_clear_with_409() {
     let ali = login(&app, "ali").await;
     let ali_id = me_id(&app, &ali).await;
     let board = a_board(&app, &ali).await;
-    BoardStroke::append(
+    hezarfen_backend::db::board_stroke::append(
+        &db,
         &BoardId::from_key(&board),
         &UserId::from_key(&ali_id),
         "{\"p\":[1,2]}",
         0,
-        &db,
     )
     .await
     .expect("append");

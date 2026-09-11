@@ -1,13 +1,16 @@
-//! The `note` table: one user's rows, listed newest first, deleted together
-//! with their attachment rows.
+//! The `course_note` table: a teacher-authored note attached to a course,
+//! listed newest first, deleted together with its attachment rows.
 
 use surrealdb::types::SurrealValue;
 
+use crate::constant::ENROLLMENT_COUNT_FIELD;
 use crate::database::Database;
+use crate::db::cap;
 use crate::db::field_update::FieldUpdate;
 use crate::db::page::PagedList;
-use crate::domain::note::{Note, NoteContent, NoteId, NoteTitle};
-use crate::domain::note_file::NoteFile;
+use crate::domain::course::CourseId;
+use crate::domain::course_note::{CourseNote, CourseNoteContent, CourseNoteId, CourseNoteTitle};
+use crate::domain::course_note_file::CourseNoteFile;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 
@@ -16,44 +19,51 @@ use crate::error::AppError;
 /// only set whose blobs are safe to unlink.
 #[derive(Debug, SurrealValue)]
 struct DeleteOutcome {
-    note: Vec<Note>,
-    files: Vec<NoteFile>,
+    note: Vec<CourseNote>,
+    files: Vec<CourseNoteFile>,
 }
 
 pub async fn create(
     db: &Database,
-    owner: &UserId,
-    title: NoteTitle,
-    content: NoteContent,
-) -> Result<Note, AppError> {
-    let note = Note {
-        id: NoteId::generate(),
-        user: owner.clone(),
+    course: &CourseId,
+    author: &UserId,
+    title: CourseNoteTitle,
+    content: CourseNoteContent,
+) -> Result<CourseNote, AppError> {
+    let note = CourseNote {
+        id: CourseNoteId::generate(),
+        course: course.clone(),
+        author: author.clone(),
         title,
         content,
     };
-    let created: Option<Note> = db.create(note.id.record()).content(note).await?;
-    created.ok_or_else(|| AppError::Internal("failed to create note".into()))
+    // The course row is *written* (bumped and put back), not read, so this
+    // collides with `Course::delete`'s cascade: a note that outlives its
+    // course is unreachable forever — every route to it goes through the
+    // course. See [`cap::touch_and_create`].
+    cap::touch_and_create(
+        &course.record(),
+        ENROLLMENT_COUNT_FIELD,
+        &note.id.record(),
+        &note,
+        db,
+    )
+    .await?
+    .ok_or(AppError::NotFound)
 }
 
-/// Read a note only if it belongs to `owner`.
-pub async fn read_owned(
-    db: &Database,
-    id: &NoteId,
-    owner: &UserId,
-) -> Result<Option<Note>, AppError> {
-    let note: Option<Note> = db.select(id.record()).await?;
-    Ok(note.filter(|note| &note.user == owner))
+pub async fn read(db: &Database, id: &CourseNoteId) -> Result<Option<CourseNote>, AppError> {
+    Ok(db.select(id.record()).await?)
 }
 
-pub async fn list_for(
+pub async fn list_for_course(
     db: &Database,
-    owner: &UserId,
+    course: &CourseId,
     limit: Option<i64>,
     offset: i64,
-) -> Result<(Vec<Note>, i64), AppError> {
-    PagedList::new("note WHERE user = $usr", "ORDER BY id DESC")
-        .bind("usr", owner.record())
+) -> Result<(Vec<CourseNote>, i64), AppError> {
+    PagedList::new("course_note WHERE course = $crs", "ORDER BY id DESC")
+        .bind("crs", course.record())
         .run(limit, offset, db)
         .await
 }
@@ -66,14 +76,14 @@ pub async fn list_for(
 /// field says everything there is to say.
 pub async fn update(
     db: &Database,
-    note: Note,
-    title: Option<NoteTitle>,
-    content: Option<NoteContent>,
-) -> Result<Note, AppError> {
+    note: CourseNote,
+    title: Option<CourseNoteTitle>,
+    content: Option<CourseNoteContent>,
+) -> Result<CourseNote, AppError> {
     FieldUpdate::new(note.id.record())
         .set("title", title)
         .set("content", content)
-        .run::<Note>(db)
+        .run::<CourseNote>(db)
         .await
 }
 
@@ -81,19 +91,15 @@ pub async fn update(
 /// the note, and the attachment rows this transaction actually removed.
 /// Blob files on disk are the web layer's to remove, but only for *these*
 /// rows — a row uploaded after the caller listed the note's files is
-/// deleted here too, and a pre-read snapshot would strand its blob. A crash
-/// between commit and unlink leaves at worst an unreachable blob, never a
-/// row pointing at nothing.
-///
-/// Children first, in one transaction, the way
-/// [`crate::db::course::delete`] does it: as two queries, an
-/// upload that committed in between kept its row while the note went, and
-/// nothing could ever list or delete it again.
-pub async fn delete(db: &Database, note: Note) -> Result<(Note, Vec<NoteFile>), AppError> {
+/// deleted here too, and a pre-read snapshot would strand its blob.
+pub async fn delete(
+    db: &Database,
+    note: CourseNote,
+) -> Result<(CourseNote, Vec<CourseNoteFile>), AppError> {
     let mut result = db
         .query(
             "BEGIN TRANSACTION;
-             LET $files = (DELETE note_file WHERE note = $note RETURN BEFORE);
+             LET $files = (DELETE course_note_file WHERE course_note = $note RETURN BEFORE);
              LET $gone = (DELETE $note RETURN BEFORE);
              RETURN { note: $gone, files: $files };
              COMMIT TRANSACTION;",
@@ -106,7 +112,7 @@ pub async fn delete(db: &Database, note: Note) -> Result<(Note, Vec<NoteFile>), 
         .take::<Vec<DeleteOutcome>>(3)?
         .into_iter()
         .next()
-        .ok_or_else(|| AppError::Internal("failed to delete note".into()))?;
+        .ok_or_else(|| AppError::Internal("failed to delete course note".into()))?;
     let note = outcome.note.into_iter().next().ok_or(AppError::NotFound)?;
     Ok((note, outcome.files))
 }
@@ -114,28 +120,40 @@ pub async fn delete(db: &Database, note: Note) -> Result<(Note, Vec<NoteFile>), 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::course::{CourseDescription, CourseKind, CourseTitle};
+    use crate::domain::course_note_file::{FileContentType, FileName};
 
     /// The blobs the handler unlinks are exactly the rows this transaction
     /// removed — including one uploaded after any pre-read snapshot would have
     /// been taken, which is the row whose blob used to leak.
     #[tokio::test]
     async fn delete_returns_the_attachment_rows_it_removed() {
-        use crate::domain::note_file::{FileContentType, FileName};
-
         let db = crate::database::init_mem().await.unwrap();
-        let owner = crate::domain::user::UserId::generate();
+        let creator = crate::domain::user::UserId::generate();
+        let course = crate::db::course::create(
+            &db,
+            &creator,
+            CourseTitle::try_new("Math").unwrap(),
+            CourseDescription::try_new("").unwrap(),
+            CourseKind::try_new("course").unwrap(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let note = create(
             &db,
-            &owner,
-            NoteTitle::try_new("a").unwrap(),
-            NoteContent::try_new("body").unwrap(),
+            course.get_id(),
+            &creator,
+            CourseNoteTitle::try_new("a").unwrap(),
+            CourseNoteContent::try_new("body").unwrap(),
         )
         .await
         .unwrap();
         // What a handler snapshot would have seen...
-        let early = crate::db::note_file::insert(
+        let early = crate::db::course_note_file::insert(
             &db,
-            NoteFile::new(
+            CourseNoteFile::new(
                 note.get_id(),
                 FileName::try_new("early.pdf").unwrap(),
                 FileContentType::try_new("application/pdf").unwrap(),
@@ -144,14 +162,14 @@ mod tests {
         )
         .await
         .unwrap();
-        let (snapshot, _) = crate::db::note_file::list_for(&db, note.get_id(), None, 0)
+        let (snapshot, _) = crate::db::course_note_file::list_for(&db, note.get_id(), None, 0)
             .await
             .unwrap();
         assert_eq!(snapshot.len(), 1);
         // ...and the upload that races in after it.
-        let late = crate::db::note_file::insert(
+        let late = crate::db::course_note_file::insert(
             &db,
-            NoteFile::new(
+            CourseNoteFile::new(
                 note.get_id(),
                 FileName::try_new("late.pdf").unwrap(),
                 FileContentType::try_new("application/pdf").unwrap(),
@@ -175,7 +193,7 @@ mod tests {
         want.sort();
         assert_eq!(keys, want);
         assert!(
-            crate::db::note_file::list_for(&db, gone.get_id(), None, 0)
+            crate::db::course_note_file::list_for(&db, gone.get_id(), None, 0)
                 .await
                 .unwrap()
                 .0
