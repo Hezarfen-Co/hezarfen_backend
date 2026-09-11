@@ -9,7 +9,6 @@ use crate::db::course;
 use crate::domain::answer_image::AnswerImage;
 use crate::domain::course::{Course, CourseDescription, CourseId, CourseKind, CourseTitle};
 use crate::domain::course_note_file::CourseNoteFile;
-use crate::domain::homework_file::HomeworkFile;
 use crate::domain::question_image::QuestionImage;
 use crate::domain::role::Role;
 use crate::domain::term::TermId;
@@ -151,7 +150,7 @@ pub struct DeleteOutcome {
 /// And the homework half of the same cascade, for
 /// [`crate::web::homework::delete_homework`]'s reason: it sweeps the
 /// course's homework with its submissions, files and results, and grading
-/// ([`crate::domain::homework_result::HomeworkResult::grade`]) writes a
+/// ([`crate::db::homework_result::grade`]) writes a
 /// result row against a homework it only *read*, which a delete committing
 /// alongside is invisible to. Without this lease the grade lands behind the
 /// sweep: an orphan `homework_result` under a vanished homework, plus a
@@ -165,10 +164,11 @@ pub struct DeleteOutcome {
 pub async fn delete(db: &Database, course: &Course) -> Result<DeleteOutcome, AppError> {
     require_open(db, course).await?;
     let _guard = crate::service::exam_attempt::EXAM_LOCK.write().await;
-    let _homework_guard = crate::web::homework::HOMEWORK_LOCK.write().await;
+    let _homework_guard = crate::service::homework::HOMEWORK_LOCK.write().await;
     let image_files = QuestionImage::file_keys_for_course(course.get_id(), db).await?;
     let answer_image_files = AnswerImage::file_keys_for_course(course.get_id(), db).await?;
-    let homework_files = HomeworkFile::file_keys_for_course(course.get_id(), db).await?;
+    let homework_files =
+        crate::db::homework_file::file_keys_for_course(db, course.get_id()).await?;
     let course_note_files = CourseNoteFile::file_keys_for_course(course.get_id(), db).await?;
     let deleted = course::delete(db, course.clone()).await?;
     Ok(DeleteOutcome {
