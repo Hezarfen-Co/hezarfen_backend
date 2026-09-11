@@ -32,10 +32,10 @@ use crate::domain::exam_result::{ExamResult, Mark};
 use crate::domain::note_file::FileContentType;
 use crate::domain::question_image::QuestionImage;
 use crate::domain::role::Role;
-use crate::domain::settings::Settings;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
+use crate::service;
 use crate::state::AppState;
 
 use super::bank_questions::BankQuestionResponse;
@@ -448,7 +448,7 @@ async fn update_exam(
             // a stored kind survives later list edits, like past times survive
             // the no-past rule.
             Some(ref kind) => {
-                let school = Settings::load(&st.db).await?;
+                let school = service::settings::load(&st.db).await?;
                 ExamKind::try_new(kind, school.get_exam_kinds())?
             }
             None => exam.get_kind().clone(),
@@ -691,7 +691,7 @@ async fn grade(
     // also a mark that averages at weight 1 forever. Both gates, same answer;
     // this one is a read, the counter's is the one that survives a race.
     let kind = exam.get_kind().as_str();
-    if !Settings::load(&st.db)
+    if !service::settings::load(&st.db)
         .await?
         .get_exam_kinds()
         .iter()

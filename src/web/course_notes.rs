@@ -25,8 +25,8 @@ use crate::domain::course_note_file::{
     CourseNoteFile, CourseNoteFileId, FileContentType, FileName,
 };
 use crate::domain::rag_output::{RagOutput, RagOutputId};
-use crate::domain::settings::Settings;
 use crate::error::{AppError, ErrorResponse};
+use crate::service;
 use crate::state::AppState;
 
 use super::courses::{can_manage_course, can_view_course};
@@ -381,7 +381,7 @@ async fn upload_file(
     course.require_open(&st.db).await?;
     // The 10-file cap is enforced inside `CourseNoteFile::insert` (count and
     // create under one lock) — checking it here too would just race.
-    let limit = Settings::load(&st.db).await?.get_max_file_bytes();
+    let limit = service::settings::load(&st.db).await?.get_max_file_bytes();
 
     let upload = read_upload(&mut multipart, limit).await?;
     let name = FileName::try_new(&upload.name.unwrap_or_default())?;

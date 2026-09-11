@@ -688,7 +688,7 @@ async fn deleting_an_event_takes_its_children_with_it() {
 
 /// The note half of the same defect: the attachment rows and the note commit
 /// together, so an upload can no longer leave a `note_file` pointing at a note
-/// that is gone (its *blob* goes too: `Note::delete` returns the rows it
+/// that is gone (its *blob* goes too: `db::note::delete` returns the rows it
 /// removed and the handler unlinks exactly those).
 #[tokio::test]
 async fn deleting_a_note_takes_its_attachment_rows_with_it() {

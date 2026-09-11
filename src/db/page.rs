@@ -138,7 +138,8 @@ fn total_of(count: Value) -> Result<i64, AppError> {
 mod tests {
     use super::*;
     use crate::database;
-    use crate::domain::note::{Note, NoteContent, NoteTitle};
+    use crate::db::note;
+    use crate::domain::note::{NoteContent, NoteTitle};
     use crate::domain::user::UserId;
     use ulid::Ulid;
 
@@ -207,24 +208,24 @@ mod tests {
         let db = database::init_mem().await.unwrap();
         let user = UserId::from_key(&Ulid::new().to_string());
         for i in 0..5 {
-            Note::create(
+            note::create(
+                &db,
                 &user,
                 NoteTitle::try_new(&format!("n{i}")).unwrap(),
                 NoteContent::try_new("x").unwrap(),
-                &db,
             )
             .await
             .unwrap();
         }
 
         // Every page is `limit` long and `total` ignores the window.
-        let (page, total) = Note::list_for(&user, Some(2), 0, &db).await.unwrap();
+        let (page, total) = note::list_for(&db, &user, Some(2), 0).await.unwrap();
         assert_eq!((page.len(), total), (2, 5));
-        let (tail, total) = Note::list_for(&user, Some(2), 4, &db).await.unwrap();
+        let (tail, total) = note::list_for(&db, &user, Some(2), 4).await.unwrap();
         assert_eq!((tail.len(), total), (1, 5));
         // Offset past the end is an empty page, not an error.
         assert_eq!(
-            Note::list_for(&user, Some(2), 9, &db)
+            note::list_for(&db, &user, Some(2), 9)
                 .await
                 .unwrap()
                 .0
@@ -232,9 +233,9 @@ mod tests {
             0
         );
         // Unpaged, and unpaged-from-an-offset: the count still covers everything.
-        let (all, total) = Note::list_for(&user, None, 0, &db).await.unwrap();
+        let (all, total) = note::list_for(&db, &user, None, 0).await.unwrap();
         assert_eq!((all.len(), total), (5, 5));
-        let (rest, total) = Note::list_for(&user, None, 3, &db).await.unwrap();
+        let (rest, total) = note::list_for(&db, &user, None, 3).await.unwrap();
         assert_eq!((rest.len(), total), (2, 5));
 
         // The pages are consecutive slices of the unpaged list — page

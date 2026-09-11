@@ -11,8 +11,8 @@ use crate::constant::{
 };
 use crate::database::{Database, transaction_with_retry};
 use crate::db::cap;
-use crate::domain::monotonic_id::next_ulid;
 use crate::db::page::PagedList;
+use crate::domain::monotonic_id::next_ulid;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
@@ -356,12 +356,14 @@ mod tests {
             .unwrap()
             .check()
             .unwrap();
-        Settings::try_new(SettingsParams {
-            max_chatbot_threads: threads,
-            ..Settings::defaults().params()
-        })
-        .unwrap()
-        .save(&db)
+        crate::db::settings::save(
+            &db,
+            Settings::try_new(SettingsParams {
+                max_chatbot_threads: threads,
+                ..Settings::defaults().params()
+            })
+            .unwrap(),
+        )
         .await
         .unwrap();
         db

@@ -493,7 +493,7 @@ impl Exam {
     /// handler's read: the compare-and-set refuses precisely when that save
     /// would have reverted somebody. `course`/`creator` are not editable and
     /// ride along unchanged. Same shape as
-    /// [`crate::domain::settings::Settings::save_if_unchanged`].
+    /// [`crate::db::settings::save_if_unchanged`].
     pub async fn update_if_unchanged(
         mut self,
         title: ExamTitle,

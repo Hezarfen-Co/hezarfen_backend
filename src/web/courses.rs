@@ -23,11 +23,11 @@ use crate::domain::homework::{Homework, HomeworkTitle};
 use crate::domain::homework_file::HomeworkFile;
 use crate::domain::question_image::QuestionImage;
 use crate::domain::role::Role;
-use crate::domain::settings::Settings;
 use crate::domain::subject::{Subject, SubjectDescription, SubjectName};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
+use crate::service;
 use crate::state::AppState;
 
 use super::homework::{description_or_none, resolve_assigned};
@@ -896,7 +896,7 @@ async fn create_exam_in_course(
 
     let title = ExamTitle::try_new(&req.title)?;
     let description = ExamDescription::try_new(&req.description.unwrap_or_default())?;
-    let school = Settings::load(&st.db).await?;
+    let school = service::settings::load(&st.db).await?;
     let kind = ExamKind::try_new(&req.kind, school.get_exam_kinds())?;
     let starts_at = req.starts_at.map(Timestamp::from_millis);
     let ends_at = req.ends_at.map(Timestamp::from_millis);

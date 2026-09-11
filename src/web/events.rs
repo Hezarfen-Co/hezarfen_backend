@@ -16,10 +16,10 @@ use crate::domain::course::{Course, CourseId};
 use crate::domain::event::{Event, EventAudience, EventDescription, EventId, EventTitle};
 use crate::domain::registration::Registration;
 use crate::domain::role::Role;
-use crate::domain::settings::Settings;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
+use crate::service;
 use crate::state::AppState;
 
 use super::{
@@ -509,7 +509,7 @@ async fn mark(
         .await?
         .ok_or(AppError::NotFound)?;
 
-    let school = Settings::load(&st.db).await?;
+    let school = service::settings::load(&st.db).await?;
     let status = AttendanceStatus::try_new(&req.status, school.get_attendance_statuses())?;
     let target = match req.user_id {
         Some(ref key) => UserId::from_key(key),

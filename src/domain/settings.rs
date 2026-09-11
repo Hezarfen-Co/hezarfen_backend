@@ -12,7 +12,6 @@
 //! existing rows, and `UPDATE` re-validates whole records).
 
 use surrealdb::types::{RecordId, SurrealValue};
-use tokio::sync::Mutex;
 
 use crate::constant::{
     DEFAULT_ATTENDANCE_STATUSES, DEFAULT_CHATBOT_HISTORY_TURNS, DEFAULT_DIETARY_TAGS,
@@ -24,35 +23,8 @@ use crate::constant::{
     MIN_CHATBOT_HISTORY_TURNS, MIN_EXAM_KIND_WEIGHT, MIN_MARK, MIN_MAX_CHATBOT_MESSAGE_LEN,
     MIN_MAX_CHATBOT_THREADS, MIN_MAX_FILE_BYTES, SETTINGS_KEY, SETTINGS_TABLE,
 };
-use crate::database::Database;
 use crate::domain::text_fold;
-use crate::error::{AppError, ValidationError};
-
-/// One settings edit at a time, over the whole process.
-///
-/// A list edit is a **pair** of writes, and the pair is the guard: every name
-/// the edit drops is retired on its reference counter first (which refuses
-/// every later claim), and only then is the list itself committed with a
-/// compare-and-set against the snapshot the removals were judged from. Neither
-/// write can be made to cover the other. Both retirement and un-retirement are
-/// *idempotent*, so a rival that decided the same removal against the same
-/// snapshot is told "already retired" and records no rollback — and when it is
-/// that rival's save that wins the compare-and-set, the attempt which really
-/// flipped the bit rolls it back, leaving the name off the stored list with a
-/// counter reading "in service": gradable again, and unremovable for good once
-/// a mark lands. No per-name bit can close that, because `Unchanged` has
-/// erased which attempt owns the flip.
-///
-/// So the pair is serialized instead. Every writer of the singleton goes
-/// through `PATCH /settings`, and the deployment runs one process by contract
-/// (stop-the-world upgrades), so process-wide is deployment-wide here — the
-/// same argument [`crate::db::cap`]'s own lock makes for `retire_name`'s
-/// two statements, one level up. The compare-and-set stays: it is what keeps a
-/// crashed or rolled-back attempt from writing a list nobody merged.
-///
-/// **Lock order:** `SETTINGS_LOCK` → `cap`'s `CLAIM_LOCK`, never the reverse —
-/// the retirements are taken while this is held.
-pub(crate) static SETTINGS_LOCK: Mutex<()> = Mutex::const_new(());
+use crate::error::ValidationError;
 
 /// One exam kind the school runs (`"midterm"`, `"oral"`, …) with its weight:
 /// how many times an exam of that kind counts into its course's average.
@@ -218,30 +190,31 @@ impl GradeBand {
 
 /// The school's policy knobs, validated as a whole (parse, don't validate —
 /// like every other entity, an existing `Settings` is always internally
-/// consistent).
+/// consistent). Fields are crate-visible because [`crate::db::settings`]
+/// binds them directly in the compare-and-set guard.
 #[derive(Debug, Clone, SurrealValue)]
 pub struct Settings {
     id: RecordId,
-    exam_kinds: Vec<ExamKindDef>,
-    attendance_statuses: Vec<String>,
-    grade_bands: Vec<GradeBand>,
+    pub(crate) exam_kinds: Vec<ExamKindDef>,
+    pub(crate) attendance_statuses: Vec<String>,
+    pub(crate) grade_bands: Vec<GradeBand>,
     /// Per-file byte cap for note uploads. `None` = the row predates the
     /// field (or the defaults) — reads as `DEFAULT_MAX_FILE_BYTES`.
-    max_file_bytes: Option<i64>,
+    pub(crate) max_file_bytes: Option<i64>,
     /// Chatbot knobs, `None`-while-unset exactly like `max_file_bytes`.
-    chatbot_history_turns: Option<i64>,
-    max_chatbot_threads: Option<i64>,
-    max_chatbot_message_len: Option<i64>,
+    pub(crate) chatbot_history_turns: Option<i64>,
+    pub(crate) max_chatbot_threads: Option<i64>,
+    pub(crate) max_chatbot_message_len: Option<i64>,
     /// Food-program knobs. `None`-while-unset exactly like `max_file_bytes` —
     /// the columns are `option<…>`, never `DEFAULT []`: `save_if_unchanged`
     /// writes the whole row, so a field this struct did not carry would coerce
     /// to `NONE` and abort the transaction.
-    meal_slots: Option<Vec<MealSlotDef>>,
-    dietary_tags: Option<Vec<String>>,
+    pub(crate) meal_slots: Option<Vec<MealSlotDef>>,
+    pub(crate) dietary_tags: Option<Vec<String>>,
     /// Minutes before a meal at which booking *and* cancelling close. One knob
     /// for both deadlines; `None` = no cutoff at all, which is also what an
     /// unset column reads as.
-    meal_cancel_cutoff_minutes: Option<i64>,
+    pub(crate) meal_cancel_cutoff_minutes: Option<i64>,
 }
 
 /// Everything [`Settings::try_new`] validates, in one struct — the knobs
@@ -263,7 +236,7 @@ pub struct SettingsParams {
 }
 
 impl Settings {
-    fn record_id() -> RecordId {
+    pub(crate) fn record_id() -> RecordId {
         RecordId::new(SETTINGS_TABLE, SETTINGS_KEY)
     }
 
@@ -528,92 +501,6 @@ impl Settings {
             .filter(|band| band.get_min() as f64 <= mark)
             .max_by_key(|band| band.get_min())
             .map(GradeBand::get_label)
-    }
-
-    /// The stored policy, or the defaults when no row exists yet.
-    pub async fn load(db: &Database) -> Result<Settings, AppError> {
-        let found: Option<Settings> = db.select(Self::record_id()).await?;
-        Ok(found.unwrap_or_else(Self::defaults))
-    }
-
-    /// Persist the policy (single UPSERT on the fixed singleton id),
-    /// unconditionally — last write wins. Prefer [`Self::save_if_unchanged`]
-    /// wherever the new policy was merged from a loaded snapshot.
-    pub async fn save(self, db: &Database) -> Result<Settings, AppError> {
-        // whole-row-save-ok: test-only seeding; every production write merges from a loaded snapshot and goes through save_if_unchanged
-        let saved: Option<Settings> = db.upsert(Self::record_id()).content(self).await?;
-        saved.ok_or_else(|| AppError::Internal("failed to save settings".into()))
-    }
-
-    /// Persist the policy only while the stored row still matches `expected`
-    /// — the snapshot the caller merged omitted fields from. `None` means a
-    /// concurrent edit landed in between and nothing was written: reload,
-    /// re-merge, retry. Without this compare-and-set, two managers patching
-    /// *different* fields silently revert each other (both merge from the
-    /// same snapshot; the later whole-row write restores its stale copy of
-    /// the other's field).
-    ///
-    /// One transaction: the seed insert materializes the defaults-as-loaded
-    /// state when no row exists yet (`load` reported the defaults, so the
-    /// defaults are what the caller merged over), then the guarded update
-    /// applies `self` only if the row (still) equals `expected`.
-    ///
-    /// **`meal_slots` is compared through a projection, and it has to be.**
-    /// SurrealDB *drops* an object key whose value is `NONE` on write, while
-    /// the `SurrealValue` derive always emits `serving_minute: NONE` for a
-    /// slot without one — so `{name: 'lunch'} = {name: 'lunch', serving_minute:
-    /// NONE}` is **false** and a plain equality guard would never match again
-    /// for any school with a serving-time-less slot (which is every school
-    /// until it sets one): every `PATCH /settings` would 409 forever. Rebuilding
-    /// both sides as full objects normalizes the shapes. The NONE-ness of the
-    /// column itself is compared separately, so "never set" stays distinguishable
-    /// from "explicitly empty". Top-level optional columns need none of this:
-    /// a missing field reads as `NONE`, and `NONE = NONE` holds.
-    pub async fn save_if_unchanged(
-        self,
-        expected: &Settings,
-        db: &Database,
-    ) -> Result<Option<Settings>, AppError> {
-        let mut result = db
-            .query(
-                "BEGIN TRANSACTION;
-                 INSERT IGNORE INTO settings $expected;
-                 UPDATE $id CONTENT $new
-                     WHERE exam_kinds = $ek
-                       AND attendance_statuses = $st
-                       AND grade_bands = $gb
-                       AND max_file_bytes = $mf
-                       AND chatbot_history_turns = $ct
-                       AND max_chatbot_threads = $cc
-                       AND max_chatbot_message_len = $cl
-                       AND (meal_slots = NONE) = $ms_unset
-                       AND (meal_slots ?? []).map(|$s| {
-                               name: $s.name,
-                               serving_minute: $s.serving_minute
-                           }) = ($ms ?? [])
-                       AND dietary_tags = $dt
-                       AND meal_cancel_cutoff_minutes = $mc;
-                 COMMIT TRANSACTION;",
-            )
-            .bind(("expected", expected.clone()))
-            .bind(("id", Self::record_id()))
-            .bind(("new", self))
-            .bind(("ek", expected.exam_kinds.clone()))
-            .bind(("st", expected.attendance_statuses.clone()))
-            .bind(("gb", expected.grade_bands.clone()))
-            .bind(("mf", expected.max_file_bytes))
-            .bind(("ct", expected.chatbot_history_turns))
-            .bind(("cc", expected.max_chatbot_threads))
-            .bind(("cl", expected.max_chatbot_message_len))
-            .bind(("ms_unset", expected.meal_slots.is_none()))
-            .bind(("ms", expected.meal_slots.clone()))
-            .bind(("dt", expected.dietary_tags.clone()))
-            .bind(("mc", expected.meal_cancel_cutoff_minutes))
-            .await?
-            .check()?;
-        // Statement slots count BEGIN too: the guarded UPDATE is slot 2. An
-        // empty slot means the row no longer matched `expected`.
-        Ok(result.take::<Vec<Settings>>(2)?.into_iter().next())
     }
 }
 
@@ -939,156 +826,6 @@ mod tests {
         assert!(len(MIN_MAX_CHATBOT_MESSAGE_LEN - 1).is_err());
         // The ceiling is the newtype's hard cap: no school can raise it.
         assert!(len(MAX_CHATBOT_MESSAGE_LEN as i64 + 1).is_err());
-    }
-
-    #[tokio::test]
-    async fn a_row_predating_the_optional_knobs_reads_the_defaults() {
-        let db = crate::database::init_mem().await.unwrap();
-        // The defaults carry no explicit knobs, so this writes a row without
-        // those fields — exactly what a volume from before them looks like.
-        Settings::defaults().save(&db).await.unwrap();
-        let loaded = Settings::load(&db).await.unwrap();
-        assert_eq!(loaded.get_max_file_bytes(), DEFAULT_MAX_FILE_BYTES);
-        assert_eq!(
-            loaded.get_chatbot_history_turns(),
-            DEFAULT_CHATBOT_HISTORY_TURNS
-        );
-        assert_eq!(
-            loaded.get_max_chatbot_threads(),
-            DEFAULT_MAX_CHATBOT_THREADS
-        );
-        assert_eq!(
-            loaded.get_max_chatbot_message_len(),
-            DEFAULT_MAX_CHATBOT_MESSAGE_LEN
-        );
-        // And a snapshot of that old row still passes the compare-and-set.
-        let saved = Settings::try_new(SettingsParams {
-            max_file_bytes: 4096,
-            ..loaded.params()
-        })
-        .unwrap()
-        .save_if_unchanged(&loaded, &db)
-        .await
-        .unwrap()
-        .expect("a merge over an old-shape row applies");
-        assert_eq!(saved.get_max_file_bytes(), 4096);
-    }
-
-    #[tokio::test]
-    async fn load_save_roundtrip_on_the_singleton() {
-        let db = crate::database::init_mem().await.unwrap();
-        // No row yet → the defaults, not an error.
-        let loaded = Settings::load(&db).await.unwrap();
-        assert_eq!(
-            loaded.get_exam_kinds(),
-            Settings::defaults().get_exam_kinds()
-        );
-        // Save a custom policy and read it back — bands (nested objects under
-        // a FLEXIBLE field) must survive the trip.
-        Settings::try_new(SettingsParams {
-            exam_kinds: kinds(&["lab"]),
-            grade_bands: bands(&[(0, "F"), (50, "P")]),
-            max_file_bytes: 2048,
-            chatbot_history_turns: 3,
-            ..params()
-        })
-        .unwrap()
-        .save(&db)
-        .await
-        .unwrap();
-        let loaded = Settings::load(&db).await.unwrap();
-        assert_eq!(names(&loaded), ["lab"]);
-        assert_eq!(loaded.get_grade_bands().len(), 2);
-        assert_eq!(loaded.grade_label(60.0), Some("P"));
-        assert_eq!(loaded.get_max_file_bytes(), 2048);
-        assert_eq!(loaded.get_chatbot_history_turns(), 3);
-        // A second save lands on the same singleton row, not a new one.
-        Settings::try_new(SettingsParams {
-            exam_kinds: kinds(&["quiz"]),
-            ..params()
-        })
-        .unwrap()
-        .save(&db)
-        .await
-        .unwrap();
-        let mut result = db.query("SELECT * FROM settings").await.unwrap();
-        let rows: Vec<Settings> = result.take(0).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(names(&rows[0]), ["quiz"]);
-    }
-
-    #[tokio::test]
-    async fn a_stale_snapshot_cannot_revert_a_newer_policy() {
-        let db = crate::database::init_mem().await.unwrap();
-
-        // Editor A snapshots the policy (the defaults — no row yet)...
-        let stale = Settings::load(&db).await.unwrap();
-        // ...then editor B lands a new exam-kind list first.
-        Settings::try_new(SettingsParams {
-            exam_kinds: kinds(&["lab"]),
-            ..params()
-        })
-        .unwrap()
-        .save(&db)
-        .await
-        .unwrap();
-
-        // A's merge over the stale snapshot (kinds kept "as loaded", bands
-        // changed) — exactly what a concurrent PATCH /settings computes —
-        // must be refused, not applied.
-        let refused = Settings::try_new(SettingsParams {
-            grade_bands: bands(&[(0, "F"), (50, "P")]),
-            ..stale.params()
-        })
-        .unwrap()
-        .save_if_unchanged(&stale, &db)
-        .await
-        .unwrap();
-        assert!(refused.is_none(), "a stale snapshot's save must not apply");
-
-        // B's edit must survive A's stale write attempt.
-        let after = Settings::load(&db).await.unwrap();
-        assert_eq!(
-            names(&after),
-            ["lab"],
-            "a concurrent editor's exam kinds must not be silently reverted"
-        );
-        assert!(after.get_grade_bands().is_empty());
-
-        // A's retry — reload, re-merge, save again — lands both edits.
-        let fresh = Settings::load(&db).await.unwrap();
-        let saved = Settings::try_new(SettingsParams {
-            grade_bands: bands(&[(0, "F"), (50, "P")]),
-            ..fresh.params()
-        })
-        .unwrap()
-        .save_if_unchanged(&fresh, &db)
-        .await
-        .unwrap()
-        .expect("a merge over the current row applies");
-        assert_eq!(names(&saved), ["lab"]);
-        assert_eq!(saved.get_grade_bands().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn save_if_unchanged_seeds_the_first_row() {
-        let db = crate::database::init_mem().await.unwrap();
-        // No row yet: `load` reports the defaults, and a save conditioned on
-        // that snapshot must apply (seeding the singleton on the way).
-        let current = Settings::load(&db).await.unwrap();
-        let saved = Settings::try_new(SettingsParams {
-            exam_kinds: kinds(&["lab"]),
-            ..current.params()
-        })
-        .unwrap()
-        .save_if_unchanged(&current, &db)
-        .await
-        .unwrap()
-        .expect("the first save applies");
-        assert_eq!(names(&saved), ["lab"]);
-        let mut result = db.query("SELECT * FROM settings").await.unwrap();
-        let rows: Vec<Settings> = result.take(0).unwrap();
-        assert_eq!(rows.len(), 1, "still one singleton row");
     }
 
     #[tokio::test]

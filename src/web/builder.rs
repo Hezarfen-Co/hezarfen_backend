@@ -28,11 +28,11 @@ use utoipa_axum::routes;
 use crate::constant::MAX_SCHOOL_NAME_LEN;
 use crate::domain::builder::{Builder, BuilderSession};
 use crate::domain::role::Role;
-use crate::domain::session::Session;
 use crate::domain::user::{Password, PasswordHash, User, Username};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::module::{Module, ModuleSet, Package};
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
+use crate::service;
 use crate::state::AppState;
 use crate::tenant::{School, SchoolStatus, Slug};
 use crate::validate::validate_required;
@@ -759,7 +759,7 @@ async fn reset_admin_password(
         .ok_or(AppError::NotFound)?;
     // The other half: the new password means nothing while a cookie minted
     // under the old one still authenticates.
-    Session::delete_by_user(user.get_id(), &db).await?;
+    service::session::delete_by_user(&db, user.get_id()).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -798,7 +798,7 @@ async fn enter_school(
     }
     let user = school_admin(&req.username, &db).await?;
 
-    let session = Session::create(user.get_id(), &db).await?;
+    let session = service::session::create(&db, user.get_id()).await?;
     let cookie = session_cookie(
         format!("{slug}.{}", session.token().as_str()),
         st.cookie_secure,

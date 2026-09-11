@@ -13,9 +13,9 @@ use crate::domain::course::Course;
 use crate::domain::exam::Exam;
 use crate::domain::exam_result::ExamResult;
 use crate::domain::role::Role;
-use crate::domain::settings::Settings;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse};
+use crate::service;
 use crate::state::AppState;
 
 use super::courses::can_manage_course;
@@ -102,7 +102,7 @@ async fn build_report(
     }
 
     // One settings read weighs and labels the whole report.
-    let school = Settings::load(db).await?;
+    let school = service::settings::load(db).await?;
     let people = person_map(courses.iter().flat_map(course_people), db).await?;
 
     let mut blocks = Vec::with_capacity(courses.len());

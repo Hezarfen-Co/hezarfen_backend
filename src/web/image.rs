@@ -15,8 +15,8 @@ use std::future::Future;
 use axum::extract::Multipart;
 
 use crate::domain::note_file::FileContentType;
-use crate::domain::settings::Settings;
 use crate::error::AppError;
+use crate::service;
 use crate::state::AppState;
 
 use super::{blob_path, image_content_type, read_upload, remove_blob};
@@ -40,7 +40,7 @@ pub(crate) async fn read_image_upload(
     st: &AppState,
     multipart: &mut Multipart,
 ) -> Result<ImageUpload, AppError> {
-    let limit = Settings::load(&st.db).await?.get_max_file_bytes();
+    let limit = service::settings::load(&st.db).await?.get_max_file_bytes();
     let upload = read_upload(multipart, limit).await?;
     let content_type = image_content_type(&upload.content_type.unwrap_or_default())?;
     Ok(ImageUpload {

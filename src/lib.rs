@@ -8,6 +8,7 @@ pub mod error;
 pub mod migration_sql;
 pub mod module;
 pub mod rate_limit;
+pub mod service;
 pub mod state;
 pub mod telemetry;
 pub mod tenant;

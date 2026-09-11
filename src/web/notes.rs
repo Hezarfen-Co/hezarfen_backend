@@ -12,8 +12,8 @@ use utoipa_axum::routes;
 use crate::constant::{MAX_MAX_FILE_BYTES, UPLOAD_BODY_OVERHEAD_BYTES};
 use crate::domain::note::{Note, NoteContent, NoteId, NoteTitle};
 use crate::domain::note_file::{FileContentType, FileName, NoteFile, NoteFileId};
-use crate::domain::settings::Settings;
 use crate::error::{AppError, ErrorResponse};
+use crate::service;
 use crate::state::AppState;
 
 use super::{CurrentUser, Page, PageParams, UploadFileForm, blob_path, read_upload, remove_blob};
@@ -89,7 +89,7 @@ async fn create(
 ) -> Result<(StatusCode, Json<NoteResponse>), AppError> {
     let title = NoteTitle::try_new(&req.title)?;
     let content = NoteContent::try_new(&req.content.unwrap_or_default())?;
-    let note = Note::create(user.get_id(), title, content, &st.db).await?;
+    let note = service::note::create(&st.db, user.get_id(), title, content).await?;
     Ok((StatusCode::CREATED, Json(NoteResponse::new(&note))))
 }
 
@@ -114,7 +114,7 @@ async fn list(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<NoteResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let (notes, total) = Note::list_for(user.get_id(), limit, offset, &st.db).await?;
+    let (notes, total) = service::note::list_for(&st.db, user.get_id(), limit, offset).await?;
     let items = notes.iter().map(NoteResponse::new).collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
@@ -137,7 +137,7 @@ async fn get_one(
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<NoteResponse>, AppError> {
-    let note = Note::read_owned(&NoteId::from_key(&id), user.get_id(), &st.db)
+    let note = service::note::read_owned(&st.db, &NoteId::from_key(&id), user.get_id())
         .await?
         .ok_or(AppError::NotFound)?;
     Ok(Json(NoteResponse::new(&note)))
@@ -165,7 +165,7 @@ async fn update(
     Path(id): Path<String>,
     Json(req): Json<UpdateNote>,
 ) -> Result<Json<NoteResponse>, AppError> {
-    let note = Note::read_owned(&NoteId::from_key(&id), user.get_id(), &st.db)
+    let note = service::note::read_owned(&st.db, &NoteId::from_key(&id), user.get_id())
         .await?
         .ok_or(AppError::NotFound)?;
 
@@ -180,7 +180,7 @@ async fn update(
         .map(NoteContent::try_new)
         .transpose()?;
 
-    let updated = note.update(title, content, &st.db).await?;
+    let updated = service::note::update(&st.db, note, title, content).await?;
     Ok(Json(NoteResponse::new(&updated)))
 }
 
@@ -202,14 +202,14 @@ async fn delete_one(
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    let note = Note::read_owned(&NoteId::from_key(&id), user.get_id(), &st.db)
+    let note = service::note::read_owned(&st.db, &NoteId::from_key(&id), user.get_id())
         .await?
         .ok_or(AppError::NotFound)?;
     // Rows go first (the note delete cascades them), blobs after: a crash in
     // between strands at worst an unreachable blob, never a row whose blob is
     // already gone. The files to unlink come from the delete itself, not a
     // pre-read list — an upload that landed in between is in the cascade too.
-    let (_, files) = note.delete(&st.db).await?;
+    let (_, files) = service::note::delete(&st.db, note).await?;
     for file in &files {
         remove_blob(&st.files_path, file.get_id().key()).await;
     }
@@ -269,12 +269,12 @@ async fn upload_file(
     Path(id): Path<String>,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<NoteFileResponse>), AppError> {
-    let note = Note::read_owned(&NoteId::from_key(&id), user.get_id(), &st.db)
+    let note = service::note::read_owned(&st.db, &NoteId::from_key(&id), user.get_id())
         .await?
         .ok_or(AppError::NotFound)?;
     // The 10-file cap is enforced inside `NoteFile::insert` (count and create
     // under one lock) — checking it here too would just race.
-    let limit = Settings::load(&st.db).await?.get_max_file_bytes();
+    let limit = service::settings::load(&st.db).await?.get_max_file_bytes();
 
     let upload = read_upload(&mut multipart, limit).await?;
     let name = FileName::try_new(&upload.name.unwrap_or_default())?;
@@ -319,7 +319,7 @@ async fn list_files(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<NoteFileResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let note = Note::read_owned(&NoteId::from_key(&id), user.get_id(), &st.db)
+    let note = service::note::read_owned(&st.db, &NoteId::from_key(&id), user.get_id())
         .await?
         .ok_or(AppError::NotFound)?;
     let (files, total) = NoteFile::list_for(note.get_id(), limit, offset, &st.db).await?;
@@ -349,7 +349,7 @@ async fn download_file(
     CurrentUser(user): CurrentUser,
     Path((id, file_id)): Path<(String, String)>,
 ) -> Result<Response, AppError> {
-    let note = Note::read_owned(&NoteId::from_key(&id), user.get_id(), &st.db)
+    let note = service::note::read_owned(&st.db, &NoteId::from_key(&id), user.get_id())
         .await?
         .ok_or(AppError::NotFound)?;
     let file = NoteFile::read_for(&NoteFileId::from_key(&file_id), note.get_id(), &st.db)
@@ -402,7 +402,7 @@ async fn delete_file(
     CurrentUser(user): CurrentUser,
     Path((id, file_id)): Path<(String, String)>,
 ) -> Result<StatusCode, AppError> {
-    let note = Note::read_owned(&NoteId::from_key(&id), user.get_id(), &st.db)
+    let note = service::note::read_owned(&st.db, &NoteId::from_key(&id), user.get_id())
         .await?
         .ok_or(AppError::NotFound)?;
     let file = NoteFile::read_for(&NoteFileId::from_key(&file_id), note.get_id(), &st.db)
