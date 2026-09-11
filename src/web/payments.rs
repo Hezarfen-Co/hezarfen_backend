@@ -35,6 +35,7 @@ use crate::domain::role::Role;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
+use crate::service;
 use crate::state::AppState;
 
 use super::{CurrentUser, Page, PageParams, PersonRef, RequireManager, paginate, person_map};
@@ -576,7 +577,7 @@ async fn appended(
 }
 
 async fn require_line(id: &str, db: &Database) -> Result<PaymentLedger, AppError> {
-    PaymentLedger::read(&PaymentLedgerId::from_key(id), db)
+    service::payment_ledger::read(db, &PaymentLedgerId::from_key(id))
         .await?
         .ok_or(AppError::NotFound)
 }
@@ -678,14 +679,14 @@ async fn record_payment(
     Json(req): Json<RecordPayment>,
 ) -> Result<(StatusCode, Json<PaymentLineResponse>), AppError> {
     let charge = require_line(&req.charge_id, &st.db).await?;
-    let line = PaymentLedger::credit(
+    let line = service::payment_ledger::credit(
+        &st.db,
         &charge,
         LedgerAmount::try_new(req.amount_minor)?,
         method_of(req.method.as_deref())?,
         note_of(req.note.as_deref())?,
         request_key_of(req.request_key.as_deref())?.as_ref(),
         manager.get_id(),
-        &st.db,
     )
     .await?;
     appended(line, &st.db).await
@@ -720,14 +721,14 @@ async fn record_refund(
     Json(req): Json<RecordRefund>,
 ) -> Result<(StatusCode, Json<PaymentLineResponse>), AppError> {
     let credit = require_line(&req.credit_id, &st.db).await?;
-    let line = PaymentLedger::refund(
+    let line = service::payment_ledger::refund(
+        &st.db,
         &credit,
         LedgerAmount::try_new(req.amount_minor)?,
         method_of(req.method.as_deref())?,
         note_of(req.note.as_deref())?,
         request_key_of(req.request_key.as_deref())?.as_ref(),
         manager.get_id(),
-        &st.db,
     )
     .await?;
     appended(line, &st.db).await
@@ -759,11 +760,11 @@ async fn record_reversal(
     Json(req): Json<RecordReversal>,
 ) -> Result<(StatusCode, Json<PaymentLineResponse>), AppError> {
     let target = require_line(&req.line_id, &st.db).await?;
-    let line = PaymentLedger::reversal(
+    let line = service::payment_ledger::reversal(
+        &st.db,
         &target,
         note_of(req.note.as_deref())?,
         manager.get_id(),
-        &st.db,
     )
     .await?;
     appended(line, &st.db).await
@@ -827,7 +828,8 @@ async fn user_ledger(
     let (limit, offset) = page.resolve()?;
     let target = UserId::from_key(&user);
     ensure_can_read_payments(&caller, &target, &st.db).await?;
-    let (rows, total) = PaymentLedger::list_for_student(&target, limit, offset, &st.db).await?;
+    let (rows, total) =
+        service::payment_ledger::list_for_student(&st.db, &target, limit, offset).await?;
     let items = line_responses(&rows, &st.db).await?;
     Ok(Json(Page::new(items, total, limit, offset)))
 }
@@ -888,7 +890,7 @@ async fn statement_response(
     offset: i64,
     db: &Database,
 ) -> Result<Json<StatementResponse>, AppError> {
-    let (lines, _) = PaymentLedger::list_for_student(student, None, 0, db).await?;
+    let (lines, _) = service::payment_ledger::list_for_student(db, student, None, 0).await?;
     // Index every line by what it points at, so the rollup is one pass over the
     // student's history rather than a query per charge.
     let mut children: HashMap<&str, Vec<&PaymentLedger>> = HashMap::new();
@@ -1058,7 +1060,7 @@ async fn balance_response(
     let people = person_map(std::iter::once(student.clone()), db).await?;
     Ok(Json(PaymentBalanceResponse {
         student: PersonRef::resolve(&people, student),
-        balance_minor: PaymentLedger::balance_of(student, db).await?,
+        balance_minor: service::payment_ledger::balance_of(db, student).await?,
     }))
 }
 
@@ -1141,7 +1143,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (lines, _) = PaymentLedger::list_for_student(&student, None, 0, &db)
+        let (lines, _) = service::payment_ledger::list_for_student(&db, &student, None, 0)
             .await
             .unwrap();
         let charge = |amount: i64| {
@@ -1151,29 +1153,29 @@ mod tests {
                 .expect("the installment was billed")
                 .clone()
         };
-        let paid = PaymentLedger::credit(
+        let paid = service::payment_ledger::credit(
+            &db,
             &charge(10_000),
             LedgerAmount::try_new(6_000).unwrap(),
             None,
             None,
             None,
             &manager,
-            &db,
         )
         .await
         .unwrap();
-        PaymentLedger::refund(
+        service::payment_ledger::refund(
+            &db,
             &paid,
             LedgerAmount::try_new(1_000).unwrap(),
             None,
             None,
             None,
             &manager,
-            &db,
         )
         .await
         .unwrap();
-        PaymentLedger::reversal(&charge(20_000), None, &manager, &db)
+        service::payment_ledger::reversal(&db, &charge(20_000), None, &manager)
             .await
             .unwrap();
 

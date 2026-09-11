@@ -20,9 +20,9 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use crate::constant::{FEE_PLAN_ASSIGNMENT_COUNT_FIELD, FEE_PLAN_ASSIGNMENT_TABLE};
 use crate::database::Database;
 use crate::db::cap::{self, Claimed};
-use crate::domain::fee_plan::{FeePlan, FeePlanId};
 use crate::db::page::PagedList;
-use crate::domain::payment_ledger::PaymentLedger;
+use crate::db::payment_ledger;
+use crate::domain::fee_plan::{FeePlan, FeePlanId};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
@@ -147,12 +147,12 @@ impl FeePlanAssignment {
             .await?
             .ok_or_else(|| AppError::Internal("the assigned fee plan vanished".into()))?;
         for (index, installment) in plan.get_installments().iter().enumerate() {
-            PaymentLedger::charge_for_installment(
+            payment_ledger::charge_for_installment(
+                db,
                 &assignment,
                 index + 1,
                 installment,
                 assigned_by,
-                db,
             )
             .await?;
         }
@@ -258,7 +258,7 @@ mod tests {
             .unwrap();
         assert!(!existed);
         assert_eq!(
-            PaymentLedger::balance_of(&student, &db).await.unwrap(),
+            payment_ledger::balance_of(&db, &student).await.unwrap(),
             -400_000,
             "both installments must be owed"
         );
@@ -270,7 +270,7 @@ mod tests {
             existed,
             "the second assign is a replay, not a new placement"
         );
-        let (lines, _) = PaymentLedger::list_for_student(&student, None, 0, &db)
+        let (lines, _) = payment_ledger::list_for_student(&db, &student, None, 0)
             .await
             .unwrap();
         assert_eq!(lines.len(), 2, "a replay may not append a single line");
@@ -280,7 +280,7 @@ mod tests {
                 .all(|l| l.get_kind() == PaymentLedgerKind::Charge)
         );
         assert_eq!(
-            PaymentLedger::balance_of(&student, &db).await.unwrap(),
+            payment_ledger::balance_of(&db, &student).await.unwrap(),
             -400_000
         );
         assert!(
@@ -375,7 +375,7 @@ mod tests {
                 reached += 1;
                 // The counter is what refuses every later edit, so it has to
                 // agree with the rows it stands for.
-                let (lines, _) = PaymentLedger::list_for_student(&student, None, 0, &db)
+                let (lines, _) = payment_ledger::list_for_student(&db, &student, None, 0)
                     .await
                     .unwrap();
                 assert_eq!(lines.len(), 1, "one installment, one charge");
@@ -482,7 +482,7 @@ mod tests {
                 !(gone && assigned),
                 "an assignment may not outlive the plan it names"
             );
-            let (lines, _) = PaymentLedger::list_for_student(&student, None, 0, &db)
+            let (lines, _) = payment_ledger::list_for_student(&db, &student, None, 0)
                 .await
                 .unwrap();
             assert!(
