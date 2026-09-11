@@ -147,18 +147,18 @@ async fn apply_profile(
     let birth_date = merge_field(req.birth_date.as_deref(), BirthDate::try_new)?;
     let display_name = merge_field(req.display_name.as_deref(), DisplayName::try_new)?;
     let bio = merge_field(req.bio.as_deref(), Bio::try_new)?;
-    let updated = user
-        .set_profile(
-            name,
-            surname,
-            email,
-            phone,
-            birth_date,
-            display_name,
-            bio,
-            db,
-        )
-        .await?;
+    let updated = crate::service::user::set_profile(
+        db,
+        user.get_id(),
+        name,
+        surname,
+        email,
+        phone,
+        birth_date,
+        display_name,
+        bio,
+    )
+    .await?;
     Ok(UserResponse::new(&updated))
 }
 
@@ -174,9 +174,14 @@ async fn apply_preferences(
     let theme = merge_field(req.theme.as_deref(), Theme::try_from_str)?;
     let language = merge_field(req.language.as_deref(), Language::try_from_str)?;
     let palette_color = merge_field(req.palette_color.as_deref(), PaletteColor::try_from_str)?;
-    let updated = user
-        .set_preferences(theme, language, palette_color, db)
-        .await?;
+    let updated = crate::service::user::set_preferences(
+        db,
+        user.get_id(),
+        theme,
+        language,
+        palette_color,
+    )
+    .await?;
     Ok(UserResponse::new(&updated))
 }
 
@@ -246,7 +251,8 @@ async fn search_users(
             "students and parents may only search staff (teacher or higher)",
         ));
     }
-    let (users, total) = User::search(&req.q, role, allowed, limit, offset, &st.db).await?;
+    let (users, total) =
+        crate::service::user::search(&st.db, &req.q, role, allowed, limit, offset).await?;
     let items = users.iter().map(PersonRef::new).collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
@@ -274,7 +280,7 @@ async fn list_users(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<UserResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let (users, total) = User::list_all(limit, offset, &st.db).await?;
+    let (users, total) = crate::service::user::list_all(&st.db, limit, offset).await?;
     let items = users.iter().map(UserResponse::new).collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
@@ -351,7 +357,7 @@ async fn get_user(
     _admin: RequireAdmin,
     Path(id): Path<String>,
 ) -> Result<Json<UserResponse>, AppError> {
-    let user = User::read(&UserId::from_key(&id), &st.db)
+    let user = crate::service::user::read(&st.db, &UserId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     Ok(Json(UserResponse::new(&user)))
@@ -382,7 +388,7 @@ async fn update_user_profile(
     Path(id): Path<String>,
     Json(req): Json<UpdateProfile>,
 ) -> Result<Json<UserResponse>, AppError> {
-    let user = User::read(&UserId::from_key(&id), &st.db)
+    let user = crate::service::user::read(&st.db, &UserId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     Ok(Json(apply_profile(user, &req, &st.db).await?))
@@ -413,7 +419,7 @@ async fn update_user_preferences(
     Path(id): Path<String>,
     Json(req): Json<UpdatePreferences>,
 ) -> Result<Json<UserResponse>, AppError> {
-    let user = User::read(&UserId::from_key(&id), &st.db)
+    let user = crate::service::user::read(&st.db, &UserId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     Ok(Json(apply_preferences(user, &req, &st.db).await?))
@@ -473,16 +479,13 @@ async fn set_role(
     if &target == admin.get_id() {
         return Err(AppError::Forbidden("cannot change your own role"));
     }
-    let user = User::read(&target, &st.db)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    // The role write and every sweep it owes commit together ([`User::set_role`]
-    // carries the whole list and the reasoning behind each arm). The write
-    // ordering *within* a request is closed from the other end: a handler that
-    // assigns a teacher-only role re-reads the live role after its write
-    // ([`super::undo_if_demoted`]), so a demotion racing an assignment is caught
-    // by whichever side is second.
-    let (updated, boards) = user.set_role(role, &st.db).await?;
+    // The role write and every sweep it owes commit together
+    // ([`crate::service::user::set_role`] carries the whole list and the
+    // reasoning behind each arm). The write ordering *within* a request is
+    // closed from the other end: a handler that assigns a teacher-only role
+    // re-reads the live role after its write ([`super::undo_if_demoted`]), so
+    // a demotion racing an assignment is caught by whichever side is second.
+    let (updated, boards) = crate::service::user::set_role(&st.db, &target, role).await?;
     // Whiteboard rooms the commit above changed, prompted with the same frames
     // their own routes publish — after the commit, because the room re-reads the
     // database before it acts on a frame. A room whose creator was demoted is
@@ -543,7 +546,7 @@ async fn students_page(
         .iter()
         .map(|link| link.get_student().clone())
         .collect();
-    let mut students = User::list_by_ids(&ids, db).await?;
+    let mut students = crate::service::user::list_by_ids(db, &ids).await?;
     // The link row alone is not the grant, exactly as [`ensure_can_observe`]
     // says: a link whose student side changed role (a sweep lost a race with
     // `link_student`) is inert everywhere else, so it must not name a person
@@ -590,7 +593,7 @@ async fn link_student(
     Path(id): Path<String>,
     Json(req): Json<LinkStudent>,
 ) -> Result<Json<ParentLinkResponse>, AppError> {
-    let parent = User::read(&UserId::from_key(&id), &st.db)
+    let parent = crate::service::user::read(&st.db, &UserId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     if parent.get_role() != Role::Parent {
@@ -599,7 +602,9 @@ async fn link_student(
             reason: "students can only be tied to a parent account",
         }));
     }
-    let Some(student) = User::read(&UserId::from_key(&req.user_id), &st.db).await? else {
+    let Some(student) =
+        crate::service::user::read(&st.db, &UserId::from_key(&req.user_id)).await?
+    else {
         return Err(AppError::Validation(ValidationError::Invalid {
             field: "user_id",
             reason: "target user does not exist",
@@ -644,7 +649,7 @@ async fn list_parent_students(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<PersonRef>>, AppError> {
     let parent = UserId::from_key(&id);
-    User::read(&parent, &st.db)
+    crate::service::user::read(&st.db, &parent)
         .await?
         .ok_or(AppError::NotFound)?;
     Ok(Json(students_page(&parent, page, &st.db).await?))
@@ -1065,7 +1070,7 @@ async fn ensure_may_read_profile(
 async fn readable_profile_user(st: &AppState, caller: &User, id: &str) -> Result<User, AppError> {
     let target = UserId::from_key(id);
     ensure_may_read_profile(caller, &target, &st.db).await?;
-    User::read(&target, &st.db).await?.ok_or(AppError::NotFound)
+    crate::service::user::read(&st.db, &target).await?.ok_or(AppError::NotFound)
 }
 
 /// The caller's own public profile — what everyone else sees of them.
@@ -1160,7 +1165,7 @@ async fn upload_my_avatar(
 
     let file = ulid::Ulid::new().to_string();
     store_blob(&st, &file, &upload.data, || async {
-        match User::set_avatar(user.get_id(), &file, &upload.content_type, size, &st.db).await? {
+        match crate::service::user::set_avatar(&st.db, user.get_id(), &file, &upload.content_type, size).await? {
             // Row written; the picture this one replaced comes off disk.
             Some(before) => Ok(((), before.get_avatar_file().map(str::to_string))),
             // The account went away mid-upload — the fresh blob is an orphan.
@@ -1281,7 +1286,7 @@ async fn delete_avatar(
 /// Clear the row's avatar and take its blob off disk — the shared tail of the
 /// self and moderation deletes. A row without one (or no row at all) is a 404.
 async fn drop_avatar(st: &AppState, user: &UserId) -> Result<StatusCode, AppError> {
-    let before = User::clear_avatar(user, &st.db)
+    let before = crate::service::user::clear_avatar(&st.db, user)
         .await?
         .ok_or(AppError::NotFound)?;
     let Some(file) = before.get_avatar_file() else {

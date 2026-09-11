@@ -120,7 +120,7 @@ async fn load_people(messages: &[Message], db: &Database) -> Result<People, AppE
         })
         .filter(|id| seen.insert(id.key().to_string()))
         .collect();
-    let users = User::list_by_ids(&ids, db).await?;
+    let users = crate::service::user::list_by_ids(db, &ids).await?;
     Ok(people_of(&users))
 }
 
@@ -197,7 +197,7 @@ async fn send_message(
             reason: "cannot message yourself",
         }));
     }
-    let recipient = User::read(&UserId::from_key(&req.recipient_id), &st.db)
+    let recipient = crate::service::user::read(&st.db, &UserId::from_key(&req.recipient_id))
         .await?
         .ok_or(AppError::NotFound)?;
     if !user.get_role().may_message(recipient.get_role()) {

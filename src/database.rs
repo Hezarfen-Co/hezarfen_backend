@@ -545,8 +545,8 @@ mod tests {
     #[test]
     fn the_admin_seed_mints_the_role_with_the_row() {
         let source =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/domain/user.rs"))
-                .expect("read user.rs");
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/service/user.rs"))
+                .expect("read service/user.rs");
         let start = source
             .find("pub async fn ensure_admin")
             .expect("ensure_admin is declared");

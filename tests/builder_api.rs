@@ -387,14 +387,14 @@ async fn resetting_an_admin_password_revokes_the_old_credential_and_its_sessions
         .get(&hezarfen_backend::tenant::Slug::try_new("gamma").unwrap())
         .await
         .unwrap();
-    hezarfen_backend::domain::user::User::create(
+    hezarfen_backend::db::user::create(
+        &gamma_db,
         Username::try_new("veli").unwrap(),
         Password::try_new("secret1")
             .unwrap()
             .hash_async()
             .await
             .unwrap(),
-        &gamma_db,
     )
     .await
     .unwrap();

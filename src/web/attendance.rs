@@ -200,7 +200,7 @@ async fn user_report(
     let target = UserId::from_key(&user);
     ensure_can_observe(&caller, &target, &st.db).await?;
     // User must exist — a missing user is a 404, not an empty report.
-    User::read(&target, &st.db)
+    crate::service::user::read(&st.db, &target)
         .await?
         .ok_or(AppError::NotFound)?;
     // Only an exactly-teacher caller is narrowed to their managed courses;
