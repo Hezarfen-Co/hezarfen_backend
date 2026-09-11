@@ -18,7 +18,8 @@ use crate::constant::{
     APPOINTMENT_SLOT_TABLE, MAX_APPOINTMENT_NOTE_LEN, MAX_SLOT_OCCURRENCES, MILLIS_PER_WEEK, ROLES,
 };
 use crate::database::{Database, transaction_with_retry};
-use crate::domain::appointment::{APPOINTMENT_LOCK, Appointment};
+use crate::domain::appointment::Appointment;
+use crate::service::appointment::APPOINTMENT_LOCK;
 use crate::db::cap;
 use crate::domain::monotonic_id::next_ulid;
 use crate::domain::role::Role;
@@ -269,7 +270,8 @@ impl AppointmentSlot {
     /// Does the teacher already have a published slot whose window collides with
     /// `[starts_at, ends_at)`? Half-open, so a slot ending exactly where the new
     /// one starts is *not* a conflict — that is how a teacher's hour is carved
-    /// into back-to-back slots. Caller must hold [`APPOINTMENT_LOCK`] for the
+    /// into back-to-back slots. Caller must hold
+    /// [`crate::service::appointment::APPOINTMENT_LOCK`] for the
     /// answer to still be true by the time the insert lands.
     async fn conflicts_existing(
         teacher: &UserId,
@@ -296,7 +298,8 @@ impl AppointmentSlot {
     /// window in the batch necessarily overlaps the envelope spanning them all,
     /// so filtering the envelope and comparing in memory is exactly the
     /// per-window [`conflicts_existing`](Self::conflicts_existing) check,
-    /// hoisted out of the loop — which is what keeps [`APPOINTMENT_LOCK`] down
+    /// hoisted out of the loop — which is what keeps
+    /// [`crate::service::appointment::APPOINTMENT_LOCK`] down
     /// to two round trips instead of one per occurrence.
     async fn windows_in_span(
         teacher: &UserId,
@@ -459,7 +462,7 @@ impl AppointmentSlot {
     /// calendar a requester browses.
     ///
     /// The bound is `starts_at`, not `ends_at`, so that this window is exactly
-    /// the one [`Appointment::book`] accepts: a slot already underway is
+    /// the one [`crate::service::appointment::book`] accepts: a slot already underway is
     /// unbookable (`cancel` could never undo the booking), and offering it would
     /// be a calendar entry that can only answer `409`. The publish-time 60s skew
     /// grace deliberately does not apply here either — `book` does not grant it,

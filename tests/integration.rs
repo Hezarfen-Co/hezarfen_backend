@@ -17733,7 +17733,7 @@ async fn declining_a_reschedule_cancels_the_booking() {
 }
 
 /// Declining cancels, so it answers to the cancel deadline. The guard lives in
-/// `Appointment::cancel` itself — when it sat in the cancel *handler*, decline
+/// `service::appointment::cancel` itself — when it sat in the cancel *handler*, decline
 /// went straight past it and called off a meeting already underway.
 #[tokio::test]
 async fn declining_a_started_reschedule_is_refused() {
