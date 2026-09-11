@@ -8,7 +8,7 @@ use crate::database::Database;
 use crate::db::cap;
 use crate::domain::badge;
 use crate::domain::course::Course;
-use crate::domain::enrollment::Enrollment;
+
 use crate::domain::exam::{Exam, ExamId};
 use crate::domain::exam_answer::ExamAnswer;
 use crate::domain::exam_attempt::{AttemptStatus, ExamAttempt, ExamAttemptId};
@@ -97,7 +97,7 @@ pub async fn ensure_student_now(user: &UserId, db: &Database) -> Result<(), AppE
 /// an unenrollment mid-exam cuts them too. Finishing stays exempt: like the
 /// rejoin lock, submitting what's already saved writes nothing new.
 pub async fn ensure_enrolled(exam: &Exam, user: &UserId, db: &Database) -> Result<(), AppError> {
-    if Enrollment::read_for_user(exam.get_course(), user, db)
+    if crate::db::enrollment::read_for_user(db, exam.get_course(), user)
         .await?
         .is_none()
     {

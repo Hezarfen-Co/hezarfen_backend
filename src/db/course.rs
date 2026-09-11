@@ -514,13 +514,11 @@ mod tests {
     /// included. A `>= 0` guard passes the roster branch and fails here.
     #[tokio::test]
     async fn a_course_with_a_roster_refuses_to_delete() {
-        use crate::domain::enrollment::Enrollment;
-
         let db = crate::database::init_mem().await.unwrap();
         let teacher = UserId::from_key("teacher");
         let student = UserId::from_key("student");
         let course = course_on(None, &db).await;
-        Enrollment::enroll(course.get_id(), &student, &teacher, &db)
+        crate::db::enrollment::enroll(&db, course.get_id(), &student, &teacher)
             .await
             .unwrap();
 
@@ -533,14 +531,14 @@ mod tests {
             "a refused delete may write nothing"
         );
         assert!(
-            Enrollment::read_for_user(course.get_id(), &student, &db)
+            crate::db::enrollment::read_for_user(&db, course.get_id(), &student)
                 .await
                 .unwrap()
                 .is_some(),
             "…the cascade least of all"
         );
 
-        Enrollment::remove(course.get_id(), &student, &db)
+        crate::db::enrollment::remove(&db, course.get_id(), &student)
             .await
             .unwrap();
         assert!(delete(&db, course.clone()).await.unwrap());
@@ -549,7 +547,7 @@ mod tests {
         // The other half of the same guard: once the course row is gone the
         // seat claim matches nothing, so a late enroll is a 404 rather than a
         // roster row that outlived its course.
-        let late = Enrollment::enroll(course.get_id(), &student, &teacher, &db)
+        let late = crate::db::enrollment::enroll(&db, course.get_id(), &student, &teacher)
             .await
             .expect_err("enrolling into a deleted course must fail");
         assert!(matches!(late, AppError::NotFound), "got {late:?}");
@@ -952,7 +950,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn a_delete_racing_an_enroll_never_answers_500() {
-        use crate::domain::enrollment::Enrollment;
         let (db, _serialized) = crate::database::init_test_server("course_delete_race").await;
         let (mut delete_500, mut enroll_500, mut enrolled) = (0, 0, 0);
         let (mut last_delete, mut last_enroll) = (String::new(), String::new());
@@ -978,7 +975,8 @@ mod tests {
                     let (id, db) = (course.get_id().clone(), db.clone());
                     let student = UserId::from_key(&format!("stu{round}_{seat}"));
                     tokio::spawn(async move {
-                        Enrollment::enroll(&id, &student, &UserId::from_key("mgr"), &db).await
+                        crate::db::enrollment::enroll(&db, &id, &student, &UserId::from_key("mgr"))
+                            .await
                     })
                 })
                 .collect();
@@ -996,7 +994,7 @@ mod tests {
             }
             // Stored state, not the return values: a seat that landed is what
             // the guard had to see.
-            if !Enrollment::list_for_course(course.get_id(), None, 0, &db)
+            if !crate::db::enrollment::list_for_course(&db, course.get_id(), None, 0)
                 .await
                 .unwrap()
                 .0
