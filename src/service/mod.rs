@@ -7,6 +7,7 @@ pub mod class_blueprint;
 pub mod course;
 pub mod course_session;
 pub mod exam_attempt;
+pub mod exam_question;
 pub mod note;
 pub mod payment_ledger;
 pub mod session;

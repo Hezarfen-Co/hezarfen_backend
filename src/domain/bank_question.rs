@@ -807,8 +807,6 @@ mod tests {
     /// "0"), and questions authored by hand never counted.
     #[tokio::test]
     async fn usage_counts_tallies_a_page_in_one_statement() {
-        use crate::domain::exam_question::ExamQuestion;
-
         // One statement, so a page costs one round trip — a `;` here would mean
         // the per-row N+1 crept back in.
         assert!(
@@ -859,14 +857,14 @@ mod tests {
             source: &BankQuestion,
             db: &Database,
         ) {
-            ExamQuestion::create_from_bank(
+            crate::db::exam_question::create_from_bank(
+                db,
                 exam,
                 subject.clone(),
                 source.get_text().clone(),
                 source.get_points(),
                 source.spec(),
                 source.get_id().clone(),
-                db,
             )
             .await
             .unwrap();
@@ -876,13 +874,13 @@ mod tests {
         instantiate(&other_exam, subject.get_id(), &used_twice, &db).await;
         instantiate(&exam, subject.get_id(), &used_once, &db).await;
         // A hand-authored question has no `from_bank` and must not be tallied.
-        ExamQuestion::create(
+        crate::db::exam_question::create(
+            &db,
             &exam,
             subject.get_id().clone(),
             QuestionText::try_new("mine").unwrap(),
             QuestionPoints::try_new(1).unwrap(),
             spec(),
-            &db,
         )
         .await
         .unwrap();
