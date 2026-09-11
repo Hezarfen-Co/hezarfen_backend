@@ -32,7 +32,7 @@
 //! The **race** half drives the real interleaving and lives in-crate, one pin
 //! per child beside the create it pins —
 //! `domain::exam::tests::an_exam_never_outlives_its_course`,
-//! `domain::course_session::tests::a_session_never_outlives_its_course`,
+//! `db::course_session::tests::a_session_never_outlives_its_course`,
 //! `domain::subject::tests::a_subject_never_outlives_its_course` — over the
 //! shared harness `domain::course::assert_no_child_outlives_a_course_delete`.
 //! It is `#[ignore]`d and needs a real server, because the subject there *is*
@@ -49,10 +49,11 @@ use axum::http::StatusCode;
 use common::{app_and_db, id_of, login_as, send, upload_course_note_file};
 use hezarfen_backend::database::{self, Database};
 use hezarfen_backend::db::course;
+use hezarfen_backend::db::course_session as db_course_session;
 use hezarfen_backend::domain::course::{CourseDescription, CourseId, CourseKind, CourseTitle};
 use hezarfen_backend::domain::course_note::{CourseNote, CourseNoteContent, CourseNoteTitle};
 use hezarfen_backend::domain::course_note_file::{CourseNoteFile, FileContentType, FileName};
-use hezarfen_backend::domain::course_session::{CourseSession, SessionTopic};
+use hezarfen_backend::domain::course_session::SessionTopic;
 use hezarfen_backend::domain::exam::{
     Exam, ExamAttemptLimit, ExamDescription, ExamKind, ExamSchedule, ExamTitle,
 };
@@ -122,13 +123,13 @@ fn make_exam(course: CourseId, db: Database) -> JoinHandle<Result<(), AppError>>
 
 fn make_session(course: CourseId, db: Database) -> JoinHandle<Result<(), AppError>> {
     tokio::spawn(async move {
-        CourseSession::create(
+        db_course_session::create(
+            &db,
             &course,
             &teacher(),
             SessionTopic::try_new("limits").unwrap(),
             Timestamp::from_millis(1),
             None,
-            &db,
         )
         .await
         .map(|_| ())
@@ -325,15 +326,9 @@ async fn a_course_note_file_under_a_deleted_note_is_refused() {
     .await
     .unwrap();
     assert!(
-        course::delete(
-            &db,
-            course::read(&db, &course)
-                .await
-                .unwrap()
-                .unwrap()
-        )
-        .await
-        .unwrap(),
+        course::delete(&db, course::read(&db, &course).await.unwrap().unwrap())
+            .await
+            .unwrap(),
         "the course, and its note with it, goes"
     );
 
