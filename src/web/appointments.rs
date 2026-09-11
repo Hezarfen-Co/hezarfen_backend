@@ -16,6 +16,7 @@ use crate::domain::role::Role;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
+use crate::service;
 use crate::state::AppState;
 
 use super::{
@@ -273,7 +274,7 @@ async fn for_decision(
     user: &User,
     db: &Database,
 ) -> Result<Appointment, AppError> {
-    let appointment = Appointment::read(id, db).await?.ok_or(AppError::NotFound)?;
+    let appointment = service::appointment::read(db, id).await?.ok_or(AppError::NotFound)?;
     let slot = AppointmentSlot::read(appointment.get_slot(), db)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -554,7 +555,8 @@ async fn book(
         ));
     }
     let reason = AppointmentReason::try_new(&req.reason)?;
-    let appointment = Appointment::book(&slot_id, user.get_id(), reason, &st.db).await?;
+    let appointment =
+        service::appointment::book(&st.db, &slot_id, user.get_id(), reason).await?;
     Ok((
         StatusCode::CREATED,
         one_appointment(appointment, &st.db).await?,
@@ -585,9 +587,9 @@ async fn list_appointments(
 ) -> Result<Json<Page<AppointmentResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
     let (rows, total) = if user.get_role().at_least(Role::Teacher) {
-        Appointment::list_for_teacher(user.get_id(), limit, offset, &st.db).await?
+        service::appointment::list_for_teacher(&st.db, user.get_id(), limit, offset).await?
     } else {
-        Appointment::list_for_requester(user.get_id(), limit, offset, &st.db).await?
+        service::appointment::list_for_requester(&st.db, user.get_id(), limit, offset).await?
     };
     // Join slots and people onto the page alone — the lookup shrinks with it.
     let items = appointment_responses(&rows, &st.db).await?;
@@ -626,7 +628,7 @@ async fn approve(
 ) -> Result<Json<AppointmentResponse>, AppError> {
     let id = AppointmentId::from_key(&id);
     for_decision(&id, &user, &st.db).await?;
-    let appointment = Appointment::approve(&id, user.get_id(), &st.db).await?;
+    let appointment = service::appointment::approve(&st.db, &id, user.get_id()).await?;
     one_appointment(appointment, &st.db).await
 }
 
@@ -664,7 +666,7 @@ async fn reject(
         Some(reason) if !reason.trim().is_empty() => Some(AppointmentReason::try_new(&reason)?),
         _ => None,
     };
-    let appointment = Appointment::reject(&id, user.get_id(), reason, &st.db).await?;
+    let appointment = service::appointment::reject(&st.db, &id, user.get_id(), reason).await?;
     one_appointment(appointment, &st.db).await
 }
 
@@ -700,7 +702,7 @@ async fn cancel(
     body: Option<Json<CancelRequest>>,
 ) -> Result<Json<AppointmentResponse>, AppError> {
     let id = AppointmentId::from_key(&id);
-    let appointment = Appointment::read(&id, &st.db)
+    let appointment = service::appointment::read(&st.db, &id)
         .await?
         .ok_or(AppError::NotFound)?;
     // Only the requester (student/parent) may cancel. Teachers/managers end a
@@ -716,10 +718,10 @@ async fn cancel(
         Some(reason) if !reason.trim().is_empty() => Some(AppointmentReason::try_new(&reason)?),
         _ => None,
     };
-    // The started-window guard lives in `Appointment::cancel`, under the lock
-    // and on a fresh read — a pre-lock copy of it here would only be a staler
-    // second opinion, and `decline_reschedule` would still bypass it.
-    let appointment = Appointment::cancel(&id, user.get_id(), reason, &st.db).await?;
+    // The started-window guard lives in `service::appointment::cancel`, under
+    // the lock and on a fresh read — a pre-lock copy of it here would only be
+    // a staler second opinion, and `decline_reschedule` would still bypass it.
+    let appointment = service::appointment::cancel(&st.db, &id, user.get_id(), reason).await?;
     one_appointment(appointment, &st.db).await
 }
 
@@ -767,7 +769,8 @@ async fn reschedule(
 
     let id = AppointmentId::from_key(&id);
     for_decision(&id, &user, &st.db).await?;
-    let appointment = Appointment::propose(&id, starts_at, ends_at, user.get_id(), &st.db).await?;
+    let appointment =
+        service::appointment::propose(&st.db, &id, starts_at, ends_at, user.get_id()).await?;
     one_appointment(appointment, &st.db).await
 }
 
@@ -812,12 +815,12 @@ async fn accept_reschedule(
     // requester's answer to "which proposal?" — the domain compares them to the
     // row and refuses anything else, so a past or inverted pair is simply a
     // mismatch (409), never a booking.
-    let appointment = Appointment::accept_proposal(
+    let appointment = service::appointment::accept_proposal(
+        &st.db,
         &id,
         user.get_id(),
         Timestamp::from_millis(req.proposed_starts_at),
         Timestamp::from_millis(req.proposed_ends_at),
-        &st.db,
     )
     .await?;
     one_appointment(appointment, &st.db).await
@@ -853,7 +856,7 @@ async fn decline_reschedule(
     if appointment.get_proposed_starts_at().is_none() {
         return Err(AppError::Conflict("no time has been proposed"));
     }
-    let appointment = Appointment::cancel(&id, user.get_id(), None, &st.db).await?;
+    let appointment = service::appointment::cancel(&st.db, &id, user.get_id(), None).await?;
     one_appointment(appointment, &st.db).await
 }
 
@@ -864,7 +867,7 @@ async fn ensure_requester(
     user: &User,
     db: &Database,
 ) -> Result<Appointment, AppError> {
-    let appointment = Appointment::read(id, db).await?.ok_or(AppError::NotFound)?;
+    let appointment = service::appointment::read(db, id).await?.ok_or(AppError::NotFound)?;
     if appointment.get_requester() != user.get_id() {
         return Err(AppError::Forbidden(
             "only the requester can answer a counter-proposal",
