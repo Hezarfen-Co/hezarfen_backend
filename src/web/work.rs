@@ -11,6 +11,7 @@ use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::domain::work_entry::{WorkEntry, WorkEntryId, out_before_in_error};
 use crate::error::{AppError, ErrorResponse};
+use crate::service::work_entry;
 use crate::state::AppState;
 
 use super::{Page, PageParams, RequireManager, RequireTeacher};
@@ -79,7 +80,7 @@ async fn check_in(
     State(st): State<AppState>,
     RequireTeacher(user): RequireTeacher,
 ) -> Result<(StatusCode, Json<WorkEntryResponse>), AppError> {
-    let entry = WorkEntry::check_in(user.get_id(), &st.db).await?;
+    let entry = work_entry::check_in(&st.db, user.get_id()).await?;
     Ok((StatusCode::CREATED, Json(WorkEntryResponse::new(&entry))))
 }
 
@@ -101,7 +102,7 @@ async fn check_out(
     State(st): State<AppState>,
     RequireTeacher(user): RequireTeacher,
 ) -> Result<Json<WorkEntryResponse>, AppError> {
-    let entry = WorkEntry::check_out(user.get_id(), &st.db).await?;
+    let entry = work_entry::check_out(&st.db, user.get_id()).await?;
     Ok(Json(WorkEntryResponse::new(&entry)))
 }
 
@@ -128,7 +129,7 @@ async fn my_work(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<WorkEntryResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let (entries, total) = WorkEntry::list_for_user(user.get_id(), limit, offset, &st.db).await?;
+    let (entries, total) = work_entry::list_for_user(&st.db, user.get_id(), limit, offset).await?;
     let items = entries.iter().map(WorkEntryResponse::new).collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
@@ -162,7 +163,7 @@ async fn user_work(
     crate::service::user::read(&st.db, &target)
         .await?
         .ok_or(AppError::NotFound)?;
-    let (entries, total) = WorkEntry::list_for_user(&target, limit, offset, &st.db).await?;
+    let (entries, total) = work_entry::list_for_user(&st.db, &target, limit, offset).await?;
     let items = entries.iter().map(WorkEntryResponse::new).collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
@@ -194,7 +195,7 @@ async fn update_entry(
 ) -> Result<Json<WorkEntryResponse>, AppError> {
     let check_in = req.check_in.map(Timestamp::from_millis);
     let check_out = req.check_out.map(Timestamp::from_millis);
-    let entry = WorkEntry::read(&WorkEntryId::from_key(&id), &st.db)
+    let entry = work_entry::read(&st.db, &WorkEntryId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     let Some(current_out) = entry.get_check_out() else {
@@ -205,12 +206,13 @@ async fn update_entry(
 
     // The side the correction left out is only *read* for the ordering check —
     // it is never written back, so a concurrent correction of it survives.
-    // Pre-flight only: `WorkEntry::update` re-makes this in the UPDATE's `WHERE`.
+    // Pre-flight only: the UPDATE's `WHERE` re-makes this check against the
+    // stored row.
     if check_out.unwrap_or(current_out) < check_in.unwrap_or_else(|| entry.get_check_in()) {
         return Err(out_before_in_error());
     }
 
-    let updated = entry.update(check_in, check_out, &st.db).await?;
+    let updated = work_entry::update(&st.db, entry, check_in, check_out).await?;
     Ok(Json(WorkEntryResponse::new(&updated)))
 }
 
@@ -233,7 +235,7 @@ async fn delete_entry(
     _manager: RequireManager,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    let removed = WorkEntry::remove(&WorkEntryId::from_key(&id), &st.db).await?;
+    let removed = work_entry::remove(&st.db, &WorkEntryId::from_key(&id)).await?;
     if removed.is_none() {
         return Err(AppError::NotFound);
     }
