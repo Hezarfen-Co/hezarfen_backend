@@ -5,10 +5,10 @@ use crate::constant::{
 };
 use crate::database::{Database, transaction_with_retry};
 use crate::db::cap;
-use crate::domain::course::CourseId;
 use crate::db::field_update::FieldUpdate;
-use crate::domain::monotonic_id::next_ulid;
 use crate::db::page::PagedList;
+use crate::domain::course::CourseId;
+use crate::domain::monotonic_id::next_ulid;
 use crate::error::{AppError, ValidationError};
 use crate::validate::{validate_optional, validate_required};
 
@@ -281,9 +281,11 @@ mod tests {
                 .map(|_| ())
             })
         }
-        crate::db::course::assert_no_child_outlives_a_course_delete("subject_orphan_race",
-        SUBJECT_TABLE,
-        make,)
+        crate::db::course::assert_no_child_outlives_a_course_delete(
+            "subject_orphan_race",
+            SUBJECT_TABLE,
+            make,
+        )
         .await;
     }
 
@@ -322,7 +324,7 @@ mod tests {
     /// is counted rather than asserted per round, and why this needs the real
     /// server and a multi-threaded runtime.
     ///
-    /// The racer is [`ExamQuestion::create`], which claims the subject's
+    /// The racer is [`crate::db::exam_question::create`], which claims the subject's
     /// question reference *before* it writes the row — a conditional write on
     /// the same record the delete's `WHERE` reads. `Err(Conflict)` (still
     /// referenced), `Err(NotFound)` and the claim's `Validation` miss are all
@@ -345,7 +347,7 @@ mod tests {
     #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn a_delete_racing_a_question_never_answers_500() {
         use crate::domain::exam_question::{
-            ExamQuestion, QuestionKind, QuestionPoints, QuestionSpec, QuestionText,
+            QuestionKind, QuestionPoints, QuestionSpec, QuestionText,
         };
         let (db, _serialized) = crate::database::init_test_server("subject_delete_race").await;
         let (mut delete_500, mut question_500) = (0, 0);
@@ -398,7 +400,8 @@ mod tests {
                     };
                     tokio::spawn(async move {
                         tokio::time::sleep(head_start).await;
-                        ExamQuestion::create(
+                        crate::db::exam_question::create(
+                            &db,
                             &exam,
                             id,
                             QuestionText::try_new("why").unwrap(),
@@ -410,7 +413,6 @@ mod tests {
                                 &[],
                             )
                             .unwrap(),
-                            &db,
                         )
                         .await
                     })
@@ -438,7 +440,7 @@ mod tests {
             {
                 wiped += 1;
             }
-            if !ExamQuestion::list_for_exam(&exam, None, 0, &db)
+            if !crate::db::exam_question::list_for_exam(&db, &exam, None, 0)
                 .await
                 .unwrap()
                 .0

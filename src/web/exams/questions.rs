@@ -1,7 +1,6 @@
 use super::*;
 
-use crate::service::exam_attempt;
-use crate::service::exam_attempt::question_of_exam;
+use crate::service::exam_question;
 
 // ---- questions --------------------------------------------------------------
 // Teachers author the question list before the exam runs; it freezes the
@@ -135,40 +134,6 @@ impl QuestionResponse {
     }
 }
 
-/// The questions freeze once anyone has started an attempt — editing them
-/// under a student mid-exam would fork what "the exam" means.
-pub(crate) async fn ensure_questions_editable(
-    exam: &ExamId,
-    db: &Database,
-) -> Result<(), AppError> {
-    if exam_attempt::any_for_exam(db, exam).await? {
-        return Err(AppError::Conflict(
-            "cannot change questions after attempts have started",
-        ));
-    }
-    Ok(())
-}
-
-/// The question's option named by `choice_id` — a 400 for a text question or an
-/// id the question doesn't have, so an option picture can only ever be
-/// addressed through an option that exists.
-pub(crate) fn choice_slot(question: &ExamQuestion, choice_id: &str) -> Result<ChoiceId, AppError> {
-    let Some(choices) = question.get_choices() else {
-        return Err(AppError::Validation(ValidationError::Invalid {
-            field: "choice_id",
-            reason: "only choice questions take option pictures",
-        }));
-    };
-    choices
-        .iter()
-        .find(|choice| choice.get_id().as_str() == choice_id)
-        .map(|choice| choice.get_id().clone())
-        .ok_or(AppError::Validation(ValidationError::Invalid {
-            field: "choice_id",
-            reason: "must name one of the choices",
-        }))
-}
-
 /// Add a question to an exam. Requires teacher+ and management rights over the
 /// exam's course. `subject_id` must name one of the course's subjects
 /// (`GET /courses/{id}/subjects`) — every question belongs to a subject.
@@ -211,7 +176,7 @@ pub(crate) async fn create_question(
     // and the insert takes the subject's reference counter in the same breath —
     // a subject delete lands either wholly before it (400) or is refused. The
     // freeze gate rides inside the insert's own transaction.
-    ensure_questions_editable(exam.get_id(), &st.db).await?;
+    exam_question::ensure_questions_editable(exam.get_id(), &st.db).await?;
 
     let subject = subject_in_course(&req.subject_id, course.get_id(), &st.db).await?;
     let text = QuestionText::try_new(&req.text)?;
@@ -224,7 +189,8 @@ pub(crate) async fn create_question(
         req.correct,
         &[],
     )?;
-    let question = ExamQuestion::create(exam.get_id(), subject, text, points, spec, &st.db).await?;
+    let question =
+        exam_question::create(&st.db, exam.get_id(), subject, text, points, spec).await?;
     // A question is born imageless — uploads come after, against its id.
     Ok((
         StatusCode::CREATED,
@@ -283,7 +249,7 @@ pub(crate) async fn question_page(
     hidden: &HashSet<String>,
     db: &Database,
 ) -> Result<Page<QuestionResponse>, AppError> {
-    let (questions, total) = ExamQuestion::list_for_exam(exam.get_id(), limit, offset, db).await?;
+    let (questions, total) = exam_question::list_for_exam(db, exam.get_id(), limit, offset).await?;
     let images = images_by_question(exam.get_id(), db).await?;
     let items = questions
         .iter()
@@ -348,8 +314,8 @@ pub(crate) async fn update_question(
     crate::service::course::require_open(&st.db, &course).await?;
     // No lease — see `create_question`; a re-tag moves the subject's reference
     // counter, and the freeze gate rides in the update's transaction.
-    ensure_questions_editable(exam.get_id(), &st.db).await?;
-    let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
+    exam_question::ensure_questions_editable(exam.get_id(), &st.db).await?;
+    let question = exam_question::question_of_exam(exam.get_id(), &qid, &st.db).await?;
 
     let subject = match req.subject_id {
         Some(ref subject_id) => subject_in_course(subject_id, course.get_id(), &st.db).await?,
@@ -382,7 +348,7 @@ pub(crate) async fn update_question(
     let stored: Vec<Choice> = question.get_choices().unwrap_or_default().to_vec();
     let spec = QuestionSpec::try_new(kind, choices, correct, &stored)?;
 
-    let updated = question.update(subject, text, points, spec, &st.db).await?;
+    let updated = exam_question::update(&st.db, question, subject, text, points, spec).await?;
     // Only the options that are actually *gone* lose their pictures: keyed by
     // choice id, an option that survives the edit keeps its image no matter
     // where it moved in the list. (This used to wipe every option picture
@@ -436,12 +402,12 @@ pub(crate) async fn delete_question(
     crate::service::course::require_open(&st.db, &course).await?;
     // No lock: the freeze gate is part of the delete's own transaction, and
     // this path checks no subject. The pre-flight below is the fast 409.
-    ensure_questions_editable(exam.get_id(), &st.db).await?;
-    let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
+    exam_question::ensure_questions_editable(exam.get_id(), &st.db).await?;
+    let question = exam_question::question_of_exam(exam.get_id(), &qid, &st.db).await?;
     // Rows go first (the delete cascades them), blobs after — a crash in
     // between strands at worst an unreachable blob.
     let images = QuestionImage::list_for_question(question.get_id(), &st.db).await?;
-    question.delete(&st.db).await?;
+    exam_question::delete(&st.db, question).await?;
     for image in &images {
         remove_blob(&st.files_path, image.get_file()).await;
     }
@@ -508,7 +474,7 @@ pub(crate) async fn question_from_bank(
     crate::service::course::require_open(&st.db, &course).await?;
     // No lease — same reasoning as `create_question`. The freeze gate rides in
     // the insert's transaction.
-    ensure_questions_editable(exam.get_id(), &st.db).await?;
+    exam_question::ensure_questions_editable(exam.get_id(), &st.db).await?;
     let subject = subject_in_course(&req.subject_id, course.get_id(), &st.db).await?;
 
     let template = BankQuestion::read(&BankQuestionId::from_key(&bid), &st.db)
@@ -520,14 +486,14 @@ pub(crate) async fn question_from_bank(
     if !crate::web::bank_questions::can_see(&template, &user) {
         return Err(AppError::NotFound);
     }
-    let question = ExamQuestion::create_from_bank(
+    let question = exam_question::create_from_bank(
+        &st.db,
         exam.get_id(),
         subject,
         template.get_text().clone(),
         template.get_points(),
         template.spec(),
         template.get_id().clone(),
-        &st.db,
     )
     .await?;
 
@@ -565,7 +531,7 @@ pub(crate) async fn question_from_bank(
                 for file in &copied {
                     remove_blob(&st.files_path, file).await;
                 }
-                let _ = question.delete(&st.db).await;
+                let _ = exam_question::delete(&st.db, question).await;
                 return Err(err);
             }
         }
@@ -640,8 +606,8 @@ pub(crate) async fn question_refresh_from_bank(
     // No lock: the question keeps its own subject here, so there is nothing to
     // pair with a subject delete, and the freeze gate rides in the overwrite's
     // transaction.
-    ensure_questions_editable(exam.get_id(), &st.db).await?;
-    let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
+    exam_question::ensure_questions_editable(exam.get_id(), &st.db).await?;
+    let question = exam_question::question_of_exam(exam.get_id(), &qid, &st.db).await?;
 
     let Some(source) = question.get_from_bank().cloned() else {
         return Err(AppError::Validation(ValidationError::Invalid {
@@ -680,15 +646,15 @@ pub(crate) async fn question_refresh_from_bank(
     let subject = question.get_subject().clone();
     // `spec()` hands over the template's stored choices *with their ids* rather
     // than re-minting any — the same funnel `question_from_bank` uses.
-    let updated = question
-        .update(
-            subject,
-            template.get_text().clone(),
-            template.get_points(),
-            template.spec(),
-            &st.db,
-        )
-        .await?;
+    let updated = exam_question::update(
+        &st.db,
+        question,
+        subject,
+        template.get_text().clone(),
+        template.get_points(),
+        template.spec(),
+    )
+    .await?;
 
     // Make the pictures match the template exactly: drop every slot the
     // template has no picture for (including the illustration, and every option
@@ -765,7 +731,7 @@ pub(crate) async fn question_to_bank(
     // No lease: `BANK_LOCK` is gone with the subject delete's writer lease, and
     // a template left holding a deleted subject reads as an empty
     // `subject_name` either way (see [`crate::web::bank_questions`]).
-    let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
+    let question = exam_question::question_of_exam(exam.get_id(), &qid, &st.db).await?;
 
     // `create_from_exam` mints its own id and insert (the funnel), fed the
     // question's fields plus the origin exam it was saved off.
@@ -827,14 +793,13 @@ pub(crate) async fn question_to_bank(
     // template with no back-link (the next save re-links it).
     let question_key = question.get_id().key().to_string();
     // No exam lease around the back-link any more, and none is needed: this is a
-    // single-column `UPDATE`, and `ExamQuestion::update` no longer re-states
+    // single-column `UPDATE`, and the question row `UPDATE` no longer re-states
     // this column from a snapshot (it names the columns it writes), so a
     // question edit racing the link cannot revert it. That lease existed only to
     // order those two, and the ordering requirement is gone with the whole-row
     // save that created it.
-    if let Err(err) = question
-        .link_banked_as(template.get_id().clone(), &st.db)
-        .await
+    if let Err(err) =
+        exam_question::link_banked_as(&st.db, question, template.get_id().clone()).await
     {
         tracing::warn!(
             "saved question {question_key} to the bank but could not link it back: {err}"

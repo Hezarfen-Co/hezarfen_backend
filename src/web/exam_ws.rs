@@ -68,7 +68,6 @@ use crate::database::Database;
 use crate::domain::exam::{Exam, ExamId};
 use crate::domain::exam_answer::ExamAnswer;
 use crate::domain::exam_attempt::{AttemptStatus, ExamAttempt, ExamAttemptId};
-use crate::domain::exam_question::ExamQuestion;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
@@ -340,7 +339,7 @@ async fn state_frame(
         ExamAnswer::list_for_exam_user(exam.get_id(), attempt.get_user(), attempt.get_seq(), db)
             .await?
             .len();
-    let question_count = ExamQuestion::list_for_exam(exam.get_id(), None, 0, db)
+    let question_count = crate::service::exam_question::list_for_exam(db, exam.get_id(), None, 0)
         .await?
         .0
         .len();
@@ -461,7 +460,8 @@ async fn handle_message(
                     // same error frame as every other conflict.
                     async {
                         let attempt = writable_room_attempt(&exam, attempt_id, user, db).await?;
-                        crate::service::course::require_open(db, &course_of(&exam, db).await?).await?;
+                        crate::service::course::require_open(db, &course_of(&exam, db).await?)
+                            .await?;
                         finish(db, attempt).await
                     }
                     .await
