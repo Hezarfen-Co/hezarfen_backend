@@ -703,7 +703,7 @@ pub const MIGRATION: &str = "
     -- above submitted. `option<>` because every row predating 2026-08-04 has no
     -- stored verdict and cannot be given one for a credit that already happened:
     -- those fall back to the old comparison (see
-    -- [`crate::domain::homework_submission::HomeworkSubmission::delete`]).
+    -- [`crate::db::homework_submission::delete`]).
     DEFINE FIELD IF NOT EXISTS counted_on_time ON homework_submission TYPE option<bool>;
     -- The grade that froze this submission, absent while it is still open. The
     -- freeze used to be a cross-table read (does a homework_result exist?)
