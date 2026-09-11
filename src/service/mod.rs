@@ -2,6 +2,7 @@
 //! SurrealQL text.
 pub mod appointment;
 pub mod appointment_slot;
+pub mod attendance;
 pub mod badge;
 pub mod builder;
 pub mod chatbot_message;
@@ -15,6 +16,8 @@ pub mod event;
 pub mod exam;
 pub mod exam_attempt;
 pub mod exam_question;
+pub mod fee_plan;
+pub mod fee_plan_assignment;
 pub mod meal_attendance;
 pub mod meal_booking;
 pub mod meal_ledger;
@@ -28,6 +31,7 @@ pub mod profile;
 pub mod rag_output;
 pub mod registration;
 pub mod session;
+pub mod session_attendance;
 pub mod settings;
 pub mod subject;
 pub mod term;

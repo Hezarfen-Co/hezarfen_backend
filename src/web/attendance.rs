@@ -9,7 +9,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::database::Database;
-use crate::domain::attendance::{Attendance, AttendanceStatus};
+use crate::domain::attendance::AttendanceStatus;
 use crate::domain::course::{Course, CourseId};
 use crate::domain::role::Role;
 use crate::domain::session_attendance::SessionAttendance;
@@ -104,8 +104,8 @@ async fn build_report(
     viewer: Option<&User>,
     db: &Database,
 ) -> Result<AttendanceReport, AppError> {
-    let events = Attendance::list_for_user(user, db).await?;
-    let sessions = SessionAttendance::list_for_user(user, db).await?;
+    let events = crate::service::attendance::list_for_user(db, user).await?;
+    let sessions = crate::service::session_attendance::list_for_user(db, user).await?;
 
     // Group session rows by course, preserving first-seen (newest-first) order.
     let mut course_ids: Vec<CourseId> = Vec::new();
