@@ -412,7 +412,8 @@ mod tests {
 
         async fn an_exam(db: &Database) -> Exam {
             let kinds = Settings::defaults().get_exam_kinds().to_vec();
-            Exam::create(
+            crate::db::exam::create(
+                db,
                 &UserId::from_key("01TESTTEACHERAAAAAAAAAAAAA"),
                 &crate::db::course::a_test_course(db).await,
                 ExamTitle::try_new("practice").unwrap(),
@@ -424,7 +425,6 @@ mod tests {
                 true,
                 false,
                 false,
-                db,
             )
             .await
             .unwrap()
