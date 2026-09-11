@@ -72,42 +72,10 @@ use crate::constant::{QUESTION_IMAGE_CONTENT_TYPES, SCHEDULE_PAST_GRACE_MS};
 use crate::database::Database;
 use crate::domain::exam_question::{Choice, ChoiceInput};
 use crate::domain::note_file::FileContentType;
-use crate::domain::parent_link::ParentLink;
 use crate::domain::role::Role;
 use crate::domain::timestamp::Timestamp;
-use crate::domain::user::{User, UserId};
+use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
-
-/// May `caller` read `target`'s per-student reports (marks, attendance,
-/// pomodoro)? Teacher+ always may (per-endpoint narrowing is the caller's
-/// business); a parent may exactly when a `parent_link` row ties them to the
-/// target *and* the target still holds the student role. Everyone else —
-/// students included — gets a 403 (self-reads go through the `/me` endpoints).
-pub(crate) async fn ensure_can_observe(
-    caller: &User,
-    target: &UserId,
-    db: &Database,
-) -> Result<(), AppError> {
-    if caller.get_role().at_least(Role::Teacher) {
-        return Ok(());
-    }
-    // The link row alone is not the grant: like stale enrollments, a link
-    // whose student side changed role (a sweep lost a race with link_student)
-    // must be inert, so the target's live role is re-read here. Missing or
-    // non-student targets fall through to the same 403 — a parent never gets
-    // an existence oracle.
-    if caller.get_role() == Role::Parent
-        && ParentLink::exists(caller.get_id(), target, db).await?
-        && crate::service::user::read(db, target)
-            .await?
-            .is_some_and(|target| target.get_role() == Role::Student)
-    {
-        return Ok(());
-    }
-    Err(AppError::Forbidden(
-        "requires teacher role or higher, or a parent link to this student",
-    ))
-}
 
 /// Close the window between "this account is teacher+" and the write that
 /// records a teacher-only assignment (a class's homeroom teacher, a course's

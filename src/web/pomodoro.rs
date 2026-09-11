@@ -11,9 +11,10 @@ use crate::domain::pomodoro::PomodoroSession;
 use crate::domain::role::Role;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse};
+use crate::service::parent_link::ensure_can_observe;
 use crate::state::AppState;
 
-use super::{CurrentUser, PageParams, ensure_can_observe, paginate};
+use super::{CurrentUser, PageParams, paginate};
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()

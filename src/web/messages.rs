@@ -15,6 +15,7 @@ use crate::domain::message::{
 };
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
+use crate::service::message;
 use crate::state::AppState;
 
 use super::dto::Role;
@@ -206,13 +207,13 @@ async fn send_message(
         ));
     }
 
-    let message = Message::send(
+    let message = message::send(
+        &st.db,
         user.get_id(),
         recipient.get_id(),
         subject,
         body,
         label,
-        &st.db,
     )
     .await?;
     let people = people_of([&user, &recipient]);
@@ -250,7 +251,7 @@ async fn list(
     };
 
     let (messages, total) =
-        Message::list_folder(user.get_id(), folder, filter.read, limit, offset, &st.db).await?;
+        message::list_folder(&st.db, user.get_id(), folder, filter.read, limit, offset).await?;
     let people = load_people(&messages, &st.db).await?;
     let items = messages
         .iter()
@@ -288,7 +289,7 @@ async fn update_message(
     Path(id): Path<String>,
     Json(req): Json<UpdateMessage>,
 ) -> Result<Json<MessageResponse>, AppError> {
-    let mut message = Message::read_for(&MessageId::from_key(&id), user.get_id(), &st.db)
+    let mut message = message::read_for(&st.db, &MessageId::from_key(&id), user.get_id())
         .await?
         .ok_or(AppError::NotFound)?;
 
@@ -313,10 +314,10 @@ async fn update_message(
         None => None,
     };
     if let Some(read) = req.read {
-        message = message.set_read(read, &st.db).await?;
+        message = message::set_read(&st.db, message, read).await?;
     }
     if let Some(folder) = folder {
-        message = message.move_to(user.get_id(), folder, &st.db).await?;
+        message = message::move_to(&st.db, message, user.get_id(), folder).await?;
     }
 
     let people = load_people(std::slice::from_ref(&message), &st.db).await?;
@@ -344,9 +345,9 @@ async fn delete_message(
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    let message = Message::read_for(&MessageId::from_key(&id), user.get_id(), &st.db)
+    let message = message::read_for(&st.db, &MessageId::from_key(&id), user.get_id())
         .await?
         .ok_or(AppError::NotFound)?;
-    message.delete_for(user.get_id(), &st.db).await?;
+    message::delete_for(&st.db, message, user.get_id()).await?;
     Ok(StatusCode::NO_CONTENT)
 }
