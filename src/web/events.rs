@@ -12,7 +12,7 @@ use utoipa_axum::routes;
 use crate::database::Database;
 use crate::domain::attendance::{Attendance, AttendanceStatus};
 use crate::domain::class_group::{ClassGroup, ClassGroupId};
-use crate::domain::course::{Course, CourseId};
+use crate::domain::course::CourseId;
 use crate::domain::event::{Event, EventAudience, EventDescription, EventId, EventTitle};
 use crate::domain::registration::Registration;
 use crate::domain::role::Role;
@@ -91,7 +91,7 @@ impl AudienceDto {
             }),
             AudienceDto::Course { course } => {
                 let course = CourseId::from_key(&course);
-                if Course::read(&course, db).await?.is_none() {
+                if crate::service::course::read(db, &course).await?.is_none() {
                     return Err(AppError::Validation(ValidationError::Invalid {
                         field: "audience",
                         reason: "course does not exist",

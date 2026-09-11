@@ -34,7 +34,7 @@ use crate::domain::board::{BOARD_ROSTER_LOCK, Board, BoardId, BoardTitle};
 use crate::domain::board_stroke::BoardStroke;
 use crate::domain::class_group::{ClassGroup, ClassGroupId};
 use crate::domain::class_member::ClassMember;
-use crate::domain::course::{Course, CourseId};
+use crate::domain::course::CourseId;
 use crate::domain::enrollment::Enrollment;
 use crate::domain::event::{Event, EventId};
 use crate::domain::role::Role;
@@ -742,7 +742,7 @@ impl InviteSource {
                     .collect())
             }
             InviteSource::Course { course } => {
-                let course = Course::read(&CourseId::from_key(&course), db)
+                let course = crate::service::course::read(db, &CourseId::from_key(&course))
                     .await?
                     .ok_or(AppError::Validation(ValidationError::Invalid {
                         field: "course",

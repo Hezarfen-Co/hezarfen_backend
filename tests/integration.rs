@@ -21298,8 +21298,9 @@ async fn refreshing_a_question_recopies_its_template() {
 /// inside the handler.
 #[tokio::test]
 async fn a_course_patch_does_not_clobber_a_concurrent_teacher_assignment() {
+    use hezarfen_backend::db::course;
     use hezarfen_backend::domain::course::{
-        Course, CourseDescription, CourseId, CourseKind, CourseTitle,
+        CourseDescription, CourseId, CourseKind, CourseTitle,
     };
 
     let (app, db) = app_and_db().await;
@@ -21310,7 +21311,7 @@ async fn a_course_patch_does_not_clobber_a_concurrent_teacher_assignment() {
     let course = create_course(&app, &owner, "cclob_c").await;
 
     // The handler's read, then the assignment lands mid-window.
-    let stale = Course::read(&CourseId::from_key(&course), &db)
+    let stale = course::read(&db, &CourseId::from_key(&course))
         .await
         .unwrap()
         .expect("course exists");
@@ -21324,17 +21325,17 @@ async fn a_course_patch_does_not_clobber_a_concurrent_teacher_assignment() {
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
 
-    let updated = stale
-        .update(
-            Some(CourseTitle::try_new("renamed").unwrap()),
-            Some(CourseDescription::try_new("").unwrap()),
-            Some(CourseKind::course()),
-            None,
-            None,
-            &db,
-        )
-        .await
-        .expect("update written");
+    let updated = course::update(
+        &db,
+        stale,
+        Some(CourseTitle::try_new("renamed").unwrap()),
+        Some(CourseDescription::try_new("").unwrap()),
+        Some(CourseKind::course()),
+        None,
+        None,
+    )
+    .await
+    .expect("update written");
     assert_eq!(
         updated.get_teachers().len(),
         1,
@@ -21360,8 +21361,8 @@ async fn a_course_patch_does_not_clobber_a_concurrent_teacher_assignment() {
 /// the rename. `unassign_teacher` gets the same field-scoped treatment.
 #[tokio::test]
 async fn staffing_a_course_does_not_clobber_a_concurrent_edit() {
-    use hezarfen_backend::domain::course::{Course, CourseId};
-    use hezarfen_backend::domain::user::UserId;
+    use hezarfen_backend::db::course;
+    use hezarfen_backend::domain::course::CourseId;
 
     let (app, db) = app_and_db().await;
     let owner = login_as(&app, &db, "cstaff_o", "teacher").await;
@@ -21370,7 +21371,7 @@ async fn staffing_a_course_does_not_clobber_a_concurrent_edit() {
     let course = create_course(&app, &owner, "cstaff_c").await;
 
     // The handler's read, then someone else's edit lands mid-window.
-    let stale = Course::read(&CourseId::from_key(&course), &db)
+    let stale = course::read(&db, &CourseId::from_key(&course))
         .await
         .unwrap()
         .expect("course exists");
@@ -21384,8 +21385,7 @@ async fn staffing_a_course_does_not_clobber_a_concurrent_edit() {
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
 
-    let assigned = stale
-        .assign_teacher(&UserId::from_key(&helper_id), &db)
+    let assigned = course::assign_teacher(&db, stale, &UserId::from_key(&helper_id))
         .await
         .expect("assignment written");
     assert_eq!(assigned.get_title().as_str(), "edited by someone else");
@@ -21393,7 +21393,7 @@ async fn staffing_a_course_does_not_clobber_a_concurrent_edit() {
     assert_eq!(assigned.get_teachers().len(), 1);
 
     // Unassigning from a struct read before another edit is just as safe.
-    let stale = Course::read(&CourseId::from_key(&course), &db)
+    let stale = course::read(&db, &CourseId::from_key(&course))
         .await
         .unwrap()
         .expect("course exists");
@@ -21406,8 +21406,7 @@ async fn staffing_a_course_does_not_clobber_a_concurrent_edit() {
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-    let dropped = stale
-        .unassign_teacher(&UserId::from_key(&helper_id), &db)
+    let dropped = course::unassign_teacher(&db, stale, &UserId::from_key(&helper_id))
         .await
         .expect("unassignment written")
         .expect("teacher was assigned");

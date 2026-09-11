@@ -702,7 +702,7 @@ impl ClassBlueprint {
     /// Drop a course that no longer exists out of this blueprint's list.
     ///
     /// The delete does this itself now:
-    /// [`crate::domain::course::Course::delete`] sweeps `class_blueprint` in
+    /// [`crate::db::course::delete`] sweeps `class_blueprint` in
     /// the same cascade that takes the course's `class_course` links, so a
     /// template stops naming a course the instant that course goes. This used
     /// to be the *only* thing that could remove such an id, and that was the

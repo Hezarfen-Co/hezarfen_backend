@@ -185,21 +185,21 @@ impl RagOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::course::{Course, CourseDescription, CourseKind, CourseTitle};
+    use crate::domain::course::{CourseDescription, CourseKind, CourseTitle};
     use crate::domain::course_note::{CourseNote, CourseNoteContent, CourseNoteTitle};
     use crate::domain::course_note_file::{CourseNoteFile, FileContentType, FileName};
     use serde_json::json;
 
     async fn note_of(db: &Database, title: &str) -> CourseNote {
         let creator = crate::domain::user::UserId::generate();
-        let course = Course::create(
+        let course = crate::db::course::create(
+            db,
             &creator,
             CourseTitle::try_new("c").unwrap(),
             CourseDescription::try_new("").unwrap(),
             CourseKind::try_new("course").unwrap(),
             None,
             None,
-            db,
         )
         .await
         .unwrap();

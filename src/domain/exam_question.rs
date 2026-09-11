@@ -1094,7 +1094,7 @@ mod tests {
             let kinds = Settings::defaults().get_exam_kinds().to_vec();
             Exam::create(
                 &UserId::from_key("01TESTTEACHERAAAAAAAAAAAAA"),
-                &crate::domain::course::a_test_course(db).await,
+                &crate::db::course::a_test_course(db).await,
                 ExamTitle::try_new("practice").unwrap(),
                 ExamDescription::try_new("").unwrap(),
                 ExamKind::try_new("quiz", &kinds).unwrap(),
@@ -1112,7 +1112,7 @@ mod tests {
 
         async fn a_subject(db: &Database) -> Subject {
             Subject::create(
-                &crate::domain::course::a_test_course(db).await,
+                &crate::db::course::a_test_course(db).await,
                 SubjectName::try_new("topic").unwrap(),
                 SubjectDescription::try_new("").unwrap(),
                 db,

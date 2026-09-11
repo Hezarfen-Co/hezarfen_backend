@@ -385,7 +385,7 @@ mod tests {
 
     async fn a_session_at(teacher: &UserId, starts_at: i64, db: &Database) -> CourseSession {
         CourseSession::create(
-            &crate::domain::course::a_test_course(db).await,
+            &crate::db::course::a_test_course(db).await,
             teacher,
             SessionTopic::try_new("limits").unwrap(),
             Timestamp::from_millis(starts_at),

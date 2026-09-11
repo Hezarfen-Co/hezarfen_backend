@@ -99,7 +99,7 @@ pub(crate) async fn image_managed_exam(
             "only the course creator, an assigned teacher, or a manager/admin can manage question images",
         ));
     }
-    course.require_open(&st.db).await?;
+    crate::service::course::require_open(&st.db, &course).await?;
     Ok(exam)
 }
 
@@ -460,7 +460,7 @@ pub(crate) async fn upload_answer_image(
     ensure_student(&user)?;
     // Before the body is read: an archived term refuses the upload without
     // making the client push its bytes first.
-    course_of(&exam, &st.db).await?.require_open(&st.db).await?;
+    crate::service::course::require_open(&st.db, &course_of(&exam, &st.db).await?).await?;
     // The body is consumed before the lock — a client's slow upload must not
     // stall the exam subsystem (mirrors the question-image upload).
     let ImageUpload { content_type, data } = read_image_upload(&st, &mut multipart).await?;
@@ -540,7 +540,7 @@ pub(crate) async fn delete_answer_image(
         .await?
         .ok_or(AppError::NotFound)?;
     ensure_student(&user)?;
-    course_of(&exam, &st.db).await?.require_open(&st.db).await?;
+    crate::service::course::require_open(&st.db, &course_of(&exam, &st.db).await?).await?;
     let _guard = EXAM_LOCK.read().await;
     let attempt = writable_attempt(&exam, user.get_id(), &st.db).await?;
     ensure_student_now(attempt.get_user(), &st.db).await?;

@@ -152,7 +152,7 @@ pub async fn attempt_ws(
     ensure_enrolled(&exam, user.get_id(), &st.db).await?;
     let attempt = writable_attempt(&exam, user.get_id(), &st.db).await?;
     check_rejoin(&exam, &attempt)?;
-    course_of(&exam, &st.db).await?.require_open(&st.db).await?;
+    crate::service::course::require_open(&st.db, &course_of(&exam, &st.db).await?).await?;
 
     let user_id = user.get_id().clone();
     Ok(ws.on_upgrade(move |socket| room(socket, st, slug, exam, attempt, user_id)))
@@ -463,7 +463,7 @@ async fn handle_message(
                     // same error frame as every other conflict.
                     async {
                         let attempt = writable_room_attempt(&exam, attempt_id, user, db).await?;
-                        course_of(&exam, db).await?.require_open(db).await?;
+                        crate::service::course::require_open(db, &course_of(&exam, db).await?).await?;
                         attempt.finish(db).await
                     }
                     .await

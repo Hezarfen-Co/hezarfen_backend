@@ -117,7 +117,7 @@ async fn build_report(
         by_course.entry(key).or_default().push(row);
     }
 
-    let courses = Course::list_by_ids(&course_ids, db).await?;
+    let courses = crate::service::course::list_by_ids(db, &course_ids).await?;
     let course_by_key: HashMap<&str, &Course> =
         courses.iter().map(|c| (c.get_id().key(), c)).collect();
     let people = person_map(courses.iter().flat_map(course_people), db).await?;

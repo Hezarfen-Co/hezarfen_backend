@@ -222,7 +222,7 @@ mod tests {
     /// [`CourseSession::create`] therefore *writes* the course row rather than
     /// reading it ([`cap::touch_and_create`]); the harness and the window it
     /// races in are documented on
-    /// [`crate::domain::course::assert_no_child_outlives_a_course_delete`].
+    /// [`crate::db::course::assert_no_child_outlives_a_course_delete`].
     /// Mutation-tested: with the bare `db.create` this shipped with, all four
     /// rounds orphan.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -242,11 +242,9 @@ mod tests {
                 .map(|_| ())
             })
         }
-        crate::domain::course::assert_no_child_outlives_a_course_delete(
-            "session_orphan_race",
-            COURSE_SESSION_TABLE,
-            make,
-        )
+        crate::db::course::assert_no_child_outlives_a_course_delete("session_orphan_race",
+        COURSE_SESSION_TABLE,
+        make,)
         .await;
     }
 
