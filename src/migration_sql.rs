@@ -1035,7 +1035,7 @@ pub const BACKFILL: &str = "
     --
     -- Counting the rows cannot read *low*. The counter has exactly one meaning —
     -- the live enrollment rows of this course — and every writer moves it with
-    -- the row in one transaction (`Enrollment::enroll`/`remove`, `set_role`'s
+    -- the row in one transaction (`db::enrollment`'s `enroll`/`remove`, `set_role`'s
     -- demotion sweep, the class pump's attach and detach); `Course::delete` takes
     -- the rows *and* the course together, so no cascade leaves counted rows
     -- behind. That is what separates it from the lifetime tallies below, which

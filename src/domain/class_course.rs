@@ -8,11 +8,11 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
 use crate::constant::{CLASS_COURSE_TABLE, MAX_CLASS_COURSES, MAX_CLASS_MEMBERS};
 use crate::database::Database;
+use crate::db::page::PagedList;
 use crate::domain::class_blueprint::ClassBlueprintId;
 use crate::domain::class_group::ClassGroupId;
 use crate::domain::class_pump::{Attached, Axis, attach, detach, link_id};
 use crate::domain::course::CourseId;
-use crate::db::page::PagedList;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
@@ -239,7 +239,6 @@ mod tests {
     use super::*;
     use crate::domain::class_member::ClassMember;
     use crate::domain::class_member::tests::{a_class, a_course, counter, exists, rows, source_of};
-    use crate::domain::enrollment::Enrollment;
 
     /// Attaching seeds the course from the roster the class already holds.
     #[tokio::test]
@@ -317,7 +316,7 @@ mod tests {
         let student = UserId::from_key("student");
         let class = a_class("9-A", &db).await;
         let algebra = a_course("algebra", None, &db).await;
-        Enrollment::enroll(&algebra, &student, &manager, &db)
+        crate::db::enrollment::enroll(&db, &algebra, &student, &manager)
             .await
             .unwrap();
         ClassMember::add(&class, &student, &manager, &db)

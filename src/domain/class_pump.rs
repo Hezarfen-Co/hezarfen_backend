@@ -50,7 +50,7 @@ use crate::error::AppError;
 /// class is full" *or* "the class is gone" — one conditional write cannot say
 /// which, so it stays one marker and the read that tells them apart is paid for
 /// only on that path (the same shape as
-/// [`crate::domain::enrollment::Enrollment::enroll`]). It is not `GONE_MARK`:
+/// [`crate::db::enrollment::enroll`]). It is not `GONE_MARK`:
 /// that one is the *pivot* claim, which is a different row.
 ///
 /// `OVER_MARK` is the *other* axis already standing above its own ceiling —
