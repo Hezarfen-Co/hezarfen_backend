@@ -22,10 +22,8 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::constant::{MAX_FEE_PLAN_ASSIGN_STUDENTS, MAX_FEE_PLAN_ASSIGN_WRITES};
 use crate::database::Database;
 use crate::domain::fee_plan::{FeePlan, FeePlanId, FeePlanName, Installment};
-use crate::domain::fee_plan_assignment::FeePlanAssignment;
 use crate::domain::parent_link::ParentLink;
 use crate::domain::payment_ledger::{
     LedgerAmount, LedgerMethod, LedgerNote, PaymentLedger, PaymentLedgerId, PaymentLedgerKind,
@@ -163,7 +161,7 @@ async fn plan_responses(
 }
 
 async fn require_plan(id: &str, db: &Database) -> Result<FeePlan, AppError> {
-    FeePlan::read(&FeePlanId::from_key(id), db)
+    service::fee_plan::read(db, &FeePlanId::from_key(id))
         .await?
         .ok_or(AppError::NotFound)
 }
@@ -189,11 +187,11 @@ async fn create_plan(
     RequireManager(manager): RequireManager,
     Json(req): Json<CreateFeePlan>,
 ) -> Result<(StatusCode, Json<FeePlanResponse>), AppError> {
-    let plan = FeePlan::create(
+    let plan = service::fee_plan::create(
+        &st.db,
         FeePlanName::try_new(&req.name)?,
         InstallmentBody::list(req.installments)?,
         manager.get_id(),
-        &st.db,
     )
     .await?;
     let people = PersonRef::map_of(&[&manager]);
@@ -224,7 +222,7 @@ async fn list_plans(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<FeePlanResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let (rows, total) = FeePlan::list_all(limit, offset, &st.db).await?;
+    let (rows, total) = service::fee_plan::list_all(&st.db, limit, offset).await?;
     let items = plan_responses(&rows, &st.db).await?;
     Ok(Json(Page::new(items, total, limit, offset)))
 }
@@ -291,7 +289,7 @@ async fn update_plan(
     let plan = require_plan(&id, &st.db).await?;
     let name = req.name.as_deref().map(FeePlanName::try_new).transpose()?;
     let installments = req.installments.map(InstallmentBody::list).transpose()?;
-    let plan = plan.update(name, installments, &st.db).await?;
+    let plan = service::fee_plan::update(&st.db, plan, name, installments).await?;
     let items = plan_responses(std::slice::from_ref(&plan), &st.db).await?;
     Ok(Json(
         items.into_iter().next().expect("one plan in, one out"),
@@ -323,7 +321,7 @@ async fn delete_plan(
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
     let plan = require_plan(&id, &st.db).await?;
-    if !plan.delete(&st.db).await? {
+    if !service::fee_plan::delete(&st.db, plan).await? {
         return Err(AppError::Conflict("an assigned plan cannot be deleted"));
     }
     Ok(StatusCode::NO_CONTENT)
@@ -405,59 +403,30 @@ async fn assign_plan(
     Path(id): Path<String>,
     Json(req): Json<AssignFeePlan>,
 ) -> Result<Json<Vec<AssignmentOutcome>>, AppError> {
-    if req.student_ids.len() > MAX_FEE_PLAN_ASSIGN_STUDENTS {
-        return Err(AppError::Validation(ValidationError::Invalid {
-            field: "student_ids",
-            reason: "may name at most 200 students",
-        }));
-    }
-    let plan = require_plan(&id, &st.db).await?;
-    // The student cap alone cannot see the schedule: every student named
-    // appends *every* installment, so what really bounds this request is the
-    // product. Refused whole and before anything is written — a batch this API
-    // billed only part of would leave a bursar guessing which families were
-    // charged.
-    if req
-        .student_ids
-        .len()
-        .saturating_mul(plan.get_installments().len())
-        > MAX_FEE_PLAN_ASSIGN_WRITES
-    {
-        return Err(AppError::Validation(ValidationError::Invalid {
-            field: "student_ids",
-            reason: "too many charges for one request: students × installments \
-                     may not exceed 3000, so split the batch",
-        }));
-    }
-    let mut outcomes = Vec::with_capacity(req.student_ids.len());
-    for student_id in req.student_ids {
-        let student = UserId::from_key(&student_id);
-        // A fee record belongs to a student; billing anyone else is a typo, and
-        // a typo here is money against the wrong person.
-        let is_student = crate::service::user::read(&st.db, &student)
-            .await?
-            .is_some_and(|user| user.get_role() == Role::Student);
-        let (status, reason) = if is_student {
-            match FeePlanAssignment::assign(&plan, &student, manager.get_id(), &st.db).await {
-                Ok((_, true)) => ("already_assigned", None),
-                Ok((_, false)) => ("assigned", None),
-                // The plan was deleted mid-batch. That is a per-student outcome
-                // like any other, not a reason to throw away the report for the
-                // students this batch already billed — their charges are
-                // written and the caller has to be told about them.
-                Err(AppError::NotFound) => ("rejected", Some("no such plan")),
-                Err(err) => return Err(err),
-            }
-        } else {
-            ("rejected", Some("no such student"))
-        };
-        outcomes.push(AssignmentOutcome {
-            student_id,
-            status,
-            reason,
-        });
-    }
-    Ok(Json(outcomes))
+    let outcomes =
+        service::fee_plan_assignment::assign_batch(&st.db, &id, manager.get_id(), req.student_ids)
+            .await?;
+    Ok(Json(
+        outcomes
+            .into_iter()
+            .map(|(student_id, outcome)| {
+                let (status, reason) = match outcome {
+                    service::fee_plan_assignment::Outcome::Assigned => ("assigned", None),
+                    service::fee_plan_assignment::Outcome::AlreadyAssigned => {
+                        ("already_assigned", None)
+                    }
+                    service::fee_plan_assignment::Outcome::Rejected(reason) => {
+                        ("rejected", Some(reason))
+                    }
+                };
+                AssignmentOutcome {
+                    student_id,
+                    status,
+                    reason,
+                }
+            })
+            .collect(),
+    ))
 }
 
 /// Who is on this plan, newest first. Paged via `?limit=&offset=`; returns a
@@ -485,7 +454,7 @@ async fn list_plan_assignments(
     let (limit, offset) = page.resolve()?;
     let plan = require_plan(&id, &st.db).await?;
     let (rows, total) =
-        FeePlanAssignment::list_for_plan(plan.get_id(), limit, offset, &st.db).await?;
+        service::fee_plan_assignment::list_for_plan(&st.db, plan.get_id(), limit, offset).await?;
     let people = person_map(
         rows.iter()
             .flat_map(|row| [row.get_student().clone(), row.get_assigned_by().clone()]),
@@ -907,13 +876,14 @@ async fn statement_response(
     };
 
     // A charge names its assignment, and the assignment names the plan.
-    let (assignments, _) = FeePlanAssignment::list_for_student(student, None, 0, db).await?;
+    let (assignments, _) =
+        service::fee_plan_assignment::list_for_student(db, student, None, 0).await?;
     let mut plan_names: HashMap<String, Option<String>> = HashMap::new();
     let mut plan_of: HashMap<&str, &FeePlanId> = HashMap::new();
     for assignment in &assignments {
         let plan = assignment.get_plan();
         if !plan_names.contains_key(plan.key()) {
-            let name = FeePlan::read(plan, db)
+            let name = service::fee_plan::read(db, plan)
                 .await?
                 .map(|plan| plan.get_name().as_str().to_string());
             plan_names.insert(plan.key().to_string(), name);
@@ -1121,7 +1091,8 @@ mod tests {
         let manager = UserId::from_key("mgr1");
         let student = UserId::from_key("stu1");
         let future = Timestamp::now().as_millis() + 30 * 24 * 60 * 60 * 1000;
-        let plan = FeePlan::create(
+        let plan = service::fee_plan::create(
+            &db,
             FeePlanName::try_new("Yearly").unwrap(),
             vec![
                 // Already due, and only part paid — the overdue row.
@@ -1135,11 +1106,10 @@ mod tests {
                 ),
             ],
             &manager,
-            &db,
         )
         .await
         .unwrap();
-        FeePlanAssignment::assign(&plan, &student, &manager, &db)
+        service::fee_plan_assignment::assign(&db, &plan, &student, &manager)
             .await
             .unwrap();
 

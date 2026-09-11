@@ -13,12 +13,13 @@ mod common;
 use axum::http::StatusCode;
 use common::{app_and_db, create_course, create_session, enroll, login, login_as, me_id, send};
 use hezarfen_backend::database::Database;
+use hezarfen_backend::db::attendance;
 use hezarfen_backend::db::course_session;
+use hezarfen_backend::db::session_attendance;
 use hezarfen_backend::db::settings;
-use hezarfen_backend::domain::attendance::{Attendance, AttendanceStatus};
+use hezarfen_backend::domain::attendance::AttendanceStatus;
 use hezarfen_backend::domain::course_session::CourseSessionId;
 use hezarfen_backend::domain::event::EventId;
-use hezarfen_backend::domain::session_attendance::SessionAttendance;
 use hezarfen_backend::domain::timestamp::Timestamp;
 use hezarfen_backend::domain::user::UserId;
 use hezarfen_backend::error::AppError;
@@ -130,7 +131,7 @@ async fn reassigning_the_teacher_does_not_unlock_the_old_teachers_staff_row() {
     assert_eq!(res.status, StatusCode::FORBIDDEN, "{}", res.body);
 
     // The row is still there, and a manager still clears it.
-    let rows = SessionAttendance::list_for_user(&UserId::from_key(&t1_id), &db)
+    let rows = session_attendance::list_for_user(&db, &UserId::from_key(&t1_id))
         .await
         .unwrap();
     assert_eq!(rows.len(), 1, "the staff row survived the refused delete");
@@ -216,7 +217,7 @@ async fn a_mark_against_a_deleted_session_is_refused_and_stores_nothing() {
     .await;
     assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
     assert!(
-        SessionAttendance::list_for_user(&ali_ref, &db)
+        session_attendance::list_for_user(&db, &ali_ref)
             .await
             .unwrap()
             .is_empty(),
@@ -226,12 +227,12 @@ async fn a_mark_against_a_deleted_session_is_refused_and_stores_nothing() {
     // Then the mark arrives, still believing in its snapshot.
     let school = settings::load(&db).await.unwrap();
     let status = AttendanceStatus::try_new("present", school.get_attendance_statuses()).unwrap();
-    let marked = SessionAttendance::mark(
+    let marked = session_attendance::mark(
+        &db,
         &snapshot,
         &ali_ref,
         status,
         &UserId::from_key(&hoca_id),
-        &db,
     )
     .await;
     assert!(
@@ -240,7 +241,7 @@ async fn a_mark_against_a_deleted_session_is_refused_and_stores_nothing() {
     );
     // The stored state is the assertion — the return value is not trusted.
     assert!(
-        SessionAttendance::list_for_user(&ali_ref, &db)
+        session_attendance::list_for_user(&db, &ali_ref)
             .await
             .unwrap()
             .is_empty(),
@@ -385,7 +386,7 @@ async fn an_event_mark_writes_its_event_and_is_refused_once_it_is_gone() {
     .await;
     assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
     assert!(
-        Attendance::list_for_user(&ali_ref, &db)
+        attendance::list_for_user(&db, &ali_ref)
             .await
             .unwrap()
             .is_empty(),
@@ -396,14 +397,14 @@ async fn an_event_mark_writes_its_event_and_is_refused_once_it_is_gone() {
     let school = settings::load(&db).await.unwrap();
     let status = AttendanceStatus::try_new("present", school.get_attendance_statuses()).unwrap();
     let marked =
-        Attendance::mark(&EventId::from_key(&event), &ali_ref, status, &hoca_ref, &db).await;
+        attendance::mark(&db, &EventId::from_key(&event), &ali_ref, status, &hoca_ref).await;
     assert!(
         matches!(marked, Err(AppError::NotFound)),
         "a mark on a deleted event is a 404, got {marked:?}"
     );
     // The stored state is the assertion — the return value is not trusted.
     assert!(
-        Attendance::list_for_user(&ali_ref, &db)
+        attendance::list_for_user(&db, &ali_ref)
             .await
             .unwrap()
             .is_empty(),

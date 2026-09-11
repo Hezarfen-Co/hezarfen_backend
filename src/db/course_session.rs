@@ -99,7 +99,7 @@ pub async fn update(
 /// Delete the session and cascade-remove its roll-call rows, in one
 /// transaction: as two unbatched queries a failure between them stranded
 /// roll-call rows on a session that was already gone. The other half of
-/// that invariant is [`crate::domain::session_attendance::SessionAttendance::mark`],
+/// that invariant is [`crate::db::session_attendance::mark`],
 /// which proves the session still exists inside its own write — a
 /// transaction here cannot stop a mark that commits *after* this one.
 pub async fn delete(db: &Database, session: CourseSession) -> Result<CourseSession, AppError> {

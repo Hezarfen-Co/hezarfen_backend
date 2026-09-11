@@ -319,7 +319,7 @@ impl Event {
     ///
     /// Re-sent while the store answers "conflict, retry", the way
     /// [`crate::db::course_session::delete`] is: now that
-    /// [`crate::domain::attendance::Attendance::mark`] writes the event row to
+    /// [`crate::db::attendance::mark`] writes the event row to
     /// prove it exists, a mark landing in this window really does contend for
     /// it — and without the retry the *delete* is the side that loses, turning
     /// a race the store resolved correctly into a 500 (measured 4 rounds in 4).
