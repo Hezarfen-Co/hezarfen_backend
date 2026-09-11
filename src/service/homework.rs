@@ -10,7 +10,6 @@ use crate::db::homework;
 use crate::db::homework_file;
 use crate::db::homework_result;
 use crate::db::homework_submission;
-use crate::domain::badge;
 use crate::domain::course::CourseId;
 use crate::domain::homework::{Homework, HomeworkDescription, HomeworkId, HomeworkTitle};
 use crate::domain::homework_result::HomeworkResult;
@@ -268,7 +267,7 @@ pub async fn require_open_term(homework: &Homework, db: &Database) -> Result<(),
 /// of the work, and losing one to a transient database error is not worth
 /// refusing a hand-in over — the next counter move re-runs this and heals it.
 pub(crate) async fn award_badges(user: &UserId, db: &Database) {
-    if let Err(err) = badge::sync(user, db).await {
+    if let Err(err) = crate::db::badge::sync(db, user).await {
         tracing::warn!("failed to sync badges for {}: {err}", user.key());
     }
 }

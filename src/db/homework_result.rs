@@ -271,14 +271,14 @@ mod tests {
     async fn a_homework(db: &Database) -> HomeworkId {
         use crate::db::homework;
         use crate::domain::homework::HomeworkTitle;
-        use crate::domain::subject::{Subject, SubjectDescription, SubjectName};
+        use crate::domain::subject::{SubjectDescription, SubjectName};
 
         let course = crate::db::course::a_test_course(db).await;
-        let subject = Subject::create(
+        let subject = crate::db::subject::create(
+            db,
             &course,
             SubjectName::try_new("topic").unwrap(),
             SubjectDescription::try_new("").unwrap(),
-            db,
         )
         .await
         .unwrap();
