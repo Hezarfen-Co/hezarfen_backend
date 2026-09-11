@@ -8,16 +8,17 @@
 //! student" answerable as a set intersection, without the backend knowing any
 //! nutrition.
 //!
+//! The queries live in [`crate::db::dietary_profile`]; the web layer reads
+//! through [`crate::service::dietary_profile`].
+//!
 //! [`Settings::get_dietary_tags`]: crate::domain::settings::Settings::get_dietary_tags
 
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
 use crate::constant::{DIETARY_PROFILE_TABLE, MAX_DIETARY_NOTE_LEN, MAX_DIETARY_TAGS};
-use crate::database::Database;
-use crate::db::field_update::FieldUpdate;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
-use crate::error::{AppError, ValidationError};
+use crate::error::ValidationError;
 use crate::validate::validate_optional;
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
@@ -46,7 +47,7 @@ impl DietaryProfileId {
 /// list — the same vocabulary a dish is tagged from, deduplicated and in the
 /// order given.
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct DietaryTags(Vec<String>);
+pub struct DietaryTags(pub(crate) Vec<String>);
 
 impl DietaryTags {
     pub fn try_new(values: &[String], allowed: &[String]) -> Result<Self, ValidationError> {
@@ -97,12 +98,12 @@ impl DietaryNote {
 
 #[derive(Debug, Clone, SurrealValue)]
 pub struct DietaryProfile {
-    id: DietaryProfileId,
-    student: UserId,
-    tags: DietaryTags,
-    note: Option<DietaryNote>,
-    updated_by: UserId,
-    updated_at: Timestamp,
+    pub(crate) id: DietaryProfileId,
+    pub(crate) student: UserId,
+    pub(crate) tags: DietaryTags,
+    pub(crate) note: Option<DietaryNote>,
+    pub(crate) updated_by: UserId,
+    pub(crate) updated_at: Timestamp,
 }
 
 impl DietaryProfile {
@@ -124,67 +125,6 @@ impl DietaryProfile {
 
     pub fn get_updated_at(&self) -> Timestamp {
         self.updated_at
-    }
-
-    /// One student's profile, or `None` while the school never recorded one.
-    /// A single `SELECT` by record id — this is what a menu read joins on.
-    pub async fn read(student: &UserId, db: &Database) -> Result<Option<Self>, AppError> {
-        Ok(db.select(DietaryProfileId::of(student).record()).await?)
-    }
-
-    /// The tags a menu read matches its dishes against: the caller's, or an
-    /// empty list when they have no profile (every manager, every teacher).
-    pub async fn tags_of(student: &UserId, db: &Database) -> Result<Vec<String>, AppError> {
-        Ok(Self::read(student, db)
-            .await?
-            .map(|profile| profile.tags.as_slice().to_vec())
-            .unwrap_or_default())
-    }
-
-    /// Write the fields the PATCH carried. Creates the row on first write;
-    /// afterwards only the named fields move, because `student` is `READONLY`
-    /// and a whole-row save would also revert a concurrent edit of the other
-    /// field (see [`FieldUpdate`]).
-    pub async fn save(
-        student: &UserId,
-        tags: Option<DietaryTags>,
-        note: Option<Option<DietaryNote>>,
-        by: &UserId,
-        db: &Database,
-    ) -> Result<Self, AppError> {
-        if Self::read(student, db).await?.is_none() {
-            let profile = Self {
-                id: DietaryProfileId::of(student),
-                student: student.clone(),
-                tags: tags.clone().unwrap_or(DietaryTags(Vec::new())),
-                note: note.clone().flatten(),
-                updated_by: by.clone(),
-                updated_at: Timestamp::now(),
-            };
-            match db.create(profile.id.record()).content(profile).await {
-                Ok(Some(created)) => return Ok(created),
-                Ok(None) => {
-                    return Err(AppError::Internal("failed to save the profile".into()));
-                }
-                // A rival first `PATCH` created the row in the round trip since
-                // the read above (the `dietary_profile_student` UNIQUE index
-                // catches the same collision), and `CREATE` leaves that row
-                // untouched — so this call is a plain field write after all,
-                // exactly as it would have been a moment later. Propagated, it
-                // was a 500 on a legitimate request. Same shape as
-                // [`MealLedger::append`](crate::domain::meal_ledger), which
-                // reads the winner back rather than failing.
-                Err(err) if err.is_already_exists() => {}
-                Err(err) => return Err(err.into()),
-            }
-        }
-        FieldUpdate::new(DietaryProfileId::of(student).record())
-            .set("tags", tags)
-            .set("note", note)
-            .set("updated_by", Some(by.clone()))
-            .set("updated_at", Some(Timestamp::now()))
-            .run::<Self>(db)
-            .await
     }
 }
 

@@ -21,14 +21,17 @@ use crate::constant::{CAP_WRITE_TRIES, MAX_MEAL_BOOKING_ATTEMPTS};
 use crate::database::{Database, backoff};
 use crate::db::cap;
 use crate::db::meal_booking;
+use crate::db::meal_ledger;
+use crate::db::menu;
 use crate::domain::meal_booking::{
     MealBooking, MealBookingId, MealBookingStatus, MealCutoff, check_cutoff, check_day_not_past,
 };
 use crate::domain::meal_ledger::MealLedger;
-use crate::domain::menu::{Menu, MenuId};
+use crate::domain::menu::MenuId;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
+use crate::service::meal_ledger::{charge_booking, reverse_booking};
 
 /// Book (idempotently) `student` onto `menu` **and bill the seat**. Already
 /// booked is returned as-is, claiming nothing; a cancelled row is revived as
@@ -62,7 +65,7 @@ pub async fn book(
     let seats = menu.record();
     for attempt in 0..CAP_WRITE_TRIES {
         backoff(attempt).await;
-        let fresh = Menu::read(menu, db).await?.ok_or(AppError::NotFound)?;
+        let fresh = menu::read(db, menu).await?.ok_or(AppError::NotFound)?;
         check_day_not_past(fresh.get_date())?;
         check_cutoff(fresh.get_date(), fresh.get_slot(), cutoff)?;
         let existing: Option<MealBooking> = meal_booking::read(db, &id).await?;
@@ -80,7 +83,7 @@ pub async fn book(
             .clone()
             .filter(|row| row.status == MealBookingStatus::Booked)
         {
-            MealLedger::charge_booking(&held, booked_by, db).await?;
+            charge_booking(db, &held, booked_by).await?;
             // Answered off a re-read, never off the row read a round trip
             // ago: a cancel committing in that gap has freed the seat,
             // given the money back and left the row `cancelled`, and
@@ -117,7 +120,7 @@ pub async fn book(
         // Before the seat: an unchargeable menu (dishes summing past the
         // cap) must refuse the booking outright, never leave a
         // booked-but-unbilled row behind.
-        let price = MealLedger::price_snapshot(menu, db).await?;
+        let price = meal_ledger::price_snapshot(db, menu).await?;
         let fresh_row = MealBooking {
             id: id.clone(),
             menu: menu.clone(),
@@ -155,7 +158,7 @@ pub async fn book(
             // reason is re-read rather than guessed. A moved menu is not a
             // refusal: the price above is stale, so price and seat are
             // taken again together.
-            cap::Claimed::Full => match Menu::read(menu, db).await? {
+            cap::Claimed::Full => match menu::read(db, menu).await? {
                 None => return Err(AppError::NotFound),
                 Some(now) if now.get_version() != fresh.get_version() => continue,
                 Some(_) => return Err(AppError::Conflict("the menu is fully booked")),
@@ -228,10 +231,10 @@ pub async fn cancel(
         .await?
         .ok_or(AppError::NotFound)?;
     if fresh.status == MealBookingStatus::Cancelled {
-        MealLedger::reverse_booking(&fresh, recorded_by, db).await?;
+        reverse_booking(db, &fresh, recorded_by).await?;
         return Ok(fresh);
     }
-    let menu = Menu::read(&fresh.menu, db)
+    let menu = menu::read(db, &fresh.menu)
         .await?
         .ok_or(AppError::NotFound)?;
     check_cutoff(menu.get_date(), menu.get_slot(), cutoff)?;
@@ -251,7 +254,7 @@ pub async fn cancel(
             live
         }
     };
-    MealLedger::reverse_booking(&saved, recorded_by, db).await?;
+    reverse_booking(db, &saved, recorded_by).await?;
     Ok(saved)
 }
 
@@ -288,9 +291,10 @@ fn refundable_after_lost_flip(seen: &MealBooking, live: &MealBooking) -> Result<
 mod tests {
     use super::*;
     use crate::database::init_mem;
+    use crate::db::menu_dish;
     use crate::domain::meal_booking::MealBookingStatus;
     use crate::domain::meal_ledger::LedgerAmount;
-    use crate::domain::menu::{Menu, MenuDate, MenuSlot};
+    use crate::domain::menu::{MenuDate, MenuSlot};
     use crate::domain::menu_dish::{DishName, DishPrice, DishTags, MenuDish};
     use crate::domain::settings::MealSlotDef;
 
@@ -304,12 +308,12 @@ mod tests {
     async fn menu_on(date: &str, capacity: Option<i64>) -> (Database, MenuId) {
         let db = init_mem().await.unwrap();
         let slots = vec![MealSlotDef::try_new("lunch", None).unwrap()];
-        let menu = Menu::create(
+        let menu = menu::create(
+            &db,
             MenuDate::try_new(date).unwrap(),
             MenuSlot::try_new("lunch", &slots).unwrap(),
             capacity,
             &UserId::generate(),
-            &db,
         )
         .await
         .unwrap();
@@ -336,13 +340,13 @@ mod tests {
     }
 
     async fn add_dish(menu: &MenuId, price: i64, db: &Database) -> MenuDish {
-        MenuDish::create(
+        menu_dish::create(
+            db,
             menu,
             DishName::try_new("çorba").unwrap(),
             None,
             DishPrice::try_new(price).unwrap(),
             DishTags::try_new(&[], &[]).unwrap(),
-            db,
         )
         .await
         .unwrap()
@@ -391,15 +395,15 @@ mod tests {
         let booking = book(&db, &id, &ali, &ali, &MealCutoff::default())
             .await
             .unwrap();
-        let row = Menu::read(&id, &db).await.unwrap().unwrap();
+        let row = menu::read(&db, &id).await.unwrap().unwrap();
         assert!(matches!(
-            row.clone().delete(&db).await,
+            menu::delete(&db, row.clone()).await,
             Err(AppError::Conflict(_))
         ));
         cancel(&db, booking, &MealCutoff::default(), &ali)
             .await
             .unwrap();
-        assert!(row.delete(&db).await.is_ok());
+        assert!(menu::delete(&db, row).await.is_ok());
     }
 
     /// A booking placed after a price edit is billed the new price, and one
@@ -501,7 +505,7 @@ mod tests {
             Err(AppError::Conflict(_))
         ));
         assert_eq!(seats(&menu, &db).await, 0);
-        let (lines, total) = MealLedger::list_for_student(&ali, None, 0, &db)
+        let (lines, total) = meal_ledger::list_for_student(&db, &ali, None, 0)
             .await
             .unwrap();
         assert!(
@@ -535,8 +539,8 @@ mod tests {
         // ahead — the shape the create-side check cannot reach. A test cannot
         // age a menu (`date` is READONLY), so the seat is placed on an
         // already-past menu by the very transaction `book` places it with.
-        let fresh = Menu::read(&menu, &db).await.unwrap().unwrap();
-        let price = MealLedger::price_snapshot(&menu, &db).await.unwrap();
+        let fresh = menu::read(&db, &menu).await.unwrap().unwrap();
+        let price = meal_ledger::price_snapshot(&db, &menu).await.unwrap();
         let row = MealBooking {
             id: MealBookingId::composite(&menu, &ali),
             menu: menu.clone(),
@@ -575,7 +579,7 @@ mod tests {
             .expect("a cancel on a past day still frees the seat");
         assert_eq!(cancelled.get_status(), MealBookingStatus::Cancelled);
         assert_eq!(seats(&menu, &db).await, 0);
-        let (lines, _) = MealLedger::list_for_student(&ali, None, 0, &db)
+        let (lines, _) = meal_ledger::list_for_student(&db, &ali, None, 0)
             .await
             .unwrap();
         assert_eq!(lines.len(), 2, "the charge and its reversal");
