@@ -558,7 +558,7 @@ async fn delete_course(
     // refused while anyone is enrolled, so a start would have to pass its
     // enrollment gate and then have that enrollment removed under it — but the
     // hole is the same one and so is the lease.
-    let _guard = crate::web::exams::EXAM_LOCK.write().await;
+    let _guard = crate::service::exam_attempt::EXAM_LOCK.write().await;
     // And the homework half of the same cascade, for
     // [`crate::web::homework::delete_homework`]'s reason: it sweeps the
     // course's homework with its submissions, files and results, and grading

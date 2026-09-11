@@ -8,12 +8,11 @@ use crate::constant::{
     MIN_QUESTION_CHOICES, SUBJECT_QUESTION_COUNT_FIELD,
 };
 use crate::database::Database;
-use crate::domain::bank_question::BankQuestionId;
 use crate::db::cap;
-use crate::domain::exam::ExamId;
-use crate::domain::exam_attempt::ExamAttempt;
-use crate::domain::monotonic_id::next_ulid;
 use crate::db::page::PagedList;
+use crate::domain::bank_question::BankQuestionId;
+use crate::domain::exam::ExamId;
+use crate::domain::monotonic_id::next_ulid;
 use crate::domain::subject::SubjectId;
 use crate::error::{AppError, ValidationError};
 use crate::validate::{validate_question_kind, validate_question_points, validate_required};
@@ -444,7 +443,8 @@ impl ExamQuestion {
         let id = question.id.record();
         // One counter write in flight at a time, like every other counter write.
         let _guard = cap::counter_lock().await;
-        let mut result = ExamAttempt::write_unfrozen_with(
+        let mut result = crate::db::exam_attempt::write_unfrozen_with(
+            db,
             exam,
             &format!(
                 "LET $seat = (UPDATE $subject SET {SUBJECT_QUESTION_COUNT_FIELD} = \
@@ -458,7 +458,6 @@ impl ExamQuestion {
                 ("question".into(), question.into_value()),
             ],
             vec![(SUBJECT_MARK, dead_subject())],
-            db,
         )
         .await?;
         // Counted off the statements that actually ran rather than a fixed
@@ -640,9 +639,14 @@ impl ExamQuestion {
             Some(_) => Some(cap::counter_lock().await),
             None => None,
         };
-        let mut result =
-            ExamAttempt::write_unfrozen_with(&self.exam, &statements, bindings, refusals, db)
-                .await?;
+        let mut result = crate::db::exam_attempt::write_unfrozen_with(
+            db,
+            &self.exam,
+            &statements,
+            bindings,
+            refusals,
+        )
+        .await?;
         // Read off the trailing `RETURN` rather than a fixed slot: a re-tag
         // arms three more statements than a plain PATCH does (and an `IF`
         // block is one slot whether or not it is taken).
@@ -694,7 +698,8 @@ impl ExamQuestion {
     /// delete — and the cascade now shares that transaction too, so a failure
     /// mid-way can no longer strand answers whose question survived.
     pub async fn delete(self, db: &Database) -> Result<ExamQuestion, AppError> {
-        let mut result = ExamAttempt::write_unfrozen(
+        let mut result = crate::db::exam_attempt::write_unfrozen(
+            db,
             &self.exam,
             &format!(
                 "DELETE exam_answer WHERE question = $q;
@@ -707,7 +712,6 @@ impl ExamQuestion {
                  RETURN $gone;"
             ),
             vec![("q".into(), self.id.record().into_value())],
-            db,
         )
         .await?;
         // The subject's reference is given back inside this same transaction,
@@ -1197,7 +1201,7 @@ mod tests {
             )
             .await
             .unwrap();
-            ExamAttempt::start(&exam, student.get_id(), &db)
+            crate::service::exam_attempt::start(&db, &exam, student.get_id())
                 .await
                 .unwrap();
 
