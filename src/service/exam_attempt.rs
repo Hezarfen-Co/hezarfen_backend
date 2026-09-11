@@ -40,7 +40,7 @@ use crate::error::AppError;
 /// subject delete's cascade — the only writer outside attempt starts, paired
 /// with the question writes' subject check — is now a conditional statement on
 /// the subject's own reference counter
-/// ([`crate::domain::subject::Subject::delete`]), which every question create,
+/// ([`crate::db::subject::delete`]), which every question create,
 /// re-tag and delete moves.
 // corner-cut: global RwLock, shard per-exam if save latency ever matters.
 pub(crate) static EXAM_LOCK: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
@@ -522,11 +522,11 @@ mod tests {
         .unwrap();
         // A real subject row, not a minted id: a question claims a reference on
         // its subject and is refused if that subject does not exist.
-        let subject = crate::domain::subject::Subject::create(
+        let subject = crate::db::subject::create(
+            db,
             &crate::db::course::a_test_course(db).await,
             crate::domain::subject::SubjectName::try_new("topic").unwrap(),
             crate::domain::subject::SubjectDescription::try_new("").unwrap(),
-            db,
         )
         .await
         .unwrap();

@@ -177,7 +177,7 @@ pub async fn any_for_exam(db: &Database, exam: &ExamId) -> Result<bool, AppError
 /// An orphan here is not merely untidy: an `exam_question` that outlives
 /// its exam keeps the reference it claimed on its subject (the cascade's
 /// per-subject decrement counted the rows it could see), and
-/// [`crate::domain::subject::Subject::delete`] is gated on that count
+/// [`crate::db::subject::delete`] is gated on that count
 /// reading zero — a subject nobody can ever delete again.
 ///
 /// The bump is restored *by captured value*, `NONE` included, so the row is
@@ -341,11 +341,11 @@ mod tests {
         .unwrap();
         // A real subject row, not a minted id: a question claims a reference on
         // its subject and is refused if that subject does not exist.
-        let subject = crate::domain::subject::Subject::create(
+        let subject = crate::db::subject::create(
+            db,
             &crate::db::course::a_test_course(db).await,
             crate::domain::subject::SubjectName::try_new("topic").unwrap(),
             crate::domain::subject::SubjectDescription::try_new("").unwrap(),
-            db,
         )
         .await
         .unwrap();

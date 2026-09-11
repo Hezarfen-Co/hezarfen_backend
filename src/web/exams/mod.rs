@@ -36,7 +36,6 @@ use crate::state::AppState;
 
 use super::bank_questions::BankQuestionResponse;
 use super::courses::{can_manage_course, can_view_course, visible_courses};
-use super::subjects::subject_in_course;
 use super::{
     ChoiceBody, CurrentUser, ExamResponse, ImageUpload, Page, PageParams, PersonRef,
     RequireTeacher, Scheduled, UploadFileForm, WindowParams, blob_path, check_not_past, paginate,

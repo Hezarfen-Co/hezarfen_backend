@@ -8,9 +8,10 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::database::Database;
-use crate::domain::course::{Course, CourseId};
+use crate::domain::course::Course;
 use crate::domain::subject::{Subject, SubjectDescription, SubjectId, SubjectName};
-use crate::error::{AppError, ErrorResponse, ValidationError};
+use crate::error::{AppError, ErrorResponse};
+use crate::service::subject;
 use crate::state::AppState;
 
 use super::courses::{can_manage_course, can_view_course};
@@ -28,50 +29,10 @@ struct UpdateSubject {
     description: Option<String>,
 }
 
-/// Turn a request-supplied subject id into a validated reference, provided the
-/// subject belongs to `course` — a question may only be tagged with a subject
-/// of its own exam's course. Unknown or foreign subjects are a `400` naming
-/// the field. Shared by the question create/update handlers.
-pub(crate) async fn subject_in_course(
-    id: &str,
-    course: &CourseId,
-    db: &Database,
-) -> Result<SubjectId, AppError> {
-    let subject =
-        Subject::read(&SubjectId::from_key(id), db)
-            .await?
-            .ok_or(AppError::Validation(ValidationError::Invalid {
-                field: "subject_id",
-                reason: "subject does not exist",
-            }))?;
-    if subject.get_course() != course {
-        return Err(AppError::Validation(ValidationError::Invalid {
-            field: "subject_id",
-            reason: "subject belongs to a different course",
-        }));
-    }
-    Ok(subject.get_id().clone())
-}
-
-/// Turn a request-supplied subject id into a validated reference, checking only
-/// that the subject exists — no course tie. For the question bank, whose subject
-/// is cross-course origin metadata: the same-course rule applies at instantiate
-/// time, not here. An unknown subject is a `400` naming the field.
-pub(crate) async fn subject_must_exist(id: &str, db: &Database) -> Result<SubjectId, AppError> {
-    let subject =
-        Subject::read(&SubjectId::from_key(id), db)
-            .await?
-            .ok_or(AppError::Validation(ValidationError::Invalid {
-                field: "subject_id",
-                reason: "subject does not exist",
-            }))?;
-    Ok(subject.get_id().clone())
-}
-
 /// The subject plus its course, or a 404 — every handler here gates on the
 /// parent course, so they always travel together.
 async fn subject_with_course(id: &str, db: &Database) -> Result<(Subject, Course), AppError> {
-    let subject = Subject::read(&SubjectId::from_key(id), db)
+    let subject = subject::read(db, &SubjectId::from_key(id))
         .await?
         .ok_or(AppError::NotFound)?;
     let course = crate::service::course::read(db, subject.get_course())
@@ -154,7 +115,7 @@ async fn update_subject(
         .map(SubjectDescription::try_new)
         .transpose()?;
 
-    let updated = subject.update(name, description, &st.db).await?;
+    let updated = subject::update(&st.db, subject, name, description).await?;
     Ok(Json(SubjectResponse::new(&updated)))
 }
 
@@ -199,6 +160,6 @@ async fn delete_subject(
     // three process-wide locks (the only site that held more than one) around
     // two cross-table counts, which were stale by the time the delete landed and
     // let a concurrent request create a question on a subject being deleted.
-    subject.delete(&st.db).await?;
+    subject::delete(&st.db, subject).await?;
     Ok(StatusCode::NO_CONTENT)
 }
