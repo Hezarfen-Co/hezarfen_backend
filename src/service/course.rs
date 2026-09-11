@@ -164,7 +164,7 @@ pub struct DeleteOutcome {
 /// blob.
 pub async fn delete(db: &Database, course: &Course) -> Result<DeleteOutcome, AppError> {
     require_open(db, course).await?;
-    let _guard = crate::web::exams::EXAM_LOCK.write().await;
+    let _guard = crate::service::exam_attempt::EXAM_LOCK.write().await;
     let _homework_guard = crate::web::homework::HOMEWORK_LOCK.write().await;
     let image_files = QuestionImage::file_keys_for_course(course.get_id(), db).await?;
     let answer_image_files = AnswerImage::file_keys_for_course(course.get_id(), db).await?;

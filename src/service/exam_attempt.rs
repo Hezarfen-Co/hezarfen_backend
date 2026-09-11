@@ -143,7 +143,7 @@ pub async fn writable_attempt(
 /// The course an exam belongs to. A dangling reference means the course-delete
 /// cascade was violated — surface it loudly as a 500, not a user-facing 404.
 pub async fn course_of(exam: &Exam, db: &Database) -> Result<Course, AppError> {
-    crate::domain::course::Course::read(exam.get_course(), db)
+    crate::db::course::read(db, exam.get_course())
         .await?
         .ok_or_else(|| AppError::Internal("exam references a missing course".into()))
 }
@@ -305,7 +305,7 @@ pub async fn start_attempt(
     ensure_sittable(&exam)?;
     ensure_student(user)?;
     ensure_enrolled(&exam, user.get_id(), db).await?;
-    course_of(&exam, db).await?.require_open(db).await?;
+    crate::service::course::require_open(db, &course_of(&exam, db).await?).await?;
     let now = Timestamp::now();
     if let Some(starts_at) = exam.get_starts_at()
         && now < starts_at
@@ -345,7 +345,7 @@ pub async fn finish_attempt(
     {
         return Err(AppError::Conflict("time is up — the attempt has expired"));
     }
-    course_of(exam, db).await?.require_open(db).await?;
+    crate::service::course::require_open(db, &course_of(exam, db).await?).await?;
     crate::db::exam_attempt::finish(db, attempt).await
 }
 
@@ -399,7 +399,7 @@ pub async fn save_answer_in(
     ensure_student_now(attempt.get_user(), db).await?;
     ensure_enrolled(exam, attempt.get_user(), db).await?;
     check_rejoin(exam, attempt)?;
-    course_of(exam, db).await?.require_open(db).await?;
+    crate::service::course::require_open(db, &course_of(exam, db).await?).await?;
     let question = question_of_exam(exam.get_id(), question_id, db).await?;
     crate::domain::exam_answer::ExamAnswer::save(
         &question,
@@ -503,7 +503,7 @@ mod tests {
     /// rows to exercise the attempt lifecycle without the HTTP layer.
     async fn open_exam_with_question(db: &Database, max_attempts: i64) -> (Exam, ExamQuestion) {
         let creator = UserId::from_key("01TESTTEACHERAAAAAAAAAAAAA");
-        let course = crate::domain::course::a_test_course(db).await;
+        let course = crate::db::course::a_test_course(db).await;
         let kinds = Settings::defaults().get_exam_kinds().to_vec();
         let exam = Exam::create(
             &creator,
@@ -540,7 +540,7 @@ mod tests {
         // A real subject row, not a minted id: a question claims a reference on
         // its subject and is refused if that subject does not exist.
         let subject = crate::domain::subject::Subject::create(
-            &crate::domain::course::a_test_course(db).await,
+            &crate::db::course::a_test_course(db).await,
             crate::domain::subject::SubjectName::try_new("topic").unwrap(),
             crate::domain::subject::SubjectDescription::try_new("").unwrap(),
             db,
