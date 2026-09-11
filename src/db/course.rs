@@ -262,7 +262,7 @@ pub async fn unassign_everywhere(db: &Database, user: &UserId) -> Result<(), App
 /// spanning every course — so their `source_exam` and `subject` links are
 /// cleared instead, in this same transaction, exactly as
 /// [`crate::db::exam::delete`] and
-/// [`crate::domain::subject::Subject::delete`] clear them one level down.
+/// [`crate::db::subject::delete`] clear them one level down.
 /// Deleting a course must leave the bank where deleting each of its exams
 /// and subjects by hand would have left it, or a template is left pointing
 /// at a dead exam (permanently: nothing else ever visits that column) and
@@ -561,14 +561,15 @@ mod tests {
     async fn a_term_is_deletable_only_once_no_course_links_it() {
         let db = crate::database::init_mem().await.unwrap();
         let at = crate::domain::timestamp::Timestamp::from_millis;
-        let term = Term::create(TermName::try_new("2026").unwrap(), at(100), at(200), &db)
-            .await
-            .unwrap();
+        let term =
+            crate::db::term::create(&db, TermName::try_new("2026").unwrap(), at(100), at(200))
+                .await
+                .unwrap();
 
         let linked = course_on(Some(term.get_id().clone()), &db).await;
         let patched = course_on(Some(term.get_id().clone()), &db).await;
         assert!(
-            !term.clone().delete(&db).await.unwrap(),
+            !crate::db::term::delete(&db, term.clone()).await.unwrap(),
             "two linked courses must refuse the delete"
         );
 
@@ -576,16 +577,16 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !term.clone().delete(&db).await.unwrap(),
+            !crate::db::term::delete(&db, term.clone()).await.unwrap(),
             "one link is still one link"
         );
 
         assert!(delete(&db, linked).await.unwrap());
         assert!(
-            term.clone().delete(&db).await.unwrap(),
+            crate::db::term::delete(&db, term.clone()).await.unwrap(),
             "the last link gone, the term may go"
         );
-        let again = term.delete(&db).await;
+        let again = crate::db::term::delete(&db, term).await;
         assert!(
             matches!(again, Err(AppError::NotFound)),
             "a second delete is a 404, not a refusal: {again:?}"
@@ -639,7 +640,7 @@ mod tests {
 
     async fn a_term(name: &str, db: &Database) -> Term {
         let at = crate::domain::timestamp::Timestamp::from_millis;
-        Term::create(TermName::try_new(name).unwrap(), at(100), at(200), db)
+        crate::db::term::create(db, TermName::try_new(name).unwrap(), at(100), at(200))
             .await
             .unwrap()
     }
@@ -654,7 +655,7 @@ mod tests {
         let db = crate::database::init_mem().await.unwrap();
         let term = a_term("2026", &db).await;
         let id = term.get_id().clone();
-        assert!(term.delete(&db).await.unwrap());
+        assert!(crate::db::term::delete(&db, term).await.unwrap());
 
         let error = create(
             &db,
@@ -708,8 +709,8 @@ mod tests {
             "the old term is free"
         );
         assert_eq!(count_on(to.get_id(), &db).await, 1, "the new one is not");
-        assert!(from.clone().delete(&db).await.unwrap());
-        assert!(!to.clone().delete(&db).await.unwrap());
+        assert!(crate::db::term::delete(&db, from.clone()).await.unwrap());
+        assert!(!crate::db::term::delete(&db, to.clone()).await.unwrap());
     }
 
     /// The double-claim guard. Both movers compute their claim and release from
@@ -887,7 +888,7 @@ mod tests {
         let from = a_term("2026", &db).await;
         let dead = a_term("2027", &db).await;
         let dead_id = dead.get_id().clone();
-        assert!(dead.delete(&db).await.unwrap());
+        assert!(crate::db::term::delete(&db, dead).await.unwrap());
         let course = course_on(Some(from.get_id().clone()), &db).await;
 
         let error = update(

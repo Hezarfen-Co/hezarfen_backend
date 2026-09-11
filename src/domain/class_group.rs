@@ -19,11 +19,12 @@ use crate::constant::{
 use crate::database::{Database, transaction_with_retry};
 use crate::db::cap;
 use crate::db::field_update::FieldUpdate;
-use crate::domain::monotonic_id::next_ulid;
 use crate::db::page::PagedList;
-use crate::domain::term::{self, TermId};
+use crate::domain::monotonic_id::next_ulid;
+use crate::domain::term::{TermId, gone_error, ref_move};
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
+use crate::service::term;
 use crate::validate::{validate_optional, validate_required};
 
 /// The `THROW` marker the delete guard aborts with — a class that still holds
@@ -131,7 +132,7 @@ impl ClassGroup {
     pub async fn require_open(&self, db: &Database) -> Result<(), AppError> {
         match self.get_term() {
             None => Ok(()),
-            Some(term) => term::Term::require_open(term, db).await,
+            Some(term) => term::require_open(db, term).await,
         }
     }
 
@@ -184,7 +185,7 @@ impl ClassGroup {
             cap::Claimed::Made(created) => Ok(created),
             // Uncapped, so "full" can only mean the conditional write matched no
             // term row at all — the claim doubles as the existence check.
-            cap::Claimed::Full => Err(term::gone_error()),
+            cap::Claimed::Full => Err(gone_error()),
             // Unreachable: the id is a ULID this call just generated.
             cap::Claimed::Duplicate => Err(AppError::Internal("failed to create class".into())),
         }
@@ -240,7 +241,7 @@ impl ClassGroup {
         teacher: Option<Option<UserId>>,
         db: &Database,
     ) -> Result<ClassGroup, AppError> {
-        let (claim, release) = term::ref_move(self.term.as_ref(), &term);
+        let (claim, release) = ref_move(self.term.as_ref(), &term);
         let expected = self.term.as_ref().map(TermId::record);
         FieldUpdate::new(self.id.record())
             .set("name", name)
@@ -258,7 +259,7 @@ impl ClassGroup {
                 expected,
                 claim,
                 release,
-                term::gone_error(),
+                gone_error(),
             )
             .run::<ClassGroup>(db)
             .await
@@ -409,7 +410,7 @@ mod tests {
 
     async fn a_term(db: &Database) -> Term {
         let at = crate::domain::timestamp::Timestamp::from_millis;
-        Term::create(TermName::try_new("2026").unwrap(), at(100), at(200), db)
+        crate::db::term::create(db, TermName::try_new("2026").unwrap(), at(100), at(200))
             .await
             .unwrap()
     }
@@ -570,7 +571,7 @@ mod tests {
             "the courses' counter is seeded from course rows and must stay untouched"
         );
         assert!(
-            !term.clone().delete(&db).await.unwrap(),
+            !crate::db::term::delete(&db, term.clone()).await.unwrap(),
             "two linked classes must refuse the delete"
         );
 
@@ -579,13 +580,13 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !term.clone().delete(&db).await.unwrap(),
+            !crate::db::term::delete(&db, term.clone()).await.unwrap(),
             "one link is still one link"
         );
 
         assert!(linked.delete(&db).await.unwrap());
         assert!(
-            term.clone().delete(&db).await.unwrap(),
+            crate::db::term::delete(&db, term.clone()).await.unwrap(),
             "the last link gone, the term may go"
         );
     }
@@ -651,7 +652,7 @@ mod tests {
         let db = crate::database::init_mem().await.unwrap();
         let term = a_term(&db).await;
         let id = term.get_id().clone();
-        assert!(term.delete(&db).await.unwrap());
+        assert!(crate::db::term::delete(&db, term).await.unwrap());
 
         let error = ClassGroup::create(
             &UserId::from_key("manager"),
@@ -686,14 +687,15 @@ mod tests {
         let db = crate::database::init_mem().await.unwrap();
         let at = crate::domain::timestamp::Timestamp::from_millis;
         let from = a_term(&db).await;
-        let to = Term::create(TermName::try_new("2027").unwrap(), at(100), at(200), &db)
+        let to = crate::db::term::create(&db, TermName::try_new("2027").unwrap(), at(100), at(200))
             .await
             .unwrap();
-        let dead = Term::create(TermName::try_new("2028").unwrap(), at(100), at(200), &db)
-            .await
-            .unwrap();
+        let dead =
+            crate::db::term::create(&db, TermName::try_new("2028").unwrap(), at(100), at(200))
+                .await
+                .unwrap();
         let dead_id = dead.get_id().clone();
-        assert!(dead.delete(&db).await.unwrap());
+        assert!(crate::db::term::delete(&db, dead).await.unwrap());
         let class = class_on(Some(from.get_id().clone()), &db).await;
 
         let error = class
@@ -747,12 +749,13 @@ mod tests {
         let db = crate::database::init_mem().await.unwrap();
         let at = crate::domain::timestamp::Timestamp::from_millis;
         let from = a_term(&db).await;
-        let to = Term::create(TermName::try_new("2027").unwrap(), at(100), at(200), &db)
+        let to = crate::db::term::create(&db, TermName::try_new("2027").unwrap(), at(100), at(200))
             .await
             .unwrap();
-        let other = Term::create(TermName::try_new("2028").unwrap(), at(100), at(200), &db)
-            .await
-            .unwrap();
+        let other =
+            crate::db::term::create(&db, TermName::try_new("2028").unwrap(), at(100), at(200))
+                .await
+                .unwrap();
         let class = class_on(Some(from.get_id().clone()), &db).await;
         let stale = class.clone();
         class

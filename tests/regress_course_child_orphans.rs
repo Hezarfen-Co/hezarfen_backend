@@ -12,7 +12,7 @@
 //!   lists it to every manager+ — undeletable,
 //! - an orphan `course_session` 404s forever through `session_with_course`,
 //! - an orphan `subject` 404s through `subject_with_course`, but
-//!   `subject_must_exist` still accepts its id, so a bank template can be
+//!   `must_exist` still accepts its id, so a bank template can be
 //!   tagged with a subject nobody can reach.
 //!
 //! All three creates now go through `cap::touch_and_create`, which *moves* the
@@ -33,7 +33,7 @@
 //! per child beside the create it pins —
 //! `db::exam::tests::an_exam_never_outlives_its_course`,
 //! `db::course_session::tests::a_session_never_outlives_its_course`,
-//! `domain::subject::tests::a_subject_never_outlives_its_course` — over the
+//! `db::subject::tests::a_subject_never_outlives_its_course` — over the
 //! shared harness `db::course::assert_no_child_outlives_a_course_delete`.
 //! It is `#[ignore]`d and needs a real server, because the subject there *is*
 //! the store's conflict detection, which the embedded engine does not have: it
@@ -58,7 +58,7 @@ use hezarfen_backend::domain::exam::{
     ExamAttemptLimit, ExamDescription, ExamKind, ExamSchedule, ExamTitle,
 };
 use hezarfen_backend::domain::settings::Settings;
-use hezarfen_backend::domain::subject::{Subject, SubjectDescription, SubjectName};
+use hezarfen_backend::domain::subject::{SubjectDescription, SubjectName};
 use hezarfen_backend::domain::timestamp::Timestamp;
 use hezarfen_backend::domain::user::UserId;
 use hezarfen_backend::error::AppError;
@@ -138,11 +138,11 @@ fn make_session(course: CourseId, db: Database) -> JoinHandle<Result<(), AppErro
 
 fn make_subject(course: CourseId, db: Database) -> JoinHandle<Result<(), AppError>> {
     tokio::spawn(async move {
-        Subject::create(
+        hezarfen_backend::db::subject::create(
+            &db,
             &course,
             SubjectName::try_new("Limits").unwrap(),
             SubjectDescription::try_new("").unwrap(),
-            &db,
         )
         .await
         .map(|_| ())

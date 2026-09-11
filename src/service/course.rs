@@ -12,9 +12,10 @@ use crate::domain::course_note_file::CourseNoteFile;
 use crate::domain::homework_file::HomeworkFile;
 use crate::domain::question_image::QuestionImage;
 use crate::domain::role::Role;
-use crate::domain::term::{self, TermId};
+use crate::domain::term::TermId;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
+use crate::service::term;
 
 /// Refuse the write when this course's term is archived — a pre-flight guard,
 /// accepted race (see README concurrency model): a term archived after this
@@ -22,7 +23,7 @@ use crate::error::{AppError, ValidationError};
 pub async fn require_open(db: &Database, course: &Course) -> Result<(), AppError> {
     match course.get_term() {
         None => Ok(()),
-        Some(term) => term::Term::require_open(term, db).await,
+        Some(term) => term::require_open(db, term).await,
     }
 }
 

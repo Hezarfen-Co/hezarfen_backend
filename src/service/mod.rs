@@ -15,4 +15,6 @@ pub mod note;
 pub mod payment_ledger;
 pub mod session;
 pub mod settings;
+pub mod subject;
+pub mod term;
 pub mod user;

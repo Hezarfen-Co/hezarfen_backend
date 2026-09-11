@@ -8,12 +8,9 @@
 
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
-use crate::constant::{COURSE_COUNT_FIELD, MAX_TERM_NAME_LEN, TERM_CLASS_COUNT_FIELD, TERM_TABLE};
-use crate::database::{Database, write_with_retry};
-use crate::db::field_update::FieldUpdate;
+use crate::constant::{MAX_TERM_NAME_LEN, TERM_TABLE};
 use crate::domain::monotonic_id::next_ulid;
-use crate::db::page::PagedList;
-use crate::domain::timestamp::{Timestamp, range_error};
+use crate::domain::timestamp::Timestamp;
 use crate::error::{AppError, ValidationError};
 use crate::validate::validate_required;
 
@@ -47,8 +44,8 @@ impl TermId {
 
 /// The answer every link to a term that is not there gets — the claim is a
 /// conditional write on the term row, so a term a delete already removed
-/// matches nothing and the caller says exactly what `web::terms::resolve_term`'s
-/// pre-flight lookup would have.
+/// matches nothing and the caller says exactly what the link resolver's
+/// pre-flight lookup ([`crate::service::term::resolve`]) would have.
 pub fn gone_error() -> AppError {
     AppError::Validation(ValidationError::Invalid {
         field: "term_id",
@@ -101,15 +98,15 @@ impl TermName {
 /// term is a date range by definition.
 #[derive(Debug, Clone, SurrealValue)]
 pub struct Term {
-    id: TermId,
-    name: TermName,
-    starts_at: Timestamp,
-    ends_at: Timestamp,
+    pub(crate) id: TermId,
+    pub(crate) name: TermName,
+    pub(crate) starts_at: Timestamp,
+    pub(crate) ends_at: Timestamp,
     /// When a manager archived this term; `None` = open. `#[surreal(default)]`
     /// for the same reason `BankQuestion::subject` has one: rows written before
     /// the column existed still decode, as open terms.
     #[surreal(default)]
-    archived_at: Option<Timestamp>,
+    pub(crate) archived_at: Option<Timestamp>,
 }
 
 impl Term {
@@ -136,222 +133,11 @@ impl Term {
     pub fn is_archived(&self) -> bool {
         self.archived_at.is_some()
     }
-
-    pub async fn create(
-        name: TermName,
-        starts_at: Timestamp,
-        ends_at: Timestamp,
-        db: &Database,
-    ) -> Result<Term, AppError> {
-        let term = Term {
-            id: TermId::generate(),
-            name,
-            starts_at,
-            ends_at,
-            archived_at: None,
-        };
-        let created: Option<Term> = db.create(term.id.record()).content(term).await?;
-        created.ok_or_else(|| AppError::Internal("failed to create term".into()))
-    }
-
-    pub async fn read(id: &TermId, db: &Database) -> Result<Option<Term>, AppError> {
-        Ok(db.select(id.record()).await?)
-    }
-
-    /// Every term, newest first — the school calendar is small by nature.
-    pub async fn list_all(
-        limit: Option<i64>,
-        offset: i64,
-        db: &Database,
-    ) -> Result<(Vec<Term>, i64), AppError> {
-        PagedList::new("term", "ORDER BY starts_at DESC, id DESC")
-            .run(limit, offset, db)
-            .await
-    }
-
-    /// Write only the fields the PATCH carried — `None` means the request
-    /// omitted it, so the column is left alone rather than re-stated from the
-    /// snapshot this struct was read into. All three columns are non-nullable,
-    /// so "absent" and "null" both correctly mean "keep".
-    pub async fn update(
-        self,
-        name: Option<TermName>,
-        starts_at: Option<Timestamp>,
-        ends_at: Option<Timestamp>,
-        db: &Database,
-    ) -> Result<Term, AppError> {
-        FieldUpdate::new(self.id.record())
-            .set("name", name)
-            .set("starts_at", starts_at)
-            .set("ends_at", ends_at)
-            .ordered("starts_at", "ends_at", range_error())
-            .run::<Term>(db)
-            .await
-    }
-
-    /// Delete the term, but only while no course *and no class* links it —
-    /// nothing here unlinks or cascades. `false` = refused, nothing was written.
-    ///
-    /// The roster of linking courses is the term's own `course_count`
-    /// refcount, claimed by [`crate::db::course::create`] and
-    /// `update` *before* they write a link, so the check and the delete are one
-    /// conditional write on one record: a course write racing this either
-    /// claims first (and the delete is refused) or finds the row gone (and is
-    /// refused itself, with the same 400 the lookup gives). `Err(NotFound)`
-    /// keeps the answer a concurrent *delete* used to get.
-    ///
-    /// Classes ([`crate::domain::class_group::ClassGroup`]) link a term the same
-    /// way and count on `class_count` — a column of their own, because
-    /// `course_count` is seeded at boot from the course rows alone.
-    pub async fn delete(self, db: &Database) -> Result<bool, AppError> {
-        let sql = format!(
-            "DELETE $term WHERE ({COURSE_COUNT_FIELD} ?? 0) = 0 \
-             AND ({TERM_CLASS_COUNT_FIELD} ?? 0) = 0 RETURN BEFORE"
-        );
-        // Through the retry, because the guard reads the very column a course
-        // create claims: a lost round writes nothing, and re-sending it is what
-        // keeps the answer the 404 or 409 it owes instead of a 500.
-        let gone: Vec<Term> =
-            write_with_retry(db, &sql, &[("term".into(), self.id.record().into_value())]).await?;
-        if !gone.is_empty() {
-            return Ok(true);
-        }
-        // Still linked or already gone: the one statement cannot tell those
-        // apart, and only the refusal path pays for the read that can.
-        match Self::read(&self.id, db).await? {
-            Some(_) => Ok(false),
-            None => Err(AppError::NotFound),
-        }
-    }
-
-    /// Freeze the term. Idempotent by construction: the `WHERE` only matches an
-    /// open row, so a repeat archive writes nothing and answers with the
-    /// *original* stamp — the year is not re-dated by a double click.
-    pub async fn archive(self, db: &Database) -> Result<Term, AppError> {
-        self.stamp(
-            "UPDATE $term SET archived_at = $now WHERE archived_at = NONE RETURN AFTER",
-            Some(Timestamp::now()),
-            db,
-        )
-        .await
-    }
-
-    /// Re-open the term; idempotent the same way.
-    pub async fn unarchive(self, db: &Database) -> Result<Term, AppError> {
-        self.stamp(
-            "UPDATE $term SET archived_at = NONE WHERE archived_at != NONE RETURN AFTER",
-            None,
-            db,
-        )
-        .await
-    }
-
-    /// One conditional write, through [`write_with_retry`] like every other
-    /// guarded single statement here; an empty result is the no-op case, and
-    /// only that path pays for the read that reports the stored row.
-    async fn stamp(
-        self,
-        sql: &str,
-        now: Option<Timestamp>,
-        db: &Database,
-    ) -> Result<Term, AppError> {
-        let mut bindings = vec![("term".into(), self.id.record().into_value())];
-        if let Some(now) = now {
-            bindings.push(("now".into(), now.as_millis().into_value()));
-        }
-        let written: Vec<Term> = write_with_retry(db, sql, &bindings).await?;
-        if let Some(term) = written.into_iter().next() {
-            return Ok(term);
-        }
-        Self::read(&self.id, db).await?.ok_or(AppError::NotFound)
-    }
-
-    /// Refuse when the named term is archived. A missing row is `Ok(())`: a
-    /// dangling link is not this guard's error, and the caller that cares
-    /// already answers it (see [`gone_error`]).
-    pub async fn require_open(id: &TermId, db: &Database) -> Result<(), AppError> {
-        match Self::read(id, db).await? {
-            Some(term) if term.is_archived() => Err(archived_error()),
-            _ => Ok(()),
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The bite test for the `WHERE` guard that replaced `TERM_LOCK` on the
-    /// PATCH path: the handler's pre-flight check is not in play here, so only
-    /// the guard can refuse a moved end that inverts the range — and it must
-    /// refuse it with the same error, having written nothing.
-    #[tokio::test]
-    async fn a_moved_end_is_refused_against_the_stored_other_end() {
-        let db = crate::database::init_mem().await.unwrap();
-        let at = Timestamp::from_millis;
-        let term = Term::create(TermName::try_new("2026").unwrap(), at(100), at(200), &db)
-            .await
-            .unwrap();
-
-        let refused = term
-            .clone()
-            .update(None, None, Some(at(50)), &db)
-            .await
-            .expect_err("an end before the stored start must be refused");
-        assert!(refused.to_string().contains("at or after starts_at"));
-        let stored = Term::read(term.get_id(), &db).await.unwrap().unwrap();
-        assert_eq!(
-            stored.get_ends_at(),
-            at(200),
-            "nothing may have been written"
-        );
-
-        // A move that keeps the range ordered still lands, guard and all.
-        let moved = term.update(None, None, Some(at(300)), &db).await.unwrap();
-        assert_eq!(moved.get_ends_at(), at(300));
-    }
-
-    /// Terms are listed newest-first *and* paged by offset, so the sort has to
-    /// be a total order: `starts_at` alone leaves rows that share an instant in
-    /// an arbitrary order, and offset paging over an unstable order can hand
-    /// the same row out twice while skipping another. Pins the `id DESC`
-    /// tie-break on identical `starts_at` — stored read-back, then page by page.
-    #[tokio::test]
-    async fn identical_starts_at_still_pages_each_term_exactly_once() {
-        let db = crate::database::init_mem().await.unwrap();
-        let at = Timestamp::from_millis;
-        let mut minted = Vec::new();
-        for i in 0..12 {
-            let term = Term::create(
-                TermName::try_new(&format!("t{i}")).unwrap(),
-                at(100),
-                at(200),
-                &db,
-            )
-            .await
-            .unwrap();
-            minted.push(term.get_id().key().to_string());
-        }
-        // Newest first: the tie-break runs the same way as the primary column.
-        minted.reverse();
-
-        let (listed, total) = Term::list_all(None, 0, &db).await.unwrap();
-        assert_eq!(total, 12);
-        let read_back: Vec<String> = listed
-            .iter()
-            .map(|row| row.get_id().key().to_string())
-            .collect();
-        assert_eq!(read_back, minted);
-
-        // The assertion that catches skip/duplicate: walk it in pages of 5.
-        let mut paged = Vec::new();
-        for offset in [0, 5, 10] {
-            let (page, total) = Term::list_all(Some(5), offset, &db).await.unwrap();
-            assert_eq!(total, 12);
-            paged.extend(page.iter().map(|row| row.get_id().key().to_string()));
-        }
-        assert_eq!(paged, minted, "every term exactly once, in list order");
-    }
 
     #[tokio::test]
     async fn name_is_required_and_bounded() {
@@ -359,136 +145,5 @@ mod tests {
         assert!(TermName::try_new("").is_err());
         assert!(TermName::try_new("   ").is_err());
         assert!(TermName::try_new(&"x".repeat(101)).is_err());
-    }
-
-    /// GUARD, not a retry measurement — read the last paragraph before
-    /// trusting this test with the retry. See
-    /// [`crate::db::course::delete`]'s race test for why the rate is
-    /// counted rather than asserted per round.
-    ///
-    /// One conditional `DELETE … RETURN BEFORE` and a bare `.check()?`: no
-    /// transaction to abort, but also no [`crate::database::write_with_retry`],
-    /// which every other guarded single-statement write in the crate goes
-    /// through. A store answering "conflict, retry" therefore comes out as a
-    /// 500 instead of the 404 or 409 the request owes.
-    ///
-    /// The racer is [`crate::db::course::create`] against this
-    /// term: it claims `course_count` on the term row before it writes the
-    /// link, which is the same record and the same column the guard reads. Both
-    /// sides are swept across each other sub-millisecond, exactly as in
-    /// [`crate::domain::subject::Subject::delete`]'s race test — a whole
-    /// millisecond of head start on either side separates them completely, and
-    /// the counters below assert the sweep straddled the site rather than
-    /// landing on one side of it (it used to alternate on `round % 2` and score
-    /// an exact 10/10, i.e. no overlap at all).
-    ///
-    /// And like that test it does *not* prove the retry: this site is one
-    /// statement, so the window in which a conflict could reach
-    /// [`write_with_retry`] is a single round trip wide — measured at 0
-    /// conflicts in 100 raced rounds, green with the retry loop cut to a single
-    /// attempt. A status-code guard, then: a raced delete answers 409 or 404 and
-    /// never 500, and a course that got linked survives it. The retry is
-    /// measured on [`crate::db::course::delete`].
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
-    async fn a_delete_racing_a_course_create_never_answers_500() {
-        use crate::domain::course::{CourseDescription, CourseKind, CourseTitle};
-        use crate::domain::user::UserId;
-        let (db, _serialized) = crate::database::init_test_server("term_delete_race").await;
-        let (mut delete_500, mut create_500) = (0, 0);
-        let (mut linked, mut wiped) = (0, 0);
-        let (mut last_delete, mut last_create) = (String::new(), String::new());
-        let at = Timestamp::from_millis;
-        for round in 0..20 {
-            let term = Term::create(TermName::try_new("2026").unwrap(), at(100), at(200), &db)
-                .await
-                .unwrap();
-
-            let separated = round % 4 == 0;
-            let drop_it = {
-                let (term, db) = (term.clone(), db.clone());
-                // One round in four holds the racers back by a clear 2ms so the
-                // delete wins outright: the sub-millisecond sweep alone leaves
-                // them ahead of it nearly every round (measured 20 to 0), and
-                // both counters below have to see a side. The other three keep
-                // the sub-ms beat, which is the only spacing that overlaps at
-                // all — a whole millisecond either way separates them.
-                let beat = if separated {
-                    std::time::Duration::ZERO
-                } else {
-                    std::time::Duration::from_micros(round * 53 % 300)
-                };
-                tokio::spawn(async move {
-                    tokio::time::sleep(beat).await;
-                    term.delete(&db).await
-                })
-            };
-            let makes: Vec<_> = (0..6)
-                .map(|_| {
-                    let (id, db) = (term.get_id().clone(), db.clone());
-                    let head_start = if separated {
-                        std::time::Duration::from_millis(2)
-                    } else {
-                        std::time::Duration::from_micros(round * 37 % 300)
-                    };
-                    tokio::spawn(async move {
-                        tokio::time::sleep(head_start).await;
-                        crate::db::course::create(
-                            &db,
-                            &UserId::from_key("teacher"),
-                            CourseTitle::try_new("algebra").unwrap(),
-                            CourseDescription::try_new("").unwrap(),
-                            CourseKind::course(),
-                            Some(id),
-                            None,
-                        )
-                        .await
-                    })
-                })
-                .collect();
-            let drop_it = drop_it.await.unwrap();
-            if matches!(drop_it, Err(AppError::Db(_))) {
-                delete_500 += 1;
-                last_delete = format!("{drop_it:?}");
-            }
-            // Stored state, both sides: a linked course means the claim beat the
-            // guard, a gone term means the delete did.
-            let mut landed = false;
-            for make in makes {
-                let make = make.await.unwrap();
-                if matches!(make, Err(AppError::Db(_))) {
-                    create_500 += 1;
-                    last_create = format!("{make:?}");
-                }
-                if let Ok(course) = &make
-                    && crate::db::course::read(&db, course.get_id())
-                        .await
-                        .unwrap()
-                        .is_some()
-                {
-                    landed = true;
-                }
-            }
-            linked += usize::from(landed);
-            if Term::read(term.get_id(), &db).await.unwrap().is_none() {
-                wiped += 1;
-            }
-        }
-        eprintln!(
-            "Term::delete raced: {delete_500}/20 delete 500s, {create_500} create 500s, \
-             {linked} rounds with a course linked / {wiped} wiped"
-        );
-        assert!(
-            linked > 0 && wiped > 0,
-            "the sweep never crossed the window ({linked} linked / {wiped} wiped)"
-        );
-        assert_eq!(
-            delete_500, 0,
-            "a raced delete must be refused, not 500: {delete_500}/20 rounds, last {last_delete}"
-        );
-        assert_eq!(
-            create_500, 0,
-            "a raced course create must retry, not 500: {create_500}/20 rounds, last {last_create}"
-        );
     }
 }

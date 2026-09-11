@@ -431,11 +431,11 @@ mod tests {
         }
 
         async fn a_subject(db: &Database) -> Subject {
-            Subject::create(
+            crate::db::subject::create(
+                db,
                 &crate::db::course::a_test_course(db).await,
                 SubjectName::try_new("topic").unwrap(),
                 SubjectDescription::try_new("").unwrap(),
-                db,
             )
             .await
             .unwrap()
@@ -544,7 +544,7 @@ mod tests {
             let exam = an_exam(&db).await;
             let subject = a_subject(&db).await;
             let id = subject.get_id().clone();
-            subject.delete(&db).await.unwrap();
+            crate::db::subject::delete(&db, subject).await.unwrap();
 
             let (text, points, spec) = body();
             let error = create(&db, exam.get_id(), id, text, points, spec)
@@ -584,7 +584,7 @@ mod tests {
             let from = a_subject(&db).await.get_id().clone();
             let dead = a_subject(&db).await;
             let gone = dead.get_id().clone();
-            dead.delete(&db).await.unwrap();
+            crate::db::subject::delete(&db, dead).await.unwrap();
             let question = a_question(&exam, &from, &db).await;
 
             let error = moved(question.clone(), &gone, &db)

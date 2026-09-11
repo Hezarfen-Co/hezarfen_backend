@@ -18,7 +18,7 @@ use crate::domain::exam::{
 };
 use crate::domain::homework::{Homework, HomeworkTitle};
 use crate::domain::role::Role;
-use crate::domain::subject::{Subject, SubjectDescription, SubjectName};
+use crate::domain::subject::{SubjectDescription, SubjectName};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
@@ -26,8 +26,6 @@ use crate::service;
 use crate::state::AppState;
 
 use super::homework::{description_or_none, resolve_assigned};
-use super::subjects::subject_in_course;
-use super::terms::resolve_term;
 use super::{
     CourseResponse, CurrentUser, ExamResponse, HomeworkResponse, Page, PageParams, PersonRef,
     RequireManager, RequireTeacher, SessionResponse, SubjectResponse, check_not_past,
@@ -326,7 +324,7 @@ async fn create_course(
     // Pre-flight only: the create itself claims a reference on the term before
     // it writes the link, and a term deleted in between fails that claim with
     // this very error — so an unknown id reads the same whichever side wins.
-    let term = resolve_term(req.term_id.as_deref(), &st.db).await?;
+    let term = service::term::resolve(&st.db, req.term_id.as_deref()).await?;
     check_capacity(req.capacity)?;
     let course = service::course::create(
         &st.db,
@@ -496,7 +494,7 @@ async fn update_course(
     // (keep), an explicit `null` is `Some(None)` (write `NONE`).
     let term = match req.term_id {
         // Explicit `null` clears the link; a value must name a real term.
-        Some(ref update) => Some(resolve_term(update.as_deref(), &st.db).await?),
+        Some(ref update) => Some(service::term::resolve(&st.db, update.as_deref()).await?),
         None => None,
     };
     // Explicit `null` lifts the cap; a value must be positive.
@@ -964,7 +962,7 @@ async fn create_subject_in_course(
 
     let name = SubjectName::try_new(&req.name)?;
     let description = SubjectDescription::try_new(&req.description.unwrap_or_default())?;
-    let subject = Subject::create(course.get_id(), name, description, &st.db).await?;
+    let subject = service::subject::create(&st.db, course.get_id(), name, description).await?;
     Ok((StatusCode::CREATED, Json(SubjectResponse::new(&subject))))
 }
 
@@ -1003,7 +1001,7 @@ async fn list_course_subjects(
         ));
     }
     let (subjects, total) =
-        Subject::list_for_course(course.get_id(), limit, offset, &st.db).await?;
+        service::subject::list_for_course(&st.db, course.get_id(), limit, offset).await?;
     let items = subjects.iter().map(SubjectResponse::new).collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
@@ -1082,7 +1080,7 @@ async fn create_homework_in_course(
     // No lease: the create takes the subject's reference counter in the same
     // breath as the row, and the subject delete is refused while that counter
     // is non-zero — so the check below is only a pre-flight for the message.
-    let subject = subject_in_course(&req.subject_id, course.get_id(), &st.db).await?;
+    let subject = service::subject::in_course(&st.db, &req.subject_id, course.get_id()).await?;
     let assigned = resolve_assigned(req.assigned, course.get_id(), &st.db).await?;
     let homework = Homework::create(
         course.get_id(),
@@ -1297,7 +1295,10 @@ mod tests {
         let user = crate::service::user::create(db, Username::try_new(username).unwrap(), hash)
             .await
             .unwrap();
-        crate::service::user::set_role(db, user.get_id(), role).await.unwrap().0
+        crate::service::user::set_role(db, user.get_id(), role)
+            .await
+            .unwrap()
+            .0
     }
 
     /// A course `creator` made, with nobody assigned.
@@ -1326,7 +1327,10 @@ mod tests {
         assert!(owns_course(&course, &creator));
 
         for role in [Role::Student, Role::Parent] {
-            let demoted = crate::service::user::set_role(&db, creator.get_id(), role).await.unwrap().0;
+            let demoted = crate::service::user::set_role(&db, creator.get_id(), role)
+                .await
+                .unwrap()
+                .0;
             assert!(
                 !can_manage_course(&course, &demoted),
                 "{role:?} creator still manages the course"
@@ -1354,7 +1358,10 @@ mod tests {
         // ...but never an owner, assigned or not.
         assert!(!owns_course(&course, &assigned));
 
-        let demoted = crate::service::user::set_role(&db, assigned.get_id(), Role::Student).await.unwrap().0;
+        let demoted = crate::service::user::set_role(&db, assigned.get_id(), Role::Student)
+            .await
+            .unwrap()
+            .0;
         assert!(!can_manage_course(&course, &demoted));
     }
 
@@ -1413,7 +1420,9 @@ mod tests {
         let db = init_mem().await.unwrap();
         let creator = user("teacher", Role::Teacher, &db).await;
         let course = course(&creator, &db).await;
-        crate::service::user::set_role(&db, creator.get_id(), Role::Student).await.unwrap();
+        crate::service::user::set_role(&db, creator.get_id(), Role::Student)
+            .await
+            .unwrap();
 
         for role in [Role::Manager, Role::Admin] {
             let boss = user(&format!("boss{}", role.as_str()), role, &db).await;

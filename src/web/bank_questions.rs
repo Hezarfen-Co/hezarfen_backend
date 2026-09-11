@@ -33,14 +33,14 @@ use crate::domain::exam_question::{
 };
 use crate::domain::note_file::FileContentType;
 use crate::domain::role::Role;
-use crate::domain::subject::{Subject, SubjectId};
+use crate::domain::subject::SubjectId;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
+use crate::service;
 use crate::state::AppState;
 
 use super::dto::person_map;
 use super::exams::ChoiceResponse;
-use super::subjects::subject_must_exist;
 use super::{
     ChoiceBody, ImageUpload, Page, PageParams, RequireTeacher, UploadFileForm, read_image_upload,
     remove_blob, serve_inline_blob, set_or_clear, store_blob,
@@ -51,7 +51,7 @@ use super::{
 // `subject` off every template — and that delete no longer takes any lock: it
 // is a conditional statement on the subject's own reference counters, which
 // bank templates deliberately do not hold (blocking on them was a dead end; see
-// [`crate::domain::subject::Subject::delete`]). With the writer gone the three
+// [`crate::db::subject::delete`]). With the writer gone the three
 // reader leases guarded nothing, and what they claimed to guard was already
 // open in production: the lock lived in one process, and the deployment runs
 // exactly one process (stop-the-world upgrades) — there is nothing else to
@@ -447,7 +447,7 @@ async fn create_question(
     Json(req): Json<CreateBankQuestion>,
 ) -> Result<(StatusCode, Json<BankQuestionResponse>), AppError> {
     // Origin metadata only — no course to check it against, but it must exist.
-    let subject = subject_must_exist(&req.subject_id, &st.db).await?;
+    let subject = service::subject::must_exist(&st.db, &req.subject_id).await?;
     let text = QuestionText::try_new(&req.text)?;
     let points = QuestionPoints::try_new(req.points)?;
     // Nothing stored to match against on create: every option is new and every
@@ -538,16 +538,17 @@ async fn list_questions(
         .iter()
         .filter_map(BankQuestion::get_subject)
         .collect();
-    let subject_names: HashMap<String, String> = Subject::list_by_ids(&subject_ids, &st.db)
-        .await?
-        .iter()
-        .map(|subject| {
-            (
-                subject.get_id().key().to_string(),
-                subject.get_name().as_str().to_string(),
-            )
-        })
-        .collect();
+    let subject_names: HashMap<String, String> =
+        service::subject::list_by_ids(&st.db, &subject_ids)
+            .await?
+            .iter()
+            .map(|subject| {
+                (
+                    subject.get_id().key().to_string(),
+                    subject.get_name().as_str().to_string(),
+                )
+            })
+            .collect();
     let people = person_map(questions.iter().map(|q| q.get_owner().clone()), &st.db).await?;
 
     let empty: Vec<BankQuestionImage> = Vec::new();
@@ -645,7 +646,7 @@ async fn update_question(
         // Omitted keeps the stored subject — which may already be `None`, cleared
         // by that subject's delete.
         let subject = match req.subject_id {
-            Some(ref subject_id) => Some(subject_must_exist(subject_id, &st.db).await?),
+            Some(ref subject_id) => Some(service::subject::must_exist(&st.db, subject_id).await?),
             None => question.get_subject().cloned(),
         };
         let text = match req.text {
@@ -951,7 +952,10 @@ mod tests {
         let user = crate::service::user::create(db, Username::try_new(username).unwrap(), hash)
             .await
             .unwrap();
-        crate::service::user::set_role(db, user.get_id(), role).await.unwrap().0
+        crate::service::user::set_role(db, user.get_id(), role)
+            .await
+            .unwrap()
+            .0
     }
 
     /// Every bank route is `RequireTeacher` today, so this is pinned at the
