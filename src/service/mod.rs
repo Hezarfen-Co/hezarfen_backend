@@ -1,6 +1,5 @@
 //! Business rules, workflow locks, multi-call orchestration; calls db::*; no
 //! SurrealQL text.
-
 pub mod appointment;
 pub mod appointment_slot;
 pub mod badge;
@@ -10,12 +9,16 @@ pub mod chatbot_thread;
 pub mod class_blueprint;
 pub mod course;
 pub mod course_session;
+pub mod dietary_profile;
 pub mod enrollment;
 pub mod event;
 pub mod exam;
 pub mod exam_attempt;
 pub mod exam_question;
+pub mod meal_attendance;
 pub mod meal_booking;
+pub mod meal_ledger;
+pub mod menu;
 pub mod message;
 pub mod note;
 pub mod parent_link;
