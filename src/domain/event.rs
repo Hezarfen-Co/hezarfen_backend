@@ -311,7 +311,7 @@ impl Event {
     /// Delete the event and cascade-remove its attendance and signup rows.
     ///
     /// Children first, and all of it in one transaction the way
-    /// [`crate::domain::course::Course::delete`] does it: run as two queries, a
+    /// [`crate::db::course::delete`] does it: run as two queries, a
     /// registration or a mark that committed in between outlived its event —
     /// an orphan no read path can ever reach and no delete can ever reclaim,
     /// since every one of them is keyed on the event that is now gone.

@@ -543,7 +543,7 @@ mod tests {
     /// rows to exercise the attempt lifecycle without the HTTP layer.
     async fn open_exam_with_question(db: &Database, max_attempts: i64) -> (Exam, ExamQuestion) {
         let creator = UserId::from_key("01TESTTEACHERAAAAAAAAAAAAA");
-        let course = crate::domain::course::a_test_course(db).await;
+        let course = crate::db::course::a_test_course(db).await;
         let kinds = Settings::defaults().get_exam_kinds().to_vec();
         let exam = Exam::create(
             &creator,
@@ -580,7 +580,7 @@ mod tests {
         // A real subject row, not a minted id: a question claims a reference on
         // its subject and is refused if that subject does not exist.
         let subject = crate::domain::subject::Subject::create(
-            &crate::domain::course::a_test_course(db).await,
+            &crate::db::course::a_test_course(db).await,
             crate::domain::subject::SubjectName::try_new("topic").unwrap(),
             crate::domain::subject::SubjectDescription::try_new("").unwrap(),
             db,

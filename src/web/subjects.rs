@@ -74,7 +74,7 @@ async fn subject_with_course(id: &str, db: &Database) -> Result<(Subject, Course
     let subject = Subject::read(&SubjectId::from_key(id), db)
         .await?
         .ok_or(AppError::NotFound)?;
-    let course = Course::read(subject.get_course(), db)
+    let course = crate::service::course::read(db, subject.get_course())
         .await?
         .ok_or(AppError::NotFound)?;
     Ok((subject, course))
@@ -142,7 +142,7 @@ async fn update_subject(
             "only the course creator, an assigned teacher, or a manager/admin can edit this subject",
         ));
     }
-    course.require_open(&st.db).await?;
+    crate::service::course::require_open(&st.db, &course).await?;
 
     // Only what the request actually carried is validated and written — an
     // omitted field stays `None` so the save never re-sends this snapshot's
@@ -193,7 +193,7 @@ async fn delete_subject(
             "only the course creator, an assigned teacher, or a manager/admin can delete this subject",
         ));
     }
-    course.require_open(&st.db).await?;
+    crate::service::course::require_open(&st.db, &course).await?;
     // No locks: the two checks *are* the delete's `WHERE`, decided against the
     // subject's own reference counters inside one statement. This used to be
     // three process-wide locks (the only site that held more than one) around

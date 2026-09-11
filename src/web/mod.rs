@@ -138,7 +138,7 @@ pub(crate) async fn undo_if_demoted(target: &UserId, db: &Database) -> Result<()
         return Ok(());
     }
     crate::domain::class_group::ClassGroup::unassign_everywhere(target, db).await?;
-    crate::domain::course::Course::unassign_everywhere(target, db).await?;
+    crate::service::course::unassign_everywhere(db, target).await?;
     Err(AppError::Conflict(
         "that user was demoted below teacher while this request ran — the assignment was undone; re-read their role and retry",
     ))
@@ -409,7 +409,7 @@ mod tests {
     #[tokio::test]
     async fn undo_if_demoted_repairs_both_assignments_or_neither() {
         use crate::domain::class_group::{ClassGroup, ClassName};
-        use crate::domain::course::{Course, CourseDescription, CourseKind, CourseTitle};
+        use crate::domain::course::{CourseDescription, CourseKind, CourseTitle};
         use crate::domain::user::{Password, Username};
 
         let db = crate::database::init_mem().await.unwrap();
@@ -441,18 +441,21 @@ mod tests {
             )
             .await
             .unwrap();
-            let course = Course::create(
-                &office,
-                CourseTitle::try_new("algebra").unwrap(),
-                CourseDescription::try_new("").unwrap(),
-                CourseKind::course(),
-                None,
-                None,
+            let course = crate::service::course::assign_teacher(
                 db,
+                &crate::service::course::create(
+                    db,
+                    &office,
+                    CourseTitle::try_new("algebra").unwrap(),
+                    CourseDescription::try_new("").unwrap(),
+                    CourseKind::course(),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap(),
+                teacher.get_id(),
             )
-            .await
-            .unwrap()
-            .assign_teacher(teacher.get_id(), db)
             .await
             .unwrap();
             (class, course)
@@ -470,7 +473,7 @@ mod tests {
                     .unwrap()
                     .get_teacher()
                     .cloned(),
-                Course::read(course, db)
+                crate::service::course::read(db, course)
                     .await
                     .unwrap()
                     .unwrap()

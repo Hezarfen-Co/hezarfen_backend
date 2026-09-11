@@ -166,7 +166,7 @@ async fn homework_with_course(id: &str, db: &Database) -> Result<(Homework, Cour
     let homework = Homework::read(&HomeworkId::from_key(id), db)
         .await?
         .ok_or(AppError::NotFound)?;
-    let course = Course::read(homework.get_course(), db)
+    let course = crate::service::course::read(db, homework.get_course())
         .await?
         .ok_or(AppError::NotFound)?;
     Ok((homework, course))
@@ -345,7 +345,7 @@ async fn update_homework(
             "only the course creator, an assigned teacher, or a manager/admin can edit this homework",
         ));
     }
-    course.require_open(&st.db).await?;
+    crate::service::course::require_open(&st.db, &course).await?;
 
     // Writer lease of [`HOMEWORK_LOCK`]: `ensure_no_orphans` below reads the
     // live submissions and results, and the row write depends on what it saw —
@@ -465,7 +465,7 @@ async fn delete_homework(
             "only the course creator, an assigned teacher, or a manager/admin can delete this homework",
         ));
     }
-    course.require_open(&st.db).await?;
+    crate::service::course::require_open(&st.db, &course).await?;
     let _guard = HOMEWORK_LOCK.write().await;
     let blob_keys = HomeworkFile::file_keys_for_homework(homework.get_id(), &st.db).await?;
     homework.delete(&st.db).await?;
@@ -524,8 +524,8 @@ async fn gate_own_submission(id: &str, user: &User, db: &Database) -> Result<Hom
 /// audience check with a 404 and never learns the homework exists. A course
 /// that vanished under us is the gates' own business, not this one's.
 async fn require_open_term(homework: &Homework, db: &Database) -> Result<(), AppError> {
-    if let Some(course) = Course::read(homework.get_course(), db).await? {
-        course.require_open(db).await?;
+    if let Some(course) = crate::service::course::read(db, homework.get_course()).await? {
+        crate::service::course::require_open(db, &course).await?;
     }
     Ok(())
 }
@@ -1147,7 +1147,7 @@ async fn grade_homework(
             "only the course creator, an assigned teacher, or a manager/admin can grade this homework",
         ));
     }
-    course.require_open(&st.db).await?;
+    crate::service::course::require_open(&st.db, &course).await?;
 
     let status = HomeworkStatus::try_new(&req.status)?;
     let mark = req.mark.map(Mark::try_new).transpose()?;
@@ -1247,7 +1247,7 @@ async fn remove_homework_result(
             "only the course creator, an assigned teacher, or a manager/admin can remove grades",
         ));
     }
-    course.require_open(&st.db).await?;
+    crate::service::course::require_open(&st.db, &course).await?;
     let removed =
         HomeworkResult::remove(homework.get_id(), &UserId::from_key(&target), &st.db).await?;
     if removed.is_none() {
@@ -1481,7 +1481,7 @@ async fn homework_report(
         .ok_or(AppError::NotFound)?;
     // Only an exactly-teacher caller is narrowed to their managed courses;
     // manager+ and a linked parent read the full report (the marks idiom).
-    let (mut courses, _) = Course::list_enrolled(&target, None, 0, &st.db).await?;
+    let (mut courses, _) = crate::service::course::list_enrolled(&st.db, &target, None, 0).await?;
     if caller.get_role() == Role::Teacher {
         courses.retain(|course| can_manage_course(course, &caller));
     }

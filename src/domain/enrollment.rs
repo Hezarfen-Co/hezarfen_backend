@@ -4,7 +4,7 @@ use crate::constant::{ENROLLMENT_COUNT_FIELD, ENROLLMENT_TABLE};
 use crate::database::{Database, transaction_with_retry};
 use crate::db::cap;
 use crate::domain::class_group::ClassGroupId;
-use crate::domain::course::{Course, CourseId};
+use crate::domain::course::CourseId;
 use crate::db::page::PagedList;
 use crate::domain::role::Role;
 use crate::domain::user::UserId;
@@ -203,7 +203,7 @@ impl Enrollment {
             .values()
             .any(|error| error.to_string().contains(FULL_MARK))
         {
-            return match Course::read(course, db).await? {
+            return match crate::db::course::read(db, course).await? {
                 Some(_) => Err(AppError::Conflict("the course is full")),
                 None => Err(AppError::NotFound),
             };
@@ -416,18 +416,18 @@ mod tests {
     /// never wrote. Asserted on the stored row, not the returned one.
     #[tokio::test]
     async fn a_hand_placed_enrollment_stores_no_source_key() {
-        use crate::domain::course::{Course, CourseDescription, CourseKind, CourseTitle};
+        use crate::domain::course::{CourseDescription, CourseKind, CourseTitle};
 
         let db = crate::database::init_mem().await.unwrap();
         let teacher = UserId::from_key("teacher");
-        let course = Course::create(
+        let course = crate::db::course::create(
+            &db,
             &teacher,
             CourseTitle::try_new("algebra").unwrap(),
             CourseDescription::try_new("").unwrap(),
             CourseKind::course(),
             None,
             None,
-            &db,
         )
         .await
         .unwrap();

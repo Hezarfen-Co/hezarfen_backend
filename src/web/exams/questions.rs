@@ -219,7 +219,7 @@ pub(crate) async fn create_question(
             "only the course creator, an assigned teacher, or a manager/admin can author questions",
         ));
     }
-    course.require_open(&st.db).await?;
+    crate::service::course::require_open(&st.db, &course).await?;
     // No lease: the subject check below is only a pre-flight for the message,
     // and the insert takes the subject's reference counter in the same breath —
     // a subject delete lands either wholly before it (400) or is refused. The
@@ -358,7 +358,7 @@ pub(crate) async fn update_question(
             "only the course creator, an assigned teacher, or a manager/admin can edit questions",
         ));
     }
-    course.require_open(&st.db).await?;
+    crate::service::course::require_open(&st.db, &course).await?;
     // No lease — see `create_question`; a re-tag moves the subject's reference
     // counter, and the freeze gate rides in the update's transaction.
     ensure_questions_editable(exam.get_id(), &st.db).await?;
@@ -446,7 +446,7 @@ pub(crate) async fn delete_question(
             "only the course creator, an assigned teacher, or a manager/admin can delete questions",
         ));
     }
-    course.require_open(&st.db).await?;
+    crate::service::course::require_open(&st.db, &course).await?;
     // No lock: the freeze gate is part of the delete's own transaction, and
     // this path checks no subject. The pre-flight below is the fast 409.
     ensure_questions_editable(exam.get_id(), &st.db).await?;
@@ -518,7 +518,7 @@ pub(crate) async fn question_from_bank(
             "only the course creator, an assigned teacher, or a manager/admin can author questions",
         ));
     }
-    course.require_open(&st.db).await?;
+    crate::service::course::require_open(&st.db, &course).await?;
     // No lease — same reasoning as `create_question`. The freeze gate rides in
     // the insert's transaction.
     ensure_questions_editable(exam.get_id(), &st.db).await?;
@@ -649,7 +649,7 @@ pub(crate) async fn question_refresh_from_bank(
             "only the course creator, an assigned teacher, or a manager/admin can edit questions",
         ));
     }
-    course.require_open(&st.db).await?;
+    crate::service::course::require_open(&st.db, &course).await?;
     // No lock: the question keeps its own subject here, so there is nothing to
     // pair with a subject delete, and the freeze gate rides in the overwrite's
     // transaction.
@@ -774,7 +774,7 @@ pub(crate) async fn question_to_bank(
             "only the course creator, an assigned teacher, or a manager/admin can save questions to the bank",
         ));
     }
-    course.require_open(&st.db).await?;
+    crate::service::course::require_open(&st.db, &course).await?;
     // No lease: `BANK_LOCK` is gone with the subject delete's writer lease, and
     // a template left holding a deleted subject reads as an empty
     // `subject_name` either way (see [`crate::web::bank_questions`]).

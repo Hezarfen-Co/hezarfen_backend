@@ -48,9 +48,8 @@ mod common;
 use axum::http::StatusCode;
 use common::{app_and_db, id_of, login_as, send, upload_course_note_file};
 use hezarfen_backend::database::{self, Database};
-use hezarfen_backend::domain::course::{
-    Course, CourseDescription, CourseId, CourseKind, CourseTitle,
-};
+use hezarfen_backend::db::course;
+use hezarfen_backend::domain::course::{CourseDescription, CourseId, CourseKind, CourseTitle};
 use hezarfen_backend::domain::course_note::{CourseNote, CourseNoteContent, CourseNoteTitle};
 use hezarfen_backend::domain::course_note_file::{CourseNoteFile, FileContentType, FileName};
 use hezarfen_backend::domain::course_session::{CourseSession, SessionTopic};
@@ -70,14 +69,14 @@ fn teacher() -> UserId {
 }
 
 async fn a_course(db: &Database) -> CourseId {
-    Course::create(
+    course::create(
+        db,
         &teacher(),
         CourseTitle::try_new("Fizik").unwrap(),
         CourseDescription::try_new("").unwrap(),
         CourseKind::course(),
         None,
         None,
-        db,
     )
     .await
     .unwrap()
@@ -86,12 +85,14 @@ async fn a_course(db: &Database) -> CourseId {
 }
 
 async fn drop_course(course: &CourseId, db: &Database) -> Result<bool, AppError> {
-    Course::read(course, db)
-        .await
-        .unwrap()
-        .expect("the course is there")
-        .delete(db)
-        .await
+    course::delete(
+        db,
+        course::read(db, course)
+            .await
+            .unwrap()
+            .expect("the course is there"),
+    )
+    .await
 }
 
 // --- the three creates, each as one spawnable unit -------------------------
@@ -324,13 +325,15 @@ async fn a_course_note_file_under_a_deleted_note_is_refused() {
     .await
     .unwrap();
     assert!(
-        Course::read(&course, &db)
-            .await
-            .unwrap()
-            .unwrap()
-            .delete(&db)
-            .await
-            .unwrap(),
+        course::delete(
+            &db,
+            course::read(&db, &course)
+                .await
+                .unwrap()
+                .unwrap()
+        )
+        .await
+        .unwrap(),
         "the course, and its note with it, goes"
     );
 
