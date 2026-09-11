@@ -166,12 +166,14 @@ impl EventAudience {
                     .map(|enrollment| enrollment.get_user().clone())
                     .collect())
             }
-            EventAudience::Class { class } => Ok(ClassMember::list_for_class(class, None, 0, db)
-                .await?
-                .0
-                .iter()
-                .map(|member| member.get_user().clone())
-                .collect()),
+            EventAudience::Class { class } => {
+                Ok(crate::db::class_member::list_for_class(db, class, None, 0)
+                    .await?
+                    .0
+                    .iter()
+                    .map(|member| member.get_user().clone())
+                    .collect())
+            }
             EventAudience::Registration { .. } => Ok(Registration::list_for_event(event, db)
                 .await?
                 .iter()

@@ -25,7 +25,7 @@ use crate::domain::course::CourseId;
 use crate::domain::role::Role;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
-use crate::service::class_blueprint;
+use crate::service::{class_blueprint, class_course, class_group, class_member};
 use crate::state::AppState;
 
 use super::courses::can_manage_course;
@@ -237,7 +237,7 @@ impl ClassCourseResponse {
 /// The class a path id names, or a 404 — every route under `/classes/{id}`
 /// gates on it, so a missing class never reads as an empty roster.
 async fn class_or_404(id: &str, db: &Database) -> Result<ClassGroup, AppError> {
-    ClassGroup::read(&ClassGroupId::from_key(id), db)
+    class_group::read(db, &ClassGroupId::from_key(id))
         .await?
         .ok_or(AppError::NotFound)
 }
@@ -299,7 +299,7 @@ async fn classes_page(
     with_creator: bool,
     db: &Database,
 ) -> Result<Page<ClassResponse>, AppError> {
-    let classes = ClassGroup::list_by_ids(ids, db).await?;
+    let classes = class_group::list_by_ids(db, ids).await?;
     let by_id: std::collections::HashMap<&str, &ClassGroup> = classes
         .iter()
         .map(|class| (class.get_id().key(), class))
@@ -356,13 +356,13 @@ async fn create_class(
     // with this very error — so an unknown id reads the same whichever side wins.
     let term = resolve_term(req.term_id.as_deref(), &st.db).await?;
     let teacher = teacher_or_none(req.teacher_id.as_deref(), &st.db).await?;
-    let class = ClassGroup::create(
+    let class = class_group::create(
+        &st.db,
         user.get_id(),
         name,
         grade,
         term,
         teacher.as_ref().map(|t| t.get_id().clone()),
-        &st.db,
     )
     .await?;
     // The row is written; a demotion that raced this request's role check swept
@@ -379,7 +379,7 @@ async fn create_class(
         // and both of its counters are still absent — so a refusal is a broken
         // invariant, not a client error, and it must not be reported as the
         // `409` whose text promises nothing was created.
-        if !class.clone().delete(&st.db).await? {
+        if !class_group::delete(&st.db, class.clone()).await? {
             return Err(AppError::Internal(format!(
                 "class {} took a member or a course between its create and the \
                  rollback of a demoted homeroom teacher; it is still there, \
@@ -488,7 +488,7 @@ async fn list_classes(
         .as_deref()
         .map(|grade| grade_or_none(Some(grade)))
         .transpose()?;
-    let (classes, total) = ClassGroup::list_all(grade, limit, offset, &st.db).await?;
+    let (classes, total) = class_group::list_all(&st.db, grade, limit, offset).await?;
     // Join people onto the page alone — the lookup shrinks with the window.
     let people = person_map(
         classes.iter().flat_map(|class| class_people(class, true)),
@@ -554,7 +554,7 @@ async fn update_class(
     let class = class_or_404(&id, &st.db).await?;
     // The class's *current* term, so a move off an archived year is refused
     // too; `resolve_term` below holds the other end (the term moved onto).
-    class.require_open(&st.db).await?;
+    class_group::require_open(&st.db, &class).await?;
 
     // Only what the request actually carried is validated and written — an
     // omitted field stays `None` so the save never re-sends this snapshot's
@@ -578,15 +578,15 @@ async fn update_class(
     let assigned = teacher
         .as_ref()
         .and_then(|teacher| teacher.as_ref().map(|teacher| teacher.get_id().clone()));
-    let updated = class
-        .update(
-            name,
-            grade,
-            term,
-            teacher.map(|teacher| teacher.map(|teacher| teacher.get_id().clone())),
-            &st.db,
-        )
-        .await?;
+    let updated = class_group::update(
+        &st.db,
+        class,
+        name,
+        grade,
+        term,
+        teacher.map(|teacher| teacher.map(|teacher| teacher.get_id().clone())),
+    )
+    .await?;
     // Only when this request named a teacher: a PATCH that left the column
     // alone raced nobody's demotion (see [`undo_if_demoted`]). The undo clears
     // the column, which is the whole of what this request wrote to it.
@@ -677,7 +677,7 @@ async fn classes_of(
     with_creator: bool,
     db: &Database,
 ) -> Result<Page<ClassResponse>, AppError> {
-    let (rows, total) = ClassMember::list_for_user(user, limit, offset, db).await?;
+    let (rows, total) = class_member::list_for_user(db, user, limit, offset).await?;
     let ids: Vec<ClassGroupId> = rows.iter().map(|row| row.get_class().clone()).collect();
     classes_page(&ids, total, limit, offset, with_creator, db).await
 }
@@ -705,8 +705,8 @@ async fn delete_class(
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
     let class = class_or_404(&id, &st.db).await?;
-    class.require_open(&st.db).await?;
-    if !class.delete(&st.db).await? {
+    class_group::require_open(&st.db, &class).await?;
+    if !class_group::delete(&st.db, class).await? {
         return Err(AppError::Conflict(
             "this class still holds students or courses — remove its members and detach its courses first",
         ));
@@ -745,7 +745,7 @@ async fn add_member(
     Json(req): Json<AddMember>,
 ) -> Result<(StatusCode, Json<ClassMemberResponse>), AppError> {
     let class = class_or_404(&id, &st.db).await?;
-    class.require_open(&st.db).await?;
+    class_group::require_open(&st.db, &class).await?;
 
     let target = UserId::from_key(&req.user_id);
     let Some(target_user) = crate::service::user::read(&st.db, &target).await? else {
@@ -763,7 +763,7 @@ async fn add_member(
         }));
     }
 
-    let member = ClassMember::add(class.get_id(), &target, user.get_id(), &st.db).await?;
+    let member = class_member::add(&st.db, class.get_id(), &target, user.get_id()).await?;
     let people = PersonRef::map_of(&[&target_user, &user]);
     Ok((
         StatusCode::CREATED,
@@ -796,7 +796,7 @@ async fn list_members(
 ) -> Result<Json<Page<ClassMemberResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
     let class = class_or_404(&id, &st.db).await?;
-    let (rows, total) = ClassMember::list_for_class(class.get_id(), limit, offset, &st.db).await?;
+    let (rows, total) = class_member::list_for_class(&st.db, class.get_id(), limit, offset).await?;
     // Join people onto the page alone — the lookup shrinks with the window.
     let people = person_map(
         rows.iter()
@@ -838,8 +838,8 @@ async fn remove_member(
     Path((id, target)): Path<(String, String)>,
 ) -> Result<StatusCode, AppError> {
     let class = class_or_404(&id, &st.db).await?;
-    class.require_open(&st.db).await?;
-    ClassMember::remove(class.get_id(), &UserId::from_key(&target), &st.db).await?;
+    class_group::require_open(&st.db, &class).await?;
+    class_member::remove(&st.db, class.get_id(), &UserId::from_key(&target)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -889,10 +889,10 @@ async fn attach_course(
         ));
     }
     // Both ends: neither a class nor a course on a past year takes a new link.
-    class.require_open(&st.db).await?;
+    class_group::require_open(&st.db, &class).await?;
     crate::service::course::require_open(&st.db, &course).await?;
 
-    let link = ClassCourse::attach(class.get_id(), course.get_id(), user.get_id(), &st.db).await?;
+    let link = class_course::attach(&st.db, class.get_id(), course.get_id(), user.get_id()).await?;
     let people = PersonRef::map_of(&[&user]);
     Ok((
         StatusCode::CREATED,
@@ -925,7 +925,7 @@ async fn list_class_courses(
 ) -> Result<Json<Page<ClassCourseResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
     let class = class_or_404(&id, &st.db).await?;
-    let (rows, total) = ClassCourse::list_for_class(class.get_id(), limit, offset, &st.db).await?;
+    let (rows, total) = class_course::list_for_class(&st.db, class.get_id(), limit, offset).await?;
     let people = person_map(rows.iter().map(|row| row.get_attached_by().clone()), &st.db).await?;
     let items = rows
         .iter()
@@ -981,11 +981,11 @@ async fn detach_course(
     }
     // Both ends, and only what is still there: a link whose course row is gone
     // has no term to read, and sweeping it is the whole point of the route.
-    class.require_open(&st.db).await?;
+    class_group::require_open(&st.db, &class).await?;
     if let Some(row) = row.as_ref() {
         crate::service::course::require_open(&st.db, row).await?;
     }
-    ClassCourse::detach(class.get_id(), &course, &st.db).await?;
+    class_course::detach(&st.db, class.get_id(), &course).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1454,7 +1454,7 @@ async fn apply_blueprint(
     // The pump writes both ends, so both are guarded — the class, and every
     // course the template would attach. A course the template names that is
     // already gone is the pump's own `skipped` business, not a term refusal.
-    class.require_open(&st.db).await?;
+    class_group::require_open(&st.db, &class).await?;
     for id in blueprint.get_courses() {
         if let Some(course) = crate::service::course::read(&st.db, id).await? {
             crate::service::course::require_open(&st.db, &course).await?;

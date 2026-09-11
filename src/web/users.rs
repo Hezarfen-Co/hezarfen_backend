@@ -14,8 +14,7 @@ use crate::constant::{
 };
 use crate::database::Database;
 use crate::domain::badge::{self, BadgeAward};
-use crate::domain::class_group::{ClassGroup, ClassGroupId};
-use crate::domain::class_member::ClassMember;
+use crate::domain::class_group::ClassGroupId;
 
 use crate::domain::parent_link::ParentLink;
 use crate::domain::preferences::{Language, PaletteColor, Theme};
@@ -174,14 +173,9 @@ async fn apply_preferences(
     let theme = merge_field(req.theme.as_deref(), Theme::try_from_str)?;
     let language = merge_field(req.language.as_deref(), Language::try_from_str)?;
     let palette_color = merge_field(req.palette_color.as_deref(), PaletteColor::try_from_str)?;
-    let updated = crate::service::user::set_preferences(
-        db,
-        user.get_id(),
-        theme,
-        language,
-        palette_color,
-    )
-    .await?;
+    let updated =
+        crate::service::user::set_preferences(db, user.get_id(), theme, language, palette_color)
+            .await?;
     Ok(UserResponse::new(&updated))
 }
 
@@ -602,8 +596,7 @@ async fn link_student(
             reason: "students can only be tied to a parent account",
         }));
     }
-    let Some(student) =
-        crate::service::user::read(&st.db, &UserId::from_key(&req.user_id)).await?
+    let Some(student) = crate::service::user::read(&st.db, &UserId::from_key(&req.user_id)).await?
     else {
         return Err(AppError::Validation(ValidationError::Invalid {
             field: "user_id",
@@ -945,8 +938,13 @@ async fn profile_of(
         courses.retain(|course| readable.contains(course.get_id()));
     }
     courses.truncate(MAX_PROFILE_COURSES);
-    let (mut members, class_total) =
-        ClassMember::list_for_user(id, Some(MAX_PROFILE_CLASSES as i64), 0, &st.db).await?;
+    let (mut members, class_total) = crate::service::class_member::list_for_user(
+        &st.db,
+        id,
+        Some(MAX_PROFILE_CLASSES as i64),
+        0,
+    )
+    .await?;
     // The window is safe to take from the database here: the class gate is
     // all-or-nothing, so it drops the whole page or none of it — never a row
     // out of the middle of one.
@@ -954,7 +952,7 @@ async fn profile_of(
         members.clear();
     }
     let class_ids: Vec<ClassGroupId> = members.iter().map(|row| row.get_class().clone()).collect();
-    let classes = ClassGroup::list_by_ids(&class_ids, &st.db).await?;
+    let classes = crate::service::class_group::list_by_ids(&st.db, &class_ids).await?;
     // Both totals are the full counts, not the windowed ones — the blocks are a
     // preview, the stats are the truth.
     let stats = ProfileStats::load(id, course_total, class_total, &st.db).await?;
@@ -1070,7 +1068,9 @@ async fn ensure_may_read_profile(
 async fn readable_profile_user(st: &AppState, caller: &User, id: &str) -> Result<User, AppError> {
     let target = UserId::from_key(id);
     ensure_may_read_profile(caller, &target, &st.db).await?;
-    crate::service::user::read(&st.db, &target).await?.ok_or(AppError::NotFound)
+    crate::service::user::read(&st.db, &target)
+        .await?
+        .ok_or(AppError::NotFound)
 }
 
 /// The caller's own public profile — what everyone else sees of them.
@@ -1165,7 +1165,15 @@ async fn upload_my_avatar(
 
     let file = ulid::Ulid::new().to_string();
     store_blob(&st, &file, &upload.data, || async {
-        match crate::service::user::set_avatar(&st.db, user.get_id(), &file, &upload.content_type, size).await? {
+        match crate::service::user::set_avatar(
+            &st.db,
+            user.get_id(),
+            &file,
+            &upload.content_type,
+            size,
+        )
+        .await?
+        {
             // Row written; the picture this one replaced comes off disk.
             Some(before) => Ok(((), before.get_avatar_file().map(str::to_string))),
             // The account went away mid-upload — the fresh blob is an orphan.

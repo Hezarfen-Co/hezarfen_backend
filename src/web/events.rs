@@ -11,7 +11,7 @@ use utoipa_axum::routes;
 
 use crate::database::Database;
 use crate::domain::attendance::{Attendance, AttendanceStatus};
-use crate::domain::class_group::{ClassGroup, ClassGroupId};
+use crate::domain::class_group::ClassGroupId;
 use crate::domain::course::CourseId;
 use crate::domain::event::{Event, EventAudience, EventDescription, EventId, EventTitle};
 use crate::domain::registration::Registration;
@@ -101,7 +101,10 @@ impl AudienceDto {
             }
             AudienceDto::Class { class } => {
                 let class = ClassGroupId::from_key(&class);
-                if ClassGroup::read(&class, db).await?.is_none() {
+                if crate::service::class_group::read(db, &class)
+                    .await?
+                    .is_none()
+                {
                     return Err(AppError::Validation(ValidationError::Invalid {
                         field: "audience",
                         reason: "class does not exist",
@@ -868,7 +871,10 @@ mod tests {
         let user = crate::service::user::create(db, Username::try_new(username).unwrap(), hash)
             .await
             .unwrap();
-        crate::service::user::set_role(db, user.get_id(), role).await.unwrap().0
+        crate::service::user::set_role(db, user.get_id(), role)
+            .await
+            .unwrap()
+            .0
     }
 
     /// `can_manage` is only reached behind `RequireTeacher` today, so this is

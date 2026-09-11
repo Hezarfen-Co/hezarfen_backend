@@ -137,7 +137,7 @@ pub(crate) async fn undo_if_demoted(target: &UserId, db: &Database) -> Result<()
     {
         return Ok(());
     }
-    crate::domain::class_group::ClassGroup::unassign_everywhere(target, db).await?;
+    crate::service::class_group::unassign_everywhere(db, target).await?;
     crate::service::course::unassign_everywhere(db, target).await?;
     Err(AppError::Conflict(
         "that user was demoted below teacher while this request ran — the assignment was undone; re-read their role and retry",
@@ -408,7 +408,7 @@ mod tests {
     /// forges those (see [`crate::db::cap`]).
     #[tokio::test]
     async fn undo_if_demoted_repairs_both_assignments_or_neither() {
-        use crate::domain::class_group::{ClassGroup, ClassName};
+        use crate::domain::class_group::ClassName;
         use crate::domain::course::{CourseDescription, CourseKind, CourseTitle};
         use crate::domain::user::{Password, Username};
 
@@ -430,13 +430,13 @@ mod tests {
             .unwrap()
             .0;
         let assigned = async |db: &Database| {
-            let class = ClassGroup::create(
+            let class = crate::service::class_group::create(
+                db,
                 &office,
                 ClassName::try_new("9-A").unwrap(),
                 None,
                 None,
                 Some(teacher.get_id().clone()),
-                db,
             )
             .await
             .unwrap();
@@ -466,7 +466,7 @@ mod tests {
             db: &Database,
         ) -> (Option<UserId>, Vec<UserId>) {
             (
-                ClassGroup::read(class, db)
+                crate::service::class_group::read(db, class)
                     .await
                     .unwrap()
                     .unwrap()

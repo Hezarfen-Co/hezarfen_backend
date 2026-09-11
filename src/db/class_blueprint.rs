@@ -8,10 +8,10 @@ use surrealdb::types::{RecordId, SurrealValue};
 
 use crate::constant::{CLASS_BLUEPRINT_TABLE, CLASS_COURSE_TABLE, ENROLLMENT_COUNT_FIELD};
 use crate::database::{Database, transaction_with_retry};
+use crate::db::class_pump::{Axis, detach};
 use crate::db::page::PagedList;
 use crate::domain::class_blueprint::{ClassBlueprint, ClassBlueprintId};
 use crate::domain::class_group::{ClassGrade, ClassGroupId};
-use crate::domain::class_pump::{Axis, detach};
 use crate::domain::course::CourseId;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
@@ -41,7 +41,7 @@ pub struct Held {
 /// and the list keeps an id nothing points at. [`prune`] only fires
 /// while walking a section, so at a grade carrying none the id is permanent.
 ///
-/// The claim is [`crate::domain::class_pump::Axis::pivot_claim`]'s exactly:
+/// The claim is [`crate::db::class_pump::Axis::pivot_claim`]'s exactly:
 /// the counter is *moved* — bumped, gated, restored to the value this
 /// transaction found, `NONE` included — because an `UPDATE` leaving the
 /// document unchanged is elided by 3.2.3 and enters no write set. Moving it
@@ -330,13 +330,13 @@ pub async fn drop_links(
 ) -> Result<(), AppError> {
     for link in links {
         detach(
+            db,
             "$link WHERE source = $blueprint",
             Axis::Course,
             &[
                 ("link".into(), link.into_value()),
                 ("blueprint".into(), id.record().into_value()),
             ],
-            db,
         )
         .await?;
     }

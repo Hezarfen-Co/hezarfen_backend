@@ -386,7 +386,7 @@ const GONE_MARK: &str = "cap_gone";
 /// `UPDATE` that leaves the document unchanged is elided and never enters the
 /// write set: `SET x = x` sits on no key at all and collides with nothing
 /// (measured on 3.2.3, and the reason
-/// [`crate::domain::class_pump::Axis::pivot_claim`] and
+/// [`crate::db::class_pump::Axis::pivot_claim`] and
 /// [`crate::domain::exam_answer::ExamAnswer::save`] have the same shape). Both
 /// statements are inside the transaction, so an abort between them cannot leave
 /// the counter up.

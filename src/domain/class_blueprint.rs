@@ -3,8 +3,8 @@
 //!
 //! A school runs many şube at grade "9" and stocks each of them by hand, one
 //! attach at a time. A blueprint is that list said once. It is a layer *above*
-//! [`crate::domain::class_pump`], never a replacement for it: applying a
-//! blueprint calls the same [`ClassCourse::attach`] a manager's own call does,
+//! [`crate::db::class_pump`], never a replacement for it: applying a
+//! blueprint calls the same [`crate::service::class_course::attach`] a manager's own call does,
 //! so the rows it lands are ordinary `class_course` links and ordinary
 //! `enrollment` rows, and an elective (seçmeli) placed by hand next to them is
 //! still an individual enrollment nothing here can see.
@@ -22,9 +22,9 @@
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
 use crate::constant::{CLASS_BLUEPRINT_TABLE, MAX_CLASS_COURSES};
+use crate::db::class_pump::{Attached, Axis};
 use crate::domain::class_course::ClassCourse;
 use crate::domain::class_group::{ClassGrade, ClassGroupId};
-use crate::domain::class_pump::{Attached, Axis};
 use crate::domain::course::CourseId;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
@@ -82,7 +82,7 @@ pub struct Skip {
 ///
 /// `matched` exists because an empty `skipped` is not success on its own. A
 /// grade label is free text ([`ClassGrade`]) and
-/// [`crate::domain::class_group::ClassGroup::list_for_grade`]
+/// [`crate::db::class_group::list_for_grade`]
 /// matches it exactly, so a blueprint keyed `"9 "` reaches none of the sections
 /// keyed `"9"` — and with nothing to skip it answers exactly like a pump that
 /// stocked every one of them. The count is the only thing that tells those
