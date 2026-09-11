@@ -5,10 +5,10 @@ use crate::constant::{
     SESSION_ATTENDANCE_TABLE,
 };
 use crate::database::{Database, transaction_with_retry};
+use crate::db::page::PagedList;
 use crate::domain::attendance::AttendanceStatus;
 use crate::domain::course::CourseId;
 use crate::domain::course_session::{CourseSession, CourseSessionId};
-use crate::db::page::PagedList;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
@@ -99,7 +99,7 @@ impl SessionAttendance {
     /// single atomic UPSERT — concurrent marks converge on the one row.
     ///
     /// The "session still exists" gate rides in the same transaction as the
-    /// mark, the mirror of the cascade in [`CourseSession::delete`]: the
+    /// mark, the mirror of the cascade in [`crate::db::course_session::delete`]: the
     /// caller's pre-flight read sits four round trips in front of this write,
     /// so a delete landing in that gap used to leave a roll-call row on a
     /// session that was gone — and that row was *unremovable*, its only delete
@@ -151,7 +151,7 @@ impl SessionAttendance {
     ///   [`LESSON_COUNTED_AT_FIELD`] on the lesson and every later mark sees
     ///   the stamp and credits nothing. It counts lessons that actually
     ///   happened — scheduling one and cancelling it earns nothing, which is
-    ///   why the credit does not live in `CourseSession::create`. Two
+    ///   why the credit does not live in `crate::db::course_session::create`. Two
     ///   simultaneous first marks both write the lesson row, so the store's own
     ///   conflict detection (and `transaction_with_retry` behind it) is what
     ///   keeps the stamp from being set twice.
@@ -295,7 +295,7 @@ impl SessionAttendance {
     /// delete's own transaction — the other direction of the delta in
     /// [`SessionAttendance::mark`], so a row that never existed and a row that
     /// was withdrawn leave the same number behind. Only *this* route decrements:
-    /// [`CourseSession::delete`]'s cascade sweeps the rows with a `DELETE` of
+    /// [`crate::db::course_session::delete`]'s cascade sweeps the rows with a `DELETE` of
     /// its own and never comes through here, which is the ruling
     /// `exam_sat_total` already carries — deleting the lesson does not un-attend
     /// it. `lessons_held_total` is never given back either: the lesson was
@@ -384,13 +384,13 @@ mod tests {
     }
 
     async fn a_session_at(teacher: &UserId, starts_at: i64, db: &Database) -> CourseSession {
-        CourseSession::create(
+        crate::db::course_session::create(
+            db,
             &crate::db::course::a_test_course(db).await,
             teacher,
             SessionTopic::try_new("limits").unwrap(),
             Timestamp::from_millis(starts_at),
             None,
-            db,
         )
         .await
         .unwrap()
@@ -664,7 +664,9 @@ mod tests {
             .await
             .unwrap();
 
-        session.delete(&db).await.unwrap();
+        crate::db::course_session::delete(&db, session)
+            .await
+            .unwrap();
         assert_eq!(attended(&student, &db).await, 1, "the cascade decremented");
         assert_eq!(held(&teacher, &db).await, 1, "the cascade decremented");
     }
@@ -678,7 +680,9 @@ mod tests {
         let student = a_student("s", &db).await;
         let session = a_session(&teacher, &db).await;
         let ghost = session.clone();
-        session.delete(&db).await.unwrap();
+        crate::db::course_session::delete(&db, session)
+            .await
+            .unwrap();
 
         assert!(matches!(
             SessionAttendance::mark(&ghost, &student, status("present"), &teacher, &db).await,
@@ -690,7 +694,7 @@ mod tests {
 
     /// The claim the existence gate cannot make by *reading*. A `DEFINE EVENT`
     /// on `course_session` fires inside the delete's own transaction, and
-    /// [`CourseSession::delete`] sweeps its children before removing the row,
+    /// [`crate::db::course_session::delete`] sweeps its children before removing the row,
     /// so the `SLEEP` opens exactly the window a mark has to lose: the sheet is
     /// written after the sweep has run, and used to commit straight past it.
     ///
@@ -735,7 +739,7 @@ mod tests {
             let ghost = session.clone();
             let drop_it = {
                 let db = db.clone();
-                tokio::spawn(async move { session.delete(&db).await })
+                tokio::spawn(async move { crate::db::course_session::delete(&db, session).await })
             };
             // The mark starts inside the held window: the sweep has run and the
             // session row is gone but uncommitted — which is exactly what a
@@ -756,7 +760,11 @@ mod tests {
             );
 
             // Stored state is the whole verdict; a return value is not evidence.
-            if CourseSession::read(&id, &db).await.unwrap().is_none() {
+            if crate::db::course_session::read(&db, &id)
+                .await
+                .unwrap()
+                .is_none()
+            {
                 swept += 1;
                 orphans += SessionAttendance::list_for_session(&id, None, 0, &db)
                     .await

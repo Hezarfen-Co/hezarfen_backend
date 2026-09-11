@@ -88,38 +88,10 @@ impl SessionAttendanceResponse {
     }
 }
 
-/// Resolve who a session's teacher should be: the caller when `teacher_id` is
-/// omitted (or names them), otherwise the referenced user — who must exist and
-/// hold the `teacher` role or higher (a student cannot teach a lesson).
-pub(crate) async fn resolve_session_teacher(
-    teacher_id: Option<&str>,
-    caller: &User,
-    db: &Database,
-) -> Result<User, AppError> {
-    let target = match teacher_id {
-        None => return Ok(caller.clone()),
-        Some(key) if key == caller.get_id().key() => return Ok(caller.clone()),
-        Some(key) => UserId::from_key(key),
-    };
-    let Some(user) = User::read(&target, db).await? else {
-        return Err(AppError::Validation(ValidationError::Invalid {
-            field: "teacher_id",
-            reason: "session teacher does not exist",
-        }));
-    };
-    if !user.get_role().at_least(Role::Teacher) {
-        return Err(AppError::Validation(ValidationError::Invalid {
-            field: "teacher_id",
-            reason: "session teacher must hold the teacher role or higher",
-        }));
-    }
-    Ok(user)
-}
-
 /// Load a session and its course together; a session whose course is gone
 /// cannot happen given the delete cascade, so both misses are plain 404s.
 async fn session_with_course(id: &str, db: &Database) -> Result<(CourseSession, Course), AppError> {
-    let session = CourseSession::read(&CourseSessionId::from_key(id), db)
+    let session = service::course_session::read(db, &CourseSessionId::from_key(id))
         .await?
         .ok_or(AppError::NotFound)?;
     let course = crate::service::course::read(db, session.get_course())
@@ -228,7 +200,7 @@ async fn update_session(
         .transpose()?;
     let teacher = match req.teacher_id {
         Some(ref key) => Some(
-            resolve_session_teacher(Some(key), &user, &st.db)
+            service::course_session::resolve_session_teacher(Some(key), &user, &st.db)
                 .await?
                 .get_id()
                 .clone(),
@@ -237,15 +209,15 @@ async fn update_session(
     };
     // The end this request left out is only *read* for the range check — it is
     // never written back, so a concurrent move of it survives. Pre-flight only:
-    // `CourseSession::update` re-makes this check in the UPDATE's `WHERE`.
+    // the write's own `WHERE` re-makes this check (the db layer's `update`).
     check_time_range(
         Some(starts_at.unwrap_or_else(|| session.get_starts_at())),
         ends_at.unwrap_or_else(|| session.get_ends_at()),
     )?;
 
-    let updated = session
-        .update(teacher, topic, starts_at, ends_at, &st.db)
-        .await?;
+    let updated =
+        service::course_session::update(&st.db, session, teacher, topic, starts_at, ends_at)
+            .await?;
     let people = person_map([updated.get_teacher().clone()], &st.db).await?;
     Ok(Json(SessionResponse::new(&updated, &people)))
 }
@@ -278,7 +250,7 @@ async fn delete_session(
         ));
     }
     crate::service::course::require_open(&st.db, &course).await?;
-    session.delete(&st.db).await?;
+    service::course_session::delete(&st.db, session).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

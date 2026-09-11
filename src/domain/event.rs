@@ -4,11 +4,11 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue, Value};
 
 use crate::constant::{EVENT_TABLE, MAX_EVENT_DESCRIPTION_LEN, MAX_EVENT_TITLE_LEN};
 use crate::database::{Database, transaction_with_retry};
+use crate::db::field_update::FieldUpdate;
 use crate::domain::class_group::ClassGroupId;
 use crate::domain::class_member::{ClassMember, ClassMemberId};
 use crate::domain::course::CourseId;
 use crate::domain::enrollment::Enrollment;
-use crate::db::field_update::FieldUpdate;
 use crate::domain::monotonic_id::next_ulid;
 use crate::domain::registration::Registration;
 use crate::domain::role::Role;
@@ -317,7 +317,7 @@ impl Event {
     /// since every one of them is keyed on the event that is now gone.
     ///
     /// Re-sent while the store answers "conflict, retry", the way
-    /// [`crate::domain::course_session::CourseSession::delete`] is: now that
+    /// [`crate::db::course_session::delete`] is: now that
     /// [`crate::domain::attendance::Attendance::mark`] writes the event row to
     /// prove it exists, a mark landing in this window really does contend for
     /// it — and without the retry the *delete* is the side that loses, turning
