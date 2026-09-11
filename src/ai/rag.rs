@@ -18,7 +18,6 @@ use crate::constant::AI_RAG_INDEX_TIMEOUT_SECS;
 use crate::database::Database;
 use crate::domain::course_note::CourseNote;
 use crate::domain::course_note_file::CourseNoteFile;
-use crate::domain::rag_output::RagOutput;
 use crate::module::Module;
 use crate::state::AppState;
 use crate::web::tenant_state::ResolvedTenant;
@@ -159,14 +158,15 @@ pub async fn index_course_note(state: &AppState, tenant: &ResolvedTenant, note: 
 /// Swap the note's outputs for the fresh one. Create-then-drop-older, not an
 /// update: the previous output belongs to a previous version of the note, and
 /// this order is what makes two concurrent index tasks converge on one row
-/// ([`RagOutput::replace_for_note`]).
+/// ([`replace_for_note`](crate::db::rag_output::replace_for_note)).
 async fn replace(
     db: &Database,
     note: &CourseNote,
     sources: Vec<crate::domain::course_note_file::CourseNoteFileId>,
     payload: serde_json::Value,
 ) -> Result<(), crate::error::AppError> {
-    RagOutput::replace_for_note(note.get_id(), note.get_course(), sources, payload, db).await?;
+    crate::db::rag_output::replace_for_note(db, note.get_id(), note.get_course(), sources, payload)
+        .await?;
     Ok(())
 }
 

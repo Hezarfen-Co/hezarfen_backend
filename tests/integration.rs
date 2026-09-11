@@ -19,13 +19,11 @@ use hezarfen_backend::db::exam_attempt::any_for_exam;
 use hezarfen_backend::db::session;
 use hezarfen_backend::domain::board::{Board, BoardId};
 use hezarfen_backend::domain::board_stroke::{BoardStroke, BoardStrokeId};
-use hezarfen_backend::domain::chatbot_message::ChatbotMessage;
 use hezarfen_backend::domain::chatbot_thread::ChatbotThreadId;
 use hezarfen_backend::domain::course::CourseId;
 use hezarfen_backend::domain::course_note::CourseNoteId;
 use hezarfen_backend::domain::course_note_file::CourseNoteFileId;
 use hezarfen_backend::domain::exam::ExamId;
-use hezarfen_backend::domain::rag_output::RagOutput;
 use hezarfen_backend::domain::timestamp::Timestamp;
 use hezarfen_backend::domain::user::{Password, User, UserId, Username};
 use hezarfen_backend::module::ModuleSet;
@@ -16976,12 +16974,14 @@ async fn chat_stream_stops_polling_when_the_client_hangs_up() {
     let thread = new_thread(&app, &ali).await;
     let me = send(&app, "GET", "/auth/me", Some(&ali), None).await;
     let user = UserId::from_key(me.body["id"].as_str().unwrap());
-    let pending =
-        ChatbotMessage::append_pending_assistant(&ChatbotThreadId::from_key(&thread), &user, &db)
-            .await
-            .expect("reserve an assistant row");
+    let pending = hezarfen_backend::db::chatbot_message::append_pending_assistant(
+        &db,
+        &ChatbotThreadId::from_key(&thread),
+        &user,
+    )
+    .await
+    .expect("reserve an assistant row");
     let mid = pending.get_id().key().to_string();
-
     // The witness is the runtime's task count, so it is read only once the
     // setup's short-lived database tasks have drained — otherwise one of those
     // finishing mid-measurement looks like the stream's own task.
@@ -27280,22 +27280,22 @@ async fn course_note_rag_outputs_read_and_delete() {
     assert_eq!(up.status, StatusCode::CREATED, "{}", up.body);
     let file_id = id_of(&up.body);
 
-    let output = RagOutput::create(
+    let output = hezarfen_backend::db::rag_output::create(
+        &db,
         &CourseNoteId::from_key(&note),
         &CourseId::from_key(&course),
         vec![CourseNoteFileId::from_key(&file_id)],
         json!({ "summary": "acids and bases" }),
-        &db,
     )
     .await
     .unwrap();
     let output_id = output.get_id().key().to_string();
-    let sibling_output = RagOutput::create(
+    let sibling_output = hezarfen_backend::db::rag_output::create(
+        &db,
         &CourseNoteId::from_key(&sibling),
         &CourseId::from_key(&course),
         Vec::new(),
         json!({ "summary": "other" }),
-        &db,
     )
     .await
     .unwrap();
@@ -27363,7 +27363,7 @@ async fn course_note_rag_outputs_read_and_delete() {
     .await;
     assert_eq!(res.status, StatusCode::NOT_FOUND, "{}", res.body);
     assert!(
-        RagOutput::read(sibling_output.get_id(), &db)
+        hezarfen_backend::db::rag_output::read(&db, sibling_output.get_id())
             .await
             .unwrap()
             .is_some()

@@ -3,6 +3,8 @@
 pub mod appointment;
 pub mod appointment_slot;
 pub mod cap;
+pub mod chatbot_message;
+pub mod chatbot_thread;
 pub mod class_blueprint;
 pub mod course;
 pub mod course_session;
@@ -15,6 +17,7 @@ pub mod meal_booking;
 pub mod note;
 pub mod page;
 pub mod payment_ledger;
+pub mod rag_output;
 pub mod session;
 pub mod settings;
 pub mod user;

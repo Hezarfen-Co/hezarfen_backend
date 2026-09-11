@@ -131,7 +131,7 @@ async fn create_thread(
     // The cap is checked and the row written as one critical section in the
     // domain: counting here and creating after would over-admit under
     // concurrency (the database does not serialize a count against inserts).
-    let thread = ChatbotThread::create_capped(user.get_id(), title, &st.db).await?;
+    let thread = service::chatbot_thread::create_capped(&st.db, user.get_id(), title).await?;
     Ok((
         StatusCode::CREATED,
         Json(ChatbotThreadResponse::new(&thread)),
@@ -159,7 +159,7 @@ async fn list_threads(
 ) -> Result<Json<Page<ChatbotThreadResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
     let (threads, total) =
-        ChatbotThread::list_for_user(user.get_id(), limit, offset, &st.db).await?;
+        service::chatbot_thread::list_for_user(&st.db, user.get_id(), limit, offset).await?;
     let items = threads.iter().map(ChatbotThreadResponse::new).collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
@@ -205,7 +205,7 @@ async fn rename_thread(
         value => Some(ChatbotThreadTitle::try_new(value)?),
     };
     let thread = own_thread(&id, user.get_id(), &st.db).await?;
-    let renamed = thread.rename(title, &st.db).await?;
+    let renamed = service::chatbot_thread::rename(&st.db, &thread, title).await?;
     Ok(Json(ChatbotThreadResponse::new(&renamed)))
 }
 
@@ -229,14 +229,14 @@ async fn delete_thread(
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
     let thread = own_thread(&id, user.get_id(), &st.db).await?;
-    thread.delete(&st.db).await?;
+    service::chatbot_thread::delete(&st.db, thread).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// Read a thread the caller owns, or `404`. A foreign id is indistinguishable
 /// from a missing one.
 async fn own_thread(id: &str, user: &UserId, db: &Database) -> Result<ChatbotThread, AppError> {
-    ChatbotThread::read_for(&ChatbotThreadId::from_key(id), user, db)
+    service::chatbot_thread::read_for(db, &ChatbotThreadId::from_key(id), user)
         .await?
         .ok_or(AppError::NotFound)
 }
@@ -341,7 +341,7 @@ async fn list_messages(
     let (limit, offset) = page.resolve()?;
     let thread = own_thread(&id, user.get_id(), &st.db).await?;
     let (messages, total) =
-        ChatbotMessage::list_for_thread(thread.get_id(), limit, offset, &st.db).await?;
+        service::chatbot_message::list_for_thread(&st.db, thread.get_id(), limit, offset).await?;
     let items = messages.iter().map(ChatbotMessageResponse::new).collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
@@ -422,9 +422,11 @@ async fn send_message(
     // creates therefore refuses the second one with a 404 — and the first is
     // swept by that same delete, so the turn leaves no half of itself behind.
     let prompt =
-        ChatbotMessage::append_user(thread.get_id(), user.get_id(), content, &st.db).await?;
+        service::chatbot_message::append_user(&st.db, thread.get_id(), user.get_id(), content)
+            .await?;
     let answer =
-        ChatbotMessage::append_pending_assistant(thread.get_id(), user.get_id(), &st.db).await?;
+        service::chatbot_message::append_pending_assistant(&st.db, thread.get_id(), user.get_id())
+            .await?;
 
     let message_id = answer.get_id().key().to_string();
     // Never awaited inline: the bridge round trip can outlast the request
@@ -502,13 +504,13 @@ async fn answer_turn(
     // This request's own question, read back by id — the text is already
     // stored, so carrying the id rather than the string keeps the prompt and
     // its answer paired however two POSTs on one thread interleave.
-    let prompt = match ChatbotMessage::prompt_of(&prompt_id, &db).await {
+    let prompt = match service::chatbot_message::prompt_of(&db, &prompt_id).await {
         Ok(Some(prompt)) => prompt,
         Ok(None) => {
             // The prompt row is gone — only reachable if the thread was deleted
             // out from under this task. There is nothing to ask, so settle.
             tracing::warn!("chat answer {} has no prompt to send", answer_id.key());
-            let _ = ChatbotMessage::fail(&answer_id, "internal", &db).await;
+            let _ = service::chatbot_message::fail(&db, &answer_id, "internal").await;
             return;
         }
         Err(err) => {
@@ -516,7 +518,7 @@ async fn answer_turn(
             // used to reclaim an unsettled row is gone, so leaving it `pending`
             // means a spinner until the 300s stale horizon. Settle it here.
             tracing::warn!("could not read the prompt for {}: {err}", answer_id.key());
-            let _ = ChatbotMessage::fail(&answer_id, "internal", &db).await;
+            let _ = service::chatbot_message::fail(&db, &answer_id, "internal").await;
             return;
         }
     };
@@ -532,10 +534,12 @@ async fn answer_turn(
     )
     .await
     {
-        Ok((text, truncated)) => ChatbotMessage::complete(&answer_id, text, truncated, &db).await,
+        Ok((text, truncated)) => {
+            service::chatbot_message::complete(&db, &answer_id, text, truncated).await
+        }
         Err(code) => {
             tracing::warn!("chat answer {} failed: {code}", answer_id.key());
-            ChatbotMessage::fail(&answer_id, &code, &db).await
+            service::chatbot_message::fail(&db, &answer_id, &code).await
         }
     };
     match settled {
@@ -624,7 +628,8 @@ async fn history_for(
     // what "the last `chatbot_history_turns` settled turns" means. +2 so dropping
     // this turn's own two rows cannot shorten it either (only the user one can
     // match: the assistant row is still `pending`).
-    let tail = ChatbotMessage::list_settled_tail(thread, turns.saturating_add(2), db).await?;
+    let tail =
+        service::chatbot_message::list_settled_tail(db, thread, turns.saturating_add(2)).await?;
     let mut history: Vec<ChatTurn> = tail
         .iter()
         .filter(|message| !fresh.contains(message.get_id()))
@@ -709,7 +714,7 @@ async fn own_message(
     db: &Database,
 ) -> Result<ChatbotMessage, AppError> {
     own_thread(thread, user, db).await?;
-    ChatbotMessage::read_for(&ChatbotMessageId::from_key(message), user, db)
+    service::chatbot_message::read_for(db, &ChatbotMessageId::from_key(message), user)
         .await?
         .filter(|message| message.get_thread_id().key() == thread)
         .ok_or(AppError::NotFound)
@@ -769,7 +774,8 @@ async fn stream_message(
                 _ = ticker.tick() => {}
                 _ = tx.closed() => return,
             }
-            let message = match ChatbotMessage::read_for(&message_id, &user_id, &db).await {
+            let message = match service::chatbot_message::read_for(&db, &message_id, &user_id).await
+            {
                 Ok(Some(message)) => message,
                 // Deleted mid-stream (the thread went away) — say so and stop.
                 Ok(None) => {
@@ -907,33 +913,43 @@ mod tests {
         let say = |text: String| ChatContent::try_new(&text).unwrap();
 
         for turn in 0..10 {
-            ChatbotMessage::append_user(&thread, &user, say(format!("soru {turn}")), &db)
+            service::chatbot_message::append_user(&db, &thread, &user, say(format!("soru {turn}")))
                 .await
                 .unwrap();
-            let answer = ChatbotMessage::append_pending_assistant(&thread, &user, &db)
+            let answer = service::chatbot_message::append_pending_assistant(&db, &thread, &user)
                 .await
                 .unwrap();
-            ChatbotMessage::complete(answer.get_id(), say(format!("cevap {turn}")), false, &db)
-                .await
-                .unwrap();
+            service::chatbot_message::complete(
+                &db,
+                answer.get_id(),
+                say(format!("cevap {turn}")),
+                false,
+            )
+            .await
+            .unwrap();
         }
         // Five turns in a row whose answer never landed.
         for turn in 0..5 {
-            ChatbotMessage::append_user(&thread, &user, say(format!("kayıp {turn}")), &db)
+            service::chatbot_message::append_user(
+                &db,
+                &thread,
+                &user,
+                say(format!("kayıp {turn}")),
+            )
+            .await
+            .unwrap();
+            let answer = service::chatbot_message::append_pending_assistant(&db, &thread, &user)
                 .await
                 .unwrap();
-            let answer = ChatbotMessage::append_pending_assistant(&thread, &user, &db)
-                .await
-                .unwrap();
-            ChatbotMessage::fail(answer.get_id(), "timed_out", &db)
+            service::chatbot_message::fail(&db, answer.get_id(), "timed_out")
                 .await
                 .unwrap();
         }
         // And this turn's own two rows, which never belong in the history.
-        let prompt = ChatbotMessage::append_user(&thread, &user, say("yeni".into()), &db)
+        let prompt = service::chatbot_message::append_user(&db, &thread, &user, say("yeni".into()))
             .await
             .unwrap();
-        let pending = ChatbotMessage::append_pending_assistant(&thread, &user, &db)
+        let pending = service::chatbot_message::append_pending_assistant(&db, &thread, &user)
             .await
             .unwrap();
         let fresh = [prompt.get_id().clone(), pending.get_id().clone()];
