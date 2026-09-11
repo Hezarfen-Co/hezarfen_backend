@@ -202,8 +202,8 @@ pub async fn search(
     } else {
         clauses.join(" AND ")
     };
-    let mut list = PagedList::new(format!("user WHERE {where_clause}"), "ORDER BY username")
-        .bind("q", needle);
+    let mut list =
+        PagedList::new(format!("user WHERE {where_clause}"), "ORDER BY username").bind("q", needle);
     if let Some(role) = role {
         list = list.bind("role", role);
     }
@@ -330,12 +330,12 @@ pub async fn set_role_cascade(
         // A room whose *creator* is demoted can never be ended by anyone:
         // the whiteboard is closed to parents outright, so the creator is
         // 404'd off their own board, `clear`/`lock`/`close`/`delete` are
-        // creator-only for everyone else, and `Board::list_for_user` is the
+        // creator-only for everyone else, and `crate::db::board::list_for_user` is the
         // crate's only enumeration — no manager or admin can so much as find
         // the id. Its participants meanwhile keep drawing (the room re-derives
         // membership per frame and they still pass), into a board only the
         // 50 000-stroke lifetime cap could ever retire. So the demotion
-        // retires it, with the same compare-and-set [`Board::close`] uses: an
+        // retires it, with the same compare-and-set [`crate::db::board::close`] uses: an
         // already-closed board keeps its first stamp. Closed and not deleted
         // because the marks are the participants' work too — they keep reading
         // the board and its whole history, and the creator's `board_count`

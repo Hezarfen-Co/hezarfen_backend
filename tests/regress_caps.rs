@@ -13,7 +13,6 @@ mod common;
 use axum::http::StatusCode;
 use common::{app_and_db, create_course, create_exam, enroll, id_of, login, login_as, me_id, send};
 use hezarfen_backend::domain::board::BoardId;
-use hezarfen_backend::domain::board_stroke::BoardStroke;
 use hezarfen_backend::domain::user::UserId;
 use serde_json::json;
 
@@ -281,12 +280,12 @@ async fn a_blank_canvas_cannot_be_cleared_for_a_free_row() {
     assert_eq!(rows(&db, &board).await, 0, "the refusal minted no marker");
 
     // One mark pays for one marker...
-    BoardStroke::append(
+    hezarfen_backend::db::board_stroke::append(
+        &db,
         &BoardId::from_key(&board),
         &UserId::from_key(&ali_id),
         "{\"p\":[1,2]}",
         0,
-        &db,
     )
     .await
     .expect("append");
@@ -364,12 +363,12 @@ async fn a_clear_marker_is_charged_to_the_lifetime_counter() {
     .await;
     let board = id_of(&res.body);
     for _ in 0..2 {
-        BoardStroke::append(
+        hezarfen_backend::db::board_stroke::append(
+            &db,
             &BoardId::from_key(&board),
             &UserId::from_key(&ali_id),
             "{\"p\":[1,2]}",
             0,
-            &db,
         )
         .await
         .expect("append");
@@ -384,12 +383,12 @@ async fn a_clear_marker_is_charged_to_the_lifetime_counter() {
 
     // The next epoch keeps counting from there — a marker is never re-counted
     // and never uncounted.
-    BoardStroke::append(
+    hezarfen_backend::db::board_stroke::append(
+        &db,
         &BoardId::from_key(&board),
         &UserId::from_key(&ali_id),
         "{\"p\":[3,4]}",
         1,
-        &db,
     )
     .await
     .expect("append");
@@ -492,12 +491,12 @@ async fn a_boards_lifetime_counter_is_repaired_from_its_rows_on_boot() {
     )
     .await;
     let board = id_of(&res.body);
-    BoardStroke::append(
+    hezarfen_backend::db::board_stroke::append(
+        &db,
         &BoardId::from_key(&board),
         &UserId::from_key(&ali_id),
         "{\"p\":[1,2]}",
         0,
-        &db,
     )
     .await
     .expect("append");

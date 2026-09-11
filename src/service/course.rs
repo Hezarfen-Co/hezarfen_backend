@@ -7,7 +7,6 @@
 use crate::database::Database;
 use crate::db::course;
 use crate::domain::course::{Course, CourseDescription, CourseId, CourseKind, CourseTitle};
-use crate::domain::course_note_file::CourseNoteFile;
 use crate::domain::role::Role;
 use crate::domain::term::TermId;
 use crate::domain::user::UserId;
@@ -168,7 +167,8 @@ pub async fn delete(db: &Database, course: &Course) -> Result<DeleteOutcome, App
         crate::db::answer_image::file_keys_for_course(db, course.get_id()).await?;
     let homework_files =
         crate::db::homework_file::file_keys_for_course(db, course.get_id()).await?;
-    let course_note_files = CourseNoteFile::file_keys_for_course(course.get_id(), db).await?;
+    let course_note_files =
+        crate::db::course_note_file::file_keys_for_course(db, course.get_id()).await?;
     let deleted = course::delete(db, course.clone()).await?;
     Ok(DeleteOutcome {
         deleted,

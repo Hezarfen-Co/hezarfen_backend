@@ -28,9 +28,8 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::constant::MAX_BOARD_PARTICIPANTS;
 use crate::database::Database;
-use crate::domain::board::{BOARD_ROSTER_LOCK, Board, BoardId, BoardTitle};
+use crate::domain::board::{Board, BoardId, BoardTitle};
 use crate::domain::board_stroke::BoardStroke;
 use crate::domain::class_group::ClassGroupId;
 use crate::domain::course::CourseId;
@@ -38,6 +37,8 @@ use crate::domain::event::EventId;
 use crate::domain::role::Role;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
+use crate::service::board::BOARD_ROSTER_LOCK;
+use crate::service::{board, board_stroke};
 use crate::state::AppState;
 use crate::tenant::Slug;
 
@@ -58,104 +59,6 @@ pub fn routes() -> OpenApiRouter<AppState> {
         .routes(routes!(clear_board))
         .routes(routes!(close_board))
         .routes(routes!(invite_board))
-}
-
-/// The board, or a 404 — including the deliberate 404 for a caller who is not
-/// on it. Every route starts here, so existence never leaks.
-///
-/// A `parent` is treated as an outsider rather than refused with a 403: the
-/// role is barred from the whiteboard entirely, and a 403 would confirm the
-/// board exists. [`resolve_participants`] keeps parents off every roster, so
-/// this arm only ever fires for a row written before that rule.
-async fn board_for(id: &str, user: &User, db: &Database) -> Result<Board, AppError> {
-    let board = Board::read(&BoardId::from_key(id), db)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    if !user.get_role().at_least(Role::Student) || !board.is_participant(user.get_id()) {
-        return Err(AppError::NotFound);
-    }
-    Ok(board)
-}
-
-/// The creator-only gate. A 403, never a 404: the caller reached it through
-/// [`board_for`], so they are a participant and the board's existence is
-/// already theirs to see.
-fn ensure_creator(board: &Board, user: &User) -> Result<(), AppError> {
-    if !board.is_creator(user.get_id()) {
-        return Err(AppError::Forbidden(
-            "only the board's creator can clear, lock, close or delete it",
-        ));
-    }
-    Ok(())
-}
-
-/// The invite list off the wire: deduped, capped, and every id resolved against
-/// a real user. The cap is applied *before* the lookup (the domain caps too, but
-/// only after the read would already have run), and an unknown id is a 400
-/// rather than a silently dropped invitation.
-///
-/// The eligible set is fetched in **one** read, not one per id. That was a
-/// per-id loop while a roster could only be typed by hand and so was a handful
-/// of ids; bulk invite made a full board an ordinary thing to own, and a
-/// read-modify-write PATCH of one — read the board, drop a name, send the rest
-/// back — is the common client shape, so the loop had become
-/// `max_participants` sequential round trips on a routine edit.
-///
-/// A `parent` is refused here, and that is the cut that keeps the role off the
-/// whiteboard: never on a roster means [`board_for`] and the room's door already
-/// answer 404 on every id-scoped route, and no socket can ever open.
-///
-/// The creator is a participant by construction, so they are neither injected
-/// into the list nor rejected from it.
-///
-/// `current` is the board's roster as it stands (empty when a board is being
-/// created), and it is what makes a read-modify-write PATCH survive: an id
-/// *already* on the board that no longer qualifies — demoted, or deleted
-/// outright — is dropped silently instead of failing the whole call, so a
-/// creator echoing back the roster they were just served gets a 200 and a
-/// cleaned list. An id that is **new** to the board still 400s; without that
-/// split the drop would be a hole letting a caller seed a roster with anyone.
-async fn resolve_participants(
-    ids: Option<Vec<String>>,
-    current: &[UserId],
-    db: &Database,
-) -> Result<Vec<UserId>, AppError> {
-    let Some(mut ids) = ids else {
-        return Ok(Vec::new());
-    };
-    ids.sort();
-    ids.dedup();
-    if ids.len() > MAX_BOARD_PARTICIPANTS {
-        return Err(AppError::Validation(ValidationError::TooLong {
-            field: "participants",
-            max: MAX_BOARD_PARTICIPANTS,
-            got: ids.len(),
-        }));
-    }
-    let wanted: Vec<UserId> = ids.iter().map(|id| UserId::from_key(id)).collect();
-    // Absent from this list means "no such user, or below `student`" — the two
-    // are one case here, and telling them apart is what the caller must not be
-    // able to do anyway.
-    let eligible: Vec<UserId> = crate::service::user::list_by_ids(db, &wanted)
-        .await?
-        .iter()
-        .filter(|found| found.get_role().at_least(Role::Student))
-        .map(|found| found.get_id().clone())
-        .collect();
-    let mut users = Vec::with_capacity(wanted.len());
-    for user in wanted {
-        if !eligible.contains(&user) {
-            if current.contains(&user) {
-                continue;
-            }
-            return Err(AppError::Validation(ValidationError::Invalid {
-                field: "participants",
-                reason: "every participant must be an existing user of at least the student role",
-            }));
-        }
-        users.push(user);
-    }
-    Ok(users)
 }
 
 /// Push one frame to whoever is in the room right now. An empty room is the
@@ -299,8 +202,8 @@ async fn create_board(
 ) -> Result<(StatusCode, Json<BoardResponse>), AppError> {
     let title = BoardTitle::try_new(&req.title)?;
     // No roster yet, so nothing is grandfathered: every id must qualify.
-    let participants = resolve_participants(req.participants, &[], &st.db).await?;
-    let board = Board::create(user.get_id(), title, participants, &st.db).await?;
+    let participants = board::resolve_participants(req.participants, &[], &st.db).await?;
+    let board = board::create(&st.db, user.get_id(), title, participants).await?;
     Ok((StatusCode::CREATED, Json(BoardResponse::new(&board))))
 }
 
@@ -342,7 +245,7 @@ async fn list_boards(
 ) -> Result<Json<Page<BoardResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
     let (boards, total) =
-        Board::list_for_user(user.get_id(), filter.open, limit, offset, &st.db).await?;
+        board::list_for_user(&st.db, user.get_id(), filter.open, limit, offset).await?;
     let items = boards.iter().map(BoardResponse::new).collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
@@ -367,7 +270,7 @@ async fn get_board(
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<BoardResponse>, AppError> {
-    let board = board_for(&id, &user, &st.db).await?;
+    let board = board::board_for(&id, &user, &st.db).await?;
     Ok(Json(BoardResponse::new(&board)))
 }
 
@@ -396,20 +299,20 @@ async fn list_strokes(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<StrokeResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let board = board_for(&id, &user, &st.db).await?;
+    let board = board::board_for(&id, &user, &st.db).await?;
     // The current epoch holds no `clear` marker — a marker is written with the
     // epoch it *closed* — so scoping history to it is the live canvas. Markers
     // are dropped anyway: a clear committing between the board read above and
     // this read files one under the epoch just named, and the room's socket
     // never shows it, so without the filter the two views disagree in exactly
     // that race.
-    let (strokes, total) = BoardStroke::history(
+    let (strokes, total) = board_stroke::history(
+        &st.db,
         board.get_id(),
         Some(board.get_epoch()),
         true,
         limit,
         offset,
-        &st.db,
     )
     .await?;
     let items = strokes.iter().map(StrokeResponse::new).collect();
@@ -447,9 +350,9 @@ async fn list_history(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<StrokeResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let board = board_for(&id, &user, &st.db).await?;
+    let board = board::board_for(&id, &user, &st.db).await?;
     let (strokes, total) =
-        BoardStroke::history(board.get_id(), scope.epoch, false, limit, offset, &st.db).await?;
+        board_stroke::history(&st.db, board.get_id(), scope.epoch, false, limit, offset).await?;
     let items = strokes.iter().map(StrokeResponse::new).collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
@@ -480,8 +383,8 @@ async fn list_epochs(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<StrokeResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let board = board_for(&id, &user, &st.db).await?;
-    let markers = BoardStroke::epochs(board.get_id(), &st.db).await?;
+    let board = board::board_for(&id, &user, &st.db).await?;
+    let markers = board_stroke::epochs(&st.db, board.get_id()).await?;
     // Paged in the web layer: the marker list is one bounded read, and a board
     // has at most one marker per clear.
     let items = paginate(&markers, limit, offset)
@@ -549,22 +452,22 @@ async fn update_board(
         true => Some(BOARD_ROSTER_LOCK.lock().await),
         false => None,
     };
-    let mut board = board_for(&id, &user, &st.db).await?;
+    let mut board = board::board_for(&id, &user, &st.db).await?;
     if req.participants.is_some() || req.locked.is_some() {
-        ensure_creator(&board, &user)?;
+        board::ensure_creator(&board, &user)?;
     }
 
     if let Some(title) = req.title.as_deref() {
-        board = board.set_title(BoardTitle::try_new(title)?, &st.db).await?;
+        board = board::set_title(&st.db, &board, BoardTitle::try_new(title)?).await?;
     }
     if let Some(participants) = req.participants {
         let participants =
-            resolve_participants(participants, board.get_participants(), &st.db).await?;
-        board = board.set_participants(participants, &st.db).await?;
+            board::resolve_participants(participants, board.get_participants(), &st.db).await?;
+        board = board::set_participants(&st.db, &board, participants).await?;
         fan_out(&st, &slug, board.get_id(), participants_frame(&board));
     }
     if let Some(locked) = req.locked {
-        board = board.set_locked(locked, user.get_id(), &st.db).await?;
+        board = board::set_locked(&st.db, &board, locked, user.get_id()).await?;
         fan_out(
             &st,
             &slug,
@@ -607,9 +510,9 @@ async fn clear_board(
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<StrokeResponse>), AppError> {
-    let board = board_for(&id, &user, &st.db).await?;
-    ensure_creator(&board, &user)?;
-    let marker = BoardStroke::clear(board.get_id(), user.get_id(), &st.db).await?;
+    let board = board::board_for(&id, &user, &st.db).await?;
+    board::ensure_creator(&board, &user)?;
+    let marker = board_stroke::clear(&st.db, board.get_id(), user.get_id()).await?;
     // The marker carries the epoch it *closed*; the room's new canvas is the
     // next one.
     fan_out(
@@ -649,9 +552,9 @@ async fn close_board(
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<BoardResponse>, AppError> {
-    let board = board_for(&id, &user, &st.db).await?;
-    ensure_creator(&board, &user)?;
-    let board = board.close(&st.db).await?;
+    let board = board::board_for(&id, &user, &st.db).await?;
+    board::ensure_creator(&board, &user)?;
+    let board = board::close(&st.db, &board).await?;
     fan_out(
         &st,
         &slug,
@@ -834,37 +737,10 @@ async fn invite_board(
     // the same roster and the second write would drop the first one's people —
     // silently, with both callers told 200. See [`BOARD_ROSTER_LOCK`].
     let _guard = BOARD_ROSTER_LOCK.lock().await;
-    let board = board_for(&id, &user, &st.db).await?;
-    ensure_creator(&board, &user)?;
+    let board = board::board_for(&id, &user, &st.db).await?;
+    board::ensure_creator(&board, &user)?;
     let invited = req.resolve(&user, &st.db).await?;
-
-    // One read for the whole group. The filters below are silent on purpose —
-    // a source is a whole group, and one member who has left or was never
-    // eligible must not fail the invite for the other twenty-nine.
-    let mut roster = board.get_participants().to_vec();
-    for candidate in crate::service::user::list_by_ids(&st.db, &invited).await? {
-        if !candidate.get_role().at_least(Role::Student) {
-            continue;
-        }
-        // The creator is a participant by construction and never sits in the
-        // array; adding them there would spend a seat on someone who already
-        // has access.
-        if candidate.get_id() == board.get_creator() || roster.contains(candidate.get_id()) {
-            continue;
-        }
-        roster.push(candidate.get_id().clone());
-    }
-
-    if roster.len() > MAX_BOARD_PARTICIPANTS {
-        return Err(AppError::ConflictOwned(format!(
-            "this invite would put the board at {} participants, over the limit of {MAX_BOARD_PARTICIPANTS}; nobody was added",
-            roster.len()
-        )));
-    }
-    // Unchanged rosters still write and still fan out: the alternative is a
-    // branch that has to prove the two lists are equal, and a re-invite that
-    // added nobody is the idempotent case, not the hot path.
-    let board = board.set_participants(roster, &st.db).await?;
+    let board = board::invite(&st.db, &board, invited).await?;
     fan_out(&st, &slug, board.get_id(), participants_frame(&board));
     Ok(Json(BoardResponse::new(&board)))
 }
@@ -892,70 +768,12 @@ async fn delete_board(
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    let board = board_for(&id, &user, &st.db).await?;
-    ensure_creator(&board, &user)?;
+    let board = board::board_for(&id, &user, &st.db).await?;
+    board::ensure_creator(&board, &user)?;
     let id = board.get_id().clone();
-    board.delete(&st.db).await?;
+    board::delete(&st.db, board).await?;
     // Told after the row is gone: a room that acts on this and then re-reads
     // must find nothing, not a board about to disappear.
     fan_out(&st, &slug, &id, json!({"type": "deleted"}));
     Ok(StatusCode::NO_CONTENT)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The security boundary of this module, in one test: an outsider is told
-    /// the board does not exist, an insider without rights is told it is not
-    /// theirs to command. Swapping those two leaks the school's board list on
-    /// one side and hides a rendered board from its own participant on the
-    /// other.
-    #[tokio::test]
-    async fn an_outsider_gets_404_and_a_participant_gets_403() {
-        let db = crate::database::init_mem().await.unwrap();
-        db.query(
-            "CREATE user:c SET username = 'c', password_hash = 'x';
-             CREATE user:p SET username = 'p', password_hash = 'x';
-             CREATE user:s SET username = 's', password_hash = 'x';",
-        )
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
-        let who = async |key: &str| {
-            crate::service::user::read(&db, &UserId::from_key(key))
-                .await
-                .unwrap()
-                .unwrap()
-        };
-        let (creator, participant, stranger) = (who("c").await, who("p").await, who("s").await);
-        let board = Board::create(
-            creator.get_id(),
-            BoardTitle::try_new("Geometri").unwrap(),
-            vec![participant.get_id().clone()],
-            &db,
-        )
-        .await
-        .unwrap();
-        let id = board.get_id().key().to_string();
-
-        assert!(matches!(
-            board_for(&id, &stranger, &db).await,
-            Err(AppError::NotFound)
-        ));
-        // A board that does not exist at all answers the same way, so the two
-        // are indistinguishable from outside.
-        assert!(matches!(
-            board_for("nope", &creator, &db).await,
-            Err(AppError::NotFound)
-        ));
-
-        let seen = board_for(&id, &participant, &db).await.unwrap();
-        assert!(matches!(
-            ensure_creator(&seen, &participant),
-            Err(AppError::Forbidden(_))
-        ));
-        assert!(ensure_creator(&board_for(&id, &creator, &db).await.unwrap(), &creator).is_ok());
-    }
 }
