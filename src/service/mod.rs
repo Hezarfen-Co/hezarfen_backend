@@ -3,6 +3,7 @@
 
 pub mod appointment;
 pub mod appointment_slot;
+pub mod class_blueprint;
 pub mod course;
 pub mod exam_attempt;
 pub mod note;
