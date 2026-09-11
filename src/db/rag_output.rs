@@ -125,25 +125,26 @@ mod tests {
         )
         .await
         .unwrap();
-        CourseNote::create(
+        crate::db::course_note::create(
+            db,
             course.get_id(),
             &creator,
             CourseNoteTitle::try_new(title).unwrap(),
             CourseNoteContent::try_new("body").unwrap(),
-            db,
         )
         .await
         .unwrap()
     }
 
     async fn file_on(db: &Database, note: &CourseNoteId) -> CourseNoteFileId {
-        CourseNoteFile::new(
+        let file = CourseNoteFile::new(
             note,
             FileName::try_new("plan.pdf").unwrap(),
             FileContentType::try_new("application/pdf").unwrap(),
             3,
         )
-        .insert(db)
+;
+        crate::db::course_note_file::insert(db, file)
         .await
         .unwrap()
         .get_id()
