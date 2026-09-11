@@ -2,10 +2,10 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
 use crate::constant::{MAX_NOTE_CONTENT_LEN, MAX_NOTE_TITLE_LEN, NOTE_TABLE};
 use crate::database::Database;
-use crate::domain::field_update::FieldUpdate;
+use crate::db::field_update::FieldUpdate;
 use crate::domain::monotonic_id::next_ulid;
 use crate::domain::note_file::NoteFile;
-use crate::domain::page::PagedList;
+use crate::db::page::PagedList;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 use crate::validate::{validate_optional, validate_required};

@@ -15,7 +15,7 @@ use crate::constant::{MAX_SOLUTION_BODY_LEN, SOLUTION_TABLE};
 use crate::database::Database;
 use crate::domain::monotonic_id::next_ulid;
 use crate::domain::note_file::FileContentType;
-use crate::domain::page::PagedList;
+use crate::db::page::PagedList;
 use crate::domain::pool_question::{PoolQuestionId, bump_question_and_write};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;

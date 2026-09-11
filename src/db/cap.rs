@@ -58,7 +58,7 @@ use crate::error::AppError;
 static CLAIM_LOCK: Mutex<()> = Mutex::const_new(());
 
 /// [`CLAIM_LOCK`], for a counter write that rides someone else's transaction
-/// instead of [`write`]'s — [`crate::domain::field_update::FieldUpdate`]'s term
+/// instead of [`write`]'s — [`crate::db::field_update::FieldUpdate`]'s term
 /// move claims and releases inside the very `UPDATE`'s transaction, and still
 /// owes the process one counter write at a time.
 ///

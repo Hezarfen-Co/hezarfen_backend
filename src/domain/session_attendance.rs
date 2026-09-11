@@ -8,7 +8,7 @@ use crate::database::{Database, transaction_with_retry};
 use crate::domain::attendance::AttendanceStatus;
 use crate::domain::course::CourseId;
 use crate::domain::course_session::{CourseSession, CourseSessionId};
-use crate::domain::page::PagedList;
+use crate::db::page::PagedList;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;

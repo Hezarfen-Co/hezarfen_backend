@@ -11,7 +11,7 @@ use crate::constant::{CLASS_MEMBER_TABLE, MAX_CLASS_COURSES, MAX_CLASS_MEMBERS};
 use crate::database::Database;
 use crate::domain::class_group::ClassGroupId;
 use crate::domain::class_pump::{Attached, Axis, attach, detach, link_id};
-use crate::domain::page::PagedList;
+use crate::db::page::PagedList;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
@@ -252,7 +252,7 @@ pub(crate) mod tests {
     }
 
     /// A counter, re-read out of the store — never off a return value, which
-    /// the in-memory engine forges wins on (see [`crate::domain::cap`]).
+    /// the in-memory engine forges wins on (see [`crate::db::cap`]).
     pub(crate) async fn counter(field: &str, of: RecordId, db: &Database) -> i64 {
         let mut result = db
             .query(format!("SELECT VALUE {field} ?? 0 FROM $of"))

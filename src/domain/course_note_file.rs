@@ -15,10 +15,10 @@ use crate::constant::{
     COURSE_NOTE_FILE_COUNT_FIELD, COURSE_NOTE_FILE_TABLE, MAX_COURSE_NOTE_FILES,
 };
 use crate::database::Database;
-use crate::domain::cap;
+use crate::db::cap;
 use crate::domain::course_note::CourseNoteId;
 use crate::domain::monotonic_id::next_ulid;
-use crate::domain::page::PagedList;
+use crate::db::page::PagedList;
 use crate::error::AppError;
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]

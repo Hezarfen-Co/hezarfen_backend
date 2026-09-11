@@ -289,7 +289,7 @@ impl MenuDish {
     /// it takes the three-way shape: absent = keep, `Some(None)` = clear.
     ///
     /// The `SET` is built here rather than by
-    /// [`FieldUpdate`](crate::domain::field_update::FieldUpdate) because the
+    /// [`FieldUpdate`](crate::db::field_update::FieldUpdate) because the
     /// revision bump lands on *another* row and has to share this write's
     /// transaction; the field-by-field scoping — an omitted field is never
     /// written, so a concurrent PATCH of another one is not reverted — is the

@@ -12,10 +12,10 @@ use crate::constant::{
     NOTE_FILE_TABLE,
 };
 use crate::database::Database;
-use crate::domain::cap;
+use crate::db::cap;
 use crate::domain::monotonic_id::next_ulid;
 use crate::domain::note::NoteId;
-use crate::domain::page::PagedList;
+use crate::db::page::PagedList;
 use crate::error::{AppError, ValidationError};
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]

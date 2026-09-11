@@ -19,7 +19,7 @@ use crate::constant::{
 };
 use crate::database::Database;
 use crate::domain::chatbot_thread::{ChatbotThreadId, touch_and_write};
-use crate::domain::page::PagedList;
+use crate::db::page::PagedList;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};

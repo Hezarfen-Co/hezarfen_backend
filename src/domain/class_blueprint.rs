@@ -42,7 +42,7 @@ use crate::domain::class_course::ClassCourse;
 use crate::domain::class_group::{ClassGrade, ClassGroup, ClassGroupId};
 use crate::domain::class_pump::{Attached, Axis, detach};
 use crate::domain::course::CourseId;
-use crate::domain::page::PagedList;
+use crate::db::page::PagedList;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 

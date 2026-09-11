@@ -921,13 +921,13 @@ pub const BOARD_STROKE_TABLE: &str = "board_stroke";
 pub const BADGE_AWARD_TABLE: &str = "badge_award";
 /// One row per *name* the school's settings offer, keyed by the name itself:
 /// how many rows still reference it, and whether it has been retired out of the
-/// list (see the reference counters in [`crate::domain::cap`]).
+/// list (see the reference counters in [`crate::db::cap`]).
 pub const KIND_REF_TABLE: &str = "kind_ref";
 pub const SLOT_REF_TABLE: &str = "slot_ref";
 
 // --- stored cap counters -------------------------------------------------
 
-/// The counter columns behind the count caps (see [`crate::domain::cap`]).
+/// The counter columns behind the count caps (see [`crate::db::cap`]).
 /// Each one lives on the *parent* row, because a single-record conditional
 /// `UPDATE` is the only guard a concurrent writer cannot outrun (a lock is
 /// released around the round trip). Spelled here rather than at the call site
@@ -970,7 +970,7 @@ pub const CHATBOT_THREAD_COUNT_FIELD: &str = "chatbot_thread_count";
 /// The column a *grant* claim moves and puts back, so its transaction writes
 /// the holder's own `user` record — the one key
 /// [`crate::domain::user::User::set_role`] writes (see
-/// [`crate::domain::cap::role_claim`]). Any `option<int>` on the row would do:
+/// [`crate::db::cap::role_claim`]). Any `option<int>` on the row would do:
 /// the claim nets zero and never reads it, so this is an alias rather than a
 /// column of its own — a new one would mean a migration on a SCHEMAFULL table
 /// for a value nothing ever observes.

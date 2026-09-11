@@ -2,9 +2,9 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
 use crate::constant::WORK_ENTRY_TABLE;
 use crate::database::{Database, transaction_with_retry};
-use crate::domain::field_update::FieldUpdate;
+use crate::db::field_update::FieldUpdate;
 use crate::domain::monotonic_id::next_ulid;
-use crate::domain::page::PagedList;
+use crate::db::page::PagedList;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};

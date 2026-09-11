@@ -1,6 +1,6 @@
 //! A teacher's published availability: "I am free here, book me". A slot is
 //! nearly pure calendar: the one piece of booking state it carries is the
-//! `occupied` counter (a [`cap`](crate::domain::cap) of one), taken when a
+//! `occupied` counter (a [`cap`](crate::db::cap) of one), taken when a
 //! booking is made and given back in the same transaction as the reject or
 //! cancel that settles it — so the slot frees itself again, and unlike a UNIQUE
 //! index it does not keep a dead booking's seat. Stored rather than counted
@@ -19,7 +19,7 @@ use crate::constant::{
 };
 use crate::database::{Database, transaction_with_retry};
 use crate::domain::appointment::{APPOINTMENT_LOCK, Appointment};
-use crate::domain::cap;
+use crate::db::cap;
 use crate::domain::monotonic_id::next_ulid;
 use crate::domain::role::Role;
 use crate::domain::timestamp::Timestamp;
@@ -579,7 +579,7 @@ impl AppointmentSlot {
 mod tests {
     use super::*;
     use crate::constant::{MILLIS_PER_DAY, SLOT_OCCUPIED_FIELD};
-    use crate::domain::cap;
+    use crate::db::cap;
 
     fn at(millis: i64) -> Timestamp {
         Timestamp::from_millis(millis)

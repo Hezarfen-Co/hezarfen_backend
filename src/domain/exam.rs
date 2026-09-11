@@ -5,7 +5,7 @@ use crate::constant::{
     UNLIMITED_EXAM_ATTEMPTS,
 };
 use crate::database::{Database, transaction_with_retry};
-use crate::domain::cap;
+use crate::db::cap;
 use crate::domain::course::CourseId;
 use crate::domain::monotonic_id::next_ulid;
 use crate::domain::settings::ExamKindDef;

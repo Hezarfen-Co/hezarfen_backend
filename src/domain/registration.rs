@@ -2,7 +2,7 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
 use crate::constant::{REGISTRATION_COUNT_FIELD, REGISTRATION_TABLE};
 use crate::database::Database;
-use crate::domain::cap;
+use crate::db::cap;
 use crate::domain::event::{Event, EventId};
 use crate::domain::role::Role;
 use crate::domain::user::{User, UserId};

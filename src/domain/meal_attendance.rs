@@ -20,7 +20,7 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use crate::constant::{MEAL_ATTENDANCE_STATUSES, MEAL_ATTENDANCE_TABLE};
 use crate::database::Database;
 use crate::domain::menu::{MenuDate, MenuId, bump_menu_and_write};
-use crate::domain::page::PagedList;
+use crate::db::page::PagedList;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};

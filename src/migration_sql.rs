@@ -280,7 +280,7 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS audience.class ON event TYPE option<record<class_group>>;
     DEFINE FIELD IF NOT EXISTS audience.capacity ON event TYPE option<int>;
     -- Seats taken on the signup list, the stored capacity guard that closes
-    -- write-skew between concurrent request tasks (see `crate::domain::cap`).
+    -- write-skew between concurrent request tasks (see `crate::db::cap`).
     -- Absent reads as zero, so no Rust struct needs it.
     DEFINE FIELD IF NOT EXISTS registration_count ON event TYPE option<int>;
     REMOVE FIELD IF EXISTS audience.users ON TABLE event;
@@ -311,7 +311,7 @@ pub const MIGRATION: &str = "
     -- is exactly what an absent stamp already means.
     DEFINE FIELD IF NOT EXISTS archived_at ON term TYPE option<int>;
     -- Courses still linking this term, the stored delete guard that closes
-    -- write-skew between concurrent request tasks (see `crate::domain::cap`).
+    -- write-skew between concurrent request tasks (see `crate::db::cap`).
     -- Absent reads as zero, so no Rust struct needs it.
     DEFINE FIELD IF NOT EXISTS course_count ON term TYPE option<int>;
     -- Classes linking this term, the other half of the same guard. A column of
@@ -782,7 +782,7 @@ pub const MIGRATION: &str = "
     DEFINE FIELD IF NOT EXISTS date ON menu TYPE string READONLY;
     DEFINE FIELD IF NOT EXISTS slot ON menu TYPE string READONLY;
     DEFINE FIELD IF NOT EXISTS capacity ON menu TYPE option<int>;
-    -- `seats_booked` is the seat cap's counter (see `domain::cap`) and
+    -- `seats_booked` is the seat cap's counter (see `db::cap`) and
     -- `version` the menu's revision: a booking claims its seat only while the
     -- menu still stands at the revision it read the price at, so a dish
     -- re-priced mid-booking cannot be billed as the old price. Both absent

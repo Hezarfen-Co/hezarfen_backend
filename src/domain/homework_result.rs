@@ -188,7 +188,7 @@ impl HomeworkResult {
         // no counter column and is SCHEMAFULL, so `due_at` is the one `int` it
         // already has; do not invent a second spelling.
         //
-        // Not [`crate::domain::cap::touch_and_create`], which is the same shape
+        // Not [`crate::db::cap::touch_and_create`], which is the same shape
         // for a bare `CREATE`: a grade is an UPSERT (a regrade must overwrite),
         // and the freeze stamp and the grader's counter have to ride the same
         // transaction, which that helper has no room for.

@@ -17,9 +17,9 @@ use crate::constant::{
     SUBJECT_HOMEWORK_COUNT_FIELD,
 };
 use crate::database::Database;
-use crate::domain::cap;
+use crate::db::cap;
 use crate::domain::course::CourseId;
-use crate::domain::field_update::FieldUpdate;
+use crate::db::field_update::FieldUpdate;
 use crate::domain::monotonic_id::next_ulid;
 use crate::domain::subject::SubjectId;
 use crate::domain::timestamp::Timestamp;

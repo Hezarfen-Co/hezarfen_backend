@@ -10,9 +10,9 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
 use crate::constant::{COURSE_COUNT_FIELD, MAX_TERM_NAME_LEN, TERM_CLASS_COUNT_FIELD, TERM_TABLE};
 use crate::database::{Database, write_with_retry};
-use crate::domain::field_update::FieldUpdate;
+use crate::db::field_update::FieldUpdate;
 use crate::domain::monotonic_id::next_ulid;
-use crate::domain::page::PagedList;
+use crate::db::page::PagedList;
 use crate::domain::timestamp::{Timestamp, range_error};
 use crate::error::{AppError, ValidationError};
 use crate::validate::validate_required;

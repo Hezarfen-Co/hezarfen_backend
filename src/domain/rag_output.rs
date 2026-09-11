@@ -20,7 +20,7 @@ use crate::domain::course::CourseId;
 use crate::domain::course_note::CourseNoteId;
 use crate::domain::course_note_file::CourseNoteFileId;
 use crate::domain::monotonic_id::next_ulid;
-use crate::domain::page::PagedList;
+use crate::db::page::PagedList;
 use crate::domain::timestamp::Timestamp;
 use crate::error::AppError;
 

@@ -9,11 +9,11 @@ use crate::constant::{
 };
 use crate::database::Database;
 use crate::domain::bank_question::BankQuestionId;
-use crate::domain::cap;
+use crate::db::cap;
 use crate::domain::exam::ExamId;
 use crate::domain::exam_attempt::ExamAttempt;
 use crate::domain::monotonic_id::next_ulid;
-use crate::domain::page::PagedList;
+use crate::db::page::PagedList;
 use crate::domain::subject::SubjectId;
 use crate::error::{AppError, ValidationError};
 use crate::validate::{validate_question_kind, validate_question_points, validate_required};
@@ -569,7 +569,7 @@ impl ExamQuestion {
         // undeletable forever).
         //
         // The two are armed on *different* conditions, which is the whole of
-        // the rule ([`crate::domain::field_update::FieldUpdate::refcount`] states
+        // the rule ([`crate::db::field_update::FieldUpdate::refcount`] states
         // it the same way): the counter statements only when the link actually
         // changes, but the CAS whenever this write *carries* the link — and it
         // always does, because the handler fills an omitted `subject_id` from
