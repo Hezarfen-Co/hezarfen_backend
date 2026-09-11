@@ -22187,8 +22187,9 @@ async fn concurrent_duplicate_menu_publishes_conflict_not_500() {
 /// writers before they can ever collide.
 #[tokio::test]
 async fn concurrent_ledger_appends_of_one_id_write_one_line_not_a_500() {
+    use hezarfen_backend::db::meal_ledger;
     use hezarfen_backend::domain::meal_booking::MealBookingId;
-    use hezarfen_backend::domain::meal_ledger::MealLedger;
+    use hezarfen_backend::service::meal_ledger as ledger_service;
 
     let (app, db) = app_and_db().await;
     let mgr = login_as(&app, &db, "ledger_race_mgr", "manager").await;
@@ -22233,14 +22234,14 @@ async fn concurrent_ledger_appends_of_one_id_write_one_line_not_a_500() {
     .expect("the booking exists");
     let student = booking.get_student().clone();
     assert_eq!(
-        MealLedger::balance_of(&student, &db).await.unwrap(),
+        meal_ledger::balance_of(&db, &student).await.unwrap(),
         -1000,
         "the seat was charged once"
     );
 
     let (first, second) = tokio::join!(
-        MealLedger::reverse_booking(&booking, &student, &db),
-        MealLedger::reverse_booking(&booking, &student, &db),
+        ledger_service::reverse_booking(&db, &booking, &student),
+        ledger_service::reverse_booking(&db, &booking, &student),
     );
     assert!(first.is_ok(), "the winner appended: {first:?}");
     assert!(
@@ -22248,12 +22249,12 @@ async fn concurrent_ledger_appends_of_one_id_write_one_line_not_a_500() {
         "the loser must read back the winner's line, not fail: {second:?}"
     );
 
-    let (lines, _) = MealLedger::list_for_student(&student, None, 0, &db)
+    let (lines, _) = meal_ledger::list_for_student(&db, &student, None, 0)
         .await
         .unwrap();
     assert_eq!(lines.len(), 2, "one charge and exactly one reversal");
     assert_eq!(
-        MealLedger::balance_of(&student, &db).await.unwrap(),
+        meal_ledger::balance_of(&db, &student).await.unwrap(),
         0,
         "the money moved back exactly once"
     );
@@ -23941,7 +23942,7 @@ async fn a_cancel_cut_short_mid_flight_is_healed_by_repeating_it() {
 /// of 6000 rounds, which surfaced as a whole-suite failure a few percent of
 /// runs. The same code orphaned 0 of 9600 rounds against a real server. So the
 /// concurrent claim lives where the store can testify about it —
-/// `domain::menu::tests::a_child_written_inside_a_delete_never_outlives_the_menu`,
+/// `db::menu::tests::a_child_written_inside_a_delete_never_outlives_the_menu`,
 /// `#[ignore]`d and run against a real server — and what stays here is the
 /// logic, pinned deterministically.
 #[tokio::test]

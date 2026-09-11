@@ -306,8 +306,11 @@ mod tests {
     use super::*;
     use crate::database::init_mem;
     use crate::db::cap;
+    use crate::db::meal_ledger;
+    use crate::db::menu;
+    use crate::db::menu_dish;
     use crate::domain::meal_booking::{MealBookingStatus, MealCutoff};
-    use crate::domain::menu::{Menu, MenuDate, MenuSlot};
+    use crate::domain::menu::{MenuDate, MenuSlot};
     use crate::domain::menu_dish::{DishName, DishPrice, DishTags, MenuDish};
     use crate::domain::settings::MealSlotDef;
     use crate::service::meal_booking;
@@ -322,12 +325,12 @@ mod tests {
     async fn menu_on(date: &str, capacity: Option<i64>) -> (Database, MenuId) {
         let db = init_mem().await.unwrap();
         let slots = vec![MealSlotDef::try_new("lunch", None).unwrap()];
-        let menu = Menu::create(
+        let menu = menu::create(
+            &db,
             MenuDate::try_new(date).unwrap(),
             MenuSlot::try_new("lunch", &slots).unwrap(),
             capacity,
             &UserId::generate(),
-            &db,
         )
         .await
         .unwrap();
@@ -354,13 +357,13 @@ mod tests {
     }
 
     async fn add_dish(menu: &MenuId, price: i64, db: &Database) -> MenuDish {
-        MenuDish::create(
+        menu_dish::create(
+            db,
             menu,
             DishName::try_new("çorba").unwrap(),
             None,
             DishPrice::try_new(price).unwrap(),
             DishTags::try_new(&[], &[]).unwrap(),
-            db,
         )
         .await
         .unwrap()
@@ -374,7 +377,7 @@ mod tests {
     async fn a_seat_cannot_be_claimed_at_a_revision_the_menu_has_left() {
         let (db, menu) = menu(None).await;
         let ali = UserId::generate();
-        let seen = Menu::read(&menu, &db).await.unwrap().unwrap().get_version();
+        let seen = menu::read(&db, &menu).await.unwrap().unwrap().get_version();
         // A dish lands: the price a booking read a moment ago is now stale.
         add_dish(&menu, 1_000, &db).await;
         let row = MealBooking {
@@ -404,7 +407,7 @@ mod tests {
         );
 
         // Re-read, and the same seat is taken with the row it belongs to.
-        let now = Menu::read(&menu, &db).await.unwrap().unwrap().get_version();
+        let now = menu::read(&db, &menu).await.unwrap().unwrap().get_version();
         assert!(now > seen);
         assert!(matches!(place(now).await, Claimed::Made(_)));
         assert_eq!(seats(&menu, &db).await, 1);
@@ -426,7 +429,7 @@ mod tests {
         let (db, id) = menu(None).await;
         let mut seen = 0;
         let mut moved = async |db: &Database| {
-            let now = Menu::read(&id, db).await.unwrap().unwrap().get_version();
+            let now = menu::read(db, &id).await.unwrap().unwrap().get_version();
             let stepped = now > seen;
             seen = now;
             stepped
@@ -435,26 +438,26 @@ mod tests {
 
         let dish = add_dish(&id, 1_000, &db).await;
         assert!(moved(&db).await, "a dish added");
-        let dish = dish
-            .update(
-                None,
-                None,
-                Some(DishPrice::try_new(2_000).unwrap()),
-                None,
-                &db,
-            )
-            .await
-            .unwrap();
+        let dish = menu_dish::update(
+            &db,
+            dish,
+            None,
+            None,
+            Some(DishPrice::try_new(2_000).unwrap()),
+            None,
+        )
+        .await
+        .unwrap();
         assert!(moved(&db).await, "a dish re-priced");
-        dish.delete(&db).await.unwrap();
+        menu_dish::delete(&db, dish).await.unwrap();
         assert!(moved(&db).await, "a dish removed");
-        Menu::read(&id, &db)
-            .await
-            .unwrap()
-            .unwrap()
-            .update(Some(Some(5)), &db)
-            .await
-            .unwrap();
+        menu::update(
+            &db,
+            menu::read(&db, &id).await.unwrap().unwrap(),
+            Some(Some(5)),
+        )
+        .await
+        .unwrap();
         assert!(moved(&db).await, "the capacity moved");
     }
 
@@ -493,7 +496,7 @@ mod tests {
         assert_eq!(stored.get_attempt(), live.get_attempt());
         assert_eq!(seats(&menu, &db).await, 1, "and gives no seat back");
         assert_eq!(
-            MealLedger::balance_of(&ali, &db).await.unwrap(),
+            meal_ledger::balance_of(&db, &ali).await.unwrap(),
             -1_000,
             "the live attempt's charge stands: it was never cancelled"
         );
@@ -530,7 +533,7 @@ mod tests {
         assert_eq!(freed.get_status(), MealBookingStatus::Cancelled);
         assert_eq!(seats(&menu, &db).await, 0);
         assert_eq!(
-            MealLedger::balance_of(&ali, &db).await.unwrap(),
+            meal_ledger::balance_of(&db, &ali).await.unwrap(),
             0,
             "the reversal must have committed with the flip, not after it"
         );
@@ -540,7 +543,7 @@ mod tests {
         meal_booking::book(&db, &menu, &ali, &ali, &open)
             .await
             .unwrap();
-        assert_eq!(MealLedger::balance_of(&ali, &db).await.unwrap(), -1_000);
+        assert_eq!(meal_ledger::balance_of(&db, &ali).await.unwrap(), -1_000);
     }
 
     /// The seat may not be held without its money. Driven against
@@ -555,8 +558,8 @@ mod tests {
         let (db, menu) = menu(None).await;
         let ali = UserId::generate();
         add_dish(&menu, 1_000, &db).await;
-        let price = MealLedger::price_snapshot(&menu, &db).await.unwrap();
-        let seen = Menu::read(&menu, &db).await.unwrap().unwrap().get_version();
+        let price = meal_ledger::price_snapshot(&db, &menu).await.unwrap();
+        let seen = menu::read(&db, &menu).await.unwrap().unwrap().get_version();
         let row = MealBooking {
             id: MealBookingId::composite(&menu, &ali),
             menu: menu.clone(),
@@ -586,7 +589,7 @@ mod tests {
         assert!(matches!(place().await, Claimed::Made(_)));
         assert_eq!(seats(&menu, &db).await, 1);
         assert_eq!(
-            MealLedger::balance_of(&ali, &db).await.unwrap(),
+            meal_ledger::balance_of(&db, &ali).await.unwrap(),
             -1_000,
             "the charge must have committed with the claim, not after it"
         );
@@ -595,7 +598,7 @@ mod tests {
         // back — no second seat and, just as importantly, no second charge.
         assert!(matches!(place().await, Claimed::Duplicate));
         assert_eq!(seats(&menu, &db).await, 1);
-        assert_eq!(MealLedger::balance_of(&ali, &db).await.unwrap(), -1_000);
+        assert_eq!(meal_ledger::balance_of(&db, &ali).await.unwrap(), -1_000);
     }
 
     /// A free menu owes no refund, so the flip must carry no ledger line at all
@@ -613,7 +616,7 @@ mod tests {
             .unwrap()
             .expect("a free seat is still a seat");
         assert_eq!(seats(&menu, &db).await, 0);
-        let (lines, total) = MealLedger::list_for_student(&ali, None, 0, &db)
+        let (lines, total) = meal_ledger::list_for_student(&db, &ali, None, 0)
             .await
             .unwrap();
         assert!(lines.is_empty() && total == 0, "a free seat moves no money");

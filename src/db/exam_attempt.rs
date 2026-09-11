@@ -172,7 +172,7 @@ pub async fn any_for_exam(db: &Database, exam: &ExamId) -> Result<bool, AppError
 /// with neither caller told anything. Writing a key the delete also writes
 /// makes the two collide and the store refuses one side. It is the shape
 /// [`crate::domain::exam_answer::ExamAnswer::save`] and
-/// [`crate::domain::menu::bump_menu_and_write`] already use.
+/// [`crate::db::menu::bump_menu_and_write`] already use.
 ///
 /// An orphan here is not merely untidy: an `exam_question` that outlives
 /// its exam keeps the reference it claimed on its subject (the cascade's

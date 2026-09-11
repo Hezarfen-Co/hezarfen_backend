@@ -18,13 +18,12 @@ use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::constant::MAX_DISHES_PER_MENU;
 use crate::database::Database;
-use crate::domain::dietary_profile::{DietaryNote, DietaryProfile, DietaryTags, conflicts};
+use crate::domain::dietary_profile::{DietaryNote, DietaryTags, conflicts};
 use crate::domain::meal_attendance::{MealAttendance, MealAttendanceStatus};
 use crate::domain::meal_booking::{MealBooking, MealBookingId, MealCutoff};
 use crate::domain::meal_ledger::{LedgerAmount, LedgerMethod, LedgerNote, MealLedger};
-use crate::domain::menu::{MENU_LOCK, Menu, MenuDate, MenuId, MenuSlot, validate_capacity};
+use crate::domain::menu::{Menu, MenuDate, MenuId, MenuSlot, validate_capacity};
 use crate::domain::menu_dish::{
     DishDescription, DishName, DishPrice, DishTags, MenuDish, MenuDishId,
 };
@@ -206,9 +205,9 @@ async fn menu_responses(
     db: &Database,
 ) -> Result<Vec<MenuResponse>, AppError> {
     let ids: Vec<MenuId> = menus.iter().map(|menu| menu.get_id().clone()).collect();
-    let dishes = MenuDish::list_for_menus(&ids, db).await?;
+    let dishes = service::menu::list_dishes_for_menus(db, &ids).await?;
     let people = person_map(menus.iter().map(|menu| menu.get_created_by().clone()), db).await?;
-    let viewer_tags = DietaryProfile::tags_of(viewer, db).await?;
+    let viewer_tags = service::dietary_profile::tags_of(db, viewer).await?;
     Ok(menus
         .iter()
         .map(|menu| MenuResponse::new(menu, &dishes, &people, &viewer_tags))
@@ -221,9 +220,9 @@ async fn one_menu(
     viewer: &UserId,
     db: &Database,
 ) -> Result<Json<MenuResponse>, AppError> {
-    let dishes = MenuDish::list_for_menu(menu.get_id(), db).await?;
+    let dishes = service::menu::list_dishes(db, menu.get_id()).await?;
     let people = person_map([menu.get_created_by().clone()], db).await?;
-    let viewer_tags = DietaryProfile::tags_of(viewer, db).await?;
+    let viewer_tags = service::dietary_profile::tags_of(db, viewer).await?;
     Ok(Json(MenuResponse::new(
         menu,
         &dishes,
@@ -275,7 +274,7 @@ async fn create_menu(
         &service::settings::load(&st.db).await?.get_meal_slots(),
     )?;
     validate_capacity(req.capacity)?;
-    let menu = Menu::create(date, slot, req.capacity, user.get_id(), &st.db).await?;
+    let menu = service::menu::create(&st.db, date, slot, req.capacity, user.get_id()).await?;
     let body = one_menu(&menu, user.get_id(), &st.db).await?;
     Ok((StatusCode::CREATED, body))
 }
@@ -306,7 +305,8 @@ async fn list_menus(
     let (limit, offset) = page.resolve()?;
     let from = range.from.as_deref().map(MenuDate::try_new).transpose()?;
     let to = range.to.as_deref().map(MenuDate::try_new).transpose()?;
-    let (menus, total) = Menu::list(from.as_ref(), to.as_ref(), limit, offset, &st.db).await?;
+    let (menus, total) =
+        service::menu::list(&st.db, from.as_ref(), to.as_ref(), limit, offset).await?;
     // The dish/people join runs over the page alone, so it shrinks with it.
     let items = menu_responses(&menus, user.get_id(), &st.db).await?;
     Ok(Json(Page::new(items, total, limit, offset)))
@@ -330,7 +330,7 @@ async fn get_menu(
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<MenuResponse>, AppError> {
-    let menu = Menu::read(&MenuId::from_key(&id), &st.db)
+    let menu = service::menu::read(&st.db, &MenuId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     one_menu(&menu, user.get_id(), &st.db).await
@@ -363,10 +363,10 @@ async fn update_menu(
     if let Some(capacity) = req.capacity {
         validate_capacity(capacity)?;
     }
-    let menu = Menu::read(&MenuId::from_key(&id), &st.db)
+    let menu = service::menu::read(&st.db, &MenuId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
-    let updated = menu.update(req.capacity, &st.db).await?;
+    let updated = service::menu::update(&st.db, menu, req.capacity).await?;
     one_menu(&updated, user.get_id(), &st.db).await
 }
 
@@ -392,12 +392,13 @@ async fn delete_menu(
     RequireManager(_user): RequireManager,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    let menu = Menu::read(&MenuId::from_key(&id), &st.db)
+    let menu = service::menu::read(&st.db, &MenuId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
-    // The seat check rides in the delete's own `WHERE` (see `Menu::delete`), so
-    // a concurrent booking cannot slip between the read and the delete.
-    menu.delete(&st.db).await?;
+    // The seat check rides in the delete's own `WHERE` (the persistence
+    // layer's `menu::delete`), so a concurrent booking cannot slip between
+    // the read and the delete.
+    service::menu::delete(&st.db, menu).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -438,28 +439,21 @@ async fn add_dish(
         &req.tags,
         &service::settings::load(&st.db).await?.get_dietary_tags(),
     )?;
-    // Dish writes take [`MENU_LOCK`] for the dish cap alone: count-then-write
-    // is write-skew, so the count and the insert have to be one step. The
-    // *price* no longer needs it — a dish write moves the menu's revision, and
-    // a booking claims its seat at the revision it priced itself against.
-    // The lock is a leaf again: the revision bump rides the dish write's own
-    // transaction now, so nothing held under it takes `cap`'s counter lock. It
-    // stays a leaf only while that holds — see [`MENU_LOCK`] for the order a
-    // caller that changes it must keep.
-    let _guard = MENU_LOCK.lock().await;
-    // The menu is read *inside* the lock: read before it, a `DELETE /menus/{id}`
-    // running in the gap takes its cascade with it and this dish lands on a menu
-    // that no longer exists.
-    let menu = Menu::read(&MenuId::from_key(&id), &st.db)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    if MenuDish::count_for_menu(menu.get_id(), &st.db).await? >= MAX_DISHES_PER_MENU {
-        return Err(AppError::Conflict(
-            "the menu already carries the maximum number of dishes",
-        ));
-    }
-    let dish = MenuDish::create(menu.get_id(), name, description, price, tags, &st.db).await?;
-    let viewer_tags = DietaryProfile::tags_of(user.get_id(), &st.db).await?;
+    // The dish-cap gate and its [`MENU_LOCK`](crate::service::menu::MENU_LOCK)
+    // lease live in the service: count-then-write is write-skew, so the count
+    // and the insert have to be one step, and the menu is read *inside* the
+    // lock — read before it, a `DELETE /menus/{id}` running in the gap takes
+    // its cascade with it and this dish lands on a menu that no longer exists.
+    let dish = service::menu::add_dish(
+        &st.db,
+        &MenuId::from_key(&id),
+        name,
+        description,
+        price,
+        tags,
+    )
+    .await?;
+    let viewer_tags = service::dietary_profile::tags_of(&st.db, user.get_id()).await?;
     Ok((
         StatusCode::CREATED,
         Json(DishResponse::new(&dish, &viewer_tags)),
@@ -490,7 +484,7 @@ async fn update_dish(
     Path(did): Path<String>,
     Json(req): Json<UpdateDish>,
 ) -> Result<Json<DishResponse>, AppError> {
-    let dish = MenuDish::read(&MenuDishId::from_key(&did), &st.db)
+    let dish = service::menu::read_dish(&st.db, &MenuDishId::from_key(&did))
         .await?
         .ok_or(AppError::NotFound)?;
     let name = req.name.as_deref().map(DishName::try_new).transpose()?;
@@ -509,10 +503,10 @@ async fn update_dish(
         )?),
         None => None,
     };
-    // Under [`MENU_LOCK`] like every dish write — see `add_dish`.
-    let _guard = MENU_LOCK.lock().await;
-    let updated = dish.update(name, description, price, tags, &st.db).await?;
-    let viewer_tags = DietaryProfile::tags_of(user.get_id(), &st.db).await?;
+    // The dish write holds [`MENU_LOCK`](crate::service::menu::MENU_LOCK)
+    // inside the service, like every dish write — see `add_dish`.
+    let updated = service::menu::update_dish(&st.db, dish, name, description, price, tags).await?;
+    let viewer_tags = service::dietary_profile::tags_of(&st.db, user.get_id()).await?;
     Ok(Json(DishResponse::new(&updated, &viewer_tags)))
 }
 
@@ -535,12 +529,12 @@ async fn delete_dish(
     RequireManager(_user): RequireManager,
     Path(did): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    let dish = MenuDish::read(&MenuDishId::from_key(&did), &st.db)
+    let dish = service::menu::read_dish(&st.db, &MenuDishId::from_key(&did))
         .await?
         .ok_or(AppError::NotFound)?;
-    // Under [`MENU_LOCK`] like every dish write — see `add_dish`.
-    let _guard = MENU_LOCK.lock().await;
-    dish.delete(&st.db).await?;
+    // The dish write holds [`MENU_LOCK`](crate::service::menu::MENU_LOCK)
+    // inside the service, like every dish write — see `add_dish`.
+    service::menu::delete_dish(&st.db, dish).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -578,7 +572,7 @@ async fn profile_response(
     student: &UserId,
     db: &Database,
 ) -> Result<Json<DietaryProfileResponse>, AppError> {
-    let profile = DietaryProfile::read(student, db).await?;
+    let profile = service::dietary_profile::read(db, student).await?;
     let people = person_map(
         std::iter::once(student.clone())
             .chain(profile.as_ref().map(|row| row.get_updated_by().clone())),
@@ -701,7 +695,7 @@ async fn update_profile(
         Some(None) => Some(None),
         Some(Some(text)) => Some(DietaryNote::try_new(&text)?),
     };
-    DietaryProfile::save(&target, tags, note, manager.get_id(), &st.db).await?;
+    service::dietary_profile::save(&st.db, &target, tags, note, manager.get_id()).await?;
     profile_response(&target, &st.db).await
 }
 
@@ -939,7 +933,7 @@ async fn list_menu_bookings(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<BookingResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let menu = Menu::read(&MenuId::from_key(&id), &st.db)
+    let menu = service::menu::read(&st.db, &MenuId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     let (rows, total) =
@@ -1139,25 +1133,30 @@ async fn mark_attendance(
     Path(id): Path<String>,
     Json(req): Json<MarkMealAttendance>,
 ) -> Result<Json<MealAttendanceResponse>, AppError> {
-    let menu = Menu::read(&MenuId::from_key(&id), &st.db)
+    let menu = service::menu::read(&st.db, &MenuId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     let status = MealAttendanceStatus::try_new(&req.status)?;
     let student = UserId::from_key(&req.student_id);
     // The target must exist; no booking is required, since a walk-in was still
     // served and the record is operationally true.
-    if crate::service::user::read(&st.db, &student).await?.is_none() {
+    if crate::service::user::read(&st.db, &student)
+        .await?
+        .is_none()
+    {
         return Err(AppError::Validation(ValidationError::Invalid {
             field: "student_id",
             reason: "target user does not exist",
         }));
     }
-    // The write moves the menu's own revision (see [`MealAttendance::mark`]), so
+    // The write moves the menu's own revision (see the persistence layer's
+    // `meal_attendance::mark`), so
     // a delete landing between the read above and this write cannot commit
     // alongside it — one of the two loses its round, and this one then answers
     // 404 with no mark behind it, exactly as the read would have.
     let row =
-        MealAttendance::mark(menu.get_id(), &student, status, marker.get_id(), &st.db).await?;
+        service::meal_attendance::mark(&st.db, menu.get_id(), &student, status, marker.get_id())
+            .await?;
     let items = attendance_responses(std::slice::from_ref(&row), &st.db).await?;
     Ok(Json(
         items.into_iter().next().expect("one mark in, one out"),
@@ -1187,10 +1186,11 @@ async fn list_menu_attendance(
 ) -> Result<Json<Page<MealAttendanceResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
     // Menu must exist — a missing menu is a 404, not an empty list.
-    let menu = Menu::read(&MenuId::from_key(&id), &st.db)
+    let menu = service::menu::read(&st.db, &MenuId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
-    let (rows, total) = MealAttendance::list_for_menu(menu.get_id(), limit, offset, &st.db).await?;
+    let (rows, total) =
+        service::meal_attendance::list_for_menu(&st.db, menu.get_id(), limit, offset).await?;
     let items = attendance_responses(&rows, &st.db).await?;
     Ok(Json(Page::new(items, total, limit, offset)))
 }
@@ -1225,13 +1225,13 @@ async fn user_attendance(
     ensure_can_read_student(&caller, &target, &st.db).await?;
     let from = range.from.as_deref().map(MenuDate::try_new).transpose()?;
     let to = range.to.as_deref().map(MenuDate::try_new).transpose()?;
-    let (rows, total) = MealAttendance::list_for_student(
+    let (rows, total) = service::meal_attendance::list_for_student(
+        &st.db,
         &target,
         from.as_ref(),
         to.as_ref(),
         limit,
         offset,
-        &st.db,
     )
     .await?;
     let items = attendance_responses(&rows, &st.db).await?;
@@ -1311,7 +1311,7 @@ async fn balance_response(
     let people = person_map(std::iter::once(student.clone()), db).await?;
     Ok(Json(BalanceResponse {
         student: PersonRef::resolve(&people, student),
-        balance_minor: MealLedger::balance_of(student, db).await?,
+        balance_minor: service::meal_ledger::balance_of(db, student).await?,
     }))
 }
 
@@ -1431,7 +1431,8 @@ async fn user_ledger(
     let (limit, offset) = page.resolve()?;
     let target = UserId::from_key(&user);
     ensure_can_read_money(&caller, &target, &st.db).await?;
-    let (rows, total) = MealLedger::list_for_student(&target, limit, offset, &st.db).await?;
+    let (rows, total) =
+        service::meal_ledger::list_for_student(&st.db, &target, limit, offset).await?;
     let items = ledger_responses(&rows, &st.db).await?;
     Ok(Json(Page::new(items, total, limit, offset)))
 }
@@ -1504,7 +1505,7 @@ async fn record_credit(
         .ok_or(AppError::NotFound)?
         .get_role()
         != Role::Student
-        && MealLedger::list_for_student(&student, Some(1), 0, &st.db)
+        && service::meal_ledger::list_for_student(&st.db, &student, Some(1), 0)
             .await?
             .0
             .is_empty()
@@ -1519,7 +1520,8 @@ async fn record_credit(
         .as_deref()
         .map(PaymentRequestKey::try_new)
         .transpose()?;
-    let line = MealLedger::credit(
+    let line = service::meal_ledger::credit(
+        &st.db,
         &student,
         LedgerAmount::try_new(req.amount_minor)?,
         req.method
@@ -1534,7 +1536,6 @@ async fn record_credit(
             .flatten(),
         request_key.as_ref(),
         admin.get_id(),
-        &st.db,
     )
     .await?;
     let items = ledger_responses(std::slice::from_ref(&line), &st.db).await?;

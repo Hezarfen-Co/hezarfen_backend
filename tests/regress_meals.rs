@@ -11,8 +11,10 @@ mod common;
 
 use axum::http::StatusCode;
 use common::{app_and_db, id_of, login, login_as, me_id, send, set_role};
-use hezarfen_backend::domain::meal_attendance::{MealAttendance, MealAttendanceStatus};
-use hezarfen_backend::domain::menu::{Menu, MenuDate, MenuId, MenuSlot};
+use hezarfen_backend::db::meal_attendance;
+use hezarfen_backend::db::menu;
+use hezarfen_backend::domain::meal_attendance::MealAttendanceStatus;
+use hezarfen_backend::domain::menu::{MenuDate, MenuId, MenuSlot};
 use hezarfen_backend::domain::settings::MealSlotDef;
 use hezarfen_backend::domain::user::UserId;
 use hezarfen_backend::error::AppError;
@@ -108,12 +110,12 @@ async fn a_menu_behind_the_calendar_is_neither_publishable_nor_bookable() {
     // Half two: the menu the create-side check cannot reach — published while
     // its day was still ahead, written here as the store holds it, since no
     // route publishes one any more.
-    let stale = Menu::create(
+    let stale = menu::create(
+        &db,
         MenuDate::try_new("2020-01-02").unwrap(),
         MenuSlot::try_new("lunch", &[MealSlotDef::try_new("lunch", None).unwrap()]).unwrap(),
         None,
         &UserId::from_key(&me_id(&app, &mgr).await),
-        &db,
     )
     .await
     .expect("the domain still writes what the volume may hold");
@@ -467,12 +469,12 @@ async fn a_mark_for_a_menu_that_is_gone_writes_no_row() {
     .await;
     assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
 
-    let marked = MealAttendance::mark(
+    let marked = meal_attendance::mark(
+        &db,
         &menu,
         &ali_id,
         MealAttendanceStatus::try_new("served").unwrap(),
         &mgr_id,
-        &db,
     )
     .await
     .expect_err("the mark is refused");
@@ -481,7 +483,7 @@ async fn a_mark_for_a_menu_that_is_gone_writes_no_row() {
         "no menu, no mark: {marked:?}"
     );
     assert_eq!(
-        MealAttendance::list_for_menu(&menu, None, 0, &db)
+        meal_attendance::list_for_menu(&db, &menu, None, 0)
             .await
             .unwrap()
             .1,
