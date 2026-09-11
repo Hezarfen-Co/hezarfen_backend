@@ -11,7 +11,7 @@ use utoipa_axum::routes;
 
 use crate::database::Database;
 use crate::domain::course::{Course, CourseDescription, CourseId, CourseKind, CourseTitle};
-use crate::domain::course_session::{CourseSession, SessionTopic};
+use crate::domain::course_session::SessionTopic;
 use crate::domain::enrollment::Enrollment;
 use crate::domain::exam::{
     Exam, ExamAttemptLimit, ExamDescription, ExamDuration, ExamKind, ExamMode, ExamSchedule,
@@ -27,7 +27,6 @@ use crate::service;
 use crate::state::AppState;
 
 use super::homework::{description_or_none, resolve_assigned};
-use super::sessions::resolve_session_teacher;
 use super::subjects::subject_in_course;
 use super::terms::resolve_term;
 use super::{
@@ -265,7 +264,10 @@ pub(crate) async fn visible_courses(user: &User, db: &Database) -> Result<Vec<Co
     } else {
         Vec::new()
     };
-    for course in service::course::list_enrolled(db, user.get_id(), None, 0).await?.0 {
+    for course in service::course::list_enrolled(db, user.get_id(), None, 0)
+        .await?
+        .0
+    {
         if !courses
             .iter()
             .any(|known| known.get_id() == course.get_id())
@@ -401,7 +403,8 @@ async fn my_courses(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<CourseResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let (courses, total) = service::course::list_enrolled(&st.db, user.get_id(), limit, offset).await?;
+    let (courses, total) =
+        service::course::list_enrolled(&st.db, user.get_id(), limit, offset).await?;
     let people = person_map(courses.iter().flat_map(course_people), &st.db).await?;
     let items = courses
         .iter()
@@ -1227,20 +1230,22 @@ async fn create_session_in_course(
     service::course::require_open(&st.db, &course).await?;
 
     let topic = SessionTopic::try_new(&req.topic.unwrap_or_default())?;
-    let teacher = resolve_session_teacher(req.teacher_id.as_deref(), &user, &st.db).await?;
+    let teacher =
+        service::course_session::resolve_session_teacher(req.teacher_id.as_deref(), &user, &st.db)
+            .await?;
     let starts_at = Timestamp::from_millis(req.starts_at);
     let ends_at = req.ends_at.map(Timestamp::from_millis);
     check_not_past("starts_at", Some(starts_at))?;
     check_not_past("ends_at", ends_at)?;
     check_time_range(Some(starts_at), ends_at)?;
 
-    let session = CourseSession::create(
+    let session = service::course_session::create(
+        &st.db,
         course.get_id(),
         teacher.get_id(),
         topic,
         starts_at,
         ends_at,
-        &st.db,
     )
     .await?;
     let people = PersonRef::map_of(&[&teacher]);
@@ -1285,7 +1290,7 @@ async fn list_course_sessions(
         ));
     }
     let (rows, total) =
-        CourseSession::list_for_course(course.get_id(), limit, offset, &st.db).await?;
+        service::course_session::list_for_course(&st.db, course.get_id(), limit, offset).await?;
     // Join teachers onto the page alone — the lookup shrinks with the window.
     let people = person_map(rows.iter().map(|s| s.get_teacher().clone()), &st.db).await?;
     let items = rows
@@ -1359,13 +1364,10 @@ mod tests {
         let db = init_mem().await.unwrap();
         let creator = user("creator", Role::Teacher, &db).await;
         let assigned = user("assigned", Role::Teacher, &db).await;
-        let course = service::course::assign_teacher(
-            &db,
-            &course(&creator, &db).await,
-            assigned.get_id(),
-        )
-        .await
-        .unwrap();
+        let course =
+            service::course::assign_teacher(&db, &course(&creator, &db).await, assigned.get_id())
+                .await
+                .unwrap();
         // Still teacher+: untouched by the floor.
         assert!(can_manage_course(&course, &assigned));
         // ...but never an owner, assigned or not.
