@@ -861,11 +861,12 @@ async fn book_meal(
     let student = booking_target(&user, req.student_id.as_deref(), &st.db).await?;
     let cutoff = meal_cutoff(&st.db).await?;
     let menu = MenuId::from_key(&id);
-    // Price, seat and charge land as one decision (see `MealBooking::book`),
-    // keyed by (seat, attempt) — a double-click books one seat and bills it
-    // once, and a dish landing between the price and the seat is refused by the
-    // claim rather than billed.
-    let booking = MealBooking::book(&menu, &student, user.get_id(), &cutoff, &st.db).await?;
+    // Price, seat and charge land as one decision (see
+    // `service::meal_booking::book`), keyed by (seat, attempt) — a double-click
+    // books one seat and bills it once, and a dish landing between the price
+    // and the seat is refused by the claim rather than billed.
+    let booking =
+        service::meal_booking::book(&st.db, &menu, &student, user.get_id(), &cutoff).await?;
     let items = booking_responses(std::slice::from_ref(&booking), &st.db).await?;
     Ok((
         StatusCode::CREATED,
@@ -908,7 +909,8 @@ async fn my_bookings(
                 .map(|link| link.get_student().clone()),
         );
     }
-    let (rows, total) = MealBooking::list_for_students(&students, limit, offset, &st.db).await?;
+    let (rows, total) =
+        service::meal_booking::list_for_students(&st.db, &students, limit, offset).await?;
     let items = booking_responses(&rows, &st.db).await?;
     Ok(Json(Page::new(items, total, limit, offset)))
 }
@@ -940,7 +942,8 @@ async fn list_menu_bookings(
     let menu = Menu::read(&MenuId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    let (rows, total) = MealBooking::list_for_menu(menu.get_id(), limit, offset, &st.db).await?;
+    let (rows, total) =
+        service::meal_booking::list_for_menu(&st.db, menu.get_id(), limit, offset).await?;
     let items = booking_responses(&rows, &st.db).await?;
     Ok(Json(Page::new(items, total, limit, offset)))
 }
@@ -1034,10 +1037,10 @@ async fn cancel_booking(
     };
     // Flips the row and appends the reversal for that attempt's charge in one
     // transaction; the charge itself stays.
-    let booking = MealBooking::read(&id, &st.db)
+    let booking = service::meal_booking::read(&st.db, &id)
         .await?
         .ok_or(AppError::NotFound)?;
-    let cancelled = booking.cancel(&cutoff, user.get_id(), &st.db).await?;
+    let cancelled = service::meal_booking::cancel(&st.db, booking, &cutoff, user.get_id()).await?;
     let items = booking_responses(std::slice::from_ref(&cancelled), &st.db).await?;
     Ok(Json(
         items.into_iter().next().expect("one booking in, one out"),
