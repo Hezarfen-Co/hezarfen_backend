@@ -18,8 +18,8 @@ mod common;
 
 use axum::http::StatusCode;
 use common::{app_and_db, create_exam_with, enroll, id_of, login_as, me_id, send};
+use hezarfen_backend::db::exam_attempt::list_for_exam;
 use hezarfen_backend::domain::exam::ExamId;
-use hezarfen_backend::domain::exam_attempt::ExamAttempt;
 use serde_json::json;
 
 /// The delete is held open for a second *after* the exam row is gone but
@@ -122,7 +122,7 @@ async fn an_attempt_started_inside_a_delete_never_outlives_the_exam() {
 
         // Stored state is the whole verdict; a response code is not evidence.
         let id = ExamId::from_key(&exam);
-        sittings += ExamAttempt::list_for_exam(&id, &db).await.unwrap().len();
+        sittings += list_for_exam(&db, &id).await.unwrap().len();
     }
     assert_eq!(sittings, 0, "a sitting outlived its exam");
 }

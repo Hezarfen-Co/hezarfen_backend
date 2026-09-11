@@ -599,7 +599,7 @@ impl Exam {
         )
         .await?;
         // An aborted transaction errors every slot; only the THROW's names the
-        // marker (the [`ExamAttempt::write_unfrozen`] treatment).
+        // marker (the [`crate::db::exam_attempt::write_unfrozen`] treatment).
         if errors
             .values()
             .any(|error| error.to_string().contains("exam_redraft"))
@@ -682,7 +682,7 @@ impl Exam {
 
 /// An unscheduled published exam — the minimum any test that writes a *child*
 /// of an exam needs, in any module: every such write moves the exam row (see
-/// [`ExamAttempt::write_unfrozen_with`](crate::domain::exam_attempt::ExamAttempt)
+/// [`crate::db::exam_attempt::write_unfrozen_with`]
 /// and [`crate::domain::exam_answer::ExamAnswer::save`]), so a minted id whose
 /// row was never created is a 404 rather than a silent orphan.
 #[cfg(test)]
@@ -1239,7 +1239,7 @@ mod tests {
     /// gated on that count reading zero — a subject nobody could ever delete
     /// again, hanging off an exam nobody could ever see. The freeze gate is a
     /// *read* of `exam_attempt` and never survived this window;
-    /// [`ExamAttempt::write_unfrozen_with`] now writes the exam row too.
+    /// [`crate::db::exam_attempt::write_unfrozen_with`] now writes the exam row too.
     ///
     /// Same seam, same `#[ignore]`, same reason as the answer twin above: the
     /// subject *is* the store's conflict detection, which the in-memory engine
