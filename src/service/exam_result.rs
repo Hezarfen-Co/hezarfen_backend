@@ -115,7 +115,7 @@ pub async fn grade(
         .map_or(1, |a| a.get_seq());
     let result = db::exam_result::grade(db, exam_id, target, seq, mark, grader, kind).await?;
     for person in [grader, target] {
-        if let Err(err) = badge::sync(person, db).await {
+        if let Err(err) = crate::db::badge::sync(db, person).await {
             tracing::warn!("failed to sync badges for {}: {err}", person.key());
         }
     }
