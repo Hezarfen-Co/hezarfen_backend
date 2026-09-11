@@ -11,7 +11,6 @@ use crate::constant::{
     STUDY_STREAK_CURRENT_FIELD, STUDY_STREAK_LAST_DAY_FIELD, STUDY_STREAK_LONGEST_FIELD,
 };
 use crate::database::{Database, transaction_with_retry};
-use crate::domain::badge;
 use crate::domain::pomodoro::{PomodoroSession, PomodoroSessionId};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
@@ -234,7 +233,7 @@ pub async fn finish(db: &Database, user: &UserId) -> Result<PomodoroSession, App
     // A badge is a decoration on top of the stint: losing one to a
     // transient database error must never fail the finish, and the next
     // counter move re-runs this and heals it.
-    if let Err(err) = badge::sync(user, db).await {
+    if let Err(err) = crate::db::badge::sync(db, user).await {
         tracing::warn!("failed to sync badges for {}: {err}", user.key());
     }
     Ok(saved)

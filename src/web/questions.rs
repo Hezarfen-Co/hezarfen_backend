@@ -19,7 +19,6 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::constant::{MAX_MAX_FILE_BYTES, POOL_QUESTION_STATUSES, UPLOAD_BODY_OVERHEAD_BYTES};
-use crate::domain::badge;
 use crate::domain::pool_question::{
     PoolQuestion, PoolQuestionBody, PoolQuestionId, PoolQuestionTitle,
 };
@@ -394,7 +393,7 @@ async fn approve_question(
     // next counter move re-runs this and heals it. Two users, because the
     // transition credits the approver and the asker alike.
     for earner in [user.get_id(), question.get_asker()] {
-        if let Err(err) = badge::sync(earner, &st.db).await {
+        if let Err(err) = crate::service::badge::sync(&st.db, earner).await {
             tracing::warn!("failed to sync badges for {}: {err}", earner.key());
         }
     }
