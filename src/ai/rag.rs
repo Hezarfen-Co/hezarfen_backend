@@ -110,7 +110,8 @@ pub async fn index_course_note(state: &AppState, tenant: &ResolvedTenant, note: 
     // Read the attachments here rather than taking a caller's list: the
     // dispatch runs after the handler answered, so this is the freshest view
     // of what the note holds, and the ids it sends are the ids it stores.
-    let files = match CourseNoteFile::list_for(note.get_id(), None, 0, &state.db).await {
+    let files = match crate::db::course_note_file::list_for(&state.db, note.get_id(), None, 0).await
+    {
         Ok((files, _)) => files,
         Err(err) => {
             tracing::warn!("could not load course note files for rag.index: {err}");

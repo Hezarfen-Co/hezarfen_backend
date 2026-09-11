@@ -2134,12 +2134,12 @@ async fn boards_and_their_strokes_survive_remigration() {
 
     // Two epochs: two marks cleared away, then one live mark.
     let draw = async |epoch: i64, payload: &str| {
-        hezarfen_backend::domain::board_stroke::BoardStroke::append(
+        hezarfen_backend::db::board_stroke::append(
+            &db,
             &hezarfen_backend::domain::board::BoardId::from_key(&board),
             &hezarfen_backend::domain::user::UserId::from_key(&ali_id),
             payload,
             epoch,
-            &db,
         )
         .await
         .expect("append")

@@ -272,8 +272,9 @@ async fn upload_file(
     let note = service::note::read_owned(&st.db, &NoteId::from_key(&id), user.get_id())
         .await?
         .ok_or(AppError::NotFound)?;
-    // The 10-file cap is enforced inside `NoteFile::insert` (count and create
-    // under one lock) — checking it here too would just race.
+    // The 10-file cap is enforced inside `service::note_file::insert` (count
+    // and create in one conditional write) — checking it here too would just
+    // race.
     let limit = service::settings::load(&st.db).await?.get_max_file_bytes();
 
     let upload = read_upload(&mut multipart, limit).await?;
@@ -288,7 +289,7 @@ async fn upload_file(
     tokio::fs::write(&path, &upload.data)
         .await
         .map_err(|err| AppError::Internal(format!("failed to store the file blob: {err}")))?;
-    match file.insert(&st.db).await {
+    match service::note_file::insert(&st.db, file).await {
         Ok(created) => Ok((StatusCode::CREATED, Json(NoteFileResponse::new(&created)))),
         Err(err) => {
             let _ = tokio::fs::remove_file(&path).await;
@@ -322,7 +323,7 @@ async fn list_files(
     let note = service::note::read_owned(&st.db, &NoteId::from_key(&id), user.get_id())
         .await?
         .ok_or(AppError::NotFound)?;
-    let (files, total) = NoteFile::list_for(note.get_id(), limit, offset, &st.db).await?;
+    let (files, total) = service::note_file::list_for(&st.db, note.get_id(), limit, offset).await?;
     let items = files.iter().map(NoteFileResponse::new).collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
@@ -352,7 +353,7 @@ async fn download_file(
     let note = service::note::read_owned(&st.db, &NoteId::from_key(&id), user.get_id())
         .await?
         .ok_or(AppError::NotFound)?;
-    let file = NoteFile::read_for(&NoteFileId::from_key(&file_id), note.get_id(), &st.db)
+    let file = service::note_file::read_for(&st.db, &NoteFileId::from_key(&file_id), note.get_id())
         .await?
         .ok_or(AppError::NotFound)?;
     let bytes = tokio::fs::read(blob_path(&st.files_path, file.get_id().key()))
@@ -405,10 +406,10 @@ async fn delete_file(
     let note = service::note::read_owned(&st.db, &NoteId::from_key(&id), user.get_id())
         .await?
         .ok_or(AppError::NotFound)?;
-    let file = NoteFile::read_for(&NoteFileId::from_key(&file_id), note.get_id(), &st.db)
+    let file = service::note_file::read_for(&st.db, &NoteFileId::from_key(&file_id), note.get_id())
         .await?
         .ok_or(AppError::NotFound)?;
-    let file = file.delete(&st.db).await?;
+    let file = service::note_file::delete(&st.db, file).await?;
     remove_blob(&st.files_path, file.get_id().key()).await;
     Ok(StatusCode::NO_CONTENT)
 }
