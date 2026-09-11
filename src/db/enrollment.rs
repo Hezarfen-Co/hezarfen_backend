@@ -43,7 +43,7 @@ const UNFIT_MARK: &str = "enroll_not_student";
 /// landed inside this very window — and the re-send then sees that row at
 /// the `$held` gate and takes the other branch, so the loop converges
 /// instead of re-asking a settled question. Same shape, same reason, as
-/// [`crate::domain::class_pump::attach`].
+/// [`crate::db::class_pump::attach`].
 pub async fn enroll(
     db: &Database,
     course: &CourseId,
