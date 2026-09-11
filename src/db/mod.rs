@@ -2,6 +2,8 @@
 
 pub mod appointment;
 pub mod appointment_slot;
+pub mod badge;
+pub mod builder;
 pub mod cap;
 pub mod class_blueprint;
 pub mod course;
@@ -15,6 +17,7 @@ pub mod meal_booking;
 pub mod note;
 pub mod page;
 pub mod payment_ledger;
+pub mod profile;
 pub mod session;
 pub mod settings;
 pub mod user;

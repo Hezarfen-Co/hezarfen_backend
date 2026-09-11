@@ -13,7 +13,6 @@ use utoipa_axum::routes;
 use crate::constant::{MAX_MAX_FILE_BYTES, UPLOAD_BODY_OVERHEAD_BYTES};
 use crate::database::Database;
 use crate::domain::answer_image::AnswerImage;
-use crate::domain::badge;
 use crate::domain::bank_question::{BankQuestion, BankQuestionId};
 use crate::domain::bank_question_image::BankQuestionImage;
 
@@ -622,7 +621,7 @@ async fn grade(
     // decoration on top of the mark: losing one to a transient database error
     // must never fail the grading, and the next counter move heals it.
     for person in [teacher.get_id(), &target] {
-        if let Err(err) = badge::sync(person, &st.db).await {
+        if let Err(err) = service::badge::sync(&st.db, person).await {
             tracing::warn!("failed to sync badges for {}: {err}", person.key());
         }
     }

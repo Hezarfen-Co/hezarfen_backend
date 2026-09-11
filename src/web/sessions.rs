@@ -11,7 +11,6 @@ use utoipa_axum::routes;
 
 use crate::database::Database;
 use crate::domain::attendance::AttendanceStatus;
-use crate::domain::badge;
 use crate::domain::course::Course;
 use crate::domain::course_session::{CourseSession, CourseSessionId, SessionTopic};
 
@@ -344,7 +343,7 @@ async fn mark_roll_call(
     // that failed, and knowing here whether the credit landed would mean
     // widening `mark`'s return type for nothing.
     for who in [&target, session.get_teacher()] {
-        if let Err(err) = badge::sync(who, &st.db).await {
+        if let Err(err) = service::badge::sync(&st.db, who).await {
             tracing::warn!("failed to sync badges for {}: {err}", who.key());
         }
     }

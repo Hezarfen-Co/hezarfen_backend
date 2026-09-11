@@ -182,7 +182,6 @@ mod tests {
 
     use crate::database::init_mem_tenants;
     use crate::db::session;
-    use crate::domain::builder::{Builder, BuilderSession};
     use crate::domain::user::{Password, Username};
     use crate::tenant::DEMO_SLUG;
     use crate::web::{CurrentUser, RequireBuilder};
@@ -218,20 +217,21 @@ mod tests {
         let session = session::create(&school, user.get_id()).await.unwrap();
         let school_cookie = format!("session={DEMO_SLUG}.{}", session.token().as_str());
 
-        Builder::ensure(
+        crate::service::builder::ensure(
+            tenants.control(),
             Username::try_new("operator").unwrap(),
             Password::try_new("secret1").unwrap(),
-            tenants.control(),
         )
         .await
         .unwrap();
-        let builder = Builder::find_by_username("operator", tenants.control())
+        let builder = crate::service::builder::find_by_username(tenants.control(), "operator")
             .await
             .unwrap()
             .unwrap();
-        let builder_session = BuilderSession::create(builder.get_id(), tenants.control())
-            .await
-            .unwrap();
+        let builder_session =
+            crate::service::builder::create_session(tenants.control(), builder.get_id())
+                .await
+                .unwrap();
         let builder_cookie = format!("session=builder.{}", builder_session.token().as_str());
 
         let state = AppState {

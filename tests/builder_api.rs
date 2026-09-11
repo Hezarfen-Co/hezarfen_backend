@@ -8,8 +8,8 @@ mod common;
 use axum::Router;
 use axum::http::StatusCode;
 use common::*;
-use hezarfen_backend::domain::builder::Builder;
 use hezarfen_backend::domain::user::{Password, Username};
+use hezarfen_backend::service::builder;
 use hezarfen_backend::tenant::{DEMO_SLUG, Tenants};
 use serde_json::{Value, json};
 
@@ -20,10 +20,10 @@ const BUILDER_PASS: &str = "secret1";
 /// production's `BUILDER_USERNAME`/`BUILDER_PASSWORD` seed, by the same path.
 async fn deployment() -> (Router, hezarfen_backend::database::Database, Tenants) {
     let (app, db, tenants) = app_and_tenants().await;
-    Builder::ensure(
+    builder::ensure(
+        tenants.control(),
         Username::try_new(BUILDER_USER).unwrap(),
         Password::try_new(BUILDER_PASS).unwrap(),
-        tenants.control(),
     )
     .await
     .expect("seed the builder");
@@ -1229,10 +1229,10 @@ async fn probe_remote_deployment_creates_and_deletes_a_hyphenated_school() {
         return;
     };
     let app = deployment.app;
-    Builder::ensure(
+    builder::ensure(
+        deployment.tenants.control(),
         Username::try_new(BUILDER_USER).unwrap(),
         Password::try_new(BUILDER_PASS).unwrap(),
-        deployment.tenants.control(),
     )
     .await
     .expect("seed the builder");

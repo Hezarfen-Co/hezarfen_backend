@@ -7,7 +7,6 @@ use crate::constant::{
     STUDY_STREAK_LONGEST_FIELD,
 };
 use crate::database::{Database, transaction_with_retry};
-use crate::domain::badge;
 use crate::domain::monotonic_id::next_ulid;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
@@ -307,7 +306,7 @@ impl PomodoroSession {
         // A badge is a decoration on top of the stint: losing one to a
         // transient database error must never fail the finish, and the next
         // counter move re-runs this and heals it.
-        if let Err(err) = badge::sync(user, db).await {
+        if let Err(err) = crate::db::badge::sync(db, user).await {
             tracing::warn!("failed to sync badges for {}: {err}", user.key());
         }
         Ok(saved)
@@ -756,7 +755,7 @@ mod tests {
             200
         );
         assert!(
-            badge::BadgeAward::list_for(&user, &db)
+            crate::db::badge::list_for(&db, &user)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -827,9 +826,7 @@ mod tests {
         assert_eq!(closed.get_finished_at().unwrap().as_millis(), started);
 
         // And the stat that sums these stays non-negative.
-        let stats = crate::domain::profile::ProfileStats::load(&user, 0, 0, &db)
-            .await
-            .unwrap();
+        let stats = crate::db::profile::load(&db, &user, 0, 0).await.unwrap();
         assert_eq!(stats.get_pomodoro_sessions(), 1);
         assert_eq!(stats.get_pomodoro_focus_ms(), 0);
     }
