@@ -9,7 +9,6 @@ use crate::domain::class_group::ClassGroupId;
 use crate::domain::class_member::{ClassMember, ClassMemberId};
 use crate::domain::course::CourseId;
 use crate::domain::monotonic_id::next_ulid;
-use crate::domain::registration::Registration;
 use crate::domain::role::Role;
 use crate::domain::timestamp::{Timestamp, range_error};
 use crate::domain::user::{User, UserId};
@@ -135,9 +134,11 @@ impl EventAudience {
                 Ok(member.is_some())
             }
             EventAudience::Registration { .. } => {
-                Ok(Registration::read_for_user(event, user.get_id(), db)
-                    .await?
-                    .is_some())
+                Ok(
+                    crate::db::registration::read_for_user(db, event, user.get_id())
+                        .await?
+                        .is_some(),
+                )
             }
         }
     }
@@ -172,11 +173,13 @@ impl EventAudience {
                 .iter()
                 .map(|member| member.get_user().clone())
                 .collect()),
-            EventAudience::Registration { .. } => Ok(Registration::list_for_event(event, db)
-                .await?
-                .iter()
-                .map(|registration| registration.get_user().clone())
-                .collect()),
+            EventAudience::Registration { .. } => {
+                Ok(crate::db::registration::list_for_event(db, event)
+                    .await?
+                    .iter()
+                    .map(|registration| registration.get_user().clone())
+                    .collect())
+            }
         }
     }
 }

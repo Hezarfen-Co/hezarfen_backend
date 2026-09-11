@@ -14,7 +14,6 @@ use crate::domain::attendance::{Attendance, AttendanceStatus};
 use crate::domain::class_group::{ClassGroup, ClassGroupId};
 use crate::domain::course::CourseId;
 use crate::domain::event::{Event, EventAudience, EventDescription, EventId, EventTitle};
-use crate::domain::registration::Registration;
 use crate::domain::role::Role;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
@@ -752,7 +751,7 @@ async fn register(
         .await?
         .ok_or(AppError::NotFound)?;
     // Fast-fail gate; the authoritative re-check runs inside
-    // `Registration::register` under its lock.
+    // `service::registration::register` under its lock.
     event.registration_capacity()?;
 
     let target = match req.user_id {
@@ -772,7 +771,8 @@ async fn register(
         ));
     }
 
-    let registration = Registration::register(&event_id, &target, user.get_id(), &st.db).await?;
+    let registration =
+        crate::service::registration::register(&st.db, &event_id, &target, user.get_id()).await?;
     // Resolve from the row, not the request: a re-register returns the
     // existing seat, whose registered_by is the *original* placer — someone
     // the {target, caller} pair may not contain.
@@ -832,7 +832,7 @@ async fn unregister(
     // staff member's seat is theirs alone. The bar is *staff*, not "a student":
     // a parent holds no seat any route can reach — they cannot get past
     // `RequireTeacher` to free their own — so a seat under that role is
-    // stranded, and a volume written before `Registration::register` claimed
+    // stranded, and a volume written before `service::registration::register` claimed
     // the holder's row already carries some.
     if &target != user.get_id()
         && let Some(target_user) = crate::service::user::read(&st.db, &target).await?
@@ -843,7 +843,7 @@ async fn unregister(
         ));
     }
 
-    if Registration::remove(&event_id, &target, &st.db)
+    if crate::service::registration::remove(&st.db, &event_id, &target)
         .await?
         .is_none()
     {
@@ -868,7 +868,10 @@ mod tests {
         let user = crate::service::user::create(db, Username::try_new(username).unwrap(), hash)
             .await
             .unwrap();
-        crate::service::user::set_role(db, user.get_id(), role).await.unwrap().0
+        crate::service::user::set_role(db, user.get_id(), role)
+            .await
+            .unwrap()
+            .0
     }
 
     /// `can_manage` is only reached behind `RequireTeacher` today, so this is
