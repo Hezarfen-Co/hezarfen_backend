@@ -241,7 +241,7 @@ impl ProfileStats {
             // Floored at zero: a stint stamped by a wall clock that stepped
             // backwards mid-session sums as negative time, and "you focused for
             // minus five seconds" is never the truthful answer. New stints
-            // cannot go inverted (see [`PomodoroSession::finish`]); rows written
+            // cannot go inverted (see [`crate::db::pomodoro::finish`]); rows written
             // before that guard still can, and this is what covers them.
             pomodoro_focus_ms: row.map_or(0, |totals| totals.focus_ms.max(0)),
             courses,

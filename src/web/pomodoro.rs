@@ -11,6 +11,7 @@ use crate::domain::pomodoro::PomodoroSession;
 use crate::domain::role::Role;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse};
+use crate::service::pomodoro;
 use crate::state::AppState;
 
 use super::{CurrentUser, PageParams, ensure_can_observe, paginate};
@@ -137,7 +138,7 @@ async fn start(
     CurrentUser(user): CurrentUser,
 ) -> Result<(StatusCode, Json<PomodoroResponse>), AppError> {
     ensure_student(&user)?;
-    let session = PomodoroSession::start(user.get_id(), &st.db).await?;
+    let session = pomodoro::start(&st.db, user.get_id()).await?;
     Ok((StatusCode::CREATED, Json(PomodoroResponse::new(&session))))
 }
 
@@ -168,7 +169,7 @@ async fn finish(
     State(st): State<AppState>,
     CurrentUser(user): CurrentUser,
 ) -> Result<Json<PomodoroResponse>, AppError> {
-    let session = PomodoroSession::finish(user.get_id(), &st.db).await?;
+    let session = pomodoro::finish(&st.db, user.get_id()).await?;
     Ok(Json(PomodoroResponse::new(&session)))
 }
 
@@ -194,7 +195,7 @@ async fn my_pomodoro(
     Query(page): Query<PageParams>,
 ) -> Result<Json<PomodoroLog>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let sessions = PomodoroSession::list_for_user(user.get_id(), &st.db).await?;
+    let sessions = pomodoro::list_for_user(&st.db, user.get_id()).await?;
     Ok(Json(PomodoroLog::new(&sessions, limit, offset)))
 }
 
@@ -228,6 +229,6 @@ async fn user_pomodoro(
     crate::service::user::read(&st.db, &target)
         .await?
         .ok_or(AppError::NotFound)?;
-    let sessions = PomodoroSession::list_for_user(&target, &st.db).await?;
+    let sessions = pomodoro::list_for_user(&st.db, &target).await?;
     Ok(Json(PomodoroLog::new(&sessions, limit, offset)))
 }

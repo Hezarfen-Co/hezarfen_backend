@@ -289,14 +289,14 @@ async fn create_event(
     check_not_past("starts_at", starts_at)?;
     check_not_past("ends_at", ends_at)?;
     check_time_range(starts_at, ends_at)?;
-    let event = Event::create(
+    let event = service::event::create(
+        &st.db,
         user.get_id(),
         title,
         description,
         audience,
         starts_at,
         ends_at,
-        &st.db,
     )
     .await?;
     Ok((StatusCode::CREATED, Json(EventResponse::new(&event))))
@@ -329,7 +329,7 @@ async fn list_events(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<EventResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let events = window.apply(Event::list_all(&st.db).await?)?;
+    let events = window.apply(service::event::list_all(&st.db).await?)?;
     let total = events.len() as i64;
     // Paged in the web layer: `WindowParams` filters and re-orders in Rust.
     let items = paginate(&events, limit, offset)
@@ -357,7 +357,7 @@ async fn get_event(
     _user: CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<EventResponse>, AppError> {
-    let event = Event::read(&EventId::from_key(&id), &st.db)
+    let event = service::event::read(&st.db, &EventId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     Ok(Json(EventResponse::new(&event)))
@@ -398,7 +398,7 @@ async fn update_event(
         .starts_at
         .map(|update| update.map(Timestamp::from_millis));
     let ends_at = req.ends_at.map(|update| update.map(Timestamp::from_millis));
-    let event = Event::read(&EventId::from_key(&id), &st.db)
+    let event = service::event::read(&st.db, &EventId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     if !can_manage(&event, &user) {
@@ -432,16 +432,23 @@ async fn update_event(
     }
     // The range CHECK needs both ends: whichever the request omitted comes
     // from the stored row. Read for the check only — the omitted side is
-    // never written back. Pre-flight only: `Event::update` re-makes this check
-    // in the UPDATE's `WHERE`, so a concurrent move of the omitted end loses.
+    // never written back. Pre-flight only: the UPDATE's own `WHERE` re-makes
+    // this check, so a concurrent move of the omitted end loses.
     check_time_range(
         starts_at.unwrap_or_else(|| event.get_starts_at()),
         ends_at.unwrap_or_else(|| event.get_ends_at()),
     )?;
 
-    let updated = event
-        .update(title, description, audience, starts_at, ends_at, &st.db)
-        .await?;
+    let updated = service::event::update(
+        &st.db,
+        event,
+        title,
+        description,
+        audience,
+        starts_at,
+        ends_at,
+    )
+    .await?;
     Ok(Json(EventResponse::new(&updated)))
 }
 
@@ -465,7 +472,7 @@ async fn delete_event(
     RequireTeacher(user): RequireTeacher,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    let event = Event::read(&EventId::from_key(&id), &st.db)
+    let event = service::event::read(&st.db, &EventId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     if !can_manage(&event, &user) {
@@ -473,7 +480,7 @@ async fn delete_event(
             "only the creator or a manager/admin can delete this event",
         ));
     }
-    event.delete(&st.db).await?;
+    service::event::delete(&st.db, event).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -505,7 +512,7 @@ async fn mark(
     Json(req): Json<MarkAttendance>,
 ) -> Result<Json<AttendanceResponse>, AppError> {
     let event_id = EventId::from_key(&id);
-    let event = Event::read(&event_id, &st.db)
+    let event = service::event::read(&st.db, &event_id)
         .await?
         .ok_or(AppError::NotFound)?;
 
@@ -526,10 +533,7 @@ async fn mark(
 
     // Only expected attendees can be marked. The marker needn't be in the
     // audience — a teacher takes roll of a student-targeted event.
-    if !event
-        .get_audience()
-        .includes(event.get_id(), &target_user, &st.db)
-        .await?
+    if !service::event::includes(&st.db, event.get_audience(), event.get_id(), &target_user).await?
     {
         return Err(AppError::Validation(ValidationError::Invalid {
             field: "user_id",
@@ -569,7 +573,7 @@ async fn list_attendance(
     let (limit, offset) = page.resolve()?;
     let event_id = EventId::from_key(&id);
     // Event must exist — a missing event is a 404, not an empty roster.
-    Event::read(&event_id, &st.db)
+    service::event::read(&st.db, &event_id)
         .await?
         .ok_or(AppError::NotFound)?;
     let (rows, total) = Attendance::list_for_event(&event_id, limit, offset, &st.db).await?;
@@ -661,11 +665,11 @@ async fn roster(
 ) -> Result<Json<Page<RosterEntry>>, AppError> {
     let (limit, offset) = page.resolve()?;
     let event_id = EventId::from_key(&id);
-    let event = Event::read(&event_id, &st.db)
+    let event = service::event::read(&st.db, &event_id)
         .await?
         .ok_or(AppError::NotFound)?;
 
-    let mut members = event.get_audience().members(event.get_id(), &st.db).await?;
+    let mut members = service::event::members(&st.db, event.get_audience(), event.get_id()).await?;
     // ULID keys sort by creation instant — a stable order keeps pages coherent.
     members.sort_by(|a, b| a.key().cmp(b.key()));
     let (marks, _) = Attendance::list_for_event(&event_id, None, 0, &st.db).await?;
@@ -748,7 +752,7 @@ async fn register(
     Json(req): Json<RegisterUser>,
 ) -> Result<Json<RegistrationResponse>, AppError> {
     let event_id = EventId::from_key(&id);
-    let event = Event::read(&event_id, &st.db)
+    let event = service::event::read(&st.db, &event_id)
         .await?
         .ok_or(AppError::NotFound)?;
     // Fast-fail gate; the authoritative re-check runs inside
@@ -822,7 +826,7 @@ async fn unregister(
     Path((id, target)): Path<(String, String)>,
 ) -> Result<StatusCode, AppError> {
     let event_id = EventId::from_key(&id);
-    let event = Event::read(&event_id, &st.db)
+    let event = service::event::read(&st.db, &event_id)
         .await?
         .ok_or(AppError::NotFound)?;
     event.registration_capacity()?;
@@ -868,7 +872,10 @@ mod tests {
         let user = crate::service::user::create(db, Username::try_new(username).unwrap(), hash)
             .await
             .unwrap();
-        crate::service::user::set_role(db, user.get_id(), role).await.unwrap().0
+        crate::service::user::set_role(db, user.get_id(), role)
+            .await
+            .unwrap()
+            .0
     }
 
     /// `can_manage` is only reached behind `RequireTeacher` today, so this is
@@ -878,14 +885,14 @@ mod tests {
     async fn demoted_event_creator_loses_management() {
         let db = init_mem().await.unwrap();
         let creator = user("ogretmen", Role::Teacher, &db).await;
-        let event = Event::create(
+        let event = service::event::create(
+            &db,
             creator.get_id(),
             EventTitle::try_new("Gezi").unwrap(),
             EventDescription::try_new("").unwrap(),
             EventAudience::School,
             None,
             None,
-            &db,
         )
         .await
         .unwrap();

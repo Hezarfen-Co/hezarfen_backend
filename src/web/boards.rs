@@ -35,7 +35,7 @@ use crate::domain::board_stroke::BoardStroke;
 use crate::domain::class_group::{ClassGroup, ClassGroupId};
 use crate::domain::class_member::ClassMember;
 use crate::domain::course::CourseId;
-use crate::domain::event::{Event, EventId};
+use crate::domain::event::EventId;
 use crate::domain::role::Role;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
@@ -767,13 +767,13 @@ impl InviteSource {
                         "requires teacher role or higher to invite an event's roster",
                     ));
                 }
-                let event = Event::read(&EventId::from_key(&event), db).await?.ok_or(
-                    AppError::Validation(ValidationError::Invalid {
+                let event = crate::service::event::read(db, &EventId::from_key(&event))
+                    .await?
+                    .ok_or(AppError::Validation(ValidationError::Invalid {
                         field: "event",
                         reason: "no such event",
-                    }),
-                )?;
-                event.get_audience().members(event.get_id(), db).await
+                    }))?;
+                crate::service::event::members(db, event.get_audience(), event.get_id()).await
             }
         }
     }

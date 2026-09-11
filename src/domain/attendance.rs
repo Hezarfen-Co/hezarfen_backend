@@ -2,8 +2,8 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
 use crate::constant::{ATTENDANCE_TABLE, REGISTRATION_COUNT_FIELD};
 use crate::database::{Database, transaction_with_retry};
-use crate::domain::event::EventId;
 use crate::db::page::PagedList;
+use crate::domain::event::EventId;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 
@@ -234,7 +234,7 @@ mod tests {
     /// The session twin's race, one table over
     /// ([`crate::domain::session_attendance::SessionAttendance`]): a
     /// `DEFINE EVENT` on `event` fires inside the delete's own transaction, and
-    /// [`Event::delete`] sweeps its attendance rows before removing the row, so
+    /// [`crate::db::event::delete`] sweeps its attendance rows before removing the row, so
     /// the `SLEEP` lands exactly between the sweep and the commit — the window
     /// where a bare upsert wrote a mark nothing would ever sweep again.
     ///
@@ -246,7 +246,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn a_mark_written_inside_a_delete_never_outlives_the_event() {
-        use crate::domain::event::{Event, EventAudience, EventDescription, EventTitle};
+        use crate::domain::event::{EventAudience, EventDescription, EventTitle};
         let (db, _serialized) = crate::database::init_test_server("event_attendance_race").await;
         db.query(
             "DEFINE EVENT hold_the_window ON TABLE event WHEN $event = 'DELETE' \
@@ -263,21 +263,21 @@ mod tests {
         let marker = UserId::from_key("t");
         let (mut swept, mut orphans) = (0, 0);
         for round in 0..4 {
-            let event = Event::create(
+            let event = crate::db::event::create(
+                &db,
                 &marker,
                 EventTitle::try_new("gezi").unwrap(),
                 EventDescription::try_new("").unwrap(),
                 EventAudience::School,
                 None,
                 None,
-                &db,
             )
             .await
             .unwrap();
             let id = event.get_id().clone();
             let drop_it = {
                 let db = db.clone();
-                tokio::spawn(async move { event.delete(&db).await })
+                tokio::spawn(async move { crate::db::event::delete(&db, event).await })
             };
             // The mark starts inside the held window: the sweep has run and the
             // event row is gone but uncommitted.
@@ -297,7 +297,7 @@ mod tests {
             );
 
             // Stored state is the whole verdict; a return value is not evidence.
-            if Event::read(&id, &db).await.unwrap().is_none() {
+            if crate::db::event::read(&db, &id).await.unwrap().is_none() {
                 swept += 1;
                 orphans += Attendance::list_for_event(&id, None, 0, &db)
                     .await
