@@ -23,6 +23,10 @@ use crate::error::AppError;
 use crate::service::course::require_open;
 use crate::service::exam_attempt::{EXAM_LOCK, any_for_exam, course_of};
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the sibling entities' create(field, field, ..) shape"
+)]
 pub async fn create(
     db: &Database,
     creator: &UserId,

@@ -82,7 +82,6 @@ pub async fn append(
 /// The one place `closed` is ordered above `locked` lives in
 /// [`state_refusal`]; both refusal paths re-read the board and
 /// ask it.
-
 async fn why_refused(db: &Database, board: &BoardId) -> Result<AppError, AppError> {
     let board = crate::db::board::read(db, board)
         .await?
