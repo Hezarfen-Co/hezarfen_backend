@@ -146,7 +146,7 @@ impl PomodoroSession {
     /// They move only for a stint that **counts**, which is
     /// [`MIN_COUNTED_POMODORO_MS`] of real focus and at most
     /// [`MAX_COUNTED_POMODORO_PER_DAY`] of them per UTC day. Without that this
-    /// is the farm [`crate::domain::pool_question::PoolQuestion::approve`]
+    /// is the farm [`crate::db::pool_question::approve`]
     /// argues about from the other end: finishing is self-service, one stint is
     /// two requests and no second person, so a counter moved once per
     /// round-trip is farmable — two hundred pairs inside the rate limit bought
