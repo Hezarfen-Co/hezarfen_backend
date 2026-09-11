@@ -1065,8 +1065,8 @@ async fn attempt_history_survives_remigration() {
 /// second user reads neither the thread nor its messages.
 #[tokio::test]
 async fn chat_thread_delete_cascades_and_stays_owner_scoped() {
-    use hezarfen_backend::domain::chatbot_message::{ChatContent, ChatbotMessage, MessageStatus};
-    use hezarfen_backend::domain::chatbot_thread::ChatbotThread;
+    use hezarfen_backend::db::{chatbot_message, chatbot_thread};
+    use hezarfen_backend::domain::chatbot_message::{ChatContent, MessageStatus};
     use hezarfen_backend::domain::user::UserId;
 
     let (app, db) = common::app_and_db().await;
@@ -1075,28 +1075,28 @@ async fn chat_thread_delete_cascades_and_stays_owner_scoped() {
     let owner = UserId::from_key(&me_id(&app, &owner_cookie).await);
     let other = UserId::from_key(&me_id(&app, &other_cookie).await);
 
-    let thread = ChatbotThread::create_capped(&owner, None, &db)
+    let thread = chatbot_thread::create_capped(&db, &owner, None)
         .await
         .expect("create");
     let id = thread.get_id().clone();
-    let prompt = ChatbotMessage::append_user(
+    let prompt = chatbot_message::append_user(
+        &db,
         &id,
         &owner,
         ChatContent::try_new("selam").expect("content"),
-        &db,
     )
     .await
     .expect("append user");
-    let reply = ChatbotMessage::append_pending_assistant(&id, &owner, &db)
+    let reply = chatbot_message::append_pending_assistant(&db, &id, &owner)
         .await
         .expect("append assistant");
     assert_eq!(reply.get_status(), MessageStatus::Pending);
 
-    let reply = ChatbotMessage::complete(
+    let reply = chatbot_message::complete(
+        &db,
         reply.get_id(),
         ChatContent::try_new("aleykum selam").expect("content"),
         false,
-        &db,
     )
     .await
     .expect("complete");
@@ -1104,7 +1104,7 @@ async fn chat_thread_delete_cascades_and_stays_owner_scoped() {
     assert_eq!(reply.get_content().as_str(), "aleykum selam");
     assert!(reply.get_completed_at().is_some());
     assert_eq!(
-        ChatbotMessage::list_for_thread(&id, None, 0, &db)
+        chatbot_message::list_for_thread(&db, &id, None, 0)
             .await
             .expect("thread")
             .0
@@ -1114,39 +1114,39 @@ async fn chat_thread_delete_cascades_and_stays_owner_scoped() {
 
     // The other user sees nothing of it, by thread or by message.
     assert!(
-        ChatbotThread::read_for(&id, &other, &db)
+        chatbot_thread::read_for(&db, &id, &other)
             .await
             .expect("cross-user thread")
             .is_none()
     );
     assert!(
-        ChatbotMessage::read_for(prompt.get_id(), &other, &db)
+        chatbot_message::read_for(&db, prompt.get_id(), &other)
             .await
             .expect("cross-user message")
             .is_none()
     );
     assert_eq!(
-        ChatbotThread::count_for_user(&other, &db)
+        chatbot_thread::count_for_user(&db, &other)
             .await
             .expect("count"),
         0
     );
     assert_eq!(
-        ChatbotThread::count_for_user(&owner, &db)
+        chatbot_thread::count_for_user(&db, &owner)
             .await
             .expect("count"),
         1
     );
 
-    thread.delete(&db).await.expect("delete");
+    chatbot_thread::delete(&db, thread).await.expect("delete");
     assert!(
-        ChatbotThread::read_for(&id, &owner, &db)
+        chatbot_thread::read_for(&db, &id, &owner)
             .await
             .expect("deleted thread")
             .is_none()
     );
     assert_eq!(
-        ChatbotThread::list_for_user(&owner, None, 0, &db)
+        chatbot_thread::list_for_user(&db, &owner, None, 0)
             .await
             .unwrap()
             .0
@@ -1172,8 +1172,8 @@ async fn chat_thread_delete_cascades_and_stays_owner_scoped() {
 /// read back as whole, which is exactly how they were shown at the time.
 #[tokio::test]
 async fn legacy_chat_turns_backfill_to_untruncated() {
-    use hezarfen_backend::domain::chatbot_message::{ChatContent, ChatbotMessage};
-    use hezarfen_backend::domain::chatbot_thread::ChatbotThread;
+    use hezarfen_backend::db::{chatbot_message, chatbot_thread};
+    use hezarfen_backend::domain::chatbot_message::ChatContent;
     use hezarfen_backend::domain::user::UserId;
 
     let (app, db) = common::app_and_db().await;
@@ -1190,26 +1190,26 @@ async fn legacy_chat_turns_backfill_to_untruncated() {
         .unwrap();
     let owner = UserId::from_key(&me_id(&app, &cookie).await);
 
-    let thread = ChatbotThread::create_capped(&owner, None, &db)
+    let thread = chatbot_thread::create_capped(&db, &owner, None)
         .await
         .expect("create");
     let id = thread.get_id().clone();
-    ChatbotMessage::append_user(
+    chatbot_message::append_user(
+        &db,
         &id,
         &owner,
         ChatContent::try_new("selam").expect("content"),
-        &db,
     )
     .await
     .expect("append user");
-    let reply = ChatbotMessage::append_pending_assistant(&id, &owner, &db)
+    let reply = chatbot_message::append_pending_assistant(&db, &id, &owner)
         .await
         .expect("append assistant");
-    ChatbotMessage::complete(
+    chatbot_message::complete(
+        &db,
         reply.get_id(),
         ChatContent::try_new("aleykum selam").expect("content"),
         false,
-        &db,
     )
     .await
     .expect("complete");

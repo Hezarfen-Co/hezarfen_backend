@@ -15,9 +15,9 @@ mod common;
 
 use axum::http::StatusCode;
 use common::{app_and_db, id_of, login, login_as, me_id, send};
+use hezarfen_backend::db::{chatbot_message, chatbot_thread};
 use hezarfen_backend::domain::appointment::AppointmentId;
-use hezarfen_backend::domain::chatbot_message::{ChatContent, ChatbotMessage};
-use hezarfen_backend::domain::chatbot_thread::ChatbotThread;
+use hezarfen_backend::domain::chatbot_message::ChatContent;
 use hezarfen_backend::domain::timestamp::Timestamp;
 use hezarfen_backend::domain::user::UserId;
 use serde_json::json;
@@ -271,29 +271,29 @@ async fn an_answer_resolves_its_own_prompt_across_an_interleave() {
     let (app, db) = app_and_db().await;
     let cookie = login(&app, "veli").await;
     let owner = UserId::from_key(&me_id(&app, &cookie).await);
-    let thread = ChatbotThread::create_capped(&owner, None, &db)
+    let thread = chatbot_thread::create_capped(&db, &owner, None)
         .await
         .expect("create thread");
     let id = thread.get_id().clone();
     let say = |text: &str| ChatContent::try_new(text).expect("content");
 
     // Exactly the order the interleave produces.
-    let prompt_a = ChatbotMessage::append_user(&id, &owner, say("soru A"), &db)
+    let prompt_a = chatbot_message::append_user(&db, &id, &owner, say("soru A"))
         .await
         .expect("prompt A");
-    let prompt_b = ChatbotMessage::append_user(&id, &owner, say("soru B"), &db)
+    let prompt_b = chatbot_message::append_user(&db, &id, &owner, say("soru B"))
         .await
         .expect("prompt B");
-    let answer_a = ChatbotMessage::append_pending_assistant(&id, &owner, &db)
+    let answer_a = chatbot_message::append_pending_assistant(&db, &id, &owner)
         .await
         .expect("answer A");
-    let answer_b = ChatbotMessage::append_pending_assistant(&id, &owner, &db)
+    let answer_b = chatbot_message::append_pending_assistant(&db, &id, &owner)
         .await
         .expect("answer B");
 
     // The interleave is real: by write order the newest user row before *both*
     // answers is B, which is what used to be handed to both of them.
-    let (stored, _) = ChatbotMessage::list_for_thread(&id, None, 0, &db)
+    let (stored, _) = chatbot_message::list_for_thread(&db, &id, None, 0)
         .await
         .expect("thread");
     let texts: Vec<&str> = stored
@@ -304,11 +304,11 @@ async fn an_answer_resolves_its_own_prompt_across_an_interleave() {
 
     // Identity decides instead, so each answer keeps its own question — the id
     // the answering task carries is the prompt of its own POST.
-    let carried_a = ChatbotMessage::prompt_of(prompt_a.get_id(), &db)
+    let carried_a = chatbot_message::prompt_of(&db, prompt_a.get_id())
         .await
         .expect("read A")
         .expect("prompt A exists");
-    let carried_b = ChatbotMessage::prompt_of(prompt_b.get_id(), &db)
+    let carried_b = chatbot_message::prompt_of(&db, prompt_b.get_id())
         .await
         .expect("read B")
         .expect("prompt B exists");
@@ -317,13 +317,13 @@ async fn an_answer_resolves_its_own_prompt_across_an_interleave() {
 
     // And the answers each settle with the reply to their own question — the
     // stored state, not just what a lookup returned.
-    ChatbotMessage::complete(answer_a.get_id(), say("cevap A"), false, &db)
+    chatbot_message::complete(&db, answer_a.get_id(), say("cevap A"), false)
         .await
         .expect("settle A");
-    ChatbotMessage::complete(answer_b.get_id(), say("cevap B"), false, &db)
+    chatbot_message::complete(&db, answer_b.get_id(), say("cevap B"), false)
         .await
         .expect("settle B");
-    let (stored, _) = ChatbotMessage::list_for_thread(&id, None, 0, &db)
+    let (stored, _) = chatbot_message::list_for_thread(&db, &id, None, 0)
         .await
         .expect("thread");
     let texts: Vec<&str> = stored

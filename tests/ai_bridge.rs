@@ -1722,7 +1722,7 @@ use hezarfen_backend::domain::rag_output::RagOutput;
 
 /// Every stored output of `note`, newest first.
 async fn outputs(db: &Database, note: &str) -> Vec<RagOutput> {
-    RagOutput::list_for(&CourseNoteId::from_key(note), None, 0, db)
+    hezarfen_backend::db::rag_output::list_for(&db, &CourseNoteId::from_key(note), None, 0)
         .await
         .expect("list rag outputs")
         .0

@@ -305,7 +305,7 @@ async fn delete_one(
     // disposable, so failing here leaves the note intact and the 500 truthful,
     // whereas dropping them after the note would strand every blob on an error
     // — and if the note delete then fails, the next change regenerates them.
-    RagOutput::delete_for_note(note.get_id(), &st.db).await?;
+    service::rag_output::delete_for_note(&st.db, note.get_id()).await?;
     // Rows go first (the note delete cascades them), blobs after: a crash in
     // between strands at worst an unreachable blob, never a row whose blob is
     // already gone. The files to unlink come from the delete itself, not a
@@ -542,7 +542,7 @@ async fn delete_file(
     // stale index cannot outlive its source in a deployment with no AI service
     // at all, and a failure here leaves the file whole instead of stranding its
     // blob; the re-index rebuilds from what is left, if a service is connected.
-    RagOutput::delete_with_source(file.get_id(), &st.db).await?;
+    service::rag_output::delete_with_source(&st.db, file.get_id()).await?;
     let file = file.delete(&st.db).await?;
     remove_blob(&st.files_path, file.get_id().key()).await;
     spawn_index(&st, &tenant, note);
@@ -612,7 +612,8 @@ async fn list_rag(
             "only enrolled users, the course creator, an assigned teacher, or a manager/admin can view this course note's AI outputs",
         ));
     }
-    let (outputs, total) = RagOutput::list_for(note.get_id(), limit, offset, &st.db).await?;
+    let (outputs, total) =
+        service::rag_output::list_for(&st.db, note.get_id(), limit, offset).await?;
     let items = outputs.iter().map(RagOutputResponse::new).collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
@@ -651,10 +652,10 @@ async fn delete_rag(
     crate::service::course::require_open(&st.db, &course).await?;
     // Scoped to the note in the path, like `CourseNoteFile::read_for`: an
     // output of another note is a 404 here, never a cross-note delete.
-    let output = RagOutput::read(&RagOutputId::from_key(&output_id), &st.db)
+    let output = service::rag_output::read(&st.db, &RagOutputId::from_key(&output_id))
         .await?
         .filter(|output| output.get_course_note() == note.get_id())
         .ok_or(AppError::NotFound)?;
-    RagOutput::delete(output.get_id(), &st.db).await?;
+    service::rag_output::delete(&st.db, output.get_id()).await?;
     Ok(StatusCode::NO_CONTENT)
 }
