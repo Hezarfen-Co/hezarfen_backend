@@ -7,10 +7,10 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::database::Database;
-use crate::domain::term::{self, Term, TermId, TermName};
+use crate::domain::term::{Term, TermId, TermName};
 use crate::domain::timestamp::Timestamp;
-use crate::error::{AppError, ErrorResponse, ValidationError};
+use crate::error::{AppError, ErrorResponse};
+use crate::service;
 use crate::state::AppState;
 
 use super::{CurrentUser, Page, PageParams, RequireManager, check_time_range};
@@ -69,31 +69,6 @@ impl TermResponse {
     }
 }
 
-/// Turn an optional request-supplied term id into a validated reference —
-/// `None` stays `None`, an unknown id is a `400` naming the field, and an
-/// *archived* one is a `409 term_archived`. That last refusal is here rather
-/// than in each handler because this is the single spot every new link to a
-/// term passes through — course create/update and class create/update alike:
-/// past years take no new structure.
-pub(crate) async fn resolve_term(
-    id: Option<&str>,
-    db: &Database,
-) -> Result<Option<TermId>, AppError> {
-    let Some(id) = id else {
-        return Ok(None);
-    };
-    let term = Term::read(&TermId::from_key(id), db)
-        .await?
-        .ok_or(AppError::Validation(ValidationError::Invalid {
-            field: "term_id",
-            reason: "term does not exist",
-        }))?;
-    if term.is_archived() {
-        return Err(term::archived_error());
-    }
-    Ok(Some(term.get_id().clone()))
-}
-
 /// Create an academic term. Requires manager+. Past dates are allowed —
 /// terms are calendar structure, not schedules.
 #[utoipa::path(
@@ -119,7 +94,7 @@ async fn create_term(
     let starts_at = Timestamp::from_millis(req.starts_at);
     let ends_at = Timestamp::from_millis(req.ends_at);
     check_time_range(Some(starts_at), Some(ends_at))?;
-    let term = Term::create(name, starts_at, ends_at, &st.db).await?;
+    let term = service::term::create(&st.db, name, starts_at, ends_at).await?;
     Ok((StatusCode::CREATED, Json(TermResponse::new(&term))))
 }
 
@@ -145,7 +120,7 @@ async fn list_terms(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<TermResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let (terms, total) = Term::list_all(limit, offset, &st.db).await?;
+    let (terms, total) = service::term::list_all(&st.db, limit, offset).await?;
     let items = terms.iter().map(TermResponse::new).collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
@@ -168,7 +143,7 @@ async fn get_term(
     CurrentUser(_user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<TermResponse>, AppError> {
-    let term = Term::read(&TermId::from_key(&id), &st.db)
+    let term = service::term::read(&st.db, &TermId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     Ok(Json(TermResponse::new(&term)))
@@ -203,21 +178,18 @@ async fn update_term(
     let starts_at = req.starts_at.map(Timestamp::from_millis);
     let ends_at = req.ends_at.map(Timestamp::from_millis);
 
-    let term = Term::read(&TermId::from_key(&id), &st.db)
+    let term = service::term::read(&st.db, &TermId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
-    if term.is_archived() {
-        return Err(term::archived_error());
-    }
-    // Pre-flight only: the range check is re-made inside the UPDATE's `WHERE`
-    // (`Term::update`), so a concurrent move of the end this PATCH omits cannot
-    // slip an inverted range past this snapshot.
+    // Pre-flight only: the range check is re-made inside the UPDATE's own
+    // `WHERE` (the term update in the db layer), so a concurrent move of the
+    // end this PATCH omits cannot slip an inverted range past this snapshot.
     check_time_range(
         Some(starts_at.unwrap_or_else(|| term.get_starts_at())),
         Some(ends_at.unwrap_or_else(|| term.get_ends_at())),
     )?;
 
-    let updated = term.update(name, starts_at, ends_at, &st.db).await?;
+    let updated = service::term::update(&st.db, term, name, starts_at, ends_at).await?;
     Ok(Json(TermResponse::new(&updated)))
 }
 
@@ -244,17 +216,11 @@ async fn delete_term(
     RequireManager(_user): RequireManager,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    let term = Term::read(&TermId::from_key(&id), &st.db)
+    let term = service::term::read(&st.db, &TermId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
-    if term.is_archived() {
-        return Err(term::archived_error());
-    }
-    if !term.delete(&st.db).await? {
-        return Err(AppError::Conflict(
-            "courses are still linked to this term — unlink them first",
-        ));
-    }
+    service::term::require_writable(&term)?;
+    service::term::delete(&st.db, term).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -279,10 +245,10 @@ async fn archive_term(
     RequireManager(_user): RequireManager,
     Path(id): Path<String>,
 ) -> Result<Json<TermResponse>, AppError> {
-    let term = Term::read(&TermId::from_key(&id), &st.db)
+    let term = service::term::read(&st.db, &TermId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
-    let archived = term.archive(&st.db).await?;
+    let archived = service::term::archive(&st.db, term).await?;
     Ok(Json(TermResponse::new(&archived)))
 }
 
@@ -306,9 +272,9 @@ async fn unarchive_term(
     RequireManager(_user): RequireManager,
     Path(id): Path<String>,
 ) -> Result<Json<TermResponse>, AppError> {
-    let term = Term::read(&TermId::from_key(&id), &st.db)
+    let term = service::term::read(&st.db, &TermId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
-    let reopened = term.unarchive(&st.db).await?;
+    let reopened = service::term::unarchive(&st.db, term).await?;
     Ok(Json(TermResponse::new(&reopened)))
 }

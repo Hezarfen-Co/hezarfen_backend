@@ -749,11 +749,11 @@ mod tests {
             &[],
         )
         .unwrap();
-        let subject = crate::domain::subject::Subject::create(
+        let subject = crate::db::subject::create(
+            db,
             &crate::db::course::a_test_course(db).await,
             crate::domain::subject::SubjectName::try_new("topic").unwrap(),
             crate::domain::subject::SubjectDescription::try_new("").unwrap(),
-            db,
         )
         .await
         .unwrap();
@@ -863,7 +863,7 @@ mod tests {
     /// The same defect on the teacher's side of the sheet, and a worse one: a
     /// question written inside the delete window kept the reference it claimed
     /// on its subject (the cascade's per-subject decrement counted only the
-    /// rows it could see), and [`crate::domain::subject::Subject::delete`] is
+    /// rows it could see), and [`crate::db::subject::delete`] is
     /// gated on that count reading zero — a subject nobody could ever delete
     /// again, hanging off an exam nobody could ever see. The freeze gate is a
     /// *read* of `exam_attempt` and never survived this window;
@@ -878,7 +878,6 @@ mod tests {
         use crate::domain::exam_question::{
             ChoiceInput, QuestionKind, QuestionPoints, QuestionSpec, QuestionText,
         };
-        use crate::domain::subject::Subject;
         let (db, _serialized) = crate::database::init_test_server("exam_question_race").await;
         db.query(
             "DEFINE EVENT hold_the_window ON TABLE exam WHEN $event = 'DELETE' \
@@ -893,11 +892,11 @@ mod tests {
         for round in 0..4 {
             let exam = published(&db).await;
             let id = exam.get_id().clone();
-            let subject = Subject::create(
+            let subject = crate::db::subject::create(
+                &db,
                 &crate::db::course::a_test_course(&db).await,
                 crate::domain::subject::SubjectName::try_new("topic").unwrap(),
                 crate::domain::subject::SubjectDescription::try_new("").unwrap(),
-                &db,
             )
             .await
             .unwrap();
@@ -952,13 +951,15 @@ mod tests {
                     .len();
                 // The subject has to be free again: a stranded reference is the
                 // half of this bug a row count alone would not catch.
-                if Subject::read(subject.get_id(), &db)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .delete(&db)
-                    .await
-                    .is_err()
+                if crate::db::subject::delete(
+                    &db,
+                    crate::db::subject::read(&db, subject.get_id())
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                )
+                .await
+                .is_err()
                 {
                     stuck += 1;
                 }

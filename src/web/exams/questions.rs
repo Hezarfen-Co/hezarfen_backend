@@ -178,7 +178,7 @@ pub(crate) async fn create_question(
     // freeze gate rides inside the insert's own transaction.
     exam_question::ensure_questions_editable(exam.get_id(), &st.db).await?;
 
-    let subject = subject_in_course(&req.subject_id, course.get_id(), &st.db).await?;
+    let subject = service::subject::in_course(&st.db, &req.subject_id, course.get_id()).await?;
     let text = QuestionText::try_new(&req.text)?;
     let points = QuestionPoints::try_new(req.points)?;
     // No stored choices to match against on create, so every option is new and
@@ -318,7 +318,9 @@ pub(crate) async fn update_question(
     let question = exam_question::question_of_exam(exam.get_id(), &qid, &st.db).await?;
 
     let subject = match req.subject_id {
-        Some(ref subject_id) => subject_in_course(subject_id, course.get_id(), &st.db).await?,
+        Some(ref subject_id) => {
+            service::subject::in_course(&st.db, subject_id, course.get_id()).await?
+        }
         None => question.get_subject().clone(),
     };
     let text = match req.text {
@@ -475,7 +477,7 @@ pub(crate) async fn question_from_bank(
     // No lease — same reasoning as `create_question`. The freeze gate rides in
     // the insert's transaction.
     exam_question::ensure_questions_editable(exam.get_id(), &st.db).await?;
-    let subject = subject_in_course(&req.subject_id, course.get_id(), &st.db).await?;
+    let subject = service::subject::in_course(&st.db, &req.subject_id, course.get_id()).await?;
 
     let template = BankQuestion::read(&BankQuestionId::from_key(&bid), &st.db)
         .await?
