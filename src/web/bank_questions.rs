@@ -651,7 +651,7 @@ async fn update_question(
     owned_question(&st, &user, &bid).await?;
     let patch = bank_question::BankQuestionPatch {
         subject: match req.subject_id {
-            Some(ref subject_id) => Some(subject_must_exist(subject_id, &st.db).await?),
+            Some(ref subject_id) => Some(crate::service::subject::must_exist(&st.db, subject_id).await?),
             None => None,
         },
         text: match req.text {

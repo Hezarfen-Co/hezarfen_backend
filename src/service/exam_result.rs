@@ -5,7 +5,6 @@
 
 use crate::database::Database;
 use crate::db;
-use crate::domain::badge;
 use crate::domain::course::CourseId;
 use crate::domain::exam::{Exam, ExamId};
 use crate::domain::exam_result::{ExamResult, Mark};
