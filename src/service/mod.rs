@@ -3,6 +3,7 @@
 
 pub mod appointment;
 pub mod course;
+pub mod enrollment;
 pub mod exam_attempt;
 pub mod note;
 pub mod payment_ledger;

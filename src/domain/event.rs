@@ -7,7 +7,7 @@ use crate::database::{Database, transaction_with_retry};
 use crate::domain::class_group::ClassGroupId;
 use crate::domain::class_member::{ClassMember, ClassMemberId};
 use crate::domain::course::CourseId;
-use crate::domain::enrollment::Enrollment;
+
 use crate::db::field_update::FieldUpdate;
 use crate::domain::monotonic_id::next_ulid;
 use crate::domain::registration::Registration;
@@ -121,9 +121,11 @@ impl EventAudience {
             EventAudience::School => Ok(true),
             EventAudience::Role { role } => Ok(user.get_role() == *role),
             EventAudience::Course { course } => {
-                Ok(Enrollment::read_for_user(course, user.get_id(), db)
-                    .await?
-                    .is_some())
+                Ok(
+                    crate::db::enrollment::read_for_user(db, course, user.get_id())
+                        .await?
+                        .is_some(),
+                )
             }
             // The (class, user) pair is the membership row's own id, so the
             // point check is a single select — no scan, no index needed.
@@ -158,7 +160,7 @@ impl EventAudience {
                 .map(|user| user.get_id().clone())
                 .collect()),
             EventAudience::Course { course } => {
-                Ok(Enrollment::list_for_course(course, None, 0, db)
+                Ok(crate::db::enrollment::list_for_course(db, course, None, 0)
                     .await?
                     .0
                     .iter()

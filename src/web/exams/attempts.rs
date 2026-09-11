@@ -327,7 +327,8 @@ pub(crate) async fn live_snapshot(
     db: &Database,
 ) -> Result<ExamLiveResponse, AppError> {
     let now = Timestamp::now();
-    let (roster, _) = Enrollment::list_for_course(exam.get_course(), None, 0, db).await?;
+    let (roster, _) =
+        crate::service::enrollment::list_for_course(db, exam.get_course(), None, 0).await?;
     // Per student: their latest sitting (the one the monitor shows) plus how
     // many they've used.
     let mut attempts: HashMap<String, ExamAttempt> = HashMap::new();

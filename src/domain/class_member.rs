@@ -9,9 +9,9 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
 use crate::constant::{CLASS_MEMBER_TABLE, MAX_CLASS_COURSES, MAX_CLASS_MEMBERS};
 use crate::database::Database;
+use crate::db::page::PagedList;
 use crate::domain::class_group::ClassGroupId;
 use crate::domain::class_pump::{Attached, Axis, attach, detach, link_id};
-use crate::db::page::PagedList;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
@@ -218,7 +218,6 @@ pub(crate) mod tests {
     use crate::domain::class_course::ClassCourse;
     use crate::domain::class_group::{ClassGroup, ClassName};
     use crate::domain::course::{CourseDescription, CourseId, CourseKind, CourseTitle};
-    use crate::domain::enrollment::Enrollment;
 
     pub(crate) async fn a_class(name: &str, db: &Database) -> ClassGroupId {
         ClassGroup::create(
@@ -293,7 +292,7 @@ pub(crate) mod tests {
         user: &UserId,
         db: &Database,
     ) -> Option<Option<ClassGroupId>> {
-        Enrollment::read_for_user(course, user, db)
+        crate::db::enrollment::read_for_user(db, course, user)
             .await
             .unwrap()
             .map(|row| row.get_source().cloned())
@@ -438,7 +437,7 @@ pub(crate) mod tests {
         let student = UserId::from_key("student");
         let class = a_class("9-A", &db).await;
         let algebra = a_course("algebra", None, &db).await;
-        Enrollment::enroll(&algebra, &student, &manager, &db)
+        crate::db::enrollment::enroll(&db, &algebra, &student, &manager)
             .await
             .unwrap();
         ClassCourse::attach(&class, &algebra, &manager, &db)

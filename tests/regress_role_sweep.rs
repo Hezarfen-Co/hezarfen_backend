@@ -21,10 +21,10 @@ mod common;
 use axum::http::StatusCode;
 use common::{app_and_db, login_as, me_id, send};
 use hezarfen_backend::database::Database;
+use hezarfen_backend::db::enrollment;
 use hezarfen_backend::domain::class_group::{ClassGroup, ClassGroupId, ClassName};
 use hezarfen_backend::domain::class_member::ClassMember;
 use hezarfen_backend::domain::course::CourseId;
-use hezarfen_backend::domain::enrollment::Enrollment;
 use hezarfen_backend::domain::event::EventId;
 use hezarfen_backend::domain::registration::Registration;
 use hezarfen_backend::domain::role::Role;
@@ -272,7 +272,7 @@ async fn an_enrollment_is_refused_once_the_student_is_demoted() {
     let course = a_course(&app, &teacher).await;
     demote(&student, Role::Teacher, &db).await;
 
-    let refused = Enrollment::enroll(&course, &student, &UserId::from_key("staff"), &db).await;
+    let refused = enrollment::enroll(&db, &course, &student, &UserId::from_key("staff")).await;
     assert!(
         refused.is_err(),
         "only students hold enrollments: {refused:?}"
@@ -293,13 +293,13 @@ async fn an_enrollment_never_survives_the_demotion_it_raced() {
     let course = a_course(&app, &teacher).await;
     // The bait: a row the sweep will delete, which is what holds it open.
     let earlier = CourseId::from_key(&common::create_course(&app, &teacher, "fizik").await);
-    Enrollment::enroll(&earlier, &student, &UserId::from_key("staff"), &db)
+    enrollment::enroll(&db, &earlier, &student, &UserId::from_key("staff"))
         .await
         .unwrap();
     hold_the_sweep("enrollment", &db).await;
 
     let demoting = demote_in_the_window(&student, Role::Teacher, &db).await;
-    let enrolled = Enrollment::enroll(&course, &student, &UserId::from_key("staff"), &db).await;
+    let enrolled = enrollment::enroll(&db, &course, &student, &UserId::from_key("staff")).await;
     still_running(&demoting);
     demoting.await.unwrap();
 
