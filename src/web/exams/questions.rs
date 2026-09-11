@@ -1,5 +1,9 @@
 use super::*;
 
+use crate::domain::bank_question::BankQuestionId;
+use crate::domain::bank_question_image::BankQuestionImage;
+use crate::service::bank_question;
+use crate::service::bank_question_image;
 use crate::service::exam_question;
 
 // ---- questions --------------------------------------------------------------
@@ -484,7 +488,7 @@ pub(crate) async fn question_from_bank(
     exam_question::ensure_questions_editable(exam.get_id(), &st.db).await?;
     let subject = service::subject::in_course(&st.db, &req.subject_id, course.get_id()).await?;
 
-    let template = BankQuestion::read(&BankQuestionId::from_key(&bid), &st.db)
+    let template = bank_question::read(&st.db, &BankQuestionId::from_key(&bid))
         .await?
         .ok_or(AppError::NotFound)?;
     // A template the caller may not see is a 404, exactly as it is on the bank's
@@ -510,7 +514,7 @@ pub(crate) async fn question_from_bank(
     // The copy is all-or-nothing: any mid-loop failure rolls back the fresh
     // question row (its cascade drops the copied image rows) and the blobs
     // written so far, leaving the source and destination untouched.
-    let sources = BankQuestionImage::list_for_question(template.get_id(), &st.db).await?;
+    let sources = bank_question_image::list_for_question(&st.db, template.get_id()).await?;
     let mut copied: Vec<String> = Vec::new();
     for source in &sources {
         let step = async {
@@ -623,7 +627,7 @@ pub(crate) async fn question_refresh_from_bank(
             reason: "this question did not come from a bank template",
         }));
     };
-    let template = BankQuestion::read(&source, &st.db)
+    let template = bank_question::read(&st.db, &source)
         .await?
         .ok_or(AppError::NotFound)?;
     if !crate::web::bank_questions::can_see(&template, &user) {
@@ -635,7 +639,7 @@ pub(crate) async fn question_refresh_from_bank(
     // question untouched, since a half-applied refresh has no old content left
     // to roll back to. Bounded — at most one illustration plus ten option
     // pictures, each under the school's file cap.
-    let sources = BankQuestionImage::list_for_question(template.get_id(), &st.db).await?;
+    let sources = bank_question_image::list_for_question(&st.db, template.get_id()).await?;
     let mut incoming: Vec<(&BankQuestionImage, Vec<u8>)> = Vec::with_capacity(sources.len());
     for source in &sources {
         let bytes = tokio::fs::read(blob_path(&st.files_path, source.get_file()))
@@ -745,14 +749,14 @@ pub(crate) async fn question_to_bank(
 
     // `create_from_exam` mints its own id and insert (the funnel), fed the
     // question's fields plus the origin exam it was saved off.
-    let template = BankQuestion::create_from_exam(
+    let template = bank_question::create_from_exam(
+        &st.db,
         user.get_id().clone(),
         question.get_subject().clone(),
         question.get_text().clone(),
         question.get_points(),
         question.spec(),
         exam.get_id().clone(),
-        &st.db,
     )
     .await?;
 
@@ -789,7 +793,7 @@ pub(crate) async fn question_to_bank(
                 for file in &copied {
                     remove_blob(&st.files_path, file).await;
                 }
-                let _ = template.delete(&st.db).await;
+                let _ = bank_question::delete(&st.db, template).await;
                 return Err(err);
             }
         }
@@ -817,7 +821,7 @@ pub(crate) async fn question_to_bank(
         );
     }
 
-    let images = BankQuestionImage::list_for_question(template.get_id(), &st.db).await?;
+    let images = bank_question_image::list_for_question(&st.db, template.get_id()).await?;
     Ok((
         StatusCode::CREATED,
         Json(BankQuestionResponse::new(&template, &images)),

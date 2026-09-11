@@ -26,6 +26,8 @@ use crate::domain::role::Role;
 use crate::domain::solution::{Solution, SolutionBody, SolutionId};
 use crate::domain::user::User;
 use crate::error::{AppError, ErrorResponse, ValidationError};
+use crate::service::pool_question;
+use crate::service::solution;
 use crate::state::AppState;
 
 use super::{
@@ -87,7 +89,7 @@ fn ensure_asker_editable(question: &PoolQuestion, user: &User) -> Result<(), App
 }
 
 async fn question_or_404(st: &AppState, id: &str) -> Result<PoolQuestion, AppError> {
-    PoolQuestion::read(&PoolQuestionId::from_key(id), &st.db)
+    pool_question::read(&st.db, &PoolQuestionId::from_key(id))
         .await?
         .ok_or(AppError::NotFound)
 }
@@ -226,7 +228,7 @@ async fn question_responses(
         .iter()
         .map(|question| question.get_id().clone())
         .collect();
-    let counts = Solution::counts_for(&question_ids, &st.db).await?;
+    let counts = solution::counts_for(&st.db, &question_ids).await?;
     Ok(questions
         .iter()
         .map(|question| {
@@ -265,9 +267,8 @@ async fn ask_question(
     }
     let title = PoolQuestionTitle::try_new(&req.title)?;
     let body = PoolQuestionBody::try_new(&req.body)?;
-    let question = PoolQuestion::new(user.get_id(), title, body)
-        .insert(&st.db)
-        .await?;
+    let question =
+        pool_question::insert(&st.db, PoolQuestion::new(user.get_id(), title, body)).await?;
     let responses = question_responses(std::slice::from_ref(&question), &st).await?;
     let response = responses
         .into_iter()
@@ -310,9 +311,9 @@ async fn list_questions(
     }
 
     let mut questions = if user.get_role().at_least(Role::Teacher) {
-        PoolQuestion::list_all(&st.db).await?
+        pool_question::list_all(&st.db).await?
     } else {
-        PoolQuestion::list_visible_to(user.get_id(), &st.db).await?
+        pool_question::list_visible_to(&st.db, user.get_id()).await?
     };
     if let Some(ref status) = filter.status {
         questions.retain(|question| question.get_status() == status);
@@ -376,17 +377,8 @@ async fn approve_question(
     RequireTeacher(user): RequireTeacher,
     Path(id): Path<String>,
 ) -> Result<Json<PoolQuestionResponse>, AppError> {
-    let approved =
-        PoolQuestion::approve(&PoolQuestionId::from_key(&id), user.get_id(), &st.db).await?;
-    let question = match approved {
-        Some(question) => question,
-        // Nothing was pending under that id: either it's already approved
-        // (409) or it never existed / was deleted (404).
-        None => {
-            question_or_404(&st, &id).await?;
-            return Err(AppError::Conflict("the question is already approved"));
-        }
-    };
+    let question =
+        pool_question::approve(&st.db, &PoolQuestionId::from_key(&id), user.get_id()).await?;
     // Both counters moved inside the approval's own transaction; the badges
     // they may have earned are a decoration on top of it. Losing one to a
     // transient database error must never fail the approval behind it, and the
@@ -434,7 +426,7 @@ async fn delete_question(
             "only the asker or a teacher+ may delete a question",
         ));
     }
-    let (removed, swept) = PoolQuestion::delete(question.get_id(), &st.db)
+    let (removed, swept) = pool_question::delete(&st.db, question.get_id())
         .await?
         .ok_or(AppError::NotFound)?;
     // Rows went first (in one transaction); now every blob they pointed at —
@@ -492,7 +484,7 @@ async fn upload_image(
 
     let file = ulid::Ulid::new().to_string();
     store_blob(&st, &file, &upload.data, || async {
-        match PoolQuestion::set_image(question.get_id(), &file, &upload.content_type, size, &st.db)
+        match pool_question::set_image(&st.db, question.get_id(), &file, &upload.content_type, size)
             .await?
         {
             // The guarded UPDATE found the question still pending: point-of-truth
@@ -568,7 +560,7 @@ async fn delete_image(
     if question.get_image_file().is_none() {
         return Err(AppError::NotFound);
     }
-    let before = PoolQuestion::clear_image(question.get_id(), &st.db)
+    let before = pool_question::clear_image(&st.db, question.get_id())
         .await?
         .ok_or(AppError::Conflict("the question is no longer pending"))?;
     if let Some(file) = before.get_image_file() {
@@ -590,7 +582,7 @@ async fn visible_solution(
 ) -> Result<Solution, AppError> {
     let question = question_or_404(st, id).await?;
     ensure_visible(&question, user)?;
-    Solution::read_for(&SolutionId::from_key(sid), question.get_id(), &st.db)
+    solution::read_for(&st.db, &SolutionId::from_key(sid), question.get_id())
         .await?
         .ok_or(AppError::NotFound)
 }
@@ -647,9 +639,11 @@ async fn offer_solution(
         ));
     }
     let body = SolutionBody::try_new(&req.body)?;
-    let solution = Solution::new(question.get_id(), user.get_id(), body)
-        .insert(&st.db)
-        .await?;
+    let solution = solution::insert(
+        &st.db,
+        Solution::new(question.get_id(), user.get_id(), body),
+    )
+    .await?;
     let people = person_map([user.get_id().clone()], &st.db).await?;
     Ok((
         StatusCode::CREATED,
@@ -682,7 +676,7 @@ async fn list_solutions(
     let (limit, offset) = page.resolve()?;
     let question = question_or_404(&st, &id).await?;
     ensure_visible(&question, &user)?;
-    let (solutions, total) = Solution::list_for(question.get_id(), limit, offset, &st.db).await?;
+    let (solutions, total) = solution::list_for(&st.db, question.get_id(), limit, offset).await?;
     let slice = solutions.as_slice();
     let people = person_map(
         slice.iter().map(|solution| solution.get_author().clone()),
@@ -727,7 +721,7 @@ async fn delete_solution(
     }
     // Row first, blob after — a crash in between strands at worst an
     // unreachable file.
-    let deleted = solution.delete(&st.db).await?;
+    let deleted = solution::delete(&st.db, solution).await?;
     if let Some(file) = deleted.get_image_file() {
         remove_blob(&st.files_path, file).await;
     }
@@ -766,7 +760,7 @@ async fn edit_solution(
 ) -> Result<Json<SolutionResponse>, AppError> {
     let solution = author_solution(&st, &user, &id, &sid).await?;
     let body = SolutionBody::try_new(&req.body)?;
-    let updated = Solution::set_body(solution.get_id(), &body, &st.db)
+    let updated = solution::set_body(&st.db, solution.get_id(), &body)
         .await?
         .ok_or(AppError::NotFound)?;
     let people = person_map([user.get_id().clone()], &st.db).await?;
@@ -816,7 +810,7 @@ async fn upload_solution_image(
 
     let file = ulid::Ulid::new().to_string();
     store_blob(&st, &file, &upload.data, || async {
-        match Solution::set_image(solution.get_id(), &file, &upload.content_type, size, &st.db)
+        match solution::set_image(&st.db, solution.get_id(), &file, &upload.content_type, size)
             .await?
         {
             // Row write done; the replaced blob (if any) comes off disk.
@@ -895,7 +889,7 @@ async fn delete_solution_image(
     if solution.get_image_file().is_none() {
         return Err(AppError::NotFound);
     }
-    let before = Solution::clear_image(solution.get_id(), &st.db)
+    let before = solution::clear_image(&st.db, solution.get_id())
         .await?
         .ok_or(AppError::NotFound)?;
     if let Some(file) = before.get_image_file() {
