@@ -13,7 +13,7 @@ use crate::service::exam_attempt::{
 
 /// The exam plus the manage-rights check the grading and history reads share.
 pub(crate) async fn gradable_exam(st: &AppState, user: &User, id: &str) -> Result<Exam, AppError> {
-    let exam = Exam::read(&ExamId::from_key(id), &st.db)
+    let exam = crate::service::exam::read(&st.db, &ExamId::from_key(id))
         .await?
         .ok_or(AppError::NotFound)?;
     let course = course_of(&exam, &st.db).await?;
@@ -203,7 +203,7 @@ pub(crate) async fn reviewable_exam(
     user: &User,
     id: &str,
 ) -> Result<Exam, AppError> {
-    let exam = Exam::read(&ExamId::from_key(id), &st.db)
+    let exam = crate::service::exam::read(&st.db, &ExamId::from_key(id))
         .await?
         .ok_or(AppError::NotFound)?;
     if exam.is_draft() {
@@ -268,7 +268,7 @@ async fn live_elsewhere(
     let now = Timestamp::now();
     let mut live = Vec::new();
     for attempt in list_unfinished_for_user(&st.db, user.get_id()).await? {
-        let Some(other) = Exam::read(attempt.get_exam(), &st.db).await? else {
+        let Some(other) = crate::service::exam::read(&st.db, attempt.get_exam()).await? else {
             continue;
         };
         if attempt.status(&other, now) == AttemptStatus::InProgress {

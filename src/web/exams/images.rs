@@ -95,7 +95,7 @@ pub(crate) async fn image_managed_exam(
     user: &User,
     id: &str,
 ) -> Result<Exam, AppError> {
-    let exam = Exam::read(&ExamId::from_key(id), &st.db)
+    let exam = crate::service::exam::read(&st.db, &ExamId::from_key(id))
         .await?
         .ok_or(AppError::NotFound)?;
     let course = course_of(&exam, &st.db).await?;
@@ -231,7 +231,7 @@ pub(crate) async fn get_question_image(
     CurrentUser(user): CurrentUser,
     Path((id, qid)): Path<(String, String)>,
 ) -> Result<Response, AppError> {
-    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
+    let exam = crate::service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     ensure_question_content_visible(&st, &exam, &user).await?;
@@ -343,7 +343,7 @@ pub(crate) async fn get_choice_image(
     CurrentUser(user): CurrentUser,
     Path((id, qid, choice_id)): Path<(String, String, String)>,
 ) -> Result<Response, AppError> {
-    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
+    let exam = crate::service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     ensure_question_content_visible(&st, &exam, &user).await?;
@@ -459,7 +459,7 @@ pub(crate) async fn upload_answer_image(
     Path((id, qid)): Path<(String, String)>,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<ImageMetaResponse>), AppError> {
-    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
+    let exam = crate::service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     ensure_student(&user)?;
@@ -541,7 +541,7 @@ pub(crate) async fn delete_answer_image(
     CurrentUser(user): CurrentUser,
     Path((id, qid)): Path<(String, String)>,
 ) -> Result<StatusCode, AppError> {
-    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
+    let exam = crate::service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     ensure_student(&user)?;
@@ -594,7 +594,7 @@ pub(crate) async fn get_answer_image(
     CurrentUser(user): CurrentUser,
     Path((id, qid)): Path<(String, String)>,
 ) -> Result<Response, AppError> {
-    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
+    let exam = crate::service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     ensure_question_content_visible(&st, &exam, &user).await?;
@@ -634,7 +634,7 @@ pub(crate) async fn get_student_answer_image(
     RequireTeacher(user): RequireTeacher,
     Path((id, target, qid)): Path<(String, String, String)>,
 ) -> Result<Response, AppError> {
-    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
+    let exam = crate::service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     let course = course_of(&exam, &st.db).await?;

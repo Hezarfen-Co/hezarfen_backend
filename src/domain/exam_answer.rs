@@ -173,7 +173,7 @@ impl ExamAnswer {
         };
         // The save writes the *exam row* as well as the answer, in one
         // transaction, and that is what ties the answer's fate to its exam:
-        // reading the exam does not survive [`crate::domain::exam::Exam::delete`]'s
+        // reading the exam does not survive [`crate::db::exam::delete`]'s
         // window — a save landing after its `DELETE exam_answer WHERE exam = $ex`
         // but before the commit reads an exam that is still there (uncommitted)
         // while the sweep ran on a snapshot predating this row, so both commit
@@ -240,7 +240,7 @@ impl ExamAnswer {
         }
         // The trailing `RETURN` is the last statement before `COMMIT`, so its
         // slot follows the statement count rather than a hand-kept number (the
-        // `Exam::delete` treatment); `num_statements` counts BEGIN and COMMIT.
+        // `db::exam::delete` treatment); `num_statements` counts BEGIN and COMMIT.
         let slot = result.num_statements().saturating_sub(2);
         result
             .take::<Vec<ExamAnswer>>(slot)?
@@ -491,22 +491,23 @@ mod tests {
     }
 
     /// The bite test for the exam-row touch in [`ExamAnswer::save`]: it exists
-    /// to collide with [`crate::domain::exam::Exam::delete`], so it must leave
+    /// to collide with [`crate::db::exam::delete`], so it must leave
     /// the counter it borrows exactly where it found it — absent stays absent
     /// (the boot backfill keys on `result_count = NONE`), and a real count is
     /// not moved by a student typing. The race half is
-    /// `domain::exam::tests::an_answer_written_inside_a_delete_never_outlives_the_exam`,
+    /// `db::exam::tests::an_answer_written_inside_a_delete_never_outlives_the_exam`,
     /// which needs a real server; this half is the arithmetic and runs anywhere.
     #[tokio::test]
     async fn a_save_puts_the_exams_mark_counter_back_exactly() {
         use crate::domain::exam::{
-            Exam, ExamAttemptLimit, ExamDescription, ExamKind, ExamSchedule, ExamTitle,
+            ExamAttemptLimit, ExamDescription, ExamKind, ExamSchedule, ExamTitle,
         };
         let db = crate::database::init_mem().await.unwrap();
         let kinds = crate::domain::settings::Settings::defaults()
             .get_exam_kinds()
             .to_vec();
-        let exam = Exam::create(
+        let exam = crate::db::exam::create(
+            &db,
             &student(),
             &crate::db::course::a_test_course(&db).await,
             ExamTitle::try_new("quiz").unwrap(),
@@ -517,7 +518,6 @@ mod tests {
             true,
             false,
             false,
-            &db,
         )
         .await
         .unwrap();

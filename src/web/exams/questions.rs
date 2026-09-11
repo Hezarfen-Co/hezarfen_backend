@@ -197,7 +197,7 @@ pub(crate) async fn create_question(
     Path(id): Path<String>,
     Json(req): Json<CreateQuestion>,
 ) -> Result<(StatusCode, Json<QuestionResponse>), AppError> {
-    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
+    let exam = crate::service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     let course = course_of(&exam, &st.db).await?;
@@ -258,7 +258,7 @@ pub(crate) async fn list_questions(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<QuestionResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
+    let exam = crate::service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     let course = course_of(&exam, &st.db).await?;
@@ -336,7 +336,7 @@ pub(crate) async fn update_question(
     Path((id, qid)): Path<(String, String)>,
     Json(req): Json<UpdateQuestion>,
 ) -> Result<Json<QuestionResponse>, AppError> {
-    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
+    let exam = crate::service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     let course = course_of(&exam, &st.db).await?;
@@ -424,7 +424,7 @@ pub(crate) async fn delete_question(
     RequireTeacher(user): RequireTeacher,
     Path((id, qid)): Path<(String, String)>,
 ) -> Result<StatusCode, AppError> {
-    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
+    let exam = crate::service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     let course = course_of(&exam, &st.db).await?;
@@ -496,7 +496,7 @@ pub(crate) async fn question_from_bank(
     Path((id, bid)): Path<(String, String)>,
     Json(req): Json<InstantiateFromBank>,
 ) -> Result<(StatusCode, Json<QuestionResponse>), AppError> {
-    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
+    let exam = crate::service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     let course = course_of(&exam, &st.db).await?;
@@ -627,7 +627,7 @@ pub(crate) async fn question_refresh_from_bank(
     RequireTeacher(user): RequireTeacher,
     Path((id, qid)): Path<(String, String)>,
 ) -> Result<Json<QuestionResponse>, AppError> {
-    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
+    let exam = crate::service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     let course = course_of(&exam, &st.db).await?;
@@ -752,7 +752,7 @@ pub(crate) async fn question_to_bank(
     RequireTeacher(user): RequireTeacher,
     Path((id, qid)): Path<(String, String)>,
 ) -> Result<(StatusCode, Json<BankQuestionResponse>), AppError> {
-    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
+    let exam = crate::service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     let course = course_of(&exam, &st.db).await?;

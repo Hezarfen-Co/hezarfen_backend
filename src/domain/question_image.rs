@@ -258,10 +258,7 @@ mod tests {
     /// keeps a picture from outliving its exam), so a minted id nothing wrote
     /// is a 404.
     async fn exam_row(db: &Database) -> ExamId {
-        crate::domain::exam::published_exam(db)
-            .await
-            .get_id()
-            .clone()
+        crate::db::exam::published_exam(db).await.get_id().clone()
     }
 
     fn png() -> FileContentType {

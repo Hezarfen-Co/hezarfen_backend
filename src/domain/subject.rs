@@ -5,10 +5,10 @@ use crate::constant::{
 };
 use crate::database::{Database, transaction_with_retry};
 use crate::db::cap;
-use crate::domain::course::CourseId;
 use crate::db::field_update::FieldUpdate;
-use crate::domain::monotonic_id::next_ulid;
 use crate::db::page::PagedList;
+use crate::domain::course::CourseId;
+use crate::domain::monotonic_id::next_ulid;
 use crate::error::{AppError, ValidationError};
 use crate::validate::{validate_optional, validate_required};
 
@@ -244,7 +244,7 @@ impl Subject {
             return Err(error.into());
         }
         // Read through the trailing `RETURN`, not a counted slot — see
-        // [`crate::domain::exam::Exam::delete`].
+        // [`crate::db::exam::delete`].
         let slot = result.num_statements().saturating_sub(2);
         let deleted: Option<Subject> = result.take::<Vec<Subject>>(slot)?.into_iter().next();
         deleted.ok_or(AppError::NotFound)
@@ -281,9 +281,11 @@ mod tests {
                 .map(|_| ())
             })
         }
-        crate::db::course::assert_no_child_outlives_a_course_delete("subject_orphan_race",
-        SUBJECT_TABLE,
-        make,)
+        crate::db::course::assert_no_child_outlives_a_course_delete(
+            "subject_orphan_race",
+            SUBJECT_TABLE,
+            make,
+        )
         .await;
     }
 
@@ -356,10 +358,7 @@ mod tests {
             // A real exam row per round: a question write moves its exam's
             // counter, so a minted id nothing wrote is a 404 and no round would
             // reach the subject race this test is about.
-            let exam = crate::domain::exam::published_exam(&db)
-                .await
-                .get_id()
-                .clone();
+            let exam = crate::db::exam::published_exam(&db).await.get_id().clone();
             let subject = Subject::create(
                 &course,
                 SubjectName::try_new("Limits").unwrap(),
