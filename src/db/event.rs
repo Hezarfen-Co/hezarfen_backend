@@ -76,7 +76,7 @@ pub async fn members(
                 .map(|enrollment| enrollment.get_user().clone())
                 .collect())
         }
-        EventAudience::Class { class } => Ok(ClassMember::list_for_class(class, None, 0, db)
+        EventAudience::Class { class } => Ok(crate::db::class_member::list_for_class(db, class, None, 0)
             .await?
             .0
             .iter()

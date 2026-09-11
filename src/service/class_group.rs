@@ -15,7 +15,7 @@ use crate::error::AppError;
 pub async fn require_open(db: &Database, class: &ClassGroup) -> Result<(), AppError> {
     match class.get_term() {
         None => Ok(()),
-        Some(term) => term::Term::require_open(term, db).await,
+        Some(term) => crate::service::term::require_open(db, term).await,
     }
 }
 

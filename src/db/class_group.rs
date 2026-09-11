@@ -278,7 +278,7 @@ mod tests {
 
     async fn a_term(db: &Database) -> Term {
         let at = crate::domain::timestamp::Timestamp::from_millis;
-        Term::create(TermName::try_new("2026").unwrap(), at(100), at(200), db)
+        crate::db::term::create(db, TermName::try_new("2026").unwrap(), at(100), at(200))
             .await
             .unwrap()
     }
@@ -432,7 +432,7 @@ mod tests {
             "the courses' counter is seeded from course rows and must stay untouched"
         );
         assert!(
-            !term.clone().delete(&db).await.unwrap(),
+            !crate::db::term::delete(&db, term.clone()).await.unwrap(),
             "two linked classes must refuse the delete"
         );
 
@@ -440,13 +440,13 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !term.clone().delete(&db).await.unwrap(),
+            !crate::db::term::delete(&db, term.clone()).await.unwrap(),
             "one link is still one link"
         );
 
         assert!(delete(&db, linked).await.unwrap());
         assert!(
-            term.clone().delete(&db).await.unwrap(),
+            crate::db::term::delete(&db, term.clone()).await.unwrap(),
             "the last link gone, the term may go"
         );
     }
@@ -509,7 +509,7 @@ mod tests {
         let db = crate::database::init_mem().await.unwrap();
         let term = a_term(&db).await;
         let id = term.get_id().clone();
-        assert!(term.delete(&db).await.unwrap());
+        assert!(crate::db::term::delete(&db, term).await.unwrap());
 
         let error = create(
             &db,
@@ -544,14 +544,14 @@ mod tests {
         let db = crate::database::init_mem().await.unwrap();
         let at = crate::domain::timestamp::Timestamp::from_millis;
         let from = a_term(&db).await;
-        let to = Term::create(TermName::try_new("2027").unwrap(), at(100), at(200), &db)
+        let to = crate::db::term::create(&db, TermName::try_new("2027").unwrap(), at(100), at(200))
             .await
             .unwrap();
-        let dead = Term::create(TermName::try_new("2028").unwrap(), at(100), at(200), &db)
+        let dead = crate::db::term::create(&db, TermName::try_new("2028").unwrap(), at(100), at(200))
             .await
             .unwrap();
         let dead_id = dead.get_id().clone();
-        assert!(dead.delete(&db).await.unwrap());
+        assert!(crate::db::term::delete(&db, dead).await.unwrap());
         let class = class_on(Some(from.get_id().clone()), &db).await;
 
         let error = update(
@@ -607,10 +607,10 @@ mod tests {
         let db = crate::database::init_mem().await.unwrap();
         let at = crate::domain::timestamp::Timestamp::from_millis;
         let from = a_term(&db).await;
-        let to = Term::create(TermName::try_new("2027").unwrap(), at(100), at(200), &db)
+        let to = crate::db::term::create(&db, TermName::try_new("2027").unwrap(), at(100), at(200))
             .await
             .unwrap();
-        let other = Term::create(TermName::try_new("2028").unwrap(), at(100), at(200), &db)
+        let other = crate::db::term::create(&db, TermName::try_new("2028").unwrap(), at(100), at(200))
             .await
             .unwrap();
         let class = class_on(Some(from.get_id().clone()), &db).await;
