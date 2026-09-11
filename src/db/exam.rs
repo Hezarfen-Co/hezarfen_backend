@@ -165,7 +165,7 @@ pub async fn update_if_unchanged(
     //
     // Sent through the retry loop, not a bare `query`: this row now has a
     // hot writer. Every answer save touches it to tie itself to the exam
-    // ([`crate::domain::exam_answer::ExamAnswer::save`]), so a teacher
+    // ([`crate::db::exam_answer::save`]), so a teacher
     // flipping `allow_rejoin` mid-exam can lose a round to a student
     // typing — and a lost round is a re-send, never the 500 a bare `?` on
     // the conflict would have answered. Re-sending is sound because the
@@ -308,7 +308,7 @@ use crate::domain::settings::ExamKindDef;
 /// An unscheduled published exam — the minimum any test that writes a *child*
 /// of an exam needs, in any module: every such write moves the exam row (see
 /// [`crate::db::exam_attempt::write_unfrozen_with`]
-/// and [`crate::domain::exam_answer::ExamAnswer::save`]), so a minted id whose
+/// and [`crate::db::exam_answer::save`]), so a minted id whose
 /// row was never created is a 404 rather than a silent orphan.
 #[cfg(test)]
 pub(crate) async fn published_exam(db: &Database) -> Exam {
@@ -450,18 +450,19 @@ mod tests {
     /// exam from being hidden.
     #[tokio::test]
     async fn re_drafting_is_refused_by_the_write_itself_once_a_mark_exists() {
-        use crate::domain::exam_result::{ExamResult, Mark};
+        use crate::db::exam_result;
+        use crate::domain::exam_result::Mark;
         let db = crate::database::init_mem().await.unwrap();
         let exam = published(&db).await;
         let student = UserId::generate();
-        ExamResult::grade(
+        exam_result::grade(
+            &db,
             exam.get_id(),
             &student,
             1,
             Mark::try_new(80).unwrap(),
             &UserId::generate(),
             exam.get_kind().as_str(),
-            &db,
         )
         .await
         .unwrap();
@@ -603,7 +604,7 @@ mod tests {
     /// genuine conflict can be masked by a sibling, and either way there is no
     /// [`crate::database::lost_the_race`] check and no retry.
     ///
-    /// The racer is a mark: [`ExamResult::grade`] claims the exam's own
+    /// The racer is a mark: [`crate::db::exam_result::grade`] claims the exam's own
     /// `result_count` (and the kind's reference) before writing, so it contends
     /// with the `DELETE $ex` and with the kind_ref decrement inside the same
     /// transaction. A round where *some* of the six grades 404 and the rest
@@ -625,7 +626,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn a_delete_racing_a_mark_never_answers_500() {
-        use crate::domain::exam_result::{ExamResult, Mark};
+        use crate::db::exam_result;
+        use crate::domain::exam_result::Mark;
         let (db, _serialized) = crate::database::init_test_server("exam_delete_race").await;
         let (mut delete_500, mut grade_500) = (0, 0);
         let (mut split, mut swept) = (0, 0);
@@ -655,14 +657,14 @@ mod tests {
                     let (id, db, kind) = (exam.get_id().clone(), db.clone(), kind.clone());
                     let student = UserId::from_key(&format!("stu{round}_{seat}"));
                     tokio::spawn(async move {
-                        ExamResult::grade(
+                        exam_result::grade(
+                            &db,
                             &id,
                             &student,
                             1,
                             Mark::try_new(50).unwrap(),
                             &UserId::from_key("teacher"),
                             &kind,
-                            &db,
                         )
                         .await
                     })
@@ -693,7 +695,7 @@ mod tests {
             if (1..6).contains(&refused) {
                 split += 1;
             }
-            if ExamResult::list_for_exam(exam.get_id(), &db)
+            if exam_result::list_for_exam(&db, exam.get_id())
                 .await
                 .unwrap()
                 .is_empty()
@@ -774,7 +776,7 @@ mod tests {
     /// would not do it — the read sees a row [`crate::db::exam::delete`] has removed but
     /// not committed, while its `DELETE exam_answer WHERE exam = $ex` swept a
     /// snapshot predating the save, so both commit and the answer is left
-    /// pointing at an exam that is gone. [`ExamAnswer::save`] writes the exam
+    /// pointing at an exam that is gone. [`crate::db::exam_answer::save`] writes the exam
     /// row instead (its `result_count`, back unchanged), so the two transactions
     /// touch one key and the store refuses one of them.
     ///
@@ -797,7 +799,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn an_answer_written_inside_a_delete_never_outlives_the_exam() {
-        use crate::domain::exam_answer::ExamAnswer;
+        use crate::db::exam_answer;
         let (db, _serialized) = crate::database::init_test_server("exam_answer_race").await;
         // Hold the delete open for a full second after the row is gone, while
         // its cascade still has to run.
@@ -833,7 +835,7 @@ mod tests {
             let child = {
                 let (db, question, student) = (db.clone(), question.clone(), student.clone());
                 tokio::spawn(async move {
-                    ExamAnswer::save(&question, &student, 1, Some(pick), None, &db).await
+                    exam_answer::save(&db, &question, &student, 1, Some(pick), None).await
                 })
             };
             let (drop_it, child) = (drop_it.await.unwrap(), child.await.unwrap());
@@ -847,7 +849,7 @@ mod tests {
             // Stored state is the whole verdict; a return value is not evidence.
             if read(&db, &id).await.unwrap().is_none() {
                 swept += 1;
-                answers += ExamAnswer::list_for_exam(&id, &db).await.unwrap().len();
+                answers += exam_answer::list_for_exam(&db, &id).await.unwrap().len();
             } else if drop_it.is_ok() {
                 panic!("round {round}: the delete reported success but the exam is still there");
             }
@@ -977,7 +979,7 @@ mod tests {
     }
 
     /// The student's half of the same picture problem: a drawing is a bare
-    /// `UPSERT` — the exact pre-fix shape of [`ExamAnswer::save`] — so it kept
+    /// `UPSERT` — the exact pre-fix shape of [`crate::db::exam_answer::save`] — so it kept
     /// the hole the text answer just lost, blob and all.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
@@ -1009,16 +1011,15 @@ mod tests {
             let child = {
                 let (db, exam_id, on) = (db.clone(), id.clone(), question.get_id().clone());
                 tokio::spawn(async move {
-                    AnswerImage::new(
+                    let image = AnswerImage::new(
                         &exam_id,
                         &on,
                         &student,
                         1,
                         FileContentType::try_new("image/png").unwrap(),
                         3,
-                    )
-                    .upsert(&db)
-                    .await
+                    );
+                    crate::db::answer_image::upsert(&db, image).await
                 })
             };
             let (drop_it, child) = (drop_it.await.unwrap(), child.await.unwrap());
@@ -1029,7 +1030,10 @@ mod tests {
 
             if read(&db, &id).await.unwrap().is_none() {
                 swept += 1;
-                drawings += AnswerImage::list_for_exam(&id, &db).await.unwrap().len();
+                drawings += crate::db::answer_image::list_for_exam(&db, &id)
+                    .await
+                    .unwrap()
+                    .len();
             } else if drop_it.is_ok() {
                 panic!("round {round}: the delete reported success but the exam is still there");
             }
@@ -1076,15 +1080,14 @@ mod tests {
             let child = {
                 let (db, exam_id, on) = (db.clone(), id.clone(), question.get_id().clone());
                 tokio::spawn(async move {
-                    QuestionImage::new(
+                    let image = QuestionImage::new(
                         &exam_id,
                         &on,
                         None,
                         FileContentType::try_new("image/png").unwrap(),
                         3,
-                    )
-                    .upsert(&db)
-                    .await
+                    );
+                    crate::db::question_image::upsert(&db, image).await
                 })
             };
             let (drop_it, child) = (drop_it.await.unwrap(), child.await.unwrap());
@@ -1095,7 +1098,10 @@ mod tests {
 
             if read(&db, &id).await.unwrap().is_none() {
                 swept += 1;
-                images += QuestionImage::list_for_exam(&id, &db).await.unwrap().len();
+                images += crate::db::question_image::list_for_exam(&db, &id)
+                    .await
+                    .unwrap()
+                    .len();
             } else if drop_it.is_ok() {
                 panic!("round {round}: the delete reported success but the exam is still there");
             }

@@ -6,10 +6,8 @@
 
 use crate::database::Database;
 use crate::db::course;
-use crate::domain::answer_image::AnswerImage;
 use crate::domain::course::{Course, CourseDescription, CourseId, CourseKind, CourseTitle};
 use crate::domain::course_note_file::CourseNoteFile;
-use crate::domain::question_image::QuestionImage;
 use crate::domain::role::Role;
 use crate::domain::term::TermId;
 use crate::domain::user::UserId;
@@ -165,8 +163,9 @@ pub async fn delete(db: &Database, course: &Course) -> Result<DeleteOutcome, App
     require_open(db, course).await?;
     let _guard = crate::service::exam_attempt::EXAM_LOCK.write().await;
     let _homework_guard = crate::service::homework::HOMEWORK_LOCK.write().await;
-    let image_files = QuestionImage::file_keys_for_course(course.get_id(), db).await?;
-    let answer_image_files = AnswerImage::file_keys_for_course(course.get_id(), db).await?;
+    let image_files = crate::db::question_image::file_keys_for_course(db, course.get_id()).await?;
+    let answer_image_files =
+        crate::db::answer_image::file_keys_for_course(db, course.get_id()).await?;
     let homework_files =
         crate::db::homework_file::file_keys_for_course(db, course.get_id()).await?;
     let course_note_files = CourseNoteFile::file_keys_for_course(course.get_id(), db).await?;

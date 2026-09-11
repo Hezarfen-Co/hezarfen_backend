@@ -50,8 +50,11 @@ pub(crate) async fn student_attempts(
 ) -> Result<Json<Vec<i64>>, AppError> {
     let exam = gradable_exam(&st, &user, &id).await?;
     let target = UserId::from_key(&target);
-    let mut seqs = ExamAnswer::list_seqs_for_user(exam.get_id(), &target, &st.db).await?;
-    for result in ExamResult::list_all_for_exam_user(exam.get_id(), &target, &st.db).await? {
+    let mut seqs =
+        crate::service::exam_answer::list_seqs_for_user(&st.db, exam.get_id(), &target).await?;
+    for result in
+        crate::service::exam_result::list_all_for_exam_user(&st.db, exam.get_id(), &target).await?
+    {
         seqs.push(result.get_seq());
     }
     seqs.sort_unstable();
@@ -121,7 +124,7 @@ pub(crate) async fn student_attempt_answer_image(
     let exam = gradable_exam(&st, &user, &id).await?;
     let target = UserId::from_key(&target);
     let question = exam_question::question_of_exam(exam.get_id(), &qid, &st.db).await?;
-    let image = AnswerImage::read(question.get_id(), &target, seq, &st.db)
+    let image = crate::service::answer_image::read(&st.db, question.get_id(), &target, seq)
         .await?
         .ok_or(AppError::NotFound)?;
     crate::web::serve_inline_blob(&st.files_path, image.get_file(), image.get_content_type()).await
@@ -153,7 +156,8 @@ pub(crate) async fn student_marks_history(
 ) -> Result<Json<Vec<ExamResultResponse>>, AppError> {
     let exam = gradable_exam(&st, &user, &id).await?;
     let target = UserId::from_key(&target);
-    let results = ExamResult::list_all_for_exam_user(exam.get_id(), &target, &st.db).await?;
+    let results =
+        crate::service::exam_result::list_all_for_exam_user(&st.db, exam.get_id(), &target).await?;
     let people = person_map(
         results
             .iter()
@@ -208,7 +212,7 @@ pub(crate) async fn reviewable_exam(
     if exam.is_draft() {
         return Err(AppError::NotFound);
     }
-    ExamResult::read_for_user(exam.get_id(), user.get_id(), &st.db)
+    crate::service::exam_result::read_for_user(&st.db, exam.get_id(), user.get_id())
         .await?
         .ok_or(AppError::NotFound)?;
     if !exam.get_allow_review() {
@@ -302,8 +306,11 @@ pub(crate) async fn review_attempts(
 ) -> Result<Json<Vec<i64>>, AppError> {
     let exam = reviewable_exam(&st, &user, &id).await?;
     let target = user.get_id().clone();
-    let mut seqs = ExamAnswer::list_seqs_for_user(exam.get_id(), &target, &st.db).await?;
-    for result in ExamResult::list_all_for_exam_user(exam.get_id(), &target, &st.db).await? {
+    let mut seqs =
+        crate::service::exam_answer::list_seqs_for_user(&st.db, exam.get_id(), &target).await?;
+    for result in
+        crate::service::exam_result::list_all_for_exam_user(&st.db, exam.get_id(), &target).await?
+    {
         seqs.push(result.get_seq());
     }
     seqs.sort_unstable();
@@ -417,7 +424,7 @@ pub(crate) async fn review_attempt_answer_image(
 ) -> Result<Response, AppError> {
     let exam = reviewable_exam(&st, &user, &id).await?;
     let question = exam_question::question_of_exam(exam.get_id(), &qid, &st.db).await?;
-    let image = AnswerImage::read(question.get_id(), user.get_id(), seq, &st.db)
+    let image = crate::service::answer_image::read(&st.db, question.get_id(), user.get_id(), seq)
         .await?
         .ok_or(AppError::NotFound)?;
     crate::web::serve_inline_blob(&st.files_path, image.get_file(), image.get_content_type()).await

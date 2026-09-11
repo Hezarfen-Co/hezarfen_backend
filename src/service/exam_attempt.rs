@@ -384,13 +384,13 @@ pub async fn save_answer_in(
     crate::service::course::require_open(db, &course_of(exam, db).await?).await?;
     let question =
         crate::service::exam_question::question_of_exam(exam.get_id(), question_id, db).await?;
-    crate::domain::exam_answer::ExamAnswer::save(
+    crate::db::exam_answer::save(
+        db,
         &question,
         attempt.get_user(),
         attempt.get_seq(),
         selected,
         text,
-        db,
     )
     .await
 }
@@ -464,10 +464,10 @@ pub async fn set_left(
 mod tests {
     use super::*;
     use crate::database::init_mem;
+    use crate::db::exam_answer;
     use crate::domain::exam::{
         ExamAttemptLimit, ExamDescription, ExamKind, ExamMode, ExamSchedule, ExamTitle,
     };
-    use crate::domain::exam_answer::ExamAnswer;
     use crate::domain::exam_question::{
         ChoiceInput, ExamQuestion, QuestionKind, QuestionPoints, QuestionSpec,
     };
@@ -664,13 +664,13 @@ mod tests {
         let (first, created) = start(&db, &exam, &user).await.unwrap();
         assert!(created);
         assert_eq!(first.get_seq(), 1);
-        ExamAnswer::save(
+        exam_answer::save(
+            &db,
             &question,
             &user,
             1,
             Some(second_choice(&question)),
             None,
-            &db,
         )
         .await
         .unwrap();
@@ -682,12 +682,12 @@ mod tests {
         assert_eq!(second.get_seq(), 2);
 
         // Sitting #1's answer is still there, read at its own seq.
-        let prior = ExamAnswer::read(question.get_id(), &user, 1, &db)
+        let prior = exam_answer::read(&db, question.get_id(), &user, 1)
             .await
             .unwrap();
         assert!(prior.is_some(), "the retake must preserve seq 1's answer");
         // The new sitting starts blank at its own seq.
-        let fresh = ExamAnswer::list_for_exam_user(exam.get_id(), &user, 2, &db)
+        let fresh = exam_answer::list_for_exam_user(&db, exam.get_id(), &user, 2)
             .await
             .unwrap();
         assert!(fresh.is_empty(), "seq 2 starts blank");
@@ -705,13 +705,13 @@ mod tests {
         let (winner, created) = start(&db, &exam, &user).await.unwrap();
         assert!(created);
         assert_eq!(winner.get_seq(), 2);
-        ExamAnswer::save(
+        exam_answer::save(
+            &db,
             &question,
             &user,
             2,
             Some(second_choice(&question)),
             None,
-            &db,
         )
         .await
         .unwrap();
@@ -731,7 +731,7 @@ mod tests {
         let lost: Result<Option<ExamAttempt>, surrealdb::Error> =
             db.create(loser.id.record()).content(loser).await;
         assert!(lost.is_err(), "the duplicate-seq create must be rejected");
-        let answers = ExamAnswer::list_for_exam_user(exam.get_id(), &user, 2, &db)
+        let answers = exam_answer::list_for_exam_user(&db, exam.get_id(), &user, 2)
             .await
             .unwrap();
         assert_eq!(

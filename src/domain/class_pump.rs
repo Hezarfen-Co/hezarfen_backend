@@ -233,7 +233,7 @@ impl Axis {
     /// and never enters the write set, so `count = count` sat on no key at all
     /// and a concurrent `DELETE /courses/{id}` committed beside it with both
     /// callers told OK (measured on 3.2.3, counter present and absent alike).
-    /// Same shape as [`crate::domain::exam_answer::ExamAnswer::save`]: the
+    /// Same shape as [`crate::db::exam_answer::save`]: the
     /// restore is by captured value, `NONE` included, so the row is
     /// byte-identical afterwards and the boot backfill still sees the `NONE` it
     /// seeds off. Both statements are inside the transaction, so an abort

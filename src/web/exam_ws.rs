@@ -66,7 +66,6 @@ use serde_json::{Value, json};
 use crate::constant::{EXAM_WS_TICK_SECS, MAX_QUESTION_ID_LEN};
 use crate::database::Database;
 use crate::domain::exam::{Exam, ExamId};
-use crate::domain::exam_answer::ExamAnswer;
 use crate::domain::exam_attempt::{AttemptStatus, ExamAttempt, ExamAttemptId};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
@@ -337,10 +336,14 @@ async fn state_frame(
     let remaining_ms = (status == AttemptStatus::InProgress)
         .then(|| deadline.map(|d| (d.as_millis() - now.as_millis()).max(0)))
         .flatten();
-    let answered =
-        ExamAnswer::list_for_exam_user(exam.get_id(), attempt.get_user(), attempt.get_seq(), db)
-            .await?
-            .len();
+    let answered = crate::service::exam_answer::list_for_exam_user(
+        db,
+        exam.get_id(),
+        attempt.get_user(),
+        attempt.get_seq(),
+    )
+    .await?
+    .len();
     let question_count = crate::service::exam_question::list_for_exam(db, exam.get_id(), None, 0)
         .await?
         .0

@@ -171,7 +171,7 @@ pub async fn any_for_exam(db: &Database, exam: &ExamId) -> Result<bool, AppError
 /// predating this insert — so both commit and the child outlives the exam,
 /// with neither caller told anything. Writing a key the delete also writes
 /// makes the two collide and the store refuses one side. It is the shape
-/// [`crate::domain::exam_answer::ExamAnswer::save`] and
+/// [`crate::db::exam_answer::save`] and
 /// [`crate::db::menu::bump_menu_and_write`] already use.
 ///
 /// An orphan here is not merely untidy: an `exam_question` that outlives
