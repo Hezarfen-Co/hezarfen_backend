@@ -333,7 +333,7 @@ async fn update_homework(
     // A kept (absent) due date may already be past; a newly set one may not be.
     check_not_past("due_at", due_at)?;
     let subject = match &req.subject_id {
-        Some(subject_id) => Some(subject_in_course(subject_id, course.get_id(), &st.db).await?),
+        Some(subject_id) => Some(crate::service::subject::in_course(&st.db, subject_id, course.get_id()).await?),
         None => None,
     };
     // The orphan guard runs on exactly the requests that re-scope the audience.
