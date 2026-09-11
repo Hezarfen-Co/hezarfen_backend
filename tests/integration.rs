@@ -9629,8 +9629,8 @@ async fn live_monitor_tracks_answer_progress() {
 
 #[tokio::test]
 async fn questions_and_answers_cascade_with_deletes() {
+    use hezarfen_backend::db::exam_answer;
     use hezarfen_backend::db::exam_question;
-    use hezarfen_backend::domain::exam_answer::ExamAnswer;
 
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "qc_t", "teacher").await;
@@ -9689,7 +9689,7 @@ async fn questions_and_answers_cascade_with_deletes() {
         2
     );
     assert_eq!(
-        ExamAnswer::list_for_exam(&exam_id, &db)
+        exam_answer::list_for_exam(&db, &exam_id)
             .await
             .unwrap()
             .len(),
@@ -9734,7 +9734,7 @@ async fn questions_and_answers_cascade_with_deletes() {
         1
     );
     assert_eq!(
-        ExamAnswer::list_for_exam(&exam_id, &db)
+        exam_answer::list_for_exam(&db, &exam_id)
             .await
             .unwrap()
             .len(),
@@ -9760,7 +9760,7 @@ async fn questions_and_answers_cascade_with_deletes() {
             .is_empty()
     );
     assert!(
-        ExamAnswer::list_for_exam(&exam_id, &db)
+        exam_answer::list_for_exam(&db, &exam_id)
             .await
             .unwrap()
             .is_empty()
@@ -9824,7 +9824,7 @@ async fn questions_and_answers_cascade_with_deletes() {
             .is_empty()
     );
     assert!(
-        ExamAnswer::list_for_exam(&exam2_id, &db)
+        exam_answer::list_for_exam(&db, &exam2_id)
             .await
             .unwrap()
             .is_empty()

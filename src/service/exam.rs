@@ -8,15 +8,15 @@
 
 use crate::constant::CAS_UPDATE_RETRIES;
 use crate::database::Database;
+use crate::db::answer_image;
 use crate::db::exam;
-use crate::domain::answer_image::AnswerImage;
+use crate::db::exam_result;
+use crate::db::question_image;
 use crate::domain::course::CourseId;
 use crate::domain::exam::{
     Exam, ExamAttemptLimit, ExamDescription, ExamDuration, ExamId, ExamKind, ExamMode,
     ExamSchedule, ExamTitle, redraft_error,
 };
-use crate::domain::exam_result::ExamResult;
-use crate::domain::question_image::QuestionImage;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
@@ -184,7 +184,7 @@ pub async fn update(db: &Database, id: &ExamId, patch: &ExamPatch) -> Result<Exa
         // grade landing after this read still cannot leave a mark on a draft.
         if draft && !current.is_draft() {
             let sat = any_for_exam(db, current.get_id()).await?;
-            let graded = !ExamResult::list_for_exam(current.get_id(), db)
+            let graded = !exam_result::list_for_exam(db, current.get_id())
                 .await?
                 .is_empty();
             if sat || graded {
@@ -271,8 +271,8 @@ pub async fn delete(db: &Database, target: &Exam) -> Result<DeleteOutcome, AppEr
     let _guard = EXAM_LOCK.write().await;
     // Rows go first (the delete cascades them), blobs after — a crash in
     // between strands at worst an unreachable blob.
-    let images = QuestionImage::list_for_exam(target.get_id(), db).await?;
-    let answer_images = AnswerImage::list_for_exam(target.get_id(), db).await?;
+    let images = question_image::list_for_exam(db, target.get_id()).await?;
+    let answer_images = answer_image::list_for_exam(db, target.get_id()).await?;
     exam::delete(db, target.clone()).await?;
     Ok(DeleteOutcome {
         image_files: images

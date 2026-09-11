@@ -1,4 +1,5 @@
 //! The only layer that executes queries.
+pub mod answer_image;
 pub mod appointment;
 pub mod appointment_slot;
 pub mod attendance;
@@ -14,8 +15,10 @@ pub mod dietary_profile;
 pub mod enrollment;
 pub mod event;
 pub mod exam;
+pub mod exam_answer;
 pub mod exam_attempt;
 pub mod exam_question;
+pub mod exam_result;
 pub mod fee_plan;
 pub mod fee_plan_assignment;
 pub mod field_update;
@@ -35,6 +38,7 @@ pub mod parent_link;
 pub mod payment_ledger;
 pub mod pomodoro;
 pub mod profile;
+pub mod question_image;
 pub mod rag_output;
 pub mod registration;
 pub mod session;

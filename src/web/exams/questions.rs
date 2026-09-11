@@ -361,10 +361,14 @@ pub(crate) async fn update_question(
         .iter()
         .map(|choice| choice.get_id().clone())
         .collect();
-    for image in QuestionImage::delete_choices_not_in(updated.get_id(), &keep, &st.db).await? {
+    for image in
+        crate::service::question_image::delete_choices_not_in(&st.db, updated.get_id(), &keep)
+            .await?
+    {
         remove_blob(&st.files_path, image.get_file()).await;
     }
-    let images = QuestionImage::list_for_question(updated.get_id(), &st.db).await?;
+    let images =
+        crate::service::question_image::list_for_question(&st.db, updated.get_id()).await?;
     Ok(Json(QuestionResponse::new(&updated, &images)))
 }
 
@@ -408,7 +412,8 @@ pub(crate) async fn delete_question(
     let question = exam_question::question_of_exam(exam.get_id(), &qid, &st.db).await?;
     // Rows go first (the delete cascades them), blobs after — a crash in
     // between strands at worst an unreachable blob.
-    let images = QuestionImage::list_for_question(question.get_id(), &st.db).await?;
+    let images =
+        crate::service::question_image::list_for_question(&st.db, question.get_id()).await?;
     exam_question::delete(&st.db, question).await?;
     for image in &images {
         remove_blob(&st.files_path, image.get_file()).await;
@@ -538,7 +543,8 @@ pub(crate) async fn question_from_bank(
             }
         }
     }
-    let images = QuestionImage::list_for_question(question.get_id(), &st.db).await?;
+    let images =
+        crate::service::question_image::list_for_question(&st.db, question.get_id()).await?;
     Ok((
         StatusCode::CREATED,
         Json(QuestionResponse::new(&question, &images)),
@@ -664,12 +670,13 @@ pub(crate) async fn question_refresh_from_bank(
     // `store_image` upserts per slot, so a slot both sides have is replaced.
     let incoming_slots: Vec<Option<&ChoiceId>> =
         incoming.iter().map(|(image, _)| image.get_slot()).collect();
-    for stale in QuestionImage::list_for_question(updated.get_id(), &st.db).await? {
+    for stale in crate::service::question_image::list_for_question(&st.db, updated.get_id()).await?
+    {
         if incoming_slots.contains(&stale.get_slot()) {
             continue;
         }
         let file = stale.get_file().to_string();
-        stale.delete(&st.db).await?;
+        crate::service::question_image::delete(&st.db, stale).await?;
         remove_blob(&st.files_path, &file).await;
     }
     for (source, bytes) in &incoming {
@@ -684,7 +691,8 @@ pub(crate) async fn question_refresh_from_bank(
         .await?;
     }
 
-    let images = QuestionImage::list_for_question(updated.get_id(), &st.db).await?;
+    let images =
+        crate::service::question_image::list_for_question(&st.db, updated.get_id()).await?;
     Ok(Json(QuestionResponse::new(&updated, &images)))
 }
 
@@ -753,7 +761,8 @@ pub(crate) async fn question_to_bank(
     // mid-loop failure rolls back the fresh bank row (cascade drops the copied
     // image rows) and the blobs written so far; the source exam question stays
     // untouched.
-    let sources = QuestionImage::list_for_question(question.get_id(), &st.db).await?;
+    let sources =
+        crate::service::question_image::list_for_question(&st.db, question.get_id()).await?;
     let mut copied: Vec<String> = Vec::new();
     for source in &sources {
         let step = async {
