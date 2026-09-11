@@ -605,7 +605,8 @@ mod tests {
     /// the backfill is the whole of the stale-data story, not a nicety.
     #[tokio::test]
     async fn a_plan_assigned_before_the_counter_existed_is_still_refused() {
-        use crate::domain::fee_plan::{FeePlan, FeePlanId, FeePlanName};
+        use crate::db::fee_plan;
+        use crate::domain::fee_plan::{FeePlanId, FeePlanName};
         use crate::error::AppError;
 
         let db = super::init_mem().await.unwrap();
@@ -645,28 +646,36 @@ mod tests {
 
         // The load-bearing half: the seeded plan is frozen, and the untouched
         // one is not.
-        let used = FeePlan::read(&FeePlanId::from_key("used"), &db)
+        let used = fee_plan::read(&db, &FeePlanId::from_key("used"))
             .await
             .unwrap()
             .unwrap();
         assert!(matches!(
-            used.clone()
-                .update(Some(FeePlanName::try_new("Edited").unwrap()), None, &db)
-                .await,
+            fee_plan::update(
+                &db,
+                used.clone(),
+                Some(FeePlanName::try_new("Edited").unwrap()),
+                None
+            )
+            .await,
             Err(AppError::Conflict(_))
         ));
-        assert!(!used.delete(&db).await.unwrap());
-        let free = FeePlan::read(&FeePlanId::from_key("free"), &db)
+        assert!(!fee_plan::delete(&db, used).await.unwrap());
+        let free = fee_plan::read(&db, &FeePlanId::from_key("free"))
             .await
             .unwrap()
             .unwrap();
         assert!(
-            free.clone()
-                .update(Some(FeePlanName::try_new("Edited").unwrap()), None, &db)
-                .await
-                .is_ok()
+            fee_plan::update(
+                &db,
+                free.clone(),
+                Some(FeePlanName::try_new("Edited").unwrap()),
+                None
+            )
+            .await
+            .is_ok()
         );
-        assert!(free.delete(&db).await.unwrap());
+        assert!(fee_plan::delete(&db, free).await.unwrap());
     }
 
     /// Stale-data path for the 2026-08-02 board-roster repair. `set_role`

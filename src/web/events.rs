@@ -537,7 +537,8 @@ async fn mark(
         }));
     }
 
-    let attendance = Attendance::mark(&event_id, &target, status, user.get_id(), &st.db).await?;
+    let attendance =
+        crate::service::attendance::mark(&st.db, &event_id, &target, status, user.get_id()).await?;
     let people = PersonRef::map_of(&[&target_user, &user]);
     Ok(Json(AttendanceResponse::new(&attendance, &people)))
 }
@@ -572,7 +573,8 @@ async fn list_attendance(
     Event::read(&event_id, &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    let (rows, total) = Attendance::list_for_event(&event_id, limit, offset, &st.db).await?;
+    let (rows, total) =
+        crate::service::attendance::list_for_event(&st.db, &event_id, limit, offset).await?;
     // Join people onto the page alone — the lookup shrinks with the window.
     let people = person_map(
         rows.iter()
@@ -609,8 +611,12 @@ async fn remove_attendance(
     _teacher: RequireTeacher,
     Path((id, target)): Path<(String, String)>,
 ) -> Result<StatusCode, AppError> {
-    let removed =
-        Attendance::remove(&EventId::from_key(&id), &UserId::from_key(&target), &st.db).await?;
+    let removed = crate::service::attendance::remove(
+        &st.db,
+        &EventId::from_key(&id),
+        &UserId::from_key(&target),
+    )
+    .await?;
     if removed.is_none() {
         return Err(AppError::NotFound);
     }
@@ -668,7 +674,7 @@ async fn roster(
     let mut members = event.get_audience().members(event.get_id(), &st.db).await?;
     // ULID keys sort by creation instant — a stable order keeps pages coherent.
     members.sort_by(|a, b| a.key().cmp(b.key()));
-    let (marks, _) = Attendance::list_for_event(&event_id, None, 0, &st.db).await?;
+    let (marks, _) = crate::service::attendance::list_for_event(&st.db, &event_id, None, 0).await?;
     let by_user: HashMap<&str, &Attendance> = marks
         .iter()
         .map(|attendance| (attendance.get_user().key(), attendance))
@@ -868,7 +874,10 @@ mod tests {
         let user = crate::service::user::create(db, Username::try_new(username).unwrap(), hash)
             .await
             .unwrap();
-        crate::service::user::set_role(db, user.get_id(), role).await.unwrap().0
+        crate::service::user::set_role(db, user.get_id(), role)
+            .await
+            .unwrap()
+            .0
     }
 
     /// `can_manage` is only reached behind `RequireTeacher` today, so this is

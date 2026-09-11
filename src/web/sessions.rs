@@ -11,7 +11,6 @@ use utoipa_axum::routes;
 
 use crate::database::Database;
 use crate::domain::attendance::AttendanceStatus;
-use crate::domain::badge;
 use crate::domain::course::Course;
 use crate::domain::course_session::{CourseSession, CourseSessionId, SessionTopic};
 
@@ -19,7 +18,7 @@ use crate::domain::role::Role;
 use crate::domain::session_attendance::SessionAttendance;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
-use crate::error::{AppError, ErrorResponse, ValidationError};
+use crate::error::{AppError, ErrorResponse};
 use crate::service;
 use crate::state::AppState;
 
@@ -296,58 +295,8 @@ async fn mark_roll_call(
     let status = AttendanceStatus::try_new(&req.status, school.get_attendance_statuses())?;
     let target = UserId::from_key(&req.user_id);
 
-    // Target user must exist.
-    let Some(target_user) = crate::service::user::read(&st.db, &target).await? else {
-        return Err(AppError::Validation(ValidationError::Invalid {
-            field: "user_id",
-            reason: "target user does not exist",
-        }));
-    };
-
-    if session.is_teacher(&target) {
-        // The session teacher's own presence is recorded by management.
-        if !user.get_role().at_least(Role::Manager) {
-            return Err(AppError::Forbidden(
-                "marking the session's teacher requires manager role or higher",
-            ));
-        }
-    } else {
-        // Everyone else on a lesson's roster is an enrolled student. Only
-        // students attend classes; checking the live role keeps a stale
-        // enrollment (left by a promotion) from putting staff on the roll.
-        if target_user.get_role() != Role::Student {
-            return Err(AppError::Validation(ValidationError::Invalid {
-                field: "user_id",
-                reason: "only students can be marked present in a lesson",
-            }));
-        }
-        if service::enrollment::read_for_user(&st.db, session.get_course(), &target)
-            .await?
-            .is_none()
-        {
-            return Err(AppError::Validation(ValidationError::Invalid {
-                field: "user_id",
-                reason: "target user is not enrolled in this course",
-            }));
-        }
-    }
-
-    let attendance =
-        SessionAttendance::mark(&session, &target, status, user.get_id(), &st.db).await?;
-    // A badge is a decoration on top of the roll call: losing one to a
-    // transient database error must never fail the mark, and the next counter
-    // move re-runs this and heals it. Both people the mark can credit are
-    // synced — the person marked (`lessons_attended`) and the lesson's teacher
-    // (`lessons_held`, on the first roll call only). The teacher's runs on every
-    // mark rather than only that first one: `sync` is add-only and idempotent,
-    // so the extra calls cost one record read and are what heals a first sync
-    // that failed, and knowing here whether the credit landed would mean
-    // widening `mark`'s return type for nothing.
-    for who in [&target, session.get_teacher()] {
-        if let Err(err) = badge::sync(who, &st.db).await {
-            tracing::warn!("failed to sync badges for {}: {err}", who.key());
-        }
-    }
+    let (attendance, target_user) =
+        service::session_attendance::mark(&st.db, &session, &user, &target, status).await?;
     let people = PersonRef::map_of(&[&target_user, &user]);
     Ok(Json(SessionAttendanceResponse::new(&attendance, &people)))
 }
@@ -384,7 +333,8 @@ async fn list_roll_call(
         ));
     }
     let (rows, total) =
-        SessionAttendance::list_for_session(session.get_id(), limit, offset, &st.db).await?;
+        service::session_attendance::list_for_session(&st.db, session.get_id(), limit, offset)
+            .await?;
     // Join people onto the page alone — the lookup shrinks with the window.
     let people = person_map(
         rows.iter()
@@ -432,23 +382,6 @@ async fn remove_roll_call(
     }
     crate::service::course::require_open(&st.db, &course).await?;
     let target = UserId::from_key(&target);
-    // A staff row is management's to remove, keyed on the *target's live role*
-    // rather than on `is_teacher`: reassigning a session's teacher used to hand
-    // the incoming teacher — an ordinary one — the outgoing teacher's staff row
-    // to delete without the manager+ this guard exists to require. A target
-    // whose user row is gone can only be a student's stale row (marking checks
-    // the role at write time), so it stays the session teacher's to clear.
-    let staff_row = crate::service::user::read(&st.db, &target)
-        .await?
-        .is_some_and(|target_user| target_user.get_role().at_least(Role::Teacher));
-    if staff_row && !user.get_role().at_least(Role::Manager) {
-        return Err(AppError::Forbidden(
-            "removing a staff roll-call row requires manager role or higher",
-        ));
-    }
-    let removed = SessionAttendance::remove(session.get_id(), &target, &st.db).await?;
-    if removed.is_none() {
-        return Err(AppError::NotFound);
-    }
+    service::session_attendance::remove(&st.db, &session, &user, &target).await?;
     Ok(StatusCode::NO_CONTENT)
 }
