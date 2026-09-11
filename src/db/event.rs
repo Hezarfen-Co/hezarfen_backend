@@ -8,7 +8,6 @@ use crate::database::{Database, transaction_with_retry};
 use crate::db::field_update::FieldUpdate;
 use crate::domain::class_member::{ClassMember, ClassMemberId};
 use crate::domain::event::{Event, EventAudience, EventDescription, EventId, EventTitle};
-use crate::domain::registration::Registration;
 use crate::domain::timestamp::{Timestamp, range_error};
 use crate::domain::user::{User, UserId};
 use crate::error::AppError;
@@ -42,7 +41,7 @@ pub async fn includes(
             Ok(member.is_some())
         }
         EventAudience::Registration { .. } => {
-            Ok(Registration::read_for_user(event, user.get_id(), db)
+            Ok(crate::db::registration::read_for_user(db, event, user.get_id())
                 .await?
                 .is_some())
         }
@@ -83,7 +82,7 @@ pub async fn members(
             .iter()
             .map(|member| member.get_user().clone())
             .collect()),
-        EventAudience::Registration { .. } => Ok(Registration::list_for_event(event, db)
+        EventAudience::Registration { .. } => Ok(crate::db::registration::list_for_event(db, event)
             .await?
             .iter()
             .map(|registration| registration.get_user().clone())

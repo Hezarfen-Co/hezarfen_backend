@@ -7,7 +7,7 @@ use crate::constant::REGISTRATION_COUNT_FIELD;
 use crate::database::Database;
 use crate::db::cap;
 use crate::db::registration;
-use crate::domain::event::{Event, EventId};
+use crate::domain::event::EventId;
 use crate::domain::registration::{Registration, RegistrationId};
 use crate::domain::role::Role;
 use crate::domain::user::UserId;
@@ -43,7 +43,7 @@ pub async fn register(
     }
     // Read for its refusals only — the audience kind and the closing time.
     // The seat count itself is re-read by the claim.
-    Event::read(event, db)
+    crate::db::event::read(db, event)
         .await?
         .ok_or(AppError::NotFound)?
         .registration_capacity()?;
@@ -80,7 +80,7 @@ pub async fn register(
         // the holder fell to parent while this ran — the conditional writes
         // match nothing (or throw) either way, and only this path pays for
         // the reads that tell them apart.
-        cap::Claimed::Full => match Event::read(event, db).await? {
+        cap::Claimed::Full => match crate::db::event::read(db, event).await? {
             None => Err(AppError::NotFound),
             Some(_) => match crate::db::user::read(db, user).await? {
                 Some(held) if held.get_role() == Role::Parent => Err(AppError::Forbidden(
