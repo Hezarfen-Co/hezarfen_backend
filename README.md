@@ -3609,7 +3609,7 @@ since a read of one record and a write of another are not serialized against
 each other — so the delete and each individual attach are also serialized in
 process: the delete holds a write lease across its compare-and-set and its
 sweep, and a pump takes a read lease one course at a time, so a delete never
-waits behind a whole grade. The backend runs single-replica by decision, which
+waits behind a whole grade. The backend runs as a single process by decision, which
 is what makes an in-process lock the complete answer. The delete is also a
 compare-and-set on the list the call read: a `409` means somebody edited the
 template in between, and nothing was written — though a template deleted and

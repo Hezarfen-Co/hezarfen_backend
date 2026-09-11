@@ -74,7 +74,7 @@ use crate::error::{AppError, ValidationError};
 /// a whole pump, so a delete waits behind one attach rather than an unbounded
 /// loop.
 ///
-/// In-process is deployment-wide here: single-replica by decision, with
+/// In-process is deployment-wide here: one process by contract, with
 /// stop-the-world upgrades — the same argument
 /// [`crate::domain::settings::SETTINGS_LOCK`] makes. No other lock is taken
 /// under it, so it has no ordering rule to break.
@@ -474,8 +474,8 @@ impl ClassBlueprint {
     /// serialize, so a pump that read the row alive can still commit its link
     /// after the sweep has run. [`BLUEPRINT_LOCK`] is what closes it: the write
     /// lease below spans the compare-and-set and the sweep, the read lease in
-    /// [`Self::apply_to`] spans each attach, and single-replica deployment
-    /// makes an in-process lock the whole answer.
+    /// [`Self::apply_to`] spans each attach, and the deployment runs one
+    /// process by contract, which makes an in-process lock the whole answer.
     ///
     /// What is left is a **process crash** between the delete and the sweep — a
     /// lock does not survive the process. That leaves inert `class_course` rows

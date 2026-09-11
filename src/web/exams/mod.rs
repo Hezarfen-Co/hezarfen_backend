@@ -609,8 +609,9 @@ async fn delete_exam(
     // an image row written after that snapshot would strand its bytes on disk
     // even though the row itself is now refused.
     //
-    // corner-cut: process-local, so it holds because the deployment is a single
-    // replica with stop-the-world deploys (two overlapping binaries would
+    // corner-cut: process-local, so it holds because the deployment runs one
+    // process by contract with stop-the-world deploys (two overlapping
+    // binaries would
     // reopen it). Closing it in the store means the `cap` shape the counter
     // work already sketched: `claim_and_create` gaining a second record to
     // touch, so the attempt writes the exam key as every other child does.

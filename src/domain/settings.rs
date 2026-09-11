@@ -44,7 +44,7 @@ use crate::error::{AppError, ValidationError};
 /// erased which attempt owns the flip.
 ///
 /// So the pair is serialized instead. Every writer of the singleton goes
-/// through `PATCH /settings`, and the deployment runs one replica by contract
+/// through `PATCH /settings`, and the deployment runs one process by contract
 /// (stop-the-world upgrades), so process-wide is deployment-wide here — the
 /// same argument [`crate::domain::cap`]'s own lock makes for `retire_name`'s
 /// two statements, one level up. The compare-and-set stays: it is what keeps a

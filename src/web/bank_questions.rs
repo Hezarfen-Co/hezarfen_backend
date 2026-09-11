@@ -53,7 +53,9 @@ use super::{
 // bank templates deliberately do not hold (blocking on them was a dead end; see
 // [`crate::domain::subject::Subject::delete`]). With the writer gone the three
 // reader leases guarded nothing, and what they claimed to guard was already
-// open in production: the lock ordered one process, and the backend runs two.
+// open in production: the lock lived in one process, and the deployment runs
+// exactly one process (stop-the-world upgrades) — there is nothing else to
+// order, so the in-process lock was the only ordering there ever was.
 //
 // The race it leaves is the one the cascade already accepts — a template can
 // adopt a subject the same instant it is deleted and be left holding a dangling
