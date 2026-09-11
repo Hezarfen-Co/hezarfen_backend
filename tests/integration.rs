@@ -20670,7 +20670,8 @@ async fn linking_the_banked_template_does_not_clobber_a_concurrent_edit() {
 /// A whole-row save from the stale struct would resurrect the dead exam link.
 #[tokio::test]
 async fn a_bank_patch_does_not_clobber_a_concurrent_write() {
-    use hezarfen_backend::domain::bank_question::{BankQuestion, BankQuestionId, BankVisibility};
+    use hezarfen_backend::db::bank_question::{read, update_if_unchanged};
+    use hezarfen_backend::domain::bank_question::{BankQuestionId, BankVisibility};
     use hezarfen_backend::domain::exam_question::{
         QuestionKind, QuestionPoints, QuestionSpec, QuestionText,
     };
@@ -20702,7 +20703,7 @@ async fn a_bank_patch_does_not_clobber_a_concurrent_write() {
 
     // The handler's read, then the exam delete lands mid-window and clears the
     // template's `source_exam`.
-    let stale = BankQuestion::read(&BankQuestionId::from_key(&bid), &db)
+    let stale = read(&db, &BankQuestionId::from_key(&bid))
         .await
         .unwrap()
         .expect("template exists");
@@ -20718,18 +20719,18 @@ async fn a_bank_patch_does_not_clobber_a_concurrent_write() {
     assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
 
     // The stale struct writes its own fields only.
-    let updated = stale
-        .update_if_unchanged(
-            None,
-            QuestionText::try_new("edited").unwrap(),
-            QuestionPoints::try_new(7).unwrap(),
-            QuestionSpec::try_new(QuestionKind::try_new("text").unwrap(), None, None, &[]).unwrap(),
-            BankVisibility::try_new(BANK_VISIBILITY_SCHOOL).unwrap(),
-            &db,
-        )
-        .await
-        .expect("update ran")
-        .expect("update written — the exam delete touched no compared column");
+    let updated = update_if_unchanged(
+        &db,
+        stale,
+        None,
+        QuestionText::try_new("edited").unwrap(),
+        QuestionPoints::try_new(7).unwrap(),
+        QuestionSpec::try_new(QuestionKind::try_new("text").unwrap(), None, None, &[]).unwrap(),
+        BankVisibility::try_new(BANK_VISIBILITY_SCHOOL).unwrap(),
+    )
+    .await
+    .expect("update ran")
+    .expect("update written — the exam delete touched no compared column");
     assert_eq!(updated.get_text().as_str(), "edited");
     assert!(
         updated.get_source_exam().is_none(),
