@@ -181,6 +181,7 @@ async fn update_term(
     let term = service::term::read(&st.db, &TermId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
+    service::term::require_writable(&term)?;
     // Pre-flight only: the range check is re-made inside the UPDATE's own
     // `WHERE` (the term update in the db layer), so a concurrent move of the
     // end this PATCH omits cannot slip an inverted range past this snapshot.
