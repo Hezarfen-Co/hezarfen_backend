@@ -16,7 +16,7 @@ use crate::domain::enrollment::Enrollment;
 use crate::domain::exam::{
     ExamAttemptLimit, ExamDescription, ExamDuration, ExamKind, ExamMode, ExamSchedule, ExamTitle,
 };
-use crate::domain::homework::{Homework, HomeworkTitle};
+use crate::domain::homework::HomeworkTitle;
 use crate::domain::role::Role;
 use crate::domain::subject::{Subject, SubjectDescription, SubjectName};
 use crate::domain::timestamp::Timestamp;
@@ -1084,7 +1084,8 @@ async fn create_homework_in_course(
     // is non-zero — so the check below is only a pre-flight for the message.
     let subject = subject_in_course(&req.subject_id, course.get_id(), &st.db).await?;
     let assigned = resolve_assigned(req.assigned, course.get_id(), &st.db).await?;
-    let homework = Homework::create(
+    let homework = service::homework::create(
+        &st.db,
         course.get_id(),
         &subject,
         title,
@@ -1092,7 +1093,6 @@ async fn create_homework_in_course(
         due_at,
         assigned,
         user.get_id(),
-        &st.db,
     )
     .await?;
     Ok((StatusCode::CREATED, Json(HomeworkResponse::new(&homework))))
@@ -1134,7 +1134,7 @@ async fn list_course_homework(
             "only enrolled users, the course creator, an assigned teacher, or a manager/admin can view this course",
         ));
     }
-    let mut homework = Homework::list_for_course(course.get_id(), &st.db).await?;
+    let mut homework = service::homework::list_for_course(&st.db, course.get_id()).await?;
     // A student sees only the homework they are assigned; managers see all.
     let manages = can_manage_course(&course, &user);
     if !manages {
@@ -1297,7 +1297,10 @@ mod tests {
         let user = crate::service::user::create(db, Username::try_new(username).unwrap(), hash)
             .await
             .unwrap();
-        crate::service::user::set_role(db, user.get_id(), role).await.unwrap().0
+        crate::service::user::set_role(db, user.get_id(), role)
+            .await
+            .unwrap()
+            .0
     }
 
     /// A course `creator` made, with nobody assigned.
@@ -1326,7 +1329,10 @@ mod tests {
         assert!(owns_course(&course, &creator));
 
         for role in [Role::Student, Role::Parent] {
-            let demoted = crate::service::user::set_role(&db, creator.get_id(), role).await.unwrap().0;
+            let demoted = crate::service::user::set_role(&db, creator.get_id(), role)
+                .await
+                .unwrap()
+                .0;
             assert!(
                 !can_manage_course(&course, &demoted),
                 "{role:?} creator still manages the course"
@@ -1354,7 +1360,10 @@ mod tests {
         // ...but never an owner, assigned or not.
         assert!(!owns_course(&course, &assigned));
 
-        let demoted = crate::service::user::set_role(&db, assigned.get_id(), Role::Student).await.unwrap().0;
+        let demoted = crate::service::user::set_role(&db, assigned.get_id(), Role::Student)
+            .await
+            .unwrap()
+            .0;
         assert!(!can_manage_course(&course, &demoted));
     }
 
@@ -1413,7 +1422,9 @@ mod tests {
         let db = init_mem().await.unwrap();
         let creator = user("teacher", Role::Teacher, &db).await;
         let course = course(&creator, &db).await;
-        crate::service::user::set_role(&db, creator.get_id(), Role::Student).await.unwrap();
+        crate::service::user::set_role(&db, creator.get_id(), Role::Student)
+            .await
+            .unwrap();
 
         for role in [Role::Manager, Role::Admin] {
             let boss = user(&format!("boss{}", role.as_str()), role, &db).await;

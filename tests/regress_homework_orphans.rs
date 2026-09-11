@@ -316,8 +316,9 @@ async fn an_upload_inside_an_audience_patch_is_refused() {
 /// leaves behind.
 #[tokio::test]
 async fn a_submission_under_a_vanished_homework_is_refused() {
-    use hezarfen_backend::domain::homework::{Homework, HomeworkId};
-    use hezarfen_backend::domain::homework_submission::HomeworkSubmission;
+    use hezarfen_backend::db::homework::read;
+    use hezarfen_backend::db::homework_submission::upsert;
+    use hezarfen_backend::domain::homework::HomeworkId;
     use hezarfen_backend::domain::user::UserId;
 
     let (app, db) = app_and_db().await;
@@ -326,7 +327,7 @@ async fn a_submission_under_a_vanished_homework_is_refused() {
         course_with_student(&app, &db, &teacher, "kimya").await;
     let hw = create_homework(&app, &teacher, &course, &subject, "deneme", far_future()).await;
     // The stale snapshot a handler would still be holding.
-    let stale = Homework::read(&HomeworkId::from_key(&hw), &db)
+    let stale = read(&db, &HomeworkId::from_key(&hw))
         .await
         .unwrap()
         .expect("the homework exists");
@@ -346,7 +347,7 @@ async fn a_submission_under_a_vanished_homework_is_refused() {
         "delete the homework"
     );
 
-    let refused = HomeworkSubmission::upsert(&stale, &user, None, &db).await;
+    let refused = upsert(&db, &stale, &user, None).await;
     assert!(
         refused.is_err(),
         "a submission to a homework that is gone must be refused, got {refused:?}"
@@ -385,8 +386,9 @@ async fn a_submission_under_a_vanished_homework_is_refused() {
 /// that holds when the lease does not, so no handler may be in the way of it.
 #[tokio::test]
 async fn a_grade_under_a_vanished_homework_is_refused() {
+    use hezarfen_backend::db::homework_result::grade;
     use hezarfen_backend::domain::homework::HomeworkId;
-    use hezarfen_backend::domain::homework_result::{HomeworkResult, HomeworkStatus};
+    use hezarfen_backend::domain::homework_result::HomeworkStatus;
     use hezarfen_backend::domain::user::UserId;
 
     let (app, db) = app_and_db().await;
@@ -411,13 +413,13 @@ async fn a_grade_under_a_vanished_homework_is_refused() {
     );
 
     // The ids a handler mid-request would still be carrying.
-    let refused = HomeworkResult::grade(
+    let refused = grade(
+        &db,
         &HomeworkId::from_key(&hw),
         &UserId::from_key(&student_id),
         HomeworkStatus::try_new("done").unwrap(),
         None,
         &UserId::from_key(&teacher_id),
-        &db,
     )
     .await;
     assert!(
