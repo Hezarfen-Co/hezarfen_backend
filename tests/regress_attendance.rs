@@ -13,9 +13,10 @@ mod common;
 use axum::http::StatusCode;
 use common::{app_and_db, create_course, create_session, enroll, login, login_as, me_id, send};
 use hezarfen_backend::database::Database;
+use hezarfen_backend::db::course_session;
 use hezarfen_backend::db::settings;
 use hezarfen_backend::domain::attendance::{Attendance, AttendanceStatus};
-use hezarfen_backend::domain::course_session::{CourseSession, CourseSessionId};
+use hezarfen_backend::domain::course_session::CourseSessionId;
 use hezarfen_backend::domain::event::EventId;
 use hezarfen_backend::domain::session_attendance::SessionAttendance;
 use hezarfen_backend::domain::timestamp::Timestamp;
@@ -199,7 +200,7 @@ async fn a_mark_against_a_deleted_session_is_refused_and_stores_nothing() {
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
 
     // The snapshot the racing request is holding, taken while the session lives.
-    let snapshot = CourseSession::read(&CourseSessionId::from_key(&session), &db)
+    let snapshot = course_session::read(&db, &CourseSessionId::from_key(&session))
         .await
         .unwrap()
         .expect("session exists");
