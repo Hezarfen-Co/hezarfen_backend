@@ -299,7 +299,7 @@ pub async fn start_attempt(
     user: &User,
 ) -> Result<(Exam, ExamAttempt, bool), AppError> {
     let _guard = EXAM_LOCK.write().await;
-    let exam = crate::domain::exam::Exam::read(exam_id, db)
+    let exam = crate::db::exam::read(db, exam_id)
         .await?
         .ok_or(AppError::NotFound)?;
     ensure_sittable(&exam)?;
@@ -505,7 +505,8 @@ mod tests {
         let creator = UserId::from_key("01TESTTEACHERAAAAAAAAAAAAA");
         let course = crate::db::course::a_test_course(db).await;
         let kinds = Settings::defaults().get_exam_kinds().to_vec();
-        let exam = Exam::create(
+        let exam = crate::db::exam::create(
+            db,
             &creator,
             &course,
             ExamTitle::try_new("practice").unwrap(),
@@ -517,7 +518,6 @@ mod tests {
             true,
             false,
             false,
-            db,
         )
         .await
         .unwrap();

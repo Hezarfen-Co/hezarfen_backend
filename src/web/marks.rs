@@ -107,7 +107,7 @@ async fn build_report(
 
     let mut blocks = Vec::with_capacity(courses.len());
     for course in &courses {
-        let exams = Exam::list_for_course(course.get_id(), db).await?;
+        let exams = crate::service::exam::list_for_course(db, course.get_id()).await?;
         let by_key: HashMap<&str, &Exam> = exams.iter().map(|e| (e.get_id().key(), e)).collect();
 
         let results = ExamResult::list_for_user_in_course(course.get_id(), user, db).await?;

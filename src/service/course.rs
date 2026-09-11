@@ -11,8 +11,8 @@ use crate::domain::course::{Course, CourseDescription, CourseId, CourseKind, Cou
 use crate::domain::course_note_file::CourseNoteFile;
 use crate::domain::homework_file::HomeworkFile;
 use crate::domain::question_image::QuestionImage;
-use crate::domain::term::{self, TermId};
 use crate::domain::role::Role;
+use crate::domain::term::{self, TermId};
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ValidationError};
 
@@ -138,8 +138,7 @@ pub struct DeleteOutcome {
 /// Delete the course: collect the image/homework/note-file blob keys, then
 /// run the cascading delete.
 ///
-/// Writer lease of [`crate::web::exams::EXAM_LOCK`] (moving to
-/// `crate::service::exam_attempt` with the exam lane's split), for
+/// Writer lease of [`crate::service::exam_attempt::EXAM_LOCK`], for
 /// `delete_exam`'s reason: this cascade sweeps the course's exams *and their
 /// attempts*, and an attempt is the one exam child whose write cannot
 /// collide with the sweep (its claim lands on the student's row, never the

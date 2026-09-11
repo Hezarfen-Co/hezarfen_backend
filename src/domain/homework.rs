@@ -18,8 +18,8 @@ use crate::constant::{
 };
 use crate::database::Database;
 use crate::db::cap;
-use crate::domain::course::CourseId;
 use crate::db::field_update::FieldUpdate;
+use crate::domain::course::CourseId;
 use crate::domain::monotonic_id::next_ulid;
 use crate::domain::subject::SubjectId;
 use crate::domain::timestamp::Timestamp;
@@ -370,7 +370,7 @@ impl Homework {
             .check()?;
         // The subject's reference is given back in this same transaction, off
         // what the delete actually removed. Read through the trailing `RETURN`,
-        // not a hand-counted slot — see [`crate::domain::exam::Exam::delete`].
+        // not a hand-counted slot — see [`crate::db::exam::delete`].
         let slot = result.num_statements().saturating_sub(2);
         let deleted: Option<Homework> = result.take::<Vec<Homework>>(slot)?.into_iter().next();
         deleted.ok_or(AppError::NotFound)

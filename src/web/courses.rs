@@ -14,8 +14,7 @@ use crate::domain::course::{Course, CourseDescription, CourseId, CourseKind, Cou
 use crate::domain::course_session::{CourseSession, SessionTopic};
 use crate::domain::enrollment::Enrollment;
 use crate::domain::exam::{
-    Exam, ExamAttemptLimit, ExamDescription, ExamDuration, ExamKind, ExamMode, ExamSchedule,
-    ExamTitle,
+    ExamAttemptLimit, ExamDescription, ExamDuration, ExamKind, ExamMode, ExamSchedule, ExamTitle,
 };
 use crate::domain::homework::{Homework, HomeworkTitle};
 use crate::domain::role::Role;
@@ -265,7 +264,10 @@ pub(crate) async fn visible_courses(user: &User, db: &Database) -> Result<Vec<Co
     } else {
         Vec::new()
     };
-    for course in service::course::list_enrolled(db, user.get_id(), None, 0).await?.0 {
+    for course in service::course::list_enrolled(db, user.get_id(), None, 0)
+        .await?
+        .0
+    {
         if !courses
             .iter()
             .any(|known| known.get_id() == course.get_id())
@@ -401,7 +403,8 @@ async fn my_courses(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<CourseResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let (courses, total) = service::course::list_enrolled(&st.db, user.get_id(), limit, offset).await?;
+    let (courses, total) =
+        service::course::list_enrolled(&st.db, user.get_id(), limit, offset).await?;
     let people = person_map(courses.iter().flat_map(course_people), &st.db).await?;
     let items = courses
         .iter()
@@ -865,7 +868,8 @@ async fn create_exam_in_course(
         Some(limit) => ExamAttemptLimit::try_new(limit)?,
         None => ExamAttemptLimit::single(),
     };
-    let exam = Exam::create(
+    let exam = crate::service::exam::create(
+        &st.db,
         user.get_id(),
         course.get_id(),
         title,
@@ -876,7 +880,6 @@ async fn create_exam_in_course(
         req.allow_rejoin.unwrap_or(true),
         req.allow_review.unwrap_or(false),
         req.draft.unwrap_or(false),
-        &st.db,
     )
     .await?;
     Ok((StatusCode::CREATED, Json(ExamResponse::new(&exam))))
@@ -916,7 +919,7 @@ async fn list_course_exams(
             "only enrolled users, the course creator, an assigned teacher, or a manager/admin can view this course",
         ));
     }
-    let mut exams = Exam::list_for_course(course.get_id(), &st.db).await?;
+    let mut exams = crate::service::exam::list_for_course(&st.db, course.get_id()).await?;
     // Drafts are the managers' workbench — enrolled students don't see them.
     if !can_manage_course(&course, &user) {
         exams.retain(|exam| !exam.is_draft());
@@ -1359,13 +1362,10 @@ mod tests {
         let db = init_mem().await.unwrap();
         let creator = user("creator", Role::Teacher, &db).await;
         let assigned = user("assigned", Role::Teacher, &db).await;
-        let course = service::course::assign_teacher(
-            &db,
-            &course(&creator, &db).await,
-            assigned.get_id(),
-        )
-        .await
-        .unwrap();
+        let course =
+            service::course::assign_teacher(&db, &course(&creator, &db).await, assigned.get_id())
+                .await
+                .unwrap();
         // Still teacher+: untouched by the floor.
         assert!(can_manage_course(&course, &assigned));
         // ...but never an owner, assigned or not.

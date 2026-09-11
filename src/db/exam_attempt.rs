@@ -164,7 +164,7 @@ pub async fn any_for_exam(db: &Database, exam: &ExamId) -> Result<bool, AppError
 /// The same transaction *writes* the exam row — bumping its mark counter
 /// and putting it straight back — which is what ties every child written
 /// through here to its exam. The freeze gate only *reads* `exam_attempt`,
-/// and a read does not survive [`Exam::delete`](crate::domain::exam::Exam::delete)'s
+/// and a read does not survive [`delete`](crate::db::exam::delete)'s
 /// window: a question or picture landing after that delete removed the exam
 /// but before it committed reads a row that is still there, while the
 /// cascade's `DELETE exam_question WHERE exam = $ex` ran on a snapshot
@@ -307,7 +307,8 @@ mod tests {
         let creator = UserId::from_key("01TESTTEACHERAAAAAAAAAAAAA");
         let course = crate::db::course::a_test_course(db).await;
         let kinds = Settings::defaults().get_exam_kinds().to_vec();
-        let exam = Exam::create(
+        let exam = crate::db::exam::create(
+            db,
             &creator,
             &course,
             ExamTitle::try_new("practice").unwrap(),
@@ -319,7 +320,6 @@ mod tests {
             true,
             false,
             false,
-            db,
         )
         .await
         .unwrap();

@@ -139,7 +139,7 @@ impl AnswerImage {
     /// write moves the exam's mark counter and puts it straight back, in this
     /// one transaction, so the exam's existence is something this write
     /// *writes* rather than something a gate read a moment earlier: a bare
-    /// upsert landing after [`Exam::delete`](crate::domain::exam::Exam::delete)
+    /// upsert landing after [`delete`](crate::db::exam::delete)
     /// removed the exam but before it committed was swept by nothing — its
     /// `DELETE answer_image WHERE exam = $ex` ran on a snapshot predating this
     /// row — and both sides reported success. That stranded the blob as well as
@@ -323,10 +323,7 @@ mod tests {
     /// what keeps it from outliving the exam), so a minted id nothing wrote is
     /// a 404.
     async fn exam_row(db: &Database) -> ExamId {
-        crate::domain::exam::published_exam(db)
-            .await
-            .get_id()
-            .clone()
+        crate::db::exam::published_exam(db).await.get_id().clone()
     }
 
     fn student() -> UserId {
