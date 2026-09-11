@@ -545,10 +545,10 @@ pub(crate) mod tests {
             .hash_async()
             .await
             .unwrap();
-        let account = crate::domain::user::User::create(
+        let account = crate::db::user::create(
+            &db,
             crate::domain::user::Username::try_new("ogrenci").unwrap(),
             hash,
-            &db,
         )
         .await
         .unwrap();
@@ -566,10 +566,13 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        account
-            .set_role(crate::domain::role::Role::Teacher, &db)
-            .await
-            .unwrap();
+        crate::service::user::set_role(
+            &db,
+            account.get_id(),
+            crate::domain::role::Role::Teacher,
+        )
+        .await
+        .unwrap();
         assert_eq!(rows("SELECT VALUE id FROM class_member", &db).await, 0);
         for class in [&first, &second] {
             assert_eq!(

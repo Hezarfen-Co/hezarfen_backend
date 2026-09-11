@@ -671,7 +671,7 @@ async fn grade(
     }
 
     // Target user must exist.
-    let Some(target_user) = User::read(&target, &st.db).await? else {
+    let Some(target_user) = crate::service::user::read(&st.db, &target).await? else {
         return Err(AppError::Validation(ValidationError::Invalid {
             field: "user_id",
             reason: "target user does not exist",

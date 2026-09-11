@@ -138,7 +138,7 @@ async fn resolve_participants(
     // Absent from this list means "no such user, or below `student`" — the two
     // are one case here, and telling them apart is what the caller must not be
     // able to do anyway.
-    let eligible: Vec<UserId> = User::list_by_ids(&wanted, db)
+    let eligible: Vec<UserId> = crate::service::user::list_by_ids(db, &wanted)
         .await?
         .iter()
         .filter(|found| found.get_role().at_least(Role::Student))
@@ -837,7 +837,7 @@ async fn invite_board(
     // a source is a whole group, and one member who has left or was never
     // eligible must not fail the invite for the other twenty-nine.
     let mut roster = board.get_participants().to_vec();
-    for candidate in User::list_by_ids(&invited, &st.db).await? {
+    for candidate in crate::service::user::list_by_ids(&st.db, &invited).await? {
         if !candidate.get_role().at_least(Role::Student) {
             continue;
         }
@@ -919,7 +919,7 @@ mod tests {
         .check()
         .unwrap();
         let who = async |key: &str| {
-            User::read(&UserId::from_key(key), &db)
+            crate::service::user::read(&db, &UserId::from_key(key))
                 .await
                 .unwrap()
                 .unwrap()

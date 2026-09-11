@@ -72,7 +72,7 @@ use crate::domain::board::{Board, BoardId};
 use crate::domain::board_stroke::{self, BoardStroke};
 use crate::domain::role::Role;
 use crate::domain::timestamp::Timestamp;
-use crate::domain::user::{User, UserId};
+use crate::domain::user::UserId;
 use crate::error::AppError;
 use crate::state::AppState;
 use crate::tenant::Slug;
@@ -207,7 +207,7 @@ type Step = Result<(), RoomClosed>;
 /// role barred from the whiteboard outright — must not leave an open socket
 /// still committing strokes.
 async fn live_board(board: &BoardId, user: &UserId, db: &Database) -> Result<Board, AppError> {
-    let barred = User::read(user, db)
+    let barred = crate::service::user::read(db, user)
         .await?
         .is_none_or(|caller| !caller.get_role().at_least(Role::Student));
     if barred {
@@ -681,17 +681,17 @@ mod tests {
 
         let db = crate::database::init_mem().await.unwrap();
         let password = Password::try_new("secret1").unwrap();
-        let creator = User::create(
+        let creator = crate::service::user::create(
+            &db,
             Username::try_new("ogretmen").unwrap(),
             password.hash_async().await.unwrap(),
-            &db,
         )
         .await
         .unwrap();
-        let mate = User::create(
+        let mate = crate::service::user::create(
+            &db,
             Username::try_new("ogrenci").unwrap(),
             password.hash_async().await.unwrap(),
-            &db,
         )
         .await
         .unwrap();
@@ -713,7 +713,9 @@ mod tests {
 
         // Demoted while the socket is open: refused from here on, and with the
         // frame a denied write already uses — no new frame type.
-        mate.set_role(Role::Parent, &db).await.unwrap();
+        crate::service::user::set_role(&db, mate.get_id(), Role::Parent)
+            .await
+            .unwrap();
         let err = live_board(board.get_id(), &mate_id, &db).await.unwrap_err();
         assert!(
             matches!(err, AppError::Forbidden(_)),

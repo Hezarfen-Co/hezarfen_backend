@@ -267,7 +267,7 @@ async fn teacher_or_none(text: Option<&str>, db: &Database) -> Result<Option<Use
 
 /// The teacher-or-higher account `key` names, or the 400 both write paths give.
 async fn resolve_teacher(key: &str, db: &Database) -> Result<User, AppError> {
-    let Some(teacher) = User::read(&UserId::from_key(key), db).await? else {
+    let Some(teacher) = crate::service::user::read(db, &UserId::from_key(key)).await? else {
         return Err(AppError::Validation(ValidationError::Invalid {
             field: "teacher_id",
             reason: "target user does not exist",
@@ -654,7 +654,7 @@ async fn user_classes(
     let target = UserId::from_key(&user);
     ensure_can_observe(&caller, &target, &st.db).await?;
     // User must exist — a missing user is a 404, not an empty page.
-    User::read(&target, &st.db)
+    crate::service::user::read(&st.db, &target)
         .await?
         .ok_or(AppError::NotFound)?;
     // A linked parent reads this too, and is no more entitled to the office's
@@ -745,7 +745,7 @@ async fn add_member(
     class.require_open(&st.db).await?;
 
     let target = UserId::from_key(&req.user_id);
-    let Some(target_user) = User::read(&target, &st.db).await? else {
+    let Some(target_user) = crate::service::user::read(&st.db, &target).await? else {
         return Err(AppError::Validation(ValidationError::Invalid {
             field: "user_id",
             reason: "target user does not exist",
@@ -1493,25 +1493,28 @@ mod tests {
     #[tokio::test]
     async fn an_empty_teacher_is_no_teacher_and_a_student_is_never_one() {
         use crate::domain::role::Role;
-        use crate::domain::user::{Password, User, Username};
+        use crate::domain::user::{Password, Username};
 
         let db = crate::database::init_mem().await.unwrap();
         assert!(teacher_or_none(None, &db).await.unwrap().is_none());
         assert!(teacher_or_none(Some(""), &db).await.unwrap().is_none());
 
         let make = async |name: &str, role: Role| {
-            let user = User::create(
+            let user = crate::service::user::create(
+                &db,
                 Username::try_new(name).unwrap(),
                 Password::try_new("secret1")
                     .unwrap()
                     .hash_async()
                     .await
                     .unwrap(),
-                &db,
             )
             .await
             .unwrap();
-            user.set_role(role, &db).await.unwrap().0
+            crate::service::user::set_role(&db, user.get_id(), role)
+                .await
+                .unwrap()
+                .0
         };
         let student = make("ali", Role::Student).await;
         let teacher = make("ada", Role::Teacher).await;

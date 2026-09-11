@@ -517,7 +517,7 @@ async fn mark(
     };
 
     // Target user must exist.
-    let Some(target_user) = User::read(&target, &st.db).await? else {
+    let Some(target_user) = crate::service::user::read(&st.db, &target).await? else {
         return Err(AppError::Validation(ValidationError::Invalid {
             field: "user_id",
             reason: "target user does not exist",
@@ -759,7 +759,7 @@ async fn register(
         Some(ref key) => UserId::from_key(key),
         None => user.get_id().clone(),
     };
-    let Some(target_user) = User::read(&target, &st.db).await? else {
+    let Some(target_user) = crate::service::user::read(&st.db, &target).await? else {
         return Err(AppError::Validation(ValidationError::Invalid {
             field: "user_id",
             reason: "target user does not exist",
@@ -835,7 +835,7 @@ async fn unregister(
     // stranded, and a volume written before `Registration::register` claimed
     // the holder's row already carries some.
     if &target != user.get_id()
-        && let Some(target_user) = User::read(&target, &st.db).await?
+        && let Some(target_user) = crate::service::user::read(&st.db, &target).await?
         && target_user.get_role().at_least(Role::Teacher)
     {
         return Err(AppError::Forbidden(
@@ -865,10 +865,10 @@ mod tests {
             .hash_async()
             .await
             .unwrap();
-        let user = User::create(Username::try_new(username).unwrap(), hash, db)
+        let user = crate::service::user::create(db, Username::try_new(username).unwrap(), hash)
             .await
             .unwrap();
-        user.set_role(role, db).await.unwrap().0
+        crate::service::user::set_role(db, user.get_id(), role).await.unwrap().0
     }
 
     /// `can_manage` is only reached behind `RequireTeacher` today, so this is
@@ -892,7 +892,10 @@ mod tests {
         assert!(can_manage(&event, &creator));
 
         for role in [Role::Student, Role::Parent] {
-            let demoted = creator.clone().set_role(role, &db).await.unwrap().0;
+            let demoted = crate::service::user::set_role(&db, creator.get_id(), role)
+                .await
+                .unwrap()
+                .0;
             assert!(
                 !can_manage(&event, &demoted),
                 "{role:?} creator still manages the event"

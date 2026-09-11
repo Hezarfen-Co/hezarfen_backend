@@ -5,7 +5,7 @@ use crate::database::Database;
 use crate::db::cap;
 use crate::domain::event::{Event, EventId};
 use crate::domain::role::Role;
-use crate::domain::user::{User, UserId};
+use crate::domain::user::UserId;
 use crate::error::AppError;
 
 #[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
@@ -77,7 +77,7 @@ impl Registration {
     ///
     /// The seat is claimed on the event row, so the same statement says nothing
     /// about the *user* it is for — and a fall to `parent` is the one demotion
-    /// whose sweep ([`crate::domain::user::User::set_role`]) can miss a seat and
+    /// whose sweep ([`crate::service::user::set_role`]) can miss a seat and
     /// leave it unfreeable: `unregister` refuses a non-student target and a
     /// parent cannot reach the route at all. So the transaction also claims the
     /// holder's own record ([`cap::role_claim`]), which is the key that
@@ -133,7 +133,7 @@ impl Registration {
             // the reads that tell them apart.
             cap::Claimed::Full => match Event::read(event, db).await? {
                 None => Err(AppError::NotFound),
-                Some(_) => match User::read(user, db).await? {
+                Some(_) => match crate::db::user::read(db, user).await? {
                     Some(held) if held.get_role() == Role::Parent => Err(AppError::Forbidden(
                         "that account was demoted to parent while this request ran — \
                          only students can be registered for",
@@ -194,7 +194,7 @@ impl Registration {
 
     // The demotion sweep — freeing every seat a fall to `parent` would strand,
     // and leaving a list that has already frozen exactly as it stands — is an
-    // arm of [`crate::domain::user::User::set_role`], so the seat comes back in
+    // arm of [`crate::service::user::set_role`], so the seat comes back in
     // the same transaction as the role that invalidated it. The freeze it obeys
     // is [`Event::registration_capacity`]'s `Conflict` arm, re-spelled for
     // SurrealQL as [`crate::constant::REGISTRATION_FROZEN_GUARD`] and held to it

@@ -370,10 +370,10 @@ mod tests {
             .hash_async()
             .await
             .unwrap();
-        crate::domain::user::User::create(
+        crate::db::user::create(
+            db,
             crate::domain::user::Username::try_new("ogrenci").unwrap(),
             hash,
-            db,
         )
         .await
         .unwrap()

@@ -136,7 +136,7 @@ pub async fn person_map(
         .into_iter()
         .filter(|id| seen.insert(id.key().to_string()))
         .collect();
-    let users = User::list_by_ids(&unique, db).await?;
+    let users = crate::service::user::list_by_ids(db, &unique).await?;
     Ok(users
         .iter()
         .map(|user| (user.get_id().key().to_string(), PersonRef::new(user)))

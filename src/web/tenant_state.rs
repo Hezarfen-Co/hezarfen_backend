@@ -183,7 +183,7 @@ mod tests {
     use crate::database::init_mem_tenants;
     use crate::db::session;
     use crate::domain::builder::{Builder, BuilderSession};
-    use crate::domain::user::{Password, User, Username};
+    use crate::domain::user::{Password, Username};
     use crate::tenant::DEMO_SLUG;
     use crate::web::{CurrentUser, RequireBuilder};
 
@@ -204,14 +204,14 @@ mod tests {
             .await
             .expect("the demo school");
 
-        let user = User::create(
+        let user = crate::service::user::create(
+            &school,
             Username::try_new("ada").unwrap(),
             Password::try_new("secret1")
                 .unwrap()
                 .hash_async()
                 .await
                 .unwrap(),
-            &school,
         )
         .await
         .unwrap();

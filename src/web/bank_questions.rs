@@ -948,10 +948,10 @@ mod tests {
             .hash_async()
             .await
             .unwrap();
-        let user = User::create(Username::try_new(username).unwrap(), hash, db)
+        let user = crate::service::user::create(db, Username::try_new(username).unwrap(), hash)
             .await
             .unwrap();
-        user.set_role(role, db).await.unwrap().0
+        crate::service::user::set_role(db, user.get_id(), role).await.unwrap().0
     }
 
     /// Every bank route is `RequireTeacher` today, so this is pinned at the
@@ -977,7 +977,10 @@ mod tests {
         assert!(ensure_owner(&question, &owner).is_ok());
 
         for role in [Role::Student, Role::Parent] {
-            let demoted = owner.clone().set_role(role, &db).await.unwrap().0;
+            let demoted = crate::service::user::set_role(&db, owner.get_id(), role)
+                .await
+                .unwrap()
+                .0;
             assert!(
                 !can_see(&question, &demoted),
                 "{role:?} owner still reads their template"

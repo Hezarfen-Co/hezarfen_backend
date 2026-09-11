@@ -454,7 +454,7 @@ pub(crate) async fn touch_and_create<T: SurrealValue + Clone>(
 /// The statements that put a transaction's write on a **user's own record**
 /// while the role that row still carries may hold the grant being written —
 /// [`touch_and_create`]'s trick pointed at the one key
-/// [`crate::domain::user::User::set_role`] writes.
+/// [`crate::service::user::set_role`] writes.
 ///
 /// WHY: a demotion sheds every grant the old role implied, and it does that in
 /// the role write's own transaction — but its sweeps are *snapshots*

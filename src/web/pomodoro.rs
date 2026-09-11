@@ -225,7 +225,7 @@ async fn user_pomodoro(
     let target = UserId::from_key(&user);
     ensure_can_observe(&caller, &target, &st.db).await?;
     // User must exist — a missing user is a 404, not an empty log.
-    User::read(&target, &st.db)
+    crate::service::user::read(&st.db, &target)
         .await?
         .ok_or(AppError::NotFound)?;
     let sessions = PomodoroSession::list_for_user(&target, &st.db).await?;

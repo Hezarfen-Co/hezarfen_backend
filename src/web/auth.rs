@@ -12,7 +12,7 @@ use utoipa_axum::routes;
 use crate::constant::{RESERVED_USERNAMES, SESSION_DURATION_DAYS};
 use crate::domain::builder::BuilderSession;
 use crate::domain::role::Role as DomainRole;
-use crate::domain::user::{Password, PasswordHash, User, Username};
+use crate::domain::user::{Password, PasswordHash, Username};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::service;
@@ -118,7 +118,8 @@ async fn register(
         }
         .into());
     }
-    // Hash BEFORE the availability check inside `User::create`, never after: the
+    // Hash BEFORE the availability check inside the user-create path, never
+    // after: the
     // ~33ms of argon2 is what makes both outcomes cost the same, so a taken
     // username can't be spotted by a fast reply. The only work the taken path
     // skips is the insert itself, orders of magnitude below hashing.
@@ -126,12 +127,12 @@ async fn register(
     // Built once, before the branch: the created and the taken path answer with
     // the very same value, so they cannot be told apart by construction rather
     // than by keeping two field lists in sync. Every fresh account starts as a
-    // student (`User::create`), so this holds whichever way the insert goes.
+    // student (`service::user::create`), so this holds whichever way the insert goes.
     let body = RegisterResponse {
         username: username.as_str().to_string(),
         role: DomainRole::Student.into(),
     };
-    match User::create(username, password_hash, &db).await {
+    match crate::service::user::create(&db, username, password_hash).await {
         Ok(_) => {}
         // Taken. Log the real reason server-side; the caller gets the same 201
         // and the same body, because telling the two apart is the whole thing
@@ -174,7 +175,7 @@ async fn login(
     let password = Password::try_new(&req.password).map_err(|_| AppError::Unauthorized)?;
     // Usernames are stored trimmed (see `Username::try_new`); trim the lookup
     // the same way so a padded login attempt matches the canonical name.
-    let user = match User::find_by_username(req.username.trim(), &db).await? {
+    let user = match crate::service::user::find_by_username(&db, req.username.trim()).await? {
         // Verification is `.await`ed so argon2 runs on the blocking pool instead
         // of stalling an async worker; that rules out a match guard, which
         // cannot await.

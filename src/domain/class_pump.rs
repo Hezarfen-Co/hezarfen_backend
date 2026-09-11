@@ -347,7 +347,7 @@ impl Axis {
 // The sweep a role change *off* `student` owes — every class membership (each
 // class getting its member count back) and every enrollment row (each course
 // getting its seat back) — is two of the arms of
-// [`crate::domain::user::User::set_role`], because it belongs in the same
+// [`crate::service::user::set_role`], because it belongs in the same
 // transaction as the role write that invalidates them. It stays one fact with
 // the counters either way: released separately, a failure between the halves
 // left enrollment rows tagged `source = class_group:X` while the class had its
