@@ -21,12 +21,22 @@ use crate::error::AppError;
 /// dangling unfinished session (the browser died mid-timer) is replaced —
 /// it never counted, and blocking the next start behind it would only
 /// punish the student for a crash.
-pub async fn start(db: &Database, user: &UserId) -> Result<PomodoroSession, AppError> {
+///
+/// `label` is the student's own name for the stint, validated and trimmed
+/// upstream and stored verbatim. A `None` binds NONE, which an
+/// `option<string>` field stores as absent — an unnamed start reads back
+/// unnamed.
+pub async fn start(
+    db: &Database,
+    user: &UserId,
+    label: Option<String>,
+) -> Result<PomodoroSession, AppError> {
     let mut result = db
-        .query("UPSERT $open CONTENT { user: $usr, started_at: $at }")
+        .query("UPSERT $open CONTENT { user: $usr, started_at: $at, label: $label }")
         .bind(("open", PomodoroSessionId::open_for(user).record()))
         .bind(("usr", user.record()))
         .bind(("at", Timestamp::now()))
+        .bind(("label", label))
         .await?
         .check()?;
     result
@@ -87,6 +97,12 @@ pub async fn start(db: &Database, user: &UserId) -> Result<PomodoroSession, AppE
 /// stamp is what lets one be added without that asymmetry. A stint below
 /// the bar is still recorded, still listed, and still sums into the log's
 /// `total_focus_ms` — the rule bounds what *counts*, never what is kept.
+///
+/// The re-filed row carries the start's `label` through verbatim
+/// (`$before[0].label`): the close copies whatever the student named the
+/// stint. On a row that predates the field that read is NONE — exactly what
+/// an `option<string>` column stores, so no backfill is owed (the same
+/// ruling as the `counted` stamp).
 ///
 /// The day quota is bucketed like the streak below (midnight UTC,
 /// [`Timestamp::day_number`]) and rolls in its own statement ahead of the
@@ -186,6 +202,7 @@ pub async fn finish(db: &Database, user: &UserId) -> Result<PomodoroSession, App
                      started_at: $before[0].started_at,
                      finished_at: $end,
                      counted: $counted,
+                     label: $before[0].label,
                  }};
                  COMMIT TRANSACTION;"
         ),
@@ -544,7 +561,7 @@ mod tests {
         let db = database::init_mem().await.unwrap();
         let user = a_user(&db).await;
 
-        start(&db, &user).await.unwrap();
+        start(&db, &user, None).await.unwrap();
         db.query("UPDATE $open SET started_at = $future")
             .bind(("open", PomodoroSessionId::open_for(&user).record()))
             .bind(("future", Timestamp::now().as_millis() + 3_600_000))
@@ -655,7 +672,7 @@ mod tests {
         let user = a_user(&db).await;
 
         for _ in 0..200 {
-            start(&db, &user).await.unwrap();
+            start(&db, &user, None).await.unwrap();
             finish(&db, &user).await.unwrap();
         }
         assert_eq!(counters(&user, &db).await, (0, 0));
@@ -690,12 +707,12 @@ mod tests {
             Err(AppError::Conflict(_))
         ));
 
-        let first = start(&db, &user).await.unwrap();
+        let first = start(&db, &user, None).await.unwrap();
         assert!(first.get_finished_at().is_none());
         assert_eq!(first.get_id().key(), format!("open_{}", user.key()));
 
         // A restart replaces the dangling session: still one row, fresh clock.
-        let second = start(&db, &user).await.unwrap();
+        let second = start(&db, &user, None).await.unwrap();
         assert!(second.get_started_at() >= first.get_started_at());
         let sessions = list_for_user(&db, &user).await.unwrap();
         assert_eq!(sessions.len(), 1);
@@ -708,7 +725,7 @@ mod tests {
             finish(&db, &user).await,
             Err(AppError::Conflict(_))
         ));
-        start(&db, &user).await.unwrap();
+        start(&db, &user, None).await.unwrap();
         let sessions = list_for_user(&db, &user).await.unwrap();
         assert_eq!(sessions.len(), 2);
     }
@@ -718,7 +735,7 @@ mod tests {
         let db = database::init_mem().await.unwrap();
         let user = UserId::from_key(&Ulid::new().to_string());
 
-        start(&db, &user).await.unwrap();
+        start(&db, &user, None).await.unwrap();
         // Stand in for the NTP step: push the running stint's start an hour
         // ahead, so the server clock `finish` reads is *behind* it.
         db.query("UPDATE $open SET started_at = $future")

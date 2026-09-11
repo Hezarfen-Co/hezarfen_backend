@@ -10703,6 +10703,7 @@ async fn pomodoro_restart_replaces_finish_closes_and_teachers_read() {
     let res = send(&app, "POST", "/pomodoro/start", Some(&ali), None).await;
     assert_eq!(res.status, StatusCode::CREATED);
     assert!(res.body["finished_at"].is_null());
+    assert!(res.body["label"].is_null());
     let first_start = res.body["started_at"].as_i64().unwrap();
 
     // A restart discards the dangling session: one row, clock reset allowed.
@@ -10759,6 +10760,54 @@ async fn pomodoro_restart_replaces_finish_closes_and_teachers_read() {
     assert_eq!(common::items(&res.body).len(), 2);
     let res = send(&app, "GET", "/pomodoro/01UNKNOWN", Some(&hoca), None).await;
     assert_eq!(res.status, StatusCode::NOT_FOUND);
+
+    // The start body is optional and names the stint: the label comes back
+    // on start, reads the same from the log, and survives the close.
+    let res = send(
+        &app,
+        "POST",
+        "/pomodoro/start",
+        Some(&ali),
+        Some(json!({ "label": "math" })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED);
+    assert_eq!(res.body["label"], "math");
+    let res = send(&app, "GET", "/pomodoro/me", Some(&ali), None).await;
+    assert_eq!(common::items(&res.body)[0]["label"], "math");
+    let res = send(&app, "POST", "/pomodoro/finish", Some(&ali), None).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["label"], "math", "the close keeps the label");
+    let res = send(&app, "GET", "/pomodoro/me", Some(&ali), None).await;
+    assert_eq!(
+        common::items(&res.body)[0]["label"],
+        "math",
+        "so does the log afterwards"
+    );
+
+    // An over-long label answers the same 400 every other optional
+    // free-text field does, and starts nothing.
+    let res = send(
+        &app,
+        "POST",
+        "/pomodoro/start",
+        Some(&ali),
+        Some(json!({ "label": "x".repeat(101) })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+
+    // A blank label is no label: the stint starts unnamed.
+    let res = send(
+        &app,
+        "POST",
+        "/pomodoro/start",
+        Some(&ali),
+        Some(json!({ "label": "   " })),
+    )
+    .await;
+    assert_eq!(res.status, StatusCode::CREATED);
+    assert!(res.body["label"].is_null());
 }
 
 #[tokio::test]

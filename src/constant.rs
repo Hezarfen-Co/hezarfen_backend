@@ -1042,6 +1042,10 @@ pub const POMODORO_COUNTED_TODAY_FIELD: &str = "pomodoro_counted_today";
 /// minimum counts and the sixteenth of the day counts.
 pub const MIN_COUNTED_POMODORO_MS: i64 = 300_000;
 pub const MAX_COUNTED_POMODORO_PER_DAY: i64 = 16;
+/// A stint's optional student-given label — the student's own name for what
+/// the stint is for ("math", "TYT denemesi"), free text rather than a subject
+/// link, bounded like the other short labels.
+pub const MAX_POMODORO_LABEL_LEN: usize = 100;
 /// The staff-side and second student-side totals, same shape and same rules:
 /// lifetime, floored at zero, absent reads as zero. `MARKS_GIVEN` and
 /// `LESSONS_HELD` are what a teacher accumulates; `POOL_APPROVED` counts the

@@ -462,6 +462,12 @@ pub const MIGRATION: &str = "
     -- `option<bool>`: a running stint has no verdict yet, and a stint closed
     -- before the rule existed carries none and cannot honestly be given one.
     DEFINE FIELD IF NOT EXISTS counted ON pomodoro_session TYPE option<bool>;
+    -- The student's own name for what the stint is for ('math', 'TYT
+    -- denemesi') — free text given at start, not a subject link. Shipped in
+    -- the same deploy as the code that writes it: on a SCHEMAFULL table a
+    -- write naming an undefined field fails, and `option` lets rows from
+    -- before the field read as none.
+    DEFINE FIELD IF NOT EXISTS label ON pomodoro_session TYPE option<string>;
     DEFINE INDEX IF NOT EXISTS pomodoro_session_user ON pomodoro_session FIELDS user;
 
     DEFINE TABLE IF NOT EXISTS exam SCHEMAFULL;

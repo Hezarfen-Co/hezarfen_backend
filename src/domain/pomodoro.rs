@@ -55,6 +55,11 @@ pub struct PomodoroSession {
     user: UserId,
     started_at: Timestamp,
     finished_at: Option<Timestamp>,
+    /// The student's own name for what this stint is for ("math", "TYT
+    /// denemesi") — free text given at start, not a subject reference.
+    /// `None` on an unnamed stint and on any row from before the field
+    /// existed, which reads exactly like an unnamed one.
+    label: Option<String>,
     counted: Option<bool>,
 }
 
@@ -81,5 +86,11 @@ impl PomodoroSession {
     /// cannot honestly be given a verdict now.
     pub fn get_counted(&self) -> Option<bool> {
         self.counted
+    }
+
+    /// What the student called this stint when they started it. `None` when
+    /// they started it unnamed, and on rows that predate the field.
+    pub fn get_label(&self) -> Option<&str> {
+        self.label.as_deref()
     }
 }

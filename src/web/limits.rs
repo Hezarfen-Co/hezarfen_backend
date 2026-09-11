@@ -362,6 +362,9 @@ struct PomodoroLimits {
     /// recorded and listed as usual, and counts nothing.
     #[schema(example = 16)]
     max_counted_per_day: i64,
+    /// How long a stint's optional student-given label may be — the student's
+    /// own name for what the stint is for, given at `POST /pomodoro/start`.
+    max_label_len: usize,
 }
 
 /// A collaborative whiteboard: its title, its roster, and the two growth caps
@@ -631,6 +634,7 @@ impl LimitsResponse {
             pomodoro: PomodoroLimits {
                 min_counted_ms: MIN_COUNTED_POMODORO_MS,
                 max_counted_per_day: MAX_COUNTED_POMODORO_PER_DAY,
+                max_label_len: MAX_POMODORO_LABEL_LEN,
             },
             board: BoardLimits {
                 max_title_len: MAX_BOARD_TITLE_LEN,

@@ -2,11 +2,12 @@ use crate::web::tenant_state::State;
 use axum::Json;
 use axum::extract::{Path, Query};
 use axum::http::StatusCode;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use crate::constant::MAX_POMODORO_LABEL_LEN;
 use crate::domain::pomodoro::PomodoroSession;
 use crate::domain::role::Role;
 use crate::domain::user::{User, UserId};
@@ -14,6 +15,7 @@ use crate::error::{AppError, ErrorResponse};
 use crate::service::parent_link::ensure_can_observe;
 use crate::service::pomodoro;
 use crate::state::AppState;
+use crate::validate::validate_optional;
 
 use super::{CurrentUser, PageParams, paginate};
 
@@ -54,6 +56,10 @@ struct PomodoroResponse {
     /// still running, and on stints closed before the rule existed. An
     /// uncounted stint is kept and listed exactly like any other.
     counted: Option<bool>,
+    /// What the student called this stint when they started it — their own
+    /// name for what it was for. `null` on an unnamed stint and on rows
+    /// from before the field existed.
+    label: Option<String>,
 }
 
 impl PomodoroResponse {
@@ -67,6 +73,7 @@ impl PomodoroResponse {
             finished_at,
             duration_ms: finished_at.map(|done| done.saturating_sub(started_at)),
             counted: session.get_counted(),
+            label: session.get_label().map(str::to_string),
         }
     }
 }
@@ -117,29 +124,57 @@ impl PomodoroLog {
     }
 }
 
+/// The optional body names the stint: `{"label": "math"}` stores what the
+/// student called it, trimmed, and the label then rides every response that
+/// carries the session. A blank label starts an unnamed stint and an
+/// over-long one is `400`; no body at all is exactly the old no-label start.
+#[derive(Deserialize, ToSchema)]
+struct StartPomodoro {
+    /// The student's own name for what this stint is for — free text, not a
+    /// subject reference, bounded by `pomodoro.max_label_len` on `GET
+    /// /limits`.
+    label: Option<String>,
+}
+
 /// Start a pomodoro focus session. Students only. The instant is stamped by
 /// the server clock — clients never supply it. Always succeeds for a student:
 /// a dangling unfinished session (the browser died mid-timer) is discarded
 /// and replaced, so there is no way to lock yourself out of starting. The
 /// frontend runs the visible countdown and the break rhythm; the backend
-/// records only the focus stint.
+/// records only the focus stint. The body is optional and names the stint:
+/// a `label` rides the response and every log it lists in — a blank or
+/// absent body starts an unnamed stint, an over-long label is `400`.
 #[utoipa::path(
     post,
     path = "/start",
     tag = "pomodoro",
     security(("session_cookie" = [])),
+    request_body(content = StartPomodoro, description = "Optional; names the stint"),
     responses(
         (status = 201, description = "Session started — the running session", body = PomodoroResponse),
+        (status = 400, description = "Label is over-long", body = ErrorResponse),
         (status = 401, description = "Not authenticated", body = ErrorResponse),
         (status = 403, description = "Requires the student role", body = ErrorResponse),
+        (status = 422, description = "The body does not fit this request: a field has the wrong type", body = ErrorResponse),
     ),
 )]
 async fn start(
     State(st): State<AppState>,
     CurrentUser(user): CurrentUser,
+    body: Option<Json<StartPomodoro>>,
 ) -> Result<(StatusCode, Json<PomodoroResponse>), AppError> {
     ensure_student(&user)?;
-    let session = pomodoro::start(&st.db, user.get_id()).await?;
+    // A blank or absent label records none; a present one is validated (400
+    // if over-long) and trimmed before it reaches the row.
+    let label = match body.and_then(|Json(req)| req.label) {
+        Some(label) if !label.trim().is_empty() => {
+            let trimmed = label.trim();
+            validate_optional("label", trimmed, MAX_POMODORO_LABEL_LEN)?;
+            Some(trimmed.to_string())
+        }
+        _ => None,
+    };
+    let session = pomodoro::start(&st.db, user.get_id(), label).await?;
     Ok((StatusCode::CREATED, Json(PomodoroResponse::new(&session))))
 }
 
