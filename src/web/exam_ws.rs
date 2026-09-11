@@ -72,14 +72,14 @@ use crate::domain::exam_question::ExamQuestion;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
+use crate::service::exam_attempt::{
+    EXAM_LOCK, check_rejoin, course_of, ensure_enrolled, ensure_sittable, ensure_student, finish,
+    read, save_answer_in, set_left, writable_attempt,
+};
 use crate::state::AppState;
 use crate::tenant::Slug;
 use crate::validate::validate_required;
 use crate::web::CurrentUser;
-use crate::web::exams::{
-    EXAM_LOCK, check_rejoin, course_of, ensure_enrolled, ensure_sittable, ensure_student,
-    save_answer_in, writable_attempt,
-};
 use crate::web::room::{self, Incoming, RoomClosed, send, with_client_seq};
 
 /// How this room names itself in the logs [`room::public_message`] writes.
@@ -184,7 +184,7 @@ async fn room(
     {
         let _guard = PRESENCE_LOCK.lock().await;
         st.exam_presence.enter(&slug, attempt_id.key());
-        if let Err(err) = attempt.set_left(None, &st.db).await {
+        if let Err(err) = set_left(&st.db, attempt, None).await {
             tracing::warn!("exam room could not clear left_at on join: {err}");
         }
     }
@@ -234,7 +234,7 @@ async fn room(
 /// started elsewhere can't be marked as left by an old room's teardown.
 async fn stamp_left(exam_id: &ExamId, attempt_id: &ExamAttemptId, db: &Database) {
     let attempt = match Exam::read(exam_id, db).await {
-        Ok(Some(exam)) => match ExamAttempt::read(attempt_id, db).await {
+        Ok(Some(exam)) => match read(db, attempt_id).await {
             Ok(Some(attempt))
                 if attempt.status(&exam, Timestamp::now()) == AttemptStatus::InProgress =>
             {
@@ -253,7 +253,7 @@ async fn stamp_left(exam_id: &ExamId, attempt_id: &ExamAttemptId, db: &Database)
         }
     };
     if let Some(attempt) = attempt
-        && let Err(err) = attempt.set_left(Some(Timestamp::now()), db).await
+        && let Err(err) = set_left(db, attempt, Some(Timestamp::now())).await
     {
         tracing::warn!("exam room could not stamp left_at: {err}");
     }
@@ -329,9 +329,7 @@ async fn state_frame(
     db: &Database,
 ) -> Result<(Value, AttemptStatus, Option<i64>), AppError> {
     let exam = Exam::read(exam, db).await?.ok_or(AppError::NotFound)?;
-    let attempt = ExamAttempt::read(attempt, db)
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let attempt = read(db, attempt).await?.ok_or(AppError::NotFound)?;
     let now = Timestamp::now();
     let status = attempt.status(&exam, now);
     let deadline = attempt.deadline(&exam);
@@ -417,7 +415,7 @@ async fn handle_message(
                 Ok(Some(exam)) => match writable_room_attempt(&exam, attempt_id, user, db).await {
                     Ok(attempt) => {
                         in_save = true;
-                        save_answer_in(&exam, &attempt, &question_id, selected, text, db).await
+                        save_answer_in(db, &exam, &attempt, &question_id, selected, text).await
                     }
                     Err(err) => Err(err),
                 },
@@ -464,7 +462,7 @@ async fn handle_message(
                     async {
                         let attempt = writable_room_attempt(&exam, attempt_id, user, db).await?;
                         course_of(&exam, db).await?.require_open(db).await?;
-                        attempt.finish(db).await
+                        finish(db, attempt).await
                     }
                     .await
                 }

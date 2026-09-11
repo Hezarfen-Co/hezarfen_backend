@@ -1,5 +1,10 @@
 use super::*;
 
+use crate::service::exam_attempt::{
+    EXAM_LOCK, check_rejoin, course_of, ensure_enrolled, ensure_student, ensure_student_now,
+    question_of_exam, read_latest_for_user, writable_attempt,
+};
+
 /// A stored question image's metadata; the bytes come from the image
 /// endpoints (`GET .../image`, `GET .../choices/{choice_id}/image`).
 #[derive(Serialize, ToSchema)]
@@ -117,7 +122,7 @@ pub(crate) async fn ensure_question_content_visible(
         return Ok(());
     }
     ensure_enrolled(exam, user.get_id(), &st.db).await?;
-    ExamAttempt::read_latest_for_user(exam.get_id(), user.get_id(), &st.db)
+    read_latest_for_user(&st.db, exam.get_id(), user.get_id())
         .await?
         .ok_or(AppError::NotFound)?;
     Ok(())
@@ -595,7 +600,7 @@ pub(crate) async fn get_answer_image(
     ensure_question_content_visible(&st, &exam, &user).await?;
     let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
     // The caller's current sitting — the drawing belongs to their latest seq.
-    let seq = ExamAttempt::read_latest_for_user(exam.get_id(), user.get_id(), &st.db)
+    let seq = read_latest_for_user(&st.db, exam.get_id(), user.get_id())
         .await?
         .ok_or(AppError::NotFound)?
         .get_seq();
@@ -642,7 +647,7 @@ pub(crate) async fn get_student_answer_image(
     let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
     // The grader's default view is the latest sitting; per-attempt drawings
     // come from the history image endpoint.
-    let seq = ExamAttempt::read_latest_for_user(exam.get_id(), &target, &st.db)
+    let seq = read_latest_for_user(&st.db, exam.get_id(), &target)
         .await?
         .ok_or(AppError::NotFound)?
         .get_seq();

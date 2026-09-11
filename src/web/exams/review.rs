@@ -1,5 +1,10 @@
 use super::*;
 
+use crate::domain::exam_attempt::AttemptStatus;
+use crate::service::exam_attempt::{
+    course_of, list_for_user, list_unfinished_for_user, question_of_exam,
+};
+
 // ---- per-attempt history ----------------------------------------------------
 // The grading views above show the latest sitting; these expose every prior
 // sitting a re-taking student left behind. Same wall as grading: teacher+ who
@@ -210,7 +215,7 @@ pub(crate) async fn reviewable_exam(
     if !exam.get_allow_review() {
         return Err(AppError::Forbidden("review not enabled for this exam"));
     }
-    let attempts = ExamAttempt::list_for_user(exam.get_id(), user.get_id(), &st.db).await?;
+    let attempts = list_for_user(&st.db, exam.get_id(), user.get_id()).await?;
     let now = Timestamp::now();
     if attempts
         .first()
@@ -221,7 +226,7 @@ pub(crate) async fn reviewable_exam(
         ));
     }
     // The same three conditions `POST /exams/{id}/attempt` starts a sitting
-    // under (`ensure_sittable` + the window + `ExamAttempt::start`'s limit
+    // under (`ensure_sittable` + the window + `exam_attempt::start`'s limit
     // check), minus the caller's role and enrollment: those bar the sitting
     // without making the key any safer to hand out, and a student dropped from
     // the course after being marked should still read their own review back.
@@ -262,7 +267,7 @@ async fn live_elsewhere(
 ) -> Result<HashSet<String>, AppError> {
     let now = Timestamp::now();
     let mut live = Vec::new();
-    for attempt in ExamAttempt::list_unfinished_for_user(user.get_id(), &st.db).await? {
+    for attempt in list_unfinished_for_user(&st.db, user.get_id()).await? {
         let Some(other) = Exam::read(attempt.get_exam(), &st.db).await? else {
             continue;
         };

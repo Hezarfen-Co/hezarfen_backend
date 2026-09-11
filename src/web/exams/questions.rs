@@ -1,5 +1,8 @@
 use super::*;
 
+use crate::service::exam_attempt;
+use crate::service::exam_attempt::question_of_exam;
+
 // ---- questions --------------------------------------------------------------
 // Teachers author the question list before the exam runs; it freezes the
 // moment anyone starts an attempt, so every student sits the same exam.
@@ -138,28 +141,12 @@ pub(crate) async fn ensure_questions_editable(
     exam: &ExamId,
     db: &Database,
 ) -> Result<(), AppError> {
-    if ExamAttempt::any_for_exam(exam, db).await? {
+    if exam_attempt::any_for_exam(db, exam).await? {
         return Err(AppError::Conflict(
             "cannot change questions after attempts have started",
         ));
     }
     Ok(())
-}
-
-/// The question, provided it belongs to `exam` — a qid under someone else's
-/// exam is a plain 404, not a leak.
-pub(crate) async fn question_of_exam(
-    exam: &ExamId,
-    qid: &str,
-    db: &Database,
-) -> Result<ExamQuestion, AppError> {
-    let question = ExamQuestion::read(&ExamQuestionId::from_key(qid), db)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    if question.get_exam() != exam {
-        return Err(AppError::NotFound);
-    }
-    Ok(question)
 }
 
 /// The question's option named by `choice_id` — a 400 for a text question or an
