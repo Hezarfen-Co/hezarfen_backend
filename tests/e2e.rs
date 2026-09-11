@@ -28,10 +28,10 @@ async fn spawn_server_with_ai(ai: Option<hezarfen_backend::ai::AiBridge>) -> (St
     // The deployment's operator, seeded exactly as `main` does from
     // `BUILDER_USERNAME`/`BUILDER_PASSWORD`, so the vendor surface is drivable
     // over real TCP here too.
-    hezarfen_backend::domain::builder::Builder::ensure(
+    hezarfen_backend::service::builder::ensure(
+        tenants.control(),
         hezarfen_backend::domain::user::Username::try_new("operator").unwrap(),
         hezarfen_backend::domain::user::Password::try_new("secret1").unwrap(),
-        tenants.control(),
     )
     .await
     .expect("seed the builder");

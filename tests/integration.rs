@@ -27951,10 +27951,10 @@ async fn probe_cookie_confusion_is_impossible_both_ways_on(app: &axum::Router, t
     let b = common::login_as_school(app, &db_b, "beta", "boran", "admin").await;
     let token_a = common::cookie_token(&a).to_string();
 
-    hezarfen_backend::domain::builder::Builder::ensure(
+    hezarfen_backend::service::builder::ensure(
+        tenants.control(),
         Username::try_new("operator").unwrap(),
         Password::try_new("secret1").unwrap(),
-        tenants.control(),
     )
     .await
     .expect("seed the builder");
@@ -28511,10 +28511,10 @@ async fn remote_probe_a_school_is_a_database_and_delete_removes_it() {
         "the namespace holds exactly the two schools and the control database"
     );
 
-    hezarfen_backend::domain::builder::Builder::ensure(
+    hezarfen_backend::service::builder::ensure(
+        d.tenants.control(),
         Username::try_new("operator").unwrap(),
         Password::try_new("secret1").unwrap(),
-        d.tenants.control(),
     )
     .await
     .expect("seed the builder");
@@ -28824,7 +28824,7 @@ async fn a_disabled_module_refuses_its_websocket_upgrade() {
 // holds for *every* module, driven through the vendor's own surface, plus the
 // coverage test that fails when a future nest is mounted ungated.
 
-use hezarfen_backend::domain::builder::Builder;
+use hezarfen_backend::service::builder;
 
 const SWEEP_BUILDER_USER: &str = "operator";
 const SWEEP_BUILDER_PASS: &str = "secret1";
@@ -28833,10 +28833,10 @@ const SWEEP_BUILDER_PASS: &str = "secret1";
 /// modules by the same path production does (mirrors `tests/builder_api.rs`).
 async fn sweep_deployment() -> (axum::Router, hezarfen_backend::database::Database, Tenants) {
     let (app, db, tenants) = common::app_and_tenants().await;
-    Builder::ensure(
+    builder::ensure(
+        tenants.control(),
         Username::try_new(SWEEP_BUILDER_USER).unwrap(),
         Password::try_new(SWEEP_BUILDER_PASS).unwrap(),
-        tenants.control(),
     )
     .await
     .expect("seed the builder");

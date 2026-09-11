@@ -6,7 +6,6 @@ use surrealdb::opt::auth::Root;
 
 use crate::config::Config;
 use crate::constant::{CAP_WRITE_BACKOFF_MS, CAP_WRITE_TRIES, CHATBOT_PENDING_STALE_SECS};
-use crate::domain::builder::Builder;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{Password, Username};
 use crate::error::AppError;
@@ -49,7 +48,7 @@ pub async fn init(cfg: &Config) -> Result<Tenants, AppError> {
     let db = std::sync::Arc::new(db);
     migrate_control(&db).await?;
     if let Some((username, password)) = builder {
-        Builder::ensure(username, password, &db).await?;
+        crate::service::builder::ensure(&db, username, password).await?;
     }
     Ok(Tenants::new_remote(db, cfg))
 }

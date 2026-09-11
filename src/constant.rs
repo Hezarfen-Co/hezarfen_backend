@@ -1090,7 +1090,7 @@ pub const HIGH_MARK_MIN: i64 = 90;
 /// award row stores one forever. So an id is never reused for a different
 /// meaning; retiring one is done by deleting the line, and the awards that
 /// carry it simply stop being served (no data migration —
-/// [`crate::domain::badge::BadgeAward::list_for`] filters to the live
+/// [`crate::db::badge::list_for`] filters to the live
 /// catalog).
 pub const BADGES: [(&str, BadgeStat, i64); 34] = [
     ("homework_submitted_1", BadgeStat::HomeworkSubmitted, 1),

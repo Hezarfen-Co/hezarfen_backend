@@ -3,7 +3,7 @@ use axum::http::request::Parts;
 use axum_extra::extract::CookieJar;
 
 use crate::database::Database;
-use crate::domain::builder::{Builder, BuilderSession};
+use crate::domain::builder::Builder;
 use crate::domain::role::Role;
 use crate::domain::user::User;
 use crate::error::AppError;
@@ -175,14 +175,14 @@ where
         }
 
         let control: Database = AppState::from_ref(state).tenants.control().clone();
-        let session = BuilderSession::find_by_token(token, &control)
+        let session = crate::service::builder::find_by_token(&control, token)
             .await?
             .ok_or(AppError::Unauthorized)?;
         if session.is_expired() {
             return Err(AppError::Unauthorized);
         }
         Ok(RequireBuilder(
-            Builder::read(session.builder(), &control)
+            crate::service::builder::read(&control, session.builder())
                 .await?
                 .ok_or(AppError::Unauthorized)?,
         ))

@@ -10,7 +10,6 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::constant::{RESERVED_USERNAMES, SESSION_DURATION_DAYS};
-use crate::domain::builder::BuilderSession;
 use crate::domain::role::Role as DomainRole;
 use crate::domain::user::{Password, PasswordHash, Username};
 use crate::error::{AppError, ErrorResponse, ValidationError};
@@ -242,7 +241,7 @@ async fn logout(
     // or suspended still clears below — logging out must never fail.
     if let Some((prefix, token)) = jar.get("session").and_then(|c| split_cookie(c.value())) {
         if prefix == BUILDER_COOKIE_PREFIX {
-            BuilderSession::delete_by_token(token, &st.db).await?;
+            crate::service::builder::delete_by_token(&st.db, token).await?;
         } else if let Ok(slug) = Slug::try_new(prefix)
             && let Ok(db) = st.tenants.get(&slug).await
         {

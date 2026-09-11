@@ -174,14 +174,9 @@ async fn apply_preferences(
     let theme = merge_field(req.theme.as_deref(), Theme::try_from_str)?;
     let language = merge_field(req.language.as_deref(), Language::try_from_str)?;
     let palette_color = merge_field(req.palette_color.as_deref(), PaletteColor::try_from_str)?;
-    let updated = crate::service::user::set_preferences(
-        db,
-        user.get_id(),
-        theme,
-        language,
-        palette_color,
-    )
-    .await?;
+    let updated =
+        crate::service::user::set_preferences(db, user.get_id(), theme, language, palette_color)
+            .await?;
     Ok(UserResponse::new(&updated))
 }
 
@@ -602,8 +597,7 @@ async fn link_student(
             reason: "students can only be tied to a parent account",
         }));
     }
-    let Some(student) =
-        crate::service::user::read(&st.db, &UserId::from_key(&req.user_id)).await?
+    let Some(student) = crate::service::user::read(&st.db, &UserId::from_key(&req.user_id)).await?
     else {
         return Err(AppError::Validation(ValidationError::Invalid {
             field: "user_id",
@@ -957,7 +951,7 @@ async fn profile_of(
     let classes = ClassGroup::list_by_ids(&class_ids, &st.db).await?;
     // Both totals are the full counts, not the windowed ones — the blocks are a
     // preview, the stats are the truth.
-    let stats = ProfileStats::load(id, course_total, class_total, &st.db).await?;
+    let stats = crate::service::profile::load(&st.db, id, course_total, class_total).await?;
     let badges = badges_of(st, id, &stats).await?;
     Ok(ProfileResponse {
         id: id.key().to_string(),
@@ -1026,7 +1020,7 @@ async fn profile_of(
 /// callers log and swallow on purpose — leaves a gap, and that heals here on
 /// the next profile read of that account.
 ///
-/// Nothing here revokes: [`badge::sync`] only ever adds, so a counter that has
+/// Nothing here revokes: [`crate::service::badge::sync`] only ever adds, so a counter that has
 /// since fallen back below its threshold leaves the badge standing. The sync's
 /// own error is logged and dropped, and the awards already read are served —
 /// a decoration may not fail the profile it decorates.
@@ -1035,20 +1029,20 @@ async fn badges_of(
     user: &UserId,
     stats: &ProfileStats,
 ) -> Result<Vec<BadgeAward>, AppError> {
-    let awards = BadgeAward::list_for(user, &st.db).await?;
+    let awards = crate::service::badge::list_for(&st.db, user).await?;
     let complete = badge::earned(stats.get_totals())
         .iter()
         .all(|id| awards.iter().any(|award| award.get_badge() == *id));
     if complete {
         return Ok(awards);
     }
-    if let Err(err) = badge::sync(user, &st.db).await {
+    if let Err(err) = crate::service::badge::sync(&st.db, user).await {
         tracing::warn!("failed to sync badges for {}: {err}", user.key());
         return Ok(awards);
     }
     // Re-read so the badge just healed appears on *this* response, stamp and
     // all, rather than only on the next one.
-    BadgeAward::list_for(user, &st.db).await
+    crate::service::badge::list_for(&st.db, user).await
 }
 
 /// The profile gate: any authenticated account reads any profile — except a
@@ -1070,7 +1064,9 @@ async fn ensure_may_read_profile(
 async fn readable_profile_user(st: &AppState, caller: &User, id: &str) -> Result<User, AppError> {
     let target = UserId::from_key(id);
     ensure_may_read_profile(caller, &target, &st.db).await?;
-    crate::service::user::read(&st.db, &target).await?.ok_or(AppError::NotFound)
+    crate::service::user::read(&st.db, &target)
+        .await?
+        .ok_or(AppError::NotFound)
 }
 
 /// The caller's own public profile — what everyone else sees of them.
@@ -1165,7 +1161,15 @@ async fn upload_my_avatar(
 
     let file = ulid::Ulid::new().to_string();
     store_blob(&st, &file, &upload.data, || async {
-        match crate::service::user::set_avatar(&st.db, user.get_id(), &file, &upload.content_type, size).await? {
+        match crate::service::user::set_avatar(
+            &st.db,
+            user.get_id(),
+            &file,
+            &upload.content_type,
+            size,
+        )
+        .await?
+        {
             // Row written; the picture this one replaced comes off disk.
             Some(before) => Ok(((), before.get_avatar_file().map(str::to_string))),
             // The account went away mid-upload — the fresh blob is an orphan.

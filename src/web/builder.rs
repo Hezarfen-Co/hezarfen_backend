@@ -26,7 +26,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::constant::MAX_SCHOOL_NAME_LEN;
-use crate::domain::builder::{Builder, BuilderSession};
+use crate::domain::builder::Builder;
 use crate::domain::role::Role;
 use crate::domain::user::{Password, PasswordHash, User, Username};
 use crate::error::{AppError, ErrorResponse, ValidationError};
@@ -257,23 +257,24 @@ async fn builder_login(
 ) -> Result<(CookieJar, Json<BuilderResponse>), AppError> {
     let control = st.tenants.control();
     let password = Password::try_new(&req.password).map_err(|_| AppError::Unauthorized)?;
-    let builder = match Builder::find_by_username(req.username.trim(), control).await? {
-        Some(builder) => {
-            if !builder.get_password_hash().verify_async(&password).await {
+    let builder =
+        match crate::service::builder::find_by_username(control, req.username.trim()).await? {
+            Some(builder) => {
+                if !builder.get_password_hash().verify_async(&password).await {
+                    return Err(AppError::Unauthorized);
+                }
+                builder
+            }
+            None => {
+                // The same decoy hash `/auth/login` runs: a wrong name and a wrong
+                // password must cost the same, or the reply time enumerates the
+                // operator accounts.
+                PasswordHash::verify_decoy_async(&password).await;
                 return Err(AppError::Unauthorized);
             }
-            builder
-        }
-        None => {
-            // The same decoy hash `/auth/login` runs: a wrong name and a wrong
-            // password must cost the same, or the reply time enumerates the
-            // operator accounts.
-            PasswordHash::verify_decoy_async(&password).await;
-            return Err(AppError::Unauthorized);
-        }
-    };
+        };
 
-    let session = BuilderSession::create(builder.get_id(), control).await?;
+    let session = crate::service::builder::create_session(control, builder.get_id()).await?;
     let cookie = session_cookie(
         format!("{BUILDER_COOKIE_PREFIX}.{}", session.token().as_str()),
         st.cookie_secure,
@@ -297,7 +298,7 @@ async fn builder_logout(
         .get("session")
         .and_then(|cookie| super::tenant_state::split_cookie(cookie.value()))
     {
-        BuilderSession::delete_by_token(token, st.tenants.control()).await?;
+        crate::service::builder::delete_by_token(st.tenants.control(), token).await?;
     }
     let jar = jar.remove(Cookie::build(("session", "")).path("/").build());
     Ok((jar, StatusCode::NO_CONTENT))
