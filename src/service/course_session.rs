@@ -32,7 +32,7 @@ pub async fn resolve_session_teacher(
         Some(key) if key == caller.get_id().key() => return Ok(caller.clone()),
         Some(key) => UserId::from_key(key),
     };
-    let Some(user) = User::read(&target, db).await? else {
+    let Some(user) = crate::db::user::read(db, &target).await? else {
         return Err(AppError::Validation(ValidationError::Invalid {
             field: "teacher_id",
             reason: "session teacher does not exist",

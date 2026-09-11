@@ -1294,10 +1294,10 @@ mod tests {
             .hash_async()
             .await
             .unwrap();
-        let user = User::create(Username::try_new(username).unwrap(), hash, db)
+        let user = crate::service::user::create(db, Username::try_new(username).unwrap(), hash)
             .await
             .unwrap();
-        user.set_role(role, db).await.unwrap().0
+        crate::service::user::set_role(db, user.get_id(), role).await.unwrap().0
     }
 
     /// A course `creator` made, with nobody assigned.
@@ -1326,7 +1326,7 @@ mod tests {
         assert!(owns_course(&course, &creator));
 
         for role in [Role::Student, Role::Parent] {
-            let demoted = creator.clone().set_role(role, &db).await.unwrap().0;
+            let demoted = crate::service::user::set_role(&db, creator.get_id(), role).await.unwrap().0;
             assert!(
                 !can_manage_course(&course, &demoted),
                 "{role:?} creator still manages the course"
@@ -1354,7 +1354,7 @@ mod tests {
         // ...but never an owner, assigned or not.
         assert!(!owns_course(&course, &assigned));
 
-        let demoted = assigned.set_role(Role::Student, &db).await.unwrap().0;
+        let demoted = crate::service::user::set_role(&db, assigned.get_id(), Role::Student).await.unwrap().0;
         assert!(!can_manage_course(&course, &demoted));
     }
 
@@ -1413,7 +1413,7 @@ mod tests {
         let db = init_mem().await.unwrap();
         let creator = user("teacher", Role::Teacher, &db).await;
         let course = course(&creator, &db).await;
-        creator.set_role(Role::Student, &db).await.unwrap();
+        crate::service::user::set_role(&db, creator.get_id(), Role::Student).await.unwrap();
 
         for role in [Role::Manager, Role::Admin] {
             let boss = user(&format!("boss{}", role.as_str()), role, &db).await;

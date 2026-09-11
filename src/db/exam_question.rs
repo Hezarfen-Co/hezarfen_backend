@@ -510,10 +510,10 @@ mod tests {
                 .hash_async()
                 .await
                 .unwrap();
-            let student = crate::domain::user::User::create(
+            let student = crate::db::user::create(
+                &db,
                 crate::domain::user::Username::try_new("ogrenci").unwrap(),
                 hash,
-                &db,
             )
             .await
             .unwrap();

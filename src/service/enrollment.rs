@@ -8,7 +8,7 @@ use crate::db::enrollment;
 use crate::domain::course::CourseId;
 use crate::domain::enrollment::Enrollment;
 use crate::domain::role::Role;
-use crate::domain::user::{User, UserId};
+use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 
 /// Enroll `target` into `course` on `enrolled_by`'s orders. The target-user
@@ -22,7 +22,7 @@ pub async fn enroll(
     target: &UserId,
     enrolled_by: &UserId,
 ) -> Result<Enrollment, AppError> {
-    let Some(target_user) = User::read(target, db).await? else {
+    let Some(target_user) = crate::db::user::read(db, target).await? else {
         return Err(AppError::Validation(ValidationError::Invalid {
             field: "user_id",
             reason: "target user does not exist",

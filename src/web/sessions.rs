@@ -297,7 +297,7 @@ async fn mark_roll_call(
     let target = UserId::from_key(&req.user_id);
 
     // Target user must exist.
-    let Some(target_user) = User::read(&target, &st.db).await? else {
+    let Some(target_user) = crate::service::user::read(&st.db, &target).await? else {
         return Err(AppError::Validation(ValidationError::Invalid {
             field: "user_id",
             reason: "target user does not exist",
@@ -438,7 +438,7 @@ async fn remove_roll_call(
     // to delete without the manager+ this guard exists to require. A target
     // whose user row is gone can only be a student's stale row (marking checks
     // the role at write time), so it stays the session teacher's to clear.
-    let staff_row = User::read(&target, &st.db)
+    let staff_row = crate::service::user::read(&st.db, &target)
         .await?
         .is_some_and(|target_user| target_user.get_role().at_least(Role::Teacher));
     if staff_row && !user.get_role().at_least(Role::Manager) {
