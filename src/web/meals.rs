@@ -28,7 +28,6 @@ use crate::domain::menu::{MENU_LOCK, Menu, MenuDate, MenuId, MenuSlot, validate_
 use crate::domain::menu_dish::{
     DishDescription, DishName, DishPrice, DishTags, MenuDish, MenuDishId,
 };
-use crate::domain::parent_link::ParentLink;
 // The same idempotence key `/payments/credits` takes — one grammar, one type.
 use crate::domain::payment_ledger::PaymentRequestKey;
 use crate::domain::role::Role;
@@ -802,11 +801,7 @@ async fn booking_target(
                     reason: "a parent must name the student the seat is for",
                 },
             ))?);
-            if ParentLink::exists(caller.get_id(), &target, db).await?
-                && crate::service::user::read(db, &target)
-                    .await?
-                    .is_some_and(|target| target.get_role() == Role::Student)
-            {
+            if crate::service::parent_link::links_live(db, caller.get_id(), &target).await? {
                 return Ok(target);
             }
             Err(AppError::Forbidden(
@@ -903,7 +898,7 @@ async fn my_bookings(
     let mut students = vec![user.get_id().clone()];
     if user.get_role() == Role::Parent {
         students.extend(
-            ParentLink::list_for_parent(user.get_id(), &st.db)
+            crate::service::parent_link::list_for_parent(&st.db, user.get_id())
                 .await?
                 .iter()
                 .map(|link| link.get_student().clone()),
@@ -1146,7 +1141,10 @@ async fn mark_attendance(
     let student = UserId::from_key(&req.student_id);
     // The target must exist; no booking is required, since a walk-in was still
     // served and the record is operationally true.
-    if crate::service::user::read(&st.db, &student).await?.is_none() {
+    if crate::service::user::read(&st.db, &student)
+        .await?
+        .is_none()
+    {
         return Err(AppError::Validation(ValidationError::Invalid {
             field: "student_id",
             reason: "target user does not exist",
@@ -1318,7 +1316,8 @@ async fn balance_response(
 /// Reading someone else's meal record — money, attendance, dietary profile:
 /// teacher+, or a parent linked to the student. Reading your *own* is always
 /// allowed, since every `{user}` route here accepts the caller's own id; that
-/// is the one way this gate differs from [`super::ensure_can_observe`], which
+/// is the one way this gate differs from
+/// [`crate::service::parent_link::ensure_can_observe`], which
 /// 403s a self-read because its subjects have their own `/me` routes.
 async fn ensure_can_read_student(
     caller: &User,
@@ -1328,7 +1327,7 @@ async fn ensure_can_read_student(
     if caller.get_id() == target {
         return Ok(());
     }
-    super::ensure_can_observe(caller, target, db).await
+    crate::service::parent_link::ensure_can_observe(caller, target, db).await
 }
 
 /// May `caller` read `target`'s meal *money* — balance and ledger? Own always;
@@ -1351,10 +1350,7 @@ async fn ensure_can_read_money(
     // role must be inert, so the target's live role is re-read. A missing or
     // non-student target falls through to the same 403 — a parent never gets an
     if caller.get_role() == Role::Parent
-        && ParentLink::exists(caller.get_id(), target, db).await?
-        && crate::service::user::read(db, target)
-            .await?
-            .is_some_and(|target| target.get_role() == Role::Student)
+        && crate::service::parent_link::links_live(db, caller.get_id(), target).await?
     {
         return Ok(());
     }

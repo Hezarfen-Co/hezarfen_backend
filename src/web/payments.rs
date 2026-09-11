@@ -3,7 +3,8 @@
 //!
 //! Every write here is manager+ — money is school administration, and a teacher
 //! has no business in it. The read gate is deliberately *narrower* than the
-//! per-student reports elsewhere ([`super::ensure_can_observe`]): a student sees
+//! per-student reports elsewhere
+//! ([`crate::service::parent_link::ensure_can_observe`]): a student sees
 //! their own record, a parent a linked student's, manager+ everyone's, and a
 //! teacher nothing at all.
 //!
@@ -26,7 +27,6 @@ use crate::constant::{MAX_FEE_PLAN_ASSIGN_STUDENTS, MAX_FEE_PLAN_ASSIGN_WRITES};
 use crate::database::Database;
 use crate::domain::fee_plan::{FeePlan, FeePlanId, FeePlanName, Installment};
 use crate::domain::fee_plan_assignment::FeePlanAssignment;
-use crate::domain::parent_link::ParentLink;
 use crate::domain::payment_ledger::{
     LedgerAmount, LedgerMethod, LedgerNote, PaymentLedger, PaymentLedgerId, PaymentLedgerKind,
     PaymentRequestKey,
@@ -775,7 +775,8 @@ async fn record_reversal(
 /// May `caller` read `target`'s payment record? Own always; a parent only for a
 /// student they hold a live link to; manager+ for anyone.
 ///
-/// Deliberately narrower than [`super::ensure_can_observe`]: **a teacher sees no
+/// Deliberately narrower than
+/// [`crate::service::parent_link::ensure_can_observe`]: **a teacher sees no
 /// money**. What a family owes the school is not classroom information.
 async fn ensure_can_read_payments(
     caller: &User,
@@ -790,10 +791,7 @@ async fn ensure_can_read_payments(
     // non-student target falls through to the same 403 — a parent never gets an
     // existence oracle.
     if caller.get_role() == Role::Parent
-        && ParentLink::exists(caller.get_id(), target, db).await?
-        && crate::service::user::read(db, target)
-            .await?
-            .is_some_and(|target| target.get_role() == Role::Student)
+        && crate::service::parent_link::links_live(db, caller.get_id(), target).await?
     {
         return Ok(());
     }

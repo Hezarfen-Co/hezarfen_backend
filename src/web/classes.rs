@@ -26,13 +26,14 @@ use crate::domain::role::Role;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::service::class_blueprint;
+use crate::service::parent_link::ensure_can_observe;
 use crate::state::AppState;
 
 use super::courses::can_manage_course;
 use super::terms::resolve_term;
 use super::{
-    CurrentUser, Page, PageParams, PersonRef, RequireManager, RequireTeacher, ensure_can_observe,
-    person_map, set_or_clear, undo_if_demoted,
+    CurrentUser, Page, PageParams, PersonRef, RequireManager, RequireTeacher, person_map,
+    set_or_clear, undo_if_demoted,
 };
 
 pub fn routes() -> OpenApiRouter<AppState> {
