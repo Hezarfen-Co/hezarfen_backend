@@ -261,7 +261,7 @@ pub async fn unassign_everywhere(db: &Database, user: &UserId) -> Result<(), App
 /// **Bank templates** survive it — they are a separate, reusable library
 /// spanning every course — so their `source_exam` and `subject` links are
 /// cleared instead, in this same transaction, exactly as
-/// [`crate::domain::exam::Exam::delete`] and
+/// [`crate::db::exam::delete`] and
 /// [`crate::domain::subject::Subject::delete`] clear them one level down.
 /// Deleting a course must leave the bank where deleting each of its exams
 /// and subjects by hand would have left it, or a template is left pointing

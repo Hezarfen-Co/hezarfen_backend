@@ -113,7 +113,7 @@ pub async fn delete(db: &Database, session: CourseSession) -> Result<CourseSessi
         &[("s".into(), session.id.record().into_value())],
         // No THROW of its own — an unconditional cascade, so the only
         // error worth telling apart is a lost round (see
-        // [`crate::domain::exam::Exam::delete`]).
+        // [`crate::db::exam::delete`]).
         &[],
     )
     .await?;

@@ -244,7 +244,7 @@ impl Subject {
             return Err(error.into());
         }
         // Read through the trailing `RETURN`, not a counted slot — see
-        // [`crate::domain::exam::Exam::delete`].
+        // [`crate::db::exam::delete`].
         let slot = result.num_statements().saturating_sub(2);
         let deleted: Option<Subject> = result.take::<Vec<Subject>>(slot)?.into_iter().next();
         deleted.ok_or(AppError::NotFound)
@@ -358,10 +358,7 @@ mod tests {
             // A real exam row per round: a question write moves its exam's
             // counter, so a minted id nothing wrote is a 404 and no round would
             // reach the subject race this test is about.
-            let exam = crate::domain::exam::published_exam(&db)
-                .await
-                .get_id()
-                .clone();
+            let exam = crate::db::exam::published_exam(&db).await.get_id().clone();
             let subject = Subject::create(
                 &course,
                 SubjectName::try_new("Limits").unwrap(),

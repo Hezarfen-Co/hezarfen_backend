@@ -143,7 +143,7 @@ pub async fn attempt_ws(
     Path(id): Path<String>,
     ws: WebSocketUpgrade,
 ) -> Result<Response, AppError> {
-    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
+    let exam = crate::service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     ensure_sittable(&exam)?;
@@ -232,7 +232,7 @@ async fn room(
 /// wins. Targeting the sitting by id (never "the latest") means a retake
 /// started elsewhere can't be marked as left by an old room's teardown.
 async fn stamp_left(exam_id: &ExamId, attempt_id: &ExamAttemptId, db: &Database) {
-    let attempt = match Exam::read(exam_id, db).await {
+    let attempt = match crate::service::exam::read(db, exam_id).await {
         Ok(Some(exam)) => match read(db, attempt_id).await {
             Ok(Some(attempt))
                 if attempt.status(&exam, Timestamp::now()) == AttemptStatus::InProgress =>
@@ -327,7 +327,9 @@ async fn state_frame(
     attempt: &ExamAttemptId,
     db: &Database,
 ) -> Result<(Value, AttemptStatus, Option<i64>), AppError> {
-    let exam = Exam::read(exam, db).await?.ok_or(AppError::NotFound)?;
+    let exam = crate::service::exam::read(db, exam)
+        .await?
+        .ok_or(AppError::NotFound)?;
     let attempt = read(db, attempt).await?.ok_or(AppError::NotFound)?;
     let now = Timestamp::now();
     let status = attempt.status(&exam, now);
@@ -410,7 +412,7 @@ async fn handle_message(
             // a failure possibly be about this one question rather than about
             // the room. See [`error_frame_for`].
             let mut in_save = false;
-            let saved = match Exam::read(exam_id, db).await {
+            let saved = match crate::service::exam::read(db, exam_id).await {
                 Ok(Some(exam)) => match writable_room_attempt(&exam, attempt_id, user, db).await {
                     Ok(attempt) => {
                         in_save = true;
@@ -452,7 +454,7 @@ async fn handle_message(
         ClientMessage::Finish => {
             // Submit the room's own sitting — a stale room must not submit a
             // retake it never hosted.
-            let finished = match Exam::read(exam_id, db).await {
+            let finished = match crate::service::exam::read(db, exam_id).await {
                 Ok(Some(exam)) => {
                     // Its own archived-term gate: `finish` is the one
                     // sitting-side write that does not go through

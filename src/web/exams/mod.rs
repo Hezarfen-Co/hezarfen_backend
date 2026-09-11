@@ -10,7 +10,7 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::constant::{CAS_UPDATE_RETRIES, MAX_MAX_FILE_BYTES, UPLOAD_BODY_OVERHEAD_BYTES};
+use crate::constant::{MAX_MAX_FILE_BYTES, UPLOAD_BODY_OVERHEAD_BYTES};
 use crate::database::Database;
 use crate::domain::answer_image::AnswerImage;
 use crate::domain::badge;
@@ -18,8 +18,7 @@ use crate::domain::bank_question::{BankQuestion, BankQuestionId};
 use crate::domain::bank_question_image::BankQuestionImage;
 
 use crate::domain::exam::{
-    Exam, ExamAttemptLimit, ExamDescription, ExamDuration, ExamId, ExamKind, ExamMode,
-    ExamSchedule, ExamTitle,
+    Exam, ExamAttemptLimit, ExamDescription, ExamDuration, ExamId, ExamKind, ExamMode, ExamTitle,
 };
 use crate::domain::exam_answer::{ExamAnswer, auto_score};
 use crate::domain::exam_question::{
@@ -33,7 +32,7 @@ use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::service;
-use crate::service::exam_attempt::{EXAM_LOCK, any_for_exam, course_of, read_latest_for_user};
+use crate::service::exam_attempt::{EXAM_LOCK, course_of, read_latest_for_user};
 use crate::state::AppState;
 
 use super::bank_questions::BankQuestionResponse;
@@ -267,7 +266,7 @@ async fn list_exams(
 ) -> Result<Json<Page<ExamResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
     let exams = if user.get_role().at_least(Role::Manager) {
-        Exam::list_all(&st.db).await?
+        service::exam::list_all(&st.db).await?
     } else {
         let courses = visible_courses(&user, &st.db).await?;
         let ids: Vec<_> = courses.iter().map(|c| c.get_id().clone()).collect();
@@ -278,7 +277,7 @@ async fn list_exams(
             .filter(|c| can_manage_course(c, &user))
             .map(|c| c.get_id().key())
             .collect();
-        let mut exams = Exam::list_for_courses(&ids, &st.db).await?;
+        let mut exams = service::exam::list_for_courses(&st.db, &ids).await?;
         exams.retain(|exam| !exam.is_draft() || managed.contains(&exam.get_course().key()));
         exams
     };
@@ -321,7 +320,7 @@ async fn get_exam(
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<ExamResponse>, AppError> {
-    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
+    let exam = service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     let course = course_of(&exam, &st.db).await?;
@@ -371,153 +370,82 @@ async fn update_exam(
     Path(id): Path<String>,
     Json(req): Json<UpdateExam>,
 ) -> Result<Json<ExamResponse>, AppError> {
-    // *Reader* lease of [`EXAM_LOCK`] for exactly one pairing: the mode gate
-    // below reads `exam_attempt`, and an attempt start takes the *writer*
-    // lease, so a first sitting still cannot land between that gate and the
-    // write, as it always did.
-    //
-    // It buys nothing against grading, which is a reader too: the re-draft gate
-    // is therefore enforced inside the update's own transaction
-    // (`Exam::update_if_unchanged`), where the store decides it. The gate
-    // below stays as the pre-flight — same error, one round trip earlier.
-    // Concurrent PATCHes of this exam no longer queue behind each other either:
-    // the lost update they used to cause is refused by the compare-and-set.
-    let _guard = EXAM_LOCK.read().await;
-    let mut left = CAS_UPDATE_RETRIES;
-    let exam = loop {
-        let exam = Exam::read(&ExamId::from_key(&id), &st.db)
-            .await?
-            .ok_or(AppError::NotFound)?;
-        let course = course_of(&exam, &st.db).await?;
-        if !can_manage_course(&course, &user) {
-            return Err(AppError::Forbidden(
-                "only the course creator, an assigned teacher, or a manager/admin can edit this exam",
-            ));
-        }
-        crate::service::course::require_open(&st.db, &course).await?;
+    let exam = service::exam::read(&st.db, &ExamId::from_key(&id))
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let course = course_of(&exam, &st.db).await?;
+    if !can_manage_course(&course, &user) {
+        return Err(AppError::Forbidden(
+            "only the course creator, an assigned teacher, or a manager/admin can edit this exam",
+        ));
+    }
+    crate::service::course::require_open(&st.db, &course).await?;
 
-        let title = match req.title {
-            Some(ref title) => ExamTitle::try_new(title)?,
-            None => exam.get_title().clone(),
-        };
-        let description = match req.description {
-            Some(ref description) => ExamDescription::try_new(description)?,
-            None => exam.get_description().clone(),
-        };
-        let kind = match req.kind {
-            // Only a kind this request sets is held to the current settings list —
-            // a stored kind survives later list edits, like past times survive
-            // the no-past rule.
-            Some(ref kind) => {
-                let school = service::settings::load(&st.db).await?;
-                ExamKind::try_new(kind, school.get_exam_kinds())?
-            }
-            None => exam.get_kind().clone(),
-        };
-
-        // Merge the schedule (set / clear / keep per field), then re-validate it
-        // as a unit — a PATCH can't leave a half-schedule behind. Only values this
-        // request sets are held to the no-past rule: kept ones may legitimately be
-        // past (a running exam's `starts_at`), and rechecking them would block
-        // unrelated edits.
-        let mode = match req.mode {
-            Some(ref update) => update.as_deref().map(ExamMode::try_new).transpose()?,
-            None => exam.get_mode().cloned(),
-        };
-        let starts_at = match req.starts_at {
-            Some(update) => {
-                let starts_at = update.map(Timestamp::from_millis);
-                check_not_past("starts_at", starts_at)?;
-                starts_at
-            }
-            None => exam.get_starts_at(),
-        };
-        let ends_at = match req.ends_at {
-            Some(update) => {
-                let ends_at = update.map(Timestamp::from_millis);
-                check_not_past("ends_at", ends_at)?;
-                ends_at
-            }
-            None => exam.get_ends_at(),
-        };
-        let duration_ms = match req.duration_ms {
-            Some(update) => update.map(ExamDuration::try_new).transpose()?,
-            None => exam.get_duration_ms(),
-        };
-        let schedule = ExamSchedule::try_new(mode, starts_at, ends_at, duration_ms)?;
-        let max_attempts = match req.max_attempts {
-            Some(limit) => ExamAttemptLimit::try_new(limit)?,
-            None => exam.get_max_attempts(),
-        };
-        let allow_rejoin = req.allow_rejoin.unwrap_or_else(|| exam.get_allow_rejoin());
-        let allow_review = req.allow_review.unwrap_or_else(|| exam.get_allow_review());
-        let draft = req.draft.unwrap_or_else(|| exam.is_draft());
-
-        // Switching sync <-> async <-> open (or back to unscheduled) would
-        // silently rewrite the deadline rules under students who already sat
-        // down; extending times, the attempt limit, and the rejoin door are the
-        // supported live adjustments instead. Gate read and write share the
-        // handler-wide writer lease of [`EXAM_LOCK`], so a first attempt can't
-        // land in the gap and leave a sat exam's mode flipped under it.
-        let mode_changed =
-            schedule.get_mode().map(ExamMode::as_str) != exam.get_mode().map(ExamMode::as_str);
-        if mode_changed && any_for_exam(&st.db, exam.get_id()).await? {
-            return Err(AppError::Conflict(
-                "cannot change the exam mode after attempts have started",
-            ));
-        }
-        // Re-drafting hides the exam — never out from under a student who
-        // already sat it or holds a mark on it. Pre-flight only: the write's own
-        // transaction re-makes this check and answers with the same error, so a
-        // grade landing after this read still cannot leave a mark on a draft.
-        if draft && !exam.is_draft() {
-            let sat = any_for_exam(&st.db, exam.get_id()).await?;
-            let graded = !ExamResult::list_for_exam(exam.get_id(), &st.db)
-                .await?
-                .is_empty();
-            if sat || graded {
-                return Err(crate::domain::exam::redraft_error());
-            }
-        }
-
-        // A graded exam keeps its kind. Moving it re-weights every mark it
-        // already carries — the same silent re-weighting the settings' removal
-        // guard refuses — and it would strand those marks' references on the
-        // kind they were counted under, freeing the kind the exam now claims to
-        // be. Marks are counted on the exam row, and the save below *pins* that
-        // counter, so a grade landing between this read and the write refuses
-        // the save (the loop then re-reads and answers the 409 below).
-        if kind.as_str() != exam.get_kind().as_str() && exam.get_result_count() > 0 {
-            return Err(AppError::Conflict(
-                "cannot change the kind of an exam that already has marks",
-            ));
-        }
-
-        if let Some(updated) = exam
-            .update_if_unchanged(
-                title,
-                description,
-                kind,
-                schedule,
-                max_attempts,
-                allow_rejoin,
-                allow_review,
-                draft,
-                &st.db,
-            )
-            .await?
-        {
-            break updated;
-        }
-        // The row moved under the snapshot every gate above judged: re-read and
-        // re-merge, so both edits land instead of the later reverting the earlier.
-        left -= 1;
-        if left == 0 {
-            return Err(AppError::Conflict(
-                "the exam kept changing underneath this update — try again",
-            ));
-        }
+    // Field validation, in the order the request is judged — only values this
+    // request sets are held to the rules (a stored kind survives list edits,
+    // kept times may legitimately be past). The merge against the stored row,
+    // the schedule re-validation as a unit, and the mode-freeze / re-draft /
+    // kind gates are the workflow's own steps:
+    // [`crate::service::exam::update`] re-derives them per retry round behind
+    // the compare-and-set.
+    let title = req.title.as_deref().map(ExamTitle::try_new).transpose()?;
+    let description = req
+        .description
+        .as_deref()
+        .map(ExamDescription::try_new)
+        .transpose()?;
+    let kind = match &req.kind {
+        // Only a kind this request sets is held to the current settings list —
+        // a stored kind survives later list edits, like past times survive
+        // the no-past rule.
+        Some(kind) => Some(ExamKind::try_new(
+            kind,
+            service::settings::load(&st.db).await?.get_exam_kinds(),
+        )?),
+        None => None,
     };
+    let mode = match &req.mode {
+        Some(update) => Some(update.as_deref().map(ExamMode::try_new).transpose()?),
+        None => None,
+    };
+    let starts_at = match req.starts_at {
+        Some(update) => {
+            let starts_at = update.map(Timestamp::from_millis);
+            check_not_past("starts_at", starts_at)?;
+            Some(starts_at)
+        }
+        None => None,
+    };
+    let ends_at = match req.ends_at {
+        Some(update) => {
+            let ends_at = update.map(Timestamp::from_millis);
+            check_not_past("ends_at", ends_at)?;
+            Some(ends_at)
+        }
+        None => None,
+    };
+    let duration_ms = match req.duration_ms {
+        Some(update) => Some(update.map(ExamDuration::try_new).transpose()?),
+        None => None,
+    };
+    let max_attempts = req
+        .max_attempts
+        .map(ExamAttemptLimit::try_new)
+        .transpose()?;
+    let patch = service::exam::ExamPatch {
+        title,
+        description,
+        kind,
+        mode,
+        starts_at,
+        ends_at,
+        duration_ms,
+        max_attempts,
+        allow_rejoin: req.allow_rejoin,
+        allow_review: req.allow_review,
+        draft: req.draft,
+    };
+    let exam = service::exam::update(&st.db, exam.get_id(), &patch).await?;
     Ok(Json(ExamResponse::new(&exam)))
 }
 
@@ -543,7 +471,7 @@ async fn delete_exam(
     RequireTeacher(user): RequireTeacher,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
+    let exam = service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     let course = course_of(&exam, &st.db).await?;
@@ -552,41 +480,16 @@ async fn delete_exam(
             "only the course creator, an assigned teacher, or a manager/admin can delete this exam",
         ));
     }
-    crate::service::course::require_open(&st.db, &course).await?;
-    // *Writer* lease of [`EXAM_LOCK`] across the whole cascade, blob names
-    // included — the lease `delete_homework` has always held, and its absence
-    // here is what made a sitting able to start inside this delete. Every other
-    // child of an exam now writes the exam row in its own transaction, so the
-    // store refuses the pair; an attempt cannot, because its claim lands on the
-    // *student's* row (`exam_sat_total`) and touches nothing this delete
-    // writes. `start_attempt` already takes the writer lease from its exam read
-    // through the insert, so this one lease is the whole ordering: a start
-    // either finishes before the sweep (which then takes its row) or reads no
-    // exam at all and is a 404. Left orphaned, that attempt kept a sitting on
-    // the student's lifetime counter and could mint a badge — awards are
-    // add-only and never revoked — for an exam that never existed.
-    //
-    // It spans the blob names too: they are collected *before* the rows go, so
-    // an image row written after that snapshot would strand its bytes on disk
-    // even though the row itself is now refused.
-    //
-    // corner-cut: process-local, so it holds because the deployment runs one
-    // process by contract with stop-the-world deploys (two overlapping
-    // binaries would
-    // reopen it). Closing it in the store means the `cap` shape the counter
-    // work already sketched: `claim_and_create` gaining a second record to
-    // touch, so the attempt writes the exam key as every other child does.
-    let _guard = EXAM_LOCK.write().await;
-    // Rows go first (the delete cascades them), blobs after — a crash in
-    // between strands at worst an unreachable blob.
-    let images = QuestionImage::list_for_exam(exam.get_id(), &st.db).await?;
-    let answer_images = AnswerImage::list_for_exam(exam.get_id(), &st.db).await?;
-    exam.delete(&st.db).await?;
-    for image in &images {
-        remove_blob(&st.files_path, image.get_file()).await;
+    // The workflow — the archived-term gate, the *writer* lease of
+    // [`EXAM_LOCK`] across the cascade, blob-key collection, the delete — is
+    // [`crate::service::exam::delete`]'s. Blob unlinking stays here because
+    // only the web layer knows `files_path`.
+    let outcome = service::exam::delete(&st.db, &exam).await?;
+    for file in &outcome.image_files {
+        remove_blob(&st.files_path, file).await;
     }
-    for image in &answer_images {
-        remove_blob(&st.files_path, image.get_file()).await;
+    for file in &outcome.answer_image_files {
+        remove_blob(&st.files_path, file).await;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -628,7 +531,7 @@ async fn grade(
     // results) could slip between them and leave a mark on a hidden exam.
     let _guard = EXAM_LOCK.read().await;
     // Exam must exist.
-    let exam = Exam::read(&exam_id, &st.db)
+    let exam = service::exam::read(&st.db, &exam_id)
         .await?
         .ok_or(AppError::NotFound)?;
     let course = course_of(&exam, &st.db).await?;
@@ -753,7 +656,7 @@ async fn list_results(
 ) -> Result<Json<Page<ExamResultResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
     // Exam must exist — a missing exam is a 404, not an empty result list.
-    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
+    let exam = service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     let course = course_of(&exam, &st.db).await?;
@@ -835,7 +738,7 @@ async fn remove_result(
     RequireTeacher(user): RequireTeacher,
     Path((id, target)): Path<(String, String)>,
 ) -> Result<StatusCode, AppError> {
-    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
+    let exam = service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     let course = course_of(&exam, &st.db).await?;
@@ -879,7 +782,7 @@ async fn exam_statistics(
     Path(id): Path<String>,
 ) -> Result<Json<ExamStatisticsResponse>, AppError> {
     // Exam must exist — a missing exam is a 404, not an empty statistic.
-    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
+    let exam = service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     let course = course_of(&exam, &st.db).await?;

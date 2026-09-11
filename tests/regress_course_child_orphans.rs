@@ -31,10 +31,10 @@
 //!
 //! The **race** half drives the real interleaving and lives in-crate, one pin
 //! per child beside the create it pins —
-//! `domain::exam::tests::an_exam_never_outlives_its_course`,
+//! `db::exam::tests::an_exam_never_outlives_its_course`,
 //! `db::course_session::tests::a_session_never_outlives_its_course`,
 //! `domain::subject::tests::a_subject_never_outlives_its_course` — over the
-//! shared harness `domain::course::assert_no_child_outlives_a_course_delete`.
+//! shared harness `db::course::assert_no_child_outlives_a_course_delete`.
 //! It is `#[ignore]`d and needs a real server, because the subject there *is*
 //! the store's conflict detection, which the embedded engine does not have: it
 //! commits both sides and answers `Ok` to each, so a race test on `memory`
@@ -55,7 +55,7 @@ use hezarfen_backend::domain::course_note::{CourseNote, CourseNoteContent, Cours
 use hezarfen_backend::domain::course_note_file::{CourseNoteFile, FileContentType, FileName};
 use hezarfen_backend::domain::course_session::SessionTopic;
 use hezarfen_backend::domain::exam::{
-    Exam, ExamAttemptLimit, ExamDescription, ExamKind, ExamSchedule, ExamTitle,
+    ExamAttemptLimit, ExamDescription, ExamKind, ExamSchedule, ExamTitle,
 };
 use hezarfen_backend::domain::settings::Settings;
 use hezarfen_backend::domain::subject::{Subject, SubjectDescription, SubjectName};
@@ -103,7 +103,8 @@ async fn drop_course(course: &CourseId, db: &Database) -> Result<bool, AppError>
 fn make_exam(course: CourseId, db: Database) -> JoinHandle<Result<(), AppError>> {
     tokio::spawn(async move {
         let kinds = Settings::defaults().get_exam_kinds().to_vec();
-        Exam::create(
+        hezarfen_backend::db::exam::create(
+            &db,
             &teacher(),
             &course,
             ExamTitle::try_new("quiz").unwrap(),
@@ -114,7 +115,6 @@ fn make_exam(course: CourseId, db: Database) -> JoinHandle<Result<(), AppError>>
             true,
             false,
             false,
-            &db,
         )
         .await
         .map(|_| ())

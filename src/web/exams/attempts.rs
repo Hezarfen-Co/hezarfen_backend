@@ -189,7 +189,7 @@ pub(crate) async fn my_attempt(
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<AttemptResponse>, AppError> {
-    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
+    let exam = crate::service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     let attempt = exam_attempt::read_latest_for_user(&st.db, exam.get_id(), user.get_id())
@@ -235,7 +235,7 @@ pub(crate) async fn finish_attempt(
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<AttemptResponse>, AppError> {
-    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
+    let exam = crate::service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     let finished = exam_attempt::finish_attempt(&st.db, &exam, user.get_id()).await?;
@@ -458,7 +458,7 @@ pub(crate) async fn exam_live(
     RequireTeacher(user): RequireTeacher,
     Path(id): Path<String>,
 ) -> Result<Json<ExamLiveResponse>, AppError> {
-    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
+    let exam = crate::service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     let course = exam_attempt::course_of(&exam, &st.db).await?;
@@ -572,7 +572,7 @@ pub(crate) async fn attempt_questions(
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<AttemptQuestionResponse>>, AppError> {
-    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
+    let exam = crate::service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     exam_attempt::ensure_enrolled(&exam, user.get_id(), &st.db).await?;
@@ -659,7 +659,7 @@ pub(crate) async fn save_answer(
     Path(id): Path<String>,
     Json(req): Json<SaveAnswer>,
 ) -> Result<Json<AnswerSavedResponse>, AppError> {
-    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
+    let exam = crate::service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     let answer = exam_attempt::save_answer_checked(
@@ -707,7 +707,7 @@ pub(crate) async fn attempt_answers(
     RequireTeacher(user): RequireTeacher,
     Path((id, target)): Path<(String, String)>,
 ) -> Result<Json<AttemptAnswersResponse>, AppError> {
-    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
+    let exam = crate::service::exam::read(&st.db, &ExamId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     let course = exam_attempt::course_of(&exam, &st.db).await?;
