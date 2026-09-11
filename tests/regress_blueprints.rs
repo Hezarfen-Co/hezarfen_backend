@@ -19,6 +19,7 @@ use hezarfen_backend::domain::class_blueprint::ClassBlueprint;
 use hezarfen_backend::domain::course::CourseId;
 use hezarfen_backend::domain::user::UserId;
 use hezarfen_backend::error::AppError;
+use hezarfen_backend::service::class_blueprint;
 use serde_json::{Value, json};
 
 /// One counter, re-read out of the store.
@@ -971,7 +972,7 @@ async fn a_row_written_before_the_column_reads_as_hand_attached() {
 
 /// The window the lock exists to close, made visible.
 ///
-/// `ClassBlueprint::delete` removes the row and then sweeps by the provenance
+/// `service::class_blueprint::delete` removes the row and then sweeps by the provenance
 /// tag, while a pump reads that row inside the transaction that writes the link
 /// — a cross-record read-then-write the store does not serialize. A pump that
 /// passed its liveness claim and then lost the blueprint commits a
@@ -983,7 +984,7 @@ async fn a_row_written_before_the_column_reads_as_hand_attached() {
 /// `class_course` fires *inside* the pump's own transaction, the instant the
 /// link row lands — which is exactly "after the guard passed, before the
 /// commit", every single time. This is a below-the-lock probe by construction
-/// (the store deletes the row, not `ClassBlueprint::delete`), so it does not
+/// (the store deletes the row, not `service::class_blueprint::delete`), so it does not
 /// test `BLUEPRINT_LOCK`; it pins the end state that lock prevents in-process,
 /// and the recovery contract that covers the one residue it cannot — a process
 /// crash between the delete and its sweep.
@@ -1625,11 +1626,11 @@ async fn a_template_write_refuses_a_course_that_is_gone() {
     let algebra = CourseId::from_key(&create_course(&app, &manager, "algebra").await);
     let ghost = CourseId::from_key("01J8XZ0K3Q8G7X2M4N5P6R7S8T");
 
-    let refused = ClassBlueprint::create(
+    let refused = class_blueprint::create(
+        &db,
         &by,
         ClassBlueprint::grade_key("9").unwrap(),
         vec![ghost.clone()],
-        &db,
     )
     .await;
     assert!(
@@ -1642,17 +1643,16 @@ async fn a_template_write_refuses_a_course_that_is_gone() {
         "…and nothing may be stored"
     );
 
-    let blueprint = ClassBlueprint::create(
+    let blueprint = class_blueprint::create(
+        &db,
         &by,
         ClassBlueprint::grade_key("9").unwrap(),
         vec![algebra.clone()],
-        &db,
     )
     .await
     .unwrap();
-    let refused = blueprint
-        .set_courses(vec![algebra.clone(), ghost], &by, &db)
-        .await;
+    let refused =
+        class_blueprint::set_courses(&db, blueprint, vec![algebra.clone(), ghost], &by).await;
     assert!(
         matches!(refused, Err(AppError::Validation(_))),
         "the edit carries the same claim: {refused:?}"

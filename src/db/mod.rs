@@ -2,6 +2,7 @@
 
 pub mod appointment;
 pub mod cap;
+pub mod class_blueprint;
 pub mod course;
 pub mod exam_attempt;
 pub mod field_update;

@@ -2,6 +2,7 @@
 //! SurrealQL text.
 
 pub mod appointment;
+pub mod class_blueprint;
 pub mod course;
 pub mod exam_attempt;
 pub mod note;

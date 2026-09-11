@@ -25,6 +25,7 @@ use crate::domain::course::CourseId;
 use crate::domain::role::Role;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
+use crate::service::class_blueprint;
 use crate::state::AppState;
 
 use super::courses::can_manage_course;
@@ -429,10 +430,12 @@ async fn stock_from_blueprint(
     db: &Database,
 ) -> Option<(String, Vec<Skip>)> {
     let grade = class.get_grade()?;
-    let blueprint = ClassBlueprint::read(&ClassBlueprintId::for_grade(grade), db)
+    let blueprint = class_blueprint::read(db, &ClassBlueprintId::for_grade(grade))
         .await
         .ok()??;
-    let skipped = blueprint.apply_to(class, by, db).await.ok()?;
+    let skipped = class_blueprint::apply_to(db, &blueprint, class, by)
+        .await
+        .ok()?;
     Some((blueprint.get_grade().as_str().to_string(), skipped))
 }
 
@@ -872,8 +875,8 @@ async fn attach_course(
     Json(req): Json<AttachCourse>,
 ) -> Result<(StatusCode, Json<ClassCourseResponse>), AppError> {
     let class = class_or_404(&id, &st.db).await?;
-    let Some(course) = crate::service::course::read(&st.db, &CourseId::from_key(&req.course_id))
-        .await?
+    let Some(course) =
+        crate::service::course::read(&st.db, &CourseId::from_key(&req.course_id)).await?
     else {
         return Err(AppError::Validation(ValidationError::Invalid {
             field: "course_id",
@@ -1165,7 +1168,7 @@ async fn resolve_courses(ids: &[String], db: &Database) -> Result<Vec<CourseId>,
 
 /// The blueprint a path grade names, or a 404.
 async fn blueprint_or_404(grade: &str, db: &Database) -> Result<ClassBlueprint, AppError> {
-    ClassBlueprint::read(&ClassBlueprintId::from_key(grade), db)
+    class_blueprint::read(db, &ClassBlueprintId::from_key(grade))
         .await?
         .ok_or(AppError::NotFound)
 }
@@ -1216,8 +1219,8 @@ async fn create_blueprint(
 ) -> Result<(StatusCode, Json<BlueprintPumpResponse>), AppError> {
     let grade = ClassBlueprint::grade_key(&req.grade)?;
     let courses = resolve_courses(&req.course_ids, &st.db).await?;
-    let mut blueprint = ClassBlueprint::create(user.get_id(), grade, courses, &st.db).await?;
-    let pumped = blueprint.pump(user.get_id(), &st.db).await?;
+    let mut blueprint = class_blueprint::create(&st.db, user.get_id(), grade, courses).await?;
+    let pumped = class_blueprint::pump(&st.db, &mut blueprint, user.get_id()).await?;
     let body = blueprint_body(&blueprint, &pumped, &st.db).await?;
     Ok((StatusCode::CREATED, Json(body)))
 }
@@ -1243,7 +1246,7 @@ async fn list_blueprints(
     Query(page): Query<PageParams>,
 ) -> Result<Json<Page<BlueprintResponse>>, AppError> {
     let (limit, offset) = page.resolve()?;
-    let (blueprints, total) = ClassBlueprint::list_all(limit, offset, &st.db).await?;
+    let (blueprints, total) = class_blueprint::list_all(&st.db, limit, offset).await?;
     let people = person_map(
         blueprints
             .iter()
@@ -1322,9 +1325,8 @@ async fn update_blueprint(
 ) -> Result<Json<BlueprintPumpResponse>, AppError> {
     let blueprint = blueprint_or_404(&grade, &st.db).await?;
     let courses = resolve_courses(&req.course_ids, &st.db).await?;
-    let (saved, pumped) = blueprint
-        .set_courses(courses, user.get_id(), &st.db)
-        .await?;
+    let (saved, pumped) =
+        class_blueprint::set_courses(&st.db, blueprint, courses, user.get_id()).await?;
     Ok(Json(blueprint_body(&saved, &pumped, &st.db).await?))
 }
 
@@ -1354,10 +1356,8 @@ async fn delete_blueprint(
     RequireManager(_user): RequireManager,
     Path(grade): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    blueprint_or_404(&grade, &st.db)
-        .await?
-        .delete(&st.db)
-        .await?;
+    let blueprint = blueprint_or_404(&grade, &st.db).await?;
+    class_blueprint::delete(&st.db, blueprint).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1397,7 +1397,7 @@ async fn blueprint_status(
     Path(grade): Path<String>,
 ) -> Result<Json<BlueprintStatusResponse>, AppError> {
     let blueprint = blueprint_or_404(&grade, &st.db).await?;
-    let sections = blueprint.status(&st.db).await?;
+    let sections = class_blueprint::status(&st.db, &blueprint).await?;
     Ok(Json(BlueprintStatusResponse {
         grade: blueprint.get_grade().as_str().to_string(),
         courses: blueprint
@@ -1460,7 +1460,7 @@ async fn apply_blueprint(
             crate::service::course::require_open(&st.db, &course).await?;
         }
     }
-    let skipped = blueprint.apply_to(&class, user.get_id(), &st.db).await?;
+    let skipped = class_blueprint::apply_to(&st.db, &blueprint, &class, user.get_id()).await?;
     Ok(Json(ApplyResponse {
         skipped: skipped.iter().map(SkipResponse::new).collect(),
     }))
