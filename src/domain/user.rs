@@ -40,7 +40,7 @@ use crate::validate::{validate_password, validate_username};
 ///
 /// Serializing the pair is what closes it, the same argument
 /// [`crate::domain::settings::SETTINGS_LOCK`] makes one level up: the deployment
-/// runs one replica by contract (stop-the-world upgrades), so process-wide is
+/// runs one process by contract (stop-the-world upgrades), so process-wide is
 /// deployment-wide. A per-row counter (the [`crate::domain::cap`] shape) does
 /// not fit — the count being capped is over *every* user row, with no parent
 /// record to hold it and no place to seed one without a backfill.

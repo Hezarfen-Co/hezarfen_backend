@@ -990,8 +990,9 @@ mod tests {
         .await
         .unwrap();
 
-        // Replica A counter-proposes. Replica B is still holding the snapshot
-        // it read before that — same id, same `pending` status.
+        // One transaction counter-proposes. A second concurrent transaction
+        // is still holding the snapshot it read before that — same id, same
+        // `pending` status.
         let stale = booking.clone();
         let (proposed_starts_at, proposed_ends_at) = (soon(180_000), soon(240_000));
         Appointment::propose(
@@ -1058,7 +1059,7 @@ mod tests {
     /// Deleting the `WHERE (occupied ?? 0) < $cap` from `cap::claim` makes the
     /// second claim succeed and this fail (mutation-proved).
     #[tokio::test]
-    async fn a_second_replica_cannot_claim_a_booked_slot() {
+    async fn a_concurrent_claim_cannot_take_a_booked_slot() {
         let db = crate::database::init_mem().await.unwrap();
         let teacher = UserId::from_key("t1");
         let slot = AppointmentSlot::create(&teacher, soon(60_000), soon(120_000), None, &db)
