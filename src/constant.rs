@@ -850,7 +850,7 @@ pub const MIN_CHUNK_CHARS: usize = 24;
 
 // --- query text --------------------------------------------------------
 
-/// The whole of [`crate::domain::bank_question::BankQuestion::usage_counts`]:
+/// The whole of [`crate::db::bank_question::usage_counts`]:
 /// **one** statement (no `;`), so a page of templates costs one round trip no
 /// matter how long it is. Named so a test can assert that, since a per-row
 /// `count()` is exactly the N+1 this page was cleaned of once.
@@ -1024,7 +1024,7 @@ pub const POMODORO_COUNTED_TODAY_FIELD: &str = "pomodoro_counted_today";
 /// `pomodoro_focus_ms_total` (and towards the study streak): it must have run at
 /// least this long, and it must be within the day's quota.
 ///
-/// Without them the pair is the farm [`crate::domain::pool_question::PoolQuestion::approve`]
+/// Without them the pair is the farm [`crate::db::pool_question::approve`]
 /// reasons about from the other end: `finish` is self-service, a stint costs two
 /// requests and no second person, so a counter moved once per round-trip is
 /// farmable — 200 pairs in a minute and a half bought `pomodoro_finished_200`,

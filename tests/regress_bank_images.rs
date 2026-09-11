@@ -29,6 +29,7 @@ use axum::http::StatusCode;
 use common::{create_course, create_subject, id_of, login_as, send};
 use hezarfen_backend::build_router;
 use hezarfen_backend::database::Database;
+use hezarfen_backend::db::bank_question_image::{list_for_question, upsert};
 use hezarfen_backend::domain::bank_question::BankQuestionId;
 use hezarfen_backend::domain::bank_question_image::BankQuestionImage;
 use hezarfen_backend::domain::note_file::FileContentType;
@@ -136,9 +137,7 @@ async fn an_image_write_under_a_missing_template_is_refused() {
     assert_eq!(dropped.status, StatusCode::NO_CONTENT);
 
     let question = BankQuestionId::from_key(&bid);
-    let refused = BankQuestionImage::new(&question, None, png(), 3)
-        .upsert(&db)
-        .await;
+    let refused = upsert(&db, BankQuestionImage::new(&question, None, png(), 3)).await;
     assert!(
         matches!(refused, Err(AppError::NotFound)),
         "a slot write under a deleted template must be refused: {refused:?}"
@@ -146,10 +145,7 @@ async fn an_image_write_under_a_missing_template_is_refused() {
     // Stored state is the verdict — a refusal that still wrote the row would be
     // the very defect this pins.
     assert!(
-        BankQuestionImage::list_for_question(&question, &db)
-            .await
-            .unwrap()
-            .is_empty(),
+        list_for_question(&db, &question).await.unwrap().is_empty(),
         "the refused write left an orphan row"
     );
 }
@@ -180,9 +176,7 @@ async fn a_replace_retires_one_blob_and_a_delete_takes_the_rest() {
         "a replace retires the blob it replaced: {after:?}"
     );
     let question = BankQuestionId::from_key(&bid);
-    let rows = BankQuestionImage::list_for_question(&question, &db)
-        .await
-        .unwrap();
+    let rows = list_for_question(&db, &question).await.unwrap();
     assert_eq!(rows.len(), 1, "one row per slot");
     assert_eq!(
         after,
@@ -204,10 +198,5 @@ async fn a_replace_retires_one_blob_and_a_delete_takes_the_rest() {
         "the delete left a blob behind: {:?}",
         blobs(&files)
     );
-    assert!(
-        BankQuestionImage::list_for_question(&question, &db)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert!(list_for_question(&db, &question).await.unwrap().is_empty());
 }

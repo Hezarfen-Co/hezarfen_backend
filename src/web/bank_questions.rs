@@ -25,11 +25,11 @@ use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::constant::{CAS_UPDATE_RETRIES, MAX_MAX_FILE_BYTES, UPLOAD_BODY_OVERHEAD_BYTES};
+use crate::constant::{MAX_MAX_FILE_BYTES, UPLOAD_BODY_OVERHEAD_BYTES};
 use crate::domain::bank_question::{BankQuestion, BankQuestionId, BankVisibility};
 use crate::domain::bank_question_image::BankQuestionImage;
 use crate::domain::exam_question::{
-    Choice, ChoiceId, QuestionKind, QuestionPoints, QuestionSpec, QuestionText,
+    ChoiceId, QuestionKind, QuestionPoints, QuestionSpec, QuestionText,
 };
 use crate::domain::note_file::FileContentType;
 use crate::domain::role::Role;
@@ -37,6 +37,8 @@ use crate::domain::subject::SubjectId;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::service;
+use crate::service::bank_question;
+use crate::service::bank_question_image;
 use crate::state::AppState;
 
 use super::dto::person_map;
@@ -309,7 +311,7 @@ async fn bank_images_by_question(
     db: &crate::database::Database,
 ) -> Result<HashMap<String, Vec<BankQuestionImage>>, AppError> {
     let mut buckets: HashMap<String, Vec<BankQuestionImage>> = HashMap::new();
-    for image in BankQuestionImage::list_for_questions(questions, db).await? {
+    for image in bank_question_image::list_for_questions(db, questions).await? {
         buckets
             .entry(image.get_bank_question().key().to_string())
             .or_default()
@@ -338,7 +340,7 @@ impl BankImageMeta {
 
 /// The template, or a 404.
 async fn question_or_404(st: &AppState, bid: &str) -> Result<BankQuestion, AppError> {
-    BankQuestion::read(&BankQuestionId::from_key(bid), &st.db)
+    bank_question::read(&st.db, &BankQuestionId::from_key(bid))
         .await?
         .ok_or(AppError::NotFound)
 }
@@ -419,7 +421,10 @@ pub(crate) async fn store_image(
 ) -> Result<BankQuestionImage, AppError> {
     let image = BankQuestionImage::new(question, slot, content_type, data.len() as i64);
     let file = image.get_file().to_string();
-    store_blob(st, &file, data, || async { image.upsert(&st.db).await }).await
+    store_blob(st, &file, data, || async {
+        bank_question_image::upsert(&st.db, image).await
+    })
+    .await
 }
 
 /// Add a template to the bank. Requires teacher+. `subject_id` is origin
@@ -459,7 +464,7 @@ async fn create_question(
         &[],
     )?;
     let question =
-        BankQuestion::create(user.get_id().clone(), subject, text, points, spec, &st.db).await?;
+        bank_question::create(&st.db, user.get_id().clone(), subject, text, points, spec).await?;
     Ok((
         StatusCode::CREATED,
         Json(BankQuestionResponse::new(&question, &[])),
@@ -515,7 +520,8 @@ async fn list_questions(
     let viewer = (!user.get_role().at_least(Role::Admin)).then(|| user.get_id().clone());
     // Filters, order, and window are all SQL — `total` comes from a count over
     // the same WHERE, so a client can page past the first window.
-    let (questions, total) = BankQuestion::list(
+    let (questions, total) = bank_question::list(
+        &st.db,
         viewer.as_ref(),
         owner.as_ref(),
         subject.as_ref(),
@@ -523,7 +529,6 @@ async fn list_questions(
         filter.q.as_deref(),
         limit,
         offset,
-        &st.db,
     )
     .await?;
 
@@ -533,7 +538,7 @@ async fn list_questions(
     let ids: Vec<&BankQuestionId> = questions.iter().map(BankQuestion::get_id).collect();
     let buckets = bank_images_by_question(&ids, &st.db).await?;
     // One grouped query for the whole page — never a count per row.
-    let used = BankQuestion::usage_counts(&ids, &st.db).await?;
+    let used = bank_question::usage_counts(&st.db, &ids).await?;
     let subject_ids: Vec<&SubjectId> = questions
         .iter()
         .filter_map(BankQuestion::get_subject)
@@ -597,7 +602,7 @@ async fn get_question(
     Path(bid): Path<String>,
 ) -> Result<Json<BankQuestionResponse>, AppError> {
     let question = visible_question(&st, &user, &bid).await?;
-    let images = BankQuestionImage::list_for_question(question.get_id(), &st.db).await?;
+    let images = bank_question_image::list_for_question(&st.db, question.get_id()).await?;
     Ok(Json(BankQuestionResponse::new(&question, &images)))
 }
 
@@ -637,62 +642,38 @@ async fn update_question(
     Path(bid): Path<String>,
     Json(req): Json<UpdateBankQuestion>,
 ) -> Result<Json<BankQuestionResponse>, AppError> {
-    // Read, merge and write again while the row keeps moving underneath: the
-    // guarded write refuses on a snapshot that has gone stale, so both edits
-    // land instead of the later one reverting the earlier.
-    let mut left = CAS_UPDATE_RETRIES;
-    let updated = loop {
-        let question = owned_question(&st, &user, &bid).await?;
-        // Omitted keeps the stored subject — which may already be `None`, cleared
-        // by that subject's delete.
-        let subject = match req.subject_id {
-            Some(ref subject_id) => Some(service::subject::must_exist(&st.db, subject_id).await?),
-            None => question.get_subject().cloned(),
-        };
-        let text = match req.text {
-            Some(ref text) => QuestionText::try_new(text)?,
-            None => question.get_text().clone(),
-        };
-        let points = match req.points {
-            Some(points) => QuestionPoints::try_new(points)?,
-            None => question.get_points(),
-        };
-        // Merge the kind-dependent fields (set / clear / keep per field), then
-        // re-validate them as a unit — a PATCH can't leave a half-question behind.
-        let kind = match req.kind {
-            Some(ref kind) => QuestionKind::try_new(kind)?,
-            None => question.get_kind().clone(),
-        };
-        // Omitting `choices` re-submits the stored options *with their ids*, so a
-        // text-only edit keeps every identity (and every picture) untouched.
-        let choices = match req.choices.clone() {
-            Some(update) => ChoiceBody::into_inputs(update),
-            None => ChoiceBody::from_stored(question.get_choices()),
-        };
-        let correct = match req.correct.clone() {
-            Some(update) => update,
-            None => question.get_correct().map(|id| id.as_str().to_string()),
-        };
-        let stored: Vec<Choice> = question.get_choices().unwrap_or_default().to_vec();
-        let spec = QuestionSpec::try_new(kind, choices, correct, &stored)?;
-        let visibility = match req.visibility {
-            Some(ref visibility) => BankVisibility::try_new(visibility)?,
-            None => question.get_visibility().clone(),
-        };
-
-        if let Some(updated) = question
-            .update_if_unchanged(subject, text, points, spec, visibility, &st.db)
-            .await?
-        {
-            break updated;
-        }
-        left -= 1;
-        if left == 0 {
-            return Err(AppError::Conflict(
-                "the template kept changing underneath this update — try again",
-            ));
-        }
+    // Authz first (404 invisible, 403 not the owner), then the fields the
+    // request sets are validated right here; the read-merge-retry loop that
+    // lands them lives in the service, which re-reads and re-merges while the
+    // row keeps moving underneath — its guarded write refuses on a snapshot
+    // that has gone stale, so both edits land instead of the later one
+    // reverting the earlier.
+    owned_question(&st, &user, &bid).await?;
+    let patch = bank_question::BankQuestionPatch {
+        subject: match req.subject_id {
+            Some(ref subject_id) => Some(subject_must_exist(subject_id, &st.db).await?),
+            None => None,
+        },
+        text: match req.text {
+            Some(ref text) => Some(QuestionText::try_new(text)?),
+            None => None,
+        },
+        points: req.points.map(QuestionPoints::try_new).transpose()?,
+        kind: match req.kind {
+            Some(ref kind) => Some(QuestionKind::try_new(kind)?),
+            None => None,
+        },
+        // Set-or-clear spelling: omitting `choices` keeps the stored options
+        // (re-submitted with their ids, so a text-only edit keeps every
+        // picture), resolved against a fresh read every retry round.
+        choices: req.choices.map(ChoiceBody::into_inputs),
+        correct: req.correct,
+        visibility: match req.visibility {
+            Some(ref visibility) => Some(BankVisibility::try_new(visibility)?),
+            None => None,
+        },
     };
+    let updated = bank_question::update(&st.db, &BankQuestionId::from_key(&bid), &patch).await?;
     let bid = updated.get_id().clone();
     // Only the options that are actually *gone* lose their pictures — an option
     // that survives the edit keeps its image wherever it moved in the list.
@@ -702,10 +683,10 @@ async fn update_question(
         .iter()
         .map(|choice| choice.get_id().clone())
         .collect();
-    for image in BankQuestionImage::delete_choices_not_in(&bid, &keep, &st.db).await? {
+    for image in bank_question_image::delete_choices_not_in(&st.db, &bid, &keep).await? {
         remove_blob(&st.files_path, image.get_file()).await;
     }
-    let images = BankQuestionImage::list_for_question(updated.get_id(), &st.db).await?;
+    let images = bank_question_image::list_for_question(&st.db, updated.get_id()).await?;
     Ok(Json(BankQuestionResponse::new(&updated, &images)))
 }
 
@@ -734,7 +715,7 @@ async fn delete_question(
     // in between strands at worst an unreachable blob. The blobs come from what
     // the delete *swept*, never a list read before it: an upload that landed in
     // between is swept too, and its blob would be stranded for good.
-    let (_, images) = question.delete(&st.db).await?;
+    let (_, images) = bank_question::delete(&st.db, question).await?;
     for image in &images {
         remove_blob(&st.files_path, image.get_file()).await;
     }
@@ -801,7 +782,7 @@ async fn get_question_image(
     Path(bid): Path<String>,
 ) -> Result<Response, AppError> {
     let question = visible_question(&st, &user, &bid).await?;
-    let image = BankQuestionImage::read_slot(question.get_id(), None, &st.db)
+    let image = bank_question_image::read_slot(&st.db, question.get_id(), None)
         .await?
         .ok_or(AppError::NotFound)?;
     serve_inline_blob(&st.files_path, image.get_file(), image.get_content_type()).await
@@ -827,10 +808,10 @@ async fn delete_question_image(
     Path(bid): Path<String>,
 ) -> Result<StatusCode, AppError> {
     let question = owned_question(&st, &user, &bid).await?;
-    let image = BankQuestionImage::read_slot(question.get_id(), None, &st.db)
+    let image = bank_question_image::read_slot(&st.db, question.get_id(), None)
         .await?
         .ok_or(AppError::NotFound)?;
-    let image = image.delete(&st.db).await?;
+    let image = bank_question_image::delete(&st.db, image).await?;
     remove_blob(&st.files_path, image.get_file()).await;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -897,7 +878,7 @@ async fn get_choice_image(
 ) -> Result<Response, AppError> {
     let question = visible_question(&st, &user, &bid).await?;
     let slot = bank_choice_slot(&question, &choice_id)?;
-    let image = BankQuestionImage::read_slot(question.get_id(), Some(&slot), &st.db)
+    let image = bank_question_image::read_slot(&st.db, question.get_id(), Some(&slot))
         .await?
         .ok_or(AppError::NotFound)?;
     serve_inline_blob(&st.files_path, image.get_file(), image.get_content_type()).await
@@ -927,10 +908,10 @@ async fn delete_choice_image(
 ) -> Result<StatusCode, AppError> {
     let question = owned_question(&st, &user, &bid).await?;
     let slot = bank_choice_slot(&question, &choice_id)?;
-    let image = BankQuestionImage::read_slot(question.get_id(), Some(&slot), &st.db)
+    let image = bank_question_image::read_slot(&st.db, question.get_id(), Some(&slot))
         .await?
         .ok_or(AppError::NotFound)?;
-    let image = image.delete(&st.db).await?;
+    let image = bank_question_image::delete(&st.db, image).await?;
     remove_blob(&st.files_path, image.get_file()).await;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -965,13 +946,13 @@ mod tests {
     async fn demoted_owner_loses_their_own_template() {
         let db = init_mem().await.unwrap();
         let owner = user("ogretmen", Role::Teacher, &db).await;
-        let question = BankQuestion::create(
+        let question = bank_question::create(
+            &db,
             owner.get_id().clone(),
             SubjectId::from_key("01TESTSUBJECTAAAAAAAAAAAAA"),
             QuestionText::try_new("2 + 2 = ?").unwrap(),
             QuestionPoints::try_new(1).unwrap(),
             QuestionSpec::try_new(QuestionKind::try_new("text").unwrap(), None, None, &[]).unwrap(),
-            &db,
         )
         .await
         .unwrap();
@@ -1012,19 +993,21 @@ mod tests {
 
         // The bank is teacher+ end to end, so a school-wide row is no way in
         // either.
-        let question = question
-            .update_if_unchanged(
-                None,
-                QuestionText::try_new("2 + 2 = ?").unwrap(),
-                QuestionPoints::try_new(1).unwrap(),
-                QuestionSpec::try_new(QuestionKind::try_new("text").unwrap(), None, None, &[])
-                    .unwrap(),
-                BankVisibility::try_new("school").unwrap(),
-                &db,
-            )
-            .await
-            .unwrap()
-            .expect("nothing raced this update");
+        let question = bank_question::update(
+            &db,
+            question.get_id(),
+            &bank_question::BankQuestionPatch {
+                subject: None,
+                text: None,
+                points: None,
+                kind: None,
+                choices: None,
+                correct: None,
+                visibility: Some(BankVisibility::try_new("school").unwrap()),
+            },
+        )
+        .await
+        .unwrap();
         let student = user("ogrenci", Role::Student, &db).await;
         assert!(!can_see(&question, &student));
         assert!(can_see(&question, &admin));
