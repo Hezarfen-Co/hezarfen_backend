@@ -13,7 +13,7 @@ use crate::domain::homework_file::HomeworkFile;
 use crate::domain::question_image::QuestionImage;
 use crate::domain::role::Role;
 use crate::domain::term::{self, TermId};
-use crate::domain::user::{User, UserId};
+use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 
 /// Refuse the write when this course's term is archived — a pre-flight guard,
@@ -90,7 +90,7 @@ pub async fn assign_teacher(
     target: &UserId,
 ) -> Result<Course, AppError> {
     require_open(db, course).await?;
-    let Some(target_user) = User::read(target, db).await? else {
+    let Some(target_user) = crate::db::user::read(db, target).await? else {
         return Err(AppError::Validation(ValidationError::Invalid {
             field: "user_id",
             reason: "target user does not exist",

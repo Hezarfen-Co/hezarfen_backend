@@ -147,13 +147,13 @@ impl EventAudience {
     /// are kept; the caller degrades their display like any stale reference.
     pub async fn members(&self, event: &EventId, db: &Database) -> Result<Vec<UserId>, AppError> {
         match self {
-            EventAudience::School => Ok(User::list_all(None, 0, db)
+            EventAudience::School => Ok(crate::db::user::list_all(db, None, 0)
                 .await?
                 .0
                 .iter()
                 .map(|user| user.get_id().clone())
                 .collect()),
-            EventAudience::Role { role } => Ok(User::list_by_role(*role, db)
+            EventAudience::Role { role } => Ok(crate::db::user::list_by_role(db, *role)
                 .await?
                 .iter()
                 .map(|user| user.get_id().clone())
@@ -359,7 +359,7 @@ mod tests {
     /// The forcing function behind the one rule with two spellings: the freeze
     /// this file decides in Rust ([`Event::registration_capacity`]) and
     /// [`crate::constant::REGISTRATION_FROZEN_GUARD`], its SurrealQL copy, which
-    /// the role cascade (`User::set_role`) carries because it frees a demoted
+    /// the role cascade (`service::user::set_role`) carries because it frees a demoted
     /// parent's seats inside a transaction and cannot call Rust from there.
     ///
     /// Every schedule shape is put to both, including the three the SQL is most

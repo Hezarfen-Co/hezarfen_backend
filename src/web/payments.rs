@@ -434,7 +434,7 @@ async fn assign_plan(
         let student = UserId::from_key(&student_id);
         // A fee record belongs to a student; billing anyone else is a typo, and
         // a typo here is money against the wrong person.
-        let is_student = User::read(&student, &st.db)
+        let is_student = crate::service::user::read(&st.db, &student)
             .await?
             .is_some_and(|user| user.get_role() == Role::Student);
         let (status, reason) = if is_student {
@@ -791,7 +791,7 @@ async fn ensure_can_read_payments(
     // existence oracle.
     if caller.get_role() == Role::Parent
         && ParentLink::exists(caller.get_id(), target, db).await?
-        && User::read(target, db)
+        && crate::service::user::read(db, target)
             .await?
             .is_some_and(|target| target.get_role() == Role::Student)
     {

@@ -98,7 +98,7 @@ pub(crate) async fn ensure_can_observe(
     // an existence oracle.
     if caller.get_role() == Role::Parent
         && ParentLink::exists(caller.get_id(), target, db).await?
-        && User::read(target, db)
+        && crate::service::user::read(db, target)
             .await?
             .is_some_and(|target| target.get_role() == Role::Student)
     {
@@ -131,7 +131,7 @@ pub(crate) async fn ensure_can_observe(
 /// A missing user counts as demoted. The ordinary path is one extra read and no
 /// write at all.
 pub(crate) async fn undo_if_demoted(target: &UserId, db: &Database) -> Result<(), AppError> {
-    if User::read(target, db)
+    if crate::service::user::read(db, target)
         .await?
         .is_some_and(|user| user.get_role().at_least(Role::Teacher))
     {
@@ -414,22 +414,21 @@ mod tests {
 
         let db = crate::database::init_mem().await.unwrap();
         let office = UserId::from_key("office");
-        let teacher = User::create(
+        let teacher = crate::service::user::create(
+            &db,
             Username::try_new("ada").unwrap(),
             Password::try_new("secret1")
                 .unwrap()
                 .hash_async()
                 .await
                 .unwrap(),
-            &db,
         )
         .await
-        .unwrap()
-        .set_role(Role::Teacher, &db)
-        .await
-        .unwrap()
-        .0;
-
+        .unwrap();
+        crate::service::user::set_role(&db, teacher.get_id(), Role::Teacher)
+            .await
+            .unwrap()
+            .0;
         let assigned = async |db: &Database| {
             let class = ClassGroup::create(
                 &office,

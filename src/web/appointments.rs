@@ -424,7 +424,7 @@ async fn list_slots(
             .filter(|teacher| seen.insert(teacher.key().to_string()))
             .cloned()
             .collect();
-        let people: HashMap<String, PersonRef> = User::list_by_ids(&teachers, &st.db)
+        let people: HashMap<String, PersonRef> = crate::service::user::list_by_ids(&st.db, &teachers)
             .await?
             .iter()
             .filter(|teacher| teacher.get_role().at_least(Role::Teacher))
@@ -558,7 +558,7 @@ async fn book(
         .ok_or(AppError::NotFound)?;
     // The slot row is not the grant: a teacher demoted since publishing keeps
     // their rows, and those rows must be inert. Their live role decides.
-    if !User::read(slot.get_teacher(), &st.db)
+    if !crate::service::user::read(&st.db, slot.get_teacher())
         .await?
         .is_some_and(|teacher| teacher.get_role().at_least(Role::Teacher))
     {
@@ -902,10 +902,10 @@ mod tests {
             .hash_async()
             .await
             .unwrap();
-        let user = User::create(Username::try_new(username).unwrap(), hash, db)
+        let user = crate::service::user::create(db, Username::try_new(username).unwrap(), hash)
             .await
             .unwrap();
-        user.set_role(role, db).await.unwrap().0
+        crate::service::user::set_role(db, user.get_id(), role).await.unwrap().0
     }
 
     /// All five `can_manage` sites are `RequireTeacher` today, so this is
@@ -927,7 +927,8 @@ mod tests {
         assert!(can_manage(&slot, &owner));
 
         for role in [Role::Student, Role::Parent] {
-            let demoted = owner.clone().set_role(role, &db).await.unwrap().0;
+            let demoted =
+                crate::service::user::set_role(&db, owner.get_id(), role).await.unwrap().0;
             assert!(
                 !can_manage(&slot, &demoted),
                 "{role:?} slot owner still decides its bookings"

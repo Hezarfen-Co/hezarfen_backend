@@ -50,7 +50,7 @@ where
         return Err(AppError::Unauthorized);
     }
 
-    User::read(session.user(), &db)
+    service::user::read(&db, session.user())
         .await?
         .ok_or(AppError::Unauthorized)
 }

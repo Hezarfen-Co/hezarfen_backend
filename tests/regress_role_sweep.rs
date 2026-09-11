@@ -29,7 +29,7 @@ use hezarfen_backend::domain::event::EventId;
 use hezarfen_backend::domain::registration::Registration;
 use hezarfen_backend::domain::role::Role;
 use hezarfen_backend::domain::timestamp::Timestamp;
-use hezarfen_backend::domain::user::{User, UserId};
+use hezarfen_backend::domain::user::UserId;
 use serde_json::json;
 
 /// How many rows `sql` selects ids for.
@@ -51,11 +51,11 @@ async fn counter(sql: &str, db: &Database) -> i64 {
 
 /// Demote through the real path — the sweeps ride the role write.
 async fn demote(user: &UserId, to: Role, db: &Database) {
-    User::read(user, db)
+    hezarfen_backend::db::user::read(db, user)
         .await
         .unwrap()
-        .expect("the account is there")
-        .set_role(to, db)
+        .expect("the account is there");
+    hezarfen_backend::service::user::set_role(db, user, to)
         .await
         .unwrap();
 }

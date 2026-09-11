@@ -1163,7 +1163,7 @@ async fn grade_homework(
     }
 
     // Target user must exist.
-    let Some(target_user) = User::read(&target, &st.db).await? else {
+    let Some(target_user) = crate::service::user::read(&st.db, &target).await? else {
         return Err(AppError::Validation(ValidationError::Invalid {
             field: "user",
             reason: "target user does not exist",
@@ -1480,7 +1480,7 @@ async fn homework_report(
     let target = UserId::from_key(&user);
     ensure_can_observe(&caller, &target, &st.db).await?;
     // User must exist — a missing user is a 404, not an empty report.
-    User::read(&target, &st.db)
+    crate::service::user::read(&st.db, &target)
         .await?
         .ok_or(AppError::NotFound)?;
     // Only an exactly-teacher caller is narrowed to their managed courses;

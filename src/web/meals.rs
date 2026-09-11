@@ -676,7 +676,7 @@ async fn update_profile(
     let target = UserId::from_key(&user);
     // Only a student eats off the school's menus; a profile on anyone else is
     // a typo, and a typo here is an allergy filed against the wrong person.
-    if User::read(&target, &st.db)
+    if crate::service::user::read(&st.db, &target)
         .await?
         .ok_or(AppError::NotFound)?
         .get_role()
@@ -803,7 +803,7 @@ async fn booking_target(
                 },
             ))?);
             if ParentLink::exists(caller.get_id(), &target, db).await?
-                && User::read(&target, db)
+                && crate::service::user::read(db, &target)
                     .await?
                     .is_some_and(|target| target.get_role() == Role::Student)
             {
@@ -1146,7 +1146,7 @@ async fn mark_attendance(
     let student = UserId::from_key(&req.student_id);
     // The target must exist; no booking is required, since a walk-in was still
     // served and the record is operationally true.
-    if User::read(&student, &st.db).await?.is_none() {
+    if crate::service::user::read(&st.db, &student).await?.is_none() {
         return Err(AppError::Validation(ValidationError::Invalid {
             field: "student_id",
             reason: "target user does not exist",
@@ -1350,10 +1350,9 @@ async fn ensure_can_read_money(
     // The link row alone is not the grant: a link whose student side changed
     // role must be inert, so the target's live role is re-read. A missing or
     // non-student target falls through to the same 403 — a parent never gets an
-    // existence oracle.
     if caller.get_role() == Role::Parent
         && ParentLink::exists(caller.get_id(), target, db).await?
-        && User::read(target, db)
+        && crate::service::user::read(db, target)
             .await?
             .is_some_and(|target| target.get_role() == Role::Student)
     {
@@ -1500,7 +1499,7 @@ async fn record_credit(
     // promoted to staff keeps what they owed), and the student rule alone made
     // that debt permanently unsettleable — there is no other route that
     // appends a credit. A typo'd staff id has no lines, so it still 400s.
-    if User::read(&student, &st.db)
+    if crate::service::user::read(&st.db, &student)
         .await?
         .ok_or(AppError::NotFound)?
         .get_role()

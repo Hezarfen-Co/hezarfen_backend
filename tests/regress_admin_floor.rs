@@ -13,7 +13,7 @@ use axum::http::StatusCode;
 use common::{app_and_db, login_as, me_id, send};
 use hezarfen_backend::database::Database;
 use hezarfen_backend::domain::role::Role;
-use hezarfen_backend::domain::user::{User, UserId};
+use hezarfen_backend::domain::user::UserId;
 use serde_json::json;
 use surrealdb::types::RecordId;
 
@@ -79,8 +79,8 @@ async fn set_role_refuses_the_last_admin() {
     let ada = login_as(&app, &db, "ada", "admin").await;
     let ada_id = UserId::from_key(&me_id(&app, &ada).await);
 
-    let user = User::read(&ada_id, &db).await.unwrap().unwrap();
-    let refused = user.set_role(Role::Student, &db).await;
+    hezarfen_backend::db::user::read(&db, &ada_id).await.unwrap().unwrap();
+    let refused = hezarfen_backend::service::user::set_role(&db, &ada_id, Role::Student).await;
     assert!(refused.is_err(), "the sole admin was demoted");
     assert_eq!(admin_count(&db).await, 1, "the admin row was still lowered");
 
@@ -97,8 +97,12 @@ async fn set_role_refuses_the_last_admin() {
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-    let ada_row = User::read(&ada_id, &db).await.unwrap().unwrap();
-    assert!(ada_row.set_role(Role::Student, &db).await.is_ok());
+    hezarfen_backend::db::user::read(&db, &ada_id).await.unwrap().unwrap();
+    assert!(
+        hezarfen_backend::service::user::set_role(&db, &ada_id, Role::Student)
+            .await
+            .is_ok()
+    );
     assert_eq!(admin_count(&db).await, 1);
 }
 

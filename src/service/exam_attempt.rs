@@ -85,7 +85,7 @@ pub fn ensure_student(user: &User) -> Result<(), AppError> {
 /// save — the room's door check is not the last word for a socket that
 /// outlives the role.
 pub async fn ensure_student_now(user: &UserId, db: &Database) -> Result<(), AppError> {
-    let user = crate::domain::user::User::read(user, db)
+    let user = crate::db::user::read(db, user)
         .await?
         .ok_or(AppError::Unauthorized)?;
     ensure_student(&user)
@@ -552,10 +552,10 @@ mod tests {
             .hash_async()
             .await
             .unwrap();
-        crate::domain::user::User::create(
+        crate::db::user::create(
+            db,
             crate::domain::user::Username::try_new("ogrenci").unwrap(),
             hash,
-            db,
         )
         .await
         .unwrap()

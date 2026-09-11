@@ -5234,7 +5234,7 @@ async fn admin_manages_roles_with_guards() {
 ///   * `src/web/users.rs:453` — `PATCH /users/{id}/role`, the *only* path that
 ///     writes `user.role` from a caller's string (`Role::try_from_str`).
 ///   * `src/web/auth.rs:114` — `POST /auth/register`, hardcoded `Role::Student`
-///     (`User::create` → `create_with_role`, `src/domain/user.rs:334`).
+///     (`service::user::create` → `create_with_role`, `src/db/user.rs`).
 ///   * `src/web/users.rs:231` — the user-search `?role=` filter (a read).
 ///   * `src/web/events.rs:89` — a role-audience event stores a role string of
 ///     its own on the event row.
@@ -6367,7 +6367,7 @@ async fn promotion_via_role_endpoint_sweeps_enrollments() {
     assert!(rows.is_empty(), "enrollment rows deleted from the DB");
 }
 
-/// Regression: `User::create` pre-checks the username and then inserts, so two
+/// Regression: `db::user::create` pre-checks the username and then inserts, so two
 /// concurrent registrations of the same name could both pass the check; the
 /// loser then hit the unique index and surfaced as a raw 500. A lost race must
 /// answer the same uniform 201 as the winner (the "taken" reply is deliberately
@@ -6865,7 +6865,9 @@ async fn admin_seed_creates_working_admin() {
     let (app, db) = app_and_db().await;
     let username = Username::try_new("root").unwrap();
     let password = Password::try_new("secret1").unwrap();
-    User::ensure_admin(username, password, &db).await.unwrap();
+    hezarfen_backend::service::user::ensure_admin(&db, username, password)
+        .await
+        .unwrap();
 
     let creds = json!({ "school": "demo", "username": "root", "password": "secret1" });
     let res = send(&app, "POST", "/auth/login", None, Some(creds)).await;
@@ -6885,7 +6887,9 @@ async fn admin_seed_is_idempotent() {
     for _ in 0..2 {
         let username = Username::try_new("root").unwrap();
         let password = Password::try_new("secret1").unwrap();
-        User::ensure_admin(username, password, &db).await.unwrap();
+        hezarfen_backend::service::user::ensure_admin(&db, username, password)
+            .await
+            .unwrap();
     }
 
     let cookie = {
@@ -6909,7 +6913,9 @@ async fn admin_seed_refuses_existing_non_admin() {
 
     let username = Username::try_new("squatter").unwrap();
     let password = Password::try_new("attacker-pw").unwrap();
-    User::ensure_admin(username, password, &db).await.unwrap();
+    hezarfen_backend::service::user::ensure_admin(&db, username, password)
+        .await
+        .unwrap();
 
     // Still a student: the admin-only listing stays closed...
     let res = send(&app, "GET", "/users", Some(&cookie), None).await;
