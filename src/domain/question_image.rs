@@ -16,7 +16,6 @@ use crate::constant::QUESTION_IMAGE_TABLE;
 use crate::database::Database;
 use crate::domain::course::CourseId;
 use crate::domain::exam::ExamId;
-use crate::domain::exam_attempt::ExamAttempt;
 use crate::domain::exam_question::{ChoiceId, ExamQuestionId};
 use crate::domain::key;
 use crate::domain::note_file::FileContentType;
@@ -127,7 +126,8 @@ impl QuestionImage {
     pub async fn upsert(self, db: &Database) -> Result<(QuestionImage, Option<String>), AppError> {
         // whole-row-save-ok: self is built in place, never read back, and the slot id is deterministic
         let (exam, id) = (self.exam.clone(), self.id.record());
-        let mut result = ExamAttempt::write_unfrozen(
+        let mut result = crate::db::exam_attempt::write_unfrozen(
+            db,
             &exam,
             "LET $replaced = (SELECT VALUE file FROM $id);
              LET $stored = (UPSERT $id CONTENT $image);
@@ -136,7 +136,6 @@ impl QuestionImage {
                 ("id".into(), id.into_value()),
                 ("image".into(), self.into_value()),
             ],
-            db,
         )
         .await?;
         // The trailing `RETURN` is the last statement before `COMMIT`, so its
@@ -235,15 +234,15 @@ impl QuestionImage {
     /// Refused once the exam has an attempt, in the same transaction — same
     /// gate, same reason as [`Self::upsert`].
     pub async fn delete(self, db: &Database) -> Result<QuestionImage, AppError> {
-        let mut result = ExamAttempt::write_unfrozen(
+        let mut result = crate::db::exam_attempt::write_unfrozen(
+            db,
             &self.exam,
             "DELETE $id RETURN BEFORE;",
             vec![("id".into(), self.id.record().into_value())],
-            db,
         )
         .await?;
         result
-            .take::<Vec<QuestionImage>>(ExamAttempt::FROZEN_SLOT)?
+            .take::<Vec<QuestionImage>>(crate::db::exam_attempt::FROZEN_SLOT)?
             .into_iter()
             .next()
             .ok_or(AppError::NotFound)

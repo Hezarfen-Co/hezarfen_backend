@@ -28,9 +28,9 @@ use common::{
     login_as, me_id, send, unenroll,
 };
 use hezarfen_backend::db::course;
+use hezarfen_backend::db::exam_attempt::list_for_exam;
 use hezarfen_backend::domain::course::CourseId;
 use hezarfen_backend::domain::exam::ExamId;
-use hezarfen_backend::domain::exam_attempt::ExamAttempt;
 use serde_json::json;
 
 /// Delete `course` the way the handler would, minus its `EXAM_LOCK` lease.
@@ -257,7 +257,7 @@ async fn an_attempt_started_inside_a_course_delete_never_outlives_it() {
     );
     // Stored state is the whole verdict; a response code is not evidence.
     assert_eq!(
-        ExamAttempt::list_for_exam(&ExamId::from_key(&exam), &db)
+        list_for_exam(&db, &ExamId::from_key(&exam))
             .await
             .unwrap()
             .len(),

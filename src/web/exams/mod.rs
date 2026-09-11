@@ -16,17 +16,14 @@ use crate::domain::answer_image::AnswerImage;
 use crate::domain::badge;
 use crate::domain::bank_question::{BankQuestion, BankQuestionId};
 use crate::domain::bank_question_image::BankQuestionImage;
-use crate::domain::course::Course;
 use crate::domain::enrollment::Enrollment;
 use crate::domain::exam::{
     Exam, ExamAttemptLimit, ExamDescription, ExamDuration, ExamId, ExamKind, ExamMode,
     ExamSchedule, ExamTitle,
 };
 use crate::domain::exam_answer::{ExamAnswer, auto_score};
-use crate::domain::exam_attempt::{AttemptStatus, ExamAttempt};
 use crate::domain::exam_question::{
-    Choice, ChoiceId, ExamQuestion, ExamQuestionId, QuestionKind, QuestionPoints, QuestionSpec,
-    QuestionText,
+    Choice, ChoiceId, ExamQuestion, QuestionKind, QuestionPoints, QuestionSpec, QuestionText,
 };
 use crate::domain::exam_result::{ExamResult, Mark};
 use crate::domain::note_file::FileContentType;
@@ -36,6 +33,7 @@ use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::service;
+use crate::service::exam_attempt::{EXAM_LOCK, any_for_exam, course_of, read_latest_for_user};
 use crate::state::AppState;
 
 use super::bank_questions::BankQuestionResponse;
@@ -70,35 +68,6 @@ impl Scheduled for Exam {
         self.get_id().key()
     }
 }
-
-/// Serializes the exam subsystem's cross-record check-then-writes, which
-/// `BEGIN…COMMIT` cannot (write skew) — the reasoning in [`crate::db::cap`].
-/// It orders requests, but only around what it wraps — every invariant that
-/// could be moved into the database itself has been, so a gap between a read
-/// and its write is decided by the store. What is left here needs a
-/// cross-record read and a write held together, which no single statement
-/// expresses:
-///
-/// Read side — the answer saves (REST and the exam room), from the
-/// writable-attempt gate through the upsert; the grade write (draft gate
-/// through the result upsert); and the exam PATCH, whose mode/re-draft gates
-/// count attempts and results. These stay concurrent with each other.
-///
-/// Write side — attempt starts alone (the max-attempts count and the retake's
-/// answer wipe). So a save can never land on a sheet a retake just wiped, and a
-/// mark can never land on an exam mid-flight into hiding.
-///
-/// Two rules have left this list. The question freeze gate rides inside each
-/// question/image write's own transaction
-/// ([`crate::domain::exam_attempt::ExamAttempt::write_unfrozen`]), and the exam PATCH
-/// no longer needs the writer lease because its save is a compare-and-set. The
-/// subject delete's cascade — the only writer outside attempt starts, paired
-/// with the question writes' subject check — is now a conditional statement on
-/// the subject's own reference counter
-/// ([`crate::domain::subject::Subject::delete`]), which every question create,
-/// re-tag and delete moves.
-// corner-cut: global RwLock, shard per-exam if save latency ever matters.
-pub(crate) static EXAM_LOCK: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
 
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
@@ -263,14 +232,6 @@ struct ExamStatisticsResponse {
     max: Option<i64>,
 }
 
-/// The course an exam belongs to. A dangling reference means the course-delete
-/// cascade was violated — surface it loudly as a 500, not a user-facing 404.
-pub(crate) async fn course_of(exam: &Exam, db: &Database) -> Result<Course, AppError> {
-    crate::service::course::read(db, exam.get_course())
-        .await?
-        .ok_or_else(|| AppError::Internal("exam references a missing course".into()))
-}
-
 // ---- exams --------------------------------------------------------------
 // Exams are created inside a course: `POST /courses/{id}/exams`.
 
@@ -433,7 +394,7 @@ async fn update_exam(
                 "only the course creator, an assigned teacher, or a manager/admin can edit this exam",
             ));
         }
-        crate::service::course::require_open(&st.db, &course).await?;
+        course.require_open(&st.db).await?;
 
         let title = match req.title {
             Some(ref title) => ExamTitle::try_new(title)?,
@@ -500,7 +461,7 @@ async fn update_exam(
         // land in the gap and leave a sat exam's mode flipped under it.
         let mode_changed =
             schedule.get_mode().map(ExamMode::as_str) != exam.get_mode().map(ExamMode::as_str);
-        if mode_changed && ExamAttempt::any_for_exam(exam.get_id(), &st.db).await? {
+        if mode_changed && any_for_exam(&st.db, exam.get_id()).await? {
             return Err(AppError::Conflict(
                 "cannot change the exam mode after attempts have started",
             ));
@@ -510,7 +471,7 @@ async fn update_exam(
         // transaction re-makes this check and answers with the same error, so a
         // grade landing after this read still cannot leave a mark on a draft.
         if draft && !exam.is_draft() {
-            let sat = ExamAttempt::any_for_exam(exam.get_id(), &st.db).await?;
+            let sat = any_for_exam(&st.db, exam.get_id()).await?;
             let graded = !ExamResult::list_for_exam(exam.get_id(), &st.db)
                 .await?
                 .is_empty();
@@ -591,7 +552,7 @@ async fn delete_exam(
             "only the course creator, an assigned teacher, or a manager/admin can delete this exam",
         ));
     }
-    crate::service::course::require_open(&st.db, &course).await?;
+    course.require_open(&st.db).await?;
     // *Writer* lease of [`EXAM_LOCK`] across the whole cascade, blob names
     // included — the lease `delete_homework` has always held, and its absence
     // here is what made a sitting able to start inside this delete. Every other
@@ -676,7 +637,7 @@ async fn grade(
             "only the course creator, an assigned teacher, or a manager/admin can grade this exam",
         ));
     }
-    crate::service::course::require_open(&st.db, &course).await?;
+    course.require_open(&st.db).await?;
     // Pre-flight: `ExamResult::grade` re-makes this check inside the mark's own
     // transaction, so a re-draft landing after this read cannot leave a mark on
     // a hidden exam.
@@ -740,7 +701,7 @@ async fn grade(
     // The mark lands on the student's current sitting; the latest seq is the
     // grade-of-record. An offline-graded exam has no sitting — grade its base
     // seq (1).
-    let seq = ExamAttempt::read_latest_for_user(&exam_id, &target, &st.db)
+    let seq = read_latest_for_user(&st.db, &exam_id, &target)
         .await?
         .map_or(1, |a| a.get_seq());
     let result = ExamResult::grade(
@@ -883,7 +844,7 @@ async fn remove_result(
             "only the course creator, an assigned teacher, or a manager/admin can remove results",
         ));
     }
-    crate::service::course::require_open(&st.db, &course).await?;
+    course.require_open(&st.db).await?;
     let removed = ExamResult::remove(
         exam.get_id(),
         &UserId::from_key(&target),

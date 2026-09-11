@@ -15,6 +15,7 @@ use hezarfen_backend::constant::{
     BANK_VISIBILITY_SCHOOL, MAX_BOARD_STROKES, MAX_BOARDS_PER_CREATOR, MAX_COURSE_NOTE_FILES,
     MAX_EPOCH_STROKES, MAX_FEE_PLAN_ASSIGN_STUDENTS,
 };
+use hezarfen_backend::db::exam_attempt::any_for_exam;
 use hezarfen_backend::db::session;
 use hezarfen_backend::domain::board::{Board, BoardId};
 use hezarfen_backend::domain::board_stroke::{BoardStroke, BoardStrokeId};
@@ -24,7 +25,6 @@ use hezarfen_backend::domain::course::CourseId;
 use hezarfen_backend::domain::course_note::CourseNoteId;
 use hezarfen_backend::domain::course_note_file::CourseNoteFileId;
 use hezarfen_backend::domain::exam::ExamId;
-use hezarfen_backend::domain::exam_attempt::ExamAttempt;
 use hezarfen_backend::domain::rag_output::RagOutput;
 use hezarfen_backend::domain::timestamp::Timestamp;
 use hezarfen_backend::domain::user::{Password, User, UserId, Username};
@@ -7887,11 +7887,7 @@ async fn attempts_cascade_with_exam_and_course_deletion() {
     )
     .await;
     assert_eq!(res.status, StatusCode::CREATED);
-    assert!(
-        ExamAttempt::any_for_exam(&ExamId::from_key(&exam), &db)
-            .await
-            .unwrap()
-    );
+    assert!(any_for_exam(&db, &ExamId::from_key(&exam)).await.unwrap());
     let res = send(
         &app,
         "DELETE",
@@ -7901,11 +7897,7 @@ async fn attempts_cascade_with_exam_and_course_deletion() {
     )
     .await;
     assert_eq!(res.status, StatusCode::NO_CONTENT);
-    assert!(
-        !ExamAttempt::any_for_exam(&ExamId::from_key(&exam), &db)
-            .await
-            .unwrap()
-    );
+    assert!(!any_for_exam(&db, &ExamId::from_key(&exam)).await.unwrap());
 
     // Deleting the whole course cascades through its exams' attempts too.
     let exam = scheduled_exam(&app, &teacher, &course, schedule).await;
@@ -7928,11 +7920,7 @@ async fn attempts_cascade_with_exam_and_course_deletion() {
     )
     .await;
     assert_eq!(res.status, StatusCode::NO_CONTENT);
-    assert!(
-        !ExamAttempt::any_for_exam(&ExamId::from_key(&exam), &db)
-            .await
-            .unwrap()
-    );
+    assert!(!any_for_exam(&db, &ExamId::from_key(&exam)).await.unwrap());
 }
 
 /// An `open` exam is sittable anytime — no window, no deadline — and

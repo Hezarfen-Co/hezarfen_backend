@@ -46,7 +46,7 @@ use super::{
 
 /// Serializes the homework subsystem's cross-record check-then-writes, which
 /// `BEGIN…COMMIT` cannot (write skew) — the same reasoning as
-/// [`crate::web::exams::EXAM_LOCK`]. Every lease below is held across the
+/// [`crate::service::exam_attempt::EXAM_LOCK`]. Every lease below is held across the
 /// database write it guards, so within this one process it does order a full
 /// round trip — but the freeze no longer *rests* on that: a graded submission
 /// used to stay unedited only because the "no grade yet" read and the write it
@@ -476,7 +476,7 @@ async fn delete_homework(
 }
 
 /// A 403 unless `user` is enrolled in `course` — the homework twin of the exam
-/// sitting wall ([`super::exams::ensure_enrolled`], which is `Exam`-shaped).
+/// sitting wall ([`crate::service::exam_attempt::ensure_enrolled`], which is `Exam`-shaped).
 /// Submitting is course content, so leaving the course closes it; re-checked on
 /// every submission and file write, so an unenrollment mid-task bites the next.
 async fn ensure_enrolled(course: &CourseId, user: &UserId, db: &Database) -> Result<(), AppError> {
@@ -495,7 +495,7 @@ async fn ensure_enrolled(course: &CourseId, user: &UserId, db: &Database) -> Res
 /// 1. Exact `Student` on the *live* role. Teachers assign homework, they never
 ///    hand it in; the `RequireStudent` extractor's ≥Student would wave a
 ///    promoted teacher through, so this checks the role `CurrentUser` read for
-///    this very request — the same reasoning as [`super::exams::ensure_student`].
+///    this very request — the same reasoning as [`crate::service::exam_attempt::ensure_student`].
 /// 2. Current enrollment in the course.
 /// 3. The audience check: a student a subset homework does not name gets a 404,
 ///    never a 403, so a subset assignment never leaks to those left out (the

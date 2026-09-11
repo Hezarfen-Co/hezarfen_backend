@@ -1,5 +1,8 @@
 use super::*;
 
+use crate::domain::exam_attempt::{AttemptStatus, ExamAttempt};
+use crate::service::exam_attempt;
+
 // ---- attempts -------------------------------------------------------------
 // A sittable exam (sync, async, or open mode) is *sat*: starting an attempt
 // is the live-attendance signal, finishing is the submission. The exam's
@@ -109,33 +112,6 @@ pub(crate) async fn attempt_progress(
     Ok((answered, question_count))
 }
 
-/// Rejects sitting an exam that can't be sat. A draft is a `404`, not a
-/// `409` — sitting is a student act, drafts are invisible to students, and a
-/// state-specific error would leak the existence this feature hides. A
-/// modeless (offline-graded) exam is a `409`: visible, just nothing to sit.
-/// Enrollment and window checks for the caller are the caller's own state —
-/// also `Conflict`, not validation.
-pub(crate) fn ensure_sittable(exam: &Exam) -> Result<(), AppError> {
-    if exam.is_draft() {
-        return Err(AppError::NotFound);
-    }
-    if exam.get_mode().is_none() {
-        return Err(AppError::Conflict(
-            "this exam is not scheduled — there is nothing to sit (give it a mode: sync, async, or open)",
-        ));
-    }
-    Ok(())
-}
-
-/// How many sittings the caller has used at this exam.
-pub(crate) async fn attempts_used(
-    exam: &ExamId,
-    user: &UserId,
-    db: &Database,
-) -> Result<u64, AppError> {
-    Ok(ExamAttempt::list_for_user(exam, user, db).await?.len() as u64)
-}
-
 /// Start, resume, or retake the caller's attempt. Requires the student role
 /// (staff run exams, they don't sit them), enrollment in the exam's course, a
 /// sittable exam (`sync`/`async`/`open` mode), and — when a window exists — the
@@ -164,47 +140,14 @@ pub(crate) async fn start_attempt(
     CurrentUser(user): CurrentUser,
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<AttemptResponse>), AppError> {
-    // Writer lease of [`EXAM_LOCK`] from the exam read through the start: the
-    // sittable/window gates must be judged against the same exam row the
-    // attempt lands under (the mirror of `update_exam`'s re-derive — without
-    // it, a mode change or re-draft at legally-zero attempts could slip
-    // between this gate and the insert, leaving an attempt on an unsittable
-    // exam). The lease
-    // also keeps the max-attempts count and the retake's wipe-and-create
-    // from interleaving with an in-flight answer save (a reader). Dropped
-    // before the response reads — they only describe the row.
-    let guard = EXAM_LOCK.write().await;
-    let exam = Exam::read(&ExamId::from_key(&id), &st.db)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    ensure_sittable(&exam)?;
-    ensure_student(&user)?;
-    ensure_enrolled(&exam, user.get_id(), &st.db).await?;
-    crate::service::course::require_open(&st.db, &course_of(&exam, &st.db).await?).await?;
-    let now = Timestamp::now();
-    if let Some(starts_at) = exam.get_starts_at()
-        && now < starts_at
-    {
-        return Err(AppError::Conflict("the exam has not started yet"));
-    }
-    if let Some(ends_at) = exam.get_ends_at()
-        && now >= ends_at
-    {
-        return Err(AppError::Conflict("the exam has already ended"));
-    }
-
-    // A retake no longer wipes the prior sitting — each attempt's answers,
-    // drawings, and marks stay put at their own seq (per-attempt history), so
-    // there are no orphaned blobs to GC here. The exam-delete cascade still
-    // cleans every sitting's blobs.
-    let (attempt, created) = ExamAttempt::start(&exam, user.get_id(), &st.db).await?;
-    drop(guard);
+    let (exam, attempt, created) =
+        exam_attempt::start_attempt(&st.db, &ExamId::from_key(&id), &user).await?;
     let mark = ExamResult::read_for_user(exam.get_id(), user.get_id(), &st.db)
         .await?
         .map(|r| r.get_mark());
     let (answered, question_count) =
         attempt_progress(exam.get_id(), user.get_id(), attempt.get_seq(), &st.db).await?;
-    let used = attempts_used(exam.get_id(), user.get_id(), &st.db).await?;
+    let used = exam_attempt::attempts_used(&st.db, exam.get_id(), user.get_id()).await?;
     let people = PersonRef::map_of(&[&user]);
     let status = if created {
         StatusCode::CREATED
@@ -249,7 +192,7 @@ pub(crate) async fn my_attempt(
     let exam = Exam::read(&ExamId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    let attempt = ExamAttempt::read_latest_for_user(exam.get_id(), user.get_id(), &st.db)
+    let attempt = exam_attempt::read_latest_for_user(&st.db, exam.get_id(), user.get_id())
         .await?
         .ok_or(AppError::NotFound)?;
     let mark = ExamResult::read_for_user(exam.get_id(), user.get_id(), &st.db)
@@ -257,7 +200,7 @@ pub(crate) async fn my_attempt(
         .map(|r| r.get_mark());
     let (answered, question_count) =
         attempt_progress(exam.get_id(), user.get_id(), attempt.get_seq(), &st.db).await?;
-    let used = attempts_used(exam.get_id(), user.get_id(), &st.db).await?;
+    let used = exam_attempt::attempts_used(&st.db, exam.get_id(), user.get_id()).await?;
     let people = PersonRef::map_of(&[&user]);
     Ok(Json(AttemptResponse::new(
         &attempt,
@@ -295,29 +238,13 @@ pub(crate) async fn finish_attempt(
     let exam = Exam::read(&ExamId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    let attempt = ExamAttempt::read_latest_for_user(exam.get_id(), user.get_id(), &st.db)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    if attempt.get_finished_at().is_some() {
-        return Err(AppError::Conflict("the attempt is already submitted"));
-    }
-    let now = Timestamp::now();
-    if let Some(deadline) = attempt.deadline(&exam)
-        && now >= deadline
-    {
-        return Err(AppError::Conflict("time is up — the attempt has expired"));
-    }
-    crate::service::course::require_open(&st.db, &course_of(&exam, &st.db).await?).await?;
-
-    // Deliberately no rejoin check: a student locked out of the room may
-    // still submit what they saved — finishing answers nothing new.
-    let finished = attempt.finish(&st.db).await?;
+    let finished = exam_attempt::finish_attempt(&st.db, &exam, user.get_id()).await?;
     let mark = ExamResult::read_for_user(exam.get_id(), user.get_id(), &st.db)
         .await?
         .map(|r| r.get_mark());
     let (answered, question_count) =
         attempt_progress(exam.get_id(), user.get_id(), finished.get_seq(), &st.db).await?;
-    let used = attempts_used(exam.get_id(), user.get_id(), &st.db).await?;
+    let used = exam_attempt::attempts_used(&st.db, exam.get_id(), user.get_id()).await?;
     let people = PersonRef::map_of(&[&user]);
     Ok(Json(AttemptResponse::new(
         &finished,
@@ -405,7 +332,7 @@ pub(crate) async fn live_snapshot(
     // many they've used.
     let mut attempts: HashMap<String, ExamAttempt> = HashMap::new();
     let mut used: HashMap<String, u64> = HashMap::new();
-    for attempt in ExamAttempt::list_for_exam(exam.get_id(), db).await? {
+    for attempt in exam_attempt::list_for_exam(db, exam.get_id()).await? {
         let key = attempt.get_user().key().to_string();
         *used.entry(key.clone()).or_insert(0) += 1;
         match attempts.entry(key) {
@@ -533,7 +460,7 @@ pub(crate) async fn exam_live(
     let exam = Exam::read(&ExamId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    let course = course_of(&exam, &st.db).await?;
+    let course = exam_attempt::course_of(&exam, &st.db).await?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
             "only the course creator, an assigned teacher, or a manager/admin can monitor this exam",
@@ -619,144 +546,6 @@ pub(crate) struct AnswerSavedResponse {
     updated_at: i64,
 }
 
-/// The caller's latest attempt provided it is still writable, or the error
-/// that says why not: no attempt yet (404 — start it first), already
-/// submitted (409), deadline passed (409). One gate shared by REST saves and
-/// the WebSocket room.
-pub(crate) async fn writable_attempt(
-    exam: &Exam,
-    user: &UserId,
-    db: &Database,
-) -> Result<ExamAttempt, AppError> {
-    let attempt = ExamAttempt::read_latest_for_user(exam.get_id(), user, db)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    match attempt.status(exam, Timestamp::now()) {
-        AttemptStatus::Submitted => Err(AppError::Conflict("the attempt is already submitted")),
-        AttemptStatus::Expired => Err(AppError::Conflict("time is up — the attempt has expired")),
-        AttemptStatus::InProgress => Ok(attempt),
-    }
-}
-
-/// A 409 when the student has walked out of the exam room and the exam's
-/// rejoin door is closed: no more answering (from anywhere) until the teacher
-/// flips `allow_rejoin` back on. Finishing is deliberately exempt — see
-/// `finish_attempt`.
-pub(crate) fn check_rejoin(exam: &Exam, attempt: &ExamAttempt) -> Result<(), AppError> {
-    if attempt.get_left_at().is_some() && !exam.get_allow_rejoin() {
-        return Err(AppError::Conflict(
-            "you left the exam and rejoin is closed — ask your teacher to reopen it",
-        ));
-    }
-    Ok(())
-}
-
-/// Save one answer inside the caller's in-progress attempt — the whole write
-/// path (attempt gate, rejoin gate, question lookup, kind check, upsert). The
-/// REST handler saves into the latest sitting via this; the WebSocket room
-/// resolves its own sitting first and shares [`save_answer_in`], so the two
-/// can never drift.
-pub(crate) async fn save_answer_checked(
-    exam: &Exam,
-    user: &UserId,
-    question_id: &str,
-    selected: Option<String>,
-    text: Option<String>,
-    db: &Database,
-) -> Result<ExamAnswer, AppError> {
-    // Reader lease of [`EXAM_LOCK`]: the writable gate and the upsert are
-    // one unit, or a retake's wipe-and-create (a writer) slips in between
-    // and this stale save lands on the fresh blank sheet.
-    //
-    // The lease covers the gate *and* the upsert here, so a retake cannot
-    // interleave with this path at all. The accepted late-save race lives in
-    // the exam-room socket instead, which writes into the sitting it joined
-    // with — a value chosen before any lease is taken. See
-    // [`crate::web::exam_ws`].
-    let _guard = EXAM_LOCK.read().await;
-    let attempt = writable_attempt(exam, user, db).await?;
-    save_answer_in(exam, &attempt, question_id, selected, text, db).await
-}
-
-/// The tail of the answer write path, given the sitting to write in: the
-/// student wall and the enrollment wall (a promotion out of `student` or an
-/// unenrollment closes the sheet, mid-exam included), the rejoin gate, the
-/// archived-term gate, the question lookup, and the upsert.
-///
-/// The archived-term refusal sits here because this is the single funnel every
-/// answer write passes: REST `POST /exams/{id}/attempt/answers` (via
-/// [`save_answer_checked`]) *and* every `answer` frame of the exam-room
-/// WebSocket ([`crate::web::exam_ws`]). The answer-image writes are the only
-/// answer-side writes outside it, and carry their own guard.
-pub(crate) async fn save_answer_in(
-    exam: &Exam,
-    attempt: &ExamAttempt,
-    question_id: &str,
-    selected: Option<String>,
-    text: Option<String>,
-    db: &Database,
-) -> Result<ExamAnswer, AppError> {
-    ensure_student_now(attempt.get_user(), db).await?;
-    ensure_enrolled(exam, attempt.get_user(), db).await?;
-    check_rejoin(exam, attempt)?;
-    crate::service::course::require_open(db, &course_of(exam, db).await?).await?;
-    let question = question_of_exam(exam.get_id(), question_id, db).await?;
-    ExamAnswer::save(
-        &question,
-        attempt.get_user(),
-        attempt.get_seq(),
-        selected,
-        text,
-        db,
-    )
-    .await
-}
-
-/// A 403 unless `user` is a student. Sitting an exam is a student action —
-/// teachers and above run exams, they never take them — so the sit paths
-/// (start, room, save) enforce it on the *current* role. Checking the live
-/// role, not just enrollment, closes the gap a mid-exam promotion would open
-/// and neutralizes any stale non-student enrollment. Reading one's own attempt
-/// and finishing stay ungated: a non-student has no attempt to read, and
-/// finishing only submits work already saved.
-pub(crate) fn ensure_student(user: &User) -> Result<(), AppError> {
-    if user.get_role() != Role::Student {
-        return Err(AppError::Forbidden("only students can sit exams"));
-    }
-    Ok(())
-}
-
-/// The answer path's live edition of [`ensure_student`]: re-read the row and
-/// judge the *current* role, exactly like the enrollment wall beside it. Both
-/// save paths run through here (REST per request, the exam room per message),
-/// so a promotion out of `student` mid-exam closes the sheet on the very next
-/// save — the room's door check is not the last word for a socket that
-/// outlives the role.
-pub(crate) async fn ensure_student_now(user: &UserId, db: &Database) -> Result<(), AppError> {
-    let user = User::read(user, db).await?.ok_or(AppError::Unauthorized)?;
-    ensure_student(&user)
-}
-
-/// A 403 unless `user` is enrolled in the exam's course — the same wall the
-/// exam room checks at its door, re-applied to the sitting's content paths so
-/// an unenrollment mid-exam cuts them too. Finishing stays exempt: like the
-/// rejoin lock, submitting what's already saved writes nothing new.
-pub(crate) async fn ensure_enrolled(
-    exam: &Exam,
-    user: &UserId,
-    db: &Database,
-) -> Result<(), AppError> {
-    if Enrollment::read_for_user(exam.get_course(), user, db)
-        .await?
-        .is_none()
-    {
-        return Err(AppError::Forbidden(
-            "you are not enrolled in this exam's course",
-        ));
-    }
-    Ok(())
-}
-
 /// The exam's questions as the sitting student sees them: `correct` stripped,
 /// their own saved answers embedded — the latest sitting's, since a retake
 /// starts from a blank sheet. Requires enrollment in the exam's course (the
@@ -785,11 +574,11 @@ pub(crate) async fn attempt_questions(
     let exam = Exam::read(&ExamId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    ensure_enrolled(&exam, user.get_id(), &st.db).await?;
+    exam_attempt::ensure_enrolled(&exam, user.get_id(), &st.db).await?;
     // The question list is for sitting students; without an attempt there is
     // nothing to sit behind — and no early peek at the questions. The embedded
     // answers are the *current* sitting's only, so the seq scopes the reads.
-    let seq = ExamAttempt::read_latest_for_user(exam.get_id(), user.get_id(), &st.db)
+    let seq = exam_attempt::read_latest_for_user(&st.db, exam.get_id(), user.get_id())
         .await?
         .ok_or(AppError::NotFound)?
         .get_seq();
@@ -844,7 +633,7 @@ pub(crate) async fn attempt_questions(
 /// promotion out of `student`) mid-exam closes the sheet. Rejected once the
 /// attempt is submitted or its deadline has passed —
 /// the server clock, not the client's, is the judge — and rejected while the
-/// student has left the exam room with the exam's rejoin door closed.
+/// student has left the exam room with the rejoin door closed.
 #[utoipa::path(
     post,
     path = "/{id}/attempt/answers",
@@ -871,14 +660,13 @@ pub(crate) async fn save_answer(
     let exam = Exam::read(&ExamId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    ensure_student(&user)?;
-    let answer = save_answer_checked(
+    let answer = exam_attempt::save_answer_checked(
+        &st.db,
         &exam,
-        user.get_id(),
+        &user,
         &req.question_id,
         req.selected,
         req.text,
-        &st.db,
     )
     .await?;
     Ok(Json(AnswerSavedResponse {
@@ -920,7 +708,7 @@ pub(crate) async fn attempt_answers(
     let exam = Exam::read(&ExamId::from_key(&id), &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
-    let course = course_of(&exam, &st.db).await?;
+    let course = exam_attempt::course_of(&exam, &st.db).await?;
     if !can_manage_course(&course, &user) {
         return Err(AppError::Forbidden(
             "only the course creator, an assigned teacher, or a manager/admin can read answer sheets",
@@ -930,7 +718,7 @@ pub(crate) async fn attempt_answers(
     // No attempt means no answer sheet — a 404, not an empty one. This grading
     // view shows the *latest* sitting; prior sittings live under the
     // per-attempt history endpoints.
-    let seq = ExamAttempt::read_latest_for_user(exam.get_id(), &target, &st.db)
+    let seq = exam_attempt::read_latest_for_user(&st.db, exam.get_id(), &target)
         .await?
         .ok_or(AppError::NotFound)?
         .get_seq();
