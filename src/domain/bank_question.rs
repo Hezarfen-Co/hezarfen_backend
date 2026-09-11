@@ -115,7 +115,7 @@ impl BankQuestionId {
 /// subject when a template is copied into an exam, not here.
 ///
 /// `subject` is optional because it is *only* metadata: deleting a subject
-/// clears it school-wide (see [`crate::domain::subject::Subject::delete`])
+/// clears it school-wide (see [`crate::db::subject::delete`])
 /// rather than being blocked by the bank. Blocking would have been a dead end
 /// — the bank is owner-or-admin editable, so a manager could not resolve their
 /// own 409 — and an existence oracle, since another teacher's *private*
@@ -837,11 +837,11 @@ mod tests {
         let other_exam = crate::db::exam::published_exam(&db).await.get_id().clone();
         // A real subject row: an exam question claims a reference on its
         // subject, so a minted id it never wrote would be refused.
-        let subject = crate::domain::subject::Subject::create(
+        let subject = crate::db::subject::create(
+            &db,
             &crate::db::course::a_test_course(&db).await,
             crate::domain::subject::SubjectName::try_new("topic").unwrap(),
             crate::domain::subject::SubjectDescription::try_new("").unwrap(),
-            &db,
         )
         .await
         .unwrap();

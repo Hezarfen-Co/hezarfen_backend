@@ -27,10 +27,10 @@ use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse, ValidationError};
 use crate::service::class_blueprint;
 use crate::service::parent_link::ensure_can_observe;
+use crate::service::term;
 use crate::state::AppState;
 
 use super::courses::can_manage_course;
-use super::terms::resolve_term;
 use super::{
     CurrentUser, Page, PageParams, PersonRef, RequireManager, RequireTeacher, person_map,
     set_or_clear, undo_if_demoted,
@@ -355,7 +355,7 @@ async fn create_class(
     // Pre-flight only: `ClassGroup::create` claims a reference on the term
     // before it writes the link, and a term deleted in between fails that claim
     // with this very error — so an unknown id reads the same whichever side wins.
-    let term = resolve_term(req.term_id.as_deref(), &st.db).await?;
+    let term = term::resolve(&st.db, req.term_id.as_deref()).await?;
     let teacher = teacher_or_none(req.teacher_id.as_deref(), &st.db).await?;
     let class = ClassGroup::create(
         user.get_id(),
@@ -554,7 +554,7 @@ async fn update_class(
 ) -> Result<Json<ClassResponse>, AppError> {
     let class = class_or_404(&id, &st.db).await?;
     // The class's *current* term, so a move off an archived year is refused
-    // too; `resolve_term` below holds the other end (the term moved onto).
+    // too; `term::resolve` below holds the other end (the term moved onto).
     class.require_open(&st.db).await?;
 
     // Only what the request actually carried is validated and written — an
@@ -567,7 +567,7 @@ async fn update_class(
     };
     let term = match req.term_id {
         // Explicit `null` clears the link; a value must name a real term.
-        Some(ref update) => Some(resolve_term(update.as_deref(), &st.db).await?),
+        Some(ref update) => Some(term::resolve(&st.db, update.as_deref()).await?),
         None => None,
     };
     let teacher = match req.teacher_id {

@@ -23,5 +23,7 @@ pub mod profile;
 pub mod registration;
 pub mod session;
 pub mod settings;
+pub mod subject;
+pub mod term;
 pub mod user;
 pub mod work_entry;

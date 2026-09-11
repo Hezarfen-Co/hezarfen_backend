@@ -38,7 +38,6 @@ use crate::state::AppState;
 
 use super::courses::{can_manage_course, can_view_course, visible_courses};
 use super::notes::content_disposition;
-use super::subjects::subject_in_course;
 use super::{
     CurrentUser, HomeworkResponse, Page, PageParams, RequireTeacher, UploadFileForm, blob_path,
     check_not_past, paginate, read_upload, remove_blob, set_or_clear,
@@ -73,7 +72,7 @@ use super::{
 ///
 /// The subject rule has left: creating a homework and re-tagging one move the
 /// subject's reference counter, and the subject delete is refused while that
-/// counter is non-zero ([`crate::domain::subject::Subject::delete`]), so
+/// counter is non-zero ([`crate::db::subject::delete`]), so
 /// neither the create ([`super::courses`]) nor the outside writer the subject
 /// delete used to take is on this list any more.
 ///
@@ -372,7 +371,9 @@ async fn update_homework(
     // A kept (absent) due date may already be past; a newly set one may not be.
     check_not_past("due_at", due_at)?;
     let subject = match req.subject_id {
-        Some(ref subject_id) => Some(subject_in_course(subject_id, course.get_id(), &st.db).await?),
+        Some(ref subject_id) => {
+            Some(service::subject::in_course(&st.db, subject_id, course.get_id()).await?)
+        }
         None => None,
     };
     // The orphan guard runs on exactly the requests that re-scope the audience.

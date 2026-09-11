@@ -421,11 +421,11 @@ mod tests {
     use crate::domain::subject::{Subject, SubjectDescription, SubjectName};
 
     async fn a_subject(name: &str, db: &Database) -> Subject {
-        Subject::create(
+        crate::db::subject::create(
+            db,
             &crate::db::course::a_test_course(db).await,
             SubjectName::try_new(name).unwrap(),
             SubjectDescription::try_new("").unwrap(),
-            db,
         )
         .await
         .unwrap()
@@ -480,7 +480,7 @@ mod tests {
         let db = crate::database::init_mem().await.unwrap();
         let subject = a_subject("algebra", &db).await;
         let id = subject.get_id().clone();
-        subject.delete(&db).await.unwrap();
+        crate::db::subject::delete(&db, subject).await.unwrap();
 
         let error = Homework::create(
             &CourseId::from_key("course"),
@@ -528,9 +528,12 @@ mod tests {
             "the old subject is free"
         );
         assert_eq!(count_on(to.get_id(), &db).await, 1, "the new one is not");
-        assert!(from.delete(&db).await.is_ok(), "no reference left");
         assert!(
-            to.delete(&db).await.is_err(),
+            crate::db::subject::delete(&db, from).await.is_ok(),
+            "no reference left"
+        );
+        assert!(
+            crate::db::subject::delete(&db, to).await.is_err(),
             "the reference moved here refuses the delete"
         );
     }
@@ -544,7 +547,7 @@ mod tests {
         let from = a_subject("algebra", &db).await;
         let dead = a_subject("geometry", &db).await;
         let gone = dead.get_id().clone();
-        dead.delete(&db).await.unwrap();
+        crate::db::subject::delete(&db, dead).await.unwrap();
         let homework = homework_on(from.get_id(), &db).await;
 
         let error = homework

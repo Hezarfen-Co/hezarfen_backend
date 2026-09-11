@@ -47,7 +47,7 @@ async fn drop_course(db: &hezarfen_backend::database::Database, course: &str) {
 
 /// A bank template outlives the course it was saved out of — it is a separate,
 /// school-wide library — so the cascade owes it the same cleanup its children's
-/// own deletes perform: `Exam::delete` clears `source_exam`, `Subject::delete`
+/// own deletes perform: `Exam::delete` clears `source_exam`, `db::subject::delete`
 /// clears `subject`. The course cascade deleted both rows and neither link,
 /// leaving a template pointing at two ids that no longer exist — the
 /// `source_exam` one forever (nothing else ever visits that column) and the
