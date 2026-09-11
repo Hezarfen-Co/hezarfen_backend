@@ -395,8 +395,7 @@ mod tests {
         .unwrap();
         crate::service::user::set_role(&db, teacher.get_id(), Role::Teacher)
             .await
-            .unwrap()
-            .0;
+            .unwrap();
         let assigned = async |db: &Database| {
             let class = crate::service::class_group::create(
                 db,

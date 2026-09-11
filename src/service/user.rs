@@ -171,6 +171,10 @@ pub async fn find_by_username(db: &Database, username: &str) -> Result<Option<Us
 }
 
 /// Persist the personal-info/profile fields a PATCH carried.
+// One argument per nullable column is the point: folding them into a struct
+// would just re-spell the HTTP DTO here and cost the compiler's check that
+// every column was considered at the call site.
+#[allow(clippy::too_many_arguments)]
 pub async fn set_profile(
     db: &Database,
     id: &UserId,
