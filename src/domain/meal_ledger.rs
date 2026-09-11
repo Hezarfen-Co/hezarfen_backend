@@ -370,7 +370,8 @@ impl MealLedger {
     /// The price comes off the *booking row*, never off the menu as it stands
     /// now: a seat taken while the menu was free carries `None` forever, so
     /// "was free" is a recorded fact and a later dish never bills a seat
-    /// retroactively. Called from [`MealBooking::book`] alone, right after the seat
+    /// retroactively. Called from
+    /// [`book`](crate::service::meal_booking::book) alone, right after the seat
     /// was claimed, so the seat and its money move together.
     ///
     /// Replaying it is free: the id is `(booking, attempt)`, so a duplicate
@@ -389,7 +390,7 @@ impl MealLedger {
     }
 
     /// The charge `booking`'s current attempt owes — the line
-    /// [`MealBooking::claim_and_place`] appends inside the very transaction that
+    /// [`claim_and_place`](crate::db::meal_booking::claim_and_place) appends inside the very transaction that
     /// takes the seat. `None` when the menu was free, which owes no line.
     ///
     /// Only the row is built here; whether it is already there is a read, and
@@ -423,9 +424,10 @@ impl MealLedger {
     ///
     /// Keyed by `(booking, attempt)` like the charge, so a retried cancel
     /// refunds once. The line normally lands *inside* the flip's own
-    /// transaction ([`MealBooking::release_seat`]); this path is what heals a
+    /// transaction
+    /// ([`release_seat`](crate::db::meal_booking::release_seat)); this path is what heals a
     /// seat flipped before that was true, and it is why
-    /// [`MealBooking::cancel`] replays it on an already-cancelled row instead
+    /// [`cancel`](crate::service::meal_booking::cancel) replays it on an already-cancelled row instead
     /// of refusing it. Nothing else on the API can append the missing line.
     pub async fn reverse_booking(
         booking: &MealBooking,
@@ -443,7 +445,8 @@ impl MealLedger {
     }
 
     /// The refund `booking`'s current attempt owes, as `(the charge it undoes,
-    /// the reversal line)` — the two ids [`MealBooking::release_seat`] needs to
+    /// the reversal line)` — the two ids
+    /// [`release_seat`](crate::db::meal_booking::release_seat) needs to
     /// append the money back inside the transaction that frees the seat.
     /// `None` when the seat was never billed (a free menu), which owes no line.
     ///
