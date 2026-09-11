@@ -6,7 +6,6 @@
 use crate::constant::EXAM_SAT_TOTAL_FIELD;
 use crate::database::Database;
 use crate::db::cap;
-use crate::domain::badge;
 use crate::domain::course::Course;
 
 use crate::domain::exam::{Exam, ExamId};
@@ -218,7 +217,7 @@ pub async fn start(
     {
         cap::Claimed::Made(created) => {
             // Only a moved counter can have crossed a threshold.
-            if first && let Err(err) = badge::sync(user, db).await {
+            if first && let Err(err) = crate::db::badge::sync(db, user).await {
                 tracing::warn!("failed to sync badges for {}: {err}", user.key());
             }
             Ok((created, true))

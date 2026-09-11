@@ -3,6 +3,8 @@
 
 pub mod appointment;
 pub mod appointment_slot;
+pub mod badge;
+pub mod builder;
 pub mod class_blueprint;
 pub mod course;
 pub mod course_session;
@@ -17,6 +19,7 @@ pub mod note;
 pub mod parent_link;
 pub mod payment_ledger;
 pub mod pomodoro;
+pub mod profile;
 pub mod registration;
 pub mod session;
 pub mod settings;

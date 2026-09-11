@@ -18,7 +18,6 @@ use utoipa_axum::routes;
 
 use crate::constant::{MAX_HOMEWORK_ASSIGNED, MAX_MAX_FILE_BYTES, UPLOAD_BODY_OVERHEAD_BYTES};
 use crate::database::Database;
-use crate::domain::badge;
 use crate::domain::course::{Course, CourseId};
 
 use crate::domain::exam_result::Mark;
@@ -838,7 +837,7 @@ async fn delete_submission(
 /// of the work, and losing one to a transient database error is not worth
 /// refusing a hand-in over — the next counter move re-runs this and heals it.
 async fn award_badges(user: &UserId, db: &Database) {
-    if let Err(err) = badge::sync(user, db).await {
+    if let Err(err) = service::badge::sync(db, user).await {
         tracing::warn!("failed to sync badges for {}: {err}", user.key());
     }
 }
