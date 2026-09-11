@@ -5,7 +5,7 @@
 use crate::database::Database;
 use crate::db::class_group;
 use crate::domain::class_group::{ClassGrade, ClassGroup, ClassGroupId, ClassName};
-use crate::domain::term::{self, TermId};
+use crate::domain::term::TermId;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 

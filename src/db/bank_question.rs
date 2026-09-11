@@ -631,11 +631,11 @@ mod tests {
         let other_exam = crate::db::exam::published_exam(&db).await.get_id().clone();
         // A real subject row: an exam question claims a reference on its
         // subject, so a minted id it never wrote would be refused.
-        let subject = crate::domain::subject::Subject::create(
+        let subject = crate::db::subject::create(
+            &db,
             &crate::db::course::a_test_course(&db).await,
             crate::domain::subject::SubjectName::try_new("topic").unwrap(),
             crate::domain::subject::SubjectDescription::try_new("").unwrap(),
-            &db,
         )
         .await
         .unwrap();
