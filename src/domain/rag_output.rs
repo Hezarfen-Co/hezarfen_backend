@@ -16,11 +16,11 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
 use crate::constant::RAG_OUTPUT_TABLE;
 use crate::database::Database;
+use crate::db::page::PagedList;
 use crate::domain::course::CourseId;
 use crate::domain::course_note::CourseNoteId;
 use crate::domain::course_note_file::CourseNoteFileId;
 use crate::domain::monotonic_id::next_ulid;
-use crate::db::page::PagedList;
 use crate::domain::timestamp::Timestamp;
 use crate::error::AppError;
 
@@ -203,25 +203,27 @@ mod tests {
         )
         .await
         .unwrap();
-        CourseNote::create(
+        crate::db::course_note::create(
+            db,
             course.get_id(),
             &creator,
             CourseNoteTitle::try_new(title).unwrap(),
             CourseNoteContent::try_new("body").unwrap(),
-            db,
         )
         .await
         .unwrap()
     }
 
     async fn file_on(db: &Database, note: &CourseNoteId) -> CourseNoteFileId {
-        CourseNoteFile::new(
-            note,
-            FileName::try_new("plan.pdf").unwrap(),
-            FileContentType::try_new("application/pdf").unwrap(),
-            3,
+        crate::db::course_note_file::insert(
+            db,
+            CourseNoteFile::new(
+                note,
+                FileName::try_new("plan.pdf").unwrap(),
+                FileContentType::try_new("application/pdf").unwrap(),
+                3,
+            ),
         )
-        .insert(db)
         .await
         .unwrap()
         .get_id()

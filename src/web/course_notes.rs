@@ -57,7 +57,7 @@ pub fn routes() -> OpenApiRouter<AppState> {
 /// The note plus its course, or a 404 — every entity handler here gates on
 /// the parent course, so they always travel together.
 async fn note_with_course(id: &str, db: &Database) -> Result<(CourseNote, Course), AppError> {
-    let note = CourseNote::read(&CourseNoteId::from_key(id), db)
+    let note = service::course_note::read(db, &CourseNoteId::from_key(id))
         .await?
         .ok_or(AppError::NotFound)?;
     let course = crate::service::course::read(db, note.get_course())
@@ -141,7 +141,8 @@ async fn create(
     crate::service::course::require_open(&st.db, &course).await?;
     let title = CourseNoteTitle::try_new(&req.title)?;
     let content = CourseNoteContent::try_new(&req.content.unwrap_or_default())?;
-    let note = CourseNote::create(course.get_id(), user.get_id(), title, content, &st.db).await?;
+    let note = service::course_note::create(&st.db, course.get_id(), user.get_id(), title, content)
+        .await?;
     // Indexing is a background bonus, never a condition of storing the note:
     // the dispatch runs in its own task, so a slow or absent AI service cannot
     // delay or fail this 201.
@@ -189,7 +190,7 @@ async fn list(
     }
     let (limit, offset) = page.resolve()?;
     let (notes, total) =
-        CourseNote::list_for_course(course.get_id(), limit, offset, &st.db).await?;
+        service::course_note::list_for_course(&st.db, course.get_id(), limit, offset).await?;
     let items = notes.iter().map(CourseNoteResponse::new).collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
@@ -267,7 +268,7 @@ async fn update(
         .map(CourseNoteContent::try_new)
         .transpose()?;
 
-    let updated = note.update(title, content, &st.db).await?;
+    let updated = service::course_note::update(&st.db, note, title, content).await?;
     // The stored index describes the old text — refresh it.
     spawn_index(&st, &tenant, updated.clone());
     Ok(Json(CourseNoteResponse::new(&updated)))
@@ -310,7 +311,7 @@ async fn delete_one(
     // between strands at worst an unreachable blob, never a row whose blob is
     // already gone. The files to unlink come from the delete itself, not a
     // pre-read list — an upload that landed in between is in the cascade too.
-    let (_, files) = note.delete(&st.db).await?;
+    let (_, files) = service::course_note::delete(&st.db, note).await?;
     for file in &files {
         remove_blob(&st.files_path, file.get_id().key()).await;
     }
@@ -379,8 +380,9 @@ async fn upload_file(
         ));
     }
     crate::service::course::require_open(&st.db, &course).await?;
-    // The 10-file cap is enforced inside `CourseNoteFile::insert` (count and
-    // create under one lock) — checking it here too would just race.
+    // The 10-file cap is enforced inside `service::course_note_file::insert`
+    // (count and create in one conditional write) — checking it here too would
+    // just race.
     let limit = service::settings::load(&st.db).await?.get_max_file_bytes();
 
     let upload = read_upload(&mut multipart, limit).await?;
@@ -395,7 +397,7 @@ async fn upload_file(
     tokio::fs::write(&path, &upload.data)
         .await
         .map_err(|err| AppError::Internal(format!("failed to store the file blob: {err}")))?;
-    match file.insert(&st.db).await {
+    match service::course_note_file::insert(&st.db, file).await {
         Ok(created) => {
             // The note now holds one more source than the stored index knows.
             spawn_index(&st, &tenant, note);
@@ -440,7 +442,8 @@ async fn list_files(
             "only enrolled users, the course creator, an assigned teacher, or a manager/admin can view this course note's files",
         ));
     }
-    let (files, total) = CourseNoteFile::list_for(note.get_id(), limit, offset, &st.db).await?;
+    let (files, total) =
+        service::course_note_file::list_for(&st.db, note.get_id(), limit, offset).await?;
     let items = files.iter().map(CourseNoteFileResponse::new).collect();
     Ok(Json(Page::new(items, total, limit, offset)))
 }
@@ -474,10 +477,13 @@ async fn download_file(
             "only enrolled users, the course creator, an assigned teacher, or a manager/admin can download this course note's files",
         ));
     }
-    let file =
-        CourseNoteFile::read_for(&CourseNoteFileId::from_key(&file_id), note.get_id(), &st.db)
-            .await?
-            .ok_or(AppError::NotFound)?;
+    let file = service::course_note_file::read_for(
+        &st.db,
+        &CourseNoteFileId::from_key(&file_id),
+        note.get_id(),
+    )
+    .await?
+    .ok_or(AppError::NotFound)?;
     let bytes = tokio::fs::read(blob_path(&st.files_path, file.get_id().key()))
         .await
         .map_err(|err| {
@@ -534,16 +540,19 @@ async fn delete_file(
         ));
     }
     crate::service::course::require_open(&st.db, &course).await?;
-    let file =
-        CourseNoteFile::read_for(&CourseNoteFileId::from_key(&file_id), note.get_id(), &st.db)
-            .await?
-            .ok_or(AppError::NotFound)?;
+    let file = service::course_note_file::read_for(
+        &st.db,
+        &CourseNoteFileId::from_key(&file_id),
+        note.get_id(),
+    )
+    .await?
+    .ok_or(AppError::NotFound)?;
     // Drop every output built from this file before the file itself, so a
     // stale index cannot outlive its source in a deployment with no AI service
     // at all, and a failure here leaves the file whole instead of stranding its
     // blob; the re-index rebuilds from what is left, if a service is connected.
     RagOutput::delete_with_source(file.get_id(), &st.db).await?;
-    let file = file.delete(&st.db).await?;
+    let file = service::course_note_file::delete(&st.db, file).await?;
     remove_blob(&st.files_path, file.get_id().key()).await;
     spawn_index(&st, &tenant, note);
     Ok(StatusCode::NO_CONTENT)
@@ -649,7 +658,7 @@ async fn delete_rag(
         ));
     }
     crate::service::course::require_open(&st.db, &course).await?;
-    // Scoped to the note in the path, like `CourseNoteFile::read_for`: an
+    // Scoped to the note in the path, like `service::course_note_file::read_for`: an
     // output of another note is a 404 here, never a cross-note delete.
     let output = RagOutput::read(&RagOutputId::from_key(&output_id), &st.db)
         .await?

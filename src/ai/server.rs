@@ -27,8 +27,7 @@ use crate::constant::{
 };
 use crate::database::Database;
 
-use crate::domain::course_note::CourseNote;
-use crate::domain::course_note_file::{CourseNoteFile, CourseNoteFileId};
+use crate::domain::course_note_file::CourseNoteFileId;
 use crate::domain::user::{User, UserId};
 use crate::error::AppError;
 use crate::module::Module;
@@ -631,11 +630,11 @@ async fn open_blob(
         )
     };
     let unavailable = |e: crate::error::AppError| ("unavailable", e.to_string());
-    let file = CourseNoteFile::read(&CourseNoteFileId::from_key(&request.file), &db)
+    let file = crate::db::course_note_file::read(&db, &CourseNoteFileId::from_key(&request.file))
         .await
         .map_err(unavailable)?
         .ok_or_else(missing)?;
-    let note = CourseNote::read(file.get_course_note(), &db)
+    let note = crate::db::course_note::read(&db, file.get_course_note())
         .await
         .map_err(unavailable)?
         .ok_or_else(missing)?;

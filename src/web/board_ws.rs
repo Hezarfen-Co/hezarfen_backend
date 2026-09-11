@@ -9,7 +9,7 @@
 //! Two rules shape everything below.
 //!
 //! **Persist, then publish.** A stroke is fanned out only once
-//! [`BoardStroke::append`] has returned `Ok`, so the channel can never carry a
+//! [`board_stroke::append`] has returned `Ok`, so the channel can never carry a
 //! mark the database refused (a locked board, a full canvas, a closed board).
 //! The database is the canvas; the channel is a notification about it. A
 //! client still dedupes by stroke `id` — a resync deliberately re-serves marks
@@ -69,11 +69,14 @@ use tokio::sync::broadcast::error::RecvError;
 use crate::constant::{BOARD_REPLAY_CHUNK, BOARD_WS_TICK_SECS, MAX_BOARD_ID_LEN};
 use crate::database::Database;
 use crate::domain::board::{Board, BoardId};
-use crate::domain::board_stroke::{self, BoardStroke};
+use crate::domain::board_stroke::{
+    BOARD_CLOSED, BOARD_LOCKED, BoardStroke, CANVAS_BLANK, EPOCH_FULL,
+};
 use crate::domain::role::Role;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
+use crate::service::{board, board_stroke};
 use crate::state::AppState;
 use crate::tenant::Slug;
 use crate::web::CurrentUser;
@@ -130,7 +133,7 @@ pub async fn board_ws(
     if id.len() > MAX_BOARD_ID_LEN || !user.get_role().at_least(Role::Student) {
         return Err(AppError::NotFound);
     }
-    let board = Board::read(&BoardId::from_key(&id), &st.db)
+    let board = board::read(&st.db, &BoardId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     if !board.is_participant(user.get_id()) {
@@ -213,7 +216,7 @@ async fn live_board(board: &BoardId, user: &UserId, db: &Database) -> Result<Boa
     if barred {
         return Err(AppError::Forbidden("your role can no longer use boards"));
     }
-    let board = Board::read(board, db).await?.ok_or(AppError::NotFound)?;
+    let board = board::read(db, board).await?.ok_or(AppError::NotFound)?;
     if !board.is_participant(user) {
         return Err(AppError::Forbidden("you are no longer on this board"));
     }
@@ -359,7 +362,7 @@ async fn replay(
 ) -> Step {
     let mut cursor = after;
     loop {
-        let chunk = match BoardStroke::replay_current(board, epoch, cursor.as_deref(), db).await {
+        let chunk = match board_stroke::replay_current(db, board, epoch, cursor.as_deref()).await {
             Ok(chunk) => chunk,
             Err(err) => return send(socket, error_frame(&err, None)).await,
         };
@@ -460,7 +463,7 @@ async fn handle_message(
             // cleared since this socket last heard anything.
             let saved = match live_board(board, user, &st.db).await {
                 Ok(live) => {
-                    BoardStroke::append(board, user, &payload, live.get_epoch(), &st.db).await
+                    board_stroke::append(&st.db, board, user, &payload, live.get_epoch()).await
                 }
                 Err(err) => Err(err),
             };
@@ -490,7 +493,7 @@ async fn handle_message(
         }
         ClientMessage::Clear => match creator_board(socket, board, user, &st.db).await? {
             None => Ok(()),
-            Some(live) => match BoardStroke::clear(live.get_id(), user, &st.db).await {
+            Some(live) => match board_stroke::clear(&st.db, live.get_id(), user).await {
                 // The marker carries the epoch it *closed*; the room's new
                 // canvas is the next one. Same shape as `POST /boards/{id}/clear`.
                 Ok(marker) => {
@@ -511,7 +514,7 @@ async fn handle_message(
         },
         ClientMessage::Lock { locked } => match creator_board(socket, board, user, &st.db).await? {
             None => Ok(()),
-            Some(live) => match live.set_locked(locked, user, &st.db).await {
+            Some(live) => match board::set_locked(&st.db, &live, locked, user).await {
                 Ok(_) => {
                     st.board_hub.publish(
                         slug,
@@ -570,10 +573,10 @@ async fn creator_board(
 fn error_frame(err: &AppError, client_seq: Option<u64>) -> Value {
     let code = match err {
         AppError::Forbidden(_) => "forbidden",
-        AppError::Conflict(message) if *message == board_stroke::EPOCH_FULL => "epoch_full",
-        AppError::Conflict(message) if *message == board_stroke::BOARD_LOCKED => "locked",
-        AppError::Conflict(message) if *message == board_stroke::BOARD_CLOSED => "board_closed",
-        AppError::Conflict(message) if *message == board_stroke::CANVAS_BLANK => "canvas_blank",
+        AppError::Conflict(message) if *message == EPOCH_FULL => "epoch_full",
+        AppError::Conflict(message) if *message == BOARD_LOCKED => "locked",
+        AppError::Conflict(message) if *message == BOARD_CLOSED => "board_closed",
+        AppError::Conflict(message) if *message == CANVAS_BLANK => "canvas_blank",
         // A refusal that already carries its own code keeps it — no board path
         // raises one today, but re-labelling one "conflict" would throw the
         // only machine answer it has away.
@@ -601,6 +604,7 @@ fn error_frame(err: &AppError, client_seq: Option<u64>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::board_stroke::{BOARD_MOVED, REFUSALS};
 
     fn code(err: AppError) -> String {
         error_frame(&err, None)["code"]
@@ -618,26 +622,26 @@ mod tests {
     /// test that pins the wording rots into a test of a string the code can no
     /// longer emit, which is exactly how the blank canvas shipped as
     /// `board_closed` through a green suite. The length assertion is the other
-    /// half — a refusal added to `board_stroke::REFUSALS` fails here until it
+    /// half — a refusal added to `REFUSALS` fails here until it
     /// is given the code its client must act on.
     #[test]
     fn every_refusal_gets_the_code_its_client_must_act_on() {
         let pairs = [
-            (board_stroke::EPOCH_FULL, "epoch_full"),
-            (board_stroke::BOARD_LOCKED, "locked"),
-            (board_stroke::BOARD_CLOSED, "board_closed"),
-            (board_stroke::CANVAS_BLANK, "canvas_blank"),
+            (EPOCH_FULL, "epoch_full"),
+            (BOARD_LOCKED, "locked"),
+            (BOARD_CLOSED, "board_closed"),
+            (CANVAS_BLANK, "canvas_blank"),
             // A stroke that lost its epoch to a clear is a plain retryable
             // conflict, and must never be mistaken for terminal.
-            (board_stroke::BOARD_MOVED, "conflict"),
+            (BOARD_MOVED, "conflict"),
         ];
         assert_eq!(
             pairs.len(),
-            board_stroke::REFUSALS.len(),
+            REFUSALS.len(),
             "a refusal the room cannot code"
         );
         for (message, expected) in pairs {
-            assert!(board_stroke::REFUSALS.contains(&message));
+            assert!(REFUSALS.contains(&message));
             assert_eq!(code(AppError::Conflict(message)), expected, "{message}");
         }
         assert_eq!(code(AppError::Forbidden("nope")), "forbidden");
@@ -653,18 +657,9 @@ mod tests {
     /// the three collapse into one code.
     #[test]
     fn a_blank_canvas_is_never_terminal() {
-        assert_eq!(
-            code(AppError::Conflict(board_stroke::CANVAS_BLANK)),
-            "canvas_blank"
-        );
-        assert_eq!(
-            code(AppError::Conflict(board_stroke::BOARD_CLOSED)),
-            "board_closed"
-        );
-        assert_eq!(
-            code(AppError::Conflict(board_stroke::BOARD_LOCKED)),
-            "locked"
-        );
+        assert_eq!(code(AppError::Conflict(CANVAS_BLANK)), "canvas_blank");
+        assert_eq!(code(AppError::Conflict(BOARD_CLOSED)), "board_closed");
+        assert_eq!(code(AppError::Conflict(BOARD_LOCKED)), "locked");
     }
 
     /// The upgrade door's role bar has to hold for the *life* of the socket.
@@ -696,11 +691,11 @@ mod tests {
         .await
         .unwrap();
         let mate_id = mate.get_id().clone();
-        let board = Board::create(
+        let board = board::create(
+            &db,
             creator.get_id(),
             BoardTitle::try_new("Tahta").unwrap(),
             vec![mate_id.clone()],
-            &db,
         )
         .await
         .unwrap();

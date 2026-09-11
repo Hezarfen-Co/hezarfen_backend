@@ -64,8 +64,7 @@ pub async fn ensure_admin(
             // is no marker that could tell such a row apart from a stranger
             // who registered the name first, so the hole cannot be healed
             // later; it has to be impossible to open.
-            user::create_with_role(db, username, password.hash_async().await?, Role::Admin)
-                .await?;
+            user::create_with_role(db, username, password.hash_async().await?, Role::Admin).await?;
             // No `username` field: with OTLP on every event is exported as a
             // log record, so an account name here leaves the process.
             tracing::info!("seeded the admin account named by ADMIN_USERNAME");
@@ -183,7 +182,18 @@ pub async fn set_profile(
     display_name: Option<Option<DisplayName>>,
     bio: Option<Option<Bio>>,
 ) -> Result<User, AppError> {
-    user::set_profile(db, id, name, surname, email, phone, birth_date, display_name, bio).await
+    user::set_profile(
+        db,
+        id,
+        name,
+        surname,
+        email,
+        phone,
+        birth_date,
+        display_name,
+        bio,
+    )
+    .await
 }
 
 /// Persist an avatar upload, handing back the replaced blob's name.
@@ -249,32 +259,28 @@ mod tests {
     /// just changed is simply never told. Assert the rows come back.
     #[tokio::test]
     async fn the_cascade_returns_the_boards_it_stripped() {
-        use crate::domain::board::{Board, BoardTitle};
+        use crate::domain::board::BoardTitle;
 
         let db = init_mem().await.unwrap();
         let creator = a_user("ogretmen", &db).await;
         let guest = a_user("ogrenci", &db).await;
-        let board = Board::create(
+        let board = crate::db::board::create(
+            &db,
             creator.get_id(),
             BoardTitle::try_new("Geometri").unwrap(),
             vec![guest.get_id().clone()],
-            &db,
         )
         .await
         .unwrap();
 
         // A promotion touches no roster and must report none.
-        let (guest, boards) = set_role(&db, guest.get_id(), Role::Teacher)
-            .await
-            .unwrap();
+        let (guest, boards) = set_role(&db, guest.get_id(), Role::Teacher).await.unwrap();
         assert!(
             boards.is_empty(),
             "only a demotion to parent strips rosters"
         );
 
-        let (_, boards) = set_role(&db, guest.get_id(), Role::Parent)
-            .await
-            .unwrap();
+        let (_, boards) = set_role(&db, guest.get_id(), Role::Parent).await.unwrap();
         assert_eq!(boards.len(), 1, "the stripped room must be reported back");
         assert_eq!(boards[0].get_id(), board.get_id());
         assert!(
@@ -292,36 +298,37 @@ mod tests {
     /// readable.
     #[tokio::test]
     async fn a_demoted_creator_s_board_is_closed_and_still_readable() {
-        use crate::domain::board::{Board, BoardTitle};
-        use crate::domain::board_stroke::{BOARD_CLOSED, BoardStroke};
+        use crate::domain::board::BoardTitle;
+        use crate::domain::board_stroke::BOARD_CLOSED;
 
         let db = init_mem().await.unwrap();
         let creator = a_user("ogretmen", &db).await;
         let guest = a_user("ogrenci", &db).await;
-        let board = Board::create(
+        let board = crate::db::board::create(
+            &db,
             creator.get_id(),
             BoardTitle::try_new("Geometri").unwrap(),
             vec![guest.get_id().clone()],
-            &db,
         )
         .await
         .unwrap();
         let mark = |epoch| {
             let (id, author, db) = (board.get_id().clone(), guest.get_id().clone(), db.clone());
-            async move { BoardStroke::append(&id, &author, "{\"p\":[1]}", epoch, &db).await }
+            async move { crate::db::board_stroke::append(&db, &id, &author, "{\"p\":[1]}", epoch).await }
         };
         mark(0).await.unwrap();
 
-        let (creator, boards) = set_role(&db, creator.get_id(), Role::Parent)
-            .await
-            .unwrap();
+        let (creator, boards) = set_role(&db, creator.get_id(), Role::Parent).await.unwrap();
         assert_eq!(boards.len(), 1, "the room must be reported back");
         let stamp = boards[0]
             .get_closed_at()
             .expect("and carry the closing stamp the room is told about");
 
         // Stored, not merely reported — and nothing else moved.
-        let stored = Board::read(board.get_id(), &db).await.unwrap().unwrap();
+        let stored = crate::db::board::read(&db, board.get_id())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(stored.get_closed_at(), Some(stamp));
         assert_eq!(
             stored.get_participants(),
@@ -329,7 +336,7 @@ mod tests {
             "closing must not empty the roster it did not touch"
         );
         assert_eq!(
-            BoardStroke::history(board.get_id(), None, false, None, 0, &db)
+            crate::db::board_stroke::history(&db, board.get_id(), None, false, None, 0)
                 .await
                 .unwrap()
                 .1,
@@ -345,11 +352,9 @@ mod tests {
 
         // The stamp is the record: a re-run of the sweep must not move it.
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        set_role(&db, creator.get_id(), Role::Parent)
-            .await
-            .unwrap();
+        set_role(&db, creator.get_id(), Role::Parent).await.unwrap();
         assert_eq!(
-            Board::read(board.get_id(), &db)
+            crate::db::board::read(&db, board.get_id())
                 .await
                 .unwrap()
                 .unwrap()
@@ -369,8 +374,8 @@ mod tests {
     #[tokio::test]
     async fn a_demotion_withdraws_the_calendar_and_settles_its_bookings() {
         use crate::domain::appointment::{AppointmentReason, AppointmentStatus};
-        use crate::service::appointment;
         use crate::domain::timestamp::Timestamp;
+        use crate::service::appointment;
 
         let db = init_mem().await.unwrap();
         let staff = |name: &'static str, db: Database| async move {
@@ -388,9 +393,15 @@ mod tests {
         let slot = |owner: &User, offset: i64, db: Database| {
             let owner = owner.get_id().clone();
             async move {
-                crate::service::appointment_slot::create(&db, &owner, soon(offset), soon(offset + 60_000), None)
-                    .await
-                    .unwrap()
+                crate::service::appointment_slot::create(
+                    &db,
+                    &owner,
+                    soon(offset),
+                    soon(offset + 60_000),
+                    None,
+                )
+                .await
+                .unwrap()
             }
         };
 
@@ -454,7 +465,12 @@ mod tests {
             .unwrap()
             .check()
             .unwrap();
-        assert!(result.take::<Vec<surrealdb::types::RecordId>>(0).unwrap().is_empty());
+        assert!(
+            result
+                .take::<Vec<surrealdb::types::RecordId>>(0)
+                .unwrap()
+                .is_empty()
+        );
 
         // Another teacher's calendar is nobody else's business.
         assert_eq!(

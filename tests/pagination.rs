@@ -421,12 +421,12 @@ async fn board_lists_are_paged() {
     // canvas.
     for epoch in 0..2 {
         for n in 0..2 {
-            hezarfen_backend::domain::board_stroke::BoardStroke::append(
+            hezarfen_backend::db::board_stroke::append(
+                &db,
                 &hezarfen_backend::domain::board::BoardId::from_key(&board),
                 &hezarfen_backend::domain::user::UserId::from_key(&ali_id),
                 &format!("{{\"p\":[{epoch},{n}]}}"),
                 epoch,
-                &db,
             )
             .await
             .expect("append");
@@ -442,12 +442,12 @@ async fn board_lists_are_paged() {
         assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
     }
     for n in 0..5 {
-        hezarfen_backend::domain::board_stroke::BoardStroke::append(
+        hezarfen_backend::db::board_stroke::append(
+            &db,
             &hezarfen_backend::domain::board::BoardId::from_key(&board),
             &hezarfen_backend::domain::user::UserId::from_key(&ali_id),
             &format!("{{\"p\":[2,{n}]}}"),
             2,
-            &db,
         )
         .await
         .expect("append");
