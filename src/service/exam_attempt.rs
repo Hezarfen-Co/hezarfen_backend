@@ -12,7 +12,6 @@ use crate::domain::enrollment::Enrollment;
 use crate::domain::exam::{Exam, ExamId};
 use crate::domain::exam_answer::ExamAnswer;
 use crate::domain::exam_attempt::{AttemptStatus, ExamAttempt, ExamAttemptId};
-use crate::domain::exam_question::{ExamQuestion, ExamQuestionId};
 use crate::domain::role::Role;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
@@ -146,22 +145,6 @@ pub async fn course_of(exam: &Exam, db: &Database) -> Result<Course, AppError> {
     crate::db::course::read(db, exam.get_course())
         .await?
         .ok_or_else(|| AppError::Internal("exam references a missing course".into()))
-}
-
-/// The question, provided it belongs to `exam` — a qid under someone else's
-/// exam is a plain 404, not a leak.
-pub async fn question_of_exam(
-    exam: &ExamId,
-    qid: &str,
-    db: &Database,
-) -> Result<ExamQuestion, AppError> {
-    let question = ExamQuestion::read(&ExamQuestionId::from_key(qid), db)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    if question.get_exam() != exam {
-        return Err(AppError::NotFound);
-    }
-    Ok(question)
 }
 
 /// Start, resume, or retake `user`'s attempt at `exam`. Returns the attempt
@@ -400,7 +383,8 @@ pub async fn save_answer_in(
     ensure_enrolled(exam, attempt.get_user(), db).await?;
     check_rejoin(exam, attempt)?;
     crate::service::course::require_open(db, &course_of(exam, db).await?).await?;
-    let question = question_of_exam(exam.get_id(), question_id, db).await?;
+    let question =
+        crate::service::exam_question::question_of_exam(exam.get_id(), question_id, db).await?;
     crate::domain::exam_answer::ExamAnswer::save(
         &question,
         attempt.get_user(),
@@ -547,13 +531,13 @@ mod tests {
         )
         .await
         .unwrap();
-        let question = ExamQuestion::create(
+        let question = crate::db::exam_question::create(
+            db,
             exam.get_id(),
             subject.get_id().clone(),
             crate::domain::exam_question::QuestionText::try_new("3 + 3?").unwrap(),
             QuestionPoints::try_new(5).unwrap(),
             spec,
-            db,
         )
         .await
         .unwrap();

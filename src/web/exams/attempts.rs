@@ -105,7 +105,7 @@ pub(crate) async fn attempt_progress(
     let answered = ExamAnswer::list_for_exam_user(exam, user, seq, db)
         .await?
         .len() as u64;
-    let question_count = ExamQuestion::list_for_exam(exam, None, 0, db)
+    let question_count = crate::service::exam_question::list_for_exam(db, exam, None, 0)
         .await?
         .0
         .len() as u64;
@@ -356,7 +356,7 @@ pub(crate) async fn live_snapshot(
             )
         })
         .collect();
-    let question_count = ExamQuestion::list_for_exam(exam.get_id(), None, 0, db)
+    let question_count = crate::service::exam_question::list_for_exam(db, exam.get_id(), None, 0)
         .await?
         .0
         .len() as u64;
@@ -583,7 +583,8 @@ pub(crate) async fn attempt_questions(
         .ok_or(AppError::NotFound)?
         .get_seq();
 
-    let (questions, _) = ExamQuestion::list_for_exam(exam.get_id(), None, 0, &st.db).await?;
+    let (questions, _) =
+        crate::service::exam_question::list_for_exam(&st.db, exam.get_id(), None, 0).await?;
     let images = images_by_question(exam.get_id(), &st.db).await?;
     let answers: HashMap<String, ExamAnswer> =
         ExamAnswer::list_for_exam_user(exam.get_id(), user.get_id(), seq, &st.db)
@@ -743,7 +744,8 @@ pub(crate) async fn answer_sheet(
     hidden: &HashSet<String>,
     db: &Database,
 ) -> Result<AttemptAnswersResponse, AppError> {
-    let (mut questions, _) = ExamQuestion::list_for_exam(exam.get_id(), None, 0, db).await?;
+    let (mut questions, _) =
+        crate::service::exam_question::list_for_exam(db, exam.get_id(), None, 0).await?;
     questions.retain(|question| !hidden.contains(question.get_id().key()));
     let answers = ExamAnswer::list_for_exam_user(exam.get_id(), target, seq, db).await?;
     let answer_images: HashMap<String, AnswerImage> =

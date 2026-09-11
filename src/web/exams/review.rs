@@ -1,9 +1,8 @@
 use super::*;
 
 use crate::domain::exam_attempt::AttemptStatus;
-use crate::service::exam_attempt::{
-    course_of, list_for_user, list_unfinished_for_user, question_of_exam,
-};
+use crate::service::exam_attempt::{course_of, list_for_user, list_unfinished_for_user};
+use crate::service::exam_question;
 
 // ---- per-attempt history ----------------------------------------------------
 // The grading views above show the latest sitting; these expose every prior
@@ -121,7 +120,7 @@ pub(crate) async fn student_attempt_answer_image(
 ) -> Result<Response, AppError> {
     let exam = gradable_exam(&st, &user, &id).await?;
     let target = UserId::from_key(&target);
-    let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
+    let question = exam_question::question_of_exam(exam.get_id(), &qid, &st.db).await?;
     let image = AnswerImage::read(question.get_id(), &target, seq, &st.db)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -253,7 +252,7 @@ pub(crate) async fn reviewable_exam(
 /// count — a question authored by hand and *saved* to the bank shares its key
 /// with every later instantiation just as an instantiated one does, so only a
 /// question with no bank link at all is never hidden
-/// ([`ExamQuestion::list_shared_with`]).
+/// ([`crate::service::exam_question::list_shared_with`]).
 ///
 /// The open sittings are read whole and judged here rather than filtered in
 /// SurrealQL, because "in progress" is [`ExamAttempt::status`]'s call off the
@@ -275,7 +274,7 @@ async fn live_elsewhere(
             live.push(other.get_id().clone());
         }
     }
-    ExamQuestion::list_shared_with(exam.get_id(), &live, &st.db).await
+    exam_question::list_shared_with(&st.db, exam.get_id(), &live).await
 }
 
 /// The caller's own sitting numbers at an exam — every seq that carries answers
@@ -417,7 +416,7 @@ pub(crate) async fn review_attempt_answer_image(
     Path((id, seq, qid)): Path<(String, i64, String)>,
 ) -> Result<Response, AppError> {
     let exam = reviewable_exam(&st, &user, &id).await?;
-    let question = question_of_exam(exam.get_id(), &qid, &st.db).await?;
+    let question = exam_question::question_of_exam(exam.get_id(), &qid, &st.db).await?;
     let image = AnswerImage::read(question.get_id(), user.get_id(), seq, &st.db)
         .await?
         .ok_or(AppError::NotFound)?;

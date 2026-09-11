@@ -751,9 +751,11 @@ mod tests {
                 .map(|_| ())
             })
         }
-        crate::db::course::assert_no_child_outlives_a_course_delete("exam_orphan_race",
-        EXAM_TABLE,
-        make,)
+        crate::db::course::assert_no_child_outlives_a_course_delete(
+            "exam_orphan_race",
+            EXAM_TABLE,
+            make,
+        )
         .await;
     }
 
@@ -1103,7 +1105,7 @@ mod tests {
     /// question claims a reference on its subject and is refused without one.
     async fn question_on(exam: &Exam, db: &Database) -> crate::domain::exam_question::ExamQuestion {
         use crate::domain::exam_question::{
-            ChoiceInput, ExamQuestion, QuestionKind, QuestionPoints, QuestionSpec, QuestionText,
+            ChoiceInput, QuestionKind, QuestionPoints, QuestionSpec, QuestionText,
         };
         let spec = QuestionSpec::try_new(
             QuestionKind::try_new("choice").unwrap(),
@@ -1129,13 +1131,13 @@ mod tests {
         )
         .await
         .unwrap();
-        ExamQuestion::create(
+        crate::db::exam_question::create(
+            db,
             exam.get_id(),
             subject.get_id().clone(),
             QuestionText::try_new("3 + 3?").unwrap(),
             QuestionPoints::try_new(5).unwrap(),
             spec,
-            db,
         )
         .await
         .unwrap()
@@ -1248,7 +1250,7 @@ mod tests {
     #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn a_question_written_inside_a_delete_never_outlives_the_exam() {
         use crate::domain::exam_question::{
-            ChoiceInput, ExamQuestion, QuestionKind, QuestionPoints, QuestionSpec, QuestionText,
+            ChoiceInput, QuestionKind, QuestionPoints, QuestionSpec, QuestionText,
         };
         use crate::domain::subject::Subject;
         let (db, _serialized) = crate::database::init_test_server("exam_question_race").await;
@@ -1298,13 +1300,13 @@ mod tests {
                         &[],
                     )
                     .unwrap();
-                    ExamQuestion::create(
+                    crate::db::exam_question::create(
+                        &db,
                         &exam_id,
                         on,
                         QuestionText::try_new("3 + 3?").unwrap(),
                         QuestionPoints::try_new(5).unwrap(),
                         spec,
-                        &db,
                     )
                     .await
                 })
@@ -1317,7 +1319,7 @@ mod tests {
 
             if Exam::read(&id, &db).await.unwrap().is_none() {
                 swept += 1;
-                questions += ExamQuestion::list_for_exam(&id, None, 0, &db)
+                questions += crate::db::exam_question::list_for_exam(&db, &id, None, 0)
                     .await
                     .unwrap()
                     .0

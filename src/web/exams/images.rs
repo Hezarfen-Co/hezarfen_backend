@@ -2,8 +2,9 @@ use super::*;
 
 use crate::service::exam_attempt::{
     EXAM_LOCK, check_rejoin, course_of, ensure_enrolled, ensure_student, ensure_student_now,
-    question_of_exam, read_latest_for_user, writable_attempt,
+    read_latest_for_user, writable_attempt,
 };
+use crate::service::exam_question::{choice_slot, ensure_questions_editable, question_of_exam};
 
 /// A stored question image's metadata; the bytes come from the image
 /// endpoints (`GET .../image`, `GET .../choices/{choice_id}/image`).
