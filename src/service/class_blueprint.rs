@@ -23,7 +23,7 @@
 //! a `class_course` row this blueprint wrote carries `source`, a row a human
 //! attached carries no such key at all, and dropping a course from the
 //! blueprint sweeps only the former. The sweep is the pump's own
-//! [`crate::domain::class_pump::detach`], so a class losing a course still
+//! [`crate::db::class_pump::detach`], so a class losing a course still
 //! repairs before it deletes — and it runs one transaction per pair too, for
 //! the same reason the pump does.
 
@@ -33,12 +33,13 @@ use surrealdb::types::RecordId;
 
 use crate::database::Database;
 use crate::db::class_blueprint;
+use crate::db::class_course;
+use crate::db::class_group;
+use crate::db::class_pump::Attached;
 use crate::domain::class_blueprint::{
     ClassBlueprint, ClassBlueprintId, Pumped, SectionStatus, Skip, skip_reason,
 };
-use crate::domain::class_course::ClassCourse;
 use crate::domain::class_group::{ClassGrade, ClassGroup};
-use crate::domain::class_pump::Attached;
 use crate::domain::course::CourseId;
 use crate::domain::user::UserId;
 use crate::error::AppError;
@@ -47,7 +48,7 @@ use crate::error::AppError;
 ///
 /// [`delete`] removes the row and then sweeps by the provenance
 /// tag, and every guarded attach reads that same row *inside* its own
-/// transaction ([`crate::domain::class_pump::attach`]'s `source` claim). Those
+/// transaction ([`crate::db::class_pump::attach`]'s `source` claim). Those
 /// two are a cross-record read-then-write racing a write to the record read,
 /// which `BEGIN`/`COMMIT` does not serialize (SurrealDB write skew): a pump can
 /// see the blueprint alive, have the delete commit and sweep past it, and only
@@ -290,7 +291,8 @@ async fn apply_courses(
         }
         let landed = {
             let _lease = BLUEPRINT_LOCK.read().await;
-            ClassCourse::attach_sourced(class.get_id(), course, by, Some(&blueprint.id), db).await?
+            class_course::attach_sourced(db, class.get_id(), course, by, Some(&blueprint.id))
+                .await?
         };
         if matches!(landed, Attached::PivotGone) {
             class_blueprint::prune(db, &blueprint.id, course).await?;
@@ -346,7 +348,7 @@ pub async fn pump(
         skipped: Vec::new(),
     };
     let mut dead = Vec::new();
-    for class in ClassGroup::list_for_grade(&blueprint.grade, db).await? {
+    for class in class_group::list_for_grade(db, &blueprint.grade).await? {
         pumped.matched += 1;
         if !apply_courses(db, blueprint, &class, by, &mut dead, &mut pumped.skipped).await? {
             break;
@@ -378,14 +380,14 @@ pub async fn pump(
 /// pump's own window ([`class_blueprint::prune`]) is about to clear, can
 /// still show it.
 ///
-/// Unpaged, like the [`ClassGroup::list_for_grade`] it is built on: the set
+/// Unpaged, like the [`crate::db::class_group::list_for_grade`] it is built on: the set
 /// is the şube one school runs at one grade, and the caller is asking about
 /// all of them.
 pub async fn status(
     db: &Database,
     blueprint: &ClassBlueprint,
 ) -> Result<Vec<SectionStatus>, AppError> {
-    let sections = ClassGroup::list_for_grade(&blueprint.grade, db).await?;
+    let sections = class_group::list_for_grade(db, &blueprint.grade).await?;
     if sections.is_empty() {
         return Ok(Vec::new());
     }
@@ -417,20 +419,20 @@ pub async fn status(
 mod tests {
     use super::*;
     use crate::constant::{CLASS_COURSE_COUNT_FIELD, MAX_CLASS_COURSES};
+    use crate::db::class_member::tests::{a_class, a_course, counter, exists, rows};
     use crate::domain::class_course::ClassCourseId;
-    use crate::domain::class_group::ClassName;
-    use crate::domain::class_member::tests::{a_class, a_course, counter, exists, rows};
+    use crate::domain::class_group::{ClassGroup, ClassName};
 
     /// A section that a pump's own grade loop can actually find — [`a_class`]
     /// carries no grade at all, so `list_for_grade` reaches none of them.
     async fn a_section(name: &str, db: &Database) -> ClassGroup {
-        ClassGroup::create(
+        class_group::create(
+            db,
             &UserId::from_key("manager"),
             ClassName::try_new(name).unwrap(),
             Some(ClassBlueprint::grade_key("9").unwrap()),
             None,
             None,
-            db,
         )
         .await
         .unwrap()
@@ -463,7 +465,7 @@ mod tests {
         // matches nothing.
         let db = crate::database::init_mem().await.unwrap();
         let course = a_course("algebra", None, &db).await;
-        let class = ClassGroup::read(&a_class("9-A", &db).await, &db)
+        let class = class_group::read(&db, &a_class("9-A", &db).await)
             .await
             .unwrap()
             .unwrap();
@@ -496,7 +498,7 @@ mod tests {
         // matches nothing and the read that follows finds no row.
         let db = crate::database::init_mem().await.unwrap();
         let course = a_course("algebra", None, &db).await;
-        let class = ClassGroup::read(&a_class("9-A", &db).await, &db)
+        let class = class_group::read(&db, &a_class("9-A", &db).await)
             .await
             .unwrap()
             .unwrap();
@@ -527,7 +529,7 @@ mod tests {
         // but the row is there — and that is the one a manager can act on.
         let db = crate::database::init_mem().await.unwrap();
         let course = a_course("algebra", None, &db).await;
-        let class = ClassGroup::read(&a_class("9-A", &db).await, &db)
+        let class = class_group::read(&db, &a_class("9-A", &db).await)
             .await
             .unwrap()
             .unwrap();
@@ -563,7 +565,7 @@ mod tests {
         let manager = UserId::from_key("manager");
         let algebra = a_course("algebra", None, &db).await;
         let physics = a_course("physics", None, &db).await;
-        let class = ClassGroup::read(&a_class("9-A", &db).await, &db)
+        let class = class_group::read(&db, &a_class("9-A", &db).await)
             .await
             .unwrap()
             .unwrap();
@@ -616,7 +618,7 @@ mod tests {
         let db = crate::database::init_mem().await.unwrap();
         let manager = UserId::from_key("manager");
         let algebra = a_course("algebra", None, &db).await;
-        let class = ClassGroup::read(&a_class("9-A", &db).await, &db)
+        let class = class_group::read(&db, &a_class("9-A", &db).await)
             .await
             .unwrap()
             .unwrap();
@@ -685,7 +687,7 @@ mod tests {
         ];
         let blueprint = a_blueprint(courses, &db).await;
         for name in ["9-A", "9-B"] {
-            let class = ClassGroup::read(&a_class(name, &db).await, &db)
+            let class = class_group::read(&db, &a_class(name, &db).await)
                 .await
                 .unwrap()
                 .unwrap();
@@ -743,7 +745,7 @@ mod tests {
         let db = crate::database::init_mem().await.unwrap();
         let manager = UserId::from_key("manager");
         let algebra = a_course("algebra", None, &db).await;
-        let class = ClassGroup::read(&a_class("9-A", &db).await, &db)
+        let class = class_group::read(&db, &a_class("9-A", &db).await)
             .await
             .unwrap()
             .unwrap();

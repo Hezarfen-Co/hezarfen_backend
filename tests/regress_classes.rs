@@ -9,12 +9,11 @@ use axum::http::StatusCode;
 use common::{Res, app_and_db, create_course, login_as, me_id, send, total};
 use hezarfen_backend::constant::{MAX_CLASS_COURSES, MAX_CLASS_MEMBERS};
 use hezarfen_backend::database::Database;
-use hezarfen_backend::domain::class_course::ClassCourse;
-use hezarfen_backend::domain::class_group::{ClassGroup, ClassName};
-use hezarfen_backend::domain::class_member::ClassMember;
+use hezarfen_backend::domain::class_group::ClassName;
 use hezarfen_backend::domain::course::CourseId;
 use hezarfen_backend::domain::user::UserId;
 use hezarfen_backend::error::AppError;
+use hezarfen_backend::service::{class_course, class_group, class_member};
 use serde_json::json;
 
 /// One counter, re-read out of the store — never off a response body.
@@ -59,13 +58,13 @@ async fn wipe_course_row(course: &str, db: &Database) {
 async fn an_attach_onto_a_deleted_course_writes_no_link() {
     let (_app, db) = app_and_db().await;
     let manager = UserId::from_key("manager");
-    let class = ClassGroup::create(
+    let class = class_group::create(
+        &db,
         &manager,
         ClassName::try_new("9-A").unwrap(),
         None,
         None,
         None,
-        &db,
     )
     .await
     .unwrap();
@@ -73,7 +72,7 @@ async fn an_attach_onto_a_deleted_course_writes_no_link() {
     // leaves behind.
     let ghost = CourseId::from_key("01J8XZ0K3Q8G7X2M4N5P6R7S8T");
 
-    let refused = ClassCourse::attach(class.get_id(), &ghost, &manager, &db).await;
+    let refused = class_course::attach(&db, class.get_id(), &ghost, &manager).await;
     assert!(
         refused.is_err(),
         "attaching a course that is gone must be refused: {refused:?}"
@@ -506,13 +505,13 @@ async fn the_roster_cap_is_claimed_off_the_live_capacity_column() {
 async fn a_roster_is_ordered_by_when_a_student_was_added() {
     let (_app, db) = app_and_db().await;
     let manager = UserId::from_key("manager");
-    let class = ClassGroup::create(
+    let class = class_group::create(
+        &db,
         &manager,
         ClassName::try_new("9-A").unwrap(),
         None,
         None,
         None,
-        &db,
     )
     .await
     .unwrap()
@@ -525,13 +524,13 @@ async fn a_roster_is_ordered_by_when_a_student_was_added() {
     // which is the very order under test.
     let added = ["a", "c", "b"];
     for key in added {
-        ClassMember::add(&class, &UserId::from_key(key), &manager, &db)
+        class_member::add(&db, &class, &UserId::from_key(key), &manager)
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
 
-    let (roster, _) = ClassMember::list_for_class(&class, None, 0, &db)
+    let (roster, _) = class_member::list_for_class(&db, &class, None, 0)
         .await
         .unwrap();
     let order: Vec<&str> = roster
@@ -554,7 +553,7 @@ async fn a_roster_is_ordered_by_when_a_student_was_added() {
         .unwrap()
         .check()
         .unwrap();
-    let (roster, _) = ClassMember::list_for_class(&class, None, 0, &db)
+    let (roster, _) = class_member::list_for_class(&db, &class, None, 0)
         .await
         .unwrap();
     assert_eq!(
@@ -574,13 +573,13 @@ async fn a_class_course_list_is_ordered_by_when_it_was_attached() {
     let (app, db) = app_and_db().await;
     let manager_cookie = login_as(&app, &db, "manager", "manager").await;
     let manager = UserId::from_key(&me_id(&app, &manager_cookie).await);
-    let class = ClassGroup::create(
+    let class = class_group::create(
+        &db,
         &manager,
         ClassName::try_new("9-A").unwrap(),
         None,
         None,
         None,
-        &db,
     )
     .await
     .unwrap()
@@ -596,13 +595,13 @@ async fn a_class_course_list_is_ordered_by_when_it_was_attached() {
         ));
     }
     for course in courses.iter().rev() {
-        ClassCourse::attach(&class, course, &manager, &db)
+        class_course::attach(&db, &class, course, &manager)
             .await
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
 
-    let (attached, _) = ClassCourse::list_for_class(&class, None, 0, &db)
+    let (attached, _) = class_course::list_for_class(&db, &class, None, 0)
         .await
         .unwrap();
     let order: Vec<&str> = attached
@@ -628,13 +627,13 @@ async fn a_class_course_list_is_ordered_by_when_it_was_attached() {
 async fn a_class_refuses_the_member_past_its_ceiling() {
     let (_app, db) = app_and_db().await;
     let manager = UserId::from_key("manager");
-    let class = ClassGroup::create(
+    let class = class_group::create(
+        &db,
         &manager,
         ClassName::try_new("9-A").unwrap(),
         None,
         None,
         None,
-        &db,
     )
     .await
     .unwrap()
@@ -648,10 +647,10 @@ async fn a_class_refuses_the_member_past_its_ceiling() {
         .check()
         .unwrap();
 
-    ClassMember::add(&class, &UserId::from_key("last"), &manager, &db)
+    class_member::add(&db, &class, &UserId::from_key("last"), &manager)
         .await
         .expect("the place under the ceiling is still free");
-    let refused = ClassMember::add(&class, &UserId::from_key("over"), &manager, &db).await;
+    let refused = class_member::add(&db, &class, &UserId::from_key("over"), &manager).await;
     assert!(
         matches!(refused, Err(AppError::ConflictCoded { code, ref message })
             if code == "class_at_roster_ceiling"
@@ -675,7 +674,7 @@ async fn a_class_refuses_the_member_past_its_ceiling() {
         .unwrap()
         .check()
         .unwrap();
-    let gone = ClassMember::add(&class, &UserId::from_key("ghost"), &manager, &db).await;
+    let gone = class_member::add(&db, &class, &UserId::from_key("ghost"), &manager).await;
     assert!(
         matches!(gone, Err(AppError::NotFound)),
         "a class that is gone is a 404: {gone:?}"
@@ -697,13 +696,13 @@ async fn a_class_over_the_other_axis_ceiling_attaches_nothing() {
     let (app, db) = app_and_db().await;
     let cookie = login_as(&app, &db, "manager", "manager").await;
     let manager = UserId::from_key(&me_id(&app, &cookie).await);
-    let class = ClassGroup::create(
+    let class = class_group::create(
+        &db,
         &manager,
         ClassName::try_new("9-A").unwrap(),
         None,
         None,
         None,
-        &db,
     )
     .await
     .unwrap()
@@ -718,7 +717,7 @@ async fn a_class_over_the_other_axis_ceiling_attaches_nothing() {
         .check()
         .unwrap();
 
-    let refused = ClassCourse::attach(&class, &algebra, &manager, &db).await;
+    let refused = class_course::attach(&db, &class, &algebra, &manager).await;
     assert!(
         matches!(refused, Err(AppError::ConflictCoded { code, ref message })
             if code == "class_roster_too_large"
@@ -745,7 +744,7 @@ async fn a_class_over_the_other_axis_ceiling_attaches_nothing() {
         .unwrap()
         .check()
         .unwrap();
-    ClassCourse::attach(&class, &algebra, &manager, &db)
+    class_course::attach(&db, &class, &algebra, &manager)
         .await
         .expect("a class exactly at the ceiling is still a bounded transaction");
 }
@@ -756,13 +755,13 @@ async fn a_class_over_the_other_axis_ceiling_attaches_nothing() {
 async fn a_class_over_the_course_ceiling_takes_no_member() {
     let (_app, db) = app_and_db().await;
     let manager = UserId::from_key("manager");
-    let class = ClassGroup::create(
+    let class = class_group::create(
+        &db,
         &manager,
         ClassName::try_new("9-B").unwrap(),
         None,
         None,
         None,
-        &db,
     )
     .await
     .unwrap()
@@ -776,7 +775,7 @@ async fn a_class_over_the_course_ceiling_takes_no_member() {
         .check()
         .unwrap();
 
-    let refused = ClassMember::add(&class, &UserId::from_key("ali"), &manager, &db).await;
+    let refused = class_member::add(&db, &class, &UserId::from_key("ali"), &manager).await;
     assert!(
         matches!(refused, Err(AppError::ConflictCoded { code, ref message })
             if code == "class_course_list_too_large"
@@ -1764,21 +1763,21 @@ async fn a_detach_never_hands_a_row_to_a_class_that_is_gone() {
     let algebra = CourseId::from_key(&create_course(&app, &staff, "algebra").await);
     let mut made = Vec::new();
     for name in ["9-B", "9-A"] {
-        let class = ClassGroup::create(
+        let class = class_group::create(
+            &db,
             &manager,
             ClassName::try_new(name).unwrap(),
             None,
             None,
             None,
-            &db,
         )
         .await
         .unwrap();
         let class = class.get_id().clone();
-        ClassMember::add(&class, &student, &manager, &db)
+        class_member::add(&db, &class, &student, &manager)
             .await
             .unwrap();
-        ClassCourse::attach(&class, &algebra, &manager, &db)
+        class_course::attach(&db, &class, &algebra, &manager)
             .await
             .unwrap();
         made.push(class);
@@ -1806,7 +1805,7 @@ async fn a_detach_never_hands_a_row_to_a_class_that_is_gone() {
         .check()
         .unwrap();
 
-    ClassCourse::detach(&owner, &algebra, &db).await.unwrap();
+    class_course::detach(&db, &owner, &algebra).await.unwrap();
     assert_eq!(
         rows("SELECT VALUE id FROM enrollment", &db).await,
         0,

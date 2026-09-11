@@ -14,8 +14,7 @@ use crate::constant::{
 };
 use crate::database::Database;
 use crate::domain::badge::{self, BadgeAward};
-use crate::domain::class_group::{ClassGroup, ClassGroupId};
-use crate::domain::class_member::ClassMember;
+use crate::domain::class_group::ClassGroupId;
 
 use crate::domain::preferences::{Language, PaletteColor, Theme};
 use crate::domain::profile::{Bio, BirthDate, DisplayName, Email, PersonName, Phone, ProfileStats};
@@ -927,8 +926,13 @@ async fn profile_of(
         courses.retain(|course| readable.contains(course.get_id()));
     }
     courses.truncate(MAX_PROFILE_COURSES);
-    let (mut members, class_total) =
-        ClassMember::list_for_user(id, Some(MAX_PROFILE_CLASSES as i64), 0, &st.db).await?;
+    let (mut members, class_total) = crate::service::class_member::list_for_user(
+        &st.db,
+        id,
+        Some(MAX_PROFILE_CLASSES as i64),
+        0,
+    )
+    .await?;
     // The window is safe to take from the database here: the class gate is
     // all-or-nothing, so it drops the whole page or none of it — never a row
     // out of the middle of one.
@@ -936,7 +940,7 @@ async fn profile_of(
         members.clear();
     }
     let class_ids: Vec<ClassGroupId> = members.iter().map(|row| row.get_class().clone()).collect();
-    let classes = ClassGroup::list_by_ids(&class_ids, &st.db).await?;
+    let classes = crate::service::class_group::list_by_ids(&st.db, &class_ids).await?;
     // Both totals are the full counts, not the windowed ones — the blocks are a
     // preview, the stats are the truth.
     let stats = crate::service::profile::load(&st.db, id, course_total, class_total).await?;

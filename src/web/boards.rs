@@ -32,8 +32,7 @@ use crate::constant::MAX_BOARD_PARTICIPANTS;
 use crate::database::Database;
 use crate::domain::board::{BOARD_ROSTER_LOCK, Board, BoardId, BoardTitle};
 use crate::domain::board_stroke::BoardStroke;
-use crate::domain::class_group::{ClassGroup, ClassGroupId};
-use crate::domain::class_member::ClassMember;
+use crate::domain::class_group::ClassGroupId;
 use crate::domain::course::CourseId;
 use crate::domain::event::EventId;
 use crate::domain::role::Role;
@@ -727,18 +726,23 @@ impl InviteSource {
                     ));
                 }
                 let class = ClassGroupId::from_key(&class);
-                if ClassGroup::read(&class, db).await?.is_none() {
+                if crate::service::class_group::read(db, &class)
+                    .await?
+                    .is_none()
+                {
                     return Err(AppError::Validation(ValidationError::Invalid {
                         field: "class",
                         reason: "no such class section",
                     }));
                 }
-                Ok(ClassMember::list_for_class(&class, None, 0, db)
-                    .await?
-                    .0
-                    .iter()
-                    .map(|member| member.get_user().clone())
-                    .collect())
+                Ok(
+                    crate::service::class_member::list_for_class(db, &class, None, 0)
+                        .await?
+                        .0
+                        .iter()
+                        .map(|member| member.get_user().clone())
+                        .collect(),
+                )
             }
             InviteSource::Course { course } => {
                 let course = crate::service::course::read(db, &CourseId::from_key(&course))
