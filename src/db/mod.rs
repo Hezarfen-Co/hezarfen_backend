@@ -1,6 +1,7 @@
 //! The only layer that executes queries.
 
 pub mod appointment;
+pub mod appointment_slot;
 pub mod cap;
 pub mod course;
 pub mod exam_attempt;
