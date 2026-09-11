@@ -216,7 +216,7 @@ async fn appointment_responses(
 ) -> Result<Vec<AppointmentResponse>, AppError> {
     let mut slots = Vec::with_capacity(rows.len());
     for row in rows {
-        slots.push(AppointmentSlot::read(row.get_slot(), db).await?);
+        slots.push(service::appointment_slot::read(db, row.get_slot()).await?);
     }
     // Collected eagerly rather than as a lazy iterator: a borrowing closure
     // held across the `person_map` await makes the handler's future
@@ -274,8 +274,10 @@ async fn for_decision(
     user: &User,
     db: &Database,
 ) -> Result<Appointment, AppError> {
-    let appointment = service::appointment::read(db, id).await?.ok_or(AppError::NotFound)?;
-    let slot = AppointmentSlot::read(appointment.get_slot(), db)
+    let appointment = service::appointment::read(db, id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let slot = service::appointment_slot::read(db, appointment.get_slot())
         .await?
         .ok_or(AppError::NotFound)?;
     if !can_manage(&slot, user) {
@@ -341,10 +343,20 @@ async fn publish_slots(
                 reason: "is required with repeat_weekly",
             }))?;
         check_not_past("until", Some(until))?;
-        AppointmentSlot::publish_weekly(user.get_id(), starts_at, ends_at, note, until, &st.db)
-            .await?
+        service::appointment_slot::publish_weekly(
+            &st.db,
+            user.get_id(),
+            starts_at,
+            ends_at,
+            note,
+            until,
+        )
+        .await?
     } else {
-        vec![AppointmentSlot::create(user.get_id(), starts_at, ends_at, note, &st.db).await?]
+        vec![
+            service::appointment_slot::create(&st.db, user.get_id(), starts_at, ends_at, note)
+                .await?,
+        ]
     };
 
     let people = PersonRef::map_of(&[&user]);
@@ -397,11 +409,11 @@ async fn list_slots(
     let (limit, offset) = page.resolve()?;
     let (slots, people) = if user.get_role().at_least(Role::Teacher) {
         (
-            AppointmentSlot::list_for_teacher(user.get_id(), &st.db).await?,
+            service::appointment_slot::list_for_teacher(&st.db, user.get_id()).await?,
             PersonRef::map_of(&[&user]),
         )
     } else {
-        let mut slots = AppointmentSlot::list_upcoming(Timestamp::now(), &st.db).await?;
+        let mut slots = service::appointment_slot::list_upcoming(&st.db, Timestamp::now()).await?;
         // The teachers' live rows, not the slots' word for it: a demotion
         // leaves the calendar behind, and an inert slot must not be offered.
         // Keying the person map off that same read makes the filter free.
@@ -453,7 +465,7 @@ async fn delete_slot(
     RequireTeacher(user): RequireTeacher,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    let slot = AppointmentSlot::read(&AppointmentSlotId::from_key(&id), &st.db)
+    let slot = service::appointment_slot::read(&st.db, &AppointmentSlotId::from_key(&id))
         .await?
         .ok_or(AppError::NotFound)?;
     if !can_manage(&slot, &user) {
@@ -461,7 +473,7 @@ async fn delete_slot(
             "only the slot's teacher or a manager/admin can delete it",
         ));
     }
-    slot.delete(&st.db).await?;
+    service::appointment_slot::delete(&st.db, slot).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -491,7 +503,7 @@ async fn delete_slot_series(
     let series = SlotSeries::from_key(&series);
     // Every occurrence of one publish carries the same teacher, so the first
     // row answers the ownership question for all of them.
-    let slot = AppointmentSlot::list_for_series(&series, &st.db)
+    let slot = service::appointment_slot::list_for_series(&st.db, &series)
         .await?
         .into_iter()
         .next()
@@ -501,7 +513,7 @@ async fn delete_slot_series(
             "only the slot's teacher or a manager/admin can delete it",
         ));
     }
-    AppointmentSlot::delete_series(&series, &st.db).await?;
+    service::appointment_slot::delete_series(&st.db, &series).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -541,7 +553,7 @@ async fn book(
         ));
     }
     let slot_id = AppointmentSlotId::from_key(&req.slot);
-    let slot = AppointmentSlot::read(&slot_id, &st.db)
+    let slot = service::appointment_slot::read(&st.db, &slot_id)
         .await?
         .ok_or(AppError::NotFound)?;
     // The slot row is not the grant: a teacher demoted since publishing keeps
@@ -555,8 +567,7 @@ async fn book(
         ));
     }
     let reason = AppointmentReason::try_new(&req.reason)?;
-    let appointment =
-        service::appointment::book(&st.db, &slot_id, user.get_id(), reason).await?;
+    let appointment = service::appointment::book(&st.db, &slot_id, user.get_id(), reason).await?;
     Ok((
         StatusCode::CREATED,
         one_appointment(appointment, &st.db).await?,
@@ -867,7 +878,9 @@ async fn ensure_requester(
     user: &User,
     db: &Database,
 ) -> Result<Appointment, AppError> {
-    let appointment = service::appointment::read(db, id).await?.ok_or(AppError::NotFound)?;
+    let appointment = service::appointment::read(db, id)
+        .await?
+        .ok_or(AppError::NotFound)?;
     if appointment.get_requester() != user.get_id() {
         return Err(AppError::Forbidden(
             "only the requester can answer a counter-proposal",
@@ -902,12 +915,12 @@ mod tests {
     async fn demoted_slot_owner_loses_management() {
         let db = init_mem().await.unwrap();
         let owner = user("ogretmen", Role::Teacher, &db).await;
-        let slot = AppointmentSlot::create(
+        let slot = service::appointment_slot::create(
+            &db,
             owner.get_id(),
             Timestamp::from_millis(1_000),
             Timestamp::from_millis(2_000),
             None,
-            &db,
         )
         .await
         .unwrap();

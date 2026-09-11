@@ -13,11 +13,12 @@ use tokio::sync::Mutex;
 use crate::constant::{CAS_UPDATE_RETRIES, SLOT_OCCUPIED_FIELD};
 use crate::database::Database;
 use crate::db::appointment;
+use crate::db::appointment_slot;
 use crate::db::cap;
 use crate::domain::appointment::{
     Appointment, AppointmentId, AppointmentReason, AppointmentStatus,
 };
-use crate::domain::appointment_slot::{AppointmentSlot, AppointmentSlotId};
+use crate::domain::appointment_slot::AppointmentSlotId;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
@@ -62,7 +63,7 @@ pub async fn book(
     reason: AppointmentReason,
 ) -> Result<Appointment, AppError> {
     let _guard = APPOINTMENT_LOCK.lock().await;
-    let slot_row = AppointmentSlot::read(slot, db)
+    let slot_row = appointment_slot::read(db, slot)
         .await?
         .ok_or(AppError::NotFound)?;
     // A window that has opened is history, not a plan: `cancel` refuses to
@@ -123,7 +124,7 @@ pub async fn book(
     {
         cap::Claimed::Made(created) => Ok(created),
         cap::Claimed::Full => {
-            if AppointmentSlot::read(slot, db).await?.is_none() {
+            if appointment_slot::read(db, slot).await?.is_none() {
                 return Err(AppError::NotFound);
             }
             Err(AppError::Conflict("the slot is already booked"))
@@ -136,10 +137,7 @@ pub async fn book(
 
 /// The row, for callers that only inspect it — the web layer's authorization
 /// gates read through here.
-pub async fn read(
-    db: &Database,
-    id: &AppointmentId,
-) -> Result<Option<Appointment>, AppError> {
+pub async fn read(db: &Database, id: &AppointmentId) -> Result<Option<Appointment>, AppError> {
     appointment::read(db, id).await
 }
 
@@ -216,7 +214,7 @@ async fn approve_inner(
             }
             _ => {}
         }
-        let slot = AppointmentSlot::read(&expected.slot, db)
+        let slot = appointment_slot::read(db, &expected.slot)
             .await?
             .ok_or(AppError::NotFound)?;
         let (starts_at, ends_at) = expected.window(&slot);
@@ -296,7 +294,7 @@ pub async fn cancel(
         if !expected.status.is_live() {
             return Err(AppError::Conflict("the appointment is already settled"));
         }
-        let slot = AppointmentSlot::read(&expected.slot, db)
+        let slot = appointment_slot::read(db, &expected.slot)
             .await?
             .ok_or(AppError::NotFound)?;
         if expected.window(&slot).0.as_millis() <= Timestamp::now().as_millis() {
@@ -395,6 +393,7 @@ fn contended() -> AppError {
 mod tests {
     use super::*;
     use crate::database::{Database, init_mem};
+    use crate::service::appointment_slot;
 
     fn at(millis: i64) -> Timestamp {
         Timestamp::from_millis(millis)
@@ -410,7 +409,7 @@ mod tests {
         let db = init_mem().await.unwrap();
         let teacher = UserId::from_key("t1");
         let (starts_at, ends_at) = (soon(60_000), soon(120_000));
-        let slot = AppointmentSlot::create(&teacher, starts_at, ends_at, None, &db)
+        let slot = appointment_slot::create(&db, &teacher, starts_at, ends_at, None)
             .await
             .unwrap();
         let mut appointment_row = book(
@@ -435,7 +434,7 @@ mod tests {
         let db = init_mem().await.unwrap();
         let teacher = UserId::from_key("t1");
         let reason = || AppointmentReason::try_new("görüşme").unwrap();
-        let started = AppointmentSlot::create(&teacher, soon(-30_000), soon(60_000), None, &db)
+        let started = appointment_slot::create(&db, &teacher, soon(-30_000), soon(60_000), None)
             .await
             .unwrap();
         assert!(matches!(
@@ -443,12 +442,14 @@ mod tests {
             Err(AppError::Conflict("the slot has already started"))
         ));
 
-        let upcoming = AppointmentSlot::create(&teacher, soon(60_000), soon(120_000), None, &db)
+        let upcoming = appointment_slot::create(&db, &teacher, soon(60_000), soon(120_000), None)
             .await
             .unwrap();
-        assert!(book(&db, upcoming.get_id(), &UserId::from_key("s1"), reason())
-            .await
-            .is_ok());
+        assert!(
+            book(&db, upcoming.get_id(), &UserId::from_key("s1"), reason())
+                .await
+                .is_ok()
+        );
     }
 
     /// Approval judges the *effective* window, so a proposal whose time has
@@ -458,7 +459,7 @@ mod tests {
         let db = init_mem().await.unwrap();
         let teacher = UserId::from_key("t1");
         let student = UserId::from_key("s1");
-        let slot = AppointmentSlot::create(&teacher, soon(60_000), soon(120_000), None, &db)
+        let slot = appointment_slot::create(&db, &teacher, soon(60_000), soon(120_000), None)
             .await
             .unwrap();
         let booking = book(
@@ -492,8 +493,14 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(
-            accept_proposal(&db, booking.get_id(), &student, passed_starts_at, passed_ends_at)
-                .await,
+            accept_proposal(
+                &db,
+                booking.get_id(),
+                &student,
+                passed_starts_at,
+                passed_ends_at
+            )
+            .await,
             Err(AppError::Conflict("that time has already started"))
         ));
         // Refused, not half-applied: still pending, still decidable at a time
@@ -507,8 +514,14 @@ mod tests {
         // Accepting a window that is *not* the standing proposal is refused —
         // the pin is what the requester saw, not a request to move the meeting.
         assert!(matches!(
-            accept_proposal(&db, booking.get_id(), &student, passed_starts_at, passed_ends_at)
-                .await,
+            accept_proposal(
+                &db,
+                booking.get_id(),
+                &student,
+                passed_starts_at,
+                passed_ends_at
+            )
+            .await,
             Err(AppError::Conflict(
                 "the proposed time has changed; \
                  re-read the booking and accept the new one"
@@ -534,7 +547,7 @@ mod tests {
         let db = init_mem().await.unwrap();
         let teacher = UserId::from_key("t1");
         let student = UserId::from_key("s1");
-        let slot = AppointmentSlot::create(&teacher, soon(60_000), soon(120_000), None, &db)
+        let slot = appointment_slot::create(&db, &teacher, soon(60_000), soon(120_000), None)
             .await
             .unwrap();
         let booking = book(
@@ -551,9 +564,15 @@ mod tests {
         // `pending` status.
         let stale = booking.clone();
         let (proposed_starts_at, proposed_ends_at) = (soon(180_000), soon(240_000));
-        propose(&db, booking.get_id(), proposed_starts_at, proposed_ends_at, &teacher)
-            .await
-            .unwrap();
+        propose(
+            &db,
+            booking.get_id(),
+            proposed_starts_at,
+            proposed_ends_at,
+            &teacher,
+        )
+        .await
+        .unwrap();
 
         let mut late = stale.clone();
         late.status = AppointmentStatus::Approved;
@@ -616,7 +635,7 @@ mod tests {
     async fn a_concurrent_claim_cannot_take_a_booked_slot() {
         let db = init_mem().await.unwrap();
         let teacher = UserId::from_key("t1");
-        let slot = AppointmentSlot::create(&teacher, soon(60_000), soon(120_000), None, &db)
+        let slot = appointment_slot::create(&db, &teacher, soon(60_000), soon(120_000), None)
             .await
             .unwrap();
         assert_eq!(occupied(slot.get_id(), &db).await, 0);
@@ -657,7 +676,7 @@ mod tests {
     async fn a_refused_booking_moves_nothing() {
         let db = init_mem().await.unwrap();
         let teacher = UserId::from_key("t1");
-        let slot = AppointmentSlot::create(&teacher, soon(60_000), soon(120_000), None, &db)
+        let slot = appointment_slot::create(&db, &teacher, soon(60_000), soon(120_000), None)
             .await
             .unwrap();
         let reason = || AppointmentReason::try_new("görüşme").unwrap();
@@ -695,7 +714,7 @@ mod tests {
         let db = init_mem().await.unwrap();
         let teacher = UserId::from_key("t1");
         let student = UserId::from_key("s1");
-        let slot = AppointmentSlot::create(&teacher, soon(60_000), soon(120_000), None, &db)
+        let slot = appointment_slot::create(&db, &teacher, soon(60_000), soon(120_000), None)
             .await
             .unwrap();
         let booking = book(
@@ -709,21 +728,21 @@ mod tests {
         approve(&db, booking.get_id(), &teacher).await.unwrap();
         assert_eq!(occupied(slot.get_id(), &db).await, 1, "approval holds it");
 
-        cancel(&db, booking.get_id(), &student, None)
-            .await
-            .unwrap();
+        cancel(&db, booking.get_id(), &student, None).await.unwrap();
         assert_eq!(occupied(slot.get_id(), &db).await, 0);
         // Cancelling twice is refused, so the seat cannot go back twice either.
         assert!(cancel(&db, booking.get_id(), &student, None).await.is_err());
         assert_eq!(occupied(slot.get_id(), &db).await, 0);
-        assert!(book(
-            &db,
-            slot.get_id(),
-            &UserId::from_key("s2"),
-            AppointmentReason::try_new("görüşme").unwrap()
-        )
-        .await
-        .is_ok());
+        assert!(
+            book(
+                &db,
+                slot.get_id(),
+                &UserId::from_key("s2"),
+                AppointmentReason::try_new("görüşme").unwrap()
+            )
+            .await
+            .is_ok()
+        );
         assert_eq!(occupied(slot.get_id(), &db).await, 1);
     }
 
@@ -732,7 +751,7 @@ mod tests {
     async fn rejecting_frees_the_slot_for_re_booking() {
         let db = init_mem().await.unwrap();
         let teacher = UserId::from_key("t1");
-        let slot = AppointmentSlot::create(&teacher, soon(60_000), soon(120_000), None, &db)
+        let slot = appointment_slot::create(&db, &teacher, soon(60_000), soon(120_000), None)
             .await
             .unwrap();
         let reason = || AppointmentReason::try_new("görüşme").unwrap();
@@ -746,13 +765,11 @@ mod tests {
         ));
         // The live booking also blocks the slot delete.
         assert!(matches!(
-            slot.clone().delete(&db).await,
+            appointment_slot::delete(&db, slot.clone()).await,
             Err(AppError::Conflict(_))
         ));
 
-        reject(&db, first.get_id(), &teacher, None)
-            .await
-            .unwrap();
+        reject(&db, first.get_id(), &teacher, None).await.unwrap();
         assert_eq!(occupied(slot.get_id(), &db).await, 0);
         let second = book(&db, slot.get_id(), &UserId::from_key("s2"), reason())
             .await

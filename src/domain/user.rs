@@ -772,7 +772,7 @@ impl User {
             // `Appointment::book` claims the slot row this deletes, so the two
             // collide in the store and the loser re-sends. A slot *published*
             // concurrently shares no key with any of this, which is why
-            // `AppointmentSlot::insert_claimed` claims the user row instead.
+            // `crate::db::appointment_slot::insert_claimed` claims the user row instead.
             batch.push(format!(
                 "DELETE {APPOINTMENT_SLOT_TABLE} WHERE id IN $slots"
             ));
@@ -1079,8 +1079,8 @@ mod tests {
     #[tokio::test]
     async fn a_demotion_withdraws_the_calendar_and_settles_its_bookings() {
         use crate::domain::appointment::AppointmentReason;
-        use crate::domain::appointment_slot::AppointmentSlot;
         use crate::service::appointment;
+        use crate::service::appointment_slot;
 
         let db = init_mem().await.unwrap();
         let staff = |name: &'static str, db: Database| async move {
@@ -1099,7 +1099,7 @@ mod tests {
         let slot = |owner: &User, offset: i64, db: Database| {
             let owner = owner.get_id().clone();
             async move {
-                AppointmentSlot::create(&owner, soon(offset), soon(offset + 60_000), None, &db)
+                appointment_slot::create(&db, &owner, soon(offset), soon(offset + 60_000), None)
                     .await
                     .unwrap()
             }
@@ -1127,14 +1127,14 @@ mod tests {
 
         // The calendar is gone, the booked weeks included.
         assert!(
-            AppointmentSlot::list_for_teacher(teacher.get_id(), &db)
+            appointment_slot::list_for_teacher(&db, teacher.get_id())
                 .await
                 .unwrap()
                 .is_empty()
         );
         for slot in [&free, &asked, &agreed] {
             assert!(
-                AppointmentSlot::read(slot.get_id(), &db)
+                appointment_slot::read(&db, slot.get_id())
                     .await
                     .unwrap()
                     .is_none(),
@@ -1167,7 +1167,7 @@ mod tests {
 
         // Another teacher's calendar is nobody else's business.
         assert_eq!(
-            AppointmentSlot::list_for_teacher(other.get_id(), &db)
+            appointment_slot::list_for_teacher(&db, other.get_id())
                 .await
                 .unwrap()
                 .len(),
