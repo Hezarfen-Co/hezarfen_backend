@@ -115,6 +115,18 @@ impl From<Option<Uuid>> for Param {
     }
 }
 
+impl From<Option<String>> for Param {
+    fn from(value: Option<String>) -> Self {
+        Self::OptText(value)
+    }
+}
+
+impl From<Option<i64>> for Param {
+    fn from(value: Option<i64>) -> Self {
+        Self::OptI64(value)
+    }
+}
+
 pub(crate) struct PagedList {
     /// Everything after `FROM`, e.g. `note WHERE user_id = $1`. Placeholders
     /// are positional in [`PagedList::bind`] order; shared verbatim by the
