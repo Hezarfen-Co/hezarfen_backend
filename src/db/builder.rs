@@ -41,7 +41,7 @@ pub async fn create_session(
     db: &Database,
     builder: &BuilderId,
 ) -> Result<BuilderSession, AppError> {
-    let key = RecordId::new(BUILDER_SESSION_TABLE, Ulid::new().to_string());
+    let key = RecordId::new(BUILDER_SESSION_TABLE, Ulid::generate().to_string());
     let session = BuilderSession {
         id: key.clone(),
         builder: builder.clone(),

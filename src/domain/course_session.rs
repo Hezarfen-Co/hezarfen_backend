@@ -12,7 +12,7 @@ use crate::validate::validate_optional;
 pub struct CourseSessionId(RecordId);
 
 impl CourseSessionId {
-    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
+    /// Minted from the process-wide monotonic generator, not `Ulid::generate()`:
     /// a course's sessions sort `starts_at DESC, id DESC` and the id breaks
     /// the tie between two sessions starting at the same instant,
     /// and a random low half sorts arbitrarily inside one millisecond.

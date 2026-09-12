@@ -102,7 +102,7 @@ mod tests {
     #[tokio::test]
     async fn stats_are_zero_without_pomodoro_rows() {
         let db = crate::database::init_mem().await.unwrap();
-        let user = UserId::from_key(&ulid::Ulid::new().to_string());
+        let user = UserId::from_key(&ulid::Ulid::generate().to_string());
 
         let stats = load(&db, &user, 3, 1).await.unwrap();
         // Derived counters: no rows is a true zero, never a null.
@@ -121,7 +121,7 @@ mod tests {
     #[tokio::test]
     async fn lifetime_totals_ride_the_same_query() {
         let db = crate::database::init_mem().await.unwrap();
-        let user = UserId::from_key(&ulid::Ulid::new().to_string());
+        let user = UserId::from_key(&ulid::Ulid::generate().to_string());
         db.query(format!(
             "CREATE $usr SET username = $name, password_hash = 'x',
                  {} = 4, {} = 3",
@@ -148,8 +148,8 @@ mod tests {
     #[tokio::test]
     async fn stats_count_finished_stints_only() {
         let db = crate::database::init_mem().await.unwrap();
-        let user = UserId::from_key(&ulid::Ulid::new().to_string());
-        let other = UserId::from_key(&ulid::Ulid::new().to_string());
+        let user = UserId::from_key(&ulid::Ulid::generate().to_string());
+        let other = UserId::from_key(&ulid::Ulid::generate().to_string());
 
         // Two finished stints (1000 ms + 2500 ms), one still running, and one
         // finished stint belonging to somebody else.
@@ -174,7 +174,7 @@ mod tests {
     #[tokio::test]
     async fn focus_time_never_reads_negative() {
         let db = crate::database::init_mem().await.unwrap();
-        let user = UserId::from_key(&ulid::Ulid::new().to_string());
+        let user = UserId::from_key(&ulid::Ulid::generate().to_string());
 
         // One honest 1000 ms stint and one inverted row — what a backwards
         // clock step left behind before `finish` grew its floor. The raw sum is

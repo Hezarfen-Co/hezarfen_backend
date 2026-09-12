@@ -17,7 +17,7 @@ use crate::validate::validate_required;
 pub struct ChatbotThreadId(RecordId);
 
 impl ChatbotThreadId {
-    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
+    /// Minted from the process-wide monotonic generator, not `Ulid::generate()`:
     /// threads sort `updated_at DESC, id DESC` and the id breaks the tie
     /// between two threads last touched in the same millisecond,
     /// and a random low half sorts arbitrarily inside one millisecond.

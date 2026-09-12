@@ -24,7 +24,7 @@ pub struct BuilderId(RecordId);
 
 impl BuilderId {
     pub fn generate() -> Self {
-        Self(RecordId::new(BUILDER_TABLE, Ulid::new().to_string()))
+        Self(RecordId::new(BUILDER_TABLE, Ulid::generate().to_string()))
     }
 
     pub fn from_key(key: &str) -> Self {

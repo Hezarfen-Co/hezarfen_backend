@@ -10,7 +10,7 @@ use crate::validate::{validate_optional, validate_required};
 pub struct SubjectId(RecordId);
 
 impl SubjectId {
-    /// Minted from the process-wide monotonic generator, not `Ulid::new()`: the
+    /// Minted from the process-wide monotonic generator, not `Ulid::generate()`: the
     /// id *is* the curriculum's order ([`crate::db::subject::list_for_course`]
     /// sorts `id ASC`), and a random low half scrambles a burst of saves that
     /// lands inside one millisecond.
@@ -99,7 +99,7 @@ mod tests {
     /// A teacher entering a curriculum gets it back in the order they typed it:
     /// `list_for_course` sorts `id ASC`, so the ids minted inside one
     /// millisecond have to sort in mint order. Revert `generate` to
-    /// `Ulid::new()` and this fails — the low 80 bits are redrawn per id, so a
+    /// `Ulid::generate()` and this fails — the low 80 bits are redrawn per id, so a
     /// same-tick burst comes out shuffled.
     #[tokio::test]
     async fn ids_sort_in_creation_order() {

@@ -18,7 +18,7 @@ use crate::validate::validate_required;
 pub struct TermId(RecordId);
 
 impl TermId {
-    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
+    /// Minted from the process-wide monotonic generator, not `Ulid::generate()`:
     /// terms sort `starts_at DESC, id DESC` and the id breaks the tie between
     /// two terms starting at the same instant,
     /// and a random low half sorts arbitrarily inside one millisecond.

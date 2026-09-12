@@ -9,7 +9,7 @@ use crate::domain::user::UserId;
 pub struct PomodoroSessionId(RecordId);
 
 impl PomodoroSessionId {
-    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
+    /// Minted from the process-wide monotonic generator, not `Ulid::generate()`:
     /// the log sorts `started_at DESC, id DESC` and the id breaks the tie between
     /// two sessions started at the same instant. The `open_` key below never ties
     /// with itself (one running session per user), so it needs no ordering.

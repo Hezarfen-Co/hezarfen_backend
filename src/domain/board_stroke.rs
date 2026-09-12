@@ -62,7 +62,7 @@ pub const REFUSALS: [&str; 5] = [
 pub struct BoardStrokeId(RecordId);
 
 impl BoardStrokeId {
-    /// Monotonic, not `Ulid::new()`: this id *is* the board's total order, and
+    /// Monotonic, not `Ulid::generate()`: this id *is* the board's total order, and
     /// a random low half scrambles every stroke drawn in the same millisecond —
     /// which is what a burst of drawing looks like.
     pub fn generate() -> Self {

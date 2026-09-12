@@ -16,7 +16,7 @@ use crate::validate::{validate_question_kind, validate_question_points, validate
 pub struct ExamQuestionId(RecordId);
 
 impl ExamQuestionId {
-    /// Minted from the process-wide monotonic generator, not `Ulid::new()`: the
+    /// Minted from the process-wide monotonic generator, not `Ulid::generate()`: the
     /// id *is* the question's presentation order
     /// ([`crate::db::exam_question::list_for_exam`]
     /// sorts `id ASC`), and a random low half scrambles a burst of saves that
@@ -115,11 +115,11 @@ impl ChoiceText {
 pub struct ChoiceId(String);
 
 impl ChoiceId {
-    /// Plain `Ulid::new()` deliberately: options are ordered by their position
+    /// Plain `Ulid::generate()` deliberately: options are ordered by their position
     /// in the stored `Vec`, never by id, so nothing here reads the id as a
     /// clock — it only has to be unique.
     fn generate() -> Self {
-        Self(Ulid::new().to_string())
+        Self(Ulid::generate().to_string())
     }
 
     pub fn as_str(&self) -> &str {
@@ -408,7 +408,7 @@ mod tests {
     /// A teacher saving several questions back to back gets them back in that
     /// order: `list_for_exam` sorts `id ASC`, so the ids minted inside one
     /// millisecond have to sort in mint order. Revert `generate` to
-    /// `Ulid::new()` and this fails — the low 80 bits are redrawn per id, so a
+    /// `Ulid::generate()` and this fails — the low 80 bits are redrawn per id, so a
     /// same-tick burst comes out shuffled.
     #[tokio::test]
     async fn ids_sort_in_creation_order() {

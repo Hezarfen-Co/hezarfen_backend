@@ -1,7 +1,7 @@
 //! Ids that sort in write order, for tables whose listings lean on `id` to
 //! break ties (or to mean "newest first" outright).
 //!
-//! `Ulid::new()` fills the low 80 bits at random, so two ids minted in the
+//! `Ulid::generate()` fills the low 80 bits at random, so two ids minted in the
 //! *same millisecond* sort arbitrarily against each other — millisecond-
 //! accurate ordering only. That is not enough when a burst of writes lands
 //! inside one tick (a recurring appointment publish expanding a series, a

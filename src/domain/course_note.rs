@@ -11,7 +11,7 @@ use crate::validate::{validate_optional, validate_required};
 pub struct CourseNoteId(RecordId);
 
 impl CourseNoteId {
-    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
+    /// Minted from the process-wide monotonic generator, not `Ulid::generate()`:
     /// a course's notes list `id DESC` (newest first,
     /// [`crate::db::course_note::list_for_course`]), and a random low half
     /// scrambles rows minted in the same millisecond.

@@ -28,7 +28,7 @@ use crate::validate::{
 pub struct ExamId(RecordId);
 
 impl ExamId {
-    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
+    /// Minted from the process-wide monotonic generator, not `Ulid::generate()`:
     /// exams list `id DESC` (newest first, [`crate::db::exam::list_all`]),
     /// and a random low half scrambles rows minted in the same millisecond.
     pub fn generate() -> Self {

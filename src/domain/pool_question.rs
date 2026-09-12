@@ -28,7 +28,7 @@ use crate::validate::validate_required;
 pub struct PoolQuestionId(RecordId);
 
 impl PoolQuestionId {
-    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
+    /// Minted from the process-wide monotonic generator, not `Ulid::generate()`:
     /// the pool sorts `asked_at DESC, id DESC` and the id *is* the tie-break
     /// ([`crate::db::pool_question::list_all`]),
     /// and a random low half scrambles rows minted in the same millisecond.

@@ -27,7 +27,7 @@ use crate::validate::{validate_optional, validate_required};
 pub struct HomeworkId(RecordId);
 
 impl HomeworkId {
-    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
+    /// Minted from the process-wide monotonic generator, not `Ulid::generate()`:
     /// homework lists `id DESC` (newest first, [`Homework::list_all`]),
     /// and a random low half scrambles rows minted in the same millisecond.
     pub fn generate() -> Self {

@@ -23,7 +23,7 @@ use crate::domain::user::UserId;
 use crate::error::ValidationError;
 use crate::validate::validate_required;
 
-/// Mints message ids in write order. Unlike `Ulid::new()`, whose 80 random
+/// Mints message ids in write order. Unlike `Ulid::generate()`, whose 80 random
 /// low bits sort arbitrarily among ids minted in the same millisecond, this
 /// increments the previous id — so the `id` tie-break in the `ORDER BY` of
 /// [`list_for_thread`](crate::db::chatbot_message::list_for_thread) /

@@ -260,7 +260,7 @@ impl AiBridge {
         // function returns by any path, so an abandoned request frees the
         // worker's slot rather than leaking it.
         let lease = self.inner.registry.pick(capability)?;
-        let id = Ulid::new().to_string();
+        let id = Ulid::generate().to_string();
         let deadline_ms = timeout.as_millis().min(u64::MAX as u128) as u64;
         let request = Request {
             id: id.clone(),
@@ -995,7 +995,7 @@ async fn register(
         return Err(());
     }
 
-    let worker_id = Ulid::new().to_string();
+    let worker_id = Ulid::generate().to_string();
     let max_concurrent = clamp_concurrency(hello.max_concurrent);
     let greeting = Greeting::Welcome {
         worker_id: worker_id.clone(),

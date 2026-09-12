@@ -288,7 +288,7 @@ mod tests {
     /// The two counter columns plus a row to carry them: the `user` table is
     /// SCHEMAFULL in production, and the counters are `option<int>` there.
     async fn a_user(db: &Database) -> UserId {
-        let user = UserId::from_key(&Ulid::new().to_string());
+        let user = UserId::from_key(&Ulid::generate().to_string());
         db.query(format!(
             "DEFINE FIELD IF NOT EXISTS {POOL_APPROVED_TOTAL_FIELD} ON user TYPE option<int>;
              DEFINE FIELD IF NOT EXISTS {POOL_PUBLISHED_TOTAL_FIELD} ON user TYPE option<int>;
@@ -336,8 +336,8 @@ mod tests {
     #[tokio::test]
     async fn approval_is_a_one_way_race_safe_transition() {
         let db = database::init_mem().await.unwrap();
-        let asker = UserId::from_key(&Ulid::new().to_string());
-        let teacher = UserId::from_key(&Ulid::new().to_string());
+        let asker = UserId::from_key(&Ulid::generate().to_string());
+        let teacher = UserId::from_key(&Ulid::generate().to_string());
 
         let q = insert(&db, question(&asker)).await.unwrap();
         assert_eq!(q.get_status(), STATUS_PENDING);
@@ -420,9 +420,9 @@ mod tests {
     #[tokio::test]
     async fn visibility_hides_others_pending_questions() {
         let db = database::init_mem().await.unwrap();
-        let asker = UserId::from_key(&Ulid::new().to_string());
-        let other = UserId::from_key(&Ulid::new().to_string());
-        let teacher = UserId::from_key(&Ulid::new().to_string());
+        let asker = UserId::from_key(&Ulid::generate().to_string());
+        let other = UserId::from_key(&Ulid::generate().to_string());
+        let teacher = UserId::from_key(&Ulid::generate().to_string());
 
         let pending = insert(&db, question(&asker)).await.unwrap();
         let published = insert(&db, question(&other)).await.unwrap();
@@ -444,8 +444,8 @@ mod tests {
     #[tokio::test]
     async fn image_attaches_only_while_pending_and_reports_the_replaced_blob() {
         let db = database::init_mem().await.unwrap();
-        let asker = UserId::from_key(&Ulid::new().to_string());
-        let teacher = UserId::from_key(&Ulid::new().to_string());
+        let asker = UserId::from_key(&Ulid::generate().to_string());
+        let teacher = UserId::from_key(&Ulid::generate().to_string());
         let png = FileContentType::try_new("image/png").unwrap();
 
         let q = insert(&db, question(&asker)).await.unwrap();
@@ -491,8 +491,8 @@ mod tests {
     #[tokio::test]
     async fn delete_cascades_solutions_and_returns_the_row() {
         let db = database::init_mem().await.unwrap();
-        let asker = UserId::from_key(&Ulid::new().to_string());
-        let helper = UserId::from_key(&Ulid::new().to_string());
+        let asker = UserId::from_key(&Ulid::generate().to_string());
+        let helper = UserId::from_key(&Ulid::generate().to_string());
 
         let q = insert(&db, question(&asker)).await.unwrap();
         let offered = crate::db::solution::insert(
@@ -564,8 +564,8 @@ mod tests {
 
         let (mut solutions, mut swept, mut delete_500) = (0, 0, 0);
         for round in 0..4 {
-            let asker = UserId::from_key(&Ulid::new().to_string());
-            let helper = UserId::from_key(&Ulid::new().to_string());
+            let asker = UserId::from_key(&Ulid::generate().to_string());
+            let helper = UserId::from_key(&Ulid::generate().to_string());
             let q = insert(&db, question(&asker)).await.unwrap();
             let id = q.get_id().clone();
 

@@ -10,7 +10,7 @@ use crate::validate::{validate_optional, validate_required};
 pub struct NoteId(RecordId);
 
 impl NoteId {
-    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
+    /// Minted from the process-wide monotonic generator, not `Ulid::generate()`:
     /// notes list `id DESC` (newest first, [`crate::db::note::list_for`]),
     /// and a random low half scrambles rows minted in the same millisecond.
     pub fn generate() -> Self {

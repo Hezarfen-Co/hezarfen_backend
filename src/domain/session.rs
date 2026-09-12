@@ -11,7 +11,7 @@ pub struct SessionId(RecordId);
 
 impl SessionId {
     pub fn generate() -> Self {
-        Self(RecordId::new(SESSION_TABLE, Ulid::new().to_string()))
+        Self(RecordId::new(SESSION_TABLE, Ulid::generate().to_string()))
     }
 
     pub fn record(&self) -> RecordId {

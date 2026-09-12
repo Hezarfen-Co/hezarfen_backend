@@ -100,7 +100,7 @@ impl Folder {
 pub struct MessageId(RecordId);
 
 impl MessageId {
-    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
+    /// Minted from the process-wide monotonic generator, not `Ulid::generate()`:
     /// the folder listings sort `id DESC` (newest first,
     /// [`crate::db::message::list_folder`]),
     /// and a random low half scrambles rows minted in the same millisecond.

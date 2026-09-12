@@ -16,7 +16,7 @@ use crate::error::ValidationError;
 pub struct NoteFileId(RecordId);
 
 impl NoteFileId {
-    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
+    /// Minted from the process-wide monotonic generator, not `Ulid::generate()`:
     /// a note's files list `id DESC` (newest first,
     /// [`crate::db::note_file::list_for`]), and a random low half scrambles
     /// rows minted in the same millisecond.

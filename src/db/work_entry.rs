@@ -154,7 +154,7 @@ mod tests {
         let db = database::init_mem().await.unwrap();
         // A `record<user>` column checks the table of the id, not row
         // existence — a fabricated id keeps this test free of user ceremony.
-        let user = UserId::from_key(&Ulid::new().to_string());
+        let user = UserId::from_key(&Ulid::generate().to_string());
 
         let open = check_in(&db, &user).await.unwrap();
         assert!(open.is_open());

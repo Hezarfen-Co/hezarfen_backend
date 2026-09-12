@@ -23,7 +23,7 @@ use crate::validate::validate_required;
 pub struct SolutionId(RecordId);
 
 impl SolutionId {
-    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
+    /// Minted from the process-wide monotonic generator, not `Ulid::generate()`:
     /// solutions sort `offered_at ASC, id ASC` and the id *is* the tie-break
     /// ([`crate::db::solution::list_for`]),
     /// and a random low half scrambles rows minted in the same millisecond.

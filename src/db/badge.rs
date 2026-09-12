@@ -184,7 +184,7 @@ mod tests {
 
     /// A user row carrying `counters`, by column name.
     async fn a_user(counters: &[(&str, i64)], db: &Database) -> UserId {
-        let user = UserId::from_key(&ulid::Ulid::new().to_string());
+        let user = UserId::from_key(&ulid::Ulid::generate().to_string());
         let sets: Vec<String> = counters
             .iter()
             .map(|(field, value)| format!("{field} = {value}"))

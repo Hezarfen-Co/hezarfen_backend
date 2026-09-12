@@ -482,7 +482,7 @@ async fn upload_image(
     let upload = read_image_upload(&st, &mut multipart).await?;
     let size = upload.size();
 
-    let file = ulid::Ulid::new().to_string();
+    let file = ulid::Ulid::generate().to_string();
     store_blob(&st, &file, &upload.data, || async {
         match pool_question::set_image(&st.db, question.get_id(), &file, &upload.content_type, size)
             .await?
@@ -808,7 +808,7 @@ async fn upload_solution_image(
     let upload = read_image_upload(&st, &mut multipart).await?;
     let size = upload.size();
 
-    let file = ulid::Ulid::new().to_string();
+    let file = ulid::Ulid::generate().to_string();
     store_blob(&st, &file, &upload.data, || async {
         match solution::set_image(&st.db, solution.get_id(), &file, &upload.content_type, size)
             .await?

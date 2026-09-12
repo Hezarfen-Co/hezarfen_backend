@@ -20,7 +20,7 @@ use crate::domain::monotonic_id::next_ulid;
 pub struct CourseNoteFileId(RecordId);
 
 impl CourseNoteFileId {
-    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
+    /// Minted from the process-wide monotonic generator, not `Ulid::generate()`:
     /// a note's files list `id DESC` (newest first,
     /// [`crate::db::course_note_file::list_for`]), and a random low half
     /// scrambles rows minted in the same millisecond.

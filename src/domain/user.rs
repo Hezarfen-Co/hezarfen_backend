@@ -5,7 +5,7 @@
 
 use std::sync::OnceLock;
 
-use argon2::password_hash::SaltString;
+use argon2::password_hash::phc::PasswordHash as PhcHash;
 use argon2::{Argon2, PasswordHasher, PasswordVerifier};
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
@@ -23,7 +23,7 @@ use crate::validate::{validate_password, validate_username};
 pub struct UserId(RecordId);
 
 impl UserId {
-    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
+    /// Minted from the process-wide monotonic generator, not `Ulid::generate()`:
     /// users list `id DESC` (newest first, [`crate::db::user::list_all`]) and page by
     /// offset over that order, and a random low half scrambles rows minted in
     /// the same millisecond. Not a secret: the session token is separate
@@ -93,13 +93,9 @@ impl Password {
     /// Private on purpose: argon2 must never run on an async worker. Callers
     /// outside this module go through [`Password::hash_async`].
     fn hash(&self) -> Result<PasswordHash, AppError> {
-        let mut salt_bytes = [0u8; 16];
-        getrandom::fill(&mut salt_bytes).map_err(|e| AppError::Internal(format!("rng: {e}")))?;
-        let salt = SaltString::encode_b64(&salt_bytes)
-            .map_err(|e| AppError::Internal(format!("salt: {e}")))?;
-        let hash = Argon2::default()
-            .hash_password(self.0.as_bytes(), &salt)?
-            .to_string();
+        // password-hash 0.6 generates the salt internally (its own CSPRNG);
+        // the explicit SaltString step is gone.
+        let hash = Argon2::default().hash_password(self.0.as_bytes())?.to_string();
         Ok(PasswordHash(hash))
     }
 
@@ -142,7 +138,7 @@ impl PasswordHash {
 
     /// Private on purpose — see [`Password::hash`]. Use [`PasswordHash::verify_async`].
     fn verify(&self, password: &Password) -> bool {
-        match argon2::password_hash::PasswordHash::new(&self.0) {
+        match PhcHash::new(&self.0) {
             Ok(parsed) => Argon2::default()
                 .verify_password(password.0.as_bytes(), &parsed)
                 .is_ok(),

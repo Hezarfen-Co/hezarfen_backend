@@ -27,7 +27,7 @@ use crate::domain::timestamp::Timestamp;
 pub struct RagOutputId(RecordId);
 
 impl RagOutputId {
-    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
+    /// Minted from the process-wide monotonic generator, not `Ulid::generate()`:
     /// a note's outputs list `id DESC` (newest first,
     /// [`list_for`](crate::db::rag_output::list_for)).
     pub fn generate() -> Self {

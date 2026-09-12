@@ -183,7 +183,7 @@ mod tests {
         crate::db::pool_question::insert(
             db,
             PoolQuestion::new(
-                &UserId::from_key(&Ulid::new().to_string()),
+                &UserId::from_key(&Ulid::generate().to_string()),
                 PoolQuestionTitle::try_new("soru").unwrap(),
                 PoolQuestionBody::try_new("neden").unwrap(),
             ),
@@ -199,7 +199,7 @@ mod tests {
         let db = database::init_mem().await.unwrap();
         let question_a = question_row(&db).await;
         let question_b = question_row(&db).await;
-        let author = UserId::from_key(&Ulid::new().to_string());
+        let author = UserId::from_key(&Ulid::generate().to_string());
 
         // Distinct offer times so the assertion pins the real contract —
         // older `offered_at` sorts first — not the same-millisecond `id`
@@ -257,7 +257,7 @@ mod tests {
     async fn image_set_replace_clear_report_the_replaced_blob() {
         let db = database::init_mem().await.unwrap();
         let question = question_row(&db).await;
-        let author = UserId::from_key(&Ulid::new().to_string());
+        let author = UserId::from_key(&Ulid::generate().to_string());
         let png = FileContentType::try_new("image/png").unwrap();
 
         let solution = insert(
@@ -318,7 +318,7 @@ mod tests {
     async fn set_body_edits_in_place() {
         let db = database::init_mem().await.unwrap();
         let question = question_row(&db).await;
-        let author = UserId::from_key(&Ulid::new().to_string());
+        let author = UserId::from_key(&Ulid::generate().to_string());
 
         let solution = insert(
             &db,
@@ -346,7 +346,7 @@ mod tests {
         assert!(
             set_body(
                 &db,
-                &SolutionId::from_key(&Ulid::new().to_string()),
+                &SolutionId::from_key(&Ulid::generate().to_string()),
                 &SolutionBody::try_new("boş").unwrap(),
             )
             .await
@@ -361,7 +361,7 @@ mod tests {
         let two = question_row(&db).await;
         let one = question_row(&db).await;
         let none = question_row(&db).await;
-        let author = UserId::from_key(&Ulid::new().to_string());
+        let author = UserId::from_key(&Ulid::generate().to_string());
 
         for (question, bodies) in [(&two, vec!["a", "b"]), (&one, vec!["c"])] {
             for body in bodies {

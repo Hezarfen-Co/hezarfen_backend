@@ -23,7 +23,7 @@ use crate::domain::timestamp::Timestamp;
 pub struct HomeworkFileId(RecordId);
 
 impl HomeworkFileId {
-    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
+    /// Minted from the process-wide monotonic generator, not `Ulid::generate()`:
     /// a submission's files list `id DESC` (newest first, [`HomeworkFile::list_for_submission`]),
     /// and a random low half scrambles rows minted in the same millisecond.
     pub fn generate() -> Self {
@@ -75,7 +75,7 @@ impl HomeworkFile {
             name,
             content_type,
             size,
-            file: Ulid::new().to_string(),
+            file: Ulid::generate().to_string(),
             created_at: Timestamp::now(),
         }
     }

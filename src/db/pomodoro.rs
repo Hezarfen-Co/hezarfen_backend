@@ -282,7 +282,7 @@ mod tests {
     /// touches a record that exists, so a fabricated id would silently store
     /// nothing. The tests above need no row — they read only the stint log.
     async fn a_user(db: &Database) -> UserId {
-        let user = UserId::from_key(&Ulid::new().to_string());
+        let user = UserId::from_key(&Ulid::generate().to_string());
         db.query("CREATE $usr SET username = $name, password_hash = 'x'")
             .bind(("usr", user.record()))
             .bind(("name", user.key().to_string()))
@@ -699,7 +699,7 @@ mod tests {
         let db = database::init_mem().await.unwrap();
         // A `record<user>` column checks the table of the id, not row
         // existence — a fabricated id keeps this test free of user ceremony.
-        let user = UserId::from_key(&Ulid::new().to_string());
+        let user = UserId::from_key(&Ulid::generate().to_string());
 
         // Nothing running yet — finishing conflicts.
         assert!(matches!(
@@ -733,7 +733,7 @@ mod tests {
     #[tokio::test]
     async fn a_backwards_clock_records_a_zero_stint_not_a_negative_one() {
         let db = database::init_mem().await.unwrap();
-        let user = UserId::from_key(&Ulid::new().to_string());
+        let user = UserId::from_key(&Ulid::generate().to_string());
 
         start(&db, &user, None).await.unwrap();
         // Stand in for the NTP step: push the running stint's start an hour

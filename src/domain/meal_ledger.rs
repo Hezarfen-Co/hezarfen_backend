@@ -70,7 +70,7 @@ use crate::domain::user::UserId;
 use crate::error::ValidationError;
 use crate::validate::validate_optional;
 
-/// Mints ledger ids in write order — `Ulid::new()`'s random low bits sort
+/// Mints ledger ids in write order — `Ulid::generate()`'s random low bits sort
 /// arbitrarily within one millisecond, which would scramble the `id` tie-break
 /// of the newest-first statement below.
 static IDS: LazyLock<std::sync::Mutex<Generator>> =

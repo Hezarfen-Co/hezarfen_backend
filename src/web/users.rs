@@ -1151,7 +1151,7 @@ async fn upload_my_avatar(
     let upload = read_image_upload(&st, &mut multipart).await?;
     let size = upload.size();
 
-    let file = ulid::Ulid::new().to_string();
+    let file = ulid::Ulid::generate().to_string();
     store_blob(&st, &file, &upload.data, || async {
         match crate::service::user::set_avatar(
             &st.db,

@@ -20,7 +20,7 @@ pub(crate) fn out_before_in_error() -> AppError {
 pub struct WorkEntryId(RecordId);
 
 impl WorkEntryId {
-    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
+    /// Minted from the process-wide monotonic generator, not `Ulid::generate()`:
     /// the log sorts `check_in DESC, id DESC` and the id breaks the tie between
     /// two stints checked in at the same instant. The `open_` key below never
     /// ties with itself (one open stint per user), so it needs no ordering.

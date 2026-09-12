@@ -50,7 +50,7 @@ use crate::domain::user::UserId;
 use crate::error::ValidationError;
 use crate::validate::validate_required;
 
-/// Mints booking ids in write order — `Ulid::new()`'s random low bits sort
+/// Mints booking ids in write order — `Ulid::generate()`'s random low bits sort
 /// arbitrarily within one millisecond, which would scramble the `id` tie-break
 /// of the newest-first listings ([`crate::db::appointment::list_for_requester`]).
 static IDS: LazyLock<std::sync::Mutex<Generator>> =

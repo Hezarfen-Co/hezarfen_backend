@@ -25,7 +25,7 @@ use crate::validate::validate_required;
 pub struct BoardId(RecordId);
 
 impl BoardId {
-    /// Monotonic, not `Ulid::new()`: boards list newest-first by id, and a
+    /// Monotonic, not `Ulid::generate()`: boards list newest-first by id, and a
     /// random low half scrambles rows minted in the same millisecond.
     pub fn generate() -> Self {
         Self(RecordId::new(BOARD_TABLE, next_ulid().to_string()))

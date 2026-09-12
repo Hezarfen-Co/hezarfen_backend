@@ -85,7 +85,7 @@ impl AnswerImage {
             question: question.clone(),
             user: user.clone(),
             seq,
-            file: Ulid::new().to_string(),
+            file: Ulid::generate().to_string(),
             content_type,
             size,
         }

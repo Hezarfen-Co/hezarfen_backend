@@ -206,7 +206,7 @@ mod tests {
     #[tokio::test]
     async fn the_window_walks_the_rows_and_total_stays_the_whole_list() {
         let db = database::init_mem().await.unwrap();
-        let user = UserId::from_key(&Ulid::new().to_string());
+        let user = UserId::from_key(&Ulid::generate().to_string());
         for i in 0..5 {
             note::create(
                 &db,

@@ -73,7 +73,7 @@ impl BankQuestionImage {
             id: BankQuestionImageId::for_slot(question, slot),
             bank_question: question.clone(),
             slot: slot.cloned(),
-            file: Ulid::new().to_string(),
+            file: Ulid::generate().to_string(),
             content_type,
             size,
         }
