@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM meal_attendance WHERE menu = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b4062a039c3f83597fed57d21edda0a641135aac1b9c0b4871e778a234c3a1c3"
+}

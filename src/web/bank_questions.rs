@@ -94,7 +94,7 @@ struct CreateBankQuestion {
     /// school's subjects; it is *not* held to a course here (the bank spans
     /// courses), only checked against the target exam's course when the
     /// template is instantiated.
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     subject_id: String,
     #[schema(example = "What is 2 + 2?", max_length = 2000)]
     text: String,
@@ -560,13 +560,13 @@ async fn list_questions(
     let items = questions
         .iter()
         .map(|question| {
-            let images = buckets.get(question.get_id().key()).unwrap_or(&empty);
+            let images = buckets.get(&question.get_id().key()).unwrap_or(&empty);
             let subject_name = question
                 .get_subject()
-                .and_then(|subject| subject_names.get(subject.key()).cloned())
+                .and_then(|subject| subject_names.get(&subject.key()).cloned())
                 .unwrap_or_default();
             let owner_name = people
-                .get(question.get_owner().key())
+                .get(&question.get_owner().key())
                 .map(|person| {
                     person
                         .display_name
@@ -574,7 +574,7 @@ async fn list_questions(
                         .unwrap_or_else(|| person.username.clone())
                 })
                 .unwrap_or_default();
-            let used_count = used.get(question.get_id().key()).copied().unwrap_or(0);
+            let used_count = used.get(&question.get_id().key()).copied().unwrap_or(0);
             BankQuestionResponse::with_names(question, images, subject_name, owner_name, used_count)
         })
         .collect();
@@ -651,7 +651,9 @@ async fn update_question(
     owned_question(&st, &user, &bid).await?;
     let patch = bank_question::BankQuestionPatch {
         subject: match req.subject_id {
-            Some(ref subject_id) => Some(crate::service::subject::must_exist(&st.db, subject_id).await?),
+            Some(ref subject_id) => {
+                Some(crate::service::subject::must_exist(&st.db, subject_id).await?)
+            }
             None => None,
         },
         text: match req.text {
@@ -919,7 +921,7 @@ async fn delete_choice_image(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::{Database, init_mem};
+    use crate::database::{Database, init_test_db};
     use crate::domain::role::Role;
     use crate::domain::user::{Password, Username};
 
@@ -944,12 +946,21 @@ mod tests {
     /// must hold when a future route arrives with a different extractor.
     #[tokio::test]
     async fn demoted_owner_loses_their_own_template() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let owner = user("ogretmen", Role::Teacher, &db).await;
+        // The subject is a foreign key: a real row, via the course fixture.
+        let subject = crate::db::subject::create(
+            &db,
+            &crate::db::course::a_test_course(&db).await,
+            crate::domain::subject::SubjectName::try_new("matematik").unwrap(),
+            crate::domain::subject::SubjectDescription::try_new("").unwrap(),
+        )
+        .await
+        .unwrap();
         let question = bank_question::create(
             &db,
             owner.get_id().clone(),
-            SubjectId::from_key("01TESTSUBJECTAAAAAAAAAAAAA"),
+            subject.get_id().clone(),
             QuestionText::try_new("2 + 2 = ?").unwrap(),
             QuestionPoints::try_new(1).unwrap(),
             QuestionSpec::try_new(QuestionKind::try_new("text").unwrap(), None, None, &[]).unwrap(),

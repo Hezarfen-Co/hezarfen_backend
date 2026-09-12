@@ -1,0 +1,158 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO bank_question\n               (id, owner, subject, text, kind, points, choices, correct,\n                source_exam, visibility, created_at)\n           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)\n           RETURNING id AS \"id: BankQuestionId\", owner AS \"owner: UserId\",\n               subject AS \"subject: SubjectId\", text AS \"text: QuestionText\",\n               kind AS \"kind: QuestionKind\", points AS \"points: QuestionPoints\",\n               choices AS \"choices: Json<Vec<Choice>>\",\n               correct AS \"correct: ChoiceId\",\n               source_exam AS \"source_exam: ExamId\",\n               visibility AS \"visibility: BankVisibility\",\n               created_at AS \"created_at: Timestamp\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: BankQuestionId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "bank_question",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "owner: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "bank_question",
+            "name": "owner"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "subject: SubjectId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "bank_question",
+            "name": "subject"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "text: QuestionText",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bank_question",
+            "name": "text"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "kind: QuestionKind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bank_question",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "points: QuestionPoints",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "bank_question",
+            "name": "points"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "choices: Json<Vec<Choice>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "bank_question",
+            "name": "choices"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "correct: ChoiceId",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bank_question",
+            "name": "correct"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "source_exam: ExamId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "bank_question",
+            "name": "source_exam"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "visibility: BankVisibility",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bank_question",
+            "name": "visibility"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "created_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "bank_question",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Int8",
+        "Jsonb",
+        "Text",
+        "Uuid",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "6ef3a60b892bcecfab0c2ee6cb49b8f746ac8d5295dfd9518551ac3b740e87a3"
+}

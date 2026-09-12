@@ -1,42 +1,42 @@
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-
-use crate::constant::{COURSE_SESSION_TABLE, MAX_SESSION_TOPIC_LEN};
+use crate::constant::MAX_SESSION_TOPIC_LEN;
 use crate::domain::course::CourseId;
-use crate::domain::monotonic_id::next_ulid;
+use crate::domain::monotonic_id::next_uuid;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::ValidationError;
 use crate::validate::validate_optional;
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct CourseSessionId(RecordId);
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
+pub struct CourseSessionId(uuid::Uuid);
 
 impl CourseSessionId {
-    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
-    /// a course's sessions sort `starts_at DESC, id DESC` and the id breaks
-    /// the tie between two sessions starting at the same instant,
+    /// Minted from the process-wide monotonic generator, not a plain random
+    /// UUID: a course's sessions sort `starts_at DESC, id DESC` and the id
+    /// breaks the tie between two sessions starting at the same instant,
     /// and a random low half sorts arbitrarily inside one millisecond.
     pub fn generate() -> Self {
-        Self(RecordId::new(COURSE_SESSION_TABLE, next_ulid().to_string()))
+        Self(next_uuid())
     }
 
+    /// The inner uuid, for runtime-checked binds (Param/QueryBuilder) that
+    /// cannot take the newtype. Static `query!` binds take `self` directly.
+    pub fn uuid(&self) -> uuid::Uuid {
+        self.0
+    }
+
+    /// Parses a wire key. A key that is not a UUID parses as the nil UUID,
+    /// which matches no row.
     pub fn from_key(key: &str) -> Self {
-        Self(RecordId::new(COURSE_SESSION_TABLE, key))
+        Self(uuid::Uuid::parse_str(key).unwrap_or(uuid::Uuid::nil()))
     }
 
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
-        }
+    pub fn key(&self) -> String {
+        self.0.to_string()
     }
 }
-
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct SessionTopic(String);
 
 impl SessionTopic {
@@ -53,7 +53,7 @@ impl SessionTopic {
 /// One scheduled lesson of a course: the unit roll call is taken on. Unlike a
 /// generic event, a session always has a start instant and belongs to a course,
 /// so its roster is the course's enrollment plus the assigned teacher.
-#[derive(Debug, Clone, SurrealValue)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct CourseSession {
     pub(crate) id: CourseSessionId,
     pub(crate) course: CourseId,

@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT event AS \"event: EventId\", app_user AS \"user: UserId\", registered_by AS \"registered_by: UserId\" FROM registration\n         WHERE event = $1 AND app_user = $2\n         LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "event: EventId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "registration",
+            "name": "event"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "user: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "registration",
+            "name": "app_user"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "registered_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "registration",
+            "name": "registered_by"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "4a5b09dda473aa90f75fbe8d89210f33df9d3285daddfd7b66f975c234a201af"
+}

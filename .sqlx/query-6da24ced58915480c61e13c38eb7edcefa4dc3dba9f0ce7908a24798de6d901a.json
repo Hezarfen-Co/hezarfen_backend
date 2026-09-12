@@ -1,0 +1,136 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id AS \"id: PaymentLedgerId\", student AS \"student: UserId\",\n                kind AS \"kind: PaymentLedgerKind\", amount_minor AS \"amount_minor: LedgerAmount\",\n                source, due_at AS \"due_at: Timestamp\", method AS \"method: LedgerMethod\",\n                note AS \"note: LedgerNote\", recorded_by AS \"recorded_by: UserId\",\n                created_at AS \"created_at: Timestamp\"\n         FROM payment_ledger WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: PaymentLedgerId",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "payment_ledger",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "student: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "payment_ledger",
+            "name": "student"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "kind: PaymentLedgerKind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "payment_ledger",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "amount_minor: LedgerAmount",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "payment_ledger",
+            "name": "amount_minor"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "source",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "payment_ledger",
+            "name": "source"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "due_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "payment_ledger",
+            "name": "due_at"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "method: LedgerMethod",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "payment_ledger",
+            "name": "method"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "note: LedgerNote",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "payment_ledger",
+            "name": "note"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "recorded_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "payment_ledger",
+            "name": "recorded_by"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "created_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "payment_ledger",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "6da24ced58915480c61e13c38eb7edcefa4dc3dba9f0ce7908a24798de6d901a"
+}

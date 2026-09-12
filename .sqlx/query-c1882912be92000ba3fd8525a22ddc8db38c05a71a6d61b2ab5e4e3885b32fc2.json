@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE event SET audience_class = NULL WHERE audience_class = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c1882912be92000ba3fd8525a22ddc8db38c05a71a6d61b2ab5e4e3885b32fc2"
+}

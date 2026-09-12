@@ -1,9 +1,9 @@
 //! Time policy for the whole backend, in one place.
 //!
-//! - Every instant is a **unix-millisecond `i64`, always UTC** — stored as an
-//!   `int`, sent over the wire as a plain number. No timezone is ever stored
-//!   or parsed, so the server's `TZ`, the client's locale, and the container's
-//!   clock configuration cannot change what a value means.
+//! - Every instant is a **unix-millisecond `i64`, always UTC** — stored as a
+//!   `BIGINT`, sent over the wire as a plain number. No timezone is ever
+//!   stored or parsed, so the server's `TZ`, the client's locale, and the
+//!   container's clock configuration cannot change what a value means.
 //! - [`Timestamp::now`] is the **only wall-clock read in the codebase**. The
 //!   clippy `disallowed-methods` config (clippy.toml) rejects every other
 //!   `now()` source (`chrono::Utc/Local`, `SystemTime`, `time::OffsetDateTime`)
@@ -12,7 +12,6 @@
 //!   `Instant` clock instead, which NTP adjustments cannot move backwards.
 
 use chrono::Datelike;
-use surrealdb::types::SurrealValue;
 
 use crate::constant::MILLIS_PER_DAY;
 use crate::error::{AppError, ValidationError};
@@ -27,8 +26,11 @@ pub(crate) fn range_error() -> AppError {
     })
 }
 
-/// A unix-millisecond instant (UTC by construction). Stored as an `int`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, SurrealValue)]
+/// A unix-millisecond instant (UTC by construction). Stored as a `BIGINT`.
+/// Also serializes as its bare number: the fee plan's installments ride the
+/// row as JSON, and a due date must stay a plain millisecond count there too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, sqlx::Type, serde::Serialize, serde::Deserialize)]
+#[sqlx(transparent)]
 pub struct Timestamp(i64);
 
 impl Timestamp {
@@ -159,5 +161,18 @@ mod tests {
         // Not flaky: both reads happen within the same test, and a UTC day
         // boundary crossing between them would still satisfy `<=`.
         assert!(today <= from_millis);
+    }
+
+    /// JSON is part of the storage contract now (embedded installments ride a
+    /// JSONB column): the instant must stay a bare millisecond number, never
+    /// a string or an object.
+    #[test]
+    fn json_form_is_the_bare_millisecond_number() {
+        assert_eq!(
+            serde_json::to_value(Timestamp::from_millis(1_700_000_000_000)).unwrap(),
+            serde_json::json!(1_700_000_000_000i64)
+        );
+        let back: Timestamp = serde_json::from_value(serde_json::json!(1_700_000_000_000i64)).unwrap();
+        assert_eq!(back.as_millis(), 1_700_000_000_000);
     }
 }

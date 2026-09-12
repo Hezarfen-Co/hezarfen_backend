@@ -12,11 +12,9 @@
 //! "has this been billed yet?" — a scan can be slipped past by a concurrent
 //! writer, and the cost of that mistake here is a double-billed family.
 
-use crate::constant::{
-    FEE_PLAN_ASSIGNMENT_COUNT_FIELD, MAX_FEE_PLAN_ASSIGN_STUDENTS, MAX_FEE_PLAN_ASSIGN_WRITES,
-};
+use crate::constant::{MAX_FEE_PLAN_ASSIGN_STUDENTS, MAX_FEE_PLAN_ASSIGN_WRITES};
 use crate::database::Database;
-use crate::db::cap::{self, Claimed};
+use crate::db::cap::Claimed;
 use crate::db::{fee_plan, fee_plan_assignment, payment_ledger};
 use crate::domain::fee_plan::FeePlan;
 use crate::domain::fee_plan_assignment::{FeePlanAssignment, FeePlanAssignmentId};
@@ -29,8 +27,9 @@ use crate::error::{AppError, ValidationError};
 /// whether it was *already* there, so the web layer can answer a replay
 /// honestly instead of pretending it just happened.
 ///
-/// The row and the plan's assignment refcount are written in **one**
-/// transaction ([`cap::claim_and_create`]): that increment is what makes the
+/// The row and the plan's assignment refcount are written in **one
+/// statement** ([`fee_plan_assignment::create`]'s claim): that increment is
+/// what makes the
 /// plan un-editable and un-deletable, and it has to be indivisible from the
 /// row it counts, or an edit could slip between the two. A plan the counter
 /// cannot be claimed on is one a concurrent delete already removed, which is
@@ -54,22 +53,9 @@ pub async fn assign(
     assigned_by: &UserId,
 ) -> Result<(FeePlanAssignment, bool), AppError> {
     let id = FeePlanAssignmentId::composite(plan.get_id(), student);
-    let row = FeePlanAssignment {
-        id: id.clone(),
-        plan: plan.get_id().clone(),
-        student: student.clone(),
-        assigned_by: assigned_by.clone(),
-        created_at: Timestamp::now(),
-    };
-    let claimed = cap::claim_and_create(
-        &plan.get_id().record(),
-        FEE_PLAN_ASSIGNMENT_COUNT_FIELD,
-        cap::UNLIMITED,
-        &id.record(),
-        &row,
-        db,
-    )
-    .await?;
+    let claimed =
+        fee_plan_assignment::create(db, plan.get_id(), student, assigned_by, Timestamp::now())
+            .await?;
     let (assignment, existed) = match claimed {
         Claimed::Made(created) => (created, false),
         // Someone assigned this pair first — their row is the answer, and
@@ -225,16 +211,35 @@ pub async fn list_for_student(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::init_mem;
+    use crate::database::init_test_db;
     use crate::domain::fee_plan::{FeePlanName, Installment};
     use crate::domain::payment_ledger::LedgerAmount;
 
+    /// A real `app_user` row: managers and students are foreign keys now. The
+    /// label names the row's username; the id is minted, so repeated calls are
+    /// new people, not the same row.
+    async fn a_person(db: &Database, label: &str, role: &str) -> UserId {
+        let user = UserId::generate();
+        sqlx::query(
+            "INSERT INTO app_user (id, username, password_hash, role) \
+             VALUES ($1, $2, 'x', $3)",
+        )
+        .bind(user.uuid())
+        .bind(format!("{label}-{}", &user.key()[30..]))
+        .bind(role)
+        .execute(db)
+        .await
+        .unwrap();
+        user
+    }
+
     async fn a_plan(db: &Database, installments: Vec<Installment>) -> FeePlan {
+        let manager = a_person(db, "mgr", "manager").await;
         fee_plan::create(
             db,
             FeePlanName::try_new("Yearly").unwrap(),
             installments,
-            &UserId::from_key("mgr1"),
+            &manager,
         )
         .await
         .unwrap()
@@ -245,9 +250,9 @@ mod tests {
     /// must not double a family's debt.
     #[tokio::test]
     async fn assigning_bills_every_installment_and_a_replay_bills_nothing() {
-        let db = init_mem().await.unwrap();
-        let manager = UserId::from_key("mgr1");
-        let student = UserId::from_key("stu1");
+        let (db, _leases) = init_test_db().await;
+        let manager = a_person(&db, "mgr", "manager").await;
+        let student = a_person(&db, "stu", "student").await;
         let plan = a_plan(
             &db,
             vec![
@@ -323,13 +328,12 @@ mod tests {
     /// (measured 2026-07-30: 2 runs in 36 on `memory` under host load, 0 in
     /// 10 000 rounds on the server). See [`crate::database::init_test_server`].
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn an_edit_racing_an_assign_leaves_the_plan_and_the_money_agreeing() {
-        let (db, _serialized) = crate::database::init_test_server("edit_race").await;
+        let (db, _leases) = crate::database::init_test_db().await;
         let mut reached = 0;
         for round in 0..20 {
-            let manager = UserId::from_key("mgr1");
-            let student = UserId::from_key(&format!("stu{round}"));
+            let manager = a_person(&db, "mgr", "manager").await;
+            let student = a_person(&db, "stu", "student").await;
             let plan = a_plan(
                 &db,
                 vec![Installment::new(
@@ -430,14 +434,13 @@ mod tests {
     /// unseen. Neither racer may answer 500 here either — this is the pair that
     /// contends hardest, both writing the plan record itself.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn a_delete_racing_an_assign_never_orphans_an_assignment() {
-        let (db, _serialized) = crate::database::init_test_server("delete_race").await;
+        let (db, _leases) = crate::database::init_test_db().await;
         let (mut deleted_first, mut assigned_first) = (0, 0);
         for round in 0..20 {
             let hold_back_the_assign = round % 2 == 0;
-            let manager = UserId::from_key("mgr1");
-            let student = UserId::from_key(&format!("stu{round}"));
+            let manager = a_person(&db, "mgr", "manager").await;
+            let student = a_person(&db, "stu", "student").await;
             let plan = a_plan(
                 &db,
                 vec![Installment::new(

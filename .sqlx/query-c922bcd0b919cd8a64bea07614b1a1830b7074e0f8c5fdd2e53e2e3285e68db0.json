@@ -1,0 +1,100 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id AS \"id: HomeworkFileId\",\n                  submission AS \"submission: HomeworkSubmissionId\",\n                  name AS \"name: FileName\",\n                  content_type AS \"content_type: FileContentType\",\n                  size,\n                  file,\n                  created_at AS \"created_at: Timestamp\"\n           FROM homework_file WHERE submission = $1 ORDER BY id DESC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: HomeworkFileId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "homework_file",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "submission: HomeworkSubmissionId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "homework_file",
+            "name": "submission"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "name: FileName",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "homework_file",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "content_type: FileContentType",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "homework_file",
+            "name": "content_type"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "size",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "homework_file",
+            "name": "size"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "file",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "homework_file",
+            "name": "file"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "homework_file",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "c922bcd0b919cd8a64bea07614b1a1830b7074e0f8c5fdd2e53e2e3285e68db0"
+}

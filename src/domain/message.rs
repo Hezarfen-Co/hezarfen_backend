@@ -1,18 +1,11 @@
-//! One-to-one mail-style messages. A single row serves both ends: the
-//! recipient's `read` flag plus one folder field per side, so each party
-//! files (archive/trash) and deletes their copy without touching the
-//! other's. Filing also stamps that side's origin folder, so a copy can be
-//! put back where it came from. A side that permanently deletes goes to the
-//! hidden `deleted` folder; once both sides are `deleted` the row itself is
-//! removed.
-
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
+use sqlx::Type;
+use uuid::Uuid;
 
 use crate::constant::{
-    MAX_MESSAGE_BODY_LEN, MAX_MESSAGE_LABEL_LEN, MAX_MESSAGE_SUBJECT_LEN, MESSAGE_TABLE,
+    MAX_MESSAGE_BODY_LEN, MAX_MESSAGE_LABEL_LEN, MAX_MESSAGE_SUBJECT_LEN,
     RECIPIENT_FOLDERS, SENDER_FOLDERS,
 };
-use crate::domain::monotonic_id::next_ulid;
+use crate::domain::monotonic_id::next_uuid;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::ValidationError;
@@ -23,11 +16,11 @@ use crate::validate::{validate_optional, validate_required};
 /// query filter and the restore stamp all pass through this enum, so a typo
 /// is a compile error rather than a silently empty folder.
 ///
-/// `#[surreal(untagged, rename_all = "lowercase")]` stores each variant as a
-/// bare lowercase string (`"inbox"`, `"archive"`, …) in the `TYPE string`
-/// columns, and round-trips straight back — same trick as `domain::role`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, SurrealValue)]
-#[surreal(untagged, rename_all = "lowercase")]
+/// Each variant stores as a bare lowercase TEXT value (`"inbox"`,
+/// `"archive"`, …) and round-trips straight back — same trick as
+/// `domain::role`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Type)]
+#[sqlx(type_name = "TEXT", rename_all = "lowercase")]
 pub enum Folder {
     Inbox,
     Sent,
@@ -96,35 +89,43 @@ impl Folder {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct MessageId(RecordId);
+/// Typed message row id. A UUIDv7 minted by the process-wide monotonic
+/// generator, so `id` order is mint order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
+pub struct MessageId(Uuid);
 
 impl MessageId {
-    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
+    /// Minted from the process-wide monotonic generator, not a random v4:
     /// the folder listings sort `id DESC` (newest first,
     /// [`crate::db::message::list_folder`]),
     /// and a random low half scrambles rows minted in the same millisecond.
     pub fn generate() -> Self {
-        Self(RecordId::new(MESSAGE_TABLE, next_ulid().to_string()))
+        Self(next_uuid())
     }
 
+    /// The inner uuid, for runtime-checked binds (Param/QueryBuilder) that
+    /// cannot take the newtype. Static `query!` binds take `self` directly.
+    pub fn uuid(&self) -> Uuid {
+        self.0
+    }
+
+    /// Parse a wire key. A key that parses as no UUID — a malformed path
+    /// segment — reads as the nil id, which matches no row: exactly the 404 a
+    /// dangling record key produced under the old store, without turning a
+    /// typo into a panic.
     pub fn from_key(key: &str) -> Self {
-        Self(RecordId::new(MESSAGE_TABLE, key))
+        Self(Uuid::parse_str(key).unwrap_or(Uuid::nil()))
     }
 
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
-        }
+    /// The hyphenated wire form.
+    pub fn key(&self) -> String {
+        self.0.to_string()
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct MessageSubject(String);
 
 impl MessageSubject {
@@ -138,7 +139,8 @@ impl MessageSubject {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct MessageBody(String);
 
 impl MessageBody {
@@ -154,7 +156,8 @@ impl MessageBody {
 
 /// A sender-chosen tag ("Etüt", "Sınav", …) the UI renders as a badge.
 /// Required-and-bounded here; "no label" is `Option<MessageLabel>` on the row.
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct MessageLabel(String);
 
 impl MessageLabel {
@@ -168,7 +171,7 @@ impl MessageLabel {
     }
 }
 
-#[derive(Debug, Clone, SurrealValue)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Message {
     pub(crate) id: MessageId,
     pub(crate) sender: UserId,
@@ -257,8 +260,8 @@ mod tests {
 
     #[tokio::test]
     async fn folder_sides_resolve_by_membership() {
-        let sender = UserId::from_key("a");
-        let recipient = UserId::from_key("b");
+        let sender = UserId::from_key("018f1a00-0000-7000-8000-000000000001");
+        let recipient = UserId::from_key("018f1a00-0000-7000-8000-000000000002");
         let message = Message {
             id: MessageId::generate(),
             sender: sender.clone(),
@@ -292,5 +295,23 @@ mod tests {
         assert!(Folder::allowed_for(true).contains(&Folder::Archive));
         assert!(Folder::allowed_for(false).contains(&Folder::Archive));
         assert!(!Folder::allowed_for(true).contains(&Folder::Inbox));
+    }
+
+    #[test]
+    fn sqlx_encodes_the_storage_form() {
+        // The folder columns are TEXT with a CHECK on these exact words; the
+        // sqlx encoding must never drift from `as_str`.
+        let mut buf = sqlx::postgres::PgArgumentBuffer::default();
+        for folder in [
+            Folder::Inbox,
+            Folder::Sent,
+            Folder::Archive,
+            Folder::Trash,
+            Folder::Deleted,
+        ] {
+            buf.clear();
+            sqlx::Encode::<sqlx::Postgres>::encode_by_ref(&folder, &mut buf);
+            assert_eq!(std::str::from_utf8(&buf).unwrap(), folder.as_str());
+        }
     }
 }

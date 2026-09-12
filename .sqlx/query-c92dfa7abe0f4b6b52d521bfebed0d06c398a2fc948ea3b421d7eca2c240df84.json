@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH subs AS (\n                       SELECT subject, count(*) AS n\n                       FROM exam_question WHERE exam = $1\n                       GROUP BY subject)\n                   UPDATE subject s SET exam_question_count = GREATEST(s.exam_question_count - c.n, 0)\n                   FROM subs c WHERE s.id = c.subject",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c92dfa7abe0f4b6b52d521bfebed0d06c398a2fc948ea3b421d7eca2c240df84"
+}

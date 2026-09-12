@@ -1,0 +1,137 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE board SET closed_at = $2 WHERE id = $1 AND closed_at IS NULL\n           RETURNING id AS \"id: BoardId\", creator AS \"creator: UserId\",\n               title AS \"title: BoardTitle\",\n               participants AS \"participants: Vec<UserId>\", locked,\n               locked_by AS \"locked_by: UserId\",\n               locked_at AS \"locked_at: Timestamp\", epoch,\n               closed_at AS \"closed_at: Timestamp\",\n               created_at AS \"created_at: Timestamp\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: BoardId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "board",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "creator: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "board",
+            "name": "creator"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "title: BoardTitle",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "board",
+            "name": "title"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "participants: Vec<UserId>",
+        "type_info": "UuidArray",
+        "origin": {
+          "Table": {
+            "table": "board",
+            "name": "participants"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "locked",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "board",
+            "name": "locked"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "locked_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "board",
+            "name": "locked_by"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "locked_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "board",
+            "name": "locked_at"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "epoch",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "board",
+            "name": "epoch"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "closed_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "board",
+            "name": "closed_at"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "created_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "board",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "9ebc278fccb979dbd426a4a24b7ab5261e0c26c29786b1abc23c03d76c27e7a9"
+}

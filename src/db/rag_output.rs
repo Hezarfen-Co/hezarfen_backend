@@ -1,13 +1,13 @@
-//! The `rag_output` table: what an AI service produced for a course note —
-//! an index, a summary, an embedding manifest — stored as this side's own
-//! copy of the answer. The AI service never writes here (it answers a
-//! request over the bridge, and this side stores the answer), which is what
-//! keeps the api-read bridge GET-only. Derived, disposable data: the row is
-//! dropped and regenerated whenever its input changes, so the cascades
-//! below — [`delete_for_note`] when the note goes, [`delete_with_source`]
-//! when one of the attachments it was built from goes — keep a stale output
-//! from outliving its input, even in a deployment with no AI service
-//! connected. The row shape lives in [`crate::domain::rag_output`].
+//! What an AI service produced for a course note, stored on this side: the
+//! write paths the api-read bridge serves (`create`/`replace_for_note` run
+//! when this backend answers a request over the bridge, and this side stores
+//! the answer), which is what keeps the api-read bridge GET-only. Derived,
+//! disposable data: the row is dropped and regenerated whenever its input
+//! changes, so the cascades below — [`delete_for_note`] when the note goes,
+//! [`delete_with_source`] when one of the attachments it was built from goes
+//! — keep a stale output from outliving its input, even in a deployment with
+//! no AI service connected. The row shape lives in
+//! [`crate::domain::rag_output`].
 
 use crate::database::Database;
 use crate::db::page::PagedList;
@@ -18,8 +18,8 @@ use crate::domain::rag_output::{RagOutput, RagOutputId};
 use crate::domain::timestamp::Timestamp;
 use crate::error::AppError;
 use serde_json::Value;
+use sqlx::types::Json;
 
-/// Store one service output against `note`.
 pub async fn create(
     db: &Database,
     note: &CourseNoteId,
@@ -32,16 +32,48 @@ pub async fn create(
         course_note: note.clone(),
         course: course.clone(),
         sources,
-        payload,
+        payload: sqlx::types::Json(payload),
         generated_at: Timestamp::now(),
     };
-    // whole-row-save-ok: create of a fresh ULID row built in place — there is no prior row to clobber
-    let created: Option<RagOutput> = db.create(row.id.record()).content(row).await?;
-    created.ok_or_else(|| AppError::Internal("failed to create rag output".into()))
+    // whole-row-save-ok: insert of a fresh UUID row built in place — there is no prior row to clobber
+    let created = sqlx::query_as!(
+        RagOutput,
+        r#"INSERT INTO rag_output (id, course_note, course, sources, payload, generated_at)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           RETURNING id AS "id: RagOutputId", course_note AS "course_note: CourseNoteId",
+                     course AS "course: CourseId",
+                     sources AS "sources: Vec<CourseNoteFileId>",
+                     payload AS "payload: Json<Value>",
+                     generated_at AS "generated_at: Timestamp""#,
+        row.id.uuid(),
+        row.course_note.uuid(),
+        row.course.uuid(),
+        &row.sources
+            .iter()
+            .map(CourseNoteFileId::uuid)
+            .collect::<Vec<uuid::Uuid>>(),
+        row.payload.0,
+        row.generated_at.as_millis()
+    )
+    .fetch_one(db)
+    .await?;
+    Ok(created)
 }
 
 pub async fn read(db: &Database, id: &RagOutputId) -> Result<Option<RagOutput>, AppError> {
-    Ok(db.select(id.record()).await?)
+    let row = sqlx::query_as!(
+        RagOutput,
+        r#"SELECT id AS "id: RagOutputId", course_note AS "course_note: CourseNoteId",
+                  course AS "course: CourseId",
+                  sources AS "sources: Vec<CourseNoteFileId>",
+                  payload AS "payload: Json<Value>",
+                  generated_at AS "generated_at: Timestamp"
+           FROM rag_output WHERE id = $1"#,
+        id.uuid()
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(row)
 }
 
 /// A note's outputs, newest first.
@@ -51,24 +83,34 @@ pub async fn list_for(
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<RagOutput>, i64), AppError> {
-    PagedList::new("rag_output WHERE course_note = $note", "ORDER BY id DESC")
-        .bind("note", note.record())
-        .run(limit, offset, db)
+    PagedList::new("rag_output WHERE course_note = $1", "ORDER BY id DESC")
+        .bind(note.uuid())
+        .run::<RagOutput>(limit, offset, db)
         .await
 }
 
 pub async fn delete(db: &Database, id: &RagOutputId) -> Result<RagOutput, AppError> {
-    let deleted: Option<RagOutput> = db.delete(id.record()).await?;
+    let deleted = sqlx::query_as!(
+        RagOutput,
+        r#"DELETE FROM rag_output WHERE id = $1
+           RETURNING id AS "id: RagOutputId", course_note AS "course_note: CourseNoteId",
+                     course AS "course: CourseId",
+                     sources AS "sources: Vec<CourseNoteFileId>",
+                     payload AS "payload: Json<Value>",
+                     generated_at AS "generated_at: Timestamp""#,
+        id.uuid()
+    )
+    .fetch_optional(db)
+    .await?;
     deleted.ok_or(AppError::NotFound)
 }
 
 /// Cascade: every output of `note`. Deleting none is a success — a note
 /// no service ever indexed has nothing to drop.
 pub async fn delete_for_note(db: &Database, note: &CourseNoteId) -> Result<(), AppError> {
-    db.query("DELETE rag_output WHERE course_note = $note")
-        .bind(("note", note.record()))
-        .await?
-        .check()?;
+    sqlx::query!("DELETE FROM rag_output WHERE course_note = $1", note.uuid())
+        .execute(db)
+        .await?;
     Ok(())
 }
 
@@ -76,7 +118,9 @@ pub async fn delete_for_note(db: &Database, note: &CourseNoteId) -> Result<(), A
 /// this note's older rows. Two concurrent index tasks can interleave in any
 /// order and still leave exactly one row — the newest — because ids come
 /// from the process-wide monotonic generator, so "older" is `id <` the row
-/// just written and the loser's row is always below the winner's.
+/// just written and the loser's row is always below the winner's. (The
+/// uuid column compares in byte order, which for UUIDv7 is mint order —
+/// the same property the old record ids got from the ULID.)
 pub async fn replace_for_note(
     db: &Database,
     note: &CourseNoteId,
@@ -85,22 +129,27 @@ pub async fn replace_for_note(
     payload: Value,
 ) -> Result<RagOutput, AppError> {
     let created = create(db, note, course, sources, payload).await?;
-    db.query("DELETE rag_output WHERE course_note = $note AND id < $new")
-        .bind(("note", note.record()))
-        .bind(("new", created.id.record()))
-        .await?
-        .check()?;
+    sqlx::query!(
+        "DELETE FROM rag_output WHERE course_note = $1 AND id < $2",
+        note.uuid(),
+        created.id.uuid()
+    )
+    .execute(db)
+    .await?;
     Ok(created)
 }
 
 /// Cascade: every output built from `file`. Runs on a file delete even
 /// with no AI service connected, so a stale output cannot survive its
-/// source.
+/// source. The GIN index on `sources` turns the containment test into a
+/// lookup.
 pub async fn delete_with_source(db: &Database, file: &CourseNoteFileId) -> Result<(), AppError> {
-    db.query("DELETE rag_output WHERE sources CONTAINS $file")
-        .bind(("file", file.record()))
-        .await?
-        .check()?;
+    sqlx::query!(
+        "DELETE FROM rag_output WHERE $1 = ANY(sources)",
+        file.uuid()
+    )
+    .execute(db)
+    .await?;
     Ok(())
 }
 
@@ -108,12 +157,29 @@ pub async fn delete_with_source(db: &Database, file: &CourseNoteFileId) -> Resul
 mod tests {
     use super::*;
     use crate::domain::course::{CourseDescription, CourseKind, CourseTitle};
-    use crate::domain::course_note::{CourseNote, CourseNoteContent, CourseNoteTitle};
-    use crate::domain::course_note_file::{CourseNoteFile, FileContentType, FileName};
+    use crate::domain::course_note::CourseNote;
+    use crate::domain::course_note::CourseNoteContent;
+    use crate::domain::course_note::CourseNoteTitle;
+    use crate::domain::course_note_file::CourseNoteFile;
+    use crate::domain::course_note_file::FileContentType;
+    use crate::domain::course_note_file::FileName;
     use serde_json::json;
 
+    /// A real `app_user` row: the course's creator is a foreign key now.
+    async fn a_person(db: &Database) -> crate::domain::user::UserId {
+        let user = crate::domain::user::UserId::generate();
+        sqlx::query("INSERT INTO app_user (id, username, password_hash) VALUES ($1, $2, 'x')")
+            .bind(user.uuid())
+            .bind(format!("rag-{}", &user.key()[30..]))
+            .execute(db)
+            .await
+            .unwrap();
+        user
+    }
+
     async fn note_of(db: &Database, title: &str) -> CourseNote {
-        let creator = crate::domain::user::UserId::generate();
+        // The course's creator is a foreign key now: a real `app_user` row.
+        let creator = a_person(db).await;
         let course = crate::db::course::create(
             db,
             &creator,
@@ -136,108 +202,92 @@ mod tests {
         .unwrap()
     }
 
-    async fn file_on(db: &Database, note: &CourseNoteId) -> CourseNoteFileId {
-        let file = CourseNoteFile::new(
-            note,
-            FileName::try_new("plan.pdf").unwrap(),
-            FileContentType::try_new("application/pdf").unwrap(),
-            3,
+    async fn a_file(db: &Database, note: &CourseNote) -> CourseNoteFile {
+        crate::db::course_note_file::insert(
+            db,
+            CourseNoteFile::new(
+                note.get_id(),
+                FileName::try_new("f").unwrap(),
+                FileContentType::try_new("text/plain").unwrap(),
+                1,
+            ),
         )
-;
-        crate::db::course_note_file::insert(db, file)
         .await
         .unwrap()
-        .get_id()
-        .clone()
     }
 
-    /// Replace converges on one row — the newest — even when an earlier
-    /// interleaving already left two rows behind for the note.
+    /// A stored round-trips through JSONB with its sources list intact, and
+    /// the note cascade takes every row of the note with it.
     #[tokio::test]
-    async fn replace_keeps_only_the_newest_output() {
-        let db = crate::database::init_mem().await.unwrap();
-        let note = note_of(&db, "a").await;
-        let stale = create(
+    async fn create_reads_back_and_cascades_from_the_note() {
+        let (db, _leases) = crate::database::init_test_db().await;
+        let note = note_of(&db, "n").await;
+        let file = a_file(&db, &note).await;
+        let row = create(
             &db,
             note.get_id(),
             note.get_course(),
-            Vec::new(),
-            json!({ "n": 1 }),
+            vec![file.get_id().clone()],
+            json!({"answer": "x"}),
         )
         .await
         .unwrap();
-        // The race this fixes: a second row for the same note.
-        create(
-            &db,
-            note.get_id(),
-            note.get_course(),
-            Vec::new(),
-            json!({ "n": 2 }),
-        )
-        .await
-        .unwrap();
+        let read_back = read(&db, row.get_id()).await.unwrap().unwrap();
+        assert_eq!(read_back.get_payload(), &json!({"answer": "x"}));
+        assert_eq!(read_back.get_sources(), &[file.get_id().clone()]);
 
-        let fresh = replace_for_note(
-            &db,
-            note.get_id(),
-            note.get_course(),
-            Vec::new(),
-            json!({ "n": 3 }),
-        )
-        .await
-        .unwrap();
-
-        let rows = list_for(&db, note.get_id(), None, 0).await.unwrap().0;
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get_id(), fresh.get_id());
-        assert!(fresh.get_id().key() > stale.get_id().key());
-    }
-
-    /// The payload survives the round trip unread, and both cascades take only
-    /// what they are aimed at.
-    #[tokio::test]
-    async fn outputs_round_trip_and_cascade() {
-        let db = crate::database::init_mem().await.unwrap();
-        let note = note_of(&db, "a").await;
-        let other = note_of(&db, "b").await;
-        let file = file_on(&db, note.get_id()).await;
-
-        let stored = create(
-            &db,
-            note.get_id(),
-            note.get_course(),
-            vec![file.clone()],
-            json!({ "summary": "x", "chunks": [{ "text": "y" }] }),
-        )
-        .await
-        .unwrap();
-        let roundtrip = read(&db, stored.get_id()).await.unwrap().unwrap();
-        assert_eq!(roundtrip.get_payload()["summary"], "x");
-        assert_eq!(roundtrip.get_payload()["chunks"][0]["text"], "y");
-        assert_eq!(roundtrip.get_sources(), std::slice::from_ref(&file));
-        assert_eq!(roundtrip.get_course(), note.get_course());
-        let untouched = create(
-            &db,
-            other.get_id(),
-            other.get_course(),
-            Vec::new(),
-            json!({ "summary": "z" }),
-        )
-        .await
-        .unwrap();
-
-        let listed =
-            async |note: &CourseNoteId| list_for(&db, note, None, 0).await.unwrap().0.len();
-        assert_eq!(listed(note.get_id()).await, 1);
-
-        // Losing a source drops the output that cited it, and nothing else.
-        delete_with_source(&db, &file).await.unwrap();
-        assert_eq!(listed(note.get_id()).await, 0);
-        assert_eq!(listed(other.get_id()).await, 1);
-
-        // Cascading a note with no outputs left is still a success.
         delete_for_note(&db, note.get_id()).await.unwrap();
-        delete_for_note(&db, other.get_id()).await.unwrap();
-        assert!(read(&db, untouched.get_id()).await.unwrap().is_none());
+        assert!(read(&db, row.get_id()).await.unwrap().is_none());
+    }
+
+    /// Replace leaves exactly one row — the newest — and the source cascade
+    /// drops a row built from a file that is gone.
+    #[tokio::test]
+    async fn replace_is_newest_wins_and_source_cascade_drops() {
+        let (db, _leases) = crate::database::init_test_db().await;
+        let note = note_of(&db, "n").await;
+        let file = a_file(&db, &note).await;
+        let first = create(
+            &db,
+            note.get_id(),
+            note.get_course(),
+            vec![file.get_id().clone()],
+            json!({"v": 1}),
+        )
+        .await
+        .unwrap();
+        let second = replace_for_note(
+            &db,
+            note.get_id(),
+            note.get_course(),
+            vec![file.get_id().clone()],
+            json!({"v": 2}),
+        )
+        .await
+        .unwrap();
+        let (rows, total) = list_for(&db, note.get_id(), None, 0).await.unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows[0].get_id(), second.get_id());
+        assert!(first.get_id() != second.get_id());
+
+        delete_with_source(&db, file.get_id()).await.unwrap();
+        let (_, total) = list_for(&db, note.get_id(), None, 0).await.unwrap();
+        assert_eq!(total, 0);
+    }
+
+    /// Deleting one row returns it; deleting it again is a 404.
+    #[tokio::test]
+    async fn delete_returns_the_row_then_refuses() {
+        let (db, _leases) = crate::database::init_test_db().await;
+        let note = note_of(&db, "n").await;
+        let row = create(&db, note.get_id(), note.get_course(), Vec::new(), json!({}))
+            .await
+            .unwrap();
+        let gone = delete(&db, row.get_id()).await.unwrap();
+        assert_eq!(gone.get_id(), row.get_id());
+        assert!(matches!(
+            delete(&db, row.get_id()).await,
+            Err(AppError::NotFound)
+        ));
     }
 }

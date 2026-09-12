@@ -1,137 +1,111 @@
 //! The `pool_question` table: ask/insert, the two listings, the guarded
 //! approve that rides the publish counters along, the pending-only image
-//! writes, and the delete that cascades solutions — plus
-//! [`bump_question_and_write`], the existence-move every child write goes
-//! through. The pure entity and newtypes live in
-//! [`crate::domain::pool_question`]; the web layer reaches these through
-//! [`crate::service::pool_question`].
+//! writes, and the delete that cascades solutions. The pure entity and
+//! newtypes live in [`crate::domain::pool_question`]; the web layer reaches
+//! these through [`crate::service::pool_question`].
 
-use surrealdb::types::SurrealValue;
-
-use crate::constant::{
-    POOL_APPROVED_TOTAL_FIELD, POOL_PUBLISHED_TOTAL_FIELD, STATUS_APPROVED, STATUS_PENDING,
-};
-use crate::database::{Database, transaction_with_retry};
+use crate::constant::{STATUS_APPROVED, STATUS_PENDING};
+use crate::database::{Database, tx_with_retry};
 use crate::domain::note_file::FileContentType;
-use crate::domain::pool_question::{PoolQuestion, PoolQuestionId};
-use crate::domain::solution::Solution;
+use crate::domain::pool_question::{
+    PoolQuestion, PoolQuestionBody, PoolQuestionId, PoolQuestionTitle,
+};
+use crate::domain::solution::{Solution, SolutionBody, SolutionId};
+use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 
-/// Move the question's `asked_at` **and** run `statement` — a write to
-/// something hanging off a question — in one transaction, handing back the row
-/// it returned. `NotFound` means the question is gone and nothing was written.
-///
-/// The move is what makes the question's **existence** part of the child's own
-/// write, the way [`crate::domain::menu::bump_menu_and_write`] does for a menu:
-/// the `UPDATE` matches nothing once the row is deleted, and a delete racing
-/// this one touches the very key this transaction writes, so the two cannot
-/// both commit. Reading the question first does *not* survive that race — the
-/// read sees a row [`delete`] has removed but not committed, while its
-/// `DELETE solution WHERE question = $q` ran on a snapshot predating this
-/// insert, so both commit and the child outlives its question with neither
-/// caller told anything.
-///
-/// `asked_at` rather than a revision column because this row carries no counter
-/// to bump and must not grow one for this alone. It is put back *by captured
-/// value* in the same transaction, so nothing outside ever observes the move
-/// and the row is byte-identical afterwards (the pool lists order on it).
-/// Writing the same value would buy nothing: an `UPDATE` that leaves the
-/// document unchanged is elided and never reaches the store's write set, so it
-/// collides with nothing.
-///
-/// Admissible for [`transaction_with_retry`] as long as `statement` is: the
-/// `UPDATE`s, `SELECT`, `IF`/`THROW` and `RETURN` can never answer "already
-/// exists".
-pub(crate) async fn bump_question_and_write<T: SurrealValue>(
-    question: &PoolQuestionId,
-    statement: &str,
-    mut bindings: Vec<(String, surrealdb::types::Value)>,
-    db: &Database,
-) -> Result<Option<T>, AppError> {
-    bindings.push(("q".into(), question.record().into_value()));
-    let (mut result, mut errors) = transaction_with_retry(
-        db,
-        &format!(
-            "BEGIN TRANSACTION;
-             LET $was_asked = (SELECT VALUE asked_at FROM ONLY $q);
-             LET $bumped = (UPDATE $q SET asked_at = asked_at + 1 RETURN VALUE id);
-             IF array::len($bumped) = 0 {{ THROW 'no_question' }};
-             UPDATE $q SET asked_at = $was_asked;
-             LET $row = ({statement});
-             RETURN $row;
-             COMMIT TRANSACTION;"
-        ),
-        &bindings,
-        &["no_question"],
-    )
-    .await?;
-    // An aborted transaction errors *every* slot, most with a generic "not
-    // executed" — only the THROW's own slot names the reason.
-    if errors
-        .values()
-        .any(|error| error.to_string().contains("no_question"))
-    {
-        return Err(AppError::NotFound);
-    }
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    // The trailing `RETURN` is the last statement before `COMMIT`, so its slot
-    // follows the statement count rather than a hand-kept number;
-    // `num_statements` counts BEGIN and COMMIT.
-    let slot = result.num_statements().saturating_sub(2);
-    Ok(result.take::<Vec<T>>(slot)?.into_iter().next())
-}
-
 pub async fn insert(db: &Database, question: PoolQuestion) -> Result<PoolQuestion, AppError> {
-    // whole-row-save-ok: create of a fresh ULID row built in place by `new` — there is no prior row to clobber
-    let created: Option<PoolQuestion> = db.create(question.id.record()).content(question).await?;
-    created.ok_or_else(|| AppError::Internal("failed to create pool question".into()))
+    let row = sqlx::query_as!(
+        PoolQuestion,
+        r#"INSERT INTO pool_question (id, asker, title, body, status, asked_at)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           RETURNING id AS "id: PoolQuestionId", asker AS "asker: UserId",
+               title AS "title: PoolQuestionTitle", body AS "body: PoolQuestionBody",
+               status, asked_at AS "asked_at: Timestamp",
+               approved_by AS "approved_by: UserId", image_file,
+               image_content_type AS "image_content_type: FileContentType",
+               image_size"#,
+        question.id.uuid(),
+        question.asker.uuid(),
+        question.title.as_str(),
+        question.body.as_str(),
+        question.status,
+        question.asked_at.as_millis(),
+    )
+    .fetch_one(db)
+    .await?;
+    Ok(row)
 }
 
 pub async fn read(db: &Database, id: &PoolQuestionId) -> Result<Option<PoolQuestion>, AppError> {
-    Ok(db.select(id.record()).await?)
+    let row = sqlx::query_as!(
+        PoolQuestion,
+        r#"SELECT id AS "id: PoolQuestionId", asker AS "asker: UserId",
+               title AS "title: PoolQuestionTitle", body AS "body: PoolQuestionBody",
+               status, asked_at AS "asked_at: Timestamp",
+               approved_by AS "approved_by: UserId", image_file,
+               image_content_type AS "image_content_type: FileContentType",
+               image_size
+           FROM pool_question WHERE id = $1"#,
+        id.uuid()
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(row)
 }
 
 /// Every question, newest first — the teacher+ view (approval queue and
 /// pool in one list).
 pub async fn list_all(db: &Database) -> Result<Vec<PoolQuestion>, AppError> {
-    let mut result = db
-        .query("SELECT * FROM pool_question ORDER BY asked_at DESC, id DESC")
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<PoolQuestion>>(0)?)
+    let rows = sqlx::query_as!(
+        PoolQuestion,
+        r#"SELECT id AS "id: PoolQuestionId", asker AS "asker: UserId",
+               title AS "title: PoolQuestionTitle", body AS "body: PoolQuestionBody",
+               status, asked_at AS "asked_at: Timestamp",
+               approved_by AS "approved_by: UserId", image_file,
+               image_content_type AS "image_content_type: FileContentType",
+               image_size
+           FROM pool_question ORDER BY asked_at DESC, id DESC"#,
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows)
 }
 
 /// The pool as a non-staff user sees it, newest first: every approved
 /// question, plus the caller's own pending ones.
 pub async fn list_visible_to(db: &Database, user: &UserId) -> Result<Vec<PoolQuestion>, AppError> {
-    let mut result = db
-        .query(
-            "SELECT * FROM pool_question WHERE status = $approved OR asker = $usr \
-             ORDER BY asked_at DESC, id DESC",
-        )
-        .bind(("approved", STATUS_APPROVED))
-        .bind(("usr", user.record()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<PoolQuestion>>(0)?)
+    let rows = sqlx::query_as!(
+        PoolQuestion,
+        r#"SELECT id AS "id: PoolQuestionId", asker AS "asker: UserId",
+               title AS "title: PoolQuestionTitle", body AS "body: PoolQuestionBody",
+               status, asked_at AS "asked_at: Timestamp",
+               approved_by AS "approved_by: UserId", image_file,
+               image_content_type AS "image_content_type: FileContentType",
+               image_size
+           FROM pool_question
+           WHERE status = $1 OR asker = $2
+           ORDER BY asked_at DESC, id DESC"#,
+        STATUS_APPROVED,
+        user.uuid()
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows)
 }
 
 /// Publish a pending question into the pool, stamping who approved it.
-/// The `WHERE status = $pending` guard makes the transition atomic: of two
+/// The `WHERE status = 'pending'` guard makes the transition atomic: of two
 /// racing approvals exactly one wins, and an approve can never land on a
 /// question deleted mid-flight. `None` = the question wasn't pending
 /// (already approved, or gone) — the caller sorts out which.
 ///
-/// Two lifetime badge counters ride that same guard, inside this
+/// Two lifetime badge counters ride that same guard inside this
 /// transaction: the approver's `pool_approved_total` and the *asker's*
-/// `pool_published_total`. Both hang off `array::len($done) > 0` — the
-/// guard's own verdict — so the pair moves once per real transition and
-/// never on a second approve of an already-approved question.
-/// (`count ?? 0 > 0` misparses here; `array::len` is the spelling that
-/// holds.) The second conjunct is the self-approval rule below.
+/// `pool_published_total`. Both move only when the guard's own verdict
+/// landed, so the pair moves once per real transition and never on a second
+/// approve of an already-approved question.
 ///
 /// Two rules keep the pair unfarmable, one per side of the transition.
 ///
@@ -144,56 +118,63 @@ pub async fn list_visible_to(db: &Database, user: &UserId) -> Result<Vec<PoolQue
 ///
 /// And a *self*-approval — a teacher+ approving a question they asked
 /// themselves, which the route deliberately still allows — moves neither
-/// counter, hence the `$done[0].asker != $by` half of the condition. It is
-/// the same farm from the other end (ask, approve, delete, repeat, with no
-/// second person involved), and the two together are why a counter can only
-/// move when one person's work was judged by another's. Nothing else about
-/// a self-approval changes: same 200, same freeze, same stamp — this skips
-/// the credit, not the approval.
+/// counter. It is the same farm from the other end (ask, approve, delete,
+/// repeat, with no second person involved), and the two together are why a
+/// counter can only move when one person's work was judged by another's.
+/// Nothing else about a self-approval changes: same 200, same freeze, same
+/// stamp — this skips the credit, not the approval.
 ///
-/// Re-sent while the store answers "conflict, retry": the guard reads a
-/// column a rival approve writes, and both counters sit on user rows every
-/// other counter site writes too. Sound to re-send — every statement is an
-/// `UPDATE`, none of which can legitimately answer "already exists" — and a
-/// lost round aborts having written nothing, increments included.
+/// Rides the retry loop because the counter bumps lock user rows every
+/// other counter site writes too; a deadlock between two approvals takes a
+/// round and lands the next attempt.
 pub async fn approve(
     db: &Database,
     id: &PoolQuestionId,
     approver: &UserId,
 ) -> Result<Option<PoolQuestion>, AppError> {
-    let (mut result, mut errors) = transaction_with_retry(
-        db,
-        &format!(
-            "BEGIN TRANSACTION;
-             LET $done = (UPDATE $q SET status = $approved, approved_by = $by
-                 WHERE status = $pending RETURN AFTER);
-             IF array::len($done) > 0 AND $done[0].asker != $by {{
-                 UPDATE $by SET
-                     {POOL_APPROVED_TOTAL_FIELD} = ({POOL_APPROVED_TOTAL_FIELD} ?? 0) + 1;
-                 LET $asker = $done[0].asker;
-                 UPDATE $asker SET
-                     {POOL_PUBLISHED_TOTAL_FIELD} = ({POOL_PUBLISHED_TOTAL_FIELD} ?? 0) + 1;
-             }};
-             RETURN $done;
-             COMMIT TRANSACTION;"
-        ),
-        &[
-            ("q".into(), id.record().into_value()),
-            ("approved".into(), STATUS_APPROVED.to_string().into_value()),
-            ("by".into(), approver.record().into_value()),
-            ("pending".into(), STATUS_PENDING.to_string().into_value()),
-        ],
-        &[],
-    )
-    .await?;
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    // The trailing `RETURN` is always the last statement before `COMMIT`,
-    // so its slot follows the statement count rather than a hand-kept
-    // number (`num_statements` counts `BEGIN` and `COMMIT` too, hence -2).
-    let slot = result.num_statements().saturating_sub(2);
-    Ok(result.take::<Vec<PoolQuestion>>(slot)?.into_iter().next())
+    let id = *id;
+    let approver = *approver;
+    tx_with_retry(db, false, async move |tx| {
+        let approved = sqlx::query_as!(
+            PoolQuestion,
+            r#"UPDATE pool_question SET status = $2, approved_by = $3
+               WHERE id = $1 AND status = $4
+               RETURNING id AS "id: PoolQuestionId", asker AS "asker: UserId",
+                   title AS "title: PoolQuestionTitle", body AS "body: PoolQuestionBody",
+                   status, asked_at AS "asked_at: Timestamp",
+                   approved_by AS "approved_by: UserId", image_file,
+                   image_content_type AS "image_content_type: FileContentType",
+                   image_size"#,
+            id.uuid(),
+            STATUS_APPROVED,
+            approver.uuid(),
+            STATUS_PENDING,
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(question) = &approved {
+            if question.asker != approver {
+                // The counter columns are NOT NULL DEFAULT 0 — the old
+                // absent-reads-as-zero coalesce is gone with the schema.
+                sqlx::query!(
+                    "UPDATE app_user SET pool_approved_total = pool_approved_total + 1
+                     WHERE id = $1",
+                    approver.uuid()
+                )
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query!(
+                    "UPDATE app_user SET pool_published_total = pool_published_total + 1
+                     WHERE id = $1",
+                    question.asker.uuid()
+                )
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        Ok(approved)
+    })
+    .await
 }
 
 /// Point the question at a freshly written image blob. Guarded on
@@ -202,6 +183,10 @@ pub async fn approve(
 /// loses the race gets `None` (and the caller takes the orphan blob back
 /// off disk). Returns the *before* row — its `image_file` is the replaced
 /// blob the caller must remove.
+///
+/// The row lock makes the before-read and the guarded write one switch; a
+/// racing approve either predates this transaction's snapshot or waits on
+/// the lock, so a fresh image can never straddle an approval.
 pub async fn set_image(
     db: &Database,
     id: &PoolQuestionId,
@@ -209,19 +194,44 @@ pub async fn set_image(
     content_type: &FileContentType,
     size: i64,
 ) -> Result<Option<PoolQuestion>, AppError> {
-    let mut result = db
-        .query(
-            "UPDATE $q SET image_file = $file, image_content_type = $ct, image_size = $size \
-             WHERE status = $pending RETURN BEFORE",
+    let id = *id;
+    let file = file.to_owned();
+    let content_type = content_type.clone();
+    tx_with_retry(db, false, async move |tx| {
+        let before = sqlx::query_as!(
+            PoolQuestion,
+            r#"SELECT id AS "id: PoolQuestionId", asker AS "asker: UserId",
+                   title AS "title: PoolQuestionTitle", body AS "body: PoolQuestionBody",
+                   status, asked_at AS "asked_at: Timestamp",
+                   approved_by AS "approved_by: UserId", image_file,
+                   image_content_type AS "image_content_type: FileContentType",
+                   image_size
+                   FROM pool_question WHERE id = $1 FOR UPDATE"#,
+            id.uuid()
         )
-        .bind(("q", id.record()))
-        .bind(("file", file.to_string()))
-        .bind(("ct", content_type.clone()))
-        .bind(("size", size))
-        .bind(("pending", STATUS_PENDING))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<PoolQuestion>>(0)?.into_iter().next())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(before) = before else {
+            return Ok(None);
+        };
+        let written = sqlx::query!(
+            r#"UPDATE pool_question
+               SET image_file = $2, image_content_type = $3, image_size = $4
+               WHERE id = $1 AND status = $5"#,
+            id.uuid(),
+            file,
+            content_type.as_str(),
+            size,
+            STATUS_PENDING,
+        )
+        .execute(&mut *tx)
+        .await?;
+        if written.rows_affected() == 0 {
+            return Ok(None);
+        }
+        Ok(Some(before))
+    })
+    .await
 }
 
 /// Detach the question's image (pending only, like `set_image`). Returns
@@ -230,16 +240,39 @@ pub async fn clear_image(
     db: &Database,
     id: &PoolQuestionId,
 ) -> Result<Option<PoolQuestion>, AppError> {
-    let mut result = db
-        .query(
-            "UPDATE $q SET image_file = NONE, image_content_type = NONE, image_size = NONE \
-             WHERE status = $pending RETURN BEFORE",
+    let id = *id;
+    tx_with_retry(db, false, async move |tx| {
+        let before = sqlx::query_as!(
+            PoolQuestion,
+            r#"SELECT id AS "id: PoolQuestionId", asker AS "asker: UserId",
+                   title AS "title: PoolQuestionTitle", body AS "body: PoolQuestionBody",
+                   status, asked_at AS "asked_at: Timestamp",
+                   approved_by AS "approved_by: UserId", image_file,
+                   image_content_type AS "image_content_type: FileContentType",
+                   image_size
+                   FROM pool_question WHERE id = $1 FOR UPDATE"#,
+            id.uuid()
         )
-        .bind(("q", id.record()))
-        .bind(("pending", STATUS_PENDING))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<PoolQuestion>>(0)?.into_iter().next())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(before) = before else {
+            return Ok(None);
+        };
+        let written = sqlx::query!(
+            r#"UPDATE pool_question
+               SET image_file = NULL, image_content_type = NULL, image_size = NULL
+               WHERE id = $1 AND status = $2"#,
+            id.uuid(),
+            STATUS_PENDING,
+        )
+        .execute(&mut *tx)
+        .await?;
+        if written.rows_affected() == 0 {
+            return Ok(None);
+        }
+        Ok(Some(before))
+    })
+    .await
 }
 
 /// Delete the question and its solutions in one transaction, returning
@@ -247,80 +280,82 @@ pub async fn clear_image(
 /// caller can take every image blob off disk (solutions carry photos too,
 /// and a row-only sweep would strand theirs forever).
 ///
-/// Rides the retry because a solution offer now writes this very row
-/// ([`bump_question_and_write`]): the two contend by design, and a lost
-/// round through a bare `check()` was a 500 for a delete that only had to
-/// be re-sent. Admissible — a `DELETE` can never answer "already exists".
+/// Children before the parent, so the foreign keys never refuse the parent
+/// delete. `cascade = true` because a solution offer committing inside this
+/// window makes the parent delete answer 23503 — a mid-cascade race the
+/// retry loop re-runs, sweeping the latecomer with it. That foreign key is
+/// also what keeps a solution from outliving its question on the insert
+/// side, so the old existence-move transaction is simply gone.
 pub async fn delete(
     db: &Database,
     id: &PoolQuestionId,
 ) -> Result<Option<(PoolQuestion, Vec<Solution>)>, AppError> {
-    let (mut result, mut errors) = transaction_with_retry(
-        db,
-        "BEGIN TRANSACTION;
-             DELETE solution WHERE question = $q RETURN BEFORE;
-             DELETE $q RETURN BEFORE;
-             COMMIT TRANSACTION;",
-        &[("q".into(), id.record().into_value())],
-        &[],
-    )
-    .await?;
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    // Slots count BEGIN: the solution sweep is slot 1, the question slot 2.
-    let solutions = result.take::<Vec<Solution>>(1)?;
-    Ok(result
-        .take::<Vec<PoolQuestion>>(2)?
-        .into_iter()
-        .next()
-        .map(|question| (question, solutions)))
+    let id = *id;
+    tx_with_retry(db, true, async move |tx| {
+        let solutions = sqlx::query_as!(
+            Solution,
+            r#"DELETE FROM solution WHERE question = $1
+               RETURNING id AS "id: SolutionId", question AS "question: PoolQuestionId",
+               author AS "author: UserId", body AS "body: SolutionBody",
+               offered_at AS "offered_at: Timestamp", image_file,
+               image_content_type AS "image_content_type: FileContentType",
+               image_size"#,
+            id.uuid()
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        let question = sqlx::query_as!(
+            PoolQuestion,
+            r#"DELETE FROM pool_question WHERE id = $1
+               RETURNING id AS "id: PoolQuestionId", asker AS "asker: UserId",
+               title AS "title: PoolQuestionTitle", body AS "body: PoolQuestionBody",
+               status, asked_at AS "asked_at: Timestamp",
+               approved_by AS "approved_by: UserId", image_file,
+               image_content_type AS "image_content_type: FileContentType",
+               image_size"#,
+            id.uuid()
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        Ok(question.map(|question| (question, solutions)))
+    })
+    .await
 }
 
 #[cfg(test)]
 mod tests {
-    use ulid::Ulid;
-
     use super::*;
     use crate::database;
     use crate::domain::solution::SolutionBody;
+    use sqlx::Row as _;
 
-    /// The two counter columns plus a row to carry them: the `user` table is
-    /// SCHEMAFULL in production, and the counters are `option<int>` there.
+    /// A real `app_user` row: the asker and the approver are foreign keys on
+    /// the question, and the counters are plain `NOT NULL DEFAULT 0` columns.
     async fn a_user(db: &Database) -> UserId {
-        let user = UserId::from_key(&Ulid::new().to_string());
-        db.query(format!(
-            "DEFINE FIELD IF NOT EXISTS {POOL_APPROVED_TOTAL_FIELD} ON user TYPE option<int>;
-             DEFINE FIELD IF NOT EXISTS {POOL_PUBLISHED_TOTAL_FIELD} ON user TYPE option<int>;
-             CREATE $usr SET username = $name, password_hash = 'x';"
-        ))
-        .bind(("usr", user.record()))
-        .bind(("name", user.key().to_string()))
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
+        let user = UserId::generate();
+        sqlx::query("INSERT INTO app_user (id, username, password_hash) VALUES ($1, $2, 'x')")
+            .bind(user.uuid())
+            .bind(format!("u{}", &user.key()[30..]))
+            .execute(db)
+            .await
+            .unwrap();
         user
     }
 
-    /// `(pool_approved_total, pool_published_total)` as stored — absent reads
-    /// zero, the way `BadgeStats::load` reads it.
+    /// `(pool_approved_total, pool_published_total)` as stored — the columns
+    /// read zero on a fresh row, the way `BadgeStats::load` reads them.
     async fn counters(user: &UserId, db: &Database) -> (i64, i64) {
-        let mut result = db
-            .query(format!(
-                "SELECT VALUE [({POOL_APPROVED_TOTAL_FIELD} ?? 0),
-                               ({POOL_PUBLISHED_TOTAL_FIELD} ?? 0)] FROM $usr"
-            ))
-            .bind(("usr", user.record()))
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
-        let rows = result.take::<Vec<Vec<i64>>>(0).unwrap();
-        let row = rows.into_iter().next().unwrap_or_default();
+        let row = sqlx::query(
+            "SELECT pool_approved_total, pool_published_total \
+             FROM app_user WHERE id = $1",
+        )
+        .bind(user.uuid())
+        .fetch_one(db)
+        .await
+        .unwrap();
         (
-            row.first().copied().unwrap_or(0),
-            row.get(1).copied().unwrap_or(0),
+            row.try_get::<i64, _>(0).unwrap(),
+            row.try_get::<i64, _>(1).unwrap(),
         )
     }
 
@@ -335,9 +370,9 @@ mod tests {
 
     #[tokio::test]
     async fn approval_is_a_one_way_race_safe_transition() {
-        let db = database::init_mem().await.unwrap();
-        let asker = UserId::from_key(&Ulid::new().to_string());
-        let teacher = UserId::from_key(&Ulid::new().to_string());
+        let (db, _leases) = database::init_test_db().await;
+        let asker = a_user(&db).await;
+        let teacher = a_user(&db).await;
 
         let q = insert(&db, question(&asker)).await.unwrap();
         assert_eq!(q.get_status(), STATUS_PENDING);
@@ -362,7 +397,7 @@ mod tests {
     /// published side, and neither on a second approve of the same question.
     #[tokio::test]
     async fn approval_moves_both_counters_once_and_only_once() {
-        let db = database::init_mem().await.unwrap();
+        let (db, _leases) = database::init_test_db().await;
         let asker = a_user(&db).await;
         let teacher = a_user(&db).await;
 
@@ -395,7 +430,7 @@ mod tests {
     /// neither counter moves when one person is both ends of the transition.
     #[tokio::test]
     async fn self_approval_still_approves_but_moves_neither_counter() {
-        let db = database::init_mem().await.unwrap();
+        let (db, _leases) = database::init_test_db().await;
         let teacher = a_user(&db).await;
 
         let q = insert(&db, question(&teacher)).await.unwrap();
@@ -419,10 +454,10 @@ mod tests {
 
     #[tokio::test]
     async fn visibility_hides_others_pending_questions() {
-        let db = database::init_mem().await.unwrap();
-        let asker = UserId::from_key(&Ulid::new().to_string());
-        let other = UserId::from_key(&Ulid::new().to_string());
-        let teacher = UserId::from_key(&Ulid::new().to_string());
+        let (db, _leases) = database::init_test_db().await;
+        let asker = a_user(&db).await;
+        let other = a_user(&db).await;
+        let teacher = a_user(&db).await;
 
         let pending = insert(&db, question(&asker)).await.unwrap();
         let published = insert(&db, question(&other)).await.unwrap();
@@ -443,9 +478,9 @@ mod tests {
 
     #[tokio::test]
     async fn image_attaches_only_while_pending_and_reports_the_replaced_blob() {
-        let db = database::init_mem().await.unwrap();
-        let asker = UserId::from_key(&Ulid::new().to_string());
-        let teacher = UserId::from_key(&Ulid::new().to_string());
+        let (db, _leases) = database::init_test_db().await;
+        let asker = a_user(&db).await;
+        let teacher = a_user(&db).await;
         let png = FileContentType::try_new("image/png").unwrap();
 
         let q = insert(&db, question(&asker)).await.unwrap();
@@ -490,9 +525,9 @@ mod tests {
 
     #[tokio::test]
     async fn delete_cascades_solutions_and_returns_the_row() {
-        let db = database::init_mem().await.unwrap();
-        let asker = UserId::from_key(&Ulid::new().to_string());
-        let helper = UserId::from_key(&Ulid::new().to_string());
+        let (db, _leases) = database::init_test_db().await;
+        let asker = a_user(&db).await;
+        let helper = a_user(&db).await;
 
         let q = insert(&db, question(&asker)).await.unwrap();
         let offered = crate::db::solution::insert(
@@ -538,47 +573,35 @@ mod tests {
     /// instead, so the two transactions touch one key and the store refuses
     /// one of them.
     ///
-    /// The window is opened by the database, not by a lucky interleaving: a
-    /// `DEFINE EVENT` on `pool_question` fires *inside* the delete's own
-    /// transaction the instant the row goes, so the `SLEEP` lands exactly
-    /// between the delete and its cascade every time.
-    ///
-    /// Real server, and `#[ignore]`d for it: the subject *is* the store's
-    /// conflict detection, which `init_mem`'s embedded engine does not have —
-    /// it commits both writes and answers `Ok` to each, so this passes there on
-    /// broken code.
+    /// The offer writes the question row too (its `solution_count`), so the
+    /// two transactions touch one row and Postgres refuses one of them; the
+    /// barrier releases both sides together so every interleaving gets its
+    /// chance.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn a_solution_offered_inside_a_delete_never_outlives_its_question() {
-        let (db, _serialized) = database::init_test_server("solution_race").await;
-        // Hold the delete open for a full second after the row is gone, while
-        // its cascade still has to run.
-        db.query(
-            "DEFINE EVENT hold_the_window ON TABLE pool_question WHEN $event = 'DELETE' \
-             THEN { SLEEP 1s; };",
-        )
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
+        let (db, _leases) = database::init_test_db().await;
 
         let (mut solutions, mut swept, mut delete_500) = (0, 0, 0);
-        for round in 0..4 {
-            let asker = UserId::from_key(&Ulid::new().to_string());
-            let helper = UserId::from_key(&Ulid::new().to_string());
+        for round in 0..8 {
+            let asker = a_user(&db).await;
+            let helper = a_user(&db).await;
             let q = insert(&db, question(&asker)).await.unwrap();
             let id = q.get_id().clone();
 
+            // Delete and offer released together: both write the question row,
+            // so Postgres serializes them and refuses whichever lost.
+            let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
             let drop_it = {
-                let (db, id) = (db.clone(), id.clone());
-                tokio::spawn(async move { delete(&db, &id).await })
-            };
-            // The offer starts inside the held window — the question row is
-            // gone but uncommitted, which is exactly what a read believes.
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            let child = {
-                let (db, id) = (db.clone(), id.clone());
+                let (db, id, gate) = (db.clone(), id.clone(), gate.clone());
                 tokio::spawn(async move {
+                    gate.wait().await;
+                    delete(&db, &id).await
+                })
+            };
+            let child = {
+                let (db, id, helper, gate) = (db.clone(), id.clone(), helper.clone(), gate);
+                tokio::spawn(async move {
+                    gate.wait().await;
                     crate::db::solution::insert(
                         &db,
                         Solution::new(
@@ -612,7 +635,7 @@ mod tests {
                     .len();
             }
         }
-        eprintln!("pool_question::delete raced by an offer: {swept}/4 rounds deleted the question");
+        eprintln!("pool_question::delete raced by an offer: {swept}/8 rounds deleted the question");
         assert!(
             swept > 0,
             "no round ever deleted the question, so the window was never reached"

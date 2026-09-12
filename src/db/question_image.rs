@@ -4,66 +4,85 @@
 //! constructor — lives in [`crate::domain::question_image`]; the blob bytes
 //! stay the web layer's.
 
-use surrealdb::types::SurrealValue;
+use sqlx::PgConnection;
 
-use crate::database::Database;
+use crate::database::{Database, tx_with_retry};
+use crate::db::exam_attempt::freeze_gate;
 use crate::domain::course::CourseId;
 use crate::domain::exam::ExamId;
 use crate::domain::exam_question::{ChoiceId, ExamQuestionId};
-use crate::domain::question_image::{QuestionImage, QuestionImageId};
+use crate::domain::note_file::FileContentType;
+use crate::domain::question_image::QuestionImage;
 use crate::error::AppError;
 
-/// What one [`upsert`] transaction returns: the row it stored
-/// and the blob name it replaced. Both are arrays because SurrealDB drops an object
-/// key valued `NONE` on the way out, while an empty array survives — "nothing
-/// was replaced" has to be readable, not missing.
-#[derive(SurrealValue)]
-struct UpsertOutcome {
-    stored: Vec<QuestionImage>,
-    replaced: Vec<String>,
-}
-
-/// Create or replace the slot's image row — the deterministic id makes
-/// this the whole "one image per slot" story — handing back what it stored
-/// plus the blob name it replaced, for the caller to take off disk. Refused
-/// once the exam has an attempt: pictures are part of the question, so they
-/// freeze with it, and the gate is in this transaction rather than in a lock
-/// the caller held.
+/// Create or replace the slot's image row — the `UNIQUE NULLS NOT DISTINCT`
+/// (question, slot) constraint makes this the whole "one image per slot"
+/// story — handing back what it stored plus the blob name it replaced, for
+/// the caller to take off disk. Refused once the exam has an attempt:
+/// pictures are part of the question, so they freeze with it, and the gate
+/// is in this transaction rather than in a lock the caller held.
 ///
-/// The replaced name is read *here*, not by the caller before it: two
-/// uploads to one slot both write this row, so they contend and the loser
-/// re-reads the winner's blob name, where two pre-reads both saw the *old*
-/// blob and left the loser's fresh one orphaned on disk.
+/// The replaced name is read *inside the same transaction*, not by the
+/// caller before it: two uploads to one slot both write this row, so they
+/// contend on it and the loser re-reads the winner's blob name, where two
+/// pre-reads both saw the *old* blob and left the loser's fresh one
+/// orphaned on disk.
 pub async fn upsert(
     db: &Database,
     image: QuestionImage,
 ) -> Result<(QuestionImage, Option<String>), AppError> {
-    // whole-row-save-ok: image is built in place, never read back, and the slot id is deterministic
-    let (exam, id) = (image.exam.clone(), image.id.record());
-    let mut result = crate::db::exam_attempt::write_unfrozen(
-        db,
-        &exam,
-        "LET $replaced = (SELECT VALUE file FROM $id);
-         LET $stored = (UPSERT $id CONTENT $image);
-         RETURN { stored: $stored, replaced: $replaced };",
-        vec![
-            ("id".into(), id.into_value()),
-            ("image".into(), image.into_value()),
-        ],
+    tx_with_retry(db, false, async move |conn| {
+        upsert_in(conn, image.clone()).await
+    })
+    .await
+}
+
+/// The gated read-and-replace, on one connection.
+pub(crate) async fn upsert_in(
+    conn: &mut PgConnection,
+    image: QuestionImage,
+) -> Result<(QuestionImage, Option<String>), AppError> {
+    freeze_gate(conn, &image.exam).await?;
+    let replaced = replaced_file(conn, &image.question, image.slot.as_ref()).await?;
+    let stored = sqlx::query_as!(
+        QuestionImage,
+        r#"INSERT INTO question_image (exam, question, slot, file, content_type, size)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           ON CONFLICT (question, slot) DO UPDATE
+               SET file = EXCLUDED.file, content_type = EXCLUDED.content_type,
+                   size = EXCLUDED.size
+           RETURNING exam AS "exam: ExamId", question AS "question: ExamQuestionId",
+                     slot AS "slot: ChoiceId", file,
+                     content_type AS "content_type: FileContentType", size"#,
+        image.exam.uuid(),
+        image.question.uuid(),
+        image.slot.as_ref().map(ChoiceId::as_str),
+        image.file,
+        image.content_type.as_str(),
+        image.size,
     )
+    .fetch_one(&mut *conn)
     .await?;
-    // The trailing `RETURN` is the last statement before `COMMIT`, so its
-    // slot follows the statement count rather than a hand-kept number;
-    // `num_statements` counts BEGIN and COMMIT.
-    let slot = result.num_statements().saturating_sub(2);
-    let failed = || AppError::Internal("failed to store question image".into());
-    let outcome = result
-        .take::<Vec<UpsertOutcome>>(slot)?
-        .into_iter()
-        .next()
-        .ok_or_else(failed)?;
-    let stored = outcome.stored.into_iter().next().ok_or_else(failed)?;
-    Ok((stored, outcome.replaced.into_iter().next()))
+    Ok((stored, replaced))
+}
+
+/// The blob name a slot's row currently names — the file a replace takes
+/// off disk. `IS NOT DISTINCT FROM` is what makes the illustration slot's
+/// `NULL` match itself.
+pub(crate) async fn replaced_file(
+    conn: &mut PgConnection,
+    question: &ExamQuestionId,
+    slot: Option<&ChoiceId>,
+) -> Result<Option<String>, AppError> {
+    let row = sqlx::query!(
+        r#"SELECT file FROM question_image
+           WHERE question = $1 AND slot IS NOT DISTINCT FROM $2"#,
+        question.uuid(),
+        slot.map(ChoiceId::as_str),
+    )
+    .fetch_optional(conn)
+    .await?;
+    Ok(row.map(|row| row.file))
 }
 
 pub async fn read_slot(
@@ -71,31 +90,48 @@ pub async fn read_slot(
     question: &ExamQuestionId,
     slot: Option<&ChoiceId>,
 ) -> Result<Option<QuestionImage>, AppError> {
-    Ok(db
-        .select(QuestionImageId::for_slot(question, slot).record())
-        .await?)
+    Ok(sqlx::query_as!(
+        QuestionImage,
+        r#"SELECT exam AS "exam: ExamId", question AS "question: ExamQuestionId",
+                  slot AS "slot: ChoiceId", file,
+                  content_type AS "content_type: FileContentType", size
+           FROM question_image
+           WHERE question = $1 AND slot IS NOT DISTINCT FROM $2"#,
+        question.uuid(),
+        slot.map(ChoiceId::as_str),
+    )
+    .fetch_optional(db)
+    .await?)
 }
 
 /// Every image of the exam's questions — one query for the list views.
 pub async fn list_for_exam(db: &Database, exam: &ExamId) -> Result<Vec<QuestionImage>, AppError> {
-    let mut result = db
-        .query("SELECT * FROM question_image WHERE exam = $ex")
-        .bind(("ex", exam.record()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<QuestionImage>>(0)?)
+    Ok(sqlx::query_as!(
+        QuestionImage,
+        r#"SELECT exam AS "exam: ExamId", question AS "question: ExamQuestionId",
+                  slot AS "slot: ChoiceId", file,
+                  content_type AS "content_type: FileContentType", size
+           FROM question_image WHERE exam = $1"#,
+        exam.uuid(),
+    )
+    .fetch_all(db)
+    .await?)
 }
 
 pub async fn list_for_question(
     db: &Database,
     question: &ExamQuestionId,
 ) -> Result<Vec<QuestionImage>, AppError> {
-    let mut result = db
-        .query("SELECT * FROM question_image WHERE question = $q")
-        .bind(("q", question.record()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<QuestionImage>>(0)?)
+    Ok(sqlx::query_as!(
+        QuestionImage,
+        r#"SELECT exam AS "exam: ExamId", question AS "question: ExamQuestionId",
+                  slot AS "slot: ChoiceId", file,
+                  content_type AS "content_type: FileContentType", size
+           FROM question_image WHERE question = $1"#,
+        question.uuid(),
+    )
+    .fetch_all(db)
+    .await?)
 }
 
 /// Drop the option pictures whose choice is gone — every choice image of
@@ -112,17 +148,22 @@ pub async fn delete_choices_not_in(
     question: &ExamQuestionId,
     keep: &[ChoiceId],
 ) -> Result<Vec<QuestionImage>, AppError> {
-    let keep: Vec<String> = keep.iter().map(|id| id.as_str().to_string()).collect();
-    let mut result = db
-        .query(
-            "DELETE question_image \
-             WHERE question = $q AND slot != NONE AND slot NOT IN $keep RETURN BEFORE",
-        )
-        .bind(("q", question.record()))
-        .bind(("keep", keep))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<QuestionImage>>(0)?)
+    let keep = keep
+        .iter()
+        .map(|id| id.as_str().to_string())
+        .collect::<Vec<_>>();
+    Ok(sqlx::query_as!(
+        QuestionImage,
+        r#"DELETE FROM question_image
+           WHERE question = $1 AND slot IS NOT NULL AND NOT (slot = ANY($2))
+           RETURNING exam AS "exam: ExamId", question AS "question: ExamQuestionId",
+                     slot AS "slot: ChoiceId", file,
+                     content_type AS "content_type: FileContentType", size"#,
+        question.uuid(),
+        &keep,
+    )
+    .fetch_all(db)
+    .await?)
 }
 
 /// The blob names behind every image of every exam of `course` — collected
@@ -131,32 +172,36 @@ pub async fn file_keys_for_course(
     db: &Database,
     course: &CourseId,
 ) -> Result<Vec<String>, AppError> {
-    let mut result = db
-        .query(
-            "SELECT VALUE file FROM question_image \
-             WHERE exam IN (SELECT VALUE id FROM exam WHERE course = $course)",
-        )
-        .bind(("course", course.record()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<String>>(0)?)
+    let rows = sqlx::query!(
+        r#"SELECT qi.file FROM question_image qi
+           JOIN exam e ON e.id = qi.exam WHERE e.course = $1"#,
+        course.uuid(),
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows.into_iter().map(|row| row.file).collect())
 }
 
 /// Refused once the exam has an attempt, in the same transaction — same
 /// gate, same reason as [`upsert`].
 pub async fn delete(db: &Database, image: QuestionImage) -> Result<QuestionImage, AppError> {
-    let mut result = crate::db::exam_attempt::write_unfrozen(
-        db,
-        &image.exam,
-        "DELETE $id RETURN BEFORE;",
-        vec![("id".into(), image.id.record().into_value())],
-    )
-    .await?;
-    result
-        .take::<Vec<QuestionImage>>(crate::db::exam_attempt::FROZEN_SLOT)?
-        .into_iter()
-        .next()
-        .ok_or(AppError::NotFound)
+    tx_with_retry(db, false, async move |conn| {
+        freeze_gate(conn, &image.exam).await?;
+        let deleted = sqlx::query_as!(
+            QuestionImage,
+            r#"DELETE FROM question_image
+               WHERE question = $1 AND slot IS NOT DISTINCT FROM $2
+               RETURNING exam AS "exam: ExamId", question AS "question: ExamQuestionId",
+                         slot AS "slot: ChoiceId", file,
+                         content_type AS "content_type: FileContentType", size"#,
+            image.question.uuid(),
+            image.slot.as_ref().map(ChoiceId::as_str),
+        )
+        .fetch_optional(&mut *conn)
+        .await?;
+        deleted.ok_or(AppError::NotFound)
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -201,11 +246,53 @@ mod tests {
         .collect()
     }
 
+    /// A real question row on `exam`: images are FK children of their
+    /// question, so a minted id is refused outright.
+    async fn a_question(db: &Database, exam: &ExamId) -> ExamQuestionId {
+        use crate::domain::exam_question::{QuestionPoints, QuestionText};
+        use crate::domain::subject::{SubjectDescription, SubjectName};
+        let spec = QuestionSpec::try_new(
+            QuestionKind::try_new("choice").unwrap(),
+            Some(
+                ["a", "b", "c"]
+                    .iter()
+                    .map(|l| ChoiceInput {
+                        id: Some((*l).into()),
+                        text: (*l).into(),
+                    })
+                    .collect(),
+            ),
+            Some("a".into()),
+            &[],
+        )
+        .unwrap();
+        let subject = crate::db::subject::create(
+            db,
+            &crate::db::course::a_test_course(db).await,
+            SubjectName::try_new("pictures").unwrap(),
+            SubjectDescription::try_new("").unwrap(),
+        )
+        .await
+        .unwrap();
+        crate::db::exam_question::create(
+            db,
+            exam,
+            subject.get_id().clone(),
+            QuestionText::try_new("pick one").unwrap(),
+            QuestionPoints::try_new(1).unwrap(),
+            spec,
+        )
+        .await
+        .unwrap()
+        .get_id()
+        .clone()
+    }
+
     #[tokio::test]
     async fn upsert_replaces_per_slot() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let exam = exam_row(&db).await;
-        let question = ExamQuestionId::generate();
+        let question = a_question(&db, &exam).await;
         let ids = choice_ids();
 
         let (first, retired) = upsert(&db, QuestionImage::new(&exam, &question, None, png(), 3))
@@ -248,9 +335,9 @@ mod tests {
     /// options keeps exactly their pictures, and drops only the removed one's.
     #[tokio::test]
     async fn only_the_dropped_options_lose_their_pictures() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let exam = exam_row(&db).await;
-        let question = ExamQuestionId::generate();
+        let question = a_question(&db, &exam).await;
         let ids = choice_ids();
         upsert(&db, QuestionImage::new(&exam, &question, None, png(), 1))
             .await
@@ -290,9 +377,9 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_keep_set_clears_every_option_picture_but_not_the_illustration() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let exam = exam_row(&db).await;
-        let question = ExamQuestionId::generate();
+        let question = a_question(&db, &exam).await;
         let ids = choice_ids();
         upsert(&db, QuestionImage::new(&exam, &question, None, png(), 1))
             .await
@@ -317,12 +404,12 @@ mod tests {
 
     #[tokio::test]
     async fn exam_listing_scopes_by_exam() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let exam_a = exam_row(&db).await;
         let exam_b = exam_row(&db).await;
         upsert(
             &db,
-            QuestionImage::new(&exam_a, &ExamQuestionId::generate(), None, png(), 1),
+            QuestionImage::new(&exam_a, &a_question(&db, &exam_a).await, None, png(), 1),
         )
         .await
         .unwrap();

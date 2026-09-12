@@ -59,7 +59,7 @@ impl Scheduled for Exam {
         self.get_ends_at().map(|at| at.as_millis())
     }
 
-    fn order_key(&self) -> &str {
+    fn order_key(&self) -> String {
         self.get_id().key()
     }
 }
@@ -183,7 +183,7 @@ struct GradeResult {
     #[schema(example = 85, minimum = 0, maximum = 100)]
     mark: i64,
     /// The student being graded.
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     user_id: String,
 }
 
@@ -268,7 +268,7 @@ async fn list_exams(
         let ids: Vec<_> = courses.iter().map(|c| c.get_id().clone()).collect();
         // Drafts show only where the caller manages the course (as its
         // creator — the manager+ path above already saw everything).
-        let managed: Vec<&str> = courses
+        let managed: Vec<String> = courses
             .iter()
             .filter(|c| can_manage_course(c, &user))
             .map(|c| c.get_id().key())
@@ -476,8 +476,8 @@ async fn delete_exam(
             "only the course creator, an assigned teacher, or a manager/admin can delete this exam",
         ));
     }
-    // The workflow — the archived-term gate, the *writer* lease of
-    // [`EXAM_LOCK`] across the cascade, blob-key collection, the delete — is
+    // The workflow — the archived-term gate, the exam-row lock and the
+    // cascade with its in-transaction blob-key collection, the delete — is
     // [`crate::service::exam::delete`]'s. Blob unlinking stays here because
     // only the web layer knows `files_path`.
     let outcome = service::exam::delete(&st.db, &exam).await?;
@@ -532,9 +532,9 @@ async fn grade(
         ));
     }
     let target = UserId::from_key(&req.user_id);
-    // The workflow — the *reader* lease of [`EXAM_LOCK`] from the exam read
-    // through the result write (so a concurrent re-draft cannot slip a mark
-    // onto a hidden exam), the draft and kind pre-flights, the
+    // The workflow — the draft and kind pre-flights (the draft one re-made
+    // on the locked exam row inside the mark's own transaction, so a
+    // concurrent re-draft cannot slip a mark onto a hidden exam), the
     // grader/target walls, the sitting resolution, the mark's own
     // transaction, and the badge sync — is
     // [`crate::service::exam_result::grade`]'s.

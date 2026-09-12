@@ -1,10 +1,6 @@
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-
-use crate::constant::{
-    EXAM_TABLE, MAX_EXAM_DESCRIPTION_LEN, MAX_EXAM_TITLE_LEN, UNLIMITED_EXAM_ATTEMPTS,
-};
+use crate::constant::{MAX_EXAM_DESCRIPTION_LEN, MAX_EXAM_TITLE_LEN, UNLIMITED_EXAM_ATTEMPTS};
 use crate::domain::course::CourseId;
-use crate::domain::monotonic_id::next_ulid;
+use crate::domain::monotonic_id::next_uuid;
 use crate::domain::settings::ExamKindDef;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
@@ -24,34 +20,38 @@ use crate::validate::{
     validate_required,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct ExamId(RecordId);
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
+pub struct ExamId(uuid::Uuid);
 
 impl ExamId {
-    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
-    /// exams list `id DESC` (newest first, [`crate::db::exam::list_all`]),
+    /// Minted from the process-wide monotonic generator, not a plain random
+    /// UUID: exams list `id DESC` (newest first,
+    /// [`crate::db::exam::list_all`]),
     /// and a random low half scrambles rows minted in the same millisecond.
     pub fn generate() -> Self {
-        Self(RecordId::new(EXAM_TABLE, next_ulid().to_string()))
+        Self(next_uuid())
     }
 
+    /// The inner uuid, for runtime-checked binds (Param/QueryBuilder) that
+    /// cannot take the newtype. Static `query!` binds take `self` directly.
+    pub fn uuid(&self) -> uuid::Uuid {
+        self.0
+    }
+
+    /// Parses a wire key. A key that is not a UUID parses as the nil UUID,
+    /// which matches no row.
     pub fn from_key(key: &str) -> Self {
-        Self(RecordId::new(EXAM_TABLE, key))
+        Self(uuid::Uuid::parse_str(key).unwrap_or(uuid::Uuid::nil()))
     }
 
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
-        }
+    pub fn key(&self) -> String {
+        self.0.to_string()
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct ExamTitle(String);
 
 impl ExamTitle {
@@ -65,7 +65,8 @@ impl ExamTitle {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct ExamDescription(String);
 
 impl ExamDescription {
@@ -84,7 +85,8 @@ impl ExamDescription {
 /// the exam's weight in the course average (set per kind in settings, not per
 /// exam). Stored exams keep their kind even if the school later edits the
 /// list; only new writes are held to the current one.
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct ExamKind(String);
 
 impl ExamKind {
@@ -106,7 +108,8 @@ impl ExamKind {
 /// A validated exam mode: `sync` (everyone sits inside one fixed window),
 /// `async` (each student starts inside the window and gets `duration_ms`), or
 /// `open` (no window — sit anytime, with an optional per-attempt duration).
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct ExamMode(String);
 
 impl ExamMode {
@@ -122,7 +125,8 @@ impl ExamMode {
 
 /// A validated per-attempt time budget, milliseconds. Required for an `async`
 /// exam, optional for an `open` one (absent = unlimited time).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct ExamDuration(i64);
 
 impl ExamDuration {
@@ -140,7 +144,8 @@ impl ExamDuration {
 /// same spelling on the wire and in storage; `1` (the default) is the classic
 /// single sitting. Editable live: raising it mid-exam grants retakes, and
 /// lowering it only blocks *future* starts (existing attempts stand).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct ExamAttemptLimit(i64);
 
 impl ExamAttemptLimit {
@@ -269,7 +274,15 @@ impl ExamSchedule {
     }
 }
 
-#[derive(Debug, Clone, SurrealValue)]
+/// One exam. The schedule is flattened into columns, always written through
+/// an [`ExamSchedule`], so the invariants above hold for every stored row.
+///
+/// The `result_count` counter deliberately does NOT live on the struct: it is
+/// a plain `BIGINT NOT NULL DEFAULT 0` column that only the mark-write and
+/// mark-delete paths touch with conditional single statements, and every read
+/// of it is its own `SELECT` — no whole-row rewrite can clobber it, and no
+/// stale snapshot can pin it.
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Exam {
     pub(crate) id: ExamId,
     pub(crate) creator: UserId,
@@ -277,41 +290,21 @@ pub struct Exam {
     pub(crate) title: ExamTitle,
     pub(crate) description: ExamDescription,
     pub(crate) kind: ExamKind,
-    // The schedule, flattened into columns (SCHEMAFULL keeps them typed).
-    // Always written through an `ExamSchedule`, so the invariants above hold
-    // for every stored row; pre-schedule rows read back as all-`None`.
     pub(crate) mode: Option<ExamMode>,
     pub(crate) starts_at: Option<Timestamp>,
     pub(crate) ends_at: Option<Timestamp>,
     pub(crate) duration_ms: Option<ExamDuration>,
-    // Attempt policy. Rows predating these columns are backfilled by the boot
-    // migration (limit 1, rejoin open), so reads never see them missing.
     pub(crate) max_attempts: ExamAttemptLimit,
     pub(crate) allow_rejoin: bool,
     pub(crate) allow_review: bool,
     // Work-in-progress marker: a draft is visible only to its course's
-    // managers, cannot be sat, and cannot be graded. Rows predating the
-    // column are backfilled published (`false`).
+    // managers, cannot be sat, and cannot be graded.
     pub(crate) draft: bool,
-    /// How many marks the exam carries — a cap-style counter
-    /// ([`crate::db::cap::claim`]
-    /// from the grade, decremented by every delete of a mark), absent meaning
-    /// zero. Unlike every other counter it is carried *in the struct*, because
-    /// the save below is a whole-row `CONTENT` write: a column this type did
-    /// not know about would be wiped by the next exam PATCH. Being in the row
-    /// is also what makes it useful — the save pins it, so a grade landing
-    /// mid-PATCH refuses the save instead of slipping past its gates.
-    pub(crate) result_count: Option<i64>,
 }
 
 impl Exam {
     pub fn get_id(&self) -> &ExamId {
         &self.id
-    }
-
-    /// The marks this exam carries, as the counter reads (absent = none yet).
-    pub fn get_result_count(&self) -> i64 {
-        self.result_count.unwrap_or(0)
     }
 
     pub fn get_creator(&self) -> &UserId {

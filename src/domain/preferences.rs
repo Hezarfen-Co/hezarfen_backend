@@ -3,18 +3,17 @@
 //! and the frontend falls back to the device preference (`prefers-color-scheme`,
 //! browser language) or its own default accent.
 
-use surrealdb::types::SurrealValue;
+use sqlx::Type;
 
 use crate::constant::{LANGUAGES, PALETTE_COLOR_LEN, THEMES};
 use crate::error::ValidationError;
 
 /// The frontend color scheme.
 ///
-/// `#[surreal(untagged, rename_all = "lowercase")]` stores each variant as a
-/// bare lowercase string (`"light"` / `"dark"`) — same encoding contract as
-/// [`crate::domain::role::Role`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, SurrealValue)]
-#[surreal(untagged, rename_all = "lowercase")]
+/// Each variant stores as a bare lowercase TEXT value (`"light"` /
+/// `"dark"`) — same encoding contract as [`crate::domain::role::Role`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Type)]
+#[sqlx(type_name = "TEXT", rename_all = "lowercase")]
 pub enum Theme {
     Light,
     Dark,
@@ -43,8 +42,8 @@ impl Theme {
 
 /// The frontend interface language, as an ISO 639-1 code — the same values the
 /// frontend's locale switch uses (`"tr"` Turkish, `"en"` English).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, SurrealValue)]
-#[surreal(untagged, rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Type)]
+#[sqlx(type_name = "TEXT", rename_all = "lowercase")]
 pub enum Language {
     Tr,
     En,
@@ -77,8 +76,9 @@ impl Language {
 /// Unlike [`Theme`] and [`Language`] this is an **open** value set: any valid
 /// hex passes, so the frontend can grow its palette without a backend change.
 /// A plain newtype over `String`, which stores as a bare string — the same
-/// `option<string>` column contract the two enums encode into.
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+/// `TEXT NULL` column contract the two enums encode into.
+#[derive(Debug, Clone, PartialEq, Eq, Type)]
+#[sqlx(transparent)]
 pub struct PaletteColor(String);
 
 impl PaletteColor {
@@ -109,7 +109,6 @@ impl PaletteColor {
 mod tests {
     use super::*;
     use crate::constant::PALETTE_COLOR_PATTERN;
-    use surrealdb::types::Value;
 
     #[tokio::test]
     async fn theme_str_round_trips() {
@@ -200,23 +199,25 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn surreal_values_are_plain_strings() {
-        // `untagged` keeps the stored value a bare string so the `option<string>`
-        // columns accept it. Guard that the encoding never regresses.
+    #[test]
+    fn sqlx_encodes_the_storage_form() {
+        // `rename_all` keeps the stored value the bare lowercase string the
+        // TEXT columns carry; the palette color stores as the string it
+        // validated to. Guard that the sqlx encoding never drifts.
+        let mut buf = sqlx::postgres::PgArgumentBuffer::default();
         for theme in THEMES {
-            let value = theme.into_value();
-            assert_eq!(value, Value::String(theme.as_str().to_string()));
-            assert_eq!(Theme::from_value(value).unwrap(), theme);
+            buf.clear();
+            sqlx::Encode::<sqlx::Postgres>::encode_by_ref(&theme, &mut buf);
+            assert_eq!(std::str::from_utf8(&buf).unwrap(), theme.as_str());
         }
         for language in LANGUAGES {
-            let value = language.into_value();
-            assert_eq!(value, Value::String(language.as_str().to_string()));
-            assert_eq!(Language::from_value(value).unwrap(), language);
+            buf.clear();
+            sqlx::Encode::<sqlx::Postgres>::encode_by_ref(&language, &mut buf);
+            assert_eq!(std::str::from_utf8(&buf).unwrap(), language.as_str());
         }
         let color = PaletteColor::try_from_str("#fefae0").unwrap();
-        let value = color.clone().into_value();
-        assert_eq!(value, Value::String("#fefae0".to_string()));
-        assert_eq!(PaletteColor::from_value(value).unwrap(), color);
+        buf.clear();
+        sqlx::Encode::<sqlx::Postgres>::encode_by_ref(&color, &mut buf);
+        assert_eq!(std::str::from_utf8(&buf).unwrap(), "#fefae0");
     }
 }

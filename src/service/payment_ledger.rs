@@ -1,56 +1,61 @@
 //! The money workflows: recording a payment, handing one back, and undoing a
-//! mistaken line, each under the lock the over-payment cap is built on.
+//! mistaken line.
 //!
 //! **A payment or a refund is replayable when the client names it.** An
 //! optional `request_key` keys the line `<target>_k_<key>` (or `_kr_` for a
 //! refund), so a retry after a timeout derives the row the first attempt
 //! wrote — same identity rule, no scan. The key is scoped by the line it
 //! targets, so it never has to be globally unique. Without a key the id is a
-//! fresh ulid and two identical calls are two payments, which is what a desk
+//! fresh uuid and two identical calls are two payments, which is what a desk
 //! taking the same amount twice really means. The **replay read happens
-//! before the cap check** and inside `PAYMENT_LOCK`: the first attempt's
-//! line is already inside what the cap folds, so checking the cap first would
-//! refuse the very payment that landed. A key replayed with a *different*
-//! amount or against a *different* line is a `409`, never the stored line —
-//! returning it would hide a client bug behind a `201`.
+//! before the cap check** and inside the same transaction the append lands
+//! in: the first attempt's line is already inside what the cap folds, so
+//! checking the cap first would refuse the very payment that landed. A key
+//! replayed with a *different* amount or against a *different* line is a
+//! `409`, never the stored line — returning it would hide a client bug
+//! behind a `201`.
 //!
-//! **The over-payment cap is the lock's, not the database's.** [`credit`]
-//! and [`refund`] refuse to take more than the line they target
-//! is worth, by folding that line's whole subtree under `PAYMENT_LOCK`. The
-//! fold, rather than a sum of the direct children, because money handed back
-//! frees the room it took: a charge paid in full and then refunded is owed
-//! again, and must be payable again. Every write that *moves* that arithmetic
-//! takes the same lock — [`reversal`] included, since a reversal
-//! landing between a payment's fold and its append would admit the payment
-//! against room it no longer has.
+//! **The over-payment cap is the row locks', not a process mutex's.**
+//! [`credit`] and [`refund`] refuse to take more than the line they target
+//! is worth, by folding that line's whole subtree in the transaction that
+//! appends. The fold, rather than a sum of the direct children, because
+//! money handed back frees the room it took: a charge paid in full and then
+//! refunded is owed again, and must be payable again.
 //!
-//! The lock is what makes that check mean anything, and it is load-bearing:
-//! the fold is a count-then-write across rows, and SurrealDB does not
-//! conflict-check a cross-record read against a concurrent insert (the
-//! write-skew this repo has hit before), so a fold left unserialized would let
-//! two payments both see room and both take it. Running as one process buys
-//! nothing on its own — two request tasks interleave across the fold's `await`
-//! exactly as two machines would. The cap therefore holds only for as long as
-//! *every* write that moves this arithmetic is taken under `PAYMENT_LOCK`;
-//! a future append that skips it re-opens the hole silently, which is why the
-//! rule is stated here rather than left to be noticed. If an over-payment ever
-//! does land it is not a crisis — an over-paid charge is plainly visible in the
-//! statement and undone by appending a refund, and both entries are true
-//! records of money that really arrived. A CAS counter row was rejected —
-//! refunding would have to decrement it, which is a stored derived balance by
-//! another name. What the fold costs is also what bounds it: at most
-//! [`MAX_LEDGER_APPLIED_LINES`] lines may be applied to any one line, since
-//! every one of them is another query taken with the lock held.
+//! What makes that check mean something is the **ancestor-chain row lock**
+//! ([`crate::db::payment_ledger::lock_for_cap`]): every write that *moves*
+//! the arithmetic of a subtree — a payment into it, a refund under one of
+//! its payments, a reversal anywhere inside it — walks its target's chain up
+//! to the subtree's root charge and takes each row `FOR UPDATE`, **inside
+//! the same transaction as its own fold and append**. Two writers to one
+//! subtree therefore contend on the root's row: the second waits, and its
+//! fold runs only after the first's append committed, against the state the
+//! first left behind. There is no window between the fold and the append
+//! for a competing write to slip into, which is exactly what the old
+//! process-wide mutex it replaced bought and nothing more; unlike the
+//! mutex it also survives multiple processes, and it never serializes
+//! writers to *different* subtrees the way the global lock did.
+//! ([`reversal`] takes the walk too, since a reversal landing between a
+//! payment's fold and its append would admit the payment against room it no
+//! longer has.) A future append that skips the walk re-opens the hole
+//! silently, which is why the rule is stated here rather than left to be
+//! noticed. If an over-payment ever does land it is not a crisis — an
+//! over-paid charge is plainly visible in the statement and undone by
+//! appending a refund, and both entries are true records of money that
+//! really arrived. A CAS counter row was rejected — refunding would have to
+//! decrement it, which is a stored derived balance by another name. What
+//! the fold costs is also what bounds it: at most
+//! [`MAX_LEDGER_APPLIED_LINES`](crate::constant::MAX_LEDGER_APPLIED_LINES)
+//! lines may be applied to any one line, since every one of them widens the
+//! subtree the fold walks.
 //!
-//! The `request_key` mismatch `409` rides on the same lock: it is a
-//! read-then-compare, and it is read *inside* the lock, so two first-time posts
-//! of one key with different amounts cannot both walk past it. One line, one
-//! amount, no double charge, and the "you reused a key" diagnostic is exact.
+//! The `request_key` mismatch `409` rides on the same locks: it is a
+//! read-then-compare, and it is read inside the transaction that would
+//! append, so two first-time posts of one key with different amounts cannot
+//! both walk past it. One line, one amount, no double charge, and the "you
+//! reused a key" diagnostic is exact.
 
-use tokio::sync::Mutex;
-
-use crate::constant::MAX_LEDGER_APPLIED_LINES;
-use crate::database::Database;
+use crate::database::{Database, tx_with_retry};
 use crate::db::payment_ledger;
 use crate::domain::payment_ledger::{
     LedgerAmount, LedgerMethod, LedgerNote, PaymentLedger, PaymentLedgerId, PaymentLedgerKind,
@@ -60,23 +65,14 @@ use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 
-/// Serializes the over-payment check, the append it authorizes, and every
-/// other append that changes the arithmetic that check does — nothing else.
-/// It is the whole guarantee behind that cap, not a convenience: the fold it
-/// protects is a cross-record read the database will not conflict-check
-/// against a concurrent insert. Held across no other lock, and no other lock is
-/// taken while it is held.
-pub(crate) static PAYMENT_LOCK: Mutex<()> = Mutex::const_new(());
-
 /// Money in, against one named `charge`. Partial payments are the norm, so
-/// a charge may collect several credits; together they may not exceed it
-/// (advisory — see the module doc's accepted race). A *reversed* charge
-/// takes no payment either, and is refused saying so rather than claiming
-/// it was paid.
+/// a charge may collect several credits; together they may not exceed it.
+/// A *reversed* charge takes no payment either, and is refused saying so
+/// rather than claiming it was paid.
 ///
 /// With a `request_key` the line is keyed by it (see
 /// [`PaymentLedgerId::for_request`]) and the call is retry-safe; without
-/// one the id is a fresh ulid and two identical calls are two payments,
+/// one the id is a fresh uuid and two identical calls are two payments,
 /// which is what a cash desk taking the same amount twice really means.
 pub async fn credit(
     db: &Database,
@@ -108,8 +104,8 @@ pub async fn credit(
 
 /// Money back out, against one named `credit` — how an over-payment or a
 /// payment recorded in error is returned. Partials allowed, and no more
-/// than the credit was worth (advisory, same race). `request_key` makes it
-/// retry-safe exactly as it does for [`credit`].
+/// than the credit was worth. `request_key` makes it retry-safe exactly as
+/// it does for [`credit`].
 pub async fn refund(
     db: &Database,
     credit: &PaymentLedger,
@@ -140,15 +136,18 @@ pub async fn refund(
 }
 
 /// The shared body of `credit` and `refund`: check the target is the kind
-/// this line may point at, then append under [`PAYMENT_LOCK`] while the
-/// target's existing children still sum below its amount.
+/// this line may point at, then — in one transaction, holding the target's
+/// ancestor chain `FOR UPDATE` ([`payment_ledger::lock_for_cap`]) — read
+/// any replay, fold the target's subtree, and append while the fold still
+/// leaves room.
 ///
-/// The replay read comes **before** the cap, and inside the lock: on a
-/// retry the first attempt's line is already part of the subtree the cap
-/// folds, so consulting the cap first would answer a payment that landed
-/// with "already paid in full" — refusing precisely the request that
-/// succeeded. Reading the id under the lock also keeps two simultaneous
-/// retries from both walking into the cap check.
+/// The replay read comes **before** the cap, and under the same row locks:
+/// on a retry the first attempt's line is already part of the subtree the
+/// cap folds, so consulting the cap first would answer a payment that
+/// landed with "already paid in full" — refusing precisely the request that
+/// succeeded. Reading it inside the transaction also keeps two simultaneous
+/// retries from both walking into the cap check: the second waits on the
+/// target's row until the first commits, then sees its line.
 #[allow(clippy::too_many_arguments)]
 async fn against(
     db: &Database,
@@ -171,105 +170,78 @@ async fn against(
         }
         .into());
     }
-    let _guard = PAYMENT_LOCK.lock().await;
-    if let Some(id) = &keyed
-        && let Some(existing) = payment_ledger::read(db, id).await?
-    {
-        // A replay is answered from the stored line — but only if it is the
-        // same money. The same key for a different amount or a different
-        // target is a client bug, and handing back the old line would hide
-        // it behind a `201`.
-        if existing.amount_minor.as_minor() != amount_minor.as_minor()
-            || existing.get_source_key() != Some(target.id.key())
-        {
-            return Err(AppError::Conflict(
-                "this request_key was already used for a different amount or target",
-            ));
-        }
-        return Ok(existing);
-    }
-    let taken = applied_to(db, target).await?;
-    if taken.saturating_add(amount_minor.as_minor()) > target.amount_minor.as_minor() {
-        // The fold cannot say *why* the room is gone: a reversal is a child
-        // of the line it undoes and folds in at `+amount` exactly as a
-        // payment does, so a reversed charge reads as full to the kuruş.
-        // The stored answer is the same either way — nothing may be
-        // recorded against it — but "already paid in full" told a bursar
-        // money had arrived when none ever did. The reversal's id is
-        // derived from its target's, so telling the two apart is one read,
-        // taken only on the refusal path.
-        if let Some(reversed) = reversed
-            && payment_ledger::read(db, &PaymentLedgerId::for_reversal(&target.id))
-                .await?
-                .is_some()
-        {
-            return Err(AppError::Conflict(reversed));
-        }
-        return Err(AppError::Conflict(over));
-    }
-    payment_ledger::append(
-        db,
-        PaymentLedger {
-            id: keyed.unwrap_or_else(PaymentLedgerId::generate),
-            student: target.student.clone(),
-            kind,
-            amount_minor,
-            source: Some(target.id.record()),
-            due_at: None,
-            method,
-            note,
-            recorded_by: recorded_by.clone(),
-            created_at: Timestamp::now(),
-        },
-    )
-    .await
-}
-
-/// How much of `target` is already taken up — the balance fold restricted
-/// to everything that points at it, however deep, and read the way `target`
-/// is measured.
-///
-/// The whole subtree, not just the direct children, because money given
-/// back frees the room it took: a charge paid in full and then *refunded*
-/// is owed again, so it must be payable again (the fold nets to zero). The
-/// same walk answers both sides, because the signs already say what each
-/// line does — a credit adds under a charge, its refund takes that back,
-/// and a reversal of that refund puts it back once more. `-target.sign()`
-/// is what flips the reading for a credit, whose room is measured in the
-/// refunds against it.
-///
-/// **The subtree is bounded, and that is what makes the walk affordable.**
-/// One query per line, all of them while [`PAYMENT_LOCK`] is held, so an
-/// unbounded subtree stalls every other payment in the school: a charge
-/// settled 2 000 kuruş at a time would make the next payment issue 2 001
-/// sequential queries under the lock. Past
-/// [`MAX_LEDGER_APPLIED_LINES`] the walk stops where it is and the write is
-/// refused — the count is what is refused, never the money already
-/// recorded, so a line that is *already* over the ceiling (written before
-/// it existed) still reads, still refunds through its own children, and is
-/// still reversible. Only a fresh line applied to *it* is turned away.
-// corner-cut: one query per line, ceiling MAX_LEDGER_APPLIED_LINES; fold the
-// walk into one recursive statement if that ceiling ever has to rise.
-async fn applied_to(db: &Database, target: &PaymentLedger) -> Result<i64, AppError> {
-    let mut total = 0i64;
-    let mut seen = 0usize;
-    // The graph is a DAG by construction — a line can only point at one
-    // that already existed — so the walk terminates.
-    let mut pending = vec![target.id.clone()];
-    while let Some(id) = pending.pop() {
-        for child in payment_ledger::list_for_source(db, &id).await? {
-            seen += 1;
-            if seen >= MAX_LEDGER_APPLIED_LINES {
+    // Owned captures: a closure holding a `&T` — a reference parameter or a
+    // `&str` of any lifetime, `'static` included — fails the higher-ranked
+    // `Send`/`AsyncFnMut` check `tx_with_retry`'s future must pass.
+    let target = target.clone();
+    let recorded_by = *recorded_by;
+    let over = over.to_owned();
+    let reversed = reversed.map(str::to_owned);
+    tx_with_retry(db, false, async move |tx| {
+        // Every writer that can move this target's arithmetic holds some row
+        // on this chain; holding the whole walk to the root is what makes
+        // the fold below and the append it authorizes one decision.
+        payment_ledger::lock_for_cap(&mut *tx, &target.id).await?;
+        // Awaits sit in match arms, never in a `let`-chain condition: an
+        // awaited condition poisons the closure future's higher-ranked
+        // `Send` that `tx_with_retry` requires.
+        let replay = match keyed.clone() {
+            Some(id) => payment_ledger::read(&mut *tx, &id).await?,
+            None => None,
+        };
+        if let Some(existing) = replay {
+            // A replay is answered from the stored line — but only if it is
+            // the same money. The same key for a different amount or a
+            // different target is a client bug, and handing back the old
+            // line would hide it behind a `201`.
+            if existing.amount_minor.as_minor() != amount_minor.as_minor()
+                || existing.get_source_key() != Some(target.id.key())
+            {
                 return Err(AppError::Conflict(
-                    "this line already carries the most lines that may be applied to it; \
-                     record the rest against another",
+                    "this request_key was already used for a different amount or target",
                 ));
             }
-            total = total.saturating_add(child.kind.sign() * child.amount_minor.as_minor());
-            pending.push(child.id);
+            return Ok(existing);
         }
-    }
-    Ok(total * -target.kind.sign())
+        let taken = payment_ledger::applied_to(&mut *tx, &target.id.key(), target.kind).await?;
+        if taken.saturating_add(amount_minor.as_minor()) > target.amount_minor.as_minor() {
+            // The fold cannot say *why* the room is gone: a reversal is a
+            // child of the line it undoes and folds in at `+amount` exactly
+            // as a payment does, so a reversed charge reads as full to the
+            // kuruş. The stored answer is the same either way — nothing may
+            // be recorded against it — but "already paid in full" told a
+            // bursar money had arrived when none ever did. The reversal's
+            // id is derived from its target's, so telling the two apart is
+            // one read, taken only on the refusal path.
+            if let Some(text) = &reversed {
+                let reversed_there =
+                    payment_ledger::read(&mut *tx, &PaymentLedgerId::for_reversal(&target.id))
+                        .await?
+                        .is_some();
+                if reversed_there {
+                    return Err(AppError::ConflictOwned(text.clone()));
+                }
+            }
+            return Err(AppError::ConflictOwned(over.clone()));
+        }
+        payment_ledger::append(
+            &mut *tx,
+            PaymentLedger {
+                id: keyed.clone().unwrap_or_else(PaymentLedgerId::generate),
+                student: target.student.clone(),
+                kind,
+                amount_minor,
+                source: Some(target.id.key().to_string()),
+                due_at: None,
+                method: method.clone(),
+                note: note.clone(),
+                recorded_by,
+                created_at: Timestamp::now(),
+            },
+        )
+        .await
+    })
+    .await
 }
 
 /// Undo a line entered by mistake, for its exact amount, with `source`
@@ -281,12 +253,13 @@ async fn applied_to(db: &Database, target: &PaymentLedger) -> Result<i64, AppErr
 /// which is the same money leaving the school and is spelled that one way.
 /// Keyed `<line>_r`, so a retried undo reverses once.
 ///
-/// Appends under `PAYMENT_LOCK` — not for its own sake (the id makes it
-/// idempotent by itself) but for the cap's: a reversal *changes* the
-/// subtree `applied_to` folds, so one landing between a
-/// concurrent payment's fold and its append would let that payment be
-/// admitted against room it no longer has. The lock is what makes the cap
-/// exact, which is the promise this module's doc makes.
+/// The walk ([`payment_ledger::lock_for_cap`]) is taken in the same
+/// transaction — not for its own sake (the id makes it idempotent by
+/// itself) but for the cap's: a reversal *changes* the subtree every other
+/// writer's fold reads, so one landing between a concurrent payment's fold
+/// and its append would let that payment be admitted against room it no
+/// longer has. The row locks are what make the cap exact, which is the
+/// promise this module's doc makes.
 pub async fn reversal(
     db: &Database,
     line: &PaymentLedger,
@@ -303,22 +276,28 @@ pub async fn reversal(
         }
         .into());
     }
-    let _guard = PAYMENT_LOCK.lock().await;
-    payment_ledger::append(
-        db,
-        PaymentLedger {
-            id: PaymentLedgerId::for_reversal(line.get_id()),
-            student: line.student.clone(),
-            kind: PaymentLedgerKind::Reversal,
-            amount_minor: line.amount_minor,
-            source: Some(line.id.record()),
-            due_at: None,
-            method: None,
-            note,
-            recorded_by: recorded_by.clone(),
-            created_at: Timestamp::now(),
-        },
-    )
+    // Owned captures (`Send` rule of `tx_with_retry` closures).
+    let line = line.clone();
+    let recorded_by = *recorded_by;
+    tx_with_retry(db, false, async move |tx| {
+        payment_ledger::lock_for_cap(&mut *tx, line.get_id()).await?;
+        payment_ledger::append(
+            &mut *tx,
+            PaymentLedger {
+                id: PaymentLedgerId::for_reversal(line.get_id()),
+                student: line.student.clone(),
+                kind: PaymentLedgerKind::Reversal,
+                amount_minor: line.amount_minor,
+                source: Some(line.id.key().to_string()),
+                due_at: None,
+                method: None,
+                note: note.clone(),
+                recorded_by,
+                created_at: Timestamp::now(),
+            },
+        )
+        .await
+    })
     .await
 }
 
@@ -351,8 +330,11 @@ mod tests {
         use crate::db::fee_plan;
         use crate::domain::fee_plan::{FeePlanName, Installment};
 
-        let manager = UserId::from_key("mgr1");
-        let student = UserId::from_key("stu1");
+        let manager =
+            crate::db::class_member::tests::fixture_user(db, "ledger-manager")
+                .await;
+        let student =
+            crate::db::class_member::tests::fixture_user(db, "ledger-student").await;
         let plan = fee_plan::create(
             db,
             FeePlanName::try_new("Yearly").unwrap(),
@@ -386,7 +368,7 @@ mod tests {
             PaymentRequestKey::try_new("abc_r").is_err(),
             "the key that spelled a reversal's id must not parse"
         );
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let (charge, _, manager) = one_charge(100, &db).await;
         let key = PaymentRequestKey::try_new("abc-r").unwrap();
         let credit_line = credit(
@@ -423,7 +405,7 @@ mod tests {
             student: charge.student.clone(),
             kind: PaymentLedgerKind::Credit,
             amount_minor: LedgerAmount::try_new(1).unwrap(),
-            source: Some(charge.id.record()),
+            source: Some(charge.id.key().to_owned()),
             due_at: None,
             method: None,
             note: None,
@@ -445,7 +427,7 @@ mod tests {
     /// a family unable to settle a bill the school itself refunded.
     #[tokio::test]
     async fn a_refund_frees_the_room_it_took_under_the_charge() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let (charge, student, manager) = one_charge(100, &db).await;
         let pay = |amount| {
             credit(
@@ -462,7 +444,10 @@ mod tests {
         let credit_line = pay(100).await.unwrap();
         // Still fully paid: a second payment has no room.
         assert!(
-            matches!(pay(100).await, Err(AppError::Conflict(_))),
+            matches!(
+                pay(100).await,
+                Err(AppError::Conflict(_) | AppError::ConflictOwned(_))
+            ),
             "a charge paid in full may not be paid twice"
         );
 
@@ -489,14 +474,17 @@ mod tests {
         assert_eq!(balance_of(&db, &student).await.unwrap(), 0);
 
         // And the room is gone again, so the cap still bites after all that.
-        assert!(matches!(pay(1).await, Err(AppError::Conflict(_))));
+        assert!(matches!(
+            pay(1).await,
+            Err(AppError::Conflict(_) | AppError::ConflictOwned(_))
+        ));
     }
 
     /// The other half of the fold: reversing a refund un-does the money going
     /// out, so the room that refund freed is taken back.
     #[tokio::test]
     async fn a_reversed_refund_takes_its_room_back() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let (charge, _, manager) = one_charge(100, &db).await;
         let credit_line = credit(
             &db,
@@ -534,7 +522,7 @@ mod tests {
                     &manager
                 )
                 .await,
-                Err(AppError::Conflict(_))
+                Err(AppError::Conflict(_) | AppError::ConflictOwned(_))
             ),
             "the refund was undone, so the charge is paid in full again"
         );
@@ -549,9 +537,12 @@ mod tests {
         use crate::db::fee_plan;
         use crate::domain::fee_plan::{FeePlanName, Installment};
 
-        let db = crate::database::init_mem().await.unwrap();
-        let manager = UserId::from_key("mgr1");
-        let student = UserId::from_key("stu1");
+        let (db, _leases) = crate::database::init_test_db().await;
+        let manager =
+            crate::db::class_member::tests::fixture_user(&db, "ledger-manager")
+                .await;
+        let student =
+            crate::db::class_member::tests::fixture_user(&db, "ledger-student").await;
         let plan = fee_plan::create(
             &db,
             FeePlanName::try_new("Yearly").unwrap(),
@@ -585,7 +576,10 @@ mod tests {
         };
         let first = paid(6_000).await.unwrap();
         assert!(
-            matches!(paid(5_000).await, Err(AppError::Conflict(_))),
+            matches!(
+                paid(5_000).await,
+                Err(AppError::Conflict(_) | AppError::ConflictOwned(_))
+            ),
             "6 000 + 5 000 overshoots a 10 000 charge"
         );
         paid(4_000).await.expect("the exact remainder is allowed");
@@ -605,7 +599,7 @@ mod tests {
         };
         assert!(matches!(
             refund_amount(6_001).await,
-            Err(AppError::Conflict(_))
+            Err(AppError::Conflict(_) | AppError::ConflictOwned(_))
         ));
         refund_amount(6_000).await.unwrap();
         assert_eq!(

@@ -28,11 +28,6 @@ const EXCLUDED: &[(&str, &str)] = &[
     // and publishing them would invite a frontend to build its own retry or
     // liveness logic against numbers we want free to change.
     (
-        "DB_KEEPALIVE_INTERVAL_SECS",
-        "database socket keepalive cadence",
-    ),
-    ("DB_PING_TIMEOUT_SECS", "database liveness probe deadline"),
-    (
         "DB_CONNECT_BACKOFF_MAX_SECS",
         "boot reconnect backoff ceiling",
     ),
@@ -56,12 +51,6 @@ const EXCLUDED: &[(&str, &str)] = &[
         "SQL fragment: the condition a fee plan's edit and delete carry so an \
          assigned plan freezes in the database; the client sees the freeze as a \
          409, never as a number",
-    ),
-    (
-        "BOARD_OPEN_GUARD",
-        "SQL fragment: the condition every whiteboard-stroke write carries so a \
-         locked or closed board freezes in the database; the client sees the \
-         freeze as a 409, never as a number",
     ),
     (
         "REGISTRATION_FROZEN_GUARD",

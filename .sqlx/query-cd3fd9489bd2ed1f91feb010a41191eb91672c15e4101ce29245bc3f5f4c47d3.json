@@ -1,0 +1,148 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM event WHERE id = $1 RETURNING id AS \"id: EventId\", creator AS \"creator: UserId\", title AS \"title: EventTitle\", description AS \"description: EventDescription\", audience_kind AS \"audience_kind: EventAudienceKind\", audience_role AS \"audience_role: Role\", audience_course AS \"audience_course: CourseId\", audience_class AS \"audience_class: ClassGroupId\", audience_capacity, starts_at AS \"starts_at: Timestamp\", ends_at AS \"ends_at: Timestamp\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: EventId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "event",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "creator: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "event",
+            "name": "creator"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "title: EventTitle",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "event",
+            "name": "title"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "description: EventDescription",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "event",
+            "name": "description"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "audience_kind: EventAudienceKind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "event",
+            "name": "audience_kind"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "audience_role: Role",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "event",
+            "name": "audience_role"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "audience_course: CourseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "event",
+            "name": "audience_course"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "audience_class: ClassGroupId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "event",
+            "name": "audience_class"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "audience_capacity",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "event",
+            "name": "audience_capacity"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "starts_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "event",
+            "name": "starts_at"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "ends_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "event",
+            "name": "ends_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "cd3fd9489bd2ed1f91feb010a41191eb91672c15e4101ce29245bc3f5f4c47d3"
+}

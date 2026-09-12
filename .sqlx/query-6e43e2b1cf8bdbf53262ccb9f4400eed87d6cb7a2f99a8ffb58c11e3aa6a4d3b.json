@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM board_stroke WHERE board = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6e43e2b1cf8bdbf53262ccb9f4400eed87d6cb7a2f99a8ffb58c11e3aa6a4d3b"
+}

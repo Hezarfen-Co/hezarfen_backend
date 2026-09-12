@@ -333,7 +333,7 @@ async fn delete_plan(
 struct AssignFeePlan {
     /// The students to place on the plan, at most 200 per call. Each is
     /// reported on individually — one bad id does not lose the rest.
-    #[schema(max_items = 200, example = json!(["01JC0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z"]))]
+    #[schema(max_items = 200, example = json!(["019732e3-7b00-7000-8000-000000000a0b"]))]
     student_ids: Vec<String>,
 }
 
@@ -546,7 +546,8 @@ async fn appended(
 }
 
 async fn require_line(id: &str, db: &Database) -> Result<PaymentLedger, AppError> {
-    service::payment_ledger::read(db, &PaymentLedgerId::from_key(id))
+    let id = PaymentLedgerId::from_key(id);
+    service::payment_ledger::read(db, &id)
         .await?
         .ok_or(AppError::NotFound)
 }
@@ -877,10 +878,10 @@ async fn statement_response(
     let (assignments, _) =
         service::fee_plan_assignment::list_for_student(db, student, None, 0).await?;
     let mut plan_names: HashMap<String, Option<String>> = HashMap::new();
-    let mut plan_of: HashMap<&str, &FeePlanId> = HashMap::new();
+    let mut plan_of: HashMap<String, &FeePlanId> = HashMap::new();
     for assignment in &assignments {
         let plan = assignment.get_plan();
-        if !plan_names.contains_key(plan.key()) {
+        if !plan_names.contains_key(plan.key().as_str()) {
             let name = service::fee_plan::read(db, plan)
                 .await?
                 .map(|plan| plan.get_name().as_str().to_string());
@@ -935,7 +936,7 @@ async fn statement_response(
             StatementEntry {
                 charge_id: charge.get_id().key().to_string(),
                 plan: plan.map(|plan| plan.key().to_string()),
-                plan_name: plan.and_then(|plan| plan_names.get(plan.key()).cloned().flatten()),
+                plan_name: plan.and_then(|plan| plan_names.get(plan.key().as_str()).cloned().flatten()),
                 amount_minor: charge.get_amount_minor().as_minor(),
                 due_at,
                 credited_minor: credited,
@@ -1085,9 +1086,11 @@ mod tests {
     /// shape of `source` links is exactly what the fold walks.
     #[tokio::test]
     async fn the_statement_rolls_each_charge_up_from_its_own_lines() {
-        let db = crate::database::init_mem().await.unwrap();
-        let manager = UserId::from_key("mgr1");
-        let student = UserId::from_key("stu1");
+        let (db, _leases) = crate::database::init_test_db().await;
+        let manager =
+            crate::db::class_member::tests::fixture_user(&db, "stmt-manager").await;
+        let student =
+            crate::db::class_member::tests::fixture_user(&db, "stmt-student").await;
         let future = Timestamp::now().as_millis() + 30 * 24 * 60 * 60 * 1000;
         let plan = service::fee_plan::create(
             &db,

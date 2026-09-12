@@ -1,0 +1,106 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO homework_result (id, homework, app_user, status, mark, graded_by, created_at)\n               VALUES ($1, $2, $3, $4, $5, $6, $7)\n               ON CONFLICT (homework, app_user) DO UPDATE\n                   SET status = EXCLUDED.status, mark = EXCLUDED.mark,\n                       graded_by = EXCLUDED.graded_by, created_at = EXCLUDED.created_at\n               RETURNING id AS \"id: HomeworkResultId\",\n                         homework AS \"homework: HomeworkId\",\n                         app_user AS \"user: UserId\",\n                         status AS \"status: HomeworkStatus\",\n                         mark AS \"mark: Mark\",\n                         graded_by AS \"graded_by: UserId\",\n                         created_at AS \"created_at: Timestamp\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: HomeworkResultId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "homework_result",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "homework: HomeworkId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "homework_result",
+            "name": "homework"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "user: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "homework_result",
+            "name": "app_user"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "status: HomeworkStatus",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "homework_result",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "mark: Mark",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "homework_result",
+            "name": "mark"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "graded_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "homework_result",
+            "name": "graded_by"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "homework_result",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Int8",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "853fade7e1404a7779885230d18f92789956e63cb79e2a61fa4d3e96d06d95dc"
+}

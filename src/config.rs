@@ -12,16 +12,11 @@ use crate::telemetry::{LogFormat, TelemetryConfig, TelemetryError};
 pub struct Config {
     pub host: String,
     pub port: u16,
-    /// SurrealDB server endpoint (`DB_URL`), e.g. `ws://127.0.0.1:8000`.
-    pub db_url: String,
-    /// Root credentials for the SurrealDB server (`DB_USER` / `DB_PASS`).
-    pub db_user: String,
-    pub db_pass: String,
-    pub db_ns: String,
-    /// The **control** database inside `db_ns` (`DB_DATABASE`): the school
-    /// registry and the builder accounts. Every school gets a database of its
-    /// own, named by its slug.
-    pub db_name: String,
+    /// PostgreSQL connection string (`DATABASE_URL`), e.g.
+    /// `postgres://hezarfen:hezarfen@127.0.0.1:5432/hezarfen_control`. Also
+    /// read by sqlx's compile-time query macros, which prepare against the
+    /// union-schema prepare database (see `scripts/prepare_db.sh`).
+    pub database_url: String,
     /// Directory for uploaded note-file blobs (`FILES_PATH`).
     pub files_path: String,
     /// Add the `Secure` attribute to the session cookie (HTTPS-only). Off by
@@ -64,11 +59,8 @@ impl Config {
         Self {
             host: env::var("HOST").unwrap_or_else(|_| "127.0.0.1".into()),
             port: parse_port(env::var("PORT").ok()),
-            db_url: env::var("DB_URL").unwrap_or_else(|_| "ws://127.0.0.1:8000".into()),
-            db_user: env::var("DB_USER").unwrap_or_else(|_| "root".into()),
-            db_pass: env::var("DB_PASS").unwrap_or_else(|_| "root".into()),
-            db_ns: env::var("DB_NAMESPACE").unwrap_or_else(|_| "hezarfen".into()),
-            db_name: env::var("DB_DATABASE").unwrap_or_else(|_| "control".into()),
+            database_url: env::var("DATABASE_URL")
+                .unwrap_or_else(|_| "postgres://hezarfen:hezarfen@127.0.0.1:5432/hezarfen_control".into()),
             files_path: env::var("FILES_PATH").unwrap_or_else(|_| "./data/files".into()),
             cookie_secure: parse_flag(env::var("COOKIE_SECURE").ok()),
             rate_limit: RateLimitConfig {

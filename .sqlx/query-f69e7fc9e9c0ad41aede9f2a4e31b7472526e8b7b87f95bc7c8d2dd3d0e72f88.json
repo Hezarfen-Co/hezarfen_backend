@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE exam SET result_count = exam.result_count + 1 WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f69e7fc9e9c0ad41aede9f2a4e31b7472526e8b7b87f95bc7c8d2dd3d0e72f88"
+}

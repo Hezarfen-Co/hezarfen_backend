@@ -1,6 +1,7 @@
 //! A student's seat on a published [`Menu`]. One row per (menu, student),
-//! keyed by a deterministic composite id — the same pair always maps to the
-//! same record, so booking is a single atomic UPSERT with no find-then-insert
+//!
+//! keyed by the natural composite primary key — the same pair always maps to
+//! the same row, so booking is a single atomic upsert with no find-then-insert
 //! race and one-row-per-pair by construction.
 //!
 //! This module is the pure row shape: the id and status, the booking row, and
@@ -16,11 +17,11 @@
 //!   to `cancelled` with a `cancelled_at` stamp, so the freed seat is still
 //!   auditable against the money it moved. Only `booked` rows count against
 //!   the menu's capacity, which is what makes the seat genuinely free again —
-//!   and re-booking is the same UPSERT flipping it back.
+//!   and re-booking is the same upsert flipping it back.
 //! - **Capacity is the menu's `seats_booked` counter**, claimed by a
-//!   conditional single-record write ([`cap`](crate::db::cap)). Counting the rows instead is
-//!   write-skew — SurrealDB does not conflict-check a cross-record count
-//!   against a concurrent insert — and a process-wide lock around that count
+//!   conditional single-row write ([`cap`](crate::db::cap)). Counting the rows instead is
+//!   write-skew — a cross-row count checked outside the insert can always be
+//!   overtaken by a racing insert — and a process-wide lock around that count
 //!   is released around the very round trip the racing insert lands in.
 //!   Cancelling gives the seat back in the *same transaction* as the flip.
 //! - **The price is claimed, not just read.** The seat is taken at the menu
@@ -36,9 +37,8 @@
 //!   trails the seat by one write can be overtaken by the next attempt and
 //!   stranded forever: every ledger id carries the attempt it belongs to.
 
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
+use sqlx::Type;
 
-use crate::constant::MEAL_BOOKING_TABLE;
 use crate::domain::meal_ledger::LedgerAmount;
 use crate::domain::menu::{MenuDate, MenuId, MenuSlot};
 use crate::domain::settings::{MealSlotDef, Settings};
@@ -46,56 +46,61 @@ use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct MealBookingId(RecordId);
+/// The (menu, student) pair — the table's natural composite primary key.
+/// UUID strings carry only `-`, so `_` is an unambiguous joiner — and the
+/// student half is last, so the menu key (a `{date}_{slot}` pair, itself
+/// underscored) reads back whole.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MealBookingId {
+    menu: MenuId,
+    student: UserId,
+}
 
 impl MealBookingId {
-    /// A deterministic id for the (menu, student) pair — same trick as
-    /// `EnrollmentId`. ULID keys are alphanumeric, so `_` is an unambiguous
-    /// joiner.
     pub fn composite(menu: &MenuId, student: &UserId) -> Self {
-        Self(RecordId::new(
-            MEAL_BOOKING_TABLE,
-            format!("{}_{}", menu.key(), student.key()),
-        ))
+        Self {
+            menu: menu.clone(),
+            student: *student,
+        }
     }
 
+    /// Parse the `{menu}_{student}` wire form. A key that parses as no pair
+    /// reads as the nil pair, which matches no row — exactly the 404 a
+    /// dangling composite key produced under the old store, without turning a
+    /// typo into a panic.
     pub fn from_key(key: &str) -> Self {
-        Self(RecordId::new(MEAL_BOOKING_TABLE, key))
+        let (menu, student) = key.rsplit_once('_').unwrap_or(("", ""));
+        Self {
+            menu: MenuId::from_key(menu),
+            student: UserId::from_key(student),
+        }
     }
 
-    /// Who the seat is for, read straight back off the key: [`Self::composite`]
-    /// joins with `_` and a ULID user key carries none, so the last segment is
-    /// always the student (a slot name may well hold one, and the menu half is
-    /// in front). `None` for a key no `composite` ever minted.
+    /// The `{menu}_{student}` wire form.
+    pub fn key(&self) -> String {
+        format!("{}_{}", self.menu.key(), self.student.key())
+    }
+
+    /// Who the seat is for, read straight off the pair.
     ///
     /// This is what lets a cancel decide *whose* seat it is asked to free
     /// before reading the row — the id is fully derivable from a menu and a
     /// user id, both readable by a teacher, so a 403-or-404 answered off the
     /// row is an existence oracle for the manager-only booking list.
-    pub fn student(&self) -> Option<UserId> {
-        self.key()
-            .rsplit_once('_')
-            .map(|(_, student)| UserId::from_key(student))
+    pub fn student(&self) -> UserId {
+        self.student
     }
 
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
-        }
+    pub fn menu(&self) -> &MenuId {
+        &self.menu
     }
 }
 
-/// Where a booking stands. `untagged` + `rename_all` store it as the bare
-/// lowercase string the `status` column types as, exactly like
+/// Where a booking stands. Stored as the bare lowercase TEXT value the
+/// `status` column carries, exactly like
 /// [`AppointmentStatus`](crate::domain::appointment::AppointmentStatus).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, SurrealValue)]
-#[surreal(untagged, rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Type)]
+#[sqlx(type_name = "TEXT", rename_all = "lowercase")]
 pub enum MealBookingStatus {
     Booked,
     Cancelled,
@@ -111,9 +116,8 @@ impl MealBookingStatus {
     }
 }
 
-#[derive(Debug, Clone, SurrealValue)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct MealBooking {
-    pub(crate) id: MealBookingId,
     pub(crate) menu: MenuId,
     pub(crate) student: UserId,
     pub(crate) booked_by: UserId,
@@ -123,7 +127,7 @@ pub struct MealBooking {
     /// idempotence key, so a re-book bills afresh while a repeat `POST` of a
     /// seat already held bills nothing.
     pub(crate) attempt: i64,
-    /// What the menu cost when the current attempt took the seat; `None` means
+    /// What the menu cost when the current attempt took the seat; `NULL` means
     /// it was free *then*. Recorded rather than inferred: without it, "the menu
     /// was free" is indistinguishable from "not billed yet", and a dish added
     /// afterwards bills a seat that was free when taken.
@@ -133,10 +137,6 @@ pub struct MealBooking {
 }
 
 impl MealBooking {
-    pub fn get_id(&self) -> &MealBookingId {
-        &self.id
-    }
-
     pub fn get_menu(&self) -> &MenuId {
         &self.menu
     }
@@ -167,6 +167,12 @@ impl MealBooking {
 
     pub fn get_created_at(&self) -> Timestamp {
         self.created_at
+    }
+
+    /// The id of the seat this row holds — the pair that is the row's primary
+    /// key.
+    pub fn id(&self) -> MealBookingId {
+        MealBookingId::composite(&self.menu, &self.student)
     }
 }
 
@@ -271,20 +277,20 @@ pub(crate) fn check_day_not_past(date: &MenuDate) -> Result<(), AppError> {
 /// (the slot list is read live).
 ///
 /// A date no serving instant can be computed from **fails closed**. A menu on
-/// an impossible day (a 31st of February — refused by [`MenuDate`] now, but
-/// rows written before that rule are still on the volume) otherwise skipped the
-/// deadline entirely, silently and forever, however large the school set it:
-/// the one menu with no cutoff at all would be the one nobody meant to publish.
-/// Refusing is the only answer that keeps "the deadline binds every menu" true;
-/// the menu has to be republished on a real day to become bookable again.
+/// an impossible day (a 31st of February — refused by [`MenuDate`]) otherwise
+/// skipped the deadline entirely, silently and forever, however large the
+/// school set it: the one menu with no cutoff at all would be the one nobody
+/// meant to publish. Refusing is the only answer that keeps "the deadline
+/// binds every menu" true; the menu has to be republished on a real day to
+/// become bookable again.
 pub(crate) fn check_cutoff(
     date: &MenuDate,
     slot: &MenuSlot,
     cutoff: &MealCutoff,
 ) -> Result<(), AppError> {
     // A school with no cutoff configured closes nothing anyway, so an
-    // impossible date is not refused there either — that would take the canteen
-    // offline for a deadline the school never set.
+    // impossible date is not refused there either — that would take the
+    // canteen offline for a deadline the school never set.
     let Some(minutes) = cutoff.minutes else {
         return Ok(());
     };
@@ -312,21 +318,7 @@ pub(crate) fn check_cutoff(
 
 #[cfg(test)]
 mod tests {
-    use surrealdb::types::Value;
-
     use super::*;
-
-    /// The `status` column is `TYPE string`: an object-wrapped enum would be
-    /// rejected on write, and the `status = 'booked'` capacity count would
-    /// silently match nothing.
-    #[test]
-    fn status_stores_as_a_bare_string() {
-        for status in [MealBookingStatus::Booked, MealBookingStatus::Cancelled] {
-            let value = status.into_value();
-            assert_eq!(value, Value::String(status.as_str().to_string()));
-            assert_eq!(MealBookingStatus::from_value(value).unwrap(), status);
-        }
-    }
 
     fn cutoff(minutes: Option<i64>, serving_minute: Option<i64>) -> MealCutoff {
         MealCutoff {
@@ -348,23 +340,6 @@ mod tests {
         // A day far ahead is open; one long gone is shut.
         assert!(check_cutoff(&far, &lunch(), &cutoff(Some(60), Some(720))).is_ok());
         assert!(check_cutoff(&past, &lunch(), &cutoff(Some(60), Some(720))).is_err());
-    }
-
-    /// A menu stored on a day that does not exist has no serving instant, so no
-    /// deadline can be counted back from it — and it must therefore refuse, not
-    /// pass. `MenuDate::try_new` rejects such a date now; this is a row written
-    /// before that rule, read back off the store exactly as the domain reads it
-    /// (the column is `TYPE string`), which is the only way one can still turn
-    /// up. Passing is what let it be booked and cancelled with no cutoff ever.
-    #[test]
-    fn an_impossible_day_has_no_open_deadline() {
-        let impossible = MenuDate::from_value(Value::String("2026-02-29".into())).unwrap();
-        assert!(MenuDate::try_new(impossible.as_str()).is_err());
-        assert!(check_cutoff(&impossible, &lunch(), &cutoff(Some(60), Some(720))).is_err());
-        assert!(check_cutoff(&impossible, &lunch(), &cutoff(Some(60), None)).is_err());
-        // A school that set no cutoff closes nothing anyway, impossible day or
-        // not: refusing there would take the canteen offline for no deadline.
-        assert!(check_cutoff(&impossible, &lunch(), &cutoff(None, Some(720))).is_ok());
     }
 
     /// A slot with no serving hour has no instant to count a deadline back
@@ -411,11 +386,6 @@ mod tests {
             )
             .is_ok()
         );
-        // A day no calendar can place is left to the cutoff, which fails it
-        // closed when one is configured; guessing "past" here would shut the
-        // canteen for a school that set no deadline.
-        let impossible = MenuDate::from_value(Value::String("2026-02-29".into())).unwrap();
-        assert!(check_day_not_past(&impossible).is_ok());
     }
 
     /// The instant the deadline counts back from: midnight UTC of the day plus
@@ -438,5 +408,50 @@ mod tests {
             Some(720)
         );
         assert_eq!(MealCutoff::default().serving_minute(&lunch()), None);
+    }
+
+    #[test]
+    fn status_as_str_is_the_storage_form() {
+        assert_eq!(MealBookingStatus::Booked.as_str(), "booked");
+        assert_eq!(MealBookingStatus::Cancelled.as_str(), "cancelled");
+    }
+
+    /// The `status` column is `TEXT` with a CHECK on these exact words; the
+    /// sqlx encoding must never drift from `as_str`, or the `status =
+    /// 'booked'` capacity count silently matches nothing.
+    #[test]
+    fn sqlx_encodes_the_storage_form() {
+        let mut buf = sqlx::postgres::PgArgumentBuffer::default();
+        for status in [MealBookingStatus::Booked, MealBookingStatus::Cancelled] {
+            buf.clear();
+            sqlx::Encode::<sqlx::Postgres>::encode_by_ref(&status, &mut buf);
+            assert_eq!(std::str::from_utf8(&buf).unwrap(), status.as_str());
+        }
+    }
+
+    /// The composite key round-trips: the menu half (itself underscored) reads
+    /// back whole, and a key that parses as no pair reads as the nil pair that
+    /// matches no row.
+    #[test]
+    fn the_booking_key_round_trips() {
+        let menu = MenuId::for_slot(
+            &MenuDate::try_new("2026-09-14").unwrap(),
+            &MenuSlot::try_new(
+                "öğle yemeği",
+                &[MealSlotDef::try_new("öğle yemeği", None).unwrap()],
+            )
+            .unwrap(),
+        );
+        let student = UserId::from_key("018f1a00-0000-7000-8000-000000000001");
+        let id = MealBookingId::composite(&menu, &student);
+        assert_eq!(MealBookingId::from_key(&id.key()), id);
+        assert_eq!(
+            MealBookingId::from_key("no-pair-here").student(),
+            UserId::from_key("")
+        );
+        assert_eq!(
+            MealBookingId::from_key("no-pair-here").menu.key(),
+            MenuId::from_key("").key()
+        );
     }
 }

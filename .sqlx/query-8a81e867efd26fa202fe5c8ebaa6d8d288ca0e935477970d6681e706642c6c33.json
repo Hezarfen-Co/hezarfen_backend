@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE app_user\n                         SET lessons_attended_total = GREATEST(lessons_attended_total - 1, 0)\n                       WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8a81e867efd26fa202fe5c8ebaa6d8d288ca0e935477970d6681e706642c6c33"
+}

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE exam_question SET banked_as = NULL WHERE banked_as = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e4035ccaa488a98fe0b0f109201e0304d2f7d4bea178399b56f6013a3027cc33"
+}

@@ -1,13 +1,10 @@
-//! The `class_group` table: the row, its term reference claimed through
-//! [`crate::db::cap`] in the same transaction as the link, and the 0/0 delete
-//! guard. The archived-term guard and the route-facing wrappers live in
+//! The `class_group` table: the row, its term reference claimed through the
+//! [`crate::db::cap`] shapes in the same statement as the link, and the 0/0
+//! delete guard. The archived-term guard and the route-facing wrappers live in
 //! [`crate::service::class_group`].
 
-use surrealdb::types::{RecordId, SurrealValue};
-
-use crate::constant::{CLASS_COURSE_COUNT_FIELD, CLASS_MEMBER_COUNT_FIELD, TERM_CLASS_COUNT_FIELD};
-use crate::database::{Database, transaction_with_retry};
-use crate::db::cap;
+use crate::constant::{CLASS_GROUP_TABLE, TERM_CLASS_COUNT_FIELD};
+use crate::database::{Database, tx_with_retry};
 use crate::db::field_update::FieldUpdate;
 use crate::db::page::PagedList;
 use crate::domain::class_group::{ClassGrade, ClassGroup, ClassGroupId, ClassName};
@@ -15,16 +12,13 @@ use crate::domain::term::{self, TermId};
 use crate::domain::user::UserId;
 use crate::error::AppError;
 
-/// The `THROW` marker the delete guard aborts with — a class that still holds
-/// students or courses, or a class row that is no longer there.
-const LINKS_MARK: &str = "class_links";
-
 /// Create the class, claiming a reference on the term it links (if any) in
-/// the *same transaction* as the row, exactly as
+/// the *same statement* as the row, exactly as
 /// [`crate::db::course::create`] does: the claim is a
 /// conditional write on the term row, so it fails when the term is already
-/// gone, it makes the term undeletable the instant this link exists, and no
-/// crash can leave either half without the other.
+/// gone, it makes the term undeletable the instant this link exists, and — the
+/// claim and the insert being one CTE — no crash and no refused claim can
+/// leave either half without the other.
 pub async fn create(
     db: &Database,
     creator: &UserId,
@@ -33,40 +27,83 @@ pub async fn create(
     term: Option<TermId>,
     teacher: Option<UserId>,
 ) -> Result<ClassGroup, AppError> {
-    let class = ClassGroup {
-        id: ClassGroupId::generate(),
-        creator: creator.clone(),
-        name,
-        grade,
-        term,
-        teacher,
-    };
-    let id = class.id.record();
-    let Some(term) = class.term.clone() else {
-        let created: Option<ClassGroup> = db.create(id).content(class).await?;
-        return created.ok_or_else(|| AppError::Internal("failed to create class".into()));
-    };
-    match cap::claim_and_create(
-        &term.record(),
-        TERM_CLASS_COUNT_FIELD,
-        cap::UNLIMITED,
-        &id,
-        &class,
-        db,
-    )
-    .await?
-    {
-        cap::Claimed::Made(created) => Ok(created),
-        // Uncapped, so "full" can only mean the conditional write matched no
-        // term row at all — the claim doubles as the existence check.
-        cap::Claimed::Full => Err(term::gone_error()),
-        // Unreachable: the id is a ULID this call just generated.
-        cap::Claimed::Duplicate => Err(AppError::Internal("failed to create class".into())),
+    let id = ClassGroupId::generate();
+    match &term {
+        Some(term) => {
+            // The claim and the insert are one statement: atomic without an
+            // explicit transaction, exactly like every other
+            // single-statement guard.
+            let written = sqlx::query_as!(
+                ClassGroup,
+                r#"WITH seat AS (
+                       UPDATE term SET class_count = class_count + 1
+                        WHERE id = $1
+                        RETURNING 1)
+                   INSERT INTO class_group (id, creator, name, grade, term, teacher)
+                   SELECT $2, $3, $4, $5, $1, $6 WHERE EXISTS (SELECT 1 FROM seat)
+                   RETURNING id AS "id: ClassGroupId", creator AS "creator: UserId",
+                     name AS "name: ClassName", grade AS "grade: ClassGrade",
+                     term AS "term: TermId", teacher AS "teacher: UserId""#,
+                term.uuid(),
+                id.uuid(),
+                creator.uuid(),
+                name.as_str(),
+                grade.as_ref().map(ClassGrade::as_str),
+                teacher.as_ref().map(UserId::uuid)
+            )
+            .fetch_optional(db)
+            .await;
+            match written {
+                Ok(Some(created)) => Ok(created),
+                // Uncapped, so a zero-row claim can only mean the conditional
+                // write matched no term row at all — the claim doubles as the
+                // existence check.
+                Ok(None) => Err(term::gone_error()),
+                // The term row is locked by the claim's own UPDATE, so this
+                // is unreachable; a defensible answer beats a 500.
+                Err(e) if crate::database::foreign_key_violation(&e) => Err(term::gone_error()),
+                // Unreachable: the id was minted one line above.
+                Err(e) if crate::database::unique_violation(&e).is_some() => {
+                    Err(AppError::Internal("failed to create class".into()))
+                }
+                Err(e) => Err(e.into()),
+            }
+        }
+        None => {
+            let created = sqlx::query_as!(
+                ClassGroup,
+                r#"INSERT INTO class_group (id, creator, name, grade, term, teacher)
+                   VALUES ($1, $2, $3, $4, $5, $6)
+                   RETURNING id AS "id: ClassGroupId", creator AS "creator: UserId",
+                     name AS "name: ClassName", grade AS "grade: ClassGrade",
+                     term AS "term: TermId", teacher AS "teacher: UserId""#,
+                id.uuid(),
+                creator.uuid(),
+                name.as_str(),
+                grade.as_ref().map(ClassGrade::as_str),
+                term.as_ref().map(TermId::uuid),
+                teacher.as_ref().map(UserId::uuid)
+            )
+            .fetch_optional(db)
+            .await?;
+            // Unreachable: the id is a v7 uuid this call just generated.
+            created.ok_or_else(|| AppError::Internal("failed to create class".into()))
+        }
     }
 }
 
 pub async fn read(db: &Database, id: &ClassGroupId) -> Result<Option<ClassGroup>, AppError> {
-    Ok(db.select(id.record()).await?)
+    let class = sqlx::query_as!(
+        ClassGroup,
+        r#"SELECT id AS "id: ClassGroupId", creator AS "creator: UserId",
+                  name AS "name: ClassName", grade AS "grade: ClassGrade",
+                  term AS "term: TermId", teacher AS "teacher: UserId"
+           FROM class_group WHERE id = $1"#,
+        id.uuid()
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(class)
 }
 
 /// Every class, newest first — or one grade's, when `grade` narrows it:
@@ -84,13 +121,16 @@ pub async fn list_all(
     offset: i64,
 ) -> Result<(Vec<ClassGroup>, i64), AppError> {
     let list = match grade {
-        None => PagedList::new("class_group", "ORDER BY id DESC"),
-        // A gradeless class stores no `grade` key at all (SurrealDB drops a
-        // key valued NONE), and an absent field reads back as NONE — so the
-        // one comparison covers both spellings.
-        Some(None) => PagedList::new("class_group WHERE grade IS NONE", "ORDER BY id DESC"),
-        Some(Some(grade)) => PagedList::new("class_group WHERE grade = $grade", "ORDER BY id DESC")
-            .bind("grade", grade.as_str().to_string()),
+        None => PagedList::new(CLASS_GROUP_TABLE, "ORDER BY id DESC"),
+        Some(None) => PagedList::new(
+            format!("{CLASS_GROUP_TABLE} WHERE grade IS NULL"),
+            "ORDER BY id DESC",
+        ),
+        Some(Some(grade)) => PagedList::new(
+            format!("{CLASS_GROUP_TABLE} WHERE grade = $1"),
+            "ORDER BY id DESC",
+        )
+        .bind(grade.as_str().to_string()),
     };
     list.run(limit, offset, db).await
 }
@@ -114,30 +154,34 @@ pub async fn update(
     teacher: Option<Option<UserId>>,
 ) -> Result<ClassGroup, AppError> {
     let (claim, release) = term::ref_move(class.term.as_ref(), &term);
-    let expected = class.term.as_ref().map(TermId::record);
-    FieldUpdate::new(class.id.record())
-        .set("name", name)
-        .set("grade", grade)
-        .set("term", term.map(|term| term.map(|term| term.record())))
+    let expected = class.term.as_ref().map(TermId::uuid);
+    FieldUpdate::new(CLASS_GROUP_TABLE, class.id.uuid())
+        .set("name", name.map(|name| name.as_str().to_string()))
+        .set(
+            "grade",
+            grade.map(|grade| grade.map(|grade| grade.as_str().to_string())),
+        )
+        .set("term", term.map(|term| term.map(|term| term.uuid())))
         // Not refcounted: a homeroom assignment is a label, so it rides the
         // plain `set` path and never arms the term CAS.
         .set(
             "teacher",
-            teacher.map(|teacher| teacher.map(|teacher| teacher.record())),
+            teacher.map(|teacher| teacher.map(|teacher| teacher.uuid())),
         )
         .refcount(
+            "term",
             TERM_CLASS_COUNT_FIELD,
             "term",
             expected,
-            claim,
-            release,
+            claim.map(|term| term.uuid()),
+            release.map(|term| term.uuid()),
             term::gone_error(),
         )
         .run::<ClassGroup>(db)
         .await
 }
 
-/// The classes `ids` names, in no particular order — the join behind
+/// The classes `ids` name, in no particular order — the join behind
 /// "which class section is this student in", where the ids come from
 /// `class_member` rows already paged. Ids that name no row are simply
 /// absent.
@@ -145,13 +189,18 @@ pub async fn list_by_ids(db: &Database, ids: &[ClassGroupId]) -> Result<Vec<Clas
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let records: Vec<RecordId> = ids.iter().map(ClassGroupId::record).collect();
-    let mut result = db
-        .query("SELECT * FROM class_group WHERE id IN $ids")
-        .bind(("ids", records))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<ClassGroup>>(0)?)
+    let ids: Vec<uuid::Uuid> = ids.iter().map(ClassGroupId::uuid).collect();
+    let classes = sqlx::query_as!(
+        ClassGroup,
+        r#"SELECT id AS "id: ClassGroupId", creator AS "creator: UserId",
+                  name AS "name: ClassName", grade AS "grade: ClassGrade",
+                  term AS "term: TermId", teacher AS "teacher: UserId"
+           FROM class_group WHERE id = ANY($1)"#,
+        &ids
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(classes)
 }
 
 /// Every class section at one grade label, in no particular order — what a
@@ -161,88 +210,133 @@ pub async fn list_for_grade(
     db: &Database,
     grade: &ClassGrade,
 ) -> Result<Vec<ClassGroup>, AppError> {
-    let mut result = db
-        .query("SELECT * FROM class_group WHERE grade = $grade")
-        .bind(("grade", grade.as_str().to_string()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<ClassGroup>>(0)?)
+    let classes = sqlx::query_as!(
+        ClassGroup,
+        r#"SELECT id AS "id: ClassGroupId", creator AS "creator: UserId",
+                  name AS "name: ClassName", grade AS "grade: ClassGrade",
+                  term AS "term: TermId", teacher AS "teacher: UserId"
+           FROM class_group WHERE grade = $1"#,
+        grade.as_str()
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(classes)
 }
 
-/// Strip `user` from every class they were the homeroom teacher of — the
+/// Clear the homeroom teacher everywhere `user` held one — the
 /// sweep for a user demoted below `teacher`, who may no longer hold one.
 /// The mirror of [`crate::db::course::unassign_everywhere`];
 /// nothing is counted on this column, so there is no reference to give back.
 pub async fn unassign_everywhere(db: &Database, user: &UserId) -> Result<(), AppError> {
-    db.query("UPDATE class_group SET teacher = NONE WHERE teacher = $usr")
-        .bind(("usr", user.record()))
-        .await?
-        .check()?;
+    sqlx::query!(
+        r#"UPDATE class_group SET teacher = NULL WHERE teacher = $1"#,
+        user.uuid()
+    )
+    .execute(db)
+    .await?;
     Ok(())
 }
 
-/// Delete the class and give its term reference back. Nothing cascades: a
-/// class that still holds students or courses is refused outright, because
+/// Delete the class and give its term reference back. Nothing else cascades:
+/// a class that still holds students or courses is refused outright, because
 /// dropping it silently would leave the enrollments it pumped behind with
-/// nothing left to sweep them.
+/// nothing left to sweep them. An event aimed at the class keeps standing
+/// with `audience_class` cleared — the course twin's documented outcome
+/// (`db::course::delete`): the roster resolves live, so it simply reads empty.
 ///
 /// `false` = refused, nothing was written. Both counts are read off the
 /// class's own row, so the check and the delete are one conditional write on
 /// one record — a member or attach racing this either claims first (and the
-/// delete is refused) or finds the row gone (and is refused itself).
+/// delete is refused) or finds the row gone (and is refused itself). The
 /// `Err(NotFound)` keeps the answer a concurrent *delete* used to get.
 pub async fn delete(db: &Database, class: ClassGroup) -> Result<bool, AppError> {
-    // Parenthesized `??` throughout: `n ?? 0 = 0` parses as `n ?? (0 = 0)`,
-    // which is truthy for every row and would delete a class still in use.
-    let sql = format!(
-        "BEGIN TRANSACTION;
-         LET $gone = (DELETE $class WHERE ({CLASS_MEMBER_COUNT_FIELD} ?? 0) = 0 \
-             AND ({CLASS_COURSE_COUNT_FIELD} ?? 0) = 0 RETURN BEFORE);
-         IF array::len($gone) = 0 {{ THROW '{LINKS_MARK}' }};
-         FOR $row IN $gone {{
-             IF $row.term != NONE {{
-                 UPDATE $row.term SET {TERM_CLASS_COUNT_FIELD} = \
-                     math::max([({TERM_CLASS_COUNT_FIELD} ?? 0) - 1, 0]);
-             }};
-         }};
-         COMMIT TRANSACTION;"
-    );
-    // An aborted transaction errors *every* slot, most with a generic "not
-    // executed" — only the THROW's own slot names the marker, and a lost
-    // round is re-sent rather than reported (see [`transaction_with_retry`]).
-    let (_, mut errors) = transaction_with_retry(
-        db,
-        &sql,
-        &[("class".into(), class.id.record().into_value())],
-        &[LINKS_MARK],
-    )
-    .await?;
-    if errors
-        .values()
-        .any(|error| error.to_string().contains(LINKS_MARK))
-    {
-        // Still linked or already gone: the guard cannot tell those apart,
-        // and only the refusal path pays for the extra read that can.
-        return match read(db, &class.id).await? {
-            Some(_) => Ok(false),
-            None => Err(AppError::NotFound),
+    tx_with_retry(db, false, async move |tx| {
+        // Events aimed at this class keep standing, audience cleared — the
+        // hard FK on `event.audience_class` would otherwise refuse the delete
+        // outright, and a dangling audience resolves to an empty roster.
+        sqlx::query!(
+            r#"UPDATE event SET audience_class = NULL WHERE audience_class = $1"#,
+            class.id.uuid()
+        )
+        .execute(&mut *tx)
+        .await?;
+        let gone = sqlx::query!(
+            r#"DELETE FROM class_group
+               WHERE id = $1
+                 AND class_member_count = 0 AND class_course_count = 0
+               RETURNING term AS "term: uuid::Uuid""#,
+            class.id.uuid()
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = gone else {
+            // Still linked or already gone: the guard cannot tell those
+            // apart, and only the refusal path pays for the extra read that
+            // can.
+            let standing = sqlx::query_scalar!(
+                r#"SELECT 1 AS "one" FROM class_group WHERE id = $1"#,
+                class.id.uuid()
+            )
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some();
+            return if standing {
+                Ok(false)
+            } else {
+                Err(AppError::NotFound)
+            };
         };
-    }
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    Ok(true)
+        if let Some(term) = row.term {
+            sqlx::query!(
+                r#"UPDATE term SET class_count = GREATEST(class_count - 1, 0)
+                   WHERE id = $1"#,
+                term
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+        Ok(true)
+    })
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::Row as _;
+
     use crate::domain::term::{Term, TermName};
 
+    /// A real `app_user` row: creator, teacher, and attached-by are foreign
+    /// keys now, so every fixture participant is a row, not a fabricated id.
+    async fn a_named_user(db: &Database, username: &str) -> UserId {
+        // The username is unique: a second call for the same name must adopt
+        // the existing row, not collide with it.
+        sqlx::query(
+            "INSERT INTO app_user (id, username, password_hash, role) \
+             VALUES ($1, $2, 'x', 'teacher') ON CONFLICT DO NOTHING",
+        )
+        .bind(UserId::generate().uuid())
+        .bind(username)
+        .execute(db)
+        .await
+        .unwrap();
+        let id: uuid::Uuid =
+            sqlx::query("SELECT id FROM app_user WHERE username = $1")
+                .bind(username)
+                .fetch_one(db)
+                .await
+                .unwrap()
+                .try_get(0)
+                .unwrap();
+        UserId::from_key(&id.to_string())
+    }
+
     async fn class_on(term: Option<TermId>, db: &Database) -> ClassGroup {
+        let manager = a_named_user(db, "manager").await;
         create(
             db,
-            &UserId::from_key("manager"),
+            &manager,
             ClassName::try_new("9-A").unwrap(),
             None,
             term,
@@ -254,9 +348,10 @@ mod tests {
 
     /// A class with a homeroom teacher, no term.
     async fn class_of(teacher: Option<UserId>, db: &Database) -> ClassGroup {
+        let manager = a_named_user(db, "manager").await;
         create(
             db,
-            &UserId::from_key("manager"),
+            &manager,
             ClassName::try_new("9-A").unwrap(),
             None,
             None,
@@ -283,41 +378,30 @@ mod tests {
             .unwrap()
     }
 
-    /// The stored counter, re-read — never off a return value, which the
-    /// in-memory engine forges wins on (see [`crate::db::cap`]).
-    async fn stored_count(sql: &str, db: &Database) -> i64 {
-        let mut result = db.query(sql).await.unwrap().check().unwrap();
-        result
-            .take::<Vec<i64>>(0)
+    /// The single integer `sql` selects — the stored counter, re-read, never
+    /// off a return value. The SQL is built from literals in this module, so
+    /// the audit wrapper is a formality.
+    async fn one_i64(db: &Database, sql: String) -> i64 {
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .fetch_one(db)
+            .await
             .unwrap()
-            .first()
-            .copied()
+            .try_get::<i64, _>(0)
             .unwrap()
     }
 
     /// The stored `class_count` on one term, absent counting as zero.
     async fn count_on(term: &TermId, db: &Database) -> i64 {
-        let mut result = db
-            .query(format!(
-                "SELECT VALUE ({TERM_CLASS_COUNT_FIELD} ?? 0) FROM $term"
-            ))
-            .bind(("term", term.record()))
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
-        result
-            .take::<Vec<i64>>(0)
-            .unwrap()
-            .first()
-            .copied()
-            .unwrap_or(0)
+        one_i64(
+            db,
+            format!("SELECT COALESCE(class_count, 0) FROM term WHERE id = '{}'", term.uuid()),
+        )
+        .await
     }
 
-    /// How many rows `sql` selects ids for.
-    async fn rows(sql: &str, db: &Database) -> usize {
-        let mut result = db.query(sql).await.unwrap().check().unwrap();
-        result.take::<Vec<RecordId>>(0).unwrap().len()
+    /// How many rows `table` holds.
+    async fn row_count(db: &Database, table: &str) -> i64 {
+        one_i64(db, format!("SELECT count(*) FROM {table}")).await
     }
 
     /// The homeroom teacher survives a create, is set and cleared by a PATCH,
@@ -326,9 +410,9 @@ mod tests {
     /// no key at all, which must read back as `None`, not fail the decode.
     #[tokio::test]
     async fn the_homeroom_teacher_is_stored_set_cleared_and_left_alone() {
-        let db = crate::database::init_mem().await.unwrap();
-        let ada = UserId::from_key("ada");
-        let boole = UserId::from_key("boole");
+        let (db, _leases) = crate::database::init_test_db().await;
+        let ada = a_named_user(&db, "ada").await;
+        let boole = a_named_user(&db, "boole").await;
 
         let bare = class_of(None, &db).await;
         assert_eq!(teacher_of(bare.get_id(), &db).await, None);
@@ -366,18 +450,18 @@ mod tests {
             None,
             None,
             None,
-            Some(Some(UserId::from_key("ada"))),
+            Some(Some(a_named_user(&db, "ada").await)),
         )
         .await
         .unwrap();
         assert_eq!(again.get_name().as_str(), "9-B");
 
-        // A row that predates the column: absent key, not NULL.
-        db.query("UPDATE $class UNSET teacher")
-            .bind(("class", bare.get_id().record()))
+        // A row without a homeroom: the column reads back as NULL, not a
+        // decode failure.
+        sqlx::query("UPDATE class_group SET teacher = NULL WHERE id = $1")
+            .bind(bare.get_id().uuid())
+            .execute(&db)
             .await
-            .unwrap()
-            .check()
             .unwrap();
         assert_eq!(teacher_of(bare.get_id(), &db).await, None);
     }
@@ -386,9 +470,9 @@ mod tests {
     /// *every* class they homeroomed, and nobody else's is touched.
     #[tokio::test]
     async fn unassign_everywhere_clears_only_that_users_classes() {
-        let db = crate::database::init_mem().await.unwrap();
-        let ada = UserId::from_key("ada");
-        let boole = UserId::from_key("boole");
+        let (db, _leases) = crate::database::init_test_db().await;
+        let ada = a_named_user(&db, "ada").await;
+        let boole = a_named_user(&db, "boole").await;
         let first = class_of(Some(ada.clone()), &db).await;
         let second = class_of(Some(ada.clone()), &db).await;
         let other = class_of(Some(boole.clone()), &db).await;
@@ -416,18 +500,18 @@ mod tests {
     /// instead would pass the first assert and fail the roundtrip through boot.
     #[tokio::test]
     async fn a_term_is_deletable_only_once_no_class_links_it() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let term = a_term(&db).await;
 
         let linked = class_on(Some(term.get_id().clone()), &db).await;
         let patched = class_on(Some(term.get_id().clone()), &db).await;
         assert_eq!(
-            stored_count("SELECT VALUE class_count ?? 0 FROM term", &db).await,
+            one_i64(&db, "SELECT COALESCE(class_count, 0) FROM term".to_string()).await,
             2,
             "classes must count on class_count, not course_count"
         );
         assert_eq!(
-            stored_count("SELECT VALUE course_count ?? 0 FROM term", &db).await,
+            one_i64(&db, "SELECT COALESCE(course_count, 0) FROM term".to_string()).await,
             0,
             "the courses' counter is seeded from course rows and must stay untouched"
         );
@@ -456,15 +540,16 @@ mod tests {
     /// which a refusal that released it would strand.
     #[tokio::test]
     async fn a_class_with_members_or_courses_refuses_to_delete() {
-        for field in [CLASS_MEMBER_COUNT_FIELD, CLASS_COURSE_COUNT_FIELD] {
-            let db = crate::database::init_mem().await.unwrap();
+        for field in ["class_member_count", "class_course_count"] {
+            let (db, _leases) = crate::database::init_test_db().await;
             let term = a_term(&db).await;
             let class = class_on(Some(term.get_id().clone()), &db).await;
-            db.query(format!("UPDATE $class SET {field} = 1"))
-                .bind(("class", class.get_id().record()))
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "UPDATE class_group SET {field} = 1 WHERE id = $1"
+            )))
+                .bind(class.get_id().uuid())
+                .execute(&db)
                 .await
-                .unwrap()
-                .check()
                 .unwrap();
 
             assert!(
@@ -476,21 +561,22 @@ mod tests {
                 "a refused delete may write nothing"
             );
             assert_eq!(
-                stored_count("SELECT VALUE class_count ?? 0 FROM term", &db).await,
+                one_i64(&db, "SELECT COALESCE(class_count, 0) FROM term".to_string()).await,
                 1,
                 "…the term reference least of all"
             );
 
             // Back to zero, and the same class deletes and releases the term.
-            db.query(format!("UPDATE $class SET {field} = 0"))
-                .bind(("class", class.get_id().record()))
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "UPDATE class_group SET {field} = 0 WHERE id = $1"
+            )))
+                .bind(class.get_id().uuid())
+                .execute(&db)
                 .await
-                .unwrap()
-                .check()
                 .unwrap();
             assert!(delete(&db, class.clone()).await.unwrap());
             assert_eq!(
-                stored_count("SELECT VALUE class_count ?? 0 FROM term", &db).await,
+                one_i64(&db, "SELECT COALESCE(class_count, 0) FROM term".to_string()).await,
                 0
             );
             let again = delete(&db, class).await;
@@ -506,14 +592,14 @@ mod tests {
     /// delete guard reads, so a stray one would make it undeletable forever).
     #[tokio::test]
     async fn a_refused_create_writes_neither_row_nor_count() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let term = a_term(&db).await;
         let id = term.get_id().clone();
         assert!(crate::db::term::delete(&db, term).await.unwrap());
 
         let error = create(
             &db,
-            &UserId::from_key("manager"),
+            &a_named_user(&db, "manager").await,
             ClassName::try_new("9-A").unwrap(),
             None,
             Some(id),
@@ -523,12 +609,12 @@ mod tests {
         .expect_err("a term that is gone must not be linkable");
         assert!(error.to_string().contains("term does not exist"));
         assert_eq!(
-            rows("SELECT VALUE id FROM class_group", &db).await,
+            row_count(&db, "class_group").await,
             0,
             "a refused create may write no row"
         );
         assert_eq!(
-            rows("SELECT VALUE id FROM term", &db).await,
+            row_count(&db, "term").await,
             0,
             "…and least of all a count on a term it just brought back"
         );
@@ -541,15 +627,16 @@ mod tests {
     /// so the old count would be 0 if the abort did not undo it).
     #[tokio::test]
     async fn a_class_term_move_moves_both_counts_or_neither() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let at = crate::domain::timestamp::Timestamp::from_millis;
         let from = a_term(&db).await;
         let to = crate::db::term::create(&db, TermName::try_new("2027").unwrap(), at(100), at(200))
             .await
             .unwrap();
-        let dead = crate::db::term::create(&db, TermName::try_new("2028").unwrap(), at(100), at(200))
-            .await
-            .unwrap();
+        let dead =
+            crate::db::term::create(&db, TermName::try_new("2028").unwrap(), at(100), at(200))
+                .await
+                .unwrap();
         let dead_id = dead.get_id().clone();
         assert!(crate::db::term::delete(&db, dead).await.unwrap());
         let class = class_on(Some(from.get_id().clone()), &db).await;
@@ -604,15 +691,16 @@ mod tests {
     /// with the counts reading as if they never ran.
     #[tokio::test]
     async fn a_stale_class_term_write_is_refused_and_moves_no_count() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let at = crate::domain::timestamp::Timestamp::from_millis;
         let from = a_term(&db).await;
         let to = crate::db::term::create(&db, TermName::try_new("2027").unwrap(), at(100), at(200))
             .await
             .unwrap();
-        let other = crate::db::term::create(&db, TermName::try_new("2028").unwrap(), at(100), at(200))
-            .await
-            .unwrap();
+        let other =
+            crate::db::term::create(&db, TermName::try_new("2028").unwrap(), at(100), at(200))
+                .await
+                .unwrap();
         let class = class_on(Some(from.get_id().clone()), &db).await;
         let stale = class.clone();
         update(
@@ -681,8 +769,8 @@ mod tests {
     async fn deleting_a_course_sweeps_its_class_attachments() {
         use crate::domain::course::{CourseDescription, CourseKind, CourseTitle};
 
-        let db = crate::database::init_mem().await.unwrap();
-        let manager = UserId::from_key("manager");
+        let (db, _leases) = crate::database::init_test_db().await;
+        let manager = a_named_user(&db, "manager").await;
         let course = crate::db::course::create(
             &db,
             &manager,
@@ -695,30 +783,27 @@ mod tests {
         .await
         .unwrap();
         let class = class_on(None, &db).await;
-        db.query(format!(
-            "CREATE class_course SET class = $class, course = $course, attached_by = $usr;
-             UPDATE $class SET {CLASS_COURSE_COUNT_FIELD} = 1;"
-        ))
-        .bind(("class", class.get_id().record()))
-        .bind(("course", course.get_id().record()))
-        .bind(("usr", manager.record()))
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
+        sqlx::query("INSERT INTO class_course (class, course, attached_by) VALUES ($1, $2, $3)")
+            .bind(class.get_id().uuid())
+            .bind(course.get_id().uuid())
+            .bind(manager.uuid())
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE class_group SET class_course_count = 1 WHERE id = $1")
+            .bind(class.get_id().uuid())
+            .execute(&db)
+            .await
+            .unwrap();
 
         assert!(crate::db::course::delete(&db, course).await.unwrap());
         assert_eq!(
-            rows("SELECT VALUE id FROM class_course", &db).await,
+            row_count(&db, "class_course").await,
             0,
             "the attachment rows must go with the course"
         );
         assert_eq!(
-            stored_count(
-                &format!("SELECT VALUE {CLASS_COURSE_COUNT_FIELD} ?? 0 FROM class_group"),
-                &db
-            )
-            .await,
+            one_i64(&db, "SELECT COALESCE(class_course_count, 0) FROM class_group".to_string()).await,
             0,
             "…and each class must get its count back"
         );

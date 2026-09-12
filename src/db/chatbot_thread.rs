@@ -4,142 +4,67 @@
 //! [`crate::domain::chatbot_thread`]; this module is where their rows are
 //! read and written.
 
-use surrealdb::types::{SurrealValue, Value};
-
-use crate::constant::{
-    CHATBOT_THREAD_COUNT_FIELD, DEFAULT_MAX_CHATBOT_THREADS, SETTINGS_KEY, SETTINGS_TABLE,
-};
-use crate::database::{Database, transaction_with_retry};
-use crate::db::cap;
+use crate::constant::DEFAULT_MAX_CHATBOT_THREADS;
+use crate::database::{Database, tx_with_retry};
 use crate::db::page::PagedList;
 use crate::domain::chatbot_thread::{ChatbotThread, ChatbotThreadId, ChatbotThreadTitle};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
-
-/// Move the thread's `updated_at` **and** run `statement` — a write to a turn
-/// hanging off that thread — in one transaction, handing back the row it
-/// returned. [`AppError::NotFound`] means the thread is gone and `statement`
-/// wrote nothing.
-///
-/// The bump is what ties a turn's fate to its thread, and reading the thread
-/// first does not: [`delete`] sweeps `chatbot_message` and drops
-/// the thread in one transaction, so a create landing after that sweep but
-/// before its commit reads a thread that is still there (uncommitted) while the
-/// sweep ran on a snapshot predating the new row — both commit, and the turn
-/// outlives the thread it was deleted with, readable and deletable by nothing.
-/// Reads do not conflict; only a write that *moves* a value on a key the delete
-/// also writes does. That is the shape
-/// [`bump_menu_and_write`](crate::domain::menu::bump_menu_and_write) and
-/// [`ExamAnswer::save`](crate::domain::exam_answer::ExamAnswer::save) already
-/// use, and the sweep's ordering inside the delete stops mattering once it is
-/// in place.
-///
-/// `updated_at` is the value moved, and it doubles as the stamp the thread list
-/// sorts on — this *is* the activity touch the send path used to issue
-/// afterwards as a separate, best-effort query whose failure was only logged.
-/// It is written strictly upwards rather than to `$now`: an `UPDATE` that
-/// leaves the document unchanged is elided and never reaches the store's write
-/// set, a turn's two rows are routinely written inside one millisecond, and a
-/// write that does not happen collides with nothing. The stamp can therefore
-/// sit a few milliseconds ahead of the clock, which an ordering key does not
-/// care about.
-///
-/// Admissible for [`transaction_with_retry`] as long as `statement` is: the
-/// `UPDATE`, the `IF`/`THROW` and the `RETURN` can never answer "already
-/// exists", and neither can a `CREATE` on a freshly minted ULID on a table with
-/// no `UNIQUE` index — no rival can have aimed at it, and a lost round wrote
-/// nothing, so re-sending it is the recovery.
-pub(crate) async fn touch_and_write<T: SurrealValue>(
-    db: &Database,
-    thread: &ChatbotThreadId,
-    statement: &str,
-    mut bindings: Vec<(String, Value)>,
-) -> Result<Option<T>, AppError> {
-    bindings.push(("conv".into(), thread.record().into_value()));
-    bindings.push(("now".into(), Timestamp::now().as_millis().into_value()));
-    let (mut result, mut errors) = transaction_with_retry(
-        db,
-        &format!(
-            "BEGIN TRANSACTION;
-             LET $touched = (UPDATE $conv SET updated_at = \
-                 math::max([$now, updated_at + 1]) RETURN VALUE id);
-             IF array::len($touched) = 0 {{ THROW 'no_thread' }};
-             LET $row = ({statement});
-             RETURN $row;
-             COMMIT TRANSACTION;"
-        ),
-        &bindings,
-        &["no_thread"],
-    )
-    .await?;
-    // An aborted transaction errors *every* slot, most with a generic "not
-    // executed" — only the THROW's own slot names the reason.
-    if errors
-        .values()
-        .any(|error| error.to_string().contains("no_thread"))
-    {
-        return Err(AppError::NotFound);
-    }
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    // Slots count BEGIN, the LET, the IF and the second LET: the RETURN is 4.
-    Ok(result.take::<Vec<T>>(4)?.into_iter().next())
-}
+use sqlx::query_as;
 
 /// Start a thread unless `user` is already at the school's
-/// `max_chatbot_threads`. The slot is taken on the user row in the same
-/// transaction as the thread ([`cap::claim_live_and_create`]) — an atomic
-/// single-record write, so two requests racing the same user's last slot
-/// cannot both win and the counter can never count a row that did not
-/// commit.
+/// `max_chatbot_threads`. The claim recipe of one: the slot bump on the
+/// user row, the live cap read, and the thread's insert are a single
+/// statement — two requests racing the same user's last slot cannot both
+/// win, and the counter can never count a row that did not commit.
 ///
 /// The cap is the one *live* on the settings singleton, sub-queried inside
 /// that same conditional write rather than bound as a number: this cap does
 /// not live on the parent row (the seat is on the user, the limit is the
 /// school's), and a snapshot of it admits every request already in flight
-/// when a `PATCH /settings` lowers it. The subquery costs one extra record
-/// read per claim on a path that already reads the row it writes.
-/// `DEFAULT_MAX_CHATBOT_THREADS` is the fallback the settings row's own
-/// absent column means — no row, or a school that never set the knob.
+/// when a `PATCH /settings` lowers it. `DEFAULT_MAX_CHATBOT_THREADS` is the
+/// fallback the settings row's own NULL means — no row, or a school that
+/// never set the knob.
+///
+/// The seat is taken on the user's own row, which is also the key a role
+/// change writes, so this write already contends with a demotion — no
+/// separate holder claim is needed.
 pub async fn create_capped(
     db: &Database,
     user: &UserId,
     title: Option<ChatbotThreadTitle>,
 ) -> Result<ChatbotThread, AppError> {
     let now = Timestamp::now();
-    let thread = ChatbotThread {
-        id: ChatbotThreadId::generate(),
-        user_id: user.clone(),
-        title,
-        created_at: now,
-        updated_at: now,
-    };
-    match cap::claim_live_and_create(
-        &user.record(),
-        CHATBOT_THREAD_COUNT_FIELD,
-        &format!(
-            "(SELECT VALUE max_chatbot_threads FROM ONLY {SETTINGS_TABLE}:{SETTINGS_KEY}) ?? $num"
-        ),
+    match query_as!(
+        ChatbotThread,
+        "WITH seat AS (
+             UPDATE app_user SET chatbot_thread_count = chatbot_thread_count + 1
+             WHERE id = $1
+               AND chatbot_thread_count < COALESCE(
+                     (SELECT max_chatbot_threads FROM settings WHERE id = 'school'),
+                     $2)
+             RETURNING 1)
+         INSERT INTO chatbot_thread (id, user_id, title, created_at, updated_at)
+         SELECT $3, $1, $4, $5, $5
+         WHERE EXISTS (SELECT 1 FROM seat)
+         RETURNING id AS \"id: ChatbotThreadId\", user_id AS \"user_id: UserId\", title AS \"title: ChatbotThreadTitle\", \
+                   created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\"",
+        user.uuid(),
         DEFAULT_MAX_CHATBOT_THREADS,
-        // No holder claim: the parent row *is* the user's, so this write
-        // already lands on the key a role change writes.
-        None,
-        (&thread.id.record(), &thread),
-        db,
+        ChatbotThreadId::generate().uuid(),
+        title.map(|t| t.as_str().to_string()),
+        now.as_millis(),
     )
+    .fetch_optional(db)
     .await?
     {
-        cap::Claimed::Made(saved) => Ok(saved),
+        Some(saved) => Ok(saved),
         // Full, or the user's row is gone — the conditional write matches
-        // nothing either way.
-        cap::Claimed::Full => Err(AppError::Conflict(
+        // nothing either way, as before.
+        None => Err(AppError::Conflict(
             "you have reached the school's limit on saved threads — delete one first",
         )),
-        // The id is a freshly minted ULID on a table with no UNIQUE index,
-        // so no rival can have aimed at it.
-        cap::Claimed::Duplicate => Err(AppError::Internal("thread id collided".into())),
     }
 }
 
@@ -152,27 +77,23 @@ pub async fn list_for_user(
     offset: i64,
 ) -> Result<(Vec<ChatbotThread>, i64), AppError> {
     PagedList::new(
-        "chatbot_thread WHERE user_id = $usr",
+        "chatbot_thread WHERE user_id = $1",
         "ORDER BY updated_at DESC, id DESC",
     )
-    .bind("usr", user.record())
+    .bind(user.uuid())
     .run(limit, offset, db)
     .await
 }
 
 /// How many threads `user` keeps — the `max_chatbot_threads` cap check.
 pub async fn count_for_user(db: &Database, user: &UserId) -> Result<usize, AppError> {
-    let mut result = db
-        .query("SELECT VALUE count() FROM chatbot_thread WHERE user_id = $usr GROUP ALL")
-        .bind(("usr", user.record()))
-        .await?
-        .check()?;
-    Ok(result
-        .take::<Vec<i64>>(0)?
-        .first()
-        .copied()
-        .unwrap_or_default()
-        .max(0) as usize)
+    let row = sqlx::query!(
+        "SELECT count(*) AS threads FROM chatbot_thread WHERE user_id = $1",
+        user.uuid()
+    )
+    .fetch_one(db)
+    .await?;
+    Ok(row.threads.unwrap_or(0).max(0) as usize)
 }
 
 /// Read a thread only if `user` owns it — a foreign id reads as absent, so
@@ -182,106 +103,131 @@ pub async fn read_for(
     id: &ChatbotThreadId,
     user: &UserId,
 ) -> Result<Option<ChatbotThread>, AppError> {
-    let thread: Option<ChatbotThread> = db.select(id.record()).await?;
+    let thread = query_as!(
+        ChatbotThread,
+        "SELECT id AS \"id: ChatbotThreadId\", user_id AS \"user_id: UserId\", title AS \"title: ChatbotThreadTitle\", created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\" FROM chatbot_thread WHERE id = $1",
+        id.uuid()
+    )
+    .fetch_optional(db)
+    .await?;
     Ok(thread.filter(|thread| &thread.user_id == user))
 }
 
-// Stamping new activity is not a call of its own: it is the bump inside
-// [`touch_and_write`], which every turn already rides, so a stamp can no
-// longer be lost (it used to be a best-effort query after the two creates,
-// whose failure was a `warn!`) and no turn can be written without it.
+// Stamping new activity is not a call of its own: it is the monotonic bump
+// inside every write that touches the thread (a turn's insert, the rename,
+// the delete below), so a stamp can no longer be lost (it used to be a
+// best-effort query after the two creates, whose failure was a `warn!`) and
+// no turn can be written without it.
 
 /// Rename the thread (`None` clears the name back to untitled), stamping
-/// the edit as activity. Field-scoped for the same reason as
-/// [`touch_and_write`]: a turn may be landing concurrently.
+/// the edit as activity. Field-scoped: a turn may be landing concurrently.
+/// The stamp is written strictly upwards — `GREATEST($now, updated_at + 1)`
+/// — because a thread's writes routinely land inside one millisecond and
+/// `updated_at` is the list's ordering key; the stamp may sit a few
+/// milliseconds ahead of the clock, which an ordering key does not care
+/// about. Zero rows: the thread is gone, the same 404 the delete answers.
 pub async fn rename(
     db: &Database,
     thread: &ChatbotThread,
     title: Option<ChatbotThreadTitle>,
 ) -> Result<ChatbotThread, AppError> {
-    let mut result = db
-        .query("UPDATE $id SET title = $title, updated_at = $now RETURN AFTER")
-        .bind(("id", thread.id.record()))
-        .bind(("title", title.map(|title| title.0)))
-        .bind(("now", Timestamp::now().as_millis()))
-        .await?
-        .check()?;
-    result
-        .take::<Vec<ChatbotThread>>(0)?
-        .into_iter()
-        .next()
-        .ok_or(AppError::NotFound)
+    let updated = query_as!(
+        ChatbotThread,
+        "UPDATE chatbot_thread SET title = $2, updated_at = GREATEST($3, updated_at + 1) \
+         WHERE id = $1 \
+         RETURNING id AS \"id: ChatbotThreadId\", user_id AS \"user_id: UserId\", title AS \"title: ChatbotThreadTitle\", \
+                   created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\"",
+        thread.get_id().uuid(),
+        title.map(|t| t.as_str().to_string()),
+        Timestamp::now().as_millis(),
+    )
+    .fetch_optional(db)
+    .await?;
+    updated.ok_or(AppError::NotFound)
 }
 
 /// Delete the thread and every turn in it — one transaction, so a crash
 /// can't orphan messages under a vanished thread. The owner's slot comes
 /// back in that same transaction, or the cap would ratchet shut.
 ///
-/// A turn, a rename and this delete all write the thread row (see
-/// [`touch_and_write`]), so the store aborting one of them is ordinary
-/// here — that collision is exactly what keeps a turn from outliving the
-/// thread — and a lost round is re-sent rather than reported as the `500`
-/// it used to be. Re-sending is sound: every statement is a `DELETE` or a
-/// field-scoped `UPDATE`, none of which can ever answer "already exists"
-/// (see [`transaction_with_retry`]). On the re-sent round the thread is
-/// already gone, so the `RETURN` is empty and the caller gets the `404`
-/// that is the truth.
+/// A turn's insert (see [`crate::db::chatbot_message`]) writes *through*
+/// the thread's row — its guarded statement moves `updated_at`, the key
+/// this delete's final write removes — so under Postgres's row locking the
+/// two serialize: either the turn saw the thread and committed first (the
+/// delete then refuses nothing, the sweep takes the turn), or the thread
+/// was gone and the turn's gate matched nothing. No turn outlives its
+/// thread. On a re-sent round the thread is already gone, so the caller
+/// gets the `404` that is the truth.
 pub async fn delete(db: &Database, thread: ChatbotThread) -> Result<ChatbotThread, AppError> {
-    let (mut result, mut errors) = transaction_with_retry(
-        db,
-        "BEGIN TRANSACTION;
-         DELETE chatbot_message WHERE thread_id = $conv;
-         LET $gone = (DELETE $conv RETURN BEFORE);
-         UPDATE $usr SET chatbot_thread_count = math::max([(chatbot_thread_count ?? 0) - array::len($gone), 0]);
-         RETURN $gone;
-         COMMIT TRANSACTION;",
-        &[
-            ("conv".into(), thread.id.record().into_value()),
-            ("usr".into(), thread.user_id.record().into_value()),
-        ],
-        &[],
-    )
-    .await?;
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    // Slots count BEGIN, the cascade, the LET and the UPDATE: the RETURN
-    // is slot 4.
-    let deleted: Option<ChatbotThread> = result.take::<Vec<ChatbotThread>>(4)?.into_iter().next();
-    deleted.ok_or(AppError::NotFound)
+    tx_with_retry(db, false, async move |tx| {
+        // Children first: the foreign key would refuse the parent while a
+        // turn still names it.
+        sqlx::query!(
+            "DELETE FROM chatbot_message WHERE thread_id = $1",
+            thread.get_id().uuid()
+        )
+        .execute(&mut *tx)
+        .await?;
+        let gone = query_as!(
+            ChatbotThread,
+            "DELETE FROM chatbot_thread WHERE id = $1 \
+             RETURNING id AS \"id: ChatbotThreadId\", user_id AS \"user_id: UserId\", title AS \"title: ChatbotThreadTitle\", \
+                       created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\"",
+            thread.get_id().uuid()
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(gone) = &gone {
+            sqlx::query!(
+                "UPDATE app_user SET chatbot_thread_count = GREATEST(chatbot_thread_count - 1, 0) \
+                 WHERE id = $1",
+                gone.get_user_id().uuid()
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+        gone.ok_or(AppError::NotFound)
+    })
+    .await
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use surrealdb::types::RecordId;
+    use sqlx::Row as _;
 
     use crate::db::chatbot_message;
     use crate::domain::chatbot_message::ChatContent;
     use crate::domain::settings::{Settings, SettingsParams};
 
+    /// The fixed fixture person, by a valid id every helper can name.
+    const U: &str = "019732e3-7b00-7000-8000-00000000aaaa";
+
     /// The owner's counter and the threads it counts, both re-read out of the
-    /// store — never off a return value, which the in-memory engine forges
-    /// wins on (see [`cap`]).
+    /// store — never off a return value.
     async fn stored(db: &Database) -> (i64, usize) {
-        let mut result = db
-            .query("SELECT VALUE (chatbot_thread_count ?? 0) FROM user:u")
-            .query("SELECT VALUE id FROM chatbot_thread")
+        let counter =
+            sqlx::query("SELECT chatbot_thread_count FROM app_user WHERE id = $1")
+                .bind(UserId::from_key(U).uuid())
+                .fetch_one(db)
+                .await
+                .unwrap()
+                .try_get::<i64, _>(0)
+                .unwrap();
+        let rows = sqlx::query("SELECT count(*) FROM chatbot_thread")
+            .fetch_one(db)
             .await
             .unwrap()
-            .check()
+            .try_get::<i64, _>(0)
             .unwrap();
-        let counter = result.take::<Vec<i64>>(0).unwrap();
-        let rows = result.take::<Vec<RecordId>>(1).unwrap();
-        (counter[0], rows.len())
+        (counter, rows as usize)
     }
 
-    async fn a_user_capped_at(threads: i64) -> Database {
-        let db = crate::database::init_mem().await.unwrap();
-        db.query("CREATE user:u SET username = 'u', password_hash = 'x';")
+    async fn a_user_capped_at(threads: i64) -> (Database, crate::database::TestDatabases) {
+        let (db, leases) = crate::database::init_test_db().await;
+        sqlx::query("INSERT INTO app_user (id, username, password_hash) VALUES ($1, 'u', 'x')")
+            .bind(UserId::from_key(U).uuid())
+            .execute(&db)
             .await
-            .unwrap()
-            .check()
             .unwrap();
         crate::db::settings::save(
             &db,
@@ -293,7 +239,7 @@ mod tests {
         )
         .await
         .unwrap();
-        db
+        (db, leases)
     }
 
     /// The seat and the row commit together, so the counter the cap reads can
@@ -301,8 +247,8 @@ mod tests {
     /// cap advances neither.
     #[tokio::test]
     async fn a_capped_create_moves_the_counter_with_the_row() {
-        let db = a_user_capped_at(1).await;
-        let user = UserId::from_key("u");
+        let (db, _leases) = a_user_capped_at(1).await;
+        let user = UserId::from_key(U);
 
         create_capped(&db, &user, None).await.expect("first thread");
         assert_eq!(stored(&db).await, (1, 1));
@@ -322,8 +268,8 @@ mod tests {
     /// this one pins the logic, which the in-memory engine can answer.
     #[tokio::test]
     async fn a_turn_writes_its_thread_and_dies_with_it() {
-        let db = a_user_capped_at(2).await;
-        let user = UserId::from_key("u");
+        let (db, _leases) = a_user_capped_at(2).await;
+        let user = UserId::from_key(U);
         let thread = create_capped(&db, &user, None).await.expect("thread");
         let opened = thread.get_updated_at().as_millis();
 
@@ -382,17 +328,16 @@ mod tests {
     async fn a_stamp_ahead_of_the_clock_still_climbs() {
         const LEAD: i64 = 1_000;
 
-        let db = a_user_capped_at(1).await;
-        let user = UserId::from_key("u");
+        let (db, _leases) = a_user_capped_at(1).await;
+        let user = UserId::from_key(U);
         let thread = create_capped(&db, &user, None).await.expect("thread");
 
         let parked = Timestamp::now().as_millis() + LEAD;
-        db.query("UPDATE $id SET updated_at = $parked")
-            .bind(("id", thread.get_id().record()))
-            .bind(("parked", parked))
+        sqlx::query("UPDATE chatbot_thread SET updated_at = $1 WHERE id = $2")
+            .bind(parked)
+            .bind(thread.get_id().uuid())
+            .execute(&db)
             .await
-            .unwrap()
-            .check()
             .unwrap();
 
         for _ in 0..2 {
@@ -438,51 +383,35 @@ mod tests {
     /// row ([`touch_and_write`]) instead of reading it — the two transactions
     /// then touch one key and the store refuses to commit both.
     ///
-    /// The window is opened by the database itself rather than by a lucky
-    /// interleaving: a `DEFINE EVENT` on `chatbot_thread` fires *inside* the
-    /// delete's own transaction, the instant the row goes, so the `SLEEP` lands
-    /// after the message sweep and before the commit every single time.
-    ///
-    /// Real server, and `#[ignore]`d for it: the subject is the store's
-    /// conflict detection, which `init_mem`'s embedded engine does not have —
-    /// it commits both writes and answers `Ok` to each, which would fail this
-    /// test on correct code (see [`crate::database::init_test_server`]).
+    /// The window the schema event used to force open is the thread row's own
+    /// lock now: a turn is written *through* the row ([`touch_and_write`]),
+    /// so a turn racing the delete serializes on that row instead of
+    /// committing past the sweep. A barrier start lets both orders happen,
+    /// and the invariant must hold in each.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn a_turn_written_inside_a_delete_never_outlives_the_thread() {
-        let (db, _serialized) = crate::database::init_test_server("chat_delete_race").await;
-        db.query("CREATE user:u SET username = 'u', password_hash = 'x';")
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
-        // Hold the delete open for a full second after the thread row is gone,
-        // while its transaction still has to commit.
-        db.query(
-            "DEFINE EVENT hold_the_window ON TABLE chatbot_thread WHEN $event = 'DELETE' \
-             THEN { SLEEP 1s; };",
-        )
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
+        // One thread minted per round: the cap must cover every round, since
+        // the rounds where the turn wins keep their thread (and its seat).
+        let (db, _leases) = a_user_capped_at(8).await;
 
-        let user = UserId::from_key("u");
+        let user = UserId::from_key(U);
         let (mut orphans, mut swept) = (0, 0);
-        for round in 0..4 {
+        for round in 0..8 {
             let thread = create_capped(&db, &user, None).await.expect("thread");
             let id = thread.get_id().clone();
 
+            let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
             let drop_it = {
-                let db = db.clone();
-                tokio::spawn(async move { delete(&db, thread).await })
-            };
-            // The turn starts inside the held window — the thread row is gone
-            // but uncommitted, which is exactly what a read believes.
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            let turn = {
-                let (id, db, user) = (id.clone(), db.clone(), user.clone());
+                let (db, thread, gate) = (db.clone(), thread, gate.clone());
                 tokio::spawn(async move {
+                    gate.wait().await;
+                    delete(&db, thread).await
+                })
+            };
+            let turn = {
+                let (id, db, user, gate) = (id.clone(), db.clone(), user.clone(), gate);
+                tokio::spawn(async move {
+                    gate.wait().await;
                     chatbot_message::append_user(
                         &db,
                         &id,
@@ -512,10 +441,10 @@ mod tests {
                 panic!("round {round}: the delete reported success but the thread is still there");
             }
         }
-        eprintln!("chatbot_thread::delete raced by a turn: {swept}/4 rounds deleted the thread");
+        eprintln!("chatbot_thread::delete raced by a turn: {swept}/8 rounds deleted the thread");
         assert!(
             swept > 0,
-            "no round ever deleted the thread, so the window was never reached"
+            "no round ever deleted the thread, so the race never actually ran"
         );
         assert_eq!(orphans, 0, "a turn outlived its thread");
     }

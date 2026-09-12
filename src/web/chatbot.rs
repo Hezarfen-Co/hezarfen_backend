@@ -77,7 +77,7 @@ struct CreateChatbotThread {
 /// sorted by it, so the thread just written to is always first.
 #[derive(Serialize, ToSchema)]
 struct ChatbotThreadResponse {
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     id: String,
     #[schema(example = "Fizik ödevi")]
     title: Option<String>,
@@ -261,7 +261,7 @@ struct SendChatbotMessage {
 #[derive(Serialize, ToSchema)]
 struct AcceptedResponse {
     /// The assistant row reserved for the answer.
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     message_id: String,
     /// Always `pending` — that is what "accepted" means here.
     #[schema(example = "pending")]
@@ -272,9 +272,9 @@ struct AcceptedResponse {
 /// set only when `status` is `failed`.
 #[derive(Serialize, ToSchema)]
 struct ChatbotMessageResponse {
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     id: String,
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     thread_id: String,
     /// `user` or `assistant`.
     #[schema(example = "assistant")]
@@ -386,7 +386,7 @@ async fn send_message(
 ) -> Result<Response, AppError> {
     // Charged first: a rejected turn must cost nothing and leave no row.
     st.chatbot_limit
-        .enforce_user(&scoped_key(&slug, user.get_id().key()))?;
+        .enforce_user(&scoped_key(&slug, user.get_id().key().as_str()))?;
 
     let thread = own_thread(&id, user.get_id(), &st.db).await?;
     let settings = service::settings::load(&st.db).await?;
@@ -900,16 +900,29 @@ mod tests {
         // A run of failed answers must make the window reach further back, not
         // shrink it: filtering a fixed-size tail after the fact handed the
         // service a handful of unanswered prompts and nothing older.
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         // A real thread row: every turn is written through it, so a turn with
-        // no thread is refused.
-        db.query("CREATE chatbot_thread:c SET user_id = user:u, created_at = 0, updated_at = 0")
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
-        let thread = ChatbotThreadId::from_key("c");
-        let user = UserId::from_key("u");
+        // no thread is refused. The owner is a foreign key now, so both
+        // fixture rows are real, under fixed keys.
+        let user = UserId::from_key("019732e3-7b00-7000-8000-00000000cafe");
+        let thread = ChatbotThreadId::from_key("019732e3-7b00-7000-8000-00000000beef");
+        sqlx::query(
+            "INSERT INTO app_user (id, username, password_hash) \
+             VALUES ($1, 'chat-web-fixture', 'x')",
+        )
+        .bind(user.uuid())
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chatbot_thread (id, user_id, created_at, updated_at) \
+             VALUES ($1, $2, 0, 0)",
+        )
+        .bind(thread.uuid())
+        .bind(user.uuid())
+        .execute(&db)
+        .await
+        .unwrap();
         let say = |text: String| ChatContent::try_new(&text).unwrap();
 
         for turn in 0..10 {

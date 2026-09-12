@@ -143,10 +143,6 @@ pub struct Metrics {
     pub panics_total: Counter<u64>,
     /// Requests refused by the rate limiter (attr: `tier`).
     pub rate_limit_rejections_total: Counter<u64>,
-    /// Database keepalive ping latency in seconds.
-    pub db_ping_duration: Histogram<f64>,
-    /// 1 when the last database ping answered, 0 when it did not.
-    pub db_up: Gauge<u64>,
     /// AI services currently registered on the QUIC bridge.
     pub ai_workers: Gauge<u64>,
     /// AI requests dispatched and not yet answered.
@@ -196,15 +192,6 @@ impl Metrics {
             rate_limit_rejections_total: meter
                 .u64_counter("rate_limit_rejections_total")
                 .with_description("Requests refused by a rate limit tier")
-                .build(),
-            db_ping_duration: meter
-                .f64_histogram("db_ping_duration")
-                .with_unit("s")
-                .with_description("Database keepalive ping round trip")
-                .build(),
-            db_up: meter
-                .u64_gauge("db_up")
-                .with_description("1 when the last database ping answered")
                 .build(),
             ai_workers: meter
                 .u64_gauge("ai_workers")

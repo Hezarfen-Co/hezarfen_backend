@@ -63,11 +63,10 @@ pub async fn delete_by_token(db: &Database, token: &str) -> Result<(), AppError>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tenant::Tenants;
 
     #[tokio::test]
     async fn the_seed_is_idempotent_and_never_rewrites_a_credential() {
-        let tenants = Tenants::new_mem().await.unwrap();
+        let tenants = crate::database::init_test_tenants().await;
         let control = tenants.control();
         let name = Username::try_new("builder1").unwrap();
         ensure(control, name.clone(), Password::try_new("secret1").unwrap())

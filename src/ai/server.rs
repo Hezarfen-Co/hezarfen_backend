@@ -12,7 +12,6 @@ use opentelemetry::KeyValue;
 use serde_json::Value;
 use tower::ServiceExt;
 use tracing::Instrument;
-use ulid::Ulid;
 
 use crate::ai::error::AiError;
 use crate::ai::protocol::{
@@ -28,10 +27,10 @@ use crate::constant::{
 use crate::database::Database;
 
 use crate::domain::course_note_file::CourseNoteFileId;
+use crate::domain::monotonic_id::next_uuid;
 use crate::domain::user::{User, UserId};
 use crate::error::AppError;
 use crate::module::Module;
-use crate::state::DbHealth;
 use crate::telemetry::Metrics;
 use crate::tenant::{Slug, Tenants};
 use crate::web::blob_path;
@@ -53,16 +52,14 @@ pub struct BridgeConfig {
     pub request_timeout: Duration,
 }
 
-/// What an api read needs to be answered: the router to dispatch into, the
-/// registry every school is resolved through, and the liveness flag that
-/// stands in for the HTTP db guard this path bypasses.
+/// What an api read needs to be answered: the router to dispatch into and
+/// the registry every school is resolved through.
 ///
 /// Deployment-wide, not per-school: `hab/2` frames name their own school, so
 /// one bridge (and one AI fleet) serves every school here.
 struct ApiHandle {
     router: axum::Router,
     tenants: Tenants,
-    db_up: DbHealth,
     /// Where uploaded blobs live — the deployment root; a school's own
     /// directory is [`school_files_path`] of it.
     files_path: std::path::PathBuf,
@@ -260,7 +257,7 @@ impl AiBridge {
         // function returns by any path, so an abandoned request frees the
         // worker's slot rather than leaking it.
         let lease = self.inner.registry.pick(capability)?;
-        let id = Ulid::new().to_string();
+        let id = next_uuid().to_string();
         let deadline_ms = timeout.as_millis().min(u64::MAX as u128) as u64;
         let request = Request {
             id: id.clone(),
@@ -357,7 +354,6 @@ impl AiBridge {
         &self,
         router: axum::Router,
         tenants: Tenants,
-        db_up: DbHealth,
         files_path: std::path::PathBuf,
         metrics: Metrics,
     ) {
@@ -370,7 +366,6 @@ impl AiBridge {
             .set(ApiHandle {
                 router,
                 tenants,
-                db_up,
                 files_path,
             })
             .is_err()
@@ -601,12 +596,6 @@ async fn open_blob(
         "unavailable",
         "the api is not serving yet — retry".to_string(),
     ))?;
-    if !api.db_up.is_up() {
-        return Err((
-            "unavailable",
-            "the database socket is down — retry".to_string(),
-        ));
-    }
     let tenant = api.school(&request.school).await?;
     let (slug, db) = (tenant.slug, tenant.db);
     // This stream bypasses the router, so it also bypasses the route_layer the
@@ -657,7 +646,7 @@ async fn open_blob(
 
     // The row exists but its blob does not: server-side damage (a lost volume
     // path), exactly as `download_file` reads it — not the service's `404`.
-    let path = blob_path(&api.files_dir(&slug), file.get_id().key());
+    let path = blob_path(&api.files_dir(&slug), &file.get_id().key());
     let handle = tokio::fs::File::open(&path).await.map_err(|e| {
         (
             "unavailable",
@@ -754,10 +743,10 @@ async fn read_api(
     dispatch_api(api, inner.metrics(), request).await
 }
 
-/// The half of [`read_api`] that needs only the armed handle: liveness,
-/// principal, dispatch, and framing the router's answer. Split out from the
-/// listener so the refusal codes it owns can be exercised without a QUIC
-/// endpoint (see this module's tests).
+/// The half of [`read_api`] that needs only the armed handle: principal,
+/// dispatch, and framing the router's answer. Split out from the listener so
+/// the refusal codes it owns can be exercised without a QUIC endpoint (see
+/// this module's tests).
 async fn dispatch_api(
     api: &ApiHandle,
     metrics: &Metrics,
@@ -771,16 +760,6 @@ async fn dispatch_api(
         on_behalf_of,
         ..
     } = request;
-
-    // The outer db guard is one of the layers this path deliberately skips, so
-    // the same liveness check happens here instead: a query issued against a
-    // dead socket hangs rather than failing (see [`DbHealth`]).
-    if !api.db_up.is_up() {
-        return Err((
-            "unavailable",
-            "the database socket is down — retry".to_string(),
-        ));
-    }
 
     // The school comes off the frame, so this is where a service naming a
     // stranger's slug (or a suspended school's) is stopped — before a row of
@@ -995,7 +974,7 @@ async fn register(
         return Err(());
     }
 
-    let worker_id = Ulid::new().to_string();
+    let worker_id = next_uuid().to_string();
     let max_concurrent = clamp_concurrency(hello.max_concurrent);
     let greeting = Greeting::Welcome {
         worker_id: worker_id.clone(),
@@ -1098,10 +1077,7 @@ mod tests {
     async fn armed(router: axum::Router) -> ApiHandle {
         ApiHandle {
             router,
-            tenants: crate::database::init_mem_tenants()
-                .await
-                .expect("in-memory deployment"),
-            db_up: Default::default(),
+            tenants: crate::database::init_test_tenants().await,
             files_path: std::env::temp_dir(),
         }
     }

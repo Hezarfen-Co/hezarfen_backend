@@ -1,8 +1,8 @@
 //! What one student may not eat: the school's record of their dietary tags
 //! plus a free-text note for the kitchen.
 //!
-//! One row per student, so the record key **is** the student's key — no
-//! generated id and no composite. Tags are validated against the same
+//! One row per student, so the primary key **is** the student — no generated
+//! id and no composite. Tags are validated against the same
 //! `dietary_tags` vocabulary a dish's tags come from ([`Settings::get_dietary_tags`]);
 //! that single shared list is what makes "this dish conflicts with this
 //! student" answerable as a set intersection, without the backend knowing any
@@ -13,41 +13,42 @@
 //!
 //! [`Settings::get_dietary_tags`]: crate::domain::settings::Settings::get_dietary_tags
 
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
-use crate::constant::{DIETARY_PROFILE_TABLE, MAX_DIETARY_NOTE_LEN, MAX_DIETARY_TAGS};
+use crate::constant::{MAX_DIETARY_NOTE_LEN, MAX_DIETARY_TAGS};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::ValidationError;
 use crate::validate::validate_optional;
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct DietaryProfileId(RecordId);
+/// The profile's identity: the student it belongs to. Not a row column of its
+/// own — the table's primary key *is* `student`, so "read the caller's
+/// profile" is a single `SELECT` by key and never a scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DietaryProfileId {
+    pub(crate) student: UserId,
+}
 
 impl DietaryProfileId {
-    /// The profile of one student — deterministic, so "read the caller's
-    /// profile" is a single `SELECT` by id and never a scan.
     pub fn of(student: &UserId) -> Self {
-        Self(RecordId::new(DIETARY_PROFILE_TABLE, student.key()))
-    }
-
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
+        Self {
+            student: student.clone(),
         }
+    }
+
+    /// The student's wire key, which is the profile's.
+    pub fn key(&self) -> String {
+        self.student.key()
     }
 }
 
 /// The tags a student's diet carries, drawn from the school's `dietary_tags`
 /// list — the same vocabulary a dish is tagged from, deduplicated and in the
-/// order given.
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct DietaryTags(pub(crate) Vec<String>);
+/// order given. Stored as a `TEXT[]` column. `no_pg_array` skips the derive's
+/// element-array assertion (which a `Vec` inner cannot satisfy); the impls
+/// still delegate to `Vec<String>`.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent, no_pg_array)]
+pub struct DietaryTags(Vec<String>);
 
 impl DietaryTags {
     pub fn try_new(values: &[String], allowed: &[String]) -> Result<Self, ValidationError> {
@@ -79,12 +80,13 @@ impl DietaryTags {
 }
 
 /// Anything the tag list cannot say — "carries an EpiPen", "no pork".
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct DietaryNote(String);
 
 impl DietaryNote {
     /// Blank (or whitespace-only) means "no note" — `None`, not an empty
-    /// string, so the column is absent rather than falsely present.
+    /// string, so the column is NULL rather than falsely present.
     pub fn try_new(value: &str) -> Result<Option<Self>, ValidationError> {
         validate_optional("note", value, MAX_DIETARY_NOTE_LEN)?;
         let value = value.trim();
@@ -96,9 +98,8 @@ impl DietaryNote {
     }
 }
 
-#[derive(Debug, Clone, SurrealValue)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct DietaryProfile {
-    pub(crate) id: DietaryProfileId,
     pub(crate) student: UserId,
     pub(crate) tags: DietaryTags,
     pub(crate) note: Option<DietaryNote>,

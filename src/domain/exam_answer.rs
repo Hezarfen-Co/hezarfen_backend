@@ -1,6 +1,4 @@
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-
-use crate::constant::{EXAM_ANSWER_TABLE, MAX_ANSWER_TEXT_LEN};
+use crate::constant::MAX_ANSWER_TEXT_LEN;
 use crate::domain::exam::ExamId;
 use crate::domain::exam_question::{ChoiceId, ExamQuestion, ExamQuestionId};
 use crate::domain::key;
@@ -9,35 +7,42 @@ use crate::domain::user::UserId;
 use crate::error::ValidationError;
 use crate::validate::validate_optional;
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct ExamAnswerId(RecordId);
+/// The identity of one (question, user, seq) triple — a sitting's answer. Not
+/// a row column: the table's primary key *is* the triple, which is what makes
+/// saving a single atomic UPSERT keyed by seq: re-answering *within a sitting*
+/// overwrites its one row, but a retake's `seq` writes a new row, so every
+/// sitting keeps its own answer history. See [`key::sitting`] for the wire
+/// shape and why the first sitting stays bare.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExamAnswerId {
+    pub(crate) question: ExamQuestionId,
+    pub(crate) user: UserId,
+    pub(crate) seq: i64,
+}
 
 impl ExamAnswerId {
-    /// A deterministic id for the (question, user, seq) triple. Saving is a
-    /// single atomic UPSERT keyed by seq: re-answering *within a sitting*
-    /// overwrites its one row, but a retake's `seq` writes a new row, so every
-    /// sitting keeps its own answer history. See [`key::sitting`] for the key
-    /// shape and why the first sitting stays bare.
     pub fn composite(question: &ExamQuestionId, user: &UserId, seq: i64) -> Self {
-        let key = key::sitting(question.key(), user.key(), seq);
-        Self(RecordId::new(EXAM_ANSWER_TABLE, key))
-    }
-
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
+        Self {
+            question: question.clone(),
+            user: user.clone(),
+            seq,
         }
+    }
+
+    /// The underscore-joined wire form (`{question}_{user}[_{seq}]`).
+    pub fn key(&self) -> String {
+        key::sitting(
+            self.question.key().as_str(),
+            self.user.key().as_str(),
+            self.seq,
+        )
     }
 }
 
 /// A free-text answer: may be empty (a student clearing their draft is a valid
 /// save), at most `MAX_ANSWER_TEXT_LEN` characters.
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct AnswerText(String);
 
 impl AnswerText {
@@ -54,11 +59,11 @@ impl AnswerText {
 /// One student's answer to one question, autosaved as they type or pick.
 /// `exam` is denormalized from the question so per-exam reads (live monitor,
 /// cascades) don't fan out through `exam_question`.
-#[derive(Debug, Clone, SurrealValue)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ExamAnswer {
-    pub(crate) id: ExamAnswerId,
     pub(crate) exam: ExamId,
     pub(crate) question: ExamQuestionId,
+    #[sqlx(rename = "app_user")]
     pub(crate) user: UserId,
     pub(crate) seq: i64,
     pub(crate) selected: Option<ChoiceId>,
@@ -67,8 +72,9 @@ pub struct ExamAnswer {
 }
 
 impl ExamAnswer {
-    pub fn get_id(&self) -> &ExamAnswerId {
-        &self.id
+    /// The row's identity, built back from its primary-key columns.
+    pub fn get_id(&self) -> ExamAnswerId {
+        ExamAnswerId::composite(&self.question, &self.user, self.seq)
     }
 
     pub fn get_exam(&self) -> &ExamId {
@@ -172,7 +178,6 @@ mod tests {
     fn answer(question: &ExamQuestion, user: &UserId, selected: Option<usize>) -> ExamAnswer {
         let selected = selected.map(|index| choice_id(question, index));
         ExamAnswer {
-            id: ExamAnswerId::composite(question.get_id(), user, 1),
             exam: question.get_exam().clone(),
             question: question.get_id().clone(),
             user: user.clone(),
@@ -186,12 +191,12 @@ mod tests {
     }
 
     fn student() -> UserId {
-        UserId::from_key("01TESTUSERAAAAAAAAAAAAAAAA")
+        UserId::from_key("0198f1a2-3b4c-7d5e-8f90-aa2b3c4d5e6f")
     }
 
     #[tokio::test]
     async fn seqs_key_distinct_rows_but_seq_one_keeps_the_bare_key() {
-        let question = ExamQuestionId::from_key("01TESTQUESTIONAAAAAAAAAAAA");
+        let question = ExamQuestionId::from_key("0198f1a2-3b4c-7d5e-8f90-1a2b3c4d5e6f");
         let user = student();
         // seq 1 keeps the pre-history bare `{question}_{user}` key…
         let first = ExamAnswerId::composite(&question, &user, 1);
@@ -215,7 +220,7 @@ mod tests {
 
     #[tokio::test]
     async fn auto_score_counts_correct_choices_only() {
-        let exam = ExamId::from_key("01TESTEXAMAAAAAAAAAAAAAAAA");
+        let exam = ExamId::from_key("0198f1a2-3b4c-7d5e-8f90-be2b3c4d5e6f");
         let user = student();
         let q1 = choice_question(&exam, 10, 0); // answered right
         let q2 = choice_question(&exam, 20, 1); // answered wrong
@@ -233,14 +238,14 @@ mod tests {
     #[tokio::test]
     async fn auto_score_of_nothing_is_zero() {
         assert_eq!(auto_score(&[], &[]), (0, 0));
-        let exam = ExamId::from_key("01TESTEXAMAAAAAAAAAAAAAAAA");
+        let exam = ExamId::from_key("0198f1a2-3b4c-7d5e-8f90-be2b3c4d5e6f");
         let questions = vec![text_question(&exam, 50)];
         assert_eq!(auto_score(&questions, &[]), (0, 0));
     }
 
     #[tokio::test]
     async fn is_correct_judges_choice_questions_only() {
-        let exam = ExamId::from_key("01TESTEXAMAAAAAAAAAAAAAAAA");
+        let exam = ExamId::from_key("0198f1a2-3b4c-7d5e-8f90-be2b3c4d5e6f");
         let user = student();
         let choice = choice_question(&exam, 10, 1);
         assert_eq!(

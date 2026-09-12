@@ -86,20 +86,18 @@ use std::time::Duration;
 use axum::extract::{ConnectInfo, Request};
 use axum::middleware::Next;
 use axum::response::Response;
-use surrealdb::types::RecordId;
 // tokio's `Instant` wraps `std::time::Instant` in production but obeys
 // `tokio::time::pause`/`advance` under `start_paused` tests, which makes the
 // window arithmetic below testable without sleeping.
 use tokio::time::Instant;
 
 use crate::constant::{
-    PURGE_AT, RATE_LIMIT_OVERFLOW_MAX, RATE_LIMIT_TABLE, RATE_SYNC_INTERVAL_SECS,
-    RATE_SYNC_MAX_KEYS, RATE_SYNC_TIMEOUT_SECS,
+    PURGE_AT, RATE_LIMIT_OVERFLOW_MAX, RATE_SYNC_INTERVAL_SECS, RATE_SYNC_MAX_KEYS,
+    RATE_SYNC_TIMEOUT_SECS,
 };
 use crate::database::Database;
 use crate::domain::timestamp::Timestamp;
 use crate::error::AppError;
-use crate::state::DbHealth;
 use crate::telemetry::Metrics;
 
 /// Per-IP rate-limit knobs, sourced from the environment (see `.env.example`) and
@@ -221,7 +219,7 @@ impl<K> RateLimiter<K> {
     }
 }
 
-/// The per-user tier, keyed by user record key instead of client IP. Lives in
+/// The per-user tier, keyed by user id instead of client IP. Lives in
 /// [`crate::state::AppState`] and is called from inside a handler, after
 /// `CurrentUser` has identified the caller.
 pub type UserRateLimiter = RateLimiter<String>;
@@ -433,8 +431,8 @@ where
     /// The task holds a *weak* reference to the buckets, so it stops with the
     /// limiter rather than keeping a dropped one alive (test suites build
     /// dozens).
-    pub fn share(&self, tier: &'static str, db: Database, db_up: DbHealth) {
-        self.share_windowed(tier, db, db_up, None);
+    pub fn share(&self, tier: &'static str, db: Database) {
+        self.share_windowed(tier, db, None);
     }
 
     /// [`RateLimiter::share`] with the wall window pinned, for tests only.
@@ -445,17 +443,11 @@ where
     /// would see the other's spend. An accidental relationship to the wall
     /// clock is precisely what kept the epoch-roll double-charge out of
     /// `tests/rate_limit.rs`, so the sharing tests choose their window instead.
-    pub fn share_pinned(&self, tier: &'static str, db: Database, db_up: DbHealth, epoch: i64) {
-        self.share_windowed(tier, db, db_up, Some(epoch));
+    pub fn share_pinned(&self, tier: &'static str, db: Database, epoch: i64) {
+        self.share_windowed(tier, db, Some(epoch));
     }
 
-    fn share_windowed(
-        &self,
-        tier: &'static str,
-        db: Database,
-        db_up: DbHealth,
-        pinned: Option<i64>,
-    ) {
+    fn share_windowed(&self, tier: &'static str, db: Database, pinned: Option<i64>) {
         // Before the early return: a disabled tier still wants its name, so a
         // limiter turned on later reports under it.
         let _ = self.tier.set(tier);
@@ -473,20 +465,22 @@ where
                 let Some(buckets) = buckets.upgrade() else {
                     return;
                 };
-                // Never queue work on a database that is down: the SDK parks a
-                // query instead of failing it, so this task would sit on a
-                // round for the whole outage and then apply a stale total.
-                if !db_up.is_up() {
-                    continue;
-                }
+                // `with_deadline` bounds every round, so an outage costs the
+                // sharing nothing but skipped rounds: local budgets keep
+                // admitting and the deltas ride the first round after recovery.
                 let epoch = pinned.unwrap_or_else(|| current_epoch(window));
                 sync_once(tier, &buckets, window, epoch, &db).await;
                 // Piggybacked cleanup, once per window: rows for a window that
                 // has passed can never be read again.
                 if swept != epoch {
                     swept = epoch;
-                    let sql = format!("DELETE {RATE_LIMIT_TABLE} WHERE window_start < $cutoff");
-                    if let Err(err) = with_deadline(db.query(sql).bind(("cutoff", epoch))).await {
+                    if let Err(err) = with_deadline(
+                        sqlx::query("DELETE FROM rate_limit WHERE window_start < $1")
+                            .bind(epoch)
+                            .execute(&db),
+                    )
+                    .await
+                    {
                         tracing::warn!(%err, "rate-limit sweep failed; retrying next window");
                     }
                 }
@@ -495,14 +489,17 @@ where
     }
 }
 
-/// Fold every live bucket's new admits into its shared row and take the
-/// window's total back.
+/// Fold every live bucket's new admits into their shared rows and take the
+/// window's totals back.
 ///
-/// One statement per bucket in one query, and each statement is its own
-/// transaction — so a statement that loses a write race fails alone. Its bucket
-/// simply keeps the delta unreported and the next round (2s later) carries it,
-/// which is why no retry loop is needed here: retrying the *query* would
-/// double-apply the statements that did land, since `hits` accumulates.
+/// The whole round is one statement: `INSERT … ON CONFLICT (id) DO UPDATE SET
+/// hits = rate_limit.hits + EXCLUDED.hits RETURNING id, hits`, so a fold is
+/// atomic — the old engine could fail one bucket's statement inside a round,
+/// Postgres cannot fail half a statement. A round that fails (deadline,
+/// outage) lands nothing: every bucket keeps its delta unreported and the
+/// next round (2s later) carries it, which is why no retry loop is needed
+/// here. Retrying the *statement* would double-apply the hits that landed,
+/// since the fold accumulates — skipping a round is the only honest failure.
 async fn sync_once<K: Eq + Hash + Clone + std::fmt::Display>(
     tier: &str,
     buckets: &Mutex<HashMap<K, Bucket>>,
@@ -551,34 +548,39 @@ async fn sync_once<K: Eq + Hash + Clone + std::fmt::Display>(
         return;
     }
 
-    let sql: String = (0..pending.len())
-        .map(|i| {
-            format!("UPSERT $id{i} SET hits = (hits ?? 0) + $delta{i}, window_start = $window RETURN VALUE hits;")
-        })
-        .collect();
-    let mut query = db.query(sql).bind(("window", epoch));
-    for (i, p) in pending.iter().enumerate() {
-        let id = RecordId::new(RATE_LIMIT_TABLE, row_key(tier, &p.key, epoch));
-        query = query
-            .bind((format!("id{i}"), id))
-            .bind((format!("delta{i}"), i64::from(p.delta)));
-    }
-    let mut response = match with_deadline(query).await {
-        Ok(response) => response,
+    // One statement for the whole round. A row's id pins its wall window
+    // (`row_key` folds the epoch in), so a conflict can only be another
+    // limiter of the same tier folding the same client inside the same window
+    // — the ON CONFLICT fold is exactly the replay that must add, not clobber.
+    let mut fold = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+        "INSERT INTO rate_limit (id, hits, window_start) ",
+    );
+    fold.push_values(pending.iter(), |mut b, p| {
+        b.push_bind(row_key(tier, &p.key, epoch))
+            .push_bind(i64::from(p.delta))
+            .push_bind(epoch);
+    });
+    fold.push(
+        " ON CONFLICT (id) DO UPDATE SET hits = rate_limit.hits + EXCLUDED.hits RETURNING id, hits",
+    );
+    let rows: Vec<(String, i64)> = match with_deadline(fold.build_query_as().fetch_all(db)).await {
+        Ok(rows) => rows,
         Err(err) => {
             tracing::warn!(%err, tier, "rate-limit sync failed; counting locally until it recovers");
             return;
         }
     };
+    let totals: HashMap<String, i64> = rows.into_iter().collect();
 
     let mut guard = buckets.lock().expect("rate limiter mutex poisoned");
-    for (i, p) in pending.iter().enumerate() {
-        // A statement that failed (a lost write race) leaves its bucket
-        // untouched: the delta stays unreported and the next round carries it.
-        let Ok(total) = response.take::<Vec<i64>>(i) else {
+    for p in &pending {
+        // A row missing from the fold's answer stands in for the failed
+        // statement it replaces: its bucket stays untouched, the delta stays
+        // unreported, and the next round carries it.
+        let Some(total) = totals.get(&row_key(tier, &p.key, epoch)) else {
             continue;
         };
-        let (Some(total), Some(bucket)) = (total.first(), guard.get_mut(&p.key)) else {
+        let Some(bucket) = guard.get_mut(&p.key) else {
             continue;
         };
         // The window may have rolled while the query was in flight, in which
@@ -617,20 +619,19 @@ impl std::fmt::LowerHex for ByteSlice<'_> {
     }
 }
 
-/// Run a sync query under a deadline. The liveness flag catches a *known*
-/// outage; this catches the socket that died between the last ping and now,
-/// which the SDK would otherwise park until the database returned — wedging
-/// the one task every tier's sharing depends on.
-async fn with_deadline<T>(
-    query: impl std::future::IntoFuture<Output = surrealdb::Result<T>>,
-) -> Result<T, AppError> {
-    tokio::time::timeout(
-        Duration::from_secs(RATE_SYNC_TIMEOUT_SECS),
-        query.into_future(),
-    )
-    .await
-    .map_err(|_| AppError::Internal("rate-limit sync timed out".into()))?
-    .map_err(AppError::from)
+/// Run one sync statement under a deadline. Postgres fails a dead connection
+/// instead of parking the query, but a slow or overloaded server can still
+/// stall a round past what the sharing can afford — every tier's budget rides
+/// this one task, so a wedged round would stall all of them. A dropped round
+/// leaves its deltas unreported and the next round carries them.
+async fn with_deadline<T, Fut>(query: Fut) -> Result<T, AppError>
+where
+    Fut: Future<Output = Result<T, sqlx::Error>>,
+{
+    tokio::time::timeout(Duration::from_secs(RATE_SYNC_TIMEOUT_SECS), query)
+        .await
+        .map_err(|_| AppError::Internal("rate-limit sync timed out".into()))?
+        .map_err(AppError::from)
 }
 
 /// Resolve the client IP a request is billed against.
@@ -901,66 +902,6 @@ mod tests {
         );
     }
 
-    /// The wall window rolls under a live local one — every local window
-    /// straddles exactly one boundary, since both are 60s and only the shared
-    /// one is clock-aligned. Each request must land in exactly one shared row:
-    /// re-reporting the whole local count to the new row charges the client
-    /// twice and spends the next window's budget before it starts.
-    ///
-    /// `sync_once` takes the epoch, so the boundary is driven here instead of
-    /// waited for — the sharing tests in `tests/rate_limit.rs` all run inside
-    /// one real wall window (`current_epoch` reads the wall clock, which
-    /// `tokio::time::pause` does not touch), which is why this path had no
-    /// coverage at all.
-    #[tokio::test]
-    async fn a_wall_epoch_roll_charges_no_request_twice() {
-        const MAX: u32 = 5;
-        let db = crate::database::init_mem().await.expect("in-memory db");
-        let limiter = UserRateLimiter::per_user_minute(MAX);
-        let window = Duration::from_secs(60);
-        let epoch = current_epoch(window);
-        assert_eq!(window.as_millis() as i64, 60_000, "epochs are 60s apart");
-
-        // A burst early in the client's local window, folded into row `epoch`.
-        for _ in 0..MAX {
-            assert!(limiter.enforce_user("user:a").is_ok());
-        }
-        sync_once("test", &limiter.buckets, window, epoch, &db).await;
-
-        // The wall clock rolls while that local window is still running.
-        sync_once("test", &limiter.buckets, window, epoch + 60_000, &db).await;
-
-        // The local window lapses, so the client opens a fresh one — inside the
-        // *same* new wall window — and spends one request in it.
-        tokio::time::pause();
-        tokio::time::advance(Duration::from_secs(61)).await;
-        tokio::time::resume();
-        assert_eq!(admits(&limiter, "user:a", 1), 1, "a fresh local window");
-        sync_once("test", &limiter.buckets, window, epoch + 60_000, &db).await;
-
-        let mut rows = db
-            .query("SELECT VALUE hits FROM rate_limit ORDER BY window_start")
-            .await
-            .expect("read shared counters");
-        assert_eq!(
-            rows.take::<Vec<i64>>(0).unwrap(),
-            vec![i64::from(MAX), 1],
-            "the new wall row may hold only what was admitted inside it"
-        );
-        assert_eq!(
-            admits(&limiter, "user:a", 4),
-            4,
-            "the client spent 1 of {MAX} in this window and must keep the rest"
-        );
-    }
-
-    /// How many of `tries` requests the limiter admits for `user`.
-    fn admits(limiter: &UserRateLimiter, user: &str, tries: usize) -> usize {
-        (0..tries)
-            .filter(|_| limiter.enforce_user(user).is_ok())
-            .count()
-    }
-
     /// The flood above was cheap to tell apart. This one is not: every flood
     /// key is driven to *exactly* the spend of the bucket it is trying to
     /// free, so a cheapest-first cutoff of `<=` puts the victim inside the tie
@@ -996,5 +937,62 @@ mod tests {
                 "{key} was exhausted and is being served again"
             );
         }
+    }
+
+    /// How many of `tries` requests the limiter admits for `user`.
+    fn admits(limiter: &UserRateLimiter, user: &str, tries: usize) -> usize {
+        (0..tries)
+            .filter(|_| limiter.enforce_user(user).is_ok())
+            .count()
+    }
+
+    /// A wall-window roll must not bill one request to two shared rows: the
+    /// fold reports only a bucket's *unreported* delta, so when the wall
+    /// window rolls under a still-live local window, the new row receives
+    /// nothing the old row had already taken. (Rebuilt over the control
+    /// database — `rate_limit` is a control table — after the SurrealDB port
+    /// dropped it along with the embedded engine.)
+    #[tokio::test]
+    async fn a_wall_epoch_roll_charges_no_request_twice() {
+        const MAX: u32 = 5;
+        let tenants = crate::database::init_test_tenants().await;
+        let db = tenants.control().clone();
+        let limiter = UserRateLimiter::per_user_minute(MAX);
+        let window = Duration::from_secs(60);
+        let epoch = current_epoch(window);
+        assert_eq!(window.as_millis() as i64, 60_000, "epochs are 60s apart");
+
+        // A burst early in the client's local window, folded into row `epoch`.
+        for _ in 0..MAX {
+            assert!(limiter.enforce_user("user:a").is_ok());
+        }
+        sync_once("test", &limiter.buckets, window, epoch, &db).await;
+
+        // The wall clock rolls while that local window is still running.
+        sync_once("test", &limiter.buckets, window, epoch + 60_000, &db).await;
+
+        // The local window lapses, so the client opens a fresh one — inside
+        // the *same* new wall window — and spends one request in it.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::time::resume();
+        assert_eq!(admits(&limiter, "user:a", 1), 1, "a fresh local window");
+        sync_once("test", &limiter.buckets, window, epoch + 60_000, &db).await;
+
+        let rows =
+            sqlx::query_scalar::<_, i64>("SELECT hits FROM rate_limit ORDER BY window_start")
+                .fetch_all(&db)
+                .await
+                .expect("read shared counters");
+        assert_eq!(
+            rows,
+            vec![i64::from(MAX), 1],
+            "the new wall row may hold only what was admitted inside it"
+        );
+        assert_eq!(
+            admits(&limiter, "user:a", 4),
+            4,
+            "the client spent 1 of {MAX} in this window and must keep the rest"
+        );
     }
 }

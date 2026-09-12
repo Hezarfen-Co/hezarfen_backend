@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO slot_ref (name, count, retired) VALUES ($1, 0, TRUE)\n           ON CONFLICT (name) DO UPDATE SET retired = TRUE\n           WHERE slot_ref.count = 0 AND slot_ref.retired IS DISTINCT FROM TRUE\n           RETURNING 1 AS \"landed!: i64\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "landed!: i64",
+        "type_info": "Int4",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "48f541ab0b2952d6f4fcea4723d820bec9ac194c8cd3580c26eb406573000869"
+}

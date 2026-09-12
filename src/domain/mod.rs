@@ -1,6 +1,8 @@
 //! Domain layer: every value is a validated newtype, and each entity owns its
-//! own persistence. Types derive `surrealdb::types::SurrealValue` so the exact
-//! same typed value flows from HTTP input all the way into the database.
+//! own persistence. Row structs derive `sqlx::FromRow` so the exact same typed
+//! value flows from HTTP input all the way into PostgreSQL; transparent
+//! newtypes derive `sqlx::Type` so a column reads straight into the validated
+//! wrapper.
 
 pub mod answer_image;
 pub mod appointment;
@@ -66,3 +68,52 @@ pub mod text_fold;
 pub mod timestamp;
 pub mod user;
 pub mod work_entry;
+
+/// Fallback for lowercase-string enums whose `#[sqlx(type_name = "TEXT",
+/// rename_all = "lowercase")]` derive the `sqlx::Type` macro rejects (an
+/// exotic shape, not a plain C-like enum). Emits the same thing the derive
+/// would: `Type` reporting `TEXT`, `Encode` writing the lowercase name,
+/// `Decode` reading a TEXT value back and refusing an unknown one as a decode
+/// error — never a panic. Unused today: every current enum derives fine; kept
+/// so the fallback shape stays one `macro_rules!` away, identically across
+/// the domain.
+#[allow(unused_macros)]
+macro_rules! text_enum {
+    ($name:ident { $($variant:ident),+ $(,)? }) => {
+        impl sqlx::Type<sqlx::Postgres> for $name {
+            fn type_info() -> sqlx::postgres::PgTypeInfo {
+                sqlx::postgres::PgTypeInfo::with_name("TEXT")
+            }
+        }
+
+        impl<'r> sqlx::Decode<'r, sqlx::Postgres> for $name {
+            fn decode(
+                value: sqlx::postgres::PgValueRef<'r>,
+            ) -> Result<Self, sqlx::error::BoxDynError> {
+                let text: &str = sqlx::Decode::<sqlx::Postgres>::decode(value)?;
+                match text {
+                    $(stringify!($variant) => Ok(Self::$variant),)+
+                    other => Err(format!(
+                        concat!("unknown ", stringify!($name), " value: `{}`"),
+                        other
+                    )
+                    .into()),
+                }
+            }
+        }
+
+        impl<'q> sqlx::Encode<'q, sqlx::Postgres> for $name {
+            fn encode_by_ref(
+                &self,
+                buf: &mut sqlx::postgres::PgArgumentBuffer,
+            ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
+                sqlx::Encode::<sqlx::Postgres>::encode(
+                    match self {
+                        $(Self::$variant => stringify!($variant),)+
+                    },
+                    buf,
+                )
+            }
+        }
+    };
+}

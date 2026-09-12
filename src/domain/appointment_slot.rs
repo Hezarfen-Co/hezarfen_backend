@@ -5,69 +5,71 @@
 //! `series` id, so no recurrence rule is ever evaluated at read time and
 //! cancelling one week is a plain row delete.
 //!
-//! The one piece of booking state a slot carries is the `occupied` counter (a
-//! [`cap`](crate::db::cap) of one), taken when a booking is made and given
+//! The one piece of booking state a slot carries is the `occupied` counter, a
+//! [`cap`](crate::db::cap) of one, taken when a booking is made and given
 //! back in the same transaction as the reject or cancel that settles it — so
 //! the slot frees itself again, and unlike a UNIQUE index it does not keep a
 //! dead booking's seat. Stored rather than counted from the
 //! [appointment](crate::domain::appointment::Appointment) rows because a
 //! conditional write on one row is the only guard a concurrent booking cannot
-//! outrun. The reads and writes behind it live in
-//! [`crate::db::appointment_slot`]; the publish and delete workflows under
-//! [`crate::service::appointment::APPOINTMENT_LOCK`] live in
-//! [`crate::service::appointment_slot`].
-
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
+//! outrun. Two overlapping windows of one teacher cannot both be published:
+//! the `appointment_slot` span exclusion constraint refuses the second
+//! insert, which is what replaced the
+//! the old process lock the appointment workflows used to hold. The reads and writes
+//! live in [`crate::db::appointment_slot`]; the publish and delete workflows
+//! in [`crate::service::appointment_slot`].
 
 use crate::constant::{
-    APPOINTMENT_SLOT_TABLE, MAX_APPOINTMENT_NOTE_LEN, MAX_SLOT_OCCURRENCES, MILLIS_PER_WEEK,
+    MAX_APPOINTMENT_NOTE_LEN, MAX_SLOT_OCCURRENCES, MILLIS_PER_WEEK,
 };
-use crate::domain::monotonic_id::next_ulid;
+use crate::domain::monotonic_id::next_uuid;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 use crate::validate::validate_optional;
 
 // Slot ids come from [`crate::domain::monotonic_id`]: a recurring publish
-// writes its whole expansion inside one millisecond, which random ULID low
-// bits would scramble against the `id` tie-break of the `ORDER BY starts_at,
-// id` listings.
+// writes its whole expansion inside one millisecond, which random UUID
+// low bits would scramble against the `id` tie-break of the
+// `ORDER BY starts_at, id` listings.
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct AppointmentSlotId(RecordId);
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
+pub struct AppointmentSlotId(uuid::Uuid);
 
 impl AppointmentSlotId {
     pub fn generate() -> Self {
-        Self(RecordId::new(
-            APPOINTMENT_SLOT_TABLE,
-            next_ulid().to_string(),
-        ))
+        Self(next_uuid())
     }
 
+    /// The inner uuid, for runtime-checked binds (Param/QueryBuilder) that
+    /// cannot take the newtype. Static `query!` binds take `self` directly.
+    pub fn uuid(&self) -> uuid::Uuid {
+        self.0
+    }
+
+    /// Parses a wire key. A key that is not a UUID parses as the nil UUID,
+    /// which matches no row — a malformed path param stays a 404, exactly
+    /// like a well-formed one that names nothing.
     pub fn from_key(key: &str) -> Self {
-        Self(RecordId::new(APPOINTMENT_SLOT_TABLE, key))
+        Self(uuid::Uuid::parse_str(key).unwrap_or(uuid::Uuid::nil()))
     }
 
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
-        }
+    pub fn key(&self) -> String {
+        self.0.to_string()
     }
 }
 
 /// The id shared by every occurrence one recurring publish created. A plain
-/// ULID string (not a record id): it names a group, never a row.
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+/// UUID string (not a row id): it names a group, never a row — the column
+/// stays `TEXT`, so cancelling one week is still `DELETE … WHERE series = $1`.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct SlotSeries(String);
 
 impl SlotSeries {
     pub fn generate() -> Self {
-        Self(next_ulid().to_string())
+        Self(next_uuid().to_string())
     }
 
     pub fn from_key(key: &str) -> Self {
@@ -79,7 +81,8 @@ impl SlotSeries {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct SlotNote(String);
 
 impl SlotNote {
@@ -95,8 +98,10 @@ impl SlotNote {
 
 /// The half-open window `[starts_at, ends_at)` a slot offers. Half-open is the
 /// whole point: back-to-back slots (10:00–10:30, 10:30–11:00) touch without
-/// overlapping, which is exactly how a teacher's hour is carved up.
-#[derive(Debug, Clone, SurrealValue)]
+/// overlapping, which is exactly how a teacher's hour is carved up. The same
+/// half-open semantics are what the stored `span` range and its exclusion
+/// constraint enforce at publish time.
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct AppointmentSlot {
     pub(crate) id: AppointmentSlotId,
     pub(crate) teacher: UserId,

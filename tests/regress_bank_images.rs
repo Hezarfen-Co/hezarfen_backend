@@ -55,7 +55,6 @@ async fn mem_app() -> (Router, Database, TempDir) {
         chatbot_limit: Default::default(),
         exam_presence: Default::default(),
         board_hub: Default::default(),
-        db_up: Default::default(),
         ai: None,
         metrics: hezarfen_backend::telemetry::Metrics::noop(),
     });

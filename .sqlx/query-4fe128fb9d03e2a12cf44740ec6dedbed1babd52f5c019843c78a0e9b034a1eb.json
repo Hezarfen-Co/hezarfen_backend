@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO kind_ref (name, count, retired) VALUES ($1, 1, false)\n                   ON CONFLICT (name) DO UPDATE SET count = kind_ref.count + 1\n                   WHERE kind_ref.retired IS DISTINCT FROM TRUE\n                   RETURNING 1 AS n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "n",
+        "type_info": "Int4",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "4fe128fb9d03e2a12cf44740ec6dedbed1babd52f5c019843c78a0e9b034a1eb"
+}

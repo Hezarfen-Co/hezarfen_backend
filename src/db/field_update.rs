@@ -1,106 +1,136 @@
-//! One `UPDATE $id SET ... RETURN AFTER` built from *only* the fields a PATCH
-//! actually carried.
+//! One `UPDATE <table> … WHERE id = $n RETURNING *` built from *only* the
+//! fields a PATCH actually carried.
 //!
 //! WHY: a handler reads the row, then writes. Filling a field the request
 //! omitted from that snapshot re-sends a value the client never gave, so a
 //! concurrent PATCH of the *other* field that landed in between is silently
-//! reverted — the same lost update a whole-row `.content(self)` save causes,
-//! just spelled field by field. Scoping the `SET` is not enough; the *values* must come
-//! from the request, so an absent field is never written at all.
+//! reverted — the lost update a whole-row save causes, just spelled field by
+//! field. Scoping the `SET` is not enough; the *values* must come from the
+//! request, so an absent field is never written at all.
 //!
-//! Callers therefore take `Option<T>` per field (`None` = absent, keep) and
-//! hand them straight here:
+//! Callers take `Option<T>` per field (`None` = absent, keep) and hand them
+//! straight here:
 //!
 //! ```ignore
-//! FieldUpdate::new(self.id.record())
+//! FieldUpdate::new("note", note.id.0)
 //!     .set("title", title)
 //!     .set("content", content)
 //!     .run::<Note>(db)
 //!     .await
 //! ```
 //!
-//! Clearing a nullable column is `Some(None)` on a `Option<Option<T>>` field
-//! — pass it as `Some(value_or_none)` so `NONE` is written explicitly.
+//! Clearing a nullable column is `Some(None)` on an `Option<Option<T>>`
+//! field — pass it as `Some(value_or_none)` so `NULL` is written explicitly
+//! (for a link column, `Param::OptUuid(None)`).
+//!
+//! Runtime-checked SQL by design (this module is the named exemption from the
+//! compile-time `query!` rule): the `SET` list is the request's shape. All
+//! emitted statements are plain Postgres — positional `$n` placeholders, the
+//! row read back with `RETURNING *` (the old store's return-updated-document
+//! spelling), and an explicit clear written as a bound `NULL`; there is no
+//! remove-a-key statement a row needs a counterpart for.
+//!
+//! The dynamic parts of every statement here are table/column names (in-crate
+//! `&'static str` constants, never client text) and the `$n` numbers this
+//! builder prints itself; every value binds — which is the audit the
+//! [`AssertSqlSafe`] wraps stand on.
 
-use surrealdb::types::{RecordId, SurrealValue, Value};
+use sqlx::postgres::{PgArguments, PgRow};
+use sqlx::{AssertSqlSafe, FromRow, PgConnection};
+use uuid::Uuid;
 
-use crate::database::{Database, transaction_with_retry, write_with_retry};
-use crate::db::cap;
+use crate::database::{Database, tx_with_retry};
+use crate::db::page::Param;
 use crate::error::AppError;
 
-/// The `THROW` markers [`FieldUpdate::refcount`]'s transaction aborts with: the
-/// row the reference was to be claimed on is gone, the row being patched is
-/// gone (or its guard bit), and the link this move started from is no longer
-/// the one the handler read.
-const CLAIM_MARK: &str = "ref_claim_gone";
-const ROW_MARK: &str = "ref_row_gone";
+/// The statement-shaped markers [`run_with_refcount`]'s transaction aborts
+/// with, mapped to their answers right after [`tx_with_retry`] returns. They
+/// never reach the wire: a refusal is a decision, never a retry, and the
+/// marker `Internal` error is replaced before it can escape.
+const REFUSAL_MARK: &str = "ref_claim_gone";
 const STALE_MARK: &str = "ref_stale_move";
+const GONE_MARK: &str = "ref_row_gone";
 
-/// `(counter field, link column, expected link, claim, release, refusal)`.
+/// The answer a moved link has always carried.
+const STALE_MOVE: &str = "the link this update moves changed since it was read; re-read and retry";
+
+/// An abort marker packed as the one error arm no caller ever observes.
+fn mark(kind: &'static str) -> AppError {
+    AppError::Internal(kind.to_owned())
+}
+
+/// `(counter table, counter field, link column, expected link, claim, release,
+/// refusal)`.
 type Refcount = (
     &'static str,
     &'static str,
-    Option<RecordId>,
-    Option<RecordId>,
-    Option<RecordId>,
+    &'static str,
+    Option<Uuid>,
+    Option<Uuid>,
+    Option<Uuid>,
     AppError,
 );
 
-pub struct FieldUpdate {
-    id: RecordId,
-    /// `field = $field` fragments, in the order they were set.
-    assignments: Vec<String>,
-    bindings: Vec<(String, Value)>,
+pub(crate) struct FieldUpdate {
+    /// The row's own table — an in-crate constant, never user input.
+    table: &'static str,
+    id: Uuid,
+    /// `(field, value)` fragments, in the order they were set; a value's
+    /// placeholder number is its position here plus one.
+    sets: Vec<(&'static str, Param)>,
     /// `(low, high, refusal)` for [`FieldUpdate::ordered`].
     ordered: Option<(&'static str, &'static str, AppError)>,
     /// `(condition, refusal)` for [`FieldUpdate::guard`].
     guard: Option<(&'static str, AppError)>,
-    /// `(counter field, link column, expected link, claim, release, refusal)`
-    /// for [`FieldUpdate::refcount`].
+    /// `(counter table, counter field, link column, expected link, claim,
+    /// release, refusal)` for [`FieldUpdate::refcount`].
     refcount: Option<Refcount>,
 }
 
 impl FieldUpdate {
-    pub fn new(id: RecordId) -> Self {
+    /// `table` names the row's table; `id` is its uuid primary key.
+    pub(crate) fn new(table: &'static str, id: Uuid) -> Self {
         Self {
+            table,
             id,
-            assignments: Vec::new(),
-            bindings: Vec::new(),
+            sets: Vec::new(),
             ordered: None,
             guard: None,
             refcount: None,
         }
     }
 
-    /// Write `field` only when the request carried it. The bind variable is
-    /// named after the field, so `id` — and `ref_claim`/`ref_release`/
-    /// `ref_expected`, which [`FieldUpdate::refcount`] binds — are the names a
-    /// caller must not use.
+    /// Write `field` only when the request carried it. The value binds as the
+    /// `SET` list's next positional parameter, in call order.
     #[must_use]
-    pub fn set<T: SurrealValue>(mut self, field: &'static str, value: Option<T>) -> Self {
+    pub(crate) fn set<T: Into<Param>>(mut self, field: &'static str, value: Option<T>) -> Self {
         if let Some(value) = value {
-            self.assignments.push(format!("{field} = ${field}"));
-            self.bindings.push((field.to_string(), value.into_value()));
+            self.sets.push((field, value.into()));
         }
         self
     }
 
     /// Refuse the write unless `low <= high` still holds on the *merged* row —
-    /// the new value for an end this PATCH carries, the stored column for one it
-    /// omits. Emitted as a `WHERE` on the same `UPDATE`, so the comparison the
-    /// handler made against its snapshot is re-made by the database at write
-    /// time, against the row as it is *then*: two PATCHes each moving one end,
-    /// each fine on its own, cannot commit an inverted range between them. That
-    /// is what an in-process `Mutex` used to buy, without a window between the
-    /// snapshot and the write for a concurrent request to slip into.
+    /// the new value for an end this PATCH carries, the stored column for one
+    /// it omits. Emitted as a `WHERE` on the same `UPDATE`, so the comparison
+    /// the handler made against its snapshot is re-made by the database at
+    /// write time, against the row as it is *then*: two PATCHes each moving
+    /// one end, each fine on its own, cannot commit an inverted range between
+    /// them. That is what an in-process `Mutex` used to buy, without a window
+    /// between the snapshot and the write for a concurrent request to slip
+    /// into.
     ///
     /// Call it after the `.set()`s of both fields. A PATCH that moves neither
-    /// end emits no guard at all (nothing to race), matching the lock window it
-    /// replaces — so a pre-existing inverted row stays editable field by field.
-    /// `NONE` on either side passes, exactly like
-    /// [`crate::web::check_time_range`] skipping an absent end.
+    /// end emits no guard at all (nothing to race), so a pre-existing inverted
+    /// row stays editable field by field. `NULL` on either side passes,
+    /// exactly like [`crate::web::check_time_range`] skipping an absent end.
     #[must_use]
-    pub fn ordered(mut self, low: &'static str, high: &'static str, refused: AppError) -> Self {
+    pub(crate) fn ordered(
+        mut self,
+        low: &'static str,
+        high: &'static str,
+        refused: AppError,
+    ) -> Self {
         self.ordered = Some((low, high, refused));
         self
     }
@@ -108,122 +138,158 @@ impl FieldUpdate {
     /// Refuse the write unless `condition` — a predicate on this same row —
     /// still holds at write time. The [`FieldUpdate::ordered`] guard for a
     /// precondition that is not about a range: a handler that read "nothing
-    /// references this yet" re-asks the database at the instant it writes, so a
-    /// reference landing in between refuses the edit instead of being edited
-    /// out from under. `condition` is always an in-crate SQL literal, never
-    /// user input.
+    /// references this yet" re-asks the database at the instant it writes, so
+    /// a reference landing in between refuses the edit instead of being
+    /// edited out from under. `condition` is always an in-crate SQL literal,
+    /// never user input.
     ///
     /// A request that carries no field at all emits no `UPDATE`, so it is not
     /// refused: it writes nothing, and reading the row back is a truthful
     /// answer to a PATCH that asked for no change.
     #[must_use]
-    pub fn guard(mut self, condition: &'static str, refused: AppError) -> Self {
+    pub(crate) fn guard(mut self, condition: &'static str, refused: AppError) -> Self {
         self.guard = Some((condition, refused));
         self
     }
 
-    /// Move a reference counter *with* this write: `claim` takes one on the row
-    /// the link moves to, `release` gives one back on the row it moves off, and
-    /// both ride the same `BEGIN…COMMIT` as the `UPDATE` that moves the link.
+    /// Move a reference counter *with* this write: `claim` takes one on the
+    /// row the link moves to (in `counter_table`), `release` gives one back
+    /// on the row it moves off, and both ride the same transaction as the
+    /// `UPDATE` that moves the link.
     ///
-    /// That is the whole point. A claim sent as its own query leaves a window
-    /// where a crash strands a count on a row nothing links any more — and a
-    /// count is what a delete guard reads, so the stranded one makes its parent
-    /// undeletable forever. `refused` is the answer when the claimed row is gone
-    /// (the conditional write doubles as the existence check, as in
-    /// [`crate::db::cap`]); the transaction then aborts, so the release and
-    /// the row write never happened either.
+    /// That is the whole point. A claim sent as its own statement leaves a
+    /// window where a crash strands a count on a row nothing links any more —
+    /// and a count is what a delete guard reads, so the stranded one makes
+    /// its parent undeletable forever. `refused` is the answer when the
+    /// claimed row is gone (the conditional claim doubles as the existence
+    /// check); the transaction then aborts, so the release and the row write
+    /// never happened either.
     ///
-    /// Only ever called alongside a `.set()` of the very column that carries the
-    /// link, so the empty-request short-circuit below cannot swallow a move.
+    /// Only ever called alongside a `.set()` of the very column that carries
+    /// the link, so the empty-request short-circuit below cannot swallow a
+    /// move.
     ///
-    /// `link` is that column (never `field`: the counter lives on the *other*
-    /// row, `course_count` on the term against a `term` link) and `expected` is
-    /// what the handler's snapshot said it held — `None` for a link that was
-    /// absent. The pair becomes a CAS on the row write, because claim and
-    /// release are computed from that snapshot: two PATCHes moving the same link
-    /// A→B both read A, and both would claim B, leaving B counted twice for one
-    /// link — a count with no link is exactly what makes a term undeletable
-    /// forever. The loser's row write matches nothing and the whole transaction
-    /// aborts, so it claims nothing and answers 409.
+    /// `link` is that column (never a `.set()` field on this row: the counter
+    /// lives on the *other* table — `course_count` on the term against a
+    /// `term` link) and `expected` is what the handler's snapshot said it
+    /// held — `None` for a link that was absent. The pair becomes a CAS on
+    /// the row write, because claim and release are computed from that
+    /// snapshot: two PATCHes moving the same link A→B both read A, and both
+    /// would claim B, leaving B counted twice for one link — a count with no
+    /// link is exactly what makes a term undeletable forever. The loser's row
+    /// write matches nothing and the whole transaction aborts, so it claims
+    /// nothing and answers 409.
     ///
-    /// **Carrying the link and shifting a counter are separate questions**, and
-    /// the CAS keys off the first one — `run` arms it for any request that
-    /// `.set()` this column, `claim`/`release` both `None` included. A PATCH
-    /// *re-stating* the link its snapshot showed shifts no counter, but it is
-    /// the same stale read: run it against a row someone else has since moved
-    /// and the unguarded write silently drags the link back, stranding the
-    /// winner's claim on a term nothing points at (undeletable forever) and
-    /// leaving the reverted-to term linked at zero (deletable while linked).
-    /// Gating the CAS on the counters is what let that through.
+    /// **Carrying the link and shifting a counter are separate questions**,
+    /// and the CAS keys off the first one — `run` arms it for any request
+    /// that `.set()`s this column, `claim`/`release` both `None` included. A
+    /// PATCH *re-stating* the link its snapshot showed shifts no counter, but
+    /// it is the same stale read: run it against a row someone else has since
+    /// moved and the unguarded write silently drags the link back, stranding
+    /// the winner's claim on a term nothing points at (undeletable forever)
+    /// and leaving the reverted-to term linked at zero (deletable while
+    /// linked). Gating the CAS on the counters is what let that through.
     #[must_use]
-    pub fn refcount(
+    pub(crate) fn refcount(
         mut self,
-        field: &'static str,
+        counter_table: &'static str,
+        counter_field: &'static str,
         link: &'static str,
-        expected: Option<RecordId>,
-        claim: Option<RecordId>,
-        release: Option<RecordId>,
+        expected: Option<Uuid>,
+        claim: Option<Uuid>,
+        release: Option<Uuid>,
         refused: AppError,
     ) -> Self {
-        self.refcount = Some((field, link, expected, claim, release, refused));
+        self.refcount = Some((
+            counter_table,
+            counter_field,
+            link,
+            expected,
+            claim,
+            release,
+            refused,
+        ));
         self
     }
 
     /// Run the update and return the stored row. An empty request writes
     /// nothing at all and reads the row back unchanged.
-    pub async fn run<T: SurrealValue>(mut self, db: &Database) -> Result<T, AppError> {
-        // Armed by the *request*, not by the counters: a PATCH that carries the
-        // link column gets the CAS even when it re-states the value it read and
-        // so shifts nothing. Decided here rather than in `refcount` so the
-        // builder's call order cannot silently disarm it — `run` is always last.
-        let moved = self.refcount.take();
-        let moved = moved.filter(|(_, link, ..)| self.is_set(link));
-        if self.assignments.is_empty() {
-            let row: Option<T> = db.select(self.id).await?;
+    pub(crate) async fn run<T>(mut self, db: &Database) -> Result<T, AppError>
+    where
+        T: for<'r> FromRow<'r, PgRow> + Send + Unpin,
+    {
+        // Armed by the *request*, not by the counters: a PATCH that carries
+        // the link column gets the CAS even when it re-states the value it
+        // read and so shifts nothing. Decided here rather than in `refcount`
+        // so the builder's call order cannot silently disarm it — `run` is
+        // always last.
+        let moved = self.refcount.take().filter(|rc| self.is_set(rc.2));
+        if self.sets.is_empty() {
+            let row: Option<T> = sqlx::query_as(AssertSqlSafe(format!(
+                "SELECT * FROM {} WHERE id = $1",
+                self.table
+            )))
+            .bind(self.id)
+            .fetch_optional(db)
+            .await?;
             return row.ok_or(AppError::NotFound);
         }
+        // The `SET` list, each value binding as the next positional
+        // parameter.
+        let mut binds: Vec<Param> = Vec::new();
+        let mut set_sql = String::new();
+        for (index, (field, value)) in self.sets.iter().enumerate() {
+            if index > 0 {
+                set_sql.push_str(", ");
+            }
+            set_sql.push_str(field);
+            set_sql.push_str(&format!(" = ${}", binds.len() + 1));
+            binds.push(value.clone());
+        }
+        // Both ends stored: name the placeholder for an end this request set,
+        // the column for one it left alone.
         let (ordered, mut refused) = match self.ordered.take() {
-            // Both ends stored: name the bound variable for an end this request
-            // set, the column for one it left alone.
             Some((low, high, err)) if self.is_set(low) || self.is_set(high) => {
-                let side = |field: &str, set| {
+                let side = |field: &str, set: bool| {
                     if set {
-                        format!("${field}")
+                        format!("${}", self.number_of(field))
                     } else {
-                        field.into()
+                        field.to_owned()
                     }
                 };
-                let low = side(low, self.is_set(low));
-                let high = side(high, self.is_set(high));
                 (
                     Some(format!(
-                        "({low} = NONE OR {high} = NONE OR {low} <= {high})"
+                        "({} IS NULL OR {} IS NULL OR {} <= {})",
+                        side(low, self.is_set(low)),
+                        side(high, self.is_set(high)),
+                        side(low, self.is_set(low)),
+                        side(high, self.is_set(high)),
                     )),
                     Some(err),
                 )
             }
             _ => (None, None),
         };
-        // Both guards land on the one `UPDATE`, ANDed. No caller sets both, so
-        // the refusal is whichever one is there.
         let (extra, extra_refused) = match self.guard.take() {
-            Some((condition, err)) => (Some(condition.to_string()), Some(err)),
+            Some((condition, err)) => (Some(condition.to_owned()), Some(err)),
             None => (None, None),
         };
+        // No caller sets both, so the refusal is whichever one is there.
         refused = refused.or(extra_refused);
-        // A PATCH that does not carry the link at all writes the same unguarded
-        // `UPDATE` it always did — it re-states nothing and races nobody. Probed
-        // on the mem engine:
-        // a bound `None` comes through as `NONE` and `link = NONE` matches a row
-        // whose option column was never set, while failing one that holds a
-        // record, so the absent-link shape needs no `??`.
-        let cas = moved
-            .as_ref()
-            .map(|(_, link, ..)| format!("{link} = $ref_expected"));
-        // The caller's own guards, kept apart from the CAS: the split below has
-        // to ask "did *only* the link move?", and a probe that ignores them
-        // answers "the link moved" to a write its `.guard()` refused outright.
+        // A PATCH that does not carry the link at all writes the same
+        // unguarded `UPDATE` it always did — it re-states nothing and races
+        // nobody. The CAS is `IS NOT DISTINCT FROM`, so an absent link
+        // (bound `None`) still compares truthfully.
+        let mut expected_at: Option<usize> = None;
+        let cas = moved.as_ref().map(|rc| {
+            binds.push(Param::OptUuid(rc.3));
+            expected_at = Some(binds.len());
+            format!("{} IS NOT DISTINCT FROM ${}", rc.2, binds.len())
+        });
+        // The caller's own guards, kept apart from the CAS: the probe below
+        // has to ask "did *only* the link move?", and a probe that ignores
+        // them answers "the link moved" to a write its `.guard()` refused
+        // outright.
         let own = ordered
             .iter()
             .chain(extra.iter())
@@ -231,262 +297,201 @@ impl FieldUpdate {
             .collect::<Vec<_>>()
             .join(" AND ");
         let conditions: Vec<String> = ordered.into_iter().chain(extra).chain(cas).collect();
-        let guard = if conditions.is_empty() {
+        let guard_sql = if conditions.is_empty() {
             String::new()
         } else {
-            format!(" WHERE {}", conditions.join(" AND "))
+            format!("{} AND ", conditions.join(" AND "))
         };
-        let sets = self.assignments.join(", ");
-        let sql = format!("UPDATE $id SET {sets}{guard} RETURN AFTER");
-        self.bindings.push(("id".into(), self.id.into_value()));
-        // Retried on a write conflict: a guarded PATCH contends on the very row
-        // its guard reads, and the loser wrote nothing, so re-sending it is the
-        // recovery — see [`write_with_retry`].
-        let rows: Vec<T> = match moved {
-            Some(moved) => run_with_refcount(db, &sql, &own, self.bindings, moved).await?,
-            None => write_with_retry(db, &sql, &self.bindings).await?,
+        // The row id binds last, after the CAS value.
+        binds.push(Param::Uuid(self.id));
+        let id_at = binds.len();
+        let update = format!(
+            "UPDATE {} SET {} WHERE {guard_sql}id = ${id_at} RETURNING *",
+            self.table, set_sql
+        );
+        let rows: Vec<PgRow> = match moved {
+            Some(rc) => {
+                let still_mine = if own.is_empty() {
+                    String::new()
+                } else {
+                    format!("({own}) AND ")
+                };
+                let probe = format!(
+                    "SELECT 1 FROM {} WHERE id = ${id_at} AND {still_mine}{} \
+                     IS DISTINCT FROM ${} LIMIT 1",
+                    self.table,
+                    rc.2,
+                    expected_at.expect("the CAS arms with its link"),
+                );
+                run_with_refcount(db, update, probe, binds, rc).await?
+            }
+            None => {
+                let mut args = PgArguments::default();
+                for bind in binds {
+                    bind.add_to(&mut args);
+                }
+                sqlx::query_with(AssertSqlSafe(update), args)
+                    .fetch_all(db)
+                    .await?
+            }
         };
-        // No row back means the guard bit (or, in the window after the handler's
-        // read, the row was deleted — the guard cannot tell the two apart, and
-        // reports the refusal it was given).
+        let rows = rows
+            .iter()
+            .map(T::from_row)
+            .collect::<Result<Vec<T>, sqlx::Error>>()?;
+        // No row back means the guard bit failed (or, in the window after the
+        // handler's read, the row was deleted — the guard cannot tell the two
+        // apart, and reports the refusal it was given).
         rows.into_iter()
             .next()
             .ok_or_else(|| refused.take().unwrap_or(AppError::NotFound))
     }
 
+    /// The `$n` the field's value bound as (set order is bind order).
+    fn number_of(&self, field: &str) -> usize {
+        self.sets
+            .iter()
+            .position(|(name, _)| *name == field)
+            .expect("ordered() sides are .set() fields")
+            + 1
+    }
+
     fn is_set(&self, field: &str) -> bool {
-        self.bindings.iter().any(|(name, _)| name == field)
+        self.sets.iter().any(|(name, _)| *name == field)
     }
 }
 
-/// Send `update` with its counter move, as one transaction. An empty `Vec` back
-/// means the row write matched nothing, exactly as [`write_with_retry`] would
-/// have reported it, so the caller's refusal is unchanged.
+/// Send the update with its counter move, as one transaction.
 ///
 /// A re-statement shifts no counter, so `claim` and `release` are both `None`
-/// and the transaction is the CAS'd row write and its split alone — still a
-/// transaction, because the split's probe must see the same snapshot the write
-/// was refused against.
+/// and the transaction is the CAS'd row write and its probe alone — still a
+/// transaction, because the probe must see the same snapshot the write was
+/// refused against.
 ///
-/// Admissible for [`transaction_with_retry`]: every statement is an `UPDATE`,
-/// an `IF`/`THROW` or a `RETURN`, and none of those can answer "already
-/// exists" — a lost round writes nothing and re-sending it is the recovery.
-async fn run_with_refcount<T: SurrealValue>(
+/// Statement order is the old one, for the old reason: the release goes
+/// first, so a move to a counter row that is gone decrements before the claim
+/// refuses — and the rolled-back transaction demonstrably undid it. Every
+/// abort takes the whole move back with it: nothing is committed unless the
+/// row write landed.
+async fn run_with_refcount(
     db: &Database,
-    update: &str,
-    own_guards: &str,
-    mut bindings: Vec<(String, Value)>,
-    (field, link, expected, claim, release, refused): Refcount,
-) -> Result<Vec<T>, AppError> {
-    // Parenthesized `??` throughout: `n ?? 0 + 1` parses as `n ?? (0 + 1)`.
-    // Both counter writes commit with the row write or neither does, so their
-    // order is free — the release goes first because that is what makes the
-    // rollback observable: a move to a term that is gone decrements before the
-    // claim throws, and the old count still being there proves the abort undid
-    // it (`a_term_move_to_a_dead_term_leaves_everything_untouched`).
-    let mut statements: Vec<String> = Vec::new();
-    if let Some(release) = release {
-        statements.push(format!(
-            "UPDATE $ref_release SET {field} = math::max([({field} ?? 0) - 1, 0])"
-        ));
-        bindings.push(("ref_release".into(), release.into_value()));
-    }
-    if let Some(claim) = claim {
-        statements.push(format!(
-            "LET $seat = (UPDATE $ref_claim SET {field} = ({field} ?? 0) + 1 RETURN VALUE id)"
-        ));
-        statements.push(format!(
-            "IF array::len($seat) = 0 {{ THROW '{CLAIM_MARK}' }}"
-        ));
-        bindings.push(("ref_claim".into(), claim.into_value()));
-    }
-    bindings.push(("ref_expected".into(), expected.into_value()));
-    statements.push(format!("LET $row = ({update})"));
-    // Without this the claim would outlive a row write that matched nothing —
-    // the very leak the transaction exists to close. Nothing was written yet
-    // either way, so the probe that tells the two empty cases apart is free to
-    // be another `UPDATE`: it matches only a row that is *there*, whose *own*
-    // guards still hold, and whose link has moved off what the handler read —
-    // which is the CAS, and nothing else, having bitten. A deleted row and a
-    // plain guard refusal both miss it and keep the answer they have always
-    // got. Carrying the caller's guards is what keeps that true when a write is
-    // refused for *both* reasons at once: a `.guard()`/`.ordered()` refusal is
-    // the caller's own answer to give, and reporting it as "the link moved"
-    // would send the client to re-read a link that was never its problem.
-    let still_mine = if own_guards.is_empty() {
-        String::new()
-    } else {
-        format!("({own_guards}) AND ")
-    };
-    statements.push(format!(
-        "IF array::len($row) = 0 {{ \
-         LET $live = (UPDATE $id WHERE {still_mine}{link} != $ref_expected RETURN VALUE id); \
-         IF array::len($live) = 0 {{ THROW '{ROW_MARK}' }} ELSE {{ THROW '{STALE_MARK}' }} }}"
-    ));
-    statements.push("RETURN $row".into());
-    let sql = format!(
-        "BEGIN TRANSACTION; {}; COMMIT TRANSACTION;",
-        statements.join("; ")
-    );
-    // BEGIN is slot 0, so the trailing RETURN sits at `statements.len()`.
-    let slot = statements.len();
+    update: String,
+    probe: String,
+    binds: Vec<Param>,
+    refcount: Refcount,
+) -> Result<Vec<PgRow>, AppError> {
+    // Destructured in the body, not the signature: a `&'static str` binding
+    // lifted from an async fn's *pattern parameter* poisons the higher-ranked
+    // `AsyncFnMut`/`Send` evaluation of any closure that captures it
+    // ("`Send` would have to be implemented for `&'0 str`, for any lifetime").
+    let (counter_table, counter_field, _link, _expected, claim, release, refused) = refcount;
+    // Owned into the closure: a captured `&str` — even `'static` — drags the
+    // async closure's arg lifetime off the higher-ranked one `tx_with_retry`
+    // needs ("AsyncFnMut is not general enough" at the route registration).
+    let counter_table = counter_table.to_owned();
+    let counter_field = counter_field.to_owned();
 
-    // One counter write in flight at a time, like every other counter write.
-    let _guard = cap::counter_lock().await;
-    let (mut result, mut errors) =
-        transaction_with_retry(db, &sql, &bindings, &[CLAIM_MARK, ROW_MARK, STALE_MARK]).await?;
-    if errors
-        .values()
-        .any(|error| error.to_string().contains(CLAIM_MARK))
-    {
-        return Err(refused);
-    }
-    if errors
-        .values()
-        .any(|error| error.to_string().contains(STALE_MARK))
-    {
-        return Err(AppError::Conflict(
-            "the link this update moves changed since it was read; re-read and retry",
-        ));
-    }
-    if errors
-        .values()
-        .any(|error| error.to_string().contains(ROW_MARK))
-    {
-        return Ok(Vec::new());
-    }
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    // Sound only because the error map came back empty: `take_errors` swap-
-    // removes errored slots, which would renumber the rest.
-    Ok(result.take::<Vec<T>>(slot)?)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::constant::SUBJECT_HOMEWORK_COUNT_FIELD;
-    use crate::database::init_mem;
-
-    /// Two subjects and one homework tagged with the first. The `course` and
-    /// `created_by` links point at rows that do not exist — a `record<…>` type
-    /// constrains the table, not the existence, and nothing here reads them.
-    async fn seeded() -> Database {
-        let db = init_mem().await.unwrap();
-        db.query(
-            "CREATE subject:s1 SET course = course:c, name = 'a', description = '';
-             CREATE subject:s2 SET course = course:c, name = 'b', description = '';
-             CREATE homework:h1 SET course = course:c, subject = subject:s1,
-                 title = 't', due_at = 1, created_by = user:u, created_at = 1;",
+    // The body lives in a named `async fn` over raw rows, the closure a
+    // thin delegate (the house `decision_cas`/`save_in` shape): an inline
+    // body of raw sqlx chains — or a delegate generic over the row type —
+    // fails the higher-ranked `Send` check axum's handler registration runs
+    // on `tx_with_retry`'s future. The `FromRow` decode happens on the
+    // caller's side of that check.
+    let outcome = tx_with_retry(db, false, async move |tx| {
+        run_refcount_tx(
+            &mut *tx,
+            update.clone(),
+            probe.clone(),
+            binds.clone(),
+            &counter_table,
+            &counter_field,
+            claim,
+            release,
         )
         .await
-        .unwrap()
-        .check()
-        .unwrap();
-        db
+    })
+    .await;
+    match outcome {
+        // The claim's refusal rides out of the transaction as the bare mark
+        // (a refusal is never retryable, so the loop stopped at it) and is
+        // answered with the caller's real error here.
+        Err(AppError::Internal(m)) if m == REFUSAL_MARK => Err(refused),
+        Err(AppError::Internal(m)) if m == STALE_MARK => Err(AppError::Conflict(STALE_MOVE)),
+        // The row is gone: exactly the "wrote nothing" answer the plain path
+        // reports, so the caller's refusal is unchanged.
+        Err(AppError::Internal(m)) if m == GONE_MARK => Ok(Vec::new()),
+        other => other,
     }
+}
 
-    /// The two subjects' homework counters, re-read out of the store.
-    async fn counts(db: &Database) -> Vec<i64> {
-        let mut result = db
-            .query(format!(
-                "SELECT VALUE ({SUBJECT_HOMEWORK_COUNT_FIELD} ?? 0) FROM subject ORDER BY id"
-            ))
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
-        result.take::<Vec<i64>>(0).unwrap()
+/// One attempt of [`run_with_refcount`]'s transaction: the release, the
+/// claim, the guarded row write, and — on an empty write — the probe that
+/// tells a stale link apart from a row that is simply gone.
+#[allow(clippy::too_many_arguments)]
+async fn run_refcount_tx(
+    tx: &mut PgConnection,
+    update: String,
+    probe: String,
+    binds: Vec<Param>,
+    counter_table: &str,
+    counter_field: &str,
+    claim: Option<Uuid>,
+    release: Option<Uuid>,
+) -> Result<Vec<PgRow>, AppError> {
+    if let Some(release) = release {
+        sqlx::query(AssertSqlSafe(format!(
+            "UPDATE {counter_table} \
+                 SET {counter_field} = GREATEST({counter_field} - 1, 0) WHERE id = $1"
+        )))
+        .bind(release)
+        .execute(&mut *tx)
+        .await?;
     }
-
-    fn homework() -> RecordId {
-        RecordId::new("homework", "h1")
+    // The conditional claim doubles as the existence check: zero rows
+    // is the claimed row being gone, the caller's own refusal.
+    if let Some(claim) = claim {
+        let seat: Option<i32> = sqlx::query_scalar(AssertSqlSafe(format!(
+            "UPDATE {counter_table} SET {counter_field} = {counter_field} + 1 \
+                 WHERE id = $1 RETURNING 1"
+        )))
+        .bind(claim)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if seat.is_none() {
+            return Err(mark(REFUSAL_MARK));
+        }
     }
-
-    fn subject(key: &str) -> RecordId {
-        RecordId::new("subject", key)
+    let mut args = PgArguments::default();
+    for bind in binds.iter().cloned() {
+        bind.add_to(&mut args);
     }
-
-    /// A write refused by the caller's *own* guard must answer with the
-    /// caller's own refusal, even when the link it carries has also moved since
-    /// the handler read it. Both are true; only one is the client's problem,
-    /// and "re-read the link and retry" sends them chasing a `409` that a retry
-    /// cannot clear — the guard will refuse the next attempt exactly the same.
-    #[tokio::test]
-    async fn a_guard_refusal_outranks_a_link_that_also_moved() {
-        let db = seeded().await;
-        let refused = FieldUpdate::new(homework())
-            .set("subject", Some(subject("s2")))
-            .guard("title = 'never'", AppError::Conflict("the caller's own no"))
-            .refcount(
-                SUBJECT_HOMEWORK_COUNT_FIELD,
-                "subject",
-                // Stale: the row says `s1`, so the CAS bites too.
-                Some(subject("s9")),
-                Some(subject("s2")),
-                Some(subject("s9")),
-                AppError::Conflict("the subject is gone"),
-            )
-            .run::<Value>(&db)
-            .await
-            .unwrap_err();
-        assert_eq!(refused.to_string(), "conflict: the caller's own no");
-        // The abort took the claim with it, and the link never moved.
-        assert_eq!(counts(&db).await, vec![0, 0]);
+    let rows: Vec<PgRow> = sqlx::query_with(AssertSqlSafe(update), args)
+        .fetch_all(&mut *tx)
+        .await?;
+    if !rows.is_empty() {
+        return Ok(rows);
     }
-
-    /// ...and with the guard satisfied, a moved link is still reported as a
-    /// moved link — the answer every current caller relies on.
-    #[tokio::test]
-    async fn a_moved_link_alone_is_still_the_stale_move_409() {
-        let db = seeded().await;
-        let refused = FieldUpdate::new(homework())
-            .set("subject", Some(subject("s2")))
-            .guard("title = 't'", AppError::Conflict("the caller's own no"))
-            .refcount(
-                SUBJECT_HOMEWORK_COUNT_FIELD,
-                "subject",
-                Some(subject("s9")),
-                Some(subject("s2")),
-                Some(subject("s9")),
-                AppError::Conflict("the subject is gone"),
-            )
-            .run::<Value>(&db)
-            .await
-            .unwrap_err();
-        assert!(
-            refused
-                .to_string()
-                .contains("the link this update moves changed"),
-            "{refused}"
-        );
-        assert_eq!(counts(&db).await, vec![0, 0]);
+    // Zero rows: the caller's own guard bit, the row deleted in the
+    // window after the handler's read, or — the CAS only — the link
+    // moved since the handler read it. Nothing was written yet either
+    // way, so the probe that tells the cases apart is free: it matches
+    // only a row that is *there*, whose *own* guards still hold, and
+    // whose link has moved off what the handler read — which is the
+    // CAS, and nothing else, having bitten. Carrying the caller's
+    // guards is what keeps that true when a write is refused for
+    // *both* reasons at once: a `.guard()`/`.ordered()` refusal is the
+    // caller's own answer to give, and reporting it as "the link
+    // moved" would send the client to re-read a link that was never
+    // its problem.
+    let mut args = PgArguments::default();
+    for bind in binds.iter().cloned() {
+        bind.add_to(&mut args);
     }
-
-    /// The unguarded shape every production caller uses today: the link moves,
-    /// the counters move with it, in one transaction.
-    #[tokio::test]
-    async fn an_unguarded_move_still_lands_with_both_counters() {
-        let db = seeded().await;
-        db.query("UPDATE subject:s1 SET homework_count = 1")
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
-        FieldUpdate::new(homework())
-            .set("subject", Some(subject("s2")))
-            .refcount(
-                SUBJECT_HOMEWORK_COUNT_FIELD,
-                "subject",
-                Some(subject("s1")),
-                Some(subject("s2")),
-                Some(subject("s1")),
-                AppError::Conflict("the subject is gone"),
-            )
-            .run::<Value>(&db)
-            .await
-            .unwrap();
-        assert_eq!(counts(&db).await, vec![0, 1]);
+    let live: Option<i32> = sqlx::query_scalar_with(AssertSqlSafe(probe), args)
+        .fetch_optional(&mut *tx)
+        .await?;
+    match live {
+        Some(_) => Err(mark(STALE_MARK)),
+        None => Err(mark(GONE_MARK)),
     }
 }

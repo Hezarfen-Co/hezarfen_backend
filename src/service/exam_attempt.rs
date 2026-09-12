@@ -3,7 +3,19 @@
 //! rejoin, archived term) every sitting path shares. The queries live in
 //! [`crate::db::exam_attempt`]; the HTTP shaping stays in the web layer.
 
-use crate::constant::EXAM_SAT_TOTAL_FIELD;
+/// The store closed every gap this file's old cross-record lease used to
+/// hold shut. The sitting create locks the exam row `FOR UPDATE` inside its
+/// own transaction and re-judges the sittable/window gates on the locked
+/// row ([`crate::db::exam_attempt::guard_start`]); the question/image
+/// writes run the freeze gate on the same locked row
+/// ([`crate::db::exam_attempt::freeze_gate`]); the exam delete takes the
+/// row before its cascade; an answer save locks it ahead of its upsert.
+/// Answer saves, grade writes and exam PATCHes — the old lease's *read*
+/// side — were never ordered against each other by anything but the store,
+/// and now the store orders them against the writers too: every one of
+/// those invariants is a guarded statement or a row lock on the exam row
+/// itself. The subject delete's conditional reference-counter statement
+/// ([`crate::db::subject::delete`]) needs no partner lock at all.
 use crate::database::Database;
 use crate::db::cap;
 use crate::domain::course::Course;
@@ -16,34 +28,8 @@ use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
 use crate::error::AppError;
 
-/// Serializes the exam subsystem's cross-record check-then-writes, which
-/// `BEGIN…COMMIT` cannot (write skew) — the reasoning in [`crate::db::cap`].
-/// It orders requests, but only around what it wraps — every invariant that
-/// could be moved into the database itself has been, so a gap between a read
-/// and its write is decided by the store. What is left here needs a
-/// cross-record read and a write held together, which no single statement
-/// expresses:
-///
-/// Read side — the answer saves (REST and the exam room), from the
-/// writable-attempt gate through the upsert; the grade write (draft gate
-/// through the result upsert); and the exam PATCH, whose mode/re-draft gates
-/// count attempts and results. These stay concurrent with each other.
-///
-/// Write side — attempt starts alone (the max-attempts count and the retake's
-/// answer wipe). So a save can never land on a sheet a retake just wiped, and a
-/// mark can never land on an exam mid-flight into hiding.
-///
-/// Two rules have left this list. The question freeze gate rides inside each
-/// question/image write's own transaction
-/// ([`crate::db::exam_attempt::write_unfrozen`]), and the exam PATCH
-/// no longer needs the writer lease because its save is a compare-and-set. The
-/// subject delete's cascade — the only writer outside attempt starts, paired
-/// with the question writes' subject check — is now a conditional statement on
-/// the subject's own reference counter
-/// ([`crate::db::subject::delete`]), which every question create,
-/// re-tag and delete moves.
-// corner-cut: global RwLock, shard per-exam if save latency ever matters.
-pub(crate) static EXAM_LOCK: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+#[cfg(test)]
+use crate::constant::EXAM_SAT_TOTAL_FIELD;
 
 /// Rejects sitting an exam that can't be sat. A draft is a `404`, not a
 /// `409` — sitting is a student act, drafts are invisible to students, and a
@@ -159,21 +145,18 @@ pub async fn course_of(exam: &Exam, db: &Database) -> Result<Course, AppError> {
 ///   drawings, and marks stay put at their own seq — the fresh sitting
 ///   simply writes into an empty higher seq.
 ///
-/// The composite id makes each create atomic; a concurrent double-start
-/// races on the same seq, loses to the unique id, and reads the winner's
-/// row.
-///
-/// A created row rides [`cap::create_counting`] so the student's
-/// `exam_sat_total` moves in the same transaction — but only for `seq == 1`,
+/// The create is one guarded transaction
+/// ([`crate::db::exam_attempt::create`]): the exam row locked and the
+/// sittable/window gates re-judged on the locked row, then the row insert
+/// riding the student's `exam_sat_total` claim — but only for `seq == 1`,
 /// because that counter is *exams sat*, not sittings. A retake is the same
 /// exam again, and counting it made a badge a student could mint alone: an
 /// open exam with unlimited attempts is a start/finish loop nobody else has
-/// to touch. `seq == 1` is the whole condition and needs no extra read —
-/// the first sitting's id is one deterministic key, so of every writer
-/// aiming at it exactly one `CREATE` commits and the losers' increments
-/// abort with their duplicates, while a retake computes its seq from a row
-/// that already exists. A `SELECT` inside the transaction would be strictly
-/// worse: SurrealDB 3.2.3 conflict-checks write sets, not read sets.
+/// to touch. `seq == 1` is the whole condition, and the composite primary
+/// key is what makes it race-free: of every writer aiming at the first
+/// sitting's exact key, exactly one insert commits and the losers' bumps
+/// roll back with their duplicates, while a retake computes its seq from a
+/// row that already exists.
 pub async fn start(
     db: &Database,
     exam: &Exam,
@@ -195,7 +178,6 @@ pub async fn start(
         }
     };
     let attempt = ExamAttempt {
-        id: ExamAttemptId::composite(exam.get_id(), user, next_seq),
         exam: exam.get_id().clone(),
         user: user.clone(),
         seq: next_seq,
@@ -203,18 +185,8 @@ pub async fn start(
         finished_at: None,
         left_at: None,
     };
-    let id = attempt.id.record();
     let first = next_seq == 1;
-    match cap::create_counting(
-        &user.record(),
-        EXAM_SAT_TOTAL_FIELD,
-        first,
-        &id,
-        &attempt,
-        db,
-    )
-    .await?
-    {
+    match crate::db::exam_attempt::create(db, &attempt, first, Timestamp::now()).await? {
         cap::Claimed::Made(created) => {
             // Only a moved counter can have crossed a threshold.
             if first && let Err(err) = crate::db::badge::sync(db, user).await {
@@ -226,7 +198,8 @@ pub async fn start(
         // collision (the winner's fresh sitting); a terminal or missing
         // latest means the create genuinely failed — surface that instead
         // of passing a finished sitting off as a resume. The duplicate
-        // aborted the transaction, so the loser's increment went with it.
+        // rolled the transaction back, so the loser's increment went with
+        // it.
         cap::Claimed::Duplicate => {
             match crate::db::exam_attempt::read_latest_for_user(db, exam.get_id(), user).await? {
                 Some(existing)
@@ -237,10 +210,10 @@ pub async fn start(
                 _ => Err(AppError::Internal("failed to start exam attempt".into())),
             }
         }
-        // Nothing caps sittings, so the conditional write can only miss by
-        // finding no user row — not a state a live session can reach, and
-        // passing it off as a resume would hand out a sitting the counter
-        // never learned about.
+        // Nothing caps sittings, so the claim can only miss by finding no
+        // user row — not a state a live session can reach, and passing it
+        // off as a resume would hand out a sitting the counter never
+        // learned about.
         cap::Claimed::Full => Err(AppError::Internal(
             "cannot start an exam attempt: the student's account row is missing".into(),
         )),
@@ -254,16 +227,13 @@ pub async fn start(
 /// (the response describes that row) plus the attempt and whether it was
 /// newly created.
 ///
-/// Writer lease of [`EXAM_LOCK`] from the exam read through the start: the
-/// sittable/window gates must be judged against the same exam row the
-/// attempt lands under (the mirror of `update_exam`'s re-derive — without
-/// it, a mode change or re-draft at legally-zero attempts could slip
-/// between this gate and the insert, leaving an attempt on an unsittable
-/// exam). The lease
-/// also keeps the max-attempts count and the retake's wipe-and-create
-/// from interleaving with an in-flight answer save (a reader). The caller
-/// drops nothing: the lease lives and dies inside this call, before the
-/// response reads — they only describe the row.
+/// The sittable/window gates below are the pre-flight — the same refusals,
+/// one round trip earlier. The write-time authority is the sitting create's
+/// own transaction ([`crate::db::exam_attempt::guard_start`]): it locks the
+/// exam row and re-judges draft, mode, and window on the locked row, which
+/// is exactly what this path's old writer lease of [`EXAM_LOCK`] bought
+/// from exam read through insert. The gates here keep judging the row the
+/// response describes.
 ///
 /// A still-running attempt comes back as-is (the handler answers `200`
 /// instead of `201`), so a reconnecting client gets its original clock
@@ -280,7 +250,6 @@ pub async fn start_attempt(
     exam_id: &ExamId,
     user: &User,
 ) -> Result<(Exam, ExamAttempt, bool), AppError> {
-    let _guard = EXAM_LOCK.write().await;
     let exam = crate::db::exam::read(db, exam_id)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -346,16 +315,6 @@ pub async fn save_answer_checked(
     text: Option<String>,
 ) -> Result<ExamAnswer, AppError> {
     ensure_student(user)?;
-    // Reader lease of [`EXAM_LOCK`]: the writable gate and the upsert are
-    // one unit, or a retake's wipe-and-create (a writer) slips in between
-    // and this stale save lands on the fresh blank sheet.
-    //
-    // The lease covers the gate *and* the upsert here, so a retake cannot
-    // interleave with this path at all. The accepted late-save race lives in
-    // the exam-room socket instead, which writes into the sitting it joined
-    // with — a value chosen before any lease is taken. See
-    // [`crate::web::exam_ws`].
-    let _guard = EXAM_LOCK.read().await;
     let attempt = writable_attempt(exam, user.get_id(), db).await?;
     save_answer_in(db, exam, &attempt, question_id, selected, text).await
 }
@@ -463,7 +422,7 @@ pub async fn set_left(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::init_mem;
+    use crate::database::init_test_db;
     use crate::db::exam_answer;
     use crate::domain::exam::{
         ExamAttemptLimit, ExamDescription, ExamKind, ExamMode, ExamSchedule, ExamTitle,
@@ -485,7 +444,17 @@ mod tests {
     /// An open exam with retakes allowed, plus one choice question — enough
     /// rows to exercise the attempt lifecycle without the HTTP layer.
     async fn open_exam_with_question(db: &Database, max_attempts: i64) -> (Exam, ExamQuestion) {
-        let creator = UserId::from_key("01TESTTEACHERAAAAAAAAAAAAA");
+        let creator = UserId::from_key("019732e3-7b00-7000-8000-00000000acdc");
+        // The creator is a foreign key now: a real `app_user` row under the
+        // fixture's fixed key.
+        sqlx::query(
+            "INSERT INTO app_user (id, username, password_hash) \
+             VALUES ($1, 'acdc-fixture', 'x') ON CONFLICT DO NOTHING",
+        )
+        .bind(creator.uuid())
+        .execute(db)
+        .await
+        .unwrap();
         let course = crate::db::course::a_test_course(db).await;
         let kinds = Settings::defaults().get_exam_kinds().to_vec();
         let exam = crate::db::exam::create(
@@ -564,20 +533,14 @@ mod tests {
 
     /// The student's lifetime sitting count, absent reading as zero.
     async fn sat_total(user: &UserId, db: &Database) -> i64 {
-        let mut result = db
-            .query(format!(
-                "SELECT VALUE ({EXAM_SAT_TOTAL_FIELD} ?? 0) FROM $usr"
-            ))
-            .bind(("usr", user.record()))
+        use sqlx::Row as _;
+
+        sqlx::query("SELECT exam_sat_total FROM app_user WHERE id = $1")
+            .bind(user.uuid())
+            .fetch_one(db)
             .await
             .unwrap()
-            .check()
-            .unwrap();
-        result
-            .take::<Vec<i64>>(0)
-            .unwrap()
-            .into_iter()
-            .next()
+            .try_get::<i64, _>(0)
             .unwrap()
     }
 
@@ -587,7 +550,7 @@ mod tests {
     /// different things by the same number.
     #[tokio::test]
     async fn starting_counts_one_sitting_and_resuming_counts_none() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let (exam, _question) = open_exam_with_question(&db, 2).await;
         let user = student(&db).await;
         assert_eq!(sat_total(&user, &db).await, 0, "a fresh row reads as zero");
@@ -611,7 +574,7 @@ mod tests {
     /// unlimited attempts would mint `exam_sat_25` off one exam and no teacher.
     #[tokio::test]
     async fn a_retake_writes_its_row_and_counts_nothing() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let (exam, _question) = open_exam_with_question(&db, 3).await;
         let user = student(&db).await;
 
@@ -630,24 +593,24 @@ mod tests {
     /// with it: a sitting is never counted twice.
     #[tokio::test]
     async fn a_lost_start_race_never_counts_the_sitting_twice() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let (exam, _question) = open_exam_with_question(&db, 1).await;
         let user = student(&db).await;
 
         let (winner, _) = start(&db, &exam, &user).await.unwrap();
         assert_eq!(sat_total(&user, &db).await, 1);
 
-        let claimed = cap::claim_and_create(
-            &user.record(),
-            EXAM_SAT_TOTAL_FIELD,
-            cap::UNLIMITED,
-            &winner.id.record(),
-            &winner,
-            &db,
-        )
-        .await
-        .unwrap();
-        assert!(matches!(claimed, cap::Claimed::Duplicate));
+        // The loser of the start race re-runs the same create: the composite
+        // id answers Duplicate, the create is answered as a resume (the same
+        // sitting, nothing new), and the counter increment the loser had
+        // claimed rolled back with its refused transaction.
+        let (resumed, created) = start(&db, &exam, &user).await.unwrap();
+        assert!(!created, "the rival start must not have created anything");
+        assert_eq!(
+            resumed.get_seq(),
+            winner.get_seq(),
+            "the resume answers the winner's sitting, not a new one"
+        );
         assert_eq!(
             sat_total(&user, &db).await,
             1,
@@ -657,7 +620,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_retake_preserves_the_prior_sittings_sheet() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let (exam, question) = open_exam_with_question(&db, 2).await;
         let user = student(&db).await;
 
@@ -695,7 +658,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_lost_retake_race_cannot_touch_the_winners_sheet() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let (exam, question) = open_exam_with_question(&db, 3).await;
         let user = student(&db).await;
 
@@ -719,17 +682,15 @@ mod tests {
         // A stale double-start races on the same seq and loses to the
         // composite id: the duplicate create is rejected, and with no wipe in
         // the path the winner's fresh answer is untouched either way.
-        let loser = ExamAttempt {
-            id: ExamAttemptId::composite(exam.get_id(), &user, 2),
-            exam: exam.get_id().clone(),
-            user: user.clone(),
-            seq: 2,
-            started_at: Timestamp::now(),
-            finished_at: None,
-            left_at: None,
-        };
-        let lost: Result<Option<ExamAttempt>, surrealdb::Error> =
-            db.create(loser.id.record()).content(loser).await;
+        let lost = sqlx::query(
+            "INSERT INTO exam_attempt (exam, app_user, seq, started_at) \
+             VALUES ($1, $2, 2, $3)",
+        )
+        .bind(exam.get_id().uuid())
+        .bind(user.uuid())
+        .bind(Timestamp::now().as_millis())
+        .execute(&db)
+        .await;
         assert!(lost.is_err(), "the duplicate-seq create must be rejected");
         let answers = exam_answer::list_for_exam_user(&db, exam.get_id(), &user, 2)
             .await

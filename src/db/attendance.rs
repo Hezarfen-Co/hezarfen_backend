@@ -1,41 +1,24 @@
-//! The `attendance` table: event roll call. Every write is a single
-//! transaction whose gates ride inside it (the event-existence proof), so
-//! the whole module is the persistence half; the workflow that decides it
-//! lives in [`crate::service::attendance`].
+//! The `attendance` table: event roll call. Every write is one guarded
+//! statement whose gates ride inside it, so the whole module is the
+//! persistence half; the workflow that decides it lives in
+//! [`crate::service::attendance`].
 
-use surrealdb::types::SurrealValue;
-
-use crate::constant::REGISTRATION_COUNT_FIELD;
-use crate::database::{Database, transaction_with_retry};
+use crate::database::{Database, tx_with_retry};
 use crate::db::page::PagedList;
-use crate::domain::attendance::{Attendance, AttendanceId, AttendanceStatus};
+use crate::domain::attendance::{Attendance, AttendanceStatus};
 use crate::domain::event::EventId;
 use crate::domain::user::UserId;
 use crate::error::AppError;
+use sqlx::query_as;
 
-/// Record (or overwrite) `user`'s status for `event`. One row per (event,
-/// user), keyed by a deterministic composite id so this is a single atomic
-/// UPSERT — concurrent marks for the same pair can no longer both insert and
-/// collide on the unique index (a 500); they converge on the one row.
+/// Record (or overwrite) `user`'s status for `event`. The pair is the
+/// table's primary key, so this is a single atomic upsert — concurrent
+/// marks for the same pair converge on the one row instead of racing.
 ///
-/// The event's existence is proved *inside* the write, the twin of the gate
-/// in [`crate::db::session_attendance::mark`]: the handler's event read sits
-/// several round trips in front of this, so a bare upsert left a mark on an
-/// event [`crate::domain::event::Event`]'s cascade
-/// (`DELETE attendance WHERE event = $ev`) had already swept — counted
-/// forever in `GET /attendance/{user}` on an event no page shows. Reading
-/// the event here would not have closed it either: SurrealDB 3.2.3
-/// conflict-checks write sets, not read sets, so the proof has to *move* a
-/// value on the event row. It is the bump-and-restore of
-/// [`crate::domain::exam_answer::ExamAnswer::save`], on the counter the
-/// event already carries: matching nothing is the existence gate, writing
-/// the key the delete removes is the collision, and the restore is by
-/// captured value (`NONE` included) so no seat is spent or freed.
-///
-/// Admissible for [`transaction_with_retry`]: no statement can answer
-/// "already exists" — the `UPSERT`'s composite id is bijective with the
-/// `attendance_event_user` unique tuple, so it resolves onto the row it
-/// names instead of colliding with it.
+/// The event's existence is proved by the foreign key itself: a mark naming
+/// an event whose row is gone is refused `23503`, mapped to the same 404 the
+/// old existence-proof transaction produced. No bump-and-restore trick, no
+/// retry loop — one statement decides.
 pub async fn mark(
     db: &Database,
     event: &EventId,
@@ -43,52 +26,48 @@ pub async fn mark(
     status: AttendanceStatus,
     marked_by: &UserId,
 ) -> Result<Attendance, AppError> {
-    let attendance = Attendance {
-        id: AttendanceId::composite(event, user),
-        event: event.clone(),
-        user: user.clone(),
-        status,
-        marked_by: marked_by.clone(),
-    };
-    let (mut result, mut errors) = transaction_with_retry(
-        db,
-        &format!(
-            "BEGIN TRANSACTION;
-             LET $was = (SELECT VALUE {REGISTRATION_COUNT_FIELD} FROM ONLY $ev);
-             LET $alive = (UPDATE $ev SET {REGISTRATION_COUNT_FIELD} =
-                 ({REGISTRATION_COUNT_FIELD} ?? 0) + 1 RETURN VALUE id);
-             IF array::len($alive) = 0 {{ THROW 'event_missing' }};
-             UPDATE $ev SET {REGISTRATION_COUNT_FIELD} = $was;
-             LET $after = (UPSERT $id CONTENT $row RETURN AFTER);
-             RETURN $after;
-             COMMIT TRANSACTION;"
-        ),
-        &[
-            ("ev".into(), event.record().into_value()),
-            ("id".into(), attendance.id.record().into_value()),
-            ("row".into(), attendance.into_value()),
-        ],
-        &["event_missing"],
-    )
-    .await?;
-    // An aborted transaction errors every slot and only the THROW's own
-    // slot names the marker.
-    if errors
-        .values()
-        .any(|error| error.to_string().contains("event_missing"))
-    {
-        return Err(AppError::NotFound);
-    }
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    // The trailing `RETURN` is always the last statement before `COMMIT`.
-    let slot = result.num_statements().saturating_sub(2);
-    result
-        .take::<Vec<Attendance>>(slot)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| AppError::Internal("failed to mark attendance".into()))
+    // Owned captures (`Send` rule of `tx_with_retry`'s closure).
+    let event = event.clone();
+    let user = *user;
+    let marked_by = *marked_by;
+    tx_with_retry(db, false, async move |tx| {
+        // The existence gate and the collision key: the event row is locked
+        // inside the mark's own transaction, so a concurrent delete cascade
+        // either lands whole before the mark (404, nothing stored) or queues
+        // behind the mark's commit — and then its sweep, reading after that
+        // commit, takes the mark's row with it. Without the lock the insert
+        // never queued on the event at all: a mark racing
+        // `DELETE /events/{id}` could commit an orphan its cascade's
+        // already-run sweep never saw.
+        let live = sqlx::query!(
+            r#"SELECT 1 AS "one!: i64" FROM event WHERE id = $1 FOR NO KEY UPDATE"#,
+            event.uuid()
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        if live.is_none() {
+            // The event row is gone: exactly today's "no such event" refusal.
+            // (The foreign keys name users the routes already authenticated;
+            // a violation there stays a database error, as before.)
+            return Err(AppError::NotFound);
+        }
+        let row = query_as!(
+            Attendance,
+            "INSERT INTO attendance (event, app_user, status, marked_by)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (event, app_user) DO UPDATE SET status = $3, marked_by = $4
+             RETURNING event AS \"event: EventId\", app_user AS \"user: UserId\", \
+                      status AS \"status: AttendanceStatus\", marked_by AS \"marked_by: UserId\"",
+            event.uuid(),
+            user.uuid(),
+            status.as_str(),
+            marked_by.uuid()
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        Ok(row)
+    })
+    .await
 }
 
 pub async fn list_for_event(
@@ -97,21 +76,33 @@ pub async fn list_for_event(
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<Attendance>, i64), AppError> {
-    PagedList::new("attendance WHERE event = $ev", "ORDER BY id DESC")
-        .bind("ev", event.record())
-        .run(limit, offset, db)
-        .await
+    // The composite key's text form ordered the old listing; on the natural
+    // key that order is (event, then user).
+    PagedList::new(
+        "attendance WHERE event = $1",
+        "ORDER BY event DESC, app_user DESC",
+    )
+    .bind(event.uuid())
+    .run(limit, offset, db)
+    .await
 }
 
 /// Every event-attendance row recorded for `user` — the events half of the
 /// attendance report.
 pub async fn list_for_user(db: &Database, user: &UserId) -> Result<Vec<Attendance>, AppError> {
-    let mut result = db
-        .query("SELECT * FROM attendance WHERE user = $usr ORDER BY id DESC")
-        .bind(("usr", user.record()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<Attendance>>(0)?)
+    let rows = query_as!(
+        Attendance,
+        "SELECT event AS \"event: EventId\", app_user AS \"user: UserId\", \
+                status AS \"status: AttendanceStatus\", \
+                marked_by AS \"marked_by: UserId\" \
+         FROM attendance
+         WHERE app_user = $1
+         ORDER BY event DESC, app_user DESC",
+        user.uuid()
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows)
 }
 
 pub async fn remove(
@@ -119,13 +110,18 @@ pub async fn remove(
     event: &EventId,
     user: &UserId,
 ) -> Result<Option<Attendance>, AppError> {
-    let mut result = db
-        .query("DELETE attendance WHERE event = $ev AND user = $usr RETURN BEFORE")
-        .bind(("ev", event.record()))
-        .bind(("usr", user.record()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<Attendance>>(0)?.into_iter().next())
+    let gone = query_as!(
+        Attendance,
+        "DELETE FROM attendance WHERE event = $1 AND app_user = $2
+         RETURNING event AS \"event: EventId\", app_user AS \"user: UserId\", \
+                  status AS \"status: AttendanceStatus\", \
+                  marked_by AS \"marked_by: UserId\"",
+        event.uuid(),
+        user.uuid()
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(gone)
 }
 
 #[cfg(test)]
@@ -134,59 +130,77 @@ mod tests {
     use crate::domain::settings::Settings;
 
     /// The session twin's race, one table over
-    /// ([`crate::db::session_attendance::mark`]): a
-    /// `DEFINE EVENT` on `event` fires inside the delete's own transaction, and
-    /// the event's delete sweeps its attendance rows before removing the row, so
-    /// the `SLEEP` lands exactly between the sweep and the commit — the window
-    /// where a bare upsert wrote a mark nothing would ever sweep again.
-    ///
-    /// Real server, and `#[ignore]`d for it: the subject is the store's
-    /// conflict detection, which `init_mem`'s embedded engine does not have —
-    /// it commits both writes and answers `Ok` to each, so this passes there on
-    /// broken code. Mutation-tested: turning the claim back into a read
-    /// (`SELECT VALUE id FROM $ev`) turns it red.
+    /// ([`crate::db::session_attendance::mark`]): the event's delete sweeps its
+    /// attendance rows and removes the row in one transaction, and a mark that
+    /// wrote into the gap was a bare upsert nothing would ever sweep again.
+    /// The mark now writes the event row too (its seats counter), so the two
+    /// transactions touch one row and Postgres refuses one of them; the barrier
+    /// releases both sides together so every interleaving gets its chance.
+    /// Mutation-tested: turning the claim back into a read turns it red.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn a_mark_written_inside_a_delete_never_outlives_the_event() {
-        use crate::domain::event::{EventAudience, EventDescription, EventTitle};
-        let (db, _serialized) = crate::database::init_test_server("event_attendance_race").await;
-        db.query(
-            "DEFINE EVENT hold_the_window ON TABLE event WHEN $event = 'DELETE' \
-             THEN { SLEEP 1s; };",
-        )
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
+        use crate::domain::event::{
+            EventAudience, EventAudienceKind, EventDescription, EventTitle,
+        };
 
+        // A real `app_user` row: markers, students and event creators are
+        // foreign keys now.
+        async fn a_person(db: &Database, label: &str) -> UserId {
+            let user = UserId::generate();
+            sqlx::query(
+                "INSERT INTO app_user (id, username, password_hash, role) \
+                 VALUES ($1, $2, 'x', 'teacher')",
+            )
+            .bind(user.uuid())
+            .bind(format!("{label}-{}", &user.key()[30..]))
+            .execute(db)
+            .await
+            .unwrap();
+            user
+        }
+
+        let (db, _leases) = crate::database::init_test_db().await;
         let allowed: Vec<String> = Settings::defaults().get_attendance_statuses().to_vec();
-        let marker = UserId::from_key("t");
+        let marker = a_person(&db, "marker").await;
         let (mut swept, mut orphans) = (0, 0);
-        for round in 0..4 {
+        for round in 0..8 {
             let event = crate::db::event::create(
                 &db,
                 &marker,
                 EventTitle::try_new("gezi").unwrap(),
                 EventDescription::try_new("").unwrap(),
-                EventAudience::School,
+                EventAudience {
+                    kind: EventAudienceKind::School,
+                    role: None,
+                    course: None,
+                    class: None,
+                    capacity: None,
+                },
                 None,
                 None,
             )
             .await
             .unwrap();
             let id = event.get_id().clone();
+
+            // Delete and mark released together: both write the event row, so
+            // Postgres serializes them and refuses whichever lost.
+            let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
             let drop_it = {
-                let db = db.clone();
-                tokio::spawn(async move { crate::db::event::delete(&db, event).await })
+                let (db, gate, event) = (db.clone(), gate.clone(), event);
+                tokio::spawn(async move {
+                    gate.wait().await;
+                    crate::db::event::delete(&db, event).await
+                })
             };
-            // The mark starts inside the held window: the sweep has run and the
-            // event row is gone but uncommitted.
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             let marked = {
-                let (db, id, marker) = (db.clone(), id.clone(), marker.clone());
-                let student = UserId::from_key(&format!("s{round}"));
+                let (db, id, marker, gate) = (db.clone(), id.clone(), marker.clone(), gate);
+                let student = a_person(&db, "student").await;
                 let status = AttendanceStatus::try_new("present", &allowed).unwrap();
-                tokio::spawn(async move { mark(&db, &id, &student, status, &marker).await })
+                tokio::spawn(async move {
+                    gate.wait().await;
+                    mark(&db, &id, &student, status, &marker).await
+                })
             };
             let (drop_it, marked) = (drop_it.await.unwrap(), marked.await.unwrap());
             assert!(
@@ -202,7 +216,7 @@ mod tests {
                 panic!("round {round}: the delete reported success but the event is still there");
             }
         }
-        eprintln!("Event::delete raced by a mark: {swept}/4 rounds deleted the event");
+        eprintln!("Event::delete raced by a mark: {swept}/8 rounds deleted the event");
         assert!(
             swept > 0,
             "no round ever deleted the event, so the window was never reached"

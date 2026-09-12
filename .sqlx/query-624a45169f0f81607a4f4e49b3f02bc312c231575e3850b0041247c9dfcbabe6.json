@@ -1,0 +1,162 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE bank_question SET\n               subject = $2, text = $3, points = $4, kind = $5,\n               choices = $6, correct = $7, visibility = $8\n           WHERE id = $1\n             AND subject IS NOT DISTINCT FROM $9\n             AND text = $10\n             AND points = $11\n             AND kind = $12\n             AND choices IS NOT DISTINCT FROM $13\n             AND correct IS NOT DISTINCT FROM $14\n             AND visibility = $15\n           RETURNING id AS \"id: BankQuestionId\", owner AS \"owner: UserId\",\n               subject AS \"subject: SubjectId\", text AS \"text: QuestionText\",\n               kind AS \"kind: QuestionKind\", points AS \"points: QuestionPoints\",\n               choices AS \"choices: Json<Vec<Choice>>\",\n               correct AS \"correct: ChoiceId\",\n               source_exam AS \"source_exam: ExamId\",\n               visibility AS \"visibility: BankVisibility\",\n               created_at AS \"created_at: Timestamp\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: BankQuestionId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "bank_question",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "owner: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "bank_question",
+            "name": "owner"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "subject: SubjectId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "bank_question",
+            "name": "subject"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "text: QuestionText",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bank_question",
+            "name": "text"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "kind: QuestionKind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bank_question",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "points: QuestionPoints",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "bank_question",
+            "name": "points"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "choices: Json<Vec<Choice>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "bank_question",
+            "name": "choices"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "correct: ChoiceId",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bank_question",
+            "name": "correct"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "source_exam: ExamId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "bank_question",
+            "name": "source_exam"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "visibility: BankVisibility",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bank_question",
+            "name": "visibility"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "created_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "bank_question",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Int8",
+        "Text",
+        "Jsonb",
+        "Text",
+        "Text",
+        "Uuid",
+        "Text",
+        "Int8",
+        "Text",
+        "Jsonb",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "624a45169f0f81607a4f4e49b3f02bc312c231575e3850b0041247c9dfcbabe6"
+}

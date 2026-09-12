@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT course_note_file.id AS \"id: CourseNoteFileId\" FROM course_note_file\n           WHERE course_note IN (SELECT id FROM course_note WHERE course = $1)",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: CourseNoteFileId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "course_note_file",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "eec74015a9ee20d498f485063c361b2965e7d0f9d8ed734a2fcc0034cd444dcd"
+}

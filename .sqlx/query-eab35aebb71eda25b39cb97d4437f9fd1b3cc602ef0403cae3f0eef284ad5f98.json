@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM class_course WHERE class = $1 AND course = $2 AND source = $3\n                       RETURNING 1 AS \"one\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "one",
+        "type_info": "Int4",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "eab35aebb71eda25b39cb97d4437f9fd1b3cc602ef0403cae3f0eef284ad5f98"
+}

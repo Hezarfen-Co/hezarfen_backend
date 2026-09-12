@@ -1,0 +1,65 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT plan AS \"plan: FeePlanId\", student AS \"student: UserId\", assigned_by AS \"assigned_by: UserId\", created_at AS \"created_at: Timestamp\"\n         FROM fee_plan_assignment WHERE plan = $1 AND student = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "plan: FeePlanId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "fee_plan_assignment",
+            "name": "plan"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "student: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "fee_plan_assignment",
+            "name": "student"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "assigned_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "fee_plan_assignment",
+            "name": "assigned_by"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "created_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "fee_plan_assignment",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "ef779de6680024cd5b7d948eb310fd2b651e86ccd8076998a3b48aedb74280b5"
+}

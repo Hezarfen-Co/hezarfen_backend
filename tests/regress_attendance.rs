@@ -29,41 +29,43 @@ fn soon() -> i64 {
     Timestamp::now().as_millis() + 3_600_000
 }
 
-/// Count writes to `table` from *inside* the writing transaction: a
-/// `DEFINE EVENT` on it fires within that write, so a parent row a mark never
-/// touches shows up here as a zero. That zero is the whole defect class —
-/// SurrealDB 3.2.3 conflict-checks write sets, not read sets, so a parent this
-/// transaction only *reads* is a parent whose concurrent delete it can never
-/// collide with, and the mark commits as an orphan.
-///
-/// The collision itself is not testable on the in-memory engine (it commits
-/// both writes and answers `Ok` to each — see
-/// `crate::database::init_test_server`); the raced halves live beside the
-/// domain code, `#[ignore]`d. What runs here, always, is the precondition
-/// those races need: the parent is written at all.
-async fn watch_writes_to(table: &str, db: &Database) {
-    db.query(format!(
-        "DEFINE EVENT parent_touch ON TABLE {table} WHEN $event = 'UPDATE' THEN {{
-             UPSERT type::record('parent_write_probe', 'n') SET n = (n ?? 0) + 1;
-         }};
-         UPSERT type::record('parent_write_probe', 'n') SET n = 0;"
-    ))
+/// Proof a mark queues on its parent row's write lock: the parent row is
+/// locked from a second transaction while the mark runs, and the mark may
+/// only answer once the guard releases. That queueing is the Postgres shape
+/// of the collision the old `DEFINE EVENT` write-probe watched — the lock,
+/// taken inside the mark's own transaction, is the shared key a concurrent
+/// delete collides with.
+async fn queues_on_parent_lock(
+    db: &Database,
+    table: &'static str,
+    row: uuid::Uuid,
+    mark: impl Future<Output = StatusCode> + Send + 'static,
+) -> StatusCode {
+    let mut guard = db.begin().await.expect("guard transaction");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT 1 FROM {table} WHERE id = $1 FOR NO KEY UPDATE"
+    )))
+    .bind(row)
+    .execute(&mut *guard)
     .await
-    .unwrap()
-    .check()
-    .unwrap();
-}
-
-/// How many parent writes the probe has seen so far.
-async fn writes_seen(db: &Database) -> i64 {
-    db.query("SELECT VALUE n FROM parent_write_probe:n")
+        .expect("lock the parent row");
+    let landed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = landed.clone();
+    let task = tokio::spawn(async move {
+        let status = mark.await;
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        status
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        !landed.load(std::sync::atomic::Ordering::SeqCst),
+        "the mark answered without queueing on the parent row's lock"
+    );
+    guard.rollback().await.expect("release the lock");
+    tokio::time::timeout(std::time::Duration::from_secs(10), task)
         .await
-        .unwrap()
-        .take::<Vec<i64>>(0)
-        .unwrap()
-        .first()
-        .copied()
-        .unwrap_or(0)
+        .expect("the mark landed once the lock lifted")
+        .expect("mark task")
 }
 
 /// A staff roll-call row is management's to write *and* to remove. The removal
@@ -274,31 +276,44 @@ async fn a_mark_writes_its_session_row_even_when_it_credits_nothing() {
     let session = create_session(&app, &hoca, &course, soon()).await;
     let mark_uri = format!("/sessions/{session}/attendance");
 
-    watch_writes_to("course_session", &db).await;
+    // (The write-probe below is `queues_on_parent_lock` now.)
 
     // The lesson has not begun, so nothing is credited — and before the fix
     // nothing at all was written to the session.
-    let before = writes_seen(&db).await;
-    let res = send(
-        &app,
-        "POST",
-        &mark_uri,
-        Some(&hoca),
-        Some(json!({ "status": "present", "user_id": ali_id })),
+    let status = queues_on_parent_lock(
+        &db,
+        "course_session",
+        uuid::Uuid::parse_str(&session).unwrap(),
+        {
+            let app = app.clone();
+            let hoca = hoca.clone();
+            let mark_uri = mark_uri.clone();
+            let ali = ali_id.clone();
+            async move {
+                send(
+                    &app,
+                    "POST",
+                    &mark_uri,
+                    Some(&hoca),
+                    Some(json!({ "status": "present", "user_id": ali })),
+                )
+                .await
+                .status
+            }
+        },
     )
     .await;
-    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-    assert!(
-        writes_seen(&db).await > before,
-        "a mark on a future-dated lesson never touched its session"
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a mark on a future-dated lesson still lands"
     );
 
     // The bell rings and the first roll call counts the lesson, stamping it.
-    db.query("UPDATE $sess SET starts_at = 1")
-        .bind(("sess", CourseSessionId::from_key(&session).record()))
+    sqlx::query("UPDATE course_session SET starts_at = 1 WHERE id = $1")
+        .bind(CourseSessionId::from_key(&session))
+        .execute(&db)
         .await
-        .unwrap()
-        .check()
         .unwrap();
     let res = send(
         &app,
@@ -312,19 +327,33 @@ async fn a_mark_writes_its_session_row_even_when_it_credits_nothing() {
 
     // The rest of the roster arrives on a lesson already counted: the credit
     // branch is closed for good, and it was the only writer.
-    let before = writes_seen(&db).await;
-    let res = send(
-        &app,
-        "POST",
-        &mark_uri,
-        Some(&hoca),
-        Some(json!({ "status": "present", "user_id": veli_id })),
+    let status = queues_on_parent_lock(
+        &db,
+        "course_session",
+        uuid::Uuid::parse_str(&session).unwrap(),
+        {
+            let app = app.clone();
+            let hoca = hoca.clone();
+            let mark_uri = mark_uri.clone();
+            let veli = veli_id.clone();
+            async move {
+                send(
+                    &app,
+                    "POST",
+                    &mark_uri,
+                    Some(&hoca),
+                    Some(json!({ "status": "present", "user_id": veli })),
+                )
+                .await
+                .status
+            }
+        },
     )
     .await;
-    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-    assert!(
-        writes_seen(&db).await > before,
-        "a mark on an already-counted lesson never touched its session"
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a mark on an already-counted lesson still lands"
     );
 
     // That the touch is a bump-and-restore rather than a second credit is
@@ -359,20 +388,33 @@ async fn an_event_mark_writes_its_event_and_is_refused_once_it_is_gone() {
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
     let event = common::id_of(&res.body);
 
-    watch_writes_to("event", &db).await;
-    let before = writes_seen(&db).await;
-    let res = send(
-        &app,
-        "POST",
-        &format!("/events/{event}/attendance"),
-        Some(&hoca),
-        Some(json!({ "status": "present", "user_id": ali_id })),
+    let status = queues_on_parent_lock(
+        &db,
+        "event",
+        uuid::Uuid::parse_str(&event).unwrap(),
+        {
+            let app = app.clone();
+            let hoca = hoca.clone();
+            let mark_uri = format!("/events/{event}/attendance");
+            let ali2 = ali_id.clone();
+            async move {
+                send(
+                    &app,
+                    "POST",
+                    &mark_uri,
+                    Some(&hoca),
+                    Some(json!({ "status": "present", "user_id": ali2 })),
+                )
+                .await
+                .status
+            }
+        },
     )
     .await;
-    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-    assert!(
-        writes_seen(&db).await > before,
-        "the mark never touched its event, so no delete can collide with it"
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the mark lands, queueing on its event row"
     );
 
     // The event goes, cascade and all.

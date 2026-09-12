@@ -152,8 +152,8 @@ async fn room(mut socket: WebSocket, st: AppState, slug: Slug, board: BoardId, u
     // lands between a replay's read and this subscribe would otherwise be lost
     // outright, whereas one delivered twice is deduplicated by its id at the
     // client (which a resync forces anyway).
-    let _connected = room::Connected::open(&st.metrics, "board", slug.as_str(), board.key());
-    let mut feed = st.board_hub.subscribe(&slug, board.key());
+    let _connected = room::Connected::open(&st.metrics, "board", slug.as_str(), &board.key());
+    let mut feed = st.board_hub.subscribe(&slug, &board.key());
     // The ids this socket drew, in the order they were published. The hub has
     // no idea who is listening, so the room filters its own strokes back out
     // here — a client that had to ignore the echo of every mark it just drew
@@ -193,7 +193,7 @@ async fn room(mut socket: WebSocket, st: AppState, slug: Slug, board: BoardId, u
         }
     }
     room::close(&mut socket).await;
-    st.board_hub.leave(&slug, board.key());
+    st.board_hub.leave(&slug, &board.key());
 }
 
 type Step = Result<(), RoomClosed>;
@@ -475,7 +475,7 @@ async fn handle_message(
                     fanned["type"] = json!("stroke");
                     fanned["epoch"] = json!(stroke.get_epoch());
                     mine.push_back(stroke.get_id().key().to_string());
-                    st.board_hub.publish(slug, board.key(), fanned.to_string());
+                    st.board_hub.publish(slug, &board.key(), fanned.to_string());
                     let mut frame = json!({ "type": "saved", "id": stroke.get_id().key() });
                     with_client_seq(&mut frame, client_seq);
                     send(socket, frame).await
@@ -499,7 +499,7 @@ async fn handle_message(
                 Ok(marker) => {
                     st.board_hub.publish(
                         slug,
-                        board.key(),
+                        &board.key(),
                         json!({
                             "type": "cleared",
                             "epoch": marker.get_epoch() + 1,
@@ -518,7 +518,7 @@ async fn handle_message(
                 Ok(_) => {
                     st.board_hub.publish(
                         slug,
-                        board.key(),
+                        &board.key(),
                         json!({ "type": "locked", "locked": locked, "by": user.key() }).to_string(),
                     );
                     Ok(())
@@ -674,7 +674,7 @@ mod tests {
         use crate::domain::board::BoardTitle;
         use crate::domain::user::{Password, Username};
 
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let password = Password::try_new("secret1").unwrap();
         let creator = crate::service::user::create(
             &db,

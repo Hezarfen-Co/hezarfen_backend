@@ -1,45 +1,45 @@
-// `Value` looks unused but is load-bearing: the `SurrealValue` derive on the
-// tagged `EventAudience` enum expands to code that names `Value` unqualified.
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue, Value};
-
-use crate::constant::{EVENT_TABLE, MAX_EVENT_DESCRIPTION_LEN, MAX_EVENT_TITLE_LEN};
+use crate::constant::{MAX_EVENT_DESCRIPTION_LEN, MAX_EVENT_TITLE_LEN};
 use crate::domain::class_group::ClassGroupId;
 use crate::domain::course::CourseId;
-use crate::domain::monotonic_id::next_ulid;
+use crate::domain::monotonic_id::next_uuid;
 use crate::domain::role::Role;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 use crate::validate::{validate_optional, validate_required};
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct EventId(RecordId);
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
+pub struct EventId(uuid::Uuid);
 
 impl EventId {
-    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
-    /// events list `id DESC` (newest first, [`crate::db::event::list_all`]),
+    /// Minted from the process-wide monotonic generator, not a plain random
+    /// UUID: events list `id DESC` (newest first,
+    /// [`crate::db::event::list_all`]),
     /// and a random low half scrambles rows minted in the same millisecond.
     pub fn generate() -> Self {
-        Self(RecordId::new(EVENT_TABLE, next_ulid().to_string()))
+        Self(next_uuid())
     }
 
+    /// The inner uuid, for runtime-checked binds (Param/QueryBuilder) that
+    /// cannot take the newtype. Static `query!` binds take `self` directly.
+    pub fn uuid(&self) -> uuid::Uuid {
+        self.0
+    }
+
+    /// Parses a wire key. A key that is not a UUID parses as the nil UUID,
+    /// which matches no row.
     pub fn from_key(key: &str) -> Self {
-        Self(RecordId::new(EVENT_TABLE, key))
+        Self(uuid::Uuid::parse_str(key).unwrap_or(uuid::Uuid::nil()))
     }
 
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
-        }
+    pub fn key(&self) -> String {
+        self.0.to_string()
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct EventTitle(String);
 
 impl EventTitle {
@@ -53,7 +53,8 @@ impl EventTitle {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct EventDescription(String);
 
 impl EventDescription {
@@ -67,49 +68,102 @@ impl EventDescription {
     }
 }
 
-/// Who an event is aimed at: the expected-attendee roster. Membership is
+/// Which shape of expected-attendee roster the event carries — the `kind`
+/// discriminant of the old tagged value, now a flat column. Membership is
 /// resolved live against today's users/enrollments/registrations — never
 /// snapshotted — so a role change, (un)enrollment, or (un)registration moves
 /// people in and out of rosters by itself. The audience does not gate *seeing*
 /// the event (the calendar stays school-visible); it defines who counts as
 /// expected and who may be marked.
 ///
-/// Stored internally tagged: `{kind: 'school'}`, `{kind: 'role', role: 'student'}`,
-/// `{kind: 'course', course: course:…}`, `{kind: 'class', class: class_group:…}`,
-/// `{kind: 'registration', capacity: 30}`.
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-#[surreal(tag = "kind", rename_all = "lowercase")]
-pub enum EventAudience {
-    /// Everybody — the pre-audience behavior and the backfill for old rows.
+/// The payload lives in the sibling columns: `audience_role` for
+/// [`EventAudienceKind::Role`], `audience_course` for
+/// [`EventAudienceKind::Course`], `audience_class` for
+/// [`EventAudienceKind::Class`], `audience_capacity` for
+/// [`EventAudienceKind::Registration`]. A `School` event carries none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+#[sqlx(type_name = "TEXT", rename_all = "lowercase")]
+pub enum EventAudienceKind {
+    /// Everybody — the pre-audience behavior.
     School,
     /// Every user holding exactly this role ("all students", "all teachers").
-    Role { role: Role },
+    Role,
     /// A course's enrolled students. Staff running the course are not implied
     /// members — a mixed gathering wants a registration or role audience.
-    Course { course: CourseId },
+    Course,
     /// A class section's (şube) students, read live off `class_member` — the
     /// same live resolution `Course` and `Role` get, so adding a student to the
     /// class puts them on every one of its events' rosters at once. The
     /// homeroom teacher is not implied, matching `Course`. A deleted class
     /// leaves the event standing with an empty roster, exactly as a deleted
     /// course does (`Course::delete` never touches `event`).
-    Class { class: ClassGroupId },
+    Class,
     /// A signup list built one person at a time through the register
     /// endpoints — teachers place students, staff take their own seat. The
-    /// list is capped at `capacity` seats when set (`None` = unlimited) and
-    /// closes once the event starts. Rows survive an audience change inertly.
-    Registration { capacity: Option<i64> },
+    /// list is capped at the `audience_capacity` seats when set (`NULL` =
+    /// unlimited) and closes once the event starts. Rows survive an audience
+    /// change inertly.
+    Registration,
 }
 
-#[derive(Debug, Clone, SurrealValue)]
+/// Who an event is aimed at, as one flat row. The five audience columns
+/// (kind + payload) are exactly the `audience_*` columns of the migration;
+/// every write goes through one validated shape, so only the payload matching
+/// `audience_kind` is ever non-NULL.
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Event {
     pub(crate) id: EventId,
     pub(crate) creator: UserId,
     pub(crate) title: EventTitle,
     pub(crate) description: EventDescription,
-    pub(crate) audience: EventAudience,
+    pub(crate) audience_kind: EventAudienceKind,
+    pub(crate) audience_role: Option<Role>,
+    pub(crate) audience_course: Option<CourseId>,
+    pub(crate) audience_class: Option<ClassGroupId>,
+    pub(crate) audience_capacity: Option<i64>,
     pub(crate) starts_at: Option<Timestamp>,
     pub(crate) ends_at: Option<Timestamp>,
+}
+
+impl EventAudienceKind {
+    /// The wire/storage spelling. Must stay in lockstep with `rename_all` —
+    /// the web layer publishes these as the audience `kind`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EventAudienceKind::School => "school",
+            EventAudienceKind::Role => "role",
+
+            EventAudienceKind::Course => "course",
+            EventAudienceKind::Class => "class",
+            EventAudienceKind::Registration => "registration",
+        }
+    }
+}
+
+/// The five audience columns as one value — the write-side bundle. The row
+/// keeps them flat; every write spells them as a unit, so a kind and its
+/// payload always land together and only the payload matching `kind` is
+/// ever non-NULL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventAudience {
+    pub kind: EventAudienceKind,
+    pub role: Option<Role>,
+    pub course: Option<CourseId>,
+    pub class: Option<ClassGroupId>,
+    pub capacity: Option<i64>,
+}
+
+impl EventAudience {
+    /// The audience of a row read back from the store.
+    pub fn of_row(event: &Event) -> Self {
+        Self {
+            kind: event.get_audience_kind(),
+            role: event.get_audience_role(),
+            course: event.get_audience_course().cloned(),
+            class: event.get_audience_class().cloned(),
+            capacity: event.get_audience_capacity(),
+        }
+    }
 }
 
 impl Event {
@@ -129,8 +183,26 @@ impl Event {
         &self.description
     }
 
-    pub fn get_audience(&self) -> &EventAudience {
-        &self.audience
+    /// Which audience shape the event carries; the payload sits in the
+    /// matching sibling column.
+    pub fn get_audience_kind(&self) -> EventAudienceKind {
+        self.audience_kind
+    }
+
+    pub fn get_audience_role(&self) -> Option<Role> {
+        self.audience_role
+    }
+
+    pub fn get_audience_course(&self) -> Option<&CourseId> {
+        self.audience_course.as_ref()
+    }
+
+    pub fn get_audience_class(&self) -> Option<&ClassGroupId> {
+        self.audience_class.as_ref()
+    }
+
+    pub fn get_audience_capacity(&self) -> Option<i64> {
+        self.audience_capacity
     }
 
     pub fn get_starts_at(&self) -> Option<Timestamp> {
@@ -151,12 +223,12 @@ impl Event {
     /// deadline), the moment that end passes (a truly timeless event never
     /// closes). Returns the seat cap for the register path.
     pub fn registration_capacity(&self) -> Result<Option<i64>, AppError> {
-        let EventAudience::Registration { capacity } = &self.audience else {
+        if self.audience_kind != EventAudienceKind::Registration {
             return Err(AppError::Validation(ValidationError::Invalid {
                 field: "audience",
                 reason: "this event does not take registrations",
             }));
-        };
+        }
         // ends_at can't precede starts_at, so when both exist starts_at governs.
         if let Some(closes_at) = self.starts_at.or(self.ends_at)
             && Timestamp::now().as_millis() >= closes_at.as_millis()
@@ -165,7 +237,7 @@ impl Event {
                 "registration closed — the event has started or ended",
             ));
         }
-        Ok(*capacity)
+        Ok(self.audience_capacity)
     }
 }
 
@@ -185,68 +257,35 @@ mod tests {
         assert!(EventDescription::try_new("").is_ok());
     }
 
-    /// The audience stores as an internally tagged object — `{kind: '…', …}`.
-    /// The schema's `audience.kind`/`audience.role`/… field definitions and the
-    /// boot backfill (`{kind: 'school'}`) are written against exactly this
-    /// encoding; guard that it never drifts.
-    #[tokio::test]
-    async fn audience_encodes_internally_tagged_and_round_trips() {
-        use surrealdb::types::Value;
-
-        let cases = [
-            (EventAudience::School, "school"),
-            (
-                EventAudience::Role {
-                    role: Role::Student,
-                },
-                "role",
-            ),
-            (
-                EventAudience::Course {
-                    course: CourseId::from_key("c1"),
-                },
-                "course",
-            ),
-            (
-                EventAudience::Class {
-                    class: ClassGroupId::from_key("g1"),
-                },
-                "class",
-            ),
-            (
-                EventAudience::Registration { capacity: Some(30) },
-                "registration",
-            ),
-            (
-                EventAudience::Registration { capacity: None },
-                "registration",
-            ),
-        ];
-        for (audience, kind) in cases {
-            let value = audience.clone().into_value();
-            let Value::Object(ref object) = value else {
-                panic!("audience must encode as an object, got {value:?}");
-            };
-            assert_eq!(
-                object.get("kind"),
-                Some(&Value::String(kind.to_string())),
-                "tag field must be `kind: '{kind}'`"
-            );
-            assert_eq!(EventAudience::from_value(value).unwrap(), audience);
-        }
+    /// The `audience_kind` column is `TEXT` with a CHECK listing exactly
+    /// these spellings — audience-shaped queries match on them, so the
+    /// storage form may not drift (which `rename_all` mirrors).
+    #[test]
+    fn audience_kind_spellings_are_frozen() {
+        assert_eq!(EventAudienceKind::School.as_str(), "school");
+        assert_eq!(EventAudienceKind::Role.as_str(), "role");
+        assert_eq!(EventAudienceKind::Course.as_str(), "course");
+        assert_eq!(EventAudienceKind::Class.as_str(), "class");
+        assert_eq!(EventAudienceKind::Registration.as_str(), "registration");
     }
 
+    /// The audience columns as a row writer would set them.
     fn event_with(
-        audience: EventAudience,
+        audience_kind: EventAudienceKind,
+        audience_capacity: Option<i64>,
         starts_at: Option<Timestamp>,
         ends_at: Option<Timestamp>,
     ) -> Event {
         Event {
             id: EventId::generate(),
-            creator: UserId::from_key("u1"),
+            creator: UserId::from_key("0198f1a2-3b4c-7d5e-8f90-aa2b3c4d5e6f"),
             title: EventTitle::try_new("signup").unwrap(),
             description: EventDescription::try_new("").unwrap(),
-            audience,
+            audience_kind,
+            audience_role: None,
+            audience_course: None,
+            audience_class: None,
+            audience_capacity,
             starts_at,
             ends_at,
         }
@@ -254,21 +293,20 @@ mod tests {
 
     #[tokio::test]
     async fn registration_capacity_gates_and_echoes_cap() {
-        let open = |capacity| EventAudience::Registration { capacity };
         let past = Some(Timestamp::from_millis(Timestamp::now().as_millis() - 1));
 
         assert!(matches!(
-            event_with(EventAudience::School, None, None).registration_capacity(),
+            event_with(EventAudienceKind::School, None, None, None).registration_capacity(),
             Err(AppError::Validation(_))
         ));
         assert_eq!(
-            event_with(open(None), None, None)
+            event_with(EventAudienceKind::Registration, None, None, None)
                 .registration_capacity()
                 .unwrap(),
             None
         );
         assert_eq!(
-            event_with(open(Some(30)), None, None)
+            event_with(EventAudienceKind::Registration, Some(30), None, None)
                 .registration_capacity()
                 .unwrap(),
             Some(30)
@@ -276,30 +314,13 @@ mod tests {
         // Started events close the list; an ends_at-only deadline in the past
         // does too.
         assert!(matches!(
-            event_with(open(Some(30)), past, None).registration_capacity(),
+            event_with(EventAudienceKind::Registration, Some(30), past, None)
+                .registration_capacity(),
             Err(AppError::Conflict(_))
         ));
         assert!(matches!(
-            event_with(open(None), None, past).registration_capacity(),
+            event_with(EventAudienceKind::Registration, None, None, past).registration_capacity(),
             Err(AppError::Conflict(_))
         ));
-    }
-
-    /// The database strips `NONE`-valued optional columns and the boot
-    /// conversion writes a bare `{kind: 'registration'}` — an object with no
-    /// `capacity` key at all must decode as an uncapped registration.
-    #[tokio::test]
-    async fn registration_audience_decodes_without_capacity_key() {
-        use surrealdb::types::Value;
-
-        let value = EventAudience::Registration { capacity: None }.into_value();
-        let Value::Object(mut object) = value else {
-            panic!("audience must encode as an object, got {value:?}");
-        };
-        object.remove("capacity");
-        assert_eq!(
-            EventAudience::from_value(Value::Object(object)).unwrap(),
-            EventAudience::Registration { capacity: None }
-        );
     }
 }

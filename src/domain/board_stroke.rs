@@ -8,21 +8,18 @@
 //! transaction as the board's own delete.
 //!
 //! The `clear` marker row IS the epoch index: it carries the epoch it closed,
-//! that epoch's final stroke count, who cleared and when — so replaying a whole
-//! session needs no second table and no `GROUP BY` over the history.
+//! that epoch's final stroke count, who cleared and when — so replaying a
+//! whole session needs no second table and no `GROUP BY` over the history.
 //!
-//! Writes funnel through [`crate::db::board_stroke`], and so do the board's
-//! two stroke counters. Nothing else may write either, because two invariants
-//! the schema cannot state depend on it: `count` is populated *only* on a
-//! `clear` row (SCHEMAFULL types both kinds the same), and the two counters
-//! must move together with the row they count (`cap::claim_two_when_and_create`
-//! is what makes that one transaction).
+//! two stroke counters. Nothing else may write either, because the invariant
+//! the schema cannot state depends on it: `count` is populated *only* on a
+//! `clear` row, and the two counters must move together with the row they
+//! count (the stroke claim's dual-counter CTE is what makes that one
+//! transaction).
 
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-
-use crate::constant::{BOARD_STROKE_KINDS, BOARD_STROKE_TABLE};
+use crate::constant::BOARD_STROKE_KINDS;
 use crate::domain::board::Board;
-use crate::domain::monotonic_id::next_ulid;
+use crate::domain::monotonic_id::next_uuid;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 
@@ -30,9 +27,9 @@ use crate::domain::user::UserId;
 pub(crate) const KIND_STROKE: &str = BOARD_STROKE_KINDS[0];
 pub(crate) const KIND_CLEAR: &str = BOARD_STROKE_KINDS[1];
 
-/// The `THROW` the clear transaction refuses with: a blank canvas, not the
+/// The refusal the clear transaction refuses with: a blank canvas, not the
 /// creator, or the board is locked or already closed. A decision, so it
-/// outranks a lost round.
+/// outranks a retryable failure.
 pub(crate) const CLEAR_REFUSED: &str = "board_clear_refused";
 
 /// The public words of every refusal this module raises. `pub` because
@@ -58,30 +55,36 @@ pub const REFUSALS: [&str; 5] = [
     CANVAS_BLANK,
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct BoardStrokeId(RecordId);
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
+pub struct BoardStrokeId(uuid::Uuid);
 
 impl BoardStrokeId {
-    /// Monotonic, not `Ulid::new()`: this id *is* the board's total order, and
-    /// a random low half scrambles every stroke drawn in the same millisecond —
-    /// which is what a burst of drawing looks like.
+    /// Monotonic, not a plain random UUID: this id *is* the board's total
+    /// order, and a random low half scrambles every stroke drawn in the same
+    /// millisecond — which is what a burst of drawing looks like.
     pub fn generate() -> Self {
-        Self(RecordId::new(BOARD_STROKE_TABLE, next_ulid().to_string()))
+        Self(next_uuid())
     }
 
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
+    /// The inner uuid, for runtime-checked binds (Param/QueryBuilder) that
+    /// cannot take the newtype. Static `query!` binds take `self` directly.
+    pub fn uuid(&self) -> uuid::Uuid {
+        self.0
     }
 
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
-        }
+    /// Parses a wire key. A key that is not a UUID parses as the nil UUID,
+    /// which matches no row.
+    pub fn from_key(key: &str) -> Self {
+        Self(uuid::Uuid::parse_str(key).unwrap_or(uuid::Uuid::nil()))
+    }
+
+    pub fn key(&self) -> String {
+        self.0.to_string()
     }
 }
 
-#[derive(Debug, Clone, SurrealValue)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct BoardStroke {
     pub(crate) id: BoardStrokeId,
     pub(crate) board: crate::domain::board::BoardId,

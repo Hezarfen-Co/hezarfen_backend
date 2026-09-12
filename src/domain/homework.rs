@@ -6,51 +6,53 @@
 //! ([`crate::domain::homework_result`]). Persistence lives in
 //! [`crate::db::homework`], workflows in [`crate::service::homework`].
 //!
-//! `course`, `created_by`, and `created_at` are fixed at creation (the schema
-//! marks them `READONLY`): moving a homework between courses would strand the
+//! `course`, `created_by`, and `created_at` are fixed at creation (READONLY
+//! app discipline): moving a homework between courses would strand the
 //! submissions and grades of students not in the target course. `subject` is
-//! deliberately *not* readonly — it is re-taggable through PATCH, validated
+//! deliberately *not* fixed — it is re-taggable through PATCH, validated
 //! same-course by the web layer, exactly like an exam question's subject.
 
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-
-use crate::constant::{HOMEWORK_TABLE, MAX_HOMEWORK_DESCRIPTION_LEN, MAX_HOMEWORK_TITLE_LEN};
+use crate::constant::{MAX_HOMEWORK_DESCRIPTION_LEN, MAX_HOMEWORK_TITLE_LEN};
 use crate::domain::course::CourseId;
-use crate::domain::monotonic_id::next_ulid;
+use crate::domain::monotonic_id::next_uuid;
 use crate::domain::subject::SubjectId;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::ValidationError;
 use crate::validate::{validate_optional, validate_required};
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct HomeworkId(RecordId);
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
+pub struct HomeworkId(uuid::Uuid);
 
 impl HomeworkId {
-    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
-    /// homework lists `id DESC` (newest first, [`Homework::list_all`]),
-    /// and a random low half scrambles rows minted in the same millisecond.
+    /// Minted from the process-wide monotonic generator, not a plain random
+    /// UUID: homework lists `id DESC` (newest first, [`HomeworkId`]-ordered
+    /// listings), and a random low half scrambles rows minted in the same
+    /// millisecond.
     pub fn generate() -> Self {
-        Self(RecordId::new(HOMEWORK_TABLE, next_ulid().to_string()))
+        Self(next_uuid())
     }
 
+    /// The inner uuid, for runtime-checked binds (Param/QueryBuilder) that
+    /// cannot take the newtype. Static `query!` binds take `self` directly.
+    pub fn uuid(&self) -> uuid::Uuid {
+        self.0
+    }
+
+    /// Parses a wire key. A key that is not a UUID parses as the nil UUID,
+    /// which matches no row.
     pub fn from_key(key: &str) -> Self {
-        Self(RecordId::new(HOMEWORK_TABLE, key))
+        Self(uuid::Uuid::parse_str(key).unwrap_or(uuid::Uuid::nil()))
     }
 
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
-        }
+    pub fn key(&self) -> String {
+        self.0.to_string()
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct HomeworkTitle(String);
 
 impl HomeworkTitle {
@@ -64,7 +66,8 @@ impl HomeworkTitle {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct HomeworkDescription(String);
 
 impl HomeworkDescription {
@@ -78,12 +81,12 @@ impl HomeworkDescription {
     }
 }
 
-/// A homework assignment. `assigned` is the optional student subset: `None`
-/// (the column absent) and an empty list both mean "the whole course" — see
+/// A homework assignment. `assigned` is the optional student subset (`uuid[]
+/// NULL`): `NULL` and an empty list both mean "the whole course" — see
 /// [`Homework::student_sees`]. Because whole-course homework carries no roster,
 /// a student who enrolls later is covered automatically; a subset is a fixed
 /// snapshot of the students named at assign (or last PATCH) time.
-#[derive(Debug, Clone, SurrealValue)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Homework {
     pub(crate) id: HomeworkId,
     pub(crate) course: CourseId,
@@ -135,7 +138,7 @@ impl Homework {
     }
 
     /// Whether `user` is in this homework's audience. A whole-course homework
-    /// (`assigned` absent or empty) is visible to every enrolled student; a
+    /// (`assigned` NULL or empty) is visible to every enrolled student; a
     /// subset homework only to the students it names. Callers pair this with an
     /// enrollment check — being named is visibility, not enrollment.
     pub fn student_sees(&self, user: &UserId) -> bool {
@@ -149,6 +152,9 @@ impl Homework {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const A: &str = "0198f1a2-3b4c-7d5e-8f90-aaaa2b3c4d5e";
+    const B: &str = "0198f1a2-3b4c-7d5e-8f90-bbbb3c4d5e6f";
 
     #[tokio::test]
     async fn title_is_required() {
@@ -166,12 +172,12 @@ mod tests {
 
     #[tokio::test]
     async fn student_sees_covers_whole_course_and_named_subsets() {
-        let a = UserId::from_key("01TESTUSERAAAAAAAAAAAAAAAA");
-        let b = UserId::from_key("01TESTUSERBBBBBBBBBBBBBBBB");
+        let a = UserId::from_key(A);
+        let b = UserId::from_key(B);
         let with = |assigned| Homework {
             id: HomeworkId::generate(),
-            course: CourseId::from_key("01TESTCOURSEAAAAAAAAAAAAAA"),
-            subject: SubjectId::from_key("01TESTSUBJECTAAAAAAAAAAAAA"),
+            course: CourseId::from_key("0198f1a2-3b4c-7d5e-8f90-cccc3c4d5e6f"),
+            subject: SubjectId::from_key("0198f1a2-3b4c-7d5e-8f90-dddd4c4d5e6f"),
             title: HomeworkTitle::try_new("hw").unwrap(),
             description: None,
             due_at: Timestamp::from_millis(1),
@@ -179,7 +185,7 @@ mod tests {
             created_by: a.clone(),
             created_at: Timestamp::from_millis(1),
         };
-        // Whole course: absent or empty list means everyone sees it.
+        // Whole course: NULL or empty list means everyone sees it.
         assert!(with(None).student_sees(&a));
         assert!(with(Some(vec![])).student_sees(&b));
         // Subset: only the named students.

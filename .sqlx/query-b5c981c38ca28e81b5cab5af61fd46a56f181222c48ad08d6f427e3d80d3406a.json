@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE appointment_slot SET occupied = GREATEST(occupied - 1, 0) WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b5c981c38ca28e81b5cab5af61fd46a56f181222c48ad08d6f427e3d80d3406a"
+}

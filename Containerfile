@@ -9,6 +9,13 @@ RUN apt-get update && \
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+# sqlx's compile-time macros verify every query against this committed cache,
+# so the build must never reach for a live database.
+ENV SQLX_OFFLINE=true
+COPY .sqlx ./.sqlx
+# The migrators read these at boot/mint (control set on the control pool,
+# school set for the template + every school database).
+COPY migrations ./migrations
 
 # Cache mounts keep the registry and incremental build artifacts between
 # builds. The binary must be copied out of /app/target inside the same RUN,
@@ -28,14 +35,15 @@ RUN apt-get update && \
     mkdir /data && chown hezarfen:hezarfen /data
 
 COPY --from=builder /usr/local/bin/hezarfen_backend /usr/local/bin/hezarfen_backend
+COPY --from=builder /app/migrations /app/migrations
 
 USER hezarfen
 
-# HOST must be 0.0.0.0 so the port mapping can reach the listener. DB_URL
-# points at the SurrealDB server (the compose service); /data holds uploads.
+# HOST must be 0.0.0.0 so the port mapping can reach the listener. DATABASE_URL
+# points at the compose Postgres (the control database); /data holds uploads.
 ENV HOST=0.0.0.0 \
     PORT=8080 \
-    DB_URL=ws://surrealdb:8000
+    DATABASE_URL=postgres://hezarfen:hezarfen@postgres:5432/hezarfen_control
 
 EXPOSE 8080
 

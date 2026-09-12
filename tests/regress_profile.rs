@@ -14,7 +14,7 @@ use axum::Router;
 use axum::http::StatusCode;
 use common::{
     app_and_db, create_course, create_exam_with, create_homework, create_subject, enroll, id_of,
-    items, login, login_as, me_id, send, set_role,
+    items, login, login_as, me_id, send, set_role, ABSENT_ID,
 };
 use hezarfen_backend::constant::{MAX_BIO_LEN, MAX_DISPLAY_NAME_LEN};
 use hezarfen_backend::database::Database;
@@ -347,33 +347,30 @@ async fn a_profile_read_heals_a_missed_badge_then_writes_nothing() {
     let ada = login(&app, "ada").await;
     let ada_id = me_id(&app, &ada).await;
 
-    // Fires inside any write to the award table, so a write this read should
-    // not make cannot hide behind an unchanged-looking response.
-    db.query(
-        "DEFINE EVENT award_write ON badge_award WHEN true THEN {
-             UPSERT type::record('award_write_probe', 'n') SET n = (n ?? 0) + 1;
-         };",
-    )
-    .await
-    .unwrap()
-    .check()
-    .unwrap();
-    let writes = || async {
-        db.query("SELECT VALUE n FROM award_write_probe:n")
+    // The award table watched through its rows: the read must not add, remove
+    // or alter one. (The old engine counted writes with a `DEFINE EVENT`;
+    // Postgres has no triggers to hang that on, and the write the guard
+    // bites on — an insert, or a re-stamp of `earned_at` — always changes
+    // what the rows hold.)
+    let awards = || async {
+        let rows: Vec<(uuid::Uuid, String, Option<i64>)> =
+            sqlx::query_as(
+                "SELECT app_user, badge, earned_at FROM badge_award ORDER BY app_user, badge",
+            )
+            .fetch_all(&db)
             .await
-            .unwrap()
-            .take::<Vec<i64>>(0)
-            .unwrap()
-            .first()
-            .copied()
-            .unwrap_or(0)
+            .unwrap();
+        rows
     };
+    assert!(awards().await.is_empty(), "nothing has been awarded yet");
 
-    db.query("UPDATE type::record('user', $id) SET homework_submitted_total = 10")
-        .bind(("id", ada_id.clone()))
+    // A counter is moved behind the API's back — exactly what a lost
+    // `badge::sync` leaves behind, since every counter writer logs and
+    // swallows that error.
+    sqlx::query("UPDATE app_user SET homework_submitted_total = 10 WHERE id = $1")
+        .bind(hezarfen_backend::domain::user::UserId::from_key(&ada_id))
+        .execute(&db)
         .await
-        .unwrap()
-        .check()
         .unwrap();
 
     let healed = profile(&app, &ada, &ada_id).await;
@@ -391,15 +388,15 @@ async fn a_profile_read_heals_a_missed_badge_then_writes_nothing() {
         healed.body
     );
     assert_eq!(healed.body["stats"]["homework_submitted_total"], 10);
-    let after_heal = writes().await;
-    assert!(after_heal > 0, "the heal wrote the awards");
+    let after_heal = awards().await;
+    assert!(!after_heal.is_empty(), "the heal wrote the awards");
 
     // Steady state: everything earned is already held, so this read must not
     // touch the award table at all.
     let again = profile(&app, &ada, &ada_id).await;
     assert_eq!(again.status, StatusCode::OK, "{}", again.body);
     assert_eq!(again.body["badges"], healed.body["badges"], "same shelf");
-    assert_eq!(writes().await, after_heal, "a profile read wrote something");
+    assert_eq!(awards().await, after_heal, "a profile read wrote something");
 }
 
 /// A fresh account reads a true `0` on every counter — never `null`, never an
@@ -1570,6 +1567,6 @@ async fn an_unknown_user_profile_is_a_404() {
     let (app, db) = app_and_db().await;
     let teacher = login_as(&app, &db, "teach", "teacher").await;
 
-    let gone = profile(&app, &teacher, "01J8XZ0K3Q8G7X2M4N5P6R7S8T").await;
+    let gone = profile(&app, &teacher, ABSENT_ID).await;
     assert_eq!(gone.status, StatusCode::NOT_FOUND, "{}", gone.body);
 }

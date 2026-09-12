@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO meal_ledger\n                     (id, student, kind, amount_minor, source, method, note, recorded_by, created_at)\n                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)\n                 ON CONFLICT (id) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid",
+        "Text",
+        "Int8",
+        "Text",
+        "Text",
+        "Text",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "afee62dfe9b8edf6c606247be8a221b8ba0c25860b167b003d8bb776b5e2126f"
+}

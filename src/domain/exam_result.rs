@@ -1,8 +1,5 @@
 use std::collections::HashMap;
 
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-
-use crate::constant::{EXAM_RESULT_TABLE, KIND_REF_TABLE};
 use crate::domain::exam::ExamId;
 use crate::domain::key;
 use crate::domain::user::UserId;
@@ -16,19 +13,11 @@ pub(crate) fn draft_error() -> AppError {
     AppError::Conflict("this exam is a draft — publish it before grading")
 }
 
-/// The reference counter for one exam kind — how many marks are written under
-/// that name, and whether the school has retired it (see
-/// [`crate::db::cap`]). Keyed by the name itself: the kind is snapshotted
-/// text on the exam, and this row is what makes "a kind nothing is graded under
-/// may be removed" a decision the database takes, not a count a concurrent mark
-/// can invalidate.
-pub(crate) fn kind_ref(kind: &str) -> RecordId {
-    RecordId::new(KIND_REF_TABLE, kind)
-}
-
 /// The refusal a mark meets once its kind has left the school's list. The
 /// mirror of the settings-side 409: whichever of the two writes reaches the
-/// counter first, the other is told the name is no longer usable.
+/// counter row (`kind_ref`) first, the other is told the name is no longer
+/// usable. The ref-row key is the kind's own name — a `TEXT` primary key,
+/// like the settings singleton.
 pub(crate) fn retired_kind_error(kind: &str) -> AppError {
     AppError::ConflictOwned(format!(
         "the '{kind}' exam kind has been removed from the school's settings — \
@@ -36,34 +25,37 @@ pub(crate) fn retired_kind_error(kind: &str) -> AppError {
     ))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct ExamResultId(RecordId);
+/// The identity of one (exam, user, seq) triple — one mark row per sitting,
+/// so grading is a single atomic UPSERT on the composite primary key with no
+/// find-then-insert race. See [`key::sitting`] for the wire shape and why the
+/// first sitting stays bare.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExamResultId {
+    pub(crate) exam: ExamId,
+    pub(crate) user: UserId,
+    pub(crate) seq: i64,
+}
 
 impl ExamResultId {
-    /// A deterministic id for the (exam, user, seq) triple — one mark row per
-    /// sitting, so grading is a single atomic UPSERT with no find-then-insert
-    /// race. See [`key::sitting`] for the key shape and why the first sitting
-    /// stays bare.
     pub fn composite(exam: &ExamId, user: &UserId, seq: i64) -> Self {
-        let key = key::sitting(exam.key(), user.key(), seq);
-        Self(RecordId::new(EXAM_RESULT_TABLE, key))
-    }
-
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
+        Self {
+            exam: exam.clone(),
+            user: user.clone(),
+            seq,
         }
+    }
+
+    /// The underscore-joined wire form (`{exam}_{user}[_{seq}]`).
+    pub fn key(&self) -> String {
+        key::sitting(self.exam.key().as_str(), self.user.key().as_str(), self.seq)
     }
 }
 
-/// A validated exam mark. Stored as an `int`, held to `[MIN_MARK, MAX_MARK]`.
+/// A validated exam mark. Stored as a `BIGINT`, held to
+/// `[MIN_MARK, MAX_MARK]`.
 /// Kept in its own row — an exam result is never a course note.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct Mark(i64);
 
 impl Mark {
@@ -77,10 +69,10 @@ impl Mark {
     }
 }
 
-#[derive(Debug, Clone, SurrealValue)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ExamResult {
-    pub(crate) id: ExamResultId,
     pub(crate) exam: ExamId,
+    #[sqlx(rename = "app_user")]
     pub(crate) user: UserId,
     pub(crate) seq: i64,
     pub(crate) mark: Mark,
@@ -88,8 +80,9 @@ pub struct ExamResult {
 }
 
 impl ExamResult {
-    pub fn get_id(&self) -> &ExamResultId {
-        &self.id
+    /// The row's identity, built back from its primary-key columns.
+    pub fn get_id(&self) -> ExamResultId {
+        ExamResultId::composite(&self.exam, &self.user, self.seq)
     }
 
     pub fn get_exam(&self) -> &ExamId {
@@ -117,14 +110,14 @@ impl ExamResult {
 /// The latest-seq mark per (exam, user) pair, preserving the outer list's
 /// row order (first appearance of each pair). Grade-of-record is the latest
 /// attempt's mark, so a pair with retakes collapses to its highest seq. Done
-/// in Rust rather than SQL: SurrealDB's `GROUP BY` can't return the whole
-/// row that carries the max, and id-order can't stand in for seq-order once
-/// seq reaches two digits.
+/// in Rust rather than SQL: it keeps the outer ordering stable without a
+/// window-function dance, and id order can't stand in for seq order once seq
+/// reaches two digits.
 pub(crate) fn latest_per_pair(rows: Vec<ExamResult>) -> Vec<ExamResult> {
     let mut order: Vec<(String, String)> = Vec::new();
     let mut best: HashMap<(String, String), ExamResult> = HashMap::new();
     for row in rows {
-        let key = (row.exam.key().to_string(), row.user.key().to_string());
+        let key = (row.exam.key(), row.user.key());
         match best.get(&key) {
             Some(existing) if existing.seq >= row.seq => {}
             Some(_) => {
@@ -152,5 +145,35 @@ mod tests {
         assert_eq!(Mark::try_new(100).unwrap().as_i64(), 100);
         assert!(Mark::try_new(-1).is_err());
         assert!(Mark::try_new(101).is_err());
+    }
+
+    /// Grade-of-record: a pair with retakes collapses to its highest seq, and
+    /// the outer list keeps its row order.
+    #[tokio::test]
+    async fn latest_per_pair_keeps_the_highest_seq_in_first_seen_order() {
+        let exam_of = |n: u16| ExamId::from_key(&format!("0198f1a2-0000-7000-8000-{n:012x}"));
+        let user_of = |n: u16| UserId::from_key(&format!("0198f1a2-1111-7000-8000-{n:012x}"));
+        let (exam, user, other) = (exam_of(1), user_of(1), user_of(2));
+        let row = |user: UserId, seq: i64, mark: i64| ExamResult {
+            exam: exam.clone(),
+            user,
+            seq,
+            mark: Mark::try_new(mark).unwrap(),
+            graded_by: user_of(9),
+        };
+
+        let got = latest_per_pair(vec![
+            row(user.clone(), 1, 60),
+            row(other.clone(), 1, 70),
+            row(user.clone(), 2, 85), // retake outranks the seq-1 mark
+            row(other, 3, 40),        // third sitting of the second pair
+        ]);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].get_user(), &user);
+        assert_eq!(got[0].get_seq(), 2);
+        assert_eq!(got[0].get_mark().as_i64(), 85);
+        assert_eq!(got[1].get_user(), &other);
+        assert_eq!(got[1].get_seq(), 3);
+        assert_eq!(got[1].get_mark().as_i64(), 40);
     }
 }

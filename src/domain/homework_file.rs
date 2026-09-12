@@ -1,54 +1,52 @@
 //! A file attached to a homework submission. Like a note file, the row carries
 //! metadata only (original filename, MIME type, byte size) and the bytes live
 //! on disk under [`crate::config::Config::files_path`] — but named by this
-//! row's own `file` field (a fresh server-generated ULID per upload, like a
+//! row's own `file` field (a fresh server-generated UUID per upload, like a
 //! question image), never by user input, so nothing a client sends shapes a
 //! disk path. Files are immutable: created and deleted, never updated, so the
-//! `READONLY` `submission`/`file`/`created_at` columns are only ever set once.
-//! The web layer owns the blob I/O and its ordering (blob before row on
-//! upload, row before blob on delete); the rows are written and read by
-//! [`crate::db::homework_file`], the upload/attach workflow by
-//! [`crate::service::homework_file`].
+//! `submission`/`file`/`created_at` columns are only ever set once (READONLY
+//! app discipline — single writer). The web layer owns the blob I/O and its
+//! ordering (blob before row on upload, row before blob on delete); the rows
+//! are written and read by [`crate::db::homework_file`], the upload/attach
+//! workflow by [`crate::service::homework_file`].
 
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-use ulid::Ulid;
-
-use crate::constant::HOMEWORK_FILE_TABLE;
 use crate::domain::homework_submission::HomeworkSubmissionId;
-use crate::domain::monotonic_id::next_ulid;
+use crate::domain::monotonic_id::next_uuid;
 use crate::domain::note_file::{FileContentType, FileName};
 use crate::domain::timestamp::Timestamp;
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct HomeworkFileId(RecordId);
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
+pub struct HomeworkFileId(uuid::Uuid);
 
 impl HomeworkFileId {
-    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
-    /// a submission's files list `id DESC` (newest first, [`HomeworkFile::list_for_submission`]),
-    /// and a random low half scrambles rows minted in the same millisecond.
+    /// Minted from the process-wide monotonic generator, not a plain random
+    /// UUID: a submission's files list `id DESC` (newest first), and a random
+    /// low half scrambles rows minted in the same millisecond.
     pub fn generate() -> Self {
-        Self(RecordId::new(HOMEWORK_FILE_TABLE, next_ulid().to_string()))
+        Self(next_uuid())
     }
 
+    /// The inner uuid, for runtime-checked binds (Param/QueryBuilder) that
+    /// cannot take the newtype. Static `query!` binds take `self` directly.
+    pub fn uuid(&self) -> uuid::Uuid {
+        self.0
+    }
+
+    /// Parses a wire key. A key that is not a UUID parses as the nil UUID,
+    /// which matches no row.
     pub fn from_key(key: &str) -> Self {
-        Self(RecordId::new(HOMEWORK_FILE_TABLE, key))
+        Self(uuid::Uuid::parse_str(key).unwrap_or(uuid::Uuid::nil()))
     }
 
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
-        }
+    pub fn key(&self) -> String {
+        self.0.to_string()
     }
 }
 
-/// An attachment row. `file` is the blob's on-disk name (a fresh ULID per
+/// An attachment row. `file` is the blob's on-disk name (a fresh UUID per
 /// upload), independent of the row id and reused as the GC key on cascade.
-#[derive(Debug, Clone, SurrealValue)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct HomeworkFile {
     pub(crate) id: HomeworkFileId,
     pub(crate) submission: HomeworkSubmissionId,
@@ -62,7 +60,8 @@ pub struct HomeworkFile {
 impl HomeworkFile {
     /// Assemble a row (fresh blob name generated here) without persisting it.
     /// The caller writes the blob under [`Self::get_file`] first, then calls
-    /// [`Self::insert`] — so a stored row always points at a real blob.
+    /// [`crate::db::homework_file::insert`] — so a stored row always points at
+    /// a real blob.
     pub fn new(
         submission: &HomeworkSubmissionId,
         name: FileName,
@@ -75,7 +74,7 @@ impl HomeworkFile {
             name,
             content_type,
             size,
-            file: Ulid::new().to_string(),
+            file: uuid::Uuid::new_v4().to_string(),
             created_at: Timestamp::now(),
         }
     }
@@ -100,7 +99,7 @@ impl HomeworkFile {
         self.size
     }
 
-    /// The blob's on-disk name — a fresh ULID, so no user input shapes a path.
+    /// The blob's on-disk name — a fresh UUID, so no user input shapes a path.
     pub fn get_file(&self) -> &str {
         &self.file
     }

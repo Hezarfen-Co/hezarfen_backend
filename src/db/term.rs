@@ -4,10 +4,8 @@
 //! stamps. The type and the errors its guards hand out live in
 //! [`crate::domain::term`].
 
-use surrealdb::types::SurrealValue;
-
-use crate::constant::{COURSE_COUNT_FIELD, TERM_CLASS_COUNT_FIELD};
-use crate::database::{Database, write_with_retry};
+use crate::constant::TERM_TABLE;
+use crate::database::Database;
 use crate::db::field_update::FieldUpdate;
 use crate::db::page::PagedList;
 use crate::domain::term::{Term, TermId, TermName};
@@ -27,12 +25,34 @@ pub async fn create(
         ends_at,
         archived_at: None,
     };
-    let created: Option<Term> = db.create(term.id.record()).content(term).await?;
-    created.ok_or_else(|| AppError::Internal("failed to create term".into()))
+    let created = sqlx::query_as!(
+        Term,
+        r#"INSERT INTO term (id, name, starts_at, ends_at, archived_at)
+           VALUES ($1, $2, $3, $4, NULL)
+           RETURNING id AS "id: TermId", name AS "name: TermName",
+                     starts_at AS "starts_at: Timestamp", ends_at AS "ends_at: Timestamp",
+                     archived_at AS "archived_at: Timestamp""#,
+        term.id.uuid(),
+        term.name.as_str(),
+        term.starts_at.as_millis(),
+        term.ends_at.as_millis(),
+    )
+    .fetch_one(db)
+    .await?;
+    Ok(created)
 }
 
 pub async fn read(db: &Database, id: &TermId) -> Result<Option<Term>, AppError> {
-    Ok(db.select(id.record()).await?)
+    let term = sqlx::query_as!(
+        Term,
+        r#"SELECT id AS "id: TermId", name AS "name: TermName",
+                  starts_at AS "starts_at: Timestamp", ends_at AS "ends_at: Timestamp",
+                  archived_at AS "archived_at: Timestamp" FROM term WHERE id = $1"#,
+        id.uuid(),
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(term)
 }
 
 /// Every term, newest first — the school calendar is small by nature.
@@ -42,7 +62,7 @@ pub async fn list_all(
     offset: i64,
 ) -> Result<(Vec<Term>, i64), AppError> {
     PagedList::new("term", "ORDER BY starts_at DESC, id DESC")
-        .run(limit, offset, db)
+        .run::<Term>(limit, offset, db)
         .await
 }
 
@@ -57,10 +77,10 @@ pub async fn update(
     starts_at: Option<Timestamp>,
     ends_at: Option<Timestamp>,
 ) -> Result<Term, AppError> {
-    FieldUpdate::new(term.id.record())
-        .set("name", name)
-        .set("starts_at", starts_at)
-        .set("ends_at", ends_at)
+    FieldUpdate::new(TERM_TABLE, term.id.uuid())
+        .set("name", name.map(|name| name.as_str().to_owned()))
+        .set("starts_at", starts_at.map(|at| at.as_millis()))
+        .set("ends_at", ends_at.map(|at| at.as_millis()))
         .ordered("starts_at", "ends_at", range_error())
         .run::<Term>(db)
         .await
@@ -77,20 +97,19 @@ pub async fn update(
 /// refused itself, with the same 400 the lookup gives). `Err(NotFound)`
 /// keeps the answer a concurrent *delete* used to get.
 ///
-/// Classes ([`crate::domain::class_group::ClassGroup`]) link a term the same
-/// way and count on `class_count` — a column of their own, because
-/// `course_count` is seeded at boot from the course rows alone.
+/// The referencing foreign keys (`course.term`, `class_group.term`, both
+/// `NO ACTION`) are the backstop behind the counters, not a second guard:
+/// while the counts are honest the `WHERE` decides every race on its own,
+/// because both claim paths lock this very row before they write a link.
 pub async fn delete(db: &Database, term: Term) -> Result<bool, AppError> {
-    let sql = format!(
-        "DELETE $term WHERE ({COURSE_COUNT_FIELD} ?? 0) = 0 \
-         AND ({TERM_CLASS_COUNT_FIELD} ?? 0) = 0 RETURN BEFORE"
-    );
-    // Through the retry, because the guard reads the very column a course
-    // create claims: a lost round writes nothing, and re-sending it is what
-    // keeps the answer the 404 or 409 it owes instead of a 500.
-    let gone: Vec<Term> =
-        write_with_retry(db, &sql, &[("term".into(), term.id.record().into_value())]).await?;
-    if !gone.is_empty() {
+    let gone = sqlx::query!(
+        r#"DELETE FROM term
+           WHERE id = $1 AND course_count = 0 AND class_count = 0"#,
+        term.id.uuid(),
+    )
+    .execute(db)
+    .await?;
+    if gone.rows_affected() > 0 {
         return Ok(true);
     }
     // Still linked or already gone: the one statement cannot tell those
@@ -105,44 +124,43 @@ pub async fn delete(db: &Database, term: Term) -> Result<bool, AppError> {
 /// open row, so a repeat archive writes nothing and answers with the
 /// *original* stamp — the year is not re-dated by a double click.
 pub async fn archive(db: &Database, term: Term) -> Result<Term, AppError> {
-    stamp(
-        db,
-        term,
-        "UPDATE $term SET archived_at = $now WHERE archived_at = NONE RETURN AFTER",
-        Some(Timestamp::now()),
+    let written = sqlx::query_as!(
+        Term,
+        r#"UPDATE term SET archived_at = $2
+           WHERE id = $1 AND archived_at IS NULL
+           RETURNING id AS "id: TermId", name AS "name: TermName",
+                     starts_at AS "starts_at: Timestamp", ends_at AS "ends_at: Timestamp",
+                     archived_at AS "archived_at: Timestamp""#,
+        term.id.uuid(),
+        Timestamp::now().as_millis(),
     )
-    .await
+    .fetch_optional(db)
+    .await?;
+    match written {
+        Some(written) => Ok(written),
+        // A repeat archive (or a term deleted under the request): the stored
+        // row is the answer, and only the no-op path pays for the read.
+        None => read(db, &term.id).await?.ok_or(AppError::NotFound),
+    }
 }
 
 /// Re-open the term; idempotent the same way.
 pub async fn unarchive(db: &Database, term: Term) -> Result<Term, AppError> {
-    stamp(
-        db,
-        term,
-        "UPDATE $term SET archived_at = NONE WHERE archived_at != NONE RETURN AFTER",
-        None,
+    let written = sqlx::query_as!(
+        Term,
+        r#"UPDATE term SET archived_at = NULL
+           WHERE id = $1 AND archived_at IS NOT NULL
+           RETURNING id AS "id: TermId", name AS "name: TermName",
+                     starts_at AS "starts_at: Timestamp", ends_at AS "ends_at: Timestamp",
+                     archived_at AS "archived_at: Timestamp""#,
+        term.id.uuid(),
     )
-    .await
-}
-
-/// One conditional write, through [`write_with_retry`] like every other
-/// guarded single statement here; an empty result is the no-op case, and
-/// only that path pays for the read that reports the stored row.
-async fn stamp(
-    db: &Database,
-    term: Term,
-    sql: &str,
-    now: Option<Timestamp>,
-) -> Result<Term, AppError> {
-    let mut bindings = vec![("term".into(), term.id.record().into_value())];
-    if let Some(now) = now {
-        bindings.push(("now".into(), now.as_millis().into_value()));
+    .fetch_optional(db)
+    .await?;
+    match written {
+        Some(written) => Ok(written),
+        None => read(db, &term.id).await?.ok_or(AppError::NotFound),
     }
-    let written: Vec<Term> = write_with_retry(db, sql, &bindings).await?;
-    if let Some(written) = written.into_iter().next() {
-        return Ok(written);
-    }
-    read(db, &term.id).await?.ok_or(AppError::NotFound)
 }
 
 #[cfg(test)]
@@ -155,7 +173,7 @@ mod tests {
     /// refuse it with the same error, having written nothing.
     #[tokio::test]
     async fn a_moved_end_is_refused_against_the_stored_other_end() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let at = Timestamp::from_millis;
         let term = create(&db, TermName::try_new("2026").unwrap(), at(100), at(200))
             .await
@@ -184,7 +202,7 @@ mod tests {
     /// tie-break on identical `starts_at` — stored read-back, then page by page.
     #[tokio::test]
     async fn identical_starts_at_still_pages_each_term_exactly_once() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let at = Timestamp::from_millis;
         let mut minted = Vec::new();
         for i in 0..12 {
@@ -248,11 +266,22 @@ mod tests {
     /// never 500, and a course that got linked survives it. The retry is
     /// measured on [`crate::db::course::delete`].
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn a_delete_racing_a_course_create_never_answers_500() {
         use crate::domain::course::{CourseDescription, CourseKind, CourseTitle};
         use crate::domain::user::UserId;
-        let (db, _serialized) = crate::database::init_test_server("term_delete_race").await;
+        let (db, _leases) = crate::database::init_test_db().await;
+        // The course's teacher is a foreign key now: one real row, reused by
+        // every create in every round.
+        let teacher = UserId::generate();
+        sqlx::query(
+            "INSERT INTO app_user (id, username, password_hash, role) \
+             VALUES ($1, $2, 'x', 'teacher')",
+        )
+        .bind(teacher.uuid())
+        .bind(format!("term-race-{}", &teacher.key()[30..]))
+        .execute(&db)
+        .await
+        .unwrap();
         let (mut delete_500, mut create_500) = (0, 0);
         let (mut linked, mut wiped) = (0, 0);
         let (mut last_delete, mut last_create) = (String::new(), String::new());
@@ -283,7 +312,7 @@ mod tests {
             };
             let makes: Vec<_> = (0..6)
                 .map(|_| {
-                    let (id, db) = (term.get_id().clone(), db.clone());
+                    let (id, db, teacher) = (term.get_id().clone(), db.clone(), teacher.clone());
                     let head_start = if separated {
                         std::time::Duration::from_millis(2)
                     } else {
@@ -293,7 +322,7 @@ mod tests {
                         tokio::time::sleep(head_start).await;
                         crate::db::course::create(
                             &db,
-                            &UserId::from_key("teacher"),
+                            &teacher,
                             CourseTitle::try_new("algebra").unwrap(),
                             CourseDescription::try_new("").unwrap(),
                             CourseKind::course(),

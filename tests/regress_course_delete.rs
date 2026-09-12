@@ -133,15 +133,11 @@ async fn a_course_delete_gives_back_the_kind_references_its_marks_held() {
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
 
     let counted = |db: hezarfen_backend::database::Database| async move {
-        db.query("SELECT VALUE count ?? 0 FROM kind_ref:midterm")
+        sqlx::query_as::<_, (i64,)>("SELECT count FROM kind_ref WHERE name = 'midterm'")
+            .fetch_optional(&db)
             .await
             .expect("kind_ref read")
-            .check()
-            .expect("kind_ref read")
-            .take::<Vec<i64>>(0)
-            .expect("kind_ref count")
-            .first()
-            .copied()
+            .map(|(count,)| count)
             .unwrap_or(0)
     };
     assert_eq!(counted(db.clone()).await, 1, "the mark must be counted");
@@ -177,9 +173,11 @@ async fn a_course_delete_gives_back_the_kind_references_its_marks_held() {
 /// unreachable (every route to an attempt goes through its exam) with the
 /// student's lifetime sitting counter up for good.
 ///
-/// The in-memory engine is enough, as it is next door: this asserts a *lock*,
-/// not the store's conflict detection, and a mutex behaves the same on either
-/// engine.
+/// Postgres hands out the same pairing the lease used to: the sitting's
+/// transaction holds the exam row's write lock across the sleeping trigger, so
+/// the delete cannot even reach its attempt sweep until the sitting has
+/// committed. Mutation-proven: dropping the lease from the cascade turns it
+/// red.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_attempt_started_inside_a_course_delete_never_outlives_it() {
     let (app, db) = app_and_db().await;
@@ -188,15 +186,20 @@ async fn an_attempt_started_inside_a_course_delete_never_outlives_it() {
     let student_id = me_id(&app, &student).await;
 
     // Hold the sitting's own write open for a full second, gates already
-    // passed, so the unenroll and the delete both land inside it.
-    db.query(
-        "DEFINE EVENT hold_the_start ON TABLE exam_attempt WHEN $event = 'CREATE' \
-         THEN { SLEEP 1s; };",
+    // passed, so the unenroll and the delete both land inside it. An AFTER
+    // INSERT trigger sleeping inside the create's own transaction is the
+    // Postgres shape of the old window event.
+    let mut conn = db.acquire().await.expect("acquire for the trigger");
+    sqlx::raw_sql(
+        "CREATE FUNCTION heztest_hold_start() RETURNS trigger AS $$
+         BEGIN PERFORM pg_sleep(1.0); RETURN NULL; END;
+         $$ LANGUAGE plpgsql;
+         CREATE TRIGGER heztest_hold_start AFTER INSERT ON exam_attempt
+         FOR EACH ROW EXECUTE FUNCTION heztest_hold_start();",
     )
+    .execute(&mut *conn)
     .await
-    .expect("define the window event")
-    .check()
-    .expect("check the window event");
+    .expect("define the window trigger");
 
     let course = common::create_course(&app, &teacher, "Kimya").await;
     enroll(&app, &teacher, &course, &student_id).await;

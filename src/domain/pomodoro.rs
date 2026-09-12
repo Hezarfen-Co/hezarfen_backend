@@ -1,46 +1,40 @@
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
+use uuid::Uuid;
 
-use crate::constant::POMODORO_SESSION_TABLE;
-use crate::domain::monotonic_id::next_ulid;
+use crate::domain::monotonic_id::next_uuid;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct PomodoroSessionId(RecordId);
+/// Typed pomodoro-session row id. A UUIDv7 minted by the process-wide
+/// monotonic generator, so `id` order is mint order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
+pub struct PomodoroSessionId(Uuid);
 
 impl PomodoroSessionId {
-    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
-    /// the log sorts `started_at DESC, id DESC` and the id breaks the tie between
-    /// two sessions started at the same instant. The `open_` key below never ties
-    /// with itself (one running session per user), so it needs no ordering.
+    /// Minted from the process-wide monotonic generator, not a random v4:
+    /// the log sorts `started_at DESC, id DESC` and the id breaks the tie
+    /// between two sessions started at the same instant.
     pub fn generate() -> Self {
-        Self(RecordId::new(
-            POMODORO_SESSION_TABLE,
-            next_ulid().to_string(),
-        ))
+        Self(next_uuid())
     }
 
-    /// The deterministic id of `user`'s *running* session. At most one runs
-    /// per user by construction: starting is a single `UPSERT` on this id
-    /// (atomic — a restart replaces the row in place), and finishing
-    /// atomically takes the row and re-files it under a ULID id. `open_`
-    /// cannot collide with a ULID key (ULIDs are bare alphanumerics).
-    pub fn open_for(user: &UserId) -> Self {
-        Self(RecordId::new(
-            POMODORO_SESSION_TABLE,
-            format!("open_{}", user.key()),
-        ))
+    /// The inner uuid, for runtime-checked binds (Param/QueryBuilder) that
+    /// cannot take the newtype. Static `query!` binds take `self` directly.
+    pub fn uuid(&self) -> Uuid {
+        self.0
     }
 
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
+    /// Parse a wire key. A key that parses as no UUID — a malformed path
+    /// segment — reads as the nil id, which matches no row: exactly the 404 a
+    /// dangling record key produced under the old store, without turning a
+    /// typo into a panic.
+    pub fn from_key(key: &str) -> Self {
+        Self(Uuid::parse_str(key).unwrap_or(Uuid::nil()))
     }
 
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
-        }
+    /// The hyphenated wire form.
+    pub fn key(&self) -> String {
+        self.0.to_string()
     }
 }
 
@@ -49,18 +43,27 @@ impl PomodoroSessionId {
 /// client can never supply its own instants, so the recorded focus time is
 /// honest. Breaks are not stored; the frontend owns the work/break rhythm and
 /// the backend records only the focus stint.
-#[derive(Debug, Clone, SurrealValue)]
+///
+/// "At most one running session per student" is no longer carried by a
+/// deterministic key: it is a partial unique index on the table
+/// (`pomodoro_session_open_stint`) over rows whose `finished_at` is NULL, so
+/// the database itself refuses (or restarts) a second running stint.
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct PomodoroSession {
-    id: PomodoroSessionId,
-    user: UserId,
-    started_at: Timestamp,
-    finished_at: Option<Timestamp>,
-    /// The student's own name for what this stint is for ("math", "TYT
+    pub(crate) id: PomodoroSessionId,
+    #[sqlx(rename = "app_user")]
+    pub(crate) user: UserId,
+    pub(crate) started_at: Timestamp,
+    pub(crate) finished_at: Option<Timestamp>,
+    /// The verdict `finish` reached for this stint, stamped at close so a later
+    /// reader never re-derives it against thresholds that have since moved.
+    /// `NULL`: a running stint has no verdict yet, and a stint closed
+    /// before the rule existed carries none and cannot honestly be given one.
+    pub(crate) counted: Option<bool>,
+    /// The student's own name for what the stint is for ("math", "TYT
     /// denemesi") — free text given at start, not a subject reference.
-    /// `None` on an unnamed stint and on any row from before the field
-    /// existed, which reads exactly like an unnamed one.
-    label: Option<String>,
-    counted: Option<bool>,
+    /// `NULL` on an unnamed stint.
+    pub(crate) label: Option<String>,
 }
 
 impl PomodoroSession {
@@ -89,7 +92,7 @@ impl PomodoroSession {
     }
 
     /// What the student called this stint when they started it. `None` when
-    /// they started it unnamed, and on rows that predate the field.
+    /// they started it unnamed.
     pub fn get_label(&self) -> Option<&str> {
         self.label.as_deref()
     }

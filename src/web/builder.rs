@@ -48,7 +48,7 @@ pub fn routes(state: &AppState) -> OpenApiRouter<AppState> {
     // budget, since a school's brute-forcer must not spend the vendor's.
     let rate_limit: &RateLimitConfig = &state.rate_limit;
     let limiter = RateLimiter::per_minute(rate_limit.auth_per_minute, rate_limit.trust_proxy);
-    limiter.share("builder", state.db.clone(), state.db_up.clone());
+    limiter.share("builder", state.db.clone());
     OpenApiRouter::new()
         .routes(routes!(builder_login))
         .route_layer(middleware::from_fn(move |req: Request, next: Next| {

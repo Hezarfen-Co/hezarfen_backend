@@ -73,7 +73,7 @@ struct CreateClass {
     term_id: Option<String>,
     /// The class's homeroom teacher (sınıf öğretmeni) — a teacher, manager or
     /// admin account. Optional; omit (or send `""`) for a class with none.
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "0198f1a2-3b4c-7d5e-8f90-000000000001")]
     teacher_id: Option<String>,
 }
 
@@ -101,20 +101,20 @@ struct UpdateClass {
 #[derive(Deserialize, ToSchema)]
 struct AddMember {
     /// The student to put in the class.
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "0198f1a2-3b4c-7d5e-8f90-000000000001")]
     user_id: String,
 }
 
 #[derive(Deserialize, ToSchema)]
 struct AttachCourse {
     /// The course the whole class takes.
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "0198f1a2-3b4c-7d5e-8f90-000000000001")]
     course_id: String,
 }
 
 #[derive(Serialize, ToSchema)]
 struct ClassResponse {
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "0198f1a2-3b4c-7d5e-8f90-000000000001")]
     id: String,
     /// Who created the class — always a manager or admin, so it is `null` for
     /// a caller below teacher+. `GET /classes/me` and a parent's
@@ -184,7 +184,7 @@ struct CreateClassResponse {
 
 /// Every person a [`ClassResponse`] names: its homeroom teacher, plus its
 /// creator when the caller is cleared to see one. Feed this into `person_map` —
-/// an id the map is missing renders as a bare ULID, so a creator left out here
+/// an id the map is missing renders as a bare id, so a creator left out here
 /// must also be left out of the response.
 fn class_people(class: &ClassGroup, with_creator: bool) -> impl Iterator<Item = UserId> + '_ {
     with_creator
@@ -301,7 +301,7 @@ async fn classes_page(
     db: &Database,
 ) -> Result<Page<ClassResponse>, AppError> {
     let classes = class_group::list_by_ids(db, ids).await?;
-    let by_id: std::collections::HashMap<&str, &ClassGroup> = classes
+    let by_id: std::collections::HashMap<String, &ClassGroup> = classes
         .iter()
         .map(|class| (class.get_id().key(), class))
         .collect();
@@ -314,7 +314,7 @@ async fn classes_page(
     .await?;
     let items = ids
         .iter()
-        .filter_map(|id| by_id.get(id.key()))
+        .filter_map(|id| by_id.get(id.key().as_str()))
         .map(|class| ClassResponse::new(class, &people, with_creator))
         .collect();
     Ok(Page::new(items, total, limit, offset))
@@ -419,7 +419,7 @@ async fn create_class(
 ///
 /// Swallowing that last case is the deliberate one. Every other pump here may
 /// fail its whole request, because the caller can name what it asked for again —
-/// a blueprint's id *is* the grade label they sent. A class's id is a ULID this
+/// a blueprint's id *is* the grade label they sent. A class's id is a uuid this
 /// request is the only place it is ever returned from, so a `500` after the row
 /// is written loses a section that exists. Best-effort therefore runs to the end
 /// of this route: the class is reported, `stocked_from` stays `null`, and the
@@ -1041,14 +1041,14 @@ impl BlueprintResponse {
 
 /// One class a pump did *not* stock, and why. The class is named as well as
 /// identified: a manager reading a skip list has to know which section is short
-/// a course, and a bare ULID is not that.
+/// a course, and a bare id is not that.
 #[derive(Serialize, ToSchema)]
 struct SkipResponse {
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "0198f1a2-3b4c-7d5e-8f90-000000000001")]
     class: String,
     #[schema(example = "9-C")]
     class_name: String,
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "0198f1a2-3b4c-7d5e-8f90-000000000001")]
     course: String,
     /// Why that course could not be attached to that class, as a machine code
     /// the client words itself — the same id-plus-client-label shape roles and
@@ -1118,7 +1118,7 @@ struct BlueprintPumpResponse {
 /// One section measured against its grade's template.
 #[derive(Serialize, ToSchema)]
 struct SectionStatusResponse {
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "0198f1a2-3b4c-7d5e-8f90-000000000001")]
     class: String,
     #[schema(example = "9-C")]
     class_name: String,
@@ -1496,7 +1496,7 @@ mod tests {
         use crate::domain::role::Role;
         use crate::domain::user::{Password, Username};
 
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         assert!(teacher_or_none(None, &db).await.unwrap().is_none());
         assert!(teacher_or_none(Some(""), &db).await.unwrap().is_none());
 
@@ -1521,8 +1521,8 @@ mod tests {
         let teacher = make("ada", Role::Teacher).await;
 
         for (field, id) in [
-            ("gone", "01J8XZ0K3Q8G7X2M4N5P6R7S8T"),
-            ("student", student.get_id().key()),
+            ("gone", "0198f1a2-3b4c-7d5e-8f90-000000000001"),
+            ("student", student.get_id().key().as_str()),
         ] {
             let refused = teacher_or_none(Some(id), &db).await;
             assert!(
@@ -1537,7 +1537,7 @@ mod tests {
             );
         }
         assert_eq!(
-            teacher_or_none(Some(teacher.get_id().key()), &db)
+            teacher_or_none(Some(teacher.get_id().key().as_str()), &db)
                 .await
                 .unwrap()
                 .map(|found| found.get_id().clone()),

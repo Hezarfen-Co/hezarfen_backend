@@ -1,34 +1,32 @@
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-
-use crate::constant::EXAM_ATTEMPT_TABLE;
 use crate::domain::exam::Exam;
 use crate::domain::exam::ExamId;
 use crate::domain::key;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 
-/// A deterministic id for the (exam, user, seq) triple, so sitting `seq`
-/// exists at most once by construction — a concurrent double "start" races
-/// on the same id and exactly one create wins. See [`key::sitting`] for the
-/// key shape and why the first sitting stays bare.
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct ExamAttemptId(RecordId);
+/// The identity of one (exam, user, seq) triple, so sitting `seq` exists at
+/// most once by construction — a concurrent double "start" races on the same
+/// primary key and exactly one insert wins. See [`key::sitting`] for the wire
+/// shape and why the first sitting stays bare.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExamAttemptId {
+    pub(crate) exam: ExamId,
+    pub(crate) user: UserId,
+    pub(crate) seq: i64,
+}
 
 impl ExamAttemptId {
     pub fn composite(exam: &ExamId, user: &UserId, seq: i64) -> Self {
-        let key = key::sitting(exam.key(), user.key(), seq);
-        Self(RecordId::new(EXAM_ATTEMPT_TABLE, key))
-    }
-
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
+        Self {
+            exam: exam.clone(),
+            user: user.clone(),
+            seq,
         }
+    }
+
+    /// The underscore-joined wire form (`{exam}_{user}[_{seq}]`).
+    pub fn key(&self) -> String {
+        key::sitting(self.exam.key().as_str(), self.user.key().as_str(), self.seq)
     }
 }
 
@@ -60,13 +58,13 @@ impl AttemptStatus {
 /// exam allows retakes; `left_at` marks a student who walked out of the exam
 /// room mid-attempt. Grading stays a separate `exam_result` row.
 ///
-/// Fields are crate-visible: [`crate::db::exam_attempt`] reads the id to
-/// target its field-scoped writes and [`crate::service::exam_attempt::start`]
-/// mints the rows on create.
-#[derive(Debug, Clone, SurrealValue)]
+/// Fields are crate-visible: [`crate::db::exam_attempt`] targets its
+/// field-scoped writes by the primary-key triple and
+/// [`crate::service::exam_attempt::start`] mints the rows on create.
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ExamAttempt {
-    pub(crate) id: ExamAttemptId,
     pub(crate) exam: ExamId,
+    #[sqlx(rename = "app_user")]
     pub(crate) user: UserId,
     pub(crate) seq: i64,
     pub(crate) started_at: Timestamp,
@@ -75,8 +73,9 @@ pub struct ExamAttempt {
 }
 
 impl ExamAttempt {
-    pub fn get_id(&self) -> &ExamAttemptId {
-        &self.id
+    /// The row's identity, built back from its primary-key columns.
+    pub fn get_id(&self) -> ExamAttemptId {
+        ExamAttemptId::composite(&self.exam, &self.user, self.seq)
     }
 
     pub fn get_exam(&self) -> &ExamId {

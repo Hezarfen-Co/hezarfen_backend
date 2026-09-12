@@ -68,7 +68,7 @@ async fn note_with_course(id: &str, db: &Database) -> Result<(CourseNote, Course
 
 #[derive(Deserialize, ToSchema)]
 struct CreateCourseNote {
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     course: String,
     #[schema(example = "Chapter 3 recap", max_length = 200)]
     title: String,
@@ -153,7 +153,7 @@ async fn create(
 #[derive(Deserialize, IntoParams)]
 struct CourseFilter {
     /// The course to list notes for (required).
-    #[param(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[param(example = "019732e3-7b00-7000-8000-00000000dead")]
     course: String,
 }
 
@@ -313,7 +313,7 @@ async fn delete_one(
     // pre-read list — an upload that landed in between is in the cascade too.
     let (_, files) = service::course_note::delete(&st.db, note).await?;
     for file in &files {
-        remove_blob(&st.files_path, file.get_id().key()).await;
+        remove_blob(&st.files_path, &file.get_id().key()).await;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -392,7 +392,7 @@ async fn upload_file(
     // Blob first, row second — a stored row always points at a real blob. If
     // the row insert fails, take the fresh blob back out.
     let file = CourseNoteFile::new(note.get_id(), name, content_type, upload.data.len() as i64);
-    let path = blob_path(&st.files_path, file.get_id().key());
+    let path = blob_path(&st.files_path, &file.get_id().key());
     crate::web::ensure_files_dir(&st.files_path).await?;
     tokio::fs::write(&path, &upload.data)
         .await
@@ -484,7 +484,7 @@ async fn download_file(
     )
     .await?
     .ok_or(AppError::NotFound)?;
-    let bytes = tokio::fs::read(blob_path(&st.files_path, file.get_id().key()))
+    let bytes = tokio::fs::read(blob_path(&st.files_path, &file.get_id().key()))
         .await
         .map_err(|err| {
             // The row exists but its blob doesn't — that's server-side damage
@@ -553,7 +553,7 @@ async fn delete_file(
     // blob; the re-index rebuilds from what is left, if a service is connected.
     service::rag_output::delete_with_source(&st.db, file.get_id()).await?;
     let file = service::course_note_file::delete(&st.db, file).await?;
-    remove_blob(&st.files_path, file.get_id().key()).await;
+    remove_blob(&st.files_path, &file.get_id().key()).await;
     spawn_index(&st, &tenant, note);
     Ok(StatusCode::NO_CONTENT)
 }

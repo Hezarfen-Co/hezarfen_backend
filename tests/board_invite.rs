@@ -13,7 +13,7 @@
 mod common;
 
 use axum::http::StatusCode;
-use common::{Res, app_and_db, create_course, enroll, login, login_as, me_id, send};
+use common::{ABSENT_ID, Res, app_and_db, create_course, enroll, login, login_as, me_id, send};
 use hezarfen_backend::constant::MAX_BOARD_PARTICIPANTS;
 use hezarfen_backend::domain::board::BoardId;
 use hezarfen_backend::domain::user::UserId;
@@ -281,13 +281,20 @@ async fn a_deleted_user_in_a_source_is_dropped() {
     enroll(&app, &teacher, &course, &ghost_id).await;
 
     // The row goes without the cascade a real DELETE runs, which is exactly the
-    // state a stale enrollment leaves behind.
-    db.query("DELETE type::record('user', $key)")
-        .bind(("key", ghost_id.clone()))
+    // state a stale enrollment leaves behind. Real FKs refuse that state, so
+    // the delete is forced the one way Postgres allows: FK triggers suspended
+    // for the one statement (`hezarfen` owns the cluster, so it may).
+    let mut tx = db.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
         .await
-        .unwrap()
-        .check()
         .unwrap();
+    sqlx::query("DELETE FROM app_user WHERE id = $1")
+        .bind(UserId::from_key(&ghost_id))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
 
     let board = a_board(&app, &teacher).await;
     let res = invite(
@@ -324,14 +331,13 @@ async fn an_over_cap_invite_is_refused_whole_and_changes_nothing() {
     // The ids need not resolve — the roster is only repaired at boot, and the
     // guard under test counts entries.
     let full: Vec<_> = (0..MAX_BOARD_PARTICIPANTS)
-        .map(|n| UserId::from_key(&format!("filler{n}")).record())
+        .map(|_| UserId::generate())
         .collect();
-    db.query("UPDATE $b SET participants = $who")
-        .bind(("b", BoardId::from_key(&board).record()))
-        .bind(("who", full))
+    sqlx::query("UPDATE board SET participants = $1 WHERE id = $2")
+        .bind(&full)
+        .bind(BoardId::from_key(&board))
+        .execute(&db)
         .await
-        .unwrap()
-        .check()
         .unwrap();
     let before = roster(&app, &teacher, &board).await;
     assert_eq!(before.len(), MAX_BOARD_PARTICIPANTS);
@@ -488,15 +494,15 @@ async fn an_unknown_source_is_a_400_and_not_the_boards_404() {
 
     for (source, field) in [
         (
-            json!({"kind": "class", "class": "01J8XZ0K3Q8G7X2M4N5P6R7S8T"}),
+            json!({"kind": "class", "class": ABSENT_ID}),
             "class",
         ),
         (
-            json!({"kind": "course", "course": "01J8XZ0K3Q8G7X2M4N5P6R7S8T"}),
+            json!({"kind": "course", "course": ABSENT_ID}),
             "course",
         ),
         (
-            json!({"kind": "event", "event": "01J8XZ0K3Q8G7X2M4N5P6R7S8T"}),
+            json!({"kind": "event", "event": ABSENT_ID}),
             "event",
         ),
     ] {

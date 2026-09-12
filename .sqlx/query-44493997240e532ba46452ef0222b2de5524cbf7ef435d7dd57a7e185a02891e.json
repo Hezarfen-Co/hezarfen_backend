@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT course AS \"course: uuid::Uuid\", app_user AS \"app_user: uuid::Uuid\"\n               FROM enrollment WHERE course = $1 AND source = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "course: uuid::Uuid",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "enrollment",
+            "name": "course"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "app_user: uuid::Uuid",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "enrollment",
+            "name": "app_user"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "44493997240e532ba46452ef0222b2de5524cbf7ef435d7dd57a7e185a02891e"
+}

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM homework_result WHERE homework = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d2b6aeb4e3926ea61b0ac68f0f118c9fd8508cccfdaa431f9195b07f5f870640"
+}

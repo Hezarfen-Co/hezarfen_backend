@@ -9,90 +9,65 @@
 //!
 //! The *cross-record* invariants live one layer down:
 //!
-//! - **One live booking per slot** — the `occupied` counter on the slot row, a
-//!   [`cap`](crate::db::cap) of one. [`crate::service::appointment::book`]
-//!   claims it *with* the booking row
-//!   ([`cap::claim_and_create`](crate::db::cap::claim_and_create)); rejecting
-//!   or cancelling gives it back in the *same transaction* as the status flip
+//! - **One live booking per slot** — the `occupied` counter on the slot row,
+//!   a [`cap`](crate::db::cap) of one. [`crate::service::appointment::book`]
+//!   claims it *with* the booking row; rejecting or cancelling gives it back
+//!   in the *same transaction* as the status flip
 //!   ([`crate::db::appointment::save_if_unchanged`]), so the slot frees itself
-//!   with nothing to sweep. Both are single-record conditional writes, so the
-//!   store decides it, not a lock.
-//! - **No double-booked person.** An approved meeting may not overlap another
-//!   approved meeting of the same teacher *or* of the same requester. That is a
-//!   count-then-write over *many* rows, which a `BEGIN…COMMIT` does not
-//!   serialize in SurrealDB (write-skew), so booking and approval hold
-//!   [`crate::service::appointment::APPOINTMENT_LOCK`], which is the whole
-//!   guarantee behind it.
+//!   with nothing to sweep.
+//! - **No double-booked teacher window.** Two overlapping published windows
+//!   cannot both exist — the `appointment_slot` exclusion constraint refuses
+//!   the second insert at the store, which is what replaced the process
+//!   lock the appointment workflows used to hold.
 //!
 //! The *single-row* invariant — a decision must be written onto the state it
-//! was validated against — is **not** the lock's job, and never was: a
-//! whole-row save built on a snapshot read before the lock was taken would
-//! silently drop whatever landed in between. That one is a compare-and-set
-//! ([`crate::db::appointment::save_if_unchanged`]), decided by the store.
-//!
-//! Overlap therefore rests on the lock alone — it is a predicate over *other*
-//! rows, with no single row to key a counter or a CAS on. That holds while
-//! every approving write takes the lock; one that skips it puts two
-//! meetings in one half-hour, so the rule is stated at the lock rather than
-//! left to be noticed. The damage if it ever happens is one double-booked
-//! half-hour, visible to both parties and fixable by cancelling either
-//! side — no money, no grade, no data loss.
+//! was validated against — is a compare-and-set
+//! ([`crate::db::appointment::save_if_unchanged`]), decided by a conditional
+//! `UPDATE`.
 
-use std::sync::LazyLock;
-
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-use ulid::Generator;
-
-use crate::constant::{APPOINTMENT_TABLE, MAX_APPOINTMENT_REASON_LEN};
+use crate::constant::{MAX_APPOINTMENT_REASON_LEN};
 use crate::domain::appointment_slot::{AppointmentSlot, AppointmentSlotId};
+use crate::domain::monotonic_id::next_uuid;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::ValidationError;
 use crate::validate::validate_required;
 
-/// Mints booking ids in write order — `Ulid::new()`'s random low bits sort
-/// arbitrarily within one millisecond, which would scramble the `id` tie-break
-/// of the newest-first listings ([`crate::db::appointment::list_for_requester`]).
-static IDS: LazyLock<std::sync::Mutex<Generator>> =
-    LazyLock::new(|| std::sync::Mutex::new(Generator::new()));
-
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct AppointmentId(RecordId);
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
+pub struct AppointmentId(uuid::Uuid);
 
 impl AppointmentId {
+    /// Mints in write order — the `id` tie-break of the newest-first listings
+    /// ([`crate::db::appointment::list_for_requester`]) must not scramble rows
+    /// minted inside one millisecond.
     pub fn generate() -> Self {
-        let mut ids = IDS.lock().expect("appointment id generator poisoned");
-        // The only error is exhausting the random bits within one millisecond
-        // (2^80 ids deep); it clears itself as the clock ticks, so retry.
-        let ulid = loop {
-            if let Ok(ulid) = ids.generate() {
-                break ulid;
-            }
-        };
-        Self(RecordId::new(APPOINTMENT_TABLE, ulid.to_string()))
+        Self(next_uuid())
     }
 
+    /// The inner uuid, for runtime-checked binds (Param/QueryBuilder) that
+    /// cannot take the newtype. Static `query!` binds take `self` directly.
+    pub fn uuid(&self) -> uuid::Uuid {
+        self.0
+    }
+
+    /// Parses a wire key. A key that is not a UUID parses as the nil UUID,
+    /// which matches no row — a malformed path param stays a 404, exactly
+    /// like a well-formed one that names nothing.
     pub fn from_key(key: &str) -> Self {
-        Self(RecordId::new(APPOINTMENT_TABLE, key))
+        Self(uuid::Uuid::parse_str(key).unwrap_or(uuid::Uuid::nil()))
     }
 
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
-        }
+    pub fn key(&self) -> String {
+        self.0.to_string()
     }
 }
 
-/// Where a booking stands. `untagged` + `rename_all` store it as the bare
-/// lowercase string the `status` column types as; an unknown value comes back
-/// as a deserialization error, never a panic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, SurrealValue)]
-#[surreal(untagged, rename_all = "lowercase")]
+/// Where a booking stands. Stored as the bare lowercase string the `status`
+/// column's CHECK allows; an unknown value comes back as a decode error,
+/// never a panic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+#[sqlx(type_name = "TEXT", rename_all = "lowercase")]
 pub enum AppointmentStatus {
     Pending,
     Approved,
@@ -123,7 +98,8 @@ impl AppointmentStatus {
 
 /// Why the requester wants the meeting. Required: a teacher approving a
 /// parent-teacher conference needs to know what it is about.
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct AppointmentReason(String);
 
 impl AppointmentReason {
@@ -140,10 +116,15 @@ impl AppointmentReason {
 /// Fields are crate-visible: [`crate::db::appointment`] reads the columns its
 /// compare-and-set discriminates on, and [`crate::service::appointment`]
 /// clones a fresh read and mutates the decision onto it.
-#[derive(Debug, Clone, SurrealValue)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Appointment {
     pub(crate) id: AppointmentId,
-    pub(crate) slot: AppointmentSlotId,
+    /// The booked slot. `NULL` only on a settled row whose slot was later
+    /// withdrawn (a demotion sweep or a delete after the seat came back):
+    /// the booking still renders, without a window — the dangling reference
+    /// the old store permitted, now an explicit NULL. A live booking's slot
+    /// is pinned by the `occupied` counter and can never be NULL.
+    pub(crate) slot: Option<AppointmentSlotId>,
     pub(crate) requester: UserId,
     pub(crate) status: AppointmentStatus,
     pub(crate) reason: AppointmentReason,
@@ -154,15 +135,10 @@ pub struct Appointment {
     pub(crate) proposed_ends_at: Option<Timestamp>,
     pub(crate) proposed_by: Option<UserId>,
     pub(crate) decided_by: Option<UserId>,
-    /// Who called the meeting off, and why, once it is `cancelled`. Both
-    /// `#[surreal(default)]` so bookings written before cancellation records
-    /// existed still read back (they resolve to `None`).
-    #[surreal(default)]
+    /// Who called the meeting off, and why, once it is `cancelled`.
     pub(crate) cancelled_by: Option<UserId>,
-    #[surreal(default)]
     pub(crate) cancel_reason: Option<AppointmentReason>,
     /// Why the request was turned down; the rejecter is already on `decided_by`.
-    #[surreal(default)]
     pub(crate) reject_reason: Option<AppointmentReason>,
     pub(crate) created_at: Timestamp,
 }
@@ -172,8 +148,8 @@ impl Appointment {
         &self.id
     }
 
-    pub fn get_slot(&self) -> &AppointmentSlotId {
-        &self.slot
+    pub fn get_slot(&self) -> Option<&AppointmentSlotId> {
+        self.slot.as_ref()
     }
 
     pub fn get_requester(&self) -> &UserId {
@@ -259,7 +235,6 @@ impl Appointment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use surrealdb::types::Value;
 
     fn at(millis: i64) -> Timestamp {
         Timestamp::from_millis(millis)
@@ -273,22 +248,19 @@ mod tests {
         assert!(AppointmentReason::try_new(&"x".repeat(MAX_APPOINTMENT_REASON_LEN + 1)).is_err());
     }
 
-    /// The `status` column is `TYPE string`: an object-wrapped enum would be
-    /// rejected on write, and the `status IN ['pending','approved']` occupancy
-    /// query is written against exactly these spellings.
-    #[tokio::test]
-    async fn status_stores_as_a_bare_string() {
-        for status in [
-            AppointmentStatus::Pending,
-            AppointmentStatus::Approved,
-            AppointmentStatus::Rejected,
-            AppointmentStatus::Cancelled,
+    /// The `status` column is `TEXT` with a CHECK listing exactly these
+    /// spellings: the occupancy query is written against them, so the storage
+    /// form may not drift from `as_str`.
+    #[test]
+    fn status_stores_as_a_bare_string() {
+        for (status, spelling) in [
+            (AppointmentStatus::Pending, "pending"),
+            (AppointmentStatus::Approved, "approved"),
+            (AppointmentStatus::Rejected, "rejected"),
+            (AppointmentStatus::Cancelled, "cancelled"),
         ] {
-            let value = status.into_value();
-            assert_eq!(value, Value::String(status.as_str().to_string()));
-            assert_eq!(AppointmentStatus::from_value(value).unwrap(), status);
+            assert_eq!(status.as_str(), spelling);
         }
-        assert!(AppointmentStatus::from_value(Value::String("declined".into())).is_err());
         assert!(AppointmentStatus::Pending.is_live());
         assert!(AppointmentStatus::Approved.is_live());
         assert!(!AppointmentStatus::Rejected.is_live());

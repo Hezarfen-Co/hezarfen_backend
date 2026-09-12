@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH shared AS (\n               SELECT from_bank AS t FROM exam_question\n               WHERE exam = ANY($1) AND from_bank IS NOT NULL\n               UNION\n               SELECT banked_as FROM exam_question\n               WHERE exam = ANY($1) AND banked_as IS NOT NULL)\n           SELECT q.id AS \"id: ExamQuestionId\" FROM exam_question q\n           WHERE q.exam = $2\n             AND (q.from_bank IN (SELECT t FROM shared)\n                  OR q.banked_as IN (SELECT t FROM shared))",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: ExamQuestionId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "exam_question",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "2ffc75c5e4eb904901b8d1c981eeae15b25690d5798f54fc85daf483e5955f22"
+}

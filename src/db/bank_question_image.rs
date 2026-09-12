@@ -1,105 +1,72 @@
-//! The `bank_question_image` slot table: the per-slot upsert that pins the
-//! template's existence into its own transaction, the page-wide listing, and
-//! the choice sweep a non-destructive PATCH runs. Blob I/O stays in the web
-//! layer; the pure entity and newtypes in
+//! The `bank_question_image` slot table: the per-slot upsert, the page-wide
+//! listing, and the choice sweep a non-destructive PATCH runs. Blob I/O
+//! stays in the web layer; the pure entity and newtypes in
 //! [`crate::domain::bank_question_image`].
 
-use surrealdb::types::{RecordId, SurrealValue};
-
-use crate::database::{Database, transaction_with_retry};
+use crate::database::{Database, foreign_key_violation, tx_with_retry};
 use crate::domain::bank_question::BankQuestionId;
-use crate::domain::bank_question_image::{BankQuestionImage, BankQuestionImageId};
+use crate::domain::bank_question_image::BankQuestionImage;
 use crate::domain::exam_question::ChoiceId;
+use crate::domain::note_file::FileContentType;
 use crate::error::AppError;
 
-/// What one [`upsert`] transaction returns: the row it
-/// stored and the blob name it replaced. Both are arrays because SurrealDB
-/// drops an object key valued `NONE` on the way out, while an empty array
-/// survives — "nothing was replaced" has to be readable, not missing.
-#[derive(SurrealValue)]
-struct UpsertOutcome {
-    stored: Vec<BankQuestionImage>,
-    replaced: Vec<String>,
-}
-
-/// Create or replace the slot's image row — the deterministic id makes this
-/// the whole "one image per slot" story — handing back what it stored plus
-/// the blob name it replaced, for the caller to take off disk.
+/// Create or replace the slot's image row — the table's `NULLS NOT DISTINCT`
+/// unique key makes this the whole "one image per slot" story — handing back
+/// what it stored plus the blob name it replaced, for the caller to take off
+/// disk.
 ///
-/// Both halves are the transaction's doing. The template's own `points` is
-/// moved and put straight back inside it, the way
-/// [`crate::db::pool_question::bump_question_and_write`] moves
-/// `asked_at` (`created_at` is `READONLY`, so the move goes on the one other
-/// int column): that makes the template's *existence* part of this write.
-/// A bare `UPSERT` guarded by having read the template first does not
-/// survive its delete window — the read sees a row
-/// [`crate::db::bank_question::delete`] has removed but
-/// not committed, while that delete's image sweep ran on a snapshot
-/// predating this row, so both commit and the image outlives the template
-/// it hangs on. Nothing could ever read, delete, or sweep it afterwards:
-/// every image route goes through the template. Moving the value makes the
-/// two transactions touch one key, so the store refuses a side; writing the
-/// same value back would be elided and collide with nothing.
+/// Both halves are the transaction's doing, and the row lock makes them one
+/// switch: two uploads racing on one slot serialize on the `FOR UPDATE`, and
+/// the loser's `ON CONFLICT` re-reads the winner's row, where two unlocked
+/// pre-reads would both have seen the *old* blob name and left the loser's
+/// fresh one orphaned on disk.
 ///
-/// The replaced blob name comes out of this same transaction rather than a
-/// read in front of it (the shape
-/// [`crate::db::pool_question::set_image`] has): two
-/// uploads to one slot both write this row, so they contend and the loser
-/// re-reads the winner's blob name, where two pre-reads both saw the *old*
-/// blob and left the loser's fresh one orphaned on disk.
-///
-/// Admissible for [`transaction_with_retry`]: the `UPSERT`'s id is
-/// deterministic per (question, slot) and the table carries no `UNIQUE`
-/// index, so the write always resolves onto the row its id names and can
-/// never answer "already exists".
+/// The template's existence rides the real foreign key: an insert whose
+/// template was deleted mid-flight answers 23503 and maps to the same 404
+/// the old points-move transaction produced with its `THROW`. Nothing is
+/// written either way.
 pub async fn upsert(
     db: &Database,
     image: BankQuestionImage,
 ) -> Result<(BankQuestionImage, Option<String>), AppError> {
-    // whole-row-save-ok: self is built in place, never read back, and the slot id is deterministic
-    let (question, id) = (image.bank_question.record(), image.id.record());
-    let (mut result, mut errors) = transaction_with_retry(
-        db,
-        "BEGIN TRANSACTION;
-         LET $was_points = (SELECT VALUE points FROM ONLY $b);
-         LET $bumped = (UPDATE $b SET points = points + 1 RETURN VALUE id);
-         IF array::len($bumped) = 0 { THROW 'no_question' };
-         UPDATE $b SET points = $was_points;
-         LET $replaced = (SELECT VALUE file FROM $id);
-         LET $stored = (UPSERT $id CONTENT $image);
-         RETURN { stored: $stored, replaced: $replaced };
-         COMMIT TRANSACTION;",
-        &[
-            ("b".into(), question.into_value()),
-            ("id".into(), id.into_value()),
-            ("image".into(), image.into_value()),
-        ],
-        &["no_question"],
-    )
-    .await?;
-    // An aborted transaction errors *every* slot, most with a generic "not
-    // executed" — only the THROW's own slot names the reason.
-    if errors
-        .values()
-        .any(|error| error.to_string().contains("no_question"))
-    {
-        return Err(AppError::NotFound);
-    }
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    // The trailing `RETURN` is the last statement before `COMMIT`, so its
-    // slot follows the statement count rather than a hand-kept number;
-    // `num_statements` counts BEGIN and COMMIT.
-    let slot = result.num_statements().saturating_sub(2);
-    let failed = || AppError::Internal("failed to store bank question image".into());
-    let outcome = result
-        .take::<Vec<UpsertOutcome>>(slot)?
-        .into_iter()
-        .next()
-        .ok_or_else(failed)?;
-    let stored = outcome.stored.into_iter().next().ok_or_else(failed)?;
-    Ok((stored, outcome.replaced.into_iter().next()))
+    tx_with_retry(db, false, async move |tx| {
+        let was = sqlx::query!(
+            r#"SELECT file FROM bank_question_image
+               WHERE bank_question = $1 AND slot IS NOT DISTINCT FROM $2
+               FOR UPDATE"#,
+            image.bank_question.uuid(),
+            image.slot.as_ref().map(ChoiceId::as_str),
+        )
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(|row| row.file);
+        let stored = match sqlx::query_as!(
+            BankQuestionImage,
+            r#"INSERT INTO bank_question_image
+                   (bank_question, slot, file, content_type, size)
+               VALUES ($1, $2, $3, $4, $5)
+               ON CONFLICT (bank_question, slot) DO UPDATE
+               SET file = $3, content_type = $4, size = $5
+               RETURNING bank_question AS "bank_question: BankQuestionId",
+                   slot AS "slot: ChoiceId", file,
+                   content_type AS "content_type: FileContentType", size"#,
+            image.bank_question.uuid(),
+            image.slot.as_ref().map(ChoiceId::as_str),
+            image.file.clone(),
+            image.content_type.as_str(),
+            image.size,
+        )
+        .fetch_one(&mut *tx)
+        .await
+        {
+            Ok(row) => row,
+            // The template row is gone; no orphan image may outlive it.
+            Err(err) if foreign_key_violation(&err) => return Err(AppError::NotFound),
+            Err(err) => return Err(err.into()),
+        };
+        Ok((stored, was))
+    })
+    .await
 }
 
 pub async fn read_slot(
@@ -107,21 +74,36 @@ pub async fn read_slot(
     question: &BankQuestionId,
     slot: Option<&ChoiceId>,
 ) -> Result<Option<BankQuestionImage>, AppError> {
-    Ok(db
-        .select(BankQuestionImageId::for_slot(question, slot).record())
-        .await?)
+    let row = sqlx::query_as!(
+        BankQuestionImage,
+        r#"SELECT bank_question AS "bank_question: BankQuestionId",
+               slot AS "slot: ChoiceId", file,
+               content_type AS "content_type: FileContentType", size
+           FROM bank_question_image
+           WHERE bank_question = $1 AND slot IS NOT DISTINCT FROM $2"#,
+        question.uuid(),
+        slot.map(ChoiceId::as_str),
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(row)
 }
 
 pub async fn list_for_question(
     db: &Database,
     question: &BankQuestionId,
 ) -> Result<Vec<BankQuestionImage>, AppError> {
-    let mut result = db
-        .query("SELECT * FROM bank_question_image WHERE bank_question = $b")
-        .bind(("b", question.record()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<BankQuestionImage>>(0)?)
+    let rows = sqlx::query_as!(
+        BankQuestionImage,
+        r#"SELECT bank_question AS "bank_question: BankQuestionId",
+               slot AS "slot: ChoiceId", file,
+               content_type AS "content_type: FileContentType", size
+           FROM bank_question_image WHERE bank_question = $1"#,
+        question.uuid()
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows)
 }
 
 /// The image rows of several templates in one query — for bucketing onto a
@@ -133,13 +115,18 @@ pub async fn list_for_questions(
     if questions.is_empty() {
         return Ok(Vec::new());
     }
-    let records: Vec<RecordId> = questions.iter().map(|q| q.record()).collect();
-    let mut result = db
-        .query("SELECT * FROM bank_question_image WHERE bank_question IN $ids")
-        .bind(("ids", records))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<BankQuestionImage>>(0)?)
+    let ids: Vec<uuid::Uuid> = questions.iter().map(|q| q.uuid()).collect();
+    let rows = sqlx::query_as!(
+        BankQuestionImage,
+        r#"SELECT bank_question AS "bank_question: BankQuestionId",
+               slot AS "slot: ChoiceId", file,
+               content_type AS "content_type: FileContentType", size
+           FROM bank_question_image WHERE bank_question = ANY($1)"#,
+        &ids
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows)
 }
 
 /// Drop the option pictures whose choice is gone — every choice image of
@@ -157,23 +144,39 @@ pub async fn delete_choices_not_in(
     keep: &[ChoiceId],
 ) -> Result<Vec<BankQuestionImage>, AppError> {
     let keep: Vec<String> = keep.iter().map(|id| id.as_str().to_string()).collect();
-    let mut result = db
-        .query(
-            "DELETE bank_question_image \
-             WHERE bank_question = $b AND slot != NONE AND slot NOT IN $keep RETURN BEFORE",
-        )
-        .bind(("b", question.record()))
-        .bind(("keep", keep))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<BankQuestionImage>>(0)?)
+    let rows = sqlx::query_as!(
+        BankQuestionImage,
+        r#"DELETE FROM bank_question_image
+           WHERE bank_question = $1
+             AND slot IS NOT NULL
+             AND NOT (slot = ANY($2))
+           RETURNING bank_question AS "bank_question: BankQuestionId",
+               slot AS "slot: ChoiceId", file,
+               content_type AS "content_type: FileContentType", size"#,
+        question.uuid(),
+        &keep
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows)
 }
 
 pub async fn delete(
     db: &Database,
     image: BankQuestionImage,
 ) -> Result<BankQuestionImage, AppError> {
-    let deleted: Option<BankQuestionImage> = db.delete(image.id.record()).await?;
+    let deleted = sqlx::query_as!(
+        BankQuestionImage,
+        r#"DELETE FROM bank_question_image
+           WHERE bank_question = $1 AND slot IS NOT DISTINCT FROM $2
+           RETURNING bank_question AS "bank_question: BankQuestionId",
+               slot AS "slot: ChoiceId", file,
+               content_type AS "content_type: FileContentType", size"#,
+        image.bank_question.uuid(),
+        image.slot.as_ref().map(ChoiceId::as_str)
+    )
+    .fetch_optional(db)
+    .await?;
     deleted.ok_or(AppError::NotFound)
 }
 
@@ -187,17 +190,28 @@ mod tests {
     }
 
     /// A real template row: an image write moves its `points` inside its own
-    /// transaction, so a minted id nothing ever wrote is refused.
+    /// transaction, so a minted id nothing ever wrote is refused. The owner is
+    /// a foreign key now, so its fixture row is real too.
     async fn a_template(db: &Database) -> BankQuestionId {
         let id = BankQuestionId::generate();
-        db.query(
-            "CREATE $b SET owner = user:u, text = 'soru', kind = 'text', points = 5,
-             visibility = 'private', created_at = 1",
+        let owner = crate::domain::user::UserId::generate();
+        sqlx::query(
+            "INSERT INTO app_user (id, username, password_hash, role) \
+             VALUES ($1, $2, 'x', 'teacher')",
         )
-        .bind(("b", id.record()))
+        .bind(owner.uuid())
+        .bind(format!("bqi-owner-{}", &owner.key()[30..]))
+        .execute(db)
         .await
-        .unwrap()
-        .check()
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO bank_question (id, owner, text, kind, points, visibility, created_at) \
+             VALUES ($1, $2, 'soru', 'text', 5, 'private', 1)",
+        )
+        .bind(id.uuid())
+        .bind(owner.uuid())
+        .execute(db)
+        .await
         .unwrap();
         id
     }
@@ -229,7 +243,7 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_replaces_per_slot() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let question = a_template(&db).await;
 
         let (first, retired) = upsert(&db, BankQuestionImage::new(&question, None, png(), 3))
@@ -252,7 +266,7 @@ mod tests {
     /// picture, and only a removed option's picture goes.
     #[tokio::test]
     async fn only_the_dropped_options_lose_their_pictures() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let question = a_template(&db).await;
         let ids = choice_ids();
         upsert(&db, BankQuestionImage::new(&question, None, png(), 1))
@@ -275,7 +289,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_keep_set_clears_every_option_picture() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let question = a_template(&db).await;
         let ids = choice_ids();
         upsert(&db, BankQuestionImage::new(&question, None, png(), 1))
@@ -313,46 +327,36 @@ mod tests {
     /// from, so an image that committed inside the window and is *not* in it is
     /// a blob stranded on disk.
     ///
-    /// The window is opened by the schema, not by a lucky interleaving: a
-    /// `DEFINE EVENT` on `bank_question` fires inside the delete's own
-    /// transaction the instant the row goes.
-    ///
-    /// Real server, and `#[ignore]`d for it: the subject *is* the store's
-    /// conflict detection, which `init_mem`'s embedded engine does not have —
-    /// it commits both and answers `Ok` to each, so this passes there on broken
-    /// code.
+    /// The upload writes the template row too (its `points`), so the two
+    /// transactions touch one row and Postgres refuses one of them; the
+    /// barrier releases both sides together so every interleaving gets its
+    /// chance.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn an_image_written_inside_a_delete_window_never_outlives_its_template() {
-        let (db, _serialized) = crate::database::init_test_server("bank_image_race").await;
-        db.query(
-            "DEFINE EVENT hold_the_window ON TABLE bank_question WHEN $event = 'DELETE' \
-             THEN { SLEEP 1s; };",
-        )
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
 
         let (mut swept, mut orphans, mut stranded) = (0, 0, 0);
-        for round in 0..4 {
+        for round in 0..8 {
             let question = a_template(&db).await;
             let template = crate::db::bank_question::read(&db, &question)
                 .await
                 .unwrap()
                 .unwrap();
 
+            // Delete and upload released together: both write the template row,
+            // so Postgres serializes them and refuses whichever lost.
+            let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
             let drop_it = {
-                let db = db.clone();
-                tokio::spawn(async move { crate::db::bank_question::delete(&db, template).await })
-            };
-            // The upload starts inside the held window — the template row is
-            // gone but uncommitted, which is exactly what the handler's
-            // ownership read believes.
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            let child = {
-                let (db, question) = (db.clone(), question.clone());
+                let (db, gate, template) = (db.clone(), gate.clone(), template);
                 tokio::spawn(async move {
+                    gate.wait().await;
+                    crate::db::bank_question::delete(&db, template).await
+                })
+            };
+            let child = {
+                let (db, question, gate) = (db.clone(), question.clone(), gate);
+                tokio::spawn(async move {
+                    gate.wait().await;
                     upsert(&db, BankQuestionImage::new(&question, None, png(), 3)).await
                 })
             };
@@ -387,7 +391,7 @@ mod tests {
             }
         }
         eprintln!(
-            "bank_question::delete raced by an upload: {swept}/4 rounds deleted the template"
+            "bank_question::delete raced by an upload: {swept}/8 rounds deleted the template"
         );
         assert!(
             swept > 0,
@@ -411,33 +415,27 @@ mod tests {
     /// table holds the first write open inside its own transaction, so the
     /// second reads the slot before the first commits.
     ///
-    /// Real server, and `#[ignore]`d for it, for the reason above: the embedded
-    /// engine has no write-write conflict detection to make a loser re-read.
+    /// Both writes touch the same `(question, slot)` row, so Postgres
+    /// serializes them and the loser re-reads inside its own transaction —
+    /// the barrier releases them together so the contention is real.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn two_uploads_to_one_slot_leave_no_blob_unretired() {
-        let (db, _serialized) = crate::database::init_test_server("bank_image_replace").await;
-        db.query(
-            "DEFINE EVENT hold_the_write ON TABLE bank_question_image WHEN true \
-             THEN { SLEEP 300ms; };",
-        )
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
 
         let mut unretired = 0;
-        for round in 0..3 {
+        for round in 0..6 {
             let question = a_template(&db).await;
             // A first picture, so both racers have an old blob to retire.
             let (original, _) = upsert(&db, BankQuestionImage::new(&question, None, png(), 1))
                 .await
                 .unwrap();
 
+            let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
             let mut writes = Vec::new();
             for size in [2, 3] {
-                let (db, question) = (db.clone(), question.clone());
+                let (db, question, gate) = (db.clone(), question.clone(), gate.clone());
                 writes.push(tokio::spawn(async move {
+                    gate.wait().await;
                     upsert(&db, BankQuestionImage::new(&question, None, png(), size)).await
                 }));
             }

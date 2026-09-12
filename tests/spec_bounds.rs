@@ -24,9 +24,7 @@ use tower::ServiceExt;
 
 /// The emitted OpenAPI document, as the server serves it.
 async fn spec() -> Value {
-    let tenants = database::init_mem_tenants()
-        .await
-        .expect("in-memory deployment");
+    let tenants = database::init_test_tenants().await;
     let app = build_router(AppState {
         db: tenants.control().clone(),
         tenants,
@@ -36,7 +34,6 @@ async fn spec() -> Value {
         chatbot_limit: Default::default(),
         exam_presence: Default::default(),
         board_hub: Default::default(),
-        db_up: Default::default(),
         ai: None,
         metrics: hezarfen_backend::telemetry::Metrics::noop(),
     });

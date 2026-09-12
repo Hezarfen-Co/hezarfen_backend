@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT draft AS \"draft: bool\", mode AS \"mode: ExamMode\",\n                  starts_at AS \"starts_at: Timestamp\",\n                  ends_at AS \"ends_at: Timestamp\"\n           FROM exam WHERE id = $1 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "draft: bool",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "exam",
+            "name": "draft"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "mode: ExamMode",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "exam",
+            "name": "mode"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "starts_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "exam",
+            "name": "starts_at"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "ends_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "exam",
+            "name": "ends_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "3259c5d4525fd7df0874642113aabf7ac293614ea0209a7c840eb4fa34d1693b"
+}

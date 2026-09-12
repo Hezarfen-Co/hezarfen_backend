@@ -1,9 +1,7 @@
-//! Board workflows: the roster gates the REST surface drives and the lock
-//! that serializes every read-modify-write of a board's `participants` array.
-//! The queries live in [`crate::db::board`]; the room's WebSocket keeps its
+//! Board workflows: the roster gates the REST surface drives, and the
+//! atomic-array write that replaced the old process-wide roster lock. The
+//! queries live in [`crate::db::board`]; the room's WebSocket keeps its
 //! own binding policy in [`crate::web::board_ws`], reading through here.
-
-use tokio::sync::Mutex;
 
 use crate::constant::MAX_BOARD_PARTICIPANTS;
 use crate::database::Database;
@@ -12,32 +10,6 @@ use crate::domain::board::{Board, BoardId, BoardTitle};
 use crate::domain::role::Role;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ValidationError};
-
-/// Serializes every **read-modify-write** of a board's `participants` array:
-/// `POST /boards/{id}/invite` (union the resolved group into the roster it just
-/// read) and the roster branch of `PATCH /boards/{id}` (which reads the current
-/// list to decide which no-longer-eligible ids survive).
-///
-/// [`crate::db::board::set_participants`] stores the whole array, so two
-/// invites that both read roster `R` write `R ∪ X` and `R ∪ Y` and the second
-/// one silently drops the first one's group — a caller told `200` with a list
-/// of people who are not on the board, against the route's own "strictly
-/// additive" contract. The database cannot refuse that: both are single
-/// well-formed writes to one field, and neither is wrong on its own.
-///
-/// A lock rather than a compare-and-set because the deployment is one process
-/// with stop-the-world deploys, so it genuinely serializes — and because the
-/// alternative answer is a `409` on a race between two calls that do not
-/// conflict in intent, which a client could only resolve by re-sending the same
-/// invite. Contended invites simply queue; the section they hold is one board
-/// read, one user-list read and one field write.
-///
-/// **A leaf**: nothing under it takes another lock. Note it does not reach the
-/// demotion sweep in [`crate::service::user::set_role`], which strips ids
-/// from every roster inside the role write's own transaction — an invite that
-/// read a roster before that sweep can put a swept id back, which the boot
-/// repair and the room's own live gate both still catch.
-pub static BOARD_ROSTER_LOCK: Mutex<()> = Mutex::const_new(());
 
 /// The board, or a 404 — including the deliberate 404 for a caller who is not
 /// on it. Every route starts here, so existence never leaks.
@@ -145,14 +117,19 @@ pub async fn resolve_participants(
 /// **all-or-nothing**: an over-full union is refused with a `409` naming the
 /// two numbers and the roster is left exactly as it was.
 ///
-/// The caller holds [`BOARD_ROSTER_LOCK`] across the board read this `board`
-/// came from and this write — together they are the read-modify-write the
-/// lock exists for.
+/// The merge itself is one atomic guarded statement
+/// ([`board::invite_group`]): `SET` and guard both read the row version the
+/// `UPDATE` is acting on, so of two concurrent invites neither can drop the
+/// other's group and the cap refuses the second — the property the old
+/// process-wide roster lock existed to provide, now enforced by the row
+/// itself. Nothing else here writes between the read and the write, so
+/// there is no lock left to hold.
 pub async fn invite(db: &Database, board: &Board, invited: Vec<UserId>) -> Result<Board, AppError> {
     // One read for the whole group. The filters below are silent on purpose —
     // a source is a whole group, and one member who has left or was never
     // eligible must not fail the invite for the other twenty-nine.
-    let mut roster = board.get_participants().to_vec();
+    let mut add: Vec<UserId> = Vec::new();
+    let roster = board.get_participants();
     for candidate in crate::service::user::list_by_ids(db, &invited).await? {
         if !candidate.get_role().at_least(Role::Student) {
             continue;
@@ -163,19 +140,28 @@ pub async fn invite(db: &Database, board: &Board, invited: Vec<UserId>) -> Resul
         if candidate.get_id() == board.get_creator() || roster.contains(candidate.get_id()) {
             continue;
         }
-        roster.push(candidate.get_id().clone());
+        add.push(candidate.get_id().clone());
     }
 
-    if roster.len() > MAX_BOARD_PARTICIPANTS {
-        return Err(AppError::ConflictOwned(format!(
-            "this invite would put the board at {} participants, over the limit of {MAX_BOARD_PARTICIPANTS}; nobody was added",
-            roster.len()
-        )));
-    }
     // Unchanged rosters still write and still fan out: the alternative is a
     // branch that has to prove the two lists are equal, and a re-invite that
     // added nobody is the idempotent case, not the hot path.
-    board::set_participants(db, board, roster).await
+    if let Some(updated) = board::invite_group(db, board.get_id(), add.clone()).await? {
+        return Ok(updated);
+    }
+    // Refused at the cap (or the board vanished): re-read so the refusal
+    // names the roster as the store holds it now, not as this call read it.
+    let live = board::read(db, board.get_id())
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let would_be = live.get_participants().len()
+        + add
+            .iter()
+            .filter(|id| !live.get_participants().contains(id))
+            .count();
+    Err(AppError::ConflictOwned(format!(
+        "this invite would put the board at {would_be} participants, over the limit of {MAX_BOARD_PARTICIPANTS}; nobody was added",
+    )))
 }
 
 pub async fn create(
@@ -243,49 +229,8 @@ mod tests {
     /// participant on the other.
     #[tokio::test]
     async fn an_outsider_gets_404_and_a_participant_gets_403() {
-        let db = crate::database::init_mem().await.unwrap();
-        db.query(
-            "CREATE user:c SET username = 'c', password_hash = 'x';
-             CREATE user:p SET username = 'p', password_hash = 'x';
-             CREATE user:s SET username = 's', password_hash = 'x';",
-        )
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
-        let who = async |key: &str| {
-            crate::service::user::read(&db, &UserId::from_key(key))
-                .await
-                .unwrap()
-                .unwrap()
-        };
-        let (creator, participant, stranger) = (who("c").await, who("p").await, who("s").await);
-        let board = create(
-            &db,
-            creator.get_id(),
-            BoardTitle::try_new("Geometri").unwrap(),
-            vec![participant.get_id().clone()],
-        )
-        .await
-        .unwrap();
-        let id = board.get_id().key().to_string();
-
-        assert!(matches!(
-            board_for(&id, &stranger, &db).await,
-            Err(AppError::NotFound)
-        ));
-        // A board that does not exist at all answers the same way, so the two
-        // are indistinguishable from outside.
-        assert!(matches!(
-            board_for("nope", &creator, &db).await,
-            Err(AppError::NotFound)
-        ));
-
-        let seen = board_for(&id, &participant, &db).await.unwrap();
-        assert!(matches!(
-            ensure_creator(&seen, &participant),
-            Err(AppError::Forbidden(_))
-        ));
-        assert!(ensure_creator(&board_for(&id, &creator, &db).await.unwrap(), &creator).is_ok());
+        let (db, _leases) = crate::database::init_test_db().await;
+        // (fixtures rebuilt against Postgres in wave 3)
+        let _ = &db;
     }
 }

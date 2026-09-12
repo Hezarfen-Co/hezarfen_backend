@@ -7,33 +7,28 @@
 
 use std::collections::HashMap;
 
-use surrealdb::types::{RecordId, SurrealValue};
+use sqlx::types::Json;
 
-use crate::constant::USAGE_COUNTS_SQL;
-use crate::database::{Database, transaction_with_retry, write_with_retry};
+use crate::database::{Database, tx_with_retry};
+use crate::db::page::{PagedList, Param};
 use crate::domain::bank_question::{BankQuestion, BankQuestionId, BankVisibility};
 use crate::domain::bank_question_image::BankQuestionImage;
 use crate::domain::exam::ExamId;
-use crate::domain::exam_question::{QuestionPoints, QuestionSpec, QuestionText};
+use crate::domain::exam_question::{
+    Choice, ChoiceId, QuestionKind, QuestionPoints, QuestionSpec, QuestionText,
+};
+use crate::domain::note_file::FileContentType;
 use crate::domain::subject::SubjectId;
 use crate::domain::text_fold::{search_fold, search_fold_sql};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 
-/// One `GROUP BY from_bank` row of [`usage_counts`].
-#[derive(SurrealValue)]
-struct UsageCount {
-    from_bank: BankQuestionId,
-    n: i64,
-}
-
-/// What one [`delete`] transaction removed — the template (an empty list once
-/// someone else deleted it first) and the image rows swept with it.
-#[derive(SurrealValue)]
-struct DeleteOutcome {
-    question: Vec<BankQuestion>,
-    images: Vec<BankQuestionImage>,
+/// The `choices` JSONB bind as the macros type the parameter — a
+/// `serde_json::Value`. A `Choice` is two plain strings: serializing one
+/// cannot fail.
+fn choices_as_value(choices: &[Choice]) -> serde_json::Value {
+    serde_json::to_value(choices).expect("Choice serialization cannot fail")
 }
 
 pub async fn create(
@@ -85,24 +80,70 @@ async fn insert(
         BankVisibility::default(),
         Timestamp::now(),
     );
-    let created: Option<BankQuestion> = db.create(question.id.record()).content(question).await?;
-    created.ok_or_else(|| AppError::Internal("failed to create bank question".into()))
+    let row = sqlx::query_as!(
+        BankQuestion,
+        r#"INSERT INTO bank_question
+               (id, owner, subject, text, kind, points, choices, correct,
+                source_exam, visibility, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+           RETURNING id AS "id: BankQuestionId", owner AS "owner: UserId",
+               subject AS "subject: SubjectId", text AS "text: QuestionText",
+               kind AS "kind: QuestionKind", points AS "points: QuestionPoints",
+               choices AS "choices: Json<Vec<Choice>>",
+               correct AS "correct: ChoiceId",
+               source_exam AS "source_exam: ExamId",
+               visibility AS "visibility: BankVisibility",
+               created_at AS "created_at: Timestamp""#,
+        question.id.uuid(),
+        question.owner.uuid(),
+        question.subject.as_ref().map(SubjectId::uuid),
+        question.text.as_str(),
+        question.kind.as_str(),
+        question.points.as_i64(),
+        question
+            .choices
+            .as_ref()
+            .map(|json| choices_as_value(&json.0)),
+        question.correct.as_ref().map(ChoiceId::as_str),
+        question.source_exam.as_ref().map(ExamId::uuid),
+        question.visibility.as_str(),
+        question.created_at.as_millis(),
+    )
+    .fetch_one(db)
+    .await?;
+    Ok(row)
 }
 
 pub async fn read(db: &Database, id: &BankQuestionId) -> Result<Option<BankQuestion>, AppError> {
-    Ok(db.select(id.record()).await?)
+    let row = sqlx::query_as!(
+        BankQuestion,
+        r#"SELECT id AS "id: BankQuestionId", owner AS "owner: UserId",
+                  subject AS "subject: SubjectId", text AS "text: QuestionText",
+                  kind AS "kind: QuestionKind", points AS "points: QuestionPoints",
+                  choices AS "choices: Json<Vec<Choice>>",
+                  correct AS "correct: ChoiceId",
+                  source_exam AS "source_exam: ExamId",
+                  visibility AS "visibility: BankVisibility",
+                  created_at AS "created_at: Timestamp"
+           FROM bank_question WHERE id = $1"#,
+        id.uuid()
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(row)
 }
 
-/// One page of the bank the caller may see, **newest first** (ULID ids sort by
-/// creation, so `id DESC` is newest-first) — plus the total row count under
-/// the same filters, so a client can page past the window.
+/// One page of the bank the caller may see, **newest first** (`id DESC` is
+/// mint order — the ids are write-ordered UUIDv7) — plus the total row count
+/// under the same filters, so a client can page past the window.
 ///
-/// Every filter is a WHERE clause and the window is a real `LIMIT`/`START`:
-/// the old version read the whole table and sliced it in memory, which hid
-/// every template past the client's first page. `q` is a case- and
-/// diacritic-insensitive fragment of the question text (blank = no text
-/// filter): needle and column both go through
-/// [`crate::domain::text_fold`], so `istanbul` finds `İSTANBUL` and back.
+/// The window is a real `LIMIT`/`OFFSET` handed to the database (the
+/// [`PagedList`] builder: the filters are runtime-conditional, which is that
+/// builder's named exemption from the compile-time macros). `q` is a case-
+/// and diacritic-insensitive fragment of the question text (blank = no text
+/// filter): needle and column both go through [`crate::domain::text_fold`],
+/// so `istanbul` finds `İSTANBUL` and back. `position` rather than `LIKE`
+/// keeps the needle a *literal* substring — no `%`/`_` wildcard surprises.
 ///
 /// `visible_to` is the security filter, and it is a WHERE clause like every
 /// other one — never a post-filter, or `total` would count templates the
@@ -113,11 +154,13 @@ pub async fn read(db: &Database, id: &BankQuestionId) -> Result<Option<BankQuest
 /// `visibility` is the *user's* filter ("only mine" / "shared with the
 /// school") and is ANDed on top of that gate, so it can only ever narrow:
 /// `school` still hides another teacher's private rows, and `private`
-/// intersected with the gate leaves exactly the caller's own drafts. It
-/// joins the same `clauses` vec as the rest, so `total` honours it too —
-/// a count that ignored it would break paging.
-// Flat filter args, like every other `list` here — a builder struct for
-// four `Option`s and a window would be more machinery than the call sites.
+/// intersected with the gate leaves exactly the caller's own drafts. It is
+/// part of the same WHERE, so `total` honours it too — a count that ignored
+/// it would break paging.
+///
+/// The uuid filters bind raw through the id newtypes' [`crate::domain`]
+/// `uuid()` accessor — [`Param::Uuid`] keeps the comparison exact, typed
+/// rather than textual.
 #[allow(clippy::too_many_arguments)]
 pub async fn list(
     db: &Database,
@@ -130,70 +173,53 @@ pub async fn list(
     offset: i64,
 ) -> Result<(Vec<BankQuestion>, i64), AppError> {
     let needle = q.map(|q| search_fold(q.trim())).filter(|q| !q.is_empty());
-    let mut clauses = Vec::new();
-    if visible_to.is_some() {
-        clauses.push("(visibility = 'school' OR owner = $viewer)");
+    let mut clauses: Vec<String> = Vec::new();
+    let mut binds: Vec<Param> = Vec::new();
+    if let Some(viewer) = visible_to {
+        binds.push(Param::Uuid(viewer.uuid()));
+        clauses.push(format!(
+            "(visibility = 'school' OR owner = ${})",
+            binds.len()
+        ));
     }
-    if visibility.is_some() {
-        clauses.push("visibility = $visibility");
+    if let Some(visibility) = visibility {
+        binds.push(Param::Text(visibility.as_str().to_string()));
+        clauses.push(format!("visibility = ${}", binds.len()));
     }
-    if owner.is_some() {
-        clauses.push("owner = $owner");
+    if let Some(owner) = owner {
+        binds.push(Param::Uuid(owner.uuid()));
+        clauses.push(format!("owner = ${}", binds.len()));
     }
-    if subject.is_some() {
-        clauses.push("subject = $subject");
+    if let Some(subject) = subject {
+        binds.push(Param::Uuid(subject.uuid()));
+        clauses.push(format!("subject = ${}", binds.len()));
     }
-    let text_clause = format!("{} CONTAINS $q", search_fold_sql("text"));
-    if needle.is_some() {
-        clauses.push(text_clause.as_str());
+    if let Some(needle) = needle {
+        binds.push(Param::Text(needle));
+        clauses.push(format!(
+            "position(${} in {}) > 0",
+            binds.len(),
+            search_fold_sql("text")
+        ));
     }
-    let where_clause = if clauses.is_empty() {
-        "true".to_string()
+    let from_where = if clauses.is_empty() {
+        "bank_question WHERE true".to_string()
     } else {
-        clauses.join(" AND ")
-    };
-    // `START` alone (no `LIMIT`) is the unpaged case — `?limit` is opt-in.
-    let window = match limit {
-        Some(_) => "LIMIT $limit START $offset",
-        None => "START $offset",
+        format!("bank_question WHERE {}", clauses.join(" AND "))
     };
     // The count runs over the *same* WHERE, so `total` can never disagree
     // with what paging through the list actually yields.
-    let mut query = db
-        .query(format!(
-            "SELECT * FROM bank_question WHERE {where_clause} ORDER BY id DESC {window};
-             SELECT VALUE count() FROM bank_question WHERE {where_clause} GROUP ALL;"
-        ))
-        .bind(("offset", offset));
-    if let Some(viewer) = visible_to {
-        query = query.bind(("viewer", viewer.record()));
+    let mut page = PagedList::new(from_where, "ORDER BY id DESC");
+    for bind in binds {
+        page = page.bind(bind);
     }
-    if let Some(visibility) = visibility {
-        query = query.bind(("visibility", visibility.as_str().to_string()));
-    }
-    if let Some(owner) = owner {
-        query = query.bind(("owner", owner.record()));
-    }
-    if let Some(subject) = subject {
-        query = query.bind(("subject", subject.record()));
-    }
-    if let Some(needle) = needle {
-        query = query.bind(("q", needle));
-    }
-    if let Some(limit) = limit {
-        query = query.bind(("limit", limit));
-    }
-    let mut result = query.await?.check()?;
-    let questions = result.take::<Vec<BankQuestion>>(0)?;
-    // `GROUP ALL` yields no row at all when nothing matched.
-    let total = result.take::<Vec<i64>>(1)?.first().copied().unwrap_or(0);
-    Ok((questions, total))
+    page.run(limit, offset, db).await
 }
 
 /// How many exam questions were instantiated from each of `ids` — the
 /// `from_bank` side of the provenance link, tallied for a whole page in
 /// **one** grouped query (a `count()` per row would be the N+1 this page
-/// already had removed once). Keys are template record keys; a template
+/// already had removed once). Keys are the templates' wire keys; a template
 /// nobody ever used has no entry at all, so the caller reads a miss as
 /// zero — and the UI can stay quiet rather than print "0".
 ///
@@ -207,16 +233,22 @@ pub async fn usage_counts(
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let records: Vec<RecordId> = ids.iter().map(|id| id.record()).collect();
-    let mut result = db
-        .query(USAGE_COUNTS_SQL)
-        .bind(("ids", records))
-        .await?
-        .check()?;
-    Ok(result
-        .take::<Vec<UsageCount>>(0)?
+    let ids: Vec<uuid::Uuid> = ids.iter().map(|id| id.uuid()).collect();
+    let rows = sqlx::query!(
+        r#"SELECT from_bank AS "from_bank: BankQuestionId", count(*) AS n
+           FROM exam_question
+           WHERE from_bank = ANY($1)
+           GROUP BY from_bank"#,
+        &ids,
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows
         .into_iter()
-        .map(|row| (row.from_bank.key().to_string(), row.n))
+        .filter_map(|row| {
+            let n = row.n.unwrap_or(0);
+            row.from_bank.map(|from_bank| (from_bank.key(), n))
+        })
         .collect())
 }
 
@@ -228,22 +260,13 @@ pub async fn usage_counts(
 /// field is re-stated from the snapshot, and the kind/choices/correct trio
 /// has to be (a text-only edit re-submits the stored options *with their
 /// ids* so each keeps its picture) — so without the compare-and-set the
-/// later writer silently reverts the earlier one — and the window is a
-/// database round trip wide, which is exactly how far apart two concurrent
-/// requests to this one process can sit.
+/// later writer silently reverts the earlier one.
 ///
 /// Every field the merge re-states is in the guard, which is the same list
-/// the `SET` writes. `choices` is compared whole: its objects carry two
-/// required string keys, so none is ever dropped for being `NONE` (the trap
-/// [`crate::db::settings::save_if_unchanged`] works around).
-///
-/// Rides [`write_with_retry`] because an image write now moves this row too
-/// ([`crate::db::bank_question_image::upsert`]): an upload landing in the
-/// same instant makes the store answer "conflict, retry", and a bare
-/// `check()` would turn that into a 500 for an edit that only had to be
-/// re-sent. A lost round writes nothing, and the guard is re-evaluated on
-/// the next one, so a genuine stale merge still comes back as `None`.
-/// Admissible: an `UPDATE` can never answer "already exists".
+/// the `SET` writes; the nullable ones compare `IS NOT DISTINCT FROM`, so an
+/// absent subject/correct/choices guards truthfully. Postgres needs no retry
+/// loop around this: the guard re-evaluates on the row lock at execution, so
+/// a rival write either predates this statement's snapshot or loses its own.
 pub async fn update_if_unchanged(
     db: &Database,
     expected: BankQuestion,
@@ -254,42 +277,50 @@ pub async fn update_if_unchanged(
     visibility: BankVisibility,
 ) -> Result<Option<BankQuestion>, AppError> {
     let (kind, choices, correct) = spec.into_parts();
-    let rows: Vec<BankQuestion> = write_with_retry(
-        db,
-        "UPDATE $id SET subject = $subject, text = $text, points = $points,
-         kind = $kind, choices = $choices, correct = $correct,
-         visibility = $visibility
-         WHERE subject = $was_subject AND text = $was_text
-           AND points = $was_points AND kind = $was_kind
-           AND choices = $was_choices AND correct = $was_correct
-           AND visibility = $was_visibility
-         RETURN AFTER",
-        &[
-            (
-                "was_subject".into(),
-                expected.subject.clone().map(|s| s.record()).into_value(),
-            ),
-            ("was_text".into(), expected.text.clone().into_value()),
-            ("was_points".into(), expected.points.into_value()),
-            ("was_kind".into(), expected.kind.clone().into_value()),
-            ("was_choices".into(), expected.choices.clone().into_value()),
-            ("was_correct".into(), expected.correct.clone().into_value()),
-            (
-                "was_visibility".into(),
-                expected.visibility.clone().into_value(),
-            ),
-            ("id".into(), expected.id.record().into_value()),
-            ("subject".into(), subject.map(|s| s.record()).into_value()),
-            ("text".into(), text.into_value()),
-            ("points".into(), points.into_value()),
-            ("kind".into(), kind.into_value()),
-            ("choices".into(), choices.into_value()),
-            ("correct".into(), correct.into_value()),
-            ("visibility".into(), visibility.into_value()),
-        ],
+    let choices = choices.map(Json);
+    let row = sqlx::query_as!(
+        BankQuestion,
+        r#"UPDATE bank_question SET
+               subject = $2, text = $3, points = $4, kind = $5,
+               choices = $6, correct = $7, visibility = $8
+           WHERE id = $1
+             AND subject IS NOT DISTINCT FROM $9
+             AND text = $10
+             AND points = $11
+             AND kind = $12
+             AND choices IS NOT DISTINCT FROM $13
+             AND correct IS NOT DISTINCT FROM $14
+             AND visibility = $15
+           RETURNING id AS "id: BankQuestionId", owner AS "owner: UserId",
+               subject AS "subject: SubjectId", text AS "text: QuestionText",
+               kind AS "kind: QuestionKind", points AS "points: QuestionPoints",
+               choices AS "choices: Json<Vec<Choice>>",
+               correct AS "correct: ChoiceId",
+               source_exam AS "source_exam: ExamId",
+               visibility AS "visibility: BankVisibility",
+               created_at AS "created_at: Timestamp""#,
+        expected.id.uuid(),
+        subject.as_ref().map(SubjectId::uuid),
+        text.as_str(),
+        points.as_i64(),
+        kind.as_str(),
+        choices.as_ref().map(|json| choices_as_value(&json.0)),
+        correct.as_ref().map(ChoiceId::as_str),
+        visibility.as_str(),
+        expected.subject.as_ref().map(SubjectId::uuid),
+        expected.text.as_str(),
+        expected.points.as_i64(),
+        expected.kind.as_str(),
+        expected
+            .choices
+            .as_ref()
+            .map(|json| choices_as_value(&json.0)),
+        expected.correct.as_ref().map(ChoiceId::as_str),
+        expected.visibility.as_str(),
     )
+    .fetch_optional(db)
     .await?;
-    Ok(rows.into_iter().next())
+    Ok(row)
 }
 
 /// Delete the template and cascade-remove its bank images, so none points
@@ -297,65 +328,99 @@ pub async fn update_if_unchanged(
 /// actually removed come back with it: the blobs are the web layer's to
 /// take off disk, but only for *these* rows — an upload that committed
 /// after the caller listed the template's images is swept here too, and a
-/// pre-read snapshot would strand its blob for good
-/// ([`crate::db::note::delete`]'s story, this domain over).
+/// pre-read snapshot would strand its blob for good.
 ///
-/// Children first, in one transaction: as two queries, a failure between
-/// them left image rows swept under a template that survived, or (the other
-/// order) a template gone with its images still there. Rides the retry
-/// because an image write now moves this very row
-/// ([`crate::db::bank_question_image::upsert`]) — the two contend by
-/// design, and a lost round through a bare `check()` would be a 500 for a
-/// delete that only had to be re-sent. Admissible: no `UPDATE` or `DELETE`
-/// in here can answer "already exists".
-///
-/// Exam questions tied to this template keep living: only their provenance
-/// links are cleared, field-scoped (never a whole-row save — the question
-/// isn't ours and may be edited concurrently), so nothing can read a link to
-/// a template that no longer exists. *Both* directions point at a template,
-/// so both are cleared: `from_bank` on the questions instantiated from it,
-/// and `banked_as` on the question it was saved out of.
+/// All four statements are one transaction, children before the parent so
+/// the foreign keys never refuse the parent delete: the provenance links
+/// clear first (exam questions tied to this template keep living — only the
+/// links go, field-scoped, in both directions: `from_bank` on the questions
+/// instantiated from it and `banked_as` on the question it was saved out
+/// of), then the image sweep, then the row. `cascade = true` because an
+/// image upsert committing inside this window makes the parent delete
+/// answer 23503 — a mid-cascade race the retry loop re-runs, sweeping the
+/// latecomer with it.
 pub async fn delete(
     db: &Database,
     target: BankQuestion,
 ) -> Result<(BankQuestion, Vec<BankQuestionImage>), AppError> {
-    let (mut result, mut errors) = transaction_with_retry(
-        db,
-        "BEGIN TRANSACTION;
-         LET $images = (DELETE bank_question_image WHERE bank_question = $b RETURN BEFORE);
-         UPDATE exam_question SET from_bank = NONE WHERE from_bank = $b;
-         UPDATE exam_question SET banked_as = NONE WHERE banked_as = $b;
-         LET $gone = (DELETE $b RETURN BEFORE);
-         RETURN { question: $gone, images: $images };
-         COMMIT TRANSACTION;",
-        &[("b".into(), target.id.record().into_value())],
-        &[],
-    )
-    .await?;
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    // The trailing `RETURN` is the last statement before `COMMIT`, so its
-    // slot follows the statement count rather than a hand-kept number;
-    // `num_statements` counts BEGIN and COMMIT.
-    let slot = result.num_statements().saturating_sub(2);
-    let outcome = result
-        .take::<Vec<DeleteOutcome>>(slot)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| AppError::Internal("failed to delete bank question".into()))?;
-    let question = outcome
-        .question
-        .into_iter()
-        .next()
+    tx_with_retry(db, true, async move |tx| {
+        let id = target.id.clone();
+        sqlx::query!(
+            "UPDATE exam_question SET from_bank = NULL WHERE from_bank = $1",
+            id.uuid()
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query!(
+            "UPDATE exam_question SET banked_as = NULL WHERE banked_as = $1",
+            id.uuid()
+        )
+        .execute(&mut *tx)
+        .await?;
+        let images = sqlx::query_as!(
+            BankQuestionImage,
+            r#"DELETE FROM bank_question_image WHERE bank_question = $1
+               RETURNING bank_question AS "bank_question: BankQuestionId",
+                     slot AS "slot: ChoiceId", file,
+                     content_type AS "content_type: FileContentType", size"#,
+            id.uuid()
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        let question = sqlx::query_as!(
+            BankQuestion,
+            r#"DELETE FROM bank_question WHERE id = $1
+               RETURNING id AS "id: BankQuestionId", owner AS "owner: UserId",
+                     subject AS "subject: SubjectId",
+                     text AS "text: QuestionText", kind AS "kind: QuestionKind",
+                     points AS "points: QuestionPoints",
+                     choices AS "choices: Json<Vec<Choice>>",
+                     correct AS "correct: ChoiceId",
+                     source_exam AS "source_exam: ExamId",
+                     visibility AS "visibility: BankVisibility",
+                     created_at AS "created_at: Timestamp""#,
+            id.uuid()
+        )
+        .fetch_optional(&mut *tx)
+        .await?
         .ok_or(AppError::NotFound)?;
-    Ok((question, outcome.images))
+        Ok((question, images))
+    })
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::constant::{BANK_VISIBILITY_PRIVATE, BANK_VISIBILITY_SCHOOL};
+
+    /// A real `app_user` row: template owners are foreign keys now. The id is
+    /// minted per call, so repeated calls are new people, not the same row.
+    async fn a_person(db: &Database, label: &str) -> UserId {
+        let user = UserId::generate();
+        sqlx::query("INSERT INTO app_user (id, username, password_hash) VALUES ($1, $2, 'x')")
+            .bind(user.uuid())
+            .bind(format!("{label}-{}", &user.key()[30..]))
+            .execute(db)
+            .await
+            .unwrap();
+        user
+    }
+
+    /// A real subject row: a template's subject reference is a foreign key
+    /// too (and the subject needs a real course under it).
+    async fn a_subject(db: &Database) -> SubjectId {
+        crate::db::subject::create(
+            db,
+            &crate::db::course::a_test_course(db).await,
+            crate::domain::subject::SubjectName::try_new("topic").unwrap(),
+            crate::domain::subject::SubjectDescription::try_new("").unwrap(),
+        )
+        .await
+        .unwrap()
+        .get_id()
+        .clone()
+    }
 
     fn spec() -> QuestionSpec {
         use crate::domain::exam_question::{ChoiceInput, QuestionKind};
@@ -377,33 +442,28 @@ mod tests {
         .unwrap()
     }
 
-    /// A row stored before `visibility` existed has no such key — it must decode
-    /// as `private`, the safe value. Asserted on the decoder itself, so no
-    /// schema DEFAULT can paper over it: a `school` default here would publish
-    /// every pre-existing template in the school at once.
+    /// A row without a visibility of its own must decode as `private`, the
+    /// safe value. The old engine could store a row with the field absent;
+    /// Postgres carries the same guarantee in the schema instead — the column
+    /// is `NOT NULL DEFAULT 'private'`, so a `school` default here would
+    /// publish every pre-existing template in the school at once. The insert
+    /// below is written exactly as a pre-visibility row arrives: no column.
     #[tokio::test]
     async fn a_row_without_the_field_decodes_private() {
-        use surrealdb::types::Value;
-
-        let db = crate::database::init_mem().await.unwrap();
-        let question = create(
-            &db,
-            UserId::generate(),
-            SubjectId::generate(),
-            QuestionText::try_new("q").unwrap(),
-            QuestionPoints::try_new(1).unwrap(),
-            spec(),
+        let (db, _leases) = crate::database::init_test_db().await;
+        let owner = a_person(&db, "owner").await;
+        let id = BankQuestionId::generate();
+        sqlx::query(
+            "INSERT INTO bank_question (id, owner, text, kind, points, created_at) \
+             VALUES ($1, $2, 'q', 'multiple_choice', 1, 0)",
         )
+        .bind(id.uuid())
+        .bind(owner.uuid())
+        .execute(&db)
         .await
         .unwrap();
-        assert_eq!(question.get_visibility().as_str(), BANK_VISIBILITY_PRIVATE);
 
-        let mut stored = question.into_value();
-        let Value::Object(map) = &mut stored else {
-            panic!("a bank question serializes to an object");
-        };
-        assert!(map.remove("visibility").is_some());
-        let old = BankQuestion::from_value(stored).unwrap();
+        let old = read(&db, &id).await.unwrap().expect("the row is there");
         assert_eq!(old.get_visibility().as_str(), BANK_VISIBILITY_PRIVATE);
         assert!(!old.get_visibility().is_school());
     }
@@ -412,13 +472,13 @@ mod tests {
     /// page can contain — never someone else's private templates.
     #[tokio::test]
     async fn list_hides_private_templates_from_others() {
-        let db = crate::database::init_mem().await.unwrap();
-        let owner = UserId::generate();
-        let other = UserId::generate();
+        let (db, _leases) = crate::database::init_test_db().await;
+        let owner = a_person(&db, "owner").await;
+        let other = a_person(&db, "other").await;
         let private = create(
             &db,
             owner.clone(),
-            SubjectId::generate(),
+            a_subject(&db).await,
             QuestionText::try_new("secret").unwrap(),
             QuestionPoints::try_new(1).unwrap(),
             spec(),
@@ -428,7 +488,7 @@ mod tests {
         let published = create(
             &db,
             owner.clone(),
-            SubjectId::generate(),
+            a_subject(&db).await,
             QuestionText::try_new("shared").unwrap(),
             QuestionPoints::try_new(1).unwrap(),
             spec(),
@@ -479,12 +539,12 @@ mod tests {
     /// still answer `Ok`.
     #[tokio::test]
     async fn a_merge_built_on_a_stale_snapshot_is_refused() {
-        let db = crate::database::init_mem().await.unwrap();
-        let owner = UserId::generate();
+        let (db, _leases) = crate::database::init_test_db().await;
+        let owner = a_person(&db, "owner").await;
         let stale = create(
             &db,
             owner,
-            SubjectId::generate(),
+            a_subject(&db).await,
             QuestionText::try_new("first").unwrap(),
             QuestionPoints::try_new(1).unwrap(),
             spec(),
@@ -527,21 +587,26 @@ mod tests {
     /// row, and `private` means "my own drafts" for everyone but an admin.
     #[tokio::test]
     async fn visibility_filter_narrows_never_widens() {
-        let db = crate::database::init_mem().await.unwrap();
-        let owner = UserId::generate();
-        let other = UserId::generate();
-        let mine = |text: &str| {
+        let (db, _leases) = crate::database::init_test_db().await;
+        let owner = a_person(&db, "owner").await;
+        let other = a_person(&db, "other").await;
+        async fn mine<'a>(
+            db: &Database,
+            owner: &UserId,
+            text: &str,
+        ) -> Result<BankQuestion, AppError> {
             create(
-                &db,
+                db,
                 owner.clone(),
-                SubjectId::generate(),
+                a_subject(db).await,
                 QuestionText::try_new(text).unwrap(),
                 QuestionPoints::try_new(1).unwrap(),
                 spec(),
             )
-        };
-        mine("draft").await.unwrap();
-        let published = mine("shared").await.unwrap();
+            .await
+        }
+        mine(&db, &owner, "draft").await.unwrap();
+        let published = mine(&db, &owner, "shared").await.unwrap();
         let subject = published.get_subject().cloned();
         update_if_unchanged(
             &db,
@@ -601,28 +666,29 @@ mod tests {
     /// "0"), and questions authored by hand never counted.
     #[tokio::test]
     async fn usage_counts_tallies_a_page_in_one_statement() {
-        // One statement, so a page costs one round trip — a `;` here would mean
-        // the per-row N+1 crept back in.
-        assert!(
-            !USAGE_COUNTS_SQL.contains(';'),
-            "usage_counts must be one statement"
-        );
-
-        let db = crate::database::init_mem().await.unwrap();
-        let owner = UserId::generate();
-        let template = |text: &str| {
+        // One statement, so a page costs one round trip: the tally is a single
+        // static `query!` (a `GROUP BY` with no loop around it), which the
+        // compiler now checks the way the old constant asserted.
+        let (db, _leases) = crate::database::init_test_db().await;
+        let owner = a_person(&db, "owner").await;
+        async fn template<'a>(
+            db: &Database,
+            owner: &UserId,
+            text: &str,
+        ) -> Result<BankQuestion, AppError> {
             create(
-                &db,
+                db,
                 owner.clone(),
-                SubjectId::generate(),
+                a_subject(db).await,
                 QuestionText::try_new(text).unwrap(),
                 QuestionPoints::try_new(1).unwrap(),
                 spec(),
             )
-        };
-        let used_twice = template("twice").await.unwrap();
-        let used_once = template("once").await.unwrap();
-        let unused = template("never").await.unwrap();
+            .await
+        }
+        let used_twice = template(&db, &owner, "twice").await.unwrap();
+        let used_once = template(&db, &owner, "once").await.unwrap();
+        let unused = template(&db, &owner, "never").await.unwrap();
 
         // Real exam rows: instantiating a template moves the exam's counter
         // (what keeps a question from outliving its exam), so a minted id
@@ -675,10 +741,10 @@ mod tests {
 
         let ids = [used_twice.get_id(), used_once.get_id(), unused.get_id()];
         let counts = usage_counts(&db, &ids).await.unwrap();
-        assert_eq!(counts.get(used_twice.get_id().key()).copied(), Some(2));
-        assert_eq!(counts.get(used_once.get_id().key()).copied(), Some(1));
+        assert_eq!(counts.get(&used_twice.get_id().key()).copied(), Some(2));
+        assert_eq!(counts.get(&used_once.get_id().key()).copied(), Some(1));
         assert_eq!(
-            counts.get(unused.get_id().key()),
+            counts.get(&unused.get_id().key()),
             None,
             "unused stays absent"
         );
@@ -687,19 +753,19 @@ mod tests {
         // A template outside the page is never counted into it.
         let narrow = usage_counts(&db, &[used_once.get_id()]).await.unwrap();
         assert_eq!(narrow.len(), 1);
-        assert_eq!(narrow.get(used_once.get_id().key()).copied(), Some(1));
+        assert_eq!(narrow.get(&used_once.get_id().key()).copied(), Some(1));
         // An empty page asks nothing at all.
         assert!(usage_counts(&db, &[]).await.unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn list_is_school_wide() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         for _ in 0..2 {
             create(
                 &db,
-                UserId::generate(),
-                SubjectId::generate(),
+                a_person(&db, "owner").await,
+                a_subject(&db).await,
                 QuestionText::try_new("q").unwrap(),
                 QuestionPoints::try_new(1).unwrap(),
                 spec(),
@@ -718,13 +784,13 @@ mod tests {
     /// The window is SQL, not an in-memory slice, and `total` ignores it.
     #[tokio::test]
     async fn list_pages_newest_first_and_filters_text() {
-        let db = crate::database::init_mem().await.unwrap();
-        let owner = UserId::generate();
+        let (db, _leases) = crate::database::init_test_db().await;
+        let owner = a_person(&db, "owner").await;
         for i in 0..5 {
             create(
                 &db,
                 owner.clone(),
-                SubjectId::generate(),
+                a_subject(&db).await,
                 QuestionText::try_new(&format!("question {i}")).unwrap(),
                 QuestionPoints::try_new(1).unwrap(),
                 spec(),
@@ -753,7 +819,7 @@ mod tests {
         let (none, total) = list(
             &db,
             None,
-            Some(&UserId::generate()),
+            Some(&a_person(&db, "empty").await),
             None,
             None,
             None,
@@ -769,11 +835,11 @@ mod tests {
     /// Turkish `İ`/`ı` must not split the search into two disjoint halves.
     #[tokio::test]
     async fn list_text_filter_folds_turkish_casing() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         create(
             &db,
-            UserId::generate(),
-            SubjectId::generate(),
+            a_person(&db, "owner").await,
+            a_subject(&db).await,
             QuestionText::try_new("İSTANBUL kaç ilçeye ayrılır?").unwrap(),
             QuestionPoints::try_new(1).unwrap(),
             spec(),

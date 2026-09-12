@@ -1,0 +1,37 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH RECURSIVE applied(id, kind, amount_minor) AS (\n               SELECT id, kind, amount_minor FROM payment_ledger WHERE source = $1\n               UNION ALL\n               SELECT l.id, l.kind, l.amount_minor\n               FROM payment_ledger l JOIN applied a ON l.source = a.id\n           )\n           SELECT kind AS \"kind!: PaymentLedgerKind\",\n                  COALESCE(sum(amount_minor), 0)::bigint AS \"total!: i64\",\n                  count(*)::bigint AS \"lines!: i64\"\n           FROM applied GROUP BY kind",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "kind!: PaymentLedgerKind",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "total!: i64",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "lines!: i64",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "0a14cf2c9ac14642cf806d7b4572e0bf45e376d2b683cc7d027ff3cd8d883f45"
+}

@@ -954,9 +954,7 @@ async fn a_chat_request_names_the_askers_school_role() {
     let service = raw::handshake(&bridge, &raw::hello("tutor", "chat.reply")).await;
     await_workers(&bridge, 1).await;
 
-    let tenants = hezarfen_backend::database::init_mem_tenants()
-        .await
-        .expect("in-memory deployment");
+    let tenants = hezarfen_backend::database::init_test_tenants().await;
     let db = tenants
         .get(&hezarfen_backend::tenant::Slug::try_new(hezarfen_backend::tenant::DEMO_SLUG).unwrap())
         .await
@@ -970,7 +968,6 @@ async fn a_chat_request_names_the_askers_school_role() {
         chatbot_limit: Default::default(),
         exam_presence: Default::default(),
         board_hub: Default::default(),
-        db_up: Default::default(),
         ai: Some(bridge.clone()),
         metrics: hezarfen_backend::telemetry::Metrics::noop(),
     });

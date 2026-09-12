@@ -14,6 +14,7 @@ use common::{app_and_db, id_of, login, login_as, me_id, send, set_role};
 use hezarfen_backend::db::meal_attendance;
 use hezarfen_backend::db::menu;
 use hezarfen_backend::domain::meal_attendance::MealAttendanceStatus;
+use hezarfen_backend::domain::meal_booking::MealBookingId;
 use hezarfen_backend::domain::menu::{MenuDate, MenuId, MenuSlot};
 use hezarfen_backend::domain::settings::MealSlotDef;
 use hezarfen_backend::domain::user::UserId;
@@ -541,13 +542,20 @@ async fn a_dish_write_is_refused_once_its_menu_is_gone() {
     let dish = add_dish(&app, &mgr, &menu, 1_000).await;
 
     // The menu row alone is removed, leaving the dish exactly as a delete
-    // interrupted between the row and its cascade would have.
-    db.query("DELETE $id")
-        .bind(("id", MenuId::from_key(&menu).record()))
+    // interrupted between the row and its cascade would have. Real FKs refuse
+    // that state, so the delete is forced the one way Postgres allows: FK
+    // triggers suspended for the one statement.
+    let mut tx = db.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
         .await
-        .unwrap()
-        .check()
         .unwrap();
+    sqlx::query("DELETE FROM menu WHERE id = $1")
+        .bind(MenuId::from_key(&menu))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
 
     let res = send(
         &app,
@@ -688,14 +696,14 @@ async fn a_slot_whose_name_would_break_the_menu_url_cannot_be_published() {
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
 
     // ...and the stale row is that list as a database written before the rule.
-    db.query(
-        "UPDATE settings:school SET meal_slots = \
-         [{ name: 'a/b', serving_minute: NONE }, { name: 'lunch', serving_minute: NONE }]",
-    )
-    .await
-    .unwrap()
-    .check()
-    .unwrap();
+    sqlx::query("UPDATE settings SET meal_slots = $1 WHERE id = 'school'")
+        .bind(sqlx::types::Json(json!([
+            { "name": "a/b", "serving_minute": null },
+            { "name": "lunch", "serving_minute": null }
+        ])))
+        .execute(&db)
+        .await
+        .unwrap();
 
     let res = send(
         &app,
@@ -1012,11 +1020,12 @@ async fn two_first_profile_writes_land_without_a_500() {
 /// the store had given away. The stored state was right throughout; only the
 /// answer lied.
 ///
-/// The cancel is injected the way `regress_roles` does it: a `DEFINE EVENT`
-/// fires inside the very write the replay makes — here the charge it replays,
-/// which is why the ledger is stripped first (a charge already there is a
-/// no-op). Fenced on `attempt = 1`, so the re-booked seat's own charge does not
-/// trip it a second time.
+/// The cancel is injected where the old `DEFINE EVENT` fired it: inside the
+/// very write the replay makes — here the charge it replays, which is why the
+/// ledger is stripped first (a charge already there is a no-op). An AFTER
+/// INSERT trigger on the ledger cancels the seat inside the charge's own
+/// transaction, fenced on the attempt-1 charge id, so the re-booked seat's own
+/// charge does not trip it a second time.
 #[tokio::test]
 async fn a_replayed_booking_answers_off_the_row_the_store_holds() {
     let (app, db) = app_and_db().await;
@@ -1036,18 +1045,29 @@ async fn a_replayed_booking_answers_off_the_row_the_store_holds() {
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
     let booking = id_of(&res.body);
 
-    db.query(format!(
-        "DELETE meal_ledger;
-         DEFINE EVENT cancel_inside ON TABLE meal_ledger WHEN $event = 'CREATE' THEN {{
-             UPDATE type::record('meal_booking', '{booking}') \
-                 SET status = 'cancelled', cancelled_at = 1 WHERE attempt = 1;
-         }};"
-    ))
+    let mut conn = db.acquire().await.expect("acquire for the trigger");
+    sqlx::query("DELETE FROM meal_ledger")
+        .execute(&db)
+        .await
+        .unwrap();
+    // The trigger derives the seat off the charge id itself (`{booking}_c{attempt}`),
+    // so the text stays static: every attempt-1 charge cancels its own booking.
+    sqlx::raw_sql(
+        "CREATE FUNCTION heztest_cancel_inside() RETURNS trigger AS $$
+         BEGIN
+           IF right(NEW.id, 3) = '_c1' THEN
+             UPDATE meal_booking SET status = 'cancelled', cancelled_at = 1
+             WHERE menu || '_' || student::text || '_c1' = NEW.id;
+           END IF;
+           RETURN NULL;
+         END;
+         $$ LANGUAGE plpgsql;
+         CREATE TRIGGER heztest_cancel_inside AFTER INSERT ON meal_ledger
+         FOR EACH ROW EXECUTE FUNCTION heztest_cancel_inside();",
+    )
+    .execute(&mut *conn)
     .await
-    .unwrap()
-    .check()
-    .unwrap();
-
+    .expect("define the cancel trigger");
     let res = send(
         &app,
         "POST",
@@ -1357,13 +1377,13 @@ async fn an_over_ceiling_seat_from_an_older_build_is_still_cancellable() {
     let booking = id_of(&res.body);
 
     // Aged past the ceiling, the way an older binary would have left it.
-    db.query(format!(
-        "UPDATE type::record('meal_booking', '{booking}') SET attempt = 25"
-    ))
-    .await
-    .unwrap()
-    .check()
-    .unwrap();
+    let booking_id = MealBookingId::from_key(&booking);
+    sqlx::query("UPDATE meal_booking SET attempt = 25 WHERE menu = $1 AND student = $2")
+        .bind(booking_id.menu())
+        .bind(booking_id.student())
+        .execute(&db)
+        .await
+        .unwrap();
 
     let res = send(
         &app,

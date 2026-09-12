@@ -1,8 +1,9 @@
 //! Work-log surfacing: the check-in/check-out pair, the staff log, and the
-//! manager corrections. The queries live in
-//! [`crate::db::work_entry`] — both transitions are single atomic writes on
-//! the deterministic open id (`INSERT IGNORE` in, take-and-refile out), so
-//! this domain has no workflow of its own.
+//! manager corrections. The queries live in [`crate::db::work_entry`] — both
+//! transitions are single atomic writes the database itself arbitrates (the
+//! `work_entry_open` partial unique index refuses a second check-in; the
+//! check-out's conditional `UPDATE` takes the one open row), so this domain
+//! has no workflow of its own.
 
 use crate::database::Database;
 use crate::db::work_entry;

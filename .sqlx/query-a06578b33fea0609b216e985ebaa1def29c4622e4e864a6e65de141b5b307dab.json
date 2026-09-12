@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT course AS \"course: uuid::Uuid\" FROM class_course WHERE class = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "course: uuid::Uuid",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "class_course",
+            "name": "course"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "a06578b33fea0609b216e985ebaa1def29c4622e4e864a6e65de141b5b307dab"
+}

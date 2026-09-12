@@ -1,0 +1,80 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH seat AS (\n             UPDATE app_user SET chatbot_thread_count = chatbot_thread_count + 1\n             WHERE id = $1\n               AND chatbot_thread_count < COALESCE(\n                     (SELECT max_chatbot_threads FROM settings WHERE id = 'school'),\n                     $2)\n             RETURNING 1)\n         INSERT INTO chatbot_thread (id, user_id, title, created_at, updated_at)\n         SELECT $3, $1, $4, $5, $5\n         WHERE EXISTS (SELECT 1 FROM seat)\n         RETURNING id AS \"id: ChatbotThreadId\", user_id AS \"user_id: UserId\", title AS \"title: ChatbotThreadTitle\", created_at AS \"created_at: Timestamp\", updated_at AS \"updated_at: Timestamp\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: ChatbotThreadId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "chatbot_thread",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "user_id: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "chatbot_thread",
+            "name": "user_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "title: ChatbotThreadTitle",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "chatbot_thread",
+            "name": "title"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "created_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "chatbot_thread",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "updated_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "chatbot_thread",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8",
+        "Uuid",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "9a923701c8caade33cf88a9a68eadb9c207323d47e3d2640d1bb4456e0d5d2ae"
+}

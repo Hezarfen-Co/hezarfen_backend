@@ -422,9 +422,10 @@ async fn update_user_preferences(
 /// Set a user's role. Admin only. An admin cannot change their own role, and
 /// the school's **last** admin cannot be demoted by anyone (`409`) — together
 /// those keep role management from locking everyone out, including when two
-/// admins demote each other at the same instant (the floor is serialized, see
-/// `ADMIN_FLOOR_LOCK`). A school that has already lost its admins is recovered
-/// with the SurrealQL in the README, since the seed never promotes.
+/// admins demote each other at the same instant (the floor is a predicate on
+/// the role write itself, so the racing demotions serialize on row locks).
+/// A school that has already lost its admins is recovered by hand against the
+/// database, since the seed never promotes.
 /// Setting any non-`student` role also drops the user's course enrollments —
 /// only students enroll, so a promoted user leaves every roster. Demoting below
 /// `teacher` drops their course teaching assignments for the mirror reason, and
@@ -489,7 +490,7 @@ async fn set_role(
     for board in boards {
         st.board_hub.publish(
             &slug,
-            board.get_id().key(),
+            board.get_id().key().as_str(),
             json!({
                 "type": "participants",
                 "creator": board.get_creator().key(),
@@ -504,7 +505,7 @@ async fn set_role(
         if let Some(closed_at) = board.get_closed_at() {
             st.board_hub.publish(
                 &slug,
-                board.get_id().key(),
+                board.get_id().key().as_str(),
                 json!({"type": "closed", "closed_at": closed_at.as_millis()}).to_string(),
             );
         }
@@ -705,7 +706,7 @@ async fn my_students(
 /// A user's public profile. Contact details are not part of it, at any role.
 #[derive(Serialize, ToSchema)]
 struct ProfileResponse {
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     id: String,
     #[schema(example = "ada")]
     username: String,
@@ -762,7 +763,7 @@ struct ProfileAvatar {
 /// `GET /classes/{id}`, which is teacher+.
 #[derive(Serialize, ToSchema)]
 struct ProfileClassRef {
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     id: String,
     #[schema(example = "9-A")]
     name: String,
@@ -773,7 +774,7 @@ struct ProfileClassRef {
 /// A course as a profile shows it — a label, nothing more.
 #[derive(Serialize, ToSchema)]
 struct ProfileCourseRef {
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     id: String,
     #[schema(example = "Matematik")]
     title: String,
@@ -1151,7 +1152,7 @@ async fn upload_my_avatar(
     let upload = read_image_upload(&st, &mut multipart).await?;
     let size = upload.size();
 
-    let file = ulid::Ulid::new().to_string();
+    let file = crate::domain::monotonic_id::next_uuid().to_string();
     store_blob(&st, &file, &upload.data, || async {
         match crate::service::user::set_avatar(
             &st.db,

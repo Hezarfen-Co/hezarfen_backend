@@ -1,12 +1,12 @@
 //! Integration tests: drive the assembled axum router directly (no network)
-//! against a fresh in-memory SurrealDB, via `tower::ServiceExt::oneshot`.
+//! against a fresh per-test Postgres deployment, via `tower::ServiceExt::oneshot`.
 
 mod common;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use common::{
-    app_and_db, app_with_ai_health, create_course, create_exam, create_exam_with, create_homework,
+    app_and_db, app_and_tenants, create_course, create_exam, create_exam_with, create_homework,
     create_session, create_subject, enroll, id_of, login, login_as, me_id, mem_app, send, set_role,
     unenroll, upload_course_note_file,
 };
@@ -25,11 +25,12 @@ use hezarfen_backend::domain::course_note::CourseNoteId;
 use hezarfen_backend::domain::course_note_file::CourseNoteFileId;
 use hezarfen_backend::domain::exam::ExamId;
 use hezarfen_backend::domain::timestamp::Timestamp;
-use hezarfen_backend::domain::user::{Password, User, UserId, Username};
+use hezarfen_backend::domain::user::{Password, UserId, Username};
 use hezarfen_backend::module::ModuleSet;
-use hezarfen_backend::state::{AppState, DbHealth};
+use hezarfen_backend::state::AppState;
 use serde_json::json;
 use tower::ServiceExt;
+use uuid::Uuid;
 
 // --- health + auth -------------------------------------------------------
 
@@ -46,27 +47,26 @@ async fn health_reports_ok() {
     assert_eq!(res.body["ai"]["workers"], 0);
 }
 
-/// The probe must survive the outage it reports. `db_guard` refuses everything
-/// else with a generic 503 while the socket is down; `/health` (and `/`) answer
+/// The probe must survive the outage it reports. A wedged database refuses
+/// everything else with a generic timeout while `/health` (and `/`) answer
 /// their own 503 that names the database, or the probe is useless exactly when
-/// it is needed.
+/// it is needed. The control pool is closed to play the outage: the probe then
+/// cannot reach its database, which is what a dead server looks like from a
+/// pool handle.
 #[tokio::test]
 async fn health_reports_the_database_down_instead_of_being_refused() {
-    let db_up = DbHealth::default();
-    let (app, _db) = app_with_ai_health(None, db_up.clone()).await;
+    let (app, _db, tenants) = app_and_tenants().await;
+    let res = send(&app, "GET", "/health", None, None).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.body["db"], "up");
 
-    db_up.set(false);
+    tenants.control().close().await;
     for path in ["/health", "/"] {
         let res = send(&app, "GET", path, None, None).await;
         assert_eq!(res.status, StatusCode::SERVICE_UNAVAILABLE, "{path}");
         assert_eq!(res.body["status"], "degraded", "{path}");
         assert_eq!(res.body["db"], "down", "{path}");
     }
-
-    db_up.set(true);
-    let res = send(&app, "GET", "/health", None, None).await;
-    assert_eq!(res.status, StatusCode::OK);
-    assert_eq!(res.body["db"], "up");
 }
 
 #[tokio::test]
@@ -187,10 +187,10 @@ async fn limits_publishes_the_bounds_the_api_actually_enforces() {
 async fn limits_still_answers_while_the_database_is_down() {
     // A frontend booting against a backend whose database is reconnecting is
     // precisely when it needs the validation contract. `/limits` touches no
-    // row, so the outage guard must let it through — otherwise the client
-    // falls back to the hard-coded copy this endpoint exists to remove.
-    let db_up = hezarfen_backend::state::DbHealth::default();
-    let (tenants, _db) = common::mem_deployment().await;
+    // row, so the outage must not take it down with the database — otherwise
+    // the client falls back to the hard-coded copy this endpoint exists to
+    // remove. The school pool is closed to play the outage.
+    let (tenants, db) = common::mem_deployment().await;
     let app = build_router(AppState {
         db: tenants.control().clone(),
         tenants,
@@ -200,19 +200,19 @@ async fn limits_still_answers_while_the_database_is_down() {
         chatbot_limit: Default::default(),
         exam_presence: Default::default(),
         board_hub: Default::default(),
-        db_up: db_up.clone(),
         ai: None,
         metrics: hezarfen_backend::telemetry::Metrics::noop(),
     });
-    db_up.set(false);
+    let ali = login(&app, "ali").await;
+    db.close().await;
 
     let res = send(&app, "GET", "/limits", None, None).await;
     assert_eq!(res.status, StatusCode::OK);
     assert!(res.body["user"]["max_username_len"].is_number());
 
-    // Everything that does touch the database still refuses, so the exemption
-    // is scoped to the one static route and has not disarmed the guard.
-    let res = send(&app, "GET", "/settings", None, None).await;
+    // Everything that does touch the database still refuses, so the static
+    // route staying up is not the database silently passing for healthy.
+    let res = send(&app, "GET", "/settings", Some(&ali), None).await;
     assert_eq!(res.status, StatusCode::SERVICE_UNAVAILABLE);
 }
 
@@ -1194,11 +1194,11 @@ async fn note_file_count_is_capped() {
 
 /// Regression: the 10-file cap was a bare count-then-write — concurrent
 /// uploads all read the same pre-count and pushed a note past the cap (the
-/// same write-skew as the event-capacity over-admit; SurrealDB transactions
-/// don't conflict-check a cross-record count against an insert). The insert
-/// now recounts under a lock, so the outcome is race-order independent:
-/// exactly enough uploads win to land on the cap, the rest get the same 409
-/// as a sequential over-fill.
+/// same write-skew as the event-capacity over-admit; the old engine's
+/// transactions did not conflict-check a cross-record count against an
+/// insert). The insert now recounts under a lock, so the outcome is
+/// race-order independent: exactly enough uploads win to land on the cap,
+/// the rest get the same 409 as a sequential over-fill.
 #[tokio::test]
 async fn concurrent_uploads_never_exceed_the_file_cap() {
     let app = mem_app().await;
@@ -1430,14 +1430,11 @@ async fn deleting_a_note_removes_its_files() {
     );
 
     // Row and blob are both gone.
-    let mut rows = db
-        .query("SELECT * FROM note_file")
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM note_file")
+        .fetch_one(&db)
         .await
-        .unwrap()
-        .check()
-        .unwrap();
-    let left: Vec<serde_json::Value> = rows.take(0).unwrap();
-    assert!(left.is_empty(), "note_file rows must cascade: {left:?}");
+        .expect("note_file count");
+    assert_eq!(left, 0, "note_file rows must cascade");
     assert!(
         !common::blob_dir().join(&file_id).exists(),
         "blob must be unlinked when its note dies"
@@ -4312,9 +4309,11 @@ async fn event_registration_follows_placement_rules() {
     // Deleting the event cascades its signup rows away.
     let res = send(&app, "DELETE", &format!("/events/{ev}"), Some(&ali), None).await;
     assert_eq!(res.status, StatusCode::NO_CONTENT);
-    let left: Vec<hezarfen_backend::domain::registration::Registration> =
-        db.select("registration").await.unwrap();
-    assert!(left.is_empty(), "event delete leaves no seats behind");
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM registration")
+        .fetch_one(&db)
+        .await
+        .expect("registration count");
+    assert_eq!(left, 0, "event delete leaves no seats behind");
 }
 
 /// A capacity caps live seats, not history: re-registering never double-counts,
@@ -4470,7 +4469,7 @@ async fn re_registering_returns_the_seat_untouched() {
         "re-registering must not rewrite who placed the student"
     );
     // Regression: the response used to resolve people only from {target,
-    // caller}, so the original registrar degraded to a bare ULID username.
+    // caller}, so the original registrar degraded to a bare id username.
     assert_eq!(
         second.body["registered_by"]["username"], "ali",
         "the original registrar must resolve to a person, not a bare id"
@@ -4479,7 +4478,7 @@ async fn re_registering_returns_the_seat_untouched() {
 }
 
 /// Regression: the capacity check used to run inside a `BEGIN…COMMIT` whose
-/// cross-record `count()` SurrealDB does not conflict-check against a
+/// cross-record `count()` the old engine did not conflict-check against a
 /// concurrent insert (write-skew) — two racing placements both saw the last
 /// seat free and a capacity-1 event admitted 2. The register path now
 /// serializes the check-then-write, so exactly one wins and the loser gets
@@ -4653,16 +4652,13 @@ async fn concurrent_enrolls_of_one_pair_claim_one_seat() {
 
     let roster = send(&app, "GET", &uri, Some(&teacher), None).await;
     assert_eq!(common::total(&roster.body), 1, "one pair, one row");
-    let mut counted = db
-        .query("SELECT VALUE enrollment_count FROM type::record('course', $c)")
-        .bind(("c", course.clone()))
+    let counted: i64 = sqlx::query_scalar("SELECT enrollment_count FROM course WHERE id = $1")
+        .bind(Uuid::parse_str(&course).expect("course id"))
+        .fetch_one(&db)
         .await
-        .expect("counter read")
-        .check()
         .expect("counter read");
     assert_eq!(
-        counted.take::<Vec<i64>>(0).expect("counter column"),
-        vec![1],
+        counted, 1,
         "one row on the roster must have cost exactly one seat"
     );
 }
@@ -4711,16 +4707,13 @@ async fn concurrent_enrolls_of_one_seat_never_refuse_their_own_winner() {
 
     let roster = send(&app, "GET", &uri, Some(&teacher), None).await;
     assert_eq!(common::total(&roster.body), 1, "one seat: {}", roster.body);
-    let mut counted = db
-        .query("SELECT VALUE enrollment_count FROM type::record('course', $c)")
-        .bind(("c", course.clone()))
+    let counted: i64 = sqlx::query_scalar("SELECT enrollment_count FROM course WHERE id = $1")
+        .bind(Uuid::parse_str(&course).expect("course id"))
+        .fetch_one(&db)
         .await
-        .expect("counter read")
-        .check()
         .expect("counter read");
     assert_eq!(
-        counted.take::<Vec<i64>>(0).expect("counter column"),
-        vec![1],
+        counted, 1,
         "and the seat it cost is the one seat the course has"
     );
 }
@@ -4744,22 +4737,13 @@ async fn subject_reference_counts_track_every_writer() {
     let due = Timestamp::now().as_millis() + 86_400_000;
 
     let counts = async |subject: &str| -> (i64, i64) {
-        let mut result = db
-            .query(
-                "SELECT VALUE [exam_question_count ?? 0, homework_count ?? 0] \
-                 FROM type::record('subject', $s)",
-            )
-            .bind(("s", subject.to_string()))
-            .await
-            .expect("counter read")
-            .check()
-            .expect("counter read");
-        let pair = result
-            .take::<Vec<Vec<i64>>>(0)
-            .expect("counter columns")
-            .pop()
-            .expect("the subject row");
-        (pair[0], pair[1])
+        let pair: (i64, i64) =
+            sqlx::query_as("SELECT exam_question_count, homework_count FROM subject WHERE id = $1")
+                .bind(Uuid::parse_str(subject).expect("subject id"))
+                .fetch_one(&db)
+                .await
+                .expect("counter read");
+        pair
     };
 
     let question = create_question(
@@ -4947,33 +4931,24 @@ async fn a_subject_delete_racing_question_creates_leaves_no_orphan() {
     }
     let killed = killer.await.unwrap();
 
-    let mut result = db
-        .query("SELECT VALUE exam_question_count ?? 0 FROM type::record('subject', $s)")
-        .bind(("s", subject.clone()))
+    let counter: i64 =
+        sqlx::query_scalar("SELECT exam_question_count FROM subject WHERE id = $1")
+            .bind(Uuid::parse_str(&subject).expect("subject id"))
+            .fetch_one(&db)
+            .await
+            .expect("counter read");
+    let landed: i64 = sqlx::query_scalar("SELECT count(*) FROM exam_question WHERE subject = $1")
+        .bind(Uuid::parse_str(&subject).expect("subject id"))
+        .fetch_one(&db)
         .await
-        .expect("counter read")
-        .check()
-        .expect("counter read");
-    let counter = result.take::<Vec<i64>>(0).expect("counter column");
-    let mut rows = db
-        .query("SELECT VALUE id FROM exam_question WHERE subject = type::record('subject', $s)")
-        .bind(("s", subject.clone()))
-        .await
-        .expect("row read")
-        .check()
         .expect("row read");
-    let landed = rows
-        .take::<Vec<surrealdb::types::RecordId>>(0)
-        .expect("question rows")
-        .len() as i64;
     assert_eq!(
         killed,
         StatusCode::CONFLICT,
         "a subject a question already points at may never be deleted"
     );
     assert_eq!(
-        counter.first().copied(),
-        Some(landed),
+        counter, landed,
         "the subject must survive with its counter equal to the rows it guards"
     );
 }
@@ -5922,12 +5897,15 @@ async fn login_purges_expired_sessions() {
     let (app, db) = app_and_db().await;
     let ali = login(&app, "ali").await; // one live session
 
-    // Inject a session that has already expired.
-    db.query("CREATE session SET user = type::record('user', $u), token = 'expired-token', expires_at = 1")
-        .bind(("u", "nobody".to_string()))
+    // Inject a session that has already expired. The FK forces the row to
+    // point at a real user; the old engine allowed a dangling one.
+    let ali_id = me_id(&app, &ali).await;
+    sqlx::query("INSERT INTO user_session (id, app_user, token, expires_at) \
+                 VALUES ($1, $2, 'expired-token', 1)")
+        .bind(Uuid::now_v7())
+        .bind(Uuid::parse_str(&ali_id).expect("user id"))
+        .execute(&db)
         .await
-        .unwrap()
-        .check()
         .unwrap();
     assert!(
         session::find_by_token(&db, "expired-token")
@@ -5961,15 +5939,14 @@ async fn expired_session_is_unauthorized_before_any_purge() {
 
     // Copy ali's live session into a second row that expired long ago
     // (epoch millis 1), pointing at the same real user.
-    db.query(
-        "CREATE session SET \
-            user = (SELECT VALUE user FROM ONLY session WHERE token = $live LIMIT 1), \
-            token = 'stale-token', expires_at = 1",
+    sqlx::query(
+        "INSERT INTO user_session (id, app_user, token, expires_at) \
+         SELECT $1, app_user, 'stale-token', 1 FROM user_session WHERE token = $2",
     )
-    .bind(("live", common::cookie_token(&ali).to_string()))
+    .bind(Uuid::now_v7())
+    .bind(common::cookie_token(&ali).to_string())
+    .execute(&db)
     .await
-    .unwrap()
-    .check()
     .unwrap();
 
     // Row exists, but the clock says no.
@@ -6025,24 +6002,16 @@ async fn padded_usernames_are_canonicalized_not_distinct_accounts() {
     }
 
     // One row, not four — the padded forms collided with the canonical name.
-    let rows: Vec<User> = db
-        .query("SELECT * FROM user WHERE username = 'ali'")
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM app_user WHERE username = 'ali'")
+        .fetch_one(&db)
         .await
-        .unwrap()
-        .check()
-        .unwrap()
-        .take(0)
         .unwrap();
-    assert_eq!(rows.len(), 1, "padding minted a lookalike account");
-    let all: Vec<User> = db
-        .query("SELECT * FROM user")
+    assert_eq!(rows, 1, "padding minted a lookalike account");
+    let all: i64 = sqlx::query_scalar("SELECT count(*) FROM app_user")
+        .fetch_one(&db)
         .await
-        .unwrap()
-        .check()
-        .unwrap()
-        .take(0)
         .unwrap();
-    assert_eq!(all.len(), 1, "unexpected extra user rows");
+    assert_eq!(all, 1, "unexpected extra user rows");
 
     // That one account still belongs to the first registration, and every
     // spelling of the name resolves to it.
@@ -6355,14 +6324,11 @@ async fn promotion_via_role_endpoint_sweeps_enrollments() {
     );
 
     // Really deleted, not merely filtered out of the listing.
-    let mut result = db
-        .query("SELECT VALUE id FROM enrollment")
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM enrollment")
+        .fetch_one(&db)
         .await
-        .expect("count enrollments")
-        .check()
-        .expect("count enrollments check");
-    let rows: Vec<surrealdb::types::RecordId> = result.take(0).expect("enrollment rows");
-    assert!(rows.is_empty(), "enrollment rows deleted from the DB");
+        .expect("count enrollments");
+    assert_eq!(rows, 0, "enrollment rows deleted from the DB");
 }
 
 /// Regression: `db::user::create` pre-checks the username and then inserts, so two
@@ -6401,17 +6367,12 @@ async fn concurrent_duplicate_registrations_conflict_not_500() {
     }
 
     // Exactly one row exists for the name.
-    let users: Vec<hezarfen_backend::domain::user::User> = db
-        .query("SELECT * FROM user WHERE username = 'dup'")
+    let users: i64 = sqlx::query_scalar("SELECT count(*) FROM app_user WHERE username = 'dup'")
+        .fetch_one(&db)
         .await
-        .unwrap()
-        .check()
-        .unwrap()
-        .take(0)
         .unwrap();
     assert_eq!(
-        users.len(),
-        1,
+        users, 1,
         "exactly one user row for the duplicated name"
     );
 
@@ -6561,7 +6522,6 @@ async fn session_cookie_secure_attribute_follows_config() {
         chatbot_limit: Default::default(),
         exam_presence: Default::default(),
         board_hub: Default::default(),
-        db_up: Default::default(),
         ai: None,
         metrics: hezarfen_backend::telemetry::Metrics::noop(),
     });
@@ -6576,40 +6536,38 @@ async fn session_cookie_secure_attribute_follows_config() {
     );
 }
 
-/// A query issued while the database socket is down does not fail — the SDK
-/// parks it until the connection returns and *then* runs it, so a handler that
-/// reaches the database mid-outage waits out the whole outage and any write it
-/// carries lands late. The guard layer refuses at the edge instead, before the
-/// request can touch the database, which is what makes the 503 safe to retry.
+/// A request issued against a closed pool does not wait — the acquire fails at
+/// once and the error is classified as "nothing executed" (`PoolClosed` →
+/// `DbUnavailable`), so the 503 advertises a safe retry. A closed school pool
+/// is the honest stand-in for an unreachable socket: no statement can even be
+/// sent, which is what makes "nothing was written" true by construction.
 #[tokio::test]
 async fn db_down_refuses_before_touching_the_database() {
-    async fn count_rows(db: &hezarfen_backend::database::Database, table: &str) -> usize {
-        let mut rows = db
-            .query(format!("SELECT id FROM {table}"))
-            .await
-            .expect("count query");
-        let ids: Vec<surrealdb::types::RecordId> = rows.take(0).expect("ids");
-        ids.len()
+    async fn count_rows(db: &hezarfen_backend::database::Database, table: &str) -> i64 {
+        sqlx::query_scalar::<sqlx::Postgres, i64>(sqlx::AssertSqlSafe(format!(
+            "SELECT count(*) FROM {table}"
+        )))
+        .fetch_one(db)
+        .await
+        .expect("count query")
     }
 
     let (tenants, db) = common::mem_deployment().await;
-    let db_up = hezarfen_backend::state::DbHealth::default();
     let app = build_router(AppState {
         db: tenants.control().clone(),
-        tenants,
+        tenants: tenants.clone(),
         files_path: common::files_dir(),
         cookie_secure: false,
         rate_limit: hezarfen_backend::rate_limit::RateLimitConfig::unlimited(),
         chatbot_limit: Default::default(),
         exam_presence: Default::default(),
         board_hub: Default::default(),
-        db_up: db_up.clone(),
         ai: None,
         metrics: hezarfen_backend::telemetry::Metrics::noop(),
     });
 
     // Healthy: a login against the seeded user reaches the handler as usual.
-    let before: usize = count_rows(&db, "user").await;
+    let before: i64 = count_rows(&db, "app_user").await;
     let ok = app
         .clone()
         .oneshot(
@@ -6627,14 +6585,13 @@ async fn db_down_refuses_before_touching_the_database() {
         .unwrap();
     assert_eq!(ok.status(), StatusCode::CREATED);
     assert_eq!(
-        count_rows(&db, "user").await,
+        count_rows(&db, "app_user").await,
         before + 1,
         "the write landed"
     );
 
-    // Socket reported down: refused with a retryable 503, and — the point of
-    // refusing at the edge rather than timing out — nothing was written.
-    db_up.set(false);
+    // Pool closed: refused with a retryable 503.
+    db.close().await;
     let refused = app
         .clone()
         .oneshot(
@@ -6656,14 +6613,17 @@ async fn db_down_refuses_before_touching_the_database() {
         "1",
         "a pre-execution refusal must advertise that retrying is safe"
     );
+
+    // Recovery is eviction: the dead pool leaves the cache, the next request
+    // dials fresh — and the refused write is still not in the database.
+    let slug = Slug::try_new("demo").expect("slug");
+    tenants.evict(&slug).await;
+    let live = tenants.get(&slug).await.expect("redial after eviction");
     assert_eq!(
-        count_rows(&db, "user").await,
+        count_rows(&live, "app_user").await,
         before + 1,
         "a refused request must not have reached the database"
     );
-
-    // Recovery flips back without a restart.
-    db_up.set(true);
     let healed = app
         .oneshot(
             Request::builder()
@@ -6679,7 +6639,7 @@ async fn db_down_refuses_before_touching_the_database() {
         .await
         .unwrap();
     assert_eq!(healed.status(), StatusCode::CREATED);
-    assert_eq!(count_rows(&db, "user").await, before + 2);
+    assert_eq!(count_rows(&live, "app_user").await, before + 2);
 }
 
 /// Regression: PATCH could set an event's times but never clear them — a JSON
@@ -9711,11 +9671,10 @@ async fn questions_and_answers_cascade_with_deletes() {
         matches!(exam_question::delete(&db, frozen).await, Err(err) if err.to_string().contains("after attempts")),
         "the gate must refuse a question delete while an attempt exists"
     );
-    db.query("DELETE exam_attempt WHERE exam = $ex")
-        .bind(("ex", exam_id.record()))
+    sqlx::query("DELETE FROM exam_attempt WHERE exam = $1")
+        .bind(exam_id.uuid())
+        .execute(&db)
         .await
-        .unwrap()
-        .check()
         .unwrap();
     let question = exam_question::list_for_exam(&db, &exam_id, None, 0)
         .await
@@ -11299,7 +11258,7 @@ async fn search_rejects_a_blank_query() {
 }
 
 /// The app is EN/TR, so the user picker must fold Turkish casing: `İ` (U+0130)
-/// lowercases to `i` + U+0307 in both Rust and SurrealQL, which used to make
+/// lowercases to `i` + U+0307 in both Rust and SQL, which used to make
 /// `ilker` and `İLKER` two disjoint searches — a teacher typing lowercase got
 /// an empty picker. Same defect, same fix as the bank-question search.
 #[tokio::test]
@@ -12391,35 +12350,26 @@ async fn post_image(
 
 /// Every stored question-image blob name, straight from the table.
 async fn image_blob_keys(db: &hezarfen_backend::database::Database) -> Vec<String> {
-    let mut result = db
-        .query("SELECT VALUE file FROM question_image")
+    sqlx::query_scalar("SELECT file FROM question_image")
+        .fetch_all(db)
         .await
         .unwrap()
-        .check()
-        .unwrap();
-    result.take::<Vec<String>>(0).unwrap()
 }
 
 /// Every stored bank-question-image blob name, straight from the table.
 async fn bank_image_blob_keys(db: &hezarfen_backend::database::Database) -> Vec<String> {
-    let mut result = db
-        .query("SELECT VALUE file FROM bank_question_image")
+    sqlx::query_scalar("SELECT file FROM bank_question_image")
+        .fetch_all(db)
         .await
         .unwrap()
-        .check()
-        .unwrap();
-    result.take::<Vec<String>>(0).unwrap()
 }
 
 /// Every stored answer-image (student drawing) blob name, straight from the table.
 async fn answer_image_blob_keys(db: &hezarfen_backend::database::Database) -> Vec<String> {
-    let mut result = db
-        .query("SELECT VALUE file FROM answer_image")
+    sqlx::query_scalar("SELECT file FROM answer_image")
+        .fetch_all(db)
         .await
         .unwrap()
-        .check()
-        .unwrap();
-    result.take::<Vec<String>>(0).unwrap()
 }
 
 /// The full life of question images: teacher uploads (question + choice slots,
@@ -13321,14 +13271,14 @@ async fn parent_links_are_admin_managed_and_role_checked() {
         "POST",
         &format!("/users/{parent_id}/students"),
         Some(&admin),
-        Some(json!({ "user_id": "01ZZZZZZZZZZZZZZZZZZZZZZZZ" })),
+        Some(json!({ "user_id": common::ABSENT_ID })),
     )
     .await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
     let res = send(
         &app,
         "POST",
-        "/users/01ZZZZZZZZZZZZZZZZZZZZZZZZ/students",
+        &format!("/users/{}/students", common::ABSENT_ID),
         Some(&admin),
         Some(json!({ "user_id": ali_id })),
     )
@@ -13575,14 +13525,11 @@ async fn role_change_sweeps_parent_links() {
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
 
     // Really deleted, not merely hidden by the role checks.
-    let mut result = db
-        .query("SELECT VALUE id FROM parent_link")
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM parent_link")
+        .fetch_one(&db)
         .await
-        .expect("count parent links")
-        .check()
-        .expect("count parent links check");
-    let rows: Vec<surrealdb::types::RecordId> = result.take(0).expect("parent link rows");
-    assert!(rows.is_empty(), "parent_link rows deleted from the DB");
+        .expect("count parent links");
+    assert_eq!(rows, 0, "parent_link rows deleted from the DB");
 }
 
 // --- messages ------------------------------------------------------------
@@ -13747,14 +13694,11 @@ async fn messages_flow_through_folders_per_side() {
     )
     .await;
     assert_eq!(res.status, StatusCode::NO_CONTENT);
-    let mut result = db
-        .query("SELECT VALUE id FROM message")
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM message")
+        .fetch_one(&db)
         .await
-        .expect("count messages")
-        .check()
-        .expect("count messages check");
-    let rows: Vec<surrealdb::types::RecordId> = result.take(0).expect("message rows");
-    assert!(rows.is_empty(), "both-sides-deleted row is removed");
+        .expect("count messages");
+    assert_eq!(rows, 0, "both-sides-deleted row is removed");
 }
 
 /// A filed copy remembers the folder it left, so restoring lands where it
@@ -13833,13 +13777,11 @@ async fn messages_remember_the_folder_a_filed_copy_came_from() {
     )
     .await;
     assert_eq!(res.status, StatusCode::NO_CONTENT);
-    let mut result = db
-        .query("SELECT VALUE sender_origin FROM message")
-        .await
-        .expect("read origins")
-        .check()
-        .expect("read origins check");
-    let origins: Vec<Option<String>> = result.take(0).expect("origin rows");
+    let origins: Vec<Option<String>> =
+        sqlx::query_scalar("SELECT sender_origin FROM message")
+            .fetch_all(&db)
+            .await
+            .expect("read origins");
     assert_eq!(origins, vec![None], "the deleted side keeps no origin");
 }
 
@@ -13919,7 +13861,7 @@ async fn messages_guard_parties_recipients_and_folders() {
         "POST",
         "/messages",
         Some(&ali),
-        Some(json!({ "recipient_id": "01J8XZ0K3Q8G7X2M4N5P6R7S8T", "subject": "hi" })),
+        Some(json!({ "recipient_id": common::GHOST_ID, "subject": "hi" })),
     )
     .await;
     assert_eq!(res.status, StatusCode::NOT_FOUND);
@@ -15012,28 +14954,21 @@ async fn grade_hw(
 
 /// Every stored homework-file blob name, straight from the table.
 async fn homework_blob_keys(db: &hezarfen_backend::database::Database) -> Vec<String> {
-    let mut result = db
-        .query("SELECT VALUE file FROM homework_file")
+    sqlx::query_scalar("SELECT file FROM homework_file")
+        .fetch_all(db)
         .await
         .unwrap()
-        .check()
-        .unwrap();
-    result.take::<Vec<String>>(0).unwrap()
 }
 
 /// Row count of `table`, straight from the database — a cascade must really
 /// delete, not merely hide behind the role checks.
-async fn hw_row_count(db: &hezarfen_backend::database::Database, table: &str) -> usize {
-    let mut result = db
-        .query(format!("SELECT VALUE id FROM {table}"))
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
-    result
-        .take::<Vec<surrealdb::types::RecordId>>(0)
-        .unwrap()
-        .len()
+async fn hw_row_count(db: &hezarfen_backend::database::Database, table: &str) -> i64 {
+    sqlx::query_scalar::<sqlx::Postgres, i64>(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM {table}"
+    )))
+    .fetch_one(db)
+    .await
+    .unwrap()
 }
 
 /// Creation validates the due date (60s grace), the subject's course, the
@@ -15479,7 +15414,7 @@ async fn homework_grading_gates_and_bounds() {
         &app,
         &w.teacher,
         &hw,
-        "01ZZZZZZZZZZZZZZZZZZZZZZZZ",
+        common::ABSENT_ID,
         "done",
         None,
     )
@@ -16072,7 +16007,7 @@ async fn homework_report_serves_observers_only() {
     let res = send(
         &app,
         "GET",
-        "/homework/report/01ZZZZZZZZZZZZZZZZZZZZZZZZ",
+        &format!("/homework/report/{}", common::ABSENT_ID),
         Some(&admin),
         None,
     )
@@ -16586,7 +16521,6 @@ async fn chat_app_limited(
         chatbot_limit,
         exam_presence: Default::default(),
         board_hub: Default::default(),
-        db_up: Default::default(),
         ai,
         metrics: hezarfen_backend::telemetry::Metrics::noop(),
     });
@@ -16595,15 +16529,15 @@ async fn chat_app_limited(
 
 /// How many `thread` and `chatbot_message` rows exist, anywhere.
 async fn chat_rows(db: &Database) -> (usize, usize) {
-    let mut res = db
-        .query("SELECT VALUE id FROM chatbot_thread; SELECT VALUE id FROM chatbot_message;")
+    let threads: i64 = sqlx::query_scalar("SELECT count(*) FROM chatbot_thread")
+        .fetch_one(db)
         .await
-        .expect("count query")
-        .check()
+        .expect("count query");
+    let messages: i64 = sqlx::query_scalar("SELECT count(*) FROM chatbot_message")
+        .fetch_one(db)
+        .await
         .expect("count check");
-    let threads: Vec<surrealdb::types::RecordId> = res.take(0).expect("thread ids");
-    let messages: Vec<surrealdb::types::RecordId> = res.take(1).expect("chatbot_message ids");
-    (threads.len(), messages.len())
+    (threads as usize, messages as usize)
 }
 
 /// Open a thread (asserts 201) and return its id.
@@ -19304,7 +19238,7 @@ async fn bank_question_list_filters_by_visibility() {
 }
 
 /// The app is EN/TR, so `?q=` must fold Turkish casing: `İ` lowercases to
-/// `i` + U+0307 in both Rust and SurrealQL, which used to make `istanbul` and
+/// `i` + U+0307 in both Rust and SQL, which used to make `istanbul` and
 /// `İSTANBUL` two disjoint searches — a teacher typing lowercase got an empty
 /// bank.
 #[tokio::test]
@@ -22112,8 +22046,8 @@ async fn meal_booking_capacity_caps_and_a_cancel_frees_a_seat() {
     assert_eq!(book(students[0].clone()).await.status, StatusCode::CONFLICT);
 }
 
-/// The cap is a count-then-write pair, which SurrealDB does not serialize:
-/// under a stampede it must still admit exactly `capacity` seats, and the
+/// The cap is a conditional claim the store enforces: under a stampede it
+/// must still admit exactly `capacity` seats, and the
 /// losers must get a 409 rather than a 500. Mirrors
 /// `concurrent_duplicate_registrations_conflict_not_500`.
 #[tokio::test]
@@ -22176,16 +22110,13 @@ async fn concurrent_meal_bookings_never_exceed_the_capacity() {
     // The rows are downstream of the counter, so assert the counter itself:
     // it is what every booking's `WHERE` compares, and a drift here would open
     // the cap on the next booking however tidy the listing looks.
-    let mut counted = db
-        .query("SELECT VALUE seats_booked FROM type::record('menu', $m)")
-        .bind(("m", menu.clone()))
+    let counted: i64 = sqlx::query_scalar("SELECT seats_booked FROM menu WHERE id = $1")
+        .bind(&menu)
+        .fetch_one(&db)
         .await
-        .expect("counter read")
-        .check()
         .expect("counter read");
     assert_eq!(
-        counted.take::<Vec<i64>>(0).expect("counter column"),
-        vec![3],
+        counted, 3,
         "the stored seat counter must agree with the seats handed out"
     );
 }
@@ -23639,16 +23570,13 @@ async fn concurrent_bookings_of_one_seat_never_refuse_their_own_winner() {
 
     let res = send(&app, "GET", "/meals/bookings/me", Some(&stu), None).await;
     assert_eq!(common::total(&res.body), 1, "one seat: {}", res.body);
-    let mut counted = db
-        .query("SELECT VALUE seats_booked FROM type::record('menu', $m)")
-        .bind(("m", menu.clone()))
+    let counted: i64 = sqlx::query_scalar("SELECT seats_booked FROM menu WHERE id = $1")
+        .bind(&menu)
+        .fetch_one(&db)
         .await
-        .expect("counter read")
-        .check()
         .expect("counter read");
     assert_eq!(
-        counted.take::<Vec<i64>>(0).expect("counter column"),
-        vec![1],
+        counted, 1,
         "and the seat it cost is the one seat the menu has"
     );
 }
@@ -23986,8 +23914,8 @@ async fn a_cancel_cut_short_mid_flight_is_healed_by_repeating_it() {
 /// This deliberately does **not** race the two requests. It used to (40 rounds,
 /// two spawned tasks), and that assertion could not be honest here: the
 /// production guard is a store-detected conflict — both transactions write
-/// `menu:<id>`'s revision, so one is refused — and the embedded engine behind
-/// `init_mem` does not conflict-check concurrent writes to one record at all.
+/// `menu:<id>`'s revision, so one is refused — and the old embedded engine
+/// did not conflict-check concurrent writes to one record at all.
 /// It committed **both** and answered `Ok` to each, orphaning 4 of 3600 and 13
 /// of 6000 rounds, which surfaced as a whole-suite failure a few percent of
 /// runs. The same code orphaned 0 of 9600 rounds against a real server. So the
@@ -23999,13 +23927,12 @@ async fn a_cancel_cut_short_mid_flight_is_healed_by_repeating_it() {
 async fn a_dish_never_lands_on_a_deleted_menu() {
     let (app, db) = app_and_db().await;
     let mgr = login_as(&app, &db, "orphan_mgr", "manager").await;
-    let dishes_on = async |menu: &str| -> Vec<surrealdb::types::RecordId> {
-        let mut res = db
-            .query("SELECT VALUE id FROM menu_dish WHERE menu = $menu")
-            .bind(("menu", surrealdb::types::RecordId::new("menu", menu)))
+    let dishes_on = async |menu: &str| -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM menu_dish WHERE menu = $1")
+            .bind(menu)
+            .fetch_one(&db)
             .await
-            .unwrap();
-        res.take(0).unwrap()
+            .unwrap()
     };
     let publish = async |date: &str| -> String {
         let res = send(
@@ -24043,8 +23970,9 @@ async fn a_dish_never_lands_on_a_deleted_menu() {
     assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
     let res = add_dish(&menu).await;
     assert_eq!(res.status, StatusCode::NOT_FOUND, "{}", res.body);
-    assert!(
-        dishes_on(&menu).await.is_empty(),
+    assert_eq!(
+        dishes_on(&menu).await,
+        0,
         "a refused add left a dish behind"
     );
 
@@ -24054,7 +23982,7 @@ async fn a_dish_never_lands_on_a_deleted_menu() {
     let menu = publish("2027-10-01").await;
     let res = add_dish(&menu).await;
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.body);
-    assert_eq!(dishes_on(&menu).await.len(), 1);
+    assert_eq!(dishes_on(&menu).await, 1);
     let res = send(
         &app,
         "DELETE",
@@ -24064,8 +23992,9 @@ async fn a_dish_never_lands_on_a_deleted_menu() {
     )
     .await;
     assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
-    assert!(
-        dishes_on(&menu).await.is_empty(),
+    assert_eq!(
+        dishes_on(&menu).await,
+        0,
         "the delete's cascade left a dish on a menu that is gone"
     );
 }
@@ -24216,20 +24145,15 @@ async fn reverse(app: &axum::Router, cookie: &str, line: &str) -> common::Res {
     .await
 }
 
-/// Row count of `table`, straight from the database. The in-memory engine
-/// drops writes under concurrency and still answers `201`, so a response is
-/// never proof that a line landed — stored state is.
-async fn pay_row_count(db: &hezarfen_backend::database::Database, table: &str) -> usize {
-    let mut result = db
-        .query(format!("SELECT VALUE id FROM {table}"))
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
-    result
-        .take::<Vec<surrealdb::types::RecordId>>(0)
-        .unwrap()
-        .len()
+/// Row count of `table`, straight from the database — a response is never
+/// proof that a line landed; stored state is.
+async fn pay_row_count(db: &hezarfen_backend::database::Database, table: &str) -> i64 {
+    sqlx::query_scalar::<sqlx::Postgres, i64>(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM {table}"
+    )))
+    .fetch_one(db)
+    .await
+    .unwrap()
 }
 
 /// A manager, a student, and a plan the student is on — the starting point of
@@ -25042,56 +24966,43 @@ async fn stored_board(db: &Database, board: &str) -> Option<Board> {
 }
 
 /// Every stroke row of a board, oldest first, straight out of the table.
-/// `SELECT *`, because SurrealDB 3 refuses `ORDER BY id` on a projection that
-/// omits `id`.
 async fn stroke_rows(db: &Database, board: &str) -> Vec<BoardStroke> {
-    let mut result = db
-        .query("SELECT * FROM board_stroke WHERE board = $b ORDER BY id")
-        .bind(("b", BoardId::from_key(board).record()))
+    sqlx::query_as::<_, BoardStroke>("SELECT * FROM board_stroke WHERE board = $1 ORDER BY id")
+        .bind(Uuid::parse_str(board).expect("board id"))
+        .fetch_all(db)
         .await
         .unwrap()
-        .check()
-        .unwrap();
-    result.take(0).unwrap()
 }
 
 /// The stored `[epoch_stroke_count, total_stroke_count]` pair.
 async fn stored_counters(db: &Database, board: &str) -> Vec<i64> {
-    let mut result = db
-        .query(
-            "SELECT VALUE [epoch_stroke_count ?? 0, total_stroke_count ?? 0] \
-             FROM $id",
-        )
-        .bind(("id", BoardId::from_key(board).record()))
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
-    result.take::<Vec<Vec<i64>>>(0).unwrap().remove(0)
+    let (epoch_stroke_count, total_stroke_count) =
+        sqlx::query_as("SELECT epoch_stroke_count, total_stroke_count FROM board WHERE id = $1")
+            .bind(Uuid::parse_str(board).expect("board id"))
+            .fetch_one(db)
+            .await
+            .unwrap();
+    vec![epoch_stroke_count, total_stroke_count]
 }
 
 async fn set_counters(db: &Database, board: &str, epoch: i64, total: i64) {
-    db.query("UPDATE $id SET epoch_stroke_count = $e, total_stroke_count = $t")
-        .bind(("id", BoardId::from_key(board).record()))
-        .bind(("e", epoch))
-        .bind(("t", total))
+    sqlx::query("UPDATE board SET epoch_stroke_count = $2, total_stroke_count = $3 WHERE id = $1")
+        .bind(Uuid::parse_str(board).expect("board id"))
+        .bind(epoch)
+        .bind(total)
+        .execute(db)
         .await
-        .unwrap()
-        .check()
         .unwrap();
 }
 
 /// The creator's stored `board_count` — the authority on how many boards they
 /// hold, so the per-creator cap is asserted here and not off a 409.
 async fn stored_board_count(db: &Database, user: &str) -> i64 {
-    let mut result = db
-        .query("SELECT VALUE board_count ?? 0 FROM $id")
-        .bind(("id", UserId::from_key(user).record()))
+    sqlx::query_scalar("SELECT board_count FROM app_user WHERE id = $1")
+        .bind(Uuid::parse_str(user).expect("user id"))
+        .fetch_one(db)
         .await
         .unwrap()
-        .check()
-        .unwrap();
-    result.take::<Vec<i64>>(0).unwrap()[0]
 }
 
 /// Every id-scoped board route, with a body where the route needs one. The
@@ -25237,12 +25148,11 @@ async fn a_parent_gets_no_whiteboard_at_all() {
     // 3. The stale row: a parent already on a roster, written before this rule.
     //    Every id-scoped route must still answer exactly like a board that was
     //    never minted — a 403 anywhere here leaks the board's existence.
-    db.query("UPDATE $b SET participants = [$u]")
-        .bind(("b", BoardId::from_key(&board).record()))
-        .bind(("u", UserId::from_key(&anne_id).record()))
+    sqlx::query("UPDATE board SET participants = $2 WHERE id = $1")
+        .bind(Uuid::parse_str(&board).expect("board id"))
+        .bind(vec![Uuid::parse_str(&anne_id).expect("user id")])
+        .execute(&db)
         .await
-        .unwrap()
-        .check()
         .unwrap();
     let ghost = board_routes("nosuchboard");
     for (n, (method, uri, body)) in board_routes(&board).into_iter().enumerate() {
@@ -25283,13 +25193,7 @@ async fn a_creator_can_patch_back_a_roster_holding_a_participant_who_no_longer_q
     let board = create_board(&app, &ali, "Geometri", &[&veli_id]).await;
     // Demoted straight in the store: `set_role` would sweep the roster, and the
     // stale row is exactly the shape a volume written before that sweep holds.
-    db.query("UPDATE $u SET role = 'parent'")
-        .bind(("u", UserId::from_key(&veli_id).record()))
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
-
+    common::set_role(&db, "veli", "parent").await;
     // What the client sees, and sends straight back.
     let read = send(&app, "GET", &format!("/boards/{board}"), Some(&ali), None).await;
     assert_eq!(read.status, StatusCode::OK, "{}", read.body);
@@ -25897,12 +25801,11 @@ async fn the_per_creator_cap_refuses_and_a_delete_frees_a_seat() {
     assert_eq!(stored_board_count(&db, &ali_id).await, 1);
 
     // Age the counter to full rather than open 200 boards.
-    db.query("UPDATE $id SET board_count = $full")
-        .bind(("id", UserId::from_key(&ali_id).record()))
-        .bind(("full", MAX_BOARDS_PER_CREATOR))
+    sqlx::query("UPDATE app_user SET board_count = $1 WHERE id = $2")
+        .bind(MAX_BOARDS_PER_CREATOR)
+        .bind(Uuid::parse_str(&ali_id).expect("user id"))
+        .execute(&db)
         .await
-        .unwrap()
-        .check()
         .unwrap();
 
     let res = send(
@@ -25919,20 +25822,11 @@ async fn the_per_creator_cap_refuses_and_a_delete_frees_a_seat() {
         MAX_BOARDS_PER_CREATOR,
         "the refusal must not have claimed a seat"
     );
-    let mut result = db
-        .query("SELECT VALUE id FROM board")
+    let boards: i64 = sqlx::query_scalar("SELECT count(*) FROM board")
+        .fetch_one(&db)
         .await
-        .unwrap()
-        .check()
         .unwrap();
-    assert_eq!(
-        result
-            .take::<Vec<surrealdb::types::RecordId>>(0)
-            .unwrap()
-            .len(),
-        1,
-        "no row was written by the refused create"
-    );
+    assert_eq!(boards, 1, "no row was written by the refused create");
 
     // Deleting frees exactly one seat, and the next create takes it.
     let res = send(
@@ -25960,10 +25854,10 @@ async fn the_per_creator_cap_refuses_and_a_delete_frees_a_seat() {
     assert_eq!(res.status, StatusCode::NOT_FOUND);
 }
 
-/// The `next_ulid` hazard, over HTTP: a burst of marks all lands inside one or
-/// two milliseconds, and `Ulid::new()` would sort those rows at random
-/// (src/domain/monotonic_id.rs:41-46). The canvas is a drawing, so an order
-/// that shuffles is a drawing that redraws wrong.
+/// The id-ordering hazard, over HTTP: a burst of marks all lands inside one
+/// or two milliseconds, and an id scheme without within-millisecond
+/// monotonicity would sort those rows at random. The canvas is a drawing, so
+/// an order that shuffles is a drawing that redraws wrong.
 #[tokio::test]
 async fn a_burst_of_strokes_comes_back_in_mint_order() {
     let (app, db) = app_and_db().await;
@@ -26418,41 +26312,35 @@ async fn a_demotion_sweeps_the_class_membership_and_what_it_pumped() {
     assert_eq!(common::total(&res.body), 0, "and so did the course");
 
     // Both tables and both counters, read off the store itself.
-    let mut result = db
-        .query(
-            "SELECT VALUE id FROM class_member; \
-             SELECT VALUE id FROM enrollment; \
-             SELECT VALUE class_member_count FROM class_group; \
-             SELECT VALUE enrollment_count FROM course;",
-        )
-        .await
-        .expect("read the swept state")
-        .check()
-        .expect("read the swept state");
-    assert!(
-        result
-            .take::<Vec<surrealdb::types::RecordId>>(0)
-            .expect("class_member rows")
-            .is_empty(),
+    let count = |sql: &'static str| {
+        let db = &db;
+        async move {
+            sqlx::query_scalar::<_, i64>(sql)
+                .fetch_one(db)
+                .await
+                .expect("read the swept state")
+        }
+    };
+    assert_eq!(
+        count("SELECT count(*) FROM class_member").await,
+        0,
         "the membership row is deleted, not merely filtered out"
     );
-    assert!(
-        result
-            .take::<Vec<surrealdb::types::RecordId>>(1)
-            .expect("enrollment rows")
-            .is_empty(),
+    assert_eq!(
+        count("SELECT count(*) FROM enrollment").await,
+        0,
         "the pumped enrollment is deleted too"
     );
-    assert_eq!(
-        result.take::<Vec<i64>>(2).expect("class_member_count"),
-        vec![0],
-        "the class counter came back"
-    );
-    assert_eq!(
-        result.take::<Vec<i64>>(3).expect("enrollment_count"),
-        vec![0],
-        "the course counter came back"
-    );
+    let class_members: i64 = sqlx::query_scalar("SELECT class_member_count FROM class_group")
+        .fetch_one(&db)
+        .await
+        .expect("read the swept state");
+    assert_eq!(class_members, 0, "the class counter came back");
+    let enrolled: i64 = sqlx::query_scalar("SELECT enrollment_count FROM course")
+        .fetch_one(&db)
+        .await
+        .expect("read the swept state");
+    assert_eq!(enrolled, 0, "the course counter came back");
 
     // The bite: a membership left behind (or a counter never released) makes
     // the class undeletable forever.
@@ -26626,7 +26514,7 @@ async fn a_course_that_cannot_seat_the_whole_class_seats_none_of_it() {
     assert_eq!(res.status, StatusCode::CONFLICT, "{}", res.body);
     let message = res.body["error"].as_str().unwrap_or_default();
     assert!(
-        message.contains(&format!("course:{course}")),
+        message.contains(&course),
         "the refusal must name the full course: {message}"
     );
 
@@ -26655,23 +26543,16 @@ async fn a_course_that_cannot_seat_the_whole_class_seats_none_of_it() {
     .await;
     assert_eq!(common::total(&res.body), 0);
     assert!(common::items(&res.body).is_empty(), "no link row");
-    let mut result = db
-        .query("SELECT VALUE enrollment_count FROM course; SELECT VALUE id FROM class_course;")
+    let enrolled: i64 = sqlx::query_scalar("SELECT enrollment_count FROM course")
+        .fetch_one(&db)
         .await
-        .expect("read the refused state")
-        .check()
         .expect("read the refused state");
-    assert_eq!(
-        result.take::<Vec<i64>>(0).expect("enrollment_count"),
-        vec![1],
-        "the counter must not have moved"
-    );
-    assert!(
-        result
-            .take::<Vec<surrealdb::types::RecordId>>(1)
-            .expect("class_course rows")
-            .is_empty(),
-    );
+    assert_eq!(enrolled, 1, "the counter must not have moved");
+    let links: i64 = sqlx::query_scalar("SELECT count(*) FROM class_course")
+        .fetch_one(&db)
+        .await
+        .expect("read the refused state");
+    assert_eq!(links, 0, "no class_course row was written");
 
     // It really was a seat shortfall: a class of one fits, and lands.
     assert_eq!(
@@ -27465,12 +27346,12 @@ async fn two_schools() -> (
     (app, db_a, db_b, tenants)
 }
 
-/// The same two schools for a remote deployment: [`common::remote_deployment`]
-/// creates them itself, since there is no `init_mem_tenants` to seed a demo.
-const TWO_SCHOOLS: &[(&str, &str)] = &[(DEMO_SLUG, "Demo School"), ("beta", "Beta Koleji")];
+/// The second school for [`common::deployment_with`], which creates the named
+/// schools itself — the demo school comes with the deployment it boots, so
+/// only `beta` is named here.
+const TWO_SCHOOLS: &[(&str, &str)] = &[("beta", "Beta Koleji")];
 
-/// One school's handle out of the registry — the one lookup that works in both
-/// modes, where `two_schools()`'s return values are memory-mode only.
+/// One school's handle out of the registry.
 async fn school_db(tenants: &Tenants, slug: &str) -> hezarfen_backend::database::Database {
     tenants
         .get(&Slug::try_new(slug).expect("a school slug"))
@@ -27607,13 +27488,11 @@ async fn probe_cross_school_lists_show_only_own_rows() {
     probe_cross_school_lists_show_only_own_rows_on(&app, &tenants).await;
 }
 
-/// [`probe_cross_school_lists_show_only_own_rows`] on a **real remote deployment** — production's `Mode::Remote`,
-/// where isolation rests on each connection's `use_db` pin.
+/// [`probe_cross_school_lists_show_only_own_rows`] against a second,
+/// independent deployment — the probe body is shared, the deployment is not.
 #[tokio::test]
 async fn remote_probe_cross_school_lists_show_only_own_rows() {
-    let Some(d) = common::remote_deployment(TWO_SCHOOLS).await else {
-        return;
-    };
+    let d = common::deployment_with(TWO_SCHOOLS).await;
     probe_cross_school_lists_show_only_own_rows_on(&d.app, &d.tenants).await;
 }
 
@@ -27667,13 +27546,11 @@ async fn probe_cross_school_ids_are_not_found_under_the_other_cookie() {
     probe_cross_school_ids_are_not_found_under_the_other_cookie_on(&app, &tenants).await;
 }
 
-/// [`probe_cross_school_ids_are_not_found_under_the_other_cookie`] on a **real remote deployment** — production's `Mode::Remote`,
-/// where isolation rests on each connection's `use_db` pin.
+/// [`probe_cross_school_ids_are_not_found_under_the_other_cookie`] against a
+/// second, independent deployment — the probe body is shared, the deployment is not.
 #[tokio::test]
 async fn remote_probe_cross_school_ids_are_not_found_under_the_other_cookie() {
-    let Some(d) = common::remote_deployment(TWO_SCHOOLS).await else {
-        return;
-    };
+    let d = common::deployment_with(TWO_SCHOOLS).await;
     probe_cross_school_ids_are_not_found_under_the_other_cookie_on(&d.app, &d.tenants).await;
 }
 
@@ -27778,13 +27655,11 @@ async fn probe_cross_school_ids_in_bodies_are_refused() {
     probe_cross_school_ids_in_bodies_are_refused_on(&app, &tenants).await;
 }
 
-/// [`probe_cross_school_ids_in_bodies_are_refused`] on a **real remote deployment** — production's `Mode::Remote`,
-/// where isolation rests on each connection's `use_db` pin.
+/// [`probe_cross_school_ids_in_bodies_are_refused`] against a second,
+/// independent deployment — the probe body is shared, the deployment is not.
 #[tokio::test]
 async fn remote_probe_cross_school_ids_in_bodies_are_refused() {
-    let Some(d) = common::remote_deployment(TWO_SCHOOLS).await else {
-        return;
-    };
+    let d = common::deployment_with(TWO_SCHOOLS).await;
     probe_cross_school_ids_in_bodies_are_refused_on(&d.app, &d.tenants).await;
 }
 
@@ -27881,13 +27756,11 @@ async fn probe_suspension_blocks_login_and_a_live_cookie_then_resume_restores_it
         .await;
 }
 
-/// [`probe_suspension_blocks_login_and_a_live_cookie_then_resume_restores_it`] on a **real remote deployment** — production's `Mode::Remote`,
-/// where isolation rests on each connection's `use_db` pin.
+/// [`probe_suspension_blocks_login_and_a_live_cookie_then_resume_restores_it`]
+/// against a second, independent deployment — shared body, own deployment.
 #[tokio::test]
 async fn remote_probe_suspension_blocks_login_and_a_live_cookie_then_resume_restores_it() {
-    let Some(d) = common::remote_deployment(TWO_SCHOOLS).await else {
-        return;
-    };
+    let d = common::deployment_with(TWO_SCHOOLS).await;
     probe_suspension_blocks_login_and_a_live_cookie_then_resume_restores_it_on(&d.app, &d.tenants)
         .await;
 }
@@ -27987,13 +27860,11 @@ async fn probe_cookie_confusion_is_impossible_both_ways() {
     probe_cookie_confusion_is_impossible_both_ways_on(&app, &tenants).await;
 }
 
-/// [`probe_cookie_confusion_is_impossible_both_ways`] on a **real remote deployment** — production's `Mode::Remote`,
-/// where isolation rests on each connection's `use_db` pin.
+/// [`probe_cookie_confusion_is_impossible_both_ways`] against a second,
+/// independent deployment — the probe body is shared, the deployment is not.
 #[tokio::test]
 async fn remote_probe_cookie_confusion_is_impossible_both_ways() {
-    let Some(d) = common::remote_deployment(TWO_SCHOOLS).await else {
-        return;
-    };
+    let d = common::deployment_with(TWO_SCHOOLS).await;
     probe_cookie_confusion_is_impossible_both_ways_on(&d.app, &d.tenants).await;
 }
 
@@ -28117,13 +27988,11 @@ async fn probe_register_is_scoped_to_the_named_school() {
     probe_register_is_scoped_to_the_named_school_on(&app, &tenants).await;
 }
 
-/// [`probe_register_is_scoped_to_the_named_school`] on a **real remote deployment** — production's `Mode::Remote`,
-/// where isolation rests on each connection's `use_db` pin.
+/// [`probe_register_is_scoped_to_the_named_school`] against a second,
+/// independent deployment — the probe body is shared, the deployment is not.
 #[tokio::test]
 async fn remote_probe_register_is_scoped_to_the_named_school() {
-    let Some(d) = common::remote_deployment(TWO_SCHOOLS).await else {
-        return;
-    };
+    let d = common::deployment_with(TWO_SCHOOLS).await;
     probe_register_is_scoped_to_the_named_school_on(&d.app, &d.tenants).await;
 }
 
@@ -28163,17 +28032,12 @@ async fn probe_register_is_scoped_to_the_named_school_on(app: &axum::Router, ten
             "register into {slug}: {}",
             res.body
         );
-        let found: Vec<String> = db
-            .query("SELECT VALUE username FROM user WHERE username = 'ayse'")
-            .await
-            .unwrap()
-            .take(0)
-            .unwrap();
-        assert_eq!(
-            found,
-            vec!["ayse".to_string()],
-            "exactly one 'ayse' in {slug}"
-        );
+        let found: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM app_user WHERE username = 'ayse'")
+                .fetch_one(db)
+                .await
+                .unwrap();
+        assert_eq!(found, 1, "exactly one 'ayse' in {slug}");
     }
 
     // Unknown school: same 401 and same body as a bad credential — no
@@ -28228,13 +28092,11 @@ async fn probe_uploaded_files_are_school_scoped() {
     probe_uploaded_files_are_school_scoped_on(&app, &tenants, common::files_dir().as_path()).await;
 }
 
-/// [`probe_uploaded_files_are_school_scoped`] on a **real remote deployment** — production's `Mode::Remote`,
-/// where isolation rests on each connection's `use_db` pin.
+/// [`probe_uploaded_files_are_school_scoped`] against a second, independent
+/// deployment — the probe body is shared, the deployment is not.
 #[tokio::test]
 async fn remote_probe_uploaded_files_are_school_scoped() {
-    let Some(d) = common::remote_deployment(TWO_SCHOOLS).await else {
-        return;
-    };
+    let d = common::deployment_with(TWO_SCHOOLS).await;
     probe_uploaded_files_are_school_scoped_on(&d.app, &d.tenants, &d.files).await;
 }
 
@@ -28309,13 +28171,11 @@ async fn probe_school_rows_never_reach_the_control_database() {
     probe_school_rows_never_reach_the_control_database_on(&app, &tenants).await;
 }
 
-/// [`probe_school_rows_never_reach_the_control_database`] on a **real remote deployment** — production's `Mode::Remote`,
-/// where isolation rests on each connection's `use_db` pin.
+/// [`probe_school_rows_never_reach_the_control_database`] against a second,
+/// independent deployment — the probe body is shared, the deployment is not.
 #[tokio::test]
 async fn remote_probe_school_rows_never_reach_the_control_database() {
-    let Some(d) = common::remote_deployment(TWO_SCHOOLS).await else {
-        return;
-    };
+    let d = common::deployment_with(TWO_SCHOOLS).await;
     probe_school_rows_never_reach_the_control_database_on(&d.app, &d.tenants).await;
 }
 
@@ -28334,8 +28194,8 @@ async fn probe_school_rows_never_reach_the_control_database_on(
     // Nothing a school writes may appear in the control database.
     let control = tenants.control();
     for table in [
-        "user",
-        "session",
+        "app_user",
+        "user_session",
         "note",
         "course",
         "event",
@@ -28347,24 +28207,23 @@ async fn probe_school_rows_never_reach_the_control_database_on(
         "chatbot_thread",
         "exam",
     ] {
-        let rows: Vec<surrealdb::types::RecordId> = control
-            .query(format!("SELECT VALUE id FROM {table}"))
-            .await
-            .expect("control query")
-            .take(0)
-            .unwrap_or_default();
-        assert!(
-            rows.is_empty(),
-            "the control database holds {} `{table}` row(s): {rows:?}",
-            rows.len()
+        let tables: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM information_schema.tables \
+             WHERE table_schema = 'public' AND table_name = $1",
+        )
+        .bind(table)
+        .fetch_one(control)
+        .await
+        .expect("control query");
+        assert_eq!(
+            tables, 0,
+            "the control database holds a school table `{table}`"
         );
     }
     // And the control database does hold the two schools.
-    let schools: Vec<String> = control
-        .query("SELECT VALUE slug FROM school ORDER BY slug")
+    let schools: Vec<String> = sqlx::query_scalar("SELECT slug FROM school ORDER BY slug")
+        .fetch_all(control)
         .await
-        .unwrap()
-        .take(0)
         .unwrap();
     assert_eq!(schools, vec!["beta".to_string(), "demo".to_string()]);
 
@@ -28421,19 +28280,16 @@ async fn probe_school_rows_never_reach_the_control_database_on(
     }
 }
 
-/// Invariant 1 on the path production actually uses: `Mode::Remote`, where every
-/// school is a *database inside one namespace on one server* and isolation rests
-/// entirely on each connection's `use_db` pin — unlike `Mode::Mem`, where a
-/// school is its own embedded datastore and isolation cannot fail.
+/// Invariant 1 on the path production actually uses: every school is its own
+/// *database on one server*, and isolation rests on the server, not on the
+/// handle — a school's rows are simply not visible from another school's
+/// database.
 ///
 /// The two slugs are the ones that are not bare identifiers: `ata-koleji` parses
 /// as a subtraction unquoted, `2024school` as a duration.
 #[tokio::test]
 async fn remote_probe_remote_mode_keeps_two_schools_apart() {
-    let Some(d) = common::remote_deployment(&[("ata-koleji", "Ata"), ("2024school", "2024")]).await
-    else {
-        return;
-    };
+    let d = common::deployment_with(&[("ata-koleji", "Ata"), ("2024school", "2024")]).await;
     let (app, tenants) = (&d.app, &d.tenants);
     let slug_a = Slug::try_new("ata-koleji").unwrap();
     let slug_b = Slug::try_new("2024school").unwrap();
@@ -28521,47 +28377,49 @@ async fn remote_probe_remote_mode_keeps_two_schools_apart() {
 }
 
 // -------------------------------------------------------------------------
-// Remote-only invariants: things `Mode::Mem` cannot even express, because a
-// memory-mode school is its own datastore rather than a database on a server.
+// Database-per-school invariants: a school is its own database on the server,
+// so its rows are unreachable from any other school's handle.
 // -------------------------------------------------------------------------
 
-/// The namespace's database list, out of `INFO FOR NS` on the control handle.
+/// The server's database list, off the control handle: the control database
+/// itself plus every school database, named `{control}_school_{slug}`.
 async fn namespace_databases(tenants: &Tenants) -> Vec<String> {
-    let mut info = tenants
-        .control()
-        .query("INFO FOR NS")
+    let control = tenants.control();
+    let control_db: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(control)
         .await
-        .expect("INFO FOR NS");
-    let info: serde_json::Value = info
-        .take::<Option<serde_json::Value>>(0)
-        .expect("INFO FOR NS row")
-        .expect("INFO FOR NS is never empty");
-    let mut names: Vec<String> = info["databases"]
-        .as_object()
-        .unwrap_or_else(|| panic!("INFO FOR NS has no databases map: {info}"))
-        .keys()
-        .cloned()
-        .collect();
+        .expect("current database");
+    let mut names: Vec<String> = sqlx::query_scalar(
+        "SELECT datname FROM pg_database \
+         WHERE datname = $1 OR datname LIKE $2",
+    )
+    .bind(&control_db)
+    .bind(format!("{control_db}\\_school\\_%"))
+    .fetch_all(control)
+    .await
+    .expect("database list");
     names.sort();
     names
 }
 
-/// Remote-only: a school **is** a database, so the namespace must hold exactly
-/// the created schools plus `control` — and `DELETE /schools/{slug}` must
-/// `REMOVE DATABASE`, not merely delete the registry row.
+/// A school **is** a database, so the server must hold exactly the created
+/// schools plus the control database — and `DELETE /schools/{slug}` must drop
+/// the database, not merely delete the registry row.
 #[tokio::test]
 async fn remote_probe_a_school_is_a_database_and_delete_removes_it() {
-    let Some(d) = common::remote_deployment(TWO_SCHOOLS).await else {
-        return;
-    };
+    let d = common::deployment_with(TWO_SCHOOLS).await;
+    let control_db: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(d.tenants.control())
+        .await
+        .expect("control name");
     assert_eq!(
         namespace_databases(&d.tenants).await,
         vec![
-            "beta".to_string(),
-            "control".to_string(),
-            "demo".to_string()
+            control_db.clone(),
+            format!("{control_db}_school_beta"),
+            format!("{control_db}_school_demo"),
         ],
-        "the namespace holds exactly the two schools and the control database"
+        "the server holds exactly the two schools and the control database"
     );
 
     hezarfen_backend::service::builder::ensure(
@@ -28586,18 +28444,16 @@ async fn remote_probe_a_school_is_a_database_and_delete_removes_it() {
     assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
     assert_eq!(
         namespace_databases(&d.tenants).await,
-        vec!["control".to_string(), "demo".to_string()],
-        "DELETE /schools/beta left beta's database standing"
+        vec![control_db.clone(), format!("{control_db}_school_demo")],
+        "DELETE /schools/beta dropped beta's database"
     );
 }
 
-/// Remote-only: raw SQL on a school's own handle sees that school's rows and
-/// no others — the `use_db` pin, checked under the API rather than through it.
+/// Raw SQL on a school's own handle sees that school's rows and no others —
+/// isolation by database, checked under the API rather than through it.
 #[tokio::test]
 async fn remote_probe_raw_sql_on_a_school_handle_counts_only_its_own_rows() {
-    let Some(d) = common::remote_deployment(TWO_SCHOOLS).await else {
-        return;
-    };
+    let d = common::deployment_with(TWO_SCHOOLS).await;
     // Different counts, so a leak cannot hide behind equal numbers.
     for (slug, users) in [
         (DEMO_SLUG, ["ada", "ali", "ayse"].as_slice()),
@@ -28622,14 +28478,10 @@ async fn remote_probe_raw_sql_on_a_school_handle_counts_only_its_own_rows() {
     }
 
     let count = async |db: &hezarfen_backend::database::Database| -> i64 {
-        db.query("SELECT count() FROM user GROUP ALL")
+        sqlx::query_scalar("SELECT count(*) FROM app_user")
+            .fetch_one(db)
             .await
             .expect("count query")
-            .take::<Vec<serde_json::Value>>(0)
-            .expect("count row")
-            .first()
-            .and_then(|row| row["count"].as_i64())
-            .unwrap_or_default()
     };
     let db_a = school_db(&d.tenants, DEMO_SLUG).await;
     let db_b = school_db(&d.tenants, "beta").await;
@@ -28637,14 +28489,12 @@ async fn remote_probe_raw_sql_on_a_school_handle_counts_only_its_own_rows() {
     assert_eq!(count(&db_b).await, 1, "beta's own users");
 }
 
-/// Remote-only: one namespace, so the *same record id string* exists in both
-/// databases' address space. Selected on the other school's handle it must
-/// still find nothing — record ids are not global.
+/// The same uuid *string* is well-formed everywhere, but the row it names
+/// exists only in the database that minted it: selecting it on the other
+/// school's handle must find nothing.
 #[tokio::test]
 async fn remote_probe_a_record_id_minted_in_one_school_is_absent_in_the_other() {
-    let Some(d) = common::remote_deployment(TWO_SCHOOLS).await else {
-        return;
-    };
+    let d = common::deployment_with(TWO_SCHOOLS).await;
     let res = send(
         &d.app,
         "POST",
@@ -28657,32 +28507,33 @@ async fn remote_probe_a_record_id_minted_in_one_school_is_absent_in_the_other() 
 
     let db_a = school_db(&d.tenants, DEMO_SLUG).await;
     let db_b = school_db(&d.tenants, "beta").await;
-    let id: surrealdb::types::RecordId = db_a
-        .query("SELECT VALUE id FROM user LIMIT 1")
+    let id: Uuid = sqlx::query_scalar("SELECT id FROM app_user LIMIT 1")
+        .fetch_one(&db_a)
         .await
-        .expect("A's user id")
-        .take::<Vec<surrealdb::types::RecordId>>(0)
-        .expect("id row")
-        .pop()
-        .expect("A minted exactly one user");
+        .expect("A's user id");
 
-    let mine: Option<serde_json::Value> = db_a.select(id.clone()).await.expect("select in A");
-    assert!(mine.is_some(), "{id:?} is A's own row");
-    let theirs: Option<serde_json::Value> = db_b.select(id.clone()).await.expect("select in B");
-    assert!(
-        theirs.is_none(),
-        "{id:?} — minted in demo — resolved on beta's handle: {theirs:?}"
+    let mine: i64 = sqlx::query_scalar("SELECT count(*) FROM app_user WHERE id = $1")
+        .bind(id)
+        .fetch_one(&db_a)
+        .await
+        .expect("select in A");
+    assert_eq!(mine, 1, "{id} is A's own row");
+    let theirs: i64 = sqlx::query_scalar("SELECT count(*) FROM app_user WHERE id = $1")
+        .bind(id)
+        .fetch_one(&db_b)
+        .await
+        .expect("select in B");
+    assert_eq!(
+        theirs, 0,
+        "{id} — minted in demo — resolved on beta's handle"
     );
 }
 
-/// Remote-only: eviction really drops the socket here (in memory mode the
-/// cached handle *is* the store, so it is never dropped). A suspend/resume must
-/// therefore reconnect and find the school's rows exactly as they were.
+/// Suspension evicts the cached pool; a resume must therefore dial fresh and
+/// find the school's rows exactly as they were.
 #[tokio::test]
 async fn remote_probe_a_suspended_school_reconnects_with_its_rows_intact() {
-    let Some(d) = common::remote_deployment(TWO_SCHOOLS).await else {
-        return;
-    };
+    let d = common::deployment_with(TWO_SCHOOLS).await;
     let slug = Slug::try_new(DEMO_SLUG).unwrap();
     let db = school_db(&d.tenants, DEMO_SLUG).await;
     let cookie = common::login_as_school(&d.app, &db, DEMO_SLUG, "ada", "admin").await;
@@ -28710,12 +28561,10 @@ async fn remote_probe_a_suspended_school_reconnects_with_its_rows_intact() {
 
     // A fresh connection (the old one was evicted) onto the same database.
     let reconnected = school_db(&d.tenants, DEMO_SLUG).await;
-    let titles: Vec<String> = reconnected
-        .query("SELECT VALUE title FROM note")
+    let titles: Vec<String> = sqlx::query_scalar("SELECT title FROM note")
+        .fetch_all(&reconnected)
         .await
-        .expect("notes after the resume")
-        .take(0)
-        .expect("title rows");
+        .expect("notes after the resume");
     assert_eq!(titles, vec!["before".to_string()], "the rows survived");
     let res = send(
         &d.app,

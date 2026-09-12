@@ -1,0 +1,184 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE appointment SET status = $2, proposed_starts_at = $3, proposed_ends_at = $4, proposed_by = $5, decided_by = $6, cancelled_by = $7, cancel_reason = $8, reject_reason = $9 WHERE id = $1 AND status = $10 AND proposed_starts_at IS NOT DISTINCT FROM $11 AND proposed_ends_at IS NOT DISTINCT FROM $12 AND decided_by IS NOT DISTINCT FROM $13 RETURNING id AS \"id: AppointmentId\", slot AS \"slot: AppointmentSlotId\", requester AS \"requester: UserId\", status AS \"status: AppointmentStatus\", reason AS \"reason: AppointmentReason\", proposed_starts_at AS \"proposed_starts_at: Timestamp\", proposed_ends_at AS \"proposed_ends_at: Timestamp\", proposed_by AS \"proposed_by: UserId\", decided_by AS \"decided_by: UserId\", cancelled_by AS \"cancelled_by: UserId\", cancel_reason AS \"cancel_reason: AppointmentReason\", reject_reason AS \"reject_reason: AppointmentReason\", created_at AS \"created_at: Timestamp\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: AppointmentId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "appointment",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "slot: AppointmentSlotId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "appointment",
+            "name": "slot"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "requester: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "appointment",
+            "name": "requester"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "status: AppointmentStatus",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "appointment",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "reason: AppointmentReason",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "appointment",
+            "name": "reason"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "proposed_starts_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "appointment",
+            "name": "proposed_starts_at"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "proposed_ends_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "appointment",
+            "name": "proposed_ends_at"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "proposed_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "appointment",
+            "name": "proposed_by"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "decided_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "appointment",
+            "name": "decided_by"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "cancelled_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "appointment",
+            "name": "cancelled_by"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "cancel_reason: AppointmentReason",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "appointment",
+            "name": "cancel_reason"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "reject_reason: AppointmentReason",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "appointment",
+            "name": "reject_reason"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "created_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "appointment",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Int8",
+        "Int8",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "Int8",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "6a07b5e12852ec4b0a8a5cf90b36cbcc2968ce33c9a794478f9dca0e311d49f5"
+}

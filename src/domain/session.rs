@@ -1,34 +1,38 @@
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-use ulid::Ulid;
+use uuid::Uuid;
 
-use crate::constant::SESSION_TABLE;
+use crate::domain::monotonic_id::next_uuid;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct SessionId(RecordId);
+/// Typed session row id. A UUIDv7 minted by the process-wide monotonic
+/// generator. (The table is `user_session` in PostgreSQL — the Rust type
+/// keeps its name.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
+pub struct SessionId(Uuid);
 
 impl SessionId {
     pub fn generate() -> Self {
-        Self(RecordId::new(SESSION_TABLE, Ulid::new().to_string()))
+        Self(next_uuid())
     }
 
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
+    /// The inner uuid, for runtime-checked binds (Param/QueryBuilder) that
+    /// cannot take the newtype. Static `query!` binds take `self` directly.
+    pub fn uuid(&self) -> Uuid {
+        self.0
     }
 
+    /// The hyphenated wire form.
     #[allow(dead_code)]
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
-        }
+    pub fn key(&self) -> String {
+        self.0.to_string()
     }
 }
 
 /// A random, opaque session token (64 hex chars).
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct SessionToken(String);
 
 impl SessionToken {
@@ -44,9 +48,10 @@ impl SessionToken {
 }
 
 /// Fields are crate-visible: [`crate::db::session`] mints the rows on login.
-#[derive(Debug, Clone, SurrealValue)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Session {
     pub(crate) id: SessionId,
+    #[sqlx(rename = "app_user")]
     pub(crate) user: UserId,
     pub(crate) token: SessionToken,
     pub(crate) expires_at: Timestamp,

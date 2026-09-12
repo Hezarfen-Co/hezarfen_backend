@@ -108,7 +108,7 @@ async fn build_report(
     let mut blocks = Vec::with_capacity(courses.len());
     for course in &courses {
         let exams = crate::service::exam::list_for_course(db, course.get_id()).await?;
-        let by_key: HashMap<&str, &Exam> = exams.iter().map(|e| (e.get_id().key(), e)).collect();
+        let by_key: HashMap<String, &Exam> = exams.iter().map(|e| (e.get_id().key(), e)).collect();
 
         let results =
             crate::service::exam_result::list_for_user_in_course(db, course.get_id(), user).await?;
@@ -117,7 +117,7 @@ async fn build_report(
         for result in &results {
             // A result whose exam is gone cannot happen given the delete
             // cascade — skip defensively rather than corrupt the average.
-            let Some(exam) = by_key.get(result.get_exam().key()) else {
+            let Some(exam) = by_key.get(result.get_exam().key().as_str()) else {
                 continue;
             };
             // The kind's current settings weight; an exam keeps a retired

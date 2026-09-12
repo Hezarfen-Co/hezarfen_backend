@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE bank_question SET subject = NULL WHERE subject = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "da785fdac4e71190dc8f4321bc74448809b3f74a5b5b946ef2afcdd2849192de"
+}

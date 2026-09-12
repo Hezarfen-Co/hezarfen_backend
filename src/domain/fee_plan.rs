@@ -4,51 +4,53 @@
 //!
 //! The installments are **embedded** on the plan row rather than child rows:
 //! a charge line copies the amount and due date it was assigned at, so the
-//! installment is a template, never a thing that has to be joined back to. No
-//! field inside the object is optional — SurrealDB 3 drops an object key whose
-//! value is `NONE`, which would make the stored shape differ from the written
-//! one.
+//! installment is a template, never a thing that has to be joined back to.
+//! The embedded list rides a `JSONB` column in stored order.
 //!
 //! Due dates may be in the **past**: a school adopting the app mid-year
 //! legitimately assigns a plan whose first installments were already due, so
 //! the no-past rule that guards exams, lessons and events deliberately does not
 //! apply here.
 
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
+use sqlx::types::Json;
 
-use crate::constant::{FEE_PLAN_TABLE, MAX_FEE_PLAN_INSTALLMENTS, MAX_FEE_PLAN_NAME_LEN};
-use crate::domain::monotonic_id::next_ulid;
+use crate::constant::{MAX_FEE_PLAN_INSTALLMENTS, MAX_FEE_PLAN_NAME_LEN};
+use crate::domain::monotonic_id::next_uuid;
 use crate::domain::payment_ledger::LedgerAmount;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::ValidationError;
 use crate::validate::validate_required;
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct FeePlanId(RecordId);
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
+pub struct FeePlanId(uuid::Uuid);
 
 impl FeePlanId {
+    /// A write-ordered id: plan listings read newest first.
     pub fn generate() -> Self {
-        Self(RecordId::new(FEE_PLAN_TABLE, next_ulid().to_string()))
+        Self(next_uuid())
     }
 
+    /// The inner uuid, for runtime-checked binds (Param/QueryBuilder) that
+    /// cannot take the newtype. Static `query!` binds take `self` directly.
+    pub fn uuid(&self) -> uuid::Uuid {
+        self.0
+    }
+
+    /// Parses a wire key. A key that is not a UUID parses as the nil UUID,
+    /// which matches no row.
     pub fn from_key(key: &str) -> Self {
-        Self(RecordId::new(FEE_PLAN_TABLE, key))
+        Self(uuid::Uuid::parse_str(key).unwrap_or(uuid::Uuid::nil()))
     }
 
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
-        }
+    pub fn key(&self) -> String {
+        self.0.to_string()
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct FeePlanName(String);
 
 impl FeePlanName {
@@ -64,8 +66,8 @@ impl FeePlanName {
 }
 
 /// One instalment of a plan: what is owed, and when it falls due. Both fields
-/// are required — see the module doc on `NONE` keys.
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+/// are required, so the stored JSON shape always matches the written one.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Installment {
     amount_minor: LedgerAmount,
     due_at: Timestamp,
@@ -101,11 +103,11 @@ pub fn validate_installments(installments: &[Installment]) -> Result<(), Validat
     Ok(())
 }
 
-#[derive(Debug, Clone, SurrealValue)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct FeePlan {
     pub(crate) id: FeePlanId,
     pub(crate) name: FeePlanName,
-    pub(crate) installments: Vec<Installment>,
+    pub(crate) installments: Json<Vec<Installment>>,
     pub(crate) created_by: UserId,
     pub(crate) created_at: Timestamp,
 }
@@ -157,5 +159,22 @@ mod tests {
         assert!(validate_installments(std::slice::from_ref(&one)).is_ok());
         assert!(validate_installments(&vec![one.clone(); MAX_FEE_PLAN_INSTALLMENTS]).is_ok());
         assert!(validate_installments(&vec![one; MAX_FEE_PLAN_INSTALLMENTS + 1]).is_err());
+    }
+
+    /// The installments ride the row as JSON, so the storage contract is that
+    /// an installment round-trips through `serde_json` unchanged — the amount
+    /// stays an integer minor-unit count and the due date a bare millisecond
+    /// number.
+    #[test]
+    fn an_installment_survives_the_json_round_trip() {
+        let one = Installment::new(
+            LedgerAmount::try_new(12_345).unwrap(),
+            Timestamp::from_millis(1_700_000_000_000),
+        );
+        let json = serde_json::to_value(&one).unwrap();
+        assert_eq!(json["amount_minor"], serde_json::json!(12_345));
+        assert_eq!(json["due_at"], serde_json::json!(1_700_000_000_000i64));
+        let back: Installment = serde_json::from_value(json).unwrap();
+        assert_eq!(back, one);
     }
 }

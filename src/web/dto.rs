@@ -74,7 +74,7 @@ impl From<DomainRole> for Role {
 /// show a raw ULID to a human.
 #[derive(Serialize, Clone, ToSchema)]
 pub struct PersonRef {
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     pub id: String,
     #[schema(example = "ada")]
     pub username: String,
@@ -117,11 +117,14 @@ impl PersonRef {
     /// Look `id` up in `people`, degrading to the bare id when the row is gone
     /// — a stale reference renders oddly instead of failing the request.
     pub fn resolve(people: &HashMap<String, PersonRef>, id: &UserId) -> Self {
-        people.get(id.key()).cloned().unwrap_or_else(|| Self {
-            id: id.key().to_string(),
-            username: id.key().to_string(),
-            display_name: None,
-        })
+        people
+            .get(id.key().as_str())
+            .cloned()
+            .unwrap_or_else(|| Self {
+                id: id.key().to_string(),
+                username: id.key().to_string(),
+                display_name: None,
+            })
     }
 }
 
@@ -148,7 +151,7 @@ pub async fn person_map(
 /// (register/login/me) and `users` (listing, role and profile changes).
 #[derive(Serialize, ToSchema)]
 pub struct UserResponse {
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     pub id: String,
     #[schema(example = "ada")]
     pub username: String,
@@ -209,7 +212,7 @@ impl UserResponse {
 /// blocks embed the course they average).
 #[derive(Serialize, ToSchema)]
 pub struct CourseResponse {
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     pub id: String,
     /// Who created (and owns) the course. Only they and managers/admins may
     /// delete it or change who teaches it.
@@ -265,7 +268,7 @@ impl CourseResponse {
 /// delete).
 #[derive(Serialize, ToSchema)]
 pub struct SubjectResponse {
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     pub id: String,
     /// The course whose curriculum this subject belongs to.
     pub course: String,
@@ -293,7 +296,7 @@ impl SubjectResponse {
 /// submission (against `due_at`), never stored on the homework itself.
 #[derive(Serialize, ToSchema)]
 pub struct HomeworkResponse {
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     pub id: String,
     /// The course this homework belongs to.
     pub course: String,

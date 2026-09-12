@@ -386,7 +386,7 @@ pub(crate) async fn live_snapshot(
         .iter()
         .map(|enrollment| {
             let key = enrollment.get_user().key();
-            let attempt = attempts.get(key);
+            let attempt = attempts.get(&key);
             let status = attempt.map(|a| a.status(exam, now));
             let deadline = attempt.and_then(|a| a.deadline(exam));
             LiveStudentResponse {
@@ -398,7 +398,7 @@ pub(crate) async fn live_snapshot(
                 }
                 .to_string(),
                 attempt: attempt.map(ExamAttempt::get_seq),
-                attempts_used: used.get(key).copied().unwrap_or(0),
+                attempts_used: used.get(&key).copied().unwrap_or(0),
                 started_at: attempt.map(|a| a.get_started_at().as_millis()),
                 finished_at: attempt
                     .and_then(|a| a.get_finished_at())
@@ -408,9 +408,9 @@ pub(crate) async fn live_snapshot(
                 remaining_ms: (status == Some(AttemptStatus::InProgress))
                     .then(|| deadline.map(|d| (d.as_millis() - now.as_millis()).max(0)))
                     .flatten(),
-                mark: marks.get(key).copied(),
-                answered: progress.get(key).map_or(0, |p| p.0),
-                last_activity: progress.get(key).map(|p| p.1),
+                mark: marks.get(&key).copied(),
+                answered: progress.get(&key).map_or(0, |p| p.0),
+                last_activity: progress.get(&key).map(|p| p.1),
             }
         })
         .collect();
@@ -604,7 +604,7 @@ pub(crate) async fn attempt_questions(
             .iter()
             .map(|question| {
                 let question_images = images
-                    .get(question.get_id().key())
+                    .get(question.get_id().key().as_str())
                     .map_or(&[][..], Vec::as_slice);
                 AttemptQuestionResponse {
                     id: question.get_id().key().to_string(),
@@ -615,11 +615,11 @@ pub(crate) async fn attempt_questions(
                     choices: ChoiceResponse::list(question.get_choices()),
                     image: image_meta(question_images, None),
                     choice_images: choice_image_metas(question, question_images),
-                    answer: answers.get(question.get_id().key()).map(|answer| {
+                    answer: answers.get(question.get_id().key().as_str()).map(|answer| {
                         AnswerStateResponse::new(
                             answer,
                             answer_images
-                                .get(question.get_id().key())
+                                .get(question.get_id().key().as_str())
                                 .map(ImageMetaResponse::from_answer),
                         )
                     }),
@@ -747,7 +747,7 @@ pub(crate) async fn answer_sheet(
 ) -> Result<AttemptAnswersResponse, AppError> {
     let (mut questions, _) =
         crate::service::exam_question::list_for_exam(db, exam.get_id(), None, 0).await?;
-    questions.retain(|question| !hidden.contains(question.get_id().key()));
+    questions.retain(|question| !hidden.contains(question.get_id().key().as_str()));
     let answers =
         crate::service::exam_answer::list_for_exam_user(db, exam.get_id(), target, seq).await?;
     let answer_images: HashMap<String, AnswerImage> =
@@ -756,7 +756,7 @@ pub(crate) async fn answer_sheet(
             .into_iter()
             .map(|image| (image.get_question().key().to_string(), image))
             .collect();
-    let by_question: HashMap<&str, &ExamQuestion> = questions
+    let by_question: HashMap<String, &ExamQuestion> = questions
         .iter()
         .map(|question| (question.get_id().key(), question))
         .collect();
@@ -773,10 +773,10 @@ pub(crate) async fn answer_sheet(
                 text: answer.get_text().map(|t| t.as_str().to_string()),
                 updated_at: answer.get_updated_at().as_millis(),
                 is_correct: by_question
-                    .get(answer.get_question().key())
+                    .get(answer.get_question().key().as_str())
                     .and_then(|question| answer.is_correct(question)),
                 answer_image: answer_images
-                    .get(answer.get_question().key())
+                    .get(answer.get_question().key().as_str())
                     .map(ImageMetaResponse::from_answer),
             })
             .collect(),

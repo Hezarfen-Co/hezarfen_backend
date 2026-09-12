@@ -93,48 +93,46 @@ pub enum AppError {
     #[error("too many requests")]
     TooManyRequests { retry_after_secs: u64 },
     #[error("database error")]
-    Db(#[source] surrealdb::Error),
-    /// The database WebSocket dropped and is mid-reconnect. Covers a query in
-    /// flight when the socket died (the SDK fails it as a connection error)
-    /// and a query racing the SDK's replay of session state (signin,
-    /// namespace), which the server refuses before execution. Transient,
-    /// self-healing, retryable.
+    Db(#[source] sqlx::Error),
+    /// The pool refused before the statement ran: the pool timed out waiting
+    /// for a connection, was closed, or TLS to the server failed to come up.
+    /// Nothing executed, so a retry is safe. Transient, self-healing,
+    /// retryable.
     #[error("database unavailable")]
     DbUnavailable,
-    /// The request outran [`crate::constant::REQUEST_TIMEOUT_SECS`], which in
-    /// practice means it reached the database in the window between the socket
-    /// dying and the keepalive noticing, and got parked in the SDK's queue.
+    /// The request outran [`crate::constant::REQUEST_TIMEOUT_SECS`], or the
+    /// connection it rode died mid-flight (Postgres reports that as an I/O
+    /// error, not a verdict).
     ///
-    /// Deliberately NOT `DbUnavailable`: that one promises the query was
-    /// refused before execution, so a retry is safe. A parked query is still
-    /// queued and *does* execute once the socket heals (verified: pings
-    /// abandoned during an outage all fire on reconnect), so retrying can
-    /// apply the same write twice. Same 503, honest message.
+    /// Deliberately NOT `DbUnavailable`: that one promises the statement was
+    /// refused before it executed, so a retry is safe. A request that died on
+    /// the wire may still have applied server-side (the commit can race the
+    /// connection dropping), so retrying can apply the same write twice.
+    /// Same 503, honest message.
     #[error("request timed out")]
     DbTimeout,
     #[error("internal error: {0}")]
     Internal(String),
 }
 
-/// Is this database error a query refused during the SDK's post-reconnect
-/// session replay? Two signatures, matched narrowly: "Specify a namespace"
-/// (signin replayed, namespace not yet) and "Anonymous access not allowed"
-/// (signin not yet). The backend signs in as root, so neither can be a real
-/// authorization verdict — but a bare "Not enough permissions" could be, so
-/// that alone must never match.
-pub(crate) fn is_session_replay_error(message: &str) -> bool {
-    message.contains("Specify a namespace") || message.contains("Anonymous access not allowed")
-}
 
-impl From<surrealdb::Error> for AppError {
-    fn from(e: surrealdb::Error) -> Self {
-        // `is_connection()`: the SDK's own verdict that the socket itself
-        // failed ("Connection reset", "WebSocket error: ..."). Structurally
-        // distinct from query/permission errors, so it can't misfile one.
-        if e.is_connection() || is_session_replay_error(&e.to_string()) {
-            AppError::DbUnavailable
-        } else {
-            AppError::Db(e)
+impl From<sqlx::Error> for AppError {
+    fn from(e: sqlx::Error) -> Self {
+        match e {
+            // A `fetch_one` that found nothing is the caller's 404, not a 500.
+            sqlx::Error::RowNotFound => AppError::NotFound,
+            // Pool problems refuse on the acquire path: nothing was queued,
+            // let alone executed, so a retry cannot double-apply a write.
+            sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed | sqlx::Error::Tls(_) => {
+                AppError::DbUnavailable
+            }
+            // A connection that died under a request. The statement may or
+            // may not have applied — the honest, retry-unsafe 503.
+            sqlx::Error::Io(_) => AppError::DbTimeout,
+            // Everything else is a verdict (or a bug) the server returned —
+            // refusals included; the helpers in [`crate::database`] read the
+            // SQLSTATE off it.
+            _ => AppError::Db(e),
         }
     }
 }
@@ -291,26 +289,6 @@ impl AppError {
 mod tests {
     use super::*;
 
-    #[test]
-    fn replay_signatures_classify_as_unavailable() {
-        // The two exact refusals a query racing the post-reconnect session
-        // replay gets, as they appear in the wire error.
-        assert!(is_session_replay_error("Specify a namespace to use"));
-        assert!(is_session_replay_error(
-            "Anonymous access not allowed: Not enough permissions to perform this action"
-        ));
-    }
-
-    #[test]
-    fn connection_errors_classify_as_unavailable() {
-        // What the SDK fails an in-flight query with when the socket dies —
-        // same wire error `clear_pending_requests` produces.
-        let e = surrealdb::Error::connection(
-            "Connection reset".to_string(),
-            surrealdb::types::ConnectionError::ConnectionFailed,
-        );
-        assert!(matches!(AppError::from(e), AppError::DbUnavailable));
-    }
 
     /// The refusal a gated nest answers with. Both keys, and the `403` — a
     /// client switches on `module`, so neither may drift.
@@ -328,14 +306,28 @@ mod tests {
     }
 
     #[test]
-    fn real_errors_stay_db_errors() {
-        // A genuine authorization verdict shares the suffix but must not match.
-        assert!(!is_session_replay_error(
-            "Not enough permissions to perform this action"
+    fn sqlx_errors_split_into_honest_classes() {
+        use sqlx::Error;
+        // Pool problems refuse on the acquire path: nothing executed, so a
+        // retry is safe.
+        assert!(matches!(
+            AppError::from(Error::PoolTimedOut),
+            AppError::DbUnavailable
         ));
-        assert!(!is_session_replay_error("Parse error: unexpected token"));
-        assert!(!is_session_replay_error(
-            "Database index `user_username` already contains 'admin'"
+        assert!(matches!(
+            AppError::from(Error::PoolClosed),
+            AppError::DbUnavailable
         ));
+        assert!(matches!(
+            AppError::from(Error::Tls("tls".into())),
+            AppError::DbUnavailable
+        ));
+        // A connection that died under a request: the honest 503 — the write
+        // may or may not have applied, so a retry is NOT advertised as safe.
+        let io = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "gone");
+        assert!(matches!(AppError::from(Error::Io(io)), AppError::DbTimeout));
+        // A query that found no row is the caller's 404, never a 500.
+        assert!(matches!(AppError::from(Error::RowNotFound), AppError::NotFound));
     }
+
 }

@@ -1,34 +1,29 @@
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-
-use crate::constant::ATTENDANCE_TABLE;
 use crate::domain::event::EventId;
 use crate::domain::user::UserId;
 use crate::error::ValidationError;
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct AttendanceId(RecordId);
+/// The identity of one (event, user) pair. Not a row column: the table's
+/// primary key *is* the pair, which is what makes marking a single atomic
+/// UPSERT (`ON CONFLICT (event, app_user)`) with no find-then-insert race,
+/// one-row-per-pair by construction. This struct's job is the
+/// underscore-joined wire form at the HTTP edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttendanceId {
+    pub(crate) event: EventId,
+    pub(crate) user: UserId,
+}
 
 impl AttendanceId {
-    /// A deterministic id for the (event, user) pair. Because the same pair
-    /// always maps to the same record id, marking is a single atomic UPSERT with
-    /// no find-then-insert race, and one-row-per-pair holds by construction.
-    /// ULID keys are alphanumeric, so `_` is an unambiguous joiner.
     pub fn composite(event: &EventId, user: &UserId) -> Self {
-        Self(RecordId::new(
-            ATTENDANCE_TABLE,
-            format!("{}_{}", event.key(), user.key()),
-        ))
-    }
-
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
+        Self {
+            event: event.clone(),
+            user: user.clone(),
         }
+    }
+
+    /// The underscore-joined wire form (`{event}_{user}`).
+    pub fn key(&self) -> String {
+        format!("{}_{}", self.event.key(), self.user.key())
     }
 }
 
@@ -36,7 +31,8 @@ impl AttendanceId {
 /// ([`crate::domain::settings::Settings::get_attendance_statuses`]): the core
 /// `present | absent | late | excused` plus any the school added. Stored rows
 /// keep their status even if the school later edits the list.
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct AttendanceStatus(String);
 
 impl AttendanceStatus {
@@ -55,18 +51,19 @@ impl AttendanceStatus {
     }
 }
 
-#[derive(Debug, Clone, SurrealValue)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Attendance {
-    pub(crate) id: AttendanceId,
     pub(crate) event: EventId,
+    #[sqlx(rename = "app_user")]
     pub(crate) user: UserId,
     pub(crate) status: AttendanceStatus,
     pub(crate) marked_by: UserId,
 }
 
 impl Attendance {
-    pub fn get_id(&self) -> &AttendanceId {
-        &self.id
+    /// The row's identity, built back from its primary-key columns.
+    pub fn get_id(&self) -> AttendanceId {
+        AttendanceId::composite(&self.event, &self.user)
     }
 
     pub fn get_event(&self) -> &EventId {

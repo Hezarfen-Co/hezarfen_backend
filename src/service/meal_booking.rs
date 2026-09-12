@@ -9,9 +9,10 @@
 //!
 //! **No process-wide lock guards this domain**, and deliberately: every
 //! invariant booking depends on is a *single-record* conditional write (the
-//! menu's `seats_booked` counter and the attempt-fenced row flip), which
-//! SurrealDB itself serializes — a cross-record lock would add contention
-//! without deciding anything the transactions do not already. What the
+//! menu's `seats_booked` counter and the attempt-fenced row flip), which the
+//! guarded writes themselves serialize — a cross-record lock would add
+//! contention without deciding anything the transactions do not already.
+//! What the
 //! service layer owns here is the *sequence*: read the menu, refuse a past
 //! day or a closed cutoff before anything is claimed, settle the attempt
 //! number before the charge id exists, and map the claim's outcomes
@@ -62,7 +63,6 @@ pub async fn book(
     cutoff: &MealCutoff,
 ) -> Result<MealBooking, AppError> {
     let id = MealBookingId::composite(menu, student);
-    let seats = menu.record();
     for attempt in 0..CAP_WRITE_TRIES {
         backoff(attempt).await;
         let fresh = menu::read(db, menu).await?.ok_or(AppError::NotFound)?;
@@ -122,7 +122,6 @@ pub async fn book(
         // booked-but-unbilled row behind.
         let price = meal_ledger::price_snapshot(db, menu).await?;
         let fresh_row = MealBooking {
-            id: id.clone(),
             menu: menu.clone(),
             student: student.clone(),
             booked_by: booked_by.clone(),
@@ -135,7 +134,7 @@ pub async fn book(
         let charge = MealLedger::charge_for(&fresh_row, booked_by);
         match meal_booking::claim_and_place(
             db,
-            &seats,
+            menu,
             fresh.get_capacity().unwrap_or(cap::UNLIMITED),
             fresh.get_version(),
             &fresh_row,
@@ -227,7 +226,7 @@ pub async fn cancel(
     cutoff: &MealCutoff,
     recorded_by: &UserId,
 ) -> Result<MealBooking, AppError> {
-    let fresh = meal_booking::read(db, &cancelled.id)
+    let fresh = meal_booking::read(db, &cancelled.id())
         .await?
         .ok_or(AppError::NotFound)?;
     if fresh.status == MealBookingStatus::Cancelled {
@@ -245,7 +244,7 @@ pub async fn cancel(
     let saved = match meal_booking::release_seat(db, &fresh, recorded_by).await? {
         Some(cancelled) => cancelled,
         None => {
-            let live = meal_booking::read(db, &cancelled.id)
+            let live = meal_booking::read(db, &cancelled.id())
                 .await?
                 .ok_or(AppError::NotFound)?;
             if !refundable_after_lost_flip(&fresh, &live)? {
@@ -290,7 +289,7 @@ fn refundable_after_lost_flip(seen: &MealBooking, live: &MealBooking) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::init_mem;
+    use crate::database::init_test_db;
     use crate::db::menu_dish;
     use crate::domain::meal_booking::MealBookingStatus;
     use crate::domain::meal_ledger::LedgerAmount;
@@ -301,45 +300,58 @@ mod tests {
     /// A published menu on a fresh in-memory database, plus a student. Dated
     /// well ahead on purpose: a menu whose day has passed refuses every
     /// booking, so a date the calendar overtakes would fail this whole module.
-    async fn menu(capacity: Option<i64>) -> (Database, MenuId) {
+    async fn menu(capacity: Option<i64>) -> (Database, MenuId, crate::database::TestDatabases) {
         menu_on("2099-09-14", capacity).await
     }
 
-    async fn menu_on(date: &str, capacity: Option<i64>) -> (Database, MenuId) {
-        let db = init_mem().await.unwrap();
+    // The lease rides with the pool: dropping it here would drop the database
+    // out from under the test that is about to run.
+    async fn menu_on(
+        date: &str,
+        capacity: Option<i64>,
+    ) -> (Database, MenuId, crate::database::TestDatabases) {
+        let (db, _leases) = init_test_db().await;
+        // The menu's creator is a foreign key now: a real `app_user` row.
+        let creator = UserId::generate();
+        sqlx::query(
+            "INSERT INTO app_user (id, username, password_hash, role) \
+             VALUES ($1, $2, 'x', 'teacher')",
+        )
+        .bind(creator.uuid())
+        .bind(format!("menu-fixture-{}", &creator.key()[30..]))
+        .execute(&db)
+        .await
+        .unwrap();
         let slots = vec![MealSlotDef::try_new("lunch", None).unwrap()];
         let menu = menu::create(
             &db,
             MenuDate::try_new(date).unwrap(),
             MenuSlot::try_new("lunch", &slots).unwrap(),
             capacity,
-            &UserId::generate(),
+            &creator,
         )
         .await
         .unwrap();
-        (db, menu.get_id().clone())
+        (db, menu.get_id().clone(), _leases)
     }
 
     /// The stored counter, absent reading as zero — the number the cap's
     /// `WHERE` actually compares, not one recomputed from the rows.
     async fn seats(menu: &MenuId, db: &Database) -> i64 {
-        let mut result = db
-            .query("SELECT VALUE seats_booked FROM $id")
-            .bind(("id", menu.record()))
+        use sqlx::Row as _;
+
+        sqlx::query("SELECT COALESCE(seats_booked, 0) FROM menu WHERE id = $1")
+            .bind(menu.key())
+            .fetch_one(db)
             .await
             .unwrap()
-            .check()
-            .unwrap();
-        result
-            .take::<Vec<Option<i64>>>(0)
+            .try_get::<i64, _>(0)
             .unwrap()
-            .into_iter()
-            .next()
-            .flatten()
-            .unwrap_or(0)
     }
 
     async fn add_dish(menu: &MenuId, price: i64, db: &Database) -> MenuDish {
+        // A cap far above every seat count in these tests: the dish must never
+        // be the binding constraint here.
         menu_dish::create(
             db,
             menu,
@@ -347,6 +359,7 @@ mod tests {
             None,
             DishPrice::try_new(price).unwrap(),
             DishTags::try_new(&[], &[]).unwrap(),
+            1_000,
         )
         .await
         .unwrap()
@@ -358,8 +371,9 @@ mod tests {
     /// seat that was already returned (which would open the cap by one forever).
     #[tokio::test]
     async fn the_seat_counter_follows_the_seats_it_guards() {
-        let (db, menu) = menu(Some(1)).await;
-        let (ali, veli) = (UserId::generate(), UserId::generate());
+        let (db, menu, _leases) = menu(Some(1)).await;
+        let ali = crate::db::class_member::tests::fixture_user(&db, "ali").await;
+        let veli = crate::db::class_member::tests::fixture_user(&db, "veli").await;
         let open = MealCutoff::default();
 
         let booking = book(&db, &menu, &ali, &ali, &open).await.unwrap();
@@ -390,8 +404,8 @@ mod tests {
     /// in the `WHERE` rather than in a read the delete then trusts.
     #[tokio::test]
     async fn a_held_seat_refuses_the_menu_delete() {
-        let (db, id) = menu(None).await;
-        let ali = UserId::generate();
+        let (db, id, _leases) = menu(None).await;
+        let ali = crate::db::class_member::tests::fixture_user(&db, "ali").await;
         let booking = book(&db, &id, &ali, &ali, &MealCutoff::default())
             .await
             .unwrap();
@@ -411,8 +425,9 @@ mod tests {
     /// never re-read from the menu.
     #[tokio::test]
     async fn a_seat_keeps_the_price_it_was_taken_at() {
-        let (db, menu) = menu(None).await;
-        let (ali, veli) = (UserId::generate(), UserId::generate());
+        let (db, menu, _leases) = menu(None).await;
+        let ali = crate::db::class_member::tests::fixture_user(&db, "ali").await;
+        let veli = crate::db::class_member::tests::fixture_user(&db, "veli").await;
         let open = MealCutoff::default();
         add_dish(&menu, 1_000, &db).await;
 
@@ -443,8 +458,9 @@ mod tests {
     /// single-process interleaving (and no in-memory engine) can stage.
     #[tokio::test]
     async fn a_lost_flip_refunds_only_the_attempt_it_released() {
-        let (db, menu) = menu(None).await;
-        let (ali, veli) = (UserId::generate(), UserId::generate());
+        let (db, menu, _leases) = menu(None).await;
+        let ali = crate::db::class_member::tests::fixture_user(&db, "ali").await;
+        let veli = crate::db::class_member::tests::fixture_user(&db, "veli").await;
         let open = MealCutoff::default();
         add_dish(&menu, 1_000, &db).await;
 
@@ -496,8 +512,8 @@ mod tests {
     /// and mint no ledger line, with the shipped defaults in force.
     #[tokio::test]
     async fn a_past_day_takes_no_seat_and_writes_no_charge() {
-        let (db, menu) = menu_on("2020-01-06", None).await;
-        let ali = UserId::generate();
+        let (db, menu, _leases) = menu_on("2020-01-06", None).await;
+        let ali = crate::db::class_member::tests::fixture_user(&db, "ali").await;
         add_dish(&menu, 4550, &db).await;
 
         assert!(matches!(
@@ -519,8 +535,8 @@ mod tests {
     /// with the cutoff knob set *and* unset.
     #[tokio::test]
     async fn todays_menu_still_books_without_a_serving_hour() {
-        let (db, menu) = menu_on(&today(), None).await;
-        let ali = UserId::generate();
+        let (db, menu, _leases) = menu_on(&today(), None).await;
+        let ali = crate::db::class_member::tests::fixture_user(&db, "ali").await;
         book(&db, &menu, &ali, &ali, &cutoff(Some(60), None))
             .await
             .expect("an unset serving hour is an unenforced cutoff");
@@ -532,8 +548,8 @@ mod tests {
     /// cutoff. The guard binds `book` alone.
     #[tokio::test]
     async fn a_past_day_still_gives_the_seat_and_the_money_back() {
-        let (db, menu) = menu_on("2020-01-06", None).await;
-        let ali = UserId::generate();
+        let (db, menu, _leases) = menu_on("2020-01-06", None).await;
+        let ali = crate::db::class_member::tests::fixture_user(&db, "ali").await;
         add_dish(&menu, 4550, &db).await;
         // The seat this student is holding was taken while the day was still
         // ahead — the shape the create-side check cannot reach. A test cannot
@@ -542,7 +558,6 @@ mod tests {
         let fresh = menu::read(&db, &menu).await.unwrap().unwrap();
         let price = meal_ledger::price_snapshot(&db, &menu).await.unwrap();
         let row = MealBooking {
-            id: MealBookingId::composite(&menu, &ali),
             menu: menu.clone(),
             student: ali.clone(),
             booked_by: ali.clone(),
@@ -555,7 +570,7 @@ mod tests {
         let charge = MealLedger::charge_for(&row, &ali);
         let booked = match meal_booking::claim_and_place(
             &db,
-            &menu.record(),
+            &menu,
             cap::UNLIMITED,
             fresh.get_version(),
             &row,

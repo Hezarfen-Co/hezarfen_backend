@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE menu SET seats_booked = seats_booked + 1\n             WHERE id = $1 AND seats_booked < $2 AND COALESCE(version, 0) = $3\n             RETURNING 1 AS seat",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "seat",
+        "type_info": "Int4",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "38438ff13783c97104b58f74976b7ddbc1cb5c1b8868d8d21d7e4e7e1b14de7c"
+}

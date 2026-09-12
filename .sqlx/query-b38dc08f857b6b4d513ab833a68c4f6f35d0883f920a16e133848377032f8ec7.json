@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE solution\n               SET image_file = $2, image_content_type = $3, image_size = $4\n               WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b38dc08f857b6b4d513ab833a68c4f6f35d0883f920a16e133848377032f8ec7"
+}

@@ -1,7 +1,7 @@
 # hezarfen_backend
 
 Rust/axum school-management API (auth, roles, exams, notes, messaging,
-courses, attendance, pomodoro, meals) on SurrealDB v3. Swagger UI at `/swagger`.
+courses, attendance, pomodoro, meals) on PostgreSQL (sqlx). Swagger UI at `/swagger`.
 
 ## Project docs — query the knowledge base, do NOT read README.md
 
@@ -30,23 +30,27 @@ python3 ~/.claude/kb/ingest.py README.md | KB
 python3 ~/.claude/kb/ingest-endpoints.py README.md | KB
 ```
 
-The project's own SurrealDB (container `hezarfen-surrealdb`, ns/db
-`hezarfen`) is runtime data — never write knowledge-base rows there.
+The project's own PostgreSQL (container `hezarfen-postgres`) is runtime data —
+never write knowledge-base rows there (the KB lives in `~/.claude/kb/kb.db`).
 
 ## Code map — orient here, skip discovery greps
 
-Pattern: `src/domain/<x>.rs` = validated newtypes + entity + its own
-persistence (SurrealValue). `src/web/<x>.rs` = DTOs + axum handlers, one file
-per resource, routes wired in `lib.rs`.
+Pattern: `src/domain/<x>.rs` = validated newtypes + entity. `src/db/<x>.rs` =
+its SQL (the only layer that executes queries). `src/service/<x>.rs` =
+workflows (one `tx_with_retry` transaction per invariant). `src/web/<x>.rs` =
+DTOs + axum handlers, one file per resource, routes wired in `lib.rs`.
 
 - core: `main`(bootstrap) `lib`(build_router+OpenAPI) `config` `constant`(limits)
-  `validate` `error` `database`(connect+SCHEMAFULL migration)
+  `validate` `error` `database`(PgPool + tx_with_retry + the two sqlx migrator sets)
   `rate_limit`(fixed-window per-IP) `state`
 - `domain/`: user role session timestamp profile preferences note note_file
   message parent_link event attendance registration course course_session
   session_attendance enrollment subject term settings work_entry pomodoro
   exam exam_attempt exam_question exam_answer exam_result question_image
   menu menu_dish dietary_profile meal_booking meal_attendance meal_ledger
+- `db/`: per-resource SQL; `cap`(count-cap CTE recipes + verdict types)
+  `field_update` `page`(PagedList)
+- `service/`: per-resource workflows (booking, minting, cascades)
 - `ai/`: QUIC bridge to the out-of-process AI services (backend listens,
   services dial in). `protocol`(frames) `server`(AiBridge: listen+dispatch)
   `registry`(workers, capability routing) `tls` `error`. Off unless
@@ -55,9 +59,11 @@ per resource, routes wired in `lib.rs`.
   responses) `page`(pagination) `exam_ws`(exam-room WebSocket) + per-resource:
   auth users notes messages events courses subjects sessions exams marks work
   pomodoro attendance settings terms meals
-- `tests/`: integration(oneshot+mem db) e2e(real TCP+cookies) rate_limit
-  pagination persistence ai_bridge(real QUIC + fake AI service)
-  ai_protocol(hab/1 wire contract; raw byte-level client, imports no protocol
+- `tests/`: integration(oneshot over per-test Postgres databases — tests/common
+  mints `init_test_tenants`/`init_test_db`/`deployment_with`, template-clone)
+  e2e(real TCP+cookies) rate_limit
+  pagination persistence(idempotent re-migration over a live db) ai_bridge(real QUIC + fake AI service)
+  ai_protocol(hab/2 wire contract; raw byte-level client, imports no protocol
   types — the only suite that catches a wire-format change)
 
 Note: README `## Layout` lags src/ (missing newer domain files); this map +

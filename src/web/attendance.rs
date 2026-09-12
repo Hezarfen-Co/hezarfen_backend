@@ -119,7 +119,7 @@ async fn build_report(
     }
 
     let courses = crate::service::course::list_by_ids(db, &course_ids).await?;
-    let course_by_key: HashMap<&str, &Course> =
+    let course_by_key: HashMap<String, &Course> =
         courses.iter().map(|c| (c.get_id().key(), c)).collect();
     let people = person_map(courses.iter().flat_map(course_people), db).await?;
 
@@ -128,13 +128,13 @@ async fn build_report(
     for course_id in &course_ids {
         // A row whose course is gone cannot happen given the delete cascade —
         // skip defensively rather than fabricate a course block.
-        let Some(course) = course_by_key.get(course_id.key()) else {
+        let Some(course) = course_by_key.get(course_id.key().as_str()) else {
             continue;
         };
         if viewer.is_some_and(|viewer| !can_manage_course(course, viewer)) {
             continue;
         }
-        let rows = &by_course[course_id.key()];
+        let rows = &by_course[course_id.key().as_str()];
         visible_rows.extend(rows.iter().copied());
         blocks.push(CourseAttendance {
             course: CourseResponse::new(course, &people),

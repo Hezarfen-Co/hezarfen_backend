@@ -5,12 +5,12 @@
 
 use std::sync::OnceLock;
 
-use argon2::password_hash::SaltString;
+use argon2::password_hash::phc::PasswordHash as PhcHash;
 use argon2::{Argon2, PasswordHasher, PasswordVerifier};
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
+use uuid::Uuid;
 
-use crate::constant::{AI_PRINCIPAL_KEY, DECOY_PASSWORD, USER_TABLE};
-use crate::domain::monotonic_id::next_ulid;
+use crate::constant::{AI_PRINCIPAL_KEY, DECOY_PASSWORD};
+use crate::domain::monotonic_id::next_uuid;
 use crate::domain::note_file::FileContentType;
 use crate::domain::preferences::{Language, PaletteColor, Theme};
 use crate::domain::profile::{Bio, BirthDate, DisplayName, Email, PersonName, Phone};
@@ -18,33 +18,40 @@ use crate::domain::role::Role;
 use crate::error::{AppError, ValidationError};
 use crate::validate::{validate_password, validate_username};
 
-/// Typed user record id (`user:<ulid>`).
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct UserId(RecordId);
+/// Typed user row id. A UUIDv7 minted by the process-wide monotonic
+/// generator, so `id` order is mint order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
+pub struct UserId(Uuid);
 
 impl UserId {
-    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
-    /// users list `id DESC` (newest first, [`crate::db::user::list_all`]) and page by
-    /// offset over that order, and a random low half scrambles rows minted in
-    /// the same millisecond. Not a secret: the session token is separate
-    /// (32-byte CSPRNG, `web::auth`), so id order carries no authority.
+    /// Minted from the process-wide monotonic generator, not a random v4:
+    /// users list `id DESC` (newest first, [`crate::db::user::list_all`]) and
+    /// page by offset over that order, and a random low half scrambles rows
+    /// minted in the same millisecond. Not a secret: the session token is
+    /// separate (32-byte CSPRNG, `web::auth`), so id order carries no
+    /// authority.
     pub fn generate() -> Self {
-        Self(RecordId::new(USER_TABLE, next_ulid().to_string()))
+        Self(next_uuid())
     }
 
+    /// The inner uuid, for runtime-checked binds (Param/QueryBuilder) that
+    /// cannot take the newtype. Static `query!` binds take `self` directly.
+    pub fn uuid(&self) -> Uuid {
+        self.0
+    }
+
+    /// Parse a wire key. A key that parses as no UUID — a malformed path
+    /// segment — reads as the nil id, which matches no row: exactly the 404 a
+    /// dangling record key produced under the old store, without turning a
+    /// typo into a panic.
     pub fn from_key(key: &str) -> Self {
-        Self(RecordId::new(USER_TABLE, key))
+        Self(Uuid::parse_str(key).unwrap_or(Uuid::nil()))
     }
 
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
-        }
+    /// The hyphenated wire form.
+    pub fn key(&self) -> String {
+        self.0.to_string()
     }
 }
 
@@ -52,7 +59,8 @@ impl UserId {
 /// canonicalizes the value: the stored string is trimmed, since the unique
 /// index and the login lookup key on it — `"ali "` must be `"ali"`, not a
 /// second, visually identical account.
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct Username(String);
 
 impl Username {
@@ -93,13 +101,9 @@ impl Password {
     /// Private on purpose: argon2 must never run on an async worker. Callers
     /// outside this module go through [`Password::hash_async`].
     fn hash(&self) -> Result<PasswordHash, AppError> {
-        let mut salt_bytes = [0u8; 16];
-        getrandom::fill(&mut salt_bytes).map_err(|e| AppError::Internal(format!("rng: {e}")))?;
-        let salt = SaltString::encode_b64(&salt_bytes)
-            .map_err(|e| AppError::Internal(format!("salt: {e}")))?;
-        let hash = Argon2::default()
-            .hash_password(self.0.as_bytes(), &salt)?
-            .to_string();
+        // password-hash 0.6 generates the salt internally (its own CSPRNG);
+        // the explicit SaltString step is gone.
+        let hash = Argon2::default().hash_password(self.0.as_bytes())?.to_string();
         Ok(PasswordHash(hash))
     }
 
@@ -120,7 +124,8 @@ impl Password {
 }
 
 /// An argon2 PHC hash, safe to persist.
-#[derive(Debug, Clone, SurrealValue)]
+#[derive(Debug, Clone, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct PasswordHash(String);
 
 /// A process-wide decoy hash, computed once on first use. Verifying against it
@@ -142,7 +147,7 @@ impl PasswordHash {
 
     /// Private on purpose — see [`Password::hash`]. Use [`PasswordHash::verify_async`].
     fn verify(&self, password: &Password) -> bool {
-        match argon2::password_hash::PasswordHash::new(&self.0) {
+        match PhcHash::new(&self.0) {
             Ok(parsed) => Argon2::default()
                 .verify_password(password.0.as_bytes(), &parsed)
                 .is_ok(),
@@ -193,7 +198,7 @@ impl PasswordHash {
     }
 }
 
-#[derive(Debug, Clone, SurrealValue)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 /// Fields are crate-visible: [`crate::db::user`] mints rows and the role
 /// cascade reads the id, exactly as the other split domains do.
 pub struct User {
@@ -230,15 +235,14 @@ pub struct User {
 impl User {
     /// The in-memory principal an AI service acts as over the QUIC bridge.
     ///
-    /// Never written to the database, and never read back from one: the id key
-    /// is the literal `"ai_service"`, which no minted row can collide with
-    /// ([`UserId::generate`] only ever produces ULIDs). Every other field is
-    /// inert — the empty password hash parses as no argon2 hash, so it verifies
-    /// against nothing, and [`Role::Ai`] clears no `at_least` bar and fails
-    /// every exact `== Role::Student` / `== Role::Parent` gate.
+    /// Never written to the database, and never read back from one: the id is
+    /// the nil UUID, which no minted id (always a v7) can ever equal. Every
+    /// other field is inert — the empty password hash parses as no argon2 hash,
+    /// so it verifies against nothing, and [`Role::Ai`] clears no `at_least`
+    /// bar and fails every exact `== Role::Student` / `== Role::Parent` gate.
     pub(crate) fn ai_principal() -> User {
         User {
-            id: UserId::from_key(AI_PRINCIPAL_KEY),
+            id: UserId(Uuid::nil()),
             username: Username(AI_PRINCIPAL_KEY.to_string()),
             password_hash: PasswordHash(String::new()),
             role: Role::Ai,
@@ -378,7 +382,7 @@ mod tests {
     #[tokio::test]
     async fn user_id_key_roundtrips() {
         let id = UserId::generate();
-        let key = id.key().to_string();
+        let key = id.key();
         assert!(!key.is_empty());
         assert_eq!(UserId::from_key(&key).key(), key);
     }

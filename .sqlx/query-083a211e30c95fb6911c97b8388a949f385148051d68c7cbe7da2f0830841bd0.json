@@ -1,0 +1,95 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH ins AS (\n               INSERT INTO payment_ledger\n                   (id, student, kind, amount_minor, source, due_at, method, note,\n                    recorded_by, created_at)\n               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)\n               ON CONFLICT (id) DO NOTHING\n               RETURNING id, student, kind, amount_minor, source, due_at, method, note,\n                         recorded_by, created_at)\n           SELECT id AS \"id!: PaymentLedgerId\", student AS \"student!: UserId\",\n                  kind AS \"kind!: PaymentLedgerKind\",\n                  amount_minor AS \"amount_minor!: LedgerAmount\", source,\n                  due_at AS \"due_at: Timestamp\", method AS \"method: LedgerMethod\",\n                  note AS \"note: LedgerNote\",\n                  recorded_by AS \"recorded_by!: UserId\", created_at AS \"created_at!: Timestamp\"\n           FROM ins\n           UNION ALL\n           SELECT id AS \"id!: PaymentLedgerId\", student AS \"student!: UserId\",\n                  kind AS \"kind!: PaymentLedgerKind\",\n                  amount_minor AS \"amount_minor!: LedgerAmount\", source,\n                  due_at AS \"due_at: Timestamp\", method AS \"method: LedgerMethod\",\n                  note AS \"note: LedgerNote\",\n                  recorded_by AS \"recorded_by!: UserId\", created_at AS \"created_at!: Timestamp\"\n           FROM payment_ledger\n           WHERE id = $1 AND NOT EXISTS (SELECT 1 FROM ins)",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!: PaymentLedgerId",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "student!: UserId",
+        "type_info": "Uuid",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "kind!: PaymentLedgerKind",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "amount_minor!: LedgerAmount",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 4,
+        "name": "source",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 5,
+        "name": "due_at: Timestamp",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 6,
+        "name": "method: LedgerMethod",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 7,
+        "name": "note: LedgerNote",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 8,
+        "name": "recorded_by!: UserId",
+        "type_info": "Uuid",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 9,
+        "name": "created_at!: Timestamp",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid",
+        "Text",
+        "Int8",
+        "Text",
+        "Int8",
+        "Text",
+        "Text",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "083a211e30c95fb6911c97b8388a949f385148051d68c7cbe7da2f0830841bd0"
+}

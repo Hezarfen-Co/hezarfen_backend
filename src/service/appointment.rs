@@ -1,20 +1,29 @@
 //! Appointment workflows: booking, the approve/reject/cancel decisions, and
-//! counter-proposals. Reads, listings, the overlap probe, and the
-//! compare-and-set live in [`crate::db::appointment`]; the slot's seat is
-//! [`crate::db::cap`]'s claim.
+//! counter-proposals. Reads, listings, the overlap probe, the seat claim,
+//! and the compare-and-set live in [`crate::db::appointment`].
 //!
-//! The overlap guarantee is [`APPOINTMENT_LOCK`]: booking and approval hold
-//! it across "is this person already committed at that time" and the write
-//! that commits — a predicate over *other* rows that no single-record
-//! conditional write can decide.
+//! There is no lock anymore. What the old APPOINTMENT_LOCK serialized is
+//! now three database guarantees:
+//!
+//! - **Occupancy** — booking claims the slot's seat and writes the row in
+//!   one statement ([`crate::db::appointment::claim_slot_and_create`]); two
+//!   racers cannot both find the slot free.
+//! - **Publish overlap** — the `appointment_slot_teacher_span` exclusion
+//!   constraint refuses two overlapping published windows at the store.
+//! - **Double-booking** — the approval's "is anyone already committed at
+//!   that time" is a predicate over *other* rows, which no single-record
+//!   write can decide and no row lock can stand in for (the rows that would
+//!   collide may not exist yet). That one decision runs **serializable** —
+//!   the lane's single documented isolation escalation: two concurrent
+//!   approvals of overlapping proposals read the same approved set, and SSI
+//!   aborts the loser (`40001`), which [`tx_with_retry`] re-sends; the
+//!   re-run sees the winner committed and refuses with the ordinary 409.
 
-use tokio::sync::Mutex;
-
-use crate::constant::{CAS_UPDATE_RETRIES, SLOT_OCCUPIED_FIELD};
-use crate::database::Database;
+use crate::constant::CAS_UPDATE_RETRIES;
+use crate::database::{Database, tx_with_retry};
 use crate::db::appointment;
 use crate::db::appointment_slot;
-use crate::db::cap;
+use crate::db::cap::Claimed;
 use crate::domain::appointment::{
     Appointment, AppointmentId, AppointmentReason, AppointmentStatus,
 };
@@ -23,46 +32,25 @@ use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 
-/// Serializes the **overlap** check and the write it authorizes — nothing else.
-/// "Is this teacher (or this requester) already committed at that time" is a
-/// predicate over other appointment rows, and SurrealDB does not conflict-check
-/// a cross-record read against a concurrent insert, so the check and its write
-/// have to be one atomic step, and this lock is the only thing that makes them
-/// one. Occupancy is no longer its business: that is the slot's `occupied`
-/// counter, a conditional single-record write the store decides.
-///
-/// So this is load-bearing, not a convenience: an approval path that does not
-/// take it can double-book a teacher, as the domain's module doc records.
-///
-/// Lock order: taken *before* `cap`'s `CLAIM_LOCK` (booking claims a slot while
-/// holding this) and never the other way round. No path ever holds this
-/// together with `ENROLL_LOCK`,
-/// `TERM_LOCK`, `EXAM_LOCK`, or `PRESENCE_LOCK` — appointments
-/// touch no roster, term, event seat, or exam room, and none of those touch
-/// appointments — so they cannot deadlock. Should a future path ever need two,
-/// take this one *last*.
-// corner-cut: global lock; per-teacher locks if appointment traffic ever grows
-// enough for the contention to matter.
-pub(crate) static APPOINTMENT_LOCK: Mutex<()> = Mutex::const_new(());
-
 /// Request `slot`. Lands `pending`: publishing availability is not consent
 /// to a specific person and topic.
 ///
 /// Refused (409) when the slot's window has already opened, when it is
 /// already taken, or when the requester is already committed elsewhere at
-/// that time. The slot is taken by [`cap::claim_and_create`], which writes
-/// the booking in the *same transaction* as the seat — a conditional
-/// single-record write, so two racing requests cannot both find it free
-/// however they interleave, and a crash between the two can no longer leave
-/// the slot occupied by a booking that does not exist. The requester's own
-/// overlap is the lock's part.
+/// that time. The slot is taken by the seat claim — a conditional
+/// single-record write the database decides — so two racing requests
+/// cannot both find it free however they interleave, and a crash between
+/// the two can no longer leave the slot occupied by a booking that does
+/// not exist. The requester's own overlap check is advisory here, exactly
+/// as under the lock: only *approved* bookings block, so two pending
+/// requests may queue on overlapping times, and the approval is where the
+/// authoritative refusal lands.
 pub async fn book(
     db: &Database,
     slot: &AppointmentSlotId,
     requester: &UserId,
     reason: AppointmentReason,
 ) -> Result<Appointment, AppError> {
-    let _guard = APPOINTMENT_LOCK.lock().await;
     let slot_row = appointment_slot::read(db, slot)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -96,10 +84,9 @@ pub async fn book(
     // deleted since the read above is gone, not full — the claim's `WHERE`
     // finds no row either way, so the distinction is re-read rather than
     // guessed.
-    let seat = slot.record();
     let appointment_row = Appointment {
         id: AppointmentId::generate(),
-        slot: slot.clone(),
+        slot: Some(slot.clone()),
         requester: requester.clone(),
         status: AppointmentStatus::Pending,
         reason,
@@ -112,26 +99,17 @@ pub async fn book(
         reject_reason: None,
         created_at: Timestamp::now(),
     };
-    match cap::claim_and_create(
-        &seat,
-        SLOT_OCCUPIED_FIELD,
-        1,
-        &appointment_row.id.record(),
-        &appointment_row,
-        db,
-    )
-    .await?
-    {
-        cap::Claimed::Made(created) => Ok(created),
-        cap::Claimed::Full => {
+    match appointment::claim_slot_and_create(db, appointment_row).await? {
+        Claimed::Made(created) => Ok(created),
+        Claimed::Full => {
             if appointment_slot::read(db, slot).await?.is_none() {
                 return Err(AppError::NotFound);
             }
             Err(AppError::Conflict("the slot is already booked"))
         }
-        // The id is a freshly minted ULID on a table with no UNIQUE index,
-        // so no rival can have aimed at it.
-        cap::Claimed::Duplicate => Err(AppError::Internal("appointment id collided".into())),
+        // The id is freshly minted on a table keyed by it: no rival can
+        // have aimed at it.
+        Claimed::Duplicate => Err(AppError::Internal("appointment id collided".into())),
     }
 }
 
@@ -162,10 +140,10 @@ pub async fn list_for_teacher(
 }
 
 /// Confirm the meeting at the slot's own window. Re-runs the double-booking
-/// guard for both teacher and requester against a fresh read under
-/// [`APPOINTMENT_LOCK`] — the authoritative check, since only approval
-/// commits anyone. Refused (409) when the effective window has already
-/// started; that also covers [`accept_proposal`], which lands here.
+/// guard for both teacher and requester *inside the decision transaction* —
+/// the authoritative check, since only approval commits anyone. Refused
+/// (409) when the effective window has already started; that also covers
+/// [`accept_proposal`], which lands here.
 ///
 /// Also refused (409) while a counter-proposal stands: the effective window
 /// would then be the *proposed* one, and the deciding side here is the
@@ -183,17 +161,32 @@ pub async fn approve(
 /// The one approval path. `accepting` carries the window the caller is
 /// answering *for*, which is the only way a proposed one may be committed:
 /// it both marks the caller as the proposal's counterparty and pins which
-/// proposal they saw. Re-checked on every retry round, so a proposal that
-/// moved between the read and the write is refused rather than confirmed.
+/// proposal they saw.
+///
+/// Read, gate, overlap probe and write are ONE serializable transaction:
+/// the overlap probe is a predicate over other approved rows, the one
+/// invariant in this lane no row lock can carry (see the module doc). The
+/// proposal pin is re-checked inside that same snapshot, so a proposal that
+/// moved between the requester's read and their accept is refused rather
+/// than committed.
 async fn approve_inner(
     db: &Database,
     id: &AppointmentId,
     decided_by: &UserId,
     accepting: Option<(Timestamp, Timestamp)>,
 ) -> Result<Appointment, AppError> {
-    let _guard = APPOINTMENT_LOCK.lock().await;
-    for _ in 0..CAS_UPDATE_RETRIES {
-        let expected = appointment::read_pending(db, id).await?;
+    // Owned captures (`Send` rule of `tx_with_retry` closures).
+    let id = id.clone();
+    let decided_by = *decided_by;
+    tx_with_retry(db, false, async move |tx| {
+        // Serializable for the overlap decision below (module doc). `SET
+        // TRANSACTION` is legal only before the first query, so it goes
+        // first; a `40001` from SSI is re-sent by the retry loop, and the
+        // re-run re-reads everything against the committed winner.
+        sqlx::query!("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+            .execute(&mut *tx)
+            .await?;
+        let expected = appointment::read_pending_on(&mut *tx, &id).await?;
         match accepting {
             None if expected.has_proposal() => {
                 return Err(AppError::Conflict(
@@ -214,7 +207,11 @@ async fn approve_inner(
             }
             _ => {}
         }
-        let slot = appointment_slot::read(db, &expected.slot)
+        let slot_id = expected
+            .get_slot()
+            .ok_or(AppError::NotFound)?
+            .clone();
+        let slot = appointment_slot::read_on(&mut *tx, &slot_id)
             .await?
             .ok_or(AppError::NotFound)?;
         let (starts_at, ends_at) = expected.window(&slot);
@@ -226,13 +223,13 @@ async fn approve_inner(
         if starts_at.as_millis() <= Timestamp::now().as_millis() {
             return Err(AppError::Conflict("that time has already started"));
         }
-        if appointment::conflicts(
-            db,
+        if appointment::conflicts_on(
+            &mut *tx,
             slot.get_teacher(),
-            &expected.requester,
+            expected.get_requester(),
             starts_at,
             ends_at,
-            Some(id),
+            Some(&id),
         )
         .await?
         {
@@ -242,17 +239,21 @@ async fn approve_inner(
         }
         let mut approved = expected.clone();
         approved.status = AppointmentStatus::Approved;
-        approved.decided_by = Some(decided_by.clone());
-        if let Some(saved) = appointment::save_if_unchanged(db, &expected, approved).await? {
-            return Ok(saved);
+        approved.decided_by = Some(decided_by);
+        match appointment::decision_cas(&mut *tx, &expected, approved).await? {
+            Some(saved) => Ok(saved),
+            // Unreachable under the row lock this transaction holds — kept
+            // for the shape's honesty: a miss means re-decide, and the
+            // caller's answer to that is this 409.
+            None => Err(contended()),
         }
-    }
-    Err(contended())
+    })
+    .await
 }
 
 /// Turn the request down. Frees the slot — the seat goes back with the
-/// status flip, in one transaction. No lock: this decides nothing about
-/// anyone's calendar, and the write is its own guard.
+/// status flip, in one transaction. No lock needed and none taken: this
+/// decides nothing about anyone's calendar, and the write is its own guard.
 pub async fn reject(
     db: &Database,
     id: &AppointmentId,
@@ -291,10 +292,10 @@ pub async fn cancel(
 ) -> Result<Appointment, AppError> {
     for _ in 0..CAS_UPDATE_RETRIES {
         let expected = appointment::read(db, id).await?.ok_or(AppError::NotFound)?;
-        if !expected.status.is_live() {
+        if !expected.get_status().is_live() {
             return Err(AppError::Conflict("the appointment is already settled"));
         }
-        let slot = appointment_slot::read(db, &expected.slot)
+        let slot = appointment_slot::read(db, expected.get_slot().ok_or(AppError::NotFound)?)
             .await?
             .ok_or(AppError::NotFound)?;
         if expected.window(&slot).0.as_millis() <= Timestamp::now().as_millis() {
@@ -340,7 +341,7 @@ pub async fn propose(
     // to `pending`), and it neither takes nor frees the slot's seat.
     for _ in 0..CAS_UPDATE_RETRIES {
         let expected = appointment::read(db, id).await?.ok_or(AppError::NotFound)?;
-        if !expected.status.is_live() {
+        if !expected.get_status().is_live() {
             return Err(AppError::Conflict("the appointment is already settled"));
         }
         if starts_at.as_millis() <= Timestamp::now().as_millis() {
@@ -375,10 +376,10 @@ pub async fn accept_proposal(
     starts_at: Timestamp,
     ends_at: Timestamp,
 ) -> Result<Appointment, AppError> {
-    // The same approval path re-reads under the lock and reads the proposed
-    // window off the row, so accepting is approval — no second code path.
-    // Only this door passes `accepting`, and the web layer opens it to the
-    // requester alone.
+    // The same approval path re-reads inside its serializable transaction
+    // and reads the proposed window off the row, so accepting is approval —
+    // no second code path. Only this door passes `accepting`, and the web
+    // layer opens it to the requester alone.
     approve_inner(db, id, decided_by, Some((starts_at, ends_at))).await
 }
 
@@ -388,15 +389,32 @@ pub async fn accept_proposal(
 fn contended() -> AppError {
     AppError::Conflict("the appointment is being decided elsewhere")
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::{Database, init_mem};
+    use crate::database::{Database, init_test_db};
     use crate::service::appointment_slot;
 
     fn at(millis: i64) -> Timestamp {
         Timestamp::from_millis(millis)
+    }
+
+    /// A real `app_user` row: teachers and students are foreign keys now. The
+    /// label names the row's username; the id is minted, so repeated calls are
+    /// new people, not the same row.
+    async fn a_person(db: &Database, label: &str, role: &str) -> UserId {
+        let user = UserId::generate();
+        sqlx::query(
+            "INSERT INTO app_user (id, username, password_hash, role) \
+             VALUES ($1, $2, 'x', $3)",
+        )
+        .bind(user.uuid())
+        .bind(format!("{label}-{}", &user.key()[30..]))
+        .bind(role)
+        .execute(db)
+        .await
+        .unwrap();
+        user
     }
 
     /// A window that has not opened yet — `book` refuses started ones.
@@ -406,8 +424,8 @@ mod tests {
 
     #[tokio::test]
     async fn window_prefers_a_proposal_over_the_slot() {
-        let db = init_mem().await.unwrap();
-        let teacher = UserId::from_key("t1");
+        let (db, _leases) = init_test_db().await;
+        let teacher = a_person(&db, "t1", "teacher").await;
         let (starts_at, ends_at) = (soon(60_000), soon(120_000));
         let slot = appointment_slot::create(&db, &teacher, starts_at, ends_at, None)
             .await
@@ -415,7 +433,7 @@ mod tests {
         let mut appointment_row = book(
             &db,
             slot.get_id(),
-            &UserId::from_key("s1"),
+            &a_person(&db, "s1", "student").await,
             AppointmentReason::try_new("ödev").unwrap(),
         )
         .await
@@ -431,14 +449,14 @@ mod tests {
     /// to undo the resulting meeting, so the booking would be stuck for good.
     #[tokio::test]
     async fn a_started_slot_cannot_be_booked() {
-        let db = init_mem().await.unwrap();
-        let teacher = UserId::from_key("t1");
+        let (db, _leases) = init_test_db().await;
+        let teacher = a_person(&db, "t1", "teacher").await;
         let reason = || AppointmentReason::try_new("görüşme").unwrap();
         let started = appointment_slot::create(&db, &teacher, soon(-30_000), soon(60_000), None)
             .await
             .unwrap();
         assert!(matches!(
-            book(&db, started.get_id(), &UserId::from_key("s1"), reason()).await,
+            book(&db, started.get_id(), &a_person(&db, "s1", "student").await, reason()).await,
             Err(AppError::Conflict("the slot has already started"))
         ));
 
@@ -446,7 +464,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            book(&db, upcoming.get_id(), &UserId::from_key("s1"), reason())
+            book(&db, upcoming.get_id(), &a_person(&db, "s1", "student").await, reason())
                 .await
                 .is_ok()
         );
@@ -456,9 +474,9 @@ mod tests {
     /// come and gone cannot be accepted — the meeting would be uncancellable.
     #[tokio::test]
     async fn a_started_proposal_cannot_be_accepted() {
-        let db = init_mem().await.unwrap();
-        let teacher = UserId::from_key("t1");
-        let student = UserId::from_key("s1");
+        let (db, _leases) = init_test_db().await;
+        let teacher = a_person(&db, "t1", "teacher").await;
+        let student = a_person(&db, "s1", "student").await;
         let slot = appointment_slot::create(&db, &teacher, soon(60_000), soon(120_000), None)
             .await
             .unwrap();
@@ -544,9 +562,9 @@ mod tests {
     /// primitive itself with the exact stale snapshot the race produces.
     #[tokio::test]
     async fn a_decision_built_on_a_stale_snapshot_never_lands() {
-        let db = init_mem().await.unwrap();
-        let teacher = UserId::from_key("t1");
-        let student = UserId::from_key("s1");
+        let (db, _leases) = init_test_db().await;
+        let teacher = a_person(&db, "t1", "teacher").await;
+        let student = a_person(&db, "s1", "student").await;
         let slot = appointment_slot::create(&db, &teacher, soon(60_000), soon(120_000), None)
             .await
             .unwrap();
@@ -611,14 +629,27 @@ mod tests {
     /// What the slot row itself says about being taken — the authority every
     /// gate now reads.
     async fn occupied(slot: &AppointmentSlotId, db: &Database) -> i64 {
-        let mut result = db
-            .query("SELECT VALUE (occupied ?? 0) FROM $slot")
-            .bind(("slot", slot.record()))
+        sqlx::query_scalar::<_, i64>("SELECT occupied FROM appointment_slot WHERE id = $1")
+            .bind(slot.uuid())
+            .fetch_one(db)
             .await
             .unwrap()
-            .check()
-            .unwrap();
-        result.take::<Vec<i64>>(0).unwrap()[0]
+    }
+
+    /// The seat claim `book` rides, asked directly: the conditional
+    /// `UPDATE … WHERE occupied < $cap` on the slot row is the whole
+    /// primitive, so this asks it the exact question the race asks.
+    async fn claim_seat(slot: &AppointmentSlotId, cap: i64, db: &Database) -> bool {
+        sqlx::query_scalar::<_, i32>(
+            "UPDATE appointment_slot SET occupied = occupied + 1 \
+             WHERE id = $1 AND occupied < $2 RETURNING 1",
+        )
+        .bind(slot.uuid())
+        .bind(cap)
+        .fetch_optional(db)
+        .await
+        .unwrap()
+        .is_some()
     }
 
     /// The double-book race with the lock taken out of the picture: a second
@@ -633,8 +664,8 @@ mod tests {
     /// second claim succeed and this fail (mutation-proved).
     #[tokio::test]
     async fn a_concurrent_claim_cannot_take_a_booked_slot() {
-        let db = init_mem().await.unwrap();
-        let teacher = UserId::from_key("t1");
+        let (db, _leases) = init_test_db().await;
+        let teacher = a_person(&db, "t1", "teacher").await;
         let slot = appointment_slot::create(&db, &teacher, soon(60_000), soon(120_000), None)
             .await
             .unwrap();
@@ -643,7 +674,7 @@ mod tests {
         book(
             &db,
             slot.get_id(),
-            &UserId::from_key("s1"),
+            &a_person(&db, "s1", "student").await,
             AppointmentReason::try_new("görüşme").unwrap(),
         )
         .await
@@ -651,9 +682,7 @@ mod tests {
         assert_eq!(occupied(slot.get_id(), &db).await, 1);
 
         assert!(
-            !cap::claim(&slot.get_id().record(), SLOT_OCCUPIED_FIELD, 1, &db)
-                .await
-                .unwrap(),
+            !claim_seat(slot.get_id(), 1, &db).await,
             "the slot's seat must already be taken"
         );
         // And the racer's refusal left the stored state alone: one booking, one
@@ -674,19 +703,19 @@ mod tests {
     /// bumped the counter would strand the slot forever.
     #[tokio::test]
     async fn a_refused_booking_moves_nothing() {
-        let db = init_mem().await.unwrap();
-        let teacher = UserId::from_key("t1");
+        let (db, _leases) = init_test_db().await;
+        let teacher = a_person(&db, "t1", "teacher").await;
         let slot = appointment_slot::create(&db, &teacher, soon(60_000), soon(120_000), None)
             .await
             .unwrap();
         let reason = || AppointmentReason::try_new("görüşme").unwrap();
 
-        book(&db, slot.get_id(), &UserId::from_key("s1"), reason())
+        book(&db, slot.get_id(), &a_person(&db, "s1", "student").await, reason())
             .await
             .unwrap();
         assert_eq!(occupied(slot.get_id(), &db).await, 1);
 
-        let refused = book(&db, slot.get_id(), &UserId::from_key("s2"), reason()).await;
+        let refused = book(&db, slot.get_id(), &a_person(&db, "s2", "student").await, reason()).await;
         assert!(
             matches!(refused, Err(AppError::Conflict(_))),
             "the slot is taken"
@@ -711,9 +740,9 @@ mod tests {
     /// cancel that moved one without the other would strand the slot forever.
     #[tokio::test]
     async fn cancelling_hands_the_seat_back_with_the_status() {
-        let db = init_mem().await.unwrap();
-        let teacher = UserId::from_key("t1");
-        let student = UserId::from_key("s1");
+        let (db, _leases) = init_test_db().await;
+        let teacher = a_person(&db, "t1", "teacher").await;
+        let student = a_person(&db, "s1", "student").await;
         let slot = appointment_slot::create(&db, &teacher, soon(60_000), soon(120_000), None)
             .await
             .unwrap();
@@ -737,7 +766,7 @@ mod tests {
             book(
                 &db,
                 slot.get_id(),
-                &UserId::from_key("s2"),
+                &a_person(&db, "s2", "student").await,
                 AppointmentReason::try_new("görüşme").unwrap()
             )
             .await
@@ -749,18 +778,18 @@ mod tests {
     /// Occupancy frees on reject, so the slot can be re-booked.
     #[tokio::test]
     async fn rejecting_frees_the_slot_for_re_booking() {
-        let db = init_mem().await.unwrap();
-        let teacher = UserId::from_key("t1");
+        let (db, _leases) = init_test_db().await;
+        let teacher = a_person(&db, "t1", "teacher").await;
         let slot = appointment_slot::create(&db, &teacher, soon(60_000), soon(120_000), None)
             .await
             .unwrap();
         let reason = || AppointmentReason::try_new("görüşme").unwrap();
 
-        let first = book(&db, slot.get_id(), &UserId::from_key("s1"), reason())
+        let first = book(&db, slot.get_id(), &a_person(&db, "s1", "student").await, reason())
             .await
             .unwrap();
         assert!(matches!(
-            book(&db, slot.get_id(), &UserId::from_key("s2"), reason()).await,
+            book(&db, slot.get_id(), &a_person(&db, "s2", "student").await, reason()).await,
             Err(AppError::Conflict(_))
         ));
         // The live booking also blocks the slot delete.
@@ -771,7 +800,7 @@ mod tests {
 
         reject(&db, first.get_id(), &teacher, None).await.unwrap();
         assert_eq!(occupied(slot.get_id(), &db).await, 0);
-        let second = book(&db, slot.get_id(), &UserId::from_key("s2"), reason())
+        let second = book(&db, slot.get_id(), &a_person(&db, "s2", "student").await, reason())
             .await
             .unwrap();
         assert_eq!(second.get_status(), AppointmentStatus::Pending);

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE app_user SET pool_approved_total = pool_approved_total + 1\n                     WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "77826c3f6154959a623a5b344a1eb4ae564e805da099c76a2d97472216e08bf3"
+}

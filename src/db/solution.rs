@@ -1,54 +1,60 @@
-//! The `solution` table: offers (through the pool question's
-//! existence-move), the question-scoped reads and page, the grouped counts,
+//! The `solution` table: offers (their question's existence enforced by the
+//! real foreign key), the question-scoped read and page, the grouped counts,
 //! and the unconditional body/image writes of an unmoderated row. The pure
 //! entity and newtypes live in [`crate::domain::solution`]; the web layer
 //! reaches these through [`crate::service::solution`].
 
 use std::collections::HashMap;
 
-use surrealdb::types::{RecordId, SurrealValue};
-
-use crate::database::Database;
+use crate::database::{Database, tx_with_retry};
 use crate::db::page::PagedList;
-use crate::db::pool_question::bump_question_and_write;
 use crate::domain::note_file::FileContentType;
 use crate::domain::pool_question::PoolQuestionId;
 use crate::domain::solution::{Solution, SolutionBody, SolutionId};
+use crate::domain::timestamp::Timestamp;
+use crate::domain::user::UserId;
 use crate::error::AppError;
 
-/// One `GROUP BY question` row of [`counts_for`].
-#[derive(SurrealValue)]
-struct SolutionCount {
-    question: PoolQuestionId,
-    n: i64,
+/// Offer the solution. `NotFound` = the question is gone, and nothing was
+/// written: the insert's foreign key (`solution_question_fkey`) refuses an
+/// orphan the old existence-move transaction spent five statements dodging —
+/// a bare create landing inside
+/// [`crate::db::pool_question::delete`]'s window used to be swept by
+/// nothing and left a solution no route could ever reach or remove (every
+/// path to one goes through its question), photo blob included.
+///
+/// The author's own foreign key never fires in practice (the request
+/// carries a live session user) and stays a database error if it ever does;
+/// only the question's key maps to the 404.
+pub async fn insert(db: &Database, solution: Solution) -> Result<Solution, AppError> {
+    match sqlx::query_as!(
+        Solution,
+        r#"INSERT INTO solution (id, question, author, body, offered_at)
+           VALUES ($1, $2, $3, $4, $5)
+           RETURNING id AS "id: SolutionId", question AS "question: PoolQuestionId",
+               author AS "author: UserId", body AS "body: SolutionBody",
+               offered_at AS "offered_at: Timestamp", image_file,
+               image_content_type AS "image_content_type: FileContentType",
+               image_size"#,
+        solution.id.uuid(),
+        solution.question.uuid(),
+        solution.author.uuid(),
+        solution.body.as_str(),
+        solution.offered_at.as_millis(),
+    )
+    .fetch_one(db)
+    .await
+    {
+        Ok(row) => Ok(row),
+        Err(err) if is_question_gone(&err) => Err(AppError::NotFound),
+        Err(err) => Err(err.into()),
+    }
 }
 
-/// Offer the solution. `NotFound` = the question is gone, and nothing was
-/// written: the create rides [`bump_question_and_write`], so the question's
-/// existence is a *write* to its row rather than a read the handler made a
-/// moment earlier — a bare create landing inside
-/// [`crate::db::pool_question::delete`]'s
-/// window was swept by nothing and left a solution no route could ever
-/// reach or remove (every path to one goes through its question), photo
-/// blob included.
-///
-/// Re-sendable despite the `CREATE`: `$id` is a ULID minted once per call
-/// on a table with no `UNIQUE` index, so a re-send cannot answer "already
-/// exists" — the one thing the retry could not survive.
-pub async fn insert(db: &Database, solution: Solution) -> Result<Solution, AppError> {
-    // whole-row-save-ok: create of a fresh ULID row built in place by `new` — there is no prior row to clobber
-    let (question, id) = (solution.question.clone(), solution.id.record());
-    bump_question_and_write(
-        &question,
-        "CREATE $id CONTENT $solution",
-        vec![
-            ("id".into(), id.into_value()),
-            ("solution".into(), solution.into_value()),
-        ],
-        db,
-    )
-    .await?
-    .ok_or_else(|| AppError::Internal("failed to create solution".into()))
+/// Did this insert fail on the *question* foreign key — the parent-gone
+/// refusal — rather than some unrelated database fault?
+fn is_question_gone(err: &sqlx::Error) -> bool {
+    err.as_database_error().and_then(|db| db.constraint()) == Some("solution_question_fkey")
 }
 
 /// Read a solution only if it belongs to `question` — keeps the nested
@@ -58,32 +64,45 @@ pub async fn read_for(
     id: &SolutionId,
     question: &PoolQuestionId,
 ) -> Result<Option<Solution>, AppError> {
-    let solution: Option<Solution> = db.select(id.record()).await?;
-    Ok(solution.filter(|solution| &solution.question == question))
+    let row = sqlx::query_as!(
+        Solution,
+        r#"SELECT id AS "id: SolutionId", question AS "question: PoolQuestionId",
+               author AS "author: UserId", body AS "body: SolutionBody",
+               offered_at AS "offered_at: Timestamp", image_file,
+               image_content_type AS "image_content_type: FileContentType",
+               image_size
+           FROM solution WHERE id = $1 AND question = $2"#,
+        id.uuid(),
+        question.uuid()
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(row)
 }
 
 /// The question's solutions, oldest first — a discussion reads downward.
 /// Ordered by `offered_at`; the `id` tiebreak only makes same-millisecond
-/// offers *stable* across re-queries, not insertion-ordered (ULID low bits
-/// are random within a millisecond, so same-ms order is arbitrary).
+/// offers *stable* across re-queries (the ids are write-ordered UUIDv7, so
+/// same-ms rows still sort by mint order).
 pub async fn list_for(
     db: &Database,
     question: &PoolQuestionId,
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<Solution>, i64), AppError> {
+    // `.uuid()` feeds the builder its raw bind value — exact, typed.
     PagedList::new(
-        "solution WHERE question = $q",
+        "solution WHERE question = $1",
         "ORDER BY offered_at ASC, id ASC",
     )
-    .bind("q", question.record())
+    .bind(question.uuid())
     .run(limit, offset, db)
     .await
 }
 
 /// Per-question solution tallies for a page of questions, in one grouped
 /// query — a per-row `count()` would cost a query per question. Keys are
-/// question record keys; a question with no solutions has no entry, so
+/// the questions' wire keys; a question with no solutions has no entry, so
 /// the caller reads misses as zero.
 pub async fn counts_for(
     db: &Database,
@@ -92,18 +111,19 @@ pub async fn counts_for(
     if questions.is_empty() {
         return Ok(HashMap::new());
     }
-    let ids: Vec<RecordId> = questions.iter().map(|question| question.record()).collect();
-    let mut result = db
-        .query(
-            "SELECT question, count() AS n FROM solution WHERE question IN $qs GROUP BY question",
-        )
-        .bind(("qs", ids))
-        .await?
-        .check()?;
-    Ok(result
-        .take::<Vec<SolutionCount>>(0)?
+    let ids: Vec<uuid::Uuid> = questions.iter().map(|id| id.uuid()).collect();
+    let rows = sqlx::query!(
+        r#"SELECT question AS "question: PoolQuestionId", count(*) AS n
+           FROM solution
+           WHERE question = ANY($1)
+           GROUP BY question"#,
+        &ids,
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows
         .into_iter()
-        .map(|row| (row.question.key().to_string(), row.n))
+        .map(|row| (row.question.key(), row.n.unwrap_or(0)))
         .collect())
 }
 
@@ -115,13 +135,20 @@ pub async fn set_body(
     id: &SolutionId,
     body: &SolutionBody,
 ) -> Result<Option<Solution>, AppError> {
-    let mut result = db
-        .query("UPDATE $s SET body = $b RETURN AFTER")
-        .bind(("s", id.record()))
-        .bind(("b", body.clone()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<Solution>>(0)?.into_iter().next())
+    let row = sqlx::query_as!(
+        Solution,
+        r#"UPDATE solution SET body = $2 WHERE id = $1
+           RETURNING id AS "id: SolutionId", question AS "question: PoolQuestionId",
+               author AS "author: UserId", body AS "body: SolutionBody",
+               offered_at AS "offered_at: Timestamp", image_file,
+               image_content_type AS "image_content_type: FileContentType",
+               image_size"#,
+        id.uuid(),
+        body.as_str()
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(row)
 }
 
 /// Point the solution at a freshly written image blob. Unconditional for
@@ -129,6 +156,9 @@ pub async fn set_body(
 /// `image_file` is the replaced blob the caller must remove; `None` means
 /// the row was deleted mid-flight (the fresh blob is the caller's orphan
 /// to take back off disk).
+///
+/// The row lock makes the before-read and the write one switch, so two
+/// racing uploads can never both be told they replaced the same blob.
 pub async fn set_image(
     db: &Database,
     id: &SolutionId,
@@ -136,54 +166,124 @@ pub async fn set_image(
     content_type: &FileContentType,
     size: i64,
 ) -> Result<Option<Solution>, AppError> {
-    let mut result = db
-        .query("UPDATE $s SET image_file = $file, image_content_type = $ct, image_size = $size RETURN BEFORE")
-        .bind(("s", id.record()))
-        .bind(("file", file.to_string()))
-        .bind(("ct", content_type.clone()))
-        .bind(("size", size))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<Solution>>(0)?.into_iter().next())
+    // Owned captures (`Send` rule of `tx_with_retry` closures).
+    let id = *id;
+    let file = file.to_owned();
+    let content_type = content_type.clone();
+    tx_with_retry(db, false, async move |tx| {
+        let before = sqlx::query_as!(
+            Solution,
+            r#"SELECT id AS "id: SolutionId", question AS "question: PoolQuestionId",
+                   author AS "author: UserId", body AS "body: SolutionBody",
+                   offered_at AS "offered_at: Timestamp", image_file,
+                   image_content_type AS "image_content_type: FileContentType",
+                   image_size
+                   FROM solution WHERE id = $1 FOR UPDATE"#,
+            id.uuid()
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(before) = before else {
+            return Ok(None);
+        };
+        sqlx::query!(
+            r#"UPDATE solution
+               SET image_file = $2, image_content_type = $3, image_size = $4
+               WHERE id = $1"#,
+            id.uuid(),
+            file.as_str(),
+            content_type.as_str(),
+            size,
+        )
+        .execute(&mut *tx)
+        .await?;
+        Ok(Some(before))
+    })
+    .await
 }
 
 /// Detach the solution's image. Returns the *before* row — its
 /// `image_file` is the blob the caller must remove.
 pub async fn clear_image(db: &Database, id: &SolutionId) -> Result<Option<Solution>, AppError> {
-    let mut result = db
-        .query(
-            "UPDATE $s SET image_file = NONE, image_content_type = NONE, image_size = NONE \
-             RETURN BEFORE",
+    // Owned capture (`Send` rule of `tx_with_retry` closures).
+    let id = *id;
+    tx_with_retry(db, false, async move |tx| {
+        let before = sqlx::query_as!(
+            Solution,
+            r#"SELECT id AS "id: SolutionId", question AS "question: PoolQuestionId",
+                   author AS "author: UserId", body AS "body: SolutionBody",
+                   offered_at AS "offered_at: Timestamp", image_file,
+                   image_content_type AS "image_content_type: FileContentType",
+                   image_size
+                   FROM solution WHERE id = $1 FOR UPDATE"#,
+            id.uuid()
         )
-        .bind(("s", id.record()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<Solution>>(0)?.into_iter().next())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(before) = before else {
+            return Ok(None);
+        };
+        sqlx::query!(
+            r#"UPDATE solution
+               SET image_file = NULL, image_content_type = NULL, image_size = NULL
+               WHERE id = $1"#,
+            id.uuid(),
+        )
+        .execute(&mut *tx)
+        .await?;
+        Ok(Some(before))
+    })
+    .await
 }
 
 pub async fn delete(db: &Database, solution: Solution) -> Result<Solution, AppError> {
-    let deleted: Option<Solution> = db.delete(solution.id.record()).await?;
+    let deleted = sqlx::query_as!(
+        Solution,
+        r#"DELETE FROM solution WHERE id = $1
+           RETURNING id AS "id: SolutionId", question AS "question: PoolQuestionId",
+               author AS "author: UserId", body AS "body: SolutionBody",
+               offered_at AS "offered_at: Timestamp", image_file,
+               image_content_type AS "image_content_type: FileContentType",
+               image_size"#,
+        solution.id.uuid()
+    )
+    .fetch_optional(db)
+    .await?;
     deleted.ok_or(AppError::NotFound)
 }
 
 #[cfg(test)]
 mod tests {
-    use ulid::Ulid;
-
     use super::*;
     use crate::database;
     use crate::domain::pool_question::{PoolQuestion, PoolQuestionBody, PoolQuestionTitle};
     use crate::domain::timestamp::Timestamp;
     use crate::domain::user::UserId;
 
+    /// A real `app_user` row: askers and authors are foreign keys now.
+    async fn a_person(db: &Database, label: &str) -> UserId {
+        let user = UserId::generate();
+        sqlx::query(
+            "INSERT INTO app_user (id, username, password_hash) \
+             VALUES ($1, $2, 'x')",
+        )
+        .bind(user.uuid())
+        .bind(format!("{label}-{}", &user.key()[30..]))
+        .execute(db)
+        .await
+        .unwrap();
+        user
+    }
+
     /// A real question row: offering a solution moves its question's
     /// `asked_at` (that is what keeps a solution from outliving its question),
     /// so a minted id nothing wrote is a 404.
     async fn question_row(db: &Database) -> PoolQuestionId {
+        let asker = a_person(db, "asker").await;
         crate::db::pool_question::insert(
             db,
             PoolQuestion::new(
-                &UserId::from_key(&Ulid::new().to_string()),
+                &asker,
                 PoolQuestionTitle::try_new("soru").unwrap(),
                 PoolQuestionBody::try_new("neden").unwrap(),
             ),
@@ -196,10 +296,10 @@ mod tests {
 
     #[tokio::test]
     async fn rows_scope_to_their_question_and_list_oldest_first() {
-        let db = database::init_mem().await.unwrap();
+        let (db, _leases) = database::init_test_db().await;
         let question_a = question_row(&db).await;
         let question_b = question_row(&db).await;
-        let author = UserId::from_key(&Ulid::new().to_string());
+        let author = a_person(&db, "author").await;
 
         // Distinct offer times so the assertion pins the real contract —
         // older `offered_at` sorts first — not the same-millisecond `id`
@@ -255,9 +355,9 @@ mod tests {
 
     #[tokio::test]
     async fn image_set_replace_clear_report_the_replaced_blob() {
-        let db = database::init_mem().await.unwrap();
+        let (db, _leases) = database::init_test_db().await;
         let question = question_row(&db).await;
-        let author = UserId::from_key(&Ulid::new().to_string());
+        let author = a_person(&db, "author").await;
         let png = FileContentType::try_new("image/png").unwrap();
 
         let solution = insert(
@@ -316,9 +416,9 @@ mod tests {
 
     #[tokio::test]
     async fn set_body_edits_in_place() {
-        let db = database::init_mem().await.unwrap();
+        let (db, _leases) = database::init_test_db().await;
         let question = question_row(&db).await;
-        let author = UserId::from_key(&Ulid::new().to_string());
+        let author = a_person(&db, "author").await;
 
         let solution = insert(
             &db,
@@ -346,7 +446,7 @@ mod tests {
         assert!(
             set_body(
                 &db,
-                &SolutionId::from_key(&Ulid::new().to_string()),
+                &SolutionId::from_key(&uuid::Uuid::now_v7().to_string()),
                 &SolutionBody::try_new("boş").unwrap(),
             )
             .await
@@ -357,11 +457,11 @@ mod tests {
 
     #[tokio::test]
     async fn counts_for_groups_per_question() {
-        let db = database::init_mem().await.unwrap();
+        let (db, _leases) = database::init_test_db().await;
         let two = question_row(&db).await;
         let one = question_row(&db).await;
         let none = question_row(&db).await;
-        let author = UserId::from_key(&Ulid::new().to_string());
+        let author = a_person(&db, "author").await;
 
         for (question, bodies) in [(&two, vec!["a", "b"]), (&one, vec!["c"])] {
             for body in bodies {
@@ -377,10 +477,10 @@ mod tests {
         let counts = counts_for(&db, &[two.clone(), one.clone(), none.clone()])
             .await
             .unwrap();
-        assert_eq!(counts.get(two.key()), Some(&2));
-        assert_eq!(counts.get(one.key()), Some(&1));
+        assert_eq!(counts.get(two.key().as_str()), Some(&2));
+        assert_eq!(counts.get(one.key().as_str()), Some(&1));
         // No solutions = no entry; the caller reads the miss as zero.
-        assert_eq!(counts.get(none.key()), None);
+        assert_eq!(counts.get(none.key().as_str()), None);
         assert!(counts_for(&db, &[]).await.unwrap().is_empty());
     }
 }

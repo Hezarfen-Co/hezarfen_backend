@@ -1,0 +1,100 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT exam AS \"exam: ExamId\", question AS \"question: ExamQuestionId\",\n                  app_user AS \"user: UserId\", seq, file,\n                  content_type AS \"content_type: FileContentType\", size\n           FROM answer_image WHERE exam = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exam: ExamId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "answer_image",
+            "name": "exam"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "question: ExamQuestionId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "answer_image",
+            "name": "question"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "user: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "answer_image",
+            "name": "app_user"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "seq",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "answer_image",
+            "name": "seq"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "file",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "answer_image",
+            "name": "file"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "content_type: FileContentType",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "answer_image",
+            "name": "content_type"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "size",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "answer_image",
+            "name": "size"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "b5a20b486f24118a944e5925439310690fbd297333b9cfe5b6f95020a2fd6464"
+}

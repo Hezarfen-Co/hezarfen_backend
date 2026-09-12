@@ -1,40 +1,41 @@
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-
-use crate::constant::{COURSE_TABLE, MAX_COURSE_DESCRIPTION_LEN, MAX_COURSE_TITLE_LEN};
-use crate::domain::monotonic_id::next_ulid;
+use crate::constant::{MAX_COURSE_DESCRIPTION_LEN, MAX_COURSE_TITLE_LEN};
+use crate::domain::monotonic_id::next_uuid;
 use crate::domain::term::TermId;
 use crate::domain::user::UserId;
 use crate::error::ValidationError;
 use crate::validate::{validate_course_kind, validate_optional, validate_required};
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct CourseId(RecordId);
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
+pub struct CourseId(uuid::Uuid);
 
 impl CourseId {
-    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
-    /// courses list `id DESC` (newest first, [`crate::db::course::list_all`]),
+    /// Minted from the process-wide monotonic generator, not a plain random
+    /// UUID: courses list `id DESC` (newest first,
+    /// [`crate::db::course::list_all`]),
     /// and a random low half scrambles rows minted in the same millisecond.
     pub fn generate() -> Self {
-        Self(RecordId::new(COURSE_TABLE, next_ulid().to_string()))
+        Self(next_uuid())
     }
 
+    /// The inner uuid, for runtime-checked binds (Param/QueryBuilder) that
+    /// cannot take the newtype. Static `query!` binds take `self` directly.
+    pub fn uuid(&self) -> uuid::Uuid {
+        self.0
+    }
+
+    /// Parses a wire key. A key that is not a UUID parses as the nil UUID,
+    /// which matches no row.
     pub fn from_key(key: &str) -> Self {
-        Self(RecordId::new(COURSE_TABLE, key))
+        Self(uuid::Uuid::parse_str(key).unwrap_or(uuid::Uuid::nil()))
     }
 
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
-        }
+    pub fn key(&self) -> String {
+        self.0.to_string()
     }
 }
-
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct CourseTitle(String);
 
 impl CourseTitle {
@@ -48,7 +49,8 @@ impl CourseTitle {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct CourseDescription(String);
 
 impl CourseDescription {
@@ -65,7 +67,8 @@ impl CourseDescription {
 /// A validated course kind: `course` (a regular class — ders), `study` (a
 /// supervised study session — etüt), or `club` (a student club — kulüp).
 /// Purely a label; all kinds behave identically.
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct CourseKind(String);
 
 impl CourseKind {
@@ -88,21 +91,19 @@ impl CourseKind {
 /// course, each exam weighted by its kind's settings weight. May belong to an
 /// academic term. Comes in three behaviorally identical kinds: `course`,
 /// `study` (etüt), and `club` (kulüp). An optional `capacity` caps the roster
-/// at enroll time (`None` = unlimited); rows written before the field existed
-/// decode as uncapped.
+/// at enroll time (`NULL` = unlimited).
 ///
 /// `creator` owns the course for good — only they (or a manager+) may delete
 /// it. `teachers` are the staff a manager assigned to run it: full management
 /// rights inside the course, no power to delete it or change the assignment
-/// list. Rows written before the field existed decode with nobody assigned.
+/// list.
 ///
 /// Fields are crate-visible: [`crate::db::course`] mints the rows on create
 /// and reads the id when updating and cascading a delete.
-#[derive(Debug, Clone, SurrealValue)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Course {
     pub(crate) id: CourseId,
     pub(crate) creator: UserId,
-    #[surreal(default)]
     pub(crate) teachers: Vec<UserId>,
     pub(crate) title: CourseTitle,
     pub(crate) description: CourseDescription,
@@ -180,60 +181,5 @@ mod tests {
         assert!(CourseKind::try_new("club").is_ok());
         assert!(CourseKind::try_new("etut").is_err());
         assert_eq!(CourseKind::course().as_str(), "course");
-    }
-
-    /// The database strips `NONE`-valued optional columns, and every course
-    /// row written before the capacity field existed has no `capacity` key at
-    /// all — both must decode as an uncapped course.
-    #[tokio::test]
-    async fn course_decodes_without_capacity_key() {
-        use surrealdb::types::Value;
-
-        let course = Course {
-            id: CourseId::generate(),
-            creator: UserId::from_key("01J8XZ0K3Q8G7X2M4N5P6R7S8T"),
-            teachers: Vec::new(),
-            title: CourseTitle::try_new("chess").unwrap(),
-            description: CourseDescription::try_new("").unwrap(),
-            kind: CourseKind::try_new("club").unwrap(),
-            term: None,
-            capacity: Some(12),
-        };
-        let Value::Object(mut object) = course.into_value() else {
-            panic!("course must encode as an object");
-        };
-        object.remove("capacity");
-        let decoded = Course::from_value(Value::Object(object)).unwrap();
-        assert_eq!(decoded.get_capacity(), None);
-    }
-
-    /// Every course row written before teacher assignment existed has no
-    /// `teachers` key. The boot backfill fills them in, but a row read before
-    /// that lands must still decode — as a course nobody was assigned to,
-    /// never as a decode error that 500s the catalog.
-    #[tokio::test]
-    async fn course_decodes_without_teachers_key() {
-        use surrealdb::types::Value;
-
-        let assigned = UserId::from_key("01J8XZ0K3Q8G7X2M4N5P6R7S8U");
-        let course = Course {
-            id: CourseId::generate(),
-            creator: UserId::from_key("01J8XZ0K3Q8G7X2M4N5P6R7S8T"),
-            teachers: vec![assigned.clone()],
-            title: CourseTitle::try_new("chess").unwrap(),
-            description: CourseDescription::try_new("").unwrap(),
-            kind: CourseKind::try_new("club").unwrap(),
-            term: None,
-            capacity: None,
-        };
-        assert!(course.is_assigned(&assigned));
-
-        let Value::Object(mut object) = course.into_value() else {
-            panic!("course must encode as an object");
-        };
-        object.remove("teachers");
-        let decoded = Course::from_value(Value::Object(object)).unwrap();
-        assert!(decoded.get_teachers().is_empty());
-        assert!(!decoded.is_assigned(&assigned));
     }
 }

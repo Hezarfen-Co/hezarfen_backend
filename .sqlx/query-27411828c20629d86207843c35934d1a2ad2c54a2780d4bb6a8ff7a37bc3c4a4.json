@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM chatbot_message WHERE thread_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "27411828c20629d86207843c35934d1a2ad2c54a2780d4bb6a8ff7a37bc3c4a4"
+}

@@ -1,51 +1,46 @@
-//! An academic term — semester, trimester, quarter, whatever this school
-//! runs; the structure is just rows, so it needs no code change per school.
-//! Courses may link to one term.
-//!
-//! Terms are calendar structure, not schedules: a school adopting the app
-//! mid-year legitimately creates a term that already started, so the no-past
-//! rule that guards exams/lessons/events deliberately does not apply here.
+use sqlx::Type;
+use uuid::Uuid;
 
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-
-use crate::constant::{MAX_TERM_NAME_LEN, TERM_TABLE};
-use crate::domain::monotonic_id::next_ulid;
+use crate::constant::MAX_TERM_NAME_LEN;
+use crate::domain::monotonic_id::next_uuid;
 use crate::domain::timestamp::Timestamp;
 use crate::error::{AppError, ValidationError};
 use crate::validate::validate_required;
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct TermId(RecordId);
+/// Typed term row id. A UUIDv7 minted by the process-wide monotonic
+/// generator, so `id` order is mint order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Type)]
+#[sqlx(transparent)]
+pub struct TermId(Uuid);
 
 impl TermId {
-    /// Minted from the process-wide monotonic generator, not `Ulid::new()`:
+    /// Minted from the process-wide monotonic generator, not a random v4:
     /// terms sort `starts_at DESC, id DESC` and the id breaks the tie between
     /// two terms starting at the same instant,
     /// and a random low half sorts arbitrarily inside one millisecond.
     pub fn generate() -> Self {
-        Self(RecordId::new(TERM_TABLE, next_ulid().to_string()))
+        Self(next_uuid())
     }
 
+    /// The inner uuid, for runtime-checked binds (Param/QueryBuilder) that
+    /// cannot take the newtype. Static `query!` binds take `self` directly.
+    pub fn uuid(&self) -> Uuid {
+        self.0
+    }
+
+    /// Parse a wire key. A key that parses as no UUID — a malformed path
+    /// segment — reads as the nil id, which matches no row: exactly the 404 a
+    /// dangling record key produced under the old store, without turning a
+    /// typo into a panic.
     pub fn from_key(key: &str) -> Self {
-        Self(RecordId::new(TERM_TABLE, key))
+        Self(Uuid::parse_str(key).unwrap_or(Uuid::nil()))
     }
 
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
-        }
+    /// The hyphenated wire form.
+    pub fn key(&self) -> String {
+        self.0.to_string()
     }
 }
-
-/// The answer every link to a term that is not there gets — the claim is a
-/// conditional write on the term row, so a term a delete already removed
-/// matches nothing and the caller says exactly what the link resolver's
-/// pre-flight lookup ([`crate::service::term::resolve`]) would have.
 pub fn gone_error() -> AppError {
     AppError::Validation(ValidationError::Invalid {
         field: "term_id",
@@ -69,18 +64,16 @@ pub fn archived_error() -> AppError {
 pub fn ref_move(
     current: Option<&TermId>,
     patch: &Option<Option<TermId>>,
-) -> (Option<RecordId>, Option<RecordId>) {
+) -> (Option<TermId>, Option<TermId>) {
     match patch {
         None => (None, None),
         Some(next) if next.as_ref() == current => (None, None),
-        Some(next) => (
-            next.as_ref().map(TermId::record),
-            current.map(TermId::record),
-        ),
+        Some(next) => (*next, current.copied()),
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct TermName(String);
 
 impl TermName {
@@ -96,16 +89,15 @@ impl TermName {
 
 /// One term on the school's academic calendar. Both ends are required — a
 /// term is a date range by definition.
-#[derive(Debug, Clone, SurrealValue)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Term {
     pub(crate) id: TermId,
     pub(crate) name: TermName,
     pub(crate) starts_at: Timestamp,
     pub(crate) ends_at: Timestamp,
-    /// When a manager archived this term; `None` = open. `#[surreal(default)]`
-    /// for the same reason `BankQuestion::subject` has one: rows written before
-    /// the column existed still decode, as open terms.
-    #[surreal(default)]
+    /// When a manager archived this term; `None` = open. The column is
+    /// nullable, so a term that predates archiving reads exactly like an
+    /// open one.
     pub(crate) archived_at: Option<Timestamp>,
 }
 

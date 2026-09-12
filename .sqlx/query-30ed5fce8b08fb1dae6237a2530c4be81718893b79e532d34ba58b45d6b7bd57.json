@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id AS \"id: BuilderId\",\n                  username AS \"username: Username\",\n                  password_hash AS \"password_hash: PasswordHash\"\n           FROM builder WHERE username = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: BuilderId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "builder",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "username: Username",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "builder",
+            "name": "username"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "password_hash: PasswordHash",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "builder",
+            "name": "password_hash"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "30ed5fce8b08fb1dae6237a2530c4be81718893b79e532d34ba58b45d6b7bd57"
+}

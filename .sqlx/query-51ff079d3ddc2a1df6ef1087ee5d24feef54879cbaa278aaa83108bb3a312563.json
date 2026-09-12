@@ -1,0 +1,80 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO meal_attendance (menu, student, status, marked_by, marked_at)\n             VALUES ($1, $2, $3, $4, $5)\n             ON CONFLICT (menu, student) DO UPDATE\n             SET status = EXCLUDED.status,\n                 marked_by = EXCLUDED.marked_by,\n                 marked_at = EXCLUDED.marked_at\n             RETURNING menu AS \"menu: MenuId\", student AS \"student: UserId\",\n                       status AS \"status: MealAttendanceStatus\", marked_by AS \"marked_by: UserId\",\n                       marked_at AS \"marked_at: Timestamp\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "menu: MenuId",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "meal_attendance",
+            "name": "menu"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "student: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "meal_attendance",
+            "name": "student"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "status: MealAttendanceStatus",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "meal_attendance",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "marked_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "meal_attendance",
+            "name": "marked_by"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "marked_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "meal_attendance",
+            "name": "marked_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid",
+        "Text",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "51ff079d3ddc2a1df6ef1087ee5d24feef54879cbaa278aaa83108bb3a312563"
+}

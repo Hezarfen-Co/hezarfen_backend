@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE app_user SET marks_given_total = app_user.marks_given_total + 1\n                   WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "dd19339a56cddd3824273b04d3581204e44a1fd0b3afd8fbf6664da427cc7bf9"
+}

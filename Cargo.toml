@@ -19,14 +19,12 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 axum = { version = "0.8.9", features = ["ws", "multipart"] }
 axum-extra = { version = "0.12", features = ["cookie"] }
 tower-http = { version = "0.7", features = ["trace", "cors", "request-id", "catch-panic"] }
-surrealdb = { version = "3.2", default-features = false, features = ["protocol-ws", "kv-mem"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = "0.4"
-argon2 = "0.5"
+argon2 = "0.6"
 getrandom = "0.4"
 hex = "0.4"
-ulid = "1"
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
@@ -37,9 +35,9 @@ utoipa = { version = "5.5.0", features = ["axum_extras"] }
 utoipa-axum = "0.2.0"
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
 quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
-rcgen = { version = "0.14.8", default-features = false, features = ["pem", "ring"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
 rustls-pemfile = "2.2.0"
-rustls = { version = "0.23.42", default-features = false, features = ["logging", "ring", "std", "tls12"] }
+rustls = { version = "0.23.44", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 sha2 = "0.11.0"
 base64 = "0.23"
 # `ServiceExt::oneshot`, which is how the AI bridge dispatches a service's api
@@ -49,10 +47,11 @@ tower = { version = "0.5", features = ["util"] }
 opentelemetry = "0.32.0"
 tracing-opentelemetry = "0.33.0"
 opentelemetry-semantic-conventions = "0.32.1"
-uuid = { version = "1.26.0", features = ["v4"] }
+uuid = { version = "1.26.1", features = ["v4", "v7"] }
 opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["trace", "metrics", "logs", "grpc-tonic", "http-proto", "reqwest-blocking-client", "internal-logs"] }
 opentelemetry-appender-tracing = "0.32.0"
+sqlx = { version = "0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring", "migrate", "macros", "uuid", "json"] }
 
 [dev-dependencies]
 # test-util enables tokio::time::pause/advance for the rate limiter tests.
@@ -60,7 +59,7 @@ tokio = { version = "1", features = ["full", "test-util"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "cookies"] }
 tempfile = "3"
 tokio-tungstenite = "0.30.0"
-futures-util = "0.3.32"
+futures-util = "0.3.34"
 proptest = "1.11.0"
 # Compiles the pattern `GET /limits` publishes and runs it over the same inputs
 # the validator sees, so the published promise cannot drift from the accept set.

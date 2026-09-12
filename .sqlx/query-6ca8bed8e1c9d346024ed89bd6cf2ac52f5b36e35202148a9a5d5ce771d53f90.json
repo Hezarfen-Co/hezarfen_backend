@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE class_group\n               SET class_course_count = GREATEST(class_course_count - 1, 0)\n               WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6ca8bed8e1c9d346024ed89bd6cf2ac52f5b36e35202148a9a5d5ce771d53f90"
+}

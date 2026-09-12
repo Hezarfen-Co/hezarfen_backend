@@ -20,7 +20,7 @@ use utoipa_axum::routes;
 
 use crate::database::Database;
 use crate::domain::dietary_profile::{DietaryNote, DietaryTags, conflicts};
-use crate::domain::meal_attendance::{MealAttendance, MealAttendanceStatus};
+use crate::domain::meal_attendance::{MealAttendance, MealAttendanceId, MealAttendanceStatus};
 use crate::domain::meal_booking::{MealBooking, MealBookingId, MealCutoff};
 use crate::domain::meal_ledger::{LedgerAmount, LedgerMethod, LedgerNote, MealLedger};
 use crate::domain::menu::{Menu, MenuDate, MenuId, MenuSlot, validate_capacity};
@@ -438,11 +438,11 @@ async fn add_dish(
         &req.tags,
         &service::settings::load(&st.db).await?.get_dietary_tags(),
     )?;
-    // The dish-cap gate and its [`MENU_LOCK`](crate::service::menu::MENU_LOCK)
-    // lease live in the service: count-then-write is write-skew, so the count
-    // and the insert have to be one step, and the menu is read *inside* the
-    // lock — read before it, a `DELETE /menus/{id}` running in the gap takes
-    // its cascade with it and this dish lands on a menu that no longer exists.
+    // The dish-cap gate lives in the service: the cap is one guarded
+    // statement now — the menu row is locked `FOR NO KEY UPDATE` inside the
+    // dish write's own transaction and the insert carries the
+    // `count(*) < cap` guard, so a dish can never land on a menu that no
+    // longer exists, and two racing writers cannot overfill it either.
     let dish = service::menu::add_dish(
         &st.db,
         &MenuId::from_key(&id),
@@ -502,8 +502,8 @@ async fn update_dish(
         )?),
         None => None,
     };
-    // The dish write holds [`MENU_LOCK`](crate::service::menu::MENU_LOCK)
-    // inside the service, like every dish write — see `add_dish`.
+    // The dish write locks the menu row inside its own transaction — see
+    // `add_dish`.
     let updated = service::menu::update_dish(&st.db, dish, name, description, price, tags).await?;
     let viewer_tags = service::dietary_profile::tags_of(&st.db, user.get_id()).await?;
     Ok(Json(DishResponse::new(&updated, &viewer_tags)))
@@ -531,8 +531,8 @@ async fn delete_dish(
     let dish = service::menu::read_dish(&st.db, &MenuDishId::from_key(&did))
         .await?
         .ok_or(AppError::NotFound)?;
-    // The dish write holds [`MENU_LOCK`](crate::service::menu::MENU_LOCK)
-    // inside the service, like every dish write — see `add_dish`.
+    // The dish write locks the menu row inside its own transaction — see
+    // `add_dish`.
     service::menu::delete_dish(&st.db, dish).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -726,7 +726,7 @@ struct BookingResponse {
 impl BookingResponse {
     fn new(booking: &MealBooking, people: &std::collections::HashMap<String, PersonRef>) -> Self {
         Self {
-            id: booking.get_id().key().to_string(),
+            id: booking.id().key(),
             menu_id: booking.get_menu().key().to_string(),
             student: PersonRef::resolve(people, booking.get_student()),
             booked_by: PersonRef::resolve(people, booking.get_booked_by()),
@@ -1005,10 +1005,8 @@ async fn cancel_booking(
         // gets the same 403 either way, and learns nothing.
         //
         // Same door as booking: whoever may take the seat may give it back.
-        let student = id
-            .student()
-            .ok_or(AppError::Forbidden("not your booking"))?;
-        let target = booking_target(&user, Some(student.key()), &st.db).await?;
+        let student = id.student();
+        let target = booking_target(&user, Some(student.key().as_str()), &st.db).await?;
         if target != student {
             return Err(AppError::Forbidden("not your booking"));
         }
@@ -1067,7 +1065,7 @@ struct MealAttendanceResponse {
 impl MealAttendanceResponse {
     fn new(row: &MealAttendance, people: &std::collections::HashMap<String, PersonRef>) -> Self {
         Self {
-            id: row.get_id().key().to_string(),
+            id: MealAttendanceId::composite(row.get_menu(), &row.get_student()).key(),
             menu_id: row.get_menu().key().to_string(),
             student: PersonRef::resolve(people, row.get_student()),
             status: row.get_status().as_str().to_string(),

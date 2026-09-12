@@ -1,0 +1,101 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id AS \"id: HomeworkResultId\",\n                  homework AS \"homework: HomeworkId\",\n                  app_user AS \"user: UserId\",\n                  status AS \"status: HomeworkStatus\",\n                  mark AS \"mark: Mark\",\n                  graded_by AS \"graded_by: UserId\",\n                  created_at AS \"created_at: Timestamp\"\n           FROM homework_result\n           WHERE app_user = $1\n             AND homework IN (SELECT id FROM homework WHERE course = $2)\n           ORDER BY id DESC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: HomeworkResultId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "homework_result",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "homework: HomeworkId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "homework_result",
+            "name": "homework"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "user: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "homework_result",
+            "name": "app_user"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "status: HomeworkStatus",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "homework_result",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "mark: Mark",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "homework_result",
+            "name": "mark"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "graded_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "homework_result",
+            "name": "graded_by"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "homework_result",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "f3a4cec1ec1f46679602989fab57cc89a722030f6200af053c392dd6aa9ee9d3"
+}

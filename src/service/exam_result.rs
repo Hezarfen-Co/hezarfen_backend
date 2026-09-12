@@ -1,7 +1,6 @@
-//! Exam-mark workflows: the grading gate chain under the exam subsystem's
-//! reader lease, ungrading behind the archived-term gate, and the read doors
-//! the web layer takes. The mark's own claim-riding transaction lives in
-//! [`crate::db::exam_result`].
+//! Exam-mark workflows: the grading gate chain, ungrading behind the
+//! archived-term gate, and the read doors the web layer takes. The mark's
+//! own claim-riding transaction lives in [`crate::db::exam_result`].
 
 use crate::database::Database;
 use crate::db;
@@ -11,18 +10,17 @@ use crate::domain::exam_result::{ExamResult, Mark};
 use crate::domain::role::Role;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
-use crate::service::exam_attempt::{EXAM_LOCK, course_of, read_latest_for_user};
+use crate::service::exam_attempt::{course_of, read_latest_for_user};
 
 /// Grade a student's current sitting: every wall the handler used to run
 /// (draft, retired kind, self-grade, target existence/role/enrollment), then
 /// the mark's own transaction.
 ///
-/// *Reader* lease of [`EXAM_LOCK`] from the exam read through the result
-/// write: the draft gate below must be judged against the same row the
-/// mark lands under, or a concurrent re-draft (a writer, which checks for
-/// results) could slip between them and leave a mark on a hidden exam. The
-/// mark's transaction re-makes the draft check inside the store, so the
-/// pre-flight here answers the same `409` one round trip earlier.
+/// The draft gate below is the pre-flight; the mark's own transaction
+/// re-makes it on the locked exam row ([`db::exam_result::grade`]), so a
+/// re-draft landing after this read cannot leave a mark on a hidden exam —
+/// the store decides, which is what the old reader lease of `EXAM_LOCK`
+/// used to stand in for.
 ///
 /// The kind gate is the settings-list twin of the counter's retired bit:
 /// `kind_ref`'s bit is what actually refuses the mark inside
@@ -47,8 +45,6 @@ pub async fn grade(
     target: &UserId,
     mark: i64,
 ) -> Result<ExamResult, AppError> {
-    // Reader lease of [`EXAM_LOCK`] — see above.
-    let _guard = EXAM_LOCK.read().await;
     // Exam must exist.
     let exam = crate::service::exam::read(db, exam_id)
         .await?

@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH gone AS (\n                            DELETE FROM user_session WHERE expires_at < $1 RETURNING 1\n                        )\n                        SELECT count(*) AS \"deleted!: i64\" FROM gone",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "deleted!: i64",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "c0be50ee13484b58e1f3d69d707f825a7763678b602413a014a9fb6a2670cf07"
+}

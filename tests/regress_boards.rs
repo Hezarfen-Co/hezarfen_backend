@@ -60,11 +60,10 @@ async fn a_strokes_page_never_carries_a_clear_marker() {
     // The clear left a marker on epoch 0 and moved the board to epoch 1. Point
     // the board back at 0: that is precisely what a reader that read the board
     // one instant before the clear committed is looking at.
-    db.query("UPDATE $b SET epoch = 0")
-        .bind(("b", BoardId::from_key(&board).record()))
+    sqlx::query("UPDATE board SET epoch = 0 WHERE id = $1")
+        .bind(BoardId::from_key(&board))
+        .execute(&db)
         .await
-        .expect("rewind")
-        .check()
         .expect("rewind");
 
     let res = send(

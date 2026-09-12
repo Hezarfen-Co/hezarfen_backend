@@ -15,7 +15,7 @@ use crate::domain::course::Course;
 use crate::domain::course_session::{CourseSession, CourseSessionId, SessionTopic};
 
 use crate::domain::role::Role;
-use crate::domain::session_attendance::SessionAttendance;
+use crate::domain::session_attendance::{SessionAttendance, SessionAttendanceId};
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
 use crate::error::{AppError, ErrorResponse};
@@ -77,7 +77,7 @@ struct SessionAttendanceResponse {
 impl SessionAttendanceResponse {
     fn new(attendance: &SessionAttendance, people: &HashMap<String, PersonRef>) -> Self {
         Self {
-            id: attendance.get_id().key().to_string(),
+            id: SessionAttendanceId::composite(attendance.get_session(), &attendance.get_user()).key(),
             session: attendance.get_session().key().to_string(),
             course: attendance.get_course().key().to_string(),
             user: PersonRef::resolve(people, attendance.get_user()),

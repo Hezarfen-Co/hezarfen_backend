@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT kind AS \"kind: PaymentLedgerKind\", source\n               FROM payment_ledger WHERE id = $1 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "kind: PaymentLedgerKind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "payment_ledger",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "source",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "payment_ledger",
+            "name": "source"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "ccb9e670723af3019a5e81ca01c2742af975aee6ed547fc50c2fc9de6e479b8f"
+}

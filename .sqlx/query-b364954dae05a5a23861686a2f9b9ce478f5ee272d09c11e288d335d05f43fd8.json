@@ -1,0 +1,81 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO dietary_profile (student, tags, note, updated_by, updated_at)\n         VALUES ($1, COALESCE($2, '{}'::text[]), $3, $4, $5)\n         ON CONFLICT (student) DO UPDATE SET\n             tags = COALESCE($2, dietary_profile.tags),\n             note = CASE WHEN $6 THEN $3 ELSE dietary_profile.note END,\n             updated_by = $4,\n             updated_at = $5\n         RETURNING student AS \"student: UserId\", tags AS \"tags: DietaryTags\", note AS \"note: DietaryNote\", updated_by AS \"updated_by: UserId\", updated_at AS \"updated_at: Timestamp\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "student: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "dietary_profile",
+            "name": "student"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "tags: DietaryTags",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "dietary_profile",
+            "name": "tags"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "note: DietaryNote",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "dietary_profile",
+            "name": "note"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "updated_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "dietary_profile",
+            "name": "updated_by"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "updated_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "dietary_profile",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "TextArray",
+        "Text",
+        "Uuid",
+        "Int8",
+        "Bool"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "b364954dae05a5a23861686a2f9b9ce478f5ee272d09c11e288d335d05f43fd8"
+}

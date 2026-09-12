@@ -44,15 +44,19 @@ async fn an_attempt_started_inside_a_delete_never_outlives_the_exam() {
     let student_id = me_id(&app, &student).await;
 
     // Hold the delete open for a full second once the row is gone, while its
-    // cascade still has to run.
-    db.query(
-        "DEFINE EVENT hold_the_window ON TABLE exam WHEN $event = 'DELETE' \
-         THEN { SLEEP 1s; };",
+    // cascade still has to run: an AFTER DELETE trigger sleeping inside the
+    // delete's own transaction is the Postgres shape of the old window event.
+    let mut conn = db.acquire().await.expect("acquire for the trigger");
+    sqlx::raw_sql(
+        "CREATE FUNCTION heztest_hold_delete() RETURNS trigger AS $$
+         BEGIN PERFORM pg_sleep(1.0); RETURN NULL; END;
+         $$ LANGUAGE plpgsql;
+         CREATE TRIGGER heztest_hold_delete AFTER DELETE ON exam
+         FOR EACH ROW EXECUTE FUNCTION heztest_hold_delete();",
     )
+    .execute(&mut *conn)
     .await
-    .expect("define the window event")
-    .check()
-    .expect("check the window event");
+    .expect("define the window trigger");
 
     let mut sittings = 0;
     for round in 0..3 {

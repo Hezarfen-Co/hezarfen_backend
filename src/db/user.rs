@@ -1,22 +1,17 @@
-//! The `user` table: the row mint (with the duplicate-username mapping), row
-//! reads and listings, the admin-floor count, the role cascade transaction,
-//! and the field-scoped writers. The workflows that sequence these under
-//! [`crate::service::user::ADMIN_FLOOR_LOCK`] live in
-//! [`crate::service::user`].
+//! The `app_user` table: the row mint (with the duplicate-username mapping),
+//! row reads and listings, the role cascade transaction (admin floor and all
+//! sweeps included), and the field-scoped writers. The workflow that drives
+//! the cascade lives in [`crate::service::user`].
+//!
+//! The compile-time macros map columns by name and check each decoded type
+//! against the prepare schema, so the seventeen user columns are spelled
+//! out — newtype overrides included — in every static statement below. The
+//! repetitions are the check.
 
-use surrealdb::types::{RecordId, SurrealValue};
-
-use crate::constant::{
-    APPOINTMENT_SLOT_TABLE, APPOINTMENT_TABLE, BOARD_TABLE, CLASS_GROUP_TABLE,
-    CLASS_MEMBER_COUNT_FIELD, CLASS_MEMBER_TABLE, COURSE_TABLE, ENROLLMENT_COUNT_FIELD,
-    ENROLLMENT_TABLE, PARENT_LINK_TABLE, REGISTRATION_COUNT_FIELD, REGISTRATION_FROZEN_GUARD,
-    REGISTRATION_TABLE,
-};
-use crate::database::{Database, transaction_with_retry, write_with_retry};
+use crate::database::{Database, tx_with_retry};
 use crate::db::field_update::FieldUpdate;
-use crate::db::page::PagedList;
-use crate::domain::appointment::AppointmentStatus;
-use crate::domain::board::Board;
+use crate::db::page::{PagedList, Param};
+use crate::domain::board::{Board, BoardId, BoardTitle};
 use crate::domain::note_file::FileContentType;
 use crate::domain::preferences::{Language, PaletteColor, Theme};
 use crate::domain::profile::{Bio, BirthDate, DisplayName, Email, PersonName, Phone};
@@ -43,58 +38,82 @@ pub async fn create(
 /// or a cancelled future), and the row left behind is an ordinary student
 /// account that [`crate::service::user::ensure_admin`] must then refuse to
 /// touch — a deployment with no admin and no way for a later boot to repair it.
+///
+/// The unique index on `username` is the whole availability check. The old
+/// pre-check-and-recheck dance existed because the old store could not name
+/// the constraint a racing insert had violated; here the violated
+/// constraint's name answers directly (`app_user_username`), and the loser
+/// of a race gets the same 409 the sequential duplicate always got.
 pub async fn create_with_role(
     db: &Database,
     username: Username,
     password_hash: PasswordHash,
     role: Role,
 ) -> Result<User, AppError> {
-    if find_by_username(db, username.as_str()).await?.is_some() {
-        return Err(AppError::Conflict("username already taken"));
-    }
-    let user = User {
-        id: UserId::generate(),
-        username,
-        password_hash,
-        role,
-        name: None,
-        surname: None,
-        email: None,
-        phone: None,
-        birth_date: None,
-        theme: None,
-        language: None,
-        palette_color: None,
-        display_name: None,
-        bio: None,
-        avatar_file: None,
-        avatar_content_type: None,
-        avatar_size: None,
-    };
-    let created: Result<Option<User>, surrealdb::Error> =
-        db.create(user.id.record()).content(user.clone()).await;
-    match created {
-        Ok(Some(created)) => Ok(created),
-        Ok(None) => Err(AppError::Internal("failed to create user".into())),
-        // The availability pre-check above is not atomic with the insert:
-        // two concurrent registrations can both pass it, and the loser then
-        // trips the unique username index. That loss is the same condition
-        // as the sequential duplicate, so report the same 409 — not a 500.
-        Err(err) => {
-            if find_by_username(db, user.username.as_str())
-                .await?
-                .is_some()
-            {
-                Err(AppError::Conflict("username already taken"))
-            } else {
-                Err(err.into())
-            }
+    let id = UserId::generate();
+    match sqlx::query_as!(
+        User,
+        r#"INSERT INTO app_user (id, username, password_hash, role)
+           VALUES ($1, $2, $3, $4)
+           RETURNING id AS "id: UserId",
+                     username AS "username: Username",
+                     password_hash AS "password_hash: PasswordHash",
+                     role AS "role: Role",
+                     name AS "name: PersonName",
+                     surname AS "surname: PersonName",
+                     email AS "email: Email",
+                     phone AS "phone: Phone",
+                     birth_date AS "birth_date: BirthDate",
+                     theme AS "theme: Theme",
+                     language AS "language: Language",
+                     palette_color AS "palette_color: PaletteColor",
+                     display_name AS "display_name: DisplayName",
+                     bio AS "bio: Bio",
+                     avatar_file,
+                     avatar_content_type AS "avatar_content_type: FileContentType",
+                     avatar_size"#,
+        id.uuid(),
+        username.as_str(),
+        password_hash.as_str(),
+        role.as_str(),
+    )
+    .fetch_one(db)
+    .await
+    {
+        Ok(user) => Ok(user),
+        Err(err) if crate::database::unique_violation(&err) == Some("app_user_username") => {
+            Err(AppError::Conflict("username already taken"))
         }
+        Err(err) => Err(err.into()),
     }
 }
 
 pub async fn read(db: &Database, id: &UserId) -> Result<Option<User>, AppError> {
-    Ok(db.select(id.record()).await?)
+    let user = sqlx::query_as!(
+        User,
+        r#"SELECT id AS "id: UserId",
+                  username AS "username: Username",
+                  password_hash AS "password_hash: PasswordHash",
+                  role AS "role: Role",
+                  name AS "name: PersonName",
+                  surname AS "surname: PersonName",
+                  email AS "email: Email",
+                  phone AS "phone: Phone",
+                  birth_date AS "birth_date: BirthDate",
+                  theme AS "theme: Theme",
+                  language AS "language: Language",
+                  palette_color AS "palette_color: PaletteColor",
+                  display_name AS "display_name: DisplayName",
+                  bio AS "bio: Bio",
+                  avatar_file,
+                  avatar_content_type AS "avatar_content_type: FileContentType",
+                  avatar_size
+           FROM app_user WHERE id = $1"#,
+        id.uuid()
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(user)
 }
 
 pub async fn list_all(
@@ -102,7 +121,7 @@ pub async fn list_all(
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<User>, i64), AppError> {
-    PagedList::new("user", "ORDER BY id DESC")
+    PagedList::new("app_user", "ORDER BY id DESC")
         .run(limit, offset, db)
         .await
 }
@@ -113,50 +132,63 @@ pub async fn list_by_ids(db: &Database, ids: &[UserId]) -> Result<Vec<User>, App
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let records: Vec<RecordId> = ids.iter().map(UserId::record).collect();
-    let mut result = db
-        .query("SELECT * FROM user WHERE id IN $ids")
-        .bind(("ids", records))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<User>>(0)?)
+    let ids: Vec<uuid::Uuid> = ids.iter().map(UserId::uuid).collect();
+    let users = sqlx::query_as!(
+        User,
+        r#"SELECT id AS "id: UserId",
+                  username AS "username: Username",
+                  password_hash AS "password_hash: PasswordHash",
+                  role AS "role: Role",
+                  name AS "name: PersonName",
+                  surname AS "surname: PersonName",
+                  email AS "email: Email",
+                  phone AS "phone: Phone",
+                  birth_date AS "birth_date: BirthDate",
+                  theme AS "theme: Theme",
+                  language AS "language: Language",
+                  palette_color AS "palette_color: PaletteColor",
+                  display_name AS "display_name: DisplayName",
+                  bio AS "bio: Bio",
+                  avatar_file,
+                  avatar_content_type AS "avatar_content_type: FileContentType",
+                  avatar_size
+           FROM app_user WHERE id = ANY($1)"#,
+        &ids
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(users)
 }
 
 /// Every user holding exactly `role` — e.g. the roster of a role-targeted
 /// event. Exact match, not `at_least`: "all teachers" means teachers, not
 /// managers and admins too.
 pub async fn list_by_role(db: &Database, role: Role) -> Result<Vec<User>, AppError> {
-    let mut result = db
-        .query("SELECT * FROM user WHERE role = $role ORDER BY id DESC")
-        .bind(("role", role))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<User>>(0)?)
-}
-
-/// Would lowering `target` out of `admin` leave the school with none? Both
-/// halves are asked of the **live** rows in one round trip: is that row an
-/// admin right now, and does any other admin exist. It asks for one id per
-/// half rather than a `count()` — a count over an indexed field compared
-/// against a plan-time value answers `{count: N}` on the real server, and
-/// neither half needs a number.
-///
-/// Caller must hold
-/// [`crate::service::user::ADMIN_FLOOR_LOCK`] for the answer to still be
-/// true by the time it is acted on.
-pub async fn would_orphan_admins(db: &Database, target: &UserId) -> Result<bool, AppError> {
-    let mut result = db
-        .query(
-            "SELECT VALUE id FROM user WHERE id = $usr AND role = $role;\n\
-             SELECT VALUE id FROM user WHERE role = $role AND id != $usr LIMIT 1",
-        )
-        .bind(("role", Role::Admin))
-        .bind(("usr", target.record()))
-        .await?
-        .check()?;
-    let is_admin = !result.take::<Vec<RecordId>>(0)?.is_empty();
-    let others = !result.take::<Vec<RecordId>>(1)?.is_empty();
-    Ok(is_admin && !others)
+    let users = sqlx::query_as!(
+        User,
+        r#"SELECT id AS "id: UserId",
+                  username AS "username: Username",
+                  password_hash AS "password_hash: PasswordHash",
+                  role AS "role: Role",
+                  name AS "name: PersonName",
+                  surname AS "surname: PersonName",
+                  email AS "email: Email",
+                  phone AS "phone: Phone",
+                  birth_date AS "birth_date: BirthDate",
+                  theme AS "theme: Theme",
+                  language AS "language: Language",
+                  palette_color AS "palette_color: PaletteColor",
+                  display_name AS "display_name: DisplayName",
+                  bio AS "bio: Bio",
+                  avatar_file,
+                  avatar_content_type AS "avatar_content_type: FileContentType",
+                  avatar_size
+           FROM app_user WHERE role = $1 ORDER BY id DESC"#,
+        role.as_str()
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(users)
 }
 
 /// Case- and diacritic-insensitive fragment search over username, name,
@@ -181,41 +213,58 @@ pub async fn search(
     offset: i64,
 ) -> Result<(Vec<User>, i64), AppError> {
     let needle = search_fold(query.trim());
-    let text_clause = format!(
-        "({} CONTAINS $q OR {} CONTAINS $q OR {} CONTAINS $q)",
-        search_fold_sql("username"),
-        search_fold_sql("name ?? ''"),
-        search_fold_sql("surname ?? ''"),
-    );
-    let mut clauses = Vec::new();
+    // Placeholders are positional, and every clause is optional, so the
+    // numbering is assigned as the clauses are added. Containment is spelled
+    // `position(...) > 0` rather than `LIKE` so the needle's `%` and `_`
+    // stay literal characters — the fold does not escape, and a query for
+    // `100%` must not grow a wildcard.
+    let mut binds: Vec<Param> = Vec::new();
+    let mut clauses: Vec<String> = Vec::new();
     if !needle.is_empty() {
-        clauses.push(text_clause.as_str());
+        let n = binds.len() + 1;
+        clauses.push(format!(
+            "(position(${n} in {}) > 0 \
+             OR position(${n} in {}) > 0 \
+             OR position(${n} in {}) > 0)",
+            search_fold_sql("username"),
+            search_fold_sql("coalesce(name, '')"),
+            search_fold_sql("coalesce(surname, '')"),
+        ));
+        binds.push(Param::Text(needle));
     }
-    if role.is_some() {
-        clauses.push("role = $role");
+    if let Some(role) = role {
+        let n = binds.len() + 1;
+        clauses.push(format!("role = ${n}"));
+        binds.push(Param::Text(role.as_str().to_string()));
     }
-    if allowed_roles.is_some() {
-        clauses.push("role IN $allowed");
+    if let Some(allowed) = allowed_roles {
+        let n = binds.len() + 1;
+        clauses.push(format!("role = ANY(${n})"));
+        binds.push(Param::Texts(
+            allowed
+                .iter()
+                .map(|role| role.as_str().to_string())
+                .collect(),
+        ));
     }
     let where_clause = if clauses.is_empty() {
-        "true".to_string()
+        "TRUE".to_string()
     } else {
         clauses.join(" AND ")
     };
-    let mut list =
-        PagedList::new(format!("user WHERE {where_clause}"), "ORDER BY username").bind("q", needle);
-    if let Some(role) = role {
-        list = list.bind("role", role);
-    }
-    if let Some(allowed) = allowed_roles {
-        list = list.bind("allowed", allowed.to_vec());
+    let mut list = PagedList::new(
+        format!("app_user WHERE {where_clause}"),
+        "ORDER BY username",
+    );
+    for bind in binds {
+        list = list.bind(bind);
     }
     list.run(limit, offset, db).await
 }
 
 /// The role write and every sweep it owes, in one transaction — the
-/// statement list behind [`crate::service::user::set_role`]. See there for
-/// the floor that guards it and the arm-by-arm reasoning; what follows is
+/// statement list behind [`crate::service::user::set_role`]; see there for
+/// the floor that guards it and the arm-by-arm reasoning. What follows is
 /// the store side.
 ///
 /// Writes *only* the `role` field of the user row (never the whole row):
@@ -224,8 +273,7 @@ pub async fn search(
 /// whole-row write would carry the snapshot's copy of the *other* group back
 /// over a concurrent edit — an in-flight profile save silently reverting an
 /// admin's demotion, or this write erasing a profile edit that raced it.
-/// [`crate::db::user::set_profile`] and
-/// [`crate::db::user::set_preferences`] are scoped for the same reason.
+/// [`set_profile`] and [`set_preferences`] are scoped for the same reason.
 ///
 /// What is swept, and why the conditions differ:
 ///
@@ -244,12 +292,15 @@ pub async fn search(
 ///   else could remove: staff free their own by hand (`unregister` allows
 ///   the self case) but a parent can reach no such door, so a promotion
 ///   strands nothing and only this demotion does. A list that has already
-///   **frozen** ([`REGISTRATION_FROZEN_GUARD`]) is left exactly as it
-///   stands — past the freeze it is historical record, re-registering
-///   answers 409, and rewriting it here would be irrecoverable. A signup
-///   whose event record is *gone* has no seat to hand back and no list that
-///   can freeze, so it is deleted rather than skipped: skipped, it is
-///   stranded forever (`unregister` 404s on the missing event).
+///   **frozen** (an audience-`registration` event whose start-or-end time
+///   has passed — the same predicate
+///   [`crate::domain::registration`]'s Rust check enforces) is left exactly
+///   as it stands — past the freeze it is historical record,
+///   re-registering answers 409, and rewriting it here would be
+///   irrecoverable. A signup whose event record is *gone* has no seat to
+///   hand back and no list that can freeze, so it is deleted rather than
+///   skipped: skipped, it is stranded forever (`unregister` 404s on the
+///   missing event).
 /// * **Below teacher** gives up course staffing and homeroom-teacher
 ///   columns — only teacher+ may hold either — and the published
 ///   appointment calendar, whose live bookings are cancelled in the same
@@ -260,8 +311,9 @@ pub async fn search(
 ///   cancelled once its window opens — leaving the slot's `occupied` seat
 ///   pinned at one and the slot itself undeletable forever. The requester
 ///   keeps the row, `cancelled`, with the teacher on `cancelled_by` and the
-///   reason on `cancel_reason`; the slot it pointed at is gone, so the
-///   booking renders without a window
+///   reason on `cancel_reason`; the slot it pointed at is gone (the
+///   `ON DELETE SET NULL` link carries the delete), so the booking renders
+///   without a window
 ///   ([`crate::domain::appointment::Appointment`]'s reader already treats a
 ///   vanished slot that way). There is no notification anywhere in
 ///   this crate, so a settled row the person can read is the strongest
@@ -275,146 +327,265 @@ pub async fn search(
 /// fan-out cannot sit inside a database transaction, and a room told before
 /// the commit would re-read the pre-commit state.
 ///
-/// Admissible for [`transaction_with_retry`] by construction: `SELECT`,
-/// `UPDATE` and `DELETE` only, so no statement can answer "already exists"
-/// and every lost round is a plain re-send.
+/// **The admin floor is the role write's own `WHERE`.** The old guard was a
+/// count read under a process-wide lock held across the whole cascade,
+/// because the old store could not serialize a cross-record count against a
+/// concurrent update (write-skew). Here the count rides the very row write
+/// it guards — a demotion that would leave no other admin writes zero rows
+/// — so two racing demotions contend on row locks and exactly one lands.
+/// Zero rows therefore means the floor refused; the missing-row reading of
+/// zero rows is unreachable (no route deletes a user row, and the caller's
+/// 404 pre-read answers that case first anyway).
 pub async fn set_role_cascade(
     db: &Database,
     target: &UserId,
     role: Role,
 ) -> Result<(User, Vec<Board>), AppError> {
-    // Built as a statement list rather than one string so the result slot
-    // of the board write is *counted*, not hand-tallied against arms that
-    // may or may not be in the batch. Slot 0 is `BEGIN`, as everywhere.
-    let mut batch = vec![
-        "BEGIN TRANSACTION".to_string(),
-        "UPDATE $usr SET role = $role RETURN AFTER".to_string(),
-    ];
-    if role != Role::Student {
-        batch.push(format!(
-            "LET $links = (DELETE {CLASS_MEMBER_TABLE} WHERE user = $usr RETURN BEFORE)"
-        ));
-        batch.push(format!(
-            "FOR $link IN ($links ?? []) {{ UPDATE $link.class SET \
-             {CLASS_MEMBER_COUNT_FIELD} = \
-             math::max([({CLASS_MEMBER_COUNT_FIELD} ?? 0) - 1, 0]); }}"
-        ));
-        batch.push(format!(
-            "LET $rows = (DELETE {ENROLLMENT_TABLE} WHERE user = $usr RETURN BEFORE)"
-        ));
-        batch.push(format!(
-            "FOR $row IN ($rows ?? []) {{ UPDATE $row.course SET \
-             {ENROLLMENT_COUNT_FIELD} = \
-             math::max([({ENROLLMENT_COUNT_FIELD} ?? 0) - 1, 0]); }}"
-        ));
-        batch.push(format!("DELETE {PARENT_LINK_TABLE} WHERE student = $usr"));
-    }
-    let mut board_slot = None;
-    if role == Role::Parent {
-        batch.push(format!(
-            "LET $signups = (SELECT * FROM {REGISTRATION_TABLE} WHERE user = $usr)"
-        ));
-        // Row and seat move together per signup, the way `unregister` does:
-        // the seats are independent facts on unrelated events. A missing
-        // event matches nothing in the guard *and* nothing in the counter
-        // write, which is precisely the orphan rule.
-        batch.push(format!(
-            "FOR $signup IN ($signups ?? []) {{ \
-             IF array::len((SELECT VALUE id FROM $signup.event \
-             WHERE {REGISTRATION_FROZEN_GUARD})) = 0 {{ \
-             LET $freed = (DELETE $signup.id RETURN BEFORE); \
-             UPDATE $signup.event SET {REGISTRATION_COUNT_FIELD} = \
-             math::max([({REGISTRATION_COUNT_FIELD} ?? 0) - array::len($freed), 0]); \
-             }}; }}"
-        ));
-        // A room whose *creator* is demoted can never be ended by anyone:
-        // the whiteboard is closed to parents outright, so the creator is
-        // 404'd off their own board, `clear`/`lock`/`close`/`delete` are
-        // creator-only for everyone else, and `crate::db::board::list_for_user` is the
-        // crate's only enumeration — no manager or admin can so much as find
-        // the id. Its participants meanwhile keep drawing (the room re-derives
-        // membership per frame and they still pass), into a board only the
-        // 50 000-stroke lifetime cap could ever retire. So the demotion
-        // retires it, with the same compare-and-set [`crate::db::board::close`] uses: an
-        // already-closed board keeps its first stamp. Closed and not deleted
-        // because the marks are the participants' work too — they keep reading
-        // the board and its whole history, and the creator's `board_count`
-        // seat stays taken, which is correct while the row it counts exists.
-        // Stamped *before* the roster strip so the strip's `RETURN AFTER`
-        // carries the closed row the caller fans out.
-        batch.push(format!(
-            "UPDATE {BOARD_TABLE} SET closed_at = $now WHERE creator = $usr AND closed_at = NONE"
-        ));
-        board_slot = Some(batch.len());
-        batch.push(format!(
-            "UPDATE {BOARD_TABLE} SET participants -= $usr \
-             WHERE $usr IN participants OR creator = $usr RETURN AFTER"
-        ));
-    }
-    if role != Role::Parent {
-        batch.push(format!("DELETE {PARENT_LINK_TABLE} WHERE parent = $usr"));
-    }
-    if !role.at_least(Role::Teacher) {
-        batch.push(format!(
-            "UPDATE {COURSE_TABLE} SET teachers -= $usr WHERE $usr IN teachers"
-        ));
-        batch.push(format!(
-            "UPDATE {CLASS_GROUP_TABLE} SET teacher = NONE WHERE teacher = $usr"
-        ));
-        // The published calendar goes too, and the bookings on it are
-        // settled first: a slot only its own teacher can list and only a
-        // teacher+ can delete is reachable by nobody once that teacher is
-        // demoted, and a live booking on one is worse — nobody can approve,
-        // reject or (past its start) cancel it, so it pins the slot's
-        // `occupied` seat forever. Cancelled rather than deleted so the
-        // person who asked is left with a settled booking they can still
-        // read, carrying who dropped it and why; the slot row (and with it
-        // the seat) goes, which is what makes this convergent.
-        batch.push(format!(
-            "LET $slots = (SELECT VALUE id FROM {APPOINTMENT_SLOT_TABLE} WHERE teacher = $usr)"
-        ));
-        batch.push(format!(
-            "UPDATE {APPOINTMENT_TABLE} SET status = '{cancelled}', cancelled_by = $usr, \
-             cancel_reason = 'the teacher no longer holds a teaching role' \
-             WHERE slot IN $slots AND status IN ['{pending}', '{approved}']",
-            cancelled = AppointmentStatus::Cancelled.as_str(),
-            pending = AppointmentStatus::Pending.as_str(),
-            approved = AppointmentStatus::Approved.as_str(),
-        ));
-        // Deleting the slots is also what makes a *concurrent* booking safe:
-        // `Appointment::book` claims the slot row this deletes, so the two
-        // collide in the store and the loser re-sends. A slot *published*
-        // concurrently shares no key with any of this, which is why
-        // `AppointmentSlot::insert_claimed` claims the user row instead.
-        batch.push(format!(
-            "DELETE {APPOINTMENT_SLOT_TABLE} WHERE id IN $slots"
-        ));
-    }
-    let sql = format!("{};\nCOMMIT TRANSACTION;", batch.join(";\n"));
-    let (mut result, mut errors) = transaction_with_retry(
-        db,
-        &sql,
-        &[
-            ("usr".into(), target.record().into_value()),
-            ("role".into(), role.into_value()),
-            ("now".into(), Timestamp::now().as_millis().into_value()),
-        ],
-        &[],
-    )
-    .await?;
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    let updated = result
-        .take::<Vec<User>>(1)?
-        .into_iter()
-        .next()
-        .ok_or(AppError::NotFound)?;
-    let boards = match board_slot {
-        Some(slot) => result.take::<Vec<Board>>(slot)?,
-        None => Vec::new(),
-    };
-    Ok((updated, boards))
+    // One wall-clock read for the whole cascade, bound by every stamping
+    // statement — the old batch's single `$now`.
+    let now = Timestamp::now().as_millis();
+    // Owned capture: an `async move` closure holding a `&UserId` fails the
+    // higher-ranked `Send` check `tx_with_retry`'s future must pass.
+    let target = *target;
+    tx_with_retry(db, true, async move |tx| {
+        // The floor's serialization point: a demotion takes the admin set's
+        // row locks *before* the write, so two same-instant demotions of
+        // each other cannot both count the other as the surviving admin —
+        // the loser re-counts against the winner's commit and refuses
+        // here. (The predicate on the `UPDATE` below stays as the write's
+        // own guard; under these locks it can no longer be raced past.)
+        if role != Role::Admin {
+            let current = sqlx::query!(
+                r#"SELECT role AS "role: Role" FROM app_user WHERE id = $1"#,
+                target.uuid()
+            )
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(|row| row.role);
+            if current == Some(Role::Admin) {
+                let admins = sqlx::query_as::<_, (uuid::Uuid,)>(
+                    "SELECT id FROM app_user WHERE role = 'admin' FOR UPDATE",
+                )
+                .fetch_all(&mut *tx)
+                .await?;
+                if admins.len() <= 1 {
+                    return Err(AppError::Conflict(
+                        "the school must keep at least one admin — promote another account first",
+                    ));
+                }
+            }
+        }
+
+        // The role write, floor guard included. `$2 <> 'admin'` arms the
+        // guard only for a demotion: a promotion or a same-role rewrite can
+        // never orphan the admins.
+        let updated = sqlx::query_as!(
+            User,
+            r#"UPDATE app_user SET role = $2
+               WHERE id = $1
+                 AND NOT (role = 'admin'
+                          AND $2 <> 'admin'
+                          AND (SELECT count(*) FROM app_user
+                               WHERE role = 'admin' AND id <> $1) = 0)
+               RETURNING id AS "id: UserId",
+                         username AS "username: Username",
+                         password_hash AS "password_hash: PasswordHash",
+                         role AS "role: Role",
+                         name AS "name: PersonName",
+                         surname AS "surname: PersonName",
+                         email AS "email: Email",
+                         phone AS "phone: Phone",
+                         birth_date AS "birth_date: BirthDate",
+                         theme AS "theme: Theme",
+                         language AS "language: Language",
+                         palette_color AS "palette_color: PaletteColor",
+                         display_name AS "display_name: DisplayName",
+                         bio AS "bio: Bio",
+                         avatar_file,
+                         avatar_content_type AS "avatar_content_type: FileContentType",
+                         avatar_size"#,
+            target.uuid(),
+            role.as_str(),
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(updated) = updated else {
+            return Err(AppError::Conflict(
+                "the school must keep at least one admin — promote another account first",
+            ));
+        };
+
+        if role != Role::Student {
+            // Class memberships go, and each class they were on gets its
+            // seat back. One row per (class, user), so one decrement each.
+            sqlx::query!(
+                r#"WITH gone AS (
+                       DELETE FROM class_member WHERE app_user = $1 RETURNING class
+                   )
+                   UPDATE class_group
+                   SET class_member_count = GREATEST(class_member_count - 1, 0)
+                   WHERE id IN (SELECT gone.class FROM gone)"#,
+                target.uuid(),
+            )
+            .execute(&mut *tx)
+            .await?;
+            // Every enrollment row — hand-placed included — and each
+            // course's seat with it.
+            sqlx::query!(
+                r#"WITH gone AS (
+                       DELETE FROM enrollment WHERE app_user = $1 RETURNING course
+                   )
+                   UPDATE course
+                   SET enrollment_count = GREATEST(enrollment_count - 1, 0)
+                   WHERE id IN (SELECT gone.course FROM gone)"#,
+                target.uuid(),
+            )
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query!("DELETE FROM parent_link WHERE student = $1", target.uuid())
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        if role == Role::Parent {
+            // Signups whose event is gone: no seat to hand back, no list
+            // that could freeze — delete the stray row outright.
+            sqlx::query!(
+                r#"DELETE FROM registration r
+                   WHERE r.app_user = $1
+                     AND NOT EXISTS (SELECT 1 FROM event e WHERE e.id = r.event)"#,
+                target.uuid(),
+            )
+            .execute(&mut *tx)
+            .await?;
+            // Row and seat move together per signup, the way `unregister`
+            // does: the seats are independent facts on unrelated events. A
+            // frozen list keeps its rows exactly as they stand; every other
+            // list — including a registration event with no dates at all,
+            // which never freezes — releases the seat.
+            sqlx::query!(
+                r#"WITH gone AS (
+                       DELETE FROM registration r
+                       USING event e
+                       WHERE r.event = e.id
+                         AND r.app_user = $1
+                         AND NOT (e.audience_kind = 'registration'
+                                  AND COALESCE(e.starts_at, e.ends_at) IS NOT NULL
+                                  AND COALESCE(e.starts_at, e.ends_at) <= $2)
+                       RETURNING r.event AS event_id
+                   )
+                   UPDATE event
+                   SET registration_count = GREATEST(registration_count - 1, 0)
+                   WHERE id IN (SELECT gone.event_id FROM gone)"#,
+                target.uuid(),
+                now,
+            )
+            .execute(&mut *tx)
+            .await?;
+            // A room whose *creator* is demoted can never be ended by anyone:
+            // the whiteboard is closed to parents outright, so the creator is
+            // 404'd off their own board, `clear`/`lock`/`close`/`delete` are
+            // creator-only for everyone else, and
+            // `crate::db::board::list_for_user` is the crate's only
+            // enumeration — no manager or admin can so much as find the id.
+            // Its participants meanwhile keep drawing (the room re-derives
+            // membership per frame and they still pass), into a board only
+            // the 50 000-stroke lifetime cap could ever retire. So the
+            // demotion retires it, with the same compare-and-set
+            // [`crate::db::board::close`] uses: an already-closed board
+            // keeps its first stamp. Closed and not deleted because the
+            // marks are the participants' work too — they keep reading the
+            // board and its whole history, and the creator's `board_count`
+            // seat stays taken, which is correct while the row it counts
+            // exists. Stamped *before* the roster strip so the strip's
+            // `RETURNING` carries the closed row the caller fans out.
+            sqlx::query!(
+                "UPDATE board SET closed_at = $2 WHERE creator = $1 AND closed_at IS NULL",
+                target.uuid(),
+                now,
+            )
+            .execute(&mut *tx)
+            .await?;
+            let boards = sqlx::query_as!(
+                Board,
+                r#"UPDATE board
+                   SET participants = array_remove(participants, $1)
+                   WHERE $1 = ANY(participants) OR creator = $1
+                   RETURNING id AS "id: BoardId",
+                             creator AS "creator: UserId",
+                             title AS "title: BoardTitle",
+                             participants AS "participants: Vec<UserId>",
+                             locked,
+                             locked_by AS "locked_by: UserId",
+                             locked_at AS "locked_at: Timestamp",
+                             epoch,
+                             closed_at AS "closed_at: Timestamp",
+                             created_at AS "created_at: Timestamp""#,
+                target.uuid(),
+            )
+            .fetch_all(&mut *tx)
+            .await?;
+            return Ok((updated, boards));
+        }
+
+        if role != Role::Parent {
+            sqlx::query!("DELETE FROM parent_link WHERE parent = $1", target.uuid())
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        if !role.at_least(Role::Teacher) {
+            // Course staffing goes — only teacher+ may hold a seat on the
+            // list.
+            sqlx::query!(
+                "UPDATE course SET teachers = array_remove(teachers, $1) WHERE $1 = ANY(teachers)",
+                target.uuid(),
+            )
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query!(
+                "UPDATE class_group SET teacher = NULL WHERE teacher = $1",
+                target.uuid(),
+            )
+            .execute(&mut *tx)
+            .await?;
+            // The published calendar goes too, and the bookings on it are
+            // settled first: a slot only its own teacher can list and only a
+            // teacher+ can delete is reachable by nobody once that teacher is
+            // demoted, and a live booking on one is worse — nobody can
+            // approve, reject or (past its start) cancel it, so it pins the
+            // slot's `occupied` seat forever. Cancelled rather than deleted
+            // so the person who asked is left with a settled booking they can
+            // still read, carrying who dropped it and why; the slot row (and
+            // with it the seat) goes, which is what makes this convergent.
+            sqlx::query!(
+                r#"UPDATE appointment
+                   SET status = 'cancelled', cancelled_by = $1, cancel_reason = $2
+                   WHERE slot IN (SELECT id FROM appointment_slot WHERE teacher = $1)
+                     AND status IN ('pending', 'approved')"#,
+                target.uuid(),
+                "the teacher no longer holds a teaching role",
+            )
+            .execute(&mut *tx)
+            .await?;
+            // Deleting the slots is also what makes a *concurrent* booking
+            // safe: `Appointment::book` claims the slot row this deletes, so
+            // the two collide in the store. A slot *published* concurrently
+            // shares no key with any of this, which is why the publish path
+            // claims the user row instead. The settled booking rows survive
+            // the delete with `slot = NULL` (`ON DELETE SET NULL`) — still
+            // readable, windowless.
+            sqlx::query!(
+                "DELETE FROM appointment_slot WHERE teacher = $1",
+                target.uuid(),
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        Ok((updated, Vec::new()))
+    })
+    .await
 }
 
 /// Write the personal-info and public-profile fields the request actually
@@ -445,31 +616,36 @@ pub async fn set_profile(
     display_name: Option<Option<DisplayName>>,
     bio: Option<Option<Bio>>,
 ) -> Result<User, AppError> {
-    FieldUpdate::new(id.record())
-        .set("name", name)
-        .set("surname", surname)
-        .set("email", email)
-        .set("phone", phone)
-        .set("birth_date", birth_date)
-        .set("display_name", display_name)
-        .set("bio", bio)
-        .run::<User>(db)
+    // `Some(None)` must bind an explicit NULL and `Some(Some(v))` a value:
+    // `Param::OptText` carries both shapes of one nullable TEXT column.
+    fn text(value: Option<Option<&str>>) -> Option<Param> {
+        value.map(|inner| Param::OptText(inner.map(str::to_string)))
+    }
+    FieldUpdate::new("app_user", id.uuid())
+        .set("name", text(name.as_ref().map(|n| n.as_ref().map(|x| x.as_str()))))
+        .set("surname", text(surname.as_ref().map(|n| n.as_ref().map(|x| x.as_str()))))
+        .set("email", text(email.as_ref().map(|n| n.as_ref().map(|x| x.as_str()))))
+        .set("phone", text(phone.as_ref().map(|n| n.as_ref().map(|x| x.as_str()))))
+        .set("birth_date", text(birth_date.as_ref().map(|n| n.as_ref().map(|x| x.as_str()))))
+        .set("display_name", text(display_name.as_ref().map(|n| n.as_ref().map(|x| x.as_str()))))
+        .set("bio", text(bio.as_ref().map(|n| n.as_ref().map(|x| x.as_str()))))
+        .run(db)
         .await
 }
 
 /// Point the row at a freshly uploaded avatar blob, returning the row *as
 /// it was* — the caller deletes `before.get_avatar_file()` off disk. Losing
-/// `RETURN BEFORE` here strands the replaced blob forever: no route ever
+/// the pre-image here strands the replaced blob forever: no route ever
 /// deletes a user, so nothing else would collect it.
 ///
 /// Field-scoped for the same reason as [`set_profile`]: an avatar
 /// upload must not carry a stale snapshot's role back over an admin's
 /// change. `None` means the row is gone.
 ///
-/// Sent through [`write_with_retry`] like every other single-statement row
-/// write here, unguarded or not: the user row is contended (preferences,
-/// profile, role all write it), and a lost round wrote nothing, so
-/// re-sending it is the recovery rather than a 500 in the caller's face.
+/// The row is locked across the pre-image read and the write (`FOR
+/// UPDATE`), so two racing uploads each collect the blob *they* actually
+/// replaced — the read and the write are one unit, not a guess that stayed
+/// true.
 pub async fn set_avatar(
     db: &Database,
     id: &UserId,
@@ -477,55 +653,135 @@ pub async fn set_avatar(
     content_type: &FileContentType,
     size: i64,
 ) -> Result<Option<User>, AppError> {
-    let rows: Vec<User> = write_with_retry(
-        db,
-        "UPDATE $u SET avatar_file = $file, avatar_content_type = $ct, avatar_size = $size \
-         RETURN BEFORE",
-        &[
-            ("u".into(), id.record().into_value()),
-            ("file".into(), file.to_string().into_value()),
-            ("ct".into(), content_type.clone().into_value()),
-            ("size".into(), size.into_value()),
-        ],
-    )
-    .await?;
-    Ok(rows.into_iter().next())
+    // Owned captures, same `Send` rule as every `tx_with_retry` closure.
+    let id = *id;
+    let file = file.to_string();
+    let content_type = content_type.clone();
+    tx_with_retry(db, false, async move |tx| {
+        let before = sqlx::query_as!(
+            User,
+            r#"SELECT id AS "id: UserId",
+                      username AS "username: Username",
+                      password_hash AS "password_hash: PasswordHash",
+                      role AS "role: Role",
+                      name AS "name: PersonName",
+                      surname AS "surname: PersonName",
+                      email AS "email: Email",
+                      phone AS "phone: Phone",
+                      birth_date AS "birth_date: BirthDate",
+                      theme AS "theme: Theme",
+                      language AS "language: Language",
+                      palette_color AS "palette_color: PaletteColor",
+                      display_name AS "display_name: DisplayName",
+                      bio AS "bio: Bio",
+                      avatar_file,
+                      avatar_content_type AS "avatar_content_type: FileContentType",
+                      avatar_size
+               FROM app_user WHERE id = $1 FOR UPDATE"#,
+            id.uuid()
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(before) = before else {
+            return Ok(None);
+        };
+        sqlx::query!(
+            r#"UPDATE app_user
+               SET avatar_file = $2, avatar_content_type = $3, avatar_size = $4
+               WHERE id = $1"#,
+            id.uuid(),
+            file.as_str(),
+            content_type.as_str(),
+            size,
+        )
+        .execute(&mut *tx)
+        .await?;
+        Ok(Some(before))
+    })
+    .await
 }
 
 /// Drop the avatar, returning the row as it was so the caller can delete
-/// the blob. Same `RETURN BEFORE` contract as [`set_avatar`].
+/// the blob. Same pre-image contract as [`set_avatar`].
 pub async fn clear_avatar(db: &Database, id: &UserId) -> Result<Option<User>, AppError> {
-    let rows: Vec<User> = write_with_retry(
-        db,
-        "UPDATE $u SET avatar_file = NONE, avatar_content_type = NONE, \
-         avatar_size = NONE RETURN BEFORE",
-        &[("u".into(), id.record().into_value())],
-    )
-    .await?;
-    Ok(rows.into_iter().next())
+    let id = *id;
+    tx_with_retry(db, false, async move |tx| {
+        let before = sqlx::query_as!(
+            User,
+            r#"SELECT id AS "id: UserId",
+                      username AS "username: Username",
+                      password_hash AS "password_hash: PasswordHash",
+                      role AS "role: Role",
+                      name AS "name: PersonName",
+                      surname AS "surname: PersonName",
+                      email AS "email: Email",
+                      phone AS "phone: Phone",
+                      birth_date AS "birth_date: BirthDate",
+                      theme AS "theme: Theme",
+                      language AS "language: Language",
+                      palette_color AS "palette_color: PaletteColor",
+                      display_name AS "display_name: DisplayName",
+                      bio AS "bio: Bio",
+                      avatar_file,
+                      avatar_content_type AS "avatar_content_type: FileContentType",
+                      avatar_size
+               FROM app_user WHERE id = $1 FOR UPDATE"#,
+            id.uuid()
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(before) = before else {
+            return Ok(None);
+        };
+        sqlx::query!(
+            r#"UPDATE app_user
+               SET avatar_file = NULL, avatar_content_type = NULL, avatar_size = NULL
+               WHERE id = $1"#,
+            id.uuid(),
+        )
+        .execute(&mut *tx)
+        .await?;
+        Ok(Some(before))
+    })
+    .await
 }
 
 /// Replace a user's password hash — the builder's admin-password reset
 /// (`POST /schools/{slug}/admin-password`). Only the credential is
 /// rewritten; revoking the sessions minted under the old one is the
-/// caller's second half
-/// ([`crate::db::session::delete_by_user`]), because a reset
-/// that leaves a stolen cookie working resets nothing.
+/// caller's second half ([`crate::db::session::delete_by_user`]), because a
+/// reset that leaves a stolen cookie working resets nothing.
 pub async fn set_password_hash(
     db: &Database,
     id: &UserId,
     password_hash: PasswordHash,
 ) -> Result<Option<User>, AppError> {
-    let rows: Vec<User> = write_with_retry(
-        db,
-        "UPDATE $u SET password_hash = $hash RETURN AFTER",
-        &[
-            ("u".into(), id.record().into_value()),
-            ("hash".into(), password_hash.into_value()),
-        ],
+    let user = sqlx::query_as!(
+        User,
+        r#"UPDATE app_user SET password_hash = $2 WHERE id = $1
+           RETURNING id AS "id: UserId",
+                     username AS "username: Username",
+                     password_hash AS "password_hash: PasswordHash",
+                     role AS "role: Role",
+                     name AS "name: PersonName",
+                     surname AS "surname: PersonName",
+                     email AS "email: Email",
+                     phone AS "phone: Phone",
+                     birth_date AS "birth_date: BirthDate",
+                     theme AS "theme: Theme",
+                     language AS "language: Language",
+                     palette_color AS "palette_color: PaletteColor",
+                     display_name AS "display_name: DisplayName",
+                     bio AS "bio: Bio",
+                     avatar_file,
+                     avatar_content_type AS "avatar_content_type: FileContentType",
+                     avatar_size"#,
+        id.uuid(),
+        password_hash.as_str(),
     )
+    .fetch_optional(db)
     .await?;
-    Ok(rows.into_iter().next())
+    Ok(user)
 }
 
 /// Write the UI-preference fields the request actually carried. Same
@@ -538,27 +794,49 @@ pub async fn set_preferences(
     language: Option<Option<Language>>,
     palette_color: Option<Option<PaletteColor>>,
 ) -> Result<User, AppError> {
-    FieldUpdate::new(id.record())
+    let theme = theme.map(|t| Param::OptText(t.map(|v| v.as_str().to_string())));
+    let language = language.map(|l| Param::OptText(l.map(|v| v.as_str().to_string())));
+    let palette_color = palette_color.map(|p| Param::OptText(p.map(|v| v.as_str().to_string())));
+    FieldUpdate::new("app_user", id.uuid())
         .set("theme", theme)
         .set("language", language)
         .set("palette_color", palette_color)
-        .run::<User>(db)
+        .run(db)
         .await
 }
 
 pub async fn find_by_username(db: &Database, username: &str) -> Result<Option<User>, AppError> {
-    let mut result = db
-        .query("SELECT * FROM user WHERE username = $username LIMIT 1")
-        .bind(("username", username.to_string()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<User>>(0)?.into_iter().next())
+    let user = sqlx::query_as!(
+        User,
+        r#"SELECT id AS "id: UserId",
+                  username AS "username: Username",
+                  password_hash AS "password_hash: PasswordHash",
+                  role AS "role: Role",
+                  name AS "name: PersonName",
+                  surname AS "surname: PersonName",
+                  email AS "email: Email",
+                  phone AS "phone: Phone",
+                  birth_date AS "birth_date: BirthDate",
+                  theme AS "theme: Theme",
+                  language AS "language: Language",
+                  palette_color AS "palette_color: PaletteColor",
+                  display_name AS "display_name: DisplayName",
+                  bio AS "bio: Bio",
+                  avatar_file,
+                  avatar_content_type AS "avatar_content_type: FileContentType",
+                  avatar_size
+           FROM app_user WHERE username = $1"#,
+        username
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(user)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::init_mem;
+    use crate::database::init_test_db;
     use crate::domain::user::Password;
 
     fn png() -> FileContentType {
@@ -581,7 +859,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_stale_profile_write_cannot_revert_a_role_change() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let user = a_user("aysenur", &db).await;
 
         // A PATCH /users/me handler reads its snapshot (role = student)...
@@ -625,7 +903,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_avatar_upload_cannot_revert_a_role_change() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let user = a_user("berk", &db).await;
 
         // The upload handler holds its snapshot (role = student)...
@@ -673,12 +951,12 @@ mod tests {
         assert_eq!(after.get_avatar_size(), Some(42));
     }
 
-    /// The blob cleanup is built entirely on `RETURN BEFORE`: without the old
-    /// `avatar_file` coming back, every replace strands a file on disk that no
-    /// route ever collects.
+    /// The blob cleanup is built on the pre-image: without the old
+    /// `avatar_file` coming back, every replace strands a file on disk that
+    /// no route ever collects.
     #[tokio::test]
     async fn the_avatar_writers_return_the_replaced_blob() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let user = a_user("ceyda", &db).await;
 
         let before = set_avatar(&db, user.get_id(), "blob-1", &png(), 10)

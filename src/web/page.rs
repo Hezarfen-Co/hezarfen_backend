@@ -61,7 +61,7 @@ impl PageParams {
 pub trait Scheduled {
     fn starts_at_ms(&self) -> Option<i64>;
     fn ends_at_ms(&self) -> Option<i64>;
-    fn order_key(&self) -> &str;
+    fn order_key(&self) -> String;
 }
 
 /// The optional `?starts_after=&ends_after=` schedule window on a list of
@@ -116,7 +116,7 @@ impl WindowParams {
             let key = |item: &T| item.starts_at_ms().or_else(|| item.ends_at_ms());
             key(a)
                 .cmp(&key(b))
-                .then_with(|| a.order_key().cmp(b.order_key()))
+                .then_with(|| a.order_key().cmp(&b.order_key()))
         });
         Ok(items)
     }
@@ -198,8 +198,8 @@ mod tests {
         fn ends_at_ms(&self) -> Option<i64> {
             self.2
         }
-        fn order_key(&self) -> &str {
-            self.0
+        fn order_key(&self) -> String {
+            self.0.to_owned()
         }
     }
 

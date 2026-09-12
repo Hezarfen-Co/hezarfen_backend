@@ -108,7 +108,7 @@ struct UpdateCourse {
 #[derive(Deserialize, ToSchema)]
 struct EnrollUser {
     /// The user to enroll.
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     user_id: String,
 }
 
@@ -116,7 +116,7 @@ struct EnrollUser {
 struct AssignTeacher {
     /// The staff member to put in charge of the course. Must hold the
     /// `teacher` role or higher.
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     user_id: String,
 }
 
@@ -177,7 +177,7 @@ struct EnrollmentResponse {
     /// class drops the student or detaches the course; a `null` one is nobody's
     /// to take back. Without it no client could tell which of its roster rows a
     /// class change is about to remove.
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     source: Option<String>,
 }
 
@@ -273,7 +273,7 @@ pub(crate) async fn visible_courses(user: &User, db: &Database) -> Result<Vec<Co
         }
     }
     // Both sources come newest-first; re-sort so the merged list is too.
-    courses.sort_by(|a, b| b.get_id().key().cmp(a.get_id().key()));
+    courses.sort_by(|a, b| b.get_id().key().cmp(&a.get_id().key()));
     Ok(courses)
 }
 
@@ -545,8 +545,8 @@ async fn delete_course(
             "only the course creator or a manager/admin can delete this course",
         ));
     }
-    // The workflow — archived-term gate, EXAM_LOCK and HOMEWORK_LOCK writer
-    // leases, blob-key collection, cascade — is [`service::course::delete`]'s.
+    // The workflow — archived-term gate, blob-key collection, cascade — is
+    // [`service::course::delete`]'s.
     // Blob unlinking stays here because only the web layer knows `files_path`.
     let outcome = service::course::delete(&st.db, &course).await?;
     if !outcome.deleted {
@@ -1020,7 +1020,7 @@ struct CreateHomework {
     /// The course subject this homework belongs to
     /// (`GET /courses/{id}/subjects`). Required — every homework is tagged with
     /// one of its course's subjects.
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     subject_id: String,
     /// When the homework is due, UTC unix-milliseconds. Required; must not be
     /// in the past. Late submissions are still accepted, just flagged late.
@@ -1282,7 +1282,7 @@ async fn list_course_sessions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::init_mem;
+    use crate::database::init_test_db;
     use crate::domain::user::{Password, Username};
 
     /// A user at `role`, minted through the real create path.
@@ -1320,7 +1320,7 @@ mod tests {
     /// so the grant itself has to re-read the live role on every call.
     #[tokio::test]
     async fn demoted_creator_loses_management_and_ownership() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let creator = user("teacher", Role::Teacher, &db).await;
         let course = course(&creator, &db).await;
         assert!(can_manage_course(&course, &creator));
@@ -1346,7 +1346,7 @@ mod tests {
     /// but the grant must not depend on that sweep having run.
     #[tokio::test]
     async fn demoted_assigned_teacher_loses_management() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let creator = user("creator", Role::Teacher, &db).await;
         let assigned = user("assigned", Role::Teacher, &db).await;
         let course =
@@ -1372,20 +1372,19 @@ mod tests {
     /// hand the office staff somebody else's lesson.
     #[tokio::test]
     async fn a_manager_scheduling_a_lesson_names_the_teacher_not_themselves() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let manager = user("manager", Role::Manager, &db).await;
         let teacher = user("teacher", Role::Teacher, &db).await;
         let course = course(&manager, &db).await;
         let st = AppState {
             db: db.clone(),
-            tenants: crate::database::init_mem_tenants().await.unwrap(),
+            tenants: crate::database::init_test_tenants().await,
             files_path: std::env::temp_dir(),
             cookie_secure: false,
             rate_limit: crate::rate_limit::RateLimitConfig::unlimited(),
             chatbot_limit: Default::default(),
             exam_presence: Default::default(),
             board_hub: Default::default(),
-            db_up: Default::default(),
             ai: None,
             metrics: crate::telemetry::Metrics::noop(),
         };
@@ -1417,7 +1416,7 @@ mod tests {
     /// creator was demoted and which has no assigned teachers.
     #[tokio::test]
     async fn manager_still_manages_a_demoted_creators_course() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let creator = user("teacher", Role::Teacher, &db).await;
         let course = course(&creator, &db).await;
         crate::service::user::set_role(&db, creator.get_id(), Role::Student)

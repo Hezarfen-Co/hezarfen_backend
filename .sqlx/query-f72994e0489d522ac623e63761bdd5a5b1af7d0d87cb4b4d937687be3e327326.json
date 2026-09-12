@@ -1,0 +1,76 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM note_file WHERE id = $1 RETURNING id AS \"id: NoteFileId\", note AS \"note: NoteId\", name AS \"name: FileName\",\n               content_type AS \"content_type: FileContentType\", size",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: NoteFileId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "note_file",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "note: NoteId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "note_file",
+            "name": "note"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "name: FileName",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "note_file",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "content_type: FileContentType",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "note_file",
+            "name": "content_type"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "size",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "note_file",
+            "name": "size"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "f72994e0489d522ac623e63761bdd5a5b1af7d0d87cb4b4d937687be3e327326"
+}

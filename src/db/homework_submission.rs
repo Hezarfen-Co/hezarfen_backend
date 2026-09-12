@@ -5,186 +5,228 @@
 //! [`crate::service::homework_submission`]; the validated text type in
 //! [`crate::domain::homework_submission`].
 
-use crate::constant::{
-    HOMEWORK_ON_TIME_TOTAL_FIELD, HOMEWORK_SUBMITTED_TOTAL_FIELD, SUBMISSION_GRADED_FIELD,
-    SUBMISSION_OPEN_GUARD,
-};
-use crate::database::{Database, transaction_with_retry};
+use crate::database::{Database, tx_with_retry};
 use crate::domain::homework::Homework;
+use crate::domain::homework::HomeworkId;
 use crate::domain::homework_submission::{
     HomeworkSubmission, HomeworkSubmissionId, SubmissionText,
 };
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
-use surrealdb::types::SurrealValue;
 
 /// Create or re-stamp `user`'s submission to `homework`, unless a grade has
 /// frozen it — `None` means frozen, and the caller answers 409. `updated_at`
-/// moves to now every time; `submitted_at` (readonly, the first-submit stamp)
-/// is kept on an existing row and set only on a fresh one.
+/// moves to now every time; `submitted_at` (the first-submit stamp) is kept
+/// on an existing row and set only on a fresh one. Returns the row plus
+/// whether it existed before this call (the web layer's 200-vs-201, and the
+/// only-a-first-hand-in-earns-badges rule).
 ///
-/// Hand-written rather than `.content()` on purpose: `.content()` re-sends
-/// the whole row, so it would carry a `submitted_at`, and any value differing
-/// from the stored one trips the readonly guard. The
-/// `submitted_at = submitted_at ?? $now` expression preserves it inside the
-/// one UPSERT statement — race-free without a lock, where a read-then-content
-/// could let two concurrent first-submits pick different stamps and 500.
+/// `preserve_text` is the photo-upload auto-create's switch: an existing row
+/// keeps its text (and its stamp moves, as any touch), because the upload
+/// never offered a text to replace it. A submit passes `false` — an absent
+/// text clears, as on the wire.
 ///
-/// The `WHERE` is the freeze: [`SUBMISSION_OPEN_GUARD`] makes "not graded
-/// yet" a condition of this very write instead of a read a concurrent grade
-/// can land behind. An absent row satisfies it (the stamp is `NONE` there
-/// too), so a first submit still creates.
+/// The `graded_by_result IS NULL` predicate is the freeze: "not graded yet"
+/// is a condition of the write itself, so a refused write answers `None`
+/// instead of wiping graded work. An absent row satisfies it trivially, so a
+/// first submit still creates.
 ///
 /// The badge counters on the student's user row move in this very
-/// transaction, and the order is load-bearing: the increment sits *after*
-/// the UPSERT and is conditional on it having matched a row, because a
-/// frozen row makes that `WHERE` match nothing **silently** (unlike
-/// [`crate::db::homework_result::grade`], which `THROW`s) — put
-/// first, it would count a submission the freeze refused. `$before = NONE`
-/// keeps it to a genuine first create, so an edit moves neither counter,
-/// which is what makes the live count mean the same thing the one-time
-/// backfill seeded (one per row; on time judged against `due_at`, equal
-/// counting as on time).
+/// transaction, and only on the create arm — an edit moves neither counter,
+/// which is what makes the live count mean one per row.
 ///
-/// `counted_on_time` is stamped on the row from the *same* `$on_time`
-/// expression the increment adds, in the same statement block: the deadline
-/// is mutable, so a withdrawal that re-judged it against the live `due_at`
-/// gave back something other than what was taken. Writing the verdict beside
-/// the counter is what keeps the two from ever disagreeing — read back by
+/// `counted_on_time` is stamped on the row from the same `on_time` verdict
+/// the increment adds, in the same transaction: the deadline is mutable, so
+/// a withdrawal that re-judged it against the live `due_at` gave back
+/// something other than what was taken. Writing the verdict beside the
+/// counter is what keeps the two from ever disagreeing — read back by
 /// [`delete`], never re-derived.
 ///
-/// That deadline is `$was_due`, the one the gate below already read *inside
-/// this transaction* — never the caller's [`Homework`] snapshot, which was
-/// read before the lease and is exactly one `PATCH due_at` old in the
-/// "teacher extends the deadline at 23:59 while the class submits" moment.
-/// Judging on the snapshot stored a verdict the web layer's own `late` flag
-/// (`updated_at > due_at`, re-derived live on every read) then contradicted
-/// forever, in both directions. An in-process lock cannot fix this — it
-/// orders two handlers, not two store transactions — so the comparison has
-/// to live where the write does. The whole entity is still taken (both
-/// callers hold the row, and the id comes off it); its `due_at` must not be.
-///
-/// The first three statements are the parent gate, and they are why this
-/// write cannot outlive its homework: the id is deterministic, so nothing
-/// else here would fail against a homework a cascade already removed — it
-/// would simply re-create the row, badge counters and all, unreachable ever
-/// after (every route to a submission goes through its homework). A *read*
-/// of the homework does not close that, on either side of the call: the
-/// store does no read-set conflict detection, so a delete committing
-/// alongside is invisible to it. The gate therefore *moves* a value on the
-/// homework row — `due_at` up by one and straight back to the captured
-/// value, so the row is byte-identical afterwards — because only a write
-/// collides, and `SET x = x` is elided and never reaches the write set. It
-/// is [`crate::domain::exam_answer::ExamAnswer::save`]'s shape exactly.
-/// `Err(NotFound)` means the homework is gone, which is the 404 the web
-/// layer's own lookup would have answered.
+/// That deadline is `was_due`, the one read *inside this transaction* under
+/// the homework row's lock — never the caller's [`Homework`] snapshot, which
+/// was read before the request's gates and is exactly one `PATCH due_at` old
+/// in the "teacher extends the deadline at 23:59 while the class submits"
+/// moment. The lock is also the serialization point: grading locks the same
+/// row before stamping, the audience-narrowing PATCH before its orphan
+/// check, and a rival first hand-in before its own insert — so the
+/// read-then-write below cannot interleave with any of them. (The pair's
+/// UNIQUE constraint backs this up; under the lock it can never fire.)
 pub async fn upsert(
     db: &Database,
     homework: &Homework,
     user: &UserId,
     text: Option<SubmissionText>,
-) -> Result<Option<HomeworkSubmission>, AppError> {
-    let id = HomeworkSubmissionId::composite(homework.get_id(), user);
+    preserve_text: bool,
+) -> Result<Option<(HomeworkSubmission, bool)>, AppError> {
     let now = Timestamp::now();
-    let text = text.map(|text| text.as_str().to_string());
-    // Sound to re-send: the UPSERT is on a deterministic id on a table with
-    // no unique index, so it can never legitimately answer "already exists",
-    // and the counter UPDATEs never can either.
-    let (mut saved, mut errors) = transaction_with_retry(
-        db,
-        &format!(
-            "BEGIN TRANSACTION;
-             LET $was_due = (SELECT VALUE due_at FROM ONLY $hw);
-             LET $alive = (UPDATE $hw SET due_at = due_at + 1 RETURN VALUE id);
-             IF array::len($alive) = 0 {{ THROW 'no_homework' }};
-             UPDATE $hw SET due_at = $was_due;
-             LET $before = (SELECT VALUE id FROM ONLY $id);
-             LET $on_time = $now <= $was_due;
-             LET $after = (UPSERT $id SET homework = $hw, user = $usr, text = $text,
-                 updated_at = $now, submitted_at = submitted_at ?? $now
-                 WHERE {SUBMISSION_OPEN_GUARD} RETURN AFTER);
-             IF $before = NONE AND array::len($after) > 0 {{
-                 UPDATE $id SET counted_on_time = $on_time;
-                 UPDATE $usr SET
-                     {HOMEWORK_SUBMITTED_TOTAL_FIELD} = ({HOMEWORK_SUBMITTED_TOTAL_FIELD} ?? 0) + 1,
-                     {HOMEWORK_ON_TIME_TOTAL_FIELD} = ({HOMEWORK_ON_TIME_TOTAL_FIELD} ?? 0)
-                         + IF $on_time {{ 1 }} ELSE {{ 0 }}
-             }};
-             RETURN $after;
-             COMMIT TRANSACTION;"
-        ),
-        &[
-            ("id".into(), id.record().into_value()),
-            ("hw".into(), homework.get_id().record().into_value()),
-            ("usr".into(), user.record().into_value()),
-            ("text".into(), text.into_value()),
-            ("now".into(), now.into_value()),
-        ],
-        &["no_homework"],
-    )
-    .await?;
-    // An aborted transaction errors *every* slot, most with a generic "not
-    // executed" — only the THROW's own slot names the reason.
-    if errors
-        .values()
-        .any(|error| error.to_string().contains("no_homework"))
-    {
-        return Err(AppError::NotFound);
-    }
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    // The trailing `RETURN` is always the last statement before `COMMIT`, so
-    // its slot follows the statement count rather than a hand-kept number.
-    // It returns the whole array, never `$after[0]`: a refused write makes
-    // that `NONE`, which fails to deserialize ("expected object, got none")
-    // instead of reading as the "frozen" the caller answers 409 to.
-    let slot = saved.num_statements().saturating_sub(2);
-    Ok(saved
-        .take::<Vec<HomeworkSubmission>>(slot)?
-        .into_iter()
-        .next())
+    // Owned captures (`Send` rule of `tx_with_retry` closures).
+    let homework_id = homework.get_id().clone();
+    let user = *user;
+    tx_with_retry(db, false, async move |tx| {
+        let text = text.clone();
+        // The parent gate: the homework row is locked and its deadline read
+        // in the very transaction that writes the submission. The id is
+        // minted fresh, so nothing else here would fail against a homework a
+        // cascade already removed — it would simply create a row under it,
+        // badge counters and all, unreachable ever after (every route to a
+        // submission goes through its homework). `Err(NotFound)` means the
+        // homework is gone, which is the 404 the web layer's own lookup
+        // would have answered.
+        let was_due = sqlx::query!(
+            // The audience re-checks UNDER the lock: a narrowing PATCH commits
+            // between the web layer's pre-flight read and this write, and a
+            // student the homework no longer names must read as gone — the
+            // same 404 their own lookup answers.
+            r#"SELECT due_at AS "due_at: Timestamp" FROM homework
+               WHERE id = $1 AND (cardinality(assigned) = 0 OR $2 = ANY(assigned))
+               FOR UPDATE"#,
+            homework_id.uuid(),
+            user.uuid()
+        )
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(|row| row.due_at);
+        let Some(was_due) = was_due else {
+            return Err(AppError::NotFound);
+        };
+        // Equal counts as on time, exactly as the deadline has always been
+        // judged.
+        let on_time = i64::from(now <= was_due);
+
+        // The row, read under the homework's lock: its existence decides the
+        // arm (and the counters).
+        let existing = sqlx::query!(
+            r#"SELECT 1 AS "row: i32" FROM homework_submission
+               WHERE homework = $1 AND app_user = $2 FOR UPDATE"#,
+            homework_id.uuid(),
+            user.uuid()
+        )
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
+
+        if existing {
+            // Re-submit: text is replaced (unless the upload auto-create is
+            // asking — it has no text to replace), `updated_at` moves, and
+            // `submitted_at` is left alone. A frozen row matches nothing and
+            // answers `None`, the caller's 409.
+            let updated = if preserve_text {
+                sqlx::query_as!(
+                    HomeworkSubmission,
+                    r#"UPDATE homework_submission SET updated_at = $3
+                       WHERE homework = $1 AND app_user = $2 AND graded_by_result IS NULL
+                       RETURNING id AS "id: HomeworkSubmissionId",
+                                 homework AS "homework: HomeworkId",
+                                 app_user AS "user: UserId",
+                                 text AS "text: SubmissionText",
+                                 submitted_at AS "submitted_at: Timestamp",
+                                 updated_at AS "updated_at: Timestamp""#,
+                    homework_id.uuid(),
+                    user.uuid(),
+                    now.as_millis()
+                )
+                .fetch_optional(&mut *tx)
+                .await?
+            } else {
+                sqlx::query_as!(
+                    HomeworkSubmission,
+                    r#"UPDATE homework_submission SET text = $3, updated_at = $4
+                       WHERE homework = $1 AND app_user = $2 AND graded_by_result IS NULL
+                       RETURNING id AS "id: HomeworkSubmissionId",
+                                 homework AS "homework: HomeworkId",
+                                 app_user AS "user: UserId",
+                                 text AS "text: SubmissionText",
+                                 submitted_at AS "submitted_at: Timestamp",
+                                 updated_at AS "updated_at: Timestamp""#,
+                    homework_id.uuid(),
+                    user.uuid(),
+                    text.as_ref().map(SubmissionText::as_str),
+                    now.as_millis()
+                )
+                .fetch_optional(&mut *tx)
+                .await?
+            };
+            return Ok(updated.map(|submission| (submission, existing)));
+        }
+
+        // First hand-in: the verdict is stored beside the counter it credits,
+        // so the two can never disagree.
+        let created = sqlx::query_as!(
+            HomeworkSubmission,
+            r#"INSERT INTO homework_submission
+                   (id, homework, app_user, text, submitted_at, updated_at, file_count, counted_on_time)
+               VALUES ($1, $2, $3, $4, $5, $5, 0, $6)
+               RETURNING id AS "id: HomeworkSubmissionId",
+                         homework AS "homework: HomeworkId",
+                         app_user AS "user: UserId",
+                         text AS "text: SubmissionText",
+                         submitted_at AS "submitted_at: Timestamp",
+                         updated_at AS "updated_at: Timestamp""#,
+            HomeworkSubmissionId::generate().uuid(),
+            homework_id.uuid(),
+            user.uuid(),
+            text.as_ref().map(SubmissionText::as_str),
+            now.as_millis(),
+            on_time != 0,
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        sqlx::query!(
+            r#"UPDATE app_user SET
+                   homework_submitted_total = homework_submitted_total + 1,
+                   homework_on_time_total = homework_on_time_total + $2
+               WHERE id = $1"#,
+            user.uuid(),
+            on_time
+        )
+        .execute(&mut *tx)
+        .await?;
+        Ok(created.map(|submission| (submission, existing)))
+    })
+    .await
 }
 
 /// Re-stamp a submission's `updated_at` to now, leaving its text and files
 /// alone. A file add or delete modifies the submission as a whole, so its
 /// "last touched" clock — which drives the computed late flag — must move
-/// even though the text row is unchanged. Free-standing because the file
-/// paths hold the composite id, not always the row. A targeted single-field
-/// UPDATE, so the `READONLY` `submitted_at` is never re-sent (a `.content()`
-/// would trip its guard). Returns the re-stamped row, or a 404 if it has
-/// since vanished.
+/// even though the text row is unchanged. A targeted single-field UPDATE, so
+/// the readonly `submitted_at` is never re-sent. Returns the re-stamped row,
+/// or a 404 if it has since vanished.
 pub async fn touch(
     db: &Database,
     id: &HomeworkSubmissionId,
 ) -> Result<HomeworkSubmission, AppError> {
     let now = Timestamp::now();
-    let mut result = db
-        .query("UPDATE $id SET updated_at = $now RETURN AFTER")
-        .bind(("id", id.record()))
-        .bind(("now", now))
-        .await?
-        .check()?;
-    result
-        .take::<Vec<HomeworkSubmission>>(0)?
-        .into_iter()
-        .next()
-        .ok_or(AppError::NotFound)
+    sqlx::query_as!(
+        HomeworkSubmission,
+        r#"UPDATE homework_submission SET updated_at = $2 WHERE id = $1
+           RETURNING id AS "id: HomeworkSubmissionId",
+                     homework AS "homework: HomeworkId",
+                     app_user AS "user: UserId",
+                     text AS "text: SubmissionText",
+                     submitted_at AS "submitted_at: Timestamp",
+                     updated_at AS "updated_at: Timestamp""#,
+        id.uuid(),
+        now.as_millis()
+    )
+    .fetch_optional(db)
+    .await?
+    .ok_or(AppError::NotFound)
 }
 
 /// Whether a grade has frozen this submission. Only ever read to tell two
 /// refusals apart *after* a conditional write has already refused one — the
 /// stamp on the row, never this read, is what decides.
 pub async fn is_graded(db: &Database, id: &HomeworkSubmissionId) -> Result<bool, AppError> {
-    let mut result = db
-        .query(format!(
-            "SELECT VALUE id FROM $id WHERE {SUBMISSION_GRADED_FIELD} != NONE"
-        ))
-        .bind(("id", id.record()))
-        .await?
-        .check()?;
-    Ok(!result.take::<Vec<HomeworkSubmissionId>>(0)?.is_empty())
+    let row = sqlx::query!(
+        r#"SELECT EXISTS(SELECT 1 FROM homework_submission
+                         WHERE id = $1 AND graded_by_result IS NOT NULL) AS "graded!: bool""#,
+        id.uuid()
+    )
+    .fetch_one(db)
+    .await?;
+    Ok(row.graded)
 }
 
 /// `user`'s submission to `homework`, if they have one.
@@ -193,23 +235,40 @@ pub async fn read_for(
     homework: &crate::domain::homework::HomeworkId,
     user: &UserId,
 ) -> Result<Option<HomeworkSubmission>, AppError> {
-    Ok(db
-        .select(HomeworkSubmissionId::composite(homework, user).record())
-        .await?)
+    Ok(sqlx::query_as!(
+        HomeworkSubmission,
+        r#"SELECT id AS "id: HomeworkSubmissionId",
+                  homework AS "homework: HomeworkId",
+                  app_user AS "user: UserId",
+                  text AS "text: SubmissionText",
+                  submitted_at AS "submitted_at: Timestamp",
+                  updated_at AS "updated_at: Timestamp"
+           FROM homework_submission WHERE homework = $1 AND app_user = $2"#,
+        homework.uuid(),
+        user.uuid()
+    )
+    .fetch_optional(db)
+    .await?)
 }
 
-/// Every submission to `homework`, in student (composite-id) order — the
-/// roster's raw rows.
+/// Every submission to `homework`, in creation order — the roster's raw rows.
 pub async fn list_for_homework(
     db: &Database,
     homework: &crate::domain::homework::HomeworkId,
 ) -> Result<Vec<HomeworkSubmission>, AppError> {
-    let mut result = db
-        .query("SELECT * FROM homework_submission WHERE homework = $hw ORDER BY id ASC")
-        .bind(("hw", homework.record()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<HomeworkSubmission>>(0)?)
+    Ok(sqlx::query_as!(
+        HomeworkSubmission,
+        r#"SELECT id AS "id: HomeworkSubmissionId",
+                  homework AS "homework: HomeworkId",
+                  app_user AS "user: UserId",
+                  text AS "text: SubmissionText",
+                  submitted_at AS "submitted_at: Timestamp",
+                  updated_at AS "updated_at: Timestamp"
+           FROM homework_submission WHERE homework = $1 ORDER BY id ASC"#,
+        homework.uuid()
+    )
+    .fetch_all(db)
+    .await?)
 }
 
 /// Delete this submission and its files in one transaction — so a crash
@@ -217,9 +276,8 @@ pub async fn list_for_homework(
 /// are the web layer's to unlink: it lists them
 /// ([`crate::db::homework_file::list_for_submission`])
 /// before calling this. `None` means a grade froze the row (the caller
-/// answers 409): the submission's own delete carries
-/// [`SUBMISSION_OPEN_GUARD`], and the file wipe is conditional on it having
-/// bitten, so a refused delete leaves the children standing too.
+/// answers 409): the delete carries `graded_by_result IS NULL` as its own
+/// condition, so a refused delete leaves the files standing too.
 ///
 /// The one place either badge counter comes back down, and deliberately the
 /// only one: this route is student-callable on their own row, so without it
@@ -234,12 +292,10 @@ pub async fn list_for_homework(
 /// and gave back something other than what was taken — extend it after a
 /// late hand-in and this debited a credit that was never given; pull it back
 /// after a punctual one and it debited nothing, leaving `on_time` above
-/// `submitted`. A row from before the column exists carries no verdict, and
-/// cannot be given one for a credit that already happened, so it falls back
-/// to the old cut (`submitted_at`, the readonly stamp the increment judged,
-/// against the live deadline); a dangling `homework` link leaves `$due`
-/// `NONE` there, which compares false and so counts as late, matching the
-/// backfill. Floored at zero: a row that predates the columns has none.
+/// `submitted`. A row with no stored verdict falls back to the old cut
+/// (`submitted_at`, the stamp the increment judged, against the deadline
+/// read here); a homework already gone counts as late, matching the
+/// backfill. Floored at zero.
 ///
 /// Badges already earned are never taken away — [`crate::domain::badge`] is
 /// add-only, which is where that permanence lives.
@@ -247,50 +303,88 @@ pub async fn delete(
     db: &Database,
     submission: HomeworkSubmission,
 ) -> Result<Option<HomeworkSubmission>, AppError> {
-    // Sound to re-send: DELETE and UPDATE can never answer "already exists".
-    let (mut result, mut errors) = transaction_with_retry(
-        db,
-        &format!(
-            "BEGIN TRANSACTION;
-             LET $due = (SELECT VALUE homework.due_at FROM ONLY $sub);
-             LET $gone = (DELETE $sub WHERE {SUBMISSION_OPEN_GUARD} RETURN BEFORE);
-             IF array::len($gone) > 0 {{
-                 DELETE homework_file WHERE submission = $sub;
-                 LET $on_time = IF ($gone[0].counted_on_time
-                     ?? ($gone[0].submitted_at <= $due)) {{ 1 }} ELSE {{ 0 }};
-                 UPDATE $usr SET
-                     {HOMEWORK_SUBMITTED_TOTAL_FIELD} =
-                         math::max([({HOMEWORK_SUBMITTED_TOTAL_FIELD} ?? 0) - 1, 0]),
-                     {HOMEWORK_ON_TIME_TOTAL_FIELD} =
-                         math::max([({HOMEWORK_ON_TIME_TOTAL_FIELD} ?? 0) - $on_time, 0])
-             }};
-             RETURN $gone;
-             COMMIT TRANSACTION;"
-        ),
-        &[
-            ("sub".into(), submission.id.record().into_value()),
-            ("usr".into(), submission.user.record().into_value()),
-        ],
-        &[],
-    )
-    .await?;
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    // The trailing `RETURN` is always the last statement before `COMMIT`.
-    let slot = result.num_statements().saturating_sub(2);
-    Ok(result
-        .take::<Vec<HomeworkSubmission>>(slot)?
-        .into_iter()
-        .next())
+    tx_with_retry(db, false, async move |tx| {
+        // The homework row's lock is the serialization point against grading:
+        // a grade locks the same row before it stamps, so either this delete
+        // refuses off the stamp, or the grade landed on a row that is now
+        // gone — grading absent work, which is allowed. Its `due_at` read is
+        // also the replay fallback's deadline.
+        let due = sqlx::query!(
+            r#"SELECT due_at AS "due_at: Timestamp" FROM homework WHERE id = $1 FOR UPDATE"#,
+            submission.get_homework().uuid()
+        )
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(|row| row.due_at);
+        // The gate runs as a lock-taking read, not a delete: the file rows
+        // must die BEFORE the submission row (their `submission` FK is
+        // `NO ACTION`), and that wipe is only honest if this delete has
+        // already won — so the open-not-frozen verdict and the row lock come
+        // first, files second, the submission row last. A rival withdrawal
+        // that beat us removed the row under its own lock; a grade that
+        // stamped it holds the homework lock first — either way `None`, one
+        // refusal as before.
+        let target = sqlx::query!(
+            r#"SELECT id AS "id: HomeworkSubmissionId",
+                      homework AS "homework: HomeworkId",
+                      app_user AS "user: UserId",
+                      text AS "text: SubmissionText",
+                      submitted_at AS "submitted_at: Timestamp",
+                      updated_at AS "updated_at: Timestamp",
+                      counted_on_time AS "counted_on_time: bool"
+               FROM homework_submission
+               WHERE id = $1 AND graded_by_result IS NULL
+               FOR UPDATE"#,
+            submission.get_id().uuid()
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(removed) = target else {
+            // Frozen, or already withdrawn by a rival — one refusal, as
+            // before.
+            return Ok(None);
+        };
+        sqlx::query!(
+            "DELETE FROM homework_file WHERE submission = $1",
+            removed.id.uuid()
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query!(
+            "DELETE FROM homework_submission WHERE id = $1",
+            removed.id.uuid()
+        )
+        .execute(&mut *tx)
+        .await?;
+        let judged_on_time = due.map(|d| removed.submitted_at <= d).unwrap_or(false);
+        let on_time = i64::from(removed.counted_on_time.unwrap_or(judged_on_time));
+        sqlx::query!(
+            r#"UPDATE app_user SET
+                   homework_submitted_total = GREATEST(homework_submitted_total - 1, 0),
+                   homework_on_time_total = GREATEST(homework_on_time_total - $2, 0)
+               WHERE id = $1"#,
+            removed.user.uuid(),
+            on_time
+        )
+        .execute(&mut *tx)
+        .await?;
+        Ok(Some(HomeworkSubmission {
+            id: removed.id,
+            homework: removed.homework,
+            user: removed.user,
+            text: removed.text,
+            submitted_at: removed.submitted_at,
+            updated_at: removed.updated_at,
+        }))
+    })
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constant::{
-        HOMEWORK_ON_TIME_TOTAL_FIELD as ON_TIME, HOMEWORK_SUBMITTED_TOTAL_FIELD as SUBMITTED,
-    };
+    use sqlx::Row as _;
+
     use crate::db::homework as homework_db;
     use crate::domain::homework::HomeworkTitle;
     use crate::domain::subject::{SubjectDescription, SubjectName};
@@ -315,10 +409,25 @@ mod tests {
             None,
             due_at,
             None,
-            &UserId::from_key("teacher"),
+            &a_teacher(db).await,
         )
         .await
         .unwrap()
+    }
+
+    /// A real `app_user` teacher row: graders are foreign keys too.
+    async fn a_teacher(db: &Database) -> UserId {
+        let user = UserId::generate();
+        sqlx::query(
+            "INSERT INTO app_user (id, username, password_hash, role) \
+             VALUES ($1, $2, 'x', 'teacher')",
+        )
+        .bind(user.uuid())
+        .bind(format!("t-{}", &user.key()[30..]))
+        .execute(db)
+        .await
+        .unwrap();
+        user
     }
 
     /// A deadline no test run can reach, so a submission is unambiguously on
@@ -363,19 +472,13 @@ mod tests {
     /// The verdict `upsert` stored on the row — what `delete` debits off.
     /// `None` is a row from before the column existed.
     async fn stored_verdict(id: &HomeworkSubmissionId, db: &Database) -> Option<bool> {
-        let mut result = db
-            .query("SELECT VALUE counted_on_time FROM $sub")
-            .bind(("sub", id.record()))
+        let row = sqlx::query("SELECT counted_on_time FROM homework_submission WHERE id = $1")
+            .bind(id.uuid())
+            .fetch_optional(db)
             .await
             .unwrap()
-            .check()
-            .unwrap();
-        result
-            .take::<Vec<Option<bool>>>(0)
-            .unwrap()
-            .into_iter()
-            .flatten()
-            .next()
+            .expect("the submission row exists");
+        row.try_get::<Option<bool>, _>(0).unwrap()
     }
 
     /// The web layer's computed flag, exactly as `SubmissionResponse::new`
@@ -391,41 +494,42 @@ mod tests {
 
     /// The two badge counters on a user row, absent counting as zero.
     async fn counters(user: &UserId, db: &Database) -> (i64, i64) {
-        let mut result = db
-            .query(format!(
-                "SELECT VALUE [({SUBMITTED} ?? 0), ({ON_TIME} ?? 0)] FROM $usr"
-            ))
-            .bind(("usr", user.record()))
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
-        let rows = result.take::<Vec<Vec<i64>>>(0).unwrap();
-        let row = rows.first().cloned().unwrap_or_default();
+        let row = sqlx::query(
+            "SELECT homework_submitted_total, homework_on_time_total \
+             FROM app_user WHERE id = $1",
+        )
+        .bind(user.uuid())
+        .fetch_one(db)
+        .await
+        .unwrap();
         (
-            row.first().copied().unwrap_or(0),
-            row.get(1).copied().unwrap_or(0),
+            row.try_get::<i64, _>(0).unwrap(),
+            row.try_get::<i64, _>(1).unwrap(),
         )
     }
 
     #[tokio::test]
     async fn resubmit_keeps_submitted_at_and_restamps_updated_at() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let homework = a_homework(far_future(), &db).await;
         let user = a_student("ogrenci", &db).await;
 
-        let first = upsert(
+        let (first, _) = upsert(
             &db,
             &homework,
             &user,
             Some(SubmissionText::try_new("draft").unwrap()),
+            false,
         )
         .await
         .unwrap()
         .unwrap();
         // A re-submit lands on the same row: submitted_at (the first hand-in)
         // pinned, updated_at moves forward, and the text can be cleared.
-        let second = upsert(&db, &homework, &user, None).await.unwrap().unwrap();
+        let (second, _) = upsert(&db, &homework, &user, None, false)
+            .await
+            .unwrap()
+            .unwrap();
         // ... and it is one submission, not two: the edit moves no counter.
         assert_eq!(counters(&user, &db).await, (1, 1));
         assert_eq!(first.get_id(), second.get_id());
@@ -456,16 +560,16 @@ mod tests {
         use crate::db::homework_result;
         use crate::domain::homework_result::HomeworkStatus;
 
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let homework = a_homework(far_future(), &db).await;
         let user = a_student("ogrenci", &db).await;
-        let teacher = UserId::from_key("01TESTTEACHERAAAAAAAAAAAAA");
+        let teacher = a_teacher(&db).await;
         let graded = |value| {
             let text = SubmissionText::try_new(value).unwrap();
-            upsert(&db, &homework, &user, Some(text))
+            upsert(&db, &homework, &user, Some(text), false)
         };
 
-        let version_a = graded("version A").await.unwrap().unwrap();
+        let (version_a, _) = graded("version A").await.unwrap().unwrap();
         assert!(!is_graded(&db, version_a.get_id()).await.unwrap());
 
         assert_eq!(counters(&user, &db).await, (1, 1));
@@ -516,7 +620,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!is_graded(&db, version_a.get_id()).await.unwrap());
-        let reopened = graded("version B").await.unwrap().unwrap();
+        let (reopened, _) = graded("version B").await.unwrap().unwrap();
         assert_eq!(
             reopened.get_text().map(SubmissionText::as_str),
             Some("version B")
@@ -531,15 +635,16 @@ mod tests {
 
     #[tokio::test]
     async fn touch_moves_updated_at_but_not_submitted_at_or_text() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let homework = a_homework(far_future(), &db).await;
         let user = a_student("ogrenci", &db).await;
 
-        let original = upsert(
+        let (original, _) = upsert(
             &db,
             &homework,
             &user,
             Some(SubmissionText::try_new("photo answer").unwrap()),
+            false,
         )
         .await
         .unwrap()
@@ -563,11 +668,14 @@ mod tests {
     /// and the last assertion reads `(2, 2)` — the farm.
     #[tokio::test]
     async fn submit_delete_submit_is_worth_one_submission() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let homework = a_homework(far_future(), &db).await;
         let user = a_student("ogrenci", &db).await;
 
-        upsert(&db, &homework, &user, None).await.unwrap().unwrap();
+        upsert(&db, &homework, &user, None, false)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(counters(&user, &db).await, (1, 1));
 
         let mine = read_for(&db, homework.get_id(), &user)
@@ -585,7 +693,10 @@ mod tests {
                 .is_none()
         );
 
-        upsert(&db, &homework, &user, None).await.unwrap().unwrap();
+        upsert(&db, &homework, &user, None, false)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(counters(&user, &db).await, (1, 1));
     }
 
@@ -595,13 +706,19 @@ mod tests {
     /// what it took.
     #[tokio::test]
     async fn a_late_submission_counts_as_submitted_but_not_on_time() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let punctual = a_homework(far_future(), &db).await;
         let overdue = a_homework(Timestamp::from_millis(1), &db).await;
         let user = a_student("ogrenci", &db).await;
 
-        upsert(&db, &punctual, &user, None).await.unwrap().unwrap();
-        upsert(&db, &overdue, &user, None).await.unwrap().unwrap();
+        upsert(&db, &punctual, &user, None, false)
+            .await
+            .unwrap()
+            .unwrap();
+        upsert(&db, &overdue, &user, None, false)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(counters(&user, &db).await, (2, 1));
 
         // Withdrawing the *late* one takes back only the submission, never the
@@ -634,20 +751,25 @@ mod tests {
     /// to prevent.
     #[tokio::test]
     async fn a_row_with_no_stored_verdict_falls_back_to_the_deadline() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let punctual = a_homework(far_future(), &db).await;
         let overdue = a_homework(Timestamp::from_millis(1), &db).await;
         let user = a_student("ogrenci", &db).await;
 
-        upsert(&db, &punctual, &user, None).await.unwrap().unwrap();
-        upsert(&db, &overdue, &user, None).await.unwrap().unwrap();
+        upsert(&db, &punctual, &user, None, false)
+            .await
+            .unwrap()
+            .unwrap();
+        upsert(&db, &overdue, &user, None, false)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(counters(&user, &db).await, (2, 1));
         // Aged into legacy rows: the counters keep the credit, the rows lose the
         // verdict — the exact state of every submission on an existing volume.
-        db.query("UPDATE homework_submission UNSET counted_on_time")
+        sqlx::query("UPDATE homework_submission SET counted_on_time = NULL")
+            .execute(&db)
             .await
-            .unwrap()
-            .check()
             .unwrap();
 
         let late = read_for(&db, overdue.get_id(), &user)
@@ -679,14 +801,17 @@ mod tests {
     /// stored `true` against a live `late = true`.
     #[tokio::test]
     async fn a_deadline_moved_under_the_caller_is_judged_by_the_stored_value() {
-        let db = crate::database::init_mem().await.unwrap();
+        let (db, _leases) = crate::database::init_test_db().await;
         let user = a_student("ogrenci", &db).await;
 
         // Extended at 23:59: the snapshot says the deadline has passed, the
         // store says it has not. A hand-in now is on time.
         let extended = a_homework(Timestamp::from_millis(1), &db).await;
         deadline_moves_to(&extended, far_future(), &db).await;
-        let landed = upsert(&db, &extended, &user, None).await.unwrap().unwrap();
+        let (landed, _) = upsert(&db, &extended, &user, None, false)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(counters(&user, &db).await, (1, 1));
         assert_eq!(stored_verdict(landed.get_id(), &db).await, Some(true));
         assert!(!late_flag(&landed, &db).await);
@@ -695,7 +820,10 @@ mod tests {
         // the deadline is gone. The same hand-in is late.
         let pulled = a_homework(far_future(), &db).await;
         deadline_moves_to(&pulled, Timestamp::from_millis(1), &db).await;
-        let missed = upsert(&db, &pulled, &user, None).await.unwrap().unwrap();
+        let (missed, _) = upsert(&db, &pulled, &user, None, false)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(counters(&user, &db).await, (2, 1));
         assert_eq!(stored_verdict(missed.get_id(), &db).await, Some(false));
         assert!(late_flag(&missed, &db).await);

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM question_image WHERE question = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "50ad501f6d5c9ec610be18e22aa2b0a943067e505d4623acb5de8ff7fc284ecb"
+}

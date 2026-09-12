@@ -1,15 +1,11 @@
 //! The `course_session` table: reads, a course's timetable listing, the
 //! request-scoped field update, and the delete that sweeps roll-call rows in
-//! one transaction. Creation writes the course row through
-//! [`cap::touch_and_create`] so a lesson can never outlive its course; the
-//! web-facing doors and the teacher-resolution rule live in
-//! [`crate::service::course_session`].
+//! one transaction. Creation stands on the course foreign key, so a lesson
+//! can never outlive its course; the web-facing doors and the
+//! teacher-resolution rule live in [`crate::service::course_session`].
 
-use surrealdb::types::SurrealValue;
-
-use crate::constant::ENROLLMENT_COUNT_FIELD;
-use crate::database::{Database, transaction_with_retry};
-use crate::db::cap;
+use crate::constant::COURSE_SESSION_TABLE;
+use crate::database::{Database, foreign_key_violation, tx_with_retry};
 use crate::db::field_update::FieldUpdate;
 use crate::db::page::PagedList;
 use crate::domain::course::CourseId;
@@ -34,23 +30,48 @@ pub async fn create(
         starts_at,
         ends_at,
     };
-    // The course row is *written* (bumped and put back), not read, so this
-    // collides with `Course::delete`'s cascade: a lesson that outlives its
-    // course 404s through `session_with_course` forever — unreadable,
-    // unpatchable, undeletable. See [`cap::touch_and_create`].
-    cap::touch_and_create(
-        &course.record(),
-        ENROLLMENT_COUNT_FIELD,
-        &session.id.record(),
-        &session,
-        db,
+    // The course foreign key is the existence proof the old bump-and-restore
+    // "touch" trick faked: a lesson whose course is already gone — or which
+    // is deleted while this insert is in flight — is refused here, so a
+    // lesson can never outlive its course and 404 through
+    // `session_with_course` forever — unreadable, unpatchable, undeletable.
+    // `23503` is the parent-gone refusal, the same answer the touch
+    // produced.
+    let created = sqlx::query_as!(
+        CourseSession,
+        r#"INSERT INTO course_session (id, course, teacher, topic, starts_at, ends_at)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           RETURNING id AS "id: CourseSessionId", course AS "course: CourseId",
+                     teacher AS "teacher: UserId", topic AS "topic: SessionTopic",
+                     starts_at AS "starts_at: Timestamp", ends_at AS "ends_at: Timestamp""#,
+        session.id.uuid(),
+        session.course.uuid(),
+        session.teacher.uuid(),
+        session.topic.as_str(),
+        session.starts_at.as_millis(),
+        session.ends_at.map(|at| at.as_millis()),
     )
-    .await?
-    .ok_or(AppError::NotFound)
+    .fetch_one(db)
+    .await;
+    match created {
+        Ok(created) => Ok(created),
+        Err(err) if foreign_key_violation(&err) => Err(AppError::NotFound),
+        Err(err) => Err(err.into()),
+    }
 }
 
 pub async fn read(db: &Database, id: &CourseSessionId) -> Result<Option<CourseSession>, AppError> {
-    Ok(db.select(id.record()).await?)
+    let session = sqlx::query_as!(
+        CourseSession,
+        r#"SELECT id AS "id: CourseSessionId", course AS "course: CourseId",
+                  teacher AS "teacher: UserId", topic AS "topic: SessionTopic",
+                  starts_at AS "starts_at: Timestamp", ends_at AS "ends_at: Timestamp"
+           FROM course_session WHERE id = $1"#,
+        id.uuid(),
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(session)
 }
 
 /// A course's sessions, most recent lesson first. Ordered by `starts_at`
@@ -63,11 +84,11 @@ pub async fn list_for_course(
     offset: i64,
 ) -> Result<(Vec<CourseSession>, i64), AppError> {
     PagedList::new(
-        "course_session WHERE course = $course",
+        "course_session WHERE course = $1",
         "ORDER BY starts_at DESC, id DESC",
     )
-    .bind("course", course.record())
-    .run(limit, offset, db)
+    .bind(course.uuid())
+    .run::<CourseSession>(limit, offset, db)
     .await
 }
 
@@ -86,11 +107,17 @@ pub async fn update(
     starts_at: Option<Timestamp>,
     ends_at: Option<Option<Timestamp>>,
 ) -> Result<CourseSession, AppError> {
-    FieldUpdate::new(session.id.record())
-        .set("teacher", teacher.map(|teacher| teacher.record()))
-        .set("topic", topic)
-        .set("starts_at", starts_at)
-        .set("ends_at", ends_at)
+    FieldUpdate::new(COURSE_SESSION_TABLE, session.id.uuid())
+        .set(
+            "teacher",
+            teacher.map(|teacher| crate::db::page::Param::Uuid(teacher.uuid())),
+        )
+        .set("topic", topic.map(|topic| topic.as_str().to_owned()))
+        .set("starts_at", starts_at.map(|at| at.as_millis()))
+        .set(
+            "ends_at",
+            ends_at.map(|ends_at| crate::db::page::Param::OptI64(ends_at.map(|at| at.as_millis()))),
+        )
         .ordered("starts_at", "ends_at", range_error())
         .run::<CourseSession>(db)
         .await
@@ -99,38 +126,42 @@ pub async fn update(
 /// Delete the session and cascade-remove its roll-call rows, in one
 /// transaction: as two unbatched queries a failure between them stranded
 /// roll-call rows on a session that was already gone. The other half of
-/// that invariant is [`crate::db::session_attendance::mark`],
-/// which proves the session still exists inside its own write — a
-/// transaction here cannot stop a mark that commits *after* this one.
+/// that invariant is [`crate::db::session_attendance::mark`], whose
+/// session-row lock makes a mark and this delete take turns — a mark
+/// committing after this cascade cannot name a session that is gone.
 pub async fn delete(db: &Database, session: CourseSession) -> Result<CourseSession, AppError> {
-    let (mut result, mut errors) = transaction_with_retry(
-        db,
-        "BEGIN TRANSACTION;
-             DELETE session_attendance WHERE session = $s;
-             LET $before = (DELETE $s RETURN BEFORE);
-             RETURN $before;
-             COMMIT TRANSACTION;",
-        &[("s".into(), session.id.record().into_value())],
-        // No THROW of its own — an unconditional cascade, so the only
-        // error worth telling apart is a lost round (see
-        // [`crate::db::exam::delete`]).
-        &[],
-    )
-    .await?;
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    // Read through the trailing `RETURN`, never a hand-counted slot.
-    let slot = result.num_statements().saturating_sub(2);
-    let deleted: Option<CourseSession> =
-        result.take::<Vec<CourseSession>>(slot)?.into_iter().next();
-    deleted.ok_or(AppError::NotFound)
+    // Cascade mode: a roll-call row written *after* the sweep's snapshot (a
+    // mark racing the delete) still references the session when the session
+    // row goes, and that 23503 means "a racing writer is mid-flight" — the
+    // re-send sweeps the settled rows and succeeds.
+    tx_with_retry(db, true, async move |tx| {
+        // Roll-call rows first: the session row's own FK would refuse the
+        // delete while they exist. An empty first sweep is fine — the
+        // session may simply have had none.
+        sqlx::query!(
+            r#"DELETE FROM session_attendance WHERE session = $1"#,
+            session.id.uuid(),
+        )
+        .execute(&mut *tx)
+        .await?;
+        let deleted = sqlx::query_as!(
+            CourseSession,
+            r#"DELETE FROM course_session WHERE id = $1
+               RETURNING id AS "id: CourseSessionId", course AS "course: CourseId",
+                     teacher AS "teacher: UserId", topic AS "topic: SessionTopic",
+                     starts_at AS "starts_at: Timestamp", ends_at AS "ends_at: Timestamp""#,
+            session.id.uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        deleted.ok_or(AppError::NotFound)
+    })
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constant::COURSE_SESSION_TABLE;
 
     /// A lesson must not outlive the course it is a lesson of: an orphan 404s
     /// forever through `session_with_course` — unreadable, unpatchable,
@@ -143,14 +174,24 @@ mod tests {
     /// Mutation-tested: with the bare `db.create` this shipped with, all four
     /// rounds orphan.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "needs a real SurrealDB server: podman start hezarfen-surrealdb && cargo test -- --ignored"]
     async fn a_session_never_outlives_its_course() {
         fn make(course: CourseId, db: Database) -> tokio::task::JoinHandle<Result<(), AppError>> {
             tokio::spawn(async move {
+                // The creator is a foreign key now: a real `app_user` row.
+                let creator = UserId::generate();
+                sqlx::query(
+                    "INSERT INTO app_user (id, username, password_hash, role) \
+                     VALUES ($1, $2, 'x', 'teacher')",
+                )
+                .bind(creator.uuid())
+                .bind(format!("session-race-{}", &creator.key()[30..]))
+                .execute(&db)
+                .await
+                .unwrap();
                 create(
                     &db,
                     &course,
-                    &UserId::generate(),
+                    &creator,
                     SessionTopic::try_new("limits").unwrap(),
                     Timestamp::from_millis(1),
                     None,
@@ -159,11 +200,6 @@ mod tests {
                 .map(|_| ())
             })
         }
-        crate::db::course::assert_no_child_outlives_a_course_delete(
-            "session_orphan_race",
-            COURSE_SESSION_TABLE,
-            make,
-        )
-        .await;
+        crate::db::course::assert_no_child_outlives_a_course_delete("course_session", make).await;
     }
 }

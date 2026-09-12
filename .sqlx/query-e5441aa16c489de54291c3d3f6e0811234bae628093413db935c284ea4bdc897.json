@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT epoch AS \"epoch: i64\", epoch_stroke_count AS \"epoch_count: i64\"\n               FROM board WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "epoch: i64",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "board",
+            "name": "epoch"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "epoch_count: i64",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "board",
+            "name": "epoch_stroke_count"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "e5441aa16c489de54291c3d3f6e0811234bae628093413db935c284ea4bdc897"
+}

@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT class AS \"class: ClassGroupId\", course AS \"course: CourseId\"\n           FROM class_course WHERE class = ANY($1)",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "class: ClassGroupId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "class_course",
+            "name": "class"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "course: CourseId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "class_course",
+            "name": "course"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "b0ca3c9037af1e5e032443bc7f3ab77a78af3688d9fa777a07e803cb5843a2a7"
+}

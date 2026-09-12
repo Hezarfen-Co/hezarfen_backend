@@ -2,8 +2,7 @@
 //! 2026-08-02 sweep: an event seat a demotion left claimed forever, and the
 //! two-query deletes that could orphan a child row.
 //!
-//! Every assertion re-reads the *store*. The in-memory engine forges wins under
-//! concurrency (src/domain/cap.rs), so nothing below is judged on a response
+//! Every assertion re-reads the *store*: nothing below is judged on a response
 //! body or asked who won a race — the cascade tests drive the reachable half
 //! and pin what the store holds once the transaction is done.
 
@@ -14,25 +13,17 @@ use common::{app_and_db, id_of, login, login_as, me_id, send};
 use hezarfen_backend::database::Database;
 use hezarfen_backend::domain::timestamp::Timestamp;
 use serde_json::json;
+use sqlx::Row as _;
 
-/// One counter, re-read out of the store — never off a response body.
-async fn counter(sql: &str, db: &Database) -> i64 {
-    let mut result = db.query(sql).await.unwrap().check().unwrap();
-    result
-        .take::<Vec<i64>>(0)
-        .unwrap()
-        .first()
-        .copied()
-        .unwrap_or(0)
+/// One counter, re-read out of the store — never off a response body. `sql`
+/// is a whole scalar query.
+async fn counter(sql: &'static str, db: &Database) -> i64 {
+    sqlx::query_scalar(sql).fetch_one(db).await.unwrap()
 }
 
-/// How many rows `sql` selects ids for.
-async fn rows(sql: &str, db: &Database) -> i64 {
-    let mut result = db.query(sql).await.unwrap().check().unwrap();
-    result
-        .take::<Vec<surrealdb::types::RecordId>>(0)
-        .unwrap()
-        .len() as i64
+/// How many rows `sql` counts.
+async fn rows(sql: &'static str, db: &Database) -> i64 {
+    counter(sql, db).await
 }
 
 /// Put `user` on `event`'s signup list as `cookie`.
@@ -81,11 +72,10 @@ async fn free_seat(app: &axum::Router, cookie: &str, event: &str, user: &str) ->
 /// The API refuses to *schedule* one there (60s grace), so the row is aged in
 /// the store — the state a real event reaches by the clock simply running on.
 async fn age_event(event: &str, db: &Database) {
-    db.query("UPDATE type::record('event', $key) SET starts_at = 1")
-        .bind(("key", event.to_string()))
+    sqlx::query("UPDATE event SET starts_at = 1 WHERE id = $1")
+        .bind(uuid::Uuid::parse_str(event).expect("a uuid event id"))
+        .execute(db)
         .await
-        .unwrap()
-        .check()
         .unwrap();
 }
 
@@ -109,7 +99,7 @@ async fn a_demotion_frees_the_event_seat_nothing_else_could_free() {
     let res = seat(&app, &teacher, &event, &ali_id).await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     assert_eq!(
-        counter("SELECT VALUE registration_count ?? 0 FROM event", &db).await,
+        counter("SELECT COALESCE(sum(registration_count), 0)::bigint FROM event", &db).await,
         1
     );
 
@@ -126,12 +116,12 @@ async fn a_demotion_frees_the_event_seat_nothing_else_could_free() {
     // The row goes and the seat comes back with it — one is worthless without
     // the other.
     assert_eq!(
-        rows("SELECT VALUE id FROM registration", &db).await,
+        rows("SELECT count(*) FROM registration", &db).await,
         0,
         "a non-student may hold no signup row"
     );
     assert_eq!(
-        counter("SELECT VALUE registration_count ?? 0 FROM event", &db).await,
+        counter("SELECT COALESCE(sum(registration_count), 0)::bigint FROM event", &db).await,
         0,
         "the seat must be handed back, or the event is full forever"
     );
@@ -179,12 +169,12 @@ async fn a_promotion_keeps_the_signup_the_promoted_user_can_still_free() {
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
 
     assert_eq!(
-        rows("SELECT VALUE id FROM registration", &db).await,
+        rows("SELECT count(*) FROM registration", &db).await,
         1,
         "a promotion must not destroy a signup its holder can still free"
     );
     assert_eq!(
-        counter("SELECT VALUE registration_count ?? 0 FROM event", &db).await,
+        counter("SELECT COALESCE(sum(registration_count), 0)::bigint FROM event", &db).await,
         1,
         "…and the seat it holds stays claimed with it"
     );
@@ -205,9 +195,9 @@ async fn a_promotion_keeps_the_signup_the_promoted_user_can_still_free() {
     .expect("re-login");
     let res = free_seat(&app, &promoted, &event, &ali_id).await;
     assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
-    assert_eq!(rows("SELECT VALUE id FROM registration", &db).await, 0);
+    assert_eq!(rows("SELECT count(*) FROM registration", &db).await, 0);
     assert_eq!(
-        counter("SELECT VALUE registration_count ?? 0 FROM event", &db).await,
+        counter("SELECT COALESCE(sum(registration_count), 0)::bigint FROM event", &db).await,
         0
     );
 }
@@ -247,12 +237,12 @@ async fn a_demotion_leaves_a_frozen_signup_list_exactly_as_it_stands() {
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
 
     assert_eq!(
-        rows("SELECT VALUE id FROM registration", &db).await,
+        rows("SELECT count(*) FROM registration", &db).await,
         1,
         "a closed roster must not be rewritten by a role change"
     );
     assert_eq!(
-        counter("SELECT VALUE registration_count ?? 0 FROM event", &db).await,
+        counter("SELECT COALESCE(sum(registration_count), 0)::bigint FROM event", &db).await,
         1,
         "…and its seat stays claimed with it — the row is the seat"
     );
@@ -285,12 +275,21 @@ async fn the_sweep_deletes_an_orphan_signup_instead_of_stranding_it() {
     // The state a delete that raced a register used to leave: the row outlives
     // its event. Written straight into the store, since the cascade now makes
     // it unreachable through the API.
-    db.query("DELETE type::record('event', $key)")
-        .bind(("key", doomed.clone()))
+    // The state a delete that raced a register used to leave: the row outlives
+    // its event. Written straight into the store, since the cascade now makes
+    // it unreachable through the API. Real FKs refuse that state, so the
+    // delete is forced with FK triggers suspended for the one transaction.
+    let mut tx = db.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
         .await
-        .unwrap()
-        .check()
         .unwrap();
+    sqlx::query("DELETE FROM event WHERE id = $1")
+        .bind(uuid::Uuid::parse_str(&doomed).expect("a uuid event id"))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
 
     let res = send(
         &app,
@@ -303,12 +302,12 @@ async fn the_sweep_deletes_an_orphan_signup_instead_of_stranding_it() {
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
 
     assert_eq!(
-        rows("SELECT VALUE id FROM registration", &db).await,
+        rows("SELECT count(*) FROM registration", &db).await,
         0,
         "an orphan signup must go with the rest — nothing else can ever remove it"
     );
     assert_eq!(
-        counter("SELECT VALUE registration_count ?? 0 FROM event", &db).await,
+        counter("SELECT COALESCE(sum(registration_count), 0)::bigint FROM event", &db).await,
         0,
         "and the surviving event still gets its seat back"
     );
@@ -316,17 +315,11 @@ async fn the_sweep_deletes_an_orphan_signup_instead_of_stranding_it() {
 
 /// How many boards list `user` as a participant, read out of the store.
 async fn boards_listing(user: &str, db: &Database) -> i64 {
-    let mut result = db
-        .query("SELECT VALUE id FROM board WHERE type::record('user', $u) IN participants")
-        .bind(("u", user.to_string()))
+    sqlx::query_scalar("SELECT count(*) FROM board WHERE $1 = ANY(participants)")
+        .bind(uuid::Uuid::parse_str(user).expect("a uuid user id"))
+        .fetch_one(db)
         .await
         .unwrap()
-        .check()
-        .unwrap();
-    result
-        .take::<Vec<surrealdb::types::RecordId>>(0)
-        .unwrap()
-        .len() as i64
 }
 
 /// A `parent` is barred from the whiteboard outright, and invites already
@@ -386,7 +379,7 @@ async fn a_demotion_to_parent_leaves_every_board_roster_and_deletes_nothing() {
     );
     // Nothing was destroyed, and the board they created is untouched beyond
     // that: same creator, and its other participant still on it.
-    assert_eq!(rows("SELECT VALUE id FROM board", &db).await, 2);
+    assert_eq!(rows("SELECT count(*) FROM board", &db).await, 2);
     let res = send(&app, "GET", &format!("/boards/{own_id}"), Some(&ali), None).await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
     assert_eq!(res.body["creator"], veli_id);
@@ -441,34 +434,46 @@ async fn a_student_holding_every_grant(
 
 /// `user`'s live role, read out of the store.
 async fn role_of(user: &str, db: &Database) -> String {
-    let mut result = db
-        .query("SELECT VALUE role FROM type::record('user', $u)")
-        .bind(("u", user.to_string()))
+    sqlx::query_scalar("SELECT role FROM app_user WHERE id = $1")
+        .bind(uuid::Uuid::parse_str(user).expect("a uuid user id"))
+        .fetch_one(db)
         .await
-        .unwrap()
-        .check()
-        .unwrap();
-    result
-        .take::<Vec<String>>(0)
-        .unwrap()
-        .first()
-        .cloned()
         .expect("the user row must exist")
 }
 
 /// Make the next write of `kind` on `table` fail, from inside whatever
-/// transaction performs it: a `DEFINE EVENT` on the table under write fires
-/// *within* that write, which is the only way to fail one statement of a
-/// cascade deterministically (no sleeps, no racing tasks).
+/// transaction performs it: a trigger that raises aborts that very write, and
+/// with it the whole cascade's transaction — the only way to fail one statement
+/// of a cascade deterministically (no sleeps, no racing tasks).
 async fn poison(table: &str, kind: &str, db: &Database) {
-    db.query(format!(
-        "DEFINE EVENT poison ON TABLE {table} WHEN $event = '{kind}' \
-         THEN {{ THROW 'poisoned' }}"
-    ))
+    let firing = match kind {
+        "CREATE" => "INSERT",
+        "UPDATE" => "UPDATE",
+        "DELETE" => "DELETE",
+        other => panic!("unknown event kind {other}"),
+    };
+    let mut conn = db.acquire().await.expect("acquire for the trigger");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE FUNCTION heztest_poison() RETURNS trigger AS $$
+         BEGIN RAISE EXCEPTION 'poisoned'; END;
+         $$ LANGUAGE plpgsql;
+         CREATE TRIGGER heztest_poison BEFORE {firing} ON {table}
+         FOR EACH ROW EXECUTE FUNCTION heztest_poison();"
+    )))
+    .execute(&mut *conn)
     .await
-    .unwrap()
-    .check()
-    .unwrap();
+    .expect("define the poison trigger");
+}
+
+/// Take the poison back, so the re-sent PATCH can land.
+async fn unpoison(table: &str, db: &Database) {
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "DROP TRIGGER IF EXISTS heztest_poison ON {table};
+         DROP FUNCTION IF EXISTS heztest_poison();"
+    )))
+    .execute(db)
+    .await
+    .expect("remove the poison trigger");
 }
 
 /// Every grant of `ali_id` still standing, and the old role with them — what
@@ -480,27 +485,27 @@ async fn nothing_was_swept(ali_id: &str, db: &Database) {
         "the role write must roll back with the sweep that failed"
     );
     assert_eq!(
-        rows("SELECT VALUE id FROM enrollment", db).await,
+        rows("SELECT count(*) FROM enrollment", db).await,
         1,
         "the enrollment must survive a failed cascade"
     );
     assert_eq!(
-        counter("SELECT VALUE enrollment_count ?? 0 FROM course", db).await,
+        counter("SELECT COALESCE(sum(enrollment_count), 0)::bigint FROM course", db).await,
         1,
         "…and so must its seat, or the roster and the count disagree forever"
     );
     assert_eq!(
-        rows("SELECT VALUE id FROM parent_link", db).await,
+        rows("SELECT count(*) FROM parent_link", db).await,
         1,
         "the parent link must survive a failed cascade"
     );
     assert_eq!(
-        rows("SELECT VALUE id FROM registration", db).await,
+        rows("SELECT count(*) FROM registration", db).await,
         1,
         "the signup must survive a failed cascade"
     );
     assert_eq!(
-        counter("SELECT VALUE registration_count ?? 0 FROM event", db).await,
+        counter("SELECT COALESCE(sum(registration_count), 0)::bigint FROM event", db).await,
         1,
         "…with its seat still claimed"
     );
@@ -533,18 +538,23 @@ async fn the_retry_takes_everything(
     assert_eq!(role_of(ali_id, db).await, "parent");
     for table in ["enrollment", "parent_link", "registration", "class_member"] {
         assert_eq!(
-            rows(&format!("SELECT VALUE id FROM {table}"), db).await,
+            sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
+                "SELECT count(*) FROM {table}"
+            )))
+            .fetch_one(db)
+            .await
+            .unwrap(),
             0,
             "{table} must be swept by the re-sent PATCH"
         );
     }
     assert_eq!(boards_listing(ali_id, db).await, 0);
     assert_eq!(
-        counter("SELECT VALUE enrollment_count ?? 0 FROM course", db).await,
+        counter("SELECT COALESCE(sum(enrollment_count), 0)::bigint FROM course", db).await,
         0
     );
     assert_eq!(
-        counter("SELECT VALUE registration_count ?? 0 FROM event", db).await,
+        counter("SELECT COALESCE(sum(registration_count), 0)::bigint FROM event", db).await,
         0
     );
     // The seat is usable, which is the whole point of freeing it: the one-seat
@@ -566,9 +576,9 @@ async fn the_retry_takes_everything(
 /// enrollment, the parent link and the event seat already gone, and nothing to
 /// ever put them back.
 ///
-/// The failure is injected the way `regress_classes` does it: a `DEFINE EVENT`
-/// on a table the cascade writes fires *inside* that write, so the abort is
-/// deterministic instead of a race the in-memory engine would lie about. Both
+/// The failure is injected the way `regress_classes` does it: a trigger on a
+/// table the cascade writes raises inside that very write, so the abort is
+/// deterministic instead of a race. Both
 /// ends of the cascade are poisoned, in two tests, because they fail different
 /// things: the board roster is the *last* statement of the parent arm (so every
 /// assertion below it is about a write that already succeeded and must be
@@ -596,11 +606,7 @@ async fn a_failure_late_in_the_cascade_leaves_the_old_role_and_every_grant_stand
     );
     nothing_was_swept(&ali_id, &db).await;
 
-    db.query("REMOVE EVENT poison ON TABLE board")
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
+    unpoison("board", &db).await;
     the_retry_takes_everything(&app, &db, &admin, &teacher, &ali_id).await;
 }
 
@@ -630,11 +636,7 @@ async fn a_failure_early_in_the_cascade_rolls_the_role_write_back_with_it() {
     );
     nothing_was_swept(&ali_id, &db).await;
 
-    db.query("REMOVE EVENT poison ON TABLE enrollment")
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
+    unpoison("enrollment", &db).await;
     the_retry_takes_everything(&app, &db, &admin, &teacher, &ali_id).await;
 }
 
@@ -661,7 +663,7 @@ async fn deleting_an_event_takes_its_children_with_it() {
     )
     .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-    assert_eq!(rows("SELECT VALUE id FROM attendance", &db).await, 1);
+    assert_eq!(rows("SELECT count(*) FROM attendance", &db).await, 1);
 
     let res = send(
         &app,
@@ -673,14 +675,14 @@ async fn deleting_an_event_takes_its_children_with_it() {
     .await;
     assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
 
-    assert_eq!(rows("SELECT VALUE id FROM event", &db).await, 0);
+    assert_eq!(rows("SELECT count(*) FROM event", &db).await, 0);
     assert_eq!(
-        rows("SELECT VALUE id FROM attendance", &db).await,
+        rows("SELECT count(*) FROM attendance", &db).await,
         0,
         "no mark may outlive its event"
     );
     assert_eq!(
-        rows("SELECT VALUE id FROM registration", &db).await,
+        rows("SELECT count(*) FROM registration", &db).await,
         0,
         "no signup may outlive its event"
     );
@@ -708,14 +710,14 @@ async fn deleting_a_note_takes_its_attachment_rows_with_it() {
 
     let up = common::upload_file(&app, &ali, &note, "plan.txt", "text/plain", b"merhaba").await;
     assert_eq!(up.status, StatusCode::CREATED, "{}", up.body);
-    assert_eq!(rows("SELECT VALUE id FROM note_file", &db).await, 1);
+    assert_eq!(rows("SELECT count(*) FROM note_file", &db).await, 1);
 
     let res = send(&app, "DELETE", &format!("/notes/{note}"), Some(&ali), None).await;
     assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
 
-    assert_eq!(rows("SELECT VALUE id FROM note", &db).await, 0);
+    assert_eq!(rows("SELECT count(*) FROM note", &db).await, 0);
     assert_eq!(
-        rows("SELECT VALUE id FROM note_file", &db).await,
+        rows("SELECT count(*) FROM note_file", &db).await,
         0,
         "no attachment row may outlive its note"
     );

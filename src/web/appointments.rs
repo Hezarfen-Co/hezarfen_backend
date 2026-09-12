@@ -58,7 +58,7 @@ struct PublishSlots {
 #[derive(Deserialize, ToSchema)]
 struct BookAppointment {
     /// The slot to take, from `GET /appointments/slots`.
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     slot: String,
     /// Why you want the meeting — required, the teacher decides on it.
     #[schema(max_length = 1000, example = "Ders notlarını konuşmak istiyorum")]
@@ -103,7 +103,7 @@ struct AcceptReschedule {
 
 #[derive(Serialize, ToSchema)]
 struct SlotResponse {
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     id: String,
     /// Whose calendar this is.
     teacher: PersonRef,
@@ -134,7 +134,7 @@ impl SlotResponse {
 
 #[derive(Serialize, ToSchema)]
 struct AppointmentResponse {
-    #[schema(example = "01J8XZ0K3Q8G7X2M4N5P6R7S8T")]
+    #[schema(example = "019732e3-7b00-7000-8000-00000000dead")]
     id: String,
     /// The slot this booking sits on.
     slot: String,
@@ -179,7 +179,10 @@ impl AppointmentResponse {
         let window = slot.map(|slot| appointment.window(slot));
         Self {
             id: appointment.get_id().key().to_string(),
-            slot: appointment.get_slot().key().to_string(),
+            // A settled booking whose slot was withdrawn renders without a
+            // window and without a slot id — the dangling reference the old
+            // store permitted, now an explicit NULL.
+            slot: appointment.get_slot().map(|slot| slot.key()).unwrap_or_default(),
             teacher: slot.map(|slot| PersonRef::resolve(people, slot.get_teacher())),
             requester: PersonRef::resolve(people, appointment.get_requester()),
             status: appointment.get_status().as_str().to_string(),
@@ -216,7 +219,12 @@ async fn appointment_responses(
 ) -> Result<Vec<AppointmentResponse>, AppError> {
     let mut slots = Vec::with_capacity(rows.len());
     for row in rows {
-        slots.push(service::appointment_slot::read(db, row.get_slot()).await?);
+        let slot = match row.get_slot() {
+            Some(slot_id) => service::appointment_slot::read(db, slot_id).await?,
+            // A settled booking whose slot was withdrawn: no window.
+            None => None,
+        };
+        slots.push(slot);
     }
     // Collected eagerly rather than as a lazy iterator: a borrowing closure
     // held across the `person_map` await makes the handler's future
@@ -277,7 +285,8 @@ async fn for_decision(
     let appointment = service::appointment::read(db, id)
         .await?
         .ok_or(AppError::NotFound)?;
-    let slot = service::appointment_slot::read(db, appointment.get_slot())
+    let slot_id = appointment.get_slot().ok_or(AppError::NotFound)?;
+    let slot = service::appointment_slot::read(db, slot_id)
         .await?
         .ok_or(AppError::NotFound)?;
     if !can_manage(&slot, user) {
@@ -430,7 +439,7 @@ async fn list_slots(
             .filter(|teacher| teacher.get_role().at_least(Role::Teacher))
             .map(|teacher| (teacher.get_id().key().to_string(), PersonRef::new(teacher)))
             .collect();
-        slots.retain(|slot| people.contains_key(slot.get_teacher().key()));
+        slots.retain(|slot| people.contains_key(slot.get_teacher().key().as_str()));
         (slots, people)
     };
     let total = slots.len() as i64;
@@ -892,7 +901,7 @@ async fn ensure_requester(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::init_mem;
+    use crate::database::init_test_db;
     use crate::domain::user::{Password, Username};
 
     /// A user at `role`, minted through the real create path.
@@ -913,7 +922,7 @@ mod tests {
     /// level that has to hold when the next route arrives with `CurrentUser`.
     #[tokio::test]
     async fn demoted_slot_owner_loses_management() {
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let owner = user("ogretmen", Role::Teacher, &db).await;
         let slot = service::appointment_slot::create(
             &db,

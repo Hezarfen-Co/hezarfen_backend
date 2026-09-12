@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE appointment\n                   SET status = 'cancelled', cancelled_by = $1, cancel_reason = $2\n                   WHERE slot IN (SELECT id FROM appointment_slot WHERE teacher = $1)\n                     AND status IN ('pending', 'approved')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "95127fb9b95a5be2a0ec909f31972b59867f7165e8fc50d8783ca911294aefb2"
+}

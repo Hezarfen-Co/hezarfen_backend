@@ -380,8 +380,8 @@ mod tests {
         use crate::domain::course::{CourseDescription, CourseKind, CourseTitle};
         use crate::domain::user::{Password, Username};
 
-        let db = crate::database::init_mem().await.unwrap();
-        let office = UserId::from_key("office");
+        let (db, _leases) = crate::database::init_test_db().await;
+        let office = crate::db::class_member::tests::fixture_user(&db, "office").await;
         let teacher = crate::service::user::create(
             &db,
             Username::try_new("ada").unwrap(),
@@ -463,11 +463,10 @@ mod tests {
         );
 
         // Demoted with no sweep — the state a lost race leaves.
-        db.query("UPDATE $usr SET role = 'student'")
-            .bind(("usr", teacher.get_id().record()))
+        sqlx::query("UPDATE app_user SET role = 'student' WHERE id = $1")
+            .bind(teacher.get_id().uuid())
+            .execute(&db)
             .await
-            .unwrap()
-            .check()
             .unwrap();
         let refused = undo_if_demoted(teacher.get_id(), &db).await;
         assert!(

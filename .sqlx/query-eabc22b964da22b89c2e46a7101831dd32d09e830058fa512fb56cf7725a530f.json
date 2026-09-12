@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE bank_question SET subject = NULL\n               WHERE subject IN (SELECT id FROM subject WHERE course = $1)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "eabc22b964da22b89c2e46a7101831dd32d09e830058fa512fb56cf7725a530f"
+}

@@ -1,7 +1,7 @@
 use super::*;
 
 use crate::service::exam_attempt::{
-    EXAM_LOCK, check_rejoin, course_of, ensure_enrolled, ensure_student, ensure_student_now,
+    check_rejoin, course_of, ensure_enrolled, ensure_student, ensure_student_now,
     read_latest_for_user, writable_attempt,
 };
 use crate::service::exam_question::{choice_slot, ensure_questions_editable, question_of_exam};
@@ -473,14 +473,12 @@ pub(crate) async fn upload_answer_image(
     // Before the body is read: an archived term refuses the upload without
     // making the client push its bytes first.
     crate::service::course::require_open(&st.db, &course_of(&exam, &st.db).await?).await?;
-    // The body is consumed before the lock — a client's slow upload must not
-    // stall the exam subsystem (mirrors the question-image upload).
+    // The body is consumed before the gates — a client's slow upload must
+    // not delay its own refusal (mirrors the question-image upload). No
+    // process lease wraps the gate and the write: the drawing upsert is one
+    // guarded statement keyed to the sitting's own seq, and a retake writes
+    // fresh rows at a higher seq, so nothing can wipe the sheet under it.
     let ImageUpload { content_type, data } = read_image_upload(&st, &mut multipart).await?;
-    // Reader lease of [`EXAM_LOCK`], exactly like `save_answer_checked`: the
-    // writable gate and the write are one unit, or a retake's wipe-and-create
-    // (a writer) slips in between and this stale drawing lands on the fresh
-    // blank sheet.
-    let _guard = EXAM_LOCK.read().await;
     let attempt = writable_attempt(&exam, user.get_id(), &st.db).await?;
     ensure_student_now(attempt.get_user(), &st.db).await?;
     ensure_enrolled(&exam, attempt.get_user(), &st.db).await?;
@@ -553,7 +551,6 @@ pub(crate) async fn delete_answer_image(
         .ok_or(AppError::NotFound)?;
     ensure_student(&user)?;
     crate::service::course::require_open(&st.db, &course_of(&exam, &st.db).await?).await?;
-    let _guard = EXAM_LOCK.read().await;
     let attempt = writable_attempt(&exam, user.get_id(), &st.db).await?;
     ensure_student_now(attempt.get_user(), &st.db).await?;
     ensure_enrolled(&exam, attempt.get_user(), &st.db).await?;

@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE exam_attempt a SET left_at = $4\n           FROM exam e\n           WHERE e.id = a.exam\n             AND a.exam = $1 AND a.app_user = $2 AND a.seq = $3\n             AND a.left_at IS NULL AND a.finished_at IS NULL\n             AND (e.duration_ms IS NULL OR $4 < a.started_at + e.duration_ms)\n             AND (e.duration_ms IS NOT NULL OR e.ends_at IS NULL OR $4 < e.ends_at)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6c1e1dc8f5a84170a208deddcdead00c79873c4fe3881e452772685dd402ba41"
+}

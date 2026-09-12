@@ -1,23 +1,22 @@
-//! The `appointment_slot` table: row reads and listings, the overlap probes
-//! behind the publish guard, the role-claimed INSERT every publish writes
-//! through, and the delete whose own `WHERE` is the no-live-booking guard.
-//! The workflows that sequence these under
-//! [`crate::service::appointment::APPOINTMENT_LOCK`] live in
+//! The `appointment_slot` table: row reads and listings, the role-claimed
+//! INSERT every publish writes through, and the delete whose own `WHERE`
+//! is the no-live-booking guard. The workflows live in
 //! [`crate::service::appointment_slot`].
+//!
+//! Publish overlap is a database guarantee now: the
+//! `appointment_slot_teacher_span` exclusion constraint refuses a second
+//! window overlapping one the teacher already holds (SQLSTATE `23505`,
+//! mapped to the same 409 the old check produced). The pre-insert reads in
+//! [`crate::service::appointment_slot`] remain for their precise refusal
+//! texts; the constraint is the authority a racing publish answers to.
 
-use surrealdb::types::{RecordId, SurrealValue};
-
-use crate::constant::{APPOINTMENT_SLOT_TABLE, ROLES};
-use crate::database::{Database, transaction_with_retry};
-use crate::db::cap;
-use crate::domain::appointment_slot::{AppointmentSlot, AppointmentSlotId, SlotSeries};
+use crate::database::{Database, exclusion_violation, tx_with_retry, unique_violation};
+use crate::domain::appointment_slot::{AppointmentSlot, AppointmentSlotId, SlotNote, SlotSeries};
 use crate::domain::role::Role;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::AppError;
-
-/// The publisher fell below `teacher` while the publish was in flight.
-const UNFIT_MARK: &str = "slot_not_staff";
+use sqlx::{query, query_as};
 
 /// Write a whole publish — one occurrence or fifty-two — while the publisher
 /// still *holds* a teaching role.
@@ -27,124 +26,157 @@ const UNFIT_MARK: &str = "slot_not_staff";
 /// snapshot can see, and a slot landing after that snapshot would survive it
 /// under a role that may not publish — reachable by no route afterwards,
 /// since the calendar hides a demoted teacher's slots and the deletes are
-/// `teacher`-gated. So the teacher's own record is claimed beside the insert
-/// ([`cap::role_claim`]), which is the key the demotion writes: either the
-/// sweep sees these slots, or this write sees the new role and publishes
-/// nothing.
+/// `teacher`-gated. So the teacher's own row is claimed beside the inserts
+/// (the role-handshake recipe in [`crate::db::cap`]): the transaction takes
+/// the teacher's row `FOR NO KEY UPDATE` — the same key the demotion
+/// writes — and the Rust check refuses unless the role still reaches the
+/// teaching bar. Either the sweep sees these slots, or this write sees the
+/// new role and publishes nothing.
 ///
-/// The bar is read off the hierarchy rather than spelled out, so a new role
-/// cannot drift out of it.
+/// Overlap is the `appointment_slot_teacher_span` exclusion constraint: a
+/// racing publish or a window colliding with an already-published one
+/// refuses the whole batch (`23505`), which the caller maps to its own
+/// overlap 409 (`overlap_refusal` carries the exact text the caller owes —
+/// single publish and weekly series refuse with different words).
 ///
-/// Admissible for [`transaction_with_retry`]: the claim is `SELECT`/`UPDATE`
-/// only, and the `INSERT` carries freshly minted ULIDs on a table with no
-/// `UNIQUE` index, so no rival can make it answer "already exists".
+/// All-or-nothing: one transaction, so a collision at week 7 of 10 leaves
+/// no stray weeks behind.
 pub async fn insert_claimed(
     db: &Database,
     teacher: &UserId,
     rows: Vec<AppointmentSlot>,
+    overlap_refusal: AppError,
 ) -> Result<Vec<AppointmentSlot>, AppError> {
-    let staff = ROLES
-        .iter()
-        .filter(|role| role.at_least(Role::Teacher))
-        .map(|role| format!("'{}'", role.as_str()))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let held = cap::role_claim("teacher", &format!("NOT IN [{staff}]"), UNFIT_MARK);
-    let sql = format!(
-        "BEGIN TRANSACTION;\n{};\nINSERT INTO {APPOINTMENT_SLOT_TABLE} $rows;\n\
-         COMMIT TRANSACTION;",
-        held.join(";\n")
-    );
-    let (mut result, mut errors) = transaction_with_retry(
-        db,
-        &sql,
-        &[
-            ("teacher".into(), teacher.record().into_value()),
-            ("rows".into(), rows.into_value()),
-        ],
-        &[UNFIT_MARK],
-    )
-    .await?;
-    // Demoted while this ran — the same refusal `RequireTeacher` makes a
-    // moment earlier, and the only one that can arrive after it.
-    if errors
-        .values()
-        .any(|error| error.to_string().contains(UNFIT_MARK))
-    {
-        return Err(AppError::Forbidden(
-            "that account no longer holds a teaching role",
-        ));
-    }
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    // BEGIN plus the claim's own statements — counted, not tallied by hand,
-    // so a statement added there cannot read back the wrong result.
-    Ok(result.take::<Vec<AppointmentSlot>>(held.len() + 1)?)
-}
-
-/// Does the teacher already have a published slot whose window collides with
-/// `[starts_at, ends_at)`? Half-open, so a slot ending exactly where the new
-/// one starts is *not* a conflict — that is how a teacher's hour is carved
-/// into back-to-back slots. Caller must hold
-/// [`crate::service::appointment::APPOINTMENT_LOCK`] for the
-/// answer to still be true by the time the insert lands.
-pub async fn conflicts_existing(
-    db: &Database,
-    teacher: &UserId,
-    starts_at: Timestamp,
-    ends_at: Timestamp,
-) -> Result<bool, AppError> {
-    let mut result = db
-        .query(
-            "SELECT VALUE id FROM appointment_slot \
-             WHERE teacher = $teacher AND starts_at < $ends AND ends_at > $starts \
-             LIMIT 1",
+    // `Option::take` makes the FnMut move legal: a refusal is terminal
+    // (never retried), so the value is taken at most once.
+    let mut overlap_refusal = Some(overlap_refusal);
+    // Owned capture (`Send` rule of `tx_with_retry` closures).
+    let teacher = *teacher;
+    tx_with_retry(db, false, async move |tx| {
+        // The role handshake. The bar is read off the hierarchy rather than
+        // spelled out, so a new role cannot drift out of it.
+        let held = sqlx::query!(
+            "SELECT role FROM app_user WHERE id = $1 FOR NO KEY UPDATE",
+            teacher.uuid()
         )
-        .bind(("teacher", teacher.record()))
-        .bind(("starts", starts_at.as_millis()))
-        .bind(("ends", ends_at.as_millis()))
-        .await?
-        .check()?;
-    Ok(!result.take::<Vec<RecordId>>(0)?.is_empty())
+            .fetch_optional(&mut *tx)
+            .await?;
+        let fit = held
+            .as_ref()
+            .and_then(|row| Role::try_from_str(&row.role).ok())
+            .is_some_and(|role| role.at_least(Role::Teacher));
+        if !fit {
+            // Demoted (or gone) while this ran — the same refusal
+            // `RequireTeacher` makes a moment earlier, and the only one
+            // that can arrive after it.
+            return Err(AppError::Forbidden(
+                "that account no longer holds a teaching role",
+            ));
+        }
+        let mut saved = Vec::with_capacity(rows.len());
+        for row in &rows {
+            match query_as!(
+                AppointmentSlot,
+                "INSERT INTO appointment_slot (id, teacher, starts_at, ends_at, note, series, created_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 RETURNING id AS \"id: AppointmentSlotId\", teacher AS \"teacher: UserId\", starts_at AS \"starts_at: Timestamp\", \
+         ends_at AS \"ends_at: Timestamp\", note AS \"note: SlotNote\", \
+         series AS \"series: SlotSeries\", created_at AS \"created_at: Timestamp\"",
+                row.get_id().uuid(),
+                row.get_teacher().uuid(),
+                row.get_starts_at().as_millis(),
+                row.get_ends_at().as_millis(),
+                row.get_note().map(|n| n.as_str().to_string()),
+                row.get_series().map(|s| s.as_str().to_string()),
+                row.get_created_at().as_millis(),
+            )
+            .fetch_one(&mut *tx)
+            .await
+            {
+                Ok(row) => saved.push(row),
+                // A teacher cannot publish two overlapping windows: the
+                // exclusion constraint, answering the caller's overlap 409.
+                // An EXCLUDE constraint answers 23P01 (exclusion), not the
+                // 23505 a UNIQUE would — the overlap 409 rides this code.
+                Err(err)
+                    if unique_violation(&err) == Some("appointment_slot_teacher_span")
+                        || exclusion_violation(&err) == Some("appointment_slot_teacher_span") =>
+                {
+                    return Err(overlap_refusal.take().unwrap_or_else(|| {
+                        AppError::Internal("overlap refusal re-raised".into())
+                    }));
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Ok(saved)
+    })
+    .await
 }
 
 /// Every window this teacher already published that intersects the envelope
 /// `[from, to)`. One read for a whole batch: a stored row that overlaps *any*
 /// window in the batch necessarily overlaps the envelope spanning them all,
 /// so filtering the envelope and comparing in memory is exactly the
-/// per-window [`conflicts_existing`] check,
-/// hoisted out of the loop — which is what keeps
-/// [`crate::service::appointment::APPOINTMENT_LOCK`] down
-/// to two round trips instead of one per occurrence.
+/// per-window overlap check hoisted out of the loop. The exclusion
+/// constraint remains the authority; this read exists for the batch's
+/// precise refusal texts.
 pub async fn windows_in_span(
     db: &Database,
     teacher: &UserId,
     from: Timestamp,
     to: Timestamp,
 ) -> Result<Vec<(Timestamp, Timestamp)>, AppError> {
-    let mut result = db
-        .query(
-            "SELECT * FROM appointment_slot \
-             WHERE teacher = $teacher AND starts_at < $to AND ends_at > $from",
-        )
-        .bind(("teacher", teacher.record()))
-        .bind(("from", from.as_millis()))
-        .bind(("to", to.as_millis()))
-        .await?
-        .check()?;
-    Ok(result
-        .take::<Vec<AppointmentSlot>>(0)?
+    let rows = query!(
+        "SELECT starts_at, ends_at FROM appointment_slot \
+         WHERE teacher = $1 AND starts_at < $3 AND ends_at > $2",
+        teacher.uuid(),
+        from.as_millis(),
+        to.as_millis()
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows
         .into_iter()
-        .map(|slot| (slot.starts_at, slot.ends_at))
+        .map(|row| (Timestamp::from_millis(row.starts_at), Timestamp::from_millis(row.ends_at)))
         .collect())
+}
+
+pub(crate) async fn read_on<'e, E>(
+    executor: E,
+    id: &AppointmentSlotId,
+) -> Result<Option<AppointmentSlot>, AppError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let slot = query_as!(
+        AppointmentSlot,
+        "SELECT id AS \"id: AppointmentSlotId\", teacher AS \"teacher: UserId\", starts_at AS \"starts_at: Timestamp\", \
+         ends_at AS \"ends_at: Timestamp\", note AS \"note: SlotNote\", \
+         series AS \"series: SlotSeries\", created_at AS \"created_at: Timestamp\" \
+         FROM appointment_slot WHERE id = $1",
+        id.uuid()
+    )
+    .fetch_optional(executor)
+    .await?;
+    Ok(slot)
 }
 
 pub async fn read(
     db: &Database,
     id: &AppointmentSlotId,
 ) -> Result<Option<AppointmentSlot>, AppError> {
-    Ok(db.select(id.record()).await?)
+    let slot = query_as!(
+        AppointmentSlot,
+        "SELECT id AS \"id: AppointmentSlotId\", teacher AS \"teacher: UserId\", starts_at AS \"starts_at: Timestamp\", \
+         ends_at AS \"ends_at: Timestamp\", note AS \"note: SlotNote\", \
+         series AS \"series: SlotSeries\", created_at AS \"created_at: Timestamp\" \
+         FROM appointment_slot WHERE id = $1",
+        id.uuid()
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(slot)
 }
 
 /// A teacher's own calendar, earliest first.
@@ -152,15 +184,18 @@ pub async fn list_for_teacher(
     db: &Database,
     teacher: &UserId,
 ) -> Result<Vec<AppointmentSlot>, AppError> {
-    let mut result = db
-        .query(
-            "SELECT * FROM appointment_slot WHERE teacher = $teacher \
-             ORDER BY starts_at ASC, id ASC",
-        )
-        .bind(("teacher", teacher.record()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<AppointmentSlot>>(0)?)
+    let slots = query_as!(
+        AppointmentSlot,
+        "SELECT id AS \"id: AppointmentSlotId\", teacher AS \"teacher: UserId\", starts_at AS \"starts_at: Timestamp\", \
+         ends_at AS \"ends_at: Timestamp\", note AS \"note: SlotNote\", \
+         series AS \"series: SlotSeries\", created_at AS \"created_at: Timestamp\" \
+         FROM appointment_slot WHERE teacher = $1 \
+         ORDER BY starts_at ASC, id ASC",
+        teacher.uuid()
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(slots)
 }
 
 /// Every slot whose window has not opened yet, earliest first — the bookable
@@ -177,30 +212,36 @@ pub async fn list_upcoming(
     db: &Database,
     from: Timestamp,
 ) -> Result<Vec<AppointmentSlot>, AppError> {
-    let mut result = db
-        .query(
-            "SELECT * FROM appointment_slot WHERE starts_at > $from \
-             ORDER BY starts_at ASC, id ASC",
-        )
-        .bind(("from", from.as_millis()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<AppointmentSlot>>(0)?)
+    let slots = query_as!(
+        AppointmentSlot,
+        "SELECT id AS \"id: AppointmentSlotId\", teacher AS \"teacher: UserId\", starts_at AS \"starts_at: Timestamp\", \
+         ends_at AS \"ends_at: Timestamp\", note AS \"note: SlotNote\", \
+         series AS \"series: SlotSeries\", created_at AS \"created_at: Timestamp\" \
+         FROM appointment_slot WHERE starts_at > $1 \
+         ORDER BY starts_at ASC, id ASC",
+        from.as_millis()
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(slots)
 }
 
 pub async fn list_for_series(
     db: &Database,
     series: &SlotSeries,
 ) -> Result<Vec<AppointmentSlot>, AppError> {
-    let mut result = db
-        .query(
-            "SELECT * FROM appointment_slot WHERE series = $series \
-             ORDER BY starts_at ASC, id ASC",
-        )
-        .bind(("series", series.as_str().to_string()))
-        .await?
-        .check()?;
-    Ok(result.take::<Vec<AppointmentSlot>>(0)?)
+    let slots = query_as!(
+        AppointmentSlot,
+        "SELECT id AS \"id: AppointmentSlotId\", teacher AS \"teacher: UserId\", starts_at AS \"starts_at: Timestamp\", \
+         ends_at AS \"ends_at: Timestamp\", note AS \"note: SlotNote\", \
+         series AS \"series: SlotSeries\", created_at AS \"created_at: Timestamp\" \
+         FROM appointment_slot WHERE series = $1 \
+         ORDER BY starts_at ASC, id ASC",
+        series.as_str()
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(slots)
 }
 
 /// Shared body of both deletes: drop every named slot, but only while its
@@ -208,48 +249,59 @@ pub async fn list_for_series(
 /// `WHERE` is the guard, which is what makes it hold against a booking
 /// landing in the middle of it (a separate read-then-delete could not).
 ///
-/// All-or-nothing across the whole list: if fewer rows go than were named,
-/// the transaction is thrown away, so a series never loses its free weeks
-/// and keeps the booked one. Whether that shortfall was a live booking or a
-/// slot that no longer exists is read off what survived — the occupied rows
-/// are still there, a vanished one is not — which is the 409/404 the caller
-/// used to get from a separate check.
+/// Settled bookings (rejected/cancelled) of the free slots are swept first
+/// so the parent delete's foreign key is never the thing that refuses. One
+/// transaction, all-or-nothing across the whole list: if fewer rows go than
+/// were named, the transaction is thrown away, so a series never loses its
+/// free weeks and keeps the booked one. Whether that shortfall was a live
+/// booking or a slot that no longer exists is read off what survived — the
+/// occupied rows are still there, a vanished one is not — which is the
+/// 409/404 the caller expects.
 pub async fn delete_free(db: &Database, ids: &[AppointmentSlotId]) -> Result<(), AppError> {
-    let records: Vec<RecordId> = ids.iter().map(|id| id.record()).collect();
-    let (_, mut errors) = transaction_with_retry(
-        db,
-        "BEGIN TRANSACTION;
-             LET $gone = (DELETE $slots WHERE (occupied ?? 0) = 0 RETURN BEFORE);
-             IF array::len($gone) != array::len($slots) {
-                 THROW IF array::len((SELECT VALUE id FROM appointment_slot
-                     WHERE id IN $slots)) > 0 { 'slot_occupied' } ELSE { 'slot_missing' }
-             };
-             DELETE appointment WHERE slot IN $slots;
-             RETURN $gone;
-             COMMIT TRANSACTION;",
-        &[("slots".into(), records.into_value())],
-        &["slot_occupied", "slot_missing"],
-    )
-    .await?;
-    // An aborted transaction errors every slot; only the THROW's own slot
-    // names the marker (the `Exam::update` treatment), and a round lost to
-    // a booking landing on `occupied` mid-flight is re-sent rather than
-    // reported (see [`transaction_with_retry`]).
-    let thrown = |marker: &str| {
-        errors
-            .values()
-            .any(|error| error.to_string().contains(marker))
-    };
-    if thrown("slot_occupied") {
-        return Err(AppError::Conflict(
-            "the slot has a pending or approved booking",
-        ));
-    }
-    if thrown("slot_missing") {
-        return Err(AppError::NotFound);
-    }
-    if let Some(error) = errors.drain().map(|(_, error)| error).next() {
-        return Err(error.into());
-    }
-    Ok(())
+    let ids: Vec<uuid::Uuid> = ids.iter().map(|id| id.uuid()).collect();
+    tx_with_retry(db, false, async move |tx| {
+        // The settled bookings of the *free* slots go first; a booked slot's
+        // rows survive (its occupied counter excludes it from both sweeps).
+        sqlx::query!(
+            "DELETE FROM appointment a
+             USING appointment_slot s
+             WHERE a.slot = s.id AND s.id = ANY($1) AND s.occupied < 1",
+            &ids
+        )
+        .execute(&mut *tx)
+        .await?;
+        let gone: Vec<AppointmentSlotId> = sqlx::query_scalar!(
+            "DELETE FROM appointment_slot WHERE id = ANY($1) AND occupied < 1 \
+             RETURNING id AS \"id: AppointmentSlotId\"",
+            &ids
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        if gone.len() == ids.len() {
+            return Ok(());
+        }
+        // Shortfall: distinguish "a live booking holds one" from "one was
+        // never there" off what still exists.
+        let remaining = sqlx::query!(
+            "SELECT count(*) AS \"standing!\" FROM appointment_slot WHERE id = ANY($1)",
+            &ids
+        )
+        .fetch_one(&mut *tx)
+        .await?
+        .standing;
+        if remaining > 0 {
+            Err(AppError::Conflict(
+                "the slot has a pending or approved booking",
+            ))
+        } else {
+            Err(AppError::NotFound)
+        }
+    })
+    .await
 }
+
+// The overlap probe behind the old publish guard — `conflicts_existing` —
+// is gone as a *decision*: the exclusion constraint decides overlap at
+// insert time. The service layer still reads [`windows_in_span`] ahead of a
+// weekly publish so its precise refusal texts survive; a racing writer that
+// slips past any read answers to the constraint.

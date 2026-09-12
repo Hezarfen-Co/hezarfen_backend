@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT parent AS \"parent: UserId\", student AS \"student: UserId\", linked_by AS \"linked_by: UserId\" FROM parent_link WHERE parent = $1\n         ORDER BY student DESC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "parent: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "parent_link",
+            "name": "parent"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "student: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "parent_link",
+            "name": "student"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "linked_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "parent_link",
+            "name": "linked_by"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "f46149d1115c4290002fba461f10784dbd7a7892c68e701e02573c186bce0aa0"
+}

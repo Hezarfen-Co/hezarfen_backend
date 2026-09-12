@@ -1,33 +1,48 @@
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-
-use crate::constant::REGISTRATION_TABLE;
 use crate::domain::event::EventId;
 use crate::domain::user::UserId;
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct RegistrationId(RecordId);
+/// The (event, user) pair — the table's natural composite primary key. The
+/// same pair always maps to the same row, so one-row-per-pair holds by
+/// construction (the enrollment trick) even if a write ever slipped past the
+/// register lock. UUID strings carry only `-`, so `_` is an unambiguous
+/// joiner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistrationId {
+    event: EventId,
+    user: UserId,
+}
 
 impl RegistrationId {
-    /// A deterministic id for the (event, user) pair — the same pair always
-    /// maps to the same record id, so one-row-per-pair holds by construction
-    /// (the enrollment trick) even if a write ever slipped past the register
-    /// lock. ULID keys are alphanumeric, so `_` is unambiguous.
     pub fn composite(event: &EventId, user: &UserId) -> Self {
-        Self(RecordId::new(
-            REGISTRATION_TABLE,
-            format!("{}_{}", event.key(), user.key()),
-        ))
-    }
-
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
+        Self {
+            event: event.clone(),
+            user: *user,
         }
+    }
+
+    /// Parse the `{event}_{user}` wire form. A key that parses as no pair
+    /// reads as the nil pair, which matches no row — exactly the 404 a
+    /// dangling composite key produced under the old store, without turning a
+    /// typo into a panic.
+    pub fn from_key(key: &str) -> Self {
+        let (event, user) = key.rsplit_once('_').unwrap_or(("", ""));
+        Self {
+            event: EventId::from_key(event),
+            user: UserId::from_key(user),
+        }
+    }
+
+    /// The `{event}_{user}` wire form.
+    pub fn key(&self) -> String {
+        format!("{}_{}", self.event.key(), self.user.key())
+    }
+
+    pub fn event(&self) -> EventId {
+        self.event.clone()
+    }
+
+    pub fn user(&self) -> UserId {
+        self.user
     }
 }
 
@@ -35,19 +50,15 @@ impl RegistrationId {
 /// event's roster: whoever holds a row is expected (and markable), everyone
 /// else is not. Rows survive audience changes inertly — switching the event
 /// away from the registration kind hides them without deleting them.
-#[derive(Debug, Clone, SurrealValue)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Registration {
-    pub(crate) id: RegistrationId,
     pub(crate) event: EventId,
+    #[sqlx(rename = "app_user")]
     pub(crate) user: UserId,
     pub(crate) registered_by: UserId,
 }
 
 impl Registration {
-    pub fn get_id(&self) -> &RegistrationId {
-        &self.id
-    }
-
     pub fn get_event(&self) -> &EventId {
         &self.event
     }
@@ -65,7 +76,7 @@ impl Registration {
     // arm of [`crate::service::user::set_role`], so the seat comes back in
     // the same transaction as the role that invalidated it. The freeze it obeys
     // is [`crate::domain::event::Event::registration_capacity`]'s `Conflict`
-    // arm, re-spelled for SurrealQL as
+    // arm, re-spelled for the stored guard in
     // [`crate::constant::REGISTRATION_FROZEN_GUARD`] and held to it by
     // `event::tests::the_sql_freeze_guard_matches_the_rust_one`.
 }

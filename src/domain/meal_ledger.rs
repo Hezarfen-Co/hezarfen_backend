@@ -1,11 +1,11 @@
 //! The food program's money: an **append-only** ledger of what a student was
 //! charged and what they paid.
 //!
-//! Nothing here ever `UPDATE`s or `DELETE`s a row, and no such path exists —
-//! every field is `READONLY` in the schema as well. A ledger line that can be
-//! edited or dropped silently rewrites a student's financial history with no
-//! trace of the rewrite; a mistake is corrected by appending the opposing
-//! line, which leaves both the mistake and the correction visible.
+//! Nothing here ever `UPDATE`s or `DELETE`s a row, and no such path exists. A
+//! ledger line that can be edited or dropped silently rewrites a student's
+//! financial history with no trace of the rewrite; a mistake is corrected by
+//! appending the opposing line, which leaves both the mistake and the
+//! correction visible.
 //!
 //! **The balance is never stored.** It is always the fold
 //!
@@ -33,7 +33,7 @@
 //!   than its flip could be overtaken by that re-book and then never be
 //!   writable at all.
 //! - **Every booking line is keyed by `(booking, attempt)`.** Both the charge
-//!   and its reversal derive their record id from the seat and the attempt
+//!   and its reversal derive their row id from the seat and the attempt
 //!   number, so replaying either writes nothing at all. Money must never
 //!   depend on a "has this been billed yet?" scan: two concurrent `POST`s of
 //!   one seat can both read "no charge yet" and both append, which is how a
@@ -42,7 +42,7 @@
 //!   client-chosen `request_key`, which lands in the line's id
 //!   ([`MealLedgerId::for_request`]) and makes the call retry-safe by the same
 //!   identity rule: a retry after a timeout resolves the line it already wrote.
-//!   Without one, a fresh ulid is minted and a resent request is a second
+//!   Without one, a fresh id is minted and a resent request is a second
 //!   credit — which nothing here can edit or delete afterwards.
 //! - **A no-show still pays.** Meal attendance has zero billing effect —
 //!   nothing in this file reads or writes it. Do not add a no-show penalty
@@ -50,56 +50,51 @@
 //!
 //! Money is `i64` minor units (kuruş) end to end. No float, no decimal, ever.
 //!
+//! The ledger row ids are **derived TEXT keys**, not minted uuids — they are
+//! the identity the store's uniqueness check enforces (`id TEXT PRIMARY
+//! KEY`): a duplicate insert of the same key is the "already billed" answer.
+//! Only the unkeyed-credit fallback mints a fresh (uuid-string) key.
+//!
 //! The writes and the SUM/balance reads live in [`crate::db::meal_ledger`];
 //! the charge/reversal and credit workflows in
 //! [`crate::service::meal_ledger`].
 
-use std::sync::LazyLock;
+use serde::{Deserialize, Serialize};
+use sqlx::Type;
 
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-use ulid::Generator;
-
-use crate::constant::{
-    MAX_LEDGER_AMOUNT_MINOR, MAX_LEDGER_METHOD_LEN, MAX_LEDGER_NOTE_LEN, MEAL_LEDGER_TABLE,
-};
+use crate::constant::{MAX_LEDGER_AMOUNT_MINOR, MAX_LEDGER_METHOD_LEN, MAX_LEDGER_NOTE_LEN};
 // The client-chosen idempotence key both ledgers take — one grammar, one
 // validator, one type, rather than a second newtype that could drift from it.
+use crate::domain::monotonic_id::next_uuid;
 use crate::domain::payment_ledger::PaymentRequestKey;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 use crate::error::ValidationError;
 use crate::validate::validate_optional;
 
-/// Mints ledger ids in write order — `Ulid::new()`'s random low bits sort
-/// arbitrarily within one millisecond, which would scramble the `id` tie-break
-/// of the newest-first statement below.
-static IDS: LazyLock<std::sync::Mutex<Generator>> =
-    LazyLock::new(|| std::sync::Mutex::new(Generator::new()));
-
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct MealLedgerId(RecordId);
+/// The ledger line's id — a derived TEXT key (`id TEXT PRIMARY KEY`):
+/// `{booking-key}_c{attempt}` / `{booking-key}_r{attempt}` for the booking
+/// lines, `{student-key}_k_{request_key}` for a keyed credit, or a fresh
+/// uuid-string key for an unkeyed one.
+#[derive(Debug, Clone, PartialEq, Eq, Type)]
+#[sqlx(transparent)]
+pub struct MealLedgerId(String);
 
 impl MealLedgerId {
+    /// A fresh key in write order — the process-wide uuid v7 generator's
+    /// string form, so the `id` tie-break of the newest-first statement below
+    /// still sorts in mint order.
     pub fn generate() -> Self {
-        let mut ids = IDS.lock().expect("meal ledger id generator poisoned");
-        // The only error is exhausting the random bits within one millisecond
-        // (2^80 ids deep); it clears itself as the clock ticks, so retry.
-        let ulid = loop {
-            if let Ok(ulid) = ids.generate() {
-                break ulid;
-            }
-        };
-        Self(RecordId::new(MEAL_LEDGER_TABLE, ulid.to_string()))
+        Self(next_uuid().to_string())
     }
 
     /// The one line a booking attempt may ever write of this `kind` — a
-    /// deterministic id, exactly like [`MealBookingId::composite`](crate::domain::meal_booking::MealBookingId::composite).
-    /// Two racing
-    /// `POST`s of one seat derive the *same* id and so cannot become two
+    /// deterministic key, exactly like the booking pair itself. Two racing
+    /// `POST`s of one seat derive the *same* key and so cannot become two
     /// charges: idempotence rests on identity, never on a scan that a
     /// concurrent writer can slip past. The `attempt` counter is what keeps a
     /// re-book after a cancel a genuinely fresh charge. Booking keys are
-    /// `<ulid>_<ulid>`, so the `c`/`r` marker keeps the two kinds apart.
+    /// `<menu>_<student>`, so the `c`/`r` marker keeps the two kinds apart.
     pub fn for_attempt(
         booking: &crate::domain::meal_booking::MealBookingId,
         attempt: i64,
@@ -111,53 +106,34 @@ impl MealLedgerId {
             // A credit is money arriving out of the blue, tied to no booking.
             MealLedgerKind::Credit => 'k',
         };
-        Self(RecordId::new(
-            MEAL_LEDGER_TABLE,
-            format!("{}_{marker}{attempt}", booking.key()),
-        ))
+        Self(format!("{}_{}{attempt}", booking.key(), marker))
     }
 
-    /// The one credit a `(student, request_key)` pair may ever have. Same trick
-    /// as [`PaymentLedgerId::for_request`](crate::domain::payment_ledger::PaymentLedgerId::for_request),
+    /// The one credit a `(student, request_key)` pair may ever have. Same
+    /// identity trick as
+    /// [`PaymentLedgerId::for_request`](crate::domain::payment_ledger::PaymentLedgerId::for_request),
     /// scoped by the student because a credit points at no line of its own: one
     /// office's "receipt-114" cannot land on another student's account, and a
     /// key replayed for the wrong student cannot resolve to this line at all.
     ///
-    /// The grammar parses uniquely because `_` joins the parts. A booking line
-    /// is `<date>_<slot>_<student>_c<n>`, whose first part carries the `-` of a
-    /// `YYYY-MM-DD` day, and an unkeyed line is a bare ULID; a credit's first
-    /// part is a student ULID (`[0-9A-Z]`) and a `request_key` is
-    /// [`crate::validate::validate_request_key`]'s `[A-Za-z0-9-]`, which cannot
-    /// spell a separator plus a marker. No key can therefore derive an id some
-    /// other line owns — a collision would hand money to the wrong row.
+    /// The grammar parses uniquely because `_` joins the parts: a student key
+    /// is a UUID (hex and `-` only) and a `request_key` is
+    /// [`crate::validate::validate_request_key`]'s `[A-Za-z0-9-]` — neither can
+    /// spell the `_k_` separator. No key can therefore derive an id some other
+    /// line owns — a collision would hand money to the wrong row.
     pub fn for_request(student: &UserId, key: &PaymentRequestKey) -> Self {
-        Self(RecordId::new(
-            MEAL_LEDGER_TABLE,
-            format!("{}_k_{}", student.key(), key.as_str()),
-        ))
-    }
-
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
+        Self(format!("{}_k_{}", student.key(), key.as_str()))
     }
 
     pub fn key(&self) -> &str {
-        key_of(&self.0)
+        &self.0
     }
 }
 
-/// The bare key of a record id — how every id leaves this API.
-fn key_of(record: &RecordId) -> &str {
-    match &record.key {
-        RecordIdKey::String(key) => key,
-        _ => "",
-    }
-}
-
-/// What a line means. `untagged` + `rename_all` store it as the bare lowercase
-/// string the `kind` column types as, in lockstep with `MEAL_LEDGER_KINDS`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, SurrealValue)]
-#[surreal(untagged, rename_all = "lowercase")]
+/// What a line means. Stored as the bare lowercase TEXT value the `kind`
+/// column carries, in lockstep with `MEAL_LEDGER_KINDS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Type)]
+#[sqlx(type_name = "TEXT", rename_all = "lowercase")]
 pub enum MealLedgerKind {
     Charge,
     Credit,
@@ -186,7 +162,11 @@ impl MealLedgerKind {
 
 /// One line's amount, always positive — the sign is the [`MealLedgerKind`]'s
 /// business. Capped so a slipped keystroke cannot book a fortune.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, SurrealValue)]
+///
+/// `Serialize`/`Deserialize` ride along because the fee plan's installments
+/// (a `Json<Vec<Installment>>` column) embed this same money type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[sqlx(transparent)]
 pub struct LedgerAmount(i64);
 
 impl LedgerAmount {
@@ -207,7 +187,8 @@ impl LedgerAmount {
 
 /// How the money arrived ("cash", "havale", …). Free text: the backend never
 /// speaks to a payment gateway and stores no card data, ever.
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, Type)]
+#[sqlx(transparent)]
 pub struct LedgerMethod(String);
 
 impl LedgerMethod {
@@ -224,7 +205,8 @@ impl LedgerMethod {
 
 /// The bookkeeper's own words about a line — a receipt number, whose envelope
 /// it came in.
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, Type)]
+#[sqlx(transparent)]
 pub struct LedgerNote(String);
 
 impl LedgerNote {
@@ -239,15 +221,16 @@ impl LedgerNote {
     }
 }
 
-#[derive(Debug, Clone, SurrealValue)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct MealLedger {
     pub(crate) id: MealLedgerId,
     pub(crate) student: UserId,
     pub(crate) kind: MealLedgerKind,
     pub(crate) amount_minor: LedgerAmount,
-    /// What caused the line: a charge points at its `meal_booking`, a reversal
-    /// at the `meal_ledger` charge it undoes. Untyped, hence a bare `RecordId`.
-    pub(crate) source: Option<RecordId>,
+    /// What caused the line: a charge points at its `meal_booking` row's
+    /// `{menu}_{student}` key, a reversal at the `meal_ledger` charge it
+    /// undoes. Polymorphic by kind, hence a bare TEXT key — no foreign key.
+    pub(crate) source: Option<String>,
     pub(crate) method: Option<LedgerMethod>,
     pub(crate) note: Option<LedgerNote>,
     pub(crate) recorded_by: UserId,
@@ -273,7 +256,7 @@ impl MealLedger {
 
     /// The cause's bare key; which table it lives in follows from the kind.
     pub fn get_source_key(&self) -> Option<&str> {
-        self.source.as_ref().map(key_of)
+        self.source.as_deref()
     }
 
     pub fn get_method(&self) -> Option<&LedgerMethod> {
@@ -307,14 +290,14 @@ impl MealLedger {
         let amount = booking.get_price_minor()?;
         Some(MealLedger {
             id: MealLedgerId::for_attempt(
-                booking.get_id(),
+                &booking.id(),
                 booking.get_attempt(),
                 MealLedgerKind::Charge,
             ),
             student: booking.get_student().clone(),
             kind: MealLedgerKind::Charge,
             amount_minor: amount,
-            source: Some(booking.get_id().record()),
+            source: Some(booking.id().key()),
             method: None,
             note: None,
             recorded_by: recorded_by.clone(),
@@ -323,34 +306,34 @@ impl MealLedger {
     }
 
     /// The refund `booking`'s current attempt owes, as `(the charge it undoes,
-    /// the reversal line)` — the two ids
+    /// the reversal line)` — the two keys
     /// [`release_seat`](crate::db::meal_booking::release_seat) needs to
     /// append the money back inside the transaction that frees the seat.
     /// `None` when the seat was never billed (a free menu), which owes no line.
     ///
-    /// Only the ids and the row are built here: whether the charge exists is a
-    /// read, and the caller that writes in one transaction has to make it there
-    /// rather than a round trip earlier.
+    /// Only the keys and the row are built here: whether the charge exists is
+    /// a read, and the caller that writes in one transaction has to make it
+    /// there rather than a round trip earlier.
     pub(crate) fn reversal_for(
         booking: &crate::domain::meal_booking::MealBooking,
         recorded_by: &UserId,
     ) -> Option<(MealLedgerId, MealLedger)> {
         let amount = booking.get_price_minor()?;
         let charge = MealLedgerId::for_attempt(
-            booking.get_id(),
+            &booking.id(),
             booking.get_attempt(),
             MealLedgerKind::Charge,
         );
         let line = MealLedger {
             id: MealLedgerId::for_attempt(
-                booking.get_id(),
+                &booking.id(),
                 booking.get_attempt(),
                 MealLedgerKind::Reversal,
             ),
             student: booking.get_student().clone(),
             kind: MealLedgerKind::Reversal,
             amount_minor: amount,
-            source: Some(charge.record()),
+            source: Some(charge.key().to_string()),
             method: None,
             note: None,
             recorded_by: recorded_by.clone(),
@@ -362,23 +345,23 @@ impl MealLedger {
 
 #[cfg(test)]
 mod tests {
-    use surrealdb::types::Value;
-
     use super::*;
 
-    /// The `kind` column is `TYPE string`: an object-wrapped enum would be
-    /// rejected on write, and the `kind = 'charge'` lookup would silently
-    /// match nothing — which would double-charge every re-booking.
+    /// The `kind` column is `TEXT` with a CHECK on these exact words; the
+    /// sqlx encoding must never drift from `as_str`, or the `kind = 'charge'`
+    /// lookup would silently match nothing — which would double-charge every
+    /// re-booking.
     #[test]
-    fn kind_stores_as_a_bare_string() {
+    fn sqlx_encodes_the_storage_form() {
+        let mut buf = sqlx::postgres::PgArgumentBuffer::default();
         for kind in [
             MealLedgerKind::Charge,
             MealLedgerKind::Credit,
             MealLedgerKind::Reversal,
         ] {
-            let value = kind.into_value();
-            assert_eq!(value, Value::String(kind.as_str().to_string()));
-            assert_eq!(MealLedgerKind::from_value(value).unwrap(), kind);
+            buf.clear();
+            sqlx::Encode::<sqlx::Postgres>::encode_by_ref(&kind, &mut buf);
+            assert_eq!(std::str::from_utf8(&buf).unwrap(), kind.as_str());
         }
     }
 
@@ -407,5 +390,19 @@ mod tests {
         assert!(LedgerAmount::try_new(-1).is_err());
         assert!(LedgerAmount::try_new(MAX_LEDGER_AMOUNT_MINOR + 1).is_err());
         assert_eq!(LedgerAmount::try_new(1).unwrap().as_minor(), 1);
+    }
+
+    /// A keyed credit's id is scoped by the student and stable across retries;
+    /// an unkeyed line mints a fresh uuid-string key.
+    #[test]
+    fn credit_keys_derive_deterministically() {
+        let student = UserId::from_key("018f1a00-0000-7000-8000-000000000001");
+        let key = PaymentRequestKey::try_new("receipt-114").unwrap();
+        let first = MealLedgerId::for_request(&student, &key);
+        assert_eq!(MealLedgerId::for_request(&student, &key), first);
+        assert_eq!(first.key(), format!("{}_k_receipt-114", student.key()));
+        // A key replayed for another student cannot resolve to the same line.
+        let other = UserId::from_key("018f1a00-0000-7000-8000-000000000002");
+        assert_ne!(MealLedgerId::for_request(&other, &key), first);
     }
 }

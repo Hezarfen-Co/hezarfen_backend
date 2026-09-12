@@ -1,6 +1,6 @@
 //! User workflows: the boot-time admin seed, and the role change — the
-//! admin floor ([`ADMIN_FLOOR_LOCK`]) held across the count that checks it
-//! and the transaction that commits it, sweeps included. Reads, listings,
+//! admin floor carried by the role write's own guard, and every sweep the
+//! change owes committed in the same transaction. Reads, listings,
 //! the row mint, and the field-scoped writers live in [`crate::db::user`].
 
 use crate::database::Database;
@@ -12,29 +12,6 @@ use crate::domain::profile::{Bio, BirthDate, DisplayName, Email, PersonName, Pho
 use crate::domain::role::Role;
 use crate::domain::user::{Password, PasswordHash, User, UserId, Username};
 use crate::error::AppError;
-
-/// One role demotion at a time, school-wide.
-///
-/// The invariant it protects is "the school always keeps an admin", and that
-/// guard is a count-then-write: read whether another admin exists, then lower
-/// this row. SurrealDB conflict-checks neither side of that pair — a
-/// `BEGIN…COMMIT` does not serialize a cross-record count against a concurrent
-/// update (write-skew, see [`crate::db::cap`]) and a statement that only
-/// *reads* the rival's row never collides with it. So two admins demoting each
-/// other both counted the other and both committed, leaving **zero** admins and
-/// a school nobody can administer: `ensure_admin` refuses to promote an
-/// existing non-admin row on every later boot, so the only way back was hand-run
-/// SurrealQL against the volume.
-///
-/// Serializing the pair is what closes it, the same argument
-/// [`crate::service::settings::SETTINGS_LOCK`] makes one level up: the deployment
-/// runs one process by contract (stop-the-world upgrades), so process-wide is
-/// deployment-wide. A per-row counter (the [`crate::db::cap`] shape) does
-/// not fit — the count being capped is over *every* user row, with no parent
-/// record to hold it and no place to seed one without a backfill.
-///
-/// **Lock order:** taken alone. Nothing is locked while it is held.
-static ADMIN_FLOOR_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Idempotent startup seed: guarantee an admin account with this username.
 /// Missing → created directly with [`Role::Admin`]. Already an admin →
@@ -52,7 +29,7 @@ pub async fn ensure_admin(
         Some(_) => {
             tracing::warn!(
                 "ADMIN_USERNAME names an existing non-admin account; refusing to promote it. \
-                 Grant the role through an existing admin or the manual SurrealQL path."
+                 Grant the role through an existing admin or a hand-run SQL session."
             );
             Ok(())
         }
@@ -77,9 +54,17 @@ pub async fn ensure_admin(
 /// hold, in one transaction. The caller is responsible for authorizing it.
 ///
 /// Refuses (`Conflict`) to lower the school's last admin, however the
-/// request is spelled and however many demotions are in flight at once —
-/// see [`ADMIN_FLOOR_LOCK`] for why that guard cannot live in the
-/// transaction below.
+/// request is spelled and however many demotions are in flight at once.
+/// The floor is not a lock here — it is a predicate on the role write
+/// itself ([`user::set_role_cascade`]): the `UPDATE` that lowers the row
+/// carries `AND NOT (demoting the admin whom no other admin remains)`, so
+/// the count it reads and the write it guards are one statement, contended
+/// on row locks like any other write. Two admins demoting each other both
+/// used to count the other and both commit — the old store could not
+/// serialize a cross-record count against a concurrent update, which is
+/// what the process-wide lock used to stand in for. The database does that
+/// serialization now; zero rows out of the guarded write is the same 409
+/// the lock's check used to answer.
 ///
 /// The sweep itself — what each role change owes, arm by arm, and why the
 /// conditions differ — is [`user::set_role_cascade`]'s statement list,
@@ -89,24 +74,10 @@ pub async fn set_role(
     target: &UserId,
     role: Role,
 ) -> Result<(User, Vec<Board>), AppError> {
-    // A missing account is a 404, answered before the floor is asked.
+    // A missing account is a 404, answered before the cascade opens a
+    // transaction. (No route deletes a user row, so the row cannot vanish
+    // between this read and the write.)
     user::read(db, target).await?.ok_or(AppError::NotFound)?;
-    // The admin floor, held from the count to the commit ([`ADMIN_FLOOR_LOCK`]
-    // for why a transaction cannot do this). Asked on the *live* rows rather
-    // than a caller's snapshot, so a snapshot that predates a promotion cannot
-    // skip the check, and cheap enough to ask on every demotion: one round
-    // trip on an admin-only route.
-    let _floor = if role == Role::Admin {
-        None
-    } else {
-        let guard = ADMIN_FLOOR_LOCK.lock().await;
-        if user::would_orphan_admins(db, target).await? {
-            return Err(AppError::Conflict(
-                "the school must keep at least one admin — promote another account first",
-            ));
-        }
-        Some(guard)
-    };
     user::set_role_cascade(db, target, role).await
 }
 
@@ -239,7 +210,7 @@ pub async fn set_preferences(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::{Database, init_mem};
+    use crate::database::{Database, init_test_db};
     use crate::domain::user::Password;
 
     async fn a_user(username: &str, db: &Database) -> User {
@@ -265,7 +236,7 @@ mod tests {
     async fn the_cascade_returns_the_boards_it_stripped() {
         use crate::domain::board::BoardTitle;
 
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let creator = a_user("ogretmen", &db).await;
         let guest = a_user("ogrenci", &db).await;
         let board = crate::db::board::create(
@@ -305,7 +276,7 @@ mod tests {
         use crate::domain::board::BoardTitle;
         use crate::domain::board_stroke::BOARD_CLOSED;
 
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let creator = a_user("ogretmen", &db).await;
         let guest = a_user("ogrenci", &db).await;
         let board = crate::db::board::create(
@@ -381,7 +352,7 @@ mod tests {
         use crate::domain::timestamp::Timestamp;
         use crate::service::appointment;
 
-        let db = init_mem().await.unwrap();
+        let (db, _leases) = init_test_db().await;
         let staff = |name: &'static str, db: Database| async move {
             let teacher = a_user(name, &db).await;
             set_role(&db, teacher.get_id(), Role::Teacher)
@@ -460,21 +431,17 @@ mod tests {
         }
         // The seat each held died with its slot row, so nothing is pinned: no
         // live booking is left pointing at a slot that no longer exists.
-        let mut result = db
-            .query(
-                "SELECT VALUE id FROM appointment \
-                 WHERE status IN ['pending', 'approved'] AND slot.starts_at = NONE",
-            )
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
-        assert!(
-            result
-                .take::<Vec<surrealdb::types::RecordId>>(0)
-                .unwrap()
-                .is_empty()
-        );
+        // The slot is a foreign key now, so this reads as a structural fact:
+        // no live booking may point at a slot row that is gone.
+        let orphans: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM appointment a \
+             WHERE a.status IN ('pending', 'approved') \
+               AND NOT EXISTS (SELECT 1 FROM appointment_slot s WHERE s.id = a.slot)",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(orphans, 0);
 
         // Another teacher's calendar is nobody else's business.
         assert_eq!(

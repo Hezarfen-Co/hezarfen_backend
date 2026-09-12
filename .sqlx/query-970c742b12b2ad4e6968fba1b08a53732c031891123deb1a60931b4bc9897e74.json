@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE bank_question SET source_exam = NULL WHERE source_exam = ANY($1)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "970c742b12b2ad4e6968fba1b08a53732c031891123deb1a60931b4bc9897e74"
+}

@@ -1,32 +1,46 @@
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-
-use crate::constant::PARENT_LINK_TABLE;
 use crate::domain::user::UserId;
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct ParentLinkId(RecordId);
+/// The (parent, student) pair — the table's natural composite primary key.
+/// The same pair always maps to the same row, so linking is a single atomic
+/// upsert with no find-then-insert race and one-row-per-pair by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParentLinkId {
+    parent: UserId,
+    student: UserId,
+}
 
 impl ParentLinkId {
-    /// A deterministic id for the (parent, student) pair — same trick as
-    /// `EnrollmentId`: the same pair always maps to the same record id, so
-    /// linking is a single atomic UPSERT with no find-then-insert race and
-    /// one-row-per-pair by construction.
     pub fn composite(parent: &UserId, student: &UserId) -> Self {
-        Self(RecordId::new(
-            PARENT_LINK_TABLE,
-            format!("{}_{}", parent.key(), student.key()),
-        ))
-    }
-
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
+        Self {
+            parent: *parent,
+            student: *student,
         }
+    }
+
+    /// Parse the `{parent}_{student}` wire form. A key that parses as no pair
+    /// reads as the nil pair, which matches no row — exactly the 404 a
+    /// dangling composite key produced under the old store, without turning a
+    /// typo into a panic. UUID strings carry only `-`, so `_` is an
+    /// unambiguous joiner.
+    pub fn from_key(key: &str) -> Self {
+        let (parent, student) = key.rsplit_once('_').unwrap_or(("", ""));
+        Self {
+            parent: UserId::from_key(parent),
+            student: UserId::from_key(student),
+        }
+    }
+
+    /// The `{parent}_{student}` wire form.
+    pub fn key(&self) -> String {
+        format!("{}_{}", self.parent.key(), self.student.key())
+    }
+
+    pub fn parent(&self) -> UserId {
+        self.parent
+    }
+
+    pub fn student(&self) -> UserId {
+        self.student
     }
 }
 
@@ -35,19 +49,14 @@ impl ParentLinkId {
 /// attendance, pomodoro). The single write it authorizes is the food program —
 /// a parent books and cancels a linked child's meals, since paying for lunch
 /// is a parent's job and a small child cannot do it themselves.
-#[derive(Debug, Clone, SurrealValue)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ParentLink {
-    pub(crate) id: ParentLinkId,
     pub(crate) parent: UserId,
     pub(crate) student: UserId,
     pub(crate) linked_by: UserId,
 }
 
 impl ParentLink {
-    pub fn get_id(&self) -> &ParentLinkId {
-        &self.id
-    }
-
     pub fn get_parent(&self) -> &UserId {
         &self.parent
     }

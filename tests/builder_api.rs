@@ -805,16 +805,15 @@ async fn probe_drop_is_scoped_and_recreation_is_empty() {
     assert_eq!(total(&notes.body), 0, "old rows survived the drop");
 }
 
-/// Claim 2, remote mode: `Tenants::create`/`drop` interpolate the slug into
-/// `DEFINE DATABASE` / `REMOVE DATABASE`. Not injectable — but the statements
-/// must at least *execute* for every slug `Slug::try_new` accepts. Run the exact
-/// production statements against a live SurrealDB parser.
+/// Claim 2, the school lifecycle: `Tenants::create`/`drop` interpolate the slug
+/// into `CREATE DATABASE` / `DROP DATABASE`. Not injectable — but the statements
+/// must at least *execute* for every slug `Slug::try_new` accepts. Each slug is
+/// driven through the real lifecycle over HTTP, which is exactly those
+/// statements against the live server.
 #[tokio::test]
 async fn probe_remote_mode_database_statements_execute_for_every_accepted_slug() {
-    let Some(deployment) = common::remote_deployment(&[]).await else {
-        return;
-    };
-    let control = deployment.tenants.control();
+    let (app, _db, _tenants) = deployment().await;
+    let builder = builder_login(&app).await;
     let mut broken: Vec<String> = Vec::new();
 
     for raw in [
@@ -827,32 +826,38 @@ async fn probe_remote_mode_database_statements_execute_for_every_accepted_slug()
         "12345",
         "a1",
     ] {
-        let Ok(slug) = Slug::try_new(raw) else {
+        // The demo school this deployment already carries is the one slug the
+        // create would refuse as taken; the rest are free.
+        if Slug::try_new(raw).is_err() || raw == DEMO_SLUG {
             continue;
-        };
-        // The exact statements `Tenants::create` / `drop` send, via the same
-        // identifier quoting they use.
-        let ident = hezarfen_backend::tenant::quoted_ident(&slug);
-        let define = control
-            .query(format!("DEFINE DATABASE IF NOT EXISTS {ident}"))
-            .await
-            .map_err(|e| e.to_string())
-            .and_then(|r| r.check().map(|_| ()).map_err(|e| e.to_string()));
-        let remove = control
-            .query(format!("REMOVE DATABASE IF EXISTS {ident}"))
-            .await
-            .map_err(|e| e.to_string())
-            .and_then(|r| r.check().map(|_| ()).map_err(|e| e.to_string()));
-        if let Err(err) = define {
-            broken.push(format!("DEFINE DATABASE {raw} -> {err}"));
         }
-        if let Err(err) = remove {
-            broken.push(format!("REMOVE DATABASE {raw} -> {err}"));
+        // The exact statements `Tenants::create` / `drop` send, through the
+        // routes that send them.
+        let made = create_school(&app, &builder, raw, "secret1").await;
+        if made.status != StatusCode::CREATED {
+            broken.push(format!(
+                "CREATE DATABASE {raw} -> {} {:?}",
+                made.status, made.body
+            ));
+        }
+        let dropped = send(
+            &app,
+            "DELETE",
+            &format!("/schools/{raw}"),
+            Some(&builder),
+            None,
+        )
+        .await;
+        if dropped.status != StatusCode::NO_CONTENT {
+            broken.push(format!(
+                "DROP DATABASE {raw} -> {} {:?}",
+                dropped.status, dropped.body
+            ));
         }
     }
     assert!(
         broken.is_empty(),
-        "slugs accepted by Slug::try_new whose remote-mode statements do not execute:\n{}",
+        "slugs accepted by Slug::try_new whose school statements do not execute:\n{}",
         broken.join("\n")
     );
 }
@@ -1220,14 +1225,12 @@ async fn probe_concurrent_creates_of_one_slug_leave_one_school() {
     assert_eq!(opens, 1, "{opens} of the two admin passwords open p6race");
 }
 
-/// Claim 1/2 driven against a **real remote deployment** — the mode every test
-/// above skips, and the only one where `DEFINE DATABASE` / `REMOVE DATABASE`
-/// actually run. `ata-koleji` is the slug the OpenAPI schema advertises.
+/// Claim 1/2 driven against a full deployment of its own, where the school
+/// lifecycle's `CREATE DATABASE` / `DROP DATABASE` actually run.
+/// `ata-koleji` is the slug the OpenAPI schema advertises.
 #[tokio::test]
 async fn probe_remote_deployment_creates_and_deletes_a_hyphenated_school() {
-    let Some(deployment) = common::remote_deployment(&[]).await else {
-        return;
-    };
+    let deployment = common::deployment_with(&[]).await;
     let app = deployment.app;
     builder::ensure(
         deployment.tenants.control(),
@@ -2005,18 +2008,11 @@ async fn probe_a_refused_batch_leaves_the_row_byte_identical() {
     let builder = builder_login(&app).await;
 
     async fn raw_row(tenants: &Tenants) -> Vec<String> {
-        tenants
-            .control()
-            .query(format!(
-                "SELECT VALUE modules FROM type::record('school', '{DEMO_SLUG}')"
-            ))
+        sqlx::query_scalar("SELECT modules FROM school WHERE slug = $1")
+            .bind(DEMO_SLUG)
+            .fetch_one(tenants.control())
             .await
             .expect("raw read")
-            .check()
-            .expect("raw check")
-            .take::<Vec<Vec<String>>>(0)
-            .expect("modules column")
-            .remove(0)
     }
 
     let before = raw_row(&tenants).await;
@@ -2048,13 +2044,11 @@ async fn probe_a_refused_batch_leaves_the_row_byte_identical() {
 /// a thread-local subscriber cannot measure this reliably: `tracing` caches a
 /// callsite's interest process-wide the first time any thread reaches it, and
 /// with tests running in parallel that thread is usually a sibling with no
-/// subscriber — the SurrealDB callsites are then disabled for the whole
-/// process before this test ever asks, and the count is 0 (measured: 0 in 7 of
-/// 8 runs against noisy siblings; a global subscriber counted on 6 of 6).
-/// Global is safe here because this subscriber only counts: it stores nothing,
-/// prints nothing, and its `enabled` refuses every callsite that is not a
-/// SurrealDB one on *this* test's thread, so a sibling test neither pays for it
-/// nor lands in the figure.
+/// subscriber — the sqlx callsites are then disabled for the whole process
+/// before this test ever asks, and the count is 0. Global is safe here because
+/// this subscriber only counts: it stores nothing, prints nothing, and its
+/// `enabled` refuses every callsite that is not a sqlx one on *this* test's
+/// thread, so a sibling test neither pays for it nor lands in the figure.
 #[tokio::test]
 async fn probe_registry_reads_per_request() {
     use std::sync::Arc;
@@ -2072,7 +2066,7 @@ async fn probe_registry_reads_per_request() {
             tracing::subscriber::Interest::sometimes()
         }
         fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
-            meta.target().starts_with("surrealdb") && std::thread::current().id() == self.thread
+            meta.target().starts_with("sqlx") && std::thread::current().id() == self.thread
         }
         fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
             self.count.fetch_add(1, Ordering::Relaxed);
@@ -2100,10 +2094,10 @@ async fn probe_registry_reads_per_request() {
     let res = send(&app, "GET", "/notes", Some(&cookie), None).await;
     assert_eq!(res.status, StatusCode::OK, "{:?}", res.body);
     let seen = count.load(Ordering::Relaxed);
-    println!("PROBE surrealdb spans/events for GET /notes = {seen}");
+    println!("PROBE sqlx spans/events for GET /notes = {seen}");
     assert!(
         seen > 0,
-        "UNMEASURED: the surrealdb SDK emitted no tracing spans, so per-request \
+        "UNMEASURED: sqlx emitted no tracing spans, so per-request \
          registry reads cannot be counted this way"
     );
 }

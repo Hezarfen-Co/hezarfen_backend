@@ -4,15 +4,12 @@
 //! itself lives in [`crate::db::class_pump`]; the table reads in
 //! [`crate::db::class_member`].
 
-use surrealdb::types::SurrealValue;
-
 use crate::constant::{MAX_CLASS_COURSES, MAX_CLASS_MEMBERS};
 use crate::database::Database;
 use crate::db::class_member;
 use crate::db::class_pump::{self, Axis};
 use crate::domain::class_group::ClassGroupId;
-use crate::domain::class_member::{ClassMember, ClassMemberId};
-use crate::domain::timestamp::Timestamp;
+use crate::domain::class_member::ClassMember;
 use crate::domain::user::UserId;
 use crate::error::{AppError, ValidationError};
 
@@ -29,26 +26,10 @@ pub async fn add(
     user: &UserId,
     added_by: &UserId,
 ) -> Result<ClassMember, AppError> {
-    let member = ClassMember {
-        id: ClassMemberId::composite(class, user),
-        class: class.clone(),
-        user: user.clone(),
-        added_by: added_by.clone(),
-        added_at: Some(Timestamp::now()),
-    };
-    let landed = class_pump::attach(
-        db,
-        class,
-        Axis::Member,
-        (&member.id.record(), &member),
-        user.record(),
-        added_by.record(),
-        None,
-    )
-    .await?;
     // Read off the refusal, never respelled here: this route and a
     // blueprint pump answer one vocabulary. `Made` is the only `None`, and
     // it takes the `Ok` arm below.
+    let landed = class_pump::add_member(db, class, user, added_by).await?;
     let code = landed.refusal_code(&Axis::Member).unwrap_or_default();
     match landed {
         class_pump::Attached::Made(saved) => Ok(saved),
@@ -103,18 +84,9 @@ pub async fn add(
 /// re-derive from a boolean.
 ///
 /// An enrollment another attached class still claims is re-tagged to that
-/// class instead of deleted (see [`crate::db::class_pump::detach`]).
+/// class instead of deleted (see [`class_pump::remove_member`]).
 pub async fn remove(db: &Database, class: &ClassGroupId, user: &UserId) -> Result<(), AppError> {
-    let gone = class_pump::detach(
-        db,
-        "$link",
-        Axis::Member,
-        &[(
-            "link".into(),
-            ClassMemberId::composite(class, user).record().into_value(),
-        )],
-    )
-    .await?;
+    let gone = class_pump::remove_member(db, class, user).await?;
     (gone > 0).then_some(()).ok_or(AppError::NotFound)
 }
 
@@ -143,8 +115,9 @@ pub async fn list_for_user(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::class_member::tests::{a_class, a_course, counter, exists, rows, source_of};
-    use crate::domain::enrollment::EnrollmentId;
+    use crate::db::class_member::tests::{
+        a_class, a_course, counter, enrollment_exists, rows, source_of,
+    };
     use crate::service::class_course;
 
     /// Adding a member enrolls them into every course the class already
@@ -152,9 +125,9 @@ mod tests {
     /// counter ticks once.
     #[tokio::test]
     async fn a_member_is_enrolled_into_every_attached_course() {
-        let db = crate::database::init_mem().await.unwrap();
-        let manager = UserId::from_key("manager");
-        let student = UserId::from_key("student");
+        let (db, _leases) = crate::database::init_test_db().await;
+        let manager = crate::db::class_member::tests::fixture_user(&db, "manager").await;
+        let student = crate::db::class_member::tests::fixture_user(&db, "student").await;
         let class = a_class("9-A", &db).await;
         let algebra = a_course("algebra", None, &db).await;
         let physics = a_course("physics", None, &db).await;
@@ -173,9 +146,9 @@ mod tests {
                 Some(Some(class.clone())),
                 "every attached course must hold a row tagged with the class"
             );
-            assert_eq!(counter("enrollment_count", course.record(), &db).await, 1);
+            assert_eq!(counter("enrollment_count", course.uuid(), &db).await, 1);
         }
-        assert_eq!(counter("class_member_count", class.record(), &db).await, 1);
+        assert_eq!(counter("class_member_count", class.uuid(), &db).await, 1);
     }
 
     /// The pumped row must carry the *same* composite id a hand enroll would
@@ -183,9 +156,9 @@ mod tests {
     /// index (a 500) would notice.
     #[tokio::test]
     async fn a_pumped_row_uses_the_hand_enrolls_composite_id() {
-        let db = crate::database::init_mem().await.unwrap();
-        let manager = UserId::from_key("manager");
-        let student = UserId::from_key("student");
+        let (db, _leases) = crate::database::init_test_db().await;
+        let manager = crate::db::class_member::tests::fixture_user(&db, "manager").await;
+        let student = crate::db::class_member::tests::fixture_user(&db, "student").await;
         let class = a_class("9-A", &db).await;
         let algebra = a_course("algebra", None, &db).await;
         class_course::attach(&db, &class, &algebra, &manager)
@@ -194,7 +167,7 @@ mod tests {
         add(&db, &class, &student, &manager).await.unwrap();
 
         assert!(
-            exists(EnrollmentId::composite(&algebra, &student).record(), &db).await,
+            enrollment_exists(&algebra, &student, &db).await,
             "the pump must key the pair the way Enrollment::composite does"
         );
     }
@@ -203,9 +176,9 @@ mod tests {
     /// no second sweep of anybody's enrollment.
     #[tokio::test]
     async fn a_second_add_is_refused_and_writes_nothing() {
-        let db = crate::database::init_mem().await.unwrap();
-        let manager = UserId::from_key("manager");
-        let student = UserId::from_key("student");
+        let (db, _leases) = crate::database::init_test_db().await;
+        let manager = crate::db::class_member::tests::fixture_user(&db, "manager").await;
+        let student = crate::db::class_member::tests::fixture_user(&db, "student").await;
         let class = a_class("9-A", &db).await;
         let algebra = a_course("algebra", None, &db).await;
         class_course::attach(&db, &class, &algebra, &manager)
@@ -219,20 +192,20 @@ mod tests {
             "a second add is a 409 coded `duplicate`: {again:?}"
         );
         assert_eq!(
-            counter("class_member_count", class.record(), &db).await,
+            counter("class_member_count", class.uuid(), &db).await,
             1,
             "a refused add may not tick the counter"
         );
-        assert_eq!(counter("enrollment_count", algebra.record(), &db).await, 1);
+        assert_eq!(counter("enrollment_count", algebra.uuid(), &db).await, 1);
     }
 
     /// Adding into a class whose courses have no room refuses the *whole* join:
     /// the roomy course must not keep a seat the full one denied.
     #[tokio::test]
     async fn a_full_course_refuses_the_whole_join() {
-        let db = crate::database::init_mem().await.unwrap();
-        let manager = UserId::from_key("manager");
-        let student = UserId::from_key("student");
+        let (db, _leases) = crate::database::init_test_db().await;
+        let manager = crate::db::class_member::tests::fixture_user(&db, "manager").await;
+        let student = crate::db::class_member::tests::fixture_user(&db, "student").await;
         let class = a_class("9-A", &db).await;
         let roomy = a_course("algebra", None, &db).await;
         let full = a_course("physics", Some(0), &db).await;
@@ -243,9 +216,10 @@ mod tests {
             .await
             .unwrap();
 
-        // The whole record id, not just the key: a caller reading the 409 must
-        // not have to guess which table the name came from.
-        let named = format!("{}:{}", crate::constant::COURSE_TABLE, full.key());
+        // The refusal names the course that had no seat. Postgres ids are
+        // bare uuids (no record-id prefix to inherit), so the message is
+        // matched on the course's own key.
+        let named = full.key().to_string();
         let refused = add(&db, &class, &student, &manager).await;
         assert!(
             matches!(refused, Err(AppError::ConflictCoded { code, ref message })
@@ -254,21 +228,21 @@ mod tests {
              as {named}: {refused:?}"
         );
         assert_eq!(
-            rows("SELECT VALUE id FROM enrollment", &db).await,
+            rows("enrollment", &db).await,
             0,
             "not one seat may survive the refusal"
         );
         assert_eq!(
-            rows("SELECT VALUE id FROM class_member", &db).await,
+            rows("class_member", &db).await,
             0,
             "…nor the membership row itself"
         );
         assert_eq!(
-            counter("enrollment_count", roomy.record(), &db).await,
+            counter("enrollment_count", roomy.uuid(), &db).await,
             0,
             "…nor the roomy course's counter"
         );
-        assert_eq!(counter("class_member_count", class.record(), &db).await, 0);
+        assert_eq!(counter("class_member_count", class.uuid(), &db).await, 0);
     }
 
     /// A student already enrolled by hand keeps their own row: no seat is
@@ -276,9 +250,9 @@ mod tests {
     /// the class leaves it standing.
     #[tokio::test]
     async fn a_hand_placed_enrollment_is_skipped_and_survives_removal() {
-        let db = crate::database::init_mem().await.unwrap();
-        let manager = UserId::from_key("manager");
-        let student = UserId::from_key("student");
+        let (db, _leases) = crate::database::init_test_db().await;
+        let manager = crate::db::class_member::tests::fixture_user(&db, "manager").await;
+        let student = crate::db::class_member::tests::fixture_user(&db, "student").await;
         let class = a_class("9-A", &db).await;
         let algebra = a_course("algebra", None, &db).await;
         crate::db::enrollment::enroll(&db, &algebra, &student, &manager)
@@ -295,7 +269,7 @@ mod tests {
             "the class must not adopt a hand-placed row"
         );
         assert_eq!(
-            counter("enrollment_count", algebra.record(), &db).await,
+            counter("enrollment_count", algebra.uuid(), &db).await,
             1,
             "the skipped pair may not be charged a second seat"
         );
@@ -306,16 +280,16 @@ mod tests {
             Some(None),
             "the sweep may only take back the rows the class wrote"
         );
-        assert_eq!(counter("enrollment_count", algebra.record(), &db).await, 1);
+        assert_eq!(counter("enrollment_count", algebra.uuid(), &db).await, 1);
     }
 
     /// Removal with nobody else claiming the row: the enrollment goes and its
     /// seat comes back.
     #[tokio::test]
     async fn removal_deletes_the_rows_the_class_pumped() {
-        let db = crate::database::init_mem().await.unwrap();
-        let manager = UserId::from_key("manager");
-        let student = UserId::from_key("student");
+        let (db, _leases) = crate::database::init_test_db().await;
+        let manager = crate::db::class_member::tests::fixture_user(&db, "manager").await;
+        let student = crate::db::class_member::tests::fixture_user(&db, "student").await;
         let class = a_class("9-A", &db).await;
         let algebra = a_course("algebra", None, &db).await;
         class_course::attach(&db, &class, &algebra, &manager)
@@ -326,11 +300,11 @@ mod tests {
         remove(&db, &class, &student).await.unwrap();
         assert_eq!(source_of(&algebra, &student, &db).await, None);
         assert_eq!(
-            counter("enrollment_count", algebra.record(), &db).await,
+            counter("enrollment_count", algebra.uuid(), &db).await,
             0,
             "the seat must come back with the row that held it"
         );
-        assert_eq!(counter("class_member_count", class.record(), &db).await, 0);
+        assert_eq!(counter("class_member_count", class.uuid(), &db).await, 0);
         let again = remove(&db, &class, &student).await;
         assert!(
             matches!(again, Err(AppError::NotFound)),
@@ -343,9 +317,9 @@ mod tests {
     /// membership row and the pumped enrollment are independent facts.
     #[tokio::test]
     async fn a_sweep_tolerates_rows_a_course_delete_already_took() {
-        let db = crate::database::init_mem().await.unwrap();
-        let manager = UserId::from_key("manager");
-        let student = UserId::from_key("student");
+        let (db, _leases) = crate::database::init_test_db().await;
+        let manager = crate::db::class_member::tests::fixture_user(&db, "manager").await;
+        let student = crate::db::class_member::tests::fixture_user(&db, "student").await;
         let class = a_class("9-A", &db).await;
         let algebra = a_course("algebra", None, &db).await;
         class_course::attach(&db, &class, &algebra, &manager)
@@ -354,18 +328,20 @@ mod tests {
         add(&db, &class, &student, &manager).await.unwrap();
 
         // `Course::delete` refuses while the roster is occupied, so the wipe is
-        // spelled the way the cascade does it, minus the guard.
-        db.query("DELETE enrollment WHERE course = $course; DELETE class_course WHERE course = $course; DELETE $course;")
-            .bind(("course", algebra.record()))
-            .await
-            .unwrap()
-            .check()
-            .unwrap();
+        // spelled the way the cascade does it, minus the guard — children
+        // first, the FK ordering the cascade itself runs.
+        for sql in [
+            "DELETE FROM enrollment WHERE course = $1",
+            "DELETE FROM class_course WHERE course = $1",
+            "DELETE FROM course WHERE id = $1",
+        ] {
+            sqlx::query(sql).bind(algebra.uuid()).execute(&db).await.unwrap();
+        }
 
         remove(&db, &class, &student)
             .await
             .expect("the membership must still be removable with its enrollment gone");
-        assert_eq!(counter("class_member_count", class.record(), &db).await, 0);
+        assert_eq!(counter("class_member_count", class.uuid(), &db).await, 0);
     }
 
     /// The role-change sweep, which is one transaction with the role write
@@ -374,8 +350,8 @@ mod tests {
     /// decrement the old two-call split existed to avoid.
     #[tokio::test]
     async fn the_role_sweep_takes_memberships_and_enrollments_together() {
-        let db = crate::database::init_mem().await.unwrap();
-        let manager = UserId::from_key("manager");
+        let (db, _leases) = crate::database::init_test_db().await;
+        let manager = crate::db::class_member::tests::fixture_user(&db, "manager").await;
         // A real row, because the sweep now rides on the role write.
         let hash = crate::domain::user::Password::try_new("secret1")
             .unwrap()
@@ -402,10 +378,10 @@ mod tests {
         crate::service::user::set_role(&db, account.get_id(), crate::domain::role::Role::Teacher)
             .await
             .unwrap();
-        assert_eq!(rows("SELECT VALUE id FROM class_member", &db).await, 0);
+        assert_eq!(rows("class_member", &db).await, 0);
         for class in [&first, &second] {
             assert_eq!(
-                counter("class_member_count", class.record(), &db).await,
+                counter("class_member_count", class.uuid(), &db).await,
                 0,
                 "every class must get its member count back"
             );
@@ -416,7 +392,7 @@ mod tests {
             "the enrollment goes in the same transaction as the membership"
         );
         assert_eq!(
-            counter("enrollment_count", algebra.record(), &db).await,
+            counter("enrollment_count", algebra.uuid(), &db).await,
             0,
             "…and its seat comes back once, not twice"
         );

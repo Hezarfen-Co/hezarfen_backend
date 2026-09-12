@@ -1,35 +1,49 @@
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-
-use crate::constant::SESSION_ATTENDANCE_TABLE;
 use crate::domain::attendance::AttendanceStatus;
 use crate::domain::course::CourseId;
 use crate::domain::course_session::CourseSessionId;
 use crate::domain::user::UserId;
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct SessionAttendanceId(RecordId);
+/// The (session, user) pair — the table's natural composite primary key.
+/// Because the same pair always maps to the same row, marking is a single
+/// atomic upsert with no find-then-insert race, and one-row-per-pair holds by
+/// construction. UUID strings carry only `-`, so `_` is an unambiguous joiner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionAttendanceId {
+    session: CourseSessionId,
+    user: UserId,
+}
 
 impl SessionAttendanceId {
-    /// A deterministic id for the (session, user) pair. Because the same pair
-    /// always maps to the same record id, marking is a single atomic UPSERT with
-    /// no find-then-insert race, and one-row-per-pair holds by construction.
-    /// ULID keys are alphanumeric, so `_` is an unambiguous joiner.
     pub fn composite(session: &CourseSessionId, user: &UserId) -> Self {
-        Self(RecordId::new(
-            SESSION_ATTENDANCE_TABLE,
-            format!("{}_{}", session.key(), user.key()),
-        ))
-    }
-
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
+        Self {
+            session: session.clone(),
+            user: *user,
         }
+    }
+
+    /// Parse the `{session}_{user}` wire form. A key that parses as no pair
+    /// reads as the nil pair, which matches no row — exactly the 404 a
+    /// dangling composite key produced under the old store, without turning a
+    /// typo into a panic.
+    pub fn from_key(key: &str) -> Self {
+        let (session, user) = key.rsplit_once('_').unwrap_or(("", ""));
+        Self {
+            session: CourseSessionId::from_key(session),
+            user: UserId::from_key(user),
+        }
+    }
+
+    /// The `{session}_{user}` wire form.
+    pub fn key(&self) -> String {
+        format!("{}_{}", self.session.key(), self.user.key())
+    }
+
+    pub fn session(&self) -> CourseSessionId {
+        self.session.clone()
+    }
+
+    pub fn user(&self) -> UserId {
+        self.user
     }
 }
 
@@ -51,22 +65,18 @@ pub(crate) fn counts_as_attended(status: &AttendanceStatus) -> bool {
 
 /// One person's roll-call state for one lesson. `course` is denormalized from
 /// the session so the per-course attendance report is a single indexed query
-/// (`WHERE user = $u`) with no join.
-#[derive(Debug, Clone, SurrealValue)]
+/// (`WHERE app_user = $u`) with no join.
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct SessionAttendance {
-    pub(crate) id: SessionAttendanceId,
     pub(crate) session: CourseSessionId,
     pub(crate) course: CourseId,
+    #[sqlx(rename = "app_user")]
     pub(crate) user: UserId,
     pub(crate) status: AttendanceStatus,
     pub(crate) marked_by: UserId,
 }
 
 impl SessionAttendance {
-    pub fn get_id(&self) -> &SessionAttendanceId {
-        &self.id
-    }
-
     pub fn get_session(&self) -> &CourseSessionId {
         &self.session
     }

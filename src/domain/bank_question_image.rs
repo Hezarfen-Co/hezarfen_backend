@@ -1,58 +1,56 @@
 //! An image pinned to a bank question — the question's own illustration
-//! (`slot = NONE`) or one choice's picture (`slot` = that choice's stable id,
+//! (`slot = NULL`) or one choice's picture (`slot` = that choice's stable id,
 //! choice questions only).
 //! A structural copy of [`crate::domain::question_image`] with the exam FK
 //! dropped: a bank template belongs to no exam, and its owner is reachable
 //! through the `bank_question` row. The row carries metadata; the bytes live
 //! on disk under [`crate::config::Config::files_path`] in a file named by
-//! `file` — a fresh server-generated ULID per upload. The row id is
-//! *deterministic* per (question, slot), so "one image per slot" holds by
-//! construction and a replace is a plain UPSERT. The web layer owns the blob
-//! I/O and its ordering; the queries live in
+//! `file` — a fresh server-generated UUID per upload. The row is keyed by
+//! (question, slot) under a `NULLS NOT DISTINCT` unique constraint, so "one
+//! image per slot" holds by construction and a replace is a plain UPSERT. The
+//! web layer owns the blob I/O and its ordering; the queries live in
 //! [`crate::db::bank_question_image`].
 
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-use ulid::Ulid;
-
-use crate::constant::BANK_QUESTION_IMAGE_TABLE;
 use crate::domain::bank_question::BankQuestionId;
 use crate::domain::exam_question::ChoiceId;
 use crate::domain::key;
 use crate::domain::note_file::FileContentType;
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct BankQuestionImageId(RecordId);
+/// The identity of one (question, slot) pair. Not a row column: the table's
+/// unique constraint *is* the pair, and this struct's job is the
+/// underscore-joined wire form at the HTTP edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BankQuestionImageId {
+    pub(crate) question: BankQuestionId,
+    pub(crate) slot: Option<ChoiceId>,
+}
 
 impl BankQuestionImageId {
-    /// The one id a (question, slot) pair can have — see [`key::slot`] for the
-    /// key shape and why the two forms can never collide.
+    /// The one id a (question, slot) pair can have — see [`key::slot`] for
+    /// the wire shape and why the two forms can never collide.
     pub fn for_slot(question: &BankQuestionId, slot: Option<&ChoiceId>) -> Self {
-        Self(RecordId::new(
-            BANK_QUESTION_IMAGE_TABLE,
-            key::slot(question.key(), slot.map(|id| id.as_str())),
-        ))
-    }
-
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
+        Self {
+            question: question.clone(),
+            slot: slot.cloned(),
         }
+    }
+
+    /// The underscore-joined wire form (`{question}_{slot|q}`).
+    pub fn key(&self) -> String {
+        key::slot(
+            self.question.key().as_str(),
+            self.slot.as_ref().map(|id| id.as_str()),
+        )
     }
 }
 
-#[derive(Debug, Clone, SurrealValue)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct BankQuestionImage {
-    pub(crate) id: BankQuestionImageId,
     pub(crate) bank_question: BankQuestionId,
-    /// `NONE` = the question's illustration; otherwise the id of the option
+    /// `NULL` = the question's illustration; otherwise the id of the option
     /// this picture belongs to.
     pub(crate) slot: Option<ChoiceId>,
-    /// The blob's on-disk name — a fresh ULID every upload.
+    /// The blob's on-disk name — a fresh UUID every upload.
     pub(crate) file: String,
     pub(crate) content_type: FileContentType,
     pub(crate) size: i64,
@@ -70,17 +68,17 @@ impl BankQuestionImage {
         size: i64,
     ) -> Self {
         Self {
-            id: BankQuestionImageId::for_slot(question, slot),
             bank_question: question.clone(),
             slot: slot.cloned(),
-            file: Ulid::new().to_string(),
+            file: uuid::Uuid::new_v4().to_string(),
             content_type,
             size,
         }
     }
 
-    pub fn get_id(&self) -> &BankQuestionImageId {
-        &self.id
+    /// The row's identity, built back from its unique-key columns.
+    pub fn get_id(&self) -> BankQuestionImageId {
+        BankQuestionImageId::for_slot(&self.bank_question, self.slot.as_ref())
     }
 
     pub fn get_bank_question(&self) -> &BankQuestionId {
@@ -135,15 +133,15 @@ mod tests {
 
     #[test]
     fn for_slot_keys_by_question_and_choice_id() {
-        let question = BankQuestionId::from_key("abc");
+        let question = BankQuestionId::from_key("0198f1a2-3b4c-7d5e-8f90-1a2b3c4d5e6f");
         let ids = choice_ids();
         assert_eq!(
             BankQuestionImageId::for_slot(&question, None).key(),
-            "abc_q"
+            format!("{}_q", question.key())
         );
         assert_eq!(
             BankQuestionImageId::for_slot(&question, Some(&ids[0])).key(),
-            format!("abc_{}", ids[0].as_str())
+            format!("{}_{}", question.key(), ids[0].as_str())
         );
         // Distinct options never share a row.
         assert_ne!(

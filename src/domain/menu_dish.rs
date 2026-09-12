@@ -5,61 +5,57 @@
 //! at any layer. `tags` are validated against the school's `dietary_tags`
 //! list, the same contract a menu's `slot` has with `meal_slots`.
 //!
-//! The queries live in [`crate::db::menu_dish`]; the dish-cap gate and the
-//! write lock in [`crate::service::menu`].
+//! The queries live in [`crate::db::menu_dish`]; the dish-cap gate in
+//! [`crate::service::menu`].
 
-use std::sync::LazyLock;
-
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-use ulid::Generator;
+use sqlx::Type;
+use uuid::Uuid;
 
 use crate::constant::{
     MAX_DISH_DESCRIPTION_LEN, MAX_DISH_NAME_LEN, MAX_DISH_PRICE_MINOR, MAX_DISH_TAGS,
-    MENU_DISH_TABLE,
 };
 use crate::domain::menu::MenuId;
+use crate::domain::monotonic_id::next_uuid;
 use crate::domain::timestamp::Timestamp;
 use crate::error::ValidationError;
 use crate::validate::{validate_optional, validate_required};
 
-/// Mints dish ids in write order — see [`MenuId::generate`]; the listings below
-/// order by `id` within a menu, which random low bits would scramble.
-static IDS: LazyLock<std::sync::Mutex<Generator>> =
-    LazyLock::new(|| std::sync::Mutex::new(Generator::new()));
-
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct MenuDishId(RecordId);
+/// Typed menu-dish row id. A UUIDv7 minted by the process-wide monotonic
+/// generator, so `id` order is mint order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Type)]
+#[sqlx(transparent)]
+pub struct MenuDishId(Uuid);
 
 impl MenuDishId {
+    /// Minted from the process-wide monotonic generator, not a random v4 —
+    /// the listings order by `id` within a menu, which random low bits would
+    /// scramble.
     pub fn generate() -> Self {
-        let mut ids = IDS.lock().expect("menu dish id generator poisoned");
-        // The only error is exhausting the random bits within one millisecond
-        // (2^80 ids deep); it clears itself as the clock ticks, so retry.
-        let ulid = loop {
-            if let Ok(ulid) = ids.generate() {
-                break ulid;
-            }
-        };
-        Self(RecordId::new(MENU_DISH_TABLE, ulid.to_string()))
+        Self(next_uuid())
     }
 
+    /// The inner uuid, for runtime-checked binds (Param/QueryBuilder) that
+    /// cannot take the newtype. Static `query!` binds take `self` directly.
+    pub fn uuid(&self) -> Uuid {
+        self.0
+    }
+
+    /// Parse a wire key. A key that parses as no UUID — a malformed path
+    /// segment — reads as the nil id, which matches no row: exactly the 404 a
+    /// dangling record key produced under the old store, without turning a
+    /// typo into a panic.
     pub fn from_key(key: &str) -> Self {
-        Self(RecordId::new(MENU_DISH_TABLE, key))
+        Self(Uuid::parse_str(key).unwrap_or(Uuid::nil()))
     }
 
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
-        }
+    /// The hyphenated wire form.
+    pub fn key(&self) -> String {
+        self.0.to_string()
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, Type)]
+#[sqlx(transparent)]
 pub struct DishName(String);
 
 impl DishName {
@@ -73,12 +69,13 @@ impl DishName {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, PartialEq, Eq, Type)]
+#[sqlx(transparent)]
 pub struct DishDescription(String);
 
 impl DishDescription {
     /// Blank (or whitespace-only) means "no description" — `None`, not an
-    /// empty string, so the column is absent rather than falsely present.
+    /// empty string, so the column is NULL rather than falsely present.
     pub fn try_new(value: &str) -> Result<Option<Self>, ValidationError> {
         validate_optional("description", value, MAX_DISH_DESCRIPTION_LEN)?;
         let value = value.trim();
@@ -92,7 +89,8 @@ impl DishDescription {
 
 /// What one serving costs, in **minor units** (kuruş). Never negative — a
 /// giveaway dish is `0`, and money that flows the other way is a ledger line.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, SurrealValue)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Type)]
+#[sqlx(transparent)]
 pub struct DishPrice(i64);
 
 impl DishPrice {
@@ -113,8 +111,10 @@ impl DishPrice {
 
 /// The dietary tags a dish carries, drawn from the school's `dietary_tags`
 /// list. Deduplicated, order preserved — the list is what a student's profile
-/// is matched against, so a repeat carries no extra meaning.
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
+/// is matched against, so a repeat carries no extra meaning. Stored as a
+/// `TEXT[]` column.
+#[derive(Debug, Clone, PartialEq, Eq, Type)]
+#[sqlx(transparent, no_pg_array)]
 pub struct DishTags(Vec<String>);
 
 impl DishTags {
@@ -146,7 +146,7 @@ impl DishTags {
     }
 }
 
-#[derive(Debug, Clone, SurrealValue)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct MenuDish {
     pub(crate) id: MenuDishId,
     pub(crate) menu: MenuId,

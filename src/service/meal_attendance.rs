@@ -1,9 +1,8 @@
 //! The attendance-mark workflows: recording who ate off a menu and the two
 //! listings the kitchen and the student report read. The mark itself is a
-//! single atomic UPSERT that rides the menu's revision bump
-//! ([`crate::db::menu::bump_menu_and_write`]) — the queries live in
-//! [`crate::db::meal_attendance`], the row shape in
-//! [`crate::domain::meal_attendance`].
+//! single atomic upsert that rides the menu's revision bump inside its own
+//! transaction — the queries live in [`crate::db::meal_attendance`], the row
+//! shape in [`crate::domain::meal_attendance`].
 
 use crate::database::Database;
 use crate::db::meal_attendance;

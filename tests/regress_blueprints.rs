@@ -13,45 +13,47 @@
 mod common;
 
 use axum::http::StatusCode;
-use common::{Res, app_and_db, create_course, login_as, me_id, send};
+use common::{GHOST_ID, Res, app_and_db, create_course, login_as, me_id, send};
 use hezarfen_backend::database::Database;
 use hezarfen_backend::domain::class_blueprint::ClassBlueprint;
 use hezarfen_backend::domain::course::CourseId;
+use hezarfen_backend::domain::timestamp::Timestamp;
 use hezarfen_backend::domain::user::UserId;
 use hezarfen_backend::error::AppError;
 use hezarfen_backend::service::class_blueprint;
 use serde_json::{Value, json};
 
-/// One counter, re-read out of the store.
-async fn counter(sql: &str, db: &Database) -> i64 {
-    let mut result = db.query(sql).await.unwrap().check().unwrap();
-    result
-        .take::<Vec<i64>>(0)
-        .unwrap()
-        .first()
-        .copied()
-        .unwrap_or(0)
+/// One counter, re-read out of the store. `sql` is a whole scalar query.
+async fn counter(sql: &'static str, db: &Database) -> i64 {
+    sqlx::query_scalar(sql).fetch_one(db).await.unwrap()
 }
 
-/// How many rows `sql` selects ids for.
-async fn rows(sql: &str, db: &Database) -> i64 {
-    let mut result = db.query(sql).await.unwrap().check().unwrap();
-    result
-        .take::<Vec<surrealdb::types::RecordId>>(0)
-        .unwrap()
-        .len() as i64
+/// How many rows `sql` counts.
+async fn rows(sql: &'static str, db: &Database) -> i64 {
+    counter(sql, db).await
+}
+
+/// One row's counter column, re-read out of the store.
+async fn count_on(column: &'static str, table: &'static str, id: &str, db: &Database) -> i64 {
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT {column} FROM {table} WHERE id = $1"
+    )))
+    .bind(uuid::Uuid::parse_str(id).expect("a uuid row id"))
+    .fetch_one(db)
+    .await
+    .unwrap()
 }
 
 /// Is that course on that class, in the store?
 async fn attached(class: &str, course: &str, db: &Database) -> bool {
-    rows(
-        &format!(
-            "SELECT VALUE id FROM class_course WHERE class = class_group:{class} \
-             AND course = course:{course}"
-        ),
-        db,
+    sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM class_course WHERE class = $1 AND course = $2",
     )
+    .bind(uuid::Uuid::parse_str(class).expect("a uuid class id"))
+    .bind(uuid::Uuid::parse_str(course).expect("a uuid course id"))
+    .fetch_one(db)
     .await
+    .unwrap()
         == 1
 }
 
@@ -59,33 +61,26 @@ async fn attached(class: &str, course: &str, db: &Database) -> bool {
 /// no such key at all — which is the whole provenance rule: absent means a
 /// human attached it.
 async fn source_of(class: &str, course: &str, db: &Database) -> Option<String> {
-    let mut result = db
-        .query(format!(
-            "SELECT VALUE (IF source != NONE THEN record::id(source) ELSE '' END) \
-             FROM class_course WHERE class = class_group:{class} AND course = course:{course}"
-        ))
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
-    result
-        .take::<Vec<String>>(0)
-        .unwrap()
-        .into_iter()
-        .next()
-        .filter(|key| !key.is_empty())
+    sqlx::query_scalar::<_, Option<String>>(
+        "SELECT source FROM class_course WHERE class = $1 AND course = $2",
+    )
+    .bind(uuid::Uuid::parse_str(class).expect("a uuid class id"))
+    .bind(uuid::Uuid::parse_str(course).expect("a uuid course id"))
+    .fetch_one(db)
+    .await
+    .unwrap()
 }
 
 /// Does that grade's template still name that course, in the store?
 async fn templated(grade: &str, course: &str, db: &Database) -> bool {
-    rows(
-        &format!(
-            "SELECT VALUE id FROM class_blueprint \
-             WHERE grade = '{grade}' AND course:{course} IN courses"
-        ),
-        db,
+    sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM class_blueprint WHERE grade = $1 AND $2 = ANY(courses)",
     )
+    .bind(grade)
+    .bind(CourseId::from_key(course))
+    .fetch_one(db)
     .await
+    .unwrap()
         == 1
 }
 
@@ -250,7 +245,7 @@ async fn a_blueprint_is_created_read_updated_and_deleted() {
     )
     .await;
     assert_eq!(dropped.status, StatusCode::NO_CONTENT);
-    assert_eq!(rows("SELECT VALUE id FROM class_blueprint", &db).await, 0);
+    assert_eq!(rows("SELECT count(*) FROM class_blueprint", &db).await, 0);
     let gone = send(&app, "GET", "/classes/blueprints/9", Some(&manager), None).await;
     assert_eq!(gone.status, StatusCode::NOT_FOUND);
 
@@ -313,23 +308,20 @@ async fn a_fresh_class_takes_its_grades_blueprint() {
             "the blueprint must own what it attached"
         );
         assert_eq!(
-            rows(
-                &format!(
-                    "SELECT VALUE id FROM enrollment WHERE course = course:{course} \
-                     AND user = user:{student}"
-                ),
-                &db
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM enrollment WHERE course = $1 AND app_user = $2",
             )
-            .await,
+            .bind(CourseId::from_key(course))
+            .bind(UserId::from_key(&student))
+            .fetch_one(&db)
+            .await
+            .unwrap(),
             1,
             "stocking a class enrolls its roster, in real rows"
         );
     }
     assert_eq!(
-        counter(
-            &format!("SELECT VALUE (class_course_count ?? 0) FROM class_group:{class}"),
-            &db
-        )
+        count_on("class_course_count", "class_group", &class, &db)
         .await,
         2
     );
@@ -345,7 +337,7 @@ async fn a_fresh_class_takes_its_grades_blueprint() {
     .await;
     assert_eq!(twice.status, StatusCode::OK);
     assert!(skips(&twice).is_empty());
-    assert_eq!(rows("SELECT VALUE id FROM class_course", &db).await, 2);
+    assert_eq!(rows("SELECT count(*) FROM class_course", &db).await, 2);
 
     // A class whose grade no blueprint covers is a 404, not an empty success.
     let other = create_class(&app, &manager, "10-A", "10").await;
@@ -411,10 +403,7 @@ async fn creating_a_class_stocks_it_from_its_grades_blueprint() {
         );
     }
     assert_eq!(
-        counter(
-            &format!("SELECT VALUE (class_course_count ?? 0) FROM class_group:{class}"),
-            &db
-        )
+        count_on("class_course_count", "class_group", &class, &db)
         .await,
         2
     );
@@ -425,14 +414,14 @@ async fn creating_a_class_stocks_it_from_its_grades_blueprint() {
     let student = student_in(&app, &db, &class, &manager, "ali").await;
     for course in [&algebra, &physics] {
         assert_eq!(
-            rows(
-                &format!(
-                    "SELECT VALUE id FROM enrollment WHERE course = course:{course} \
-                     AND user = user:{student}"
-                ),
-                &db
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM enrollment WHERE course = $1 AND app_user = $2",
             )
-            .await,
+            .bind(CourseId::from_key(course))
+            .bind(UserId::from_key(&student))
+            .fetch_one(&db)
+            .await
+            .unwrap(),
             1,
             "a stocked class enrolls its roster like any other"
         );
@@ -454,11 +443,13 @@ async fn creating_a_class_stocks_it_from_its_grades_blueprint() {
         assert!(skips(&res).is_empty(), "{:?}", res.body);
         let bare = res.body["class"]["id"].as_str().unwrap();
         assert_eq!(
-            rows(
-                &format!("SELECT VALUE id FROM class_course WHERE class = class_group:{bare}"),
-                &db
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM class_course WHERE class = $1",
             )
-            .await,
+            .bind(uuid::Uuid::parse_str(bare).expect("a uuid class id"))
+            .fetch_one(&db)
+            .await
+            .unwrap(),
             0,
             "nothing may be attached to a section no template reached"
         );
@@ -496,10 +487,10 @@ async fn a_create_reports_what_its_blueprint_could_not_stock() {
     // meets when a course goes after it read the list. Nothing carries it yet
     // (no section exists at grade 9), so this is the pair that cannot fit when
     // the first one is created.
-    db.query(format!("DELETE course:{physics}"))
+    sqlx::query("DELETE FROM course WHERE id = $1")
+        .bind(CourseId::from_key(&physics))
+        .execute(&db)
         .await
-        .unwrap()
-        .check()
         .unwrap();
     assert!(
         templated("9", &physics, &db).await,
@@ -531,11 +522,11 @@ async fn a_create_reports_what_its_blueprint_could_not_stock() {
         .expect("class id")
         .to_string();
     assert_eq!(
-        rows(
-            &format!("SELECT VALUE id FROM class_group WHERE id = class_group:{class}"),
-            &db
-        )
-        .await,
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM class_group WHERE id = $1")
+            .bind(uuid::Uuid::parse_str(&class).expect("a uuid class id"))
+            .fetch_one(&db)
+            .await
+            .unwrap(),
         1,
         "the class is really there — the skip is a report, not a rollback"
     );
@@ -544,11 +535,11 @@ async fn a_create_reports_what_its_blueprint_could_not_stock() {
         "…and the course that did fit is on it"
     );
     assert_eq!(
-        rows(
-            &format!("SELECT VALUE id FROM class_course WHERE class = class_group:{class}"),
-            &db
-        )
-        .await,
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM class_course WHERE class = $1")
+            .bind(uuid::Uuid::parse_str(&class).expect("a uuid class id"))
+            .fetch_one(&db)
+            .await
+            .unwrap(),
         1
     );
     // The dangling id is pruned by the run that found it, here as anywhere.
@@ -580,7 +571,7 @@ async fn an_edit_retro_pumps_every_class_at_the_grade() {
     )
     .await;
     assert_eq!(made.status, StatusCode::CREATED);
-    assert_eq!(rows("SELECT VALUE id FROM class_course", &db).await, 0);
+    assert_eq!(rows("SELECT count(*) FROM class_course", &db).await, 0);
 
     // …and the edit is what has to reach the two classes standing there.
     let patched = send(
@@ -605,37 +596,28 @@ async fn an_edit_retro_pumps_every_class_at_the_grade() {
     // grade.
     for class in [&a, &b] {
         assert_eq!(
-            counter(
-                &format!("SELECT VALUE (class_course_count ?? 0) FROM class_group:{class}"),
-                &db
-            )
+            count_on("class_course_count", "class_group", class, &db)
             .await,
             1
         );
     }
     assert_eq!(
-        counter(
-            &format!("SELECT VALUE (class_course_count ?? 0) FROM class_group:{ten}"),
-            &db
-        )
+        count_on("class_course_count", "class_group", &ten, &db)
         .await,
         0
     );
     assert_eq!(
-        counter(
-            &format!("SELECT VALUE (enrollment_count ?? 0) FROM course:{algebra}"),
-            &db
-        )
+        count_on("enrollment_count", "course", &algebra, &db)
         .await,
         1,
         "one student at the grade, one seat"
     );
     assert_eq!(
-        rows(
-            &format!("SELECT VALUE id FROM enrollment WHERE user = user:{ali}"),
-            &db
-        )
-        .await,
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM enrollment WHERE app_user = $1")
+            .bind(UserId::from_key(&ali))
+            .fetch_one(&db)
+            .await
+            .unwrap(),
         1
     );
 }
@@ -687,23 +669,17 @@ async fn a_class_that_does_not_fit_is_reported_not_aborted() {
     // Nothing moved on the skipped class: not its attachment counter, and not
     // one of the seats the refused attach touched on its way to the refusal.
     assert_eq!(
-        counter(
-            &format!("SELECT VALUE (class_course_count ?? 0) FROM class_group:{full}"),
-            &db
-        )
+        count_on("class_course_count", "class_group", &full, &db)
         .await,
         0
     );
     assert_eq!(
-        counter(
-            &format!("SELECT VALUE (enrollment_count ?? 0) FROM course:{tight}"),
-            &db
-        )
+        count_on("enrollment_count", "course", &tight, &db)
         .await,
         0,
         "the empty class took no seat, and the refused one gave every seat back"
     );
-    assert_eq!(rows("SELECT VALUE id FROM enrollment", &db).await, 0);
+    assert_eq!(rows("SELECT count(*) FROM enrollment", &db).await, 0);
 }
 
 /// One cause, one code, whichever door it came through: the `409` a manager's
@@ -848,36 +824,27 @@ async fn a_removal_spares_a_hand_attached_course() {
         "…and nothing else — a hand attach survives"
     );
     assert_eq!(
-        counter(
-            &format!("SELECT VALUE (class_course_count ?? 0) FROM class_group:{pumped}"),
-            &db
-        )
+        count_on("class_course_count", "class_group", &pumped, &db)
         .await,
         0,
         "the detach gives the class its count back"
     );
     assert_eq!(
-        counter(
-            &format!("SELECT VALUE (class_course_count ?? 0) FROM class_group:{byhand}"),
-            &db
-        )
+        count_on("class_course_count", "class_group", &byhand, &db)
         .await,
         1
     );
     assert_eq!(
-        rows(
-            &format!("SELECT VALUE id FROM enrollment WHERE user = user:{ali}"),
-            &db
-        )
-        .await,
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM enrollment WHERE app_user = $1")
+            .bind(UserId::from_key(&ali))
+            .fetch_one(&db)
+            .await
+            .unwrap(),
         0,
         "the enrollments the blueprint pumped go with it"
     );
     assert_eq!(
-        counter(
-            &format!("SELECT VALUE (enrollment_count ?? 0) FROM course:{algebra}"),
-            &db
-        )
+        count_on("enrollment_count", "course", &algebra, &db)
         .await,
         1,
         "the hand-attached class keeps its student's seat"
@@ -907,12 +874,11 @@ async fn a_row_written_before_the_column_reads_as_hand_attached() {
     )
     .await;
     assert_eq!(attached_by_hand.status, StatusCode::CREATED);
-    // Age the row to before the column existed. `UNSET`, not `= NONE`: an
-    // absent key is what the store holds today, and it is what the rule reads.
-    db.query("UPDATE class_course UNSET source")
+    // Age the row to before the column existed: a NULL `source` is what the
+    // store holds for a hand attach, and it is what the rule reads.
+    sqlx::query("UPDATE class_course SET source = NULL")
+        .execute(&db)
         .await
-        .unwrap()
-        .check()
         .unwrap();
     assert_eq!(source_of(&class, &algebra, &db).await, None);
 
@@ -961,10 +927,7 @@ async fn a_row_written_before_the_column_reads_as_hand_attached() {
         "a pre-migration row is hand-attached and unreachable by any blueprint sweep"
     );
     assert_eq!(
-        counter(
-            &format!("SELECT VALUE (enrollment_count ?? 0) FROM course:{algebra}"),
-            &db
-        )
+        count_on("enrollment_count", "course", &algebra, &db)
         .await,
         1
     );
@@ -979,15 +942,14 @@ async fn a_row_written_before_the_column_reads_as_hand_attached() {
 /// `class_course` row tagged with a record nothing can reach, since the grade
 /// label *is* the id and no sweep will ever run for it again.
 ///
-/// Racing two requests would be a coin flip the in-memory engine lies about, so
-/// the delete is injected by the database itself: a `DEFINE EVENT` on
-/// `class_course` fires *inside* the pump's own transaction, the instant the
-/// link row lands — which is exactly "after the guard passed, before the
-/// commit", every single time. This is a below-the-lock probe by construction
-/// (the store deletes the row, not `service::class_blueprint::delete`), so it does not
-/// test `BLUEPRINT_LOCK`; it pins the end state that lock prevents in-process,
-/// and the recovery contract that covers the one residue it cannot — a process
-/// crash between the delete and its sweep.
+/// Under Postgres the window itself is shut — `class_course.source` is a real
+/// foreign key, so a blueprint delete inside the attach's transaction takes the
+/// attach down with it, and a crash between the delete and its sweep is one
+/// transaction. What the store can no longer refuse is the residue an old
+/// volume can still carry, so the stranded row is forged the one way Postgres
+/// allows (FK triggers suspended for the one transaction) and what is pinned is
+/// the recovery contract for it: a human detaches it one course at a time, and
+/// the counters come back exact.
 #[tokio::test]
 async fn a_blueprint_lost_mid_attach_strands_a_row_that_stays_detachable() {
     let (app, db) = app_and_db().await;
@@ -1019,41 +981,46 @@ async fn a_blueprint_lost_mid_attach_strands_a_row_that_stays_detachable() {
     assert_eq!(moved.status, StatusCode::OK, "{:?}", moved.body);
     assert!(!attached(&class, &algebra, &db).await);
 
-    // Delete the blueprint from inside the very write that attaches on its
-    // behalf.
-    db.query(
-        "DEFINE EVENT lose_blueprint ON TABLE class_course WHEN $event = 'CREATE' \
-         THEN { DELETE type::record('class_blueprint', '9'); };",
+    // The stranded state: the link row committed, the blueprint it names did
+    // not survive. Real FKs refuse that state, so it is written with FK
+    // triggers suspended — the manager id is real, the `source` FK is the one
+    // the strand consists of.
+    let manager_id = UserId::from_key(&me_id(&app, &manager).await);
+    let mut tx = db.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM class_blueprint WHERE grade = '9'")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO class_course (class, course, attached_by, attached_at, source) \
+         VALUES ($1, $2, $3, $4, '9')",
     )
+    .bind(uuid::Uuid::parse_str(&class).expect("a uuid class id"))
+    .bind(CourseId::from_key(&algebra))
+    .bind(manager_id)
+    .bind(Timestamp::now().as_millis())
+    .execute(&mut *tx)
     .await
-    .unwrap()
-    .check()
     .unwrap();
-
-    let pumped = send(
-        &app,
-        "POST",
-        &format!("/classes/{class}/blueprint"),
-        Some(&manager),
-        None,
-    )
-    .await;
-    assert_eq!(pumped.status, StatusCode::OK, "{:?}", pumped.body);
-    assert!(
-        skips(&pumped).is_empty(),
-        "the pump was told it succeeded — which is what makes the row below \
-         invisible to the caller: {:?}",
-        pumped.body
-    );
+    sqlx::query("UPDATE class_group SET class_course_count = 1 WHERE id = $1")
+        .bind(uuid::Uuid::parse_str(&class).expect("a uuid class id"))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
 
     assert_eq!(
-        rows("SELECT VALUE id FROM class_blueprint", &db).await,
+        rows("SELECT count(*) FROM class_blueprint", &db).await,
         0,
         "the injected delete really landed"
     );
     assert!(
         attached(&class, &algebra, &db).await,
-        "the link committed after its blueprint was gone: this is the stranded \
+        "the link stands after its blueprint was gone: this is the stranded \
          row, tagged with a record no sweep can ever reach"
     );
     assert_eq!(source_of(&class, &algebra, &db).await, Some("9".into()));
@@ -1076,10 +1043,7 @@ async fn a_blueprint_lost_mid_attach_strands_a_row_that_stays_detachable() {
     );
     assert!(!attached(&class, &algebra, &db).await);
     assert_eq!(
-        counter(
-            &format!("SELECT VALUE (class_course_count ?? 0) FROM class_group:{class}"),
-            &db
-        )
+        count_on("class_course_count", "class_group", &class, &db)
         .await,
         0,
         "a stranded row still releases its counter when it is detached"
@@ -1460,14 +1424,11 @@ async fn a_half_swept_removal_is_finished_by_the_documented_re_patch() {
 
     // The state a sweep that died half-way leaves: the list is stored without
     // history, its attachment is not.
-    db.query(
-        "UPDATE type::record('class_blueprint', '9') SET courses = [type::record('course', $c)]",
-    )
-    .bind(("c", algebra.clone()))
-    .await
-    .unwrap()
-    .check()
-    .unwrap();
+    sqlx::query("UPDATE class_blueprint SET courses = $1 WHERE grade = '9'")
+        .bind(vec![CourseId::from_key(&algebra)])
+        .execute(&db)
+        .await
+        .unwrap();
 
     let courses = held(&app, &manager, "9").await;
     assert_eq!(
@@ -1490,19 +1451,19 @@ async fn a_half_swept_removal_is_finished_by_the_documented_re_patch() {
         "re-sending the stored list must finish the removal it stored"
     );
     assert_eq!(
-        rows(
-            &format!("SELECT VALUE id FROM enrollment WHERE user = user:{ali} AND course = course:{history}"),
-            &db
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM enrollment WHERE app_user = $1 AND course = $2",
         )
-        .await,
+        .bind(UserId::from_key(&ali))
+        .bind(CourseId::from_key(&history))
+        .fetch_one(&db)
+        .await
+        .unwrap(),
         0,
         "…enrollments and all"
     );
     assert_eq!(
-        counter(
-            &format!("SELECT VALUE (enrollment_count ?? 0) FROM course:{history}"),
-            &db
-        )
+        count_on("enrollment_count", "course", &history, &db)
         .await,
         0,
         "…with the seat given back"
@@ -1512,11 +1473,14 @@ async fn a_half_swept_removal_is_finished_by_the_documented_re_patch() {
         "and the course the template still holds is untouched"
     );
     assert_eq!(
-        rows(
-            &format!("SELECT VALUE id FROM enrollment WHERE user = user:{ali} AND course = course:{algebra}"),
-            &db
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM enrollment WHERE app_user = $1 AND course = $2",
         )
-        .await,
+        .bind(UserId::from_key(&ali))
+        .bind(CourseId::from_key(&algebra))
+        .fetch_one(&db)
+        .await
+        .unwrap(),
         1
     );
 }
@@ -1538,14 +1502,17 @@ async fn a_course_pruned_mid_pump_is_out_of_the_body_that_pruned_it() {
     let history = create_course(&app, &manager, "history").await;
     let class = create_class(&app, &manager, "9-A", "9").await;
 
-    db.query(format!(
-        "DEFINE EVENT kill_on_create ON TABLE class_blueprint WHEN $event = 'CREATE' \
-         THEN {{ DELETE type::record('course', '{algebra}'); }};"
-    ))
+    let mut conn = db.acquire().await.expect("acquire for the trigger");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE FUNCTION heztest_kill_on_create() RETURNS trigger AS $$
+         BEGIN DELETE FROM course WHERE id = '{algebra}'; RETURN NULL; END;
+         $$ LANGUAGE plpgsql;
+         CREATE TRIGGER heztest_kill_on_create AFTER INSERT ON class_blueprint
+         FOR EACH ROW EXECUTE FUNCTION heztest_kill_on_create();"
+    )))
+    .execute(&mut *conn)
     .await
-    .unwrap()
-    .check()
-    .unwrap();
+    .expect("define the kill-on-create trigger");
     let made = send(
         &app,
         "POST",
@@ -1571,14 +1538,16 @@ async fn a_course_pruned_mid_pump_is_out_of_the_body_that_pruned_it() {
     );
 
     // The same window on the edit route.
-    db.query(format!(
-        "DEFINE EVENT kill_on_update ON TABLE class_blueprint WHEN $event = 'UPDATE' \
-         THEN {{ DELETE type::record('course', '{history}'); }};"
-    ))
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE FUNCTION heztest_kill_on_update() RETURNS trigger AS $$
+         BEGIN DELETE FROM course WHERE id = '{history}'; RETURN NULL; END;
+         $$ LANGUAGE plpgsql;
+         CREATE TRIGGER heztest_kill_on_update AFTER UPDATE ON class_blueprint
+         FOR EACH ROW EXECUTE FUNCTION heztest_kill_on_update();"
+    )))
+    .execute(&mut *conn)
     .await
-    .unwrap()
-    .check()
-    .unwrap();
+    .expect("define the kill-on-update trigger");
     let patched = send(
         &app,
         "PATCH",
@@ -1624,7 +1593,7 @@ async fn a_template_write_refuses_a_course_that_is_gone() {
     let manager = login_as(&app, &db, "mgr", "manager").await;
     let by = UserId::from_key(&me_id(&app, &manager).await);
     let algebra = CourseId::from_key(&create_course(&app, &manager, "algebra").await);
-    let ghost = CourseId::from_key("01J8XZ0K3Q8G7X2M4N5P6R7S8T");
+    let ghost = CourseId::from_key(GHOST_ID);
 
     let refused = class_blueprint::create(
         &db,
@@ -1638,7 +1607,7 @@ async fn a_template_write_refuses_a_course_that_is_gone() {
         "a course that is gone is a 400, not a template naming it: {refused:?}"
     );
     assert_eq!(
-        rows("SELECT VALUE id FROM class_blueprint", &db).await,
+        rows("SELECT count(*) FROM class_blueprint", &db).await,
         0,
         "…and nothing may be stored"
     );

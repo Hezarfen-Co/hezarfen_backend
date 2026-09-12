@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT COALESCE(a.proposed_starts_at, s.starts_at) AS starts_at, COALESCE(a.proposed_ends_at, s.ends_at) AS ends_at FROM appointment a JOIN appointment_slot s ON a.slot = s.id WHERE a.status = 'approved' AND ($3::uuid IS NULL OR a.id <> $3) AND (a.requester = $2 OR s.teacher = $1)",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "starts_at",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "ends_at",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "92352557e90d8ff07e151ff84f4dbdc3cbfa102a3ab3f668c8a890b21fbe9736"
+}

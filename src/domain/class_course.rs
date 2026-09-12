@@ -7,41 +7,39 @@
 //! [`crate::db::class_course`] — this file is the row shape and its
 //! composite id.
 
-use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
-
-use crate::constant::CLASS_COURSE_TABLE;
-use crate::db::class_pump::link_id;
 use crate::domain::class_blueprint::ClassBlueprintId;
 use crate::domain::class_group::ClassGroupId;
 use crate::domain::course::CourseId;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::UserId;
 
-#[derive(Debug, Clone, PartialEq, Eq, SurrealValue)]
-pub struct ClassCourseId(RecordId);
+/// The identity of one (class, course) pair. Not a row column: the table's
+/// primary key *is* the pair, and this struct's job is the underscore-joined
+/// wire form at the HTTP edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassCourseId {
+    pub(crate) class: ClassGroupId,
+    pub(crate) course: CourseId,
+}
 
 impl ClassCourseId {
-    /// The record one (class, course) pair always maps to.
+    /// The one id a (class, course) pair can have.
     pub fn composite(class: &ClassGroupId, course: &CourseId) -> Self {
-        Self(link_id(CLASS_COURSE_TABLE, class, course.key()))
-    }
-
-    pub fn record(&self) -> RecordId {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> &str {
-        match &self.0.key {
-            RecordIdKey::String(key) => key,
-            _ => "",
+        Self {
+            class: class.clone(),
+            course: course.clone(),
         }
+    }
+
+    /// The underscore-joined wire form (`{class}_{course}`).
+    pub fn key(&self) -> String {
+        format!("{}_{}", self.class.key(), self.course.key())
     }
 }
 
 /// One course a class is attached to. `attached_by` is who attached it.
-#[derive(Debug, Clone, SurrealValue)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ClassCourse {
-    pub(crate) id: ClassCourseId,
     pub(crate) class: ClassGroupId,
     pub(crate) course: CourseId,
     pub(crate) attached_by: UserId,
@@ -49,19 +47,19 @@ pub struct ClassCourse {
     /// attached the course to this class directly — the mirror of
     /// [`crate::domain::enrollment`]'s `source`, and read the same way: only a
     /// row carrying the key is a blueprint's to take back, so a hand-attached
-    /// course survives every blueprint sweep. Rows written before the column
-    /// carry no key at all, which is exactly "hand-attached".
+    /// course survives every blueprint sweep.
     pub(crate) source: Option<ClassBlueprintId>,
-    /// When it was attached, and the *only* thing "newest first" can mean here:
-    /// the row's id is the (class, course) pair, so ordering by it sorts the
-    /// list by the course's own ULID. Optional because rows written before this
-    /// column carry no stamp — see the migration note.
+    /// When it was attached, and the *only* thing "newest first" can mean
+    /// here: the row's primary key is the (class, course) pair, so ordering
+    /// falls to this stamp (or the attached course's id). Optional because
+    /// rows written before this column carry no stamp.
     pub(crate) attached_at: Option<Timestamp>,
 }
 
 impl ClassCourse {
-    pub fn get_id(&self) -> &ClassCourseId {
-        &self.id
+    /// The row's identity, built back from its primary-key columns.
+    pub fn get_id(&self) -> ClassCourseId {
+        ClassCourseId::composite(&self.class, &self.course)
     }
 
     pub fn get_class(&self) -> &ClassGroupId {
