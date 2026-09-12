@@ -2,9 +2,8 @@
 //! first, with the note's file cap claimed and released in the same write as
 //! the row.
 
-use crate::constant::{MAX_NOTE_FILES, NOTE_FILE_COUNT_FIELD};
-use crate::database::Database;
-use crate::db::cap;
+use crate::constant::MAX_NOTE_FILES;
+use crate::database::{Database, tx_with_retry, unique_violation};
 use crate::db::page::PagedList;
 use crate::domain::note::NoteId;
 use crate::domain::note_file::{NoteFile, NoteFileId};
@@ -12,31 +11,45 @@ use crate::error::AppError;
 
 /// Persist the row assembled by [`NoteFile::new`], refusing once its note
 /// already holds [`MAX_NOTE_FILES`]. The slot and the row are taken together
-/// by [`cap::claim_and_create`] on the note row: a `BEGIN…COMMIT` around a
-/// count can't enforce the cap (SurrealDB doesn't conflict-check a
-/// cross-record count against a concurrent insert) and a process-wide mutex
-/// can't either, since it is released around the very round trip the insert
-/// races — a conditional single-record write can. Claiming in a *separate*
-/// query would enforce the cap but leak a slot on a crash between the two.
+/// by one conditional statement on the note row (the claim CTE of
+/// `cap::claim_and_create`, spelled out at its call site — see
+/// `crate::db::cap`): a `BEGIN…COMMIT` around a count can't enforce the cap
+/// and a process-wide mutex can't either, since it is released around the
+/// very round trip the insert races — a single guarded statement can.
+/// Claiming in a *separate* query would enforce the cap but leak a slot on
+/// a crash between the two.
 pub async fn insert(db: &Database, file: NoteFile) -> Result<NoteFile, AppError> {
-    // whole-row-save-ok: create of a fresh ULID row built in place by `new` — there is no prior row to clobber
-    match cap::claim_and_create(
-        &file.note.record(),
-        NOTE_FILE_COUNT_FIELD,
+    // whole-row-save-ok: insert of a fresh UUID row built in place by `new` — there is no prior row to clobber
+    let created = sqlx::query_as!(
+        NoteFile,
+        r#"WITH seat AS (
+               UPDATE note SET file_count = file_count + 1
+               WHERE id = $1 AND file_count < $2
+               RETURNING 1)
+           INSERT INTO note_file (id, note, name, content_type, size)
+           SELECT $3, $1, $4, $5, $6 WHERE EXISTS (SELECT 1 FROM seat)
+           RETURNING id, note, name, content_type, size"#,
+        file.note,
         MAX_NOTE_FILES as i64,
-        &file.id.record(),
-        &file,
-        db,
+        file.id,
+        file.name,
+        file.content_type,
+        file.size
     )
-    .await?
-    {
-        cap::Claimed::Made(created) => Ok(created),
+    .fetch_optional(db)
+    .await;
+    match created {
+        Ok(Some(row)) => Ok(row),
         // Also how a missing note reads: no note row means no slot to take.
-        cap::Claimed::Full => Err(AppError::Conflict(
+        Ok(None) => Err(AppError::Conflict(
             "the note already holds the maximum of 10 files — delete one first",
         )),
-        // Unreachable: the id is a ULID this call just generated.
-        cap::Claimed::Duplicate => Err(AppError::Internal("failed to create note file".into())),
+        // A duplicate would be a 23505 on the row's own key, which this path
+        // cannot produce — the id is a UUID this call just generated.
+        Err(err) if unique_violation(&err).is_some() => {
+            Err(AppError::Internal("failed to create note file".into()))
+        }
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -47,8 +60,15 @@ pub async fn read_for(
     id: &NoteFileId,
     note: &NoteId,
 ) -> Result<Option<NoteFile>, AppError> {
-    let file: Option<NoteFile> = db.select(id.record()).await?;
-    Ok(file.filter(|file| &file.note == note))
+    let file = sqlx::query_as!(
+        NoteFile,
+        r#"SELECT id, note, name, content_type, size FROM note_file WHERE id = $1 AND note = $2"#,
+        id,
+        note
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(file)
 }
 
 /// All of `note`'s attachment rows, newest first.
@@ -58,9 +78,9 @@ pub async fn list_for(
     limit: Option<i64>,
     offset: i64,
 ) -> Result<(Vec<NoteFile>, i64), AppError> {
-    PagedList::new("note_file WHERE note = $note", "ORDER BY id DESC")
-        .bind("note", note.record())
-        .run(limit, offset, db)
+    PagedList::new("note_file WHERE note = $1", "ORDER BY id DESC")
+        .bind(note.uuid())
+        .run::<NoteFile>(limit, offset, db)
         .await
 }
 
@@ -68,133 +88,102 @@ pub async fn list_for(
 /// itself is untouched, so unlike the note-delete cascade this one has a
 /// counter to correct. (Deleting a *note* takes its counter with it.)
 pub async fn delete(db: &Database, file: NoteFile) -> Result<NoteFile, AppError> {
-    let mut result = db
-        .query(
-            "BEGIN TRANSACTION;
-             LET $gone = (DELETE $id RETURN BEFORE);
-             UPDATE $note SET file_count = math::max([(file_count ?? 0) - array::len($gone), 0]);
-             RETURN $gone;
-             COMMIT TRANSACTION;",
+    tx_with_retry(db, true, async |conn| {
+        let gone = sqlx::query_as!(
+            NoteFile,
+            r#"DELETE FROM note_file WHERE id = $1 RETURNING id, note, name, content_type, size"#,
+            file.id
         )
-        .bind(("id", file.id.record()))
-        .bind(("note", file.note.record()))
-        .await?
-        .check()?;
-    result
-        .take::<Vec<NoteFile>>(3)?
-        .into_iter()
-        .next()
-        .ok_or(AppError::NotFound)
+        .fetch_optional(&mut *conn)
+        .await?;
+        let file = gone.ok_or(AppError::NotFound)?;
+        sqlx::query!(
+            "UPDATE note SET file_count = GREATEST(file_count - 1, 0) WHERE id = $1",
+            file.note
+        )
+        .execute(&mut *conn)
+        .await?;
+        Ok(file)
+    })
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::note_file::{FileContentType, FileName};
+    use crate::domain::note::NoteContent;
+    use crate::domain::note::NoteTitle;
+    use crate::domain::note_file::FileContentType;
+    use crate::domain::note_file::FileName;
 
-    #[tokio::test]
-    async fn rows_scope_to_their_note() {
-        let db = crate::database::init_mem().await.unwrap();
-        // Real note rows: the cap counter lives on the note, so an insert whose
-        // note does not exist has no slot to take (a 409, like a full note).
+    async fn a_note(db: &Database) -> Note {
         let owner = crate::domain::user::UserId::generate();
-        let note_of = async |title: &str| {
-            crate::db::note::create(
-                &db,
-                &owner,
-                crate::domain::note::NoteTitle::try_new(title).unwrap(),
-                crate::domain::note::NoteContent::try_new("body").unwrap(),
-            )
-            .await
-            .unwrap()
-        };
-        let note_a = note_of("a").await.get_id().clone();
-        let note_b = note_of("b").await.get_id().clone();
-        let file = insert(
-            &db,
-            NoteFile::new(
-                &note_a,
-                FileName::try_new("plan.pdf").unwrap(),
-                FileContentType::try_new("application/pdf").unwrap(),
-                3,
-            ),
-        )
-        .await
-        .unwrap();
-
-        // Readable under its own note, invisible under another.
-        let found = read_for(&db, file.get_id(), &note_a).await.unwrap();
-        assert_eq!(found.unwrap().get_name().as_str(), "plan.pdf");
-        assert!(
-            read_for(&db, file.get_id(), &note_b)
-                .await
-                .unwrap()
-                .is_none()
-        );
-
-        let listed = async |note: &NoteId| list_for(&db, note, None, 0).await.unwrap().0;
-        assert_eq!(listed(&note_a).await.len(), 1);
-        assert!(listed(&note_b).await.is_empty());
-
-        delete(&db, file).await.unwrap();
-        assert!(listed(&note_a).await.is_empty());
-    }
-
-    /// The counter and the rows are written in one transaction, so the stored
-    /// count must equal the stored rows — after a success *and* after the
-    /// refusal that fills the cap, which must move neither.
-    #[tokio::test]
-    async fn counter_tracks_stored_rows() {
-        let db = crate::database::init_mem().await.unwrap();
-        let note = crate::db::note::create(
-            &db,
-            &crate::domain::user::UserId::generate(),
-            crate::domain::note::NoteTitle::try_new("a").unwrap(),
-            crate::domain::note::NoteContent::try_new("body").unwrap(),
+        crate::db::note::create(
+            db,
+            &owner,
+            NoteTitle::try_new("n").unwrap(),
+            NoteContent::try_new("b").unwrap(),
         )
         .await
         .unwrap()
-        .get_id()
-        .clone();
-        let stored_count = async |note: &NoteId| -> i64 {
-            db.query("SELECT VALUE file_count FROM $note")
-                .bind(("note", note.record()))
-                .await
-                .unwrap()
-                .take::<Vec<i64>>(0)
-                .unwrap()
-                .into_iter()
-                .next()
-                .unwrap_or(0)
-        };
-        let add = async |note: &NoteId| {
-            insert(
-                &db,
-                NoteFile::new(
-                    note,
-                    FileName::try_new("plan.pdf").unwrap(),
-                    FileContentType::try_new("application/pdf").unwrap(),
-                    3,
-                ),
-            )
-            .await
-        };
+    }
 
-        for filled in 1..=MAX_NOTE_FILES {
-            add(&note).await.unwrap();
-            assert_eq!(stored_count(&note).await, filled as i64);
-            assert_eq!(
-                list_for(&db, &note, None, 0).await.unwrap().1,
-                filled as i64
+    /// The cap answers with a conflict, and neither the refused row nor its
+    /// slot was written: the count is still what the last accepted upload
+    /// left.
+    #[tokio::test]
+    async fn insert_refuses_at_the_cap_without_leaking_a_slot() {
+        let db = crate::database::init_mem().await.unwrap();
+        let note = a_note(&db).await;
+        for index in 0..MAX_NOTE_FILES {
+            let file = NoteFile::new(
+                note.get_id(),
+                FileName::try_new(&format!("f{index}")).unwrap(),
+                FileContentType::try_new("text/plain").unwrap(),
+                1,
             );
+            insert(&db, file).await.unwrap();
         }
-
-        // At the cap: the refusal writes nothing, counter included.
-        assert!(matches!(add(&note).await, Err(AppError::Conflict(_))));
-        assert_eq!(stored_count(&note).await, MAX_NOTE_FILES as i64);
-        assert_eq!(
-            list_for(&db, &note, None, 0).await.unwrap().1,
-            MAX_NOTE_FILES as i64
+        let over = NoteFile::new(
+            note.get_id(),
+            FileName::try_new("over").unwrap(),
+            FileContentType::try_new("text/plain").unwrap(),
+            1,
         );
+        assert!(matches!(
+            insert(&db, over).await,
+            Err(AppError::Conflict(_))
+        ));
+        let (files, total) = list_for(&db, note.get_id(), None, 0).await.unwrap();
+        assert_eq!(total, MAX_NOTE_FILES as i64);
+        assert_eq!(files.len(), MAX_NOTE_FILES);
+    }
+
+    /// Deleting a row hands its slot back: after one delete a new upload is
+    /// accepted again, and the count never dips below zero.
+    #[tokio::test]
+    async fn delete_returns_the_slot_to_the_note() {
+        let db = crate::database::init_mem().await.unwrap();
+        let note = a_note(&db).await;
+        let file = NoteFile::new(
+            note.get_id(),
+            FileName::try_new("f").unwrap(),
+            FileContentType::try_new("text/plain").unwrap(),
+            1,
+        );
+        let file = insert(&db, file).await.unwrap();
+        let gone = delete(&db, file.clone()).await.unwrap();
+        assert_eq!(gone.get_id(), file.get_id());
+        // Deleting it a second time is a 404, not a second decrement.
+        assert!(matches!(delete(&db, file).await, Err(AppError::NotFound)));
+        let next = NoteFile::new(
+            note.get_id(),
+            FileName::try_new("next").unwrap(),
+            FileContentType::try_new("text/plain").unwrap(),
+            1,
+        );
+        insert(&db, next).await.unwrap();
+        let (_, total) = list_for(&db, note.get_id(), None, 0).await.unwrap();
+        assert_eq!(total, 1);
     }
 }

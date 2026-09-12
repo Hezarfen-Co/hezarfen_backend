@@ -1,3 +1,4 @@
+use uuid::Uuid;
 use crate::constant::{MAX_NOTE_CONTENT_LEN, MAX_NOTE_TITLE_LEN};
 use crate::domain::course::CourseId;
 use crate::domain::monotonic_id::next_uuid;
