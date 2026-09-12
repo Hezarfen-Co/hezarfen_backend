@@ -99,20 +99,20 @@ impl BadgeStat {
 /// select into (`SELECT homework_submitted, … FROM app_user WHERE id = $1`).
 #[derive(Debug, Clone, Default, sqlx::FromRow)]
 pub struct BadgeStats {
-    homework_submitted: i64,
-    homework_on_time: i64,
-    exam_sat: i64,
-    pomodoro_finished: i64,
-    pomodoro_focus_ms: i64,
-    marks_given: i64,
-    lessons_held: i64,
-    pool_approved: i64,
-    pool_published: i64,
-    lessons_attended: i64,
-    high_mark: i64,
+    pub(crate) homework_submitted: i64,
+    pub(crate) homework_on_time: i64,
+    pub(crate) exam_sat: i64,
+    pub(crate) pomodoro_finished: i64,
+    pub(crate) pomodoro_focus_ms: i64,
+    pub(crate) marks_given: i64,
+    pub(crate) lessons_held: i64,
+    pub(crate) pool_approved: i64,
+    pub(crate) pool_published: i64,
+    pub(crate) lessons_attended: i64,
+    pub(crate) high_mark: i64,
     /// The longest study run, off `study_streak_longest`. Named for the wire,
     /// like every field here, and never the run in progress.
-    study_streak: i64,
+    pub(crate) study_streak: i64,
 }
 
 impl BadgeStats {
@@ -200,8 +200,8 @@ pub fn earned(stats: &BadgeStats) -> Vec<&'static str> {
 /// columns.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct BadgeAward {
-    badge: String,
-    earned_at: Timestamp,
+    pub(crate) badge: String,
+    pub(crate) earned_at: Timestamp,
 }
 
 impl BadgeAward {

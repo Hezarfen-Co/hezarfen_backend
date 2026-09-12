@@ -67,6 +67,9 @@ pub(crate) enum Param {
     OptText(Option<String>),
     /// Nullable BIGINT column clear/set.
     OptI64(Option<i64>),
+    /// A TEXT-array predicate value (`col = ANY($n)`): the closed role set a
+    /// visibility filter allows, the tag list a search narrows to.
+    Texts(Vec<String>),
 }
 
 impl Param {
@@ -80,6 +83,7 @@ impl Param {
             Param::OptUuid(value) => args.add(value),
             Param::OptText(value) => args.add(value),
             Param::OptI64(value) => args.add(value),
+            Param::Texts(value) => args.add(value),
         };
     }
 }
@@ -182,16 +186,18 @@ impl PagedList {
         if count_sql.is_some() {
             Param::from(offset).add_to(&mut args);
         }
-        let rows: Vec<T> =
-            sqlx::query_as_with(AssertSqlSafe(page_sql), args).fetch_all(db).await?;
+        let rows: Vec<T> = sqlx::query_as_with(AssertSqlSafe(page_sql), args)
+            .fetch_all(db)
+            .await?;
         let total = match count_sql {
             Some(count_sql) => {
                 let mut args = PgArguments::default();
                 for bind in self.binds {
                     bind.add_to(&mut args);
                 }
-                let scalar: i64 =
-                    sqlx::query_scalar_with(AssertSqlSafe(count_sql), args).fetch_one(db).await?;
+                let scalar: i64 = sqlx::query_scalar_with(AssertSqlSafe(count_sql), args)
+                    .fetch_one(db)
+                    .await?;
                 scalar
             }
             None => rows.len() as i64,
@@ -223,8 +229,7 @@ mod tests {
     /// A whole-table read counts the bare table.
     #[test]
     fn an_unfiltered_list_counts_the_bare_table() {
-        let (sql, count) =
-            PagedList::new("term", "ORDER BY starts_at DESC").statements(Some(5), 0);
+        let (sql, count) = PagedList::new("term", "ORDER BY starts_at DESC").statements(Some(5), 0);
         assert!(sql.contains("LIMIT $1 OFFSET $2"));
         assert_eq!(count.as_deref(), Some("SELECT count(*) FROM term"));
     }
@@ -250,10 +255,12 @@ mod tests {
     /// order.
     #[test]
     fn window_placeholders_continue_the_where_numbering() {
-        let (sql, count) =
-            PagedList::new("note WHERE user_id = $1 AND archived_at IS NULL", "ORDER BY id")
-                .bind(Uuid::nil())
-                .statements(Some(2), 4);
+        let (sql, count) = PagedList::new(
+            "note WHERE user_id = $1 AND archived_at IS NULL",
+            "ORDER BY id",
+        )
+        .bind(Uuid::nil())
+        .statements(Some(2), 4);
         assert!(sql.contains("LIMIT $2 OFFSET $3"));
         assert_eq!(
             count.as_deref(),
