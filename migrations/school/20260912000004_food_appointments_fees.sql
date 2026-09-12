@@ -41,7 +41,9 @@ CREATE INDEX appointment_slot_series ON appointment_slot (series);
 
 CREATE TABLE appointment (
     id                 uuid PRIMARY KEY,
-    slot               uuid NOT NULL REFERENCES appointment_slot(id) ON DELETE NO ACTION,
+    -- Nullable + SET NULL ports the old dangling-ref contract: a settled
+    -- booking whose slot was deleted still renders, without a window.
+    slot               uuid NULL REFERENCES appointment_slot(id) ON DELETE SET NULL,
     requester          uuid NOT NULL REFERENCES app_user(id) ON DELETE NO ACTION,
     status             TEXT NOT NULL DEFAULT 'pending'
         CHECK (status IN ('pending', 'approved', 'rejected', 'cancelled')),

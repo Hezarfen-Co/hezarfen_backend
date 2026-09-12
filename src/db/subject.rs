@@ -11,6 +11,7 @@ use crate::domain::course::CourseId;
 use crate::domain::subject::{Subject, SubjectDescription, SubjectId, SubjectName};
 use crate::error::AppError;
 
+
 pub async fn create(
     db: &Database,
     course: &CourseId,
@@ -115,13 +116,13 @@ pub async fn update(
 /// Exam questions and homework are *not* cascaded: their `subject` is a
 /// required field that may not be orphaned, so either one still refuses the
 /// delete with a 409. That refusal is this transaction's own check, read
-/// off the two reference counters this row carries (`exam_question_count`
-/// and its homework twin) under a `FOR UPDATE` row lock — the lock *is*
-/// the guard, because every counter writer must update this same row, so
-/// no question can land between the check and the delete. The old store
-/// could not conflict-check the cross-table shape, which is why the check
-/// had to be the `DELETE`'s own `WHERE`; here the row lock does it and the
-/// check reads the same columns.
+/// off the two reference counters this row carries
+/// (`exam_question_count` and its homework twin) under a `FOR UPDATE` row
+/// lock — the lock *is* the guard, because every counter writer must
+/// update this same row, so no question can land between the check and the
+/// delete. The old store could not conflict-check the cross-table shape,
+/// which is why the check had to be the `DELETE`'s own `WHERE`; here the
+/// row lock does it and the `WHERE` reads off the same columns.
 ///
 /// Which of the two blocked is read off the counters *before* the delete,
 /// purely to pick the message; the decision itself was already made by the

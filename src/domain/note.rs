@@ -20,6 +20,12 @@ impl NoteId {
         Self(next_uuid())
     }
 
+    /// The inner uuid, for runtime-checked binds (Param/QueryBuilder) that
+    /// cannot take the newtype. Static `query!` binds take `self` directly.
+    pub fn uuid(&self) -> Uuid {
+        self.0
+    }
+
     /// Parse a wire key. A key that parses as no UUID — a malformed path
     /// segment — reads as the nil id, which matches no row: exactly the 404 a
     /// dangling record key produced under the old store, without turning a

@@ -39,6 +39,9 @@ impl ClassMemberId {
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ClassMember {
     pub(crate) class: ClassGroupId,
+    /// The column is `app_user` (the reserved-word rename); the Rust name is
+    /// the domain's.
+    #[sqlx(rename = "app_user")]
     pub(crate) user: UserId,
     pub(crate) added_by: UserId,
     /// When they were added, and the *only* thing "newest first" can mean
