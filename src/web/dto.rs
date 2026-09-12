@@ -117,11 +117,14 @@ impl PersonRef {
     /// Look `id` up in `people`, degrading to the bare id when the row is gone
     /// — a stale reference renders oddly instead of failing the request.
     pub fn resolve(people: &HashMap<String, PersonRef>, id: &UserId) -> Self {
-        people.get(id.key()).cloned().unwrap_or_else(|| Self {
-            id: id.key().to_string(),
-            username: id.key().to_string(),
-            display_name: None,
-        })
+        people
+            .get(id.key().as_str())
+            .cloned()
+            .unwrap_or_else(|| Self {
+                id: id.key().to_string(),
+                username: id.key().to_string(),
+                display_name: None,
+            })
     }
 }
 

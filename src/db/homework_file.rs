@@ -46,13 +46,13 @@ pub async fn insert(db: &Database, file: HomeworkFile) -> Result<Option<Homework
                      file,
                      created_at AS "created_at: Timestamp""#,
         MAX_HOMEWORK_FILES_PER_SUBMISSION as i64,
-        file.submission,
-        file.id,
-        file.name,
-        file.content_type,
+        file.submission.uuid(),
+        file.id.uuid(),
+        file.name.as_str(),
+        file.content_type.as_str(),
         file.size,
         file.file,
-        file.created_at,
+        file.created_at.as_millis(),
     )
     .fetch_optional(db)
     .await
@@ -95,8 +95,8 @@ pub async fn read_for(
                   file,
                   created_at AS "created_at: Timestamp"
            FROM homework_file WHERE id = $1 AND submission = $2"#,
-        id,
-        submission
+        id.uuid(),
+        submission.uuid()
     )
     .fetch_optional(db)
     .await?)
@@ -125,8 +125,8 @@ pub async fn read_in_homework(
            FROM homework_file
            WHERE id = $1
              AND submission IN (SELECT id FROM homework_submission WHERE homework = $2)"#,
-        id,
-        homework
+        id.uuid(),
+        homework.uuid()
     )
     .fetch_optional(db)
     .await?)
@@ -147,7 +147,7 @@ pub async fn list_for_submission(
                   file,
                   created_at AS "created_at: Timestamp"
            FROM homework_file WHERE submission = $1 ORDER BY id DESC"#,
-        submission
+        submission.uuid()
     )
     .fetch_all(db)
     .await?)
@@ -161,8 +161,8 @@ pub async fn count_for_submission(
     submission: &crate::domain::homework_submission::HomeworkSubmissionId,
 ) -> Result<usize, AppError> {
     let row = sqlx::query!(
-        r#"SELECT count(*) AS "count: i64" FROM homework_file WHERE submission = $1"#,
-        submission
+        r#"SELECT count(*) AS "count!: i64" FROM homework_file WHERE submission = $1"#,
+        submission.uuid()
     )
     .fetch_one(db)
     .await?;
@@ -180,7 +180,7 @@ pub async fn file_keys_for_homework(
     Ok(sqlx::query!(
         r#"SELECT file FROM homework_file
            WHERE submission IN (SELECT id FROM homework_submission WHERE homework = $1)"#,
-        homework
+        homework.uuid()
     )
     .fetch_all(db)
     .await?
@@ -201,7 +201,7 @@ pub async fn file_keys_for_course(
                SELECT id FROM homework_submission
                WHERE homework IN (SELECT id FROM homework WHERE course = $1)
            )"#,
-        course
+        course.uuid()
     )
     .fetch_all(db)
     .await?
@@ -224,13 +224,13 @@ pub async fn file_keys_for_course(
 /// `Err(NotFound)` still means the file row itself had vanished.
 pub async fn delete(db: &Database, file: HomeworkFile) -> Result<Option<HomeworkFile>, AppError> {
     let now = Timestamp::now();
-    tx_with_retry(db, false, async |tx| {
+    tx_with_retry(db, false, async move |tx| {
         let open = sqlx::query!(
             r#"UPDATE homework_submission SET updated_at = $2
                WHERE id = $1 AND graded_by_result IS NULL
                RETURNING 1 AS "open: i32""#,
-            file.submission,
-            now
+            file.submission.uuid(),
+            now.as_millis()
         )
         .fetch_optional(&mut *tx)
         .await?;
@@ -247,8 +247,8 @@ pub async fn delete(db: &Database, file: HomeworkFile) -> Result<Option<Homework
                          size,
                          file,
                          created_at AS "created_at: Timestamp""#,
-            file.id,
-            file.submission
+            file.id.uuid(),
+            file.submission.uuid()
         )
         .fetch_optional(&mut *tx)
         .await?;
@@ -257,7 +257,7 @@ pub async fn delete(db: &Database, file: HomeworkFile) -> Result<Option<Homework
                 sqlx::query!(
                     "UPDATE homework_submission SET file_count = GREATEST(file_count - 1, 0)
                      WHERE id = $1",
-                    file.submission
+                    file.submission.uuid()
                 )
                 .execute(&mut *tx)
                 .await?;

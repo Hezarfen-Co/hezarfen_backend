@@ -29,7 +29,7 @@ pub async fn upsert(
     db: &Database,
     image: BankQuestionImage,
 ) -> Result<(BankQuestionImage, Option<String>), AppError> {
-    tx_with_retry(db, false, async |tx| {
+    tx_with_retry(db, false, async move |tx| {
         let was = sqlx::query!(
             r#"SELECT file FROM bank_question_image
                WHERE bank_question = $1 AND slot IS NOT DISTINCT FROM $2
@@ -37,7 +37,7 @@ pub async fn upsert(
             image.bank_question.uuid(),
             image.slot.as_ref().map(ChoiceId::as_str),
         )
-        .fetch_optional(tx)
+        .fetch_optional(&mut *tx)
         .await?
         .map(|row| row.file);
         let stored = match sqlx::query_as!(
@@ -48,7 +48,7 @@ pub async fn upsert(
                ON CONFLICT (bank_question, slot) DO UPDATE
                SET file = $3, content_type = $4, size = $5
                RETURNING bank_question AS "bank_question: BankQuestionId",
-                   slot AS "slot: Option<ChoiceId>", file,
+                   slot AS "slot: ChoiceId", file,
                    content_type AS "content_type: FileContentType", size"#,
             image.bank_question.uuid(),
             image.slot.as_ref().map(ChoiceId::as_str),
@@ -56,7 +56,7 @@ pub async fn upsert(
             image.content_type.as_str(),
             image.size,
         )
-        .fetch_one(tx)
+        .fetch_one(&mut *tx)
         .await
         {
             Ok(row) => row,
@@ -77,7 +77,7 @@ pub async fn read_slot(
     let row = sqlx::query_as!(
         BankQuestionImage,
         r#"SELECT bank_question AS "bank_question: BankQuestionId",
-               slot AS "slot: Option<ChoiceId>", file,
+               slot AS "slot: ChoiceId", file,
                content_type AS "content_type: FileContentType", size
            FROM bank_question_image
            WHERE bank_question = $1 AND slot IS NOT DISTINCT FROM $2"#,
@@ -96,7 +96,7 @@ pub async fn list_for_question(
     let rows = sqlx::query_as!(
         BankQuestionImage,
         r#"SELECT bank_question AS "bank_question: BankQuestionId",
-               slot AS "slot: Option<ChoiceId>", file,
+               slot AS "slot: ChoiceId", file,
                content_type AS "content_type: FileContentType", size
            FROM bank_question_image WHERE bank_question = $1"#,
         question.uuid()
@@ -119,10 +119,10 @@ pub async fn list_for_questions(
     let rows = sqlx::query_as!(
         BankQuestionImage,
         r#"SELECT bank_question AS "bank_question: BankQuestionId",
-               slot AS "slot: Option<ChoiceId>", file,
+               slot AS "slot: ChoiceId", file,
                content_type AS "content_type: FileContentType", size
            FROM bank_question_image WHERE bank_question = ANY($1)"#,
-        ids
+        &ids
     )
     .fetch_all(db)
     .await?;
@@ -151,10 +151,10 @@ pub async fn delete_choices_not_in(
              AND slot IS NOT NULL
              AND NOT (slot = ANY($2))
            RETURNING bank_question AS "bank_question: BankQuestionId",
-               slot AS "slot: Option<ChoiceId>", file,
+               slot AS "slot: ChoiceId", file,
                content_type AS "content_type: FileContentType", size"#,
         question.uuid(),
-        keep
+        &keep
     )
     .fetch_all(db)
     .await?;
@@ -170,7 +170,7 @@ pub async fn delete(
         r#"DELETE FROM bank_question_image
            WHERE bank_question = $1 AND slot IS NOT DISTINCT FROM $2
            RETURNING bank_question AS "bank_question: BankQuestionId",
-               slot AS "slot: Option<ChoiceId>", file,
+               slot AS "slot: ChoiceId", file,
                content_type AS "content_type: FileContentType", size"#,
         image.bank_question.uuid(),
         image.slot.as_ref().map(ChoiceId::as_str)

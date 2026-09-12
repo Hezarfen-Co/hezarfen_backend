@@ -170,10 +170,13 @@ async fn against(
         }
         .into());
     }
-    // Owned captures: a closure holding a `&T` fails the higher-ranked
-    // `Send` check `tx_with_retry`'s future must pass.
+    // Owned captures: a closure holding a `&T` — a reference parameter or a
+    // `&str` of any lifetime, `'static` included — fails the higher-ranked
+    // `Send`/`AsyncFnMut` check `tx_with_retry`'s future must pass.
     let target = target.clone();
     let recorded_by = *recorded_by;
+    let over = over.to_owned();
+    let reversed = reversed.map(str::to_owned);
     tx_with_retry(db, false, async move |tx| {
         // Every writer that can move this target's arithmetic holds some row
         // on this chain; holding the whole walk to the root is what makes
@@ -210,16 +213,16 @@ async fn against(
             // bursar money had arrived when none ever did. The reversal's
             // id is derived from its target's, so telling the two apart is
             // one read, taken only on the refusal path.
-            if let Some(text) = reversed {
+            if let Some(text) = &reversed {
                 let reversed_there =
                     payment_ledger::read(&mut *tx, &PaymentLedgerId::for_reversal(&target.id))
                         .await?
                         .is_some();
                 if reversed_there {
-                    return Err(AppError::Conflict(text));
+                    return Err(AppError::ConflictOwned(text.clone()));
                 }
             }
-            return Err(AppError::Conflict(over));
+            return Err(AppError::ConflictOwned(over.clone()));
         }
         payment_ledger::append(
             &mut *tx,

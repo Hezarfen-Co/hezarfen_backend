@@ -248,7 +248,7 @@ pub async fn unassign_everywhere(db: &Database, user: &UserId) -> Result<(), App
 /// delete is refused) or finds the row gone (and is refused itself). The
 /// `Err(NotFound)` keeps the answer a concurrent *delete* used to get.
 pub async fn delete(db: &Database, class: ClassGroup) -> Result<bool, AppError> {
-    tx_with_retry(db, false, async |tx| {
+    tx_with_retry(db, false, async move |tx| {
         let gone = sqlx::query!(
             r#"DELETE FROM class_group
                WHERE id = $1

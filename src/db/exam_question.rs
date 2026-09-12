@@ -94,8 +94,9 @@ async fn insert(
     //
     // The id is a freshly minted UUIDv7, so no rival can aim at it: the
     // only possible duplicate key is one this call minted, which is none.
-    tx_with_retry(db, false, async |conn| {
-        freeze_gate(conn, exam).await?;
+    let exam = exam.clone();
+    tx_with_retry(db, false, async move |conn| {
+        freeze_gate(conn, &exam).await?;
         claim_subject_and_insert(conn, &question).await
     })
     .await
@@ -258,7 +259,7 @@ pub async fn update(
     // already landed, writes that stale subject straight back over the
     // winner — a revert with the counters left pointing at the move.
     let retag = (subject != question.subject).then(|| (subject, question.subject.clone()));
-    tx_with_retry(db, false, async |conn| {
+    tx_with_retry(db, false, async move |conn| {
         // Freeze first, as always: it outranks every caller gate, and a
         // frozen exam answers the same 409 the pre-flight check gave.
         freeze_gate(conn, &question.exam).await?;
@@ -376,7 +377,7 @@ pub async fn link_banked_as(
 /// delete — and the cascade now shares that transaction too, so a failure
 /// mid-way can no longer strand answers whose question survived.
 pub async fn delete(db: &Database, question: ExamQuestion) -> Result<ExamQuestion, AppError> {
-    tx_with_retry(db, false, async |conn| {
+    tx_with_retry(db, false, async move |conn| {
         freeze_gate(conn, &question.exam).await?;
         sqlx::query!(
             r#"DELETE FROM exam_answer WHERE question = $1"#,

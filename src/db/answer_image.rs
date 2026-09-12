@@ -44,7 +44,7 @@ pub async fn upsert(
     db: &Database,
     image: AnswerImage,
 ) -> Result<(AnswerImage, Option<String>), AppError> {
-    tx_with_retry(db, false, async |conn| upsert_in(conn, &image).await).await
+    tx_with_retry(db, false, async move |conn| upsert_in(conn, &image).await).await
 }
 
 /// The locked exam-row probe plus the upsert, on one connection.

@@ -12,6 +12,7 @@ use crate::domain::note_file::FileContentType;
 use crate::domain::pool_question::PoolQuestionId;
 use crate::domain::solution::{Solution, SolutionBody, SolutionId};
 use crate::domain::timestamp::Timestamp;
+use crate::domain::user::UserId;
 use crate::error::AppError;
 
 /// Offer the solution. `NotFound` = the question is gone, and nothing was
@@ -33,7 +34,7 @@ pub async fn insert(db: &Database, solution: Solution) -> Result<Solution, AppEr
            RETURNING id AS "id: SolutionId", question AS "question: PoolQuestionId",
                author AS "author: UserId", body AS "body: SolutionBody",
                offered_at AS "offered_at: Timestamp", image_file,
-               image_content_type AS "image_content_type: Option<FileContentType>",
+               image_content_type AS "image_content_type: FileContentType",
                image_size"#,
         solution.id.uuid(),
         solution.question.uuid(),
@@ -68,7 +69,7 @@ pub async fn read_for(
         r#"SELECT id AS "id: SolutionId", question AS "question: PoolQuestionId",
                author AS "author: UserId", body AS "body: SolutionBody",
                offered_at AS "offered_at: Timestamp", image_file,
-               image_content_type AS "image_content_type: Option<FileContentType>",
+               image_content_type AS "image_content_type: FileContentType",
                image_size
            FROM solution WHERE id = $1 AND question = $2"#,
         id.uuid(),
@@ -116,13 +117,13 @@ pub async fn counts_for(
            FROM solution
            WHERE question = ANY($1)
            GROUP BY question"#,
-        ids,
+        &ids,
     )
     .fetch_all(db)
     .await?;
     Ok(rows
         .into_iter()
-        .map(|row| (row.question.key(), row.n))
+        .map(|row| (row.question.key(), row.n.unwrap_or(0)))
         .collect())
 }
 
@@ -140,7 +141,7 @@ pub async fn set_body(
            RETURNING id AS "id: SolutionId", question AS "question: PoolQuestionId",
                author AS "author: UserId", body AS "body: SolutionBody",
                offered_at AS "offered_at: Timestamp", image_file,
-               image_content_type AS "image_content_type: Option<FileContentType>",
+               image_content_type AS "image_content_type: FileContentType",
                image_size"#,
         id.uuid(),
         body.as_str()
@@ -165,18 +166,22 @@ pub async fn set_image(
     content_type: &FileContentType,
     size: i64,
 ) -> Result<Option<Solution>, AppError> {
-    tx_with_retry(db, false, async |tx| {
+    // Owned captures (`Send` rule of `tx_with_retry` closures).
+    let id = *id;
+    let file = file.to_owned();
+    let content_type = content_type.clone();
+    tx_with_retry(db, false, async move |tx| {
         let before = sqlx::query_as!(
             Solution,
             r#"SELECT id AS "id: SolutionId", question AS "question: PoolQuestionId",
                    author AS "author: UserId", body AS "body: SolutionBody",
                    offered_at AS "offered_at: Timestamp", image_file,
-                   image_content_type AS "image_content_type: Option<FileContentType>",
+                   image_content_type AS "image_content_type: FileContentType",
                    image_size
                    FROM solution WHERE id = $1 FOR UPDATE"#,
             id.uuid()
         )
-        .fetch_optional(tx)
+        .fetch_optional(&mut *tx)
         .await?;
         let Some(before) = before else {
             return Ok(None);
@@ -186,11 +191,11 @@ pub async fn set_image(
                SET image_file = $2, image_content_type = $3, image_size = $4
                WHERE id = $1"#,
             id.uuid(),
-            file,
+            file.as_str(),
             content_type.as_str(),
             size,
         )
-        .execute(tx)
+        .execute(&mut *tx)
         .await?;
         Ok(Some(before))
     })
@@ -200,18 +205,20 @@ pub async fn set_image(
 /// Detach the solution's image. Returns the *before* row — its
 /// `image_file` is the blob the caller must remove.
 pub async fn clear_image(db: &Database, id: &SolutionId) -> Result<Option<Solution>, AppError> {
-    tx_with_retry(db, false, async |tx| {
+    // Owned capture (`Send` rule of `tx_with_retry` closures).
+    let id = *id;
+    tx_with_retry(db, false, async move |tx| {
         let before = sqlx::query_as!(
             Solution,
             r#"SELECT id AS "id: SolutionId", question AS "question: PoolQuestionId",
                    author AS "author: UserId", body AS "body: SolutionBody",
                    offered_at AS "offered_at: Timestamp", image_file,
-                   image_content_type AS "image_content_type: Option<FileContentType>",
+                   image_content_type AS "image_content_type: FileContentType",
                    image_size
                    FROM solution WHERE id = $1 FOR UPDATE"#,
             id.uuid()
         )
-        .fetch_optional(tx)
+        .fetch_optional(&mut *tx)
         .await?;
         let Some(before) = before else {
             return Ok(None);
@@ -222,7 +229,7 @@ pub async fn clear_image(db: &Database, id: &SolutionId) -> Result<Option<Soluti
                WHERE id = $1"#,
             id.uuid(),
         )
-        .execute(tx)
+        .execute(&mut *tx)
         .await?;
         Ok(Some(before))
     })
@@ -236,7 +243,7 @@ pub async fn delete(db: &Database, solution: Solution) -> Result<Solution, AppEr
            RETURNING id AS "id: SolutionId", question AS "question: PoolQuestionId",
                author AS "author: UserId", body AS "body: SolutionBody",
                offered_at AS "offered_at: Timestamp", image_file,
-               image_content_type AS "image_content_type: Option<FileContentType>",
+               image_content_type AS "image_content_type: FileContentType",
                image_size"#,
         solution.id.uuid()
     )

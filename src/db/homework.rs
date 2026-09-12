@@ -63,7 +63,13 @@ pub async fn create(
         created_by: created_by.clone(),
         created_at: Timestamp::now(),
     };
-    let assigned_values = homework.assigned.clone().unwrap_or_default();
+    let assigned_values: Vec<uuid::Uuid> = homework
+        .assigned
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(UserId::uuid)
+        .collect();
     // The fresh v7 id cannot collide, so the pair-unique answer has no rival
     // here; the mapping is kept for symmetry with the other claim sites.
     let created = sqlx::query_as!(
@@ -79,21 +85,21 @@ pub async fn create(
                      course AS "course: CourseId",
                      subject AS "subject: SubjectId",
                      title AS "title: HomeworkTitle",
-                     description AS "description: Option<HomeworkDescription>",
+                     description AS "description: HomeworkDescription",
                      due_at AS "due_at: Timestamp",
                      CASE WHEN cardinality(assigned) = 0 THEN NULL ELSE assigned END
-                         AS "assigned: Option<Vec<UserId>>",
+                         AS "assigned: Vec<UserId>",
                      created_by AS "created_by: UserId",
                      created_at AS "created_at: Timestamp""#,
-        subject,
-        homework.id,
-        course,
-        homework.title,
-        homework.description,
-        homework.due_at,
-        assigned_values,
-        homework.created_by,
-        homework.created_at,
+        subject.uuid(),
+        homework.id.uuid(),
+        course.uuid(),
+        homework.title.as_str(),
+        homework.description.as_ref().map(HomeworkDescription::as_str),
+        homework.due_at.as_millis(),
+        &assigned_values,
+        homework.created_by.uuid(),
+        homework.created_at.as_millis(),
     )
     .fetch_optional(db)
     .await
@@ -114,14 +120,14 @@ pub async fn read(db: &Database, id: &HomeworkId) -> Result<Option<Homework>, Ap
                   course AS "course: CourseId",
                   subject AS "subject: SubjectId",
                   title AS "title: HomeworkTitle",
-                  description AS "description: Option<HomeworkDescription>",
+                  description AS "description: HomeworkDescription",
                   due_at AS "due_at: Timestamp",
                   CASE WHEN cardinality(assigned) = 0 THEN NULL ELSE assigned END
-                      AS "assigned: Option<Vec<UserId>>",
+                      AS "assigned: Vec<UserId>",
                   created_by AS "created_by: UserId",
                   created_at AS "created_at: Timestamp"
            FROM homework WHERE id = $1"#,
-        id
+        id.uuid()
     )
     .fetch_optional(db)
     .await?)
@@ -136,14 +142,14 @@ pub async fn list_for_course(db: &Database, course: &CourseId) -> Result<Vec<Hom
                   course AS "course: CourseId",
                   subject AS "subject: SubjectId",
                   title AS "title: HomeworkTitle",
-                  description AS "description: Option<HomeworkDescription>",
+                  description AS "description: HomeworkDescription",
                   due_at AS "due_at: Timestamp",
                   CASE WHEN cardinality(assigned) = 0 THEN NULL ELSE assigned END
-                      AS "assigned: Option<Vec<UserId>>",
+                      AS "assigned: Vec<UserId>",
                   created_by AS "created_by: UserId",
                   created_at AS "created_at: Timestamp"
            FROM homework WHERE course = $1 ORDER BY id DESC"#,
-        course
+        course.uuid()
     )
     .fetch_all(db)
     .await?)
@@ -158,10 +164,10 @@ pub async fn list_all(db: &Database) -> Result<Vec<Homework>, AppError> {
                   course AS "course: CourseId",
                   subject AS "subject: SubjectId",
                   title AS "title: HomeworkTitle",
-                  description AS "description: Option<HomeworkDescription>",
+                  description AS "description: HomeworkDescription",
                   due_at AS "due_at: Timestamp",
                   CASE WHEN cardinality(assigned) = 0 THEN NULL ELSE assigned END
-                      AS "assigned: Option<Vec<UserId>>",
+                      AS "assigned: Vec<UserId>",
                   created_by AS "created_by: UserId",
                   created_at AS "created_at: Timestamp"
            FROM homework ORDER BY id DESC"#,
@@ -181,21 +187,21 @@ pub async fn list_for_courses(
     if courses.is_empty() {
         return Ok(Vec::new());
     }
-    let ids: Vec<CourseId> = courses.to_vec();
+    let ids: Vec<uuid::Uuid> = courses.iter().map(CourseId::uuid).collect();
     Ok(sqlx::query_as!(
         Homework,
         r#"SELECT id AS "id: HomeworkId",
                   course AS "course: CourseId",
                   subject AS "subject: SubjectId",
                   title AS "title: HomeworkTitle",
-                  description AS "description: Option<HomeworkDescription>",
+                  description AS "description: HomeworkDescription",
                   due_at AS "due_at: Timestamp",
                   CASE WHEN cardinality(assigned) = 0 THEN NULL ELSE assigned END
-                      AS "assigned: Option<Vec<UserId>>",
+                      AS "assigned: Vec<UserId>",
                   created_by AS "created_by: UserId",
                   created_at AS "created_at: Timestamp"
            FROM homework WHERE course = ANY($1) ORDER BY id DESC"#,
-        ids
+        &ids
     )
     .fetch_all(db)
     .await?)
@@ -217,17 +223,17 @@ pub async fn list_for_user_in_course(
                   course AS "course: CourseId",
                   subject AS "subject: SubjectId",
                   title AS "title: HomeworkTitle",
-                  description AS "description: Option<HomeworkDescription>",
+                  description AS "description: HomeworkDescription",
                   due_at AS "due_at: Timestamp",
                   CASE WHEN cardinality(assigned) = 0 THEN NULL ELSE assigned END
-                      AS "assigned: Option<Vec<UserId>>",
+                      AS "assigned: Vec<UserId>",
                   created_by AS "created_by: UserId",
                   created_at AS "created_at: Timestamp"
            FROM homework
            WHERE course = $1 AND (cardinality(assigned) = 0 OR $2 = ANY(assigned))
            ORDER BY id DESC"#,
-        course,
-        user
+        course.uuid(),
+        user.uuid()
     )
     .fetch_all(db)
     .await?)
@@ -255,7 +261,7 @@ pub async fn update(
     due_at: Option<Timestamp>,
     assigned: Option<Option<Vec<UserId>>>,
 ) -> Result<Homework, AppError> {
-    tx_with_retry(db, false, async |tx| {
+    tx_with_retry(db, false, async move |tx| {
         // The homework row's lock. The orphan guard's reads and the write
         // below are one transaction with it, so a submission — whose own
         // transaction locks this very row before writing — cannot land
@@ -269,14 +275,14 @@ pub async fn update(
                       course AS "course: CourseId",
                       subject AS "subject: SubjectId",
                       title AS "title: HomeworkTitle",
-                      description AS "description: Option<HomeworkDescription>",
+                      description AS "description: HomeworkDescription",
                       due_at AS "due_at: Timestamp",
                       CASE WHEN cardinality(assigned) = 0 THEN NULL ELSE assigned END
-                          AS "assigned: Option<Vec<UserId>>",
+                          AS "assigned: Vec<UserId>",
                       created_by AS "created_by: UserId",
                       created_at AS "created_at: Timestamp"
                FROM homework WHERE id = $1 FOR UPDATE"#,
-            homework.get_id()
+            homework.get_id().uuid()
         )
         .fetch_optional(&mut *tx)
         .await?
@@ -300,14 +306,14 @@ pub async fn update(
         if let Some(next) = moving {
             sqlx::query!(
                 "UPDATE subject SET homework_count = GREATEST(homework_count - 1, 0) WHERE id = $1",
-                current.subject
+                current.subject.uuid()
             )
             .execute(&mut *tx)
             .await?;
             let seat = sqlx::query!(
                 r#"UPDATE subject SET homework_count = homework_count + 1
                    WHERE id = $1 RETURNING 1 AS "seat: i32""#,
-                next
+                next.uuid()
             )
             .fetch_optional(&mut *tx)
             .await?;
@@ -323,7 +329,7 @@ pub async fn update(
         // A, the locked row says B, and the refusal is the 409 the generic
         // PATCH builder has always answered with.
         if subject.is_some() && current.subject != homework.subject {
-            return Err(AppError::Conflict(STALE_MOVE.to_string()));
+            return Err(AppError::Conflict(STALE_MOVE));
         }
 
         // What the PATCH carried is written; what it did not carry keeps the
@@ -332,20 +338,25 @@ pub async fn update(
         // emitted — except it is one static statement instead of a runtime
         // build.
         let new_subject = subject.clone().unwrap_or_else(|| current.subject.clone());
-        let new_title = title.unwrap_or_else(|| current.title.clone());
-        let new_description = match description {
+        let new_title = title.clone().unwrap_or_else(|| current.title.clone());
+        let new_description = match description.clone() {
             None => current.description.clone(),
             Some(None) => None,
             Some(Some(text)) => Some(text),
         };
         let new_due_at = due_at.unwrap_or(current.due_at);
-        let new_assigned = match assigned {
+        let new_assigned = match assigned.clone() {
             None => current.assigned.clone(),
             // Clear = the whole course, stored as `'{}'`.
             Some(None) => None,
             Some(Some(subset)) => Some(subset),
         };
-        let assigned_values = new_assigned.unwrap_or_default();
+        let assigned_values: Vec<uuid::Uuid> = new_assigned
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(UserId::uuid)
+            .collect();
         sqlx::query_as!(
             Homework,
             r#"UPDATE homework SET subject = $2, title = $3, description = $4,
@@ -355,18 +366,18 @@ pub async fn update(
                          course AS "course: CourseId",
                          subject AS "subject: SubjectId",
                          title AS "title: HomeworkTitle",
-                         description AS "description: Option<HomeworkDescription>",
+                         description AS "description: HomeworkDescription",
                          due_at AS "due_at: Timestamp",
                          CASE WHEN cardinality(assigned) = 0 THEN NULL ELSE assigned END
-                             AS "assigned: Option<Vec<UserId>>",
+                             AS "assigned: Vec<UserId>",
                          created_by AS "created_by: UserId",
                          created_at AS "created_at: Timestamp""#,
-            homework.get_id(),
-            new_subject,
-            new_title,
-            new_description,
-            new_due_at,
-            assigned_values,
+            homework.get_id().uuid(),
+            new_subject.uuid(),
+            new_title.as_str(),
+            new_description.as_ref().map(HomeworkDescription::as_str),
+            new_due_at.as_millis(),
+            &assigned_values,
         )
         .fetch_optional(&mut *tx)
         .await?
@@ -395,7 +406,7 @@ async fn ensure_no_orphans(
     };
     let submitted: Vec<UserId> = sqlx::query!(
         r#"SELECT app_user AS "user: UserId" FROM homework_submission WHERE homework = $1"#,
-        homework.get_id()
+        homework.get_id().uuid()
     )
     .fetch_all(&mut *tx)
     .await?
@@ -404,7 +415,7 @@ async fn ensure_no_orphans(
     .collect();
     let graded: Vec<UserId> = sqlx::query!(
         r#"SELECT app_user AS "user: UserId" FROM homework_result WHERE homework = $1"#,
-        homework.get_id()
+        homework.get_id().uuid()
     )
     .fetch_all(&mut *tx)
     .await?
@@ -440,11 +451,11 @@ pub async fn delete(
     db: &Database,
     homework: Homework,
 ) -> Result<(Homework, Vec<String>), AppError> {
-    tx_with_retry(db, true, async |tx| {
+    tx_with_retry(db, true, async move |tx| {
         let blob_keys: Vec<String> = sqlx::query!(
             r#"SELECT file FROM homework_file
                WHERE submission IN (SELECT id FROM homework_submission WHERE homework = $1)"#,
-            homework.get_id()
+            homework.get_id().uuid()
         )
         .fetch_all(&mut *tx)
         .await?
@@ -454,19 +465,19 @@ pub async fn delete(
         sqlx::query!(
             r#"DELETE FROM homework_file
                WHERE submission IN (SELECT id FROM homework_submission WHERE homework = $1)"#,
-            homework.get_id()
+            homework.get_id().uuid()
         )
         .execute(&mut *tx)
         .await?;
         sqlx::query!(
             "DELETE FROM homework_result WHERE homework = $1",
-            homework.get_id()
+            homework.get_id().uuid()
         )
         .execute(&mut *tx)
         .await?;
         sqlx::query!(
             "DELETE FROM homework_submission WHERE homework = $1",
-            homework.get_id()
+            homework.get_id().uuid()
         )
         .execute(&mut *tx)
         .await?;
@@ -477,13 +488,13 @@ pub async fn delete(
                          course AS "course: CourseId",
                          subject AS "subject: SubjectId",
                          title AS "title: HomeworkTitle",
-                         description AS "description: Option<HomeworkDescription>",
+                         description AS "description: HomeworkDescription",
                          due_at AS "due_at: Timestamp",
                          CASE WHEN cardinality(assigned) = 0 THEN NULL ELSE assigned END
-                             AS "assigned: Option<Vec<UserId>>",
+                             AS "assigned: Vec<UserId>",
                          created_by AS "created_by: UserId",
                          created_at AS "created_at: Timestamp""#,
-            homework.get_id()
+            homework.get_id().uuid()
         )
         .fetch_optional(&mut *tx)
         .await?
@@ -492,7 +503,7 @@ pub async fn delete(
         // the row the delete actually removed.
         sqlx::query!(
             "UPDATE subject SET homework_count = GREATEST(homework_count - 1, 0) WHERE id = $1",
-            deleted.subject
+            deleted.subject.uuid()
         )
         .execute(&mut *tx)
         .await?;

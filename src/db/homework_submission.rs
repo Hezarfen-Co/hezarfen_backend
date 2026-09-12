@@ -60,7 +60,11 @@ pub async fn upsert(
     preserve_text: bool,
 ) -> Result<Option<(HomeworkSubmission, bool)>, AppError> {
     let now = Timestamp::now();
-    tx_with_retry(db, false, async |tx| {
+    // Owned captures (`Send` rule of `tx_with_retry` closures).
+    let homework_id = homework.get_id().clone();
+    let user = *user;
+    tx_with_retry(db, false, async move |tx| {
+        let text = text.clone();
         // The parent gate: the homework row is locked and its deadline read
         // in the very transaction that writes the submission. The id is
         // minted fresh, so nothing else here would fail against a homework a
@@ -70,8 +74,8 @@ pub async fn upsert(
         // homework is gone, which is the 404 the web layer's own lookup
         // would have answered.
         let was_due = sqlx::query!(
-            "SELECT due_at FROM homework WHERE id = $1 FOR UPDATE",
-            homework.get_id()
+            r#"SELECT due_at AS "due_at: Timestamp" FROM homework WHERE id = $1 FOR UPDATE"#,
+            homework_id.uuid()
         )
         .fetch_optional(&mut *tx)
         .await?
@@ -88,8 +92,8 @@ pub async fn upsert(
         let existing = sqlx::query!(
             r#"SELECT 1 AS "row: i32" FROM homework_submission
                WHERE homework = $1 AND app_user = $2 FOR UPDATE"#,
-            homework.get_id(),
-            user
+            homework_id.uuid(),
+            user.uuid()
         )
         .fetch_optional(&mut *tx)
         .await?
@@ -108,12 +112,12 @@ pub async fn upsert(
                        RETURNING id AS "id: HomeworkSubmissionId",
                                  homework AS "homework: HomeworkId",
                                  app_user AS "user: UserId",
-                                 text AS "text: Option<SubmissionText>",
+                                 text AS "text: SubmissionText",
                                  submitted_at AS "submitted_at: Timestamp",
                                  updated_at AS "updated_at: Timestamp""#,
-                    homework.get_id(),
-                    user,
-                    now
+                    homework_id.uuid(),
+                    user.uuid(),
+                    now.as_millis()
                 )
                 .fetch_optional(&mut *tx)
                 .await?
@@ -125,13 +129,13 @@ pub async fn upsert(
                        RETURNING id AS "id: HomeworkSubmissionId",
                                  homework AS "homework: HomeworkId",
                                  app_user AS "user: UserId",
-                                 text AS "text: Option<SubmissionText>",
+                                 text AS "text: SubmissionText",
                                  submitted_at AS "submitted_at: Timestamp",
                                  updated_at AS "updated_at: Timestamp""#,
-                    homework.get_id(),
-                    user,
-                    text,
-                    now
+                    homework_id.uuid(),
+                    user.uuid(),
+                    text.as_ref().map(SubmissionText::as_str),
+                    now.as_millis()
                 )
                 .fetch_optional(&mut *tx)
                 .await?
@@ -149,14 +153,14 @@ pub async fn upsert(
                RETURNING id AS "id: HomeworkSubmissionId",
                          homework AS "homework: HomeworkId",
                          app_user AS "user: UserId",
-                         text AS "text: Option<SubmissionText>",
+                         text AS "text: SubmissionText",
                          submitted_at AS "submitted_at: Timestamp",
                          updated_at AS "updated_at: Timestamp""#,
-            HomeworkSubmissionId::generate(),
-            homework.get_id(),
-            user,
-            text,
-            now,
+            HomeworkSubmissionId::generate().uuid(),
+            homework_id.uuid(),
+            user.uuid(),
+            text.as_ref().map(SubmissionText::as_str),
+            now.as_millis(),
             on_time != 0,
         )
         .fetch_optional(&mut *tx)
@@ -166,7 +170,7 @@ pub async fn upsert(
                    homework_submitted_total = homework_submitted_total + 1,
                    homework_on_time_total = homework_on_time_total + $2
                WHERE id = $1"#,
-            user,
+            user.uuid(),
             on_time
         )
         .execute(&mut *tx)
@@ -193,11 +197,11 @@ pub async fn touch(
            RETURNING id AS "id: HomeworkSubmissionId",
                      homework AS "homework: HomeworkId",
                      app_user AS "user: UserId",
-                     text AS "text: Option<SubmissionText>",
+                     text AS "text: SubmissionText",
                      submitted_at AS "submitted_at: Timestamp",
                      updated_at AS "updated_at: Timestamp""#,
-        id,
-        now
+        id.uuid(),
+        now.as_millis()
     )
     .fetch_optional(db)
     .await?
@@ -210,8 +214,8 @@ pub async fn touch(
 pub async fn is_graded(db: &Database, id: &HomeworkSubmissionId) -> Result<bool, AppError> {
     let row = sqlx::query!(
         r#"SELECT EXISTS(SELECT 1 FROM homework_submission
-                         WHERE id = $1 AND graded_by_result IS NOT NULL) AS "graded""#,
-        id
+                         WHERE id = $1 AND graded_by_result IS NOT NULL) AS "graded!: bool""#,
+        id.uuid()
     )
     .fetch_one(db)
     .await?;
@@ -229,12 +233,12 @@ pub async fn read_for(
         r#"SELECT id AS "id: HomeworkSubmissionId",
                   homework AS "homework: HomeworkId",
                   app_user AS "user: UserId",
-                  text AS "text: Option<SubmissionText>",
+                  text AS "text: SubmissionText",
                   submitted_at AS "submitted_at: Timestamp",
                   updated_at AS "updated_at: Timestamp"
            FROM homework_submission WHERE homework = $1 AND app_user = $2"#,
-        homework,
-        user
+        homework.uuid(),
+        user.uuid()
     )
     .fetch_optional(db)
     .await?)
@@ -250,11 +254,11 @@ pub async fn list_for_homework(
         r#"SELECT id AS "id: HomeworkSubmissionId",
                   homework AS "homework: HomeworkId",
                   app_user AS "user: UserId",
-                  text AS "text: Option<SubmissionText>",
+                  text AS "text: SubmissionText",
                   submitted_at AS "submitted_at: Timestamp",
                   updated_at AS "updated_at: Timestamp"
            FROM homework_submission WHERE homework = $1 ORDER BY id ASC"#,
-        homework
+        homework.uuid()
     )
     .fetch_all(db)
     .await?)
@@ -292,15 +296,15 @@ pub async fn delete(
     db: &Database,
     submission: HomeworkSubmission,
 ) -> Result<Option<HomeworkSubmission>, AppError> {
-    tx_with_retry(db, false, async |tx| {
+    tx_with_retry(db, false, async move |tx| {
         // The homework row's lock is the serialization point against grading:
         // a grade locks the same row before it stamps, so either this delete
         // refuses off the stamp, or the grade landed on a row that is now
         // gone — grading absent work, which is allowed. Its `due_at` read is
         // also the replay fallback's deadline.
         let due = sqlx::query!(
-            "SELECT due_at FROM homework WHERE id = $1 FOR UPDATE",
-            submission.get_homework()
+            r#"SELECT due_at AS "due_at: Timestamp" FROM homework WHERE id = $1 FOR UPDATE"#,
+            submission.get_homework().uuid()
         )
         .fetch_optional(&mut *tx)
         .await?
@@ -311,11 +315,11 @@ pub async fn delete(
                RETURNING id AS "id: HomeworkSubmissionId",
                          homework AS "homework: HomeworkId",
                          app_user AS "user: UserId",
-                         text AS "text: Option<SubmissionText>",
+                         text AS "text: SubmissionText",
                          submitted_at AS "submitted_at: Timestamp",
                          updated_at AS "updated_at: Timestamp",
-                         counted_on_time AS "counted_on_time: Option<bool>""#,
-            submission.get_id()
+                         counted_on_time AS "counted_on_time: bool""#,
+            submission.get_id().uuid()
         )
         .fetch_optional(&mut *tx)
         .await?;
@@ -326,7 +330,7 @@ pub async fn delete(
         };
         sqlx::query!(
             "DELETE FROM homework_file WHERE submission = $1",
-            removed.id
+            removed.id.uuid()
         )
         .execute(&mut *tx)
         .await?;
@@ -337,7 +341,7 @@ pub async fn delete(
                    homework_submitted_total = GREATEST(homework_submitted_total - 1, 0),
                    homework_on_time_total = GREATEST(homework_on_time_total - $2, 0)
                WHERE id = $1"#,
-            removed.user,
+            removed.user.uuid(),
             on_time
         )
         .execute(&mut *tx)

@@ -106,7 +106,10 @@ pub async fn grade(
     // row's `FOR UPDATE` is what makes that read the write's own: a rival
     // grade holds the same lock across its whole transaction, so the two
     // serialize instead of interleaving their counter moves.
-    tx_with_retry(db, false, async |conn| {
+    let exam = exam.clone();
+    let (user, graded_by) = (*user, *graded_by);
+    let kind = kind.to_owned();
+    tx_with_retry(db, false, async move |conn| {
         let exam_row = sqlx::query!(
             r#"SELECT draft AS "draft: bool" FROM exam WHERE id = $1 FOR UPDATE"#,
             exam.uuid(),
@@ -143,7 +146,7 @@ pub async fn grade(
             .fetch_optional(&mut *conn)
             .await?;
             if claimed.is_none() {
-                return Err(retired_kind_error(kind));
+                return Err(retired_kind_error(&kind));
             }
             sqlx::query!(
                 r#"UPDATE exam SET result_count = exam.result_count + 1 WHERE id = $1"#,
@@ -288,7 +291,10 @@ pub async fn remove(
     // release them a second time, and on a kind another exam still grades
     // under, one release too many reads as one mark too few — a kind
     // wrongly free to leave the settings.
-    tx_with_retry(db, false, async |conn| {
+    let exam = exam.clone();
+    let user = *user;
+    let kind = kind.to_owned();
+    tx_with_retry(db, false, async move |conn| {
         // The `gone` CTE deletes and reports in one statement: the counters
         // below move by exactly what this delete removed, so a concurrent
         // grade's rows (it holds the exam row's lock, and this statement's

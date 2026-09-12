@@ -370,7 +370,7 @@ pub async fn unassign_everywhere(db: &Database, user: &UserId) -> Result<(), App
 /// to get — and unlike the old one-statement guard, this one tells the two
 /// apart without a second read.
 pub async fn delete(db: &Database, course: Course) -> Result<bool, AppError> {
-    tx_with_retry(db, true, async |tx| {
+    tx_with_retry(db, true, async move |tx| {
         // The guard and the lock: the row (and its roster count) cannot
         // change under this transaction, and every enroll claim contends on
         // this very row, so check and cascade are one decision.

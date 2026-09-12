@@ -133,7 +133,7 @@ pub async fn file_keys_for_course(
 /// note itself is untouched, so unlike the note-delete cascade this one
 /// has a counter to correct.
 pub async fn delete(db: &Database, file: CourseNoteFile) -> Result<CourseNoteFile, AppError> {
-    tx_with_retry(db, true, async |conn| {
+    tx_with_retry(db, true, async move |conn| {
         let gone = sqlx::query_as!(
             CourseNoteFile,
             r#"DELETE FROM course_note_file WHERE id = $1

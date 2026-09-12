@@ -44,9 +44,9 @@ pub async fn create(
            RETURNING id AS "id: BoardId", creator AS "creator: UserId",
                title AS "title: BoardTitle",
                participants AS "participants: Vec<UserId>", locked,
-               locked_by AS "locked_by: Option<UserId>",
-               locked_at AS "locked_at: Option<Timestamp>", epoch,
-               closed_at AS "closed_at: Option<Timestamp>",
+               locked_by AS "locked_by: UserId",
+               locked_at AS "locked_at: Timestamp", epoch,
+               closed_at AS "closed_at: Timestamp",
                created_at AS "created_at: Timestamp""#,
         board.creator.uuid(),
         MAX_BOARDS_PER_CREATOR,
@@ -83,9 +83,9 @@ pub async fn read(db: &Database, id: &BoardId) -> Result<Option<Board>, AppError
         r#"SELECT id AS "id: BoardId", creator AS "creator: UserId",
                title AS "title: BoardTitle",
                participants AS "participants: Vec<UserId>", locked,
-               locked_by AS "locked_by: Option<UserId>",
-               locked_at AS "locked_at: Option<Timestamp>", epoch,
-               closed_at AS "closed_at: Option<Timestamp>",
+               locked_by AS "locked_by: UserId",
+               locked_at AS "locked_at: Timestamp", epoch,
+               closed_at AS "closed_at: Timestamp",
                created_at AS "created_at: Timestamp"
            FROM board WHERE id = $1"#,
         id.uuid()
@@ -139,9 +139,9 @@ pub async fn set_participants(
            RETURNING id AS "id: BoardId", creator AS "creator: UserId",
                title AS "title: BoardTitle",
                participants AS "participants: Vec<UserId>", locked,
-               locked_by AS "locked_by: Option<UserId>",
-               locked_at AS "locked_at: Option<Timestamp>", epoch,
-               closed_at AS "closed_at: Option<Timestamp>",
+               locked_by AS "locked_by: UserId",
+               locked_at AS "locked_at: Timestamp", epoch,
+               closed_at AS "closed_at: Timestamp",
                created_at AS "created_at: Timestamp""#,
         board.id.uuid(),
         &participants
@@ -161,9 +161,9 @@ pub async fn set_title(db: &Database, board: &Board, title: BoardTitle) -> Resul
            RETURNING id AS "id: BoardId", creator AS "creator: UserId",
                title AS "title: BoardTitle",
                participants AS "participants: Vec<UserId>", locked,
-               locked_by AS "locked_by: Option<UserId>",
-               locked_at AS "locked_at: Option<Timestamp>", epoch,
-               closed_at AS "closed_at: Option<Timestamp>",
+               locked_by AS "locked_by: UserId",
+               locked_at AS "locked_at: Timestamp", epoch,
+               closed_at AS "closed_at: Timestamp",
                created_at AS "created_at: Timestamp""#,
         board.id.uuid(),
         title.as_str()
@@ -188,9 +188,9 @@ pub async fn set_locked(
            RETURNING id AS "id: BoardId", creator AS "creator: UserId",
                title AS "title: BoardTitle",
                participants AS "participants: Vec<UserId>", locked,
-               locked_by AS "locked_by: Option<UserId>",
-               locked_at AS "locked_at: Option<Timestamp>", epoch,
-               closed_at AS "closed_at: Option<Timestamp>",
+               locked_by AS "locked_by: UserId",
+               locked_at AS "locked_at: Timestamp", epoch,
+               closed_at AS "closed_at: Timestamp",
                created_at AS "created_at: Timestamp""#,
         board.id.uuid(),
         locked,
@@ -228,9 +228,9 @@ pub(crate) async fn invite_group(
            RETURNING id AS "id: BoardId", creator AS "creator: UserId",
                title AS "title: BoardTitle",
                participants AS "participants: Vec<UserId>", locked,
-               locked_by AS "locked_by: Option<UserId>",
-               locked_at AS "locked_at: Option<Timestamp>", epoch,
-               closed_at AS "closed_at: Option<Timestamp>",
+               locked_by AS "locked_by: UserId",
+               locked_at AS "locked_at: Timestamp", epoch,
+               closed_at AS "closed_at: Timestamp",
                created_at AS "created_at: Timestamp""#,
         board.uuid(),
         &invited
@@ -259,9 +259,9 @@ pub async fn close(db: &Database, board: &Board) -> Result<Board, AppError> {
            RETURNING id AS "id: BoardId", creator AS "creator: UserId",
                title AS "title: BoardTitle",
                participants AS "participants: Vec<UserId>", locked,
-               locked_by AS "locked_by: Option<UserId>",
-               locked_at AS "locked_at: Option<Timestamp>", epoch,
-               closed_at AS "closed_at: Option<Timestamp>",
+               locked_by AS "locked_by: UserId",
+               locked_at AS "locked_at: Timestamp", epoch,
+               closed_at AS "closed_at: Timestamp",
                created_at AS "created_at: Timestamp""#,
         board.id.uuid(),
         Timestamp::now().as_millis()
@@ -285,7 +285,7 @@ pub async fn close(db: &Database, board: &Board) -> Result<Board, AppError> {
 /// and issued separately it could leave a board's whole history orphaned
 /// under a record that no longer exists.
 pub async fn delete(db: &Database, board: Board) -> Result<Board, AppError> {
-    tx_with_retry(db, true, async |conn| {
+    tx_with_retry(db, true, async move |conn| {
         sqlx::query!("DELETE FROM board_stroke WHERE board = $1", board.id.uuid())
             .execute(&mut *conn)
             .await?;
@@ -295,9 +295,9 @@ pub async fn delete(db: &Database, board: Board) -> Result<Board, AppError> {
                RETURNING id AS "id: BoardId", creator AS "creator: UserId",
                title AS "title: BoardTitle",
                participants AS "participants: Vec<UserId>", locked,
-               locked_by AS "locked_by: Option<UserId>",
-               locked_at AS "locked_at: Option<Timestamp>", epoch,
-               closed_at AS "closed_at: Option<Timestamp>",
+               locked_by AS "locked_by: UserId",
+               locked_at AS "locked_at: Timestamp", epoch,
+               closed_at AS "closed_at: Timestamp",
                created_at AS "created_at: Timestamp""#,
             board.id.uuid()
         )

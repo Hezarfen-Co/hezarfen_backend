@@ -60,10 +60,14 @@ pub async fn grade(
 ) -> Result<HomeworkResult, AppError> {
     let id = HomeworkResultId::generate();
     let now = Timestamp::now();
-    tx_with_retry(db, false, async |tx| {
+    // Owned captures (`Send` rule of `tx_with_retry` closures).
+    let homework = homework.clone();
+    let user = *user;
+    let graded_by = *graded_by;
+    tx_with_retry(db, false, async move |tx| {
         let alive = sqlx::query!(
             r#"SELECT 1 AS "row: i32" FROM homework WHERE id = $1 FOR UPDATE"#,
-            homework
+            homework.uuid()
         )
         .fetch_optional(&mut *tx)
         .await?;
@@ -73,8 +77,8 @@ pub async fn grade(
         let before = sqlx::query!(
             r#"SELECT 1 AS "row: i32" FROM homework_result
                WHERE homework = $1 AND app_user = $2 FOR UPDATE"#,
-            homework,
-            user
+            homework.uuid(),
+            user.uuid()
         )
         .fetch_optional(&mut *tx)
         .await?
@@ -92,32 +96,32 @@ pub async fn grade(
                          homework AS "homework: HomeworkId",
                          app_user AS "user: UserId",
                          status AS "status: HomeworkStatus",
-                         mark AS "mark: Option<Mark>",
+                         mark AS "mark: Mark",
                          graded_by AS "graded_by: UserId",
                          created_at AS "created_at: Timestamp""#,
-            id,
-            homework,
-            user,
-            status,
-            mark,
-            graded_by,
-            now,
+            id.uuid(),
+            homework.uuid(),
+            user.uuid(),
+            status.as_str(),
+            mark.map(|mark| mark.as_i64()),
+            graded_by.uuid(),
+            now.as_millis(),
         )
         .fetch_one(&mut *tx)
         .await?;
         sqlx::query!(
             r#"UPDATE homework_submission SET graded_by_result = $3
                WHERE homework = $1 AND app_user = $2 AND graded_by_result IS NULL"#,
-            homework,
-            user,
-            graded.id
+            homework.uuid(),
+            user.uuid(),
+            graded.id.uuid()
         )
         .execute(&mut *tx)
         .await?;
         if !before {
             sqlx::query!(
                 "UPDATE app_user SET marks_given_total = marks_given_total + 1 WHERE id = $1",
-                graded_by
+                graded_by.uuid()
             )
             .execute(&mut *tx)
             .await?;
@@ -139,12 +143,12 @@ pub async fn read_for(
                   homework AS "homework: HomeworkId",
                   app_user AS "user: UserId",
                   status AS "status: HomeworkStatus",
-                  mark AS "mark: Option<Mark>",
+                  mark AS "mark: Mark",
                   graded_by AS "graded_by: UserId",
                   created_at AS "created_at: Timestamp"
            FROM homework_result WHERE homework = $1 AND app_user = $2"#,
-        homework,
-        user
+        homework.uuid(),
+        user.uuid()
     )
     .fetch_optional(db)
     .await?)
@@ -161,11 +165,11 @@ pub async fn list_for_homework(
                   homework AS "homework: HomeworkId",
                   app_user AS "user: UserId",
                   status AS "status: HomeworkStatus",
-                  mark AS "mark: Option<Mark>",
+                  mark AS "mark: Mark",
                   graded_by AS "graded_by: UserId",
                   created_at AS "created_at: Timestamp"
            FROM homework_result WHERE homework = $1 ORDER BY id DESC"#,
-        homework
+        homework.uuid()
     )
     .fetch_all(db)
     .await?)
@@ -185,15 +189,15 @@ pub async fn list_for_user_in_course(
                   homework AS "homework: HomeworkId",
                   app_user AS "user: UserId",
                   status AS "status: HomeworkStatus",
-                  mark AS "mark: Option<Mark>",
+                  mark AS "mark: Mark",
                   graded_by AS "graded_by: UserId",
                   created_at AS "created_at: Timestamp"
            FROM homework_result
            WHERE app_user = $1
              AND homework IN (SELECT id FROM homework WHERE course = $2)
            ORDER BY id DESC"#,
-        user,
-        course
+        user.uuid(),
+        course.uuid()
     )
     .fetch_all(db)
     .await?)
@@ -218,7 +222,10 @@ pub async fn remove(
     homework: &HomeworkId,
     user: &UserId,
 ) -> Result<Option<HomeworkResult>, AppError> {
-    tx_with_retry(db, false, async |tx| {
+    // Owned captures (`Send` rule of `tx_with_retry` closures).
+    let homework = homework.clone();
+    let user = *user;
+    tx_with_retry(db, false, async move |tx| {
         // The homework row's lock orders this against a concurrent grade
         // (which locks the same row before inserting): either this delete
         // wins and the re-grade lands after as a fresh grade, or the grade
@@ -227,7 +234,7 @@ pub async fn remove(
         // answers.
         let alive = sqlx::query!(
             r#"SELECT 1 AS "row: i32" FROM homework WHERE id = $1 FOR UPDATE"#,
-            homework
+            homework.uuid()
         )
         .fetch_optional(&mut *tx)
         .await?;
@@ -240,11 +247,11 @@ pub async fn remove(
                          homework AS "homework: HomeworkId",
                          app_user AS "user: UserId",
                          status AS "status: HomeworkStatus",
-                         mark AS "mark: Option<Mark>",
+                         mark AS "mark: Mark",
                          graded_by AS "graded_by: UserId",
                          created_at AS "created_at: Timestamp""#,
-            homework,
-            user
+            homework.uuid(),
+            user.uuid()
         )
         .fetch_optional(&mut *tx)
         .await?;
@@ -254,15 +261,15 @@ pub async fn remove(
         sqlx::query!(
             r#"UPDATE homework_submission SET graded_by_result = NULL
                WHERE homework = $1 AND app_user = $2 AND graded_by_result = $3"#,
-            homework,
-            user,
-            removed.id
+            homework.uuid(),
+            user.uuid(),
+            removed.id.uuid()
         )
         .execute(&mut *tx)
         .await?;
         sqlx::query!(
             "UPDATE app_user SET marks_given_total = GREATEST(marks_given_total - 1, 0) WHERE id = $1",
-            removed.graded_by
+            removed.graded_by.uuid()
         )
         .execute(&mut *tx)
         .await?;

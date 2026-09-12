@@ -377,16 +377,18 @@ pub(crate) async fn add_member(
     by: &UserId,
 ) -> Result<Attached<ClassMember>, AppError> {
     let added_at = Timestamp::now();
-    tx_with_retry(db, false, async |tx| {
+    let class = class.clone();
+    let (user, by) = (*user, *by);
+    tx_with_retry(db, false, async move |tx| {
         if let Some(early) =
-            early_verdicts(tx, class, Axis::Member, Pivot::User(user), None).await?
+            early_verdicts(tx, &class, Axis::Member, Pivot::User(&user), None).await?
         {
             return Ok(refusal_of(early));
         }
         // The claim and the link are one statement (the cap recipe's CTE): the
         // conditional `UPDATE` on the class row gates the `INSERT`, so a full
         // or gone class writes nothing at all.
-        let inserted = match sqlx::query!(
+        let inserted = match sqlx::query_scalar!(
             r#"WITH seat AS (
                    UPDATE class_group SET class_member_count = class_member_count + 1
                     WHERE id = $1 AND class_member_count < $2
@@ -400,7 +402,7 @@ pub(crate) async fn add_member(
             by as _,
             added_at as _
         )
-        .execute(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
         {
             Ok(result) => result,
@@ -414,7 +416,7 @@ pub(crate) async fn add_member(
             Err(e) if foreign_key_violation(&e) => return Ok(Attached::PivotGone),
             Err(e) => return Err(e.into()),
         };
-        if inserted.rows_affected() == 0 {
+        if inserted.is_none() {
             // Full, or the class is gone — the claim matches nothing either
             // way, and only this path pays for the read that tells them apart.
             let standing = sqlx::query_scalar!(
@@ -437,15 +439,15 @@ pub(crate) async fn add_member(
         .fetch_all(&mut *tx)
         .await?;
         let pairs = courses.into_iter().map(|course| (course, user.uuid()));
-        match enroll_pairs(tx, class, pairs, by).await? {
+        match enroll_pairs(tx, &class, pairs, &by).await? {
             Sweep::Done => {}
             Sweep::CourseGone(course) => return Ok(Attached::CourseGone(course)),
             Sweep::Full(course) => return Ok(Attached::Full(course)),
         }
         Ok(Attached::Made(ClassMember {
             class: class.clone(),
-            user: *user,
-            added_by: *by,
+            user,
+            added_by: by,
             added_at: Some(added_at),
         }))
     })
@@ -472,13 +474,23 @@ pub(crate) async fn attach_course(
     source: Option<&ClassBlueprintId>,
 ) -> Result<Attached<ClassCourse>, AppError> {
     let attached_at = Timestamp::now();
-    tx_with_retry(db, false, async |tx| {
-        if let Some(early) =
-            early_verdicts(tx, class, Axis::Course, Pivot::Course(course), source).await?
+    let class = class.clone();
+    let course = course.clone();
+    let by = *by;
+    let source = source.cloned();
+    tx_with_retry(db, false, async move |tx| {
+        if let Some(early) = early_verdicts(
+            tx,
+            &class,
+            Axis::Course,
+            Pivot::Course(&course),
+            source.as_ref(),
+        )
+        .await?
         {
             return Ok(refusal_of(early));
         }
-        let inserted = match sqlx::query!(
+        let inserted = match sqlx::query_scalar!(
             r#"WITH seat AS (
                    UPDATE class_group SET class_course_count = class_course_count + 1
                     WHERE id = $1 AND class_course_count < $2
@@ -493,7 +505,7 @@ pub(crate) async fn attach_course(
             attached_at as _,
             source as _
         )
-        .execute(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
         {
             Ok(result) => result,
@@ -503,7 +515,7 @@ pub(crate) async fn attach_course(
             Err(e) if foreign_key_violation(&e) => return Ok(Attached::PivotGone),
             Err(e) => return Err(e.into()),
         };
-        if inserted.rows_affected() == 0 {
+        if inserted.is_none() {
             let standing = sqlx::query_scalar!(
                 r#"SELECT 1 AS "one" FROM class_group WHERE id = $1"#,
                 class as _
@@ -524,16 +536,16 @@ pub(crate) async fn attach_course(
         .fetch_all(&mut *tx)
         .await?;
         let pairs = members.into_iter().map(|user| (course.uuid(), user));
-        match enroll_pairs(tx, class, pairs, by).await? {
+        match enroll_pairs(tx, &class, pairs, &by).await? {
             Sweep::Done => {}
             Sweep::CourseGone(course) => return Ok(Attached::CourseGone(course)),
             Sweep::Full(course) => return Ok(Attached::Full(course)),
         }
         Ok(Attached::Made(ClassCourse {
             class: class.clone(),
-            course: *course,
-            attached_by: *by,
-            source: source.cloned(),
+            course: course.clone(),
+            attached_by: by,
+            source: source.clone(),
             attached_at: Some(attached_at),
         }))
     })
@@ -694,7 +706,9 @@ pub(crate) async fn remove_member(
     class: &ClassGroupId,
     user: &UserId,
 ) -> Result<i64, AppError> {
-    tx_with_retry(db, true, async |tx| {
+    let class = class.clone();
+    let user = *user;
+    tx_with_retry(db, true, async move |tx| {
         let gone = sqlx::query_scalar!(
             r#"DELETE FROM class_member WHERE class = $1 AND app_user = $2
                RETURNING 1 AS "one""#,
@@ -725,7 +739,7 @@ pub(crate) async fn remove_member(
         .into_iter()
         .map(|row| (row.course, row.app_user))
         .collect::<Vec<_>>();
-        sweep_enrollments(tx, class, rows).await?;
+        sweep_enrollments(tx, &class, rows).await?;
         Ok(1)
     })
     .await
@@ -743,8 +757,11 @@ pub(crate) async fn detach_course(
     course: &CourseId,
     source: Option<&ClassBlueprintId>,
 ) -> Result<i64, AppError> {
-    tx_with_retry(db, true, async |tx| {
-        let gone = match source {
+    let class = class.clone();
+    let course = course.clone();
+    let source = source.cloned();
+    tx_with_retry(db, true, async move |tx| {
+        let gone = match &source {
             Some(source) => {
                 sqlx::query_scalar!(
                     r#"DELETE FROM class_course WHERE class = $1 AND course = $2 AND source = $3
@@ -789,7 +806,7 @@ pub(crate) async fn detach_course(
         .into_iter()
         .map(|row| (row.course, row.app_user))
         .collect::<Vec<_>>();
-        sweep_enrollments(tx, class, rows).await?;
+        sweep_enrollments(tx, &class, rows).await?;
         Ok(1)
     })
     .await

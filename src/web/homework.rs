@@ -180,7 +180,8 @@ async fn list_homework(
             .collect();
         let mut homework = service::homework::list_for_courses(&st.db, &ids).await?;
         homework.retain(|hw| {
-            managed.iter().any(|key| key == hw.get_course().key()) || hw.student_sees(user.get_id())
+            managed.iter().any(|key| key == &hw.get_course().key())
+                || hw.student_sees(user.get_id())
         });
         homework
     };
@@ -192,7 +193,7 @@ async fn list_homework(
     let items = paginate(&homework, limit, offset)
         .iter()
         .map(|hw| {
-            if manages_all || managed.iter().any(|key| key == hw.get_course().key()) {
+            if manages_all || managed.iter().any(|key| key == &hw.get_course().key()) {
                 HomeworkResponse::new(hw)
             } else {
                 HomeworkResponse::for_viewer(hw, user.get_id())
@@ -1133,7 +1134,7 @@ async fn list_homework_submissions(
     for user_key in paginate(&users, limit, offset) {
         let submission = match submissions
             .iter()
-            .find(|submission| submission.get_user().key() == user_key)
+            .find(|submission| &submission.get_user().key() == user_key)
         {
             Some(submission) => Some(HomeworkRosterSubmission {
                 text: submission.get_text().map(|text| text.as_str().to_string()),
@@ -1155,7 +1156,7 @@ async fn list_homework_submissions(
             submission,
             result: results
                 .iter()
-                .find(|result| result.get_user().key() == user_key)
+                .find(|result| &result.get_user().key() == user_key)
                 .map(HomeworkResultResponse::new),
         });
     }

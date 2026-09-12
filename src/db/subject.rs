@@ -136,7 +136,7 @@ pub async fn update(
 /// existence. Its cascade runs *after* the guarded delete, so a refused
 /// delete leaves every template's subject where it was.
 pub async fn delete(db: &Database, subject: Subject) -> Result<Subject, AppError> {
-    crate::database::tx_with_retry(db, false, async |tx| {
+    crate::database::tx_with_retry(db, false, async move |tx| {
         // The pre-image read and the guard in one locked statement: the row
         // (and its counters) cannot change under this transaction.
         let held = sqlx::query!(

@@ -90,7 +90,7 @@ pub async fn list_for(
 /// itself is untouched, so unlike the note-delete cascade this one has a
 /// counter to correct. (Deleting a *note* takes its counter with it.)
 pub async fn delete(db: &Database, file: NoteFile) -> Result<NoteFile, AppError> {
-    tx_with_retry(db, true, async |conn| {
+    tx_with_retry(db, true, async move |conn| {
         let gone = sqlx::query_as!(
             NoteFile,
             r#"DELETE FROM note_file WHERE id = $1 RETURNING id AS "id: NoteFileId", note AS "note: NoteId", name AS "name: FileName",

@@ -117,7 +117,7 @@ pub async fn delete(
     db: &Database,
     note: CourseNote,
 ) -> Result<(CourseNote, Vec<CourseNoteFile>), AppError> {
-    tx_with_retry(db, true, async |conn| {
+    tx_with_retry(db, true, async move |conn| {
         sqlx::query!("DELETE FROM rag_output WHERE course_note = $1", note.id.uuid())
             .execute(&mut *conn)
             .await?;

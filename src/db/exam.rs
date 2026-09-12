@@ -232,7 +232,7 @@ pub async fn update_if_unchanged(
     expected.allow_rejoin = allow_rejoin;
     expected.allow_review = allow_review;
     expected.draft = draft;
-    let saved = tx_with_retry(db, false, async |conn| {
+    let saved = tx_with_retry(db, false, async move |conn| {
         if redraft {
             // `exam_redraft`: the same refusal the handler's pre-flight
             // answers, re-made at write time. A sitting or a mark existing
@@ -354,7 +354,7 @@ pub async fn delete(db: &Database, target: Exam) -> Result<Deleted, AppError> {
     tx_with_retry(
         db,
         true,
-        async |conn| {
+        async move |conn| {
             // The row lock every other exam-child writer contends on.
             let locked = sqlx::query!(
                 r#"SELECT id AS "id: ExamId" FROM exam WHERE id = $1 FOR UPDATE"#,

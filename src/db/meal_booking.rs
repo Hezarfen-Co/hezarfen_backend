@@ -139,14 +139,14 @@ pub(crate) async fn claim_and_place(
     // Owned captures only: a closure holding a `&T` fails the higher-ranked
     // `Send` check `tx_with_retry`'s future must pass.
     let booked_by = row.booked_by.uuid();
-    let status = row.status.as_str();
+    let status = row.status.as_str().to_string();
     let cancelled_at = row.cancelled_at.map(|t| t.as_millis());
     let created_at = row.created_at.as_millis();
     let charge = charge.map(|line| {
         (
             line.id.key().to_string(),
             line.student.uuid(),
-            line.kind.as_str(),
+            line.kind.as_str().to_string(),
             line.amount_minor.as_minor(),
             line.source.clone(),
             line.method.as_ref().map(|m| m.as_str().to_string()),
@@ -220,7 +220,7 @@ pub(crate) async fn claim_and_place(
                     menu_key,
                     student,
                     booked_by,
-                    status,
+                    status.as_str(),
                     attempt,
                     price.map(LedgerAmount::as_minor),
                     cancelled_at,
@@ -246,7 +246,7 @@ pub(crate) async fn claim_and_place(
                  ON CONFLICT (id) DO NOTHING",
                 id.as_str(),
                 student,
-                kind,
+                kind.as_str(),
                 amount,
                 source.as_deref(),
                 method.as_deref(),

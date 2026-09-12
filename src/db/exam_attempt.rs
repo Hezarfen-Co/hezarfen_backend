@@ -366,9 +366,10 @@ pub async fn create(
     count_sitting: bool,
     now: Timestamp,
 ) -> Result<Claimed<ExamAttempt>, AppError> {
-    tx_with_retry(db, false, async |conn| {
+    let attempt = attempt.clone();
+    tx_with_retry(db, false, async move |conn| {
         guard_start(conn, &attempt.exam, now).await?;
-        create_in(conn, attempt, count_sitting).await
+        create_in(conn, &attempt, count_sitting).await
     })
     .await
 }

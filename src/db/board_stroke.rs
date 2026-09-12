@@ -8,7 +8,7 @@ use crate::constant::{
 use crate::database::{Database, tx_with_retry};
 use crate::db::cap;
 use crate::db::page::PagedList;
-use crate::domain::board::{Board, BoardId};
+use crate::domain::board::{Board, BoardId, BoardTitle};
 use crate::domain::board_stroke::{
     BOARD_CLOSED, BOARD_MOVED, BoardStroke, BoardStrokeId, CANVAS_BLANK, CLEAR_REFUSED, EPOCH_FULL,
     KIND_CLEAR, KIND_STROKE, NOT_THE_CREATOR, state_refusal,
@@ -164,7 +164,10 @@ async fn why_refused(db: &Database, board: &BoardId) -> Result<AppError, AppErro
 /// files the final epoch in the index, which is the one clear the history
 /// needs.
 pub async fn clear(db: &Database, board: &BoardId, by: &UserId) -> Result<BoardStroke, AppError> {
-    tx_with_retry(db, false, async |conn| {
+    // Owned captures (`Send` rule of `tx_with_retry` closures).
+    let board = board.clone();
+    let by = *by;
+    tx_with_retry(db, false, async move |conn| {
         // The pre-image, under the row's write lock: the epoch the marker
         // closes, the count it carries, and the guards it must satisfy all
         // come from this read, and nothing interlocks between it and the
@@ -174,9 +177,9 @@ pub async fn clear(db: &Database, board: &BoardId, by: &UserId) -> Result<BoardS
             r#"SELECT id AS "id: BoardId", creator AS "creator: UserId",
                       title AS "title: BoardTitle",
                       participants AS "participants: Vec<UserId>", locked,
-                      locked_by AS "locked_by: Option<UserId>",
-                      locked_at AS "locked_at: Option<Timestamp>", epoch,
-                      closed_at AS "closed_at: Option<Timestamp>",
+                      locked_by AS "locked_by: UserId",
+                      locked_at AS "locked_at: Timestamp", epoch,
+                      closed_at AS "closed_at: Timestamp",
                       created_at AS "created_at: Timestamp"
                FROM board WHERE id = $1 FOR UPDATE"#,
             board.uuid()
@@ -190,7 +193,7 @@ pub async fn clear(db: &Database, board: &BoardId, by: &UserId) -> Result<BoardS
         if let Some(BOARD_CLOSED) = state_refusal(&live) {
             return Err(AppError::Conflict(BOARD_CLOSED));
         }
-        if !live.is_creator(by) {
+        if !live.is_creator(&by) {
             return Err(AppError::Forbidden(NOT_THE_CREATOR));
         }
         if let Some(refusal) = state_refusal(&live) {

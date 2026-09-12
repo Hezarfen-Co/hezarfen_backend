@@ -130,7 +130,7 @@ pub async fn update(
 /// session-row lock makes a mark and this delete take turns — a mark
 /// committing after this cascade cannot name a session that is gone.
 pub async fn delete(db: &Database, session: CourseSession) -> Result<CourseSession, AppError> {
-    tx_with_retry(db, false, async |tx| {
+    tx_with_retry(db, false, async move |tx| {
         // Roll-call rows first: the session row's own FK would refuse the
         // delete while they exist. An empty first sweep is fine — the
         // session may simply have had none.

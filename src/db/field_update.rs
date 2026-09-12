@@ -36,7 +36,7 @@
 //! [`AssertSqlSafe`] wraps stand on.
 
 use sqlx::postgres::{PgArguments, PgRow};
-use sqlx::{AssertSqlSafe, FromRow};
+use sqlx::{AssertSqlSafe, FromRow, PgConnection};
 use uuid::Uuid;
 
 use crate::database::{Database, tx_with_retry};
@@ -309,7 +309,7 @@ impl FieldUpdate {
             "UPDATE {} SET {}{} WHERE id = ${id_at} RETURNING *",
             self.table, set_sql, guard_sql
         );
-        let rows: Vec<T> = match moved {
+        let rows: Vec<PgRow> = match moved {
             Some(rc) => {
                 let still_mine = if own.is_empty() {
                     String::new()
@@ -323,18 +323,22 @@ impl FieldUpdate {
                     rc.2,
                     expected_at.expect("the CAS arms with its link"),
                 );
-                run_with_refcount::<T>(db, update, probe, binds, rc).await?
+                run_with_refcount(db, update, probe, binds, rc).await?
             }
             None => {
                 let mut args = PgArguments::default();
                 for bind in binds {
                     bind.add_to(&mut args);
                 }
-                sqlx::query_as_with(AssertSqlSafe(update), args)
+                sqlx::query_with(AssertSqlSafe(update), args)
                     .fetch_all(db)
                     .await?
             }
         };
+        let rows = rows
+            .iter()
+            .map(T::from_row)
+            .collect::<Result<Vec<T>, sqlx::Error>>()?;
         // No row back means the guard bit failed (or, in the window after the
         // handler's read, the row was deleted — the guard cannot tell the two
         // apart, and reports the refusal it was given).
@@ -369,89 +373,125 @@ impl FieldUpdate {
 /// refuses — and the rolled-back transaction demonstrably undid it. Every
 /// abort takes the whole move back with it: nothing is committed unless the
 /// row write landed.
-async fn run_with_refcount<T>(
+async fn run_with_refcount(
     db: &Database,
     update: String,
     probe: String,
     binds: Vec<Param>,
-    (counter_table, counter_field, _link, _expected, claim, release, refused): Refcount,
-) -> Result<Vec<T>, AppError>
-where
-    T: for<'r> FromRow<'r, PgRow> + Send + Unpin,
-{
-    // Owned captures + `async move`: the closure's future must be Send and
-    // general enough for axum's handler registration — borrowed captures
-    // (`async |tx|` over `&mut`/`&T`) fail that check tree-wide.
-    let mut refused = Some(refused);
+    refcount: Refcount,
+) -> Result<Vec<PgRow>, AppError> {
+    // Destructured in the body, not the signature: a `&'static str` binding
+    // lifted from an async fn's *pattern parameter* poisons the higher-ranked
+    // `AsyncFnMut`/`Send` evaluation of any closure that captures it
+    // ("`Send` would have to be implemented for `&'0 str`, for any lifetime").
+    let (counter_table, counter_field, _link, _expected, claim, release, refused) = refcount;
+    // Owned into the closure: a captured `&str` — even `'static` — drags the
+    // async closure's arg lifetime off the higher-ranked one `tx_with_retry`
+    // needs ("AsyncFnMut is not general enough" at the route registration).
+    let counter_table = counter_table.to_owned();
+    let counter_field = counter_field.to_owned();
+
+    // The body lives in a named `async fn` over raw rows, the closure a
+    // thin delegate (the house `decision_cas`/`save_in` shape): an inline
+    // body of raw sqlx chains — or a delegate generic over the row type —
+    // fails the higher-ranked `Send` check axum's handler registration runs
+    // on `tx_with_retry`'s future. The `FromRow` decode happens on the
+    // caller's side of that check.
     let outcome = tx_with_retry(db, false, async move |tx| {
-        let binds = binds.clone();
-        if let Some(release) = release {
-            sqlx::query(AssertSqlSafe(format!(
-                "UPDATE {counter_table} \
-                     SET {counter_field} = GREATEST({counter_field} - 1, 0) WHERE id = $1"
-            )))
-            .bind(release)
-            .execute(&mut *tx)
-            .await?;
-        }
-        // The conditional claim doubles as the existence check: zero rows
-        // is the claimed row being gone, the caller's own refusal.
-        if let Some(claim) = claim {
-            let seat: Option<i32> = sqlx::query_scalar(AssertSqlSafe(format!(
-                "UPDATE {counter_table} SET {counter_field} = {counter_field} + 1 \
-                     WHERE id = $1 RETURNING 1"
-            )))
-            .bind(claim)
-            .fetch_optional(&mut *tx)
-            .await?;
-            if seat.is_none() {
-                return Err(refused.take().unwrap_or_else(|| mark(REFUSAL_MARK)));
-            }
-        }
-        let mut args = PgArguments::default();
-        for bind in binds.iter().cloned() {
-            bind.add_to(&mut args);
-        }
-        let rows: Vec<T> = sqlx::query_as_with(AssertSqlSafe(update.as_str()), args)
-            .fetch_all(&mut *tx)
-            .await?;
-        if !rows.is_empty() {
-            return Ok(rows);
-        }
-        // Zero rows: the caller's own guard bit, the row deleted in the
-        // window after the handler's read, or — the CAS only — the link
-        // moved since the handler read it. Nothing was written yet either
-        // way, so the probe that tells the cases apart is free: it matches
-        // only a row that is *there*, whose *own* guards still hold, and
-        // whose link has moved off what the handler read — which is the
-        // CAS, and nothing else, having bitten. Carrying the caller's
-        // guards is what keeps that true when a write is refused for
-        // *both* reasons at once: a `.guard()`/`.ordered()` refusal is the
-        // caller's own answer to give, and reporting it as "the link
-        // moved" would send the client to re-read a link that was never
-        // its problem.
-        let mut args = PgArguments::default();
-        for bind in binds {
-            bind.add_to(&mut args);
-        }
-        let live: Option<i32> = sqlx::query_scalar_with(AssertSqlSafe(probe.as_str()), args)
-            .fetch_optional(&mut *tx)
-            .await?;
-        match live {
-            Some(_) => Err(mark(STALE_MARK)),
-            None => Err(mark(GONE_MARK)),
-        }
+        run_refcount_tx(
+            &mut *tx,
+            update.clone(),
+            probe.clone(),
+            binds.clone(),
+            &counter_table,
+            &counter_field,
+            claim,
+            release,
+        )
+        .await
     })
     .await;
     match outcome {
-        // The mark only ever leaves the closure once the real refusal was
-        // spent, so it is the final answer here (today's slot.take() could
-        // never resurrect it either).
-        Err(AppError::Internal(m)) if m == REFUSAL_MARK => Err(mark(REFUSAL_MARK)),
+        // The claim's refusal rides out of the transaction as the bare mark
+        // (a refusal is never retryable, so the loop stopped at it) and is
+        // answered with the caller's real error here.
+        Err(AppError::Internal(m)) if m == REFUSAL_MARK => Err(refused),
         Err(AppError::Internal(m)) if m == STALE_MARK => Err(AppError::Conflict(STALE_MOVE)),
         // The row is gone: exactly the "wrote nothing" answer the plain path
         // reports, so the caller's refusal is unchanged.
         Err(AppError::Internal(m)) if m == GONE_MARK => Ok(Vec::new()),
         other => other,
+    }
+}
+
+/// One attempt of [`run_with_refcount`]'s transaction: the release, the
+/// claim, the guarded row write, and — on an empty write — the probe that
+/// tells a stale link apart from a row that is simply gone.
+#[allow(clippy::too_many_arguments)]
+async fn run_refcount_tx(
+    tx: &mut PgConnection,
+    update: String,
+    probe: String,
+    binds: Vec<Param>,
+    counter_table: &str,
+    counter_field: &str,
+    claim: Option<Uuid>,
+    release: Option<Uuid>,
+) -> Result<Vec<PgRow>, AppError> {
+    if let Some(release) = release {
+        sqlx::query(AssertSqlSafe(format!(
+            "UPDATE {counter_table} \
+                 SET {counter_field} = GREATEST({counter_field} - 1, 0) WHERE id = $1"
+        )))
+        .bind(release)
+        .execute(&mut *tx)
+        .await?;
+    }
+    // The conditional claim doubles as the existence check: zero rows
+    // is the claimed row being gone, the caller's own refusal.
+    if let Some(claim) = claim {
+        let seat: Option<i32> = sqlx::query_scalar(AssertSqlSafe(format!(
+            "UPDATE {counter_table} SET {counter_field} = {counter_field} + 1 \
+                 WHERE id = $1 RETURNING 1"
+        )))
+        .bind(claim)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if seat.is_none() {
+            return Err(mark(REFUSAL_MARK));
+        }
+    }
+    let mut args = PgArguments::default();
+    for bind in binds.iter().cloned() {
+        bind.add_to(&mut args);
+    }
+    let rows: Vec<PgRow> = sqlx::query_with(AssertSqlSafe(update), args)
+        .fetch_all(&mut *tx)
+        .await?;
+    if !rows.is_empty() {
+        return Ok(rows);
+    }
+    // Zero rows: the caller's own guard bit, the row deleted in the
+    // window after the handler's read, or — the CAS only — the link
+    // moved since the handler read it. Nothing was written yet either
+    // way, so the probe that tells the cases apart is free: it matches
+    // only a row that is *there*, whose *own* guards still hold, and
+    // whose link has moved off what the handler read — which is the
+    // CAS, and nothing else, having bitten. Carrying the caller's
+    // guards is what keeps that true when a write is refused for
+    // *both* reasons at once: a `.guard()`/`.ordered()` refusal is the
+    // caller's own answer to give, and reporting it as "the link
+    // moved" would send the client to re-read a link that was never
+    // its problem.
+    let mut args = PgArguments::default();
+    for bind in binds.iter().cloned() {
+        bind.add_to(&mut args);
+    }
+    let live: Option<i32> = sqlx::query_scalar_with(AssertSqlSafe(probe), args)
+        .fetch_optional(&mut *tx)
+        .await?;
+    match live {
+        Some(_) => Err(mark(STALE_MARK)),
+        None => Err(mark(GONE_MARK)),
     }
 }

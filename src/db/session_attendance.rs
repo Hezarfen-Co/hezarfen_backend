@@ -88,7 +88,12 @@ pub async fn mark(
     let attended = crate::domain::session_attendance::counts_as_attended(&status);
     let delta: i64 = if attended { 1 } else { -1 };
     let now = Timestamp::now();
-    tx_with_retry(db, false, async |tx| {
+    // Owned captures (`Send` rule of `tx_with_retry` closures).
+    let session = session.clone();
+    let user = *user;
+    let status = status.clone();
+    let marked_by = *marked_by;
+    tx_with_retry(db, false, async move |tx| {
         // The gate and the serialization point: a live session row, locked
         // against the delete cascade and every rival mark.
         let sess = sqlx::query!(
@@ -234,7 +239,10 @@ pub async fn remove(
     session: &CourseSessionId,
     user: &UserId,
 ) -> Result<Option<SessionAttendance>, AppError> {
-    tx_with_retry(db, false, async |tx| {
+    // Owned captures (`Send` rule of `tx_with_retry` closures).
+    let session = session.clone();
+    let user = *user;
+    tx_with_retry(db, false, async move |tx| {
         // The pre-image and the row's right to exist in one locked
         // statement: the row cannot vanish (or change status) under this
         // transaction, and `None` here is simply "nothing to remove".

@@ -75,8 +75,10 @@ pub async fn save(
     // `no_exam` THROW did. Real foreign keys stand behind the lock — a
     // child insert whose parent is gone refuses itself — which is what
     // retired the bump-and-restore this used to ride on.
-    tx_with_retry(db, false, async |conn| {
-        save_in(conn, question, user, seq, selected.clone(), text.clone()).await
+    let question = question.clone();
+    let user = *user;
+    tx_with_retry(db, false, async move |conn| {
+        save_in(conn, &question, &user, seq, selected.clone(), text.clone()).await
     })
     .await
 }
@@ -123,6 +125,7 @@ pub(crate) async fn save_in(
     )
     .fetch_one(&mut *conn)
     .await
+    .map_err(AppError::from)
 }
 
 /// One student's stored answer for a question in sitting `seq`, if any.

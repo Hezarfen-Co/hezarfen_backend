@@ -60,13 +60,15 @@ pub async fn enroll(
     if let Some(existing) = read_for_user(db, course, user).await? {
         return disown_if_pumped(db, existing).await;
     }
-    let verdict = tx_with_retry(db, false, async |tx| {
+    let course_id = course.clone();
+    let (user_id, enrolled_by_id) = (*user, *enrolled_by);
+    let verdict = tx_with_retry(db, false, async move |tx| {
         // The duplicate gate rides ahead of the role check, so "you are
         // already in" still outranks everything.
         let held = sqlx::query!(
             r#"SELECT 1 AS "one" FROM enrollment WHERE course = $1 AND app_user = $2"#,
-            course.uuid(),
-            user.uuid(),
+            course_id.uuid(),
+            user_id.uuid(),
         )
         .fetch_optional(&mut *tx)
         .await?;
@@ -78,7 +80,7 @@ pub async fn enroll(
         // demotion (see the doc above).
         let role = sqlx::query!(
             r#"SELECT role FROM app_user WHERE id = $1 FOR NO KEY UPDATE"#,
-            user.uuid(),
+            user_id.uuid(),
         )
         .fetch_optional(&mut *tx)
         .await?;
@@ -101,10 +103,10 @@ pub async fn enroll(
                SELECT $1, $3, $4, NULL WHERE EXISTS (SELECT 1 FROM seat)
                RETURNING course AS "course: CourseId", app_user AS "user: UserId",
                           enrolled_by AS "enrolled_by: UserId", source AS "source: ClassGroupId""#,
-            course.uuid(),
+            course_id.uuid(),
             cap::UNLIMITED,
-            user.uuid(),
-            enrolled_by.uuid(),
+            user_id.uuid(),
+            enrolled_by_id.uuid(),
         )
         .fetch_optional(&mut *tx)
         .await?;

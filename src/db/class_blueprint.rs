@@ -82,7 +82,8 @@ pub async fn create(
         courses: courses.clone(),
         creator: creator.clone(),
     };
-    tx_with_retry(db, false, async |tx| {
+    let creator = *creator;
+    tx_with_retry(db, false, async move |tx| {
         courses_alive(tx, &courses).await?;
         let inserted = sqlx::query!(
             r#"INSERT INTO class_blueprint (grade, courses, creator)
@@ -151,7 +152,8 @@ pub async fn set_courses_if_unchanged(
     held: Vec<CourseId>,
     wanted: Vec<CourseId>,
 ) -> Result<Option<ClassBlueprint>, AppError> {
-    tx_with_retry(db, false, async |tx| {
+    let id = id.clone();
+    tx_with_retry(db, false, async move |tx| {
         courses_alive(tx, &wanted).await?;
         let updated = sqlx::query!(
             r#"UPDATE class_blueprint SET courses = $2

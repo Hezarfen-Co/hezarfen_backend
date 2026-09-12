@@ -31,7 +31,10 @@ pub async fn upsert(
     db: &Database,
     image: QuestionImage,
 ) -> Result<(QuestionImage, Option<String>), AppError> {
-    tx_with_retry(db, false, async |conn| upsert_in(conn, image.clone()).await).await
+    tx_with_retry(db, false, async move |conn| {
+        upsert_in(conn, image.clone()).await
+    })
+    .await
 }
 
 /// The gated read-and-replace, on one connection.
@@ -182,7 +185,7 @@ pub async fn file_keys_for_course(
 /// Refused once the exam has an attempt, in the same transaction — same
 /// gate, same reason as [`upsert`].
 pub async fn delete(db: &Database, image: QuestionImage) -> Result<QuestionImage, AppError> {
-    tx_with_retry(db, false, async |conn| {
+    tx_with_retry(db, false, async move |conn| {
         freeze_gate(conn, &image.exam).await?;
         let deleted = sqlx::query_as!(
             QuestionImage,
