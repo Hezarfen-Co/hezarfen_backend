@@ -17,6 +17,12 @@ impl SessionId {
         Self(next_uuid())
     }
 
+    /// The inner uuid, for runtime-checked binds (Param/QueryBuilder) that
+    /// cannot take the newtype. Static `query!` binds take `self` directly.
+    pub fn uuid(&self) -> Uuid {
+        self.0
+    }
+
     /// The hyphenated wire form.
     #[allow(dead_code)]
     pub fn key(&self) -> String {

@@ -45,6 +45,12 @@ impl AppointmentId {
         Self(next_uuid())
     }
 
+    /// The inner uuid, for runtime-checked binds (Param/QueryBuilder) that
+    /// cannot take the newtype. Static `query!` binds take `self` directly.
+    pub fn uuid(&self) -> Uuid {
+        self.0
+    }
+
     /// Parses a wire key. A key that is not a UUID parses as the nil UUID,
     /// which matches no row — a malformed path param stays a 404, exactly
     /// like a well-formed one that names nothing.
@@ -113,7 +119,12 @@ impl AppointmentReason {
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Appointment {
     pub(crate) id: AppointmentId,
-    pub(crate) slot: AppointmentSlotId,
+    /// The booked slot. `NULL` only on a settled row whose slot was later
+    /// withdrawn (a demotion sweep or a delete after the seat came back):
+    /// the booking still renders, without a window — the dangling reference
+    /// the old store permitted, now an explicit NULL. A live booking's slot
+    /// is pinned by the `occupied` counter and can never be NULL.
+    pub(crate) slot: Option<AppointmentSlotId>,
     pub(crate) requester: UserId,
     pub(crate) status: AppointmentStatus,
     pub(crate) reason: AppointmentReason,
@@ -137,8 +148,8 @@ impl Appointment {
         &self.id
     }
 
-    pub fn get_slot(&self) -> &AppointmentSlotId {
-        &self.slot
+    pub fn get_slot(&self) -> Option<&AppointmentSlotId> {
+        self.slot.as_ref()
     }
 
     pub fn get_requester(&self) -> &UserId {

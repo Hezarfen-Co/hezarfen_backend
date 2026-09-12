@@ -41,7 +41,9 @@ CREATE INDEX appointment_slot_series ON appointment_slot (series);
 
 CREATE TABLE appointment (
     id                 uuid PRIMARY KEY,
-    slot               uuid NOT NULL REFERENCES appointment_slot(id) ON DELETE NO ACTION,
+    -- Nullable + SET NULL ports the old dangling-ref contract: a settled
+    -- booking whose slot was deleted still renders, without a window.
+    slot               uuid NULL REFERENCES appointment_slot(id) ON DELETE SET NULL,
     requester          uuid NOT NULL REFERENCES app_user(id) ON DELETE NO ACTION,
     status             TEXT NOT NULL DEFAULT 'pending'
         CHECK (status IN ('pending', 'approved', 'rejected', 'cancelled')),
@@ -108,7 +110,11 @@ CREATE TABLE dietary_profile (
 -- A cancel flips `status` and stamps `cancelled_at`; the row stays so the
 -- freed seat is still auditable against the ledger line it charged.
 CREATE TABLE meal_booking (
-    menu         TEXT NOT NULL REFERENCES menu(id) ON DELETE NO ACTION,
+    -- No FK to menu(id) ON PURPOSE: cancelled booking rows must survive menu
+    -- deletion (their attempt counter keeps meal_ledger (booking, attempt)
+    -- ids unique across a republish — the pinned meal_bookings_round_trip
+    -- contract). A booking's menu exists at write time by app transaction.
+    menu         TEXT NOT NULL,
     student      uuid NOT NULL REFERENCES app_user(id) ON DELETE NO ACTION,
     booked_by    uuid NOT NULL REFERENCES app_user(id) ON DELETE NO ACTION,
     status       TEXT NOT NULL DEFAULT 'booked'
