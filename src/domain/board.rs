@@ -12,7 +12,6 @@
 //! so every mutation here is a field-scoped `UPDATE … SET`. A whole-row
 //! rewrite would silently wipe both.
 
-use uuid::Uuid;
 use crate::constant::{MAX_BOARD_PARTICIPANTS, MAX_BOARD_TITLE_LEN};
 use crate::domain::monotonic_id::next_uuid;
 use crate::domain::timestamp::Timestamp;

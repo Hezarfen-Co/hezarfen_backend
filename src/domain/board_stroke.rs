@@ -17,7 +17,6 @@
 //! count (the stroke claim's dual-counter CTE is what makes that one
 //! transaction).
 
-use uuid::Uuid;
 use crate::constant::BOARD_STROKE_KINDS;
 use crate::domain::board::Board;
 use crate::domain::monotonic_id::next_uuid;

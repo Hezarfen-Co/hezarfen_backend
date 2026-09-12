@@ -10,7 +10,6 @@
 
 pub use crate::domain::note_file::{FileContentType, FileName};
 
-use uuid::Uuid;
 use crate::domain::course_note::CourseNoteId;
 use crate::domain::monotonic_id::next_uuid;
 
