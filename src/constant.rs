@@ -829,19 +829,8 @@ pub const MAX_ETAG_BODY_BYTES: u64 = 1 << 20; // 1 MiB
 pub const REPLY_CHUNKS: usize = 8;
 pub const MIN_CHUNK_CHARS: usize = 24;
 
-// --- query text --------------------------------------------------------
-
-/// The whole of [`crate::db::bank_question::usage_counts`]:
-/// **one** statement (no `;`), so a page of templates costs one round trip no
-/// matter how long it is. Named so a test can assert that, since a per-row
-/// `count()` is exactly the N+1 this page was cleaned of once.
-pub const USAGE_COUNTS_SQL: &str =
-    "SELECT from_bank, count() AS n FROM exam_question WHERE from_bank IN $ids GROUP BY from_bank";
-
 // --- database tables ---------------------------------------------------
 
-pub const USER_TABLE: &str = "user";
-pub const SESSION_TABLE: &str = "session";
 pub const NOTE_TABLE: &str = "note";
 pub const MESSAGE_TABLE: &str = "message";
 pub const NOTE_FILE_TABLE: &str = "note_file";

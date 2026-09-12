@@ -112,7 +112,24 @@ pub async fn enroll(
         .await?;
         match row {
             Some(row) => Ok(Verdict::Made(row)),
-            None => Ok(Verdict::Full),
+            None => {
+                // A same-student racer whose held-check predated the winner's
+                // commit queues on the role lock, wakes to a full roster, and
+                // its own row is already the winner's: that is the replay,
+                // not a refusal. Fresh snapshot per statement, so this read
+                // sees the committed winner.
+                let now_held = sqlx::query!(
+                    r#"SELECT 1 AS "one" FROM enrollment WHERE course = $1 AND app_user = $2"#,
+                    course_id.uuid(),
+                    user_id.uuid(),
+                )
+                .fetch_optional(&mut *tx)
+                .await?;
+                if now_held.is_some() {
+                    return Ok(Verdict::Held);
+                }
+                Ok(Verdict::Full)
+            }
         }
     })
     .await;

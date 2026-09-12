@@ -136,13 +136,6 @@ const EXCLUDED: &[(&str, &str)] = &[
         "DEFAULT_DIETARY_TAGS",
         "settings seed; the live list is on GET /settings",
     ),
-    // The three migration batches and their list moved to
-    // `src/migration_sql.rs` — they are SurrealQL text, not bounds, and the
-    // numeric sweep below still catches any bound that tries to follow them.
-    ("USAGE_COUNTS_SQL", "one-statement bank usage-count query"),
-    // Storage-side keys and literals. Each names a row, a column value or a
-    // fold rule the server writes; none is a number a client is held to.
-    ("SETTINGS_KEY", "the settings singleton's record key"),
     (
         "DECOY_PASSWORD",
         "login-decoy input, never a real credential",

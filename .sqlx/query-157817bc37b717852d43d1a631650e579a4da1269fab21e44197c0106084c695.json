@@ -1,21 +1,10 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id AS \"id: SessionId\",\n                  app_user AS \"user: UserId\",\n                  token AS \"token: SessionToken\",\n                  expires_at AS \"expires_at: Timestamp\"\n           FROM user_session WHERE token = $1",
+  "query": "SELECT\n                  app_user AS \"user: UserId\",\n                  token AS \"token: SessionToken\",\n                  expires_at AS \"expires_at: Timestamp\"\n           FROM user_session WHERE token = $1",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "id: SessionId",
-        "type_info": "Uuid",
-        "origin": {
-          "Table": {
-            "table": "user_session",
-            "name": "id"
-          }
-        }
-      },
-      {
-        "ordinal": 1,
         "name": "user: UserId",
         "type_info": "Uuid",
         "origin": {
@@ -26,7 +15,7 @@
         }
       },
       {
-        "ordinal": 2,
+        "ordinal": 1,
         "name": "token: SessionToken",
         "type_info": "Text",
         "origin": {
@@ -37,7 +26,7 @@
         }
       },
       {
-        "ordinal": 3,
+        "ordinal": 2,
         "name": "expires_at: Timestamp",
         "type_info": "Int8",
         "origin": {
@@ -56,9 +45,8 @@
     "nullable": [
       false,
       false,
-      false,
       false
     ]
   },
-  "hash": "3a1a31d80635fd424a8d6e7e3c0242317c7a8c34d8900f70714c1db991b93809"
+  "hash": "157817bc37b717852d43d1a631650e579a4da1269fab21e44197c0106084c695"
 }

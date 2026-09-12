@@ -1,21 +1,10 @@
 {
   "db_name": "PostgreSQL",
-  "query": "INSERT INTO user_session (id, app_user, token, expires_at)\n           VALUES ($1, $2, $3, $4)\n           RETURNING id AS \"id: SessionId\",\n                     app_user AS \"user: UserId\",\n                     token AS \"token: SessionToken\",\n                     expires_at AS \"expires_at: Timestamp\"",
+  "query": "INSERT INTO user_session (id, app_user, token, expires_at)\n           VALUES ($1, $2, $3, $4)\n           RETURNING\n                     app_user AS \"user: UserId\",\n                     token AS \"token: SessionToken\",\n                     expires_at AS \"expires_at: Timestamp\"",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "id: SessionId",
-        "type_info": "Uuid",
-        "origin": {
-          "Table": {
-            "table": "user_session",
-            "name": "id"
-          }
-        }
-      },
-      {
-        "ordinal": 1,
         "name": "user: UserId",
         "type_info": "Uuid",
         "origin": {
@@ -26,7 +15,7 @@
         }
       },
       {
-        "ordinal": 2,
+        "ordinal": 1,
         "name": "token: SessionToken",
         "type_info": "Text",
         "origin": {
@@ -37,7 +26,7 @@
         }
       },
       {
-        "ordinal": 3,
+        "ordinal": 2,
         "name": "expires_at: Timestamp",
         "type_info": "Int8",
         "origin": {
@@ -59,9 +48,8 @@
     "nullable": [
       false,
       false,
-      false,
       false
     ]
   },
-  "hash": "162bc2deeef2ea6e238026df897a64a0021969fe8b805761cdd742e74f07e657"
+  "hash": "04bae764ec61cfeb13e3bfe67da8853fb83eca5f2a2d112fac7970cb6f653bd0"
 }

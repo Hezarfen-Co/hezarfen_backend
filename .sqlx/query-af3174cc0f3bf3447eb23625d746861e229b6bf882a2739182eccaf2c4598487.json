@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n                  builder AS \"builder: BuilderId\",\n                  token AS \"token: SessionToken\",\n                  expires_at AS \"expires_at: Timestamp\"\n           FROM builder_session WHERE token = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "builder: BuilderId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "builder_session",
+            "name": "builder"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "token: SessionToken",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "builder_session",
+            "name": "token"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "expires_at: Timestamp",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "builder_session",
+            "name": "expires_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "af3174cc0f3bf3447eb23625d746861e229b6bf882a2739182eccaf2c4598487"
+}

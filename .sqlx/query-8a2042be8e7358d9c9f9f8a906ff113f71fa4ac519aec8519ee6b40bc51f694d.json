@@ -1,21 +1,10 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id,\n                  exam_kinds AS \"exam_kinds: Json<Vec<ExamKindDef>>\",\n                  attendance_statuses,\n                  grade_bands AS \"grade_bands: Json<Vec<GradeBand>>\",\n                  max_file_bytes,\n                  chatbot_history_turns,\n                  max_chatbot_message_len,\n                  max_chatbot_threads,\n                  meal_slots AS \"meal_slots: Json<Vec<MealSlotDef>>\",\n                  dietary_tags,\n                  meal_cancel_cutoff_minutes\n           FROM settings WHERE id = 'school'",
+  "query": "SELECT\n                  exam_kinds AS \"exam_kinds: Json<Vec<ExamKindDef>>\",\n                  attendance_statuses,\n                  grade_bands AS \"grade_bands: Json<Vec<GradeBand>>\",\n                  max_file_bytes,\n                  chatbot_history_turns,\n                  max_chatbot_message_len,\n                  max_chatbot_threads,\n                  meal_slots AS \"meal_slots: Json<Vec<MealSlotDef>>\",\n                  dietary_tags,\n                  meal_cancel_cutoff_minutes\n           FROM settings WHERE id = 'school'",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "id",
-        "type_info": "Text",
-        "origin": {
-          "Table": {
-            "table": "settings",
-            "name": "id"
-          }
-        }
-      },
-      {
-        "ordinal": 1,
         "name": "exam_kinds: Json<Vec<ExamKindDef>>",
         "type_info": "Jsonb",
         "origin": {
@@ -26,7 +15,7 @@
         }
       },
       {
-        "ordinal": 2,
+        "ordinal": 1,
         "name": "attendance_statuses",
         "type_info": "TextArray",
         "origin": {
@@ -37,7 +26,7 @@
         }
       },
       {
-        "ordinal": 3,
+        "ordinal": 2,
         "name": "grade_bands: Json<Vec<GradeBand>>",
         "type_info": "Jsonb",
         "origin": {
@@ -48,7 +37,7 @@
         }
       },
       {
-        "ordinal": 4,
+        "ordinal": 3,
         "name": "max_file_bytes",
         "type_info": "Int8",
         "origin": {
@@ -59,7 +48,7 @@
         }
       },
       {
-        "ordinal": 5,
+        "ordinal": 4,
         "name": "chatbot_history_turns",
         "type_info": "Int8",
         "origin": {
@@ -70,7 +59,7 @@
         }
       },
       {
-        "ordinal": 6,
+        "ordinal": 5,
         "name": "max_chatbot_message_len",
         "type_info": "Int8",
         "origin": {
@@ -81,7 +70,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 6,
         "name": "max_chatbot_threads",
         "type_info": "Int8",
         "origin": {
@@ -92,7 +81,7 @@
         }
       },
       {
-        "ordinal": 8,
+        "ordinal": 7,
         "name": "meal_slots: Json<Vec<MealSlotDef>>",
         "type_info": "Jsonb",
         "origin": {
@@ -103,7 +92,7 @@
         }
       },
       {
-        "ordinal": 9,
+        "ordinal": 8,
         "name": "dietary_tags",
         "type_info": "TextArray",
         "origin": {
@@ -114,7 +103,7 @@
         }
       },
       {
-        "ordinal": 10,
+        "ordinal": 9,
         "name": "meal_cancel_cutoff_minutes",
         "type_info": "Int8",
         "origin": {
@@ -132,7 +121,6 @@
       false,
       false,
       false,
-      false,
       true,
       true,
       true,
@@ -142,5 +130,5 @@
       true
     ]
   },
-  "hash": "6bf5756d2c738d68617d5cb6fbc8f15b5e574977db29e41469b7c4e439ea92fc"
+  "hash": "8a2042be8e7358d9c9f9f8a906ff113f71fa4ac519aec8519ee6b40bc51f694d"
 }
