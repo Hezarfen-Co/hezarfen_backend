@@ -2,6 +2,9 @@ services:
   postgres:
     image: docker.io/library/postgres:18-alpine
     container_name: hezarfen-postgres
+    # 500 connections: the test suite mints a control+school pool per test
+    # (nextest runs ~a dozen concurrently), which exhausts the 100 default.
+    command: ["postgres", "-c", "max_connections=500"]
     environment:
       POSTGRES_USER: hezarfen
       POSTGRES_PASSWORD: hezarfen
