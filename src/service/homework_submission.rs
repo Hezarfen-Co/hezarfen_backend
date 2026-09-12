@@ -1,8 +1,9 @@
-//! Homework submission workflows: the student's submit (the lease-to-write
-//! window that keeps a PATCH's audience re-scope from stranding a hand-in)
-//! and the withdrawal that gives the badge counters back. The row writes
-//! live in [`crate::db::homework_submission`]; every locked path here
-//! leases [`HOMEWORK_LOCK`](crate::service::homework::HOMEWORK_LOCK).
+//! Homework submission workflows: the student's submit (the graded gate and
+//! the audience interlock around the guarded upsert) and the withdrawal that
+//! gives the badge counters back. The row writes live in
+//! [`crate::db::homework_submission`]; the freeze itself is a condition of
+//! those writes, and the homework row's lock is what orders them against
+//! grading — there is no subsystem lock here any more.
 
 use crate::database::Database;
 use crate::db::homework_file;
@@ -23,29 +24,22 @@ pub struct Submitted {
 }
 
 /// Submit (or re-submit) the caller's own work for a homework. The graded
-/// gate and the audience interlock are the reader lease's — taken *before*
-/// the gate read: read first and the audience this gate approved is one
-/// committed PATCH old, so the narrowing that just passed the orphan guard
-/// (no submission yet) is followed by the very submission it would have
-/// refused. Holding the lease across gate *and* write is what makes the
-/// PATCH wait and then see the row.
+/// read below answers the common case — graded minutes ago, and the student
+/// who never submitted has no row to carry the freeze; the upsert's own
+/// `graded_by_result IS NULL` condition is what holds when the grade lands
+/// *while* this request runs (grade and write serialize on the homework
+/// row's lock).
 ///
-/// `None` from [`homework_submission::upsert`] is a grade landing mid-request
-/// (the stamp on the row refusing the write); the graded read above answers
-/// the common case, and both return the same 409.
+/// `None` from [`homework_submission::upsert`] is that freeze biting; both
+/// refusals return the same 409.
 pub async fn submit(
     db: &Database,
     user: &User,
     id: &str,
     text: Option<SubmissionText>,
 ) -> Result<Submitted, AppError> {
-    let _guard = crate::service::homework::HOMEWORK_LOCK.read().await;
     let homework = crate::service::homework::gate_own_submission(id, user, db).await?;
     crate::service::homework::require_open_term(&homework, db).await?;
-    // The graded gate, twice over. This read answers the common case — graded
-    // minutes ago, and the student who never submitted has no row to carry the
-    // freeze; the upsert's own `WHERE` (the grade stamp on the row) is what
-    // holds when the grade lands *while* this request runs.
     const GRADED: AppError = AppError::Conflict(
         "this homework has been graded — ask the teacher to remove the grade before editing your submission",
     );
@@ -55,12 +49,11 @@ pub async fn submit(
     {
         return Err(GRADED);
     }
-    // 201-vs-200: a prior read is exact, where comparing the returned stamps
-    // would misreport a same-millisecond re-submit as a create.
-    let existed = homework_submission::read_for(db, homework.get_id(), user.get_id())
-        .await?
-        .is_some();
-    let Some(submission) = homework_submission::upsert(db, &homework, user.get_id(), text).await?
+    // `existed` comes back from the transaction itself, so the 201-vs-200
+    // answer and the badge rule are exact even against a rival first
+    // hand-in.
+    let Some((submission, existed)) =
+        homework_submission::upsert(db, &homework, user.get_id(), text, false).await?
     else {
         return Err(GRADED);
     };
@@ -85,7 +78,6 @@ pub async fn submit(
 pub async fn delete(db: &Database, user: &User, id: &str) -> Result<Vec<HomeworkFile>, AppError> {
     let homework = crate::service::homework::gate_own_submission(id, user, db).await?;
     crate::service::homework::require_open_term(&homework, db).await?;
-    let _guard = crate::service::homework::HOMEWORK_LOCK.read().await;
     const GRADED: AppError = AppError::Conflict(
         "this homework has been graded — ask the teacher to remove the grade before deleting your submission",
     );

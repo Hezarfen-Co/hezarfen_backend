@@ -1,62 +1,25 @@
-//! Homework workflows: the PATCH re-scope with its orphan guard, the
-//! cascading delete, and the shared student-side wall
+//! Homework workflows: the cascading delete and the shared student-side wall
 //! ([`gate_own_submission`]) every submission path walks. Row reads and
 //! listings pass through to [`crate::db::homework`]; the submission, file,
-//! and grade workflows live in the sibling `service::homework_*` modules,
-//! whose every locked path leases [`HOMEWORK_LOCK`].
+//! and grade workflows live in the sibling `service::homework_*` modules.
+//!
+//! There is no homework subsystem lock any more: the writes that used to
+//! serialize on one — the PATCH's orphan guard, the delete cascade, grading,
+//! and every student-side write — now contend on the *homework row itself*
+//! (`SELECT … FOR UPDATE` inside each transaction), so the ordering they
+//! need survives a multi-process deployment. See
+//! [`crate::db::homework::update`] and
+//! [`crate::db::homework_result::grade`].
 
 use crate::database::Database;
 use crate::db::homework;
-use crate::db::homework_file;
-use crate::db::homework_result;
-use crate::db::homework_submission;
 use crate::domain::course::CourseId;
 use crate::domain::homework::{Homework, HomeworkDescription, HomeworkId, HomeworkTitle};
-use crate::domain::homework_result::HomeworkResult;
-use crate::domain::homework_submission::HomeworkSubmission;
 use crate::domain::role::Role;
 use crate::domain::subject::SubjectId;
 use crate::domain::timestamp::Timestamp;
 use crate::domain::user::{User, UserId};
 use crate::error::AppError;
-
-/// Serializes the homework subsystem's cross-record check-then-writes, which
-/// `BEGIN…COMMIT` cannot (write skew) — the same reasoning as
-/// [`crate::service::exam_attempt::EXAM_LOCK`]. Every lease below is held across the
-/// database write it guards, so within this one process it does order a full
-/// round trip — but the freeze no longer *rests* on that: a graded submission
-/// used to stay unedited only because the "no grade yet" read and the write it
-/// licensed sat under one lease. That rule now lives in the database too —
-/// grading stamps [`crate::constant::SUBMISSION_GRADED_FIELD`] on the
-/// submission row and every student-side write carries `graded_by_result =
-/// NONE` as its own condition. The one case the stamp cannot cover — grading
-/// work with no submission row yet — falls back to the lease pair, so a write
-/// lease must never stop spanning its own database call (see
-/// [`crate::db::homework_result::grade`]).
-///
-/// What still leases it, honestly:
-/// - Write: the homework PATCH's orphan guard ([`update`]), the
-///   homework-delete cascade ([`delete`]), and grade/ungrade — whose
-///   freeze rule (the stamp landing on a submission that may be written in the
-///   same instant) is the one thing here still resting on the two leases being
-///   mutually exclusive. The *existence* half has left: a grade now moves a
-///   value on the homework row inside its own transaction
-///   ([`crate::db::homework_result::grade`]), so a
-///   concurrent delete refuses it rather than being read around.
-/// - Read: the student's submission/file writes, which no longer gate the
-///   freeze but still must not land under a PATCH re-scoping the audience out
-///   from under them.
-///
-/// The subject rule has left: creating a homework and re-tagging one move the
-/// subject's reference counter, and the subject delete is refused while that
-/// counter is non-zero ([`crate::domain::subject::Subject::delete`]), so
-/// neither the create (in `web::courses`) nor the outside writer the subject
-/// delete used to take is on this list any more.
-///
-/// Lock order, where both are taken: `HOMEWORK_LOCK` before the counter lock in
-/// [`crate::db::cap`], never the reverse.
-// corner-cut: global RwLock, shard per-homework if write latency ever matters.
-pub(crate) static HOMEWORK_LOCK: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
 
 #[expect(
     clippy::too_many_arguments,
@@ -120,17 +83,10 @@ pub async fn list_for_user_in_course(
 
 /// Re-scope (or re-tag, re-title, re-describe, re-schedule) the homework.
 ///
-/// Writer lease of [`HOMEWORK_LOCK`]: `ensure_no_orphans` below reads the
-/// live submissions and results, and the row write depends on what it saw —
-/// without the lease a submission (a reader) could land between the check
-/// and the write, orphaned by the narrowing that just missed it. The subject
-/// re-tag no longer needs it — it moves the two subjects' reference counters
-/// inside [`homework::update`].
-///
-/// The orphan guard runs on exactly the requests that re-scope the audience.
-/// An absent `assigned` writes nothing, so the stored subset is untouched and
-/// no narrowing can happen behind the guard's back — which the old "carry the
-/// snapshot back" branch could do, re-narrowing over a concurrent widening.
+/// The audience-narrowing orphan guard and the stale-re-tag refusal are one
+/// transaction with the write in [`homework::update`], under the homework
+/// row's lock — a submission (which locks the same row before writing)
+/// cannot land between the check and the narrowing it would have refused.
 pub async fn update(
     db: &Database,
     homework: Homework,
@@ -140,62 +96,17 @@ pub async fn update(
     due_at: Option<Timestamp>,
     assigned: Option<Option<Vec<UserId>>>,
 ) -> Result<Homework, AppError> {
-    let _guard = HOMEWORK_LOCK.write().await;
-    if let Some(resolved) = assigned.as_ref() {
-        ensure_no_orphans(&homework, resolved.as_deref(), db).await?;
-    }
     homework::update(db, homework, subject, title, description, due_at, assigned).await
 }
 
-/// Refuse (409) a PATCH that would narrow `homework`'s audience so a student
-/// who already submitted or was graded falls outside it — their work would be
-/// stranded. `new_assigned` is the proposed subset (`None` = whole course, in
-/// which case no one can be orphaned). The blocking students are named in the
-/// message so the teacher knows whose work to clear (or whom to keep assigned)
-/// first.
-async fn ensure_no_orphans(
-    homework: &Homework,
-    new_assigned: Option<&[UserId]>,
-    db: &Database,
-) -> Result<(), AppError> {
-    // Whole-course covers everyone — no narrowing, no orphans.
-    let Some(subset) = new_assigned else {
-        return Ok(());
-    };
-    let submissions = homework_submission::list_for_homework(db, homework.get_id()).await?;
-    let results = homework_result::list_for_homework(db, homework.get_id()).await?;
-    let mut blocked: Vec<String> = Vec::new();
-    for user in submissions
-        .iter()
-        .map(HomeworkSubmission::get_user)
-        .chain(results.iter().map(HomeworkResult::get_user))
-    {
-        let key = user.key().to_string();
-        if !subset.contains(user) && !blocked.contains(&key) {
-            blocked.push(key);
-        }
-    }
-    if blocked.is_empty() {
-        Ok(())
-    } else {
-        Err(AppError::ConflictOwned(format!(
-            "narrowing the assigned list would orphan existing work by {} student(s): {}",
-            blocked.len(),
-            blocked.join(", ")
-        )))
-    }
-}
-
-/// Delete the homework: collect the submission-file blob keys, then run the
-/// cascading delete under [`HOMEWORK_LOCK`]'s write lease
-/// so no submission can land under the homework mid-delete; the blob names are
-/// collected before the rows are wiped (the cascade is one transaction, children
-/// first) and removed after, so a crash in between strands at worst an
-/// unreachable file.
+/// Delete the homework: run the cascading delete (submissions, their files,
+/// results, then the row — one transaction, children first) and return the
+/// submission-file blob keys, which the transaction collected before the
+/// wipes so no file added mid-delete can strand its blob. The web layer
+/// unlinks the blobs once the rows are gone; a crash in between strands at
+/// worst an unreachable file.
 pub async fn delete(db: &Database, homework: Homework) -> Result<Vec<String>, AppError> {
-    let _guard = HOMEWORK_LOCK.write().await;
-    let blob_keys = homework_file::file_keys_for_homework(db, homework.get_id()).await?;
-    homework::delete(db, homework).await?;
+    let (_, blob_keys) = homework::delete(db, homework).await?;
     Ok(blob_keys)
 }
 

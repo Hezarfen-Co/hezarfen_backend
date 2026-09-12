@@ -70,6 +70,7 @@ impl SubmissionText {
 pub struct HomeworkSubmission {
     pub(crate) id: HomeworkSubmissionId,
     pub(crate) homework: HomeworkId,
+    #[sqlx(rename = "app_user")]
     pub(crate) user: UserId,
     pub(crate) text: Option<SubmissionText>,
     pub(crate) submitted_at: Timestamp,

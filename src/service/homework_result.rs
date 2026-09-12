@@ -1,10 +1,9 @@
 //! Homework grading workflows: the policy gates around the atomic grade —
 //! nobody grades themselves, the target must be a live enrolled student in
 //! the homework's audience — and the un-grade. The freeze-stamping
-//! transaction lives in [`crate::db::homework_result`]; grading holds
-//! [`HOMEWORK_LOCK`](crate::service::homework::HOMEWORK_LOCK)'s writer lease
-//! across its gates and the write, the reader side of every student write's
-//! lease pair.
+//! transaction lives in [`crate::db::homework_result`]; it locks the
+//! homework row across the stamp, which is what orders a grade against every
+//! student-side write — there is no subsystem lock here any more.
 
 use crate::database::Database;
 use crate::db::homework;
@@ -20,11 +19,11 @@ use crate::error::{AppError, ValidationError};
 /// Record (or overwrite) `target`'s grade for the homework. The web layer
 /// has already read the homework, checked course-management rights, walled
 /// the archived term, and validated the status and mark; everything here is
-/// re-run or decided under the writer lease:
+/// re-run or decided against the row the grade transaction locks:
 ///
-/// - the homework is re-read (a homework delete is a fellow writer — its
-///   lease excludes this one, so a grade cannot resurrect a result row under
-///   a vanished homework; the vanished row answers 404);
+/// - the homework is re-read (a homework delete is a fellow writer — both
+///   contend on the homework row's lock, so a grade cannot resurrect a
+///   result row under a vanished homework; the vanished row answers 404);
 /// - grading never targets oneself — no grader, whatever their role, may
 ///   write their own grade;
 /// - the target user must exist, and only students carry homework grades —
@@ -40,7 +39,6 @@ pub async fn grade(
     mark: Option<Mark>,
     target: &UserId,
 ) -> Result<HomeworkResult, AppError> {
-    let _guard = crate::service::homework::HOMEWORK_LOCK.write().await;
     let homework = homework::read(db, id).await?.ok_or(AppError::NotFound)?;
 
     // Grading never targets oneself.
@@ -100,7 +98,6 @@ pub async fn ungrade(
     id: &HomeworkId,
     target: &UserId,
 ) -> Result<Option<HomeworkResult>, AppError> {
-    let _guard = crate::service::homework::HOMEWORK_LOCK.write().await;
     homework_result::remove(db, id, target).await
 }
 
